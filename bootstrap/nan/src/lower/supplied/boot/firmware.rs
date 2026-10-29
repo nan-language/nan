@@ -15,6 +15,7 @@ use super::super::super::runtime::{report, state};
 use super::super::super::stack::{Kind, Site};
 use super::super::mem::vector::{self, Element};
 use super::super::{Supply, sys};
+use crate::workspace::Arch;
 
 /// The offsets in the system table of its console-output protocol and its boot services; in
 /// the console-output protocol of its string output; in the boot services of `GetMemoryMap`,
@@ -70,6 +71,7 @@ pub fn with_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// `services.write_console(text)`: writes `text` to the firmware's console output in UTF-16,
 /// each line feed preceded by a carriage return.
 pub fn write_console(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let arch = lo.ck.db.target.arch();
     let text = supply.param(1).address();
     let start = fx.load(PTR, text, 0);
     let len = fx.load(PTR, text, 8);
@@ -84,7 +86,7 @@ pub fn write_console(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let table = system_table(lo, fx);
     let conout = fx.load(PTR, table, CONSOLE_OUT);
     let output = fx.load(PTR, conout, OUTPUT_STRING);
-    let status = win64_call(fx, output, &[conout, units]);
+    let status = firmware_call(arch, fx, output, &[conout, units]);
     lo.record_free(fx, units);
     fail_unless(lo, fx, supply, status, |_, _| {});
     supply.done(lo, fx);
@@ -94,6 +96,7 @@ pub fn write_console(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// the volume the image was loaded from, through the loaded image's device and its simple file
 /// system, into bytes drawn through `alloc`.
 pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let arch = lo.ck.db.target.arch();
     let path = supply.param(1).address();
     let cell = fx.load(PTR, supply.param(2).address(), 0);
     let table = system_table(lo, fx);
@@ -105,16 +108,16 @@ pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         fx.load(PTR, state_address, state::PLATFORM)
     };
     let loaded_image = guid(lo, fx, &LOADED_IMAGE);
-    let status = win64_call(fx, handle_protocol, &[image, loaded_image, found]);
+    let status = firmware_call(arch, fx, handle_protocol, &[image, loaded_image, found]);
     fail_unless(lo, fx, supply, status, |_, _| {});
     let loaded = fx.load(PTR, found, 0);
     let device = fx.load(PTR, loaded, DEVICE_HANDLE);
     let file_system = guid(lo, fx, &SIMPLE_FILE_SYSTEM);
-    let status = win64_call(fx, handle_protocol, &[device, file_system, found]);
+    let status = firmware_call(arch, fx, handle_protocol, &[device, file_system, found]);
     fail_unless(lo, fx, supply, status, |_, _| {});
     let volume = fx.load(PTR, found, 0);
     let open_volume = fx.load(PTR, volume, OPEN_VOLUME);
-    let status = win64_call(fx, open_volume, &[volume, found]);
+    let status = firmware_call(arch, fx, open_volume, &[volume, found]);
     fail_unless(lo, fx, supply, status, |_, _| {});
     let root = fx.load(PTR, found, 0);
     let start = fx.load(PTR, path, 0);
@@ -128,25 +131,25 @@ pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let open = fx.load(PTR, root, file::OPEN);
     let mode = fx.ptr(READ_MODE);
     let attributes = fx.ptr(0);
-    let status = win64_call(fx, open, &[root, found, name, mode, attributes]);
+    let status = firmware_call(arch, fx, open, &[root, found, name, mode, attributes]);
     lo.record_free(fx, name);
-    fail_unless(lo, fx, supply, status, |_, fx| close(fx, &[root]));
+    fail_unless(lo, fx, supply, status, |_, fx| close(arch, fx, &[root]));
     let file = fx.load(PTR, found, 0);
     let set_position = fx.load(PTR, file, file::SET_POSITION);
     let end = fx.int(PTR, END_OF_FILE);
-    win64_call(fx, set_position, &[file, end]);
+    firmware_call(arch, fx, set_position, &[file, end]);
     let get_position = fx.load(PTR, file, file::GET_POSITION);
-    win64_call(fx, get_position, &[file, found]);
+    firmware_call(arch, fx, get_position, &[file, found]);
     let size = fx.load(PTR, found, 0);
     let zero = fx.ptr(0);
-    win64_call(fx, set_position, &[file, zero]);
+    firmware_call(arch, fx, set_position, &[file, zero]);
     let bytes = supply.sret.expect("the bytes' address");
     let element = Element { size: 1, align: 1 };
     vector::empty(fx, bytes, cell, element);
     let room = vector::reserve(lo, fx, bytes, size, element);
     let short = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
     fx.when(short, |fx| {
-        close(fx, &[file, root]);
+        close(arch, fx, &[file, root]);
         sys::fail_with(lo, fx, supply, "OutOfMemory");
     });
     let data = fx.load(PTR, bytes, vector::DATA);
@@ -156,9 +159,9 @@ pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let left = fx.b.ins().isub(size, offset);
         fx.store(left, found, 0);
         let at = fx.b.ins().iadd(data, offset);
-        let status = win64_call(fx, read, &[file, found, at]);
+        let status = firmware_call(arch, fx, read, &[file, found, at]);
         fail_unless(lo, fx, supply, status, |lo, fx| {
-            close(fx, &[file, root]);
+            close(arch, fx, &[file, root]);
             vector::free_storage(lo, fx, bytes);
         });
         let got = fx.load(PTR, found, 0);
@@ -168,16 +171,19 @@ pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         (fx.b.ins().band(more, progress), vec![offset])
     })[0];
     fx.store(filled, bytes, vector::LEN);
-    close(fx, &[file, root]);
+    close(arch, fx, &[file, root]);
     supply.ret(lo, fx, Held::Address(bytes));
 }
 
 /// `take m.exit_services()`: reads the firmware's final memory map into a runtime record the
 /// runtime state keeps, in a record grown while the map does not fit it, and ends boot services
-/// with its key, reading the map again while they refuse; then installs the entry root and the
-/// boot CPU's descriptor tables with maskable interrupts disabled, enables AVX when the CPU has
-/// it, and gives the machine's `boot::Kernel`, which holds what the `boot::Machine` held.
+/// with its key, reading the map again while they refuse; then, with maskable interrupts
+/// disabled, installs the entry root, on x86_64 with the boot CPU's descriptor tables and AVX
+/// enabled when the CPU has it, on AArch64 with the memory attributes and translation control
+/// the entry root needs; and gives the machine's `boot::Kernel`, which holds what the
+/// `boot::Machine` held.
 pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let arch = lo.ck.db.target.arch();
     let machine = supply.param(0).address();
     let table = system_table(lo, fx);
     let services = fx.load(PTR, table, BOOT_SERVICES);
@@ -195,7 +201,7 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let ended = fx.repeat(&[zero, zero], |fx, held| {
         let (map, room) = (held[0], held[1]);
         fx.store(room, size, 0);
-        let status = win64_call(fx, get_map, &[size, map, key, stride, version]);
+        let status = firmware_call(arch, fx, get_map, &[size, map, key, stride, version]);
         let short =
             fx.b.ins()
                 .icmp_imm_s(IntCC::Equal, status, EFI_BUFFER_TOO_SMALL);
@@ -216,7 +222,7 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             },
             |_, fx| {
                 let current = fx.load(PTR, key, 0);
-                let status = win64_call(fx, exit, &[image, current]);
+                let status = firmware_call(arch, fx, exit, &[image, current]);
                 let refused = fx.b.ins().icmp_imm_s(IntCC::NotEqual, status, EFI_SUCCESS);
                 vec![map, room, refused]
             },
@@ -233,10 +239,18 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(described, state_address, state::MAP_STRIDE);
     let root = lo.entry_root();
     let root = lo.data_address(fx, root);
-    lo.call_stub(fx, Stub::WriteCr3, &[root]);
-    let boot = lo.cpu_records(fx);
-    lo.load_cpu_tables(fx, boot);
-    lo.enable_avx(fx, boot);
+    match arch {
+        Some(Arch::Aarch64) => {
+            lo.call_stub(fx, Stub::Cli, &[]);
+            lo.call_stub(fx, Stub::EnterRoot, &[root]);
+        }
+        _ => {
+            lo.call_stub(fx, Stub::WriteCr3, &[root]);
+            let boot = lo.cpu_records(fx);
+            lo.load_cpu_tables(fx, boot);
+            lo.enable_avx(fx, boot);
+        }
+    }
     let kernel = supply.sret.expect("the kernel's address");
     let grant = supply.owner.clone().expect("the machine's root grant");
     let layout = lo.layout(&grant);
@@ -326,10 +340,10 @@ fn put_unit(fx: &mut Fx, units: Value, written: Variable, unit: Value) {
 }
 
 /// Closes file protocol handles.
-fn close(fx: &mut Fx, handles: &[Value]) {
+fn close(arch: Option<Arch>, fx: &mut Fx, handles: &[Value]) {
     for handle in handles {
         let close = fx.load(PTR, *handle, file::CLOSE);
-        win64_call(fx, close, &[*handle]);
+        firmware_call(arch, fx, close, &[*handle]);
     }
 }
 
@@ -358,11 +372,15 @@ fn fail_unless(
     });
 }
 
-/// Calls a firmware function at an address under the Microsoft x64 convention, giving its
-/// status. The firmware runs on the boot stack, outside the task-stack accounting, as a stub
-/// does.
-fn win64_call(fx: &mut Fx, code: Value, args: &[Value]) -> Value {
-    let mut signature = Signature::new(CallConv::WindowsFastcall);
+/// Calls a firmware function at an address under the firmware's convention, giving its status:
+/// the Microsoft x64 convention on x86_64 and the Procedure Call Standard on AArch64. The
+/// firmware runs on the boot stack, outside the task-stack accounting, as a stub does.
+fn firmware_call(arch: Option<Arch>, fx: &mut Fx, code: Value, args: &[Value]) -> Value {
+    let convention = match arch {
+        Some(Arch::Aarch64) => CallConv::SystemV,
+        _ => CallConv::WindowsFastcall,
+    };
+    let mut signature = Signature::new(convention);
     signature
         .params
         .extend(args.iter().map(|_| AbiParam::new(PTR)));

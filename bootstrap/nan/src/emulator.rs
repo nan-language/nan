@@ -1,5 +1,6 @@
-//! The emulator the machine targets' descriptors name: whether it can start, the invocation
-//! booting a machine image under it, and boots bounded in host processor time.
+//! The emulator the machine targets' descriptors name: whether a target's images can run on this
+//! machine, the invocation booting a machine image under the emulator, and boots bounded in host
+//! processor time.
 
 use std::fs;
 use std::io::{self, Read};
@@ -9,10 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::command::Launch;
-use crate::workspace::Target;
-
-/// The emulator program.
-const QEMU: &str = "qemu-system-x86_64";
+use crate::workspace::{Arch, Kind, Target};
 
 /// The firmware an `x86_64-uefi` image boots through, and its fallbacks across distributions.
 const OVMF: [&str; 4] = [
@@ -21,6 +19,21 @@ const OVMF: [&str; 4] = [
     "/usr/share/OVMF/OVMF_CODE_4M.fd",
     "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
 ];
+
+/// The firmware an `aarch64-uefi` image boots through, each a flash image padded to the size of
+/// the `virt` board's flash, and its fallbacks across distributions.
+const AAVMF: [&str; 2] = [
+    "/usr/share/AAVMF/AAVMF_CODE.fd",
+    "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+];
+
+/// The emulator program of an architecture's machine targets.
+fn program(arch: Arch) -> &'static str {
+    match arch {
+        Arch::Amd64 => "qemu-system-x86_64",
+        Arch::Aarch64 => "qemu-system-aarch64",
+    }
+}
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pub const OTHER_END: i32 = 70;
@@ -43,27 +56,50 @@ const TICKS_PER_SECOND: u64 = 100;
 const USER_TIME: usize = 11;
 const SYSTEM_TIME: usize = 12;
 
-/// The emulator arguments common to every machine run: the machine, accelerated by KVM where the
-/// host offers it, processors, memory, entropy device, exit port, serial port on the standard
-/// streams, no display or reboot, and an end with the process that starts it.
-fn base_args() -> Vec<String> {
+/// The emulator arguments common to every machine run of an architecture: the machine, on x86_64
+/// accelerated by KVM where the host offers it, processors, memory, entropy device, exit port,
+/// serial port on the standard streams, no display or reboot, and an end with the process that
+/// starts it.
+fn base_args(arch: Arch) -> Vec<String> {
+    let machine: &[&str] = match arch {
+        Arch::Amd64 => &[
+            "-machine",
+            "q35",
+            "-accel",
+            "kvm",
+            "-accel",
+            "tcg",
+            "-device",
+            "virtio-rng-pci",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x01",
+        ],
+        Arch::Aarch64 => &[
+            "-machine",
+            "virt,gic-version=3",
+            "-cpu",
+            "cortex-a72",
+            "-accel",
+            "tcg",
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-device",
+            "virtio-rng-device",
+            "-semihosting-config",
+            "enable=on,target=native",
+        ],
+    };
     [
         "-run-with",
         "exit-with-parent=on",
-        "-machine",
-        "q35",
-        "-accel",
-        "kvm",
-        "-accel",
-        "tcg",
         "-smp",
         "4",
         "-m",
         "512M",
-        "-device",
-        "virtio-rng-pci",
-        "-device",
-        "isa-debug-exit,iobase=0xf4,iosize=0x01",
+    ]
+    .iter()
+    .chain(machine)
+    .chain(&[
         "-display",
         "none",
         "-no-reboot",
@@ -72,21 +108,28 @@ fn base_args() -> Vec<String> {
         "stdio",
         "-monitor",
         "none",
-    ]
-    .iter()
+    ])
     .map(|argument| (*argument).to_owned())
     .collect()
 }
 
-/// Whether the emulator of a machine target can start: the emulator program runs and can end
-/// with the process that starts it, and OVMF is present for `x86_64-uefi`.
+/// Whether a target's images can run on this machine: a host target's when the machine has its
+/// architecture, and a machine target's when its emulator can start, the emulator program
+/// running and able to end with the process that starts it, and the firmware present for a UEFI
+/// target.
 pub fn available(target: Target) -> bool {
-    let runs = Command::new(QEMU)
+    let Some(arch) = target.arch() else {
+        return false;
+    };
+    if target.is_host() {
+        return arch == Arch::running();
+    }
+    let runs = Command::new(program(arch))
         .args(["-run-with", "help"])
         .stderr(Stdio::null())
         .output()
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("exit-with-parent"));
-    runs && (target != Target::Uefi || firmware().is_some())
+    runs && (target.kind() != Some(Kind::Uefi) || Path::new(firmware(arch)).exists())
 }
 
 /// Boots the emulator as `launch` gives, with the standard streams of this process, and gives
@@ -105,9 +148,18 @@ fn run_status(ended: io::Result<ExitStatus>) -> i32 {
     }
 }
 
-/// The OVMF firmware present on the host.
-fn firmware() -> Option<&'static str> {
-    OVMF.iter().copied().find(|path| Path::new(path).exists())
+/// The firmware of an architecture's UEFI target: the first of its paths present on the host,
+/// or the first of them when none is.
+fn firmware(arch: Arch) -> &'static str {
+    let paths: &[&'static str] = match arch {
+        Arch::Amd64 => &OVMF,
+        Arch::Aarch64 => &AAVMF,
+    };
+    paths
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).exists())
+        .unwrap_or(paths[0])
 }
 
 /// What becomes of what a machine writes to its boot volume.
@@ -118,20 +170,22 @@ pub enum Writes {
     Dropped,
 }
 
-/// The emulator invocation that boots a machine image: an `x86_64-bare` image directly through
-/// the PVH boot protocol, an `x86_64-uefi` image through OVMF from a FAT volume holding it as
-/// `/EFI/BOOT/BOOTX64.EFI` and each of `files` at `/` followed by its name.
+/// The emulator invocation that boots a machine image: a bare image directly, by the PVH boot
+/// protocol on x86_64 and by loading its segments on AArch64, and a UEFI image through the
+/// firmware from a FAT volume holding it at the default boot path and each of `files` at `/`
+/// followed by its name.
 pub fn launch(
     target: Target,
     image: &Path,
     files: &[PathBuf],
     writes: Writes,
 ) -> io::Result<Launch> {
-    let mut args = base_args();
-    match target {
-        Target::Uefi => {
-            let firmware = firmware().unwrap_or(OVMF[0]);
-            let volume = boot_volume(image, files)?.display().to_string();
+    let arch = target.arch().expect("a machine target's architecture");
+    let mut args = base_args(arch);
+    match target.kind() {
+        Some(Kind::Uefi) => {
+            let firmware = firmware(arch);
+            let volume = boot_volume(arch, image, files)?.display().to_string();
             args.push("-drive".to_owned());
             args.push(format!(
                 "if=pflash,format=raw,unit=0,readonly=on,file={firmware}"
@@ -148,22 +202,26 @@ pub fn launch(
         }
     }
     Ok(Launch {
-        program: QEMU.into(),
+        program: program(arch).into(),
         args,
         emulated: true,
     })
 }
 
 /// The FAT boot volume of a UEFI image: a directory beside it holding the image as the default
-/// boot path the firmware loads, and each of `files` at its root.
-fn boot_volume(image: &Path, files: &[PathBuf]) -> io::Result<PathBuf> {
+/// boot path the firmware of its architecture loads, and each of `files` at its root.
+fn boot_volume(arch: Arch, image: &Path, files: &[PathBuf]) -> io::Result<PathBuf> {
     let directory = volume_of(image);
     if directory.exists() {
         fs::remove_dir_all(&directory)?;
     }
     let boot = directory.join("EFI").join("BOOT");
     fs::create_dir_all(&boot)?;
-    fs::copy(image, boot.join("BOOTX64.EFI"))?;
+    let default = match arch {
+        Arch::Amd64 => "BOOTX64.EFI",
+        Arch::Aarch64 => "BOOTAA64.EFI",
+    };
+    fs::copy(image, boot.join(default))?;
     for file in files {
         let name = file.file_name().expect("an image file has a name");
         fs::copy(file, directory.join(name))?;

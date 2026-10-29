@@ -99,7 +99,7 @@ const TASK_PREEMPTED: u64 = 280
 const TASK_SIZE: u64 = 288
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
-/// it runs, its index and the locks it holds; on `x86_64-host` also its ring, whether it waits
+/// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
 /// idle in its ring, the operations in flight on it, whether another thread asked to cancel
 /// one, its POSIX thread and the top of the stack its stack overflow reports run on; on a
 /// kernel the flags from before its outermost held lock disabled interrupts.
@@ -260,7 +260,7 @@ const TRAP_RECORD_LEN: u64 = 8
 
 const TRAP_RECORD_BYTES: u64 = 16
 
-/// The default size of a task's stack, of the entry task's stack on `x86_64-host`, and of a
+/// The default size of a task's stack, of the entry task's stack on a host target, and of a
 /// guard region.
 const TASKS_STACK: u64 = 65_536
 
@@ -491,7 +491,9 @@ fn tasks_own_stack(mut lo: Lowering, mut fx: Fx, code: clif::Value, usable: clif
 /// of the larger stack the entry's own `limits stack N` needs, with the routine reserve and the
 /// guard region, drawn through a cell for a domain, or mapped for the zero cell; zero when the
 /// stack cannot be drawn. The task joins the list of live tasks.
-fn tasks_spawn(mut lo: Lowering, mut fx: Fx) {
+fn tasks_spawn(mut lo: Lowering, mut fx: Fx)
+    waive length "the task record's allocation, its stack and guard, its first switch context and its place in the live list, in order"
+{
     let params = mut fx.entry()
     expect params.len() > 7
     let glue = params[0]
@@ -537,10 +539,16 @@ fn tasks_spawn(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(cell, addr: record, offset: TASK_STACK_CELL)
     let guard = mut fx.b.iadd_imm_s(stack, y: i64.fit(TASKS_GUARD))
     mut fx.store(guard, addr: record, offset: TASK_GUARD)
-    let end = mut fx.b.iadd(stack, y: length)
-    let top = mut fx.b.iadd_imm_s(end, y: -8)
+    // The initial stack pointer of the task's first run, which its switch restores: aligned to
+    // 16 bytes, which the start routine is entered with on AArch64, and on x86_64 eight below
+    // that, over a zeroed return slot, so the start routine is entered as a call leaves the stack.
     let zero = mut fx.ptr(0)
-    mut fx.store(zero, addr: top, offset: 0)
+    let end = mut fx.b.iadd(stack, y: length)
+    var top = end
+    if lo.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        top = mut fx.b.iadd_imm_s(end, y: -8)
+        mut fx.store(zero, addr: top, offset: 0)
+    }
     mut fx.store(top, addr: record, offset: TASK_CONTEXT)
     mut fx.store(zero, addr: record, offset: TASK_CONTEXT + 8)
     let start_id = mut lo.routine(Routine.TaskStart)
@@ -617,7 +625,7 @@ fn switch_out(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let thread = mut lo.thread(mut fx)
     let scheduler = mut fx.offset(thread, offset: THREAD_CONTEXT)
     let context = mut fx.offset(record, offset: TASK_CONTEXT)
-    discard mut fx.b.stack_switch(context, load_context_ptr: scheduler, in_payload0: record)
+    mut lo.switch_stacks(mut fx, store: context, load: scheduler, payload: record)
 } switch_out
 
 /// Switches the running kernel task, which an interrupt preempted, away from its CPU: it
@@ -816,7 +824,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
             return mem::List[clif::Value].empty(fx1.alloc)
         })
     }
-    discard mut fx.b.stack_switch(scheduler, load_context_ptr: context, in_payload0: record)
+    mut lo.switch_stacks(mut fx, store: scheduler, load: context, payload: record)
     let resumed_thread = mut lo.thread(mut fx)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: resumed_thread, offset: THREAD_CURRENT)

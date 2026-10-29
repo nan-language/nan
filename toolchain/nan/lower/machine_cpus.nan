@@ -1,13 +1,23 @@
-//! The processors of a machine image: their records, which their GS bases address, the CPUs the platform reports through the ACPI MADT, the boot CPU first, and the starting of the others, through a trampoline the anchor copies below 1 MiB.
+//! The processors of a machine image: their records, which the GS base addresses on x86_64 and `TPIDR_EL1` on AArch64; the CPUs the platform reports, through the ACPI MADT or PSCI, the boot CPU first; and the starting of the others, through a trampoline the anchor copies below 1 MiB or through PSCI.
 
 /// The most CPUs a machine image runs; the platform's others stay stopped.
 const MAX_CPUS: u64 = 64
 
+/// The PSCI functions the AArch64 machine layer calls through the hypervisor conduit: the power
+/// state of an affinity, and the start of a CPU at an entry on a context, and the status an
+/// affinity's power state returns at or below when a processor answers for it.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004
+
+const PSCI_CPU_ON: u64 = 0xC400_0003
+
+const PSCI_PRESENT_MAX: i64 = 2
+
 /// The offsets of a CPU record's fields: its executor thread's record, which the `thread` stub
 /// reads; the vector its running interrupt fn serves; the top and lowest address of its
-/// interrupt stack, which the vector seam reads; its local APIC's id; whether it has started its
-/// executor; its global descriptor table, the pseudo-descriptor loading it, and its task-state
-/// segment; the page-table root `hw::Ring0.write_cr3` last installed, zero for the entry root;
+/// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
+/// its affinity on AArch64; whether it has started its executor; its global descriptor table, the
+/// pseudo-descriptor loading it, and its task-state segment; the page-table root
+/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
 /// whether it has AVX enabled, which the vector seam reads to save the extended state; and the
 /// frame the vector seam saved for the interrupt it serves, zero outside one.
 const CPU_THREAD: u64 = 0
@@ -18,7 +28,7 @@ const CPU_STACK_TOP: u64 = 16
 
 const CPU_STACK_BASE: u64 = 24
 
-const CPU_APIC_ID: u64 = 32
+const CPU_HARDWARE_ID: u64 = 32
 
 const CPU_STARTED: u64 = 40
 
@@ -85,16 +95,19 @@ fn Lowering.running_cpu(mut self, mut fx: Fx) -> clif::Value {
     return mut self.cpu_record(mut fx, index)
 } Lowering.running_cpu
 
-/// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its GS
-/// base addresses from now on; on a kernel, a CPU for each processor the platform reports;
+/// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
+/// register addresses from now on; on a kernel, a CPU for each processor the platform reports;
 /// an executor thread record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor
 /// tables loaded and AVX enabled when it has it.
 fn Lowering.machine_init(mut self, mut fx: Fx) {
     let boot = mut self.cpu_records(mut fx)
-    mut self.write_msr(mut fx, msr: GS_BASE, value: boot)
-    let count = match self.kernel() {
-        true => mut self.discover(mut fx, boot)
-        false => mut fx.ptr(1)
+    mut self.set_cpu_base(mut fx, record: boot)
+    let count = if not self.kernel() {
+        mut fx.ptr(1)
+    } else if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        mut self.aarch64_discover(mut fx, boot)
+    } else {
+        mut self.discover(mut fx, boot)
     }
     let state_address = mut self.state(mut fx)
     mut fx.store(count, addr: state_address, offset: STATE_THREAD_COUNT)
@@ -114,7 +127,7 @@ fn Lowering.machine_init(mut self, mut fx: Fx) {
         let cpu = mut self.cpu_record(mut fx1, index)
         mut fx1.store(record, addr: cpu, offset: CPU_THREAD)
     })
-    if self.ck.db().target == workspace::Target.Bare {
+    if self.ck.db().target == workspace::Target.X64Bare {
         mut self.load_cpu_tables(mut fx, record: boot)
         mut self.enable_avx(mut fx, record: boot)
     }
@@ -160,6 +173,7 @@ fn Lowering.load_cpu_tables(mut self, mut fx: Fx, record: clif::Value) {
 
 /// Installs `root` as the running CPU's page-table root, with maskable interrupts disabled so
 /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
+/// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub.
 fn Lowering.swap_root(mut self, mut fx: Fx, root: clif::Value) -> clif::Value {
     let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
     expect saved.len() > 0
@@ -167,10 +181,25 @@ fn Lowering.swap_root(mut self, mut fx: Fx, root: clif::Value) -> clif::Value {
     let record = mut self.running_cpu(mut fx)
     let replaced = mut fx.load(PTR, addr: record, offset: CPU_ROOT)
     mut fx.store(root, addr: record, offset: CPU_ROOT)
-    discard mut self.call_stub(mut fx, stub: Stub.WriteCr3, args: Array[clif::Value, 1].filled(root).view())
+    let install = if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        Stub.WriteTtbr0
+    } else {
+        Stub.WriteCr3
+    }
+    discard mut self.call_stub(mut fx, stub: install, args: Array[clif::Value, 1].filled(root).view())
     discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(flags).view())
     return replaced
 } Lowering.swap_root
+
+/// Points the running CPU's base register, the x86_64 `GS` base or the AArch64 `TPIDR_EL1`,
+/// at its CPU record, from where the `Thread` stub reads its executor thread.
+fn Lowering.set_cpu_base(mut self, mut fx: Fx, record: clif::Value) {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        discard mut self.call_stub(mut fx, stub: Stub.SetCpu, args: Array[clif::Value, 1].filled(record).view())
+    } else {
+        mut self.write_msr(mut fx, msr: GS_BASE, value: record)
+    }
+} Lowering.set_cpu_base
 
 /// Points interrupt stack table entry `ist` of a CPU's task-state segment at a stack top.
 fn Lowering.set_interrupt_stack(mut self, mut fx: Fx, record: clif::Value, ist: u8, top: clif::Value)
@@ -185,7 +214,7 @@ fn Lowering.set_interrupt_stack(mut self, mut fx: Fx, record: clif::Value, ist: 
 /// in the order of the MADT.
 fn Lowering.discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
     let own = mut self.local_apic_id(mut fx)
-    mut fx.store(own, addr: boot, offset: CPU_APIC_ID)
+    mut fx.store(own, addr: boot, offset: CPU_HARDWARE_ID)
     let one = mut fx.ptr(1)
     let count = mut fx.variable(PTR, initial: one)
     let rsdp = mut self.rsdp(mut fx)
@@ -221,7 +250,7 @@ fn Lowering.discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
                     mut fx4.if_true(taken, then: fn[mut lo3](mut fx5: Fx) {
                         let recorded = mut fx5.b.use_var(count)
                         let record = mut lo3.cpu_record(mut fx5, index: recorded)
-                        mut fx5.store(id, addr: record, offset: CPU_APIC_ID)
+                        mut fx5.store(id, addr: record, offset: CPU_HARDWARE_ID)
                         let incremented = mut fx5.b.iadd_imm_s(recorded, y: 1)
                         mut fx5.b.def_var(count, val: incremented)
                     })
@@ -246,12 +275,59 @@ fn Lowering.discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
     return mut fx.b.use_var(count)
 } Lowering.discover
 
+/// The number of CPUs the board provides, at least 1 and at most `MAX_CPUS`, recording each
+/// one's affinity in its record: the boot CPU, affinity zero, first, then every consecutive
+/// affinity a processor answers a power-state query for. The board numbers its processors from
+/// zero without gaps, so each affinity is its CPU's index.
+fn Lowering.aarch64_discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
+    let zero_value = mut fx.ptr(0)
+    mut fx.store(zero_value, addr: boot, offset: CPU_HARDWARE_ID)
+    let one = mut fx.ptr(1)
+    let count = mut fx.variable(PTR, initial: one)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(one).view(), body: fn[mut self](mut fx1: Fx, at: Slice[clif::Value]) -> Pass {
+        expect at.len() > 0
+        let affinity = at[0]
+        let room = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: affinity, y: i64.fit(MAX_CPUS))
+        let present = mut fx1.choose_in(mut self, condition: room, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let function = mut fx2.ptr(PSCI_AFFINITY_INFO)
+            let level = mut fx2.ptr(0)
+            let pad = mut fx2.ptr(0)
+            var args = Array[clif::Value, 4].filled(function)
+            args[1] = affinity
+            args[2] = level
+            args[3] = pad
+            let status = mut lo2.call_stub(mut fx2, stub: Stub.Hvc, args: args.view())
+            expect status.len() > 0
+            let answered = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: status[0], y: PSCI_PRESENT_MAX)
+            mut fx2.if_true(answered, then: fn[mut lo2](mut fx3: Fx) {
+                let counted = mut fx3.b.use_var(count)
+                let record = mut lo2.cpu_record(mut fx3, index: counted)
+                mut fx3.store(affinity, addr: record, offset: CPU_HARDWARE_ID)
+                let incremented = mut fx3.b.iadd_imm_s(counted, y: 1)
+                mut fx3.b.def_var(count, val: incremented)
+            })
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(answered)
+            return produced
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(mut fx2.int(clif::Type.Int8, value: 0))
+            return produced
+        })
+        let next = mut fx1.b.iadd_imm_s(affinity, y: 1)
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(next)
+        return Pass(again: present[0], next: take state)
+    })
+    return mut fx.b.use_var(count)
+} Lowering.aarch64_discover
+
 /// The address of the ACPI root system description pointer, zero when the platform gives
 /// none: on `x86_64-bare` the one the start information names, or else the one found in the
 /// BIOS area; on `x86_64-uefi` the one the firmware's configuration table names.
 fn Lowering.rsdp(mut self, mut fx: Fx) -> clif::Value {
     let state_address = mut self.state(mut fx)
-    if self.ck.db().target == workspace::Target.Uefi {
+    if self.ck.db().target.kind() == Some(workspace::Kind.Uefi) {
         let table = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM_TABLE)
         return mut self.configured_rsdp(mut fx, table)
     }
@@ -469,11 +545,16 @@ const START_TRIES: u64 = 2
 
 const START_WAIT: u64 = 2_000_000
 
-/// Starts every CPU other than the boot CPU on the entry root: holdings_each prepares its tables and
-/// interrupt delivery through `prepare` and starts its executor, after which the boot CPU
-/// starts the next one. A CPU that does not start within its tries ends the sequence, keeping
-/// the trampoline's parameters, and the CPUs after it stay stopped.
+/// Starts every CPU other than the boot CPU on the entry root, through PSCI on AArch64 and
+/// otherwise through the trampoline: each prepares its tables and interrupt delivery through
+/// `prepare` and starts its executor, after which the boot CPU starts the next one. A CPU that
+/// does not start within its tries ends the sequence, keeping the trampoline's parameters, and
+/// the CPUs after it stay stopped.
 fn Lowering.start_cpus(mut self, mut fx: Fx, prepare: object::FuncId) {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        mut self.aarch64_start_cpus(mut fx, prepare)
+        return
+    }
     let state_address = mut self.state(mut fx)
     let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
     let several = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: count, y: 1)
@@ -507,7 +588,7 @@ fn Lowering.start_cpus(mut self, mut fx: Fx, prepare: object::FuncId) {
             let top = mut fx2.b.iadd_imm_s(stack_base, y: i64.fit(MEMORY_CHUNK))
             mut fx2.store(top, addr: page, offset: START_STACK)
             mut fx2.store(record, addr: page, offset: START_CPU)
-            let id = mut fx2.load(PTR, addr: record, offset: CPU_APIC_ID)
+            let id = mut fx2.load(PTR, addr: record, offset: CPU_HARDWARE_ID)
             mut self.send_ipi(mut fx2, destination: id, command: IPI_INIT)
             mut self.spin(mut fx2, pauses: START_WAIT)
             let tries = mut fx2.ptr(START_TRIES)
@@ -537,6 +618,60 @@ fn Lowering.start_cpus(mut self, mut fx: Fx, prepare: object::FuncId) {
         })
     })
 } Lowering.start_cpus
+
+/// Starts every CPU other than the boot CPU, each on the entry root through the secondary
+/// entry seam: it reads the start record the boot CPU fills with the entry root, the CPU's
+/// executor stack, the start glue and the CPU's record, turns its MMU on and runs the glue,
+/// which prepares its interrupt delivery and starts its executor. The boot CPU starts the CPUs
+/// one at a time, filling the record anew for each, and a CPU that does not start ends the
+/// sequence, leaving the CPUs after it stopped.
+fn Lowering.aarch64_start_cpus(mut self, mut fx: Fx, prepare: object::FuncId) {
+    let state_address = mut self.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let several = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: count, y: 1)
+    mut fx.if_true(several, then: fn[mut self](mut fx1: Fx) {
+        let seam_id = mut self.aarch64_secondary_seam()
+        let seam_ref = mut self.func_ref(mut fx1, id: seam_id)
+        let seam = mut fx1.b.func_addr(PTR, func_ref: seam_ref)
+        let record = mut self.secondary_record(mut fx1)
+        let root_data = mut self.aarch64_entry_root()
+        let root = mut self.data_address(mut fx1, id: root_data)
+        mut fx1.store(root, addr: record, offset: SECONDARY_ROOT)
+        let glue_id = mut self.cpu_glue(prepare)
+        let glue_ref = mut self.func_ref(mut fx1, id: glue_id)
+        let glue = mut fx1.b.func_addr(PTR, func_ref: glue_ref)
+        mut fx1.store(glue, addr: record, offset: SECONDARY_GLUE)
+        let one = mut fx1.ptr(1)
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(one).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 0
+            let index = current[0]
+            let cpu = mut self.cpu_record(mut fx2, index)
+            let chunk = mut fx2.ptr(1)
+            let stack_base = system_map_chunks(mut self, fx: mut fx2, count: chunk)
+            let missing = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: stack_base, y: 0)
+            mut fx2.if_true(missing, then: fn[mut self](mut fx3: Fx) {
+                raise_kind(mut self, fx: mut fx3, kind: "trap.exhausted")
+            })
+            let top = mut fx2.b.iadd_imm_s(stack_base, y: i64.fit(MEMORY_CHUNK))
+            mut fx2.store(top, addr: record, offset: SECONDARY_STACK)
+            mut fx2.store(cpu, addr: record, offset: SECONDARY_CPU)
+            let affinity = mut fx2.load(PTR, addr: cpu, offset: CPU_HARDWARE_ID)
+            let function = mut fx2.ptr(PSCI_CPU_ON)
+            var args = Array[clif::Value, 4].filled(function)
+            args[1] = affinity
+            args[2] = seam
+            args[3] = record
+            discard mut self.call_stub(mut fx2, stub: Stub.Hvc, args: args.view())
+            let started = mut self.wait_started(mut fx2, record: cpu)
+            let next = mut fx2.b.iadd_imm_s(index, y: 1)
+            let remaining = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: count)
+            let again = mut fx2.b.band(started, y: remaining)
+            var state = mem::List[clif::Value].empty(fx2.alloc)
+            mut state.push(next)
+            return Pass(again: again, next: take state)
+        })
+    })
+} Lowering.aarch64_start_cpus
 
 /// Whether a CPU has started within `START_WAIT` pauses.
 fn Lowering.wait_started(mut self, mut fx: Fx, record: clif::Value) -> clif::Value {
@@ -589,9 +724,9 @@ fn Lowering.trampoline_code(mut self) -> object::DataId {
     return id
 } Lowering.trampoline_code
 
-/// The glue a started CPU calls with its record: it points its GS base at the record, loads
-/// its descriptor tables, enables AVX when it has it, prepares its interrupt delivery through
-/// `prepare`, records that it started and runs the executor's scheduler.
+/// The glue a started CPU calls with its record: it points its base register at the record, on
+/// x86_64 loads its descriptor tables and enables AVX when it has it, prepares its interrupt
+/// delivery through `prepare`, records that it started and runs the executor's scheduler.
 fn Lowering.cpu_glue(mut self, prepare: object::FuncId) -> object::FuncId {
     var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -600,9 +735,11 @@ fn Lowering.cpu_glue(mut self, prepare: object::FuncId) -> object::FuncId {
         let entry_params = mut fx1.entry()
         expect entry_params.len() > 0
         let record = entry_params[0]
-        mut lo1.write_msr(mut fx1, msr: GS_BASE, value: record)
-        mut lo1.load_cpu_tables(mut fx1, record)
-        mut lo1.enable_avx(mut fx1, record)
+        mut lo1.set_cpu_base(mut fx1, record: record)
+        if lo1.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+            mut lo1.load_cpu_tables(mut fx1, record)
+            mut lo1.enable_avx(mut fx1, record)
+        }
         let prepare_ref = mut lo1.func_ref(mut fx1, id: prepare)
         discard mut fx1.b.call(prepare_ref, args: mem::List[clif::Value].empty(fx1.alloc).view())
         mut lo1.cpu_started(mut fx1, record)

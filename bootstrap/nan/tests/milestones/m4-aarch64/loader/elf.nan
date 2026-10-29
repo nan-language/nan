@@ -1,0 +1,139 @@
+//! The ELF64 image of a bare kernel: its loadable segments and their placement.
+
+/// The program header type of a loadable segment, and the sizes of an image's header and of a
+/// program header.
+const PT_LOAD: u32 = 1
+
+const HEADER_BYTES: u64 = 64
+
+const PROGRAM_HEADER_BYTES: u64 = 56
+
+/// The memory the entry root maps, which segments must lie in.
+const MAPPED: u64 = 0x1_0000_0000
+
+pub closed enum ImageError derives Eq, Render {
+    NotElf
+    Truncated
+    Inverted
+    Unmapped
+    Misplaced
+} ImageError
+
+/// Where an image's program headers lie and how many there are.
+struct Programs {
+    offset: u64
+    count: u16
+} Programs
+
+/// A segment of an image: its type, its bytes' offset in the image, its physical address, and
+/// its sizes in the image and in memory.
+struct Segment {
+    kind: u32
+    offset: u64
+    address: u64
+    file_size: u64
+    memory_size: u64
+} Segment
+
+/// Places every loadable segment of an image at its physical address and gives how many it
+/// placed.
+fn place_all(raw: Untrusted[Slice[u8]]) -> u32 fails ImageError {
+    let programs = try header(raw)
+    var placed: u32 = 0
+    for index in 0u16..<programs.count {
+        invariant placed <= u32.widen(index)
+        let segment = try program(raw, programs, index)
+        if segment.kind == PT_LOAD {
+            if not place(raw, segment) {
+                fail ImageError.Misplaced
+            }
+            placed += 1
+        }
+    }
+    return placed
+} place_all
+
+/// The program headers of an ELF64 little-endian x86-64 executable.
+validator fn header(raw: Untrusted[Slice[u8]]) -> Programs fails ImageError {
+    let bytes = raw.inspect()
+    if bytes.len() < 64 {
+        fail ImageError.Truncated
+    }
+    if bytes.u32_le(0) != 0x464C_457F or bytes[4] != 2 or bytes[5] != 1 or bytes.u16_le(18) != 183 {
+        fail ImageError.NotElf
+    }
+    let programs = Programs(offset: bytes.u64_le(32), count: bytes.u16_le(56))
+    let table = u64.widen(programs.count) * PROGRAM_HEADER_BYTES
+    if programs.offset < HEADER_BYTES or programs.offset > u64.widen(bytes.len()) or table > u64.widen(bytes.len()) - programs.offset {
+        fail ImageError.Truncated
+    }
+    return programs
+} header
+
+/// Program header `index` of an image, which lies in the image; a loadable segment's bytes lie
+/// in the image and its memory in the mapped memory.
+validator fn program(raw: Untrusted[Slice[u8]], programs: Programs, index: u16) -> Segment fails ImageError {
+    let bytes = raw.inspect()
+    let Some(table) = bytes.split_at(usize.widen(programs.offset)) else {
+        fail ImageError.Truncated
+    }
+    let Some(rest) = table.tail.split_at(usize.widen(u64.widen(index) * PROGRAM_HEADER_BYTES)) else {
+        fail ImageError.Truncated
+    }
+    let Some(entry) = rest.tail.prefix(usize.widen(PROGRAM_HEADER_BYTES)) else {
+        fail ImageError.Truncated
+    }
+    let segment = Segment(kind: entry.u32_le(0), offset: entry.u64_le(8), address: entry.u64_le(24), file_size: entry.u64_le(32), memory_size: entry.u64_le(40))
+    if segment.kind != PT_LOAD {
+        return segment
+    }
+    if segment.file_size > segment.memory_size {
+        fail ImageError.Inverted
+    }
+    if segment.offset > u64.widen(bytes.len()) or segment.file_size > u64.widen(bytes.len()) - segment.offset {
+        fail ImageError.Truncated
+    }
+    if segment.address > MAPPED or segment.memory_size > MAPPED - segment.address {
+        fail ImageError.Unmapped
+    }
+    return segment
+} program
+
+/// Copies a segment's bytes to its physical address and zero-fills it to its size in memory;
+/// gives whether the memory then holds the segment's bytes.
+validator fn place(raw: Untrusted[Slice[u8]], segment: Segment) -> bool {
+    let bytes = raw.inspect()
+    let Some(parts) = bytes.split_at(usize.widen(segment.offset)) else {
+        return false
+    }
+    let Some(source) = parts.tail.prefix(usize.widen(segment.file_size)) else {
+        return false
+    }
+    let from = hw::Ptr.of_view(source)
+    let to = hw::Ptr[u8].of_addr(usize.widen(segment.address))
+    var same = true
+    trusted "the entry root maps the segment's memory, which nothing else reaches once boot services have ended, the loader calling no runtime service and never sleeping" {
+        from.copy(to, count: source.len())
+        var filled = segment.file_size
+        while filled < segment.memory_size {
+            to.offset(isize.fit(filled)).write(0)
+            filled += 1
+        }
+        for index in 0..<source.len() {
+            if to.offset(isize.fit(index)).read() != source[index] {
+                same = false
+            }
+        }
+    }
+    return same
+} place
+
+test header_rejects_other_files for header {
+    let bytes = Array[u8, 64].filled(0)
+    let outcome = attempt header(Untrusted.of(bytes.view()))
+    let rejected = match outcome {
+        Err(error) => error == ImageError.NotElf
+        Ok(_) => false
+    }
+    expect rejected
+} header_rejects_other_files

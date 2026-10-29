@@ -1,0 +1,576 @@
+//! Emission of AArch64 code: the frame and its prologue and epilogue, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, the jump tables, and the runs of source locations.
+
+/// The frame below the frame record, from the stack pointer up: the outgoing argument area, the
+/// stack slots, the spill slots and padding, then the callee-saved registers the code changes, the
+/// general-purpose ones' and the vector ones' each padded to a multiple of 16 bytes.
+struct ArmFrame {
+    /// The offset of the spill slots from the stack pointer.
+    spills: u32
+    /// The bytes below the callee-saved registers, a multiple of 16.
+    body: u32
+    saved: machinst::RegSet
+    /// The bytes the general-purpose callee-saved registers take, then all of them.
+    int_saves: u32
+    saves: u32
+    /// The alignment beyond 16 the stack slots ask, 16 for none.
+    align: u32
+    /// The bytes from the frame record's top to the deepest the stack pointer goes.
+    size: u64
+} ArmFrame
+
+fn ArmFrame.of(code: VCode[aarch64::Inst], allocation: Allocation) -> ArmFrame {
+    let spills = round_up(code.slots_end, to: 8)
+    let body = round_up(spills + (8 * allocation.slot_count), to: 16)
+    var ints: u32 = 0
+    var vectors: u32 = 0
+    for index in 0u32..<machinst::PHYSICAL {
+        let reg = machinst::Reg(index: index)
+        if allocation.saved.contains(reg) {
+            if aarch64::is_vector(reg) {
+                vectors += 1
+            } else {
+                ints += 1
+            }
+        }
+    }
+    let int_saves = 8 * (ints + (ints % 2))
+    let saves = int_saves + (8 * (vectors + (vectors % 2)))
+    var size = u64.widen(16 + saves + body)
+    if code.align > 16 {
+        size += u64.widen(code.align - 16)
+    }
+    return ArmFrame(spills: spills, body: body, saved: allocation.saved, int_saves: int_saves, saves: saves, align: code.align, size: size)
+} ArmFrame.of
+
+/// The scratch registers of a class: `x16` and `x17`, or `v31` and `v30`.
+fn arm_scratch(float: bool, index: u32) -> machinst::Reg
+    requires index < 2
+{
+    if float {
+        return aarch64::vreg(31 - index)
+    }
+    return aarch64::xreg(16 + index)
+} arm_scratch
+
+/// The scratch registers, by the index `held` follows them at.
+fn arm_scratch_at(index: usize) -> machinst::Reg
+    requires index < SCRATCH_COUNT
+{
+    return arm_scratch(index >= 2, index: u32.fit(index % 2))
+} arm_scratch_at
+
+fn arm_scratches() -> Array[machinst::Reg, SCRATCH_COUNT] {
+    var regs = Array[machinst::Reg, SCRATCH_COUNT].filled(NO_REG)
+    for index in 0..<SCRATCH_COUNT {
+        regs[index] = arm_scratch_at(index)
+    }
+    return regs
+} arm_scratches
+
+/// The register holding a spill slot's offset from the stack pointer when it lies beyond a load's
+/// reach: the link register, which the prologue saves.
+const FAR: machinst::Reg = aarch64::LR
+
+/// The state of emission: the code encoded so far, the runs of source locations, and the spill
+/// slot whose value each scratch register holds, `NONE` for none.
+struct ArmEmitter {
+    asm: aarch64::Assembler
+    isa: Isa
+    frame: ArmFrame
+    calls: bool
+    locations: mem::List[Located]
+    loc: clif::SourceLoc
+    held: Array[u32, SCRATCH_COUNT]
+    /// The first of the allocation's saves across calls not emitted yet.
+    next_save: usize
+    alloc: mem::Alloc
+} ArmEmitter
+
+/// The index of a scratch register in `held`, none for another register.
+fn arm_scratch_index(reg: machinst::Reg) -> Option[usize] {
+    for index in 0..<SCRATCH_COUNT {
+        if arm_scratch_at(index) == reg {
+            return Some(index)
+        }
+    }
+    return None
+} arm_scratch_index
+
+/// Records the spill slot a register holds, `NONE` for none, forgetting it for any other scratch
+/// register.
+fn ArmEmitter.hold(mut self, reg: machinst::Reg, slot: u32) {
+    if slot != NONE {
+        mut self.forget_slot(slot)
+    }
+    match arm_scratch_index(reg) {
+        Some(index) => {
+            expect index < SCRATCH_COUNT
+            self.held[index] = slot
+        }
+        None => {}
+    }
+} ArmEmitter.hold
+
+/// Forgets that any scratch register holds a slot.
+fn ArmEmitter.forget_slot(mut self, slot: u32) {
+    for index in 0..<SCRATCH_COUNT {
+        if self.held[index] == slot {
+            self.held[index] = NONE
+        }
+    }
+} ArmEmitter.forget_slot
+
+/// Whether a register holds a spill slot's value.
+fn ArmEmitter.holds(self, reg: machinst::Reg, slot: u32) -> bool {
+    let Some(index) = arm_scratch_index(reg) else {
+        return false
+    }
+    expect index < SCRATCH_COUNT
+    return self.held[index] == slot
+} ArmEmitter.holds
+
+fn arm_emit(code: VCode[aarch64::Inst], allocation: Allocation, isa: Isa, alloc: mem::Alloc) -> Code {
+    var emitter = ArmEmitter(asm: aarch64::Assembler.new(alloc), isa: isa, frame: ArmFrame.of(code, allocation), calls: code.calls, locations: mem::List[Located].empty(alloc), loc: clif::DEFAULT_LOC, held: Array[u32, SCRATCH_COUNT].filled(NONE), next_save: 0, alloc: alloc)
+    for _ in 0..<(code.blocks.len() + code.table_count()) {
+        discard mut emitter.asm.new_label()
+    }
+    mut emitter.prologue()
+    for index in 0..<code.blocks.len() {
+        mut emitter.block(code, allocation, block: u32.fit(index))
+    }
+    mut emitter.tables(code)
+    let ArmEmitter(asm: asm, isa: _, frame: frame, calls: _, locations: locations, loc: _, held: _, next_save: _, alloc: _) = emitter
+    let aarch64::Encoded(bytes: bytes, relocs: relocs) = take asm.finish()
+    return Code(bytes: take bytes, align: 16, relocs: take relocs, frame: frame.size, locations: take locations, removable: false)
+} arm_emit
+
+fn ArmEmitter.put(mut self, inst: aarch64::Inst) {
+    mut self.asm.emit(inst)
+} ArmEmitter.put
+
+/// Starts the run of code of a source location, dropping a run that holds no code.
+fn ArmEmitter.locate(mut self, loc: clif::SourceLoc) {
+    if loc == self.loc {
+        return
+    }
+    self.loc = loc
+    let offset = self.asm.offset()
+    let count = self.locations.len()
+    if count > 0 and self.locations[count - 1].offset == offset {
+        discard mut self.locations.pop()
+    }
+    let last = self.locations.len()
+    if loc.is_default() or (last > 0 and self.locations[last - 1].loc == loc) {
+        return
+    }
+    mut self.locations.push(Located(offset: offset, loc: loc))
+} ArmEmitter.locate
+
+/// Moves the stack pointer down, or up, by `bytes`, in steps the immediate reaches.
+fn ArmEmitter.adjust_sp(mut self, bytes: u32, down: bool) {
+    var left = bytes
+    while left > 0 {
+        var step = left
+        if left > 0xFF_F000 {
+            step = 0xFF_F000
+        } else if left >= 0x1000 {
+            step = left & 0xFF_F000
+        }
+        if down {
+            mut self.put(aarch64::Inst.SubImm(width: aarch64::Width.Bits64, dst: aarch64::SP, src: aarch64::SP, imm: step))
+        } else {
+            mut self.put(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: aarch64::SP, src: aarch64::SP, imm: step))
+        }
+        left -= step
+    }
+} ArmEmitter.adjust_sp
+
+/// Where the callee-saved register at `index` among the saved general-purpose or vector ones goes,
+/// from the frame pointer: pairs of general-purpose registers downward from the frame record,
+/// then each vector register below them.
+fn ArmEmitter.save_offset(self, vector: bool, index: u32) -> i32 {
+    if vector {
+        return -i32.fit(self.frame.int_saves + (8 * (index + 1)))
+    }
+    return -i32.fit(16 * ((index / 2) + 1))
+} ArmEmitter.save_offset
+
+/// The callee-saved registers the code changes, of a class, in order.
+fn ArmEmitter.saved_of(self, vector: bool) -> mem::List[machinst::Reg] {
+    var regs = mem::List[machinst::Reg].empty(self.alloc)
+    for index in 0u32..<machinst::PHYSICAL {
+        let reg = machinst::Reg(index: index)
+        if self.frame.saved.contains(reg) and aarch64::is_vector(reg) == vector {
+            mut regs.push(reg)
+        }
+    }
+    return regs
+} ArmEmitter.saved_of
+
+/// Stores the callee-saved registers the code changes, or loads them back, through the frame
+/// pointer: general-purpose ones in pairs, the last alone, and vector ones alone.
+fn ArmEmitter.transfer_saved(mut self, load: bool) {
+    let ints = self.saved_of(vector: false)
+    var at: usize = 0
+    while at < ints.len() {
+        let offset = self.save_offset(vector: false, index: u32.fit(at))
+        if at + 1 < ints.len() {
+            if load {
+                mut self.put(aarch64::Inst.Ldp(mode: aarch64::PairMode.Signed, dst1: ints[at], dst2: ints[at + 1], base: aarch64::FP, imm: offset))
+            } else {
+                mut self.put(aarch64::Inst.Stp(mode: aarch64::PairMode.Signed, src1: ints[at], src2: ints[at + 1], base: aarch64::FP, imm: offset))
+            }
+        } else if load {
+            mut self.put(aarch64::Inst.Ldr(width: aarch64::Width.Bits64, dst: ints[at], src: aarch64::Amode.at(aarch64::FP, disp: offset)))
+        } else {
+            mut self.put(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: ints[at], dst: aarch64::Amode.at(aarch64::FP, disp: offset)))
+        }
+        at += 2
+    }
+    let vectors = self.saved_of(vector: true)
+    for index in 0..<vectors.len() {
+        let mem = aarch64::Amode.at(aarch64::FP, disp: self.save_offset(vector: true, index: u32.fit(index)))
+        if load {
+            mut self.put(aarch64::Inst.LdrFloat(prec: aarch64::Precision.Double, dst: vectors[index], src: mem))
+        } else {
+            mut self.put(aarch64::Inst.StrFloat(prec: aarch64::Precision.Double, src: vectors[index], dst: mem))
+        }
+    }
+} ArmEmitter.transfer_saved
+
+/// Sets up the frame: links the frame record into the frame pointer chain, probes the pages the
+/// frame spans when it reaches the guard page size, reserves the rest, aligned as the stack slots
+/// ask, and saves the callee-saved registers the code changes.
+fn ArmEmitter.prologue(mut self) {
+    mut self.put(aarch64::Inst.Stp(mode: aarch64::PairMode.Pre, src1: aarch64::FP, src2: aarch64::LR, base: aarch64::SP, imm: -16))
+    mut self.put(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: aarch64::FP, src: aarch64::SP))
+    if self.isa.probes {
+        mut self.probe()
+    }
+    mut self.adjust_sp(self.frame.saves + self.frame.body, down: true)
+    if self.frame.align > 16 {
+        let temp = arm_scratch(false, index: 0)
+        mut self.put(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: temp, src: aarch64::SP))
+        mut self.put(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: aarch64::Width.Bits64, dst: temp, src: temp, imm: ~u64.widen(self.frame.align - 1)))
+        mut self.put(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: aarch64::SP, src: temp))
+    }
+    mut self.transfer_saved(load: false)
+} ArmEmitter.prologue
+
+/// Touches each guard-page-sized step of the stack the frame and a callee's frame record span, as
+/// Cranelift's AArch64 backend does: at most three steps unrolled, more in a loop.
+fn ArmEmitter.probe(mut self) {
+    var total = u32.truncate(self.frame.size) - 16
+    if self.calls {
+        total += 16
+    }
+    let count = total / GUARD
+    if count == 0 {
+        return
+    }
+    let zero = aarch64::SP
+    if count <= 3 {
+        for _ in 0u32..<count {
+            mut self.put(aarch64::Inst.SubImm(width: aarch64::Width.Bits64, dst: aarch64::SP, src: aarch64::SP, imm: GUARD))
+            mut self.put(aarch64::Inst.Str(width: aarch64::Width.Bits32, src: zero, dst: aarch64::Amode.at(aarch64::SP, disp: 0)))
+        }
+        mut self.put(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: aarch64::SP, src: aarch64::SP, imm: count * GUARD))
+        return
+    }
+    let offset = arm_scratch(false, index: 0)
+    let end = arm_scratch(false, index: 1)
+    mut self.put(aarch64::Inst.MovImm(dst: offset, imm: 0))
+    mut self.put(aarch64::Inst.MovImm(dst: end, imm: u64.widen(total)))
+    let again = mut self.asm.new_label()
+    mut self.asm.bind(again)
+    mut self.put(aarch64::Inst.SubImm(width: aarch64::Width.Bits64, dst: offset, src: offset, imm: GUARD))
+    mut self.put(aarch64::Inst.Str(width: aarch64::Width.Bits32, src: zero, dst: aarch64::Amode.Reg(base: aarch64::SP, index: offset, scaled: false)))
+    mut self.put(aarch64::Inst.AddsReg(width: aarch64::Width.Bits64, dst: zero, lhs: offset, rhs: end))
+    mut self.put(aarch64::Inst.Bcond(cond: aarch64::Cond.Gt, label: again))
+} ArmEmitter.probe
+
+/// Restores the callee-saved registers and the caller's frame, and returns.
+fn ArmEmitter.epilogue(mut self) {
+    mut self.transfer_saved(load: true)
+    if self.frame.saves + self.frame.body > 0 or self.frame.align > 16 {
+        mut self.put(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: aarch64::SP, src: aarch64::FP))
+    }
+    mut self.put(aarch64::Inst.Ldp(mode: aarch64::PairMode.Post, dst1: aarch64::FP, dst2: aarch64::LR, base: aarch64::SP, imm: 16))
+    mut self.put(aarch64::Inst.Ret(reg: aarch64::LR))
+} ArmEmitter.epilogue
+
+/// A block's code: its label bound, its instructions, and its exit, the branch to the block laid
+/// out next left out and a conditional branch to it inverted.
+fn ArmEmitter.block(mut self, code: VCode[aarch64::Inst], allocation: Allocation, block: u32)
+    requires usize.widen(block) < code.blocks.len()
+{
+    let data = code.blocks[usize.widen(block)]
+    expect code.holds(data)
+    mut self.asm.bind(block)
+    self.held = Array[u32, SCRATCH_COUNT].filled(NONE)
+    let next = block + 1
+    var at = data.begin
+    while at < data.end {
+        let vinst = code.insts[usize.widen(at)]
+        mut self.locate(vinst.loc)
+        match vinst.inst {
+            aarch64::Inst.B(label: label) => {
+                mut self.edge_moves(code, allocation, data)
+                if label != next {
+                    mut self.put(vinst.inst)
+                }
+            }
+            aarch64::Inst.Bcond(cond: cond, label: label) => {
+                match inverted_exit(code, at: at, data: data, label: label, next: next) {
+                    Some(other) => {
+                        mut self.put(aarch64::Inst.Bcond(cond: cond.invert(), label: other))
+                        at += 2
+                        continue
+                    }
+                    None => mut self.put(vinst.inst)
+                }
+            }
+            aarch64::Inst.Cbnz(width: width, reg: reg, label: label) => {
+                match inverted_exit(code, at: at, data: data, label: label, next: next) {
+                    Some(other) => {
+                        mut self.instruction(code, allocation, inst: aarch64::Inst.Cbz(width: width, reg: reg, label: other))
+                        at += 2
+                        continue
+                    }
+                    None => mut self.instruction(code, allocation, inst: vinst.inst)
+                }
+            }
+            aarch64::Inst.Return(results: _) => mut self.epilogue()
+            aarch64::Inst.Args(params: _) => {}
+            aarch64::Inst.JumpTable(index: index, base: base, temp: temp, table: table) => mut self.instruction(code, allocation, inst: aarch64::Inst.JumpTable(index: index, base: base, temp: temp, table: u32.fit(code.blocks.len()) + table))
+            aarch64::Inst.Call(target: _, args: _, results: _, clobbers: _) => mut self.saved_call(code, allocation, inst: vinst.inst, at)
+            else => mut self.instruction(code, allocation, inst: vinst.inst)
+        }
+        at += 1
+    }
+} ArmEmitter.block
+
+/// The target of the branch ending a block after a conditional branch at `at` to the block laid
+/// out next, when the conditional branch alone decides the exit and so can branch there instead
+/// on the inverse condition.
+fn inverted_exit(code: VCode[aarch64::Inst], at: u32, data: VBlock, label: u32, next: u32) -> Option[u32] {
+    if label != next or at + 2 != data.end {
+        return None
+    }
+    let aarch64::Inst.B(label: other) = code.insts[usize.widen(at + 1)].inst else {
+        return None
+    }
+    if at > data.begin {
+        match code.insts[usize.widen(at - 1)].inst {
+            aarch64::Inst.Bcond(cond: _, label: _) => return None
+            else => {}
+        }
+    }
+    return Some(other)
+} inverted_exit
+
+/// A call, the registers saved across it stored to their slots before it and loaded after.
+fn ArmEmitter.saved_call(mut self, code: VCode[aarch64::Inst], allocation: Allocation, inst: aarch64::Inst, at: u32) {
+    let begin = self.next_save
+    var last = begin
+    while last < allocation.saves.len() and allocation.saves[last].at == at {
+        last += 1
+    }
+    for index in begin..<last {
+        let save = allocation.saves[index]
+        mut self.move_loc(Loc.Slot(slot_of(allocation, vreg: save.vreg)), src: Loc.Reg(save.reg), float: code.is_float(save.reg))
+    }
+    mut self.instruction(code, allocation, inst)
+    for index in begin..<last {
+        let save = allocation.saves[index]
+        mut self.move_loc(Loc.Reg(save.reg), src: Loc.Slot(slot_of(allocation, vreg: save.vreg)), float: code.is_float(save.reg))
+    }
+    self.next_save = last
+} ArmEmitter.saved_call
+
+/// The jump tables after the code, each at its label, the labels of tables after the blocks' own.
+fn ArmEmitter.tables(mut self, code: VCode[aarch64::Inst]) {
+    for table in 0..<code.table_count() {
+        let start = self.asm.offset()
+        mut self.asm.bind(u32.fit(code.blocks.len() + table))
+        expect table + 1 < code.table_starts.len()
+        for at in code.table_starts[table]..<code.table_starts[table + 1] {
+            expect usize.widen(at) < code.table_blocks.len()
+            mut self.asm.table_entry(code.table_blocks[usize.widen(at)], start)
+        }
+    }
+} ArmEmitter.tables
+
+/// The memory of a spill slot: from the stack pointer, through `FAR` when beyond a load's reach.
+fn ArmEmitter.slot(mut self, slot: u32) -> aarch64::Amode {
+    let offset = self.frame.spills + (8 * slot)
+    if aarch64::reaches(i64.widen(offset), scale: 3) {
+        return aarch64::Amode.at(aarch64::SP, disp: i32.fit(offset))
+    }
+    mut self.put(aarch64::Inst.MovImm(dst: FAR, imm: u64.widen(offset)))
+    return aarch64::Amode.Reg(base: aarch64::SP, index: FAR, scaled: false)
+} ArmEmitter.slot
+
+/// Copies between two locations of one class, through the class's second scratch register from
+/// slot to slot; a load into a scratch register holding the slot is left out.
+fn ArmEmitter.move_loc(mut self, dst: Loc, src: Loc, float: bool) {
+    if dst == src {
+        return
+    }
+    match dst {
+        Loc.Reg(to) => match src {
+            Loc.Reg(from_reg) => {
+                if float {
+                    mut self.put(aarch64::Inst.FloatMov(prec: aarch64::Precision.Double, dst: to, src: from_reg))
+                } else {
+                    mut self.put(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: to, src: from_reg))
+                }
+                mut self.hold(to, slot: NONE)
+            }
+            Loc.Slot(slot) => {
+                if self.holds(to, slot) {
+                    return
+                }
+                mut self.load_slot(to, slot, float: float)
+                mut self.hold(to, slot)
+            }
+        }
+        Loc.Slot(to_slot) => {
+            var from = arm_scratch(float, index: 1)
+            match src {
+                Loc.Reg(from_reg) => {
+                    from = from_reg
+                }
+                Loc.Slot(slot) => mut self.load_slot(from, slot, float: float)
+            }
+            let mem = mut self.slot(to_slot)
+            if float {
+                mut self.put(aarch64::Inst.StrFloat(prec: aarch64::Precision.Double, src: from, dst: mem))
+            } else {
+                mut self.put(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: from, dst: mem))
+            }
+            mut self.forget_slot(to_slot)
+            mut self.hold(from, slot: to_slot)
+        }
+    }
+} ArmEmitter.move_loc
+
+fn ArmEmitter.load_slot(mut self, to: machinst::Reg, slot: u32, float: bool) {
+    let mem = mut self.slot(slot)
+    if float {
+        mut self.put(aarch64::Inst.LdrFloat(prec: aarch64::Precision.Double, dst: to, src: mem))
+    } else {
+        mut self.put(aarch64::Inst.Ldr(width: aarch64::Width.Bits64, dst: to, src: mem))
+    }
+} ArmEmitter.load_slot
+
+/// The moves passing a block's jump arguments to its target's parameters, as one parallel move:
+/// each copy made once nothing still to be read sits in its destination, a cycle broken by
+/// saving one destination in the class's first scratch register.
+fn ArmEmitter.edge_moves(mut self, code: VCode[aarch64::Inst], allocation: Allocation, data: VBlock) {
+    if data.arg_count == 0 {
+        return
+    }
+    let succs = code.block_succs(data)
+    expect succs.len() > 0 and usize.widen(succs[0]) < code.blocks.len()
+    let args = code.block_args(data)
+    let params = code.block_params(code.blocks[usize.widen(succs[0])])
+    expect args.len() <= params.len()
+    var moves = mem::List[Move].empty(self.alloc)
+    for index in 0..<args.len() {
+        let src = location(allocation, reg: args[index])
+        let dst = location(allocation, reg: params[index])
+        if src != dst {
+            mut moves.push(Move(dst: dst, src: src, float: code.is_float(args[index])))
+        }
+    }
+    while moves.len() > 0 {
+        var progressed = false
+        var index: usize = 0
+        while index < moves.len() {
+            let candidate = moves[index]
+            if is_read(moves, at: candidate.dst, except: index) {
+                index += 1
+                continue
+            }
+            mut self.move_loc(candidate.dst, src: candidate.src, float: candidate.float)
+            discard mut moves.remove(index)
+            progressed = true
+        }
+        if not progressed {
+            expect moves.len() > 0
+            let blocked = moves[0].dst
+            let saved = Loc.Reg(arm_scratch(moves[0].float, index: 0))
+            mut self.move_loc(saved, src: blocked, float: moves[0].float)
+            for pending in mut moves {
+                if pending.src == blocked {
+                    pending.src = saved
+                }
+            }
+        }
+    }
+} ArmEmitter.edge_moves
+
+/// Whether an instruction is a sequence that may write a register before it has read all its
+/// operands, so that a definition must not share a register with a use.
+fn is_arm_sequence(inst: aarch64::Inst) -> bool {
+    return match inst {
+        aarch64::Inst.AtomicRmwLoop(op: _, size: _, addr: _, operand: _, old: _, temp: _, status: _) or aarch64::Inst.AtomicCasLoop(size: _, addr: _, expected: _, replacement: _, old: _, status: _) => true
+        aarch64::Inst.JumpTable(index: _, base: _, temp: _, table: _) or aarch64::Inst.CanonNan(prec: _, reg: _, temp: _) or aarch64::Inst.TlsDesc(symbol: _, temp: _) => true
+        else => false
+    }
+} is_arm_sequence
+
+/// An instruction with its allocated registers: a move between locations directly, any other
+/// with each spilled operand in a scratch register, loaded before when read and stored after
+/// when written.
+fn ArmEmitter.instruction(mut self, code: VCode[aarch64::Inst], allocation: Allocation, inst: aarch64::Inst) {
+    match inst {
+        aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: dst, src: src) => {
+            mut self.move_loc(location(allocation, reg: dst), src: location(allocation, reg: src), float: false)
+            return
+        }
+        aarch64::Inst.FloatMov(prec: _, dst: dst, src: src) => {
+            mut self.move_loc(location(allocation, reg: dst), src: location(allocation, reg: src), float: true)
+            return
+        }
+        else => {}
+    }
+    var operands = mem::List[Operand].empty(self.alloc)
+    discard inst.map_regs(fn[mut operands](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+        mut operands.push(Operand(reg: reg, role: role, assigned: reg))
+        return reg
+    })
+    assign_scratch(mut operands, code, allocation, sequence: is_arm_sequence(inst), scratches: arm_scratches())
+    for index in 0..<operands.len() {
+        let operand = operands[index]
+        if is_spilled(allocation, reg: operand.reg) and is_first(operands, at: index, read: true) {
+            mut self.move_loc(Loc.Reg(operand.assigned), src: location(allocation, reg: operand.reg), float: code.is_float(operand.reg))
+        }
+    }
+    var next: usize = 0
+    let rewritten = inst.map_regs(fn[mut next](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+        expect next < operands.len()
+        let assigned = operands[next].assigned
+        next += 1
+        return assigned
+    })
+    mut self.put(rewritten)
+    let clobbers = rewritten.clobbers()
+    for index in 0..<SCRATCH_COUNT {
+        if clobbers.contains(arm_scratch_at(index)) {
+            self.held[index] = NONE
+        }
+    }
+    for operand in operands {
+        if operand.role != machinst::Role.Use {
+            mut self.hold(operand.assigned, slot: NONE)
+        }
+    }
+    for index in 0..<operands.len() {
+        let operand = operands[index]
+        if is_spilled(allocation, reg: operand.reg) and is_first(operands, at: index, read: false) {
+            mut self.move_loc(location(allocation, reg: operand.reg), src: Loc.Reg(operand.assigned), float: code.is_float(operand.reg))
+        }
+    }
+} ArmEmitter.instruction

@@ -50,7 +50,7 @@ deny_directive = 'deny' IDENT "->" IDENT NL ;
 A **directive** is one manifest line:
 
 - `language` states the [language version](37-evolution.md#language-versions) of the package.
-- `targets` lists the [targets](27-program-model.md#targets) the package is checked and built for, among `x86_64-host`, `x86_64-uefi`, `x86_64-bare` and `any`. `x86_64-nanos` is reserved: listing it is an error (`manifest.reserved-target`). Any other name is an error (`manifest.unknown-target`). `any` listed with another target is an error (`manifest.any-not-alone`).
+- `targets` lists the [targets](27-program-model.md#targets) the package is checked and built for, among `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare` and `any`. `x86_64-nanos` and `aarch64-nanos` are reserved: listing either is an error (`manifest.reserved-target`). Any other name is an error (`manifest.unknown-target`). `any` listed with another target is an error (`manifest.any-not-alone`).
 - `entry` names the [entry function](27-program-model.md#entry).
 - `dep` declares an [alias](#aliases).
 - `allow` is a [manifest grant](14-authority.md#manifest-grants) of its authority to the names listed; `contribute` takes the path of a registry.
@@ -266,7 +266,7 @@ pkg fn scaled(side: u32) -> u64 {
 
 ## Target variants
 
-A **target variant** is a module directory `name@selector` holding module `name` for the declared targets its selector matches. The selectors are exactly `x86_64-host`, `x86_64-uefi` and `x86_64-bare`, each matching that target; `x86_64`, matching all three; and `host`, `uefi` and `bare`, each matching the target ending in it. Any other selector matches no target.
+A **target variant** is a module directory `name@selector` holding module `name` for the declared targets its selector matches. The selectors are exactly the names of the six concrete targets, each matching that target; `x86_64` and `aarch64`, each matching the three targets starting with it; and `host`, `uefi` and `bare`, each matching the two targets ending in it. Any other selector matches no target.
 
 - A module is one plain directory or a set of variants; a plain directory and a variant of one module are an error (`module.variant-mixed`), reported on the variant. The root module is a plain directory.
 - Each declared [concrete target](27-program-model.md#targets) matches exactly one variant of each module that has variants. A target matching none is an error (`module.variant-missing`), reported on the `targets` directive; a target matching two is an error (`module.variant-overlap`), reported on the later of the two variant directories in byte order of path. A variant matching no declared target, as every variant of a package declaring `any` does, is an error (`module.variant-unmatched`).
@@ -338,6 +338,61 @@ pkg fn has_firmware() -> bool { // error: module.variant-mismatch
 pkg fn default_stack() -> usize {
     return 65_536
 } default_stack
+```
+
+```nan
+// file: probe/package.nan
+//! Register counts for both host targets.
+
+package probe {
+    language 1
+    targets aarch64-host, x86_64-host
+} probe
+
+// file: probe/probe.nan
+//! Counts the general-purpose registers of the architecture the package was built for.
+
+pub fn register_count() -> u32 {
+    return cpu::general_registers()
+} register_count
+
+// file: probe/cpu@aarch64/cpu.nan
+//! The architecture's registers.
+
+pkg fn general_registers() -> u32 {
+    return 31
+} general_registers
+
+// file: probe/cpu@x86_64/cpu.nan
+//! The architecture's registers.
+
+pkg fn general_registers() -> u32 {
+    return 16
+} general_registers
+```
+
+```nan
+// file: probe/package.nan
+//! Register counts for both bare targets.
+
+package probe {
+    language 1
+    targets aarch64-bare, x86_64-bare // error: module.variant-missing
+} probe
+
+// file: probe/probe.nan
+//! Counts the general-purpose registers of the architecture the package was built for.
+
+pub fn register_count() -> u32 {
+    return cpu::general_registers()
+} register_count
+
+// file: probe/cpu@x86_64/cpu.nan
+//! The architecture's registers.
+
+pkg fn general_registers() -> u32 {
+    return 16
+} general_registers
 ```
 
 ## Paths

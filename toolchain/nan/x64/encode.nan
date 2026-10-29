@@ -6,7 +6,7 @@ pkg struct Assembler {
     /// The offset each label is bound at, `UNBOUND` until it is.
     labels: mem::List[u32]
     fixups: mem::List[Fixup]
-    pkg relocs: mem::List[Reloc]
+    pkg relocs: mem::List[machinst::Reloc]
     alloc: mem::Alloc
 } Assembler
 
@@ -31,7 +31,7 @@ pkg struct Cut derives Copy, Eq {
 
 const UNBOUND: u32 = 0xFFFF_FFFF
 
-pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc), relocs: mem::List[Reloc].empty(alloc), alloc: alloc)
+pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc), relocs: mem::List[machinst::Reloc].empty(alloc), alloc: alloc)
 
 pkg fn Assembler.offset(self) -> u32 {
     return u32.fit(self.code.len())
@@ -52,7 +52,7 @@ pkg fn Assembler.bind(mut self, label: u32) {
 /// Encoded code: its bytes, the relocations they need, and the branches shortened, by offset.
 pkg struct Encoded {
     pkg bytes: mem::Bytes
-    pkg relocs: mem::List[Reloc]
+    pkg relocs: mem::List[machinst::Reloc]
     pkg cuts: mem::List[Cut]
 } Encoded
 
@@ -109,7 +109,7 @@ fn Assembler.shorten(mut self) -> mem::List[Cut] {
     if cuts.len() == 0 {
         return cuts
     }
-    let shortened_code = Encoded(bytes: mem::Bytes.empty(self.alloc), relocs: mem::List[Reloc].empty(self.alloc), cuts: take cuts)
+    let shortened_code = Encoded(bytes: mem::Bytes.empty(self.alloc), relocs: mem::List[machinst::Reloc].empty(self.alloc), cuts: take cuts)
     var code = mem::Bytes.empty(self.alloc)
     var copied: usize = 0
     for cut in shortened_code.cuts {
@@ -225,9 +225,9 @@ fn Assembler.label8(mut self, label: u32) {
 } Assembler.label8
 
 /// A four-byte field the relocation of a symbol fills.
-fn Assembler.reloc32(mut self, kind: RelocKind, symbol: Symbol, addend: i64) {
+fn Assembler.reloc32(mut self, kind: machinst::RelocKind, symbol: machinst::Symbol, addend: i64) {
     let at = self.offset()
-    mut self.relocs.push(Reloc(offset: at, kind: kind, target: symbol, addend: addend))
+    mut self.relocs.push(machinst::Reloc(offset: at, kind: kind, target: symbol, addend: addend))
     mut self.put32(0)
 } Assembler.reloc32
 
@@ -293,13 +293,13 @@ fn Assembler.reg_mem(mut self, w: bool, opcode: u32, len: u32, reg: u8, mem: Amo
             var index_number: u8 = 0
             match index {
                 Some(held) => {
-                    index_number = held.hw()
+                    index_number = hw(held)
                 }
                 None => {}
             }
-            mut self.rex(w, reg: reg, index: index_number, base: base.hw(), force: force)
+            mut self.rex(w, reg: reg, index: index_number, base: hw(base), force: force)
             mut self.opcode(opcode, len: len)
-            mut self.address(reg, base: base.hw(), index: index, shift: shift, disp: disp)
+            mut self.address(reg, base: hw(base), index: index, shift: shift, disp: disp)
         }
         Amode.Rip(target: target, disp: disp) => {
             mut self.rex(w, reg: reg, index: 0, base: 0, force: force)
@@ -308,15 +308,15 @@ fn Assembler.reg_mem(mut self, w: bool, opcode: u32, len: u32, reg: u8, mem: Amo
             let addend = i64.widen(disp) - 4 - i64.widen(trailing)
             match target {
                 RipTarget.Label(label) => mut self.label32(label, disp: disp, trailing: trailing)
-                RipTarget.Direct(symbol) => mut self.reloc32(RelocKind.Relative4, symbol: symbol, addend: addend)
-                RipTarget.Got(symbol) => mut self.reloc32(RelocKind.GotRelative4, symbol: symbol, addend: addend)
+                RipTarget.Direct(symbol) => mut self.reloc32(machinst::RelocKind.Relative4, symbol: symbol, addend: addend)
+                RipTarget.Got(symbol) => mut self.reloc32(machinst::RelocKind.GotRelative4, symbol: symbol, addend: addend)
             }
         }
     }
 } Assembler.reg_mem
 
 /// Writes ModRM, SIB and displacement for `reg` and `base + index * 2^shift + disp`.
-fn Assembler.address(mut self, reg: u8, base: u8, index: Option[Reg], shift: u8, disp: i32) {
+fn Assembler.address(mut self, reg: u8, base: u8, index: Option[machinst::Reg], shift: u8, disp: i32) {
     let field = (reg & 7) << 3
     let low = base & 7
     var mode: u8 = 0x80
@@ -328,7 +328,7 @@ fn Assembler.address(mut self, reg: u8, base: u8, index: Option[Reg], shift: u8,
     match index {
         Some(held) => {
             mut self.put8(mode | field | 4)
-            mut self.put8((shift << 6) | ((held.hw() & 7) << 3) | low)
+            mut self.put8((shift << 6) | ((hw(held) & 7) << 3) | low)
         }
         None => {
             if low == 4 {
@@ -355,12 +355,12 @@ pkg fn Assembler.emit(mut self, inst: Inst) {
         Inst.Load(kind: kind, dst: dst, src: src) => mut self.load(kind, dst, src)
         Inst.Store(size: size, src: src, dst: dst) => mut self.store(size, src, dst)
         Inst.StoreImm(size: size, imm: imm, dst: dst) => mut self.store_imm(size, imm, dst)
-        Inst.Lea(dst: dst, src: src) => mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: dst.hw(), mem: src, trailing: 0, force: false)
-        Inst.Alu(op: op, size: size, dst: dst, src: src) => mut self.op_rr(op.code() * 8, size: size, rm: dst.hw(), reg: src.hw())
+        Inst.Lea(dst: dst, src: src) => mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: hw(dst), mem: src, trailing: 0, force: false)
+        Inst.Alu(op: op, size: size, dst: dst, src: src) => mut self.op_rr(op.code() * 8, size: size, rm: hw(dst), reg: hw(src))
         Inst.AluImm(op: op, size: size, dst: dst, imm: imm) => mut self.op_imm(op.code(), size: size, dst: dst, imm: imm)
-        Inst.Cmp(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x38, size: size, rm: lhs.hw(), reg: rhs.hw())
+        Inst.Cmp(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x38, size: size, rm: hw(lhs), reg: hw(rhs))
         Inst.CmpImm(size: size, lhs: lhs, imm: imm) => mut self.op_imm(7, size: size, dst: lhs, imm: imm)
-        Inst.Test(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x84, size: size, rm: lhs.hw(), reg: rhs.hw())
+        Inst.Test(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x84, size: size, rm: hw(lhs), reg: hw(rhs))
         Inst.Unary(op: op, size: size, reg: reg) => mut self.group3(unary_code(op), size: size, reg: reg)
         Inst.Imul(size: size, dst: dst, src: src) => mut self.imul(size, dst, src)
         Inst.ImulImm(size: size, dst: dst, src: src, imm: imm) => mut self.imul_imm(size, dst, src, imm)
@@ -370,7 +370,7 @@ pkg fn Assembler.emit(mut self, inst: Inst) {
         Inst.SignExtendData(size: size) => mut self.sign_extend_data(size)
         Inst.Shift(op: op, size: size, dst: dst, amount: amount) => mut self.shift(op, size, dst, amount)
         Inst.ShiftCl(op: op, size: size, dst: dst) => mut self.shift_cl(op, size, dst)
-        Inst.Setcc(cond: cond, dst: dst) => mut self.reg_reg(false, opcode: 0x0F90 + u32.widen(cond.code()), len: 2, reg: 0, rm: dst.hw(), force: is_high_byte(dst.hw()))
+        Inst.Setcc(cond: cond, dst: dst) => mut self.reg_reg(false, opcode: 0x0F90 + u32.widen(cond.code()), len: 2, reg: 0, rm: hw(dst), force: is_high_byte(hw(dst)))
         Inst.Cmov(cond: cond, size: size, dst: dst, src: src) => mut self.cmov(cond, size, dst, src)
         Inst.Extend(kind: kind, dst: dst, src: src) => mut self.extend(kind, dst, src)
         Inst.BitScan(reverse: reverse, size: size, dst: dst, src: src) => mut self.bit_scan(reverse, size, dst, src)
@@ -391,15 +391,15 @@ pkg fn Assembler.emit(mut self, inst: Inst) {
         Inst.Args(params: _) => {}
         Inst.StackSwitch(store: store, load: load, temp: temp, other: other) => mut self.stack_switch(store, load, temp, other)
         Inst.TlsGetAddr(symbol: symbol) => mut self.tls_get_addr(symbol)
-        Inst.FloatArith(op: op, size: size, dst: dst, src: src) => mut self.scalar(size, opcode: float_code(op), reg: dst.hw(), rm: src.hw())
-        Inst.FloatSqrt(size: size, dst: dst, src: src) => mut self.scalar(size, opcode: 0x51, reg: dst.hw(), rm: src.hw())
-        Inst.FloatConvert(source: source, dst: dst, src: src) => mut self.scalar(source, opcode: 0x5A, reg: dst.hw(), rm: src.hw())
-        Inst.FloatBits(op: op, dst: dst, src: src) => mut self.reg_reg(false, opcode: 0x0F00 + bits_code(op), len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+        Inst.FloatArith(op: op, size: size, dst: dst, src: src) => mut self.scalar(size, opcode: float_code(op), reg: hw(dst), rm: hw(src))
+        Inst.FloatSqrt(size: size, dst: dst, src: src) => mut self.scalar(size, opcode: 0x51, reg: hw(dst), rm: hw(src))
+        Inst.FloatConvert(source: source, dst: dst, src: src) => mut self.scalar(source, opcode: 0x5A, reg: hw(dst), rm: hw(src))
+        Inst.FloatBits(op: op, dst: dst, src: src) => mut self.reg_reg(false, opcode: 0x0F00 + bits_code(op), len: 2, reg: hw(dst), rm: hw(src), force: false)
         Inst.Ucomis(size: size, lhs: lhs, rhs: rhs) => mut self.ucomis(size, lhs, rhs)
         Inst.CvtIntToFloat(int_size: int_size, size: size, dst: dst, src: src) => mut self.convert(size, w: int_size == Size.Qword, opcode: 0x2A, reg: dst, rm: src)
         Inst.CvtFloatToInt(size: size, int_size: int_size, dst: dst, src: src) => mut self.convert(size, w: int_size == Size.Qword, opcode: 0x2C, reg: dst, rm: src)
-        Inst.MovToXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F6E, xmm: dst, gpr: src)
-        Inst.MovFromXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F7E, xmm: src, gpr: dst)
+        Inst.MovToXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F6E, vector: dst, gpr: src)
+        Inst.MovFromXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F7E, vector: src, gpr: dst)
         Inst.FloatToIntSat(signed: signed, size: size, dst: dst, src: src, temp: temp) => mut self.float_to_int_sat(signed, size, dst, src, temp)
         Inst.UintToFloat(size: size, dst: dst, src: src, temp: temp) => mut self.uint_to_float(size, dst, src, temp)
         Inst.CanonNan(size: size, reg: reg, temp: temp) => mut self.canon_nan(size, reg, temp)
@@ -444,16 +444,16 @@ fn bits_code(op: BitOp) -> u32
     }
 } bits_code
 
-fn Assembler.mov(mut self, dst: Reg, src: Reg) {
-    if dst.is_xmm() {
-        mut self.reg_reg(false, opcode: 0x0F28, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+fn Assembler.mov(mut self, dst: machinst::Reg, src: machinst::Reg) {
+    if is_xmm(dst) {
+        mut self.reg_reg(false, opcode: 0x0F28, len: 2, reg: hw(dst), rm: hw(src), force: false)
         return
     }
-    mut self.reg_reg(true, opcode: 0x89, len: 1, reg: src.hw(), rm: dst.hw(), force: false)
+    mut self.reg_reg(true, opcode: 0x89, len: 1, reg: hw(src), rm: hw(dst), force: false)
 } Assembler.mov
 
-fn Assembler.mov_imm(mut self, dst: Reg, imm: u64) {
-    let number = dst.hw()
+fn Assembler.mov_imm(mut self, dst: machinst::Reg, imm: u64) {
+    let number = hw(dst)
     if imm <= 0xFFFF_FFFF {
         mut self.rex(false, reg: 0, index: 0, base: number, force: false)
         mut self.put8(0xB8 + (number & 7))
@@ -471,17 +471,17 @@ fn Assembler.mov_imm(mut self, dst: Reg, imm: u64) {
     mut self.put64(imm)
 } Assembler.mov_imm
 
-fn Assembler.mov_symbol(mut self, dst: Reg, symbol: Symbol, addend: i64) {
-    let number = dst.hw()
+fn Assembler.mov_symbol(mut self, dst: machinst::Reg, symbol: machinst::Symbol, addend: i64) {
+    let number = hw(dst)
     mut self.rex(true, reg: 0, index: 0, base: number, force: false)
     mut self.put8(0xB8 + (number & 7))
     let at = self.offset()
-    mut self.relocs.push(Reloc(offset: at, kind: RelocKind.Absolute8, target: symbol, addend: addend))
+    mut self.relocs.push(machinst::Reloc(offset: at, kind: machinst::RelocKind.Absolute8, target: symbol, addend: addend))
     mut self.put64(0)
 } Assembler.mov_symbol
 
-fn Assembler.load(mut self, kind: LoadKind, dst: Reg, src: Amode) {
-    let number = dst.hw()
+fn Assembler.load(mut self, kind: LoadKind, dst: machinst::Reg, src: Amode) {
+    let number = hw(dst)
     match kind {
         LoadKind.Zx8 => mut self.reg_mem(false, opcode: 0x0FB6, len: 2, reg: number, mem: src, trailing: 0, force: false)
         LoadKind.Zx16 => mut self.reg_mem(false, opcode: 0x0FB7, len: 2, reg: number, mem: src, trailing: 0, force: false)
@@ -498,9 +498,9 @@ fn Assembler.load(mut self, kind: LoadKind, dst: Reg, src: Amode) {
     }
 } Assembler.load
 
-fn Assembler.store(mut self, size: Size, src: Reg, dst: Amode) {
-    let number = src.hw()
-    if src.is_xmm() {
+fn Assembler.store(mut self, size: Size, src: machinst::Reg, dst: Amode) {
+    let number = hw(src)
+    if is_xmm(src) {
         if size == Size.Dword {
             mut self.put8(0xF3)
         } else {
@@ -547,10 +547,10 @@ fn Assembler.op_rr(mut self, base: u8, size: Size, rm: u8, reg: u8)
 
 /// `op r/m, imm` of the immediate group, ModRM extension `ext`, with the accumulator's short
 /// forms.
-fn Assembler.op_imm(mut self, ext: u8, size: Size, dst: Reg, imm: i32)
+fn Assembler.op_imm(mut self, ext: u8, size: Size, dst: machinst::Reg, imm: i32)
     requires ext < 8
 {
-    let number = dst.hw()
+    let number = hw(dst)
     if size == Size.Byte {
         if dst == RAX {
             mut self.put8((ext * 8) + 4)
@@ -580,8 +580,8 @@ fn Assembler.op_imm(mut self, ext: u8, size: Size, dst: Reg, imm: i32)
 } Assembler.op_imm
 
 /// An instruction of group 3, `F6` or `F7` with the ModRM extension `ext`.
-fn Assembler.group3(mut self, ext: u8, size: Size, reg: Reg) {
-    let number = reg.hw()
+fn Assembler.group3(mut self, ext: u8, size: Size, reg: machinst::Reg) {
+    let number = hw(reg)
     if size == Size.Byte {
         mut self.reg_reg(false, opcode: 0xF6, len: 1, reg: ext, rm: number, force: is_high_byte(number))
         return
@@ -590,19 +590,19 @@ fn Assembler.group3(mut self, ext: u8, size: Size, reg: Reg) {
     mut self.reg_reg(w, opcode: 0xF7, len: 1, reg: ext, rm: number, force: false)
 } Assembler.group3
 
-fn Assembler.imul(mut self, size: Size, dst: Reg, src: Reg) {
+fn Assembler.imul(mut self, size: Size, dst: machinst::Reg, src: machinst::Reg) {
     let w = mut self.sized(size)
-    mut self.reg_reg(w, opcode: 0x0FAF, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+    mut self.reg_reg(w, opcode: 0x0FAF, len: 2, reg: hw(dst), rm: hw(src), force: false)
 } Assembler.imul
 
-fn Assembler.imul_imm(mut self, size: Size, dst: Reg, src: Reg, imm: i32) {
+fn Assembler.imul_imm(mut self, size: Size, dst: machinst::Reg, src: machinst::Reg, imm: i32) {
     let w = mut self.sized(size)
     if imm >= -128 and imm <= 127 {
-        mut self.reg_reg(w, opcode: 0x6B, len: 1, reg: dst.hw(), rm: src.hw(), force: false)
+        mut self.reg_reg(w, opcode: 0x6B, len: 1, reg: hw(dst), rm: hw(src), force: false)
         mut self.put8(u8.truncate(imm))
         return
     }
-    mut self.reg_reg(w, opcode: 0x69, len: 1, reg: dst.hw(), rm: src.hw(), force: false)
+    mut self.reg_reg(w, opcode: 0x69, len: 1, reg: hw(dst), rm: hw(src), force: false)
     if size == Size.Word {
         mut self.put16(u16.truncate(imm))
     } else {
@@ -632,11 +632,11 @@ fn Assembler.jcc(mut self, cond: Cond, label: u32) {
 } Assembler.jcc
 
 /// `lea base, [rip + table]`, `movsxd temp, [base + 4 * index]`, `add base, temp`, `jmp base`.
-fn Assembler.jump_table(mut self, index: Reg, base: Reg, temp: Reg, table: u32) {
-    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: base.hw(), mem: Amode.Rip(target: RipTarget.Label(table), disp: 0), trailing: 0, force: false)
-    mut self.reg_mem(true, opcode: 0x63, len: 1, reg: temp.hw(), mem: Amode.Mem(base: base, index: Some(index), shift: 2, disp: 0), trailing: 0, force: false)
-    mut self.op_rr(0x00, size: Size.Qword, rm: base.hw(), reg: temp.hw())
-    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: base.hw(), force: false)
+fn Assembler.jump_table(mut self, index: machinst::Reg, base: machinst::Reg, temp: machinst::Reg, table: u32) {
+    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: hw(base), mem: Amode.Rip(target: RipTarget.Label(table), disp: 0), trailing: 0, force: false)
+    mut self.reg_mem(true, opcode: 0x63, len: 1, reg: hw(temp), mem: Amode.Mem(base: base, index: Some(index), shift: 2, disp: 0), trailing: 0, force: false)
+    mut self.op_rr(0x00, size: Size.Qword, rm: hw(base), reg: hw(temp))
+    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: hw(base), force: false)
 } Assembler.jump_table
 
 /// An entry of a jump table starting at offset `start`: the offset of a label from that start.
@@ -653,12 +653,12 @@ pkg fn Assembler.align4(mut self) {
     }
 } Assembler.align4
 
-fn Assembler.srem_or_zero(mut self, size: Size, divisor: Reg) {
+fn Assembler.srem_or_zero(mut self, size: Size, divisor: machinst::Reg) {
     let divide = mut self.new_label()
     let done = mut self.new_label()
     mut self.op_imm(7, size: size, dst: divisor, imm: -1)
     mut self.jcc_short(Cond.NotEqual, label: divide)
-    mut self.op_rr(0x30, size: Size.Dword, rm: RDX.hw(), reg: RDX.hw())
+    mut self.op_rr(0x30, size: Size.Dword, rm: hw(RDX), reg: hw(RDX))
     mut self.jmp_short(done)
     mut self.bind(divide)
     mut self.group3(7, size: size, reg: divisor)
@@ -674,8 +674,8 @@ fn Assembler.sign_extend_data(mut self, size: Size) {
     }
 } Assembler.sign_extend_data
 
-fn Assembler.shift(mut self, op: ShiftOp, size: Size, dst: Reg, amount: u8) {
-    let number = dst.hw()
+fn Assembler.shift(mut self, op: ShiftOp, size: Size, dst: machinst::Reg, amount: u8) {
+    let number = hw(dst)
     let byte = size == Size.Byte
     let w = mut self.sized(size)
     var opcode: u32 = 0xC1
@@ -691,8 +691,8 @@ fn Assembler.shift(mut self, op: ShiftOp, size: Size, dst: Reg, amount: u8) {
     }
 } Assembler.shift
 
-fn Assembler.shift_cl(mut self, op: ShiftOp, size: Size, dst: Reg) {
-    let number = dst.hw()
+fn Assembler.shift_cl(mut self, op: ShiftOp, size: Size, dst: machinst::Reg) {
+    let number = hw(dst)
     let byte = size == Size.Byte
     let w = mut self.sized(size)
     var opcode: u32 = 0xD3
@@ -702,14 +702,14 @@ fn Assembler.shift_cl(mut self, op: ShiftOp, size: Size, dst: Reg) {
     mut self.reg_reg(w, opcode: opcode, len: 1, reg: op.code(), rm: number, force: byte and is_high_byte(number))
 } Assembler.shift_cl
 
-fn Assembler.cmov(mut self, cond: Cond, size: Size, dst: Reg, src: Reg) {
+fn Assembler.cmov(mut self, cond: Cond, size: Size, dst: machinst::Reg, src: machinst::Reg) {
     let w = mut self.sized(size)
-    mut self.reg_reg(w, opcode: 0x0F40 + u32.widen(cond.code()), len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+    mut self.reg_reg(w, opcode: 0x0F40 + u32.widen(cond.code()), len: 2, reg: hw(dst), rm: hw(src), force: false)
 } Assembler.cmov
 
-fn Assembler.extend(mut self, kind: ExtendKind, dst: Reg, src: Reg) {
-    let to = dst.hw()
-    let source = src.hw()
+fn Assembler.extend(mut self, kind: ExtendKind, dst: machinst::Reg, src: machinst::Reg) {
+    let to = hw(dst)
+    let source = hw(src)
     match kind {
         ExtendKind.Zx8 => mut self.reg_reg(false, opcode: 0x0FB6, len: 2, reg: to, rm: source, force: is_high_byte(source))
         ExtendKind.Zx16 => mut self.reg_reg(false, opcode: 0x0FB7, len: 2, reg: to, rm: source, force: false)
@@ -720,17 +720,17 @@ fn Assembler.extend(mut self, kind: ExtendKind, dst: Reg, src: Reg) {
     }
 } Assembler.extend
 
-fn Assembler.bit_scan(mut self, reverse: bool, size: Size, dst: Reg, src: Reg) {
+fn Assembler.bit_scan(mut self, reverse: bool, size: Size, dst: machinst::Reg, src: machinst::Reg) {
     var opcode: u32 = 0x0FBC
     if reverse {
         opcode = 0x0FBD
     }
     let w = mut self.sized(size)
-    mut self.reg_reg(w, opcode: opcode, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+    mut self.reg_reg(w, opcode: opcode, len: 2, reg: hw(dst), rm: hw(src), force: false)
 } Assembler.bit_scan
 
-fn Assembler.bswap(mut self, size: Size, reg: Reg) {
-    let number = reg.hw()
+fn Assembler.bswap(mut self, size: Size, reg: machinst::Reg) {
+    let number = hw(reg)
     mut self.rex(size == Size.Qword, reg: 0, index: 0, base: number, force: false)
     mut self.put8(0x0F)
     mut self.put8(0xC8 + (number & 7))
@@ -738,10 +738,10 @@ fn Assembler.bswap(mut self, size: Size, reg: Reg) {
 
 /// A `lock`-prefixed instruction with a memory destination, whose byte form is `opcode` and
 /// whose wider forms are `opcode + 1`.
-fn Assembler.locked(mut self, size: Size, opcode: u32, reg: Reg, mem: Amode)
+fn Assembler.locked(mut self, size: Size, opcode: u32, reg: machinst::Reg, mem: Amode)
     requires opcode < 0x1_0000
 {
-    let number = reg.hw()
+    let number = hw(reg)
     let w = mut self.sized(size)
     mut self.put8(0xF0)
     if size == Size.Byte {
@@ -751,8 +751,8 @@ fn Assembler.locked(mut self, size: Size, opcode: u32, reg: Reg, mem: Amode)
     mut self.reg_mem(w, opcode: opcode + 1, len: 2, reg: number, mem: mem, trailing: 0, force: false)
 } Assembler.locked
 
-fn Assembler.xchg(mut self, size: Size, reg: Reg, mem: Amode) {
-    let number = reg.hw()
+fn Assembler.xchg(mut self, size: Size, reg: machinst::Reg, mem: Amode) {
+    let number = hw(reg)
     let w = mut self.sized(size)
     if size == Size.Byte {
         mut self.reg_mem(w, opcode: 0x86, len: 1, reg: number, mem: mem, trailing: 0, force: is_high_byte(number))
@@ -761,7 +761,7 @@ fn Assembler.xchg(mut self, size: Size, reg: Reg, mem: Amode) {
     mut self.reg_mem(w, opcode: 0x87, len: 1, reg: number, mem: mem, trailing: 0, force: false)
 } Assembler.xchg
 
-fn Assembler.atomic_rmw_loop(mut self, op: AluOp, size: Size, operand: Reg, mem: Amode, temp: Reg) {
+fn Assembler.atomic_rmw_loop(mut self, op: AluOp, size: Size, operand: machinst::Reg, mem: Amode, temp: machinst::Reg) {
     let kind = match size {
         Size.Byte => LoadKind.Zx8
         Size.Word => LoadKind.Zx16
@@ -776,7 +776,7 @@ fn Assembler.atomic_rmw_loop(mut self, op: AluOp, size: Size, operand: Reg, mem:
     if size == Size.Qword {
         wide = Size.Qword
     }
-    mut self.op_rr(op.code() * 8, size: wide, rm: temp.hw(), reg: operand.hw())
+    mut self.op_rr(op.code() * 8, size: wide, rm: hw(temp), reg: hw(operand))
     mut self.locked(size, opcode: 0x0FB0, reg: temp, mem: mem)
     mut self.jcc_short(Cond.NotEqual, label: again)
 } Assembler.atomic_rmw_loop
@@ -787,44 +787,44 @@ fn Assembler.call(mut self, target: CallTarget) {
             mut self.put8(0xE8)
             mut self.reloc32(kind, symbol: symbol, addend: -4)
         }
-        CallTarget.Indirect(reg) => mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 2, rm: reg.hw(), force: false)
+        CallTarget.Indirect(reg) => mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 2, rm: hw(reg), force: false)
     }
 } Assembler.call
 
-fn Assembler.push_pop(mut self, opcode: u8, reg: Reg)
+fn Assembler.push_pop(mut self, opcode: u8, reg: machinst::Reg)
     requires opcode == 0x50 or opcode == 0x58
 {
-    let number = reg.hw()
+    let number = hw(reg)
     mut self.rex(false, reg: 0, index: 0, base: number, force: false)
     mut self.put8(opcode + (number & 7))
 } Assembler.push_pop
 
-fn Assembler.stack_switch(mut self, store: Reg, load: Reg, temp: Reg, other: Reg) {
+fn Assembler.stack_switch(mut self, store: machinst::Reg, load: machinst::Reg, temp: machinst::Reg, other: machinst::Reg) {
     let resume = mut self.new_label()
     mut self.exchange(store, load: load, temp: temp, disp: 0, reg: RSP)
     mut self.exchange(store, load: load, temp: temp, disp: 8, reg: RBP)
     mut self.load(LoadKind.Qword, dst: temp, src: Amode.at(load, disp: 16))
-    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: other.hw(), mem: Amode.Rip(target: RipTarget.Label(resume), disp: 0), trailing: 0, force: false)
+    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: hw(other), mem: Amode.Rip(target: RipTarget.Label(resume), disp: 0), trailing: 0, force: false)
     mut self.store(Size.Qword, src: other, dst: Amode.at(store, disp: 16))
-    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: temp.hw(), force: false)
+    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: hw(temp), force: false)
     mut self.bind(resume)
 } Assembler.stack_switch
 
 /// Loads a register's new value from `load + disp`, saves its current one at `store + disp` and
 /// sets it.
-fn Assembler.exchange(mut self, store: Reg, load: Reg, temp: Reg, disp: i32, reg: Reg) {
+fn Assembler.exchange(mut self, store: machinst::Reg, load: machinst::Reg, temp: machinst::Reg, disp: i32, reg: machinst::Reg) {
     mut self.load(LoadKind.Qword, dst: temp, src: Amode.at(load, disp: disp))
     mut self.store(Size.Qword, src: reg, dst: Amode.at(store, disp: disp))
     mut self.mov(reg, src: temp)
 } Assembler.exchange
 
-fn Assembler.tls_get_addr(mut self, symbol: Symbol) {
+fn Assembler.tls_get_addr(mut self, symbol: machinst::Symbol) {
     mut self.opcode(0x66488D, len: 3)
     mut self.put8(0x3D)
-    mut self.reloc32(RelocKind.TlsGeneralDynamic, symbol: symbol, addend: -4)
+    mut self.reloc32(machinst::RelocKind.TlsGeneralDynamic, symbol: symbol, addend: -4)
     mut self.opcode(0x666648, len: 3)
     mut self.put8(0xE8)
-    mut self.reloc32(RelocKind.CallPlt4, symbol: Symbol.TlsGetAddr, addend: -4)
+    mut self.reloc32(machinst::RelocKind.CallPlt4, symbol: machinst::Symbol.TlsGetAddr, addend: -4)
 } Assembler.tls_get_addr
 
 /// An SSE scalar instruction: `F3` for `Dword` or `F2` for `Qword`, then `0F` and the opcode.
@@ -841,33 +841,33 @@ fn Assembler.scalar_prefix(mut self, size: Size) {
     }
 } Assembler.scalar_prefix
 
-fn Assembler.ucomis(mut self, size: Size, lhs: Reg, rhs: Reg) {
+fn Assembler.ucomis(mut self, size: Size, lhs: machinst::Reg, rhs: machinst::Reg) {
     if size == Size.Qword {
         mut self.put8(0x66)
     }
-    mut self.reg_reg(false, opcode: 0x0F2E, len: 2, reg: lhs.hw(), rm: rhs.hw(), force: false)
+    mut self.reg_reg(false, opcode: 0x0F2E, len: 2, reg: hw(lhs), rm: hw(rhs), force: false)
 } Assembler.ucomis
 
 /// A conversion between an SSE scalar of `size` and an integer register, REX.W for a 64-bit
 /// integer.
-fn Assembler.convert(mut self, size: Size, w: bool, opcode: u8, reg: Reg, rm: Reg) {
+fn Assembler.convert(mut self, size: Size, w: bool, opcode: u8, reg: machinst::Reg, rm: machinst::Reg) {
     mut self.scalar_prefix(size)
-    mut self.reg_reg(w, opcode: 0x0F00 + u32.widen(opcode), len: 2, reg: reg.hw(), rm: rm.hw(), force: false)
+    mut self.reg_reg(w, opcode: 0x0F00 + u32.widen(opcode), len: 2, reg: hw(reg), rm: hw(rm), force: false)
 } Assembler.convert
 
 /// `movd` or `movq` between an SSE and a general-purpose register.
-fn Assembler.movd(mut self, size: Size, opcode: u32, xmm: Reg, gpr: Reg) {
+fn Assembler.movd(mut self, size: Size, opcode: u32, vector: machinst::Reg, gpr: machinst::Reg) {
     mut self.put8(0x66)
-    mut self.reg_reg(size == Size.Qword, opcode: opcode, len: 2, reg: xmm.hw(), rm: gpr.hw(), force: false)
+    mut self.reg_reg(size == Size.Qword, opcode: opcode, len: 2, reg: hw(vector), rm: hw(gpr), force: false)
 } Assembler.movd
 
 /// Loads float bits into an SSE register through a general-purpose one.
-fn Assembler.float_const(mut self, size: Size, dst: Reg, scratch: Reg, bits: u64) {
+fn Assembler.float_const(mut self, size: Size, dst: machinst::Reg, scratch: machinst::Reg, bits: u64) {
     mut self.mov_imm(scratch, imm: bits)
-    mut self.movd(size, opcode: 0x0F6E, xmm: dst, gpr: scratch)
+    mut self.movd(size, opcode: 0x0F6E, vector: dst, gpr: scratch)
 } Assembler.float_const
 
-fn Assembler.float_to_int_sat(mut self, signed: bool, size: Size, dst: Reg, src: Reg, temp: Reg) {
+fn Assembler.float_to_int_sat(mut self, signed: bool, size: Size, dst: machinst::Reg, src: machinst::Reg, temp: machinst::Reg) {
     if signed {
         mut self.float_to_sint_sat(size, dst, src, temp)
     } else {
@@ -877,7 +877,7 @@ fn Assembler.float_to_int_sat(mut self, signed: bool, size: Size, dst: Reg, src:
 
 /// Truncates to `i64`; the conversion's indefinite result marks a NaN, which gives 0, or an
 /// overflow, which saturates by the sign of the source.
-fn Assembler.float_to_sint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+fn Assembler.float_to_sint_sat(mut self, size: Size, dst: machinst::Reg, src: machinst::Reg, temp: machinst::Reg) {
     let done = mut self.new_label()
     let not_nan = mut self.new_label()
     mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: src)
@@ -885,10 +885,10 @@ fn Assembler.float_to_sint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: R
     mut self.jcc_short(Cond.NoOverflow, label: done)
     mut self.ucomis(size, lhs: src, rhs: src)
     mut self.jcc_short(Cond.NoParity, label: not_nan)
-    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.op_rr(0x30, size: Size.Dword, rm: hw(dst), reg: hw(dst))
     mut self.jmp_short(done)
     mut self.bind(not_nan)
-    mut self.reg_reg(false, opcode: 0x0F57, len: 2, reg: temp.hw(), rm: temp.hw(), force: false)
+    mut self.reg_reg(false, opcode: 0x0F57, len: 2, reg: hw(temp), rm: hw(temp), force: false)
     mut self.ucomis(size, lhs: temp, rhs: src)
     mut self.jcc_short(Cond.AboveOrEqual, label: done)
     mut self.mov_imm(dst, imm: 0x7FFF_FFFF_FFFF_FFFF)
@@ -897,7 +897,7 @@ fn Assembler.float_to_sint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: R
 
 /// Truncates to `u64`: below 2^63 as a signed conversion, from it by converting the source less
 /// 2^63 and setting the top bit; NaN and negative sources give 0, too large ones saturate.
-fn Assembler.float_to_uint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+fn Assembler.float_to_uint_sat(mut self, size: Size, dst: machinst::Reg, src: machinst::Reg, temp: machinst::Reg) {
     let large = mut self.new_label()
     let not_nan = mut self.new_label()
     let next = mut self.new_label()
@@ -912,35 +912,35 @@ fn Assembler.float_to_uint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: R
     mut self.ucomis(size, lhs: src, rhs: temp)
     mut self.jcc_short(Cond.AboveOrEqual, label: large)
     mut self.jcc_short(Cond.NoParity, label: not_nan)
-    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.op_rr(0x30, size: Size.Dword, rm: hw(dst), reg: hw(dst))
     mut self.jmp_short(done)
     mut self.bind(not_nan)
     mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: src)
     mut self.op_imm(7, size: Size.Qword, dst: dst, imm: 0)
     mut self.jcc_short(Cond.GreaterOrEqual, label: done)
-    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.op_rr(0x30, size: Size.Dword, rm: hw(dst), reg: hw(dst))
     mut self.jmp_short(done)
     mut self.bind(large)
     mut self.float_const(size, dst: temp, scratch: dst, bits: minus_half)
-    mut self.scalar(size, opcode: 0x58, reg: temp.hw(), rm: src.hw())
+    mut self.scalar(size, opcode: 0x58, reg: hw(temp), rm: hw(src))
     mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: temp)
     mut self.op_imm(7, size: Size.Qword, dst: dst, imm: 0)
     mut self.jcc_short(Cond.GreaterOrEqual, label: next)
     mut self.mov_imm(dst, imm: 0xFFFF_FFFF_FFFF_FFFF)
     mut self.jmp_short(done)
     mut self.bind(next)
-    mut self.reg_reg(true, opcode: 0x0FBA, len: 2, reg: 5, rm: dst.hw(), force: false)
+    mut self.reg_reg(true, opcode: 0x0FBA, len: 2, reg: 5, rm: hw(dst), force: false)
     mut self.put8(63)
     mut self.bind(done)
 } Assembler.float_to_uint_sat
 
 /// Converts a `u64`: a non-negative one as signed, any other halved with its low bit kept,
 /// converted and doubled.
-fn Assembler.uint_to_float(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+fn Assembler.uint_to_float(mut self, size: Size, dst: machinst::Reg, src: machinst::Reg, temp: machinst::Reg) {
     let negative = mut self.new_label()
     let even = mut self.new_label()
     let done = mut self.new_label()
-    mut self.op_rr(0x84, size: Size.Qword, rm: src.hw(), reg: src.hw())
+    mut self.op_rr(0x84, size: Size.Qword, rm: hw(src), reg: hw(src))
     mut self.jcc_short(Cond.Sign, label: negative)
     mut self.convert(size, w: true, opcode: 0x2A, reg: dst, rm: src)
     mut self.jmp_short(done)
@@ -951,11 +951,11 @@ fn Assembler.uint_to_float(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) 
     mut self.op_imm(1, size: Size.Qword, dst: temp, imm: 1)
     mut self.bind(even)
     mut self.convert(size, w: true, opcode: 0x2A, reg: dst, rm: temp)
-    mut self.scalar(size, opcode: 0x58, reg: dst.hw(), rm: dst.hw())
+    mut self.scalar(size, opcode: 0x58, reg: hw(dst), rm: hw(dst))
     mut self.bind(done)
 } Assembler.uint_to_float
 
-fn Assembler.canon_nan(mut self, size: Size, reg: Reg, temp: Reg) {
+fn Assembler.canon_nan(mut self, size: Size, reg: machinst::Reg, temp: machinst::Reg) {
     let done = mut self.new_label()
     mut self.ucomis(size, lhs: reg, rhs: reg)
     mut self.jcc_short(Cond.NoParity, label: done)
@@ -967,7 +967,7 @@ fn Assembler.canon_nan(mut self, size: Size, reg: Reg, temp: Reg) {
     mut self.bind(done)
 } Assembler.canon_nan
 
-fn Assembler.xmm_cmov(mut self, cond: Cond, dst: Reg, src: Reg) {
+fn Assembler.xmm_cmov(mut self, cond: Cond, dst: machinst::Reg, src: machinst::Reg) {
     let skip = mut self.new_label()
     mut self.jcc_short(cond.invert(), label: skip)
     mut self.mov(dst, src: src)

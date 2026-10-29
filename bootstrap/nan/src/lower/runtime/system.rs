@@ -1,5 +1,5 @@
 //! The system the runtime runs on: the memory of its records and of the chunks cells draw, task
-//! stacks, idling, its standard streams, its start and its exit. On `x86_64-host` the host module
+//! stacks, idling, its standard streams, its start and its exit. On a host target the host module
 //! provides them over the C library and Linux; on a machine target the machine module does, over
 //! the boot heap, the serial and exit ports and the CPUs.
 
@@ -97,7 +97,7 @@ pub fn unavailable(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
-/// Writes a byte range to a standard stream: on `x86_64-host` to its descriptor, on a machine
+/// Writes a byte range to a standard stream: on a host target to its descriptor, on a machine
 /// target to the serial port, which carries both streams.
 pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
     match lo.machine() {
@@ -125,7 +125,7 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     }
 }
 
-/// A task stack of `len` bytes whose lowest page is an inaccessible guard on `x86_64-host`, zero
+/// A task stack of `len` bytes whose lowest page is an inaccessible guard on a host target, zero
 /// when the system refuses; a machine target draws it as a runtime record, its guard region
 /// unprotected since its stacks have static bounds.
 pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value) -> Value {
@@ -144,14 +144,14 @@ pub fn unmap_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, len: Value) {
 }
 
 /// Makes the guard region at the base of a stack drawn through a cell inaccessible, or
-/// accessible again, on `x86_64-host`.
+/// accessible again, on a host target.
 pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bool) {
     if !lo.machine() {
         host::protect_guard(lo, fx, base, accessible);
     }
 }
 
-/// Waits until a task may be ready: on `x86_64-host` in the running thread's ring, handling the
+/// Waits until a task may be ready: on a host target in the running thread's ring, handling the
 /// completions that arrive; on a machine target the CPU halts until an interrupt.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     match lo.machine() {

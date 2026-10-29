@@ -358,15 +358,15 @@ pub closed struct PreemptEntry {
 ```
 
 - The **landing fields** are `hw::Vector.user`, `hw::SyscallEntry.handler` and `hw::PreemptEntry.handler`.
-- The target's [descriptor](27-program-model.md#descriptors) assigns each vector a class, one of the four `hw::VectorHandler` variant names or none, and lists the vectors that need a nonzero `ist`.
-- These are errors (`registry.platform-entry`): an `hw::Vector` whose vector has no class or a class other than its handler's variant name, whose `ist` is 0 for a vector that needs a nonzero one, or whose `user` is not `None` for a vector of class `Irq`; a landing field holding a function that is not a [landing fn](23-low-level.md#landing-functions); and a contribution to `hw::preempt` outside a [platform package](28-stdlib.md#platform-packages).
+- The target's [descriptor](27-program-model.md#descriptors) assigns each vector a class, one of the four `hw::VectorHandler` variant names or none, and lists the vectors that need a nonzero `ist` or that every vector takes `ist` 0.
+- These are errors (`registry.platform-entry`): an `hw::Vector` whose vector has no class or a class other than its handler's variant name, whose `ist` is 0 for a vector that needs a nonzero one or nonzero for a vector that takes 0, or whose `user` is not `None` for a vector of class `Irq`; a landing field holding a function that is not a [landing fn](23-low-level.md#landing-functions); and a contribution to `hw::preempt` outside a [platform package](28-stdlib.md#platform-packages).
 - A contribution to `hw::vectors` or `hw::preempt` under a declared target without vector seams, or to `hw::syscall_entry` under one without the syscall seam ([machine seams](23-low-level.md#machine-seams)), is an error (`registry.platform-target`).
 
 The `hw::vectors` entry whose key field is a vector **binds** that vector, except that it binds an exception raised in user code only when its `user` is not `None`. The seams use the tables as follows:
 
-- The gate of each vector holds the entry's `ist` as its interrupt stack table index, 0 selecting none.
+- On x86_64 the gate of each vector holds the entry's `ist` as its interrupt stack table index, 0 selecting none; on AArch64 every vector's seam runs on the CPU's interrupt stack of `ist` 0.
 - The seam of a bound vector calls the interrupt fn of `handler` ([interrupt functions](24-kernel.md#interrupt-functions)), or, for an exception raised in user code, the landing fn of `user`, with the arguments [user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) gives. Interrupt functions fixes what the seam of an unbound vector does.
-- The syscall seam calls the `handler` of the `hw::syscall_entry` entry with the arguments user exceptions and syscalls gives. Without an entry, the image leaves the `syscall` instruction disabled.
+- The syscall seam calls the `handler` of the `hw::syscall_entry` entry with the arguments user exceptions and syscalls gives. Without an entry, the image leaves the `syscall` instruction disabled on x86_64, and an `svc` instruction in user mode halts the kernel on AArch64.
 - The vector seams call the `handler` of the `hw::preempt` entry, which the platform package contributes, where [preemption](24-kernel.md#preemption) has the interrupted thread yield.
 
 ```nan

@@ -97,7 +97,8 @@ pub fn build(
             .as_ref()
             .map_or(manifest.line, |(_, line)| *line);
         let mut diagnostic = Diagnostic::at(Code::TargetLinkFailed, &source.files[0].path, line);
-        diagnostic.envelope = Some(("cc".to_owned(), output.lines().map(str::to_owned).collect()));
+        let linker = lower::host::linker(target).to_owned();
+        diagnostic.envelope = Some((linker, output.lines().map(str::to_owned).collect()));
         diagnostics.push(diagnostic);
         return Ok(Build {
             diagnostics,
@@ -216,8 +217,8 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
 }
 
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing any
-/// earlier image at once: on `x86_64-host` an executable the `cc` of the `PATH` links, giving
-/// `cc`'s output when it fails; on a machine target the image writer's, entered by the program
+/// earlier image at once: on a host target an executable the target's linker links, giving the
+/// linker's output when it fails; on a machine target the image writer's, entered by the program
 /// entry seam.
 pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Result<(), String>> {
     let directory = image.parent().expect("an image lies in a directory");
@@ -237,7 +238,7 @@ pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Re
         false => {
             let staged_object = staged("o");
             fs::write(&staged_object, object)?;
-            let linked = lower::host::link(&staged_object, &new);
+            let linked = lower::host::link(target, &staged_object, &new);
             fs::remove_file(&staged_object)?;
             if let Err(output) = linked {
                 return Ok(Err(output));

@@ -1,0 +1,67 @@
+//! The AArch64 procedure call standard: where a signature's parameters and results pass, in registers or on the stack. The UEFI firmware's convention reserves `x18` but places arguments the same way, so one placement serves both the System V and the firmware conventions.
+
+/// Where a value passes: in a register, or on the stack at an offset from the stack pointer at the
+/// call.
+pkg enum Place derives Copy, Eq {
+    Reg(machinst::Reg)
+    Stack(u32)
+} Place
+
+/// The places of a signature's parameters and results, two for a 128-bit integer (its low half
+/// first), and the bytes its stack arguments take.
+pkg struct Places {
+    pkg params: mem::List[Place]
+    pkg returns: mem::List[Place]
+    pkg stack: u32
+} Places
+
+/// Whether a value of a type passes in a floating-point register: a float, where code may use them.
+pkg fn in_vector(ty: clif::Type, floats: bool) -> bool = floats and ty.is_float()
+
+/// The places of a signature: integers and pointers in `x0` to `x7`, a 128-bit one in a pair of
+/// them starting at an even one, floats in `v0` to `v7`, and the rest on the stack in order, each
+/// in 8 bytes or a 128-bit one in 16 aligned to 16, which take a multiple of 16 bytes. Results go
+/// in registers the same way. Without floating-point registers a float passes as an integer of its
+/// width does.
+pkg fn places(sig: clif::Signature, floats: bool, alloc: mem::Alloc) -> Places {
+    var params = mem::List[Place].empty(alloc)
+    let stack = place_values(sig.params.view(), floats, placed: mut params)
+    var returns = mem::List[Place].empty(alloc)
+    let returned = place_values(sig.returns.view(), floats, placed: mut returns)
+    expect returned == 0
+    return Places(params: take params, returns: take returns, stack: (stack + 15) & ~15u32)
+} places
+
+/// Appends the places of values to `placed`, giving the bytes of stack they take.
+fn place_values(values: Slice[clif::AbiParam], floats: bool, mut placed: mem::List[Place]) -> u32 {
+    var ints: u32 = 0
+    var vectors: u32 = 0
+    var stack: u32 = 0
+    for value in values {
+        invariant ints <= 8 and vectors <= 8
+        let ty = value.value_type
+        if ty == clif::Type.Int128 {
+            if ints + 2 <= 8 {
+                ints += ints % 2
+                mut placed.push(Place.Reg(xreg(ints)))
+                mut placed.push(Place.Reg(xreg(ints + 1)))
+                ints += 2
+            } else {
+                stack = (stack + 15) & ~15u32
+                mut placed.push(Place.Stack(stack))
+                mut placed.push(Place.Stack(stack + 8))
+                stack += 16
+            }
+        } else if in_vector(ty, floats) and vectors < 8 {
+            mut placed.push(Place.Reg(vreg(vectors)))
+            vectors += 1
+        } else if not in_vector(ty, floats) and ints < 8 {
+            mut placed.push(Place.Reg(xreg(ints)))
+            ints += 1
+        } else {
+            mut placed.push(Place.Stack(stack))
+            stack += 8
+        }
+    }
+    return stack
+} place_values

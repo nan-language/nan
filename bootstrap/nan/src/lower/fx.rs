@@ -35,6 +35,12 @@ pub fn unaligned() -> MemFlagsData {
     MemFlagsData::new().with_notrap()
 }
 
+/// Flags of a load through a hardware pointer, which faults where nothing is mapped: aligned,
+/// without `notrap`.
+fn device() -> MemFlagsData {
+    MemFlagsData::new().with_aligned()
+}
+
 /// The flags of a scalar access, possibly unaligned.
 fn access(unaligned_access: bool) -> MemFlagsData {
     if unaligned_access {
@@ -101,6 +107,13 @@ impl<'f> Fx<'f> {
         big: bool,
     ) -> Value {
         let value = (self.b.ins()).load(ty, access(unaligned_access), addr, offset as i32);
+        self.ordered(value, big)
+    }
+
+    /// The scalar of type `ty` a hardware pointer addresses, in big-endian byte order when `big`
+    /// holds.
+    pub fn load_device(&mut self, ty: Type, addr: Value, big: bool) -> Value {
+        let value = self.b.ins().load(ty, device(), addr, 0);
         self.ordered(value, big)
     }
 

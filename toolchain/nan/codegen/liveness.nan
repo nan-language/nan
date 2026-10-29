@@ -12,7 +12,7 @@ struct Liveness {
 } Liveness
 
 /// The entries of a table with one per physical register.
-const REG_COUNT: usize = usize.widen(x64::PHYSICAL)
+const REG_COUNT: usize = usize.widen(machinst::PHYSICAL)
 
 /// The entries of a table bounding a run per physical register.
 const REG_BOUNDS: usize = REG_COUNT + 1
@@ -32,7 +32,7 @@ struct Exposed derives Copy, Eq {
     block: u32
 } Exposed
 
-fn Liveness.of(code: VCode, alloc: mem::Alloc) -> Liveness {
+fn Liveness.of[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -> Liveness {
     let count = usize.widen(code.vreg_count())
     var live = Liveness(starts: filled(count, value: NONE, alloc), ends: filled(count, value: 0u32, alloc), fixed: mem::List[Range].empty(alloc), fixed_at: Array[u32, REG_BOUNDS].filled(0))
     var def_blocks = filled(count, value: NONE, alloc)
@@ -76,7 +76,7 @@ fn Liveness.extend(mut self, vreg: u32, position: u32) {
 
 /// Records where each virtual register a block defines is first defined, its parameters at the
 /// block's start.
-fn Liveness.record_defs(mut self, code: VCode, block: u32, mut def_blocks: mem::List[u32], mut def_positions: mem::List[u32])
+fn Liveness.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, mut def_blocks: mem::List[u32], mut def_positions: mem::List[u32])
     requires usize.widen(block) < code.blocks.len()
 {
     let data = code.blocks[usize.widen(block)]
@@ -93,13 +93,13 @@ fn Liveness.record_defs(mut self, code: VCode, block: u32, mut def_blocks: mem::
         let inst = code.insts[usize.widen(at)].inst
         let reads = 2 * at
         let writes = reads + 1
-        discard inst.map_regs(fn[mut self, mut def_blocks, mut def_positions](reg: x64::Reg, role: x64::Role) -> x64::Reg {
-            if not reg.is_virtual() or role == x64::Role.Use {
+        discard inst.map_regs(fn[mut self, mut def_blocks, mut def_positions](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            if not reg.is_virtual() or role == machinst::Role.Use {
                 return reg
             }
             let vreg = reg.vreg()
             var position = writes
-            if role == x64::Role.EarlyDef or role == x64::Role.Temp {
+            if role == machinst::Role.EarlyDef or role == machinst::Role.Temp {
                 position = reads
                 mut self.extend(vreg, position: writes)
             }
@@ -116,7 +116,7 @@ fn Liveness.record_defs(mut self, code: VCode, block: u32, mut def_blocks: mem::
 
 /// Extends each virtual register over its uses in a block, noting the uses its definition does
 /// not precede in the block.
-fn Liveness.record_uses(mut self, code: VCode, block: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed])
+fn Liveness.record_uses[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed])
     requires usize.widen(block) < code.blocks.len()
 {
     let data = code.blocks[usize.widen(block)]
@@ -124,8 +124,8 @@ fn Liveness.record_uses(mut self, code: VCode, block: u32, def_blocks: mem::List
     for at in data.begin..<data.end {
         let inst = code.insts[usize.widen(at)].inst
         let reads = 2 * at
-        discard inst.map_regs(fn[mut self, mut exposed](reg: x64::Reg, role: x64::Role) -> x64::Reg {
-            if reg.is_virtual() and (role == x64::Role.Use or role == x64::Role.Mod) {
+        discard inst.map_regs(fn[mut self, mut exposed](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            if reg.is_virtual() and (role == machinst::Role.Use or role == machinst::Role.Mod) {
                 mut self.use_at(reg.vreg(), block, position: reads, def_blocks, def_positions, mut exposed)
             }
             return reg
@@ -148,7 +148,7 @@ fn Liveness.use_at(mut self, vreg: u32, block: u32, position: u32, def_blocks: m
 
 /// Extends each virtual register over the blocks it is live through: from each block a use of it
 /// is exposed in, back through predecessors to the block defining it.
-fn Liveness.propagate(mut self, code: VCode, def_blocks: mem::List[u32], take exposed: mem::List[Exposed], alloc: mem::Alloc) {
+fn Liveness.propagate[I: machinst::MachInst and Copy](mut self, code: VCode[I], def_blocks: mem::List[u32], take exposed: mem::List[Exposed], alloc: mem::Alloc) {
     let preds = Predecessors.of(code, alloc)
     var sorted = exposed
     mut sorted.sort_by(fn(left: Exposed, right: Exposed) -> core::Ordering {
@@ -201,7 +201,7 @@ struct Predecessors {
     at: mem::List[u32]
 } Predecessors
 
-fn Predecessors.of(code: VCode, alloc: mem::Alloc) -> Predecessors {
+fn Predecessors.of[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -> Predecessors {
     let blocks = code.blocks.len()
     expect blocks < 0xFFFF_FFFF
     var counts = filled(blocks + 1, value: 0u32, alloc)
@@ -247,33 +247,28 @@ proj fn Predecessors.of_block(self, block: u32) -> Slice[u32] {
     return within.head
 } Predecessors.of_block
 
-/// Whether a physical register is one allocation hands out.
-fn is_allocatable(reg: x64::Reg) -> bool = reg.is_physical() and not (reg == x64::RSP or reg == x64::RBP or reg == x64::R10 or reg == x64::R11 or reg.index == 30 or reg.index == 31)
-
 /// Records the ranges over which instructions hold physical registers: from a definition to its
 /// last use in the block, an early definition or temporary from the instruction's reads, and a
 /// clobber at the instruction's writes.
-fn Liveness.record_fixed(mut self, code: VCode, alloc: mem::Alloc) {
+fn Liveness.record_fixed[I: machinst::MachInst and Copy](mut self, code: VCode[I], alloc: mem::Alloc) {
     expect code.insts.len() < usize.widen(MAX_INSTS)
+    let allocatable = code.allocatable()
     var ranges = mem::List[Range].empty(alloc)
     var latest = Array[u32, REG_COUNT].filled(NONE)
     for at in 0u32..<u32.fit(code.insts.len()) {
         let inst = code.insts[usize.widen(at)].inst
-        discard inst.map_regs(fn[mut ranges, mut latest](reg: x64::Reg, role: x64::Role) -> x64::Reg {
-            if not is_allocatable(reg) {
+        discard inst.map_regs(fn[mut ranges, mut latest](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            if not allocatable.contains(reg) {
                 return reg
             }
             hold(mut ranges, mut latest, reg: reg.index, role: role, at: at)
             return reg
         })
         let clobbers = inst.clobbers()
-        let call = match inst {
-            x64::Inst.Call(target: _, args: _, results: _, clobbers: _) => true
-            else => false
-        }
-        for index in 0u32..<x64::PHYSICAL {
-            let reg = x64::Reg(index: index)
-            if clobbers.contains(reg) and is_allocatable(reg) {
+        let call = inst.is_call()
+        for index in 0u32..<machinst::PHYSICAL {
+            let reg = machinst::Reg(index: index)
+            if clobbers.contains(reg) and allocatable.contains(reg) {
                 mut ranges.push(Range(reg: index, start: (2 * at) + 1, end: (2 * at) + 1, call: call))
                 latest[usize.widen(index)] = u32.fit(ranges.len() - 1)
             }
@@ -281,7 +276,7 @@ fn Liveness.record_fixed(mut self, code: VCode, alloc: mem::Alloc) {
     }
     var counts = Array[u32, REG_BOUNDS].filled(0)
     for range in ranges {
-        expect range.reg < x64::PHYSICAL
+        expect range.reg < machinst::PHYSICAL
         counts[usize.widen(range.reg) + 1] += 1
     }
     for index in 1..<counts.len() {
@@ -303,16 +298,16 @@ fn Liveness.record_fixed(mut self, code: VCode, alloc: mem::Alloc) {
 } Liveness.record_fixed
 
 /// Records how an instruction at `at` holds a physical register.
-fn hold(mut ranges: mem::List[Range], mut latest: Array[u32, REG_COUNT], reg: u32, role: x64::Role, at: u32)
-    requires reg < x64::PHYSICAL and at < MAX_INSTS
+fn hold(mut ranges: mem::List[Range], mut latest: Array[u32, REG_COUNT], reg: u32, role: machinst::Role, at: u32)
+    requires reg < machinst::PHYSICAL and at < MAX_INSTS
 {
     let last = latest[usize.widen(reg)]
     let reads = 2 * at
     let writes = reads + 1
     match role {
-        x64::Role.Use or x64::Role.Mod => {
+        machinst::Role.Use or machinst::Role.Mod => {
             var end = reads
-            if role == x64::Role.Mod {
+            if role == machinst::Role.Mod {
                 end = writes
             }
             if last == NONE {
@@ -326,11 +321,11 @@ fn hold(mut ranges: mem::List[Range], mut latest: Array[u32, REG_COUNT], reg: u3
                 }
             }
         }
-        x64::Role.Def => {
+        machinst::Role.Def => {
             mut ranges.push(Range(reg: reg, start: writes, end: writes, call: false))
             latest[usize.widen(reg)] = u32.fit(ranges.len() - 1)
         }
-        x64::Role.EarlyDef or x64::Role.Temp => {
+        machinst::Role.EarlyDef or machinst::Role.Temp => {
             mut ranges.push(Range(reg: reg, start: reads, end: writes, call: false))
             latest[usize.widen(reg)] = u32.fit(ranges.len() - 1)
         }

@@ -24,10 +24,20 @@ const PRIMITIVES: [&str; 9] = [
 ];
 
 /// The privileged intrinsics that are trusted primitives too.
-const PRIVILEGED_PRIMITIVES: [&str; 3] = ["write_cr3", "read_msr", "write_msr"];
+const PRIVILEGED_PRIMITIVES: [&str; 5] = [
+    "write_cr3",
+    "read_msr",
+    "write_msr",
+    "write_ttbr0",
+    "write_sysreg",
+];
 
 /// The calling conventions and the targets each serves.
-const CONVENTIONS: [(&str, Target); 2] = [("sysv", Target::Host), ("win64", Target::Uefi)];
+const CONVENTIONS: [(&str, &[Target]); 3] = [
+    ("sysv", &[Target::X64Host, Target::Aarch64Host]),
+    ("win64", &[Target::X64Uefi]),
+    ("aapcs64", &[Target::Aarch64Uefi]),
+];
 
 impl Checker<'_> {
     /// Whether a std function is a trusted primitive.
@@ -613,7 +623,7 @@ impl Checker<'_> {
 
     /// A convention clause: a known convention serving every target its package declares.
     pub fn check_convention(&self, item: ItemId, token: Tok, convention: &str) {
-        let Some((_, target)) = CONVENTIONS.iter().find(|(name, _)| *name == convention) else {
+        let Some((_, targets)) = CONVENTIONS.iter().find(|(name, _)| *name == convention) else {
             self.report(item, token, Code::TrustedConventionUnknown);
             return;
         };
@@ -623,7 +633,10 @@ impl Checker<'_> {
             .manifest
             .iter()
             .flat_map(|manifest| &manifest.targets);
-        if declared.into_iter().any(|declared| declared != target) {
+        if declared
+            .into_iter()
+            .any(|declared| !targets.contains(declared))
+        {
             self.report(item, token, Code::TrustedConventionTarget);
         }
     }

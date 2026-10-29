@@ -1,7 +1,8 @@
 //! The milestone harness: in a copy of each scenario workspace of `tests/milestones`, runs the
 //! commands its milestone states, then `nan verify`, which must accept the workspace after
 //! running its tests; for M2, the obligation outcomes are also compared with the proof cache's,
-//! and for M4 each program runs under its emulator until its serial output shows the behaviour.
+//! and for each M4 scenario, one per architecture, each program runs under its emulator until its
+//! serial output shows the behaviour.
 //! Its runs of `nan` use the harnesses' home directory and a local store of their own, which each
 //! scenario starts empty.
 
@@ -401,7 +402,9 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
         let Ok(line) = received.recv_timeout(left) else {
             break;
         };
-        missing.retain(|wanted| *wanted != line);
+        // The PL011 the AArch64 emulator models also writes out a byte it loops back, which
+        // can begin a line.
+        missing.retain(|wanted| !line.ends_with(wanted));
         written.push(line);
     }
     let terminated = Command::new("kill")
@@ -426,29 +429,36 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
     );
 }
 
-/// Builds a copy of the M4 scenario outside every git working tree, runs each program under its
+/// What the M4 kernel and loader of either architecture write once they show their behaviour.
+const KERNEL_SHOWS: [&str; 5] = [
+    "kernel: running on 4 cpus",
+    "smp: tasks ran on every one of 4 cpus",
+    "preempt: 5 tasks that never await all ran",
+    "uart: reader woke on byte 78",
+    "virtio-rng: received 16 bytes",
+];
+const LOADER_SHOWS: [&str; 1] =
+    ["loader: copied 3 loadable segments of kernel.elf to their physical addresses"];
+
+/// Builds a copy of an M4 scenario outside every git working tree, runs each program under its
 /// emulator until it shows its behaviour, then verifies the scenario.
-#[test]
-fn m4() {
-    let outside = std::env::temp_dir().join(format!("nan-milestones-{}", std::process::id()));
-    let root = copied_into("m4", &outside);
+fn m4_scenario(milestone: &str) {
+    let outside =
+        std::env::temp_dir().join(format!("nan-milestones-{milestone}-{}", std::process::id()));
+    let root = copied_into(milestone, &outside);
     ok(&root, &["build"]);
-    shows(
-        &root,
-        "kernel",
-        &[
-            "kernel: running on 4 cpus",
-            "smp: tasks ran on every one of 4 cpus",
-            "preempt: 5 tasks that never await all ran",
-            "uart: reader woke on byte 78",
-            "virtio-rng: received 16 bytes",
-        ],
-    );
-    shows(
-        &root,
-        "loader",
-        &["loader: copied 3 loadable segments of kernel.elf to their physical addresses"],
-    );
+    shows(&root, "kernel", &KERNEL_SHOWS);
+    shows(&root, "loader", &LOADER_SHOWS);
     verified(&root);
     fs::remove_dir(outside).expect("the scenario's directory removed");
+}
+
+#[test]
+fn m4() {
+    m4_scenario("m4");
+}
+
+#[test]
+fn m4_aarch64() {
+    m4_scenario("m4-aarch64");
 }

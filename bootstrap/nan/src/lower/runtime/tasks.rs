@@ -92,7 +92,7 @@ pub mod task {
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
-/// it runs, its index and the locks it holds; on `x86_64-host` also its ring, whether it waits
+/// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
 /// idle in its ring, the operations in flight on it, whether another thread asked to cancel one,
 /// its POSIX thread and the top of the stack its stack overflow reports run on; on a kernel the
 /// flags from before its outermost held lock disabled interrupts.
@@ -213,7 +213,7 @@ pub mod trap_record {
     pub const BYTES: u64 = 16;
 }
 
-/// The default size of a task's stack, of the entry task's stack on `x86_64-host`, and of a
+/// The default size of a task's stack, of the entry task's stack on a host target, and of a
 /// guard region.
 pub const STACK: u64 = 65_536;
 pub const ENTRY_STACK: u64 = 67_108_864;
@@ -472,10 +472,19 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(cell, record, task::STACK_CELL);
     let guard = fx.b.ins().iadd_imm_s(stack, GUARD as i64);
     fx.store(guard, record, task::GUARD);
-    let top = fx.b.ins().iadd(stack, length);
-    let top = fx.b.ins().iadd_imm_s(top, -8);
+    // The initial stack pointer of the task's first run, which its switch restores: aligned to
+    // 16 bytes, which the start routine is entered with on AArch64, and on x86_64 eight below
+    // that, over a zeroed return slot, so the start routine is entered as a call leaves the
+    // stack.
     let zero = fx.ptr(0);
-    fx.store(zero, top, 0);
+    let top = fx.b.ins().iadd(stack, length);
+    let top = if lo.ck.db.target.arch() == Some(crate::workspace::Arch::Aarch64) {
+        top
+    } else {
+        let top = fx.b.ins().iadd_imm_s(top, -8);
+        fx.store(zero, top, 0);
+        top
+    };
     fx.store(top, record, task::CONTEXT);
     fx.store(zero, record, task::CONTEXT + 8);
     let start = lo.routine(Routine::TaskStart);
@@ -553,7 +562,7 @@ fn switch_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let thread = lo.thread(fx);
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
-    fx.b.ins().stack_switch(context, scheduler, record);
+    lo.switch_stacks(fx, context, scheduler, record);
 }
 
 /// Switches the running kernel task, which an interrupt preempted, away from its CPU: it becomes
@@ -789,7 +798,7 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             },
         );
     }
-    fx.b.ins().stack_switch(scheduler, context, record);
+    lo.switch_stacks(fx, scheduler, context, record);
     let thread = lo.thread(fx);
     let zero = fx.ptr(0);
     fx.store(zero, thread, thread::CURRENT);

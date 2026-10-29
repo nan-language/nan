@@ -1,0 +1,127 @@
+//! Writes a line per check to the PL011, then lets the first task end.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// An address the entry root leaves unmapped, and the exception class of a data abort at EL1.
+const UNMAPPED: u64 = 0x1_0000_0000
+
+const DATA_ABORT: u64 = 0x25
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+/// Checks the abort's syndrome and faulting address, and resumes past the faulting instruction.
+interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit limits stack 1_024 {
+    let fault = frame.info()
+    check(name: "abort", held: fault.address == UNMAPPED and (fault.code >> 26) == DATA_ABORT)
+    let next = frame.ip().wrapping_add(4)
+    trusted "the faulting load is one instruction, whose result the kernel ignores" {
+        mut frame.set_ip(next)
+    }
+    return hw::IrqExit.Resume
+} on_abort
+
+contribute hw::vectors abort = hw::Vector(vector: 1, ist: 0, handler: hw::VectorHandler.PageFault(on_abort), user: None)
+
+fn arithmetic() {
+    var bits: u64 = 0
+    var shift: u32 = 0
+    while shift < 40u32 {
+        bits = bits | (1u64 << shift)
+        shift = shift + 1u32
+    }
+    check(name: "count_ones", held: bits.count_ones() == 40u32)
+    var a: u8 = 0
+    var steps: u8 = 0
+    while steps < 15u8 {
+        a = a + 1u8
+        steps = steps + 1u8
+    }
+    check(name: "u8 count_ones", held: a.count_ones() == 4u32)
+    let product: u8 = a * a
+    check(name: "u8 product", held: product == 225u8)
+    var s: i8 = 0
+    var downs: i8 = 0
+    while downs < 10i8 {
+        s = s - 1i8
+        downs = downs + 1i8
+    }
+    let square: i8 = s * s
+    check(name: "i8 square", held: square == 100i8)
+    let wide: i64 = i64.from_bits(bits >> 20u32)
+    let negative: i64 = 0i64 - wide
+    check(name: "i64 square", held: negative * negative == 1_099_509_530_625i64)
+    let word: u32 = u32.truncate(bits >> 28u32)
+    check(name: "u32 square", held: word * word == 16_769_025u32)
+    let signed_word: i32 = 0i32 - i32.from_bits(word)
+    check(name: "i32 square", held: signed_word * signed_word == 16_769_025i32)
+} arithmetic
+
+fn frames() {
+    var pad = Array[usize, 2000].filled(3)
+    var buf = Array[usize, 256].filled(0)
+    var i: usize = 0
+    while i < 256 {
+        buf[i] = i
+        i = i + 1
+    }
+    var sum: usize = 0
+    i = 0
+    while i < 256 {
+        sum = sum + buf[i]
+        i = i + 1
+    }
+    var padsum: usize = 0
+    i = 0
+    while i < 2000 {
+        padsum = padsum + pad[i]
+        i = i + 1
+    }
+    check(name: "far frame", held: sum == 32_640 and padsum == 6_000)
+} frames
+
+fn privileged(cpu: hw::Ring0) {
+    let hz = cpu.read_sysreg(hw::SysReg.CntfrqEl0)
+    check(name: "read_sysreg", held: hz > 0)
+    trusted "the virtual timer value register is the running CPU's, which no task uses yet" {
+        cpu.write_sysreg(hw::SysReg.CntvTvalEl0, value: hz)
+    }
+    let refused = match attempt hw::UserAddr[u64].of(0x4000).copy_in(cpu) {
+        Ok(_) => false
+        Err(error) => error == hw::UserAddrError.Unmapped
+    }
+    check(name: "copy_in", held: refused)
+} privileged
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let regions = mut k.regions()
+    check(name: "regions", held: regions.len() > 0)
+    let Some(cpu) = mut k.ring0() else {
+        check(name: "ring0", held: false)
+        loop {
+        }
+    }
+    privileged(cpu)
+    take k.anchor(take regions, run: fn(exec: task::Executor) limits stack 65_536 {
+        arithmetic()
+        frames()
+        discard trusted "the abort handler resumes past the load from the unmapped address" { hw::Ptr[u64].of_addr(usize.widen(UNMAPPED)).read() }
+        check(name: "resumed", held: true)
+    })
+} main

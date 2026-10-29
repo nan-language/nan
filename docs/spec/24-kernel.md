@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on `x86_64-uefi` and `x86_64-bare`: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state and the kernel lowering of waiting; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state and the kernel lowering of waiting; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -29,18 +29,18 @@ pub fn Anchor.with[R: Any, E](body: fn(state: S) -> R fails E) -> Option[R] fail
 pub fn cpu_count() -> u32 limits pure, notrap, terminates
 ```
 
-- The [entry function](27-program-model.md#entry) of an `x86_64-bare` image starts on the boot CPU with maskable interrupts disabled, every other CPU stopped, SSE enabled, and AVX enabled when the CPU has it.
+- The [entry function](27-program-model.md#entry) of a bare target's image starts on the boot CPU with maskable interrupts disabled and every other CPU stopped, on `x86_64-bare` with SSE enabled and AVX enabled when the CPU has it, and on `aarch64-bare` with floating point and Advanced SIMD enabled.
 - `k.alloc()` is the root allocator of `boot::Kernel` ([allocators](12-memory.md#allocators)). Its root cell's supply is the **boot heap**, memory the image reserves in the size its target's [descriptor](27-program-model.md#descriptors) states. Every call returns the same handle.
-- The first call of `k.regions()` returns, in address order, a region for each range of usable memory outside the first MiB and outside the image, which holds the boot heap and the boot stack ([physical memory](#physical-memory)); the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on `x86_64-bare`, the entries of type 1 of the start-info memory map and, on `x86_64-uefi`, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
+- The first call of `k.regions()` returns, in address order, a region for each range of usable memory outside the image, which holds the boot heap and the boot stack ([physical memory](#physical-memory)), outside the first MiB on x86_64 and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on `x86_64-bare`, the entries of type 1 of the start-info memory map, on `aarch64-bare`, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable. CPUs are numbered from 0, the boot CPU being 0.
 - `hw::Anchor[S]` has no values; it names the anchor of type S.
-- Each CPU's **CPU tables** are a global descriptor table holding a null descriptor, 64-bit code and data segments of privilege level 0, data and 64-bit code segments of privilege level 3, and the CPU's task-state segment, whose interrupt stack table entries 1 to 7 hold the tops of the CPU's interrupt stacks. On `x86_64-bare` the program entry seam loads the boot CPU's tables; on `x86_64-uefi`, `exit_services` does ([firmware services](#firmware-services)). Step 2 of `anchor` loads those of every other CPU.
+- On x86_64, each CPU's **CPU tables** are a global descriptor table holding a null descriptor, 64-bit code and data segments of privilege level 0, data and 64-bit code segments of privilege level 3, and the CPU's task-state segment, whose interrupt stack table entries 1 to 7 hold the tops of the CPU's interrupt stacks. On `x86_64-bare` the program entry seam loads the boot CPU's tables; on `x86_64-uefi`, `exit_services` does ([firmware services](#firmware-services)). Step 2 of `anchor` loads those of every other CPU. AArch64 has no CPU tables.
 
 `take k.anchor(take state, run: f)` performs these steps and never returns:
 
 1. It moves `state` into storage the image reserves and installs it as the anchor, visible to every CPU from then on.
-2. On each CPU, the boot CPU included, it loads the CPU's tables where they are not loaded, loads an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry, and starts the kernel executor, enabling maskable interrupts as that executor starts. Each other CPU starts in long mode on the [entry root](#physical-memory).
+2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded and an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
 3. It runs `f` as the first kernel task on that executor, whose value it passes as `exec`. The executor draws task stacks and records through `k.alloc()` ([executors](16-concurrency.md#executors)), and `f` is a [task closure](16-concurrency.md#task-closures), capturing by `take` and Copy only; the executor records no clock ([capability tables](14-authority.md#capability-tables)).
 4. When `f` returns or fails, the kernel halts ([kernel halts](#kernel-halts)).
 
@@ -120,7 +120,7 @@ pub fn tick_count() -> Option[u64] {
 
 ## Interrupt functions
 
-An **interrupt fn** is a function with the `interrupt` [modifier](02-items.md#modifiers), run by a seam when its vector fires. Vectors 0 to 31 are **exception vectors** and vectors 32 to 255 are **interrupt vectors**.
+An **interrupt fn** is a function with the `interrupt` [modifier](02-items.md#modifiers), run by a seam when its vector fires. The [descriptor](27-program-model.md#descriptors) of each machine target divides the vectors into **exception vectors** and **interrupt vectors**, and names its **abort vectors**: 8 and 18 on x86_64, 2 on AArch64.
 
 ```nan-api
 // module: hw
@@ -163,7 +163,7 @@ pub closed enum IrqExit derives Copy, Eq {
 } IrqExit
 ```
 
-A vector's class is the one its target's [descriptor](27-program-model.md#descriptors) assigns. The interrupt fn of an exception vector of class `Trap` receives an `hw::TrapFrame[hw::NoCode]`, of class `TrapWithCode` an `hw::TrapFrame[hw::ErrorCode]` and of class `PageFault` an `hw::TrapFrame[hw::PageFault]`; a vector without a class is never bound. `frame.info()` holds the error code the CPU pushed and, for `hw::PageFault`, the faulting address.
+A vector's class is the one its target's [descriptor](27-program-model.md#descriptors) assigns. The interrupt fn of an exception vector of class `Trap` receives an `hw::TrapFrame[hw::NoCode]`, of class `TrapWithCode` an `hw::TrapFrame[hw::ErrorCode]` and of class `PageFault` an `hw::TrapFrame[hw::PageFault]`; a vector without a class is never bound. `frame.info()` holds the error code the CPU pushed on x86_64 or the exception's syndrome on AArch64 and, for `hw::PageFault`, the faulting address.
 
 The head of an interrupt fn has no generic parameters, `fails` or `uses wait`, its result is `hw::IrqExit`, and its parameters take one of three forms:
 
@@ -178,22 +178,24 @@ The head of an interrupt fn has no generic parameters, `fails` or `uses wait`, i
 - An interrupt fn's digest is checked as if its head stated `limits notrap, terminates, noalloc` ([limits](10-effects-digests.md#limits)). Its limits clause states only the `stack N` that [static bounds](17-suspension-io.md#static-bounds) requires; any other limit there is an error (`kernel.irq-limit`) whose exact fix deletes it.
 - An `interrupt fn` [function type](10-effects-digests.md#function-types) has the parameters and result of one form and no `fails` or `uses wait` (`kernel.irq-head`), and its limits clause states at most `stack N` (`kernel.irq-limit`). Its values carry the implied limits.
 - A call of an interrupt fn, or of a value of an `interrupt fn` type, is an error (`kernel.irq-call`).
-- `irq.complete()` writes the end-of-interrupt register of the CPU's local APIC. `hw::IrqContext` is [linear](05-properties.md#linear-types), so every path completes it.
+- `irq.complete()` ends the interrupt it serves, writing the end-of-interrupt register of the CPU's local APIC on x86_64 and of the CPU's interface of the interrupt controller on AArch64. `hw::IrqContext` is [linear](05-properties.md#linear-types), so every path completes it.
 - `frame.set_ip(ip)` makes the interrupted code resume at `ip`. It is a [trusted primitive](23-low-level.md#trusted-primitives) whose soundness condition is that execution may continue at `ip` with the saved state.
 
 Contributions bind the interrupt and exception forms through `hw::vectors`, whose entries [platform registries](25-registries.md#platform-registries) check against the class of their vector (`registry.platform-entry`).
 
-When a vector fires while the CPU runs at privilege level 0, the CPU enters its seam with maskable interrupts disabled, and:
+When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 on x86_64 and at EL1 on AArch64, the CPU enters its seam with maskable interrupts disabled, and:
 
 1. The seam saves the interrupted code's registers and [extended state](#floating-point) on its interrupt stack.
 2. For a vector bound to an `hw::IrqShared`, it acquires that lock, calls the device's interrupt fn with the device and a new `hw::IrqContext`, and releases the lock. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
 3. On `hw::IrqExit.Reschedule`, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
-4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for vector 8 or 18 returns, the kernel halts instead.
+4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
 
 Each CPU has an interrupt stack, reserved by the image, for each `ist` value that its bindings use, those of `hw::IrqShared.install` using 0 ([platform registries](25-registries.md#platform-registries)). A seam entered while its stack is in use on its CPU continues on it below the frames in use.
 
 - The stack of `ist` 0 holds at least the largest stack use among the lowered interrupt fns that run on it for interrupt vectors, plus the largest among those for exception vectors, plus two [seam frames](27-program-model.md#descriptors).
 - The stack of a nonzero `ist` holds at least the largest stack use among the lowered interrupt fns that run on it, plus one seam frame.
+
+On AArch64 the interrupt controller delivers an interrupt only while it is enabled: the anchor enables the timer's vector and each interrupt vector a contribution binds, on every CPU, `hw::IrqShared.install` enables its vector and `uninstall` disables it. Every interrupt from 32 up goes to the boot CPU.
 
 ```nan
 // file: timer/package.nan
@@ -272,13 +274,13 @@ pub fn replay_spurious(take irq: hw::IrqContext) -> hw::IrqExit {
 
 ### User exceptions and syscalls
 
-An exception raised while the CPU runs at privilege level 3, and the `syscall` instruction, never reach an interrupt fn. Their seams call landing fns bound in [platform registries](25-registries.md#platform-registries): for an exception, the landing fn that `hw::vectors` binds for user-origin occurrences of its vector; for `syscall`, that of `hw::syscall_entry`.
+An exception raised while the CPU runs in **user mode**, at privilege level 3 on x86_64 and at EL0 on AArch64, and the system call instruction, `syscall` on x86_64 and `svc` on AArch64, never reach an interrupt fn. Their seams call landing fns bound in [platform registries](25-registries.md#platform-registries): for an exception, the landing fn that `hw::vectors` binds for user-origin occurrences of its vector; for `syscall`, that of `hw::syscall_entry`.
 
-No operation of language 1 enters privilege level 3, so these seams are never entered; the [reservation register](37-evolution.md#reservations) lists them.
+No operation of language 1 enters user mode, so these seams are never entered; the [reservation register](37-evolution.md#reservations) lists them.
 
 - The seam saves the user state on the kernel stack of the thread that ran the user code, enables maskable interrupts and calls the landing fn there, in thread context as part of that thread.
-- The landing fn of an `hw::Vector.user` field receives the vector, the error code the CPU pushed or 0 when it pushed none, and the faulting address for vector 14 or 0 for other vectors.
-- The landing fn of the `hw::SyscallEntry.handler` field receives the user's `rax` as `number` and its `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9`, in that order, as `args`, each an `Untrusted[u64]` ([sources](15-untrusted.md#sources)); its result replaces the user's `rax`.
+- The landing fn of an `hw::Vector.user` field receives the vector; the error code the CPU pushed, or 0 when it pushed none, on x86_64 and the syndrome on AArch64; and the faulting address for a vector of class `PageFault` or 0 for other vectors.
+- The landing fn of the `hw::SyscallEntry.handler` field receives as `number` and `args`, each an `Untrusted[u64]` ([sources](15-untrusted.md#sources)), the user's `rax` and its `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` on x86_64, and its `x8` and its `x0` to `x5` on AArch64, in that order; its result replaces the user's `rax` on x86_64 and `x0` on AArch64.
 - When the landing fn returns, the seam restores the user state and resumes the user code.
 - A user-origin exception on a vector without such a landing fn halts the kernel.
 
@@ -299,7 +301,7 @@ pub fn without_irqs[T: Any, E](body: fn(t: IrqsDisabled) -> T fails E limits not
 
 - Its values come only from `IrqContext.irqs_disabled`, `TrapFrame.irqs_disabled` and `hw::without_irqs`.
 - `hw::without_irqs(body)` saves whether maskable interrupts are enabled on the current CPU, disables them, calls `body` with a token, restores the saved state and returns what `body` returned or fails with its failure.
-- On `x86_64-host`, each executor thread is a CPU for this chapter and has no maskable interrupts: `hw::cpu_count()` is the number of executor threads, `without_irqs` only calls `body`, `IrqContext.complete` does nothing and `hw::IrqShared.install` binds no vector.
+- On the host targets, each executor thread is a CPU for this chapter and has no maskable interrupts: `hw::cpu_count()` is the number of executor threads, `without_irqs` only calls `body`, `IrqContext.complete` does nothing and `hw::IrqShared.install` binds no vector.
 
 ```nan
 // file: ticker/package.nan
@@ -398,7 +400,7 @@ pub fn IrqShared.uninstall(take self) -> T
 ```
 
 - `with` spins until it acquires the lock, calls `body` with exclusive `mut` access to the value, releases the lock and returns `body`'s result. Acquisition orders `body` after every earlier holder's accesses.
-- A `with` on a lock that the calling CPU already holds never returns: the kernel halts, and on `x86_64-host` the innermost process or test [domain](11-errors-domains.md#domains) holding the call is [abandoned](11-errors-domains.md#abandoning-a-domain), with the halt report ([kernel halts](#kernel-halts)) in place of a trap report.
+- A `with` on a lock that the calling CPU already holds never returns: the kernel halts, and on the host targets the innermost process or test [domain](11-errors-domains.md#domains) holding the call is [abandoned](11-errors-domains.md#abandoning-a-domain), with the halt report ([kernel halts](#kernel-halts)) in place of a trap report.
 - A spin lock is never [poisoned](11-errors-domains.md#poisoning): its bodies cannot trap, and a trap anywhere in a kernel halts it.
 - An `hw::SpinGuard[T]` is the holding of an acquired spin lock outside a `with` body. Only the kernel executor obtains and releases one, on its run-queue lock ([scheduling](#scheduling)).
 
@@ -524,7 +526,7 @@ pub fn count_switch(switches: hw::PerCpu[Switches]) {
 
 ### Kernel suspension
 
-On `x86_64-uefi` and `x86_64-bare`, a task suspends ([stackful tasks](17-suspension-io.md#stackful-tasks)) through the kernel executor's suspend routine, part of the stack-switching [support routine](27-program-model.md#runtime-support):
+On the machine targets, a task suspends ([stackful tasks](17-suspension-io.md#stackful-tasks)) through the kernel executor's suspend routine, part of the stack-switching [support routine](27-program-model.md#runtime-support):
 
 1. The waiting primitive registers the task as a waiter of the event it awaits.
 2. The routine disables maskable interrupts, acquires the CPU's run-queue lock and calls `hw::switch_to` with the CPU's next ready thread, or with its idle thread when none is ready.
@@ -535,7 +537,7 @@ Interrupt fns make tasks ready only through `hw::Signal.post`; a task waiting fo
 
 ### Preemption
 
-On `x86_64-uefi` and `x86_64-bare`, the [platform package](28-stdlib.md#platform-packages) contributes the one `hw::preempt` entry ([platform registries](25-registries.md#platform-registries)). **Preemption** of a thread proceeds in this order:
+On the machine targets, the [platform package](28-stdlib.md#platform-packages) contributes the one `hw::preempt` entry ([platform registries](25-registries.md#platform-registries)). **Preemption** of a thread proceeds in this order:
 
 1. The seam moves the thread's saved state from the interrupt stack onto the thread's own stack.
 2. It calls the landing fn that the `handler` of the `hw::preempt` entry holds there, with maskable interrupts disabled. That landing fn makes the thread ready and switches the CPU to its next ready thread as [kernel suspension](#kernel-suspension) step 2 does.
@@ -577,8 +579,8 @@ pub closed struct Offset[T: AnyBits] derives Copy, Eq {
 } Offset
 ```
 
-- On `x86_64-uefi` and `x86_64-bare`, the **entry root** is the page-table root in use when the entry function starts on `x86_64-bare`, and the one that `exit_services` installs on `x86_64-uefi`. Its tables lie in memory the image reserves, and it maps the image, the memory the image reserves and all usable memory writable at their physical addresses, where code reaches the memory of frames and regions. The soundness condition of `write_cr3` keeps the image, the memory it reserves and every live frame and region mapped there ([privileged intrinsics](23-low-level.md#privileged-intrinsics)).
-- By the soundness condition of `write_cr3`, no value that safe code reaches holds a frame of a page table that a CPU's root reaches: the trusted code linking a frame into such a table consumes it, such as by storing it through `hw::Ptr.write`.
+- On the machine targets, the **entry root** is the page-table root in use when the entry function starts on a bare target, and the one that `exit_services` installs on a UEFI target. Its tables lie in memory the image reserves, and it maps the image, the memory the image reserves and all usable memory writable at their physical addresses, where code reaches the memory of frames and regions. The soundness condition of `write_cr3` and `write_ttbr0` keeps the image, the memory it reserves and every live frame and region mapped there ([privileged intrinsics](23-low-level.md#privileged-intrinsics)).
+- By the soundness condition of `write_cr3` and `write_ttbr0`, no value that safe code reaches holds a frame of a page table that a CPU's root reaches: the trusted code linking a frame into such a table consumes it, such as by storing it through `hw::Ptr.write`.
 - `take region.frames(mut frames)` appends, in address order, every S-aligned frame lying wholly inside the region. Memory of the region outside those frames is never used again.
 - `take frame.split(mut parts)` appends the S ÷ T frames of size T that make up `frame`, in address order. `PhysFrame[S].merge(take parts)` returns `Ok` of the frame they make up when `parts` holds exactly S ÷ T contiguous frames in address order whose first is S-aligned, and otherwise returns `Err(parts)` unchanged. `split` and `frames` grow their list as `push` does ([growth](12-memory.md#growth)).
 - `frame.contents_mut(at)` projects the T stored `at.bytes` bytes into the frame. It traps (`trap.bounds`) when T does not fit inside the frame from that offset or the offset is not aligned for T. Being AnyBits, T is valid whatever the frame holds. Its T, like that of `hw::Offset[T]`, has a fixed layout ([DMA](23-low-level.md#dma)).
@@ -615,7 +617,7 @@ pub fn small_frames(take frame: hw::PhysFrame[2_097_152], alloc: mem::Alloc) -> 
 
 ## Firmware services
 
-On `x86_64-uefi`, the [root grant](14-authority.md#root-grants) `boot::Machine` reaches the firmware's services only during the [protocol phase](14-authority.md#protocol-phases) before they exit.
+On the UEFI targets, the [root grant](14-authority.md#root-grants) `boot::Machine` reaches the firmware's services only during the [protocol phase](14-authority.md#protocol-phases) before they exit.
 
 ```nan-api
 // module: boot
@@ -644,7 +646,7 @@ pub open enum ServiceError derives Render {
 - `with_services(body)` calls `body` with [`boot::Services`](#kernel-types), a view, so no capability derived from it outlives the call.
 - `write_console` writes `text` to the firmware's console output, each line feed as a carriage return and a line feed. `read_file` reads the file that `path` names from the root directory of the volume the image was loaded from, with `/` between components.
 - Each fails with `NotFound` when the firmware returns `EFI_NOT_FOUND`, with `OutOfMemory` when it returns `EFI_OUT_OF_RESOURCES` or a draw through `alloc` is exhausted, and with `DeviceError` on any other error status.
-- `take m.exit_services()` ends the firmware's boot services, installs the entry root and loads the boot CPU's tables ([anchor](#anchor)), and returns the `boot::Kernel` of the machine, with maskable interrupts disabled. Its regions come from the firmware's final memory map ([anchor](#anchor)).
+- `take m.exit_services()` ends the firmware's boot services, installs the entry root and, on x86_64, loads the boot CPU's tables ([anchor](#anchor)), and returns the `boot::Kernel` of the machine, with maskable interrupts disabled. Its regions come from the firmware's final memory map ([anchor](#anchor)).
 
 ```nan
 // file: loader/package.nan
@@ -672,9 +674,9 @@ fn main(take m: boot::Machine) -> Never limits stack 16_384 {
 
 ## Floating point
 
-A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of `x86_64-uefi` and `x86_64-bare` judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
+A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
 
-Every seam and `hw::switch_to` saves the complete extended CPU state (the x87 and SSE registers, and the AVX registers when the CPU has them) of the code it leaves and restores it before that code resumes. Lowering may use these registers for operations other than float arithmetic.
+Every seam and `hw::switch_to` saves the complete extended CPU state (on x86_64 the x87 and SSE registers, and the AVX registers when the CPU has them; on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR) of the code it leaves and restores it before that code resumes. Lowering may use these registers for operations other than float arithmetic.
 
 ```nan
 // file: kernel/package.nan
@@ -702,12 +704,12 @@ A **kernel halt** ends a kernel domain ([domains](11-errors-domains.md#domains))
 | `first-task-ended` | the first kernel task returns or fails | the `anchor` call |
 | `lock-reacquired` | a CPU calls `with` on a spin lock or per-CPU value it is already inside, or reaches its run-queue lock or the cell state of a draw or return while it already holds it | that call, or the interrupted instruction |
 | `unbound-vector` | a vector fires with no binding for its origin | the interrupted instruction |
-| `abort-exception` | an interrupt fn for vector 8 or 18 returns | the interrupted instruction |
+| `abort-exception` | an interrupt fn for an abort vector returns | the interrupted instruction |
 
 The first CPU to begin a halt performs these steps; a CPU beginning a halt after it stops as step 1 stops the others.
 
-1. It sends every other running CPU a non-maskable interrupt, whose seam then stops that CPU with maskable interrupts disabled instead of calling an interrupt fn, and waits until each has stopped.
-2. It programs the 16550 UART at the serial port the descriptor names to 115200 baud, 8 data bits, no parity and 1 stop bit, then writes the report there, by polling and without allocating. For a trap this is the [trap report](11-errors-domains.md#trap-reports) without a replay line. For another cause it has the same form, with `halt` and the cause in place of the trap kind, the location the table gives, and, for `unbound-vector`, the operand line `vector = ` and the vector number.
+1. It sends every other running CPU an interrupt that disabled maskable interrupts do not hold back, a non-maskable interrupt on x86_64 and a fast interrupt request on AArch64, whose seam then stops that CPU with maskable interrupts disabled instead of calling an interrupt fn, and waits until each has stopped.
+2. It programs the UART at the serial port the descriptor names to 115200 baud, 8 data bits, no parity and 1 stop bit, then writes the report there, by polling and without allocating. For a trap this is the [trap report](11-errors-domains.md#trap-reports) without a replay line. For another cause it has the same form, with `halt` and the cause in place of the trap kind, the location the table gives, and, for `unbound-vector`, the operand line `vector = ` and the vector number.
 3. It writes the byte 70 to the [exit port](27-program-model.md#descriptors), then stops with maskable interrupts disabled. No deferred call or other user code runs.
 
 When the first task started by the `anchor` call on line 24 of `kernel/kernel.nan` in [Anchor](#anchor) ends, the kernel halts with this report:

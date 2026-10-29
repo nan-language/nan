@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 pub use closure::{Closure, Member, Release, Store as ReleaseStore, holds_sources};
 pub use machine::Machine;
 pub use manifest::{
-    Authority, Manifest, Target, relative as relative_source, resolve as resolve_source,
+    Arch, Authority, Kind, Manifest, Target, relative as relative_source, resolve as resolve_source,
 };
 pub use modules::Module;
 
@@ -698,7 +698,7 @@ impl Package {
         self.manifest
             .as_ref()
             .and_then(|manifest| manifest.targets.first().copied())
-            .unwrap_or(Target::Host)
+            .unwrap_or(Target::X64Host)
     }
 
     /// The canonical path of a module of the package, its name absent for the root module.

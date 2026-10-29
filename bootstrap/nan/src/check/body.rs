@@ -1135,7 +1135,7 @@ impl Checker<'_> {
             let frame = body.frames[0].clone();
             let token = self.db.ast(item).token;
             let entry = self.names_entry(item);
-            let fixable = !entry || self.db.target == crate::workspace::Target::Host;
+            let fixable = !entry || self.db.target.is_host();
             let clauses = Clauses::of(&function.head, fixable);
             body.check_effects(token, &frame, &sig.fn_ty(), &clauses, entry);
         }

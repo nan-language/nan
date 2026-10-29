@@ -8,18 +8,25 @@ use std::path::{Path, PathBuf};
 
 use crate::timing::Times;
 
-/// The milestones with a scenario and its workspace, relative to the repository.
-pub const SCENARIOS: [(&str, &str); 5] = [
-    ("M2", "bootstrap/nan/tests/milestones/m2"),
-    ("M3", "bootstrap/nan/tests/milestones/m3"),
-    ("M4", "bootstrap/nan/tests/milestones/m4"),
-    ("M5", "toolchain"),
-    ("M6", "bootstrap/nan/tests/milestones/m6"),
+/// The scenarios: each one's milestone, the label its rows carry and its workspace, relative to
+/// the repository.
+pub const SCENARIOS: [(&str, &str, &str); 6] = [
+    ("M2", "M2", "bootstrap/nan/tests/milestones/m2"),
+    ("M3", "M3", "bootstrap/nan/tests/milestones/m3"),
+    ("M4", "M4", "bootstrap/nan/tests/milestones/m4"),
+    (
+        "M4",
+        "M4 AArch64",
+        "bootstrap/nan/tests/milestones/m4-aarch64",
+    ),
+    ("M5", "M5", "toolchain"),
+    ("M6", "M6", "bootstrap/nan/tests/milestones/m6"),
 ];
 
 /// What a scenario measures.
 pub struct Scenario {
     pub milestone: &'static str,
+    pub label: &'static str,
     pub measured: nan::Measured,
     /// Each ledger entry's kind, by package.
     pub ledger: BTreeMap<String, BTreeMap<String, usize>>,
@@ -65,8 +72,12 @@ pub fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn scenarios(repository: &Path, work: &Path) -> Result<Vec<Scenario>, String> {
     let fault = |error: std::io::Error| error.to_string();
     let mut measured = Vec::new();
-    for (milestone, source) in SCENARIOS {
-        let root = work.join(milestone);
+    for (milestone, label, source) in SCENARIOS {
+        let root = work.join(
+            Path::new(source)
+                .file_name()
+                .expect("a workspace directory"),
+        );
         copy_tree(&repository.join(source), &root).map_err(fault)?;
         if milestone == "M3" {
             ok(
@@ -81,12 +92,12 @@ pub fn scenarios(repository: &Path, work: &Path) -> Result<Vec<Scenario>, String
             )?;
             ok(&root, &["dep", "sync", "panel"])?;
         }
-        measured.push(scenario(milestone, &root)?);
+        measured.push(scenario(milestone, label, &root)?);
     }
     Ok(measured)
 }
 
-fn scenario(milestone: &'static str, root: &Path) -> Result<Scenario, String> {
+fn scenario(milestone: &'static str, label: &'static str, root: &Path) -> Result<Scenario, String> {
     let measured = nan::measure(root).map_err(|error| error.to_string())?;
     let mut ledger: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut waivers = BTreeMap::new();
@@ -123,6 +134,7 @@ fn scenario(milestone: &'static str, root: &Path) -> Result<Scenario, String> {
     };
     Ok(Scenario {
         milestone,
+        label,
         measured,
         ledger,
         waivers,
@@ -180,7 +192,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         within &= discharge.proved * 10 >= discharge.total * 9;
         text.push_str(&format!(
             "| {} | {} | {} | {:.1}% | at least 90% |\n",
-            scenario.milestone,
+            scenario.label,
             discharge.proved,
             discharge.total,
             100.0 * discharge.proved as f64 / discharge.total.max(1) as f64
@@ -191,7 +203,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         let checks = &scenario.measured.predicate_checks;
         text.push_str(&format!(
             "| {} | {} | {} |\n",
-            scenario.milestone,
+            scenario.label,
             checks.len(),
             checks.join(", ")
         ));
@@ -205,7 +217,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
             true => "none".to_owned(),
             false => items.join(", "),
         };
-        text.push_str(&format!("| {} | {listed} |\n", scenario.milestone));
+        text.push_str(&format!("| {} | {listed} |\n", scenario.label));
     }
     text.push_str("\n## Ledger entries, per kind and package\n\n| Milestone | Package | Entries |\n| --- | --- | --- |\n");
     for scenario in scenarios {
@@ -218,10 +230,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
                 true => "none".to_owned(),
                 false => entries.join(", "),
             };
-            text.push_str(&format!(
-                "| {} | {package} | {listed} |\n",
-                scenario.milestone
-            ));
+            text.push_str(&format!("| {} | {package} | {listed} |\n", scenario.label));
         }
     }
     text.push_str("\n## Deepest stack use of each task against its task stack size\n\nEach task's stack use is its entry's, judged as a final build judges a `stack N` demand; an unbounded one names the call that leaves it unbounded.\n\n| Milestone | Task entry | Stack use | Task stack |\n| --- | --- | ---: | ---: |\n");
@@ -234,7 +243,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
             };
             text.push_str(&format!(
                 "| {} | {} | {used} | {} |\n",
-                scenario.milestone, task.site, task.stack
+                scenario.label, task.site, task.stack
             ));
         }
     }
@@ -259,7 +268,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
             .unwrap_or_default();
         text.push_str(&format!(
             "| {} | {} | {} | {} | {} | {largest} |\n",
-            scenario.milestone,
+            scenario.label,
             match waivers.is_empty() {
                 true => "none".to_owned(),
                 false => waivers.join(", "),
@@ -269,7 +278,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
             at(90).copied().unwrap_or_default(),
         ));
         for (item, radius) in &scenario.radii {
-            radii.push_str(&format!("{}\t{item}\t{radius}\n", scenario.milestone));
+            radii.push_str(&format!("{}\t{item}\t{radius}\n", scenario.label));
         }
     }
     text.push_str("\n## Parameter lists with more than 4 parameters, `self` included\n\n| Milestone | Heads | Parameters |\n| --- | ---: | --- |\n");
@@ -285,7 +294,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
             .collect();
         text.push_str(&format!(
             "| {} | {} | {} |\n",
-            scenario.milestone,
+            scenario.label,
             heads.len(),
             counts.join(", ")
         ));
@@ -295,7 +304,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         for (site, taken) in &scenario.measured.task_closures {
             text.push_str(&format!(
                 "| {} | {site} | {} |\n",
-                scenario.milestone,
+                scenario.label,
                 taken.join(", ")
             ));
         }

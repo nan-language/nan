@@ -1,0 +1,402 @@
+//! Instruction selection for AArch64: the blocks of machine instructions over virtual registers that compute a function, in the order emission lays them out, with the frame they need.
+
+/// The state of AArch64 selection: the code selected so far and what it knows of the function's
+/// values.
+struct ArmSelector {
+    isa: Isa
+    alloc: mem::Alloc
+    facts: Facts
+    code: VCode[aarch64::Inst]
+    /// Each value's register, its low half for a 128-bit integer, `NO_REG` until it has one.
+    lows: mem::List[machinst::Reg]
+    /// The high half of each 128-bit integer value.
+    highs: mem::List[machinst::Reg]
+    /// Each stack slot's offset from the stack pointer.
+    slot_offsets: mem::List[u32]
+    /// The block being selected.
+    current: VBlock
+    /// The source location of the instruction being selected.
+    loc: clif::SourceLoc
+} ArmSelector
+
+/// The AArch64 machine code of a function.
+fn arm_select(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> VCode[aarch64::Inst] {
+    var selector = ArmSelector.new(func, isa, alloc)
+    let order = selector.facts.order(func)
+    for block in order {
+        mut selector.select_block(func, block)
+        let at = usize.widen(block.index)
+        expect at < selector.facts.then_edges.len() and at < selector.facts.else_edges.len()
+        if selector.facts.then_edges[at] != NONE {
+            mut selector.edge_block(func, block, then: true)
+        }
+        if selector.facts.else_edges[at] != NONE {
+            mut selector.edge_block(func, block, then: false)
+        }
+    }
+    selector.code.hints = selector.code.edge_hints(alloc)
+    return selector.code
+} arm_select
+
+fn ArmSelector.new(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> ArmSelector {
+    let values = usize.widen(func.value_count())
+    var selector = ArmSelector(
+        isa: isa,
+        alloc: alloc,
+        facts: Facts.of(func, alloc),
+        code: VCode[aarch64::Inst].empty(alloc),
+        lows: filled(values, value: NO_REG, alloc),
+        highs: filled(values, value: NO_REG, alloc),
+        slot_offsets: mem::List[u32].empty(alloc),
+        current: VBlock(begin: 0, end: 0, param_start: 0, param_count: 0, arg_start: 0, arg_count: 0, succ_start: 0, succ_count: 0),
+        loc: clif::DEFAULT_LOC,
+    )
+    mut selector.lay_out_frame(func)
+    return selector
+} ArmSelector.new
+
+/// Lays out the outgoing argument area the calls need and the stack slots above it.
+fn ArmSelector.lay_out_frame(mut self, func: clif::Function) {
+    var outgoing: u32 = 0
+    var calls = false
+    for block in self.facts.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            match func.inst_data(inst) {
+                clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => {
+                    let sig = func.imported_signature(func.ext_func(func_ref).signature)
+                    outgoing = larger(outgoing, other: aarch64::places(sig, floats: self.isa.floats, alloc: self.alloc).stack)
+                    calls = true
+                }
+                clif::InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: _, args: _) => {
+                    outgoing = larger(outgoing, other: aarch64::places(func.imported_signature(sig_ref), floats: self.isa.floats, alloc: self.alloc).stack)
+                    calls = true
+                }
+                clif::InstructionData.UnaryGlobalValue(opcode: clif::Opcode.TlsValue, global_value: _) => {
+                    calls = true
+                }
+                else => {}
+            }
+        }
+    }
+    let SlotLayout(offsets: offsets, end: end, align: align) = lay_out_slots(func, outgoing: outgoing, alloc: self.alloc)
+    self.slot_offsets = offsets
+    self.code.slots_end = end
+    self.code.align = align
+    self.code.calls = calls
+} ArmSelector.lay_out_frame
+
+fn ArmSelector.emit(mut self, inst: aarch64::Inst) {
+    mut self.code.insts.push(VInst(inst: inst, loc: self.loc))
+} ArmSelector.emit
+
+fn ArmSelector.temp(mut self, float: bool) -> machinst::Reg {
+    return mut self.code.new_vreg(float)
+} ArmSelector.temp
+
+/// A move between registers of one class, the destination preferring the source's register.
+fn ArmSelector.mov(mut self, dst: machinst::Reg, src: machinst::Reg) {
+    prefer(mut self.code.hints, reg: dst, preferred: src)
+    prefer(mut self.code.hints, reg: src, preferred: dst)
+    if self.code.is_float(dst) {
+        mut self.emit(aarch64::Inst.FloatMov(prec: aarch64::Precision.Double, dst: dst, src: src))
+    } else {
+        mut self.emit(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: dst, src: src))
+    }
+} ArmSelector.mov
+
+/// A new register holding a copy of `src`.
+fn ArmSelector.copy(mut self, src: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.temp(self.code.is_float(src))
+    mut self.mov(dst, src: src)
+    return dst
+} ArmSelector.copy
+
+/// The register of a value, its low half for a 128-bit integer: a new virtual register the first
+/// time an instruction names the value.
+fn ArmSelector.reg(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.lows.len() and at < self.highs.len()
+    if self.lows[at] != NO_REG {
+        return self.lows[at]
+    }
+    let ty = func.value_type(resolved)
+    let low = mut self.code.new_vreg(aarch64::in_vector(ty, floats: self.isa.floats))
+    self.lows[at] = low
+    if ty == clif::Type.Int128 {
+        self.highs[at] = mut self.code.new_vreg(false)
+    }
+    return low
+} ArmSelector.reg
+
+/// The register of a 128-bit value's high half.
+fn ArmSelector.high(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
+    discard mut self.reg(value, func)
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.highs.len()
+    return self.highs[at]
+} ArmSelector.high
+
+/// Makes a value's registers those of another value, or copies them when the value already has
+/// its own.
+fn ArmSelector.alias(mut self, value: clif::Value, func: clif::Function, low: machinst::Reg, high: machinst::Reg) {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.lows.len() and at < self.highs.len()
+    if self.lows[at] == NO_REG {
+        self.lows[at] = low
+        self.highs[at] = high
+        return
+    }
+    let existing = self.lows[at]
+    let existing_high = self.highs[at]
+    mut self.mov(existing, src: low)
+    if high != NO_REG {
+        mut self.mov(existing_high, src: high)
+    }
+} ArmSelector.alias
+
+/// The register of an instruction's first result.
+fn ArmSelector.dst_of(mut self, func: clif::Function, inst: clif::Inst) -> machinst::Reg {
+    return mut self.reg(result_of(func, inst, alloc: self.alloc), func)
+} ArmSelector.dst_of
+
+/// The register of the high half of an instruction's 128-bit first result.
+fn ArmSelector.dst_high_of(mut self, func: clif::Function, inst: clif::Inst) -> machinst::Reg {
+    return mut self.high(result_of(func, inst, alloc: self.alloc), func)
+} ArmSelector.dst_high_of
+
+/// The constant a value is, as a signed integer of its type's width: sign-extended from a
+/// narrower integer type.
+fn ArmSelector.signed_constant(self, value: clif::Value, func: clif::Function) -> Option[i64] {
+    let Some(bits) = self.facts.constant(value, func) else {
+        return None
+    }
+    let ty = func.value_type(value)
+    if not ty.is_int() or ty == clif::Type.Int128 {
+        return None
+    }
+    return Some(i64.from_bits(sign_extended(bits, width: ty.bits())))
+} ArmSelector.signed_constant
+
+/// The register holding a value for an instruction to read; a constant or a stack slot's address
+/// is made in a new register for each read.
+fn ArmSelector.src(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
+    let Some(bits) = self.facts.constant(value, func) else {
+        let at = usize.widen(func.resolve_aliases(value).index)
+        expect at < self.facts.defs.len()
+        let def = self.facts.defs[at]
+        if def != NONE {
+            match func.inst_data(clif::Inst(index: def)) {
+                clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => {
+                    return mut self.slot_address(slot, offset)
+                }
+                else => {}
+            }
+        }
+        return mut self.reg(value, func)
+    }
+    let ty = func.value_type(value)
+    if aarch64::in_vector(ty, floats: self.isa.floats) {
+        return mut self.float_constant(ty, bits)
+    }
+    return mut self.int_constant(bits)
+} ArmSelector.src
+
+/// A new register holding integer bits.
+fn ArmSelector.int_constant(mut self, bits: u64) -> machinst::Reg {
+    let reg = mut self.temp(false)
+    mut self.emit(aarch64::Inst.MovImm(dst: reg, imm: bits))
+    return reg
+} ArmSelector.int_constant
+
+/// A new vector register holding float bits: moved from the zero register for zero, else from a
+/// general-purpose register holding them.
+fn ArmSelector.float_constant(mut self, ty: clif::Type, bits: u64) -> machinst::Reg {
+    let reg = mut self.temp(true)
+    var int = aarch64::SP
+    if bits != 0 {
+        int = mut self.int_constant(bits)
+    }
+    mut self.emit(aarch64::Inst.FloatFromInt(prec: precision(ty), dst: reg, src: int))
+    return reg
+} ArmSelector.float_constant
+
+/// The register holding a 128-bit value's high half for an instruction to read.
+fn ArmSelector.src_high(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
+    let Some(bits) = self.facts.constant(value, func) else {
+        return mut self.high(value, func)
+    }
+    var high: u64 = 0
+    if i64.from_bits(bits) < 0 {
+        high = 0xFFFF_FFFF_FFFF_FFFF
+    }
+    return mut self.int_constant(high)
+} ArmSelector.src_high
+
+/// A stack slot's address plus an offset, from the stack pointer.
+fn ArmSelector.slot_disp(self, slot: clif::StackSlot, offset: i32) -> i64 {
+    let at = usize.widen(slot.index)
+    expect at < self.slot_offsets.len()
+    return i64.widen(self.slot_offsets[at]) + i64.widen(offset)
+} ArmSelector.slot_disp
+
+/// A new register holding a stack slot's address plus an offset, added to the stack pointer in
+/// at most two immediates.
+fn ArmSelector.slot_address(mut self, slot: clif::StackSlot, offset: i32) -> machinst::Reg {
+    let disp = self.slot_disp(slot, offset)
+    expect disp >= 0 and disp < 0x100_0000
+    let bytes = u32.fit(disp)
+    let reg = mut self.temp(false)
+    let low = bytes & 0xFFF
+    let high = bytes - low
+    if high == 0 {
+        mut self.emit(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: reg, src: aarch64::SP, imm: low))
+        return reg
+    }
+    if low == 0 {
+        mut self.emit(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: reg, src: aarch64::SP, imm: high))
+        return reg
+    }
+    let partial = mut self.temp(false)
+    mut self.emit(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: partial, src: aarch64::SP, imm: high))
+    mut self.emit(aarch64::Inst.AddImm(width: aarch64::Width.Bits64, dst: reg, src: partial, imm: low))
+    return reg
+} ArmSelector.slot_address
+
+fn ArmSelector.start_block(mut self) {
+    self.current = VBlock(begin: u32.fit(self.code.insts.len()), end: 0, param_start: u32.fit(self.code.params.len()), param_count: 0, arg_start: u32.fit(self.code.args.len()), arg_count: 0, succ_start: u32.fit(self.code.succs.len()), succ_count: 0)
+} ArmSelector.start_block
+
+fn ArmSelector.finish_block(mut self) {
+    self.current.end = u32.fit(self.code.insts.len())
+    let params = u32.fit(self.code.params.len())
+    let args = u32.fit(self.code.args.len())
+    let succs = u32.fit(self.code.succs.len())
+    expect self.current.param_start <= params and self.current.arg_start <= args and self.current.succ_start <= succs
+    self.current.param_count = params - self.current.param_start
+    self.current.arg_count = args - self.current.arg_start
+    self.current.succ_count = succs - self.current.succ_start
+    mut self.code.blocks.push(self.current)
+} ArmSelector.finish_block
+
+fn ArmSelector.select_block(mut self, func: clif::Function, block: clif::Block) {
+    mut self.start_block()
+    let params = func.block_params(block, alloc: self.alloc)
+    if func.entry_block() == Some(block) {
+        mut self.entry_params(func, params: params.view())
+    } else {
+        for param in params {
+            let low = mut self.reg(param, func)
+            mut self.code.params.push(low)
+            if func.value_type(param) == clif::Type.Int128 {
+                let high = mut self.high(param, func)
+                mut self.code.params.push(high)
+            }
+        }
+    }
+    for inst in func.block_insts(block, alloc: self.alloc) {
+        self.loc = func.srcloc(inst)
+        mut self.select_inst(func, block, inst)
+    }
+    mut self.finish_block()
+} ArmSelector.select_block
+
+/// The entry's parameters, received where the function's signature places them.
+fn ArmSelector.entry_params(mut self, func: clif::Function, params: Slice[clif::Value]) {
+    let placed = aarch64::places(func.signature, floats: self.isa.floats, alloc: self.alloc)
+    var regs = machinst::RegSet.empty()
+    for place in placed.params {
+        match place {
+            aarch64::Place.Reg(reg) => {
+                regs = regs.plus(reg)
+            }
+            aarch64::Place.Stack(_) => {}
+        }
+    }
+    mut self.emit(aarch64::Inst.Args(params: regs))
+    var at: usize = 0
+    for param in params {
+        let low = mut self.reg(param, func)
+        expect at < placed.params.len()
+        mut self.receive(low, ty: func.value_type(param), place: placed.params[at])
+        at += 1
+        if func.value_type(param) == clif::Type.Int128 {
+            let high = mut self.high(param, func)
+            expect at < placed.params.len()
+            mut self.receive(high, ty: clif::Type.Int64, place: placed.params[at])
+            at += 1
+        }
+    }
+} ArmSelector.entry_params
+
+/// Moves a parameter from where it arrives into its register; the stack arguments lie above the
+/// frame record the frame pointer addresses.
+fn ArmSelector.receive(mut self, reg: machinst::Reg, ty: clif::Type, place: aarch64::Place) {
+    match place {
+        aarch64::Place.Reg(arrived) => mut self.mov(reg, src: arrived)
+        aarch64::Place.Stack(offset) => {
+            let src = aarch64::Amode.at(aarch64::FP, disp: i32.fit(offset + 16))
+            if self.code.is_float(reg) {
+                mut self.emit(aarch64::Inst.LdrFloat(prec: precision(ty), dst: reg, src: src))
+            } else {
+                mut self.emit(aarch64::Inst.Ldr(width: aarch64::Width.Bits64, dst: reg, src: src))
+            }
+        }
+    }
+} ArmSelector.receive
+
+/// A block holding only the jump of one edge of a block's conditional branch, passing its
+/// arguments.
+fn ArmSelector.edge_block(mut self, func: clif::Function, block: clif::Block, then: bool) {
+    mut self.start_block()
+    let insts = func.block_insts(block, alloc: self.alloc)
+    expect insts.len() > 0
+    let last = insts[insts.len() - 1]
+    self.loc = func.srcloc(last)
+    match func.inst_data(last) {
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            if then {
+                mut self.jump(func, target: then_call.block, args: then_call.args.view())
+            } else {
+                mut self.jump(func, target: else_call.block, args: else_call.args.view())
+            }
+        }
+        else => {
+            expect false
+        }
+    }
+    mut self.finish_block()
+} ArmSelector.edge_block
+
+/// A jump passing arguments to a block's parameters.
+fn ArmSelector.jump(mut self, func: clif::Function, target: clif::Block, args: Slice[clif::Value]) {
+    for arg in args {
+        let low = mut self.src(arg, func)
+        mut self.code.args.push(low)
+        if func.value_type(arg) == clif::Type.Int128 {
+            let high = mut self.src_high(arg, func)
+            mut self.code.args.push(high)
+        }
+    }
+    let position = self.facts.position_of(self.facts.destination(target))
+    mut self.code.succs.push(position)
+    mut self.emit(aarch64::Inst.B(label: position))
+} ArmSelector.jump
+
+/// The width of an operation on an integer type in a general-purpose register: 64 bits for a
+/// 64-bit type and each half of a 128-bit one, 32 for the narrower ones, whose upper bits nothing
+/// reads.
+fn width_of(ty: clif::Type) -> aarch64::Width {
+    if ty.bits() >= 64 {
+        return aarch64::Width.Bits64
+    }
+    return aarch64::Width.Bits32
+} width_of
+
+/// The precision of a float type.
+fn precision(ty: clif::Type) -> aarch64::Precision {
+    if ty == clif::Type.Float32 {
+        return aarch64::Precision.Single
+    }
+    return aarch64::Precision.Double
+} precision

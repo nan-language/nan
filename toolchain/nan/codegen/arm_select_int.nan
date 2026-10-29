@@ -1,0 +1,726 @@
+//! Instruction selection for AArch64 of integer arithmetic, bit operations and extensions, and the dispatch of every instruction to its family. A narrow integer in a register leaves the bits above its width unspecified, so what reads them extends it first.
+
+/// The machine instructions of one instruction of `block`.
+fn ArmSelector.select_inst(mut self, func: clif::Function, block: clif::Block, inst: clif::Inst) {
+    match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => {}
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => mut self.unary(func, inst, opcode, arg)
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => mut self.binary(func, inst, opcode, x, y)
+        clif::InstructionData.Ternary(opcode: opcode, x: x, y: y, z: z) => {
+            expect opcode == clif::Opcode.Select
+            mut self.select_value(func, inst, c: x, x: y, y: z)
+        }
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let outcome = mut self.int_compare(func, cond, x, y)
+            mut self.set_flag(func, inst, outcome)
+        }
+        clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let outcome = mut self.float_compare(func, cond, x, y)
+            mut self.set_flag(func, inst, outcome)
+        }
+        clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: offset) => mut self.load(func, inst, p: arg, offset)
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: offset) => mut self.store(func, x, p, offset)
+        clif::InstructionData.LoadNoOffset(opcode: opcode, flags: _, arg: arg) => {
+            if opcode == clif::Opcode.Bitcast {
+                mut self.bitcast(func, inst, arg)
+            } else {
+                mut self.atomic_load(func, inst, p: arg)
+            }
+        }
+        clif::InstructionData.StoreNoOffset(opcode: _, flags: _, x: x, p: p) => mut self.atomic_store(func, x, p)
+        clif::InstructionData.AtomicRmw(opcode: _, flags: _, op: op, p: p, x: x) => mut self.atomic_rmw(func, inst, op, p, x)
+        clif::InstructionData.AtomicCas(opcode: _, flags: _, p: p, e: e, x: x) => mut self.atomic_cas(func, inst, p, e, x)
+        clif::InstructionData.NullAry(opcode: opcode) => {
+            if opcode == clif::Opcode.Fence {
+                mut self.emit(aarch64::Inst.Dmb)
+            } else {
+                let dst = mut self.dst_of(func, inst)
+                mut self.emit(aarch64::Inst.Mov(width: aarch64::Width.Bits64, dst: dst, src: aarch64::FP))
+            }
+        }
+        clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => {
+            let address = mut self.slot_address(slot, offset)
+            mut self.alias(result_of(func, inst, alloc: self.alloc), func, low: address, high: NO_REG)
+        }
+        clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: global_value) => mut self.global_value(func, inst, opcode, global_value)
+        clif::InstructionData.FuncAddr(opcode: _, func_ref: func_ref) => {
+            let ext = func.ext_func(func_ref)
+            let dst = mut self.dst_of(func, inst)
+            mut self.symbol_address(dst, name: ext.name, colocated: ext.colocated)
+        }
+        clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: args) => mut self.call(func, inst, func_ref, args: args.view())
+        clif::InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: callee, args: args) => mut self.call_indirect(func, inst, sig_ref, callee, args: args.view())
+        clif::InstructionData.MultiAry(opcode: _, args: args) => mut self.ret(func, args: args.view())
+        clif::InstructionData.Jump(opcode: _, destination: destination) => mut self.jump(func, target: destination.block, args: destination.args.view())
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            let chain = self.facts.switch_of(block)
+            if chain != NONE {
+                mut self.jump_table(func, index: chain)
+                return
+            }
+            if self.facts.merges(then_call, else_call) {
+                mut self.jump(func, target: then_call.block, args: then_call.args.view())
+            } else {
+                mut self.brif(func, block, c: arg, then_block: then_call.block, else_block: else_call.block)
+            }
+        }
+        clif::InstructionData.Trap(opcode: _, code: _) => mut self.emit(aarch64::Inst.Udf)
+    }
+} ArmSelector.select_inst
+
+fn ArmSelector.unary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) {
+    match opcode {
+        clif::Opcode.Ineg => mut self.ineg(func, inst, arg)
+        clif::Opcode.Bnot => mut self.bnot(func, inst, arg)
+        clif::Opcode.Clz => mut self.clz(func, inst, arg)
+        clif::Opcode.Ctz => mut self.ctz(func, inst, arg)
+        clif::Opcode.Popcnt => mut self.popcnt(func, inst, arg)
+        clif::Opcode.Bswap => mut self.bswap(func, inst, arg)
+        clif::Opcode.Uextend => mut self.extend(func, inst, arg, signed: false)
+        clif::Opcode.Sextend => mut self.extend(func, inst, arg, signed: true)
+        clif::Opcode.Ireduce => {
+            let low = mut self.src(arg, func)
+            mut self.alias(result_of(func, inst, alloc: self.alloc), func, low, high: NO_REG)
+        }
+        clif::Opcode.Isplit => {
+            let low = mut self.src(arg, func)
+            let high = mut self.src_high(arg, func)
+            mut self.alias(result_of(func, inst, alloc: self.alloc), func, low, high: NO_REG)
+            mut self.alias(second_result_of(func, inst, alloc: self.alloc), func, low: high, high: NO_REG)
+        }
+        clif::Opcode.Sqrt or clif::Opcode.Fpromote or clif::Opcode.Fdemote => mut self.float_unary(func, inst, opcode, arg)
+        clif::Opcode.Fabs or clif::Opcode.Fneg => mut self.float_sign(func, inst, opcode, arg)
+        clif::Opcode.FcvtToSintSat => mut self.float_to_int(func, inst, arg, signed: true)
+        clif::Opcode.FcvtToUintSat => mut self.float_to_int(func, inst, arg, signed: false)
+        clif::Opcode.FcvtFromSint => mut self.int_to_float(func, inst, arg, signed: true)
+        clif::Opcode.FcvtFromUint => mut self.int_to_float(func, inst, arg, signed: false)
+        else => {
+            expect false
+            mut self.emit(aarch64::Inst.Udf)
+        }
+    }
+} ArmSelector.unary
+
+fn ArmSelector.binary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, x: clif::Value, y: clif::Value) {
+    match opcode {
+        clif::Opcode.Iadd => mut self.iadd(func, inst, x, y)
+        clif::Opcode.Isub => mut self.isub(func, inst, x, y)
+        clif::Opcode.Imul => mut self.imul(func, inst, x, y)
+        clif::Opcode.Udiv => mut self.divide(func, inst, x, y, signed: false, remainder: false)
+        clif::Opcode.Sdiv => mut self.divide(func, inst, x, y, signed: true, remainder: false)
+        clif::Opcode.Urem => mut self.divide(func, inst, x, y, signed: false, remainder: true)
+        clif::Opcode.Srem => mut self.divide(func, inst, x, y, signed: true, remainder: true)
+        clif::Opcode.Umulhi => mut self.mulhi(func, inst, x, y, signed: false)
+        clif::Opcode.Smulhi => mut self.mulhi(func, inst, x, y, signed: true)
+        clif::Opcode.Band => mut self.bitwise(func, inst, op: aarch64::LogicOp.And, x, y)
+        clif::Opcode.Bor => mut self.bitwise(func, inst, op: aarch64::LogicOp.Orr, x, y)
+        clif::Opcode.Bxor => mut self.bitwise(func, inst, op: aarch64::LogicOp.Eor, x, y)
+        clif::Opcode.Ishl => mut self.shift(func, inst, kind: aarch64::ShiftKind.Lsl, x, y)
+        clif::Opcode.Ushr => mut self.shift(func, inst, kind: aarch64::ShiftKind.Lsr, x, y)
+        clif::Opcode.Sshr => mut self.shift(func, inst, kind: aarch64::ShiftKind.Asr, x, y)
+        clif::Opcode.Rotr => mut self.shift(func, inst, kind: aarch64::ShiftKind.Ror, x, y)
+        clif::Opcode.Umin => mut self.minmax(func, inst, x, y, cond: aarch64::Cond.Lo)
+        clif::Opcode.Umax => mut self.minmax(func, inst, x, y, cond: aarch64::Cond.Hi)
+        clif::Opcode.Iconcat => {
+            let low = mut self.src(x, func)
+            let high = mut self.src(y, func)
+            mut self.alias(result_of(func, inst, alloc: self.alloc), func, low, high)
+        }
+        clif::Opcode.UaddOverflow => mut self.overflowing(func, inst, x, y, subtract: false, signed: false)
+        clif::Opcode.SaddOverflow => mut self.overflowing(func, inst, x, y, subtract: false, signed: true)
+        clif::Opcode.UsubOverflow => mut self.overflowing(func, inst, x, y, subtract: true, signed: false)
+        clif::Opcode.SsubOverflow => mut self.overflowing(func, inst, x, y, subtract: true, signed: true)
+        clif::Opcode.UmulOverflow => mut self.mul_overflowing(func, inst, x, y, signed: false)
+        clif::Opcode.SmulOverflow => mut self.mul_overflowing(func, inst, x, y, signed: true)
+        clif::Opcode.Fadd => mut self.float_arith(func, inst, op: aarch64::FloatOp.Add, x, y)
+        clif::Opcode.Fsub => mut self.float_arith(func, inst, op: aarch64::FloatOp.Sub, x, y)
+        clif::Opcode.Fmul => mut self.float_arith(func, inst, op: aarch64::FloatOp.Mul, x, y)
+        clif::Opcode.Fdiv => mut self.float_arith(func, inst, op: aarch64::FloatOp.Div, x, y)
+        clif::Opcode.Fcopysign => mut self.fcopysign(func, inst, x, y)
+        else => {
+            expect false
+            mut self.emit(aarch64::Inst.Udf)
+        }
+    }
+} ArmSelector.binary
+
+/// A register holding an integer extended from its type's width to 64 bits, signed or zero, or
+/// the register itself for a 64-bit one.
+fn ArmSelector.extended(mut self, src: machinst::Reg, ty: clif::Type, signed: bool) -> machinst::Reg {
+    if ty.bits() >= 64 {
+        return src
+    }
+    let wide = mut self.temp(false)
+    match ty.bits() {
+        8 => {
+            if signed {
+                mut self.emit(aarch64::Inst.Extend(kind: aarch64::ExtendKind.Sxtb, dst: wide, src: src))
+            } else {
+                mut self.emit(aarch64::Inst.Extend(kind: aarch64::ExtendKind.Uxtb, dst: wide, src: src))
+            }
+        }
+        16 => {
+            if signed {
+                mut self.emit(aarch64::Inst.Extend(kind: aarch64::ExtendKind.Sxth, dst: wide, src: src))
+            } else {
+                mut self.emit(aarch64::Inst.Extend(kind: aarch64::ExtendKind.Uxth, dst: wide, src: src))
+            }
+        }
+        else => {
+            if signed {
+                mut self.emit(aarch64::Inst.Extend(kind: aarch64::ExtendKind.Sxtw, dst: wide, src: src))
+            } else {
+                mut self.emit(aarch64::Inst.Mov(width: aarch64::Width.Bits32, dst: wide, src: src))
+            }
+        }
+    }
+    return wide
+} ArmSelector.extended
+
+/// A register holding a narrow integer extended to 32 bits, or the register itself for a 32- or
+/// 64-bit one, whose operations read all their bits.
+fn ArmSelector.full(mut self, src: machinst::Reg, ty: clif::Type, signed: bool) -> machinst::Reg {
+    if ty.bits() >= 32 {
+        return src
+    }
+    return mut self.extended(src, ty, signed: signed)
+} ArmSelector.full
+
+/// The constant a value is when it is an add or subtract immediate, or the negation of one, as a
+/// signed integer of its type's width.
+fn ArmSelector.arith_imm(self, value: clif::Value, func: clif::Function) -> Option[i64] {
+    let Some(imm) = self.signed_constant(value, func) else {
+        return None
+    }
+    if imm <= -0x100_0000 or imm >= 0x100_0000 {
+        return None
+    }
+    var magnitude = imm
+    if imm < 0 {
+        magnitude = -imm
+    }
+    if aarch64::is_arith_imm(u64.fit(magnitude)) {
+        return Some(imm)
+    }
+    return None
+} ArmSelector.arith_imm
+
+/// `dst = src + imm` at a width, by an add or a subtract of the immediate's magnitude.
+fn ArmSelector.add_imm(mut self, width: aarch64::Width, dst: machinst::Reg, src: machinst::Reg, imm: i64) {
+    if imm >= 0 {
+        mut self.emit(aarch64::Inst.AddImm(width: width, dst: dst, src: src, imm: u32.fit(imm)))
+    } else {
+        mut self.emit(aarch64::Inst.SubImm(width: width, dst: dst, src: src, imm: u32.fit(-imm)))
+    }
+} ArmSelector.add_imm
+
+/// `dst = (low, high) op (y's halves)` for a 128-bit integer, the high halves' operation reading
+/// the carry the low halves' sets.
+fn ArmSelector.wide_carry(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, subtract: bool) {
+    let x_low = mut self.src(x, func)
+    let x_high = mut self.src_high(x, func)
+    let y_low = mut self.src(y, func)
+    let y_high = mut self.src_high(y, func)
+    let dst = mut self.dst_of(func, inst)
+    let dst_high = mut self.dst_high_of(func, inst)
+    let wide = aarch64::Width.Bits64
+    if subtract {
+        mut self.emit(aarch64::Inst.SubsReg(width: wide, dst: dst, lhs: x_low, rhs: y_low))
+        mut self.emit(aarch64::Inst.Sbc(width: wide, dst: dst_high, lhs: x_high, rhs: y_high))
+    } else {
+        mut self.emit(aarch64::Inst.AddsReg(width: wide, dst: dst, lhs: x_low, rhs: y_low))
+        mut self.emit(aarch64::Inst.Adc(width: wide, dst: dst_high, lhs: x_high, rhs: y_high))
+    }
+} ArmSelector.wide_carry
+
+fn ArmSelector.iadd(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        mut self.wide_carry(func, inst, x, y, subtract: false)
+        return
+    }
+    let operands = self.facts.commuted(func, x, y)
+    let width = width_of(ty)
+    let dst = mut self.dst_of(func, inst)
+    let src = mut self.src(operands.x, func)
+    let Some(imm) = self.arith_imm(operands.y, func) else {
+        let other = mut self.src(operands.y, func)
+        mut self.emit(aarch64::Inst.AddReg(width: width, dst: dst, lhs: src, rhs: other))
+        return
+    }
+    mut self.add_imm(width, dst, src, imm: imm)
+} ArmSelector.iadd
+
+fn ArmSelector.isub(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        mut self.wide_carry(func, inst, x, y, subtract: true)
+        return
+    }
+    let width = width_of(ty)
+    let dst = mut self.dst_of(func, inst)
+    if self.signed_constant(x, func) == Some(0) {
+        let operand = mut self.src(y, func)
+        mut self.emit(aarch64::Inst.Neg(width: width, dst: dst, src: operand))
+        return
+    }
+    let src = mut self.src(x, func)
+    let Some(imm) = self.arith_imm(y, func) else {
+        let other = mut self.src(y, func)
+        mut self.emit(aarch64::Inst.SubReg(width: width, dst: dst, lhs: src, rhs: other))
+        return
+    }
+    mut self.add_imm(width, dst, src, imm: -imm)
+} ArmSelector.isub
+
+fn ArmSelector.imul(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        mut self.wide_mul(func, inst, x, y)
+        return
+    }
+    let operands = self.facts.commuted(func, x, y)
+    let width = width_of(ty)
+    let dst = mut self.dst_of(func, inst)
+    let src = mut self.src(operands.x, func)
+    match self.power_factor(operands.y, func) {
+        Some(shift) => {
+            mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsl, width: width, dst: dst, src: src, amount: shift))
+            return
+        }
+        None => {}
+    }
+    let other = mut self.src(operands.y, func)
+    mut self.emit(aarch64::Inst.Madd(width: width, dst: dst, lhs: src, rhs: other, addend: aarch64::SP))
+} ArmSelector.imul
+
+/// The exponent of a constant power of two a value is, as a 32-bit integer of its type.
+fn ArmSelector.power_factor(self, value: clif::Value, func: clif::Function) -> Option[u8] {
+    let Some(imm) = self.signed_constant(value, func) else {
+        return None
+    }
+    let Some(small) = i32.checked_fit(imm) else {
+        return None
+    }
+    return power_of_two(small)
+} ArmSelector.power_factor
+
+/// The low 128 bits of a 128-bit product: the full product of the low halves, plus the cross
+/// products into the high half.
+fn ArmSelector.wide_mul(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    let x_low = mut self.src(x, func)
+    let x_high = mut self.src_high(x, func)
+    let y_low = mut self.src(y, func)
+    let y_high = mut self.src_high(y, func)
+    let wide = aarch64::Width.Bits64
+    let dst = mut self.dst_of(func, inst)
+    let dst_high = mut self.dst_high_of(func, inst)
+    let carried = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Umulh(dst: carried, lhs: x_low, rhs: y_low))
+    let crossed = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Madd(width: wide, dst: crossed, lhs: x_low, rhs: y_high, addend: carried))
+    mut self.emit(aarch64::Inst.Madd(width: wide, dst: dst_high, lhs: x_high, rhs: y_low, addend: crossed))
+    mut self.emit(aarch64::Inst.Madd(width: wide, dst: dst, lhs: x_low, rhs: y_low, addend: aarch64::SP))
+} ArmSelector.wide_mul
+
+fn ArmSelector.ineg(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if ty != clif::Type.Int128 {
+        mut self.emit(aarch64::Inst.Neg(width: width_of(ty), dst: dst, src: src))
+        return
+    }
+    let src_high = mut self.src_high(arg, func)
+    let dst_high = mut self.dst_high_of(func, inst)
+    mut self.emit(aarch64::Inst.SubsReg(width: aarch64::Width.Bits64, dst: dst, lhs: aarch64::SP, rhs: src))
+    mut self.emit(aarch64::Inst.Sbc(width: aarch64::Width.Bits64, dst: dst_high, lhs: aarch64::SP, rhs: src_high))
+} ArmSelector.ineg
+
+fn ArmSelector.bnot(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.Mvn(width: width_of(ty), dst: dst, src: src))
+    if ty == clif::Type.Int128 {
+        let src_high = mut self.src_high(arg, func)
+        let dst_high = mut self.dst_high_of(func, inst)
+        mut self.emit(aarch64::Inst.Mvn(width: aarch64::Width.Bits64, dst: dst_high, src: src_high))
+    }
+} ArmSelector.bnot
+
+/// A constant's bits within a width, the bitmask immediate a logical operation of that width
+/// reads.
+fn width_bits(bits: u64, width: aarch64::Width) -> u64 {
+    if width == aarch64::Width.Bits32 {
+        return bits & 0xFFFF_FFFF
+    }
+    return bits
+} width_bits
+
+fn ArmSelector.bitwise(mut self, func: clif::Function, inst: clif::Inst, op: aarch64::LogicOp, x: clif::Value, y: clif::Value) {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        let x_low = mut self.src(x, func)
+        let x_high = mut self.src_high(x, func)
+        let y_low = mut self.src(y, func)
+        let y_high = mut self.src_high(y, func)
+        let dst = mut self.dst_of(func, inst)
+        let dst_high = mut self.dst_high_of(func, inst)
+        mut self.emit(aarch64::Inst.Logic(op: op, width: aarch64::Width.Bits64, dst: dst, lhs: x_low, rhs: y_low))
+        mut self.emit(aarch64::Inst.Logic(op: op, width: aarch64::Width.Bits64, dst: dst_high, lhs: x_high, rhs: y_high))
+        return
+    }
+    let width = width_of(ty)
+    if op == aarch64::LogicOp.Orr {
+        match self.facts.rotation(func, x, y) {
+            Some(rotated) => {
+                let src = mut self.src(rotated.value, func)
+                let dst = mut self.dst_of(func, inst)
+                mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Ror, width: width, dst: dst, src: src, amount: rotated.amount))
+                return
+            }
+            None => {}
+        }
+    }
+    let operands = self.facts.commuted(func, x, y)
+    let src = mut self.src(operands.x, func)
+    let dst = mut self.dst_of(func, inst)
+    match self.facts.constant(operands.y, func) {
+        Some(bits) => {
+            let imm = width_bits(bits, width)
+            if aarch64::bitmask(imm, width).is_some() {
+                mut self.emit(aarch64::Inst.LogicImm(op: op, width: width, dst: dst, src: src, imm: imm))
+                return
+            }
+        }
+        None => {}
+    }
+    let other = mut self.src(operands.y, func)
+    mut self.emit(aarch64::Inst.Logic(op: op, width: width, dst: dst, lhs: src, rhs: other))
+} ArmSelector.bitwise
+
+/// A shift or rotation by the amount modulo the type's width. A 32- or 64-bit one is the
+/// instruction, whose amount the processor takes modulo the width; a narrower one extends the
+/// value as its shift reads it and masks the amount, and rotates as the two shifts it combines.
+fn ArmSelector.shift(mut self, func: clif::Function, inst: clif::Inst, kind: aarch64::ShiftKind, x: clif::Value, y: clif::Value) {
+    let ty = func.value_type(x)
+    expect ty != clif::Type.Int128
+    let bits = ty.bits()
+    let width = width_of(ty)
+    let narrow = bits < 32
+    let src = mut self.src(x, func)
+    var value = src
+    if narrow and kind != aarch64::ShiftKind.Lsl {
+        value = mut self.extended(src, ty, signed: kind == aarch64::ShiftKind.Asr)
+    }
+    let dst = mut self.dst_of(func, inst)
+    match self.facts.constant(y, func) {
+        Some(amount_bits) => {
+            let amount = u8.truncate(amount_bits & u64.widen(bits - 1))
+            if amount == 0 {
+                mut self.mov(dst, src: src)
+            } else if narrow and kind == aarch64::ShiftKind.Ror {
+                let right = mut self.temp(false)
+                mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: width, dst: right, src: value, amount: amount))
+                let left = mut self.temp(false)
+                mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsl, width: width, dst: left, src: value, amount: u8.truncate(bits) - amount))
+                mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: width, dst: dst, lhs: right, rhs: left))
+            } else {
+                mut self.emit(aarch64::Inst.ShiftImm(kind: kind, width: width, dst: dst, src: value, amount: amount))
+            }
+        }
+        None => {
+            let amount = mut self.src(y, func)
+            if not narrow {
+                mut self.emit(aarch64::Inst.Shift(kind: kind, width: width, dst: dst, lhs: value, rhs: amount))
+                return
+            }
+            let masked = mut self.temp(false)
+            mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: width, dst: masked, src: amount, imm: u64.widen(bits - 1)))
+            if kind != aarch64::ShiftKind.Ror {
+                mut self.emit(aarch64::Inst.Shift(kind: kind, width: width, dst: dst, lhs: value, rhs: masked))
+                return
+            }
+            let right = mut self.temp(false)
+            mut self.emit(aarch64::Inst.Shift(kind: aarch64::ShiftKind.Lsr, width: width, dst: right, lhs: value, rhs: masked))
+            let complement = mut self.temp(false)
+            let full_width = mut self.int_constant(u64.widen(bits))
+            mut self.emit(aarch64::Inst.SubReg(width: width, dst: complement, lhs: full_width, rhs: masked))
+            let left = mut self.temp(false)
+            mut self.emit(aarch64::Inst.Shift(kind: aarch64::ShiftKind.Lsl, width: width, dst: left, lhs: value, rhs: complement))
+            mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: width, dst: dst, lhs: right, rhs: left))
+        }
+    }
+} ArmSelector.shift
+
+/// The count of leading zero bits: `clz`, a narrow value zero-extended and counted as 32 bits
+/// less the bits above its width.
+fn ArmSelector.clz(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if ty.bits() >= 32 {
+        mut self.emit(aarch64::Inst.Clz(width: width_of(ty), dst: dst, src: src))
+        return
+    }
+    let wide = mut self.extended(src, ty, signed: false)
+    let counted = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Clz(width: aarch64::Width.Bits32, dst: counted, src: wide))
+    mut self.emit(aarch64::Inst.SubImm(width: aarch64::Width.Bits32, dst: dst, src: counted, imm: 32 - ty.bits()))
+} ArmSelector.clz
+
+/// The count of trailing zero bits: the leading zeros of the bit reversal, a narrow value with a
+/// stop bit set at its width.
+fn ArmSelector.ctz(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let width = width_of(ty)
+    var value = mut self.src(arg, func)
+    if ty.bits() < 32 {
+        let stopped = mut self.temp(false)
+        mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.Orr, width: width, dst: stopped, src: value, imm: 1u64 << ty.bits()))
+        value = stopped
+    }
+    let reversed = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Rbit(width: width, dst: reversed, src: value))
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.Clz(width: width, dst: dst, src: reversed))
+} ArmSelector.ctz
+
+/// The count of set bits: through the vector unit where code may use it, each byte counted and
+/// the counts summed; else each nibble's count by three subtractions of the value shifted and
+/// masked, the nibbles summed into bytes, and the bytes into the top one by a multiplication.
+fn ArmSelector.popcnt(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let value = mut self.extended(src, ty, signed: false)
+    let dst = mut self.dst_of(func, inst)
+    if self.isa.floats {
+        let vector = mut self.temp(true)
+        mut self.emit(aarch64::Inst.FloatFromInt(prec: aarch64::Precision.Double, dst: vector, src: value))
+        let counts = mut self.temp(true)
+        mut self.emit(aarch64::Inst.Cnt(dst: counts, src: vector))
+        let sum = mut self.temp(true)
+        mut self.emit(aarch64::Inst.Addv(dst: sum, src: counts))
+        mut self.emit(aarch64::Inst.IntFromFloat(prec: aarch64::Precision.Single, dst: dst, src: sum))
+        return
+    }
+    let width = width_of(ty)
+    var sevens: u64 = 0x7777_7777
+    var nibbles: u64 = 0x0F0F_0F0F
+    var ones: u64 = 0x0101_0101
+    var top: u8 = 24
+    if width == aarch64::Width.Bits64 {
+        sevens = 0x7777_7777_7777_7777
+        nibbles = 0x0F0F_0F0F_0F0F_0F0F
+        ones = 0x0101_0101_0101_0101
+        top = 56
+    }
+    var count = value
+    var shifted = value
+    for _ in 0u32..<3 {
+        let halved = mut self.temp(false)
+        mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: width, dst: halved, src: shifted, amount: 1))
+        let masked = mut self.temp(false)
+        mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: width, dst: masked, src: halved, imm: sevens))
+        let less = mut self.temp(false)
+        mut self.emit(aarch64::Inst.SubReg(width: width, dst: less, lhs: count, rhs: masked))
+        count = less
+        shifted = masked
+    }
+    let folded = mut self.temp(false)
+    mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: width, dst: folded, src: count, amount: 4))
+    let pairs = mut self.temp(false)
+    mut self.emit(aarch64::Inst.AddReg(width: width, dst: pairs, lhs: folded, rhs: count))
+    let bytes = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: width, dst: bytes, src: pairs, imm: nibbles))
+    let multiplier = mut self.int_constant(ones)
+    let summed = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Madd(width: width, dst: summed, lhs: bytes, rhs: multiplier, addend: aarch64::SP))
+    mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: width, dst: dst, src: summed, amount: top))
+} ArmSelector.popcnt
+
+fn ArmSelector.bswap(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if ty.bits() == 16 {
+        let reversed = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Rev(width: aarch64::Width.Bits32, dst: reversed, src: src))
+        mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: aarch64::Width.Bits32, dst: dst, src: reversed, amount: 16))
+        return
+    }
+    mut self.emit(aarch64::Inst.Rev(width: width_of(ty), dst: dst, src: src))
+} ArmSelector.bswap
+
+fn ArmSelector.extend(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
+    let source = func.value_type(arg)
+    let result = result_of(func, inst, alloc: self.alloc)
+    let src = mut self.src(arg, func)
+    let wide = mut self.extended(src, ty: source, signed: signed)
+    if func.value_type(result) != clif::Type.Int128 {
+        mut self.alias(result, func, low: wide, high: NO_REG)
+        return
+    }
+    let high = mut self.temp(false)
+    if signed {
+        mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Asr, width: aarch64::Width.Bits64, dst: high, src: wide, amount: 63))
+    } else {
+        mut self.emit(aarch64::Inst.MovImm(dst: high, imm: 0))
+    }
+    mut self.alias(result, func, low: wide, high: high)
+} ArmSelector.extend
+
+/// Division and remainder, a narrow integer extended to 32 bits first. As Cranelift's backend
+/// does, a divisor not known to be nonzero traps when it is zero, and a 32- or 64-bit signed
+/// division that overflows traps; a remainder is the dividend less the quotient times the
+/// divisor.
+fn ArmSelector.divide(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, signed: bool, remainder: bool) {
+    let ty = func.value_type(x)
+    expect ty != clif::Type.Int128
+    let width = width_of(ty)
+    let dividend_reg = mut self.src(x, func)
+    let divisor_reg = mut self.src(y, func)
+    let dividend = mut self.full(dividend_reg, ty, signed: signed)
+    let divisor = mut self.full(divisor_reg, ty, signed: signed)
+    let known = self.signed_constant(y, func)
+    if known.is_none() or known == Some(0) {
+        mut self.emit(aarch64::Inst.TrapIfZero(width: width, reg: divisor))
+    }
+    if signed and not remainder and ty.bits() >= 32 and (known.is_none() or known == Some(-1)) {
+        mut self.emit(aarch64::Inst.TrapIfOverflow(width: width, lhs: dividend, rhs: divisor))
+    }
+    let dst = mut self.dst_of(func, inst)
+    var quotient = dst
+    if remainder {
+        quotient = mut self.temp(false)
+    }
+    if signed {
+        mut self.emit(aarch64::Inst.Sdiv(width: width, dst: quotient, lhs: dividend, rhs: divisor))
+    } else {
+        mut self.emit(aarch64::Inst.Udiv(width: width, dst: quotient, lhs: dividend, rhs: divisor))
+    }
+    if remainder {
+        mut self.emit(aarch64::Inst.Msub(width: width, dst: dst, lhs: quotient, rhs: divisor, minuend: dividend))
+    }
+} ArmSelector.divide
+
+/// The high half of a product: `smulh` or `umulh` of 64-bit integers, else the full product of
+/// the extended operands shifted down by the width.
+fn ArmSelector.mulhi(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, signed: bool) {
+    let ty = func.value_type(x)
+    let a = mut self.src(x, func)
+    let b = mut self.src(y, func)
+    let dst = mut self.dst_of(func, inst)
+    if ty.bits() == 64 {
+        if signed {
+            mut self.emit(aarch64::Inst.Smulh(dst: dst, lhs: a, rhs: b))
+        } else {
+            mut self.emit(aarch64::Inst.Umulh(dst: dst, lhs: a, rhs: b))
+        }
+        return
+    }
+    let wide_a = mut self.extended(a, ty, signed: signed)
+    let wide_b = mut self.extended(b, ty, signed: signed)
+    let product = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Madd(width: aarch64::Width.Bits64, dst: product, lhs: wide_a, rhs: wide_b, addend: aarch64::SP))
+    var kind = aarch64::ShiftKind.Lsr
+    if signed {
+        kind = aarch64::ShiftKind.Asr
+    }
+    mut self.emit(aarch64::Inst.ShiftImm(kind: kind, width: aarch64::Width.Bits64, dst: dst, src: product, amount: u8.truncate(ty.bits())))
+} ArmSelector.mulhi
+
+/// The smaller (`Lo`) or larger (`Hi`) of two unsigned integers.
+fn ArmSelector.minmax(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, cond: aarch64::Cond) {
+    let ty = func.value_type(x)
+    let width = width_of(ty)
+    let a_reg = mut self.src(x, func)
+    let b_reg = mut self.src(y, func)
+    let a = mut self.full(a_reg, ty, signed: false)
+    let b = mut self.full(b_reg, ty, signed: false)
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.Cmp(width: width, lhs: a, rhs: b))
+    mut self.emit(aarch64::Inst.Csel(cond: cond, width: width, dst: dst, a: a, b: b))
+} ArmSelector.minmax
+
+/// An addition or subtraction with the flag of its overflow: of a 32- or 64-bit integer, read
+/// off the flags it sets; of a narrower one, whether the result of the extended operands differs
+/// from its own low bits extended.
+fn ArmSelector.overflowing(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, subtract: bool, signed: bool) {
+    let ty = func.value_type(x)
+    expect ty != clif::Type.Int128
+    let width = width_of(ty)
+    let a_reg = mut self.src(x, func)
+    let b_reg = mut self.src(y, func)
+    let dst = mut self.dst_of(func, inst)
+    let overflowed = mut self.reg(second_result_of(func, inst, alloc: self.alloc), func)
+    if ty.bits() >= 32 {
+        if subtract {
+            mut self.emit(aarch64::Inst.SubsReg(width: width, dst: dst, lhs: a_reg, rhs: b_reg))
+        } else {
+            mut self.emit(aarch64::Inst.AddsReg(width: width, dst: dst, lhs: a_reg, rhs: b_reg))
+        }
+        var cond = aarch64::Cond.Vs
+        if not signed and subtract {
+            cond = aarch64::Cond.Lo
+        } else if not signed {
+            cond = aarch64::Cond.Hs
+        }
+        mut self.emit(aarch64::Inst.Cset(cond: cond, width: aarch64::Width.Bits32, dst: overflowed))
+        return
+    }
+    let a = mut self.extended(a_reg, ty, signed: signed)
+    let b = mut self.extended(b_reg, ty, signed: signed)
+    if subtract {
+        mut self.emit(aarch64::Inst.SubReg(width: aarch64::Width.Bits32, dst: dst, lhs: a, rhs: b))
+    } else {
+        mut self.emit(aarch64::Inst.AddReg(width: aarch64::Width.Bits32, dst: dst, lhs: a, rhs: b))
+    }
+    mut self.narrow_overflow(dst, ty, signed: signed, overflowed: overflowed)
+} ArmSelector.overflowing
+
+/// Sets `overflowed` to whether a 32-bit result differs from its low bits of a narrow type
+/// extended.
+fn ArmSelector.narrow_overflow(mut self, result: machinst::Reg, ty: clif::Type, signed: bool, overflowed: machinst::Reg) {
+    let fitted = mut self.extended(result, ty, signed: signed)
+    mut self.emit(aarch64::Inst.Cmp(width: aarch64::Width.Bits32, lhs: result, rhs: fitted))
+    mut self.emit(aarch64::Inst.Cset(cond: aarch64::Cond.Ne, width: aarch64::Width.Bits32, dst: overflowed))
+} ArmSelector.narrow_overflow
+
+/// A multiplication with the flag of its overflow: of 64-bit integers, whether the high half
+/// differs from the low half's sign or, unsigned, from zero; of narrower ones, whether the full
+/// product of the extended operands differs from its low bits extended.
+fn ArmSelector.mul_overflowing(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, signed: bool) {
+    let ty = func.value_type(x)
+    expect ty != clif::Type.Int128
+    let a_reg = mut self.src(x, func)
+    let b_reg = mut self.src(y, func)
+    let dst = mut self.dst_of(func, inst)
+    let overflowed = mut self.reg(second_result_of(func, inst, alloc: self.alloc), func)
+    let wide = aarch64::Width.Bits64
+    if ty.bits() == 64 {
+        let high = mut self.temp(false)
+        if signed {
+            mut self.emit(aarch64::Inst.Smulh(dst: high, lhs: a_reg, rhs: b_reg))
+        } else {
+            mut self.emit(aarch64::Inst.Umulh(dst: high, lhs: a_reg, rhs: b_reg))
+        }
+        mut self.emit(aarch64::Inst.Madd(width: wide, dst: dst, lhs: a_reg, rhs: b_reg, addend: aarch64::SP))
+        if signed {
+            let sign = mut self.temp(false)
+            mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Asr, width: wide, dst: sign, src: dst, amount: 63))
+            mut self.emit(aarch64::Inst.Cmp(width: wide, lhs: high, rhs: sign))
+        } else {
+            mut self.emit(aarch64::Inst.CmpImm(width: wide, lhs: high, imm: 0))
+        }
+        mut self.emit(aarch64::Inst.Cset(cond: aarch64::Cond.Ne, width: aarch64::Width.Bits32, dst: overflowed))
+        return
+    }
+    let a = mut self.extended(a_reg, ty, signed: signed)
+    let b = mut self.extended(b_reg, ty, signed: signed)
+    mut self.emit(aarch64::Inst.Madd(width: wide, dst: dst, lhs: a, rhs: b, addend: aarch64::SP))
+    let fitted = mut self.extended(dst, ty, signed: signed)
+    mut self.emit(aarch64::Inst.Cmp(width: wide, lhs: dst, rhs: fitted))
+    mut self.emit(aarch64::Inst.Cset(cond: aarch64::Cond.Ne, width: aarch64::Width.Bits32, dst: overflowed))
+} ArmSelector.mul_overflowing

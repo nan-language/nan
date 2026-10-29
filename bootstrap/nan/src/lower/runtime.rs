@@ -346,12 +346,13 @@ pub mod state {
     pub const COMPLETIONS: u64 = 232;
     pub const COMPLETIONS_TAIL: u64 = 240;
     /// On a machine target: the two values the platform entered the image with, the
-    /// start-information address on `x86_64-bare` and the image handle and system table on
-    /// `x86_64-uefi`; the installed anchor's address, zero before one; the location record of
-    /// the `anchor` call that installed it; the number of CPUs that started their executor;
-    /// nonzero once a kernel halt begins; the number of CPUs it has stopped; and on
-    /// `x86_64-uefi`, once `exit_services` ends the firmware's boot services, the record of its
-    /// final memory map, the map's size and the size of each of its descriptors.
+    /// start-information address on `x86_64-bare`, the device tree's address on `aarch64-bare`
+    /// and the image handle and system table on a UEFI target; the installed anchor's address,
+    /// zero before one; the location record of the `anchor` call that installed it; the number of
+    /// CPUs that started their executor; nonzero once a kernel halt begins; the number of CPUs it
+    /// has stopped; and on a UEFI target, once `exit_services` ends the firmware's boot services,
+    /// the record of its final memory map, the map's size and the size of each of its
+    /// descriptors.
     pub const PLATFORM: u64 = 248;
     pub const PLATFORM_TABLE: u64 = 256;
     pub const ANCHOR: u64 = 264;
@@ -418,8 +419,8 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The address of the thread-local word holding the running executor thread's record, on
-    /// `x86_64-host`.
+    /// The address of the thread-local word holding the running executor thread's record, on a
+    /// host target.
     pub fn thread_slot(&mut self, fx: &mut Fx) -> Value {
         let id = match self.thread_id {
             Some(id) => id,
@@ -466,7 +467,7 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// A C library function, by name, which only an `x86_64-host` image links.
+    /// A C library function, by name, which only a host image links.
     pub fn libc(
         &mut self,
         name: &str,
@@ -507,8 +508,9 @@ impl Lowering<'_, '_> {
         fx.b.inst_results(call).to_vec()
     }
 
-    /// Relaxes the processor in a spin loop: on `x86_64-host` it yields the processor to the
-    /// system, on a machine target it hints the spin with `pause`.
+    /// Relaxes the processor in a spin loop: on a host target it yields the processor to the
+    /// system, on a machine target it hints the spin with `pause` on x86_64 and `yield` on
+    /// AArch64.
     pub fn relax(&mut self, fx: &mut Fx) {
         if self.machine() {
             self.call_stub(fx, Stub::Pause, &[]);

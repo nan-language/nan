@@ -19,7 +19,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 | `testing` | the simulated world, structural comparison | none |
 
 - These are the only std modules. A std path has at most one module segment after the alias, as in `sys::net::Conn`; every other std item is in its package's root module.
-- Each of the nine packages declares `targets any` and has no target variants, so each of its items has one interface and one meaning on every [target](27-program-model.md#targets). Each platform package declares exactly its own target.
+- Each of the nine packages declares `targets any` and has no target variants, so each of its items has one interface and one meaning on every [target](27-program-model.md#targets). Each platform package declares exactly the targets whose descriptors name it.
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
@@ -94,7 +94,7 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::Register` | [Registers](23-low-level.md#registers) |
 | `hw` | `hw::Mmio`, `hw::Ports` | [Register windows](23-low-level.md#register-windows) |
 | `hw` | `hw::Dma`, `hw::DmaShared`, `hw::dma_fence` | [DMA](23-low-level.md#dma) |
-| `hw` | `hw::Ring0`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
+| `hw` | `hw::Ring0`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
 | `hw` | `hw::mint_root` | [Landing functions](23-low-level.md#landing-functions) |
 | `hw` | `hw::Anchor`, `hw::cpu_count` | [Anchor](24-kernel.md#anchor) |
 | `hw` | `hw::IrqContext`, `hw::TrapFrame`, `hw::NoCode`, `hw::ErrorCode`, `hw::PageFault`, `hw::IrqExit` | [Interrupt functions](24-kernel.md#interrupt-functions) |
@@ -311,16 +311,16 @@ pub fn header_length(frame: Slice[u8]) -> Option[u16] limits pure, notrap, termi
 
 A **platform package** is the package that mints a target's [root grant](14-authority.md#root-grants) and implements the target-dependent operations of the capabilities that root grant yields. Exactly three exist; each concrete target's [descriptor](27-program-model.md#descriptors) names one:
 
-| Platform package | Target | Root grant | Implements |
+| Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
-| `host_platform` | `x86_64-host` | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
-| `uefi_platform` | `x86_64-uefi` | `boot::Machine` | `boot::Services`, through the firmware's boot services |
-| `bare_platform` | `x86_64-bare` | `boot::Kernel` | none; it builds the root grant from the PVH start information |
+| `host_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
+| `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services`, through the firmware's boot services |
+| `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the start information, the PVH start information on `x86_64-bare` and the device tree on `aarch64-bare` |
 
-- A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its target, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI or PVH; no other std item has one.
+- A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI, PVH or device trees; no other std item has one.
 - No alias and no `dep` directive names a platform package, so no path outside it reaches its items. The [final closure](27-program-model.md#final-builds) of a program also holds the platform package its descriptor names, and no other.
 - Each platform package's manifest grants `priv` to its modules, so its package item is sealed ([device and priv grants](14-authority.md#device-and-priv-grants)); that of `host_platform`, whose modules hold trusted code, also grants them `trusted`.
-- `uefi_platform` and `bare_platform` each contribute the `hw::preempt` entry of their target ([preemption](24-kernel.md#preemption)).
+- `uefi_platform` and `bare_platform` each contribute the `hw::preempt` entry of their targets ([preemption](24-kernel.md#preemption)).
 
 A **target-dependent operation** is an operation of a sys capability, of a resource one opens, or of `boot::Services`. Its std item reaches the platform function through the capability-table [support routine](27-program-model.md#runtime-support), which calls the platform function recorded in the table entry of the capability, or of the entry a resource records ([resources](14-authority.md#resources)): the platform package's for an entry its root grant minted, and the sim's, which `sys` implements on every target, for an entry a [sim](22-testing.md#simulated-capabilities) constructor minted. That call contributes exactly these facts to the item's [digest](10-effects-digests.md#digests): wait exactly when the operation's head states `uses wait`; alloc exactly when the operation takes a `mem::Alloc`; may-trap exactly when it takes a `mem::Alloc` or adds a [capability table](14-authority.md#capability-tables) entry; terminates exactly when wait does not hold. A capability that no root grant of a target yields has values there only as sims.
 

@@ -8,62 +8,151 @@ use crate::syntax::literal::text_value;
 use crate::syntax::token::TokenKind;
 use crate::syntax::tree::{NodeId, Tree};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Target {
+/// A concrete target's architecture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Arch {
+    Amd64,
+    Aarch64,
+}
+
+impl Arch {
+    /// The architecture of the machine running the toolchain.
+    pub fn running() -> Arch {
+        match std::env::consts::ARCH {
+            "aarch64" => Arch::Aarch64,
+            _ => Arch::Amd64,
+        }
+    }
+}
+
+/// What a concrete target's programs run on: Linux, UEFI firmware or the bare machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Kind {
     Host,
     Uefi,
     Bare,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Target {
+    X64Host,
+    X64Uefi,
+    X64Bare,
+    Aarch64Host,
+    Aarch64Uefi,
+    Aarch64Bare,
     Any,
 }
 
 impl Target {
+    /// The concrete targets.
+    pub const CONCRETE: [Target; 6] = [
+        Target::X64Host,
+        Target::X64Uefi,
+        Target::X64Bare,
+        Target::Aarch64Host,
+        Target::Aarch64Uefi,
+        Target::Aarch64Bare,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
-            Target::Host => "x86_64-host",
-            Target::Uefi => "x86_64-uefi",
-            Target::Bare => "x86_64-bare",
+            Target::X64Host => "x86_64-host",
+            Target::X64Uefi => "x86_64-uefi",
+            Target::X64Bare => "x86_64-bare",
+            Target::Aarch64Host => "aarch64-host",
+            Target::Aarch64Uefi => "aarch64-uefi",
+            Target::Aarch64Bare => "aarch64-bare",
             Target::Any => "any",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Target> {
-        [Target::Host, Target::Uefi, Target::Bare, Target::Any]
+        Target::CONCRETE
             .into_iter()
+            .chain([Target::Any])
             .find(|target| target.name() == name)
     }
 
-    /// Whether the target is a machine target, `x86_64-uefi` or `x86_64-bare`, whose image the
+    /// The concrete target of an architecture and a kind.
+    pub fn of(arch: Arch, kind: Kind) -> Target {
+        Target::CONCRETE
+            .into_iter()
+            .find(|target| target.arch() == Some(arch) && target.kind() == Some(kind))
+            .expect("a concrete target of each architecture and kind")
+    }
+
+    /// A concrete target's architecture; `any` has none.
+    pub fn arch(self) -> Option<Arch> {
+        match self {
+            Target::X64Host | Target::X64Uefi | Target::X64Bare => Some(Arch::Amd64),
+            Target::Aarch64Host | Target::Aarch64Uefi | Target::Aarch64Bare => Some(Arch::Aarch64),
+            Target::Any => None,
+        }
+    }
+
+    /// A concrete target's kind; `any` has none.
+    pub fn kind(self) -> Option<Kind> {
+        match self {
+            Target::X64Host | Target::Aarch64Host => Some(Kind::Host),
+            Target::X64Uefi | Target::Aarch64Uefi => Some(Kind::Uefi),
+            Target::X64Bare | Target::Aarch64Bare => Some(Kind::Bare),
+            Target::Any => None,
+        }
+    }
+
+    /// Whether the target is a host target, whose images run as Linux processes.
+    pub fn is_host(self) -> bool {
+        self.kind() == Some(Kind::Host)
+    }
+
+    /// Whether the target is a machine target, a UEFI or bare one, whose image the
     /// implementation's own writer builds.
     pub fn is_machine(self) -> bool {
-        matches!(self, Target::Uefi | Target::Bare)
+        matches!(self.kind(), Some(Kind::Uefi | Kind::Bare))
+    }
+
+    /// Whether a target variant's selector matches the target: its name, its architecture's or
+    /// its kind's.
+    pub fn selected_by(self, selector: &str) -> bool {
+        let arch = match self.arch() {
+            Some(Arch::Amd64) => "x86_64",
+            Some(Arch::Aarch64) => "aarch64",
+            None => return false,
+        };
+        let kind = match self.kind() {
+            Some(Kind::Host) => "host",
+            Some(Kind::Uefi) => "uefi",
+            Some(Kind::Bare) => "bare",
+            None => return false,
+        };
+        selector == self.name() || selector == arch || selector == kind
     }
 
     /// The platform package a concrete target's descriptor names; `any` names none.
     pub fn platform_package(self) -> Option<&'static str> {
-        match self {
-            Target::Host => Some("host_platform"),
-            Target::Uefi => Some("uefi_platform"),
-            Target::Bare => Some("bare_platform"),
-            Target::Any => None,
+        match self.kind()? {
+            Kind::Host => Some("host_platform"),
+            Kind::Uefi => Some("uefi_platform"),
+            Kind::Bare => Some("bare_platform"),
         }
     }
 
     /// The module and name of the root grant a concrete target's entry takes; `any` has none.
     pub fn root_grant(self) -> Option<(&'static str, &'static str)> {
-        match self {
-            Target::Host => Some(("host", "World")),
-            Target::Uefi => Some(("boot", "Machine")),
-            Target::Bare => Some(("boot", "Kernel")),
-            Target::Any => None,
+        match self.kind()? {
+            Kind::Host => Some(("host", "World")),
+            Kind::Uefi => Some(("boot", "Machine")),
+            Kind::Bare => Some(("boot", "Kernel")),
         }
     }
 
     /// What an image of the target appends to its package's name.
     pub fn image_suffix(self) -> &'static str {
-        match self {
-            Target::Uefi => ".efi",
-            Target::Bare => ".elf",
-            Target::Host | Target::Any => "",
+        match self.kind() {
+            Some(Kind::Uefi) => ".efi",
+            Some(Kind::Bare) => ".elf",
+            Some(Kind::Host) | None => "",
         }
     }
 }
@@ -283,7 +372,7 @@ impl Reader<'_> {
                     for name in &names {
                         match Target::from_name(name) {
                             Some(target) => manifest.targets.push(target),
-                            None if name == "x86_64-nanos" => {
+                            None if name == "x86_64-nanos" || name == "aarch64-nanos" => {
                                 self.report(line, Code::ManifestReservedTarget)
                             }
                             None => self.report(line, Code::ManifestUnknownTarget),

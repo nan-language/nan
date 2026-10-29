@@ -4,7 +4,7 @@ This chapter defines tasks and task scopes, spawning with join handles and reapi
 
 ## Task scopes
 
-A **task** is a stackful unit of concurrent execution that an [executor](#executors) runs ([stackful tasks](17-suspension-io.md#stackful-tasks)). The runtime starts the task of the entry function on `x86_64-host` ([entry](27-program-model.md#entry)) and the task of each test run ([test runs](22-testing.md#test-runs)). Every other task is a child of a task scope, a task of a race, the first task of a domain body ([domain run](11-errors-domains.md#domain-run)), the component task of a [runner](26-components.md#runner), a [keyed task](26-components.md#keyed-tasks) or the first kernel task ([anchor](24-kernel.md#anchor)). A **task scope** is the region that a call of `task::scope` opens; the call ends only after every task spawned on the scope has ended.
+A **task** is a stackful unit of concurrent execution that an [executor](#executors) runs ([stackful tasks](17-suspension-io.md#stackful-tasks)). The runtime starts the task of the entry function on the host targets ([entry](27-program-model.md#entry)) and the task of each test run ([test runs](22-testing.md#test-runs)). Every other task is a child of a task scope, a task of a race, the first task of a domain body ([domain run](11-errors-domains.md#domain-run)), the component task of a [runner](26-components.md#runner), a [keyed task](26-components.md#keyed-tasks) or the first kernel task ([anchor](24-kernel.md#anchor)). A **task scope** is the region that a call of `task::scope` opens; the call ends only after every task spawned on the scope has ended.
 
 ```nan-api
 // module: task

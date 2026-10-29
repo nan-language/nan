@@ -335,7 +335,7 @@ A trap kind appears only in trap reports, in `sys::TrapKind` and in `// traps:` 
 
 ### Abandoning a domain
 
-The runtime abandons a domain D when a task of D traps, when a [test run](22-testing.md#test-runs) on D times out, and, on `x86_64-host`, when a task calls `with` on a spin lock or per-CPU value its CPU is already inside, D then being the innermost process or test domain holding the task ([locks](24-kernel.md#locks)), whose end writes the [halt report](24-kernel.md#kernel-halts) in place of a trap report. The steps are, in this order:
+The runtime abandons a domain D when a task of D traps, when a [test run](22-testing.md#test-runs) on D times out, and, on the host targets, when a task calls `with` on a spin lock or per-CPU value its CPU is already inside, D then being the innermost process or test domain holding the task ([locks](24-kernel.md#locks)), whose end writes the [halt report](24-kernel.md#kernel-halts) in place of a trap report. The steps are, in this order:
 
 1. The trapping task, if any, stops at the trapping operation.
 2. Every other task of D stops. A suspended task is never resumed. A running task stops at some point of its execution, once every operation of these kinds that it has begun has completed: a call of a std function of a type with [interior mutability](12-memory.md#interior-mutability) or of `task::Sender`, `task::Receiver`, `task::Scope`, `sys::Cx` or `sys::Outbox`, a change of the count of a `mem::Shared` or of the handles of a `task::Cown`, and a support routine. An `await when` body is not such an operation. What it executes before it stops happens before the steps that follow.
@@ -410,10 +410,10 @@ A **domain** is a unit that a trap abandons; a kernel domain also ends at every 
 
 | Domain | Holds | Abandoning ends it by |
 | --- | --- | --- |
-| process | the tasks of an `x86_64-host` program outside other domains | writing the trap report to standard error and exiting with status 70 ([host runs](27-program-model.md#host-runs)) |
+| process | the tasks of a host target's program outside other domains | writing the trap report to standard error and exiting with status 70 ([host runs](27-program-model.md#host-runs)) |
 | `sys::Domain` body | the body passed to a domain run and its tasks | settlement, then freeing; the domain run returns `Err` |
-| test | one run of a test on `x86_64-host` ([test runs](22-testing.md#test-runs)) | settlement, then freeing; the run fails with the trap report, or with `test.timeout` and no report when it timed out |
-| kernel | every context of an `x86_64-uefi` or `x86_64-bare` image, or of the boot of a test image ([emulator runs](22-testing.md#emulator-runs)) | a [kernel halt](24-kernel.md#kernel-halts) |
+| test | one run of a test on a host target ([test runs](22-testing.md#test-runs)) | settlement, then freeing; the run fails with the trap report, or with `test.timeout` and no report when it timed out |
+| kernel | every context of a machine target's image, or of the boot of a test image ([emulator runs](22-testing.md#emulator-runs)) | a [kernel halt](24-kernel.md#kernel-halts) |
 
 The process and the kernel end without settlement. The domains are exactly these four kinds.
 
@@ -467,7 +467,7 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 
 `sys::Domain.run_sized(body, stack, exec, alloc)` behaves as `run(body, exec, alloc)`, except that the first task's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a body whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run in a domain.
 
-A use of `sys::Domain.run` or `sys::Domain.run_sized` in code checked for `x86_64-uefi` or `x86_64-bare`, or within the reach of a final build for one of them ([environments](27-program-model.md#environments)), is an error (`domain.unavailable`).
+A use of `sys::Domain.run` or `sys::Domain.run_sized` in code checked for a machine target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`domain.unavailable`).
 
 ```nan
 pub closed enum JobError derives Render {

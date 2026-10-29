@@ -10,8 +10,8 @@ use crate::check::db::ItemId;
 use crate::diagnostic::{Code, Diagnostic, Reason, Role};
 use crate::nir::Span;
 
-/// The stub call bound of `x86_64-host`: the most of its caller's stack a call of a support
-/// routine or compiler stub uses.
+/// The stub call bound of every concrete target: the most of its caller's stack a call of a
+/// support routine or compiler stub uses.
 pub const STUB_CALL_BOUND: u64 = 256;
 
 /// Where in source a call or a use lies.

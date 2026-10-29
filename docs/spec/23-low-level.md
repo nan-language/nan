@@ -54,7 +54,7 @@ pub fn first_byte(source: Slice[u8]) -> u8
 
 ### Trusted primitives
 
-A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `read_msr` and `write_msr` ([privileged intrinsics](#privileged-intrinsics)), and `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)).
+A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `read_msr`, `write_msr`, `write_ttbr0` and `write_sysreg` ([privileged intrinsics](#privileged-intrinsics)), and `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)).
 
 - A call of a trusted primitive outside trusted code, or its use as a function value, is an error (`trusted.primitive-outside`).
 - Each primitive has a **soundness condition**, stated with its rules. Its **structured requires** are its `requires` clauses: the part of the condition that [contract terms](18-contracts.md#contract-terms) express. Each is a trusted requirement [obligation](18-contracts.md#obligations) at every call, which the prover proves, a run-time check enforces (`trap.requires`), or an `assume` in the enclosing trusted code makes assumed.
@@ -170,7 +170,7 @@ pub closed enum UserAddrError derives Copy, Eq, Render {
 - `hw::UserAddr[T]` holds one `u64`, the address of a `T` in the user address space of the page-table root the running CPU uses.
 - The T of `hw::UserAddr[T]` has a [fixed layout](21-interpreter.md#interpreter-memory); another T is an error (`hw.layout-unfixed`), reported where the type is written.
 - `addr.copy_in(cpu)` copies the bytes of a `T` from user memory in one fetch: it reads each byte exactly once and returns the copy as [Untrusted](15-untrusted.md#untrusted-values).
-- It fails with `UserAddrError.OutsideUser` when the range from the address to the address plus the size of `T` does not lie below `0x0000_8000_0000_0000`, and with `UserAddrError.Unmapped` when a page of the range is not mapped readable for user mode. Neither case traps.
+- It fails with `UserAddrError.OutsideUser` when the range from the address to the address plus the size of `T` does not lie below `0x0000_8000_0000_0000` on x86_64 and `0x0001_0000_0000_0000` on AArch64, and with `UserAddrError.Unmapped` when a page of the range is not mapped readable for user mode. Neither case traps.
 - `copy_in` needs no manifest grant: holding `hw::Ring0` is its authority. It terminates, allocates nothing and has the sync fact ([digests](10-effects-digests.md#digests)).
 
 ```nan
@@ -342,6 +342,7 @@ pub fn Ports.write_at[E: AnyBits, N: usize](mut self, register: Register[R, Arra
 
 - `map` is a trusted primitive whose soundness condition is that the window holds this machine's R registers, which for `Mmio` the virtual address `phys` reaches uncached in every address space where the window is used, and that no other live window maps them. `unmap` ends the window.
 - A port window whose R has an 8-byte register or element is an error (`register.port-width`).
+- Port I/O exists on x86_64 alone: a call of `hw::Ports.map` in code checked for an AArch64 target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`register.port-target`).
 - A **volatile call** is a call of `read`, `write`, `read_at` or `write_at`. Its register argument is written as the member path `R.f` itself; any other argument there is an error (`register.operand`).
 - `read` and `read_at` of a register that is not readable are an error (`register.not-readable`), and `write` and `write_at` of one that is not writable are an error (`register.not-writable`). `read` and `write` of an array register, and `read_at` and `write_at` of any other register, are errors (`register.array-access`).
 - An index not below the array's length traps (`trap.bounds`).
@@ -441,6 +442,29 @@ pub fn clear_status(mut regs: hw::Mmio[SerialRegs]) {
 } clear_status
 ```
 
+```nan
+// file: kernel/package.nan
+//! Serial console for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+    allow device in kernel
+    allow trusted in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! The serial port's registers.
+
+pub registers SerialRegs {
+    data: u8 at 0x0 read write
+} SerialRegs
+
+pub fn map_serial() -> hw::Ports[SerialRegs] {
+    return trusted "the board decodes port 0x3F8 to its 16550 alone and nothing else maps it" { hw::Ports[SerialRegs].map(0x3F8) } // error: register.port-target
+} map_serial
+```
+
 ## DMA
 
 A **DMA buffer** is an `hw::Dma[T]` or an `hw::DmaShared[T]`: memory a device accesses at its bus address. An `hw::Dma[T]` is handed to a device whole: a submission takes it and a [completion](17-suspension-io.md#completion-io) returns it. An `hw::DmaShared[T]` is shared with a device while both run, such as a descriptor ring.
@@ -474,7 +498,7 @@ pub fn dma_fence()
 ```
 
 - Every operation of this section is a device operation (`authority.ungranted`), has the device fact, terminates and allocates nothing.
-- A buffer's memory is its box's contents, which never move. On `x86_64-uefi` and `x86_64-bare` its bus address is the physical address that the address of the contents translates to when `of` runs, and a device reaches the size of `T` bytes from it, which are contiguous in physical memory ([physical memory](24-kernel.md#physical-memory)). On `x86_64-host` its bus address is the address of the contents, and only [simulated devices](22-testing.md#simulated-capabilities) reach it.
+- A buffer's memory is its box's contents, which never move. On the machine targets its bus address is the physical address that the address of the contents translates to when `of` runs, and a device reaches the size of `T` bytes from it, which are contiguous in physical memory ([physical memory](24-kernel.md#physical-memory)). On the host targets its bus address is the address of the contents, and only [simulated devices](22-testing.md#simulated-capabilities) reach it.
 - The T of `hw::Dma[T]` and `hw::DmaShared[T]` has a [fixed layout](21-interpreter.md#interpreter-memory); another T is an error (`hw.layout-unfixed`), reported where the type is written.
 - The contents of an `hw::DmaShared[T]` are reached only through its **DMA access calls**, whose field operand is the member path `T.f` of a field f of T, written directly, where T is a bytes layout. Another operand, or a call not matching its field's row, is an error (`hw.dma-operand`).
 
@@ -654,6 +678,52 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 - `invalidate_page` removes the running CPU's cached translation of the page holding `page`.
 - `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact.
 - Every privileged intrinsic has the priv fact, terminates, never allocates and never traps.
+- Each privileged intrinsic, and `hw::Idt.of_vectors`, belongs to the architecture whose machine targets' descriptors list it, `invalidate_page` to both. A call of one in code checked for a target of another architecture, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`hw.intrinsic-target`).
+
+The privileged intrinsics of `aarch64-uefi` and `aarch64-bare` are exactly `invalidate_page` and these.
+
+```nan-api
+// module: hw
+
+pub fn Ring0.write_ttbr0(self, take root: PageTableRoot) -> Option[PageTableRoot]
+
+pub fn Ring0.read_sysreg(self, register: SysReg) -> u64
+
+pub fn Ring0.write_sysreg(self, register: SysReg, value: u64)
+    requires register.is_writable()
+
+pub closed enum SysReg derives Copy, Eq {
+    SctlrEl1
+    TcrEl1
+    MairEl1
+    Ttbr1El1
+    ContextidrEl1
+    CpacrEl1
+    CntkctlEl1
+    TpidrEl0
+    TpidrroEl0
+    CntpCtlEl0
+    CntpCvalEl0
+    CntpTvalEl0
+    CntvCtlEl0
+    CntvCvalEl0
+    CntvTvalEl0
+    MidrEl1
+    MpidrEl1
+    CntfrqEl0
+    CntpctEl0
+    CntvctEl0
+    CtrEl0
+    IdAa64pfr0El1
+    IdAa64isar0El1
+    IdAa64mmfr0El1
+} SysReg
+
+pub fn SysReg.is_writable(self) -> bool limits pure, notrap, terminates
+```
+
+- `write_ttbr0` makes `root` the root of the running CPU's translations of the addresses below `0x0001_0000_0000_0000`, held in `TTBR0_EL1`, invalidates the CPU's cached translations and returns as `write_cr3` does, with the same soundness condition.
+- `read_sysreg` and `write_sysreg` read and write the system register that `register` names, `SctlrEl1` naming `SCTLR_EL1`, `CntpCtlEl0` naming `CNTP_CTL_EL0` and so on. `register.is_writable()` is true exactly for the registers from `SctlrEl1` to `CntvTvalEl0`. `write_sysreg` is a trusted primitive whose soundness condition is that the write leaves every translation, stack and support routine state that code relies on intact.
 
 An **install token** is a linear value that an intrinsic returns when the hardware keeps referencing its argument. Owning the token keeps the argument alive and unmoved.
 
@@ -672,7 +742,7 @@ pub fn PageTableRoot.into_frame(take self) -> PhysFrame[4_096]
 ```
 
 - `hw::IdtInstalled` holds the box `load_idt` took. No std operation releases it, so the table stays allocated while the machine runs; a kernel moves the token into its [anchor](24-kernel.md#anchor).
-- `hw::PageTableRoot` owns the [physical frame](24-kernel.md#physical-memory) of a top-level page table and is a primitive capability. The root that `write_cr3` takes is held by the CPU until a later `write_cr3` on that CPU returns it.
+- `hw::PageTableRoot` owns the [physical frame](24-kernel.md#physical-memory) of a top-level page table and is a primitive capability. The root that `write_cr3` or `write_ttbr0` takes is held by the CPU until a later call of the same intrinsic on that CPU returns it.
 
 ```nan
 // file: kernel/package.nan
@@ -698,22 +768,64 @@ pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::Page
 } activate
 ```
 
+```nan
+// file: kernel/package.nan
+//! Address spaces for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+    allow priv in kernel
+    allow trusted in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Address-space switching and the timer's frequency.
+
+pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::PageTableRoot] {
+    return trusted "root maps the running kernel image and the current stack" { cpu.write_ttbr0(take root) }
+} activate
+
+pub fn timer_hertz(cpu: hw::Ring0) -> u64 {
+    return cpu.read_sysreg(hw::SysReg.CntfrqEl0)
+} timer_hertz
+```
+
+```nan
+// file: kernel/package.nan
+//! Address spaces for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+    allow priv in kernel
+    allow trusted in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Address-space switching.
+
+pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::PageTableRoot] {
+    return trusted "root maps the running kernel image and the current stack" { cpu.write_cr3(take root) } // error: hw.intrinsic-target
+} activate
+```
+
 ## Machine seams
 
-A **machine seam** is a compiler-generated stub at a fixed hardware entry, calling an interrupt fn or landing fn. Each [descriptor](27-program-model.md#descriptors) fixes its seams; on x86_64 they are exactly:
+A **machine seam** is a compiler-generated stub at a fixed hardware entry, calling an interrupt fn or landing fn. Each [descriptor](27-program-model.md#descriptors) fixes its seams; they are exactly:
 
 | Seam | Targets | Entered by | Calls |
 | --- | --- | --- | --- |
-| program entry | `x86_64-host`, `x86_64-uefi`, `x86_64-bare` | the platform starting the image | the descriptor's entry landing fn, then the [entry function](27-program-model.md#entry) with the root grant it returns |
-| vector n, n from 0 to 255 | `x86_64-uefi`, `x86_64-bare` | an interrupt or exception through gate n | the [interrupt fn](24-kernel.md#interrupt-functions) or landing fn bound to n |
-| syscall | `x86_64-bare` | the `syscall` instruction in user mode | the landing fn of `hw::syscall_entry` |
+| program entry | every concrete target | the platform starting the image | the descriptor's entry landing fn, then the [entry function](27-program-model.md#entry) with the root grant it returns |
+| vector n, n from 0 to 255 | the machine targets | on x86_64, an interrupt or exception through gate n; on AArch64, an exception of vector n's kind, or interrupt n of the interrupt controller | the [interrupt fn](24-kernel.md#interrupt-functions) or landing fn bound to n |
+| syscall | the bare targets | the `syscall` instruction on x86_64 and the `svc` instruction on AArch64, in user mode | the landing fn of `hw::syscall_entry` |
 
 - [Platform registries](25-registries.md#platform-registries) and `hw::IrqShared.install` ([locks](24-kernel.md#locks)) bind the vector and syscall seams. [Interrupt functions](24-kernel.md#interrupt-functions) and [kernel halts](24-kernel.md#kernel-halts) state what a vector seam without a binding does, and platform registries what the syscall seam does without one.
 - A seam saves the interrupted state, switches to its context's stack, passes its function the arguments that function's kind receives, and restores the state that function's result selects. [Kernel execution model](24-kernel.md) fixes the saved state and stacks.
 
 ### Compiler stubs
 
-A **compiler stub** is machine code that the implementation emits from its descriptor's fixed list: the machine seams, and one **out-of-line stub** for each privileged intrinsic, `hw::UserAddr.copy_in`, each volatile access kind and width (memory-mapped reads and writes of 1, 2, 4 and 8 bytes; port reads and writes of 1, 2 and 4 bytes), each width of a DMA access call and `hw::dma_fence`.
+A **compiler stub** is machine code that the implementation emits from its descriptor's fixed list: the machine seams, and one **out-of-line stub** for each privileged intrinsic, `hw::UserAddr.copy_in`, each volatile access kind and width (memory-mapped reads and writes of 1, 2, 4 and 8 bytes; on x86_64, port reads and writes of 1, 2 and 4 bytes), each width of a DMA access call and `hw::dma_fence`.
 
 - Lowering performs each of these operations as a call of its out-of-line stub, never inlined. No memory access moves across that call.
 - The list of a descriptor changes only with the [language version](37-evolution.md#language-versions). The machine code of an image is exactly its lowered code, its compiler stubs and its [support routines](27-program-model.md#runtime-support).
@@ -796,14 +908,15 @@ convention_clause = 'convention' TEXT ;
 - Declaring a foreign fn is a `trusted` operation (`authority.ungranted`), and each declaration is a trust escape.
 - Its parameters are read parameters, and its parameter and result types are integer and float scalars, `hw::Ptr[T]` and AnyBits layouts; its result may also be `Unit` or `Never`. Its name is one identifier, and it has no generic parameters or `fails`. Any other head is an error (`trusted.foreign-signature`). [Effects, digests and limits](10-effects-digests.md#foreign-functions-and-trusted-code) gives its waiting and digest rules.
 - Its symbol is its name. A call of a foreign fn, or through a foreign function type, passes and returns an integer or float scalar as the convention passes the C type of that width and signedness, a pointer as its address, an integer layout as its bits value, and a bytes layout as a structure of N bytes with alignment 1.
-- A final build of an `x86_64-host` image resolves the symbols of the foreign fns it reaches through `cc` ([images](27-program-model.md#images)). A final build of an `x86_64-uefi` or `x86_64-bare` image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
+- A final build of a host target's image resolves the symbols of the foreign fns it reaches through its linker ([images](27-program-model.md#images)). A final build of a machine target's image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
 
 ### Calling conventions
 
 | Convention | Meaning | Targets |
 | --- | --- | --- |
-| `"sysv"` | the System V AMD64 calling convention | `x86_64-host` |
+| `"sysv"` | the calling convention of the System V ABI for the target's architecture: the AMD64 one on x86_64 and the Procedure Call Standard for the Arm 64-bit Architecture on AArch64 | `x86_64-host`, `aarch64-host` |
 | `"win64"` | the Microsoft x64 calling convention | `x86_64-uefi` |
+| `"aapcs64"` | the Procedure Call Standard for the Arm 64-bit Architecture, with `x18` reserved for the platform | `aarch64-uefi` |
 
 - Any other convention text is an error (`trusted.convention-unknown`).
 - A convention clause, on a foreign fn or a [function type](10-effects-digests.md#function-types), in a package declaring a target that the convention's row does not list, `any` included, is an error (`trusted.convention-target`).
@@ -852,6 +965,46 @@ foreign fn read(fd: i32, mut buf: SliceMut[u8]) -> isize convention "sysv" // er
 pub fn read_input(mut buf: SliceMut[u8]) -> isize {
     return read(0, mut buf)
 } read_input
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on both host architectures.
+
+package procinfo {
+    language 1
+    targets aarch64-host, x86_64-host
+    allow trusted in procinfo
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Reads the process id from the C library.
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+pub fn process_id() -> i32 {
+    return getpid()
+} process_id
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on AArch64 hosts.
+
+package procinfo {
+    language 1
+    targets aarch64-host
+    allow trusted in procinfo
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Reads the process id from the C library.
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "aapcs64" // error: trusted.convention-target
+
+pub fn process_id() -> i32 {
+    return getpid()
+} process_id
 ```
 
 ## Memory model
@@ -960,6 +1113,7 @@ The types of this table are [base types](05-properties.md#structural-properties)
 | `hw.atomic-type` | error | [Trusted atomics](#trusted-atomics) |
 | `hw.dma-completion` | error | [DMA](#dma) |
 | `hw.dma-operand` | error | [DMA](#dma) |
+| `hw.intrinsic-target` | error | [Privileged intrinsics](#privileged-intrinsics) |
 | `hw.landing-called` | error | [Landing functions](#landing-functions) |
 | `hw.landing-signature` | error | [Landing functions](#landing-functions) |
 | `hw.layout-unfixed` | error | [Address types](#address-types), [DMA](#dma) |
@@ -981,6 +1135,7 @@ The types of this table are [base types](05-properties.md#structural-properties)
 | `register.not-writable` | error | [Register windows](#register-windows) |
 | `register.operand` | error | [Register windows](#register-windows), [Sim constructors](22-testing.md#sim-constructors) |
 | `register.overlap` | error | [Registers](#registers) |
+| `register.port-target` | error | [Register windows](#register-windows) |
 | `register.port-width` | error | [Register windows](#register-windows) |
 | `register.stride` | error | [Registers](#registers) |
 | `register.type` | error | [Registers](#registers) |

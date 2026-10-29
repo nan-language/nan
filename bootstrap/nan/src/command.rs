@@ -38,7 +38,7 @@ pub struct Run {
 }
 
 /// What a command ends with: its output, the program `nan run` starts, or the status `nan run`
-/// ends with when the emulator cannot start.
+/// ends with when it cannot start one.
 enum Outcome {
     Output(Output),
     Launch(Launch),

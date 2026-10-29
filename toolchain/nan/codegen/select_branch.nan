@@ -1,4 +1,4 @@
-//! Instruction selection of comparisons, the conditional branches and selects that read them, and the 128-bit comparisons.
+//! Instruction selection for x86-64 of comparisons, the conditional branches and selects that read them, the 128-bit comparisons, and jump tables.
 
 /// How the flags a comparison sets answer it: one condition, both of two, or either of two.
 enum FlagTest derives Copy, Eq {
@@ -30,21 +30,6 @@ fn int_cond(cond: clif::IntCC) -> x64::Cond {
         clif::IntCC.UnsignedLessThanOrEqual => x64::Cond.BelowOrEqual
     }
 } int_cond
-
-/// The comparison of the operands in the other order that holds exactly when `cond` does.
-fn swapped(cond: clif::IntCC) -> clif::IntCC {
-    return match cond {
-        clif::IntCC.SignedLessThan => clif::IntCC.SignedGreaterThan
-        clif::IntCC.SignedGreaterThanOrEqual => clif::IntCC.SignedLessThanOrEqual
-        clif::IntCC.SignedGreaterThan => clif::IntCC.SignedLessThan
-        clif::IntCC.SignedLessThanOrEqual => clif::IntCC.SignedGreaterThanOrEqual
-        clif::IntCC.UnsignedLessThan => clif::IntCC.UnsignedGreaterThan
-        clif::IntCC.UnsignedGreaterThanOrEqual => clif::IntCC.UnsignedLessThanOrEqual
-        clif::IntCC.UnsignedGreaterThan => clif::IntCC.UnsignedLessThan
-        clif::IntCC.UnsignedLessThanOrEqual => clif::IntCC.UnsignedGreaterThanOrEqual
-        else => cond
-    }
-} swapped
 
 /// Sets the flags comparing two integers at their type's width: `test` against zero, `cmp` with
 /// an immediate when one side is a constant that fits, else `cmp`.
@@ -155,7 +140,7 @@ fn Selector.set_flag(mut self, func: clif::Function, inst: clif::Inst, outcome: 
     mut self.write_flag(dst, outcome)
 } Selector.set_flag
 
-fn Selector.write_flag(mut self, dst: x64::Reg, outcome: FlagTest) {
+fn Selector.write_flag(mut self, dst: machinst::Reg, outcome: FlagTest) {
     match outcome {
         FlagTest.One(cond) => mut self.emit(x64::Inst.Setcc(cond: cond, dst: dst))
         FlagTest.Both(left: left, right: right) => mut self.combine(dst, left, right, op: x64::AluOp.And)
@@ -163,7 +148,7 @@ fn Selector.write_flag(mut self, dst: x64::Reg, outcome: FlagTest) {
     }
 } Selector.write_flag
 
-fn Selector.combine(mut self, dst: x64::Reg, left: x64::Cond, right: x64::Cond, op: x64::AluOp) {
+fn Selector.combine(mut self, dst: machinst::Reg, left: x64::Cond, right: x64::Cond, op: x64::AluOp) {
     let other = mut self.temp(false)
     mut self.emit(x64::Inst.Setcc(cond: left, dst: dst))
     mut self.emit(x64::Inst.Setcc(cond: right, dst: other))
@@ -174,7 +159,7 @@ fn Selector.combine(mut self, dst: x64::Reg, left: x64::Cond, right: x64::Cond, 
 /// `c` is or tests against zero, made again for each reader, else those of testing `c` against
 /// zero.
 fn Selector.condition(mut self, func: clif::Function, c: clif::Value) -> FlagTest {
-    let Some(decided) = self.decider(func, value: c) else {
+    let Some(decided) = self.facts.decider(func, value: c) else {
         let reg = mut self.src(c, func)
         let size = exact_size(func.value_type(c))
         mut self.emit(x64::Inst.Test(size: size, lhs: reg, rhs: reg))
@@ -198,73 +183,6 @@ fn Selector.condition(mut self, func: clif::Function, c: clif::Value) -> FlagTes
     return outcome
 } Selector.condition
 
-/// A comparison deciding whether a value is not zero, holding exactly then or, when
-/// `inverted`, exactly otherwise.
-struct Decider derives Copy, Eq {
-    compare: clif::Inst
-    inverted: bool
-} Decider
-
-/// The comparison deciding whether a value is not zero: the one defining it, the one deciding a
-/// value it extends or tests against zero, or the one deciding the condition of a select of 1 and
-/// 0 defining it.
-fn Selector.decider(self, func: clif::Function, value: clif::Value) -> Option[Decider] {
-    var current = value
-    var inverted = false
-    loop {
-        let at = usize.widen(func.resolve_aliases(current).index)
-        expect at < self.defs.len()
-        let def = self.defs[at]
-        if def == NONE {
-            return None
-        }
-        let inst = clif::Inst(index: def)
-        match func.inst_data(inst) {
-            clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
-                if (cond == clif::IntCC.Equal or cond == clif::IntCC.NotEqual) and self.constant(y, func) == Some(0) and self.constant(x, func).is_none() and self.is_flag(func, value: x) {
-                    current = x
-                    inverted = inverted != (cond == clif::IntCC.Equal)
-                    continue
-                }
-                return Some(Decider(compare: inst, inverted: inverted))
-            }
-            clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => return Some(Decider(compare: inst, inverted: inverted))
-            clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => {
-                current = arg
-            }
-            clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: c, y: chosen, z: other) => {
-                let picked = self.constant(chosen, func)
-                let left = self.constant(other, func)
-                if picked == Some(1) and left == Some(0) {
-                    current = c
-                } else if picked == Some(0) and left == Some(1) {
-                    current = c
-                    inverted = not inverted
-                } else {
-                    return None
-                }
-            }
-            else => return None
-        }
-    }
-} Selector.decider
-
-/// Whether a value is a comparison's flag or one extended or chosen from 1 and 0 by a select.
-fn Selector.is_flag(self, func: clif::Function, value: clif::Value) -> bool {
-    let at = usize.widen(func.resolve_aliases(value).index)
-    expect at < self.defs.len()
-    let def = self.defs[at]
-    if def == NONE {
-        return false
-    }
-    return match func.inst_data(clif::Inst(index: def)) {
-        clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
-        clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => self.is_flag(func, value: arg)
-        clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: _, y: chosen, z: other) => (self.constant(chosen, func) == Some(1) and self.constant(other, func) == Some(0)) or (self.constant(chosen, func) == Some(0) and self.constant(other, func) == Some(1))
-        else => false
-    }
-} Selector.is_flag
-
 /// The one condition a flag test reads, combining a test of two into a flag tested again.
 fn Selector.single(mut self, outcome: FlagTest) -> x64::Cond {
     let FlagTest.One(cond) = outcome else {
@@ -281,7 +199,7 @@ fn Selector.single(mut self, outcome: FlagTest) -> x64::Cond {
 fn Selector.select_value(mut self, func: clif::Function, inst: clif::Inst, c: clif::Value, x: clif::Value, y: clif::Value) {
     let outcome = mut self.condition(func, c)
     let ty = func.value_type(x)
-    let Some(flag_test) = flag_choice(outcome, chosen: self.constant(x, func), other: self.constant(y, func)) else {
+    let Some(flag_test) = flag_choice(outcome, chosen: self.facts.constant(x, func), other: self.facts.constant(y, func)) else {
         mut self.select_move(func, inst, outcome, x, y)
         return
     }
@@ -338,9 +256,9 @@ fn Selector.select_move(mut self, func: clif::Function, inst: clif::Inst, outcom
 fn Selector.brif(mut self, func: clif::Function, block: clif::Block, c: clif::Value, then_block: clif::Block, else_block: clif::Block) {
     let outcome = mut self.condition(func, c)
     let at = usize.widen(block.index)
-    expect at < self.then_edges.len() and at < self.else_edges.len()
-    let taken = self.target_of(self.then_edges[at], block: then_block)
-    let other = self.target_of(self.else_edges[at], block: else_block)
+    expect at < self.facts.then_edges.len() and at < self.facts.else_edges.len()
+    let taken = self.facts.target_of(self.facts.then_edges[at], block: then_block)
+    let other = self.facts.target_of(self.facts.else_edges[at], block: else_block)
     match outcome {
         FlagTest.One(cond) => mut self.emit(x64::Inst.Jcc(cond: cond, label: taken))
         FlagTest.Both(left: left, right: right) => {
@@ -357,10 +275,28 @@ fn Selector.brif(mut self, func: clif::Function, block: clif::Block, c: clif::Va
     mut self.code.succs.push(other)
 } Selector.brif
 
-/// Where an edge of a conditional branch jumps: the block passing its arguments, or its target.
-fn Selector.target_of(self, edge: u32, block: clif::Block) -> u32 {
-    if edge != NONE {
-        return edge
+/// A chain's branches: its value, zero-extended and less the smallest constant, indexing a table
+/// of the targets when within the constants' span, else a jump to the default.
+fn Selector.jump_table(mut self, func: clif::Function, index: u32) {
+    let JumpTable(value: tested, low: low, span: span, default: default, entries: entries, reached: reached) = self.facts.jump_table(index)
+    let value = mut self.src(tested, func)
+    let offset_index = mut self.temp(false)
+    match func.value_type(tested).bits() {
+        8 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx8, dst: offset_index, src: value))
+        16 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx16, dst: offset_index, src: value))
+        32 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx32, dst: offset_index, src: value))
+        else => mut self.mov(offset_index, src: value)
     }
-    return self.position_of(self.destination(block))
-} Selector.target_of
+    if low != 0 {
+        mut self.emit(x64::Inst.AluImm(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: offset_index, imm: i32.fit(low)))
+    }
+    mut self.emit(x64::Inst.CmpImm(size: x64::Size.Qword, lhs: offset_index, imm: i32.fit(span)))
+    mut self.emit(x64::Inst.Jcc(cond: x64::Cond.Above, label: default))
+    for label in reached {
+        mut self.code.succs.push(label)
+    }
+    let table = mut self.code.add_table(entries.view())
+    let base = mut self.temp(false)
+    let offset = mut self.temp(false)
+    mut self.emit(x64::Inst.JumpTable(index: offset_index, base: base, temp: offset, table: table))
+} Selector.jump_table

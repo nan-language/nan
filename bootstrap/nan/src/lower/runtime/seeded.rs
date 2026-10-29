@@ -335,7 +335,7 @@ fn yield_point(lo: &mut Lowering, fx: &mut Fx) {
                 let thread = lo.thread(fx);
                 let scheduler = fx.offset(thread, thread::CONTEXT);
                 let context = fx.offset(record, task::CONTEXT);
-                fx.b.ins().stack_switch(context, scheduler, record);
+                lo.switch_stacks(fx, context, scheduler, record);
                 Vec::new()
             },
         );

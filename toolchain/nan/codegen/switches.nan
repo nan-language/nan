@@ -1,4 +1,4 @@
-//! Instruction selection of chains of branches testing one value against constants: a jump through a table of their targets.
+//! The chains of branches testing one value for equality with constants that become jump tables.
 
 /// The fewest constants a chain tests to become a jump table.
 const TABLE_CASES: usize = 6
@@ -271,29 +271,25 @@ fn is_dense(keys: Slice[u64]) -> bool {
     return low <= 0x7FFF_FFFF and span < TABLE_ENTRIES and span < 4 * u64.widen(keys.len())
 } is_dense
 
-/// The index of the chain a block heads, `NONE` for one heading none.
-fn Selector.switch_of(self, block: clif::Block) -> u32 {
-    let at = usize.widen(block.index)
-    expect at < self.switches.heads.len()
-    return self.switches.heads[at]
-} Selector.switch_of
+/// A chain's jump table: the value it tests, its smallest constant and how far the largest lies
+/// above it, the position of the block a value outside them reaches, the positions each constant
+/// from the smallest on reaches, and the positions the table reaches, the default's first.
+struct JumpTable {
+    value: clif::Value
+    low: u64
+    span: u64
+    default: u32
+    entries: mem::List[u32]
+    reached: mem::List[u32]
+} JumpTable
 
-/// A chain's branches: its value, zero-extended and less the smallest constant, indexing a table
-/// of the targets when within the constants' span, else a jump to the default.
-fn Selector.jump_table(mut self, func: clif::Function, index: u32) {
-    expect usize.widen(index) < self.switches.chains.len()
+/// The jump table of the chain at an index.
+fn Facts.jump_table(self, index: u32) -> JumpTable {
     let at = usize.widen(index)
-    let tested = self.switches.chains[at].value
-    let otherwise = self.switches.chains[at].default
-    var keys = mem::List[u64].empty(self.alloc)
-    var labels = mem::List[u32].empty(self.alloc)
-    for key in self.switches.chains[at].keys {
-        mut keys.push(key)
-    }
-    for target in self.switches.chains[at].targets {
-        mut labels.push(self.position_of(self.destination(target)))
-    }
-    expect keys.len() > 0 and keys.len() == labels.len()
+    expect at < self.switches.chains.len()
+    let keys = self.switches.chains[at].keys.view()
+    let targets = self.switches.chains[at].targets.view()
+    expect keys.len() > 0 and keys.len() == targets.len()
     var low = keys[0]
     var high = keys[0]
     for key in keys {
@@ -304,35 +300,16 @@ fn Selector.jump_table(mut self, func: clif::Function, index: u32) {
             high = key
         }
     }
-    let value = mut self.src(tested, func)
-    let offset_index = mut self.temp(false)
-    match func.value_type(tested).bits() {
-        8 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx8, dst: offset_index, src: value))
-        16 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx16, dst: offset_index, src: value))
-        32 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx32, dst: offset_index, src: value))
-        else => mut self.mov(offset_index, src: value)
-    }
-    if low != 0 {
-        mut self.emit(x64::Inst.AluImm(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: offset_index, imm: i32.fit(low)))
-    }
-    mut self.emit(x64::Inst.CmpImm(size: x64::Size.Qword, lhs: offset_index, imm: i32.fit(high - low)))
-    let default = self.position_of(self.destination(otherwise))
-    mut self.emit(x64::Inst.Jcc(cond: x64::Cond.Above, label: default))
+    let default = self.position_of(self.destination(self.switches.chains[at].default))
     var reached = mem::List[u32].empty(self.alloc)
     mut reached.push(default)
     var entries = filled(usize.widen(high - low) + 1, value: default, alloc: self.alloc)
     for case in 0..<keys.len() {
-        let label = labels[case]
+        let label = self.position_of(self.destination(targets[case]))
         entries[usize.widen(keys[case] - low)] = label
         if reached.position(fn(succ: u32) => succ == label).is_none() {
             mut reached.push(label)
         }
     }
-    for label in reached {
-        mut self.code.succs.push(label)
-    }
-    let table = mut self.code.add_table(entries.view())
-    let base = mut self.temp(false)
-    let offset = mut self.temp(false)
-    mut self.emit(x64::Inst.JumpTable(index: offset_index, base: base, temp: offset, table: table))
-} Selector.jump_table
+    return JumpTable(value: self.switches.chains[at].value, low: low, span: high - low, default: default, entries: take entries, reached: take reached)
+} Facts.jump_table

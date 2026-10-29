@@ -19,6 +19,7 @@ use super::super::super::{Glue, Lowering};
 use super::super::{Supply, tasks as task_ops};
 use super::forward;
 use crate::check::ty::{FnTy, Ty};
+use crate::workspace::Arch;
 
 /// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it on
 /// a machine target and their state restored after.
@@ -129,7 +130,9 @@ pub fn device_value(lo: &mut Lowering, value_ty: &Ty) -> u64 {
 /// `install` moves the device into a new record, and on a machine target binds its vector to
 /// it, unless the final build or another installation binds that vector; `with` takes the
 /// record's lock around its body; `uninstall` unbinds the vector and waits until no CPU runs the
-/// interrupt fn for it, then moves the device out of the freed record.
+/// interrupt fn for it, then moves the device out of the freed record. On AArch64, where the
+/// interrupt controller delivers only the interrupts enabled on it, binding a vector from 32 up
+/// enables its interrupt and unbinding disables it.
 pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let value_at = device_value(lo, &value_ty);
@@ -218,11 +221,23 @@ fn bind(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, record: 
     fx.when(taken, |fx| {
         report::raise_kind(lo, fx, "trap.duplicate-access")
     });
+    if lo.ck.db.target.arch() == Some(Arch::Aarch64) {
+        let shared =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, vector, 32);
+        fx.when(shared, |fx| lo.aarch64_enable(fx, vector));
+    }
 }
 
 /// Unbinds a device record's vector and waits until no CPU runs its interrupt fn.
 fn unbind(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let vector = fx.load(PTR, record, device::VECTOR);
+    if lo.ck.db.target.arch() == Some(Arch::Aarch64) {
+        let shared =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, vector, 32);
+        fx.when(shared, |fx| lo.aarch64_disable(fx, vector));
+    }
     let slot = lo.irq_binding(fx, vector);
     let unbound = fx.ptr(0);
     fx.b.ins()

@@ -1,11 +1,21 @@
-//! The emulator the machine targets' descriptors name: whether it can start, the invocation booting a machine image under it, and boots bounded in host processor time.
-
-/// The emulator program.
-const QEMU: Str = "qemu-system-x86_64"
+//! The emulator the machine targets' descriptors name: whether a target's images can run on this machine, the invocation booting a machine image under the emulator, and boots bounded in host processor time.
 
 /// The firmware an `x86_64-uefi` image boots through, and its fallbacks across distributions,
 /// separated by spaces.
 const OVMF: Str = "/usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd"
+
+/// The firmware an `aarch64-uefi` image boots through, each a flash image padded to the size of
+/// the `virt` board's flash, and its fallbacks across distributions, separated by spaces.
+const AAVMF: Str = "/usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw"
+
+/// The emulator program of an architecture's machine targets.
+fn program(arch: workspace::Arch, alloc: mem::Alloc) -> text::String {
+    let name = match arch {
+        workspace::Arch.Amd64 => "qemu-system-x86_64"
+        workspace::Arch.Aarch64 => "qemu-system-aarch64"
+    }
+    return text::String.of(name, alloc)
+} program
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pkg const OTHER_END: u8 = 70
@@ -29,11 +39,20 @@ const USER_TIME: usize = 11
 
 const SYSTEM_TIME: usize = 12
 
-/// The emulator arguments common to every machine run, separated by spaces: the machine,
+/// The emulator arguments common to every machine run of an architecture: the machine, on x86_64
 /// accelerated by KVM where the host offers it, processors, memory, entropy device, exit port,
 /// serial port on the standard streams, no display or reboot, and an end with the process that
 /// starts it.
-const BASE_ARGS: Str = "-run-with exit-with-parent=on -machine q35 -accel kvm -accel tcg -smp 4 -m 512M -device virtio-rng-pci -device isa-debug-exit,iobase=0xf4,iosize=0x01 -display none -no-reboot -nodefaults -serial stdio -monitor none"
+fn base_args(arch: workspace::Arch, alloc: mem::Alloc) -> mem::List[text::String] {
+    let machine = match arch {
+        workspace::Arch.Amd64 => "-machine q35 -accel kvm -accel tcg -device virtio-rng-pci -device isa-debug-exit,iobase=0xf4,iosize=0x01"
+        workspace::Arch.Aarch64 => "-machine virt,gic-version=3 -cpu cortex-a72 -accel tcg -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native"
+    }
+    var written = text::String.of("-run-with exit-with-parent=on -smp 4 -m 512M ", alloc)
+    mut written.append(machine)
+    mut written.append(" -display none -no-reboot -nodefaults -serial stdio -monitor none")
+    return words_of(written.as_str(), alloc)
+} base_args
 
 /// The words of a text separated by spaces.
 fn words_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -54,7 +73,7 @@ fn words_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     return parts
 } words_of
 
-/// What `nan run` starts once it has built an image: the image on `x86_64-host`, the emulator
+/// What `nan run` starts once it has built an image: the image on a host target, the emulator
 /// booting it on a machine target, and its arguments.
 pkg struct Launch {
     pkg program: text::String
@@ -75,15 +94,22 @@ pkg fn Launch.start(self, alloc: mem::Alloc) -> u8 {
     return 101
 } Launch.start
 
-/// Whether the emulator of a machine target can start: the emulator program runs and can end
-/// with the process that starts it, and OVMF is present for `x86_64-uefi`.
+/// Whether a target's images can run on this machine: a host target's when the machine has its
+/// architecture, and a machine target's when its emulator can start, the emulator program running
+/// and able to end with the process that starts it, and the firmware present for a UEFI target.
 pkg fn available(target: workspace::Target, alloc: mem::Alloc) -> bool {
+    let Some(arch) = target.arch() else {
+        return false
+    }
+    if target.is_host() {
+        return arch == workspace::Arch.running()
+    }
     let args = words_of("-run-with help", alloc)
-    let runs = match attempt platform::run_output(QEMU, args: args.view(), input: None, capture_errors: false, alloc) {
+    let runs = match attempt platform::run_output(program(arch, alloc).as_str(), args: args.view(), input: None, capture_errors: false, alloc) {
         Ok(ran) => holds(ran.stdout.view(), wanted: b"exit-with-parent")
         Err(_) => false
     }
-    return runs and (target != workspace::Target.Uefi or firmware(alloc).is_some())
+    return runs and (target.kind() != Some(workspace::Kind.Uefi) or platform::exists(firmware(arch, alloc).as_str()))
 } available
 
 /// Whether bytes hold a run of bytes.
@@ -118,26 +144,26 @@ fn run_status(ended: Result[platform::Status, platform::IoError]) -> u8 {
     let Ok(platform::Status.Exited(code)) = ended else {
         return OTHER_END
     }
-    let Some(value) = u32.checked_fit(code) else {
-        return OTHER_END
+    return match first u8.checked_fit(code) {
+        Some(status) if status % 2 == 1 => status / 2
+        else => OTHER_END
     }
-    if value % 2 != 1 {
-        return OTHER_END
-    }
-    let Some(status) = u8.checked_fit((value - 1) / 2) else {
-        return OTHER_END
-    }
-    return status
 } run_status
 
-/// The OVMF firmware present on the host.
-fn firmware(alloc: mem::Alloc) -> Option[text::String] {
-    for path in words_of(OVMF, alloc) {
+/// The firmware of an architecture's UEFI target: the first of its paths present on the host, or
+/// the first of them when none is.
+fn firmware(arch: workspace::Arch, alloc: mem::Alloc) -> text::String {
+    let listed = match arch {
+        workspace::Arch.Amd64 => OVMF
+        workspace::Arch.Aarch64 => AAVMF
+    }
+    var paths = words_of(listed, alloc)
+    for path in paths {
         if platform::exists(path.as_str()) {
-            return Some(text::String.of(path.as_str(), alloc))
+            return text::String.of(path.as_str(), alloc)
         }
     }
-    return None
+    return mut paths.remove(0)
 } firmware
 
 /// What becomes of what a machine writes to its boot volume.
@@ -148,26 +174,21 @@ pkg enum Writes derives Copy, Eq {
     Dropped
 } Writes
 
-/// The emulator invocation that boots a machine image: an `x86_64-bare` image directly through
-/// the PVH boot protocol, an `x86_64-uefi` image through OVMF from a FAT volume holding it as
-/// `/EFI/BOOT/BOOTX64.EFI` and each of `files` at `/` followed by its name.
+/// The emulator invocation that boots a machine image: a bare image directly, by the PVH boot
+/// protocol on x86_64 and by loading its segments on AArch64, and a UEFI image through the
+/// firmware from a FAT volume holding it at the default boot path and each of `files` at `/`
+/// followed by its name.
 pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String], writes: Writes, alloc: mem::Alloc) -> Launch fails platform::IoError {
-    var args = words_of(BASE_ARGS, alloc)
-    if target == workspace::Target.Uefi {
-        var chosen = text::String.empty(alloc)
-        match firmware(alloc) {
-            Some(found) => {
-                chosen = found
-            }
-            None => {
-                var paths = words_of(OVMF, alloc)
-                chosen = mut paths.remove(0)
-            }
-        }
-        let volume = try boot_volume(image, files, alloc)
+    let Some(arch) = target.arch() else {
+        expect false
+        fail platform::IoError.NotFound
+    }
+    var args = base_args(arch, alloc)
+    if target.kind() == Some(workspace::Kind.Uefi) {
+        let volume = try boot_volume(arch, image, files, alloc)
         mut args.push(text::String.of("-drive", alloc))
         var drive = text::String.of("if=pflash,format=raw,unit=0,readonly=on,file=", alloc)
-        mut drive.append(chosen.as_str())
+        mut drive.append(firmware(arch, alloc).as_str())
         mut args.push(take drive)
         mut args.push(text::String.of("-drive", alloc))
         var disk = text::String.empty(alloc)
@@ -187,19 +208,23 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
         mut args.push(text::String.of("-kernel", alloc))
         mut args.push(text::String.of(image, alloc))
     }
-    return Launch(program: text::String.of(QEMU, alloc), args: take args, emulated: true)
+    return Launch(program: program(arch, alloc), args: take args, emulated: true)
 } launch
 
 /// The FAT boot volume of a UEFI image: a directory beside it holding the image as the default
-/// boot path the firmware loads, and each of `files` at its root.
-fn boot_volume(image: Str, files: Slice[text::String], alloc: mem::Alloc) -> text::String fails platform::IoError {
+/// boot path the firmware of its architecture loads, and each of `files` at its root.
+fn boot_volume(arch: workspace::Arch, image: Str, files: Slice[text::String], alloc: mem::Alloc) -> text::String fails platform::IoError {
     let directory = volume_of(image, alloc)
     if platform::exists(directory.as_str()) {
         try platform::remove_dir_all(directory.as_str(), alloc)
     }
     let boot_dir = platform::join(directory.as_str(), name: "EFI/BOOT", alloc)
     try platform::create_dir_all(boot_dir.as_str(), alloc)
-    try copy_file(image, to: platform::join(boot_dir.as_str(), name: "BOOTX64.EFI", alloc).as_str(), alloc)
+    let default = match arch {
+        workspace::Arch.Amd64 => "BOOTX64.EFI"
+        workspace::Arch.Aarch64 => "BOOTAA64.EFI"
+    }
+    try copy_file(image, to: platform::join(boot_dir.as_str(), name: default, alloc).as_str(), alloc)
     for file in files {
         let Some(name) = platform::file_name(file.as_str(), alloc) else {
             expect false

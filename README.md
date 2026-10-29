@@ -10,7 +10,7 @@ On Linux x86_64:
 curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | sh
 ```
 
-The script installs `nan`, the NaN toolchain built by itself, as `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory and `NAN_VERSION` another release, such as `v0.1.0`. Building programs for `x86_64-host` requires a C compiler available as `cc`, which links them; running and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU 10.2 or later (`qemu-system-x86_64`) and OVMF.
+The script installs `nan`, the NaN toolchain built by itself, as `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory and `NAN_VERSION` another release, such as `v0.1.0`. Building programs for `x86_64-host` requires a C compiler available as `cc`, which links them, and for `aarch64-host` off an AArch64 machine the GNU cross compiler `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`), and the `uefi` targets their firmware, OVMF and AAVMF.
 
 ## Specification
 
@@ -27,7 +27,7 @@ nan run
 nan test
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting an `x86_64-uefi` or `x86_64-bare` image under QEMU with its serial port on the terminal. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names. `nan show <path> --api` prints the head, contracts and digest of any item, std included, and `nan primer` the primer.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting a UEFI or bare image under QEMU with its serial port on the terminal. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names. `nan show <path> --api` prints the head, contracts and digest of any item, std included, and `nan primer` the primer.
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 
@@ -55,7 +55,7 @@ The first command installs the Rust toolchain pinned in `rust-toolchain.toml`. T
 | `cargo nextest run -p nan --test programs -E 'test(/<program>/)'` | Build and run one program of `bootstrap/nan/tests/programs`, given by its directory name |
 | `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |
 | `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN toolchain of `toolchain/` with the bootstrap on one chapter, std package, program or the toolchain, which it then builds twice to check itself (`toolchain`) |
-| `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenario and the NaN toolchain against the bound of the freeze |
+| `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenarios and the NaN toolchain against the bound of the freeze |
 | `cargo run -p nanbench -- tokens`, `measure`, `corpus`, `run <model>`, `report` | Nanbench: the primer tiers' token counts, the measurements of the freeze, a check of the task corpus, a model's run of it (`ANTHROPIC_API_KEY`) and the metrics, written under `bootstrap/nanbench/results/` |
 
 ## License

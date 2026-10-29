@@ -11,9 +11,9 @@ use crate::emulator::{self, Writes};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
-use crate::workspace::{Target, Workspace};
+use crate::workspace::{Kind, Target, Workspace};
 
-/// What `nan run` starts once it has built an image: the image on `x86_64-host`, the emulator
+/// What `nan run` starts once it has built an image: the image on a host target, the emulator
 /// booting it on a machine target, and its arguments.
 pub struct Launch {
     pub program: PathBuf,
@@ -53,7 +53,7 @@ pub fn run(
     let compared = invocation.value("--compare-with");
     let host = programs.iter().all(|program| {
         let manifest = workspace.packages[*program].manifest.as_ref();
-        manifest.is_some_and(|manifest| manifest.targets.contains(&Target::Host))
+        manifest.is_some_and(|manifest| manifest.targets.iter().any(|target| target.is_host()))
     });
     let unusable = programs.is_empty()
         || (invocation.name == Name::Run && !single)
@@ -89,15 +89,15 @@ pub fn run(
         let image = images.pop().expect("a built image");
         let path = workspace.root.join(&image);
         let target = workspace.packages[programs[0]].program_target();
-        if target.is_machine() && !emulator::available(target) {
+        if !emulator::available(target) {
             return Ok(Outcome::Ended(emulator::OTHER_END));
         }
-        let launch = match target {
-            Target::Uefi => {
-                let files = volume_files(workspace, &path)?;
+        let launch = match target.kind() {
+            Some(Kind::Uefi) => {
+                let files = volume_files(workspace, target, &path)?;
                 emulator::launch(target, &path, &files, Writes::Kept)?
             }
-            Target::Bare => emulator::launch(target, &path, &[], Writes::Kept)?,
+            Some(Kind::Bare) => emulator::launch(target, &path, &[], Writes::Kept)?,
             _ => Launch {
                 program: path,
                 args: invocation.passed.to_vec(),
@@ -134,12 +134,17 @@ pub fn run(
     Ok(Outcome::Output(output))
 }
 
-/// The image files of the workspace's machine programs other than `image`, which the boot volume
-/// of an `x86_64-uefi` image holds under `nan run`.
-fn volume_files(workspace: &Workspace, image: &Path) -> io::Result<Vec<PathBuf>> {
+/// The image files of the workspace's programs for the machine targets of a UEFI target's
+/// architecture, other than `image`, which the boot volume of that UEFI target's image holds
+/// under `nan run`.
+fn volume_files(workspace: &Workspace, uefi: Target, image: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for target in [Target::Uefi, Target::Bare] {
-        let directory = workspace.root.join(".nan/images").join(target.name());
+    let arch = uefi.arch().expect("a UEFI target's architecture");
+    for kind in [Kind::Uefi, Kind::Bare] {
+        let directory = workspace
+            .root
+            .join(".nan/images")
+            .join(Target::of(arch, kind).name());
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };

@@ -1,0 +1,545 @@
+//! What instruction selection knows of a function before it selects an instruction: which instruction defines each value and how often reachable code uses it, the blocks in the order emission lays them out with the blocks the edges of conditional branches go through, where jumps land, the chains of branches becoming jump tables, the stack slots' layout, and the values whose definitions selection folds: constants, the comparisons deciding a flag, and shifts.
+
+/// What selection knows of a function before it selects an instruction.
+struct Facts {
+    alloc: mem::Alloc
+    /// How many times each value is used.
+    use_counts: mem::List[u32]
+    /// The index of the instruction defining each value, `NONE` for a block parameter.
+    defs: mem::List[u32]
+    /// Each block's index in the code, `NONE` for one no path from the entry reaches.
+    positions: mem::List[u32]
+    /// The block a jump to each block lands in: past the blocks holding only a jump without
+    /// arguments.
+    destinations: mem::List[u32]
+    /// The chains of branches becoming jump tables.
+    switches: Switches
+    /// For each block ending in a conditional branch, the index of the block each edge passing
+    /// arguments goes through, `NONE` for an edge without arguments.
+    then_edges: mem::List[u32]
+    else_edges: mem::List[u32]
+} Facts
+
+fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
+    let values = usize.widen(func.value_count())
+    let blocks = block_count(func, alloc)
+    var known = Facts(
+        alloc: alloc,
+        use_counts: filled(values, value: 0u32, alloc),
+        defs: filled(values, value: NONE, alloc),
+        positions: filled(blocks, value: NONE, alloc),
+        destinations: destinations(func, count: blocks, alloc),
+        switches: find_switches(func, count: blocks, alloc),
+        then_edges: filled(blocks, value: NONE, alloc),
+        else_edges: filled(blocks, value: NONE, alloc),
+    )
+    mut known.place_blocks(func)
+    mut known.count_values(func)
+    return known
+} Facts.of
+
+/// The stack slots of a function laid out above an outgoing argument area: each slot's offset
+/// from the stack pointer, where the slots end, and the largest alignment one asks, at least 16.
+struct SlotLayout {
+    offsets: mem::List[u32]
+    end: u32
+    align: u32
+} SlotLayout
+
+/// Lays out the stack slots above `outgoing` bytes of arguments, each aligned as it asks and at
+/// least to 8 bytes.
+fn lay_out_slots(func: clif::Function, outgoing: u32, alloc: mem::Alloc) -> SlotLayout {
+    var align: u32 = 16
+    for index in 0u32..<func.stack_slot_count() {
+        align = larger(align, other: slot_align(func.stack_slot_data(clif::StackSlot(index: index))))
+    }
+    var offsets = mem::List[u32].empty(alloc)
+    var end = round_up(outgoing, to: align)
+    for index in 0u32..<func.stack_slot_count() {
+        let data = func.stack_slot_data(clif::StackSlot(index: index))
+        let start = round_up(end, to: slot_align(data))
+        mut offsets.push(start)
+        end = start + data.size
+    }
+    return SlotLayout(offsets: take offsets, end: end, align: align)
+} lay_out_slots
+
+/// One more than the highest block index the layout holds.
+fn block_count(func: clif::Function, alloc: mem::Alloc) -> usize {
+    var count: usize = 0
+    for block in func.layout_blocks(alloc) {
+        if usize.widen(block.index) >= count {
+            count = usize.widen(block.index) + 1
+        }
+    }
+    return count
+} block_count
+
+/// The block a jump to each block lands in: the end of the chain of blocks other than the entry
+/// that hold only a jump without arguments, or a block of the chain when it loops.
+fn destinations(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List[u32] {
+    var next = filled(count, value: NONE, alloc)
+    let entry = func.entry_block()
+    for block in func.layout_blocks(alloc) {
+        if entry == Some(block) or func.block_params(block, alloc).len() > 0 {
+            continue
+        }
+        let insts = func.block_insts(block, alloc)
+        if insts.len() != 1 {
+            continue
+        }
+        let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(insts[0]) else {
+            continue
+        }
+        expect usize.widen(block.index) < next.len()
+        if destination.args.len() == 0 and usize.widen(destination.block.index) < count {
+            next[usize.widen(block.index)] = destination.block.index
+        }
+    }
+    var found = filled(count, value: NONE, alloc)
+    for index in 0..<count {
+        invariant next.len() == count and found.len() == count
+        var walk = u32.fit(index)
+        var steps: usize = 0
+        while next[usize.widen(walk)] != NONE and found[usize.widen(walk)] == NONE and steps < count {
+            walk = next[usize.widen(walk)]
+            steps += 1
+        }
+        if found[usize.widen(walk)] != NONE {
+            found[index] = found[usize.widen(walk)]
+        } else if next[usize.widen(walk)] == NONE {
+            found[index] = walk
+        } else {
+            found[index] = u32.fit(index)
+        }
+    }
+    return found
+} destinations
+
+/// The block a jump to a block lands in.
+fn Facts.destination(self, block: clif::Block) -> clif::Block {
+    let at = usize.widen(block.index)
+    expect at < self.destinations.len()
+    return clif::Block(index: self.destinations[at])
+} Facts.destination
+
+/// Whether both edges of a conditional branch land in one block without arguments.
+fn Facts.merges(self, then_call: clif::BlockCall, else_call: clif::BlockCall) -> bool {
+    return then_call.args.len() == 0 and else_call.args.len() == 0 and self.destination(then_call.block) == self.destination(else_call.block)
+} Facts.merges
+
+/// The blocks a block's terminator lands in.
+fn Facts.successors(self, func: clif::Function, block: clif::Block) -> mem::List[clif::Block] {
+    var found = mem::List[clif::Block].empty(self.alloc)
+    let chain = self.switch_of(block)
+    if chain != NONE {
+        expect usize.widen(chain) < self.switches.chains.len()
+        for target in self.switches.chains[usize.widen(chain)].targets {
+            mut found.push(self.destination(target))
+        }
+        mut found.push(self.destination(self.switches.chains[usize.widen(chain)].default))
+        return found
+    }
+    let insts = func.block_insts(block, alloc: self.alloc)
+    if insts.len() == 0 {
+        return found
+    }
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => mut found.push(self.destination(destination.block))
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            mut found.push(self.destination(then_call.block))
+            mut found.push(self.destination(else_call.block))
+        }
+        else => {}
+    }
+    return found
+} Facts.successors
+
+/// Whether a path from the entry reaches each block.
+fn Facts.reachable(self, func: clif::Function) -> mem::List[bool] {
+    let alloc = self.alloc
+    let count = self.positions.len()
+    var seen = filled(count, value: false, alloc)
+    var pending = mem::List[clif::Block].empty(alloc)
+    let Some(entry) = func.entry_block() else {
+        return seen
+    }
+    expect usize.widen(entry.index) < seen.len()
+    seen[usize.widen(entry.index)] = true
+    mut pending.push(entry)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        for next in self.successors(func, block) {
+            let at = usize.widen(next.index)
+            expect at < seen.len()
+            if not seen[at] {
+                seen[at] = true
+                mut pending.push(next)
+            }
+        }
+    }
+    return seen
+} Facts.reachable
+
+/// The reachable blocks in the order emission lays them out: those not cold in layout order,
+/// then the cold ones.
+fn Facts.order(self, func: clif::Function) -> mem::List[clif::Block] {
+    var order = mem::List[clif::Block].empty(self.alloc)
+    let laid_out = func.layout_blocks(self.alloc)
+    for block in laid_out {
+        if self.position_of(block) != NONE and not func.is_cold(block) {
+            mut order.push(block)
+        }
+    }
+    for block in laid_out {
+        if self.position_of(block) != NONE and func.is_cold(block) {
+            mut order.push(block)
+        }
+    }
+    return order
+} Facts.order
+
+/// A block's index in the code, `NONE` for one no path from the entry reaches.
+fn Facts.position_of(self, block: clif::Block) -> u32 {
+    let at = usize.widen(block.index)
+    expect at < self.positions.len()
+    return self.positions[at]
+} Facts.position_of
+
+/// Numbers the reachable blocks in emission order, each followed by the blocks its conditional
+/// branch's edges with arguments go through.
+fn Facts.place_blocks(mut self, func: clif::Function) {
+    let seen = self.reachable(func)
+    for index in 0..<seen.len() {
+        if seen[index] {
+            expect index < self.positions.len()
+            self.positions[index] = 0
+        }
+    }
+    var next: u32 = 0
+    for block in self.order(func) {
+        let at = usize.widen(block.index)
+        expect at < self.positions.len() and at < self.then_edges.len() and at < self.else_edges.len()
+        self.positions[at] = next
+        next += 1
+        let insts = func.block_insts(block, alloc: self.alloc)
+        if insts.len() == 0 {
+            continue
+        }
+        let clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+            continue
+        }
+        if self.merges(then_call, else_call) {
+            continue
+        }
+        if then_call.args.len() > 0 {
+            self.then_edges[at] = next
+            next += 1
+        }
+        if else_call.args.len() > 0 {
+            self.else_edges[at] = next
+            next += 1
+        }
+    }
+} Facts.place_blocks
+
+/// Records which instruction defines each value and how often reachable code uses it.
+fn Facts.count_values(mut self, func: clif::Function) {
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            for result in func.inst_results(inst, alloc: self.alloc) {
+                expect usize.widen(result.index) < self.defs.len()
+                self.defs[usize.widen(result.index)] = inst.index
+            }
+            each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                expect at < self.use_counts.len()
+                self.use_counts[at] += 1
+            })
+        }
+    }
+} Facts.count_values
+
+/// Shows `visit` each value an instruction reads, branch arguments included.
+fn each_operand(data: clif::InstructionData, visit: fn(value: clif::Value)) {
+    match data {
+        clif::InstructionData.Unary(opcode: _, arg: arg) or clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: _) or clif::InstructionData.LoadNoOffset(opcode: _, flags: _, arg: arg) => visit(arg)
+        clif::InstructionData.Binary(opcode: _, x: x, y: y) or clif::InstructionData.IntCompare(opcode: _, cond: _, x: x, y: y) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: x, y: y) => {
+            visit(x)
+            visit(y)
+        }
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: _) or clif::InstructionData.StoreNoOffset(opcode: _, flags: _, x: x, p: p) or clif::InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: p, x: x) => {
+            visit(x)
+            visit(p)
+        }
+        clif::InstructionData.Ternary(opcode: _, x: x, y: y, z: z) or clif::InstructionData.AtomicCas(opcode: _, flags: _, p: x, e: y, x: z) => {
+            visit(x)
+            visit(y)
+            visit(z)
+        }
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: args) or clif::InstructionData.MultiAry(opcode: _, args: args) => each_value(args.view(), visit)
+        clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: callee, args: args) => {
+            visit(callee)
+            each_value(args.view(), visit)
+        }
+        clif::InstructionData.Jump(opcode: _, destination: destination) => each_value(destination.args.view(), visit)
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            visit(arg)
+            each_value(then_call.args.view(), visit)
+            each_value(else_call.args.view(), visit)
+        }
+        else => {}
+    }
+} each_operand
+
+fn each_value(values: Slice[clif::Value], visit: fn(value: clif::Value)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+fn filled[T: Copy](count: usize, value: T, alloc: mem::Alloc) -> mem::List[T] {
+    var list = mem::List[T].empty(alloc)
+    for _ in 0..<count {
+        mut list.push(value)
+    }
+    return list
+} filled
+
+fn larger(value: u32, other: u32) -> u32
+    ensures result >= value and result >= other
+{
+    if value > other {
+        return value
+    }
+    return other
+} larger
+
+/// The least multiple of `to`, a power of two, at or above `value`.
+fn round_up(value: u32, to: u32) -> u32
+    requires to > 0 and value <= 0xFFFF_FFFF - to
+{
+    return (value + to - 1) & ~(to - 1)
+} round_up
+
+fn slot_align(data: clif::StackSlotData) -> u32
+    ensures result >= 8
+{
+    return larger(8, other: 1u32 << u32.widen(data.align_shift))
+} slot_align
+
+/// The constant a value is, when an `iconst`, `f32const` or `f64const` defines it: its bits.
+fn Facts.constant(self, value: clif::Value, func: clif::Function) -> Option[u64] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE {
+        return None
+    }
+    match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: imm) => return Some(imm.to_bits())
+        clif::InstructionData.UnaryIeee32(opcode: _, bits: bits) => return Some(u64.widen(bits))
+        clif::InstructionData.UnaryIeee64(opcode: _, bits: bits) => return Some(bits)
+        else => return None
+    }
+} Facts.constant
+
+/// The first result of an instruction.
+fn result_of(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> clif::Value {
+    let results = func.inst_results(inst, alloc)
+    expect results.len() > 0
+    return results[0]
+} result_of
+
+/// The second result of an instruction.
+fn second_result_of(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> clif::Value {
+    let results = func.inst_results(inst, alloc)
+    expect results.len() > 1
+    return results[1]
+} second_result_of
+
+/// The operands of a commutative operation with a constant one last.
+fn Facts.commuted(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Operands {
+    if self.constant(x, func).is_some() and self.constant(y, func).is_none() {
+        return Operands(x: y, y: x)
+    }
+    return Operands(x: x, y: y)
+} Facts.commuted
+
+struct Operands derives Copy, Eq {
+    x: clif::Value
+    y: clif::Value
+} Operands
+
+/// The value and amount of a right rotation `x | y` computes of a 32- or 64-bit integer, when
+/// one operand shifts it right and the other left by the rest of the width, and only the `bor`
+/// reads either.
+fn Facts.rotation(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Option[Shifted] {
+    let width = func.value_type(x).bits()
+    if width != 32 and width != 64 {
+        return None
+    }
+    let Some(right) = self.shifted(func, value: x, opcode: clif::Opcode.Ushr) else {
+        let Some(left_first) = self.shifted(func, value: x, opcode: clif::Opcode.Ishl) else {
+            return None
+        }
+        let Some(right_second) = self.shifted(func, value: y, opcode: clif::Opcode.Ushr) else {
+            return None
+        }
+        return rotation_of(func, right: right_second, left: left_first, width: width)
+    }
+    let Some(left) = self.shifted(func, value: y, opcode: clif::Opcode.Ishl) else {
+        return None
+    }
+    return rotation_of(func, right, left, width: width)
+} Facts.rotation
+
+/// A right and a left shift of one value whose amounts add up to the width, as a right rotation.
+fn rotation_of(func: clif::Function, right: Shifted, left: Shifted, width: u32) -> Option[Shifted] {
+    if func.resolve_aliases(right.value) != func.resolve_aliases(left.value) or u32.widen(right.amount) + u32.widen(left.amount) != width {
+        return None
+    }
+    return Some(right)
+} rotation_of
+
+/// The value a single-use shift by a constant between 1 and 63 of an opcode defining `value`
+/// shifts, with the amount.
+fn Facts.shifted(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[Shifted] {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.defs.len() and at < self.use_counts.len()
+    let def = self.defs[at]
+    if def == NONE or self.use_counts[at] != 1 {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: found, x: shifted, y: amount) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    if found != opcode {
+        return None
+    }
+    let Some(bits) = self.constant(amount, func) else {
+        return None
+    }
+    if bits == 0 or bits > 63 {
+        return None
+    }
+    return Some(Shifted(value: shifted, amount: u8.truncate(bits)))
+} Facts.shifted
+
+/// A value and a constant amount it is shifted or rotated by.
+struct Shifted derives Copy, Eq {
+    value: clif::Value
+    amount: u8
+} Shifted
+
+/// The exponent of a power of two.
+fn power_of_two(value: i32) -> Option[u8] {
+    if value <= 0 {
+        return None
+    }
+    let bits = value.to_bits()
+    if (bits & (bits - 1)) != 0 {
+        return None
+    }
+    return Some(u8.truncate(bits.trailing_zeros()))
+} power_of_two
+
+/// The comparison of the operands in the other order that holds exactly when `cond` does.
+fn swapped(cond: clif::IntCC) -> clif::IntCC {
+    return match cond {
+        clif::IntCC.SignedLessThan => clif::IntCC.SignedGreaterThan
+        clif::IntCC.SignedGreaterThanOrEqual => clif::IntCC.SignedLessThanOrEqual
+        clif::IntCC.SignedGreaterThan => clif::IntCC.SignedLessThan
+        clif::IntCC.SignedLessThanOrEqual => clif::IntCC.SignedGreaterThanOrEqual
+        clif::IntCC.UnsignedLessThan => clif::IntCC.UnsignedGreaterThan
+        clif::IntCC.UnsignedGreaterThanOrEqual => clif::IntCC.UnsignedLessThanOrEqual
+        clif::IntCC.UnsignedGreaterThan => clif::IntCC.UnsignedLessThan
+        clif::IntCC.UnsignedLessThanOrEqual => clif::IntCC.UnsignedGreaterThanOrEqual
+        else => cond
+    }
+} swapped
+
+/// A comparison deciding whether a value is not zero, holding exactly then or, when
+/// `inverted`, exactly otherwise.
+struct Decider derives Copy, Eq {
+    compare: clif::Inst
+    inverted: bool
+} Decider
+
+/// The comparison deciding whether a value is not zero: the one defining it, the one deciding a
+/// value it extends or tests against zero, or the one deciding the condition of a select of 1 and
+/// 0 defining it.
+fn Facts.decider(self, func: clif::Function, value: clif::Value) -> Option[Decider] {
+    var current = value
+    var inverted = false
+    loop {
+        let at = usize.widen(func.resolve_aliases(current).index)
+        expect at < self.defs.len()
+        let def = self.defs[at]
+        if def == NONE {
+            return None
+        }
+        let inst = clif::Inst(index: def)
+        match func.inst_data(inst) {
+            clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+                if (cond == clif::IntCC.Equal or cond == clif::IntCC.NotEqual) and self.constant(y, func) == Some(0) and self.constant(x, func).is_none() and self.is_flag(func, value: x) {
+                    current = x
+                    inverted = inverted != (cond == clif::IntCC.Equal)
+                    continue
+                }
+                return Some(Decider(compare: inst, inverted: inverted))
+            }
+            clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => return Some(Decider(compare: inst, inverted: inverted))
+            clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => {
+                current = arg
+            }
+            clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: c, y: chosen, z: other) => {
+                let picked = self.constant(chosen, func)
+                let left = self.constant(other, func)
+                if picked == Some(1) and left == Some(0) {
+                    current = c
+                } else if picked == Some(0) and left == Some(1) {
+                    current = c
+                    inverted = not inverted
+                } else {
+                    return None
+                }
+            }
+            else => return None
+        }
+    }
+} Facts.decider
+
+/// Whether a value is a comparison's flag or one extended or chosen from 1 and 0 by a select.
+fn Facts.is_flag(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE {
+        return false
+    }
+    return match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+        clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => self.is_flag(func, value: arg)
+        clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: _, y: chosen, z: other) => (self.constant(chosen, func) == Some(1) and self.constant(other, func) == Some(0)) or (self.constant(chosen, func) == Some(0) and self.constant(other, func) == Some(1))
+        else => false
+    }
+} Facts.is_flag
+
+/// Where an edge of a conditional branch jumps: the block passing its arguments, or its target.
+fn Facts.target_of(self, edge: u32, block: clif::Block) -> u32 {
+    if edge != NONE {
+        return edge
+    }
+    return self.position_of(self.destination(block))
+} Facts.target_of
+
+/// The index of the chain a block heads, `NONE` for one heading none.
+fn Facts.switch_of(self, block: clif::Block) -> u32 {
+    let at = usize.widen(block.index)
+    expect at < self.switches.heads.len()
+    return self.switches.heads[at]
+} Facts.switch_of

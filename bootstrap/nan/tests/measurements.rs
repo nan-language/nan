@@ -1,5 +1,5 @@
 //! The bounded measurements of the freeze that checking gives: the prover proves at least 90% of
-//! the bounds and overflow obligations of the M4 scenario's packages and, separately, of the NaN
+//! the bounds and overflow obligations of each M4 scenario's packages and, separately, of the NaN
 //! front end's workspace, M5's. Each runs on a copy of its workspace with the harnesses' home
 //! directory and a local store of its own.
 
@@ -48,6 +48,11 @@ fn discharged(source: &str, name: &str) {
 #[test]
 fn m4_discharge() {
     discharged("tests/milestones/m4", "m4");
+}
+
+#[test]
+fn m4_aarch64_discharge() {
+    discharged("tests/milestones/m4-aarch64", "m4-aarch64");
 }
 
 #[test]

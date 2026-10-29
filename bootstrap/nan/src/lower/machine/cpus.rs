@@ -1,6 +1,7 @@
-//! The processors of a machine image: their records, which their GS bases address, the CPUs the
-//! platform reports through the ACPI MADT, the boot CPU first, and the starting of the others,
-//! through a trampoline the anchor copies below 1 MiB.
+//! The processors of a machine image: their records, which the GS base addresses on x86_64 and
+//! `TPIDR_EL1` on AArch64; the CPUs the platform reports, through the ACPI MADT or PSCI, the boot
+//! CPU first; and the starting of the others, through a trampoline the anchor copies below 1 MiB
+//! or through PSCI.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
@@ -14,16 +15,25 @@ use super::super::runtime::system::{self, unavailable_unless};
 use super::super::runtime::tasks::thread;
 use super::super::runtime::{Routine, report, state};
 use super::stubs::Stub;
-use crate::workspace::Target;
+use crate::workspace::{Arch, Kind, Target};
 
 /// The most CPUs a machine image runs; the platform's others stay stopped.
 pub const MAX_CPUS: u64 = 64;
 
+/// The PSCI functions the AArch64 machine layer calls through the hypervisor conduit: the power
+/// state of a processor, which discovers the CPUs, and powering one on; and the largest status a
+/// query gives for a processor that exists — on, off or on-pending — an affinity no processor
+/// answers for giving a negative status instead.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+const PSCI_CPU_ON: u64 = 0xC400_0003;
+const PSCI_PRESENT_MAX: i64 = 2;
+
 /// The offsets of a CPU record's fields: its executor thread's record, which the `thread` stub
 /// reads; the vector its running interrupt fn serves; the top and lowest address of its
-/// interrupt stack, which the vector seam reads; its local APIC's id; whether it has started its
-/// executor; its global descriptor table, the pseudo-descriptor loading it, and its task-state
-/// segment; the page-table root `hw::Ring0.write_cr3` last installed, zero for the entry root;
+/// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
+/// its affinity on AArch64; whether it has started its executor; its global descriptor table, the
+/// pseudo-descriptor loading it, and its task-state segment; the page-table root
+/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
 /// whether it has AVX enabled, which the vector seam reads to save the extended state; and the
 /// frame the vector seam saved for the interrupt it serves, zero outside one.
 pub mod cpu {
@@ -31,7 +41,7 @@ pub mod cpu {
     pub const VECTOR: u64 = 8;
     pub const STACK_TOP: u64 = 16;
     pub const STACK_BASE: u64 = 24;
-    pub const APIC_ID: u64 = 32;
+    pub const HARDWARE_ID: u64 = 32;
     pub const STARTED: u64 = 40;
     pub const GDT: u64 = 48;
     pub const GDTR: u64 = 104;
@@ -87,16 +97,17 @@ impl Lowering<'_, '_> {
         self.cpu_record(fx, index)
     }
 
-    /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its GS
-    /// base addresses from now on; on a kernel, a CPU for each processor the platform reports;
+    /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
+    /// register addresses from now on; on a kernel, a CPU for each processor the platform reports;
     /// an executor thread record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor
     /// tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
-        self.write_msr(fx, GS_BASE, boot);
-        let count = match self.kernel() {
-            true => self.discover(fx, boot),
-            false => fx.ptr(1),
+        self.set_cpu_base(fx, boot);
+        let count = match (self.kernel(), self.ck.db.target.arch()) {
+            (true, Some(Arch::Amd64)) => self.discover(fx, boot),
+            (true, Some(Arch::Aarch64)) => self.aarch64_discover(fx, boot),
+            _ => fx.ptr(1),
         };
         let state_address = self.state(fx);
         fx.store(count, state_address, state::THREAD_COUNT);
@@ -116,7 +127,7 @@ impl Lowering<'_, '_> {
             let cpu = self.cpu_record(fx, index);
             fx.store(record, cpu, cpu::THREAD);
         });
-        if self.ck.db.target == Target::Bare {
+        if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
             self.enable_avx(fx, boot);
         }
@@ -162,14 +173,30 @@ impl Lowering<'_, '_> {
 
     /// Installs `root` as the running CPU's page-table root, with maskable interrupts disabled so
     /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
+    /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub.
     pub fn swap_root(&mut self, fx: &mut Fx, root: Value) -> Value {
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let record = self.running_cpu(fx);
         let replaced = fx.load(PTR, record, cpu::ROOT);
         fx.store(root, record, cpu::ROOT);
-        self.call_stub(fx, Stub::WriteCr3, &[root]);
+        let install = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => Stub::WriteTtbr0,
+            _ => Stub::WriteCr3,
+        };
+        self.call_stub(fx, install, &[root]);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);
         replaced
+    }
+
+    /// Points the running CPU's base register, the x86_64 `GS` base or the AArch64 `TPIDR_EL1`,
+    /// at its CPU record, from where the `Thread` stub reads its executor thread.
+    pub fn set_cpu_base(&mut self, fx: &mut Fx, record: Value) {
+        match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => {
+                self.call_stub(fx, Stub::SetCpu, &[record]);
+            }
+            _ => self.write_msr(fx, GS_BASE, record),
+        }
     }
 
     /// Points interrupt stack table entry `ist` of a CPU's task-state segment at a stack top.
@@ -178,12 +205,57 @@ impl Lowering<'_, '_> {
         fx.b.ins().store(unaligned(), top, record, at as i32);
     }
 
+    /// The number of CPUs the board provides, at least 1 and at most `MAX_CPUS`, recording each
+    /// one's affinity in its record: the boot CPU, affinity zero, first, then every consecutive
+    /// affinity a processor answers a power-state query for. The board numbers its processors from
+    /// zero without gaps, so each affinity is its CPU's index.
+    fn aarch64_discover(&mut self, fx: &mut Fx, boot: Value) -> Value {
+        let zero = fx.ptr(0);
+        fx.store(zero, boot, cpu::HARDWARE_ID);
+        let one = fx.ptr(1);
+        let count = fx.var(PTR, one);
+        fx.repeat(&[one], |fx, at| {
+            let affinity = at[0];
+            let room =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, affinity, MAX_CPUS as i64);
+            let present = fx.choose_in(
+                self,
+                room,
+                &[types::I8],
+                |lo, fx| {
+                    let function = fx.ptr(PSCI_AFFINITY_INFO);
+                    let level = fx.ptr(0);
+                    let pad = fx.ptr(0);
+                    let status = lo.call_stub(fx, Stub::Hvc, &[function, affinity, level, pad])[0];
+                    let present = fx.b.ins().icmp_imm_s(
+                        IntCC::UnsignedLessThanOrEqual,
+                        status,
+                        PSCI_PRESENT_MAX,
+                    );
+                    fx.when(present, |fx| {
+                        let counted = fx.b.use_var(count);
+                        let record = lo.cpu_record(fx, counted);
+                        fx.store(affinity, record, cpu::HARDWARE_ID);
+                        let counted = fx.b.ins().iadd_imm_s(counted, 1);
+                        fx.b.def_var(count, counted);
+                    });
+                    vec![present]
+                },
+                |_, fx| vec![fx.int(types::I8, 0)],
+            )[0];
+            let next = fx.b.ins().iadd_imm_s(affinity, 1);
+            (present, vec![next])
+        });
+        fx.b.use_var(count)
+    }
+
     /// The number of CPUs the platform reports as usable, at least 1 and at most `MAX_CPUS`,
     /// recording each one's local APIC id in its record: the boot CPU's first, then the others
     /// in the order of the MADT.
     fn discover(&mut self, fx: &mut Fx, boot: Value) -> Value {
         let own = self.local_apic_id(fx);
-        fx.store(own, boot, cpu::APIC_ID);
+        fx.store(own, boot, cpu::HARDWARE_ID);
         let one = fx.ptr(1);
         let count = fx.var(PTR, one);
         let rsdp = self.rsdp(fx);
@@ -224,7 +296,7 @@ impl Lowering<'_, '_> {
                             fx.when(taken, |fx| {
                                 let counted = fx.b.use_var(count);
                                 let record = lo.cpu_record(fx, counted);
-                                fx.store(id, record, cpu::APIC_ID);
+                                fx.store(id, record, cpu::HARDWARE_ID);
                                 let counted = fx.b.ins().iadd_imm_s(counted, 1);
                                 fx.b.def_var(count, counted);
                             });
@@ -246,7 +318,7 @@ impl Lowering<'_, '_> {
     /// BIOS area; on `x86_64-uefi` the one the firmware's configuration table names.
     fn rsdp(&mut self, fx: &mut Fx) -> Value {
         let state_address = self.state(fx);
-        if self.ck.db.target == Target::Uefi {
+        if self.ck.db.target.kind() == Some(Kind::Uefi) {
             let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
             return self.configured_rsdp(fx, table);
         }
@@ -430,11 +502,16 @@ const START_TRIES: u64 = 2;
 const START_WAIT: u64 = 2_000_000;
 
 impl Lowering<'_, '_> {
-    /// Starts every CPU other than the boot CPU on the entry root: each prepares its tables and
-    /// interrupt delivery through `prepare` and starts its executor, after which the boot CPU
-    /// starts the next one. A CPU that does not start within its tries ends the sequence, keeping
-    /// the trampoline's parameters, and the CPUs after it stay stopped.
+    /// Starts every CPU other than the boot CPU on the entry root, through PSCI on AArch64 and
+    /// otherwise through the trampoline: each prepares its tables and interrupt delivery through
+    /// `prepare` and starts its executor, after which the boot CPU starts the next one. A CPU that
+    /// does not start within its tries ends the sequence, keeping the trampoline's parameters, and
+    /// the CPUs after it stay stopped.
     pub fn start_cpus(&mut self, fx: &mut Fx, prepare: FuncId) {
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            self.aarch64_start_cpus(fx, prepare);
+            return;
+        }
         let state_address = self.state(fx);
         let count = fx.load(PTR, state_address, state::THREAD_COUNT);
         let several = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, count, 1);
@@ -462,7 +539,7 @@ impl Lowering<'_, '_> {
                 let top = fx.b.ins().iadd_imm_s(stack, CHUNK as i64);
                 fx.store(top, page, start::STACK);
                 fx.store(record, page, start::CPU);
-                let id = fx.load(PTR, record, cpu::APIC_ID);
+                let id = fx.load(PTR, record, cpu::HARDWARE_ID);
                 self.send_ipi(fx, id, super::interrupts::IPI_INIT);
                 self.spin(fx, START_WAIT);
                 let tries = fx.ptr(START_TRIES);
@@ -475,6 +552,50 @@ impl Lowering<'_, '_> {
                     let tries_left = fx.b.ins().icmp_imm_s(IntCC::NotEqual, left, 0);
                     (fx.b.ins().band(waiting, tries_left), vec![left, started])
                 })[1];
+                let next = fx.b.ins().iadd_imm_s(index, 1);
+                let remaining = fx.b.ins().icmp(IntCC::UnsignedLessThan, next, count);
+                (fx.b.ins().band(started, remaining), vec![next])
+            });
+        });
+    }
+
+    /// Starts every CPU other than the boot CPU, each on the entry root through the secondary
+    /// entry seam: it reads the start record the boot CPU fills with the entry root, the CPU's
+    /// executor stack, the start glue and the CPU's record, turns its MMU on and runs the glue,
+    /// which prepares its interrupt delivery and starts its executor. The boot CPU starts the CPUs
+    /// one at a time, filling the record anew for each, and a CPU that does not start ends the
+    /// sequence, leaving the CPUs after it stopped.
+    fn aarch64_start_cpus(&mut self, fx: &mut Fx, prepare: FuncId) {
+        let state_address = self.state(fx);
+        let count = fx.load(PTR, state_address, state::THREAD_COUNT);
+        let several = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, count, 1);
+        fx.when(several, |fx| {
+            let seam = self.aarch64_secondary_seam();
+            let seam = self.func_ref(fx, seam);
+            let seam = fx.b.ins().func_addr(PTR, seam);
+            let record = self.secondary_record(fx);
+            let root = self.aarch64_entry_root();
+            let root = self.data_address(fx, root);
+            fx.store(root, record, super::secondary::ROOT);
+            let glue = self.cpu_glue(prepare);
+            let glue = self.func_ref(fx, glue);
+            let glue = fx.b.ins().func_addr(PTR, glue);
+            fx.store(glue, record, super::secondary::GLUE);
+            let one = fx.ptr(1);
+            fx.repeat(&[one], |fx, state| {
+                let index = state[0];
+                let cpu = self.cpu_record(fx, index);
+                let chunk = fx.ptr(1);
+                let stack = system::map_chunks(self, fx, chunk);
+                let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, stack, 0);
+                fx.when(missing, |fx| report::raise_kind(self, fx, "trap.exhausted"));
+                let top = fx.b.ins().iadd_imm_s(stack, CHUNK as i64);
+                fx.store(top, record, super::secondary::STACK);
+                fx.store(cpu, record, super::secondary::CPU);
+                let affinity = fx.load(PTR, cpu, cpu::HARDWARE_ID);
+                let function = fx.ptr(PSCI_CPU_ON);
+                self.call_stub(fx, Stub::Hvc, &[function, affinity, seam, record]);
+                let started = self.wait_started(fx, cpu);
                 let next = fx.b.ins().iadd_imm_s(index, 1);
                 let remaining = fx.b.ins().icmp(IntCC::UnsignedLessThan, next, count);
                 (fx.b.ins().band(started, remaining), vec![next])
@@ -532,9 +653,10 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The glue a started CPU calls with its record: it points its GS base at the record, loads
-    /// its descriptor tables, enables AVX when it has it, prepares its interrupt delivery through
-    /// `prepare`, records that it started and runs the executor's scheduler.
+    /// The glue a started CPU calls with its record: it points its base register at the record,
+    /// on x86_64 loads its descriptor tables and enables AVX when it has it, prepares its
+    /// interrupt delivery through `prepare`, records that it started and runs the executor's
+    /// scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
         signature.params.push(AbiParam::new(PTR));
@@ -548,9 +670,11 @@ impl Lowering<'_, '_> {
             super::super::lines::HIDDEN | super::super::lines::CRITICAL,
             |lo, fx| {
                 let record = fx.entry()[0];
-                lo.write_msr(fx, GS_BASE, record);
-                lo.load_cpu_tables(fx, record);
-                lo.enable_avx(fx, record);
+                lo.set_cpu_base(fx, record);
+                if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
+                    lo.load_cpu_tables(fx, record);
+                    lo.enable_avx(fx, record);
+                }
                 let prepare = lo.func_ref(fx, prepare);
                 fx.b.ins().call(prepare, &[]);
                 lo.cpu_started(fx, record);

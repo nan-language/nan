@@ -1,7 +1,14 @@
-//! Writes `x86_64-bare` images: static ELF64 executables whose segments load at their physical addresses, with a `XEN_ELFNOTE_PHYS32_ENTRY` note naming the entry a PVH loader enters.
+//! Writes bare-target images: static ELF64 executables whose segments load at their physical addresses. On `x86_64-bare` a `XEN_ELFNOTE_PHYS32_ENTRY` note names the entry a PVH loader enters; on `aarch64-bare` the platform enters `e_entry` directly, with no note.
 
-/// The physical address at which an image's first segment loads.
-const ELF_BASE: u64 = 0x0010_0000
+/// The physical address at which a bare image's first segment loads: 1 MiB on x86_64, and on
+/// AArch64 2 MiB into the `virt` board's memory, leaving those 2 MiB to the device tree QEMU
+/// places at its start.
+fn elf_base(arch: workspace::Arch) -> u64 {
+    return match arch {
+        workspace::Arch.Amd64 => 0x0010_0000
+        workspace::Arch.Aarch64 => 0x4020_0000
+    }
+} elf_base
 
 const ELF_HEADER: u64 = 64
 const ELF_PROGRAM_HEADER: u64 = 56
@@ -9,6 +16,7 @@ const ELF_SECTION_HEADER: u16 = 64
 
 const ET_EXEC: u16 = 2
 const EM_X86_64: u16 = 62
+const EM_AARCH64: u16 = 183
 const EV_CURRENT: u32 = 1
 const PT_LOAD: u32 = 1
 const PT_NOTE: u32 = 4
@@ -50,17 +58,29 @@ fn program_header(mut out: mem::Bytes, kind: u32, flags: u32, offset: u64, exten
     object::append_u64(mut out, value: align)
 } program_header
 
-/// The bytes of a static ELF64 executable loading the linked object's segments at their
-/// addresses, entered at the address `entry`, which its note also names.
-fn elf_write(linked: Linked, entry: u64, alloc: mem::Alloc) -> mem::Bytes {
-    let count = u64.widen(linked.segments.len()) + 1
-    let note_offset = ELF_HEADER + ELF_PROGRAM_HEADER * count
-    let entry_note = note(entry, alloc)
+/// The bytes of a static ELF64 executable for `arch` loading the linked object's segments at
+/// their addresses, entered at the address `entry`. On x86_64 a `PT_NOTE` segment names the PVH
+/// entry; on AArch64 the platform enters `e_entry` and no note is written.
+fn elf_write(linked: Linked, entry: u64, arch: workspace::Arch, alloc: mem::Alloc) -> mem::Bytes {
+    let noted = arch == workspace::Arch.Amd64
+    var count = u64.widen(linked.segments.len())
+    if noted {
+        count = count + 1
+    }
+    let headers = ELF_HEADER + ELF_PROGRAM_HEADER * count
+    var entry_note = mem::Bytes.empty(alloc)
+    if noted {
+        entry_note = note(entry, alloc)
+    }
+    let machine = match arch {
+        workspace::Arch.Amd64 => EM_X86_64
+        workspace::Arch.Aarch64 => EM_AARCH64
+    }
     var out = mem::Bytes.empty(alloc)
     mut out.append(b"\x7fELF\x02\x01\x01")
     object::resize(mut out, length: 16)
     object::append_u16(mut out, value: ET_EXEC)
-    object::append_u16(mut out, value: EM_X86_64)
+    object::append_u16(mut out, value: machine)
     object::append_u32(mut out, value: EV_CURRENT)
     object::append_u64(mut out, value: entry)
     object::append_u64(mut out, value: ELF_HEADER)
@@ -72,7 +92,7 @@ fn elf_write(linked: Linked, entry: u64, alloc: mem::Alloc) -> mem::Bytes {
     object::append_u16(mut out, value: ELF_SECTION_HEADER)
     object::append_u16(mut out, value: 0)
     object::append_u16(mut out, value: 0)
-    var offset = next_multiple_of(note_offset + u64.widen(entry_note.len()), multiple: PAGE)
+    var offset = next_multiple_of(headers + u64.widen(entry_note.len()), multiple: PAGE)
     var placed = mem::List[u64].empty(alloc)
     for segment in linked.segments {
         let flags = match segment.access {
@@ -85,9 +105,11 @@ fn elf_write(linked: Linked, entry: u64, alloc: mem::Alloc) -> mem::Bytes {
         mut placed.push(offset)
         offset = next_multiple_of(offset + u64.widen(segment.bytes.len()), multiple: PAGE)
     }
-    let length = u64.widen(entry_note.len())
-    program_header(mut out, kind: PT_NOTE, flags: PF_R, offset: note_offset, extent: Extent(address: 0, file: length, memory: 0), align: 4)
-    mut out.append(entry_note.view())
+    if noted {
+        let length = u64.widen(entry_note.len())
+        program_header(mut out, kind: PT_NOTE, flags: PF_R, offset: headers, extent: Extent(address: 0, file: length, memory: 0), align: 4)
+        mut out.append(entry_note.view())
+    }
     expect placed.len() == linked.segments.len()
     for index in 0..<linked.segments.len() {
         object::resize(mut out, length: usize.widen(placed[index]))

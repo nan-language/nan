@@ -1,8 +1,8 @@
-//! Interrupt delivery on the machine targets: the vector seam, which saves the interrupted state
-//! and preempts the interrupted kernel task when told to; the dispatcher, which calls the
-//! interrupt fn bound to the fired vector by an `hw::vectors` contribution or by
-//! `hw::IrqShared.install`; each CPU's local APIC and timer; and the stopping of the CPUs in a
-//! kernel halt.
+//! Interrupt delivery on the machine targets: the x86_64 vector seam, which saves the interrupted
+//! state and preempts the interrupted kernel task when told to; the dispatcher both
+//! architectures' seams reach, which calls the interrupt fn bound to the fired vector by an
+//! `hw::vectors` contribution or by `hw::IrqShared.install`; each CPU's local APIC and timer; and
+//! the stopping of the CPUs in a kernel halt.
 
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::{
@@ -17,10 +17,12 @@ use super::super::runtime::tasks::{self, task};
 use super::super::runtime::{report, state};
 use super::super::{Instance, Lowering};
 use super::SEAM_FRAME;
+use super::aarch64;
 use super::cpus::cpu;
 use super::stubs::Stub;
 use crate::check::ty::Ty;
 use crate::interp::{FnVal, Val};
+use crate::workspace::Arch;
 
 /// The vectors whose exception pushes an error code the CPU leaves on the stack; every other
 /// vector's stub pushes a zero so each interrupt frame has the same shape.
@@ -96,15 +98,56 @@ const _: () = assert!(frame::CODE == 0x80 && frame::RSP == 0xa0);
 /// The offsets in the frame the seam saves of what its readers read: after the 15 saved
 /// registers and the vector, the error code, then the interrupted instruction pointer, flags and
 /// stack pointer.
-pub mod frame {
+mod frame {
     pub const CODE: u64 = 128;
     pub const RIP: u64 = 136;
     pub const RFLAGS: u64 = 152;
     pub const RSP: u64 = 160;
 }
 
-/// The vector of page faults, whose trap frame holds the faulting address.
-const PAGE_FAULT: i64 = 14;
+/// The offsets in the frame an architecture's vector seam saves of what the dispatcher,
+/// `hw::TrapFrame` and halt reports read: the error code or syndrome, the interrupted
+/// instruction's address, the processor state holding whether maskable interrupts were enabled,
+/// and the interrupted stack pointer.
+#[derive(Clone, Copy)]
+pub struct SavedFrame {
+    pub code: u64,
+    pub ip: u64,
+    pub state: u64,
+    pub sp: u64,
+}
+
+const X64_FRAME: SavedFrame = SavedFrame {
+    code: frame::CODE,
+    ip: frame::RIP,
+    state: frame::RFLAGS,
+    sp: frame::RSP,
+};
+
+/// What the dispatcher knows of an architecture's vectors: the vector of the interrupt a halting
+/// CPU stops the others with, where the dispatcher receives it as a vector; the vector the timer
+/// pacing the kernel fires; the vector of the interrupt controller's spurious interrupts, where
+/// it delivers them as one; the vectors whose interrupt fn's return halts the kernel; the vector
+/// of page faults, whose trap frame holds the faulting address; and, where the interrupt
+/// controller numbers interrupts past the last vector, the end of the vectors an
+/// `hw::IrqShared` installs on.
+pub(super) struct Vectors {
+    pub(super) stop: Option<i64>,
+    pub(super) timer: i64,
+    pub(super) spurious: Option<i64>,
+    pub(super) aborts: &'static [i64],
+    pub(super) page_fault: i64,
+    pub(super) installable_end: Option<i64>,
+}
+
+const X64_VECTORS: Vectors = Vectors {
+    stop: Some(NMI_VECTOR),
+    timer: TIMER_VECTOR,
+    spurious: Some(SPURIOUS_VECTOR),
+    aborts: &ABORT_VECTORS,
+    page_fault: 14,
+    installable_end: None,
+};
 
 /// The interrupt flag of the saved flags.
 const INTERRUPTS_ENABLED: i64 = 0x200;
@@ -175,8 +218,8 @@ pub mod device {
 
 /// An interrupt vector the final build binds by contribution: its number, its `ist`, the class
 /// its handler's variant names and the interrupt fn bound to it.
-struct Bound {
-    vector: i64,
+pub(super) struct Bound {
+    pub(super) vector: i64,
     ist: u8,
     class: &'static str,
     handler: Instance,
@@ -185,7 +228,7 @@ struct Bound {
 impl Lowering<'_, '_> {
     /// The interrupt vectors the final build binds, in vector order: each entry of the
     /// `hw::vectors` table whose handler holds an interrupt fn.
-    fn bound_vectors(&mut self) -> Vec<Bound> {
+    pub(super) fn bound_vectors(&mut self) -> Vec<Bound> {
         let Some(registry) = self.ck.db.std_item("hw", "vectors") else {
             return Vec::new();
         };
@@ -219,7 +262,7 @@ impl Lowering<'_, '_> {
 
     /// The handler of the `hw::preempt` table's entry, a landing fn the platform package
     /// contributes.
-    fn preempt_handler(&mut self) -> Option<Instance> {
+    pub(super) fn preempt_handler(&mut self) -> Option<Instance> {
         let registry = self.ck.db.std_item("hw", "preempt")?;
         let value = self.table_entries(registry).into_iter().next()?;
         let Val::Struct(_, fields) = &value.value else {
@@ -234,11 +277,66 @@ impl Lowering<'_, '_> {
         Some(self.callable_instance(fn_ref, false))
     }
 
-    /// Sets up interrupt delivery for a kernel's executor: builds the interrupt descriptor table,
-    /// masks the legacy interrupt controller, and gives the glue each CPU runs to take
-    /// interrupts: it draws its interrupt stacks, loads the table and starts its local APIC and
-    /// timer. Maskable interrupts stay disabled until the executor enables them.
+    /// The architecture of the machine target being lowered for.
+    pub(super) fn machine_arch(&self) -> Arch {
+        self.ck
+            .db
+            .target
+            .arch()
+            .expect("a machine target's architecture")
+    }
+
+    /// What the dispatcher knows of the target's vectors.
+    pub(super) fn vectors(&self) -> Vectors {
+        match self.machine_arch() {
+            Arch::Amd64 => X64_VECTORS,
+            Arch::Aarch64 => aarch64::VECTORS,
+        }
+    }
+
+    /// The layout of the frame the target's vector seam saves.
+    pub fn saved_frame(&self) -> SavedFrame {
+        match self.machine_arch() {
+            Arch::Amd64 => X64_FRAME,
+            Arch::Aarch64 => aarch64::FRAME,
+        }
+    }
+
+    /// Whether the code a saved frame interrupted ran with maskable interrupts enabled: the
+    /// interrupt flag of the saved flags is set on x86_64, the IRQ mask of the saved processor
+    /// state clear on AArch64.
+    fn interrupts_were_enabled(&mut self, fx: &mut Fx, saved: Value) -> Value {
+        let state = fx.load(PTR, saved, self.saved_frame().state);
+        match self.machine_arch() {
+            Arch::Amd64 => {
+                let enabled = fx.b.ins().band_imm_s(state, INTERRUPTS_ENABLED);
+                fx.b.ins().icmp_imm_s(IntCC::NotEqual, enabled, 0)
+            }
+            Arch::Aarch64 => {
+                let masked = fx.b.ins().band_imm_s(state, aarch64::IRQ_MASKED);
+                fx.b.ins().icmp_imm_s(IntCC::Equal, masked, 0)
+            }
+        }
+    }
+
+    /// The address a page fault faulted at: `cr2` on x86_64, the fault address register the
+    /// AArch64 seam saved in the frame.
+    fn fault_address(&mut self, fx: &mut Fx, saved: Value) -> Value {
+        match self.machine_arch() {
+            Arch::Amd64 => self.call_stub(fx, Stub::ReadCr2, &[])[0],
+            Arch::Aarch64 => fx.load(PTR, saved, aarch64::frame::FAR),
+        }
+    }
+
+    /// Sets up interrupt delivery for a kernel's executor and gives the glue each CPU runs to
+    /// take interrupts. On x86_64 it builds the interrupt descriptor table, masks the legacy
+    /// interrupt controller, and the glue draws the CPU's interrupt stacks, loads the table and
+    /// starts its local APIC and timer. Maskable interrupts stay disabled until the executor
+    /// enables them.
     pub fn interrupt_setup(&mut self, fx: &mut Fx) -> FuncId {
+        if self.machine_arch() == Arch::Aarch64 {
+            return self.aarch64_interrupt_setup(fx);
+        }
         let idt = self.reserved(fx, "_NSidt", IDT_BYTES, 16);
         self.fill_idt(fx, idt);
         let masked = fx.ptr(0xFF);
@@ -361,7 +459,7 @@ impl Lowering<'_, '_> {
 
     /// The read-only sizes of the interrupt stacks, which `finish_interrupts` defines once every
     /// interrupt fn is lowered: that of `ist` 0, then that of each other `ist`.
-    fn interrupt_stack_sizes(&mut self) -> DataId {
+    pub(super) fn interrupt_stack_sizes(&mut self) -> DataId {
         let id = self
             .module
             .declare_data("_NSirq_stacks", Linkage::Local, false, false)
@@ -439,7 +537,7 @@ impl Lowering<'_, '_> {
 
     /// The glue the seam calls on a preempted task's stack: it calls the `hw::preempt` entry's
     /// landing fn, which returns once a later switch resumes the task.
-    fn preempt_glue(&mut self) -> FuncId {
+    pub(super) fn preempt_glue(&mut self) -> FuncId {
         let signature = Signature::new(super::super::CALL_CONV);
         let id = self
             .module
@@ -458,11 +556,12 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The interrupt dispatcher the vector seam calls with the fired vector and the saved frame;
-    /// it gives nonzero when the seam is to preempt the interrupted task. It records both in the
-    /// running CPU's record while it dispatches the vector, then restores those of the interrupt
-    /// it nested in.
-    fn dispatcher(&mut self, bound: &[Bound]) -> FuncId {
+    /// The interrupt dispatcher the vector seam calls with what fired and the saved frame; it
+    /// gives nonzero when the seam is to preempt the interrupted task. The x86_64 seam passes the
+    /// fired vector, the AArch64 one the kind of exception, from which the dispatcher finds the
+    /// vector. It records the vector and the frame in the running CPU's record while it
+    /// dispatches the vector, then restores those of the interrupt it nested in.
+    pub(super) fn dispatcher(&mut self, bound: &[Bound]) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
         signature.params.push(AbiParam::new(PTR));
         signature.params.push(AbiParam::new(PTR));
@@ -473,7 +572,10 @@ impl Lowering<'_, '_> {
             .expect("the dispatcher");
         let dispatch = self.dispatch_vector(bound, signature.clone());
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
-            let params = fx.entry();
+            let mut params = fx.entry();
+            if lo.machine_arch() == Arch::Aarch64 {
+                params[0] = lo.aarch64_vector(fx, params[0], params[1]);
+            }
             let record = lo.running_cpu(fx);
             let outer = [cpu::VECTOR, cpu::FRAME].map(|field| fx.load(PTR, record, field));
             fx.store(params[0], record, cpu::VECTOR);
@@ -500,7 +602,7 @@ impl Lowering<'_, '_> {
     }
 
     /// An interrupt stack of `size` bytes drawn as a runtime record, trapping on exhaustion.
-    fn interrupt_stack(&mut self, fx: &mut Fx, size: Value) -> Value {
+    pub(super) fn interrupt_stack(&mut self, fx: &mut Fx, size: Value) -> Value {
         let stack = self.record_alloc(fx, size);
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, stack, 0);
         fx.when(missing, |fx| report::raise_kind(self, fx, "trap.exhausted"));
@@ -518,8 +620,8 @@ impl Lowering<'_, '_> {
             serving,
             &[PTR],
             |lo, fx| {
-                let rip = fx.load(PTR, saved, frame::RIP);
-                vec![report::location_at(lo, fx, rip)]
+                let ip = fx.load(PTR, saved, lo.saved_frame().ip);
+                vec![report::location_at(lo, fx, ip)]
             },
             |_, fx| vec![fx.ptr(0)],
         )[0]
@@ -529,28 +631,31 @@ impl Lowering<'_, '_> {
     /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
     /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
     /// binds. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with maskable
-    /// interrupts enabled and the anchor is installed, the task is preempted. After an interrupt
-    /// fn for vector 8 or 18 returns, and on an unbound vector, the kernel halts at the
-    /// interrupted instruction.
+    /// interrupts enabled and the anchor is installed, the task is preempted. An unbound timer
+    /// interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
+    /// unbound vector, the kernel halts at the interrupted instruction.
     fn dispatch_vector(&mut self, bound: &[Bound], signature: Signature) -> FuncId {
         let id = self
             .module
             .declare_function("_NSseam_dispatch_vector", Linkage::Local, &signature)
             .expect("the vector dispatch");
         let preempting = self.preempt_handler().is_some();
+        let vectors = self.vectors();
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
             let params = fx.entry();
             let (vector, saved) = (params[0], params[1]);
-            let nmi = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, NMI_VECTOR);
-            fx.when(nmi, |fx| lo.stop_if_halting(fx));
+            if let Some(stop) = vectors.stop {
+                let stopping = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, stop);
+                fx.when(stopping, |fx| lo.stop_if_halting(fx));
+            }
             let zero = fx.ptr(0);
             for entry in bound {
                 let this = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, entry.vector);
                 fx.when(this, |fx| {
                     let reschedule = lo.dispatch_bound(fx, entry, saved);
-                    if ABORT_VECTORS.contains(&entry.vector) {
-                        let rip = fx.load(PTR, saved, frame::RIP);
-                        let location = report::location_at(lo, fx, rip);
+                    if vectors.aborts.contains(&entry.vector) {
+                        let ip = fx.load(PTR, saved, lo.saved_frame().ip);
+                        let location = report::location_at(lo, fx, ip);
                         report::halt(lo, fx, "abort-exception", location, None);
                         return;
                     }
@@ -558,48 +663,33 @@ impl Lowering<'_, '_> {
                     fx.b.ins().return_(&[preempt]);
                 });
             }
-            let installable =
+            let mut installable =
                 fx.b.ins()
                     .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, vector, 32);
+            if let Some(end) = vectors.installable_end {
+                let below = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, vector, end);
+                installable = fx.b.ins().band(installable, below);
+            }
             fx.when(installable, |fx| {
-                let slot = lo.irq_binding(fx, vector);
-                let running = fx.offset(slot, binding::RUNNING);
-                let one = fx.ptr(1);
-                super::super::runtime::fetch_add(fx, running, one);
-                let device = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), slot);
-                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, device, 0);
-                let reschedule = fx.choose(
-                    present,
-                    &[types::I8],
-                    |fx| {
-                        let glue = fx.load(PTR, device, device::GLUE);
-                        let mut call = Signature::new(super::super::CALL_CONV);
-                        call.params.push(AbiParam::new(PTR));
-                        call.returns.push(AbiParam::new(types::I8));
-                        let call = fx.b.import_signature(call);
-                        let inst = fx.b.ins().call_indirect(call, glue, &[device]);
-                        vec![fx.b.inst_results(inst)[0]]
-                    },
-                    |fx| vec![fx.int(types::I8, 0)],
-                )[0];
-                let minus = fx.int(PTR, -1);
-                super::super::runtime::fetch_add(fx, running, minus);
+                let (present, reschedule) = lo.installed_reschedule(fx, vector);
                 fx.when(present, |fx| {
                     let preempt = lo.preempts(fx, reschedule, saved, preempting);
                     fx.b.ins().return_(&[preempt]);
                 });
             });
-            let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, TIMER_VECTOR);
+            let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, vectors.timer);
             fx.when(timer, |fx| {
-                lo.apic_eoi(fx);
+                lo.end_of_interrupt(fx);
                 fx.b.ins().return_(&[zero]);
             });
-            let spurious = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, SPURIOUS_VECTOR);
-            fx.when(spurious, |fx| {
-                fx.b.ins().return_(&[zero]);
-            });
-            let rip = fx.load(PTR, saved, frame::RIP);
-            let location = report::location_at(lo, fx, rip);
+            if let Some(spurious) = vectors.spurious {
+                let spurious = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, spurious);
+                fx.when(spurious, |fx| {
+                    fx.b.ins().return_(&[zero]);
+                });
+            }
+            let ip = fx.load(PTR, saved, lo.saved_frame().ip);
+            let location = report::location_at(lo, fx, ip);
             report::halt(lo, fx, "unbound-vector", location, Some(("vector", vector)));
         });
         id
@@ -609,7 +699,7 @@ impl Lowering<'_, '_> {
     /// new `hw::IrqContext`, an exception handler with an `hw::TrapFrame` naming the saved frame
     /// and, for a page fault, holding the faulting address.
     /// Gives whether its `hw::IrqExit` is `Reschedule`.
-    fn dispatch_bound(&mut self, fx: &mut Fx, entry: &Bound, saved: Value) -> Value {
+    pub(super) fn dispatch_bound(&mut self, fx: &mut Fx, entry: &Bound, saved: Value) -> Value {
         let abi = self.abi(&entry.handler);
         let id = self.instance(entry.handler.clone());
         let arg = match entry.class {
@@ -620,9 +710,9 @@ impl Lowering<'_, '_> {
                 let trap_frame = fx.slot(layout.size, layout.align);
                 let at = self.layouts.field(self.ck, &ty, None, "saved").offset;
                 fx.store(saved, trap_frame, at);
-                let fault = match entry.vector {
-                    PAGE_FAULT => self.call_stub(fx, Stub::ReadCr2, &[])[0],
-                    _ => fx.ptr(0),
+                let fault = match entry.vector == self.vectors().page_fault {
+                    true => self.fault_address(fx, saved),
+                    false => fx.ptr(0),
                 };
                 let at = self.layouts.field(self.ck, &ty, None, "fault").offset;
                 fx.store(fault, trap_frame, at);
@@ -632,6 +722,35 @@ impl Lowering<'_, '_> {
         let called = self.invoke(fx, Invoked::Direct(id), &abi, &[arg]);
         let exit_ty = abi.result.clone();
         self.reschedules(fx, &exit_ty, called.result)
+    }
+
+    /// Calls the device an `hw::IrqShared` installed on a vector of 32 or more, counting the call
+    /// so an uninstall waits for it. Gives whether a device was installed and, when one was,
+    /// whether its `hw::IrqExit` is `Reschedule`.
+    pub(super) fn installed_reschedule(&mut self, fx: &mut Fx, vector: Value) -> (Value, Value) {
+        let slot = self.irq_binding(fx, vector);
+        let running = fx.offset(slot, binding::RUNNING);
+        let one = fx.ptr(1);
+        super::super::runtime::fetch_add(fx, running, one);
+        let device = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), slot);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, device, 0);
+        let reschedule = fx.choose(
+            present,
+            &[types::I8],
+            |fx| {
+                let glue = fx.load(PTR, device, device::GLUE);
+                let mut call = Signature::new(super::super::CALL_CONV);
+                call.params.push(AbiParam::new(PTR));
+                call.returns.push(AbiParam::new(types::I8));
+                let call = fx.b.import_signature(call);
+                let inst = fx.b.ins().call_indirect(call, glue, &[device]);
+                vec![fx.b.inst_results(inst)[0]]
+            },
+            |fx| vec![fx.int(types::I8, 0)],
+        )[0];
+        let minus = fx.int(PTR, -1);
+        super::super::runtime::fetch_add(fx, running, minus);
+        (present, reschedule)
     }
 
     /// Whether an `hw::IrqExit` an interrupt fn gave is `Reschedule`.
@@ -671,26 +790,23 @@ impl Lowering<'_, '_> {
         if !preempting {
             return fx.ptr(0);
         }
-        let flags = fx.load(PTR, saved, frame::RFLAGS);
-        let enabled = fx.b.ins().band_imm_s(flags, INTERRUPTS_ENABLED);
-        let enabled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, enabled, 0);
+        let enabled = self.interrupts_were_enabled(fx, saved);
         let state_address = self.state(fx);
         let anchor = fx.load(PTR, state_address, state::ANCHOR);
         let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, anchor, 0);
         let record = tasks::current_task(self, fx);
         let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+        let sp_at = self.saved_frame().sp;
         let on_stack = fx.choose(
             running,
             &[types::I8],
             |fx| {
-                let rsp = fx.load(PTR, saved, frame::RSP);
+                let sp = fx.load(PTR, saved, sp_at);
                 let base = fx.load(PTR, record, task::STACK);
                 let size = fx.load(PTR, record, task::STACK_SIZE);
                 let top = fx.b.ins().iadd(base, size);
-                let above =
-                    fx.b.ins()
-                        .icmp(IntCC::UnsignedGreaterThanOrEqual, rsp, base);
-                let below = fx.b.ins().icmp(IntCC::UnsignedLessThan, rsp, top);
+                let above = fx.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sp, base);
+                let below = fx.b.ins().icmp(IntCC::UnsignedLessThan, sp, top);
                 vec![fx.b.ins().band(above, below)]
             },
             |fx| vec![fx.int(types::I8, 0)],
@@ -730,9 +846,13 @@ impl Lowering<'_, '_> {
         self.mmio_write(fx, 4, at, value);
     }
 
-    /// Writes the local APIC's end-of-interrupt register, ending the interrupt in service.
-    pub fn apic_eoi(&mut self, fx: &mut Fx) {
-        self.apic_write(fx, APIC_EOI, 0);
+    /// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the
+    /// local APIC's end-of-interrupt register on x86_64, and the GIC CPU interface's on AArch64.
+    pub fn end_of_interrupt(&mut self, fx: &mut Fx) {
+        match self.machine_arch() {
+            Arch::Amd64 => self.apic_write(fx, APIC_EOI, 0),
+            Arch::Aarch64 => self.aarch64_eoi(fx),
+        }
     }
 
     /// The running CPU's local APIC id.
@@ -762,9 +882,8 @@ impl Lowering<'_, '_> {
     }
 
     /// The first step of a kernel halt, with maskable interrupts disabled so that nothing else
-    /// runs on the halting CPU: the first CPU to begin one sends every other started CPU a
-    /// non-maskable interrupt and waits until each has stopped; a CPU beginning a halt after it
-    /// stops instead.
+    /// runs on the halting CPU: the first CPU to begin one sends every other started CPU the stop
+    /// interrupt and waits until each has stopped; a CPU beginning a halt after it stops instead.
     pub fn stop_other_cpus(&mut self, fx: &mut Fx) {
         self.call_stub(fx, Stub::Cli, &[]);
         let state_address = self.state(fx);
@@ -776,14 +895,20 @@ impl Lowering<'_, '_> {
                 .atomic_cas(MemFlagsData::trusted(), flag, zero, one);
         let later = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
         fx.when(later, |fx| {
-            self.call_stub(fx, Stub::Halt, &[]);
+            // The non-maskable interrupt reaches a halted x86_64 CPU, which then counts itself;
+            // an AArch64 CPU halts with the stop interrupt masked, so it counts itself first.
+            match self.machine_arch() {
+                Arch::Amd64 => {
+                    self.call_stub(fx, Stub::Halt, &[]);
+                }
+                Arch::Aarch64 => self.stop_cpu(fx),
+            }
         });
         let started = fx.load(PTR, state_address, state::STARTED_CPUS);
         let others = fx.b.ins().iadd_imm_s(started, -1);
         let running = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, others, 0);
         fx.when(running, |fx| {
-            let all = fx.ptr(0);
-            self.send_ipi(fx, all, IPI_NMI_OTHERS);
+            self.send_stop(fx);
             let stopped = fx.offset(state_address, state::STOPPED_CPUS);
             fx.repeat(&[], |fx, _| {
                 let count =
@@ -798,16 +923,38 @@ impl Lowering<'_, '_> {
         });
     }
 
-    /// On a non-maskable interrupt during a kernel halt, stops the running CPU, counting it.
-    fn stop_if_halting(&mut self, fx: &mut Fx) {
+    /// Sends every other CPU the interrupt that stops it in a halt, which disabled maskable
+    /// interrupts do not hold back: a non-maskable interrupt on x86_64, and on AArch64 the
+    /// software interrupt the interrupt controller delivers as a fast interrupt.
+    fn send_stop(&mut self, fx: &mut Fx) {
+        match self.machine_arch() {
+            Arch::Amd64 => {
+                let all = fx.ptr(0);
+                self.send_ipi(fx, all, IPI_NMI_OTHERS);
+            }
+            Arch::Aarch64 => self.aarch64_send_stop(fx),
+        }
+    }
+
+    /// On a non-maskable interrupt during a kernel halt, stops the running CPU, counting it; the
+    /// interrupt has other causes outside one.
+    pub(super) fn stop_if_halting(&mut self, fx: &mut Fx) {
         let state_address = self.state(fx);
         let halting = fx.load(PTR, state_address, state::HALTING);
         let halting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, halting, 0);
-        fx.when(halting, |fx| {
-            let stopped = fx.offset(state_address, state::STOPPED_CPUS);
-            let one = fx.ptr(1);
-            super::super::runtime::fetch_add(fx, stopped, one);
-            self.call_stub(fx, Stub::Halt, &[]);
-        });
+        fx.when(halting, |fx| self.stop_cpu(fx));
+    }
+
+    /// Counts the running CPU among the stopped and halts it. An AArch64 CPU masks fast
+    /// interrupts first, so that a stop interrupt arriving meanwhile cannot count it twice.
+    pub(super) fn stop_cpu(&mut self, fx: &mut Fx) {
+        if self.machine_arch() == Arch::Aarch64 {
+            self.call_stub(fx, Stub::FiqOff, &[]);
+        }
+        let state_address = self.state(fx);
+        let stopped = fx.offset(state_address, state::STOPPED_CPUS);
+        let one = fx.ptr(1);
+        super::super::runtime::fetch_add(fx, stopped, one);
+        self.call_stub(fx, Stub::Halt, &[]);
     }
 }

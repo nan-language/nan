@@ -41,7 +41,7 @@ pkg enum RelocTarget derives Copy, Eq, Hash {
 /// address plus `addend`.
 pkg struct ModuleReloc derives Copy, Eq, Hash {
     pkg offset: u32
-    pkg kind: x64::RelocKind
+    pkg kind: machinst::RelocKind
     pkg target: RelocTarget
     pkg addend: i64
 } ModuleReloc
@@ -80,14 +80,24 @@ struct Relocations {
 } Relocations
 
 /// The ELF type of a relocation kind.
-fn elf_type(kind: x64::RelocKind) -> u32 {
+fn elf_type(kind: machinst::RelocKind) -> u32 {
     return match kind {
-        x64::RelocKind.Absolute4 => R_X86_64_32
-        x64::RelocKind.Absolute8 => R_X86_64_64
-        x64::RelocKind.Relative4 => R_X86_64_PC32
-        x64::RelocKind.CallPlt4 => R_X86_64_PLT32
-        x64::RelocKind.GotRelative4 => R_X86_64_GOTPCREL
-        x64::RelocKind.TlsGeneralDynamic => R_X86_64_TLSGD
+        machinst::RelocKind.Absolute4 => R_X86_64_32
+        machinst::RelocKind.Absolute8 => R_X86_64_64
+        machinst::RelocKind.Relative4 => R_X86_64_PC32
+        machinst::RelocKind.CallPlt4 => R_X86_64_PLT32
+        machinst::RelocKind.GotRelative4 => R_X86_64_GOTPCREL
+        machinst::RelocKind.TlsGeneralDynamic => R_X86_64_TLSGD
+        machinst::RelocKind.Arm64Call => R_AARCH64_CALL26
+        machinst::RelocKind.Arm64AdrPrel => R_AARCH64_ADR_PREL_PG_HI21
+        machinst::RelocKind.Arm64AddLo12 => R_AARCH64_ADD_ABS_LO12_NC
+        machinst::RelocKind.Arm64Abs64 => R_AARCH64_ABS64
+        machinst::RelocKind.Arm64AdrGotPage => R_AARCH64_ADR_GOT_PAGE
+        machinst::RelocKind.Arm64Ld64GotLo12 => R_AARCH64_LD64_GOT_LO12_NC
+        machinst::RelocKind.Arm64TlsDescAdrPage => R_AARCH64_TLSDESC_ADR_PAGE21
+        machinst::RelocKind.Arm64TlsDescLd64Lo12 => R_AARCH64_TLSDESC_LD64_LO12
+        machinst::RelocKind.Arm64TlsDescAddLo12 => R_AARCH64_TLSDESC_ADD_LO12
+        machinst::RelocKind.Arm64TlsDescCall => R_AARCH64_TLSDESC_CALL
     }
 } elf_type
 
@@ -173,22 +183,30 @@ pkg fn DataDescription.write_data_addr(mut self, offset: u32, data: u32, addend:
 } DataDescription.write_data_addr
 
 /// The relocations writing the addresses the data holds, the functions' first.
-fn DataDescription.records(self, alloc: mem::Alloc) -> mem::List[Record] {
+fn DataDescription.records(self, arch: workspace::Arch, alloc: mem::Alloc) -> mem::List[Record] {
+    let absolute = match arch {
+        workspace::Arch.Aarch64 => R_AARCH64_ABS64
+        workspace::Arch.Amd64 => R_X86_64_64
+    }
+    let relative = match arch {
+        workspace::Arch.Aarch64 => R_AARCH64_PREL32
+        workspace::Arch.Amd64 => R_X86_64_PC32
+    }
     var records = mem::List[Record].empty(alloc)
     for address in self.function_addresses {
         expect usize.widen(address.reference) < self.functions.len()
         let target = Target.Declared(RelocTarget.Function(self.functions[usize.widen(address.reference)]))
-        mut records.push(Record(offset: address.offset, kind: R_X86_64_64, target: target, addend: address.addend))
+        mut records.push(Record(offset: address.offset, kind: absolute, target: target, addend: address.addend))
     }
     for address in self.function_offsets {
         expect usize.widen(address.reference) < self.functions.len()
         let target = Target.Declared(RelocTarget.Function(self.functions[usize.widen(address.reference)]))
-        mut records.push(Record(offset: address.offset, kind: R_X86_64_PC32, target: target, addend: address.addend))
+        mut records.push(Record(offset: address.offset, kind: relative, target: target, addend: address.addend))
     }
     for address in self.data_addresses {
         expect usize.widen(address.reference) < self.data_objects.len()
         let target = Target.Declared(RelocTarget.Data(self.data_objects[usize.widen(address.reference)]))
-        mut records.push(Record(offset: address.offset, kind: R_X86_64_64, target: target, addend: address.addend))
+        mut records.push(Record(offset: address.offset, kind: absolute, target: target, addend: address.addend))
     }
     return records
 } DataDescription.records
@@ -237,12 +255,16 @@ pkg struct Module {
 } Module
 
 pkg fn Module.new(target: workspace::Target, alloc: mem::Alloc) -> Module {
+    let arch = match target.arch() {
+        Some(found) => found
+        None => workspace::Arch.Amd64
+    }
     return Module(
         target: target,
         functions: mem::List[FunctionDeclaration].empty(alloc),
         data_objects: mem::List[DataDeclaration].empty(alloc),
         names: mem::HashMap[text::String, Declared].empty(seed: 0, alloc),
-        elf: Elf.new("nan", alloc),
+        elf: Elf.new("nan", arch: arch, alloc),
         relocations: mem::List[Relocations].empty(alloc),
         leaves: codegen::Leaves.empty(alloc),
         schedule: Schedule.empty(alloc),
@@ -425,16 +447,16 @@ fn Module.compile(mut self, id: FuncId, take func: clif::Function, inlinable: bo
 
 /// The target of a relocation of compiled code: a declared function or data object, named by
 /// namespace 0 or 1 and its index, or the C library's `__tls_get_addr`.
-fn symbol_target(symbol: x64::Symbol) -> Target {
+fn symbol_target(symbol: machinst::Symbol) -> Target {
     match symbol {
-        x64::Symbol.Name(name) => {
+        machinst::Symbol.Name(name) => {
             if name.namespace == 0 {
                 return Target.Declared(RelocTarget.Function(FuncId(index: name.index)))
             }
             expect name.namespace == 1
             return Target.Declared(RelocTarget.Data(DataId(index: name.index)))
         }
-        x64::Symbol.TlsGetAddr => return Target.TlsGetAddr
+        machinst::Symbol.TlsGetAddr => return Target.TlsGetAddr
     }
 } symbol_target
 
@@ -481,7 +503,11 @@ pkg fn Module.define_data(mut self, id: DataId, take description: DataDescriptio
     let tls = declaration.tls
     let symbol = declaration.symbol
     let writable = declaration.writable
-    let records = description.records(self.alloc)
+    let arch = match self.target.arch() {
+        Some(found) => found
+        None => workspace::Arch.Amd64
+    }
+    let records = description.records(arch: arch, alloc: self.alloc)
     let align = description.align.value_or(1)
     let DataDescription(init: init, align: _, functions: _, data_objects: _, function_addresses: _, function_offsets: _, data_addresses: _) = description
     match init {

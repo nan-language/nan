@@ -12,7 +12,8 @@
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
 //! into the same bytes, and the bootstrap's stage comparison accepts it. The NaN toolchain runs
 //! beside the bootstrap on a copy of the workspace and local store the bootstrap runs in, on one
-//! processor under an address-space cap, with a user directory of its own.
+//! processor, or on every one when it builds itself, under an address-space cap, with a user
+//! directory of its own.
 
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -227,7 +228,11 @@ fn rewrite_manifest(dir: &Path, line: &str, with: &str) -> Result<(), String> {
 /// machine's architecture.
 fn machine_copy(dir: &Path) -> Result<(), String> {
     copy_tree(&repository().join("toolchain"), dir, false).map_err(|error| error.to_string())?;
-    rewrite_manifest(dir, DECLARED_TARGET, &format!("targets {}\n", host_target()))
+    rewrite_manifest(
+        dir,
+        DECLARED_TARGET,
+        &format!("targets {}\n", host_target()),
+    )
 }
 
 /// Copies the toolchain workspace into `dir` as `machine_copy` does, its root file replaced by
@@ -267,15 +272,10 @@ fn image() -> Result<PathBuf, String> {
     Ok(image)
 }
 
-/// One processor of the harness's affinity set, the next one for each run this process starts,
-/// from one its process id picks, so that runs beside each other do not share a processor. The
-/// runtime of an image sets up an executor thread and an io_uring instance per processor of its
-/// affinity set, and the kernel charges the instances' memory to the user's locked-memory limit,
-/// which concurrent toolchain runs with every processor would exhaust.
-fn processor() -> String {
-    static STARTED: AtomicUsize = AtomicUsize::new(0);
+/// The processors of the harness's affinity set.
+fn affinity() -> Vec<u32> {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let allowed: Vec<u32> = status
+    status
         .lines()
         .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
         .unwrap_or("0")
@@ -285,7 +285,17 @@ fn processor() -> String {
             let (low, high) = range.split_once('-').unwrap_or((range, range));
             low.parse().unwrap_or(0)..=high.parse().unwrap_or(0)
         })
-        .collect();
+        .collect()
+}
+
+/// One processor of the harness's affinity set, the next one for each run this process starts,
+/// from one its process id picks, so that runs beside each other do not share a processor. The
+/// runtime of an image sets up an executor thread and an io_uring instance per processor of its
+/// affinity set, and the kernel charges the instances' memory to the user's locked-memory limit,
+/// which concurrent toolchain runs with every processor would exhaust.
+fn processor() -> String {
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    let allowed = affinity();
     let run = std::process::id() as usize + STARTED.fetch_add(1, Ordering::Relaxed);
     allowed[run % allowed.len()].to_string()
 }
@@ -323,12 +333,23 @@ struct Given<'a> {
     store: &'a Path,
     /// The variables asking for NIR or a lowering, with their values.
     asked: &'a [(&'a str, &'a str)],
+    /// Whether the run takes every processor of the harness's affinity set, so that its tasks
+    /// run in parallel on them, rather than one.
+    spread: bool,
 }
 
-/// Starts a run of a NaN toolchain in `dir`, on one processor, under its bounds, killed after its
-/// time limit.
+/// Starts a run of a NaN toolchain in `dir`, on the processors `given` spreads it on, under its
+/// bounds, killed after its time limit.
 fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Result<Front, String> {
     fs::create_dir_all(given.home).map_err(|error| error.to_string())?;
+    let processors = match given.spread {
+        true => affinity()
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        false => processor(),
+    };
     let mut command = Command::new("sh");
     command
         .arg("-c")
@@ -336,7 +357,7 @@ fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Res
             "ulimit -v {}; exec taskset -c \"$0\" \"$@\"",
             toolchain.space
         ))
-        .arg(processor())
+        .arg(processors)
         .arg(&toolchain.image)
         .args(args)
         .current_dir(dir)
@@ -546,6 +567,7 @@ fn compare(
         home: &home,
         store: &front_store,
         asked: &[],
+        spread: false,
     };
     let run = front(toolchain, &front_dir, &given, args)?;
     let (expected, status) = nan(bootstrap, args)?;
@@ -604,6 +626,7 @@ fn compare_nir(
         home: &home,
         store: &front_store,
         asked: &asked,
+        spread: false,
     };
     let run = front(toolchain, &front_dir, &given, &[])?;
     let streams = nan::nir_streams(bootstrap).map_err(|error| error.to_string())?;
@@ -690,6 +713,7 @@ fn compare_lowered(
         home: &home,
         store: &front_store,
         asked: &asked,
+        spread: false,
     };
     let run = front(toolchain, &front_dir, &given, &[])?;
     let mut expected =
@@ -1019,7 +1043,7 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
 }
 
 /// Starts building the toolchain workspace copied into `dir` with the NaN toolchain `builder`,
-/// with a user directory and local store of its own.
+/// on every processor, as a release builds it, with a user directory and local store of its own.
 fn self_build(builder: &Toolchain, dir: &Path) -> Result<SelfBuild, String> {
     driven_copy(dir)?;
     let home = dir.with_extension("home");
@@ -1029,6 +1053,7 @@ fn self_build(builder: &Toolchain, dir: &Path) -> Result<SelfBuild, String> {
         home: &home,
         store: &store,
         asked: &[],
+        spread: true,
     };
     Ok(SelfBuild {
         run: front(builder, dir, &given, &["build", "nan"])?,
@@ -1168,6 +1193,7 @@ fn front_steps(
             home: &home,
             store: &front_store,
             asked: &[],
+            spread: false,
         };
         let run = front(first, &front_dir, &given, args)?;
         let bootstrap = taken.recv().map_err(ended)?;
@@ -1235,6 +1261,7 @@ fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         home: &home,
         store: &store,
         asked: &[],
+        spread: false,
     };
     let (printed, code) = front(&starved, &dir, &given, &["check"])?.output()?;
     let expected = "internal-error check .: records 1\ninternal internal.resource-exhausted - -\n    reproducer .nan/repro/1\ninternal-error check .: records 1\n";

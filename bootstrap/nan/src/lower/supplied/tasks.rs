@@ -6,11 +6,11 @@ pub mod cowns;
 pub mod domains;
 pub mod scopes;
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{AbiParam, Signature, Value};
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{self, entry, live_entry};
+use super::super::runtime::tables;
 use super::super::runtime::{Routine, tasks};
 use super::super::{CALL_CONV, Lowering};
 use super::Supply;
@@ -27,13 +27,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::within_ns"
         | "task::race" => scopes::lower(lo, fx, supply),
         "task::Cown" => cowns::lower(lo, fx, supply),
-        "task::Executor" => super::sys::coarse(
-            lo,
-            fx,
-            supply,
-            tables::kind::EXECUTOR,
-            tables::EXECUTOR_RESOLUTION,
-        ),
+        "task::Executor" => super::sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
         "sys::Domain" | "sys::Trap" => domains::lower(lo, fx, supply),
         "host::Runner" | "sys::Cx" | "sys::Outbox" => components::lower(lo, fx, supply),
@@ -42,19 +36,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     true
 }
 
-/// The cell of the executor whose handle is at an address, and whether the handle is live.
-pub fn executor(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
+/// Whether the handle of the executor at an address is live, and the state words of its entry
+/// when it is: its cell, its clock's handle and its resolution.
+pub fn executor(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value; 4]) {
     let handle = fx.load(PTR, handle, 0);
-    let record = live_entry(lo, fx, handle);
-    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
-    let zero = fx.ptr(0);
-    let cell = fx.choose(
-        live,
-        &[PTR],
-        |fx| vec![fx.load(PTR, record, entry::STATE)],
-        |_| vec![zero],
-    )[0];
-    (live, cell)
+    tables::snapshot(lo, fx, handle)
 }
 
 /// The signature of glue given a task's record.

@@ -8,7 +8,6 @@ use super::super::super::Lowering;
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::Routine;
-use super::super::super::runtime::tables::entry;
 use super::super::Supply;
 use super::super::mem::vector;
 use super::super::sys;
@@ -52,13 +51,19 @@ pub fn new(lo: &mut Lowering, fx: &mut Fx, limit: Value, cell: Value) -> Value {
     index
 }
 
-/// The file system an entry names, and its path prefix.
-fn of_entry(lo: &mut Lowering, fx: &mut Fx, record: Value) -> (Value, (Value, Value)) {
-    let index = fx.load(PTR, record, entry::STATE);
+/// The file system at `index`, and the joined path of the prefix of the operation's `Fs` and
+/// its path, failing the operation with `Revoked.Stale` when that `Fs` is stale.
+fn resolved(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    index: Value,
+) -> (Value, (Value, Value)) {
     let system = object_at(lo, fx, index);
-    let start = fx.load(PTR, record, entry::STATE + 8);
-    let len = fx.load(PTR, record, entry::STATE + 16);
-    (system, (start, len))
+    let prefix = sys::checked_text(lo, fx, supply, supply.param(0).address());
+    let path = joined(lo, fx, prefix, supply.param(1));
+    lo.record_free(fx, prefix.0);
+    (system, path)
 }
 
 /// The joined path of a prefix and a path in runtime memory: the prefix, `/` when it is not
@@ -198,10 +203,9 @@ fn resize(
 
 /// `sys::Fs.open` and `sys::Fs.create`: a file opened for reading, which must exist, or for
 /// writing, created or truncated.
-pub fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, creates: bool) {
+pub fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, index: Value, creates: bool) {
     cancellation_point(lo, fx, supply);
-    let (system, prefix) = of_entry(lo, fx, record);
-    let path = joined(lo, fx, prefix, supply.param(1));
+    let (system, path) = resolved(lo, fx, supply, index);
     let target = if creates {
         let target = find_or_create(lo, fx, system, path);
         let none = fx.ptr(0);
@@ -226,10 +230,9 @@ pub fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, crea
 }
 
 /// `sys::Fs.read_all`: a copy of a file's bytes drawn through `alloc`.
-pub fn read_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+pub fn read_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, index: Value) {
     cancellation_point(lo, fx, supply);
-    let (system, prefix) = of_entry(lo, fx, record);
-    let path = joined(lo, fx, prefix, supply.param(1));
+    let (system, path) = resolved(lo, fx, supply, index);
     let (target, _) = find(lo, fx, system, path);
     lo.record_free(fx, path.0);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);
@@ -254,10 +257,9 @@ pub fn read_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) 
 }
 
 /// `sys::Fs.write_all`: a file holding exactly `data`, created when missing.
-pub fn write_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+pub fn write_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, index: Value) {
     cancellation_point(lo, fx, supply);
-    let (system, prefix) = of_entry(lo, fx, record);
-    let path = joined(lo, fx, prefix, supply.param(1));
+    let (system, path) = resolved(lo, fx, supply, index);
     let target = find_or_create(lo, fx, system, path);
     let data = sys::view(fx, supply.param(2));
     let none = fx.ptr(0);
@@ -267,10 +269,9 @@ pub fn write_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value)
 
 /// `sys::Fs.remove`: the file leaves its file system, its bytes freed once no open file reads
 /// them.
-pub fn remove(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+pub fn remove(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, index: Value) {
     cancellation_point(lo, fx, supply);
-    let (system, prefix) = of_entry(lo, fx, record);
-    let path = joined(lo, fx, prefix, supply.param(1));
+    let (system, path) = resolved(lo, fx, supply, index);
     let (target, link) = find(lo, fx, system, path);
     lo.record_free(fx, path.0);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);

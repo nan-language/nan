@@ -6,16 +6,19 @@
 //! 32. An entry record is its generation, whether it is live (2 while its revocation spreads),
 //! its kind, its source's index plus one (the next free entry's for a free one), and four words
 //! of state; the second and third words of a `Fs` or `Net` entry hold the address and length of
-//! a text the entry owns. An outbox's state is its runner's record, its key and whether it is a
-//! keyed task's. An executor's state is its cell, the handle of the clock it records and its
-//! resolution in nanoseconds, zero standing for one. A `Clock` entry's state is the nanosecond of the clock that delays count at
-//! which its root was minted, then its resolution in nanoseconds, zero standing for one; it also
-//! heads the deadlines in flight that `task::within` calls armed through it, linked through
-//! their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead
-//! of the clock that delays count, which a host's wall clock reads from the platform instead,
-//! then its resolution.
+//! a text the entry owns. A live entry's state never changes once its handle is returned, so an
+//! operation reads its words through a snapshot that rechecks the handle once they are read; a
+//! text, which revocation frees, is read only under the lock. An outbox's state is its runner's
+//! record, its key and whether it is a keyed task's. An executor's state is its cell, the handle
+//! of the clock it records and its resolution in nanoseconds, zero standing for one. A `Clock`
+//! entry's state is the nanosecond of the clock that delays count at which its root was minted,
+//! then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in
+//! flight that `task::within` calls armed through it, linked through their timers. A
+//! `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock
+//! that delays count, which a host's wall clock reads from the platform instead, then its
+//! resolution.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
 use super::super::body::Held;
 use super::super::call::{Called, Invoked};
@@ -83,7 +86,9 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                 live,
                 &[PTR],
                 |fx| {
-                    let handle = new_entry(lo, fx, params[1]);
+                    let kind = fx.load(types::I32, source, entry::KIND);
+                    let kind = fx.b.ins().uextend(PTR, kind);
+                    let handle = new_entry(lo, fx, kind);
                     let record = entry_at(lo, fx, handle);
                     for word in 0..4 {
                         let value = fx.load(PTR, source, entry::STATE + 8 * word);
@@ -93,21 +98,12 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let index = fx.b.ins().iadd_imm_s(index, 1);
                     let index = fx.b.ins().ireduce(types::I32, index);
                     fx.store(index, record, entry::SOURCE);
-                    let text = fx.load(PTR, record, entry::STATE + 8);
+                    let raised = fx.b.ins().iadd(record, params[1]);
+                    let value = fx.load(PTR, raised, 0);
+                    let value = fx.b.ins().umax(value, params[2]);
+                    fx.store(value, raised, 0);
                     let owns = owns_text(fx, record);
-                    let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, text, 0);
-                    let owns = fx.b.ins().band(owns, held);
-                    fx.when(owns, |fx| {
-                        let len = fx.load(PTR, record, entry::STATE + 16);
-                        let size = fx.b.ins().iadd_imm_s(len, 1);
-                        let copy = lo.record_alloc(fx, size);
-                        let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
-                        fx.when(failed, |fx| {
-                            super::report::raise_kind(lo, fx, "trap.exhausted")
-                        });
-                        lo.call_routine(fx, Routine::Copy, &[copy, text, len]);
-                        fx.store(copy, record, entry::STATE + 8);
-                    });
+                    fx.when(owns, |fx| derive_text(lo, fx, record, params[3], params[4]));
                     vec![handle]
                 },
                 |fx| vec![fx.int(PTR, -1)],
@@ -181,6 +177,45 @@ fn owns_text(fx: &mut Fx, record: Value) -> Value {
     let fs = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::FS);
     let net = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::NET);
     fx.b.ins().bor(fs, net)
+}
+
+/// Gives a derived `Fs` or `Net` entry a text of its own in runtime memory: its source's, which
+/// its state words hold, extended by a given text as a path for `Fs` and replaced by it for
+/// `Net`, or kept when the given text's address is zero.
+fn derive_text(lo: &mut Lowering, fx: &mut Fx, record: Value, text: Value, len: Value) {
+    let source = fx.load(PTR, record, entry::STATE + 8);
+    let source_len = fx.load(PTR, record, entry::STATE + 16);
+    let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, text, 0);
+    let kind = fx.load(types::I32, record, entry::KIND);
+    let fs = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::FS);
+    let net = fx.b.ins().bxor_imm_s(fs, 1);
+    let replaced = fx.b.ins().band(given, net);
+    let zero = fx.ptr(0);
+    let head_len = fx.b.ins().select(replaced, zero, source_len);
+    let joined = fx.b.ins().band(given, fs);
+    let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source_len, 0);
+    let separated = fx.b.ins().band(joined, has_head);
+    let separator = fx.b.ins().uextend(PTR, separated);
+    let tail_len = fx.b.ins().select(given, len, zero);
+    let total = fx.b.ins().iadd(head_len, separator);
+    let total = fx.b.ins().iadd(total, tail_len);
+    let size = fx.b.ins().iadd_imm_s(total, 1);
+    let copy = lo.record_alloc(fx, size);
+    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
+    fx.when(failed, |fx| {
+        super::report::raise_kind(lo, fx, "trap.exhausted")
+    });
+    lo.call_routine(fx, Routine::Copy, &[copy, source, head_len]);
+    fx.when(separated, |fx| {
+        let at = fx.b.ins().iadd(copy, head_len);
+        let slash = fx.int(types::I8, i64::from(b'/'));
+        fx.store(slash, at, 0);
+    });
+    let tail = fx.b.ins().iadd(copy, head_len);
+    let tail = fx.b.ins().iadd(tail, separator);
+    lo.call_routine(fx, Routine::Copy, &[tail, text, tail_len]);
+    fx.store(copy, record, entry::STATE + 8);
+    fx.store(total, record, entry::STATE + 16);
 }
 
 /// Revokes the live entry a handle names and every entry deriving from it, transitively: each
@@ -259,13 +294,22 @@ fn expire_deadlines(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     });
 }
 
-/// Links a deadline's timer into the deadlines of its live clock entry, or gives false when the
-/// clock is stale.
-pub fn link_deadline(lo: &mut Lowering, fx: &mut Fx, clock: Value, timer: Value) -> Value {
+/// Links a deadline's timer into the deadlines of its live clock entry: whether the clock is
+/// live, and the nanosecond at which its root was minted and its resolution, meaningless when
+/// it is stale.
+pub fn link_deadline(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    clock: Value,
+    timer: Value,
+) -> (Value, [Value; 2]) {
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
     fx.store(clock, timer, deadline::CLOCK);
+    let slot = entry_at(lo, fx, clock);
+    let minted = fx.load(PTR, slot, entry::STATE);
+    let resolution = fx.load(PTR, slot, RESOLUTION);
     let record = live_entry(lo, fx, clock);
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
     fx.when(live, |fx| {
@@ -278,7 +322,7 @@ pub fn link_deadline(lo: &mut Lowering, fx: &mut Fx, clock: Value, timer: Value)
         fx.store(timer, record, entry::DEADLINES);
     });
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    live
+    (live, [minted, resolution])
 }
 
 /// Takes a deadline's timer out of its clock entry's deadlines, unless the clock's revocation
@@ -376,6 +420,55 @@ pub fn live_entry(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
     let ok = fx.b.ins().band(same, live);
     let zero = fx.ptr(0);
     fx.b.ins().select(ok, record, zero)
+}
+
+/// The state words of the entry a handle names, read without the lock, and whether the handle
+/// was still live once they were read, which makes them that entry's.
+pub fn snapshot(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value; 4]) {
+    let record = entry_at(lo, fx, handle);
+    let flags = MemFlagsData::trusted();
+    let words = [0, 1, 2, 3].map(|word| {
+        let at = fx.offset(record, entry::STATE + 8 * word);
+        fx.b.ins().atomic_load(PTR, flags, at)
+    });
+    let generation = fx.b.ins().atomic_load(types::I32, flags, record);
+    let live_at = fx.offset(record, entry::LIVE);
+    let live = fx.b.ins().atomic_load(types::I32, flags, live_at);
+    let wanted = fx.b.ins().ushr_imm_s(handle, 32);
+    let wanted = fx.b.ins().ireduce(types::I32, wanted);
+    let same = fx.b.ins().icmp(IntCC::Equal, generation, wanted);
+    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, live, 0);
+    (fx.b.ins().band(same, live), words)
+}
+
+/// A copy in runtime memory of the text of the live entry a handle names, taken under the lock,
+/// and its length; zero for a stale handle. The caller frees the copy.
+pub fn copy_text(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let record = live_entry(lo, fx, handle);
+    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+    let copy = fx.choose_in(
+        lo,
+        live,
+        &[PTR, PTR],
+        |lo, fx| {
+            let text = fx.load(PTR, record, entry::STATE + 8);
+            let len = fx.load(PTR, record, entry::STATE + 16);
+            let size = fx.b.ins().iadd_imm_s(len, 1);
+            let copy = lo.record_alloc(fx, size);
+            let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
+            fx.when(failed, |fx| {
+                super::report::raise_kind(lo, fx, "trap.exhausted")
+            });
+            lo.call_routine(fx, Routine::Copy, &[copy, text, len]);
+            vec![copy, len]
+        },
+        |_, fx| vec![fx.ptr(0), fx.ptr(0)],
+    );
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    (copy[0], copy[1])
 }
 
 /// A new live entry of a kind, a free one when any is, by handle; traps when the table is

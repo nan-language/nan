@@ -75,7 +75,9 @@ pub enum Routine {
     Rehome,
     /// `(world)`: fills a root grant's capabilities and allocator.
     MintRoot,
-    /// `(handle, kind) -> handle`: a new entry deriving from a capability's entry.
+    /// `(handle, word, floor, text, len) -> handle`: a new entry deriving from a capability's
+    /// live entry, its state word at offset `word` raised to at least `floor` and its text
+    /// extended or replaced by `text` when that is not zero; all ones for a stale handle.
     Derive,
     /// `(handle)`: revokes an entry and every entry deriving from it.
     Revoke,
@@ -236,7 +238,8 @@ impl Routine {
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
             Routine::AllocIn => (&[P, P, P, P], &[P]),
-            Routine::Split | Routine::Derive | Routine::Hold => (&[P, P], &[P]),
+            Routine::Split | Routine::Hold => (&[P, P], &[P]),
+            Routine::Derive => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
             Routine::Rehome => (&[P, P], &[]),
             Routine::Charged

@@ -242,7 +242,7 @@ fn scope_failure(body: &Body, unit: &crate::nir::Unit, closure: u32) -> Option<T
 fn scope_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let fails = supply.type_arg(0);
     let body_ty = fn_param(supply, 1);
-    let (live, cell) = super::executor(lo, fx, supply.param(0).address());
+    let (live, [cell, _, _, _]) = super::executor(lo, fx, supply.param(0).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
         let none = fx.ptr(0);
@@ -757,14 +757,13 @@ fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let deadline = fx.int(PTR, kind::DEADLINE);
     fx.store(deadline, timer, operation::KIND);
     fx.store(record, timer, operation::TASK);
-    let live = tables::link_deadline(lo, fx, clock, timer);
+    let (live, [minted, resolution]) = tables::link_deadline(lo, fx, clock, timer);
     fx.choose_in(
         lo,
         live,
         &[],
         |lo, fx| {
-            let record = tables::entry_at(lo, fx, clock);
-            let delay = super::super::sys::clock_delay(lo, fx, record, ns);
+            let delay = super::super::sys::clock_delay(lo, fx, minted, resolution, ns);
             arm_deadline(lo, fx, timer, delay);
             Vec::new()
         },
@@ -857,7 +856,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let result_ty = supply.type_arg(0);
     let fails = supply.type_arg(1);
     let task_ty = fn_param(supply, 1);
-    let (live, cell) = super::executor(lo, fx, supply.param(0).address());
+    let (live, [cell, _, _, _]) = super::executor(lo, fx, supply.param(0).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
         let none = fx.ptr(0);

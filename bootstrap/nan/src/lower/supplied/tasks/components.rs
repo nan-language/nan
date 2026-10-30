@@ -202,7 +202,8 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let message_ty = supply.type_arg(2);
     let body_ty = fn_param(supply, 3);
     let env = supply.param(0);
-    let (live, exec_cell) = super::executor(lo, fx, supply.param(1).address());
+    let (live, [exec_cell, clock, resolution, _]) =
+        super::executor(lo, fx, supply.param(1).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
         release_env(lo, fx, &env_ty, env);
@@ -223,11 +224,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(one, record, runner::REFS);
     fx.store(cell, record, runner::CELL);
     fx.store(exec_cell, record, runner::EXECUTOR);
-    let exec = fx.load(PTR, supply.param(1).address(), 0);
-    let exec = tables::entry_at(lo, fx, exec);
-    let resolution = fx.load(PTR, exec, tables::EXECUTOR_RESOLUTION);
     fx.store(resolution, record, runner::RESOLUTION);
-    let clock = fx.load(PTR, exec, cap_entry::STATE + 8);
     let clock = tables::entry_at(lo, fx, clock);
     let origin = fx.load(PTR, clock, cap_entry::STATE);
     fx.store(origin, record, runner::ORIGIN);
@@ -1138,8 +1135,8 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
-    let outbox = tables::live_entry(lo, fx, handle);
-    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, outbox, 0);
+    let (live, [_, key, keyed_post, _]) = tables::snapshot(lo, fx, handle);
+    let stale = fx.b.ins().bxor_imm_s(live, 1);
     let stopped = fx.load(PTR, record, runner::STOPPED);
     let stopped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, stopped, 0);
     let closed = fx.b.ins().bor(stale, stopped);
@@ -1156,9 +1153,7 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     lo.call_routine(fx, Routine::Fill, &[node, zero, header]);
     let current = tasks::current_task(lo, fx);
     fx.store(current, node, entry::POSTER);
-    let key = fx.load(PTR, outbox, cap_entry::STATE + 8);
     fx.store(key, node, entry::KEY);
-    let keyed_post = fx.load(PTR, outbox, cap_entry::STATE + 16);
     fx.store(keyed_post, node, entry::KEYED);
     let at = fx.offset(node, entry::MESSAGE);
     lo.store_held(fx, at, held, &message);

@@ -21,13 +21,14 @@ pub struct Problem {
 }
 
 /// What resolving a signature finds: its diagnostics, the type mismatches with their expected
-/// and found texts, and the instantiations, `Dyn` and function types it writes, checked once
-/// every signature is known.
+/// and found texts, and the instantiations, `Dyn` and function types and bounds it writes,
+/// checked once every signature is known.
 #[derive(Clone, Debug, Default)]
 pub struct Problems {
     pub found: Vec<Problem>,
     pub mismatches: Vec<(Tok, String, String)>,
     pub instantiations: Vec<(Ty, Tok)>,
+    pub bounds: Vec<(Bound, Tok)>,
     /// The paths naming nothing that match the old form of a tombstone without an old head, by
     /// their first and last tokens, with the tombstone.
     pub renamed: Vec<((Tok, Tok), ItemId)>,
@@ -912,7 +913,9 @@ impl Checker<'_> {
         }
         let params = self.shapes(interface);
         let args = self.generic_args(ctx, &params, bound.args.as_deref(), token, problems)?;
-        Some(Bound { interface, args })
+        let bound = Bound { interface, args };
+        problems.bounds.push((bound.clone(), token));
+        Some(bound)
     }
 
     /// The arguments a type, bound or `Dyn` writes for `params`, all of them (`generic.arity`).

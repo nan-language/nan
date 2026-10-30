@@ -16,7 +16,7 @@ pub interface Component[Env: Send, M: Send] {
 ```
 
 - A component is declared by an [impl line](08-generics-interfaces.md#impl-lines) `impl S: sys::Component[Env, M]` together with the functions `S.start` and `S.on` that [conformance](08-generics-interfaces.md#conformance) requires. These two functions are the component's **handlers**.
-- Env and M are Send and, being unbounded by `Any`, [droppable](05-properties.md#generic-parameters): a linear argument for either is an error (`prop.linear-argument`).
+- Env and M are Send and, being unbounded by `Any`, [droppable](05-properties.md#generic-parameters): a linear argument for either is an error (`prop.linear-argument`), reported on the impl line. `sys::Cx` and `sys::Outbox` bound their M, and `host::Runner.run` its Env and M, by `Any`, so the handlers and the uses of the runner accept a linear one.
 - A running component has an **intake**, a first-in, first-out queue of messages. Its [runner](#runner) calls `S.start` once, then removes messages from the intake one at a time, oldest first, calling `S.on` for each with the state, the message, the Env and a [component context](#component-context). It removes the next message only after `on` has returned.
 - Neither interface method states `uses wait`, so an implementing function stating it is an error by conformance (`interface.head-mismatch`). A handler therefore contains no [suspension point](17-suspension-io.md#stackful-tasks): it never suspends.
 - A component is **quiescent** whenever none of its handlers runs. The runner gives the state and the Env to handlers alone, so every handler starts on a quiescent component, and the state `run` returns is that of a quiescent component.
@@ -59,6 +59,35 @@ pub fn Meter.on(mut self, take message: Untrusted[mem::Bytes], mut env: Env, mut
     try await env.clock.sleep(10)
     self.bytes += u64.widen(message.byte_len())
 } Meter.on
+```
+
+```nan
+pub closed struct Env {
+    pub log: sys::Log
+} Env
+
+pub closed linear struct Lease {
+    pub slot: u32
+} Lease
+
+pub closed struct Keeper derives Encode {
+    pub kept: u64
+} Keeper
+
+impl Keeper: sys::Component[Env, Lease] // error: prop.linear-argument
+
+pub fn Keeper.start(mut env: Env) -> Keeper = Keeper(kept: 0)
+
+pub fn Keeper.on(mut self, take message: Lease, mut env: Env, mut cx: sys::Cx[Lease]) {
+    let Lease(slot: _) = message
+    self.kept += 1
+} Keeper.on
+
+pub fn keep(world: host::World) -> Keeper fails task::SendError uses wait {
+    return try await host::Runner[Keeper].run(Env(log: world.log), exec: world.exec, alloc: world.alloc, body: fn(inbox: sys::Outbox[Lease]) fails task::SendError uses wait {
+        try await inbox.post(Lease(slot: 1))
+    })
+} keep
 ```
 
 ### Component state
@@ -147,7 +176,7 @@ A **component context** is the `sys::Cx[M]` that `on` receives. Its operations a
 ```nan-api
 // module: sys
 
-pub open view struct Cx[M: Send] {
+pub open view struct Cx[M: Any and Send] {
 } Cx
 
 pub fn Cx.send(mut self, take message: M)
@@ -217,7 +246,7 @@ pub fn Cx.spawn(mut self, key: u64, take run: task fn(out: Outbox[M]) fails task
 
 pub fn Cx.cancel(mut self, key: u64)
 
-pub open struct Outbox[M: Send] {
+pub open struct Outbox[M: Any] {
 } Outbox
 
 pub fn Outbox.post(self, take message: M) fails task::SendError uses wait
@@ -356,7 +385,7 @@ The **runner** `host::Runner[S]` runs a component of state S for the duration of
 pub open struct Runner[S] {
 } Runner
 
-pub fn Runner.run[Env: Send, M: Send, E](take env: Env, exec: task::Executor, alloc: mem::Alloc, body: fn(inbox: sys::Outbox[M]) fails E uses wait) -> S fails E uses wait
+pub fn Runner.run[Env: Any, M: Any, E](take env: Env, exec: task::Executor, alloc: mem::Alloc, body: fn(inbox: sys::Outbox[M]) fails E uses wait) -> S fails E uses wait
 ```
 
 - `host::Runner[S]` has no values; it names `run`. The runner's executor and allocator are the `exec` and `alloc` of the call.

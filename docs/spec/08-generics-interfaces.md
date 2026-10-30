@@ -290,6 +290,25 @@ pub fn empty_capacity(window: Window[0]) -> usize { // error: generic.where-unme
 } empty_capacity
 ```
 
+```nan
+pub interface Index[K: Hash] {
+    fn count(self) -> usize
+} Index
+
+pub fn indexed[T: Index[f64]](index: T) -> usize { // error: generic.unsatisfied-bound
+    return index.count()
+} indexed
+```
+
+```nan
+pub interface Index[K: Hash] {
+    fn count(self) -> usize
+} Index
+
+pub fn dropped(index: mem::Box[Dyn[Index[f64]]]) { // error: generic.unsatisfied-bound
+} dropped
+```
+
 ### Checking at definition
 
 A generic item is checked once, at its definition. There each type parameter has exactly the members, operators and properties its bounds give, each const parameter satisfies its `where` conditions as facts, and a call to a bound's method has the digest that method's limits give ([indirect calls](10-effects-digests.md#indirect-calls)). Instantiating a checked generic item produces only the diagnostics of the [instantiation](#instantiation) rules, the `prop` codes for type arguments, `error.from-ambiguous` ([error enums](11-errors-domains.md#error-enums)) and the checks of a [final build](27-program-model.md#final-builds); no diagnostic arises inside its body.

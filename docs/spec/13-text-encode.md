@@ -605,6 +605,7 @@ A decoder is a validator of data arriving [Untrusted](15-untrusted.md#untrusted-
 | `mem::List[T]`, `mem::Set[T]`, `mem::Bounded[T, N]` | a sequence in iteration order; more than N elements fails with `OutOfRange` |
 | `mem::Map[K, V]` | a map in iteration order |
 | `mem::Box[T]`, `mem::Shared[T]` | the contents, decoded into a new box or shared value |
+| `Untrusted[T]` | the contents, decoded into a new Untrusted value |
 | `mem::Id[T]` | as the `u32` of its index |
 
 - Decoding an integer outside its type fails with `OutOfRange`, and text that is not well-formed UTF-8 with `InvalidText`.
@@ -680,7 +681,7 @@ The **schema hash** of a type implementing `Encode` is the [hash](29-identity-ve
 | `Variant` | `open: bool`; `variants`, a sequence of records with `key: Str`, `aliases` and `payload: Option` of a node | enums, `Option`, `Result` |
 | `Back` | `depth: u64` | recursion |
 
-- `Record` fields and `Variant` variants appear in ascending byte order of keys. `defaulted` is true when the field takes a default when missing. `mem::Box[T]` and `mem::Shared[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
+- `Record` fields and `Variant` variants appear in ascending byte order of keys. `defaulted` is true when the field takes a default when missing. `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
 - Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
 
 ## Wire format

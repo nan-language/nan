@@ -1,5 +1,5 @@
 //! Untrusted data: what `Untrusted.of` may wrap, where `inspect` appears, the rules of validators,
-//! parsing types, and the validator and decoder operations that need a `validate` grant.
+//! parsing types, and the validator, decoder and encoder operations that need a `validate` grant.
 
 use super::Checker;
 use super::db::ItemId;
@@ -141,6 +141,20 @@ impl Checker<'_> {
     /// Reports the `validate` grant a use of the decoder of `decoded` needs.
     pub fn check_decoder_use(&self, item: ItemId, token: Tok, decoded: &Ty) {
         if !decoded.has_error() && !self.is_parsing(decoded) {
+            self.require(item, token, Authority::Validate);
+        }
+    }
+
+    /// Whether a type holds an Untrusted instantiation, whose contents its encoders write out:
+    /// is one, has one as a type argument at any depth, or among the constituents of a struct or
+    /// enum it instantiates.
+    pub fn holds_untrusted(&self, ty: &Ty) -> bool {
+        self.any_part(ty, &|part| self.is_std(part, "core::Untrusted"))
+    }
+
+    /// Reports the `validate` grant a use of the encoder of `encoded` needs.
+    pub fn check_encoder_use(&self, item: ItemId, token: Tok, encoded: &Ty) {
+        if !encoded.has_error() && self.holds_untrusted(encoded) {
             self.require(item, token, Authority::Validate);
         }
     }

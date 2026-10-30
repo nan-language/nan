@@ -315,7 +315,9 @@ impl Checker<'_> {
             "text::String" => return Node::Text,
             "mem::Bytes" => return Node::Bytes,
             "text::Fixed" => return Node::BoundedText(count(0).unwrap_or_default()),
-            "mem::Box" | "mem::Shared" => return self.schema_within(&arg(0), enclosing),
+            "mem::Box" | "mem::Shared" | "core::Untrusted" => {
+                return self.schema_within(&arg(0), enclosing);
+            }
             "mem::Id" => return Node::Unsigned(32),
             "core::Array" | "mem::Bounded" | "mem::Set" | "mem::List" => {
                 let element = Box::new(self.schema_within(&arg(0), enclosing));

@@ -355,12 +355,21 @@ fn declared(lo: &mut Lowering, item: crate::check::db::ItemId, args: &[Arg]) -> 
     }
 }
 
+/// A type without its Untrusted wrappers, which an Untrusted value is laid out and encoded as.
+fn unwrapped(lo: &Lowering, ty: &Ty) -> Ty {
+    let mut ty = ty;
+    while lo.ck.is_std(ty, "core::Untrusted") {
+        ty = ty.type_arg(0).expect("an Untrusted type argument");
+    }
+    ty.clone()
+}
+
 /// The encoding function of a type in a format: given the value's address and a writer.
 fn encoder(lo: &mut Lowering, format: Format, ty: &Ty) -> FuncId {
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
     signature.params.push(AbiParam::new(PTR));
-    let ty = ty.clone();
+    let ty = unwrapped(lo, ty);
     lo.glue_function(
         Glue::Encode(format, ty.clone()),
         signature,
@@ -767,7 +776,7 @@ fn decoder(lo: &mut Lowering, format: Format, ty: &Ty) -> FuncId {
         signature.params.push(AbiParam::new(PTR));
     }
     signature.returns.push(AbiParam::new(types::I32));
-    let ty = ty.clone();
+    let ty = unwrapped(lo, ty);
     lo.glue_function(
         Glue::Decode(format, ty.clone()),
         signature,

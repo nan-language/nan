@@ -168,7 +168,9 @@ fn encoded(interp: &Interpreter, value: &Val, ty: &Ty) -> Tree {
                         })
                         .collect(),
                 ),
-                "mem::Box" | "mem::Shared" => encoded(interp, &value.fields()[0], &arg(0)),
+                "mem::Box" | "mem::Shared" | "core::Untrusted" => {
+                    encoded(interp, &value.fields()[0], &arg(0))
+                }
                 "mem::Id" => Tree::Unsigned(value.fields()[0].int() as u64),
                 _ => {
                     match &interp.ck.sig(*item).kind {
@@ -643,6 +645,7 @@ impl Decoding<'_, '_, '_, '_> {
                     None => return fail("OutOfMemory"),
                 }
             }
+            "core::Untrusted" => Val::Struct(item, Rc::new(vec![self.value(&arg(0))?])),
             "mem::Id" => {
                 let index = self.scalar(Scalar::U32)?;
                 Val::Struct(item, Rc::new(vec![index]))

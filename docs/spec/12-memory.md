@@ -557,6 +557,17 @@ pub proj fn Bytes.cursor_mut(mut self) -> core::SliceCursorMut[u8]
 - `insert` and `remove` shift the later elements by one place; `pop` removes the last element, or returns `None` on an empty list. `truncate(len)` releases the elements from index `len` on, and does nothing when `len` is not below `len()`.
 - `zeroed(len, alloc)` is a `mem::Bytes` of `len` zero bytes; `append` appends a copy of `data`.
 
+```nan
+pub closed linear struct Lease {
+    pub slot: u32
+} Lease
+
+pub fn renew(mut leases: mem::List[Lease], take lease: Lease) {
+    mut leases.push(take lease)
+    mut leases.truncate(1) // error: prop.linear-argument
+} renew
+```
+
 ### Maps and sets
 
 `mem::Map[K: Ord, V]` maps keys to values and iterates in ascending key order. `mem::HashMap[K: Eq and Hash, V]` maps keys to values by hashing and iterates in insertion order. `mem::Set[T: Ord]` holds distinct values and iterates in ascending order.

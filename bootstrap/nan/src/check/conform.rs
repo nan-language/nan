@@ -1010,6 +1010,18 @@ impl super::db::Db<'_> {
                 | "SetIntoCursor"
         )
     }
+
+    /// Whether a std member counts its owner's parameters as droppable, as its owning chapter
+    /// says of the members of `mem::List` that may release elements.
+    pub fn canonical_member_droppable(&self, function: ItemId) -> bool {
+        matches!(
+            self.canonical(function).as_str(),
+            "mem::List.truncate"
+                | "mem::List.retain"
+                | "mem::List.try_push"
+                | "mem::List.try_insert"
+        )
+    }
 }
 
 impl Checker<'_> {

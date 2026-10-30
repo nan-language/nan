@@ -672,6 +672,23 @@ fn main(take m: boot::Machine) -> Never limits stack 16_384 {
 } main
 ```
 
+```nan
+// file: loader/package.nan
+//! Kernel loading for a UEFI loader.
+
+package loader {
+    language 1
+    targets x86_64-uefi
+} loader
+
+// file: loader/loader.nan
+//! Reads the kernel image under limits.
+
+pub fn kernel_image(services: boot::Services, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails boot::ServiceError limits notrap, noalloc {
+    return try services.read_file("kernel.elf", alloc) // error: limit.allocates
+} kernel_image
+```
+
 ## Floating point
 
 A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.

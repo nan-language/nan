@@ -11,7 +11,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 19] = [
+const DRAWING: [&str; 22] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "text::json::Codec.decode",
@@ -21,6 +21,8 @@ const DRAWING: [&str; 19] = [
     "sys::Fs.read_all",
     "sys::Domain.run",
     "sys::Domain.run_sized",
+    "sys::Cx.send",
+    "sys::Cx.after",
     "sys::Cx.spawn",
     "sys::sim::fs",
     "sys::sim::stdio",
@@ -28,10 +30,15 @@ const DRAWING: [&str; 19] = [
     "hw::sim::Registers.of",
     "hw::sim::Registers.queue",
     "hw::sim::Registers.queue_at",
+    "boot::Kernel.regions",
     "boot::Kernel.anchor",
     "host::Runner.run",
     "testing::world",
 ];
+
+/// The supplied operations without a `try_` name that draw memory and fail, rather than trap,
+/// when it is exhausted.
+const FAILING_DRAWS: [&str; 1] = ["boot::Services.read_file"];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows, and exhausted capability tables and cells.
@@ -139,7 +146,8 @@ impl Checker<'_> {
     }
 
     /// Whether a supplied operation has a trap site: unless its head demands `notrap`, when it
-    /// draws memory other than through a `try_` form, or its owning chapter names a trap.
+    /// draws memory and neither is a `try_` form nor fails on exhaustion, or its owning chapter
+    /// names a trap.
     pub fn supplied_traps(&self, item: ItemId) -> bool {
         let Some(head) = self.fn_sig(item) else {
             return true;
@@ -151,7 +159,9 @@ impl Checker<'_> {
         let member = path
             .rsplit_once('.')
             .map_or(path.as_str(), |(_, member)| member);
-        let exhausts = self.draws(item, &path, &head) && !member.starts_with("try_");
+        let exhausts = self.draws(item, &path, &head)
+            && !member.starts_with("try_")
+            && !FAILING_DRAWS.contains(&path.as_str());
         exhausts || TRAPPING.contains(&path.as_str())
     }
 
@@ -165,7 +175,7 @@ impl Checker<'_> {
         if INLINE.contains(&owner) {
             return false;
         }
-        if DRAWING.contains(&path) || member.starts_with("try_") {
+        if DRAWING.contains(&path) || FAILING_DRAWS.contains(&path) || member.starts_with("try_") {
             return true;
         }
         self.db

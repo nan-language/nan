@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::artefact::{self, read_bytes, read_uvar};
+use crate::check::reversibility;
 use crate::hash::Hash;
 use crate::machine::api::{Entry, Snapshot};
 use crate::store::{Class, Summary};
@@ -135,9 +136,11 @@ fn interface(code_root: &[u8]) -> Vec<(String, String)> {
     found
 }
 
-/// The facts a digest line states: its effects and authority entries, may-trap and terminates.
+/// The facts a digest line states: its effects and authority entries, its class, may-trap and
+/// terminates.
 struct Facts<'a> {
     entries: Vec<&'a str>,
+    class: reversibility::Class,
     may_trap: bool,
     terminates: bool,
 }
@@ -151,21 +154,25 @@ fn words<'a>(part: Option<&&'a str>, prefix: &str) -> Vec<&'a str> {
 
 fn facts(line: &str) -> Facts<'_> {
     let parts: Vec<&str> = line.split(" | ").collect();
-    let mut entries = words(parts.first(), "effects ");
+    let (effects, class) = reversibility::split_effects(parts.first().copied().unwrap_or_default());
+    let mut entries = words(Some(&effects), "effects ");
     entries.extend(words(parts.get(1), "authority "));
     Facts {
         entries,
+        class,
         may_trap: parts.get(2) == Some(&"may-trap yes"),
         terminates: parts.get(3) == Some(&"terminates"),
     }
 }
 
-/// Whether a digest gains a fact or set element over another, or loses terminates.
+/// Whether a digest gains a fact or set element over another, raises its class, or loses
+/// terminates.
 fn widens(old: &str, new: &str) -> bool {
     let (old, new) = (facts(old), facts(new));
     let unbounded = new.entries.contains(&"any") && !old.entries.contains(&"any");
     unbounded
         || new.entries.iter().any(|entry| !old.entries.contains(entry))
+        || !new.class.at_most(old.class)
         || (new.may_trap && !old.may_trap)
         || (old.terminates && !new.terminates)
 }

@@ -8,6 +8,7 @@ use std::ops::RangeInclusive;
 use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::expand::DerivedItem;
 use super::identity::Hashes;
+use super::reversibility::Class;
 use super::{
     Checker, check_targets, checked_closures, checked_packages, checkers, decl, ty, unchecked,
 };
@@ -365,8 +366,8 @@ pub(super) fn digest_lines(
 /// directly or through a call, and the methods of primitive capabilities it reaches.
 pub struct Explained {
     pub digests: Vec<String>,
-    /// Each fact with the file and line raising it, by line.
-    pub facts: Vec<(&'static str, String, u32)>,
+    /// Each fact, a class as written, with the file and line raising it, by line.
+    pub facts: Vec<(String, String, u32)>,
     pub methods: Vec<String>,
     pub obligations: Vec<Explanation>,
 }
@@ -400,9 +401,10 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
         };
         let data = db.item(item);
         let body = checker.typed_body(item)?;
-        let mut facts: Vec<(&'static str, String, u32)> = Vec::new();
+        let mut facts: Vec<(String, String, u32)> = Vec::new();
         for site in checker.text_sites(item, &body) {
             let digest = &site.facts;
+            let class = digest.class.text();
             let raised = [
                 ("wait", digest.wait),
                 ("alloc", digest.alloc),
@@ -410,9 +412,14 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
                 ("priv", digest.privileged),
                 ("sync", digest.sync),
                 ("float", digest.float),
+                (class.as_str(), digest.class != Class::Traceless),
             ];
             for (fact, holds) in raised {
-                let found = (fact, data.file.path.clone(), data.line(site.token));
+                let found = (
+                    fact.to_owned(),
+                    data.file.path.clone(),
+                    data.line(site.token),
+                );
                 if holds && !facts.contains(&found) {
                     facts.push(found);
                 }
@@ -422,6 +429,7 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
             ["wait", "alloc", "device", "priv", "sync", "float"]
                 .iter()
                 .position(|known| *known == fact)
+                .unwrap_or(6)
         };
         facts.sort_by_key(|(fact, _, line)| (*line, order(fact)));
         let mut methods: Vec<String> = checker

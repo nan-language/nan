@@ -1,0 +1,241 @@
+//! Reversibility classes: their order, joins and compensation, and their text and encoding.
+
+/// What code does to state outside the program, at most.
+pkg enum Class derives Copy, Eq, Hash {
+    Traceless
+    Recorded
+    Restorable
+    /// Irreversible effects of the kinds whose bits are set, the lowest bit the first kind.
+    Irreversible(u8)
+} Class
+
+const EMIT: u8 = 1
+
+/// The greatest class.
+pkg fn Class.worst() -> Class = Class.Irreversible(15)
+
+/// The class a word names, `irreversible` without kinds, if it names one.
+pkg fn Class.of_word(word: Str) -> Option[Class] {
+    return match word {
+        "traceless" => Some(Class.Traceless)
+        "recorded" => Some(Class.Recorded)
+        "restorable" => Some(Class.Restorable)
+        "irreversible" => Some(Class.Irreversible(0))
+        else => None
+    }
+} Class.of_word
+
+/// The bit of a kind, 0 for a word that names none.
+fn kind_bit(word: Str) -> u8 {
+    return match word {
+        "emit" => 1
+        "actuate" => 2
+        "erase" => 4
+        "spend" => 8
+        else => 0
+    }
+} kind_bit
+
+/// Appends a kind by its position.
+fn append_kind(mut written: text::String, position: u8) {
+    let word = match position {
+        0 => "emit"
+        1 => "actuate"
+        2 => "erase"
+        else => "spend"
+    }
+    mut written.append(word)
+} append_kind
+
+/// The kinds of an irreversible class.
+fn Class.kinds(self) -> Option[u8] {
+    return match self {
+        Class.Irreversible(kinds) => Some(kinds)
+        else => None
+    }
+} Class.kinds
+
+/// The class with a kind added, if it is irreversible and the word names a kind.
+pkg fn Class.extended(self, word: Str) -> Option[Class] {
+    let Some(kinds) = self.kinds() else {
+        return None
+    }
+    let bit = kind_bit(word)
+    if bit == 0 {
+        return None
+    }
+    return Some(Class.Irreversible(kinds | bit))
+} Class.extended
+
+/// The class a digest line writes.
+pkg fn Class.parse(written: Str) -> Option[Class] {
+    let prefix = "irreversible("
+    if not written.starts_with(prefix) {
+        let Some(class) = Class.of_word(written) else {
+            return None
+        }
+        if class.kinds().is_some() {
+            return None
+        }
+        return Some(class)
+    }
+    if not written.ends_with(")") {
+        return None
+    }
+    let Some(inner) = written.slice_bytes(prefix.byte_len(), end: written.byte_len() - 1) else {
+        return None
+    }
+    var class = Class.Irreversible(0)
+    var rest = inner
+    loop {
+        let end = rest.find(", ").value_or(rest.byte_len())
+        let Some(word) = rest.slice_bytes(0, end) else {
+            return None
+        }
+        let Some(added) = class.extended(word) else {
+            return None
+        }
+        class = added
+        if end == rest.byte_len() {
+            return Some(class)
+        }
+        let Some(after) = rest.slice_bytes(end + 2, end: rest.byte_len()) else {
+            return None
+        }
+        rest = after
+    }
+} Class.parse
+
+/// Where a class starts in a digest line's effects part, which writes it last, and the class.
+pkg struct ClassAt derives Copy {
+    pkg start: usize
+    pkg class: Class
+} ClassAt
+
+/// The class a digest line's effects part writes, if it writes one.
+pkg fn ClassAt.of(effects: Str) -> Option[ClassAt] {
+    var start = effects.find("recorded")
+    if start.is_none() {
+        start = effects.find("restorable")
+    }
+    if start.is_none() {
+        start = effects.find("irreversible")
+    }
+    let Some(at) = start else {
+        return None
+    }
+    let Some(written) = effects.slice_bytes(at, end: effects.byte_len()) else {
+        return None
+    }
+    let Some(class) = Class.parse(written) else {
+        return None
+    }
+    return Some(ClassAt(start: at, class: class))
+} ClassAt.of
+
+/// Its row's position in the class table.
+fn Class.position(self) -> u8 {
+    return match self {
+        Class.Traceless => 0
+        Class.Recorded => 1
+        Class.Restorable => 2
+        Class.Irreversible(_) => 3
+    }
+} Class.position
+
+pkg fn Class.join(self, other: Class) -> Class {
+    let own = self.kinds()
+    let others = other.kinds()
+    if own.is_some() and others.is_some() {
+        return Class.Irreversible(own.value_or(0) | others.value_or(0))
+    }
+    if other.position() > self.position() {
+        return other
+    }
+    return self
+} Class.join
+
+/// The greatest class at most both.
+pkg fn Class.meet(self, other: Class) -> Class {
+    let own = self.kinds()
+    let others = other.kinds()
+    if own.is_some() and others.is_some() {
+        let kinds = own.value_or(0) & others.value_or(0)
+        if kinds == 0 {
+            return Class.Restorable
+        }
+        return Class.Irreversible(kinds)
+    }
+    if other.position() < self.position() {
+        return other
+    }
+    return self
+} Class.meet
+
+pkg fn Class.at_most(self, bound: Class) -> bool {
+    let kinds = self.kinds()
+    let bounding = bound.kinds()
+    if kinds.is_some() and bounding.is_some() {
+        return (kinds.value_or(0) & ~bounding.value_or(0)) == 0
+    }
+    return self.position() <= bound.position()
+} Class.at_most
+
+/// The class of code with an undo clause: an emission stays irreversible, and every other
+/// effect becomes restorable.
+pkg fn Class.compensated(self) -> Class {
+    let Some(kinds) = self.kinds() else {
+        return self
+    }
+    if (kinds & EMIT) != 0 {
+        return Class.Irreversible(EMIT)
+    }
+    return Class.Restorable
+} Class.compensated
+
+/// The class as a limit and a digest line write it.
+pkg fn Class.text(self, alloc: mem::Alloc) -> text::String {
+    let Some(kinds) = self.kinds() else {
+        let word = match self {
+            Class.Traceless => "traceless"
+            Class.Recorded => "recorded"
+            else => "restorable"
+        }
+        return text::String.of(word, alloc)
+    }
+    var written = text::String.of("irreversible(", alloc)
+    var listed = false
+    for position in 0..<4u8 {
+        if (kinds & (1u8 << u32.widen(position))) == 0 {
+            continue
+        }
+        if listed {
+            mut written.append(", ")
+        }
+        append_kind(mut written, position)
+        listed = true
+    }
+    mut written.append(")")
+    return written
+} Class.text
+
+/// The class in the canonical NIR encoding: its position, followed for an irreversible class by
+/// its kinds' positions.
+pkg fn Class.encode(self, mut out: mem::Bytes) {
+    encoding::uvar(mut out, value: u64.widen(self.position()))
+    let Some(kinds) = self.kinds() else {
+        return
+    }
+    var count: u64 = 0
+    for position in 0..<4u32 {
+        if (kinds & (1u8 << position)) != 0 {
+            count += 1
+        }
+    }
+    encoding::uvar(mut out, value: count)
+    for position in 0..<4u32 {
+        if (kinds & (1u8 << position)) != 0 {
+            encoding::uvar(mut out, value: u64.widen(position))
+        }
+    }
+} Class.encode

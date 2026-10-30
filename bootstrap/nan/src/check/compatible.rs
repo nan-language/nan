@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::db::ItemId;
 use super::entail::{self, Weakened};
+use super::reversibility;
 use super::schema::Node;
 use super::sig::SigKind;
 use super::synthetic::{self, Synthetic};
@@ -133,15 +134,21 @@ fn judging(ck: &Checker, item: ItemId, old: &Entry, new: &Entry) -> Judging {
     let held = |lines: &[String]| lines.iter().all(|line| new.text.contains(line));
     match &ck.sig(item).kind {
         SigKind::Fn(_) => {
-            let (old_core, old_limits) = limits(old_head);
-            let (new_core, new_limits) = limits(new_head);
+            let (old_core, old_limits, old_class) = limits(old_head);
+            let (new_core, new_limits, new_class) = limits(new_head);
             let added: Vec<&&str> = new_limits
                 .iter()
                 .filter(|limit| !old_limits.contains(limit))
                 .collect();
             let kept = old_limits.iter().all(|limit| new_limits.contains(limit));
+            let class_kept = match (old_class, new_class) {
+                (Some(old), Some(new)) => new.at_most(old),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
             if old_core != new_core
                 || !kept
+                || !class_kept
                 || added.iter().any(|limit| limit.starts_with("stack "))
             {
                 return Judging::Breaking;
@@ -216,12 +223,24 @@ fn opened(old: &str, new: &str) -> bool {
     old == new && new.contains(" open ")
 }
 
-/// A function's head line without its limits, and its limits.
-fn limits(head: &str) -> (&str, Vec<&str>) {
-    match head.split_once(" limits ") {
-        Some((core, limits)) => (core, limits.split(", ").collect()),
-        None => (head, Vec::new()),
+/// A function's head line without its limits, its limits other than a class, and its class.
+fn limits(head: &str) -> (&str, Vec<&str>, Option<reversibility::Class>) {
+    let Some((core, mut rest)) = head.split_once(" limits ") else {
+        return (head, Vec::new(), None);
+    };
+    let (mut limits, mut class) = (Vec::new(), None);
+    while !rest.is_empty() {
+        let end = match rest.starts_with("irreversible(") {
+            true => rest.find(')').map_or(rest.len(), |close| close + 1),
+            false => rest.find(", ").unwrap_or(rest.len()),
+        };
+        match reversibility::Class::parse(&rest[..end]) {
+            Some(named) => class = Some(named),
+            None => limits.push(&rest[..end]),
+        }
+        rest = rest[end..].strip_prefix(", ").unwrap_or(&rest[end..]);
     }
+    (core, limits, class)
 }
 
 /// A function of an item's module holding an item's old examples, whose check runs them against

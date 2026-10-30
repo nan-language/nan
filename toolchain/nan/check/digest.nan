@@ -13,6 +13,7 @@ struct Digest derives Eq {
     capabilities: Option[mem::Set[ty::ItemId]]
     /// The validators and decoders it calls; none for the unbounded set.
     validators: Option[mem::Set[ty::ItemId]]
+    class: ty::Class
 } Digest
 
 /// A site of code: where it brings facts, and what brings them.
@@ -122,6 +123,10 @@ struct DigestWalk {
     body: mem::Shared[TBody]
     /// The closure whose code is walked, 0 for the item's own body.
     closure: u32
+    /// The class its own limits clause holds, which its device accesses take.
+    premise: Option[ty::Class]
+    /// Whether a device access took the premise.
+    premised: bool
     sites: mem::List[DigestSite]
     /// The sites of each `expect` condition, by the condition's first token.
     expects: mem::List[ExpectSites]
@@ -129,22 +134,23 @@ struct DigestWalk {
 
 /// The digest of code that does nothing.
 fn Digest.none(alloc: mem::Alloc) -> Digest {
-    return Digest(wait: false, alloc: false, device: false, privileged: false, sync: false, terminates: true, float: false, capabilities: Some(mem::Set[ty::ItemId].empty(alloc)), validators: Some(mem::Set[ty::ItemId].empty(alloc)))
+    return Digest(wait: false, alloc: false, device: false, privileged: false, sync: false, terminates: true, float: false, capabilities: Some(mem::Set[ty::ItemId].empty(alloc)), validators: Some(mem::Set[ty::ItemId].empty(alloc)), class: ty::Class.Traceless)
 } Digest.none
 
 /// The declared digest of a function type or head: the worst digest, waiting as it states
 /// and with the facts its limits set.
 fn Digest.declared(wait: bool, limit_set: ty::LimitSet, alloc: mem::Alloc) -> Digest {
-    var digest = Digest(wait: wait, alloc: not limit_set.pure and not limit_set.noalloc, device: not limit_set.pure, privileged: not limit_set.pure, sync: not limit_set.pure, terminates: limit_set.terminates, float: false, capabilities: None, validators: None)
+    var digest = Digest(wait: wait, alloc: not limit_set.pure and not limit_set.noalloc, device: not limit_set.pure, privileged: not limit_set.pure, sync: not limit_set.pure, terminates: limit_set.terminates, float: false, capabilities: None, validators: None, class: limit_set.class.value_or(ty::Class.worst()))
     if limit_set.pure {
         digest.capabilities = Some(mem::Set[ty::ItemId].empty(alloc))
         digest.validators = Some(mem::Set[ty::ItemId].empty(alloc))
+        digest.class = ty::Class.Traceless
     }
     return digest
 } Digest.declared
 
 fn Digest.copy(self, alloc: mem::Alloc) -> Digest {
-    return Digest(wait: self.wait, alloc: self.alloc, device: self.device, privileged: self.privileged, sync: self.sync, terminates: self.terminates, float: self.float, capabilities: copied_set(self.capabilities, alloc), validators: copied_set(self.validators, alloc))
+    return Digest(wait: self.wait, alloc: self.alloc, device: self.device, privileged: self.privileged, sync: self.sync, terminates: self.terminates, float: self.float, capabilities: copied_set(self.capabilities, alloc), validators: copied_set(self.validators, alloc), class: self.class)
 } Digest.copy
 
 fn Digest.join(mut self, other: Digest) {
@@ -157,11 +163,13 @@ fn Digest.join(mut self, other: Digest) {
     self.float = self.float or other.float
     join_set(mut self.capabilities, other: other.capabilities)
     join_set(mut self.validators, other: other.validators)
+    self.class = self.class.join(other.class)
 } Digest.join
 
-/// Whether it holds no effect fact, the wait fact excepted, and empty sets.
+/// Whether it holds no effect fact, the wait fact excepted, empty sets and the class
+/// `traceless`.
 fn Digest.pure(self) -> bool {
-    if self.alloc or self.device or self.privileged or self.sync {
+    if self.alloc or self.device or self.privileged or self.sync or self.class != ty::Class.Traceless {
         return false
     }
     let Some(capabilities) = self.capabilities else {
@@ -183,6 +191,12 @@ fn Digest.broken(self, limit_set: ty::LimitSet) -> Option[diagnostic::Code] {
     }
     if limit_set.noalloc and self.alloc {
         return Some(diagnostic::Code.LimitAllocates)
+    }
+    let Some(bound) = limit_set.class else {
+        return None
+    }
+    if not self.class.at_most(bound) {
+        return Some(diagnostic::Code.LimitReversibilityExceeded)
     }
     return None
 } Digest.broken
@@ -233,8 +247,18 @@ fn extended_set(set: Option[mem::Set[ty::ItemId]], item: ty::ItemId, alloc: mem:
 } extended_set
 
 /// The digest of a function item: computed from its body, supplied for a std function
-/// without one, and otherwise declared.
+/// without one, and otherwise declared; compensated when the function has an undo clause.
 fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
+    let digest = self.uncompensated_digest(item)
+    if not self.compensates(item) {
+        return digest
+    }
+    var compensated = digest.contents().copy(self.alloc())
+    compensated.class = compensated.class.compensated()
+    return mem::Shared.of(take compensated, alloc: self.alloc())
+} Checker.digest
+
+fn Checker.uncompensated_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let db = self.db()
     db.note(item)
     let search = self.underway.contents().computing
@@ -250,7 +274,7 @@ fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
         None => {}
     }
     return self.about(Some(item), compute: fn() => self.compute_digest(item))
-} Checker.digest
+} Checker.uncompensated_digest
 
 fn Checker.compute_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let alloc = self.alloc()
@@ -866,8 +890,26 @@ fn Checker.closure_sites(self, item: ty::ItemId, body: mem::Shared[TBody], closu
 /// nothing yet.
 fn Checker.walker(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> DigestWalk {
     let alloc = self.alloc()
-    return DigestWalk(ck: self.share(), item: item, body: body.share(), closure: closure, sites: mem::List[DigestSite].empty(alloc), expects: mem::List[ExpectSites].empty(alloc))
+    return DigestWalk(ck: self.share(), item: item, body: body.share(), closure: closure, premise: self.premise(item, body, closure), premised: false, sites: mem::List[DigestSite].empty(alloc), expects: mem::List[ExpectSites].empty(alloc))
 } Checker.walker
+
+/// The class the own limits clause of a body, or of the closure of it numbered `closure`,
+/// holds.
+fn Checker.premise(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> Option[ty::Class] {
+    if closure == 0 {
+        let Some(head) = self.fn_sig(item) else {
+            return None
+        }
+        return head.limit_set.class
+    }
+    let Some(root) = body.contents().root else {
+        return None
+    }
+    let Some(found) = root.closure_numbered(closure) else {
+        return None
+    }
+    return found.ty.limit_set.class
+} Checker.premise
 
 /// The walk of a body's own code, or of the closure it numbers `closure`.
 fn Checker.walk(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> DigestWalk {
@@ -886,6 +928,65 @@ fn Checker.walk(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) 
     mut walk.expr(found.body)
     return walk
 } Checker.walk
+
+/// A device premise of a function's text: the class its device accesses take, with the first
+/// token of the closure stating it, none for the function's own body.
+struct DevicePremise {
+    token: Option[u32]
+    class: ty::Class
+} DevicePremise
+
+/// A closure of a body, by its number, with its first token.
+struct NumberedClosure derives Copy {
+    index: u32
+    token: u32
+} NumberedClosure
+
+/// The device premises of a function's text: its own body's, then each closure's whose device
+/// accesses take one.
+fn Checker.device_premises(self, item: ty::ItemId) -> mem::List[DevicePremise] {
+    let alloc = self.alloc()
+    var found = mem::List[DevicePremise].empty(alloc)
+    let Some(body) = self.typed_body(item) else {
+        return found
+    }
+    let Some(root) = body.contents().root else {
+        return found
+    }
+    var walked = mem::List[NumberedClosure].empty(alloc)
+    mut walked.push(NumberedClosure(index: 0, token: 0))
+    nested_closures(root, found: mut walked)
+    for closure in walked {
+        let walk = self.walk(item, body, closure: closure.index)
+        let Some(class) = walk.premise else {
+            continue
+        }
+        if not walk.premised {
+            continue
+        }
+        var token: Option[u32] = None
+        if closure.index != 0 {
+            token = Some(closure.token)
+        }
+        mut found.push(DevicePremise(token: token, class: class))
+    }
+    return found
+} Checker.device_premises
+
+/// The closures an expression holds at any depth, those inside closures included, each with its
+/// first token.
+fn nested_closures(expr: TExpr, mut found: mem::List[NumberedClosure]) {
+    match expr.kind {
+        TKind.Closure(closure) => {
+            let held = closure.contents()
+            mut found.push(NumberedClosure(index: held.index, token: expr.token))
+            nested_closures(held.body, mut found)
+            return
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => nested_closures(child, mut found))
+} nested_closures
 
 /// Reports each `expect` of a body, its closures' included, whose condition is not `pure`.
 fn Checker.check_expect_purity(self, item: ty::ItemId, body: mem::Shared[TBody]) {
@@ -971,10 +1072,7 @@ fn Checker.check_limits(self, item: ty::ItemId, body: mem::Shared[TBody]) {
             continue
         }
         expect method < methods.len()
-        let demanded = methods[method].sig.limit_set
-        limit_set.pure = limit_set.pure or demanded.pure
-        limit_set.terminates = limit_set.terminates or demanded.terminates
-        limit_set.noalloc = limit_set.noalloc or demanded.noalloc
+        demand(mut limit_set, demanded: methods[method].sig.limit_set)
     }
     var reported = mem::List[u32].empty(self.alloc())
     self.judge(item, body, closure: 0, limit_set, mut reported)
@@ -1054,19 +1152,16 @@ fn Checker.judge(
             continue
         }
         var own = found.ty.limit_set
-        own.pure = own.pure or found.demanded.pure
-        own.terminates = own.terminates or found.demanded.terminates
-        own.noalloc = own.noalloc or found.demanded.noalloc
+        demand(mut own, demanded: found.demanded)
         self.judge(item, body, closure: nested, limit_set: own, mut reported)
-        if limit_set.pure or limit_set.terminates or limit_set.noalloc {
+        if demands_facts(limit_set) {
             self.judge(item, body, closure: nested, limit_set, mut reported)
         }
     }
-    let demanding = limit_set.pure or limit_set.terminates or limit_set.noalloc
-    if not demanding and not self.db().recording() {
+    if not demands_facts(limit_set) and not self.db().recording() {
         return
     }
-    let sites = self.sites(item, body, closure)
+    let sites = self.judged_sites(item, body, closure)
     for site in sites {
         if site.brought == Brought.Charged or reported.position(fn(value: u32) => value == site.token).is_some() {
             continue
@@ -1075,18 +1170,52 @@ fn Checker.judge(
             continue
         }
         mut reported.push(site.token)
-        self.report_because(item, token: site.token, code, because: self.trace(item, site, code))
+        self.report_because(item, token: site.token, code, because: self.trace(item, site, code, limit_set))
     }
 } Checker.judge
 
+/// Whether limits demand a fact the sites of code may lack.
+fn demands_facts(limit_set: ty::LimitSet) -> bool {
+    return limit_set.pure or limit_set.terminates or limit_set.noalloc or limit_set.class.is_some()
+} demands_facts
+
+/// Adds the demands of `demanded`, other than `notrap` and `stack N`, to `limit_set`, a class
+/// joining as the greatest class at most both.
+fn demand(mut limit_set: ty::LimitSet, demanded: ty::LimitSet) {
+    limit_set.pure = limit_set.pure or demanded.pure
+    limit_set.terminates = limit_set.terminates or demanded.terminates
+    limit_set.noalloc = limit_set.noalloc or demanded.noalloc
+    let Some(wanted) = demanded.class else {
+        return
+    }
+    limit_set.class = match limit_set.class {
+        Some(own) => Some(own.meet(wanted))
+        None => Some(wanted)
+    }
+} demand
+
+/// The sites of a body, or of the closure of it numbered `closure`, as limits judge them: with
+/// their classes compensated when the function has an undo clause.
+fn Checker.judged_sites(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> mem::List[DigestSite] {
+    var sites = self.sites(item, body, closure)
+    if self.compensates(item) {
+        for site in mut sites {
+            site.facts.class = site.facts.class.compensated()
+        }
+    }
+    return sites
+} Checker.judged_sites
+
 /// The because-chain of a site breaking a limit: a `called` reason per call down to the
 /// operation carrying the fact, and a `raised` reason for that operation.
-fn Checker.trace(self, item: ty::ItemId, site: DigestSite, code: diagnostic::Code) -> mem::List[diagnostic::Reason] {
+fn Checker.trace(self, item: ty::ItemId, site: DigestSite, code: diagnostic::Code, limit_set: ty::LimitSet) -> mem::List[diagnostic::Reason] {
     let alloc = self.alloc()
+    let broken = limits_of(code, limit_set)
     var because = mem::List[diagnostic::Reason].empty(alloc)
     var current = item
     var token = site.token
     var brought = site.brought
+    var class = site.facts.class
     var seen = mem::List[ty::ItemId].empty(alloc)
     loop {
         let Brought.Call(Some(callee)) = brought else {
@@ -1100,25 +1229,33 @@ fn Checker.trace(self, item: ty::ItemId, site: DigestSite, code: diagnostic::Cod
         let Some(body) = self.typed_body(callee) else {
             return because
         }
-        let sites = self.sites(callee, body, closure: 0)
-        let Some(next) = sites.position(fn(inner: DigestSite) => inner.facts.broken(limits_of(code)).is_some()) else {
+        let sites = self.judged_sites(callee, body, closure: 0)
+        let Some(next) = sites.position(fn(inner: DigestSite) => inner.facts.broken(broken).is_some()) else {
             return because
         }
         current = callee
         token = sites[next].token
         brought = sites[next].brought
+        class = sites[next].facts.class
     }
-    mut because.push(self.reason(current, token, role: diagnostic::Role.Raised, subject: raised_fact(code, alloc)))
+    mut because.push(self.reason(current, token, role: diagnostic::Role.Raised, subject: raised_fact(code, class, alloc)))
     return because
 } Checker.trace
 
-/// The limits demanding the fact a code reports missing.
-fn limits_of(code: diagnostic::Code) -> ty::LimitSet {
-    return ty::LimitSet(pure: code == diagnostic::Code.LimitImpure, notrap: false, terminates: code == diagnostic::Code.LimitMayNotTerminate, noalloc: code == diagnostic::Code.LimitAllocates, stack: None)
+/// The demands of `limit_set` whose breach a code reports.
+fn limits_of(code: diagnostic::Code, limit_set: ty::LimitSet) -> ty::LimitSet {
+    var class: Option[ty::Class] = None
+    if code == diagnostic::Code.LimitReversibilityExceeded {
+        class = limit_set.class
+    }
+    return ty::LimitSet(pure: code == diagnostic::Code.LimitImpure, notrap: false, terminates: code == diagnostic::Code.LimitMayNotTerminate, noalloc: code == diagnostic::Code.LimitAllocates, class: class, stack: None)
 } limits_of
 
-/// The fact an operation raising a limit's code carries.
-fn raised_fact(code: diagnostic::Code, alloc: mem::Alloc) -> text::String {
+/// The fact an operation raising a limit's code carries: its class for a class limit.
+fn raised_fact(code: diagnostic::Code, class: ty::Class, alloc: mem::Alloc) -> text::String {
+    if code == diagnostic::Code.LimitReversibilityExceeded {
+        return class.text(alloc)
+    }
     let fact = match code {
         diagnostic::Code.LimitImpure => "effect"
         diagnostic::Code.LimitMayNotTerminate => "may-not-terminate"
@@ -1235,6 +1372,7 @@ fn DigestWalk.stmt_sites(mut self, stmt: TStmt) -> bool {
         TStmtKind.Expect(condition) => {
             var condition_walk = self.ck.walker(self.item, body: self.body, closure: self.closure)
             mut condition_walk.expr(condition)
+            self.premised = self.premised or condition_walk.premised
             mut self.expects.push(ExpectSites(token: condition.token, sites: take condition_walk.sites))
             return false
         }
@@ -1350,6 +1488,9 @@ fn DigestWalk.function_site(mut self, token: u32, function: ty::ItemId) {
     if self.ck.is_validator(function) {
         facts.validators = Some(extended_set(facts.validators, item: function, alloc))
     }
+    if facts.device and self.ck.db().is_std(function) and is_volatile(self.ck.db().canonical(function).as_str()) {
+        facts.class = mut self.device_access()
+    }
     let brought = match self.ck.db().ast(function).kind.is_fn_with_body() {
         true => Brought.Call(Some(function))
         false => Brought.Call(None)
@@ -1375,9 +1516,19 @@ fn DigestWalk.builtin_sites(mut self, token: u32, builtin: Builtin, call: Call) 
     if builtin == Builtin.DmaAccess {
         var facts = Digest.none(alloc)
         facts.device = true
+        facts.class = mut self.device_access()
         mut self.site(token, digest: take facts, brought: Brought.Operation)
     }
 } DigestWalk.builtin_sites
+
+/// The class of a device access of the code walked: its premise's, or the greatest.
+fn DigestWalk.device_access(mut self) -> ty::Class {
+    let Some(class) = self.premise else {
+        return ty::Class.worst()
+    }
+    self.premised = true
+    return class
+} DigestWalk.device_access
 
 /// A function argument supplied at a call: a closure's digest, a named function's, or the
 /// declared digest of a function value's type, a parameter of the code walked adding none;

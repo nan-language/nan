@@ -471,21 +471,22 @@ pub fn headroom(m: meter::Meter) -> u32 limits notrap {
 
 ## Clause region
 
-The **clause region** is the logical lines between a function head and its body that hold the function's requires, ensures, example, decreases, todo and waive clauses.
+The **clause region** is the logical lines between a function head and its body that hold the function's requires, ensures, example, undo, decreases, todo and waive clauses.
 
 ```ebnf
 clause_region = clause_line+ ;
 clause_line = requires_clause
     | ensures_clause
     | example_clause
+    | undo_clause
     | decreases_clause
     | todo_clause
     | waive_clause ;
 ```
 
-- Every clause rule ends with `NL`. Requires, ensures, example, decreases and todo clauses are defined in [Contracts](18-contracts.md#clauses), and waive clauses in [Statements and expressions](06-statements-expressions.md#thresholds).
+- Every clause rule ends with `NL`. Requires, ensures, example, decreases and todo clauses are defined in [Contracts](18-contracts.md#clauses), undo clauses in [Compensation](10-effects-digests.md#compensation), and waive clauses in [Statements and expressions](06-statements-expressions.md#thresholds).
 - Clause lines are never at column 0; the [canonical format](35-format.md#canonical-format) fixes their indentation.
-- Clause lines form groups in the order requires, ensures, example, decreases, todo, waive. A clause marked [disputed](18-contracts.md#todo) by a `todo` prefix belongs to the group of the clause it marks.
+- Clause lines form groups in the order requires, ensures, example, undo, decreases, todo, waive. A clause marked [disputed](18-contracts.md#todo) by a `todo` prefix belongs to the group of the clause it marks.
 - A clause line following a line of a later group is an error (`item.clause-order`); the exact fix moves it to just before the first line of a later group.
 - A clause region belongs only to a function with a body block or to an interface method.
 

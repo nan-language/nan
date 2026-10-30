@@ -353,6 +353,16 @@ impl<'a> Lower<'a> {
                 .into_iter()
                 .filter(|limit| self.rule(*limit) == Rule::Limit)
                 .map(|limit| {
+                    if let Some(class) = self.find(limit, Rule::Reversibility) {
+                        return Limit {
+                            kind: LimitKind::Class,
+                            token: self.first(class),
+                            size: None,
+                            kinds: (self.nodes(class).into_iter())
+                                .map(|kind| self.first(kind))
+                                .collect(),
+                        };
+                    }
                     let tokens = self.tokens(limit);
                     let kind = match self.text(tokens[0]) {
                         "pure" => LimitKind::Pure,
@@ -365,6 +375,7 @@ impl<'a> Lower<'a> {
                         kind,
                         token: tokens[0],
                         size: tokens.get(1).copied(),
+                        kinds: Vec::new(),
                     }
                 })
                 .collect(),
@@ -490,6 +501,11 @@ impl<'a> Lower<'a> {
             Rule::WaiveClause => ClauseKind::Waive {
                 length: self.has_word(node, "length"),
                 reason: self.text_of(self.tokens_of(node, TokenKind::Text)[0]),
+            },
+            Rule::UndoClause => ClauseKind::Undo {
+                target: self.path(self.find(node, Rule::Path).expect("an undoer path")),
+                member: self.idents(node).get(1).map(|token| self.name(*token)),
+                premise: self.text_of(self.tokens_of(node, TokenKind::Text)[0]),
             },
             _ => {
                 return match self.nodes(node).first().copied() {

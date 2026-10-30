@@ -349,7 +349,7 @@ impl SourceFile {
                 | Keyword::Waive
                 | Keyword::Todo,
             ) => true,
-            TokenKind::Ident => self.text(at) == "example",
+            TokenKind::Ident => matches!(self.text(at), "example" | "undo"),
             _ => false,
         }
     }

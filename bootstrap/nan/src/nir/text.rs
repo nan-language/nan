@@ -462,6 +462,7 @@ fn limits_written(limits: &crate::check::ty::LimitSet) -> String {
             words.push(word.to_owned());
         }
     }
+    words.extend(limits.class.map(|class| class.text()));
     if let Some(size) = limits.stack {
         words.push(format!("stack {size}"));
     }

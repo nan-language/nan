@@ -5,6 +5,7 @@
 use super::Checker;
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::props::{Property, Props};
+use super::reversibility::Class;
 use super::sig::SigKind;
 use super::tir::ClauseRole;
 use crate::nir::Role;
@@ -179,7 +180,7 @@ impl Checker<'_> {
     /// A function's digest as its digest line writes it after `digest: `.
     pub fn digest_text(&self, item: ItemId) -> String {
         let digest = self.digest(item);
-        let effects: Vec<&str> = [
+        let mut effects: Vec<String> = [
             ("wait", digest.wait),
             ("alloc", digest.alloc),
             ("sync", digest.sync),
@@ -187,8 +188,12 @@ impl Checker<'_> {
         ]
         .into_iter()
         .filter(|(_, holds)| *holds)
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.to_owned())
         .collect();
+        if digest.class != Class::Traceless {
+            effects.push(digest.class.text());
+        }
+        let effects: Vec<&str> = effects.iter().map(String::as_str).collect();
         let mut authority: Vec<String> = [("device", digest.device), ("priv", digest.privileged)]
             .into_iter()
             .filter(|(_, holds)| *holds)

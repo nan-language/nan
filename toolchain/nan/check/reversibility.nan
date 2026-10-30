@@ -1,0 +1,112 @@
+//! The classes of the std operations without a body, and the undo clauses that compensate a digest.
+
+/// The volatile calls, which with DMA access calls are the device accesses.
+const VOLATILE_CALLS: Str = "hw::Mmio.read hw::Mmio.write hw::Mmio.read_at hw::Mmio.write_at hw::Ports.read hw::Ports.write hw::Ports.read_at hw::Ports.write_at"
+
+/// The operations of the sys capabilities and their resources whose class is `recorded` on the
+/// host targets and under `any`.
+const RECORDED_OPERATIONS: Str = "sys::Log.info sys::Log.warn sys::Log.error sys::Stdio.write_out sys::Stdio.write_err"
+
+/// Those whose class is `restorable`.
+const RESTORABLE_OPERATIONS: Str = "sys::fs::File.write sys::Net.listen"
+
+/// Those whose class is `irreversible(erase)`.
+const ERASING_OPERATIONS: Str = "sys::Fs.create sys::Fs.write_all sys::Fs.remove"
+
+/// Those whose class is `irreversible(emit)`.
+const EMITTING_OPERATIONS: Str = "sys::Net.connect sys::net::Conn.write sys::net::Conn.close sys::net::Conn.abandon"
+
+/// Whether a std operation is a volatile call.
+fn is_volatile(path: Str) -> bool {
+    return is_listed(VOLATILE_CALLS, word: path)
+} is_volatile
+
+/// The class of a std operation without a body under a target: the greatest for a volatile
+/// call, and on the machine targets, where the sys capabilities are sims, `traceless` for theirs.
+fn supplied_class(path: Str, target: workspace::Target) -> ty::Class {
+    if is_volatile(path) {
+        return ty::Class.worst()
+    }
+    if path == "boot::Services.write_console" {
+        return ty::Class.Recorded
+    }
+    if target.is_machine() {
+        return ty::Class.Traceless
+    }
+    if is_listed(RECORDED_OPERATIONS, word: path) {
+        return ty::Class.Recorded
+    }
+    if is_listed(RESTORABLE_OPERATIONS, word: path) {
+        return ty::Class.Restorable
+    }
+    if is_listed(ERASING_OPERATIONS, word: path) {
+        return ty::Class.Irreversible(4)
+    }
+    if is_listed(EMITTING_OPERATIONS, word: path) {
+        return ty::Class.Irreversible(1)
+    }
+    return ty::Class.Traceless
+} supplied_class
+
+/// Whether a function has an undo clause, which compensates its digest.
+fn Checker.compensates(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    for clause in function.clauses {
+        match clause.kind {
+            ast::ClauseKind.Undo(target: _, member: _, premise: _) => return true
+            else => {}
+        }
+    }
+    return false
+} Checker.compensates
+
+/// The undoer an undo clause of a function names: a function item of the function's package,
+/// other than the function, visible wherever it is.
+fn Checker.undoer(self, item: ty::ItemId, target: ast::Path, member: Option[ast::Name]) -> Option[ty::ItemId] {
+    let db = self.db()
+    let module = db.module_of(item)
+    var named = item
+    match member {
+        Some(name) => {
+            let Some(key) = db.owner_key(module, owner: target) else {
+                return None
+            }
+            let functions = db.members(key, name: name.text.as_str())
+            if functions.len() == 0 {
+                return None
+            }
+            named = functions[0]
+        }
+        None => {
+            let Ok(Named.Item(found)) = db.resolve(module, path: target) else {
+                return None
+            }
+            named = found
+        }
+    }
+    let ast::ItemKind.Fn(_) = db.ast(named).kind else {
+        return None
+    }
+    if named == item or db.package_of(named) != db.package_of(item) or not self.seen_with(named, function: item) {
+        return None
+    }
+    return Some(named)
+} Checker.undoer
+
+/// The undo clauses of a function: each names an undoer, whose class is at most `restorable`.
+fn Checker.check_undo(self, item: ty::ItemId, function: ast::FnItem) {
+    for clause in function.clauses {
+        let ast::ClauseKind.Undo(target: target, member: member, premise: _) = clause.kind else {
+            continue
+        }
+        let Some(undoer) = self.undoer(item, target, member) else {
+            self.report(item, token: clause.token, code: diagnostic::Code.EffectUndoTarget)
+            continue
+        }
+        if not self.digest(undoer).contents().class.at_most(ty::Class.Restorable) {
+            self.report(item, token: clause.token, code: diagnostic::Code.EffectUndoIrreversible)
+        }
+    }
+} Checker.check_undo

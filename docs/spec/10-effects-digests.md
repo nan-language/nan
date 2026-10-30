@@ -1,6 +1,6 @@
 # Effects, digests and limits
 
-This chapter defines waiting, with the `uses wait` clause and the `await` marker; digests and their facts; how facts propagate through direct calls, function arguments, indirect calls, foreign fns and trusted code; limits, their promises and the stack check of final builds; function types and the fit rule; higher-order calls and failure polymorphism; and purity.
+This chapter defines waiting, with the `uses wait` clause and the `await` marker; digests and their facts, with reversibility classes and undo clauses; how facts propagate through direct calls, function arguments, indirect calls, foreign fns and trusted code; limits, their promises and the stack check of final builds; function types and the fit rule; higher-order calls and failure polymorphism; and purity.
 
 ## Waiting
 
@@ -94,18 +94,19 @@ The **digest** of a function, closure, const initializer or const assert is the 
 | float use | boolean | operates on a float value or converts from or to a float type ([floats](09-numbers.md#floats)) |
 | capabilities | set | calls functions of these [primitive capabilities](05-properties.md#capability-types), `mem::Alloc` excepted |
 | validators | set | calls these [validators](15-untrusted.md#validators) and [decoders](13-text-encode.md#decoders-as-validators) |
+| reversibility | class | changes state outside the program at most as this [class](#reversibility) states |
 
 - The **effect facts** are wait, alloc, device, priv and sync.
 - A **trap site** is an [obligation](18-contracts.md#obligations) that keeps a [run-time check](18-contracts.md#run-time-checks), or an operation that its owning chapter defines as trapping without an obligation, such as exhausting a [growable container](12-memory.md#growth). An obligation discharged by `assume` keeps no check and is no trap site. A `todo` expression is [incompleteness](18-contracts.md#todo) and no trap site. Stack overflow is governed by [stack limits](#stack-limits) and is no trap site.
 - A function `C.f` of a primitive capability `C` has `C` in its capabilities set unless its head demands `pure`. A validator or decoder has itself in its validators set.
 - An operation that the toolchain supplies (a built-in operator, an intrinsic, a [supplied operation](28-stdlib.md#supplied-operations), a compiler stub or a support routine) has the facts its owning chapter states for it, and no others, the dispatch of a [target-dependent operation](28-stdlib.md#platform-packages) included.
-- The **worst digest** has alloc, device, priv, sync and may-trap true, wait, terminates and float use false, and the unbounded set, which holds every element, as capabilities and as validators.
+- The **worst digest** has alloc, device, priv, sync and may-trap true, wait, terminates and float use false, the unbounded set, which holds every element, as capabilities and as validators, and the greatest class, `irreversible(emit, actuate, erase, spend)`.
 
-The checker computes one digest per target that the package declares. A digest is visible wherever its item may be named, as part of the [closure set](00-charter.md#guarantees) of the naming line. A consumer whose acceptance depends, through a limit, a fit or purity, on a dependency's digest holding terminates, or lacking another fact or a set element, records that reliance in its [requires-set](29-identity-versioning.md#requires-sets). Digests are recorded beside the [interface hash](29-identity-versioning.md#hashes), never in it.
+The checker computes one digest per target that the package declares. A digest is visible wherever its item may be named, as part of the [closure set](00-charter.md#guarantees) of the naming line. A consumer whose acceptance depends, through a limit, a fit or purity, on a dependency's digest holding terminates, lacking another fact or a set element, or having a class at most a bound, records that reliance in its [requires-set](29-identity-versioning.md#requires-sets). Digests are recorded beside the [interface hash](29-identity-versioning.md#hashes), never in it.
 
 `nan show <path> --api` prints a digest as one line, `digest: effects E | authority A | may-trap M | T`:
 
-- E is the true facts among `wait`, `alloc`, `sync` and `float`, in that order, or `none`.
+- E is the true facts among `wait`, `alloc`, `sync` and `float`, in that order, then the class when it is not `traceless`, or `none`.
 - A is `device` and `priv` when true, then the capabilities' paths, then the validators' paths, each set in byte order, or `none` when all are absent. The two sets are unbounded together, as in the worst digest, and are then written once, as `any`.
 - M is `yes` when may-trap holds and `no` otherwise; T is `terminates` or `may-not-terminate`.
 - Entries within E and within A are separated by one space.
@@ -125,9 +126,108 @@ api example::percent_of example/example.nan:2
 ok show example::percent_of --api: records 1
 ```
 
-### Reserved field
+### Reversibility
 
-The digest reserves an eleventh field, named reversibility, after the fields of the table. Language 1 computes no reversibility and writes it in no digest, digest line or encoding. How a reader treats a fact kind that it does not know is fixed by [requires-sets](29-identity-versioning.md#requires-sets).
+The **class** of a digest bounds what its code does to state outside the program, such as files, devices and peers. The classes are, from least to greatest:
+
+| Class | The code changes outside state at most by |
+| --- | --- |
+| `traceless` | nothing |
+| `recorded` | appending to a record that only grows, such as a log or a standard stream |
+| `restorable` | changes that later code can put back |
+| `irreversible(K)` | effects that no later code undoes, of the kinds K |
+
+K is a non-empty set of **kinds**, written in this order and separated by `, `: `emit` (data or a request leaves the machine), `actuate` (a physical effect), `erase` (outside information is lost) and `spend` (a resource is consumed for good). `irreversible(K)` is at most `irreversible(L)` exactly when K is a subset of L. The join of classes is the greatest of them, irreversible classes joining into `irreversible` of the union of their kinds.
+
+- An operation has the class its owning chapter states, and `traceless` when it states none; [Reversibility classes](28-stdlib.md#reversibility-classes) states those of the std operations.
+- A **device access**, a [volatile call](23-low-level.md#registers) or a [DMA access call](23-low-level.md#dma), has the greatest class, except under a **device premise**: in a function or closure whose own limits clause holds a class, each device access among its own operations has that class. A device premise is a [trust escape](31-trust.md#trust-escapes), which the ledger records as a `class` entry.
+
+```nan
+pub fn report(log: sys::Log, count: u32) limits recorded {
+    log.info("count", value: count)
+} report
+```
+
+```nan
+pub fn clear_draft(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable {
+    try await fs.remove("draft") // error: limit.reversibility-exceeded
+} clear_draft
+```
+
+```nan
+// file: kernel/package.nan
+//! Doorbell of a bare kernel's device.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Rings the doorbell of a block device's queue.
+
+pub registers Doorbell {
+    ring: u32 at 0x0 write
+} Doorbell
+
+pub fn notify(mut bell: hw::Mmio[Doorbell]) limits restorable {
+    mut bell.write(Doorbell.ring, value: 1)
+} notify
+```
+
+The ledger of this package holds a `class` entry on `notify` with its class, `restorable`.
+
+### Compensation
+
+An **undo clause** in the clause region of a function item claims that another function puts back what the function changes:
+
+```ebnf
+undo_clause = 'undo' path ( "." IDENT )? TEXT NL ;
+```
+
+- The path names the **undoer** as a [test target](22-testing.md#test-items) names its function: a function item of the claiming function's package, other than that function, visible wherever it is visible. A path naming anything else is an error (`effect.undo-target`).
+- The undoer's class is at most `restorable`; otherwise the clause is an error (`effect.undo-irreversible`).
+- The TEXT is the clause's premise: why the undoer puts back what the function changes. The claim is a [trust escape](31-trust.md#trust-escapes), which the ledger records as an `undo` entry.
+- The digest of a function with an undo clause is **compensated**: its class C, as [Propagation](#propagation) computes it, becomes `irreversible(emit)` when C holds `emit`, and the lesser of C and `restorable` otherwise. Each site of its text is judged against limits with its class compensated so.
+
+```nan
+pub fn enable(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable
+    undo disable "the flag holds 0 before enable runs, and disable writes 0 back"
+{
+    try await fs.write_all("flag", data: b"1")
+} enable
+
+pub fn disable(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable
+    undo enable "the flag holds 1 before disable runs, and enable writes 1 back"
+{
+    try await fs.write_all("flag", data: b"0")
+} disable
+```
+
+Each function's digest is compensated from `irreversible(erase)` to `restorable`:
+
+```text
+$ nan show example::enable --api
+ok show example::enable --api: records 1
+api example::enable example/example.nan:2
+    pub fn enable(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable
+        undo disable "the flag holds 0 before enable runs, and disable writes 0 back"
+    digest: effects wait restorable | authority sys::Fs | may-trap no | may-not-terminate
+ok show example::enable --api: records 1
+```
+
+```nan
+pub fn enable(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable
+    undo forget "forget removes the flag that enable wrote" // error: effect.undo-irreversible
+{
+    try await fs.write_all("flag", data: b"1")
+} enable
+
+pub fn forget(fs: sys::Fs) fails sys::fs::FsError uses wait {
+    try await fs.remove("flag")
+} forget
+```
 
 ## Propagation
 
@@ -137,7 +237,7 @@ Facts propagate through direct calls. The **own operations** of a function or cl
 - the [declared digest](#indirect-calls) of each indirect call it makes and of each call it makes to a method of a generic parameter's [bound](08-generics-interfaces.md#generic-parameters);
 - what each [function argument](#function-arguments) it supplies charges.
 
-A join holds a boolean fact other than terminates when any part holds it, holds terminates when every part holds it, and holds the union of the parts' sets. A generic item's digest is computed once, at its definition, and every instantiation has it. A consumer uses a dependency's digest as [reuse](30-artefacts.md#reuse) re-derives it over the dependency closure; the digest an artefact records is the one computed in its publisher's closure.
+A join holds a boolean fact other than terminates when any part holds it, holds terminates when every part holds it, and holds the union of the parts' sets and the join of their classes. A generic item's digest is computed once, at its definition, and every instantiation has it. A consumer uses a dependency's digest as [reuse](30-artefacts.md#reuse) re-derives it over the dependency closure; the digest an artefact records is the one computed in its publisher's closure.
 
 The **dependencies** of a function or closure are the functions it calls directly and the functions and closures it supplies as function arguments. A **cycle** is a maximal set of functions and closures each of which reaches every member, itself included, through dependencies. Every member of a cycle has the same facts other than wait and terminates: the join of the parts that this section joins into any member, members excepted.
 
@@ -214,7 +314,7 @@ pub fn collect_above(values: Slice[u32], floor: u32, mut seen: mem::List[u32]) -
 
 An **indirect call** is a call through a function value, a [registry](25-registries.md#registries) field or a [call through `Dyn`](18-contracts.md#clauses), other than a call through the calling function's or closure's own function-typed parameter.
 
-The **declared digest** of a function type, registry field type or interface method head is the worst digest, except that wait holds exactly when it states `uses wait` and the [limits](#limits) it demands, or that [interrupt functions](24-kernel.md#interrupt-functions) imply for an `interrupt fn` type, set facts: `pure` makes alloc, device, priv and sync false and both sets empty, `notrap` makes may-trap false, `terminates` makes terminates true and `noalloc` makes alloc false. An indirect call, and a call to a method of a generic parameter's bound, has the declared digest of the type or head it calls through.
+The **declared digest** of a function type, registry field type or interface method head is the worst digest, except that wait holds exactly when it states `uses wait` and the [limits](#limits) it demands, or that [interrupt functions](24-kernel.md#interrupt-functions) imply for an `interrupt fn` type, set facts: `pure` makes alloc, device, priv and sync false, both sets empty and the class `traceless`, `notrap` makes may-trap false, `terminates` makes terminates true, `noalloc` makes alloc false and a class makes the class that class. An indirect call, and a call to a method of a generic parameter's bound, has the declared digest of the type or head it calls through.
 
 ```nan
 pub closed struct Filter {
@@ -355,11 +455,13 @@ pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::Page
 
 ## Limits
 
-A **limit** is a demand in the `limits` clause of a function head, a closure head, an interface method head or a function type: a digest fact, or a bound on stack use.
+A **limit** is a demand in the `limits` clause of a function head, a closure head, an interface method head or a function type: a digest fact, a bound on the class, or a bound on stack use.
 
 ```ebnf
 limits_clause = "limits" limit ( "," limit )* ;
-limit = 'pure' | 'notrap' | 'terminates' | 'noalloc' | 'stack' INT ;
+limit = 'pure' | 'notrap' | 'terminates' | 'noalloc' | 'stack' INT | reversibility ;
+reversibility = 'traceless' | 'recorded' | 'restorable' | 'irreversible' "(" irreversible_kind ( "," irreversible_kind )* ")" ;
+irreversible_kind = 'emit' | 'actuate' | 'erase' | 'spend' ;
 ```
 
 | Limit | Demands |
@@ -368,15 +470,16 @@ limit = 'pure' | 'notrap' | 'terminates' | 'noalloc' | 'stack' INT ;
 | `notrap` | may-trap is false |
 | `terminates` | terminates is true |
 | `noalloc` | alloc is false |
+| a class C | the class is at most C ([Reversibility](#reversibility)) |
 | `stack N` | the stack use is at most N bytes, checked at the final build ([Stack limits](#stack-limits)) |
 
-- In a limits clause, a `,` continues the clause exactly when the token after it is `pure`, `notrap`, `terminates`, `noalloc` or `stack`; any other `,` belongs to the enclosing list. A parameter named like one of these words therefore never directly follows a function type that has a limits clause.
-- A limit appears at most once in a clause (`limit.duplicate`), and `noalloc` beside `pure` is an error (`limit.redundant`); both exact fixes delete the extra limit.
+- In a limits clause, a `,` continues the clause exactly when the token after it is `pure`, `notrap`, `terminates`, `noalloc`, `stack`, `traceless`, `recorded`, `restorable` or `irreversible`; any other `,` belongs to the enclosing list. A parameter named like one of these words therefore never directly follows a function type that has a limits clause.
+- A limit appears at most once in a clause, a clause holds at most one class, and a class holds each kind at most once (`limit.duplicate`); `noalloc` or a class beside `pure` is an error (`limit.redundant`). Each exact fix deletes the extra limit or kind.
 - N is an `INT` without a literal suffix whose value is from 1 to 4,294,967,295; any other is an error (`limit.stack-size`).
-- `nan fmt` writes limits in the order `pure`, `notrap`, `terminates`, `noalloc`, `stack`.
+- `nan fmt` writes limits in the order `pure`, `notrap`, `terminates`, `noalloc`, the class, `stack`, and the kinds of a class in their order.
 - A limit of a function or closure covers its digest as [Propagation](#propagation) computes it, so calls through its own function-typed parameters are charged to its callers.
 - A head that states `uses wait` and demands `pure` is an error (`limit.impure`), and one that states `uses wait` and demands `terminates` is an error (`limit.may-not-terminate`), each reported at the limit.
-- A function or closure whose digest lacks a fact its limits demand is an error at each site of its text, closure bodies included, that brings a fact or set element breaking a limit, the wait fact excepted: `limit.impure` for `pure`, `limit.may-trap` for `notrap`, `limit.may-not-terminate` for `terminates` and `limit.allocates` for `noalloc`. Its because-chain holds a `called` reason per call from the reported site to the operation carrying the fact and a `raised` reason for that operation, or a `declared` reason for the declared digest carrying it. A site that several enclosing functions and closures report is reported once, for the innermost.
+- A function or closure whose digest lacks a fact its limits demand is an error at each site of its text, closure bodies included, that brings a fact or set element breaking a limit, the wait fact excepted: `limit.impure` for `pure`, `limit.may-trap` for `notrap`, `limit.may-not-terminate` for `terminates`, `limit.allocates` for `noalloc` and `limit.reversibility-exceeded` for a class. Its because-chain holds a `called` reason per call from the reported site to the operation carrying the fact and a `raised` reason for that operation, whose subject is the operation's class for a class, or a `declared` reason for the declared digest carrying it. A site that several enclosing functions and closures report is reported once, for the innermost.
 - Under `notrap`, an obligation in the text that the prover does not prove is reported with the prover's [outcome](20-prover.md#outcomes), `proof.unknown` or `proof.refuted`, instead of `limit.may-trap`.
 - The limits of an interface method head are met by its implementing functions ([conformance](08-generics-interfaces.md#conformance)), and those of a function type by each function that fits it ([Fit](#fit)).
 - Apart from the size of a task's stack ([task stacks](17-suspension-io.md#task-stacks)), a limits clause changes no behaviour.
@@ -704,7 +807,7 @@ pub fn wait_for_data(mut conn: sys::net::Conn, alloc: mem::Alloc) -> bool fails 
 
 ## Purity
 
-A function, closure or function value is **pure** when its digest, or the declared digest of its type, has no effect fact and empty capabilities and validators sets. Pure code may trap, run without end and use floats unless other limits forbid it.
+A function, closure or function value is **pure** when its digest, or the declared digest of its type, has no effect fact, empty capabilities and validators sets and the class `traceless`. Pure code may trap, run without end and use floats unless other limits forbid it.
 
 Purity is required:
 
@@ -732,6 +835,8 @@ pub fn is_heavy(byte: u8) -> bool = weight(byte) > 300
 | `effect.fit-kind` | error | [Fit](#fit) |
 | `effect.fit-wait` | error | [Fit](#fit) |
 | `effect.foreign-wait` | error | [Foreign functions and trusted code](#foreign-functions-and-trusted-code) |
+| `effect.undo-irreversible` | error | [Compensation](#compensation) |
+| `effect.undo-target` | error | [Compensation](#compensation) |
 | `effect.uses-unknown` | error | [Waiting](#waiting) |
 | `limit.allocates` | error | [Limits](#limits) |
 | `limit.duplicate` | error | [Limits](#limits) |
@@ -739,6 +844,7 @@ pub fn is_heavy(byte: u8) -> bool = weight(byte) > 300
 | `limit.may-not-terminate` | error | [Limits](#limits) |
 | `limit.may-trap` | error | [Limits](#limits) |
 | `limit.redundant` | error | [Limits](#limits) |
+| `limit.reversibility-exceeded` | error | [Limits](#limits) |
 | `limit.stack-exceeded` | error | [Stack limits](#stack-limits) |
 | `limit.stack-size` | error | [Limits](#limits) |
 | `limit.stack-unbounded` | error | [Stack limits](#stack-limits), [Static bounds](17-suspension-io.md#static-bounds) |

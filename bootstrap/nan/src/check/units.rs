@@ -8,6 +8,7 @@ use super::Checker;
 use super::db::{ItemId, PackageId};
 use super::digest::Digest;
 use super::props::Props;
+use super::reversibility::Class;
 use super::sig::{FnSig, GenericDef, Payload, SigKind};
 use super::testing::Target as TestTarget;
 use super::ty::{Arg, Param, Scalar, Ty};
@@ -902,6 +903,9 @@ impl<'a> Checker<'a> {
                     None => number(out, 1),
                 }),
             );
+        }
+        if digest.class != Class::Traceless {
+            record.field(11, content(|out| digest.class.encode(out)));
         }
         record.finish()
     }

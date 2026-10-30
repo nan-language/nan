@@ -229,7 +229,14 @@ fn function_judging(old: machine::ApiEntry, new: machine::ApiEntry, old_head: St
             stack_added = true
         }
     }
-    if old_split.core != new_split.core or not kept or stack_added {
+    let class_kept = match old_split.class {
+        Some(old_class) => match new_split.class {
+            Some(new_class) => new_class.at_most(old_class)
+            None => false
+        }
+        None => true
+    }
+    if old_split.core != new_split.core or not kept or not class_kept or stack_added {
         return CompatibleJudging.Breaking
     }
     var old_contract = clauses_of(old, keyword: "requires ", alloc)
@@ -322,16 +329,17 @@ fn opened_type(old: Str, new: Str) -> bool {
     return old == new and new.find(" open ").is_some()
 } opened_type
 
-/// A function's head line without its limits, and its limits.
+/// A function's head line without its limits, its limits other than a class, and its class.
 struct LimitsSplit {
     core: text::String
     limit_words: mem::List[text::String]
+    class: Option[ty::Class]
 } LimitsSplit
 
 fn split_limits(head: Str, alloc: mem::Alloc) -> LimitsSplit {
     var limit_words = mem::List[text::String].empty(alloc)
     let Some(at) = head.find(" limits ") else {
-        return LimitsSplit(core: text::String.of(head, alloc), limit_words: take limit_words)
+        return LimitsSplit(core: text::String.of(head, alloc), limit_words: take limit_words, class: None)
     }
     var core = text::String.empty(alloc)
     match head.slice_bytes(0, end: at) {
@@ -340,25 +348,46 @@ fn split_limits(head: Str, alloc: mem::Alloc) -> LimitsSplit {
     }
     expect head.byte_len() >= 8 and at <= head.byte_len() - 8
     let Some(rest) = head.slice_bytes(at + 8, end: head.byte_len()) else {
-        return LimitsSplit(core: take core, limit_words: take limit_words)
+        return LimitsSplit(core: take core, limit_words: take limit_words, class: None)
     }
+    var class: Option[ty::Class] = None
     var start: usize = 0
     loop {
         let Some(tail_text) = rest.slice_bytes(start, end: rest.byte_len()) else {
             break
         }
-        let Some(comma) = tail_text.find(", ") else {
-            mut limit_words.push(text::String.of(tail_text, alloc))
+        if tail_text.is_empty() {
             break
         }
-        let Some(limit) = tail_text.slice_bytes(0, end: comma) else {
+        var end = tail_text.find(", ").value_or(tail_text.byte_len())
+        if tail_text.starts_with("irreversible(") {
+            end = match tail_text.find(")") {
+                Some(close) => close + 1
+                None => tail_text.byte_len()
+            }
+        }
+        let Some(limit) = tail_text.slice_bytes(0, end: end) else {
             break
         }
-        mut limit_words.push(text::String.of(limit, alloc))
-        expect comma <= ~0usize - 2 and start <= ~0usize - 2 - comma
-        start += comma + 2
+        match ty::Class.parse(limit) {
+            Some(named) => {
+                class = Some(named)
+            }
+            None => mut limit_words.push(text::String.of(limit, alloc))
+        }
+        if end == tail_text.byte_len() {
+            break
+        }
+        expect end <= ~0usize - 2 and start <= ~0usize - 2 - end
+        start += end
+        let Some(after) = tail_text.slice_bytes(end, end: tail_text.byte_len()) else {
+            break
+        }
+        if after.starts_with(", ") {
+            start += 2
+        }
     }
-    return LimitsSplit(core: take core, limit_words: take limit_words)
+    return LimitsSplit(core: take core, limit_words: take limit_words, class: class)
 } split_limits
 
 /// A function of an item's module holding an item's old examples, whose check runs them against

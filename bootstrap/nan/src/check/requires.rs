@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::Checker;
 use super::Member;
 use super::db::{ItemId, PackageId};
+use super::reversibility::Class;
 use super::sig::SigKind;
 use super::ty::{Arg, Ty};
 use super::units::ItemNames;
@@ -100,7 +101,8 @@ impl Entry {
 }
 
 /// The digest fields a limit demands the absence of, by their key in the digest encoding:
-/// wait 1, alloc 2, device 3, priv 4, sync 5, may-trap 6; terminates, key 7, is relied on present.
+/// wait 1, alloc 2, device 3, priv 4, sync 5, may-trap 6; terminates, key 7, is relied on present,
+/// and the class, key 11, within a bound.
 const PURE: [u64; 5] = [1, 2, 3, 4, 5];
 
 /// Records the entry of an item in a requires-set, giving its canonical path.
@@ -281,7 +283,8 @@ impl Checker<'_> {
     }
 
     /// The digest facts an item's limits rely on in each foreign function its body calls: the
-    /// absence of what `pure`, `noalloc` and `notrap` exclude, and terminates.
+    /// absence of what `pure`, `noalloc` and `notrap` exclude, terminates, and the class staying
+    /// within the bound `pure` or a class sets.
     fn relied_facts(&self, item: ItemId, package: PackageId) -> Vec<(ItemId, Vec<(u64, String)>)> {
         let Some(head) = self.fn_sig(item) else {
             return Vec::new();
@@ -290,8 +293,12 @@ impl Checker<'_> {
         let mut relied: Vec<(u64, String)> = Vec::new();
         if limits.pure {
             relied.extend(PURE.iter().map(|key| (*key, String::new())));
+            relied.push((11, Class::Traceless.text()));
         } else if limits.noalloc {
             relied.push((2, String::new()));
+        }
+        if let Some(class) = limits.class {
+            relied.push((11, class.text()));
         }
         if limits.notrap {
             relied.push((6, String::new()));

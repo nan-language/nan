@@ -715,7 +715,10 @@ fn reduction(file: &SourceFile, tree: &Tree, known: &Known, reading: Reading) ->
                 continue;
             };
             let kept = match tree.rule(clause) {
-                Rule::RequiresClause | Rule::EnsuresClause | Rule::ExampleClause => true,
+                Rule::RequiresClause
+                | Rule::EnsuresClause
+                | Rule::ExampleClause
+                | Rule::UndoClause => true,
                 Rule::TodoClause => tree.child_nodes(clause).next().is_some(),
                 _ => false,
             };

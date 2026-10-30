@@ -167,6 +167,8 @@ The **ledger** of an item is the list of its entries of the kinds this table giv
 | `waiver` | a [waiver](06-statements-expressions.md#waivers) | its threshold and reason | the function | no |
 | `todo` | a `todo` | its text | the item containing it | no |
 | `dbg` | a `dbg` | none | the item containing it | no |
+| `class` | a [device premise](10-effects-digests.md#reversibility) | its class | the item containing its function or closure | yes |
+| `undo` | an [undo clause](10-effects-digests.md#compensation) | its undoer and premise | the function | yes |
 
 ```nan
 // file: procinfo/package.nan

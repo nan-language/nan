@@ -1,6 +1,6 @@
 # Standard library 1.0
 
-This chapter defines std: its packages, modules and layers, the index of every pub std item with the section defining it, the std items no other chapter defines (array and slice members, Option and Result members, ordered lookup), the supplied operations, the contracts and evidence pub std items carry, the authority each std package reaches, the platform packages, the controlled vocabulary and naming conventions of std names, and the reserved std names.
+This chapter defines std: its packages, modules and layers, the index of every pub std item with the section defining it, the std items no other chapter defines (array and slice members, Option and Result members, ordered lookup), the supplied operations, the contracts and evidence pub std items carry, the authority each std package reaches, the reversibility classes of std operations, the platform packages, the controlled vocabulary and naming conventions of std names, and the reserved std names.
 
 ## Std layers
 
@@ -267,7 +267,7 @@ test finds_port_by_name for port_of {
 
 A **supplied operation** is a std function without a body, whose item ends at its head line or after its clause region ([heads](02-items.md#heads)). The toolchain implements it as its head, its clauses and the section defining it state, and the [prover](20-prover.md#callee-knowledge) takes its requires and ensures without proving them. The section defining it states its facts ([digests](10-effects-digests.md#digests)), which are exactly these:
 
-- wait when its head states `uses wait`, and terminates otherwise; float use when a parameter or its result has a float type; and the device, priv and sync facts that its section states for pointers, register windows, DMA and privileged intrinsics.
+- wait when its head states `uses wait`, and terminates otherwise; float use when a parameter or its result has a float type; the device, priv and sync facts that its section states for pointers, register windows, DMA and privileged intrinsics; and, unless its head demands `pure`, the class that [Reversibility classes](#reversibility-classes) gives it.
 - Unless its head demands `pure`: sync when it is a member of a type with [interior mutability](12-memory.md#interior-mutability), or is `mem::Shared.share` or `mem::Shared.make_mut`, which change a count; and, in its capabilities set, the primitive capabilities among its parameters' types.
 - Unless its head demands `pure` or `noalloc`, alloc when it draws memory: when its name starts with `try_`, when the type it is a member of has a member of its name prefixed with `try_`, or when its section states that it draws memory, but never for the members of `text::Fixed` and `mem::Bounded`, which store their contents inline.
 - Unless its head demands `notrap`, may-trap when it draws memory, its name does not start with `try_` and its section does not state that it fails when that memory is exhausted, or when its section names a trap it raises.
@@ -308,6 +308,19 @@ pub fn header_length(frame: Slice[u8]) -> Option[u16] limits pure, notrap, termi
     return Some(head.u16_be(2))
 } header_length
 ```
+
+## Reversibility classes
+
+Apart from [device accesses](10-effects-digests.md#reversibility), the std operations whose [class](10-effects-digests.md#reversibility) is not `traceless` are exactly these:
+
+| Operations | Class |
+| --- | --- |
+| `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console` | `recorded` |
+| `sys::fs::File.write`, `sys::Net.listen` | `restorable` |
+| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove` | `irreversible(erase)` |
+| `sys::Net.connect`, `sys::net::Conn.write`, `sys::net::Conn.close`, `sys::net::Conn.abandon` | `irreversible(emit)` |
+
+The classes of the operations of the sys capabilities and of the resources they open hold on the host targets and under `any`. On the machine targets, where those capabilities have values only as [sims](22-testing.md#simulated-capabilities), they are `traceless`.
 
 ## Platform packages
 

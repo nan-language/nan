@@ -308,7 +308,7 @@ impl Checker<'_> {
                 let allowed = match clause.kind {
                     ClauseKind::Requires(_) | ClauseKind::Ensures(_) | ClauseKind::Missing => true,
                     ClauseKind::Decreases(_) | ClauseKind::Waive { .. } => method.body.is_some(),
-                    ClauseKind::Example(_) => false,
+                    ClauseKind::Example(_) | ClauseKind::Undo { .. } => false,
                 };
                 if !allowed {
                     self.report(item, clause.token, Code::InterfaceMethodClause);

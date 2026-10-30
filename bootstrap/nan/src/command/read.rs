@@ -197,7 +197,7 @@ pub fn explain(
                     let (_, file) = workspace.file(&path).expect("items lie in workspace files");
                     records.push(Record {
                         word: "fact".to_owned(),
-                        fields: vec![fact.to_owned(), format!("{path}:{line}")],
+                        fields: vec![fact, format!("{path}:{line}")],
                         lines: vec![output::printable(file.syntax.line_text(line))],
                     });
                 }
@@ -253,7 +253,7 @@ fn ledger_records(workspace: &Workspace, scope: &Scope) -> Vec<Record> {
             fields.push(format!("{}:{}", entry.path, entry.line));
             let lines = match entry.kind {
                 Kind::Trusted | Kind::Assume | Kind::Todo => entry.texts,
-                Kind::Waiver => entry.texts.into_iter().skip(1).collect(),
+                Kind::Waiver | Kind::Undo => entry.texts.into_iter().skip(1).collect(),
                 _ => Vec::new(),
             };
             Record {

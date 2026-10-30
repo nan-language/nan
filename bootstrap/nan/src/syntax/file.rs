@@ -696,6 +696,7 @@ impl Parser {
             Rule::RequiresClause,
             Rule::EnsuresClause,
             Rule::ExampleClause,
+            Rule::UndoClause,
             Rule::DecreasesClause,
             Rule::TodoClause,
             Rule::WaiveClause,
@@ -771,7 +772,7 @@ impl Parser {
                         | Keyword::Todo
                 )
             }
-            TokenKind::Ident => self.file.text(first_statement) == "example",
+            TokenKind::Ident => matches!(self.file.text(first_statement), "example" | "undo"),
             _ => false,
         };
         let opener_ends_head = self

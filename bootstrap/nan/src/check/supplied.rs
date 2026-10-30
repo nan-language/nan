@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use super::Checker;
 use super::db::{ItemId, TypeKey};
 use super::digest::Digest;
+use super::reversibility;
 use super::sig::FnSig;
 use super::ty::Ty;
 
@@ -99,8 +100,9 @@ impl Checker<'_> {
     /// The digest of a supplied operation: waiting as its head states and terminating unless it
     /// waits; the facts its owning chapter states; drawing memory when it grows or makes
     /// storage; the sync fact on a type with interior mutability or an atomic count; the
-    /// primitive capabilities it receives or is a member of, other than allocators; and float
-    /// use when its head takes or gives a float. A head demanding `pure` or `noalloc` leaves out what it excludes.
+    /// primitive capabilities it receives or is a member of, other than allocators; float use
+    /// when its head takes or gives a float; and the class of its operation under the target.
+    /// A head demanding `pure` or `noalloc` leaves out what it excludes.
     pub fn supplied(&self, item: ItemId) -> Digest {
         let Some(head) = self.fn_sig(item) else {
             return Digest::declared(false, &Default::default());
@@ -118,6 +120,7 @@ impl Checker<'_> {
         if head.limits.pure {
             return digest;
         }
+        digest.class = reversibility::supplied(&path, self.db.target);
         digest.alloc = !head.limits.noalloc && self.draws(item, &path, &head);
         let owner = match self.db.owners.get(&item) {
             Some(TypeKey::Item(owner)) => Some(*owner),

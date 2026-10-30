@@ -302,7 +302,7 @@ An item is compatible with another for a role when their interface hashes are eq
 | A new interface method with a default body, the interface staying Dyn-usable if it was | every role |
 | A weaker `requires` or a stronger `ensures` on a function that is not an interface method | `call`, `name` |
 | Changed examples, every example of the old item holding when the [interpreter](21-interpreter.md#interpreter) runs it against the new release | every role |
-| A new promise: a property gained, or a limit other than `stack N` added | every role |
+| A new promise: a property gained, a limit other than `stack N` added, or a class limit lowered | every role |
 | The removal of the item while a `preserves` tombstone forwards its old form, its replacement being compatible as if it had the old canonical path | every role |
 | A `pub` struct or enum that stops being a [parsing type](15-untrusted.md#validator-classes) | no role |
 
@@ -311,7 +311,7 @@ An item is compatible with another for a role when their interface hashes are eq
 
 ### Facts outside the interface hash
 
-- A [digest fact](10-effects-digests.md#digests) or digest-set element that an item gains, and terminates when the item loses it, breaks exactly the consumers whose requires-set recorded reliance on its absence, or on terminates; the opposite changes are compatible.
+- A [digest fact](10-effects-digests.md#digests) or digest-set element that an item gains, a class it raises, and terminates when the item loses it, break exactly the consumers whose requires-set recorded reliance on its absence, on a bound the new class passes, or on terminates; the opposite changes are compatible.
 - A differing [behaviour epoch](#behaviour-epochs) is breaking for every role.
 - Final-link roots [approve](#approvals) epoch changes and [widenings](14-authority.md#authority-summaries); a widening breaks consumers only through the digest facts and elements giving it.
 - Any other fact these rules do not model is breaking whenever its value differs, except a fact kind a later language version introduces, read as [Requires-sets](#requires-sets) states.
@@ -408,7 +408,7 @@ The **requires-set** of a package records what its acceptance relies on in other
 1. the item's canonical path, or the old form a forwarding use matched together with its replacement's canonical path;
 2. the roles in which the package uses the item;
 3. its interface hash and behaviour epoch in the release checked against;
-4. each digest fact, and each capability or validator of a digest set, whose absence the package relied on, and terminates when it relied on its presence, through a limit, a fit or purity ([digests](10-effects-digests.md#digests));
+4. each digest fact, and each capability or validator of a digest set, whose absence the package relied on, the bound it relied on the class staying within, and terminates when it relied on its presence, through a limit, a fit or purity ([digests](10-effects-digests.md#digests));
 5. for each method name resolved on the item as a type, the canonical path of the function [method resolution](08-generics-interfaces.md#method-resolution) found;
 6. the item hash, when the package instantiates the item or unfolds its transparent body;
 7. for an interface the package implements by an impl line, the names of the functions named after that line's impl target in the line's module that are not methods of the interface.

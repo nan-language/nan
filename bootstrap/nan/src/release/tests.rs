@@ -33,3 +33,13 @@ fn a_removed_item_is_additive_only_while_a_preserves_tombstone_forwards_it() {
     assert_eq!(class(&changed, path()), Class::Breaking);
     assert_eq!(class(&changed, Some(Forward::Head)), Class::Additive);
 }
+
+#[test]
+fn a_digest_widens_when_its_class_rises() {
+    let line =
+        |effects: &str| format!("effects {effects} | authority none | may-trap no | terminates");
+    let (restorable, erase) = (line("wait restorable"), line("wait irreversible(erase)"));
+    assert!(widens(&restorable, &erase));
+    assert!(!widens(&erase, &restorable));
+    assert!(widens(&erase, &line("wait irreversible(emit, erase)")));
+}

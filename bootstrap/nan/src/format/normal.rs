@@ -24,7 +24,7 @@ pub struct Known<'a> {
     pub transparent: bool,
     /// The fields of a struct its interface form or text shows.
     pub fields: Reach,
-    /// The facts line of a struct or enum.
+    /// The facts line of a struct, enum or function.
     pub facts: Option<String>,
 }
 

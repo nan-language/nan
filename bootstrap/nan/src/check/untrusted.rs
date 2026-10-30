@@ -10,6 +10,8 @@ use crate::diagnostic::Code;
 use crate::syntax::ast::{FnModifier, ItemKind, Tok};
 use crate::workspace::Authority;
 
+pub mod uses;
+
 impl Checker<'_> {
     /// Whether a type is a parsing type: a scalar, `Unit`, `Never`, an Untrusted instantiation, a
     /// layout or a struct or enum other than a base type built only from parsing types.
@@ -130,17 +132,9 @@ impl Checker<'_> {
             })
     }
 
-    /// Reports the `validate` grant a use of a validator, or of the decoder of an instantiation
-    /// that is no parsing type, needs.
+    /// Reports the `validate` grant a call of a validator, or a function value naming one, needs.
     pub fn check_validator_use(&self, item: ItemId, token: Tok, function: ItemId) {
         if self.is_validator(function) {
-            self.require(item, token, Authority::Validate);
-        }
-    }
-
-    /// Reports the `validate` grant a use of the decoder of `decoded` needs.
-    pub fn check_decoder_use(&self, item: ItemId, token: Tok, decoded: &Ty) {
-        if !decoded.has_error() && !self.is_parsing(decoded) {
             self.require(item, token, Authority::Validate);
         }
     }
@@ -150,13 +144,6 @@ impl Checker<'_> {
     /// enum it instantiates.
     pub fn holds_untrusted(&self, ty: &Ty) -> bool {
         self.any_part(ty, &|part| self.is_std(part, "core::Untrusted"))
-    }
-
-    /// Reports the `validate` grant a use of the encoder of `encoded` needs.
-    pub fn check_encoder_use(&self, item: ItemId, token: Tok, encoded: &Ty) {
-        if !encoded.has_error() && self.holds_untrusted(encoded) {
-            self.require(item, token, Authority::Validate);
-        }
     }
 
     /// Whether `Untrusted.of` may wrap a type: not one that is or contains `SliceMut`, `Dyn`, a

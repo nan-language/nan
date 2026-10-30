@@ -78,7 +78,7 @@ The **interface hash** is the hash of the UTF-8 bytes `interface`, LF and the it
 
 | Kind | Interface form |
 | --- | --- |
-| `fn` | its visibility, modifiers, head and convention clause, then its `requires`, `ensures` and `example` clauses with their `todo` markers; for a transparent function that is not generic, is no member of a generic type, and whose body names only fields, items and members visible wherever the function is visible, also `=` and the body |
+| `fn` | its visibility, modifiers, head and convention clause, then its `requires`, `ensures` and `example` clauses with their `todo` markers; for a transparent function that is not generic, is no member of a generic type, and whose body names only fields, items and members visible wherever the function is visible, also `=` and the body; then, when it has [codec uses](15-untrusted.md#validate-grants), the facts line |
 | `struct` | the head with visibility, modifiers, generic parameters and `derives`; each field visible wherever the struct is visible, with its type and `where` predicate; each invariant line naming only such fields; then the facts line |
 | `enum` | the whole normalised form, then the facts line |
 | `layout`, `registers`, `impl`, `registry`, `contribute`, `retired`, `const assert` | the whole normalised form |
@@ -87,8 +87,8 @@ The **interface hash** is the hash of the UTF-8 bytes `interface`, LF and the it
 | `test` | the line `test <name> for <target>` |
 | `package` | the `package` line and the `language` and `targets` directives |
 
-- The **facts line** is `facts` followed, each after one space, by those of `linear`, `view`, `token` (a state token), `holds-token` (containing one), `Copy`, `Send`, `Inert`, `AnyBits`, `parsing` (a `pub` struct or enum that is a [parsing type](15-untrusted.md#validator-classes)) and `holds-untrusted` (a `pub` struct or enum deriving `Encode` that [holds an Untrusted instantiation](15-untrusted.md#validator-classes)) that the type's [interface facts](05-properties.md#interface-facts) state, in that order, each fact resting on dependent parameters followed by their names in `[ ]`, separated by `, `.
-- Bodies, `decreases`, `waive` and clause-region `todo` clauses never enter an interface form; a change confined to a body changes the item hash and never the interface hash. [Dyn-usability](08-generics-interfaces.md#dynamic-dispatch) follows from the method heads.
+- The **facts line** is `facts` followed, each after one space, by those of `linear`, `view`, `token` (a state token), `holds-token` (containing one), `Copy`, `Send`, `Inert`, `AnyBits`, `parsing` (a `pub` struct or enum that is a [parsing type](15-untrusted.md#validator-classes)) and `holds-untrusted` (a `pub` struct or enum deriving `Encode` that [holds an Untrusted instantiation](15-untrusted.md#validator-classes)) that the type's [interface facts](05-properties.md#interface-facts) state, in that order, each fact resting on dependent parameters followed by their names in `[ ]`, separated by `, `. A function's facts line holds `decode` and `encode`, in that order, each resting on the type parameters its codec uses mark with it.
+- Bodies, `decreases`, `waive` and clause-region `todo` clauses never enter an interface form, a function's codec uses aside; a change confined to a body changes the item hash and, unless it changes those, never the interface hash. [Dyn-usability](08-generics-interfaces.md#dynamic-dispatch) follows from the method heads.
 
 The next item's normalised form is the first text and its interface form the second.
 

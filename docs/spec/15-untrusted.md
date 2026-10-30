@@ -271,10 +271,13 @@ pub validator fn tally_zeros(raw: Untrusted[Slice[u8]], mut tally: Tally) {
 
 A module **uses** a validator, decoder or encoder when one of its items:
 
-- calls it or names it as a function value; or
-- names an instantiation of a generic item with a type argument `A` that is not a type parameter, where a call that the generic item makes through a bound on the type parameter `A` fixes, directly or by passing that parameter as a type argument to further generic items, resolves to it once `A` is substituted: `mem::wire::Codec[Note].decode` uses `Note.decode`, and `mem::wire::Codec[Note].encode` uses `Note.encode`.
+- calls it or names it as a function value;
+- names an instantiation of a function, by a call or as a function value, giving an argument `A` to a type parameter of its codec uses: it uses that codec of `A`, so `mem::wire::Codec[Note].decode` uses `Note.decode` and `mem::wire::Codec[Note].encode` uses `Note.encode`; or
+- gives a type `A` that is not a type parameter to a type parameter bounded by an interface `I` other than `Encode` and the property interfaces, calls a method of `I` on `A`, or views `A` as `Dyn[I]`: where `A` implements `I` through an impl line, it uses each implementing function of the line that is a validator, and what naming each implementing function and default body of the line instantiated for `A`, and for the method called with its own type arguments, uses, a use of a codec of a type parameter that this leaves unfixed being declassifying; through a derive, what each constituent type of `A` implementing `I` uses; through the toolchain, what each type argument of `A` implementing `I` uses.
 
 A call through a bound on a type parameter, or through `Dyn`, is not itself a use.
+
+The **codec uses** of a function are the type parameters whose decoders and encoders its code uses, each marked `decode`, `encode` or both. A use, as above, of a codec of a type parameter of the code holding it, a call of its `decode` or `encode` through its bound included, is no use of a decoder or encoder: it marks the parameter with that codec. A use of a codec of another type marks with that codec each type parameter that the type holds as a type argument at any depth. `Codec.decode` of `mem::wire`, `text::json` and `text::construction` marks `T` `decode`, and the `encode` and `try_encode` of `mem::wire` and `text::json` mark it `encode`. The codec uses of a function are [interface facts](05-properties.md#interface-facts) of it.
 
 `validate` is the [manifest grant](14-authority.md#manifest-grants) for reading Untrusted contents. A module performs it directly exactly when it holds one of these operations, each located on the line given:
 
@@ -342,6 +345,118 @@ pub closed struct Lookup derives Encode {
 pub fn store_lookup(lookup: Lookup, mut out: mem::Bytes) {
     mem::wire::Codec[Lookup].encode(lookup, mut out) // error: authority.ungranted
 } store_lookup
+```
+
+```nan
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
+pub fn store[T: Encode](value: T, mut out: mem::Bytes) {
+    mem::wire::Codec[T].encode(value, mut out)
+} store
+
+pub fn store_lookup(lookup: Lookup, mut out: mem::Bytes) {
+    store(lookup, mut out) // error: authority.ungranted
+} store_lookup
+```
+
+```nan
+pub fn load[T: Encode](raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut slot: Option[T]) fails core::DecodeError {
+    slot = Some(try mem::wire::Codec[T].decode(raw, alloc))
+} load
+
+pub fn load_count(raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut slot: Option[u32]) fails core::DecodeError {
+    try load(raw, alloc, mut slot)
+} load_count
+
+pub fn load_name(raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut slot: Option[text::String]) fails core::DecodeError {
+    let read: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut slot: Option[text::String]) fails core::DecodeError = load // error: authority.ungranted
+    try read(raw, alloc, mut slot)
+} load_name
+```
+
+```nan
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
+pub interface Store {
+    fn save(self, mut out: mem::Bytes)
+} Store
+
+pub closed struct Kept[T: Encode] {
+    pub value: T
+} Kept
+
+impl Kept[T: Encode]: Store
+
+pub fn Kept.save(self, mut out: mem::Bytes) {
+    mem::wire::Codec[T].encode(self.value, mut out)
+} Kept.save
+
+pub fn persist[S: Store](value: S, mut out: mem::Bytes) {
+    value.save(mut out)
+} persist
+
+pub fn persist_lookup(take lookup: Lookup, mut out: mem::Bytes) {
+    persist(Kept(value: take lookup), mut out) // error: authority.ungranted
+} persist_lookup
+```
+
+```nan
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
+pub interface Saver {
+    fn save[T: Encode](self, value: T, mut out: mem::Bytes)
+} Saver
+
+pub closed struct Shelf derives Copy {
+    pub slot: u8
+} Shelf
+
+impl Shelf: Saver
+
+pub fn Shelf.save[T: Encode](self, value: T, mut out: mem::Bytes) {
+    mem::wire::Codec[T].encode(value, mut out)
+} Shelf.save
+
+pub fn save_count(count: u32, mut out: mem::Bytes) {
+    Saver.save(Shelf(slot: 0), count, mut out)
+} save_count
+
+pub fn save_lookup(lookup: Lookup, mut out: mem::Bytes) {
+    Saver.save(Shelf(slot: 0), lookup, mut out) // error: authority.ungranted
+} save_lookup
+```
+
+```nan
+pub interface Saver {
+    fn save[T: Encode](self, value: T, mut out: mem::Bytes)
+} Saver
+
+pub closed struct Shelf derives Copy {
+    pub slot: u8
+} Shelf
+
+impl Shelf: Saver
+
+pub fn Shelf.save[T: Encode](self, value: T, mut out: mem::Bytes) {
+    mem::wire::Codec[T].encode(value, mut out)
+} Shelf.save
+
+pub fn keep[S: Saver](saver: S, count: u32, mut out: mem::Bytes) {
+    saver.save(count, mut out)
+} keep
+
+pub fn keep_count(count: u32, mut out: mem::Bytes) {
+    keep(Shelf(slot: 0), count, mut out) // error: authority.ungranted
+} keep_count
 ```
 
 ## Diagnostics

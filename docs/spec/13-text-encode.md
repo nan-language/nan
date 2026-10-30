@@ -911,6 +911,12 @@ test port_text_is_checked for load_port {
 } port_text_is_checked
 ```
 
+```nan
+pub fn load_mtus(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[mem::List[u16], core::DecodeError] {
+    return attempt text::construction::Codec[mem::List[u16]].decode(raw, alloc) // error: authority.ungranted
+} load_mtus
+```
+
 ## Diagnostics
 
 | Code | Class | Rule |

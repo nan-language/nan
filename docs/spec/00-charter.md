@@ -67,7 +67,7 @@ The **closure set** of a line is exactly:
 
 - its enclosing item;
 - the names of the items its module declares;
-- each item and member it names, each [tombstone](29-identity-versioning.md#forwarding) whose old form one of its uses matches, and the type of each expression in it, with what each exposes at the line's position under the [visibility](03-packages-modules.md#visibility) rules: head and shape, contracts and examples, structural properties, digest, a const's value, a transparent body, the impl lines naming it and a type's members;
+- each item and member it names, each [tombstone](29-identity-versioning.md#forwarding) whose old form one of its uses matches, and the type of each expression in it, with what each exposes at the line's position under the [visibility](03-packages-modules.md#visibility) rules: head and shape, contracts and examples, structural properties, digest, codec uses, a const's value, a transparent body, the impl lines naming it and a type's members;
 - for a line holding a [const context](21-interpreter.md#const-evaluation), an example clause or an obligation whose outcome a [refutation confirmation](21-interpreter.md#refutation-confirmation) decides, the NIR of every function those [interpreter](21-interpreter.md#interpreter) runs execute;
 - the manifest directives naming its module; its package's `language`, `targets` and `entry` directives; and the `dep` directive of each alias it uses, with the release the [lock](29-identity-versioning.md#lock) names for it;
 - the [core vocabulary](03-packages-modules.md#core-vocabulary).
@@ -260,6 +260,7 @@ Each term links to its home, whose definition governs.
 | [closure hash](31-trust.md#seals) | Hash of what a sealed item relies on. |
 | [closure set](#guarantees) | Everything that decides a line. |
 | [code root](30-artefacts.md#code-roots) | Reproducible part of an artefact. |
+| [codec uses](15-untrusted.md#validate-grants) | Type parameters whose decoders and encoders a function uses. |
 | [column 0](01-lexical.md#lines) | Physical line's first position. |
 | [command](33-toolchain.md#commands) | `nan` subcommand. |
 | [compare-and-swap edit](33-toolchain.md#edits) | Item replacement conditional on its hash. |

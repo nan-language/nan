@@ -327,7 +327,7 @@ impl Checker<'_> {
                     if let Some(owner) = &function.label.owner {
                         self.check_method_placement(item, owner);
                         self.check_implementing(item, fn_sig);
-                        if function.label.name.text == "abandon" && !abandon_head(fn_sig) {
+                        if function.label.name.text == "abandon" && !fn_sig.abandon_head() {
                             self.report(item, ast.token, Code::DeferAbandonHead);
                         }
                     }
@@ -828,18 +828,6 @@ impl Checker<'_> {
             _ => false,
         }
     }
-}
-
-/// Whether a head is an abandon method's: `fn T.abandon(take self)` without modifier, own
-/// generic parameters, other parameters, result, `fails` or `uses wait`.
-fn abandon_head(sig: &super::sig::FnSig) -> bool {
-    let receiver = matches!(&sig.params[..], [param] if param.is_self && param.mode == Mode::Take);
-    receiver
-        && sig.modifier.is_none()
-        && sig.own_generics().is_empty()
-        && sig.result == Ty::Unit
-        && sig.fails.is_none()
-        && !sig.wait
 }
 
 /// The types and bounds a head writes, each type required at visibility `own`.

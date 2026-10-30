@@ -8,6 +8,7 @@ use std::rc::Rc;
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::resolve::Named;
 use super::sig::SigKind;
+use super::ty::Arg;
 use super::{Checker, Member};
 use crate::format::bindings::bindings;
 use crate::syntax::ast::{self, ItemKind};
@@ -216,7 +217,8 @@ impl Checker<'_> {
     /// The items an item names: those its paths name, its test target aside; the functions
     /// named after a type under each member name it writes after `.` and each cursor method its
     /// `for` statements call; the type a function is named after; and the functions
-    /// implementing the interface of an impl line. It reads no other item's facts as a subject's.
+    /// implementing the interface of an impl line, with its Env's abandon method for one naming
+    /// `sys::Component`. It reads no other item's facts as a subject's.
     pub fn names(&self, item: ItemId) -> Rc<BTreeSet<ItemId>> {
         if let Some(named) = self.named.borrow().get(&item) {
             return named.clone();
@@ -256,6 +258,15 @@ impl Checker<'_> {
                     .iter()
                     .filter_map(|method| self.implementing_function(item, &method.name)),
             );
+            if self.db.canonical(bound.interface) == "sys::Component" {
+                named.extend(
+                    bound
+                        .args
+                        .first()
+                        .and_then(Arg::ty)
+                        .and_then(|env| self.abandon_method(env)),
+                );
+            }
         }
         named
     }

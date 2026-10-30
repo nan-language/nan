@@ -68,6 +68,7 @@ codes! {
     ClosureProjectionValue = "closure.projection-value",
     ClosureSecondClass = "closure.second-class",
     ClosureShortEffect = "closure.short-effect",
+    ComponentEnvNotAbandonable = "component.env-not-abandonable",
     ComponentNotComponent = "component.not-component",
     ComponentStateGeneric = "component.state-generic",
     ComponentStateNotEncode = "component.state-not-encode",

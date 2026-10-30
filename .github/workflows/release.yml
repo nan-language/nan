@@ -129,6 +129,7 @@ jobs:
           sed -e "s/@VERSION@/${TAG#v}/" \
               -e "s/@SHA256_X86_64@/$(cut -d' ' -f1 "nan-$TAG-x86_64-linux.sha256")/" \
               -e "s/@SHA256_AARCH64@/$(cut -d' ' -f1 "nan-$TAG-aarch64-linux.sha256")/" \
+              -e "s/@SHA256_LICENSE@/$(sha256sum LICENSE | cut -d' ' -f1)/" \
               .github/aur/PKGBUILD > /home/builder/nan-bin/PKGBUILD
           cd /home/builder/nan-bin
           runuser -u builder -- makepkg
@@ -173,3 +174,43 @@ jobs:
           install -m 600 /dev/null "$RUNNER_TEMP/copr"
           printf '%s\n' "$COPR_CONFIG" > "$RUNNER_TEMP/copr"
           copr-cli --config "$RUNNER_TEMP/copr" build @nanlang/nan nan-*.src.rpm
+
+  ppa:
+    needs: publish
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Write the source packages
+        env:
+          PPA_GPG_PRIVATE_KEY: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q debhelper dput
+          printf '%s\n' "$PPA_GPG_PRIVATE_KEY" | gpg --batch --import
+          key=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+          maintainer=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "uid" { print $10; exit }')
+          upstream=${TAG#v}
+          tree="$RUNNER_TEMP/ppa/nan-$upstream"
+          mkdir -p "$tree"
+          cp "nan-$TAG-x86_64-linux" "nan-$TAG-aarch64-linux" "$tree"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP/ppa" -cJf "$RUNNER_TEMP/ppa/nan_$upstream.orig.tar.xz" "nan-$upstream"
+          # The images need glibc 2.34, which Ubuntu ships from 22.04 on.
+          curl -fsS https://api.launchpad.net/devel/ubuntu/series \
+            | jq -r '.entries[] | select((.status == "Supported" or .status == "Current Stable Release") and (.version | tonumber) >= 22.04) | .name' \
+            > "$RUNNER_TEMP/series"
+          while read -r series; do
+            rm -rf "$tree/debian"
+            cp -r .github/ppa/debian "$tree/debian"
+            sed -n '/^--- LLVM Exceptions/,$ { s/^$/./; s/^/ /; p }' LICENSE >> "$tree/debian/copyright"
+            sed -i "s|@MAINTAINER@|$maintainer|" "$tree/debian/control"
+            sed -i -e "s|@VERSION@|$upstream-1~${series}1|" -e "s|@SERIES@|$series|" -e "s|@UPSTREAM@|$upstream|" \
+                -e "s|@MAINTAINER@|$maintainer|" -e "s|@DATE@|$(date -R)|" "$tree/debian/changelog"
+            (cd "$tree" && dpkg-buildpackage -S -sa --sign-key="$key")
+          done < "$RUNNER_TEMP/series"
+      - name: Upload the source packages to the PPA
+        run: dput ppa:nanlang/nan "$RUNNER_TEMP"/ppa/*_source.changes

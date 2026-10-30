@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | 
 
 The script installs `nan`, the NaN toolchain built by itself, as `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory and `NAN_VERSION` another release, such as `v0.1.0`. Building programs for the host target of the machine's architecture requires a C compiler available as `cc`, which links them, and for the other host target the GNU cross compiler, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`), and the `uefi` targets their firmware, OVMF and AAVMF.
 
-On Arch Linux, the AUR package [`nan-bin`](https://aur.archlinux.org/packages/nan-bin) installs `nan` as `/usr/bin/nan`, with these tools as optional dependencies; on Fedora, so does the package `nan` of the Copr project [`@nanlang/nan`](https://copr.fedorainfracloud.org/coprs/g/nanlang/nan/), after `dnf copr enable @nanlang/nan`.
+Packages install `nan` as `/usr/bin/nan`, with these tools as optional dependencies: on Arch Linux, [`nan-bin`](https://aur.archlinux.org/packages/nan-bin) from the AUR; on Fedora, `nan` after `dnf copr enable @nanlang/nan` ([Copr](https://copr.fedorainfracloud.org/coprs/g/nanlang/nan/)); on Ubuntu 22.04 or later, `nan` after `add-apt-repository ppa:nanlang/nan` ([PPA](https://launchpad.net/~nanlang/+archive/ubuntu/nan)).
 
 ## Specification
 

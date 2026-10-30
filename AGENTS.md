@@ -29,7 +29,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `docs/spec/` | The NaN 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
 | `editors/` | Editor support: the TextMate grammar of `.nan` files in `textmate/` |
-| `.github/` | The CI workflow, the release workflow and the templates of the AUR and Copr packages it publishes |
+| `.github/` | The CI workflow, the release workflow and the templates of the AUR, Copr and PPA packages it publishes |
 | `.agents/skills/` | Agent skills; `.claude/skills` links here |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.

@@ -154,7 +154,9 @@ pub mod domain {
     pub const SIBLING: u64 = 64;
     /// The first of the holdings it owns.
     pub const HOLDINGS: u64 = 72;
-    pub const SIZE: u64 = 80;
+    /// The handle of its cell, which the chunks passing to it are charged to.
+    pub const CELL: u64 = 80;
+    pub const SIZE: u64 = 88;
 }
 
 /// The offsets of an operation record's fields: what a task waits on at a cancellation point,

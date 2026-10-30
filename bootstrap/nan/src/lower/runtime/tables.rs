@@ -17,7 +17,7 @@ use super::super::call::{Called, Invoked};
 use super::super::fx::{Fx, PTR};
 use super::super::supplied::tasks::components;
 use super::super::{Instance, Lowering};
-use super::{Routine, memory, state};
+use super::{Routine, memory, state, tasks};
 
 /// The capability table's capacity.
 pub const ENTRIES: u64 = 65_536;
@@ -455,7 +455,7 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
 }
 
 /// A machine target's root grant: a root cell without a limit, whose supply is the boot heap,
-/// and an executor drawing through it that records no clock; its regions and `hw::Ring0` are not
+/// made the process domain's, and an executor drawing through it that records no clock; its regions and `hw::Ring0` are not
 /// yet taken.
 fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
     let grant_ty = lo.root_grant();
@@ -476,11 +476,19 @@ fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
         let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
         fx.store(untaken, grant, at);
     }
+    process_cell(lo, fx, cell);
     fx.b.ins().return_(&[]);
 }
 
-/// Writes a `host::World`'s allocator, naming a root cell, and its empty arguments and
-/// environment, which store through it.
+/// Makes a root grant's cell the process domain's.
+fn process_cell(lo: &mut Lowering, fx: &mut Fx, cell: Value) {
+    let state_address = lo.state(fx);
+    let process = fx.load(PTR, state_address, state::PROCESS);
+    fx.store(cell, process, tasks::domain::CELL);
+}
+
+/// Writes a `host::World`'s allocator, naming a root cell, which becomes the process domain's,
+/// and its empty arguments and environment, which store through it.
 pub fn grant_memory(lo: &mut Lowering, fx: &mut Fx, world: Value, cell: Value) {
     let world_ty = lo.std_ty("host", "World", Vec::new());
     let alloc = lo.layouts.field(lo.ck, &world_ty, None, "alloc").offset;
@@ -495,6 +503,7 @@ pub fn grant_memory(lo: &mut Lowering, fx: &mut Fx, world: Value, cell: Value) {
         }
         fx.store(cell, world, at + 24);
     }
+    process_cell(lo, fx, cell);
 }
 
 /// A new live entry of a kind, by handle.

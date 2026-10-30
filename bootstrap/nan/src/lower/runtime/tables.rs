@@ -62,10 +62,6 @@ const WORKING_DIRECTORY: i64 = -100;
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();
     match routine {
-        Routine::Check => {
-            let entry = live_entry(lo, fx, params[0]);
-            fx.b.ins().return_(&[entry]);
-        }
         Routine::Derive => {
             let state_address = lo.state(fx);
             let lock = fx.offset(state_address, state::LOCK);

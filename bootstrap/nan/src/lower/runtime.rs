@@ -74,8 +74,6 @@ pub enum Routine {
     Rehome,
     /// `(world)`: fills a root grant's capabilities and allocator.
     MintRoot,
-    /// `(handle) -> entry`: a capability's table entry, zero when stale.
-    Check,
     /// `(handle, kind) -> handle`: a new entry deriving from a capability's entry.
     Derive,
     /// `(handle)`: revokes an entry and every entry deriving from it.
@@ -181,7 +179,6 @@ impl Routine {
             Routine::Unhold => "_NScap_table_unhold",
             Routine::Rehome => "_NScap_table_rehome",
             Routine::MintRoot => "_NScap_table_mint_root",
-            Routine::Check => "_NScap_table_check",
             Routine::Derive => "_NScap_table_derive",
             Routine::Revoke => "_NScap_table_revoke",
             Routine::OutboxMint => "_NScap_table_outbox_mint",
@@ -241,7 +238,6 @@ impl Routine {
             Routine::Charged
             | Routine::Limit
             | Routine::TaskEnv
-            | Routine::Check
             | Routine::OutboxClaim
             | Routine::RegionOpen
             | Routine::RecordAlloc => (&[P], &[P]),
@@ -578,7 +574,6 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Lift => memory::define(lo, fx, routine),
         Routine::Hold | Routine::Unhold | Routine::Rehome => holdings::define(lo, fx, routine),
         Routine::MintRoot
-        | Routine::Check
         | Routine::Derive
         | Routine::Revoke
         | Routine::OutboxMint

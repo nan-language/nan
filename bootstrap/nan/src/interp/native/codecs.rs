@@ -1,14 +1,15 @@
 //! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and
-//! `text::construction::Codec`. A value encodes into the tree of kinds `core::Encoder` writes,
-//! which each format then writes out; decoding reads a format through the calls of
-//! `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
+//! type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then
+//! writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through
+//! the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 mod construction;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use super::super::value::Val;
+use super::super::value::{Loc, Val, View};
 use super::super::{End, Exec, Flow, Interpreter, Site};
 use super::collections::{conformance, ordering};
 use super::render::float_text;
@@ -16,7 +17,7 @@ use super::stores::{boxed, cell_of, counted, entries, exhausted, holding, place}
 use crate::check::db::ItemId;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
-use crate::nir::Span;
+use crate::nir::{Callable, FnRef, Span};
 use crate::syntax::ast::TypeModifier;
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
@@ -81,20 +82,323 @@ pub fn member(
                 site,
             };
             let decoded = decoding.value(&ty).and_then(|value| {
-                decoding.reader.finish()?;
+                decoding.reader.finish(decoding.interp)?;
                 Ok(value)
             });
-            match decoded {
-                Ok(value) => Ok(Flow::Return(value)),
-                Err(Failure::Decode(kind)) => {
-                    let error = interp.ty_item("core", "DecodeError");
-                    let index = interp.variant_index(error, kind);
-                    Ok(Flow::Fail(Val::Variant(error, index, Rc::new(Vec::new()))))
-                }
-                Err(Failure::Run(end)) => Err(end),
-            }
+            outcome(interp, decoded)
         }
         _ => return None,
+    })
+}
+
+/// `T.encode(self, mut e)` or `T.decode(mut d, alloc)` of a type whose `Encode` a derive writes
+/// or the toolchain supplies, through the calls of an encoder or decoder of type `through`: the
+/// value's encoded tree written out, or a value read in the order the std encodings and derived
+/// decoders read it.
+pub fn through(
+    interp: &mut Interpreter,
+    ty: &Ty,
+    through: &Ty,
+    method: &str,
+    args: &[Val],
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<Flow> {
+    if method == "encode" {
+        let calls = Calls {
+            target: args[1].clone(),
+            ty: through.clone(),
+            interface: interp.ty_item("core", "Encoder"),
+            cell: 0,
+            at,
+            site,
+        };
+        let tree = encoded(interp, &args[0], ty);
+        calls.write(interp, &tree)?;
+        return Ok(Flow::Return(Val::Unit));
+    }
+    let cell = cell_of(interp, &args[1]);
+    let mut calls = Calls {
+        target: args[0].clone(),
+        ty: through.clone(),
+        interface: interp.ty_item("core", "Decoder"),
+        cell,
+        at,
+        site,
+    };
+    let mut decoding = Decoding {
+        interp,
+        reader: &mut calls,
+        cell,
+        depth: 0,
+        at,
+        site,
+    };
+    let decoded = decoding.value(ty);
+    outcome(interp, decoded)
+}
+
+/// What a decoding gives: its value, or its failure as a `core::DecodeError`.
+fn outcome(interp: &Interpreter, decoded: Decoded<Val>) -> Exec<Flow> {
+    match decoded {
+        Ok(value) => Ok(Flow::Return(value)),
+        Err(Failure::Decode(kind)) => {
+            let error = interp.ty_item("core", "DecodeError");
+            let index = interp.variant_index(error, kind);
+            Ok(Flow::Fail(Val::Variant(error, index, Rc::new(Vec::new()))))
+        }
+        Err(Failure::Raised(error)) => Ok(Flow::Fail(error)),
+        Err(Failure::Run(end)) => Err(end),
+    }
+}
+
+/// The calls of an encoder or decoder of a type, at the place `target` holds it, made by an
+/// encoding or decoding drawing on `cell`.
+struct Calls {
+    target: Val,
+    ty: Ty,
+    interface: ItemId,
+    cell: u32,
+    at: (ItemId, Span),
+    site: Site,
+}
+
+impl Calls {
+    /// Calls the interface's method `name` on the target with `args`, giving its result, or
+    /// the failure it raises.
+    fn call(&self, interp: &mut Interpreter, name: &str, args: Vec<Val>) -> Decoded<Val> {
+        let method = interp
+            .ck
+            .interface_method(self.interface, name)
+            .expect("a method of the interface");
+        let fn_ref = FnRef {
+            callable: Callable::Method {
+                interface: self.interface,
+                method: method as u32,
+            },
+            args: Rc::from(vec![Arg::Ty(self.ty.clone())]),
+        };
+        let mut all = vec![self.target.clone()];
+        all.extend(args);
+        match interp.call_function(&fn_ref, all, self.at, self.site)? {
+            Flow::Fail(error) => Err(Failure::Raised(error)),
+            Flow::Return(value) | Flow::Yield(value) => Ok(value),
+        }
+    }
+
+    /// Writes an encoded tree through the encoder's calls.
+    fn write(&self, interp: &mut Interpreter, tree: &Tree) -> Exec<()> {
+        let call = |interp: &mut Interpreter, name: &str, args: Vec<Val>| -> Exec<()> {
+            match self.call(interp, name, args) {
+                Err(Failure::Run(end)) => Err(end),
+                _ => Ok(()),
+            }
+        };
+        let count = |len: usize| Val::Int(len as i128);
+        match tree {
+            Tree::Bool(value) => call(interp, "write_bool", vec![Val::Bool(*value)]),
+            Tree::Unsigned(value) => {
+                call(interp, "write_unsigned", vec![Val::Int(i128::from(*value))])
+            }
+            Tree::Signed(value) => call(interp, "write_signed", vec![Val::Int(i128::from(*value))]),
+            Tree::Float(value) => call(interp, "write_float", vec![Val::F64(*value)]),
+            Tree::Char(c) => call(interp, "write_char", vec![Val::Char(*c)]),
+            Tree::Text(bytes) => {
+                let text = byte_view(interp, bytes, false);
+                call(interp, "write_text", vec![text])
+            }
+            Tree::Bytes(bytes) => {
+                let bytes = byte_view(interp, bytes, false);
+                call(interp, "write_bytes", vec![bytes])
+            }
+            Tree::Sequence(elements) => {
+                call(interp, "begin_sequence", vec![count(elements.len())])?;
+                for element in elements {
+                    self.write(interp, element)?;
+                }
+                call(interp, "end", Vec::new())
+            }
+            Tree::Map(entries) => {
+                call(interp, "begin_map", vec![count(entries.len())])?;
+                for (key, value) in entries {
+                    self.write(interp, key)?;
+                    self.write(interp, value)?;
+                }
+                call(interp, "end", Vec::new())
+            }
+            Tree::Record(fields) => {
+                call(interp, "begin_record", vec![count(fields.len())])?;
+                for (key, value) in fields {
+                    let key = byte_view(interp, key, false);
+                    call(interp, "write_key", vec![key])?;
+                    self.write(interp, value)?;
+                }
+                call(interp, "end", Vec::new())
+            }
+            Tree::Variant(key, payload) => {
+                let key = byte_view(interp, key, false);
+                let follows = Val::Bool(payload.is_some());
+                call(interp, "begin_variant", vec![key, follows])?;
+                if let Some(payload) = payload {
+                    self.write(interp, payload)?;
+                }
+                call(interp, "end", Vec::new())
+            }
+        }
+    }
+
+    /// The bytes of text or bytes of length `len`, read in one chunk once the room for them
+    /// is known: at most `most` bytes for a fixed text, or what the cell has left otherwise.
+    fn chunk(&self, interp: &mut Interpreter, len: Val, most: Option<usize>) -> Decoded<Vec<u8>> {
+        let len = len.int() as u64;
+        match most {
+            Some(most) if len > most as u64 => return fail("OutOfRange"),
+            None if interp.budgets.charged(self.cell) + u128::from(len)
+                > interp.budgets.limit(self.cell) =>
+            {
+                return fail("OutOfMemory");
+            }
+            _ => {}
+        }
+        let out = byte_view(interp, &vec![0; len as usize], true);
+        self.call(interp, "read_chunk", vec![out.clone()])?;
+        let Val::View(view) = out else {
+            unreachable!("a view");
+        };
+        Ok(interp
+            .view_values(&view)
+            .iter()
+            .map(|byte| byte.int() as u8)
+            .collect())
+    }
+
+    /// The position among `keys` of the key a decoder reads through its method `name`.
+    fn keyed(
+        &self,
+        interp: &mut Interpreter,
+        name: &str,
+        keys: &[&[u8]],
+    ) -> Decoded<Option<usize>> {
+        let views: Vec<Val> = keys
+            .iter()
+            .map(|key| byte_view(interp, key, false))
+            .collect();
+        let count = views.len();
+        let keys = Val::View(View {
+            array: Loc {
+                extent: interp.memory.alloc(Val::Array(Rc::new(views)), false, 0),
+                path: Vec::new(),
+            },
+            start: 0,
+            len: count,
+        });
+        Ok(match self.call(interp, name, vec![keys])? {
+            Val::Variant(_, _, payload) if !payload.is_empty() => {
+                Some(payload[0].int() as usize).filter(|index| *index < count)
+            }
+            _ => None,
+        })
+    }
+}
+
+impl Reader for Calls {
+    fn read_bool(&mut self, interp: &mut Interpreter) -> Decoded<bool> {
+        Ok(self.call(interp, "read_bool", Vec::new())?.bool())
+    }
+
+    fn read_unsigned(&mut self, interp: &mut Interpreter) -> Decoded<u64> {
+        Ok(self.call(interp, "read_unsigned", Vec::new())?.int() as u64)
+    }
+
+    fn read_signed(&mut self, interp: &mut Interpreter) -> Decoded<i64> {
+        Ok(self.call(interp, "read_signed", Vec::new())?.int() as i64)
+    }
+
+    fn read_float(&mut self, interp: &mut Interpreter) -> Decoded<f64> {
+        match self.call(interp, "read_float", Vec::new())? {
+            Val::F64(value) => Ok(value),
+            other => panic!("a float, not {other:?}"),
+        }
+    }
+
+    fn read_char(&mut self, interp: &mut Interpreter) -> Decoded<u32> {
+        match self.call(interp, "read_char", Vec::new())? {
+            Val::Char(c) => Ok(u32::from(c)),
+            other => panic!("a char, not {other:?}"),
+        }
+    }
+
+    fn read_text(&mut self, interp: &mut Interpreter, most: Option<usize>) -> Decoded<Vec<u8>> {
+        let len = self.call(interp, "begin_text", Vec::new())?;
+        self.chunk(interp, len, most)
+    }
+
+    fn read_bytes(&mut self, interp: &mut Interpreter) -> Decoded<Vec<u8>> {
+        let len = self.call(interp, "begin_bytes", Vec::new())?;
+        self.chunk(interp, len, None)
+    }
+
+    fn begin_sequence(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.call(interp, "begin_sequence", Vec::new()).map(drop)
+    }
+
+    fn begin_map(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.call(interp, "begin_map", Vec::new()).map(drop)
+    }
+
+    fn begin_record(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.call(interp, "begin_record", Vec::new()).map(drop)
+    }
+
+    fn next_follows(&mut self, interp: &mut Interpreter) -> Decoded<bool> {
+        Ok(self.call(interp, "next_follows", Vec::new())?.bool())
+    }
+
+    fn map_value(&mut self, _: &mut Interpreter) -> Decoded<()> {
+        Ok(())
+    }
+
+    fn read_key(&mut self, interp: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
+        self.keyed(interp, "read_key", keys)
+    }
+
+    fn read_variant(&mut self, interp: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
+        self.keyed(interp, "read_variant", keys)
+    }
+
+    fn payload_follows(&mut self, interp: &mut Interpreter) -> Decoded<bool> {
+        Ok(self.call(interp, "payload_follows", Vec::new())?.bool())
+    }
+
+    fn skip(&mut self, interp: &mut Interpreter, _: usize) -> Decoded<()> {
+        self.call(interp, "skip", Vec::new()).map(drop)
+    }
+
+    fn end(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.call(interp, "end", Vec::new()).map(drop)
+    }
+
+    fn finish(&mut self, _: &mut Interpreter) -> Decoded<()> {
+        Ok(())
+    }
+}
+
+/// A view of bytes in an extent of their own, writable or not.
+fn byte_view(interp: &mut Interpreter, bytes: &[u8], writable: bool) -> Val {
+    let values = bytes
+        .iter()
+        .map(|byte| Val::Int(i128::from(*byte)))
+        .collect();
+    let extent = interp
+        .memory
+        .alloc(Val::Array(Rc::new(values)), writable, bytes.len() as u64);
+    Val::View(View {
+        array: Loc {
+            extent,
+            path: Vec::new(),
+        },
+        start: 0,
+        len: bytes.len(),
     })
 }
 
@@ -421,9 +725,11 @@ fn from_base64(text: &[u8]) -> Option<Vec<u8>> {
     (base64(&bytes).as_bytes() == text).then_some(bytes)
 }
 
-/// Why decoding stopped: a decode error, by its variant's name, or an end of the run.
+/// Why decoding stopped: a decode error, by its variant's name, a decoder's own failure, or an
+/// end of the run.
 enum Failure {
     Decode(&'static str),
+    Raised(Val),
     Run(End),
 }
 
@@ -439,34 +745,43 @@ fn fail<T>(kind: &'static str) -> Decoded<T> {
     Err(Failure::Decode(kind))
 }
 
-/// A format read through the calls of `core::Decoder`.
+/// A source of encoded values read through the calls of `core::Decoder`: a format, or a
+/// decoder whose calls the interpreter runs.
 trait Reader {
-    fn read_bool(&mut self) -> Decoded<bool>;
-    fn read_unsigned(&mut self) -> Decoded<u64>;
-    fn read_signed(&mut self) -> Decoded<i64>;
-    fn read_float(&mut self) -> Decoded<f64>;
+    fn read_bool(&mut self, interp: &mut Interpreter) -> Decoded<bool>;
+    fn read_unsigned(&mut self, interp: &mut Interpreter) -> Decoded<u64>;
+    fn read_signed(&mut self, interp: &mut Interpreter) -> Decoded<i64>;
+    fn read_float(&mut self, interp: &mut Interpreter) -> Decoded<f64>;
     /// A char's scalar value, as written.
-    fn read_char(&mut self) -> Decoded<u32>;
-    fn read_text(&mut self) -> Decoded<Vec<u8>>;
-    fn read_bytes(&mut self) -> Decoded<Vec<u8>>;
-    fn begin_sequence(&mut self) -> Decoded<()>;
-    fn begin_map(&mut self) -> Decoded<()>;
-    fn begin_record(&mut self) -> Decoded<()>;
+    fn read_char(&mut self, interp: &mut Interpreter) -> Decoded<u32>;
+    /// The bytes of text, for a fixed text of at most `most` bytes.
+    fn read_text(&mut self, interp: &mut Interpreter, most: Option<usize>) -> Decoded<Vec<u8>>;
+    fn read_bytes(&mut self, interp: &mut Interpreter) -> Decoded<Vec<u8>>;
+    fn begin_sequence(&mut self, interp: &mut Interpreter) -> Decoded<()>;
+    fn begin_map(&mut self, interp: &mut Interpreter) -> Decoded<()>;
+    fn begin_record(&mut self, interp: &mut Interpreter) -> Decoded<()>;
     /// Begins the record of a variant's labelled payload.
-    fn begin_labelled(&mut self) -> Decoded<()> {
-        self.begin_record()
+    fn begin_labelled(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.begin_record(interp)
     }
-    fn next_follows(&mut self) -> Decoded<bool>;
+    fn next_follows(&mut self, interp: &mut Interpreter) -> Decoded<bool>;
     /// Between a map entry's key and its value.
-    fn map_value(&mut self) -> Decoded<()>;
-    fn read_key(&mut self) -> Decoded<Vec<u8>>;
-    fn read_variant(&mut self) -> Decoded<Vec<u8>>;
-    fn payload_follows(&mut self) -> Decoded<bool>;
+    fn map_value(&mut self, interp: &mut Interpreter) -> Decoded<()>;
+    /// The position among `keys` of the key read, if any.
+    fn read_key(&mut self, interp: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>>;
+    /// The position among `keys` of the variant key read, if any.
+    fn read_variant(&mut self, interp: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>>;
+    fn payload_follows(&mut self, interp: &mut Interpreter) -> Decoded<bool>;
     /// Passes over the value of the field whose key was just read, at a nesting depth.
-    fn skip(&mut self, depth: usize) -> Decoded<()>;
-    fn end(&mut self) -> Decoded<()>;
+    fn skip(&mut self, interp: &mut Interpreter, depth: usize) -> Decoded<()>;
+    fn end(&mut self, interp: &mut Interpreter) -> Decoded<()>;
     /// Fails on what is left after the value.
-    fn finish(&mut self) -> Decoded<()>;
+    fn finish(&mut self, interp: &mut Interpreter) -> Decoded<()>;
+}
+
+/// The position of a key among `keys`.
+fn position(keys: &[&[u8]], key: &[u8]) -> Option<usize> {
+    keys.iter().position(|named| *named == key)
 }
 
 /// The decoding of one value: the reader, the cell containers draw through, and the nesting.
@@ -494,12 +809,12 @@ impl Decoding<'_, '_, '_, '_> {
             Ty::Scalar(scalar) => self.scalar(*scalar),
             Ty::Unit => {
                 self.nest()?;
-                self.reader.begin_record()?;
-                if self.reader.next_follows()? {
-                    let _ = self.reader.read_key()?;
+                self.reader.begin_record(self.interp)?;
+                if self.reader.next_follows(self.interp)? {
+                    self.reader.read_key(self.interp, &[])?;
                     return fail("UnknownKey");
                 }
-                self.reader.end()?;
+                self.reader.end(self.interp)?;
                 self.depth -= 1;
                 Ok(Val::Unit)
             }
@@ -514,22 +829,22 @@ impl Decoding<'_, '_, '_, '_> {
             (low..=high).contains(&value)
         };
         Ok(match scalar {
-            Scalar::Bool => Val::Bool(self.reader.read_bool()?),
-            Scalar::Char => match char::from_u32(self.reader.read_char()?) {
+            Scalar::Bool => Val::Bool(self.reader.read_bool(self.interp)?),
+            Scalar::Char => match char::from_u32(self.reader.read_char(self.interp)?) {
                 Some(c) => Val::Char(c),
                 None => return fail("Invalid"),
             },
-            Scalar::F64 => Val::F64(self.reader.read_float()?),
-            Scalar::F32 => Val::F32(self.reader.read_float()? as f32),
+            Scalar::F64 => Val::F64(self.reader.read_float(self.interp)?),
+            Scalar::F32 => Val::F32(self.reader.read_float(self.interp)? as f32),
             _ if scalar.is_signed() => {
-                let value = i128::from(self.reader.read_signed()?);
+                let value = i128::from(self.reader.read_signed(self.interp)?);
                 match in_range(value) {
                     true => Val::Int(value),
                     false => return fail("OutOfRange"),
                 }
             }
             _ => {
-                let value = i128::from(self.reader.read_unsigned()?);
+                let value = i128::from(self.reader.read_unsigned(self.interp)?);
                 match in_range(value) {
                     true => Val::Int(value),
                     false => return fail("OutOfRange"),
@@ -580,13 +895,13 @@ impl Decoding<'_, '_, '_, '_> {
             "text::String" | "mem::Bytes" => {
                 let bytes = match path.as_str() {
                     "text::String" => {
-                        let text = self.reader.read_text()?;
+                        let text = self.reader.read_text(self.interp, None)?;
                         if std::str::from_utf8(&text).is_err() {
                             return fail("InvalidText");
                         }
                         text
                     }
-                    _ => self.reader.read_bytes()?,
+                    _ => self.reader.read_bytes(self.interp)?,
                 };
                 let values = bytes
                     .into_iter()
@@ -595,11 +910,11 @@ impl Decoding<'_, '_, '_, '_> {
                 self.held(&path, values, &Ty::Scalar(Scalar::U8))?
             }
             "text::Fixed" => {
-                let text = self.reader.read_text()?;
+                let bound = count(0);
+                let text = self.reader.read_text(self.interp, Some(bound))?;
                 if std::str::from_utf8(&text).is_err() {
                     return fail("InvalidText");
                 }
-                let bound = count(0);
                 if text.len() > bound {
                     return fail("OutOfRange");
                 }
@@ -632,18 +947,18 @@ impl Decoding<'_, '_, '_, '_> {
             }
             "mem::Map" => {
                 self.nest()?;
-                self.reader.begin_map()?;
+                self.reader.begin_map(self.interp)?;
                 let mut keys = Vec::new();
                 let mut pairs = Vec::new();
                 let key_value = self.interp.ty_item("mem", "KeyValue");
-                while self.reader.next_follows()? {
+                while self.reader.next_follows(self.interp)? {
                     let key = self.value(&arg(0))?;
-                    self.reader.map_value()?;
+                    self.reader.map_value(self.interp)?;
                     let value = self.value(&arg(1))?;
                     keys.push(key.clone());
                     pairs.push(Val::Struct(key_value, Rc::new(vec![key, value])));
                 }
-                self.reader.end()?;
+                self.reader.end(self.interp)?;
                 self.depth -= 1;
                 self.ascending(&keys, &arg(0))?;
                 let entry = Ty::item(key_value, vec![Arg::Ty(arg(0)), Arg::Ty(arg(1))]);
@@ -691,15 +1006,14 @@ impl Decoding<'_, '_, '_, '_> {
             }
             SigKind::Enum { variants } => {
                 self.nest()?;
-                let key = self.reader.read_variant()?;
-                let key = aliases.get(&key).cloned().unwrap_or(key);
-                let Some(index) = variants
+                let names: Vec<&[u8]> = variants
                     .iter()
-                    .position(|variant| variant.name.as_bytes() == key)
-                else {
+                    .map(|variant| variant.name.as_bytes())
+                    .collect();
+                let Some(index) = self.named(&names, &aliases, true)? else {
                     return fail("UnknownVariant");
                 };
-                let follows = self.reader.payload_follows()?;
+                let follows = self.reader.payload_follows(self.interp)?;
                 let payload = match (&variants[index].payload, follows) {
                     (Payload::None, false) => Vec::new(),
                     (Payload::Single(ty), true) => vec![self.value(&subst.ty(ty))?],
@@ -712,7 +1026,7 @@ impl Decoding<'_, '_, '_, '_> {
                     }
                     _ => return fail("Malformed"),
                 };
-                self.reader.end()?;
+                self.reader.end(self.interp)?;
                 self.depth -= 1;
                 Ok(Val::Variant(item, index as u32, Rc::new(payload)))
             }
@@ -731,21 +1045,20 @@ impl Decoding<'_, '_, '_, '_> {
     ) -> Decoded<Vec<Val>> {
         self.nest()?;
         match labelled {
-            true => self.reader.begin_labelled()?,
-            false => self.reader.begin_record()?,
+            true => self.reader.begin_labelled(self.interp)?,
+            false => self.reader.begin_record(self.interp)?,
         }
         let mut values: Vec<Option<Val>> = vec![None; named.len()];
-        while self.reader.next_follows()? {
-            let key = self.reader.read_key()?;
-            let key = aliases.get(&key).cloned().unwrap_or(key);
-            match named.iter().position(|(name, _)| name.as_bytes() == key) {
+        let names: Vec<&[u8]> = named.iter().map(|(name, _)| name.as_bytes()).collect();
+        while self.reader.next_follows(self.interp)? {
+            match self.named(&names, aliases, false)? {
                 Some(index) if values[index].is_some() => return fail("DuplicateKey"),
                 Some(index) => values[index] = Some(self.value(&named[index].1)?),
-                None if open => self.reader.skip(self.depth)?,
+                None if open => self.reader.skip(self.interp, self.depth)?,
                 None => return fail("UnknownKey"),
             }
         }
-        self.reader.end()?;
+        self.reader.end(self.interp)?;
         self.depth -= 1;
         named
             .iter()
@@ -756,6 +1069,33 @@ impl Decoding<'_, '_, '_, '_> {
                 None => fail("MissingField"),
             })
             .collect()
+    }
+
+    /// The position among `names` of the field or variant the key read next names, directly or
+    /// through an alias: the keys read are the names, then the old keys of the aliases of names.
+    fn named(
+        &mut self,
+        names: &[&[u8]],
+        aliases: &BTreeMap<Vec<u8>, Vec<u8>>,
+        variant: bool,
+    ) -> Decoded<Option<usize>> {
+        let aliased: Vec<(&[u8], usize)> = aliases
+            .iter()
+            .filter_map(|(old, current)| Some((old.as_slice(), position(names, current)?)))
+            .collect();
+        let keys: Vec<&[u8]> = names
+            .iter()
+            .copied()
+            .chain(aliased.iter().map(|(old, _)| *old))
+            .collect();
+        let read = match variant {
+            true => self.reader.read_variant(self.interp, &keys)?,
+            false => self.reader.read_key(self.interp, &keys)?,
+        };
+        Ok(read.map(|index| match index.checked_sub(names.len()) {
+            Some(alias) => aliased[alias].1,
+            None => index,
+        }))
     }
 
     /// The default of a missing field's type, when it implements `Default`.
@@ -778,29 +1118,29 @@ impl Decoding<'_, '_, '_, '_> {
     /// The variant one of `keys` names, with its payload when its key has a type.
     fn variant(&mut self, keys: &[(&str, Option<Ty>)]) -> Decoded<(usize, Option<Val>)> {
         self.nest()?;
-        let key = self.reader.read_variant()?;
-        let Some(index) = keys.iter().position(|(name, _)| name.as_bytes() == key) else {
+        let names: Vec<&[u8]> = keys.iter().map(|(name, _)| name.as_bytes()).collect();
+        let Some(index) = self.named(&names, &BTreeMap::new(), true)? else {
             return fail("UnknownVariant");
         };
-        let follows = self.reader.payload_follows()?;
+        let follows = self.reader.payload_follows(self.interp)?;
         let payload = match (&keys[index].1, follows) {
             (Some(ty), true) => Some(self.value(ty)?),
             (None, false) => None,
             _ => return fail("Malformed"),
         };
-        self.reader.end()?;
+        self.reader.end(self.interp)?;
         self.depth -= 1;
         Ok((index, payload))
     }
 
     fn sequence(&mut self, element: &Ty) -> Decoded<Vec<Val>> {
         self.nest()?;
-        self.reader.begin_sequence()?;
+        self.reader.begin_sequence(self.interp)?;
         let mut elements = Vec::new();
-        while self.reader.next_follows()? {
+        while self.reader.next_follows(self.interp)? {
             elements.push(self.value(element)?);
         }
-        self.reader.end()?;
+        self.reader.end(self.interp)?;
         self.depth -= 1;
         Ok(elements)
     }
@@ -962,7 +1302,7 @@ impl WireReader {
 }
 
 impl Reader for WireReader {
-    fn read_bool(&mut self) -> Decoded<bool> {
+    fn read_bool(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         match self.input.byte()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -970,35 +1310,35 @@ impl Reader for WireReader {
         }
     }
 
-    fn read_unsigned(&mut self) -> Decoded<u64> {
+    fn read_unsigned(&mut self, _: &mut Interpreter) -> Decoded<u64> {
         self.uvar()
     }
 
-    fn read_signed(&mut self) -> Decoded<i64> {
+    fn read_signed(&mut self, _: &mut Interpreter) -> Decoded<i64> {
         let zigzag = self.uvar()?;
         Ok(((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64))
     }
 
-    fn read_float(&mut self) -> Decoded<f64> {
+    fn read_float(&mut self, _: &mut Interpreter) -> Decoded<f64> {
         let bytes = self.input.take(8)?;
         Ok(f64::from_bits(u64::from_le_bytes(
             bytes.try_into().expect("eight bytes"),
         )))
     }
 
-    fn read_char(&mut self) -> Decoded<u32> {
+    fn read_char(&mut self, _: &mut Interpreter) -> Decoded<u32> {
         Ok(u32::try_from(self.uvar()?).unwrap_or(u32::MAX))
     }
 
-    fn read_text(&mut self) -> Decoded<Vec<u8>> {
+    fn read_text(&mut self, _: &mut Interpreter, _: Option<usize>) -> Decoded<Vec<u8>> {
         self.framed()
     }
 
-    fn read_bytes(&mut self) -> Decoded<Vec<u8>> {
+    fn read_bytes(&mut self, _: &mut Interpreter) -> Decoded<Vec<u8>> {
         self.framed()
     }
 
-    fn begin_sequence(&mut self) -> Decoded<()> {
+    fn begin_sequence(&mut self, _: &mut Interpreter) -> Decoded<()> {
         let count = self.uvar()?;
         if count > (self.input.bytes.len() - self.input.at) as u64 {
             return fail("Truncated");
@@ -1007,11 +1347,11 @@ impl Reader for WireReader {
         Ok(())
     }
 
-    fn begin_map(&mut self) -> Decoded<()> {
-        self.begin_sequence()
+    fn begin_map(&mut self, interp: &mut Interpreter) -> Decoded<()> {
+        self.begin_sequence(interp)
     }
 
-    fn begin_record(&mut self) -> Decoded<()> {
+    fn begin_record(&mut self, _: &mut Interpreter) -> Decoded<()> {
         let left = self.uvar()?;
         if left > (self.input.bytes.len() - self.input.at) as u64 {
             return fail("Truncated");
@@ -1024,7 +1364,7 @@ impl Reader for WireReader {
         Ok(())
     }
 
-    fn next_follows(&mut self) -> Decoded<bool> {
+    fn next_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         self.close_value()?;
         match self.frames.last_mut() {
             Some(WireFrame::Counted(left) | WireFrame::Record { left, .. }) => {
@@ -1036,11 +1376,11 @@ impl Reader for WireReader {
         }
     }
 
-    fn map_value(&mut self) -> Decoded<()> {
+    fn map_value(&mut self, _: &mut Interpreter) -> Decoded<()> {
         Ok(())
     }
 
-    fn read_key(&mut self) -> Decoded<Vec<u8>> {
+    fn read_key(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         let key = self.framed()?;
         let end = self.length_end()?;
         let Some(WireFrame::Record {
@@ -1054,18 +1394,19 @@ impl Reader for WireReader {
             Some(std::cmp::Ordering::Less) => return fail("Malformed"),
             _ => {}
         }
-        *last = Some(key.clone());
         *value_end = Some(end);
-        Ok(key)
+        let named = position(keys, &key);
+        *last = Some(key);
+        Ok(named)
     }
 
-    fn read_variant(&mut self) -> Decoded<Vec<u8>> {
+    fn read_variant(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         let key = self.framed()?;
         self.frames.push(WireFrame::Variant { payload_end: None });
-        Ok(key)
+        Ok(position(keys, &key))
     }
 
-    fn payload_follows(&mut self) -> Decoded<bool> {
+    fn payload_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         match self.input.byte()? {
             0 => Ok(false),
             1 => {
@@ -1079,7 +1420,7 @@ impl Reader for WireReader {
         }
     }
 
-    fn skip(&mut self, _: usize) -> Decoded<()> {
+    fn skip(&mut self, _: &mut Interpreter, _: usize) -> Decoded<()> {
         if let Some(WireFrame::Record { value_end, .. }) = self.frames.last_mut()
             && let Some(end) = value_end.take()
         {
@@ -1089,7 +1430,7 @@ impl Reader for WireReader {
         fail("Malformed")
     }
 
-    fn end(&mut self) -> Decoded<()> {
+    fn end(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.close_value()?;
         match self.frames.pop() {
             Some(WireFrame::Counted(0) | WireFrame::Record { left: 0, .. }) => Ok(()),
@@ -1101,7 +1442,7 @@ impl Reader for WireReader {
         }
     }
 
-    fn finish(&mut self) -> Decoded<()> {
+    fn finish(&mut self, _: &mut Interpreter) -> Decoded<()> {
         match self.input.at == self.input.bytes.len() {
             true => Ok(()),
             false => fail("Trailing"),
@@ -1311,7 +1652,7 @@ impl JsonReader {
 }
 
 impl Reader for JsonReader {
-    fn read_bool(&mut self) -> Decoded<bool> {
+    fn read_bool(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         if self.literal(b"true") {
             return Ok(true);
         }
@@ -1321,16 +1662,16 @@ impl Reader for JsonReader {
         }
     }
 
-    fn read_unsigned(&mut self) -> Decoded<u64> {
+    fn read_unsigned(&mut self, _: &mut Interpreter) -> Decoded<u64> {
         u64::try_from(self.integer()?).or_else(|_| fail("OutOfRange"))
     }
 
-    fn read_signed(&mut self) -> Decoded<i64> {
+    fn read_signed(&mut self, _: &mut Interpreter) -> Decoded<i64> {
         let value = self.integer()?;
         i64::try_from(value).or_else(|_| fail("OutOfRange"))
     }
 
-    fn read_float(&mut self) -> Decoded<f64> {
+    fn read_float(&mut self, _: &mut Interpreter) -> Decoded<f64> {
         if self.input.peek()? == b'"' {
             return match self.string()?.as_slice() {
                 b"NaN" => Ok(f64::NAN),
@@ -1343,7 +1684,7 @@ impl Reader for JsonReader {
         text.parse::<f64>().or_else(|_| fail("Malformed"))
     }
 
-    fn read_char(&mut self) -> Decoded<u32> {
+    fn read_char(&mut self, _: &mut Interpreter) -> Decoded<u32> {
         let text = self.string()?;
         let text = String::from_utf8(text).map_err(|_| Failure::Decode("InvalidText"))?;
         let mut chars = text.chars();
@@ -1353,34 +1694,34 @@ impl Reader for JsonReader {
         }
     }
 
-    fn read_text(&mut self) -> Decoded<Vec<u8>> {
+    fn read_text(&mut self, _: &mut Interpreter, _: Option<usize>) -> Decoded<Vec<u8>> {
         self.string()
     }
 
-    fn read_bytes(&mut self) -> Decoded<Vec<u8>> {
+    fn read_bytes(&mut self, _: &mut Interpreter) -> Decoded<Vec<u8>> {
         let text = self.string()?;
         from_base64(&text).ok_or(Failure::Decode("Malformed"))
     }
 
-    fn begin_sequence(&mut self) -> Decoded<()> {
+    fn begin_sequence(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b'[')?;
         self.frames.push(JsonFrame::Array { started: false });
         Ok(())
     }
 
-    fn begin_map(&mut self) -> Decoded<()> {
+    fn begin_map(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b'[')?;
         self.frames.push(JsonFrame::Map { started: false });
         Ok(())
     }
 
-    fn begin_record(&mut self) -> Decoded<()> {
+    fn begin_record(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b'{')?;
         self.frames.push(JsonFrame::Object { started: false });
         Ok(())
     }
 
-    fn next_follows(&mut self) -> Decoded<bool> {
+    fn next_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         match self.frames.last() {
             Some(JsonFrame::Object { .. }) => self.element_follows(b'}'),
             Some(JsonFrame::Map { started }) => {
@@ -1397,40 +1738,40 @@ impl Reader for JsonReader {
         }
     }
 
-    fn map_value(&mut self) -> Decoded<()> {
+    fn map_value(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b',')
     }
 
-    fn read_key(&mut self) -> Decoded<Vec<u8>> {
+    fn read_key(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         let key = self.string()?;
         self.input.expect(b':')?;
-        Ok(key)
+        Ok(position(keys, &key))
     }
 
-    fn read_variant(&mut self) -> Decoded<Vec<u8>> {
+    fn read_variant(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         if self.input.peek()? == b'"' {
             self.frames.push(JsonFrame::Variant { payload: false });
-            return self.string();
+            return Ok(position(keys, &self.string()?));
         }
         self.input.expect(b'{')?;
         let key = self.string()?;
         self.input.expect(b':')?;
         self.frames.push(JsonFrame::Variant { payload: true });
-        Ok(key)
+        Ok(position(keys, &key))
     }
 
-    fn payload_follows(&mut self) -> Decoded<bool> {
+    fn payload_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         match self.frames.last() {
             Some(JsonFrame::Variant { payload }) => Ok(*payload),
             _ => fail("Malformed"),
         }
     }
 
-    fn skip(&mut self, _: usize) -> Decoded<()> {
+    fn skip(&mut self, _: &mut Interpreter, _: usize) -> Decoded<()> {
         self.skip_value()
     }
 
-    fn end(&mut self) -> Decoded<()> {
+    fn end(&mut self, _: &mut Interpreter) -> Decoded<()> {
         match self.frames.pop() {
             Some(JsonFrame::Array { .. }) => self.input.expect(b']'),
             Some(JsonFrame::Object { .. }) => self.input.expect(b'}'),
@@ -1441,7 +1782,7 @@ impl Reader for JsonReader {
         }
     }
 
-    fn finish(&mut self) -> Decoded<()> {
+    fn finish(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.space();
         match self.input.at == self.input.bytes.len() {
             true => Ok(()),

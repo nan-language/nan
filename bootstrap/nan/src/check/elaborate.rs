@@ -651,7 +651,8 @@ impl Checker<'_> {
                 "hash" => "hash",
                 "default" => "default",
                 "render" => "render",
-                "write" => "write",
+                "encode" => "encode",
+                "decode" => "decode",
                 "generate" => "generate",
                 _ => return None,
             };

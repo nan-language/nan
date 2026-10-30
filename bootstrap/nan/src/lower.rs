@@ -123,7 +123,9 @@ pub enum Glue {
     FusedMulAdd(supplied::floats::Width),
     /// Writes a value of a type in a codec's format.
     Encode(supplied::codecs::Format, Ty),
-    /// Reads a value of a type in a codec's format.
+    /// Writes a value of a type, the second, through the calls of an encoder of the first.
+    EncodeCalls(Ty, Ty),
+    /// Reads a value of a type in a codec's format, or through the calls of a decoder.
     Decode(supplied::codecs::DecodeFormat, Ty),
     /// Reads a uvar of the wire format.
     WireUvar,

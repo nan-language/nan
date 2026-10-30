@@ -1,4 +1,4 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out; decoding reads a format through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const DECODE_DEPTH_LIMIT: usize = 128
@@ -33,10 +33,11 @@ enum Tree {
 
 const BASE64_ALPHABET: Slice[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
-/// Why decoding stopped: a decode error, by its variant of `core::DecodeError`, or an end of
-/// the run.
+/// Why decoding stopped: a decode error, by its variant of `core::DecodeError`, a decoder's own
+/// failure, or an end of the run.
 enum Failure {
     Decode(DecodeKind)
+    Raised(Val)
     Run(End) from
 } Failure
 
@@ -107,32 +108,36 @@ enum CodecFormat derives Copy, Eq {
     Construction
 } CodecFormat
 
-/// A format read through the calls of `core::Decoder`.
+/// A source of encoded values read through the calls of `core::Decoder`: a format, or a
+/// decoder whose calls the interpreter runs.
 interface Reader {
-    fn read_bool(mut self) -> bool fails Failure
-    fn read_unsigned(mut self) -> u64 fails Failure
-    fn read_signed(mut self) -> i64 fails Failure
-    fn read_float(mut self) -> f64 fails Failure
+    fn read_bool(mut self, mut interp: Interpreter) -> bool fails Failure
+    fn read_unsigned(mut self, mut interp: Interpreter) -> u64 fails Failure
+    fn read_signed(mut self, mut interp: Interpreter) -> i64 fails Failure
+    fn read_float(mut self, mut interp: Interpreter) -> f64 fails Failure
     /// A char's scalar value, as written.
-    fn read_char(mut self) -> u32 fails Failure
-    fn read_text(mut self) -> mem::Bytes fails Failure
-    fn read_bytes(mut self) -> mem::Bytes fails Failure
-    fn begin_sequence(mut self) fails Failure
-    fn begin_map(mut self) fails Failure
-    fn begin_record(mut self) fails Failure
+    fn read_char(mut self, mut interp: Interpreter) -> u32 fails Failure
+    /// The bytes of text, for a fixed text of at most `most` bytes.
+    fn read_text(mut self, mut interp: Interpreter, most: Option[usize]) -> mem::Bytes fails Failure
+    fn read_bytes(mut self, mut interp: Interpreter) -> mem::Bytes fails Failure
+    fn begin_sequence(mut self, mut interp: Interpreter) fails Failure
+    fn begin_map(mut self, mut interp: Interpreter) fails Failure
+    fn begin_record(mut self, mut interp: Interpreter) fails Failure
     /// Begins the record of a variant's labelled payload.
-    fn begin_labelled(mut self) fails Failure
-    fn next_follows(mut self) -> bool fails Failure
+    fn begin_labelled(mut self, mut interp: Interpreter) fails Failure
+    fn next_follows(mut self, mut interp: Interpreter) -> bool fails Failure
     /// Between a map entry's key and its value.
-    fn map_value(mut self) fails Failure
-    fn read_key(mut self) -> mem::Bytes fails Failure
-    fn read_variant(mut self) -> mem::Bytes fails Failure
-    fn payload_follows(mut self) -> bool fails Failure
+    fn map_value(mut self, mut interp: Interpreter) fails Failure
+    /// The position among `keys` of the key read, if any.
+    fn read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure
+    /// The position among `keys` of the variant key read, if any.
+    fn read_variant(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure
+    fn payload_follows(mut self, mut interp: Interpreter) -> bool fails Failure
     /// Passes over the value of the field whose key was just read, at a nesting depth.
-    fn skip(mut self, depth: usize) fails Failure
-    fn end(mut self) fails Failure
+    fn skip(mut self, mut interp: Interpreter, depth: usize) fails Failure
+    fn end(mut self, mut interp: Interpreter) fails Failure
     /// Fails on what is left after the value.
-    fn finish(mut self) fails Failure
+    fn finish(mut self, mut interp: Interpreter) fails Failure
 } Reader
 
 impl WireReader: Reader
@@ -140,6 +145,25 @@ impl WireReader: Reader
 impl JsonReader: Reader
 
 impl ConstructionReader: Reader
+
+impl CodecCalls: Reader
+
+/// The calls of an encoder or decoder of a type, at the place `target` holds it, made by an
+/// encoding or decoding drawing on `cell`.
+struct CodecCalls {
+    target: Val
+    ty: ty::Ty
+    interface_item: ty::ItemId
+    cell: u32
+    at: ItemSpan
+    site: RunSite
+} CodecCalls
+
+/// The old key of an alias, with the position of the field or variant it names.
+struct AliasedKey {
+    old: mem::Bytes
+    field: usize
+} AliasedKey
 
 /// A variant key a decoding accepts, with its payload's type when it has one.
 struct VariantKey {
@@ -203,16 +227,284 @@ fn Interpreter.codec_member(
     let input = mut self.bytes(raw)
     let cell = self.cell_of(args[1])
     let decoded = attempt mut self.decode_value(format, take input, cell, ty, at, site)
+    return Some(try self.decode_outcome(take decoded))
+} Interpreter.codec_member
+
+/// `T.encode(self, mut e)` or `T.decode(mut d, alloc)` of a type whose `Encode` a derive writes
+/// or the toolchain supplies, through the calls of an encoder or decoder of type `through`: the
+/// value's encoded tree written out, or a value read in the order the std encodings and derived
+/// decoders read it.
+fn Interpreter.codec_through(
+    mut self,
+    ty: ty::Ty,
+    through: ty::Ty,
+    method: Str,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let alloc = self.alloc
+    expect args.len() > 1
+    if method == "encode" {
+        let calls = CodecCalls(target: args[1].copy(alloc), ty: through, interface_item: self.ty_item("core", name: "Encoder"), cell: 0, at: at, site: site)
+        let tree = self.encoded(args[0], ty)
+        try calls.write(mut self, tree)
+        return InterpFlow.Return(Val.Unit)
+    }
+    let cell = self.cell_of(args[1])
+    var calls = CodecCalls(target: args[0].copy(alloc), ty: through, interface_item: self.ty_item("core", name: "Decoder"), cell: cell, at: at, site: site)
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site)
+    let decoded = attempt mut decoding.value(mut self, reader: mut calls, ty)
+    return try self.decode_outcome(take decoded)
+} Interpreter.codec_through
+
+/// What a decoding gives: its value, or its failure as a `core::DecodeError`.
+fn Interpreter.decode_outcome(self, take decoded: Result[Val, Failure]) -> InterpFlow fails End {
     match decoded {
-        Ok(value) => return Some(InterpFlow.Return(take value))
+        Ok(value) => return InterpFlow.Return(take value)
         Err(Failure.Decode(kind)) => {
             let error = self.ty_item("core", name: "DecodeError")
             let index = self.variant_index(error, name: kind.name())
-            return Some(InterpFlow.Fail(Val.Variant(item: error, index: index, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))))
+            return InterpFlow.Fail(Val.Variant(item: error, index: index, fields: mem::Shared.of(mem::List[Val].empty(self.alloc), alloc: self.alloc)))
         }
+        Err(Failure.Raised(error)) => return InterpFlow.Fail(take error)
         Err(Failure.Run(end)) => fail end
     }
-} Interpreter.codec_member
+} Interpreter.decode_outcome
+
+/// Calls the interface's method `name` on the target with `args`, giving its result, or the
+/// failure it raises.
+fn CodecCalls.call(self, mut interp: Interpreter, name: Str, take args: mem::List[Val]) -> Val fails Failure {
+    let alloc = interp.alloc
+    let Some(method) = interp.ck.interface_method(self.interface_item, name) else {
+        expect false
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    mut type_args.push(ty::Arg.Ty(self.ty))
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: self.interface_item, method: u32.fit(method)), args: interp.ck.types().args(take type_args))
+    var all = Val.single(self.target.copy(alloc), alloc)
+    for arg in take args {
+        mut all.push(take arg)
+    }
+    match try mut interp.call_function(fn_ref, args: take all, at: self.at, site: self.site) {
+        InterpFlow.Fail(error) => fail Failure.Raised(take error)
+        InterpFlow.Return(value) or InterpFlow.Yield(value) => return value
+    }
+} CodecCalls.call
+
+/// Calls the encoder's method `name` with `args`.
+fn CodecCalls.put(self, mut interp: Interpreter, name: Str, take args: mem::List[Val]) fails End {
+    match attempt self.call(mut interp, name, take args) {
+        Err(Failure.Run(end)) => fail end
+        else => {}
+    }
+} CodecCalls.put
+
+/// Writes an encoded tree through the encoder's calls.
+fn CodecCalls.write(self, mut interp: Interpreter, tree: Tree) fails End {
+    let alloc = interp.alloc
+    match tree {
+        Tree.Bool(value) => try self.put(mut interp, name: "write_bool", args: Val.single(Val.Bool(value), alloc))
+        Tree.Unsigned(value) => try self.put(mut interp, name: "write_unsigned", args: Val.single(Val.Int(wide::Wide.of_u64(value)), alloc))
+        Tree.Signed(value) => try self.put(mut interp, name: "write_signed", args: Val.single(Val.Int(wide::Wide.of_i64(value)), alloc))
+        Tree.Float(value) => try self.put(mut interp, name: "write_float", args: Val.single(Val.Float64(value), alloc))
+        Tree.Char(c) => try self.put(mut interp, name: "write_char", args: Val.single(Val.Char(c), alloc))
+        Tree.Text(bytes) => {
+            let text = mut interp.byte_view(bytes.view(), writable: false)
+            try self.put(mut interp, name: "write_text", args: Val.single(take text, alloc))
+        }
+        Tree.Bytes(bytes) => {
+            let view = mut interp.byte_view(bytes.view(), writable: false)
+            try self.put(mut interp, name: "write_bytes", args: Val.single(take view, alloc))
+        }
+        Tree.Sequence(elements) => {
+            try self.put(mut interp, name: "begin_sequence", args: Val.single(Val.of_usize(elements.len()), alloc))
+            for element in elements.view() {
+                try self.write(mut interp, tree: element)
+            }
+            try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
+        }
+        Tree.Map(entries) => {
+            try self.put(mut interp, name: "begin_map", args: Val.single(Val.of_usize(entries.len()), alloc))
+            for entry in entries.view() {
+                try self.write(mut interp, tree: entry.key)
+                try self.write(mut interp, tree: entry.value)
+            }
+            try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
+        }
+        Tree.Record(fields) => {
+            try self.put(mut interp, name: "begin_record", args: Val.single(Val.of_usize(fields.len()), alloc))
+            for field in fields.view() {
+                let key = mut interp.byte_view(field.key.view(), writable: false)
+                try self.put(mut interp, name: "write_key", args: Val.single(take key, alloc))
+                try self.write(mut interp, tree: field.value)
+            }
+            try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
+        }
+        Tree.Variant(key: key, payload: payload) => {
+            var args = Val.single(mut interp.byte_view(key.view(), writable: false), alloc)
+            mut args.push(Val.Bool(payload.is_some()))
+            try self.put(mut interp, name: "begin_variant", args: take args)
+            match payload {
+                Some(contents) => try self.write(mut interp, tree: contents.contents())
+                None => {}
+            }
+            try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
+        }
+    }
+} CodecCalls.write
+
+/// The bytes of text or bytes of length `len`, read in one chunk once the room for them is
+/// known: at most `most` bytes for a fixed text, or what the cell has left otherwise.
+fn CodecCalls.chunk(self, mut interp: Interpreter, len: Val, most: Option[usize]) -> mem::Bytes fails Failure {
+    let alloc = interp.alloc
+    let count = len.int_value().low_bits()
+    match most {
+        Some(bound) => {
+            if count > u64.widen(bound) {
+                fail Failure.Decode(DecodeKind.OutOfRange)
+            }
+        }
+        None => {
+            let needed = interp.budgets.charged(self.cell).wrapping_add(wide::Wide.of_u64(count))
+            if interp.budgets.limit(self.cell).lt(needed) {
+                fail Failure.Decode(DecodeKind.OutOfMemory)
+            }
+        }
+    }
+    let zeros = mem::Bytes.zeroed(usize.widen(count), alloc)
+    let out = mut interp.byte_view(zeros.view(), writable: true)
+    discard try self.call(mut interp, name: "read_chunk", args: Val.single(out.copy(alloc), alloc))
+    let Val.View(view) = out else {
+        expect false
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    for byte in interp.view_values(view).view() {
+        mut bytes.push(u8.truncate(byte.int_value().low_bits()))
+    }
+    return bytes
+} CodecCalls.chunk
+
+/// The position among `keys` of the key a decoder reads through its method `name`.
+fn CodecCalls.keyed(self, mut interp: Interpreter, name: Str, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
+    let alloc = interp.alloc
+    var views = mem::List[Val].empty(alloc)
+    for key in keys {
+        mut views.push(mut interp.byte_view(key.view(), writable: false))
+    }
+    let extent = mut interp.memory.alloc(Val.Array(mem::Shared.of(take views, alloc)), writable: false, size: 0)
+    let slice = Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: keys.len()))
+    let read = try self.call(mut interp, name, args: Val.single(take slice, alloc))
+    match read {
+        Val.Variant(item: _, index: _, fields: fields) => {
+            if fields.contents().len() == 0 {
+                return None
+            }
+            let index = fields.contents()[0].int_value().low_bits()
+            if index < u64.widen(keys.len()) {
+                return Some(usize.widen(index))
+            }
+            return None
+        }
+        else => {}
+    }
+    return None
+} CodecCalls.keyed
+
+fn CodecCalls.read_bool(mut self, mut interp: Interpreter) -> bool fails Failure {
+    return (try self.call(mut interp, name: "read_bool", args: mem::List[Val].empty(interp.alloc))).bool_value()
+} CodecCalls.read_bool
+
+fn CodecCalls.read_unsigned(mut self, mut interp: Interpreter) -> u64 fails Failure {
+    return (try self.call(mut interp, name: "read_unsigned", args: mem::List[Val].empty(interp.alloc))).int_value().low_bits()
+} CodecCalls.read_unsigned
+
+fn CodecCalls.read_signed(mut self, mut interp: Interpreter) -> i64 fails Failure {
+    return i64.from_bits((try self.call(mut interp, name: "read_signed", args: mem::List[Val].empty(interp.alloc))).int_value().low_bits())
+} CodecCalls.read_signed
+
+fn CodecCalls.read_float(mut self, mut interp: Interpreter) -> f64 fails Failure {
+    match try self.call(mut interp, name: "read_float", args: mem::List[Val].empty(interp.alloc)) {
+        Val.Float64(value) => return value
+        else => {}
+    }
+    expect false
+    return 0.0
+} CodecCalls.read_float
+
+fn CodecCalls.read_char(mut self, mut interp: Interpreter) -> u32 fails Failure {
+    match try self.call(mut interp, name: "read_char", args: mem::List[Val].empty(interp.alloc)) {
+        Val.Char(c) => return c.to_bits()
+        else => {}
+    }
+    expect false
+    return 0
+} CodecCalls.read_char
+
+fn CodecCalls.read_text(mut self, mut interp: Interpreter, most: Option[usize]) -> mem::Bytes fails Failure {
+    let len = try self.call(mut interp, name: "begin_text", args: mem::List[Val].empty(interp.alloc))
+    return try self.chunk(mut interp, len, most)
+} CodecCalls.read_text
+
+fn CodecCalls.read_bytes(mut self, mut interp: Interpreter) -> mem::Bytes fails Failure {
+    let len = try self.call(mut interp, name: "begin_bytes", args: mem::List[Val].empty(interp.alloc))
+    return try self.chunk(mut interp, len, most: None)
+} CodecCalls.read_bytes
+
+fn CodecCalls.begin_sequence(mut self, mut interp: Interpreter) fails Failure {
+    discard try self.call(mut interp, name: "begin_sequence", args: mem::List[Val].empty(interp.alloc))
+} CodecCalls.begin_sequence
+
+fn CodecCalls.begin_map(mut self, mut interp: Interpreter) fails Failure {
+    discard try self.call(mut interp, name: "begin_map", args: mem::List[Val].empty(interp.alloc))
+} CodecCalls.begin_map
+
+fn CodecCalls.begin_record(mut self, mut interp: Interpreter) fails Failure {
+    discard try self.call(mut interp, name: "begin_record", args: mem::List[Val].empty(interp.alloc))
+} CodecCalls.begin_record
+
+fn CodecCalls.begin_labelled(mut self, mut interp: Interpreter) fails Failure {
+    try mut self.begin_record(mut interp)
+} CodecCalls.begin_labelled
+
+fn CodecCalls.next_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
+    return (try self.call(mut interp, name: "next_follows", args: mem::List[Val].empty(interp.alloc))).bool_value()
+} CodecCalls.next_follows
+
+fn CodecCalls.map_value(mut self, mut interp: Interpreter) {
+} CodecCalls.map_value
+
+fn CodecCalls.read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
+    return try self.keyed(mut interp, name: "read_key", keys)
+} CodecCalls.read_key
+
+fn CodecCalls.read_variant(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
+    return try self.keyed(mut interp, name: "read_variant", keys)
+} CodecCalls.read_variant
+
+fn CodecCalls.payload_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
+    return (try self.call(mut interp, name: "payload_follows", args: mem::List[Val].empty(interp.alloc))).bool_value()
+} CodecCalls.payload_follows
+
+fn CodecCalls.skip(mut self, mut interp: Interpreter, depth: usize) fails Failure {
+    discard try self.call(mut interp, name: "skip", args: mem::List[Val].empty(interp.alloc))
+} CodecCalls.skip
+
+fn CodecCalls.end(mut self, mut interp: Interpreter) fails Failure {
+    discard try self.call(mut interp, name: "end", args: mem::List[Val].empty(interp.alloc))
+} CodecCalls.end
+
+fn CodecCalls.finish(mut self, mut interp: Interpreter) {
+} CodecCalls.finish
+
+/// A view of bytes in an extent of their own, writable or not.
+fn Interpreter.byte_view(mut self, bytes: Slice[u8], writable: bool) -> Val {
+    let alloc = self.alloc
+    let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(byte_values(bytes, alloc), alloc)), writable: writable, size: u64.widen(bytes.len()))
+    return Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: bytes.len()))
+} Interpreter.byte_view
 
 /// The value of a type a codec's input holds, the decoding failing on what follows it.
 fn Interpreter.decode_value(
@@ -794,23 +1086,24 @@ fn Decoding.nest(mut self) fails Failure {
 /// The value of a type a reader holds, failing on anything after it.
 fn Decoding.whole[R: Reader](mut self, mut interp: Interpreter, mut reader: R, ty: ty::Ty) -> Val fails Failure {
     let value = try mut self.value(mut interp, mut reader, ty)
-    try mut reader.finish()
+    try mut reader.finish(mut interp)
     return value
 } Decoding.whole
 
 fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, ty: ty::Ty) -> Val fails Failure {
     let ck = interp.ck.share()
     match ck.types().kind(ty) {
-        ty::TyKind.Scalar(scalar) => return try mut self.scalar(mut reader, scalar)
+        ty::TyKind.Scalar(scalar) => return try mut self.scalar(mut interp, mut reader, scalar)
         ty::TyKind.Unit => {
             let outer = self.depth
             try mut self.nest()
-            try mut reader.begin_record()
-            if try mut reader.next_follows() {
-                discard try mut reader.read_key()
+            try mut reader.begin_record(mut interp)
+            if try mut reader.next_follows(mut interp) {
+                let none = mem::List[mem::Bytes].empty(interp.alloc)
+                discard try mut reader.read_key(mut interp, keys: none.view())
                 fail Failure.Decode(DecodeKind.UnknownKey)
             }
-            try mut reader.end()
+            try mut reader.end(mut interp)
             self.depth = outer
             return Val.Unit
         }
@@ -821,25 +1114,25 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
     fail Failure.Decode(DecodeKind.Malformed)
 } Decoding.value
 
-fn Decoding.scalar[R: Reader](mut self, mut reader: R, scalar: ty::Scalar) -> Val fails Failure {
+fn Decoding.scalar[R: Reader](mut self, mut interp: Interpreter, mut reader: R, scalar: ty::Scalar) -> Val fails Failure {
     match scalar {
-        ty::Scalar.Bool => return Val.Bool(try mut reader.read_bool())
+        ty::Scalar.Bool => return Val.Bool(try mut reader.read_bool(mut interp))
         ty::Scalar.Char => {
-            let code = try mut reader.read_char()
+            let code = try mut reader.read_char(mut interp)
             let Some(c) = char.checked_from_bits(code) else {
                 fail Failure.Decode(DecodeKind.Invalid)
             }
             return Val.Char(c)
         }
-        ty::Scalar.Float64 => return Val.Float64(try mut reader.read_float())
-        ty::Scalar.Float32 => return Val.Float32(f32.nearest(try mut reader.read_float()))
+        ty::Scalar.Float64 => return Val.Float64(try mut reader.read_float(mut interp))
+        ty::Scalar.Float32 => return Val.Float32(f32.nearest(try mut reader.read_float(mut interp)))
         else => {}
     }
     var value = wide::Wide.zero()
     if scalar.is_signed() {
-        value = wide::Wide.of_i64(try mut reader.read_signed())
+        value = wide::Wide.of_i64(try mut reader.read_signed(mut interp))
     } else {
-        value = wide::Wide.of_u64(try mut reader.read_unsigned())
+        value = wide::Wide.of_u64(try mut reader.read_unsigned(mut interp))
     }
     if not fits_scalar(value, scalar) {
         fail Failure.Decode(DecodeKind.OutOfRange)
@@ -898,17 +1191,21 @@ fn Decoding.text_item[R: Reader](
     let alloc = interp.alloc
     let byte = ty::Ty.scalar(ty::Scalar.Unsigned8)
     if path == "mem::Bytes" {
-        let bytes = try mut reader.read_bytes()
+        let bytes = try mut reader.read_bytes(mut interp)
         return try mut self.held(mut interp, path, values: byte_values(bytes.view(), alloc), element: byte)
     }
-    let written = try mut reader.read_text()
+    let bound = decode_count(args, index: 0)
+    var most: Option[usize] = None
+    if path == "text::Fixed" {
+        most = Some(bound)
+    }
+    let written = try mut reader.read_text(mut interp, most)
     if not text::utf8::is_valid(written.view()) {
         fail Failure.Decode(DecodeKind.InvalidText)
     }
     if path == "text::String" {
         return try mut self.held(mut interp, path, values: byte_values(written.view(), alloc), element: byte)
     }
-    let bound = decode_count(args, index: 0)
     if written.len() > bound {
         fail Failure.Decode(DecodeKind.OutOfRange)
     }
@@ -966,7 +1263,7 @@ fn Decoding.collection_item[R: Reader](
             return Val.Struct(item: item, fields: mem::Shared.of(Val.single(take contents, alloc), alloc))
         }
         "mem::Id" => {
-            let index = try mut self.scalar(mut reader, scalar: ty::Scalar.Unsigned32)
+            let index = try mut self.scalar(mut interp, mut reader, scalar: ty::Scalar.Unsigned32)
             return Val.Struct(item: item, fields: mem::Shared.of(Val.single(take index, alloc), alloc))
         }
         else => return try mut self.declared(mut interp, mut reader, item, args)
@@ -980,20 +1277,20 @@ fn Decoding.map_entries[R: Reader](mut self, mut interp: Interpreter, mut reader
     let value_ty = type_arg_or_unit(args, index: 1)
     let outer = self.depth
     try mut self.nest()
-    try mut reader.begin_map()
+    try mut reader.begin_map(mut interp)
     var keys = mem::List[Val].empty(alloc)
     var pairs = mem::List[Val].empty(alloc)
     let key_value = interp.ty_item("mem", name: "KeyValue")
-    while try mut reader.next_follows() {
+    while try mut reader.next_follows(mut interp) {
         let key = try mut self.value(mut interp, mut reader, ty: key_ty)
-        try mut reader.map_value()
+        try mut reader.map_value(mut interp)
         let value = try mut self.value(mut interp, mut reader, ty: value_ty)
         mut keys.push(key.copy(alloc))
         var parts = Val.single(take key, alloc)
         mut parts.push(take value)
         mut pairs.push(Val.Struct(item: key_value, fields: mem::Shared.of(take parts, alloc)))
     }
-    try mut reader.end()
+    try mut reader.end(mut interp)
     self.depth = outer
     try mut self.ascending(mut interp, keys: keys.view(), ty: key_ty)
     let entry = interp.entry_ty(key_ty, value: value_ty)
@@ -1064,19 +1361,15 @@ fn Decoding.declared_variant[R: Reader](
     let ck = interp.ck.share()
     let outer = self.depth
     try mut self.nest()
-    let read = try mut reader.read_variant()
-    let key = aliased_key(take read, aliases, alloc)
-    var found: Option[usize] = None
-    for index in 0..<variants.len() {
-        if variants[index].name.as_bytes() == key.view() {
-            found = Some(index)
-            break
-        }
+    var names = mem::List[mem::Bytes].empty(alloc)
+    for variant in variants {
+        mut names.push(name_copy(variant.name.as_bytes(), alloc))
     }
+    let found = try mut self.named(mut interp, mut reader, names: names.view(), aliases, variant: true)
     let Some(chosen) = found else {
         fail Failure.Decode(DecodeKind.UnknownVariant)
     }
-    let follows = try mut reader.payload_follows()
+    let follows = try mut reader.payload_follows(mut interp)
     var payload = mem::List[Val].empty(alloc)
     match variants[chosen].payload {
         Payload.None => {
@@ -1101,18 +1394,62 @@ fn Decoding.declared_variant[R: Reader](
             payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, labelled: true, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc))
         }
     }
-    try mut reader.end()
+    try mut reader.end(mut interp)
     self.depth = outer
     return Val.Variant(item: item, index: u32.truncate(chosen), fields: mem::Shared.of(take payload, alloc))
 } Decoding.declared_variant
 
-/// A key read, or the key a tombstone's alias gives it.
-fn aliased_key(take key: mem::Bytes, aliases: mem::HashMap[mem::Bytes, mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
-    let Some(alias) = aliases.get(key) else {
-        return key
+/// The position among `names` of the field or variant the key read next names, directly or
+/// through an alias: the keys read are the names, then the old keys of the aliases of names in
+/// byte order.
+fn Decoding.named[R: Reader](
+    mut self,
+    mut interp: Interpreter,
+    mut reader: R,
+    names: Slice[mem::Bytes],
+    aliases: mem::HashMap[mem::Bytes, mem::Bytes],
+    variant: bool,
+    ) -> Option[usize] fails Failure {
+    let alloc = interp.alloc
+    var aliased = mem::List[AliasedKey].empty(alloc)
+    for entry in aliases.cursor() {
+        match key_position(names, key: entry.value().view()) {
+            Some(field) => mut aliased.push(AliasedKey(old: name_copy(entry.key().view(), alloc), field: field))
+            None => {}
+        }
     }
-    return name_copy(alias.view(), alloc)
-} aliased_key
+    mut aliased.sort_by(fn(left: AliasedKey, right: AliasedKey) => left.old.view().cmp(right.old.view()))
+    var keys = mem::List[mem::Bytes].empty(alloc)
+    for name in names {
+        mut keys.push(name_copy(name.view(), alloc))
+    }
+    for alias in aliased.view() {
+        mut keys.push(name_copy(alias.old.view(), alloc))
+    }
+    var read: Option[usize] = None
+    if variant {
+        read = try mut reader.read_variant(mut interp, keys: keys.view())
+    } else {
+        read = try mut reader.read_key(mut interp, keys: keys.view())
+    }
+    let Some(index) = read else {
+        return None
+    }
+    if index < names.len() {
+        return Some(index)
+    }
+    return Some(aliased[index - names.len()].field)
+} Decoding.named
+
+/// The position of a key among `keys`.
+fn key_position(keys: Slice[mem::Bytes], key: Slice[u8]) -> Option[usize] {
+    for index in 0..<keys.len() {
+        if keys[index].view() == key {
+            return Some(index)
+        }
+    }
+    return None
+} key_position
 
 /// A copy of bytes.
 fn name_copy(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
@@ -1136,25 +1473,21 @@ fn Decoding.record[R: Reader](
     let outer = self.depth
     try mut self.nest()
     if labelled {
-        try mut reader.begin_labelled()
+        try mut reader.begin_labelled(mut interp)
     } else {
-        try mut reader.begin_record()
+        try mut reader.begin_record(mut interp)
     }
     var values = mem::List[Option[Val]].empty(alloc)
     for _ in 0..<named.len() {
         mut values.push(None)
     }
-    while try mut reader.next_follows() {
+    var names = mem::List[mem::Bytes].empty(alloc)
+    for field in named {
+        mut names.push(name_copy(field.name.as_bytes(), alloc))
+    }
+    while try mut reader.next_follows(mut interp) {
         invariant values.len() == named.len()
-        let read = try mut reader.read_key()
-        let key = aliased_key(take read, aliases, alloc)
-        var found: Option[usize] = None
-        for index in 0..<named.len() {
-            if named[index].name.as_bytes() == key.view() {
-                found = Some(index)
-                break
-            }
-        }
+        let found = try mut self.named(mut interp, mut reader, names: names.view(), aliases, variant: false)
         match found {
             Some(index) => {
                 if values[index].is_some() {
@@ -1166,11 +1499,11 @@ fn Decoding.record[R: Reader](
                 if not open {
                     fail Failure.Decode(DecodeKind.UnknownKey)
                 }
-                try mut reader.skip(self.depth)
+                try mut reader.skip(mut interp, depth: self.depth)
             }
         }
     }
-    try mut reader.end()
+    try mut reader.end(mut interp)
     self.depth = outer
     var decoded = mem::List[Val].empty(alloc)
     var position: usize = 0
@@ -1204,18 +1537,15 @@ fn Decoding.default(mut self, mut interp: Interpreter, ty: ty::Ty) -> Val fails 
 fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R, keys: Slice[VariantKey]) -> DecodedVariant fails Failure {
     let outer = self.depth
     try mut self.nest()
-    let key = try mut reader.read_variant()
-    var found: Option[usize] = None
-    for index in 0..<keys.len() {
-        if keys[index].name.as_bytes() == key.view() {
-            found = Some(index)
-            break
-        }
+    var names = mem::List[mem::Bytes].empty(interp.alloc)
+    for key in keys {
+        mut names.push(name_copy(key.name.as_bytes(), alloc: interp.alloc))
     }
+    let found = try mut self.named(mut interp, mut reader, names: names.view(), aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc: interp.alloc), variant: true)
     let Some(chosen) = found else {
         fail Failure.Decode(DecodeKind.UnknownVariant)
     }
-    let follows = try mut reader.payload_follows()
+    let follows = try mut reader.payload_follows(mut interp)
     var payload: Option[Val] = None
     match keys[chosen].payload {
         Some(payload_ty) => {
@@ -1230,7 +1560,7 @@ fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R,
             }
         }
     }
-    try mut reader.end()
+    try mut reader.end(mut interp)
     self.depth = outer
     return DecodedVariant(index: chosen, payload: take payload)
 } Decoding.variant
@@ -1238,12 +1568,12 @@ fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R,
 fn Decoding.sequence[R: Reader](mut self, mut interp: Interpreter, mut reader: R, element: ty::Ty) -> mem::List[Val] fails Failure {
     let outer = self.depth
     try mut self.nest()
-    try mut reader.begin_sequence()
+    try mut reader.begin_sequence(mut interp)
     var elements = mem::List[Val].empty(interp.alloc)
-    while try mut reader.next_follows() {
+    while try mut reader.next_follows(mut interp) {
         mut elements.push(try mut self.value(mut interp, mut reader, ty: element))
     }
-    try mut reader.end()
+    try mut reader.end(mut interp)
     self.depth = outer
     return elements
 } Decoding.sequence
@@ -1392,7 +1722,7 @@ fn WireReader.close_value(mut self) fails Failure {
     }
 } WireReader.close_value
 
-fn WireReader.read_bool(mut self) -> bool fails Failure {
+fn WireReader.read_bool(mut self, mut interp: Interpreter) -> bool fails Failure {
     let byte = try mut self.input.byte()
     if byte == 0 {
         return false
@@ -1403,34 +1733,34 @@ fn WireReader.read_bool(mut self) -> bool fails Failure {
     fail Failure.Decode(DecodeKind.Malformed)
 } WireReader.read_bool
 
-fn WireReader.read_unsigned(mut self) -> u64 fails Failure {
+fn WireReader.read_unsigned(mut self, mut interp: Interpreter) -> u64 fails Failure {
     return try mut self.uvar()
 } WireReader.read_unsigned
 
-fn WireReader.read_signed(mut self) -> i64 fails Failure {
+fn WireReader.read_signed(mut self, mut interp: Interpreter) -> i64 fails Failure {
     let zigzag = try mut self.uvar()
     return i64.from_bits((zigzag >> 1) ^ (0u64).wrapping_sub(zigzag & 1))
 } WireReader.read_signed
 
-fn WireReader.read_float(mut self) -> f64 fails Failure {
+fn WireReader.read_float(mut self, mut interp: Interpreter) -> f64 fails Failure {
     let bytes = try mut self.input.next_bytes(8)
     return f64.from_bits(bytes.view().u64_le(0))
 } WireReader.read_float
 
-fn WireReader.read_char(mut self) -> u32 fails Failure {
+fn WireReader.read_char(mut self, mut interp: Interpreter) -> u32 fails Failure {
     let value = try mut self.uvar()
     return u32.checked_fit(value).value_or(~0u32)
 } WireReader.read_char
 
-fn WireReader.read_text(mut self) -> mem::Bytes fails Failure {
+fn WireReader.read_text(mut self, mut interp: Interpreter, most: Option[usize]) -> mem::Bytes fails Failure {
     return try mut self.framed()
 } WireReader.read_text
 
-fn WireReader.read_bytes(mut self) -> mem::Bytes fails Failure {
+fn WireReader.read_bytes(mut self, mut interp: Interpreter) -> mem::Bytes fails Failure {
     return try mut self.framed()
 } WireReader.read_bytes
 
-fn WireReader.begin_sequence(mut self) fails Failure {
+fn WireReader.begin_sequence(mut self, mut interp: Interpreter) fails Failure {
     let count = try mut self.uvar()
     if count > u64.widen(self.input.bytes.len() - self.input.at) {
         fail Failure.Decode(DecodeKind.Truncated)
@@ -1438,11 +1768,11 @@ fn WireReader.begin_sequence(mut self) fails Failure {
     mut self.frames.push(WireFrame.Counted(count))
 } WireReader.begin_sequence
 
-fn WireReader.begin_map(mut self) fails Failure {
-    try mut self.begin_sequence()
+fn WireReader.begin_map(mut self, mut interp: Interpreter) fails Failure {
+    try mut self.begin_sequence(mut interp)
 } WireReader.begin_map
 
-fn WireReader.begin_record(mut self) fails Failure {
+fn WireReader.begin_record(mut self, mut interp: Interpreter) fails Failure {
     let left = try mut self.uvar()
     if left > u64.widen(self.input.bytes.len() - self.input.at) {
         fail Failure.Decode(DecodeKind.Truncated)
@@ -1450,11 +1780,11 @@ fn WireReader.begin_record(mut self) fails Failure {
     mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: None))
 } WireReader.begin_record
 
-fn WireReader.begin_labelled(mut self) fails Failure {
-    try mut self.begin_record()
+fn WireReader.begin_labelled(mut self, mut interp: Interpreter) fails Failure {
+    try mut self.begin_record(mut interp)
 } WireReader.begin_labelled
 
-fn WireReader.next_follows(mut self) -> bool fails Failure {
+fn WireReader.next_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
     try mut self.close_value()
     let Some(frame) = mut self.frames.pop() else {
         fail Failure.Decode(DecodeKind.Malformed)
@@ -1475,10 +1805,10 @@ fn WireReader.next_follows(mut self) -> bool fails Failure {
     }
 } WireReader.next_follows
 
-fn WireReader.map_value(mut self) {
+fn WireReader.map_value(mut self, mut interp: Interpreter) {
 } WireReader.map_value
 
-fn WireReader.read_key(mut self) -> mem::Bytes fails Failure {
+fn WireReader.read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
     let key = try mut self.framed()
     let end = try mut self.length_end()
     let Some(frame) = mut self.frames.pop() else {
@@ -1500,16 +1830,16 @@ fn WireReader.read_key(mut self) -> mem::Bytes fails Failure {
         None => {}
     }
     mut self.frames.push(WireFrame.Record(left: left, value_end: Some(end), last: Some(name_copy(key.view(), alloc: self.input.alloc))))
-    return key
+    return key_position(keys, key: key.view())
 } WireReader.read_key
 
-fn WireReader.read_variant(mut self) -> mem::Bytes fails Failure {
+fn WireReader.read_variant(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
     let key = try mut self.framed()
     mut self.frames.push(WireFrame.Variant(payload_end: None))
-    return key
+    return key_position(keys, key: key.view())
 } WireReader.read_variant
 
-fn WireReader.payload_follows(mut self) -> bool fails Failure {
+fn WireReader.payload_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
     let byte = try mut self.input.byte()
     if byte == 0 {
         return false
@@ -1528,7 +1858,7 @@ fn WireReader.payload_follows(mut self) -> bool fails Failure {
     return true
 } WireReader.payload_follows
 
-fn WireReader.skip(mut self, depth: usize) fails Failure {
+fn WireReader.skip(mut self, mut interp: Interpreter, depth: usize) fails Failure {
     let Some(frame) = mut self.frames.pop() else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
@@ -1547,7 +1877,7 @@ fn WireReader.skip(mut self, depth: usize) fails Failure {
     }
 } WireReader.skip
 
-fn WireReader.end(mut self) fails Failure {
+fn WireReader.end(mut self, mut interp: Interpreter) fails Failure {
     try mut self.close_value()
     let Some(frame) = mut self.frames.pop() else {
         fail Failure.Decode(DecodeKind.Malformed)
@@ -1574,7 +1904,7 @@ fn WireReader.end(mut self) fails Failure {
     }
 } WireReader.end
 
-fn WireReader.finish(mut self) fails Failure {
+fn WireReader.finish(mut self, mut interp: Interpreter) fails Failure {
     if self.input.at != self.input.bytes.len() {
         fail Failure.Decode(DecodeKind.Trailing)
     }
@@ -2000,7 +2330,7 @@ fn JsonReader.element_follows(mut self, close: u8) -> bool fails Failure {
     return true
 } JsonReader.element_follows
 
-fn JsonReader.read_bool(mut self) -> bool fails Failure {
+fn JsonReader.read_bool(mut self, mut interp: Interpreter) -> bool fails Failure {
     if mut self.literal(b"true") {
         return true
     }
@@ -2010,7 +2340,7 @@ fn JsonReader.read_bool(mut self) -> bool fails Failure {
     fail Failure.Decode(DecodeKind.Malformed)
 } JsonReader.read_bool
 
-fn JsonReader.read_unsigned(mut self) -> u64 fails Failure {
+fn JsonReader.read_unsigned(mut self, mut interp: Interpreter) -> u64 fails Failure {
     let value = try mut self.integer()
     let Some(unsigned) = value.to_u64() else {
         fail Failure.Decode(DecodeKind.OutOfRange)
@@ -2018,7 +2348,7 @@ fn JsonReader.read_unsigned(mut self) -> u64 fails Failure {
     return unsigned
 } JsonReader.read_unsigned
 
-fn JsonReader.read_signed(mut self) -> i64 fails Failure {
+fn JsonReader.read_signed(mut self, mut interp: Interpreter) -> i64 fails Failure {
     let value = try mut self.integer()
     let Some(signed) = value.to_i64() else {
         fail Failure.Decode(DecodeKind.OutOfRange)
@@ -2026,7 +2356,7 @@ fn JsonReader.read_signed(mut self) -> i64 fails Failure {
     return signed
 } JsonReader.read_signed
 
-fn JsonReader.read_float(mut self) -> f64 fails Failure {
+fn JsonReader.read_float(mut self, mut interp: Interpreter) -> f64 fails Failure {
     let next = try mut self.input.peek()
     if next == b'"' {
         let written = try mut self.string()
@@ -2045,7 +2375,7 @@ fn JsonReader.read_float(mut self) -> f64 fails Failure {
     return json_float(written.as_bytes(), alloc: self.input.alloc)
 } JsonReader.read_float
 
-fn JsonReader.read_char(mut self) -> u32 fails Failure {
+fn JsonReader.read_char(mut self, mut interp: Interpreter) -> u32 fails Failure {
     let written = try mut self.string()
     if not text::utf8::is_valid(written.view()) {
         fail Failure.Decode(DecodeKind.InvalidText)
@@ -2059,11 +2389,11 @@ fn JsonReader.read_char(mut self) -> u32 fails Failure {
     return c.to_bits()
 } JsonReader.read_char
 
-fn JsonReader.read_text(mut self) -> mem::Bytes fails Failure {
+fn JsonReader.read_text(mut self, mut interp: Interpreter, most: Option[usize]) -> mem::Bytes fails Failure {
     return try mut self.string()
 } JsonReader.read_text
 
-fn JsonReader.read_bytes(mut self) -> mem::Bytes fails Failure {
+fn JsonReader.read_bytes(mut self, mut interp: Interpreter) -> mem::Bytes fails Failure {
     let written = try mut self.string()
     let Some(bytes) = base64_bytes(written.view(), alloc: self.input.alloc) else {
         fail Failure.Decode(DecodeKind.Malformed)
@@ -2071,26 +2401,26 @@ fn JsonReader.read_bytes(mut self) -> mem::Bytes fails Failure {
     return bytes
 } JsonReader.read_bytes
 
-fn JsonReader.begin_sequence(mut self) fails Failure {
+fn JsonReader.begin_sequence(mut self, mut interp: Interpreter) fails Failure {
     try mut self.input.expect_byte(b'[')
     mut self.frames.push(JsonFrame.Array(started: false))
 } JsonReader.begin_sequence
 
-fn JsonReader.begin_map(mut self) fails Failure {
+fn JsonReader.begin_map(mut self, mut interp: Interpreter) fails Failure {
     try mut self.input.expect_byte(b'[')
     mut self.frames.push(JsonFrame.Map(started: false))
 } JsonReader.begin_map
 
-fn JsonReader.begin_record(mut self) fails Failure {
+fn JsonReader.begin_record(mut self, mut interp: Interpreter) fails Failure {
     try mut self.input.expect_byte(b'{')
     mut self.frames.push(JsonFrame.Object(started: false))
 } JsonReader.begin_record
 
-fn JsonReader.begin_labelled(mut self) fails Failure {
-    try mut self.begin_record()
+fn JsonReader.begin_labelled(mut self, mut interp: Interpreter) fails Failure {
+    try mut self.begin_record(mut interp)
 } JsonReader.begin_labelled
 
-fn JsonReader.next_follows(mut self) -> bool fails Failure {
+fn JsonReader.next_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
     let count = self.frames.len()
     if count > 0 {
         let frame = self.frames[count - 1]
@@ -2112,30 +2442,31 @@ fn JsonReader.next_follows(mut self) -> bool fails Failure {
     return try mut self.element_follows(close: b']')
 } JsonReader.next_follows
 
-fn JsonReader.map_value(mut self) fails Failure {
+fn JsonReader.map_value(mut self, mut interp: Interpreter) fails Failure {
     try mut self.input.expect_byte(b',')
 } JsonReader.map_value
 
-fn JsonReader.read_key(mut self) -> mem::Bytes fails Failure {
+fn JsonReader.read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
     let key = try mut self.string()
     try mut self.input.expect_byte(b':')
-    return key
+    return key_position(keys, key: key.view())
 } JsonReader.read_key
 
-fn JsonReader.read_variant(mut self) -> mem::Bytes fails Failure {
+fn JsonReader.read_variant(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
     let next = try mut self.input.peek()
     if next == b'"' {
         mut self.frames.push(JsonFrame.Variant(payload: false))
-        return try mut self.string()
+        let key = try mut self.string()
+        return key_position(keys, key: key.view())
     }
     try mut self.input.expect_byte(b'{')
     let key = try mut self.string()
     try mut self.input.expect_byte(b':')
     mut self.frames.push(JsonFrame.Variant(payload: true))
-    return key
+    return key_position(keys, key: key.view())
 } JsonReader.read_variant
 
-fn JsonReader.payload_follows(mut self) -> bool fails Failure {
+fn JsonReader.payload_follows(mut self, mut interp: Interpreter) -> bool fails Failure {
     let count = self.frames.len()
     if count > 0 {
         match self.frames[count - 1] {
@@ -2146,11 +2477,11 @@ fn JsonReader.payload_follows(mut self) -> bool fails Failure {
     fail Failure.Decode(DecodeKind.Malformed)
 } JsonReader.payload_follows
 
-fn JsonReader.skip(mut self, depth: usize) fails Failure {
+fn JsonReader.skip(mut self, mut interp: Interpreter, depth: usize) fails Failure {
     try mut self.skip_value()
 } JsonReader.skip
 
-fn JsonReader.end(mut self) fails Failure {
+fn JsonReader.end(mut self, mut interp: Interpreter) fails Failure {
     let Some(frame) = mut self.frames.pop() else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
@@ -2166,7 +2497,7 @@ fn JsonReader.end(mut self) fails Failure {
     }
 } JsonReader.end
 
-fn JsonReader.finish(mut self) fails Failure {
+fn JsonReader.finish(mut self, mut interp: Interpreter) fails Failure {
     mut self.input.space()
     if self.input.at != self.input.bytes.len() {
         fail Failure.Decode(DecodeKind.Trailing)

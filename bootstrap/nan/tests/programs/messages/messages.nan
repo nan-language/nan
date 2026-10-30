@@ -1,4 +1,4 @@
-//! A lookup holding Untrusted fields, encoded and decoded in both formats, read by a validator.
+//! A lookup holding Untrusted fields, encoded and decoded in both formats and on a tape, read by a validator.
 
 pub closed enum Scope derives Encode {
     Local
@@ -15,6 +15,216 @@ pub closed struct Lookup derives Encode {
 validator fn text_of(field: Untrusted[text::String], alloc: mem::Alloc) -> text::String {
     return text::String.of(field.inspect().as_str(), alloc)
 } text_of
+
+/// The calls of an encoder, written as tagged words.
+struct Writer {
+    pub bytes: mem::Bytes
+} Writer
+
+impl Writer: core::Encoder
+
+/// Reads back what a writer wrote.
+struct Reader {
+    pub bytes: mem::Bytes
+    pub at: usize
+    pub payload: bool
+} Reader
+
+impl Reader: core::Decoder
+
+/// Writes a tag and a word.
+fn Writer.put(mut self, tag: u8, word: u64) limits terminates {
+    mut self.bytes.push(tag)
+    for shift in 0..<8u64 {
+        mut self.bytes.push(u8.truncate(word >> u32.truncate(shift * 8)))
+    }
+} Writer.put
+
+/// Writes bytes after their length.
+fn Writer.put_bytes(mut self, tag: u8, bytes: Slice[u8]) limits terminates {
+    mut self.put(tag, word: u64.widen(bytes.len()))
+    mut self.bytes.append(bytes)
+} Writer.put_bytes
+
+/// Reads a tag, failing unless it is `tag`, then its word.
+fn Reader.fetch(mut self, tag: u8) -> u64 fails core::DecodeError limits terminates {
+    if self.at + 9 > self.bytes.len() {
+        fail core::DecodeError.Truncated
+    }
+    if self.bytes.view()[self.at] != tag {
+        fail core::DecodeError.Malformed
+    }
+    var word = 0u64
+    for shift in 0..<8usize {
+        word = word | (u64.widen(self.bytes.view()[self.at + 1 + shift]) << u32.truncate(shift * 8))
+    }
+    self.at += 9
+    return word
+} Reader.fetch
+
+/// Reads the length of bytes after a tag, then passes over them, giving where they start.
+fn Reader.fetch_bytes(mut self, tag: u8) -> usize fails core::DecodeError limits terminates {
+    let len = usize.widen(try mut self.fetch(tag))
+    if self.at + len > self.bytes.len() {
+        fail core::DecodeError.Truncated
+    }
+    let start = self.at
+    self.at += len
+    return start
+} Reader.fetch_bytes
+
+/// Whether the bytes from `start` to the reader's position are `key`.
+fn Reader.holds(self, start: usize, key: Slice[u8]) -> bool limits terminates {
+    if self.at - start != key.len() {
+        return false
+    }
+    for index in 0..<key.len() {
+        if self.bytes.view()[start + index] != key[index] {
+            return false
+        }
+    }
+    return true
+} Reader.holds
+
+fn Writer.write_bool(mut self, value: bool) limits terminates {
+    mut self.put(1, word: u64.widen(value.to_bits()))
+} Writer.write_bool
+
+fn Writer.write_unsigned(mut self, value: u64) limits terminates {
+    mut self.put(2, word: value)
+} Writer.write_unsigned
+
+fn Writer.write_signed(mut self, value: i64) limits terminates {
+    mut self.put(3, word: value.to_bits())
+} Writer.write_signed
+
+fn Writer.write_float(mut self, value: f64) limits terminates {
+    mut self.put(4, word: value.to_bits())
+} Writer.write_float
+
+fn Writer.write_char(mut self, value: char) limits terminates {
+    mut self.put(5, word: u64.widen(value.to_bits()))
+} Writer.write_char
+
+fn Writer.write_text(mut self, value: Str) limits terminates {
+    mut self.put_bytes(6, bytes: value.as_bytes())
+} Writer.write_text
+
+fn Writer.write_bytes(mut self, value: Slice[u8]) limits terminates {
+    mut self.put_bytes(7, bytes: value)
+} Writer.write_bytes
+
+fn Writer.begin_sequence(mut self, count: usize) limits terminates {
+    mut self.put(8, word: u64.widen(count))
+} Writer.begin_sequence
+
+fn Writer.begin_map(mut self, count: usize) limits terminates {
+    mut self.put(9, word: u64.widen(count))
+} Writer.begin_map
+
+fn Writer.begin_record(mut self, count: usize) limits terminates {
+    mut self.put(10, word: u64.widen(count))
+} Writer.begin_record
+
+fn Writer.write_key(mut self, key: Str) limits terminates {
+    mut self.put_bytes(11, bytes: key.as_bytes())
+} Writer.write_key
+
+fn Writer.begin_variant(mut self, key: Str, payload: bool) limits terminates {
+    mut self.put(12, word: u64.widen(payload.to_bits()))
+    mut self.put_bytes(11, bytes: key.as_bytes())
+} Writer.begin_variant
+
+fn Writer.end(mut self) limits terminates {
+    mut self.put(13, word: 0)
+} Writer.end
+
+fn Reader.read_bool(mut self) -> bool fails core::DecodeError limits terminates {
+    return try mut self.fetch(1) == 1
+} Reader.read_bool
+
+fn Reader.read_unsigned(mut self) -> u64 fails core::DecodeError limits terminates {
+    return try mut self.fetch(2)
+} Reader.read_unsigned
+
+fn Reader.read_signed(mut self) -> i64 fails core::DecodeError limits terminates {
+    return i64.from_bits(try mut self.fetch(3))
+} Reader.read_signed
+
+fn Reader.read_float(mut self) -> f64 fails core::DecodeError limits terminates {
+    return f64.from_bits(try mut self.fetch(4))
+} Reader.read_float
+
+fn Reader.read_char(mut self) -> char fails core::DecodeError limits terminates {
+    let Some(c) = char.checked_from_bits(u32.truncate(try mut self.fetch(5))) else {
+        fail core::DecodeError.Invalid
+    }
+    return c
+} Reader.read_char
+
+fn Reader.begin_text(mut self) -> usize fails core::DecodeError limits terminates {
+    return usize.widen(try mut self.fetch(6))
+} Reader.begin_text
+
+fn Reader.begin_bytes(mut self) -> usize fails core::DecodeError limits terminates {
+    return usize.widen(try mut self.fetch(7))
+} Reader.begin_bytes
+
+fn Reader.read_chunk(mut self, mut out: SliceMut[u8]) fails core::DecodeError limits terminates {
+    if self.at + out.len() > self.bytes.len() {
+        fail core::DecodeError.Truncated
+    }
+    for index in 0..<out.len() {
+        out[index] = self.bytes.view()[self.at + index]
+    }
+    self.at += out.len()
+} Reader.read_chunk
+
+fn Reader.begin_sequence(mut self) fails core::DecodeError limits terminates {
+    discard try mut self.fetch(8)
+} Reader.begin_sequence
+
+fn Reader.begin_map(mut self) fails core::DecodeError limits terminates {
+    discard try mut self.fetch(9)
+} Reader.begin_map
+
+fn Reader.begin_record(mut self) fails core::DecodeError limits terminates {
+    discard try mut self.fetch(10)
+} Reader.begin_record
+
+fn Reader.next_follows(mut self) -> bool fails core::DecodeError limits terminates {
+    if self.at >= self.bytes.len() {
+        fail core::DecodeError.Truncated
+    }
+    return self.bytes.view()[self.at] != 13
+} Reader.next_follows
+
+fn Reader.read_key(mut self, keys: Slice[Str]) -> Option[usize] fails core::DecodeError limits terminates {
+    let start = try mut self.fetch_bytes(11)
+    for index in 0..<keys.len() {
+        if self.holds(start, key: keys[index].as_bytes()) {
+            return Some(index)
+        }
+    }
+    return None
+} Reader.read_key
+
+fn Reader.read_variant(mut self, keys: Slice[Str]) -> Option[usize] fails core::DecodeError limits terminates {
+    self.payload = try mut self.fetch(12) == 1
+    return try mut self.read_key(keys)
+} Reader.read_variant
+
+fn Reader.payload_follows(mut self) -> bool limits terminates {
+    return self.payload
+} Reader.payload_follows
+
+fn Reader.skip(mut self) fails core::DecodeError limits terminates {
+    fail core::DecodeError.Malformed
+} Reader.skip
+
+fn Reader.end(mut self) fails core::DecodeError limits terminates {
+    discard try mut self.fetch(13)
+} Reader.end
 
 fn lookup(alloc: mem::Alloc) -> Lookup {
     var tag = mem::Bytes.empty(alloc)
@@ -54,4 +264,12 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     report(world.log, format: "json", decoded: attempt text::json::Codec[Lookup].decode(Untrusted.of(bytes.view()), alloc), alloc)
     let invalid = b"{\"id\":7,\"path\":\"\xFF\",\"scope\":\"Local\",\"tags\":[]}"
     report(world.log, format: "invalid", decoded: attempt text::json::Codec[Lookup].decode(Untrusted.of(take invalid), alloc), alloc)
+    var writer = Writer(bytes: mem::Bytes.empty(alloc))
+    sent.encode(e: mut writer)
+    world.log.info("tape bytes", value: writer.bytes.len())
+    var reader = Reader(bytes: take writer.bytes, at: 0, payload: false)
+    report(world.log, format: "tape", decoded: attempt Lookup.decode(d: mut reader, alloc), alloc)
+    mut reader.bytes.truncate(40)
+    reader.at = 0
+    report(world.log, format: "cut", decoded: attempt Lookup.decode(d: mut reader, alloc), alloc)
 } main

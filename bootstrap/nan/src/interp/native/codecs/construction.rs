@@ -1,6 +1,7 @@
 //! The reader of construction text, the form derived `Render` writes.
 
-use super::{Decoded, Failure, Input, MAX_DEPTH, Reader, fail};
+use super::super::super::Interpreter;
+use super::{Decoded, Failure, Input, MAX_DEPTH, Reader, fail, position};
 use crate::syntax::lexer::is_rejected;
 
 /// What the reader is inside: elements up to a closing byte, which the frame passes over
@@ -272,14 +273,14 @@ impl ConstructionReader {
     }
 
     /// Passes over any value, nested no deeper than decoding reads.
-    fn skip_value(&mut self, depth: usize) -> Decoded<()> {
+    fn skip_value(&mut self, interp: &mut Interpreter, depth: usize) -> Decoded<()> {
         let nest = |depth: usize| match depth + 1 > MAX_DEPTH {
             true => fail("TooDeep"),
             false => Ok(depth + 1),
         };
         match self.input.peek()? {
             b'"' => self.literal(Literal::Text).map(drop),
-            b'\'' => self.read_char().map(drop),
+            b'\'' => self.read_char(interp).map(drop),
             b'b' if self.byte_at(self.input.at + 1) == Some(b'"') => {
                 self.literal(Literal::Bytes).map(drop)
             }
@@ -293,14 +294,14 @@ impl ConstructionReader {
                     owned: true,
                     started: false,
                 });
-                while self.next_follows()? {
-                    self.skip_value(depth)?;
+                while self.next_follows(interp)? {
+                    self.skip_value(interp, depth)?;
                     if map {
                         self.input.expect(b':')?;
-                        self.skip_value(depth)?;
+                        self.skip_value(interp, depth)?;
                     }
                 }
-                self.end()
+                self.end(interp)
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
                 self.word()?;
@@ -316,15 +317,15 @@ impl ConstructionReader {
                     owned: true,
                     started: false,
                 });
-                while self.next_follows()? {
+                while self.next_follows(interp)? {
                     let at = self.input.at;
                     let labelled = self.word().is_ok() && self.follows(b':');
                     if !labelled {
                         self.input.at = at;
                     }
-                    self.skip_value(depth)?;
+                    self.skip_value(interp, depth)?;
                 }
-                self.end()
+                self.end(interp)
             }
             _ if self.negative_infinity()? => match self.word()?.as_slice() {
                 b"inf" => Ok(()),
@@ -336,7 +337,7 @@ impl ConstructionReader {
 }
 
 impl Reader for ConstructionReader {
-    fn read_bool(&mut self) -> Decoded<bool> {
+    fn read_bool(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         match self.word()?.as_slice() {
             b"true" => Ok(true),
             b"false" => Ok(false),
@@ -344,15 +345,15 @@ impl Reader for ConstructionReader {
         }
     }
 
-    fn read_unsigned(&mut self) -> Decoded<u64> {
+    fn read_unsigned(&mut self, _: &mut Interpreter) -> Decoded<u64> {
         u64::try_from(self.integer()?).or_else(|_| fail("OutOfRange"))
     }
 
-    fn read_signed(&mut self) -> Decoded<i64> {
+    fn read_signed(&mut self, _: &mut Interpreter) -> Decoded<i64> {
         i64::try_from(self.integer()?).or_else(|_| fail("OutOfRange"))
     }
 
-    fn read_float(&mut self) -> Decoded<f64> {
+    fn read_float(&mut self, _: &mut Interpreter) -> Decoded<f64> {
         let negative = self.negative_infinity()?;
         let first = self.input.peek()?;
         if negative || first.is_ascii_alphabetic() || first == b'_' {
@@ -367,7 +368,7 @@ impl Reader for ConstructionReader {
         text.parse::<f64>().or_else(|_| fail("Malformed"))
     }
 
-    fn read_char(&mut self) -> Decoded<u32> {
+    fn read_char(&mut self, _: &mut Interpreter) -> Decoded<u32> {
         let text = self.literal(Literal::Char)?;
         let text = String::from_utf8(text).expect("a literal's text");
         let mut chars = text.chars();
@@ -377,15 +378,15 @@ impl Reader for ConstructionReader {
         }
     }
 
-    fn read_text(&mut self) -> Decoded<Vec<u8>> {
+    fn read_text(&mut self, _: &mut Interpreter, _: Option<usize>) -> Decoded<Vec<u8>> {
         self.literal(Literal::Text)
     }
 
-    fn read_bytes(&mut self) -> Decoded<Vec<u8>> {
+    fn read_bytes(&mut self, _: &mut Interpreter) -> Decoded<Vec<u8>> {
         self.literal(Literal::Bytes)
     }
 
-    fn begin_sequence(&mut self) -> Decoded<()> {
+    fn begin_sequence(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b'[')?;
         self.frames.push(Frame::Elements {
             close: b']',
@@ -395,7 +396,7 @@ impl Reader for ConstructionReader {
         Ok(())
     }
 
-    fn begin_map(&mut self) -> Decoded<()> {
+    fn begin_map(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b'{')?;
         self.frames.push(Frame::Elements {
             close: b'}',
@@ -405,7 +406,7 @@ impl Reader for ConstructionReader {
         Ok(())
     }
 
-    fn begin_record(&mut self) -> Decoded<()> {
+    fn begin_record(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.word()?;
         let frame = match self.follows(b'(') {
             true => Frame::Elements {
@@ -419,7 +420,7 @@ impl Reader for ConstructionReader {
         Ok(())
     }
 
-    fn begin_labelled(&mut self) -> Decoded<()> {
+    fn begin_labelled(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.frames.push(Frame::Elements {
             close: b')',
             owned: false,
@@ -428,7 +429,7 @@ impl Reader for ConstructionReader {
         Ok(())
     }
 
-    fn next_follows(&mut self) -> Decoded<bool> {
+    fn next_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         let (close, started) = match self.frames.last_mut() {
             Some(Frame::Bare) => return Ok(false),
             Some(Frame::Elements { close, started, .. }) => {
@@ -445,26 +446,26 @@ impl Reader for ConstructionReader {
         Ok(true)
     }
 
-    fn map_value(&mut self) -> Decoded<()> {
+    fn map_value(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.expect(b':')
     }
 
-    fn read_key(&mut self) -> Decoded<Vec<u8>> {
+    fn read_key(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         let key = self.word()?;
         self.input.expect(b':')?;
-        Ok(key)
+        Ok(position(keys, &key))
     }
 
-    fn read_variant(&mut self) -> Decoded<Vec<u8>> {
+    fn read_variant(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
         let mut key = self.word()?;
         if self.follows(b'.') {
             key = self.word()?;
         }
         self.frames.push(Frame::Variant { payload: false });
-        Ok(key)
+        Ok(position(keys, &key))
     }
 
-    fn payload_follows(&mut self) -> Decoded<bool> {
+    fn payload_follows(&mut self, _: &mut Interpreter) -> Decoded<bool> {
         let follows = self.follows(b'(');
         match self.frames.last_mut() {
             Some(Frame::Variant { payload }) => {
@@ -475,11 +476,11 @@ impl Reader for ConstructionReader {
         }
     }
 
-    fn skip(&mut self, depth: usize) -> Decoded<()> {
-        self.skip_value(depth)
+    fn skip(&mut self, interp: &mut Interpreter, depth: usize) -> Decoded<()> {
+        self.skip_value(interp, depth)
     }
 
-    fn end(&mut self) -> Decoded<()> {
+    fn end(&mut self, _: &mut Interpreter) -> Decoded<()> {
         match self.frames.pop() {
             Some(Frame::Elements {
                 close, owned: true, ..
@@ -490,7 +491,7 @@ impl Reader for ConstructionReader {
         }
     }
 
-    fn finish(&mut self) -> Decoded<()> {
+    fn finish(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.space();
         match self.input.at == self.input.bytes.len() {
             true => Ok(()),

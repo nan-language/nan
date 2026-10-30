@@ -604,6 +604,62 @@ pub open enum DecodeError derives Copy, Eq, Hash, Render {
   2. Each field `where` predicate in declaration order, then each `invariant`, is evaluated; a false one fails with `Invalid`.
   3. The value is constructed.
 - An enum decodes the variant `read_variant` names; a payload present or absent against the variant's form fails with `Malformed`. A labelled payload decodes as the fields of a closed struct do.
+- A decoder gives `read_key` and `read_variant` the keys of the fields or variants in declaration order, then the old keys of their [aliases](#keys); an index past them reads as `None`.
+- A decoder reads text and bytes with one `read_chunk` of the length `begin_text` or `begin_bytes` gives, after failing with `OutOfRange` past a fixed text's bound or with `OutOfMemory` when it cannot draw that length.
+- A decoder fails with `TooDeep` on nesting deeper than 128 sequences, maps, records and variants, and with the failure of each call of `d` that fails.
+
+```nan
+pub closed struct Reading derives Encode {
+    pub sensor: u16
+    pub level: i32
+} Reading
+
+pub closed struct KeyCount {
+    pub keys: u32
+} KeyCount
+
+impl KeyCount: core::Encoder
+
+pub fn KeyCount.write_key(mut self, key: Str) limits terminates {
+    self.keys += 1
+} KeyCount.write_key
+
+pub fn KeyCount.write_bool(mut self, value: bool) = Unit
+
+pub fn KeyCount.write_unsigned(mut self, value: u64) = Unit
+
+pub fn KeyCount.write_signed(mut self, value: i64) = Unit
+
+pub fn KeyCount.write_float(mut self, value: f64) = Unit
+
+pub fn KeyCount.write_char(mut self, value: char) = Unit
+
+pub fn KeyCount.write_text(mut self, value: Str) = Unit
+
+pub fn KeyCount.write_bytes(mut self, value: Slice[u8]) = Unit
+
+pub fn KeyCount.begin_sequence(mut self, count: usize) = Unit
+
+pub fn KeyCount.begin_map(mut self, count: usize) = Unit
+
+pub fn KeyCount.begin_record(mut self, count: usize) = Unit
+
+pub fn KeyCount.begin_variant(mut self, key: Str, payload: bool) = Unit
+
+pub fn KeyCount.end(mut self) = Unit
+
+pub fn key_count(reading: Reading) -> u32
+    example key_count(Reading(sensor: 3, level: -1)) == 2
+{
+    var count = KeyCount(keys: 0)
+    reading.encode(e: mut count)
+    return count.keys
+} key_count
+
+pub fn read_reading[D: core::Decoder](mut d: D, alloc: mem::Alloc) -> Reading fails core::DecodeError {
+    return try Reading.decode(mut d, alloc)
+} read_reading
+```
 
 ### Decoders as validators
 

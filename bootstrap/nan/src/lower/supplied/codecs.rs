@@ -2,13 +2,15 @@
 //! format and type, an encoding function writes a value through a writer and a decoding
 //! function reads one through a reader, laid out as the kinds of `core::Encoder` and
 //! `core::Decoder` are: a struct as a record of its fields in ascending byte order of their
-//! keys, an enum value as a variant, and each std type as its encoding states.
+//! keys, an enum value as a variant, and each std type as its encoding states. The calls of a
+//! decoder are a format too.
 //!
 //! A writer is the buffer bytes go to, zero while measuring, and the count of bytes written. A
-//! reader is the address of the next byte, the end of the input and the nesting depth. A
-//! decoding function gives zero, or one plus the index of the `core::DecodeError` variant it
-//! fails with, having released what it read.
+//! reader is the address of the next byte, or the decoder's address, the end of the input and
+//! the nesting depth. A decoding function gives zero, or one plus the index of the
+//! `core::DecodeError` variant it fails with, having released what it read.
 
+pub mod calls;
 pub mod construction;
 mod json;
 mod wire;
@@ -35,12 +37,13 @@ pub enum Format {
     Json,
 }
 
-/// A format values decode from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A format values decode from, or the calls of a decoder of a type.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeFormat {
     Wire,
     Json,
     Construction,
+    Calls(Ty),
 }
 
 pub mod writer {
@@ -103,7 +106,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     };
     match (supply.member(), encoding) {
         ("encode" | "try_encode", Some(format)) => encode(lo, fx, supply, format),
-        ("decode", _) => decode(lo, fx, supply, decoding),
+        ("decode", _) => decode(lo, fx, supply, &decoding),
         (member, _) => panic!("no lowering of {owner}.{member}"),
     }
     true
@@ -156,7 +159,7 @@ fn call(lo: &mut Lowering, fx: &mut Fx, function: FuncId, args: &[Value]) -> Vec
 }
 
 /// `Codec.decode(raw, alloc)`: one value read, failing with `Trailing` on what is left.
-fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: DecodeFormat) {
+fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: &DecodeFormat) {
     let ty = supply.type_arg(0);
     let raw = supply.param(0).address();
     let start = fx.load(PTR, raw, 0);
@@ -180,7 +183,7 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: DecodeFormat)
         read,
         &[types::I32],
         |lo, fx| {
-            if format != DecodeFormat::Wire {
+            if *format != DecodeFormat::Wire {
                 json::space(fx, state);
             }
             let pos = fx.load(PTR, state, reader::POS);
@@ -192,6 +195,12 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: DecodeFormat)
         },
         |_, _| vec![code],
     )[0];
+    returned(lo, fx, supply, &ty, target, code);
+}
+
+/// Returns the value a decoding function read at `target`, or fails with the
+/// `core::DecodeError` its code names.
+fn returned(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, ty: &Ty, target: Value, code: Value) {
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
     fx.when(failed, |fx| {
         let fails = supply.abi.fails.clone().expect("a decode's failure type");
@@ -210,7 +219,7 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: DecodeFormat)
         lo.store_held(fx, target, held, &fails);
         supply.fail(fx);
     });
-    let held = lo.held_at(fx, &ty, target);
+    let held = lo.held_at(fx, ty, target);
     supply.ret(lo, fx, held);
 }
 
@@ -781,15 +790,16 @@ fn encode_case(
 
 /// The decoding function of a type in a format: given a reader, the allocator handle values
 /// draw through and the address the value goes to, the code of its failure, zero for none.
-fn decoder(lo: &mut Lowering, format: DecodeFormat, ty: &Ty) -> FuncId {
+fn decoder(lo: &mut Lowering, format: &DecodeFormat, ty: &Ty) -> FuncId {
     let mut signature = Signature::new(CALL_CONV);
     for _ in 0..3 {
         signature.params.push(AbiParam::new(PTR));
     }
     signature.returns.push(AbiParam::new(types::I32));
     let ty = unwrapped(lo, ty);
+    let format = format.clone();
     lo.glue_function(
-        Glue::Decode(format, ty.clone()),
+        Glue::Decode(format.clone(), ty.clone()),
         signature,
         move |lo, fx| {
             let params = fx.entry();
@@ -836,7 +846,7 @@ fn decode_into(
     ty: &Ty,
     target: Value,
 ) -> Value {
-    let function = decoder(lo, decoding.format, ty);
+    let function = decoder(lo, &decoding.format, ty);
     call(lo, fx, function, &[decoding.reader, decoding.alloc, target])[0]
 }
 
@@ -971,10 +981,15 @@ fn decode_kind(
     let reader_state = decoding.reader;
     match kind {
         Kind::Bool => {
-            let (flag, failed) = match decoding.format {
+            let (flag, failed) = match &decoding.format {
                 DecodeFormat::Wire => wire::read_bool(fx, reader_state),
                 DecodeFormat::Json => json::read_bool(lo, fx, reader_state),
                 DecodeFormat::Construction => construction::read_bool(lo, fx, reader_state),
+                DecodeFormat::Calls(decoder) => {
+                    let (flag, failed) =
+                        calls::read(lo, fx, decoder, reader_state, "read_bool", &[]);
+                    (flag.scalar(), failed)
+                }
             };
             check(lo, fx, failed, |_, _| {});
             fx.store(flag, target, 0);
@@ -1005,10 +1020,15 @@ fn decode_kind(
             fx.store(narrowed, target, 0);
         }
         Kind::Float(scalar) => {
-            let (value, failed) = match decoding.format {
+            let (value, failed) = match &decoding.format {
                 DecodeFormat::Wire => wire::read_float(fx, reader_state),
                 DecodeFormat::Json => json::read_float(lo, fx, reader_state),
                 DecodeFormat::Construction => construction::read_float(lo, fx, reader_state),
+                DecodeFormat::Calls(decoder) => {
+                    let (value, failed) =
+                        calls::read(lo, fx, decoder, reader_state, "read_float", &[]);
+                    (value.scalar(), failed)
+                }
             };
             check(lo, fx, failed, |_, _| {});
             let value = match scalar {
@@ -1018,7 +1038,7 @@ fn decode_kind(
             fx.store(value, target, 0);
         }
         Kind::Char => {
-            let scalar = match decoding.format {
+            let scalar = match &decoding.format {
                 DecodeFormat::Wire => {
                     let value = read_integer(lo, fx, decoding, false);
                     let most = fx.int(types::I64, i64::from(u32::MAX));
@@ -1034,6 +1054,11 @@ fn decode_kind(
                     check(lo, fx, failed, |_, _| {});
                     scalar
                 }
+                DecodeFormat::Calls(decoder) => {
+                    let scalar =
+                        calls::read_scalar(lo, fx, decoder, reader_state, "read_char", |_, _| {});
+                    fx.b.ins().uextend(types::I64, scalar)
+                }
             };
             let surrogate = in_range(fx, scalar, 0xD800, 0xDFFF);
             let beyond =
@@ -1047,7 +1072,7 @@ fn decode_kind(
         Kind::Text(fixed) => decode_text(lo, fx, decoding, ty, *fixed, target),
         Kind::Bytes => {
             vector::empty(fx, target, decoding.alloc, BYTE);
-            match decoding.format {
+            match &decoding.format {
                 DecodeFormat::Wire => {
                     let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
                     check(lo, fx, failed, |_, _| {});
@@ -1064,6 +1089,9 @@ fn decode_kind(
                         construction::measure_literal(lo, fx, reader_state, literal);
                     check(lo, fx, failed, |_, _| {});
                     draw_measured(lo, fx, decoding, Measured::Literal(literal), len, target);
+                }
+                DecodeFormat::Calls(decoder) => {
+                    calls::decode_text(lo, fx, decoder, reader_state, ty, None, false, target)
                 }
             }
         }
@@ -1117,10 +1145,18 @@ fn decode_kind(
 
 /// An unsigned or signed value in 64 bits, returning from the decoding function on failure.
 fn read_integer(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, signed: bool) -> Value {
-    let (value, failed) = match decoding.format {
+    let (value, failed) = match &decoding.format {
         DecodeFormat::Wire => wire::read_integer(lo, fx, decoding.reader, signed),
         DecodeFormat::Json => json::read_integer(lo, fx, decoding.reader, signed),
         DecodeFormat::Construction => construction::read_integer(lo, fx, decoding.reader, signed),
+        DecodeFormat::Calls(decoder) => {
+            let name = match signed {
+                true => "read_signed",
+                false => "read_unsigned",
+            };
+            let (value, failed) = calls::read(lo, fx, decoder, decoding.reader, name, &[]);
+            (value.scalar(), failed)
+        }
     };
     check(lo, fx, failed, |_, _| {});
     value
@@ -1197,7 +1233,7 @@ fn decode_text(
     target: Value,
 ) {
     let reader_state = decoding.reader;
-    let (source, len) = match decoding.format {
+    let (source, len) = match &decoding.format {
         DecodeFormat::Wire => {
             let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
@@ -1216,6 +1252,13 @@ fn decode_text(
             let (len, failed) = construction::measure_literal(lo, fx, reader_state, literal);
             check(lo, fx, failed, |_, _| {});
             (Measured::Literal(literal), len)
+        }
+        DecodeFormat::Calls(decoder) => {
+            if fixed.is_none() {
+                vector::empty(fx, target, decoding.alloc, BYTE);
+            }
+            calls::decode_text(lo, fx, decoder, reader_state, ty, fixed, true, target);
+            return;
         }
     };
     match fixed {
@@ -1307,7 +1350,7 @@ fn element_follows(
     close: u8,
     undo: impl FnOnce(&mut Lowering, &mut Fx),
 ) -> Value {
-    match decoding.format {
+    match &decoding.format {
         DecodeFormat::Wire => fx.b.ins().icmp(IntCC::UnsignedLessThan, index, count),
         DecodeFormat::Json => {
             let (follows, failed) = json::element_follows(lo, fx, decoding.reader, index, close);
@@ -1330,13 +1373,16 @@ fn element_follows(
             check(lo, fx, parts[1], undo);
             parts[0]
         }
+        DecodeFormat::Calls(decoder) => {
+            calls::read_scalar(lo, fx, decoder, decoding.reader, "next_follows", undo)
+        }
     }
 }
 
-/// Opens a sequence, map or record: the wire format's count, or a text format's opening byte,
-/// returning from the decoding function on failure.
-fn open(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, opening: u8) -> Value {
-    match decoding.format {
+/// Opens a sequence, map or record: the wire format's count, a text format's opening byte, or
+/// the decoder's call `begin`, returning from the decoding function on failure.
+fn open(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, opening: u8, begin: &str) -> Value {
+    match &decoding.format {
         DecodeFormat::Wire => {
             let (count, failed) = wire::read_count(lo, fx, decoding.reader);
             check(lo, fx, failed, |_, _| {});
@@ -1352,6 +1398,26 @@ fn open(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, opening: u8) -> Val
             check(lo, fx, failed, |_, _| {});
             fx.ptr(1)
         }
+        DecodeFormat::Calls(decoder) => {
+            let (_, failed) = calls::read(lo, fx, decoder, decoding.reader, begin, &[]);
+            check(lo, fx, failed, |_, _| {});
+            fx.ptr(0)
+        }
+    }
+}
+
+/// Ends a sequence, map, record or variant read through a decoder's calls with its `end`,
+/// returning from the decoding function after `undo` on failure; a format ends each as its
+/// last part is read.
+fn end(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    decoding: &Decoding,
+    undo: impl FnOnce(&mut Lowering, &mut Fx),
+) {
+    if let DecodeFormat::Calls(decoder) = &decoding.format {
+        let (_, failed) = calls::read(lo, fx, decoder, decoding.reader, "end", &[]);
+        check(lo, fx, failed, undo);
     }
 }
 
@@ -1369,7 +1435,7 @@ fn decode_sequence(
 ) {
     let reader_state = decoding.reader;
     nest(fx, reader_state);
-    let count = open(lo, fx, decoding, b'[');
+    let count = open(lo, fx, decoding, b'[', "begin_sequence");
     let shape = Element::of(lo, element);
     let element_layout = lo.layout(element);
     let scratch = fx.slot(element_layout.size, element_layout.align);
@@ -1461,6 +1527,7 @@ fn decode_sequence(
         let next = fx.b.ins().select(follows, next, index);
         (follows, vec![next])
     })[0];
+    end(lo, fx, decoding, |lo, fx| release_read(lo, fx, read));
     unnest(fx, reader_state);
     match form {
         Form::Array(count) => {
@@ -1545,7 +1612,7 @@ fn decode_map(
         false => (b'[', b']'),
     };
     nest(fx, reader_state);
-    let count = open(lo, fx, decoding, opening);
+    let count = open(lo, fx, decoding, opening, "begin_map");
     vector::empty(fx, target, decoding.alloc, entries.shape);
     let entry_ty = entries.entry.clone();
     let release_read = |lo: &mut Lowering, fx: &mut Fx| {
@@ -1598,6 +1665,7 @@ fn decode_map(
         let next = fx.b.ins().select(follows, next, index);
         (follows, vec![next])
     })[0];
+    end(lo, fx, decoding, |lo, fx| release_read(lo, fx));
     unnest(fx, reader_state);
     let data = fx.load(PTR, target, vector::DATA);
     ascending(
@@ -1657,16 +1725,16 @@ fn decode_record(
     nest(fx, reader_state);
     let room = key_room(record);
     let key_buffer = fx.slot(room, 1);
-    let left = match (decoding.format, labelled) {
+    let left = match (&decoding.format, labelled) {
         (DecodeFormat::Construction, true) => fx.ptr(1),
         (DecodeFormat::Construction, false) => {
             let (parens, failed) = construction::open_record(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
             fx.b.ins().uextend(PTR, parens)
         }
-        _ => open(lo, fx, decoding, b'{'),
+        _ => open(lo, fx, decoding, b'{', "begin_record"),
     };
-    let close = match decoding.format {
+    let close = match &decoding.format {
         DecodeFormat::Construction => b')',
         _ => b'}',
     };
@@ -1678,27 +1746,44 @@ fn decode_record(
         let index = state[0];
         let follows = element_follows(lo, fx, decoding, index, left, close, release_read);
         fx.when(follows, |fx| {
-            let (key_start, key_len, value_end) = match decoding.format {
+            let (matched, value_end) = match &decoding.format {
                 DecodeFormat::Wire => {
                     let (start, len, end, failed) = wire::read_key(lo, fx, reader_state, last);
                     check(lo, fx, failed, release_read);
-                    (start, len, Some(end))
+                    (match_key(lo, fx, record, start, len), Some(end))
                 }
                 DecodeFormat::Json => {
                     let capacity = fx.ptr(room);
                     let (len, failed) = json::read_key(lo, fx, reader_state, key_buffer, capacity);
                     check(lo, fx, failed, release_read);
-                    (key_buffer, len, None)
+                    (match_key(lo, fx, record, key_buffer, len), None)
                 }
                 DecodeFormat::Construction => {
                     let capacity = fx.ptr(room);
                     let (len, failed) =
                         construction::read_key(lo, fx, reader_state, key_buffer, capacity);
                     check(lo, fx, failed, release_read);
-                    (key_buffer, len, None)
+                    (match_key(lo, fx, record, key_buffer, len), None)
+                }
+                DecodeFormat::Calls(decoder) => {
+                    let names: Vec<&[u8]> = record
+                        .fields
+                        .iter()
+                        .map(|(key, _, _)| key.as_bytes())
+                        .collect();
+                    let matched = calls::read_key(
+                        lo,
+                        fx,
+                        decoder,
+                        reader_state,
+                        "read_key",
+                        &names,
+                        &record.aliases,
+                        release_read,
+                    );
+                    (matched, None)
                 }
             };
-            let matched = match_key(lo, fx, record, key_start, key_len);
             let unknown = fx.b.ins().icmp_imm_s(IntCC::Equal, matched, -1);
             fx.when(unknown, |fx| {
                 if !record.open {
@@ -1709,9 +1794,12 @@ fn decode_record(
                 match value_end {
                     Some(end) => fx.store(end, reader_state, reader::POS),
                     None => {
-                        let failed = match decoding.format {
+                        let failed = match &decoding.format {
                             DecodeFormat::Construction => {
                                 construction::skip_value(lo, fx, reader_state)
+                            }
+                            DecodeFormat::Calls(decoder) => {
+                                calls::read(lo, fx, decoder, reader_state, "skip", &[]).1
                             }
                             _ => json::skip_value(lo, fx, reader_state),
                         };
@@ -1751,6 +1839,7 @@ fn decode_record(
         let next = fx.b.ins().iadd_imm_s(index, 1);
         (follows, vec![next])
     });
+    end(lo, fx, decoding, release_read);
     unnest(fx, reader_state);
     let default = lo.core_interface("Default");
     for (position, (_, field_ty, offset)) in record.fields.iter().enumerate() {
@@ -1842,35 +1931,53 @@ fn decode_variant(
     nest(fx, reader_state);
     let room = key_room(&record);
     let key_buffer = fx.slot(room, 1);
-    let (key_start, key_len, text_payload) = match decoding.format {
+    let (matched, text_payload) = match &decoding.format {
         DecodeFormat::Wire => {
             let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
-            (start, len, None)
+            (match_key(lo, fx, &record, start, len), None)
         }
         DecodeFormat::Json => {
             let capacity = fx.ptr(room);
             let (len, payload, failed) =
                 json::read_variant(lo, fx, reader_state, key_buffer, capacity);
             check(lo, fx, failed, |_, _| {});
-            (key_buffer, len, Some(payload))
+            (match_key(lo, fx, &record, key_buffer, len), Some(payload))
         }
         DecodeFormat::Construction => {
             let capacity = fx.ptr(room);
             let (len, payload, failed) =
                 construction::read_variant(lo, fx, reader_state, key_buffer, capacity);
             check(lo, fx, failed, |_, _| {});
-            (key_buffer, len, Some(payload))
+            (match_key(lo, fx, &record, key_buffer, len), Some(payload))
+        }
+        DecodeFormat::Calls(decoder) => {
+            let names: Vec<&[u8]> = cases.iter().map(|case| case.key.as_bytes()).collect();
+            let matched = calls::read_key(
+                lo,
+                fx,
+                decoder,
+                reader_state,
+                "read_variant",
+                &names,
+                &record.aliases,
+                |_, _| {},
+            );
+            (matched, None)
         }
     };
-    let matched = match_key(lo, fx, &record, key_start, key_len);
     let unknown = fx.b.ins().icmp_imm_s(IntCC::Equal, matched, -1);
     fx.when(unknown, |fx| fail(fx, failure::UNKNOWN_VARIANT));
-    let (follows, payload_end) = match decoding.format {
+    let (follows, payload_end) = match &decoding.format {
         DecodeFormat::Wire => {
             let (follows, end, failed) = wire::read_payload_flag(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
             (follows, Some(end))
+        }
+        DecodeFormat::Calls(decoder) => {
+            let follows =
+                calls::read_scalar(lo, fx, decoder, reader_state, "payload_follows", |_, _| {});
+            (follows, None)
         }
         _ => (text_payload.expect("a text variant's form"), None),
     };
@@ -1909,7 +2016,7 @@ fn decode_variant(
                 }
                 CasePayload::None => {}
             };
-            let closing = match (decoding.format, &case.payload) {
+            let closing = match (&decoding.format, &case.payload) {
                 (DecodeFormat::Json, _) => Some(b'}'),
                 (DecodeFormat::Construction, CasePayload::Single(_)) => Some(b')'),
                 _ => None,
@@ -1928,6 +2035,7 @@ fn decode_variant(
                     check(lo, fx, failed, release_payload);
                 }
             }
+            end(lo, fx, decoding, release_payload);
             lo.write_variant_tag(fx, ty, target, &case.key);
         });
     }

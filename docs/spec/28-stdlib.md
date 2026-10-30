@@ -268,7 +268,7 @@ A **supplied operation** is a std function without a body, whose item ends at it
 - wait when its head states `uses wait`, and terminates otherwise; float use when a parameter or its result has a float type; and the device, priv and sync facts that its section states for pointers, register windows, DMA and privileged intrinsics.
 - Unless its head demands `pure`: sync when it is a member of a type with [interior mutability](12-memory.md#interior-mutability), or is `mem::Shared.share` or `mem::Shared.make_mut`, which change a count; and, in its capabilities set, the primitive capabilities among its parameters' types.
 - Unless its head demands `pure` or `noalloc`, alloc when it draws memory: when its name starts with `try_`, when the type it is a member of has a member of its name prefixed with `try_`, or when its section states that it draws memory, but never for the members of `text::Fixed` and `mem::Bounded`, which store their contents inline.
-- Unless its head demands `notrap`, may-trap when it draws memory and its name does not start with `try_`, or when its section names a trap it raises.
+- Unless its head demands `notrap`, may-trap when it draws memory, its name does not start with `try_` and its section does not state that it fails when that memory is exhausted, or when its section names a trap it raises.
 
 ## Std evidence
 

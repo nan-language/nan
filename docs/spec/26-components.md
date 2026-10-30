@@ -194,6 +194,18 @@ pub fn Countdown.on(mut self, take message: Message, mut env: Env, mut cx: sys::
 } Countdown.on
 ```
 
+```nan
+pub fn requeue(mut cx: sys::Cx[u32], message: u32) limits noalloc {
+    mut cx.send(message) // error: limit.allocates
+} requeue
+```
+
+```nan
+pub fn retry(mut cx: sys::Cx[u32], message: u32) limits notrap {
+    mut cx.after(ms: 100, send: message) // error: limit.may-trap
+} retry
+```
+
 ## Keyed tasks
 
 A **keyed task** is a task that `mut cx.spawn(key: k, run: f)` starts on the runner's executor, identified by its key `k`. An **outbox** is a `sys::Outbox[M]`, the handle through which tasks post messages to a component's intake.

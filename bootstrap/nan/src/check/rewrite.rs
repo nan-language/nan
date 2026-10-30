@@ -104,16 +104,18 @@ impl Checker<'_> {
         );
     }
 
-    /// The fix deleting the limit at `token` from its clause, with a comma beside it, or the
-    /// whole clause when it is the only limit.
+    /// The fix deleting the limit, or the kind of a class, at `token` from its list, with a
+    /// comma beside it, or the whole clause when it is the only limit.
     fn limit_deleted(&self, item: ItemId, token: Tok) -> Fix {
         let syntax = &self.db.item(item).file.syntax;
         let tokens = &syntax.tokens;
         let comma = |at: usize| tokens[at].kind == TokenKind::Punct(Punct::Comma);
-        let last = if syntax.text(token as usize) == "stack" {
-            syntax.next(token as usize + 1)
-        } else {
-            token as usize
+        let last = match syntax.text(token as usize) {
+            "stack" => syntax.next(token as usize + 1),
+            "irreversible" => (token as usize..)
+                .find(|at| tokens[*at].kind == TokenKind::Punct(Punct::RParen))
+                .expect("a class closes its kinds"),
+            _ => token as usize,
         };
         let before = syntax.previous(token as usize).unwrap_or(token as usize);
         let after = syntax.next(last + 1);

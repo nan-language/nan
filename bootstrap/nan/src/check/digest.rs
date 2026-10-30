@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use super::Checker;
 use super::db::ItemId;
+use super::reversibility::{self, Class};
 use super::sig::SigKind;
 use super::tir::{
     Builtin, Call, Callee, LocalKind, TBlock, TBody, TClosure, TExpr, TKind, TStmtKind,
@@ -29,6 +30,7 @@ pub struct Digest {
     pub capabilities: Option<BTreeSet<ItemId>>,
     /// The validators and decoders it calls; none for the unbounded set.
     pub validators: Option<BTreeSet<ItemId>>,
+    pub class: Class,
 }
 
 impl Digest {
@@ -44,6 +46,7 @@ impl Digest {
             float: false,
             capabilities: Some(BTreeSet::new()),
             validators: Some(BTreeSet::new()),
+            class: Class::Traceless,
         }
     }
 
@@ -60,10 +63,12 @@ impl Digest {
             float: false,
             capabilities: None,
             validators: None,
+            class: limits.class.unwrap_or(Class::WORST),
         };
         if limits.pure {
             digest.capabilities = Some(BTreeSet::new());
             digest.validators = Some(BTreeSet::new());
+            digest.class = Class::Traceless;
         }
         digest
     }
@@ -78,9 +83,11 @@ impl Digest {
         self.float |= other.float;
         join_set(&mut self.capabilities, &other.capabilities);
         join_set(&mut self.validators, &other.validators);
+        self.class = self.class.join(other.class);
     }
 
-    /// Whether it holds no effect fact, the wait fact excepted, and empty sets.
+    /// Whether it holds no effect fact, the wait fact excepted, empty sets and the class
+    /// `traceless`.
     pub fn pure(&self) -> bool {
         !self.alloc
             && !self.device
@@ -88,6 +95,7 @@ impl Digest {
             && !self.sync
             && self.capabilities.as_ref().is_some_and(BTreeSet::is_empty)
             && self.validators.as_ref().is_some_and(BTreeSet::is_empty)
+            && self.class == Class::Traceless
     }
 
     /// The code of the rule a limit demanding facts this digest lacks breaks.
@@ -98,7 +106,13 @@ impl Digest {
         if limits.terminates && !self.terminates {
             return Some(Code::LimitMayNotTerminate);
         }
-        (limits.noalloc && self.alloc).then_some(Code::LimitAllocates)
+        if limits.noalloc && self.alloc {
+            return Some(Code::LimitAllocates);
+        }
+        limits
+            .class
+            .is_some_and(|bound| !self.class.at_most(bound))
+            .then_some(Code::LimitReversibilityExceeded)
     }
 }
 
@@ -220,8 +234,19 @@ pub struct Cycles {
 
 impl Checker<'_> {
     /// The digest of a function item: computed from its body, supplied for a std function
-    /// without one, and otherwise declared.
+    /// without one, and otherwise declared; compensated when the function has an undo clause.
     pub fn digest(&self, item: ItemId) -> Rc<Digest> {
+        let digest = self.uncompensated_digest(item);
+        match self.compensates(item) {
+            true => Rc::new(Digest {
+                class: digest.class.compensated(),
+                ..(*digest).clone()
+            }),
+            false => digest,
+        }
+    }
+
+    fn uncompensated_digest(&self, item: ItemId) -> Rc<Digest> {
         self.db.note(item);
         let mut digests = self.digests.borrow_mut();
         if let Some(digest) = digests.done.get(&item) {
@@ -329,8 +354,11 @@ impl Checker<'_> {
                 if let Some(root) = &body.root {
                     nested_closures(root, &mut closures);
                 }
-                match closures.into_iter().find(|closure| closure.index == index) {
-                    Some(closure) => own(&body, Some(closure), closure.ty.wait),
+                match closures
+                    .into_iter()
+                    .find(|(_, closure)| closure.index == index)
+                {
+                    Some((_, closure)) => own(&body, Some(closure), closure.ty.wait),
                     None => Digest::none(),
                 }
             }
@@ -607,11 +635,17 @@ impl Checker<'_> {
         body: &'c TBody,
         closure: Option<&TClosure>,
     ) -> Walk<'_, 'c, '_> {
+        let premise = match closure {
+            Some(closure) => closure.ty.limits.class,
+            None => self.fn_sig(item).and_then(|head| head.limits.class),
+        };
         let mut walk = Walk {
             ck: self,
             item,
             body,
             closure: closure.map_or(0, |closure| closure.index),
+            premise,
+            premised: false,
             sites: Vec::new(),
             expects: Vec::new(),
         };
@@ -624,6 +658,31 @@ impl Checker<'_> {
             }
         }
         walk
+    }
+
+    /// The device premises of a function's text: the class of its own body's, then of each
+    /// closure's whose device accesses take one, with the closure's first token.
+    pub fn device_premises(&self, item: ItemId) -> Vec<(Option<Tok>, Class)> {
+        let Some(body) = self.typed_body(item) else {
+            return Vec::new();
+        };
+        let mut closures = Vec::new();
+        if let Some(root) = &body.root {
+            nested_closures(root, &mut closures);
+        }
+        let walks = std::iter::once((None, None)).chain(
+            closures
+                .into_iter()
+                .map(|(token, closure)| (Some(token), Some(closure))),
+        );
+        walks
+            .filter_map(|(token, closure)| {
+                let walk = self.walk(item, &body, closure);
+                walk.premise
+                    .filter(|_| walk.premised)
+                    .map(|class| (token, class))
+            })
+            .collect()
     }
 
     /// Reports each `expect` of a body, its closures' included, whose condition is not pure.
@@ -674,10 +733,7 @@ impl Checker<'_> {
                     self.interface_method(bound.interface, &function.label.name.text)
                 && let SigKind::Interface { methods } = &self.sig(bound.interface).kind
             {
-                let demanded = &methods[method].sig.limits;
-                limits.pure |= demanded.pure;
-                limits.terminates |= demanded.terminates;
-                limits.noalloc |= demanded.noalloc;
+                demand(&mut limits, &methods[method].sig.limits);
             }
         }
         let mut reported = Vec::new();
@@ -728,29 +784,40 @@ impl Checker<'_> {
     ) {
         for inner in closures_of(body, closure) {
             let mut own = inner.ty.limits;
-            own.pure |= inner.demanded.pure;
-            own.terminates |= inner.demanded.terminates;
-            own.noalloc |= inner.demanded.noalloc;
+            demand(&mut own, &inner.demanded);
             self.judge(item, body, Some(inner), &own, reported);
-            if limits.pure || limits.terminates || limits.noalloc {
+            if limits.pure || limits.terminates || limits.noalloc || limits.class.is_some() {
                 self.judge(item, body, Some(inner), limits, reported);
             }
         }
-        for site in self.sites(item, body, closure) {
+        for site in self.judged_sites(item, body, closure) {
             if site.brought == Brought::Charged || reported.contains(&site.token) {
                 continue;
             }
             if let Some(code) = site.facts.broken(limits) {
                 reported.push(site.token);
-                let because = self.trace(item, &site, code);
+                let because = self.trace(item, &site, code, limits);
                 self.report_because(item, site.token, code, because);
             }
         }
     }
 
+    /// The sites of a body, or of a closure of it, as limits judge them: with their classes
+    /// compensated when the function has an undo clause.
+    fn judged_sites(&self, item: ItemId, body: &TBody, closure: Option<&TClosure>) -> Vec<Site> {
+        let mut sites = self.sites(item, body, closure);
+        if self.compensates(item) {
+            for site in &mut sites {
+                site.facts.class = site.facts.class.compensated();
+            }
+        }
+        sites
+    }
+
     /// The because-chain of a site breaking a limit: a `called` reason per call down to the
     /// operation carrying the fact, and a `raised` reason for that operation.
-    fn trace(&self, item: ItemId, site: &Site, code: Code) -> Vec<Reason> {
+    fn trace(&self, item: ItemId, site: &Site, code: Code, limits: &LimitSet) -> Vec<Reason> {
+        let broken = limits_of(code, limits);
         let mut because = Vec::new();
         let mut current = (item, site.clone());
         let mut seen = Vec::new();
@@ -769,41 +836,48 @@ impl Checker<'_> {
                 return because;
             };
             let next = self
-                .sites(callee, &body, None)
+                .judged_sites(callee, &body, None)
                 .into_iter()
-                .find(|inner| inner.facts.broken(&limits_of(code)).is_some());
+                .find(|inner| inner.facts.broken(&broken).is_some());
             match next {
                 Some(next) => current = (callee, next),
                 None => return because,
             }
         }
-        because.push(self.reason(
-            current.0,
-            current.1.token,
-            Role::Raised,
-            raised(code).to_owned(),
-        ));
+        let subject = match code {
+            Code::LimitImpure => "effect".to_owned(),
+            Code::LimitMayNotTerminate => "may-not-terminate".to_owned(),
+            Code::LimitReversibilityExceeded => current.1.facts.class.text(),
+            _ => "alloc".to_owned(),
+        };
+        because.push(self.reason(current.0, current.1.token, Role::Raised, subject));
         because
     }
 }
 
-/// The limits demanding the fact a code reports missing.
-fn limits_of(code: Code) -> LimitSet {
+/// The demands of `limits` whose breach a code reports.
+fn limits_of(code: Code, limits: &LimitSet) -> LimitSet {
     LimitSet {
         pure: code == Code::LimitImpure,
         terminates: code == Code::LimitMayNotTerminate,
         noalloc: code == Code::LimitAllocates,
+        class: limits
+            .class
+            .filter(|_| code == Code::LimitReversibilityExceeded),
         ..LimitSet::default()
     }
 }
 
-/// The fact an operation raising a limit's code carries.
-fn raised(code: Code) -> &'static str {
-    match code {
-        Code::LimitImpure => "effect",
-        Code::LimitMayNotTerminate => "may-not-terminate",
-        _ => "alloc",
-    }
+/// Adds the demands of `demanded`, other than `notrap` and `stack N`, to `limits`, a class
+/// joining as the greatest class at most both.
+fn demand(limits: &mut LimitSet, demanded: &LimitSet) {
+    limits.pure |= demanded.pure;
+    limits.terminates |= demanded.terminates;
+    limits.noalloc |= demanded.noalloc;
+    limits.class = match (limits.class, demanded.class) {
+        (Some(own), Some(demanded)) => Some(own.meet(demanded)),
+        (own, demanded) => own.or(demanded),
+    };
 }
 
 /// The closures a body holds directly, or those a closure of it holds.
@@ -833,10 +907,11 @@ fn collect_dependencies(expr: &TExpr, found: &mut Vec<ItemId>) {
     expr.each_child(&mut |child| collect_dependencies(child, found));
 }
 
-/// The closures an expression holds at any depth, those inside closures included.
-fn nested_closures<'b>(expr: &'b TExpr, found: &mut Vec<&'b TClosure>) {
+/// The closures an expression holds at any depth, those inside closures included, each with
+/// its first token.
+fn nested_closures<'b>(expr: &'b TExpr, found: &mut Vec<(Tok, &'b TClosure)>) {
     if let TKind::Closure(closure) = &expr.kind {
-        found.push(closure);
+        found.push((expr.token, closure));
         nested_closures(&closure.body, found);
         return;
     }
@@ -858,6 +933,10 @@ struct Walk<'w, 'c, 'a> {
     body: &'c TBody,
     /// The closure whose code is walked, 0 for the item's own body.
     closure: u32,
+    /// The class its own limits clause holds, which its device accesses take.
+    premise: Option<Class>,
+    /// Whether a device access took the premise.
+    premised: bool,
     sites: Vec<Site>,
     /// The sites of each `expect` condition, by the condition's first token.
     expects: Vec<(Tok, Vec<Site>)>,
@@ -933,10 +1012,13 @@ impl Walk<'_, '_, '_> {
                         item: self.item,
                         body: self.body,
                         closure: self.closure,
+                        premise: self.premise,
+                        premised: false,
                         sites: Vec::new(),
                         expects: Vec::new(),
                     };
                     condition_walk.expr(condition);
+                    self.premised |= condition_walk.premised;
                     self.expects.push((condition.token, condition_walk.sites));
                     continue;
                 }
@@ -1005,6 +1087,12 @@ impl Walk<'_, '_, '_> {
                     validators.insert(*item);
                     facts.validators = Some(validators);
                 }
+                if facts.device
+                    && self.ck.db.is_std(*item)
+                    && reversibility::is_volatile(&self.ck.db.canonical(*item))
+                {
+                    facts.class = self.device_access();
+                }
                 let body_owned = self.ck.db.ast(*item).kind.is_fn_with_body();
                 self.site(token, facts, Brought::Call(body_owned.then_some(*item)));
             }
@@ -1047,6 +1135,7 @@ impl Walk<'_, '_, '_> {
                 if *builtin == Builtin::DmaAccess {
                     let mut facts = Digest::none();
                     facts.device = true;
+                    facts.class = self.device_access();
                     self.site(token, facts, Brought::Operation);
                 }
             }
@@ -1088,6 +1177,12 @@ impl Walk<'_, '_, '_> {
             _ => Brought::Call(None),
         };
         self.site(token, facts, brought);
+    }
+
+    /// The class of a device access of the code walked: its premise's, or the greatest.
+    fn device_access(&mut self) -> Class {
+        self.premised |= self.premise.is_some();
+        self.premise.unwrap_or(Class::WORST)
     }
 
     /// Whether an expression is a function-typed parameter of the code walked.

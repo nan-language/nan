@@ -109,6 +109,7 @@ clause_region = clause_line+ ;
 clause_line = requires_clause
     | ensures_clause
     | example_clause
+    | undo_clause
     | decreases_clause
     | todo_clause
     | waive_clause ;
@@ -286,7 +287,10 @@ From [Effects, digests and limits](10-effects-digests.md).
 ```ebnf
 uses_clause = "uses" ( 'wait' | IDENT {!effect.uses-unknown} ) ;
 limits_clause = "limits" limit ( "," limit )* ;
-limit = 'pure' | 'notrap' | 'terminates' | 'noalloc' | 'stack' INT ;
+limit = 'pure' | 'notrap' | 'terminates' | 'noalloc' | 'stack' INT | reversibility ;
+reversibility = 'traceless' | 'recorded' | 'restorable' | 'irreversible' "(" irreversible_kind ( "," irreversible_kind )* ")" ;
+irreversible_kind = 'emit' | 'actuate' | 'erase' | 'spend' ;
+undo_clause = 'undo' path ( "." IDENT )? TEXT NL ;
 fn_type = fn_kind "fn" fn_type_head | "fn" fn_type_head convention_clause? ;
 fn_kind = 'task' | "interrupt" ;
 fn_type_head = "(" fn_type_param_list? ")" fn_result? fails_clause? uses_clause? limits_clause? ;
@@ -426,7 +430,7 @@ summary_entry = 'capability' TEXT
     | 'priv'
     | "validator" TEXT
     | 'escape' escape_kind TEXT ;
-escape_kind = "trusted" | "assume" | "foreign" | "landing" | "validator" | 'decoder' | 'grant' ;
+escape_kind = "trusted" | "assume" | "foreign" | "landing" | "validator" | 'decoder' | 'grant' | 'class' | 'undo' ;
 history_file = COL0 'nan' 'history' INT NL COL0 history_tail ;
 history_tail = history_record NL COL0 history_tail
     | retired_item COL0 history_tail
@@ -475,7 +479,7 @@ Generated as [Keywords](01-lexical.md#keywords) states:
 | Class | Words |
 | --- | --- |
 | hard keywords | the 67 words of `HARD_KEYWORD` |
-| context words | `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `changes`, `closed`, `convention`, `deny`, `dep`, `depth`, `device`, `entry`, `example`, `from`, `keyed`, `language`, `le`, `length`, `manual`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `pure`, `read`, `rest`, `result`, `stack`, `stride`, `tags`, `targets`, `task`, `terminates`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
+| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `changes`, `closed`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `manual`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
 | reserved words | `bank`, `flexible`, `ipc`, `machine`, `migrate`, `protocol`, `stable` |
 
 ## One-token lookahead

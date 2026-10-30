@@ -298,6 +298,7 @@ Each term links to its home, whose definition governs.
 | [dependent parameter](05-properties.md#structural-properties) | Type parameter on which a property of a type follows its argument. |
 | [derive](08-generics-interfaces.md#derives) | Compiler-written conformance. |
 | [descriptor](27-program-model.md#descriptors) | Fixed definition of a target. |
+| [device premise](10-effects-digests.md#reversibility) | Class a function's own limits state, which its device accesses take; a trust escape. |
 | [diagnostic](34-diagnostics.md#diagnostic-record) | Checker report. |
 | [diagnostic class](34-diagnostics.md#classes) | Error, incompleteness or internal error. |
 | [diagnostic code](34-diagnostics.md#codes) | Stable `family.condition` name of a diagnostic. |
@@ -471,6 +472,7 @@ Each term links to its home, whose definition governs.
 | [result location](07-ownership.md#result-location) | Where a value is built. |
 | [retired form](37-evolution.md#successive-versions) | Form a later language version rejects with an exact rewrite. |
 | [reuse](30-artefacts.md#reuse) | Using a dependency's checked NIR as is. |
+| [reversibility class](10-effects-digests.md#reversibility) | Digest fact bounding what code does to state outside the program. |
 | [revocation](14-authority.md#revocation) | Ending every copy of a capability. |
 | [root grant](14-authority.md#root-grants) | Capability minted at entry. |
 | [root module](03-packages-modules.md#modules) | Package root's module. |
@@ -527,6 +529,7 @@ Each term links to its home, whose definition governs.
 | [trust escape](31-trust.md#trust-escapes) | Ledger entry whose item `nan verify` requires sealed. |
 | [trusted code](23-low-level.md#trusted-code) | `trusted` block or expression. |
 | [undefined behaviour](23-low-level.md#safe-code) | Behaviour the specification does not define. |
+| [undo clause](10-effects-digests.md#compensation) | Claim, sealed as a trust escape, that another function puts back what a function changes. |
 | [Untrusted](15-untrusted.md#untrusted-values) | Wrapper `Untrusted[T]` for outside data. |
 | [user directory](36-builds.md#cache) | Per-user `.nan` directory holding the build cache and local store. |
 | [validator](15-untrusted.md#validators) | `validator fn`, reading Untrusted contents. |

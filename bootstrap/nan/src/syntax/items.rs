@@ -195,9 +195,10 @@ pub fn clause_group(tree: &Tree, clause: NodeId) -> u8 {
         (Rule::RequiresClause, _) | (_, Some(Rule::RequiresClause)) => 0,
         (Rule::EnsuresClause, _) | (_, Some(Rule::EnsuresClause)) => 1,
         (Rule::ExampleClause, _) | (_, Some(Rule::ExampleClause)) => 2,
-        (Rule::DecreasesClause, _) => 3,
-        (Rule::TodoClause, _) => 4,
-        _ => 5,
+        (Rule::UndoClause, _) => 3,
+        (Rule::DecreasesClause, _) => 4,
+        (Rule::TodoClause, _) => 5,
+        _ => 6,
     }
 }
 

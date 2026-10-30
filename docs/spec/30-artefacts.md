@@ -65,7 +65,7 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 3 | the roles, each a uvar, its row's position from 0 in the [role table](29-identity-versioning.md#roles) |
 | 4 | the interface hash |
 | 5 | the behaviour epoch, a uvar |
-| 6 | the relied facts, each a pair of the field's key in the encoding of [digests](19-nir.md#encoding) and the canonical path of the capability or validator, or the empty text for a field that is not a set; a pair naming the terminates field records reliance on its presence, any other pair reliance on an absence |
+| 6 | the relied facts, each a pair of the field's key in the encoding of [digests](19-nir.md#encoding) and the canonical path of the capability or validator, the bound as a digest line writes it for the class, or the empty text for another field; a pair naming the terminates field records reliance on its presence, one naming the class reliance on the class being at most its bound, any other pair reliance on an absence |
 | 7 | the method resolutions, each a pair of the method name and the function reference found, as the NIR encoding writes one |
 | 8 | the item hash, when the entry records one; absent otherwise |
 | 9 | the implementer names, each a text, in byte order |
@@ -76,7 +76,7 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 2 | its kind, a uvar, its row's position from 0 in the ledger table |
 | 3 | the path, as spans write it, of the file holding its line |
 | 4 | its line number |
-| 5 | the texts its row says it holds, in the row's order: each premise, reason and `todo` text as its literal's content; each condition in normalised form; a validator's class as `parsing` or `declassifying`; a waiver's threshold as written and its reason as its literal's content; a grant as `device` or `priv` followed by its modules and aliases |
+| 5 | the texts its row says it holds, in the row's order: each premise, reason and `todo` text as its literal's content; each condition in normalised form; a validator's class as `parsing` or `declassifying`; a waiver's threshold as written and its reason as its literal's content; a grant as `device` or `priv` followed by its modules and aliases; a device premise's class as a digest line writes it; an undoer as its canonical path |
 
 - A unit holds its digests and its `example` functions, and the units of [reliance tests](22-testing.md#reliance-tests) are in part 4.
 - Trap reports and diagnostics quote the lines of a package whose units come from an artefact from its line tables.

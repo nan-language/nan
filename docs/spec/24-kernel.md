@@ -181,7 +181,7 @@ The head of an interrupt fn has no generic parameters, `fails` or `uses wait`, i
 
 - A head of any other shape is an error (`kernel.irq-head`).
 - A body that may wait is an error (`kernel.irq-wait`), reported instead of `item.wait-missing`.
-- An interrupt fn's digest is checked as if its head stated `limits notrap, terminates, noalloc` ([limits](10-effects-digests.md#limits)). Its limits clause states only the `stack N` that [static bounds](17-suspension-io.md#static-bounds) requires; any other limit there is an error (`kernel.irq-limit`) whose exact fix deletes it.
+- An interrupt fn's digest is checked as if its head stated `limits notrap, terminates, noalloc` ([limits](10-effects-digests.md#limits)). Its limits clause states only the `stack N` that [static bounds](17-suspension-io.md#static-bounds) requires and a [class](10-effects-digests.md#reversibility); any other limit there is an error (`kernel.irq-limit`) whose exact fix deletes it.
 - An `interrupt fn` [function type](10-effects-digests.md#function-types) has the parameters and result of one form and no `fails` or `uses wait` (`kernel.irq-head`), and its limits clause states at most `stack N` (`kernel.irq-limit`). Its values carry the implied limits.
 - A call of an interrupt fn, or of a value of an `interrupt fn` type, is an error (`kernel.irq-call`).
 - `irq.complete()` ends the interrupt it serves, writing the end-of-interrupt register of the CPU's local APIC on x86_64 and of the CPU's interface of the interrupt controller on AArch64. `hw::IrqContext` is [linear](05-properties.md#linear-types), so every path completes it.

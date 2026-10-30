@@ -6,6 +6,7 @@ use std::rc::Rc;
 use super::Checker;
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::resolve::{Named, PathError};
+use super::reversibility::Class;
 use super::ty::{Arg, Args, Bound, Const, FnParam, FnTy, LimitSet, Param, Scalar, Ty};
 use crate::diagnostic::Code;
 use crate::interp::Val;
@@ -1293,9 +1294,10 @@ fn single_name(label: &ast::TypeExpr) -> Option<String> {
     }
 }
 
-/// The rules of a `limits` clause: only a stack size on an interrupt fn, each limit once,
-/// `noalloc` not beside `pure`, a stack size from 1 to 4,294,967,295 written without a suffix,
-/// and neither `pure` nor `terminates` beside `uses wait`.
+/// The rules of a `limits` clause: only a stack size and a class on an interrupt fn, each limit
+/// once and each kind of a class once, neither `noalloc` nor a class beside `pure`, a stack size
+/// from 1 to 4,294,967,295 written without a suffix, and neither `pure` nor `terminates` beside
+/// `uses wait`.
 pub fn limit_problems(
     limits: &ast::Limits,
     wait: bool,
@@ -1309,11 +1311,11 @@ pub fn limit_problems(
         .iter()
         .any(|limit| limit.kind == LimitKind::Pure);
     for limit in &limits.limits {
-        let code = if interrupt && limit.kind != LimitKind::Stack {
+        let code = if interrupt && !matches!(limit.kind, LimitKind::Stack | LimitKind::Class) {
             Some(Code::KernelIrqLimit)
         } else if seen.contains(&limit.kind) {
             Some(Code::LimitDuplicate)
-        } else if limit.kind == LimitKind::Noalloc && pure {
+        } else if matches!(limit.kind, LimitKind::Noalloc | LimitKind::Class) && pure {
             Some(Code::LimitRedundant)
         } else if limit.kind == LimitKind::Stack {
             let size = limit.size.map(&text);
@@ -1337,6 +1339,15 @@ pub fn limit_problems(
             });
         }
         seen.push(limit.kind);
+        let kinds: Vec<String> = limit.kinds.iter().map(|kind| text(*kind)).collect();
+        for (at, kind) in limit.kinds.iter().enumerate() {
+            if kinds[..at].contains(&kinds[at]) {
+                found.push(Problem {
+                    code: Code::LimitDuplicate,
+                    token: *kind,
+                });
+            }
+        }
     }
     found
 }
@@ -1360,6 +1371,10 @@ pub fn limit_set(
             LimitKind::Notrap => set.notrap = true,
             LimitKind::Terminates => set.terminates = true,
             LimitKind::Noalloc => set.noalloc = true,
+            LimitKind::Class => {
+                let kinds: Vec<String> = limit.kinds.iter().map(|kind| text(*kind)).collect();
+                set.class = Class::named(&text(limit.token), kinds.iter().map(String::as_str));
+            }
             LimitKind::Stack => {
                 set.stack = limit
                     .size

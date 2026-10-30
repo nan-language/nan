@@ -132,6 +132,7 @@ pub enum LimitKind {
     Notrap,
     Terminates,
     Noalloc,
+    Class,
     Stack,
 }
 
@@ -141,6 +142,8 @@ pub struct Limit {
     pub token: Tok,
     /// The `INT` of `stack N`.
     pub size: Option<Tok>,
+    /// The kinds of an `irreversible` class.
+    pub kinds: Vec<Tok>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +246,12 @@ pub enum ClauseKind {
     Waive {
         length: bool,
         reason: Text,
+    },
+    /// `undo` naming the undoer, as a path and the member it names through it, and its premise.
+    Undo {
+        target: Path,
+        member: Option<Name>,
+        premise: Text,
     },
 }
 

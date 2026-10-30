@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use super::{bindings, group_number, opener_spaced, punning};
+use crate::check::reversibility;
 use crate::syntax::file::{ItemSyntax, SourceFile};
 use crate::syntax::grammar::{Keyword, Punct, Rule};
 use crate::syntax::items::clause_group;
@@ -321,7 +322,11 @@ impl Facts {
                 }
                 Rule::LimitsClause => {
                     let limits: Vec<NodeId> = tree.child_nodes(node).collect();
-                    let order = ["pure", "notrap", "terminates", "noalloc", "stack"];
+                    let order = ["pure", "notrap", "terminates", "noalloc"]
+                        .into_iter()
+                        .chain(reversibility::WORDS)
+                        .chain(["stack"]);
+                    let order: Vec<&str> = order.collect();
                     facts.sort(tree, &limits, |limit| {
                         let word = text(tree.span(*limit).expect("a limit").0);
                         (
@@ -329,6 +334,17 @@ impl Facts {
                                 .iter()
                                 .position(|name| *name == word)
                                 .unwrap_or(order.len()) as u8,
+                            String::new(),
+                        )
+                    });
+                }
+                Rule::Reversibility => {
+                    let kinds: Vec<NodeId> = tree.child_nodes(node).collect();
+                    facts.sort(tree, &kinds, |kind| {
+                        let word = text(tree.span(*kind).expect("a kind").0);
+                        let order = reversibility::KINDS.iter().position(|name| *name == word);
+                        (
+                            order.unwrap_or(reversibility::KINDS.len()) as u8,
                             String::new(),
                         )
                     });

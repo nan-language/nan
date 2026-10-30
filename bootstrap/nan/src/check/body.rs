@@ -1389,7 +1389,9 @@ impl Body<'_, '_> {
                 });
                 None
             }
-            ast::ClauseKind::Missing | ast::ClauseKind::Waive { .. } => None,
+            ast::ClauseKind::Missing
+            | ast::ClauseKind::Waive { .. }
+            | ast::ClauseKind::Undo { .. } => None,
         };
         if let Some((role, expr)) = typed {
             self.clauses.push(TClause {

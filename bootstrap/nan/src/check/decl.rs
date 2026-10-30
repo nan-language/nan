@@ -491,6 +491,7 @@ impl Checker<'_> {
             self.check_expect_purity(item, &body);
             if let ItemKind::Fn(function) = &ast.kind {
                 self.check_decreases(item, function);
+                self.check_undo(item, function);
             }
             if let ItemKind::Test(test) = &ast.kind {
                 self.check_property_test(item, test, &body);

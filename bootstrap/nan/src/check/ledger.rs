@@ -1,6 +1,6 @@
 //! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns,
-//! validators and declassifying decoders, `device` and `priv` grants, waivers, `todo` and `dbg`,
-//! each with its line and parts.
+//! validators and declassifying decoders, `device` and `priv` grants, waivers, `todo`, `dbg`,
+//! device premises and undo clauses, each with its line and parts.
 
 use super::Checker;
 use super::db::{ItemId, PackageId};
@@ -23,6 +23,8 @@ pub enum Kind {
     Waiver,
     Todo,
     Dbg,
+    Class,
+    Undo,
 }
 
 impl Kind {
@@ -38,6 +40,8 @@ impl Kind {
             Kind::Waiver => "waiver",
             Kind::Todo => "todo",
             Kind::Dbg => "dbg",
+            Kind::Class => "class",
+            Kind::Undo => "undo",
         }
     }
 
@@ -135,15 +139,41 @@ impl Checker<'_> {
                     );
                 }
                 for clause in &function.clauses {
-                    if let ClauseKind::Waive { length, reason } = &clause.kind {
-                        let threshold = if *length { "length" } else { "depth" };
-                        add(
-                            Kind::Waiver,
-                            data.line(clause.token),
-                            vec![threshold.to_owned(), reason.value.clone()],
-                            false,
-                        );
+                    match &clause.kind {
+                        ClauseKind::Waive { length, reason } => {
+                            let threshold = if *length { "length" } else { "depth" };
+                            add(
+                                Kind::Waiver,
+                                data.line(clause.token),
+                                vec![threshold.to_owned(), reason.value.clone()],
+                                false,
+                            );
+                        }
+                        ClauseKind::Undo {
+                            target,
+                            member,
+                            premise,
+                        } => {
+                            let undoer = match self.undoer(item, target, member.as_ref()) {
+                                Some(undoer) => self.db.canonical(undoer),
+                                None => match member {
+                                    Some(member) => format!("{}.{}", target.written(), member.text),
+                                    None => target.written(),
+                                },
+                            };
+                            add(
+                                Kind::Undo,
+                                data.line(clause.token),
+                                vec![undoer, premise.value.clone()],
+                                true,
+                            );
+                        }
+                        _ => {}
                     }
+                }
+                for (token, class) in self.device_premises(item) {
+                    let line = token.map_or(head_line, |token| data.line(token));
+                    add(Kind::Class, line, vec![class.text()], true);
                 }
             }
             ItemKind::Struct(_) | ItemKind::Enum(_) => {

@@ -45,7 +45,7 @@ pub enum Entry {
 }
 
 /// The ledger kinds of trust escapes, as `escape` entries write them.
-pub const ESCAPE_KINDS: [&str; 7] = [
+pub const ESCAPE_KINDS: [&str; 9] = [
     "trusted",
     "assume",
     "foreign",
@@ -53,6 +53,8 @@ pub const ESCAPE_KINDS: [&str; 7] = [
     "validator",
     "decoder",
     "grant",
+    "class",
+    "undo",
 ];
 
 impl Entry {

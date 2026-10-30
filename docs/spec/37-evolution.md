@@ -173,7 +173,6 @@ A **reservation** is a word, syntax, name, format or seam space that language 1 
 | framing of record fields by key, and by length in `mem::wire` | format | Encode records | skipped fields are discarded | [Decoding rules](13-text-encode.md#decoding-rules) |
 | sections native cache and availability | format | an artefact | `artefact.reserved-section` | [Sections](30-artefacts.md#sections) |
 | registry snapshot and policy floor fields | format | the lock | `format.reserved-field` | [Lock](35-format.md#lock) |
-| reversibility field | format | a digest | never written | [Reserved field](10-effects-digests.md#reserved-field) |
 | algorithm tags other than `0x01` | format | a hash | the bytes are no hash | [Hash values](29-identity-versioning.md#hash-values) |
 | codegen values other than the base instruction set | format | a descriptor | never selected | [Descriptors](27-program-model.md#descriptors) |
 | the user-origin seams, `hw::Vector.user` and `hw::SyscallEntry.handler` | seam | an exception raised in user mode, and the system call instruction | contributions are checked; the seams are never entered | [User exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) |

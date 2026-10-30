@@ -115,9 +115,10 @@ fn named_type(out: &mut Vec<u8>, path: &str) {
     text(out, path);
 }
 
-/// The position of each limit word in the `limit` rule, with `stack`'s size.
-fn limit_words(limits: &LimitSet) -> Vec<(u64, Option<u64>)> {
-    let mut words: Vec<(u64, Option<u64>)> = [
+/// The position of each limit in the `limit` rule, with the encoding of `stack`'s size or of
+/// the class.
+fn limit_words(limits: &LimitSet) -> Vec<(u64, Option<Vec<u8>>)> {
+    let mut words: Vec<(u64, Option<Vec<u8>>)> = [
         limits.pure,
         limits.notrap,
         limits.terminates,
@@ -128,7 +129,16 @@ fn limit_words(limits: &LimitSet) -> Vec<(u64, Option<u64>)> {
     .filter(|(_, holds)| *holds)
     .map(|(position, _)| (position as u64, None))
     .collect();
-    words.extend(limits.stack.map(|size| (4, Some(size))));
+    words.extend(limits.stack.map(|size| {
+        let mut content = Vec::new();
+        number(&mut content, size);
+        (4, Some(content))
+    }));
+    words.extend(limits.class.map(|class| {
+        let mut content = Vec::new();
+        class.encode(&mut content);
+        (5, Some(content))
+    }));
     words
 }
 
@@ -138,7 +148,8 @@ pub struct Encoder<'n> {
 }
 
 impl Encoder<'_> {
-    /// A limits clause: a list of its entries, each a record of its word and `stack`'s size.
+    /// A limits clause: a list of its entries, each a record of its word and `stack`'s size or
+    /// the class.
     pub fn limits(&self, limits: &LimitSet) -> Vec<u8> {
         let mut out = Vec::new();
         list(
@@ -149,9 +160,7 @@ impl Encoder<'_> {
                 let mut content = Vec::new();
                 number(&mut content, word);
                 entry.field(1, content);
-                if let Some(size) = size {
-                    let mut content = Vec::new();
-                    number(&mut content, size);
+                if let Some(content) = size {
                     entry.field(2, content);
                 }
                 out.extend(entry.finish());

@@ -42,6 +42,7 @@ mod references;
 mod registry;
 pub(crate) mod requires;
 mod resolve;
+pub(crate) mod reversibility;
 mod rewrite;
 pub(crate) mod root;
 mod runs;

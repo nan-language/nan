@@ -208,7 +208,7 @@ summary_entry = 'capability' TEXT
     | 'priv'
     | "validator" TEXT
     | 'escape' escape_kind TEXT ;
-escape_kind = "trusted" | "assume" | "foreign" | "landing" | "validator" | 'decoder' | 'grant' ;
+escape_kind = "trusted" | "assume" | "foreign" | "landing" | "validator" | 'decoder' | 'grant' | 'class' | 'undo' ;
 ```
 
 The records hold the fields of the lock that [Lock](29-identity-versioning.md#lock) defines:

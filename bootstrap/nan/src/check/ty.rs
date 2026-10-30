@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::db::ItemId;
+use super::reversibility::Class;
 use crate::syntax::ast::{FnKind, Mode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -164,13 +165,14 @@ impl Arg {
 
 pub type Args = Rc<[Arg]>;
 
-/// The demands of a `limits` clause, without `stack N`.
+/// The demands of a `limits` clause.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LimitSet {
     pub pure: bool,
     pub notrap: bool,
     pub terminates: bool,
     pub noalloc: bool,
+    pub class: Option<Class>,
     pub stack: Option<u64>,
 }
 

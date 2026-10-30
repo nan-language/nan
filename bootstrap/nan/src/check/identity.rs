@@ -371,7 +371,7 @@ impl Checker<'_> {
     }
 
     /// Whether an item is visible wherever a function is.
-    fn seen_with(&self, named: ItemId, function: ItemId) -> bool {
+    pub(super) fn seen_with(&self, named: ItemId, function: ItemId) -> bool {
         let named = self.db.ast(named).visibility;
         match self.db.ast(function).visibility {
             Visibility::Private => true,

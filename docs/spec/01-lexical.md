@@ -287,7 +287,8 @@ The context words of language 1 are exactly these:
 | `closed`, `open`, `view` | type [modifiers](02-items.md#modifiers) |
 | `wait` | `uses wait` ([waiting](10-effects-digests.md#waiting)) |
 | `task` | `task fn` [function types](10-effects-digests.md#function-types) |
-| `pure`, `notrap`, `terminates`, `noalloc`, `stack` | [limits](10-effects-digests.md#limits) clauses |
+| `pure`, `notrap`, `terminates`, `noalloc`, `stack`, `traceless`, `recorded`, `restorable`, `irreversible`, `emit`, `actuate`, `erase`, `spend` | [limits](10-effects-digests.md#limits) clauses |
+| `undo` | [undo](10-effects-digests.md#compensation) clauses |
 | `convention` | [calling conventions](23-low-level.md#calling-conventions) |
 | `bit`, `rest`, `bytes`, `le`, `be`, `tags`, `at` | [layouts](23-low-level.md#layouts) |
 | `at`, `stride`, `read`, `write`, `write_one_clear` | [registers](23-low-level.md#registers) items |

@@ -22,7 +22,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | --- | --- |
 | `bootstrap/` | The Rust code: a Cargo workspace (with its lock, pinned Rust toolchain and nextest configuration in `.config/`) of one crate per directory, the bootstrap compiler in `nan/` and nanbench in `nanbench/` |
 | `bootstrap/nan/src/` | Source of the `nan` binary; a module's unit tests live in `<module>/tests.rs` beside it |
-| `bootstrap/nan/tests/` | The conformance, program, milestone and self-check harnesses; `programs/` holds one program per directory with its `expected` output, `milestones/` one scenario workspace per milestone |
+| `bootstrap/nan/tests/` | The conformance, program, milestone and self-check harnesses; `programs/` holds one program per directory with its `expected` output and, for extra emulator arguments per boot, an `emulator` file, `milestones/` one scenario workspace per milestone |
 | `std/` | The std packages, one directory per package |
 | `toolchain/` | The NaN toolchain, a workspace of one package, `nan` |
 | `bootstrap/nanbench/` | The benchmark gating language versions: its crate in `src/`, the task corpus in `tasks/` (one directory per task), the benchmark programs in `bench/` and the published results in `results/` |

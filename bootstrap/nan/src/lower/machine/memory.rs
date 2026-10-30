@@ -1,6 +1,8 @@
-//! The physical memory of a machine image: the usable memory its platform lists, and the boot
-//! area, which holds the boot heap and then the runtime tables `Init` sets up. A bare target
-//! carves the boot area from usable memory as it starts; a UEFI target's image reserves it.
+//! The physical memory of a machine image: the usable memory its platform lists, the boot area,
+//! which holds the boot heap and then the runtime tables `Init` sets up, and the tables extending
+//! the entry root over usable memory above 4 GiB. A bare target carves the boot area, with those
+//! tables at its end, from usable memory as it starts; a UEFI target's image reserves the boot
+//! area, and `exit_services` carves the tables alone.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_frontend::Variable;
@@ -8,13 +10,24 @@ use cranelift_frontend::Variable;
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::memory::CHUNK;
-use super::super::runtime::{state, system};
-use super::MAPPED;
+use super::super::runtime::{report, state, system};
 use super::heap::{self, BOOT_HEAP};
+use super::{
+    A64_ACCESS, A64_ATTR_NORMAL, A64_INNER, A64_TABLE, A64_VALID, LARGE, MAPPED, PRESENT, Stub,
+    WRITABLE,
+};
 use crate::workspace::{Arch, Kind, Target};
 
-/// The bytes of the boot area: the boot heap, then the runtime tables.
-pub const BOOT_AREA: u64 = BOOT_HEAP + system::TABLE_BYTES;
+/// The bytes of the boot area: the boot heap, then the runtime tables, to a whole page.
+pub const BOOT_AREA: u64 = (BOOT_HEAP + system::TABLE_BYTES).next_multiple_of(TABLE);
+
+/// The bytes of a page table, and the bytes an entry of its upper tables maps: a gigabyte.
+const TABLE: u64 = 4_096;
+const GIGABYTE: u64 = 1 << 30;
+
+/// The memory the entry root can map at its physical addresses: the lower half of the 48-bit
+/// address space, below 128 TiB.
+const REACHABLE: u64 = 1 << 47;
 
 /// The first mebibyte, which usable memory leaves out on x86_64.
 const LOW_MEMORY: i64 = 0x10_0000;
@@ -71,6 +84,17 @@ mod device_tree {
 /// and last address plus one; the range may be empty.
 type Visit<'a> = &'a mut dyn FnMut(&mut Lowering, &mut Fx, Value, Value);
 
+/// The extension of the entry root over usable memory above 4 GiB: the gigabytes it maps from
+/// address zero, the upper tables it adds past the root's own, on x86_64 whether the CPU maps
+/// 1 GiB pages, and the bytes of the tables it adds.
+#[derive(Clone, Copy)]
+struct Extension {
+    gigabytes: Value,
+    uppers: Value,
+    pages: Option<Value>,
+    bytes: Value,
+}
+
 impl Lowering<'_, '_> {
     /// `Init`'s placement of the boot area, aligned to a chunk, whose address it records in the
     /// runtime state and gives: carved on a bare target, reserved by the image on a UEFI target.
@@ -91,30 +115,175 @@ impl Lowering<'_, '_> {
         (area, fx.offset(area, BOOT_AREA))
     }
 
-    /// The boot area at the lowest chunk-aligned address of usable memory outside the image from
-    /// which it fits in usable memory, its tables zero-filled; `Init` returns 1 when none is.
+    /// The first address and last address plus one of the tables extending the entry root.
+    pub fn entry_tables_extent(&mut self, fx: &mut Fx) -> (Value, Value) {
+        let state_address = self.state(fx);
+        let tables = fx.load(PTR, state_address, state::ENTRY_TABLES);
+        let end = fx.load(PTR, state_address, state::ENTRY_TABLES_END);
+        (tables, end)
+    }
+
+    /// The boot area with the tables extending the entry root at its end, carved outside the
+    /// image, its runtime tables zero-filled; `Init` returns 1 when no usable memory holds it.
+    /// Extends the entry root, which the entry seam installed, and on AArch64 installs it again so
+    /// that its walks see the tables written.
     fn carve_boot_area(&mut self, fx: &mut Fx) -> Value {
+        let extension = self.root_extension(fx);
         let image = self.image_extent(fx);
+        let bytes = fx.b.ins().iadd_imm_s(extension.bytes, BOOT_AREA as i64);
+        let area = self.carve(fx, bytes, &[image]);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, area, -1);
+        system::unavailable_if(fx, missing);
+        let tables = fx.offset(area, BOOT_HEAP);
+        let len = fx.ptr(system::TABLE_BYTES);
+        heap::clear(self, fx, tables, len);
+        let root_tables = fx.offset(area, BOOT_AREA);
+        self.write_root_extension(fx, extension, root_tables);
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            let root = self.entry_root();
+            let root = self.data_address(fx, root);
+            self.call_stub(fx, Stub::WriteTtbr0, &[root]);
+        }
+        area
+    }
+
+    /// `exit_services`'s extension of the entry root before installing it, with its tables carved
+    /// from usable memory outside the image, trapping (`trap.exhausted`) when none holds them.
+    pub fn extend_entry_root(&mut self, fx: &mut Fx) {
+        let extension = self.root_extension(fx);
+        let image = self.image_extent(fx);
+        let tables = self.carve(fx, extension.bytes, &[image]);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, tables, -1);
+        fx.when(missing, |fx| report::raise_kind(self, fx, "trap.exhausted"));
+        self.write_root_extension(fx, extension, tables);
+    }
+
+    /// The lowest chunk-aligned address of usable memory outside the `held` ranges from which
+    /// `bytes` lie wholly in that usable memory below 4 GiB, where the entry root's own tables
+    /// map them; all ones when there is none.
+    fn carve(&mut self, fx: &mut Fx, bytes: Value, held: &[(Value, Value)]) -> Value {
         let none = fx.ptr(u64::MAX);
         let lowest = fx.var(PTR, none);
-        self.usable_memory(fx, &[image], &mut |_, fx, base, end| {
+        let mapped = fx.ptr(MAPPED);
+        self.usable_memory(fx, held, &mut |_, fx, base, end| {
             let bumped = fx.b.ins().iadd_imm_s(base, CHUNK as i64 - 1);
             let aligned = fx.b.ins().band_imm_s(bumped, -(CHUNK as i64));
-            let top = fx.offset(aligned, BOOT_AREA);
-            let fits = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, end);
+            let top = fx.b.ins().iadd(aligned, bytes);
+            let below = fx.b.ins().umin(end, mapped);
+            let fits = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, below);
             let held = fx.b.use_var(lowest);
             let lower = fx.b.ins().icmp(IntCC::UnsignedLessThan, aligned, held);
             let chosen = fx.b.ins().band(fits, lower);
             let next = fx.b.ins().select(chosen, aligned, held);
             fx.b.def_var(lowest, next);
         });
-        let area = fx.b.use_var(lowest);
-        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, area, -1);
-        system::unavailable_if(fx, missing);
-        let tables = fx.offset(area, BOOT_HEAP);
-        let len = fx.ptr(system::TABLE_BYTES);
-        heap::clear(self, fx, tables, len);
-        area
+        fx.b.use_var(lowest)
+    }
+
+    /// The extension of the entry root over the usable memory the platform lists above 4 GiB, up
+    /// to its end rounded up to a gigabyte: its upper tables, one per 512 GiB past the root's own,
+    /// and on x86_64, when the CPU maps no 1 GiB pages, a page directory per gigabyte past 4 GiB.
+    fn root_extension(&mut self, fx: &mut Fx) -> Extension {
+        let floor = fx.ptr(MAPPED);
+        let top = fx.var(PTR, floor);
+        self.usable_memory(fx, &[], &mut |_, fx, base, end| {
+            let held = fx.b.use_var(top);
+            let present = fx.b.ins().icmp(IntCC::UnsignedLessThan, base, end);
+            let higher = fx.b.ins().umax(held, end);
+            let next = fx.b.ins().select(present, higher, held);
+            fx.b.def_var(top, next);
+        });
+        let top = fx.b.use_var(top);
+        let bumped = fx.b.ins().iadd_imm_s(top, GIGABYTE as i64 - 1);
+        let gigabytes = fx.b.ins().ushr_imm_s(bumped, 30);
+        let bumped = fx.b.ins().iadd_imm_s(gigabytes, 511);
+        let spanned = fx.b.ins().ushr_imm_s(bumped, 9);
+        let uppers = fx.b.ins().iadd_imm_s(spanned, -1);
+        let (pages, tables) = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => (None, uppers),
+            _ => {
+                let pages = self.call_stub(fx, Stub::GigabytePages, &[])[0];
+                let zero = fx.ptr(0);
+                let past =
+                    fx.b.ins()
+                        .iadd_imm_s(gigabytes, -((MAPPED / GIGABYTE) as i64));
+                let directories = fx.b.ins().select(pages, zero, past);
+                (Some(pages), fx.b.ins().iadd(uppers, directories))
+            }
+        };
+        let bytes = fx.b.ins().ishl_imm_s(tables, 12);
+        Extension {
+            gigabytes,
+            uppers,
+            pages,
+            bytes,
+        }
+    }
+
+    /// Extends the entry root in place over the gigabytes past the first 4 that `extension` maps,
+    /// with its tables at `tables`, zero-filled first, whose extent it records in the runtime
+    /// state. Each gigabyte gets an entry in its upper table, the root's own for the first
+    /// 512 GiB: on AArch64 a 1 GiB block, on x86_64 a 1 GiB page or, when the CPU maps none, a
+    /// page directory of 2 MiB pages, the directories following the upper tables.
+    fn write_root_extension(&mut self, fx: &mut Fx, extension: Extension, tables: Value) {
+        let state_address = self.state(fx);
+        fx.store(tables, state_address, state::ENTRY_TABLES);
+        let end = fx.b.ins().iadd(tables, extension.bytes);
+        fx.store(end, state_address, state::ENTRY_TABLES_END);
+        heap::clear(self, fx, tables, extension.bytes);
+        let root = self.entry_root();
+        let root = self.data_address(fx, root);
+        let own = fx.offset(root, TABLE);
+        let skipped = fx.b.ins().ishl_imm_s(extension.uppers, 12);
+        let directories = fx.b.ins().iadd(tables, skipped);
+        let (link, block) = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => (
+                A64_VALID | A64_TABLE,
+                A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL,
+            ),
+            _ => (WRITABLE | PRESENT, LARGE | WRITABLE | PRESENT),
+        };
+        let first = fx.ptr(MAPPED / GIGABYTE);
+        fx.each(first, extension.gigabytes, |fx, gigabyte| {
+            let index = fx.b.ins().ushr_imm_s(gigabyte, 9);
+            let offset = fx.b.ins().ishl_imm_s(index, 12);
+            let added = fx.b.ins().iadd(tables, offset);
+            let added = fx.b.ins().iadd_imm_s(added, -(TABLE as i64));
+            let first_upper = fx.b.ins().icmp_imm_s(IntCC::Equal, index, 0);
+            let upper = fx.b.ins().select(first_upper, own, added);
+            let linked = fx.b.ins().bor_imm_s(upper, link as i64);
+            let slot = fx.b.ins().ishl_imm_s(index, 3);
+            let slot = fx.b.ins().iadd(root, slot);
+            fx.store(linked, slot, 0);
+            let address = fx.b.ins().ishl_imm_s(gigabyte, 30);
+            let mut entry = fx.b.ins().bor_imm_s(address, block as i64);
+            if let Some(pages) = extension.pages {
+                let past =
+                    fx.b.ins()
+                        .iadd_imm_s(gigabyte, -((MAPPED / GIGABYTE) as i64));
+                let past = fx.b.ins().ishl_imm_s(past, 12);
+                let directory = fx.b.ins().iadd(directories, past);
+                let small = fx.b.ins().icmp_imm_s(IntCC::Equal, pages, 0);
+                fx.when(small, |fx| {
+                    let zero = fx.ptr(0);
+                    let count = fx.ptr(TABLE / 8);
+                    fx.each(zero, count, |fx, page| {
+                        let offset = fx.b.ins().ishl_imm_s(page, 21);
+                        let at = fx.b.ins().iadd(address, offset);
+                        let large = fx.b.ins().bor_imm_s(at, block as i64);
+                        let slot = fx.b.ins().ishl_imm_s(page, 3);
+                        let slot = fx.b.ins().iadd(directory, slot);
+                        fx.store(large, slot, 0);
+                    });
+                });
+                let linked = fx.b.ins().bor_imm_s(directory, link as i64);
+                entry = fx.b.ins().select(pages, entry, linked);
+            }
+            let within = fx.b.ins().band_imm_s(gigabyte, 511);
+            let within = fx.b.ins().ishl_imm_s(within, 3);
+            let slot = fx.b.ins().iadd(upper, within);
+            fx.store(entry, slot, 0);
+        });
     }
 
     /// The boot area in the zeroed data the image reserves for it with one chunk more, so that it
@@ -125,12 +294,11 @@ impl Lowering<'_, '_> {
         fx.b.ins().band_imm_s(bumped, -(CHUNK as i64))
     }
 
-    /// Visits the usable memory the platform lists below the 4 GiB the entry root maps, in its
-    /// parts outside the `held` ranges, outside the first MiB on x86_64 and outside the device
-    /// tree and the ranges it reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the
-    /// usable entries of the start information's memory map, on `aarch64-bare`, the ranges of the
-    /// device tree's memory nodes and, on a UEFI target, the usable entries of the firmware's
-    /// final memory map.
+    /// Visits the usable memory the platform lists below 128 TiB, in its parts outside the `held`
+    /// ranges, outside the first MiB on x86_64 and outside the device tree and the ranges it
+    /// reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the usable entries of the
+    /// start information's memory map, on `aarch64-bare`, the ranges of the device tree's memory
+    /// nodes and, on a UEFI target, the usable entries of the firmware's final memory map.
     pub fn usable_memory(&mut self, fx: &mut Fx, held: &[(Value, Value)], visit: Visit) {
         let state_address = self.state(fx);
         match self.ck.db.target {
@@ -190,7 +358,7 @@ impl Lowering<'_, '_> {
 
 /// Visits the parts of the usable memory `range` outside the `held` ranges and the ranges the
 /// device tree's memory reservation block at `reserved` lists, clipped to start past the first
-/// MiB on x86_64 and to end below the 4 GiB the entry root maps. Each pass visits the part before
+/// MiB on x86_64 and to end below 128 TiB. Each pass visits the part before
 /// the one of those ranges overlapping the rest that starts lowest, then skips past that range.
 fn visit_unheld(
     lo: &mut Lowering,
@@ -207,8 +375,8 @@ fn visit_unheld(
         }
         _ => range.0,
     };
-    let mapped = fx.ptr(MAPPED);
-    let end = fx.b.ins().umin(range.1, mapped);
+    let reachable = fx.ptr(REACHABLE);
+    let end = fx.b.ins().umin(range.1, reachable);
     fx.repeat(&[base], |fx, state| {
         let rest = (state[0], end);
         let mut lowest = (end, end);

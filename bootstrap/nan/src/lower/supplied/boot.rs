@@ -67,8 +67,9 @@ fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, none);
 }
 
-/// `k.regions()`: the first time, a region for each range of usable memory outside the image and
-/// the boot area, in address order, drawn through the root allocator; an empty list after.
+/// `k.regions()`: the first time, a region for each range of usable memory outside the image, the
+/// boot area and the tables extending the entry root, in address order, drawn through the root
+/// allocator; an empty list after.
 fn regions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let grant = supply.param(0).address();
     let at = field(lo, supply, "regions");
@@ -89,7 +90,8 @@ fn regions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.when(first, |fx| {
         let image = lo.image_extent(fx);
         let area = lo.boot_area_extent(fx);
-        lo.usable_memory(fx, &[image, area], &mut |lo, fx, base, end| {
+        let tables = lo.entry_tables_extent(fx);
+        lo.usable_memory(fx, &[image, area, tables], &mut |lo, fx, base, end| {
             push_region(lo, fx, list, element, base, end);
         });
     });

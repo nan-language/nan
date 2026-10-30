@@ -1028,6 +1028,7 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let dir = base().join("programs").join(name);
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
     fs::remove_file(dir.join(name).join("expected"))?;
+    drop(fs::remove_file(dir.join(name).join("emulator")));
     compare(&toolchain, &dir, &store, &["build", name])?;
     let manifest = fs::read_to_string(dir.join(name).join("package.nan"))?;
     let target = manifest

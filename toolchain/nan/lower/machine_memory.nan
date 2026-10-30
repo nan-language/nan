@@ -1,7 +1,16 @@
-//! The physical memory of a machine image: the usable memory its platform lists, and the boot area, which holds the boot heap and then the runtime tables `Init` sets up. A bare target carves the boot area from usable memory as it starts; a UEFI target's image reserves it.
+//! The physical memory of a machine image: the usable memory its platform lists, the boot area, which holds the boot heap and then the runtime tables `Init` sets up, and the tables extending the entry root over usable memory above 4 GiB. A bare target carves the boot area, with those tables at its end, from usable memory as it starts; a UEFI target's image reserves the boot area, and `exit_services` carves the tables alone.
 
-/// The bytes of the boot area: the boot heap, then the runtime tables.
-const BOOT_AREA: u64 = BOOT_HEAP + RUNTIME_SYSTEM_TABLE_BYTES
+/// The bytes of the boot area: the boot heap, then the runtime tables, to a whole page.
+const BOOT_AREA: u64 = next_multiple_of(BOOT_HEAP + RUNTIME_SYSTEM_TABLE_BYTES, multiple: PAGE_TABLE)
+
+/// The bytes of a page table, and the bytes an entry of its upper tables maps: a gigabyte.
+const PAGE_TABLE: u64 = 4_096
+
+const ONE_GIGABYTE: u64 = 1 << 30
+
+/// The memory the entry root can map at its physical addresses: the lower half of the 48-bit
+/// address space, below 128 TiB.
+const REACHABLE: u64 = 1 << 47
 
 /// The first mebibyte, which usable memory leaves out on x86_64.
 const LOW_MEMORY: i64 = 0x10_0000
@@ -79,6 +88,16 @@ const DEVICE_TREE_ADDRESS_CELLS: u64 = 2
 
 const DEVICE_TREE_SIZE_CELLS: u64 = 1
 
+/// The extension of the entry root over usable memory above 4 GiB: the gigabytes it maps from
+/// address zero, the upper tables it adds past the root's own, on x86_64 whether the CPU maps
+/// 1 GiB pages, and the bytes of the tables it adds.
+struct RootExtension derives Copy {
+    gigabytes: clif::Value
+    uppers: clif::Value
+    pages: Option[clif::Value]
+    bytes: clif::Value
+} RootExtension
+
 /// `Init`'s placement of the boot area, aligned to a chunk, whose address it records in the
 /// runtime state and gives: carved on a bare target, reserved by the image on a UEFI target.
 fn Lowering.boot_area(mut self, mut fx: Fx) -> clif::Value {
@@ -98,31 +117,172 @@ fn Lowering.boot_area_extent(mut self, mut fx: Fx) -> Extent {
     return Extent(start: area, end: mut fx.offset(area, offset: BOOT_AREA))
 } Lowering.boot_area_extent
 
-/// The boot area at the lowest chunk-aligned address of usable memory outside the image from
-/// which it fits in usable memory, its tables zero-filled; `Init` returns 1 when none is.
+/// The first address and last address plus one of the tables extending the entry root.
+fn Lowering.entry_tables_extent(mut self, mut fx: Fx) -> Extent {
+    let state_address = mut self.state(mut fx)
+    let tables = mut fx.load(PTR, addr: state_address, offset: STATE_ENTRY_TABLES)
+    let end = mut fx.load(PTR, addr: state_address, offset: STATE_ENTRY_TABLES_END)
+    return Extent(start: tables, end: end)
+} Lowering.entry_tables_extent
+
+/// The boot area with the tables extending the entry root at its end, carved outside the image,
+/// its runtime tables zero-filled; `Init` returns 1 when no usable memory holds it. Extends the
+/// entry root, which the entry seam installed, and on AArch64 installs it again so that its walks
+/// see the tables written.
 fn Lowering.carve_boot_area(mut self, mut fx: Fx) -> clif::Value {
+    let extension = mut self.root_extension(mut fx)
     let image = mut self.image_extent(mut fx)
-    let none = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
-    let lowest = mut fx.variable(PTR, initial: none)
-    mut self.usable_memory(mut fx, held: Array[Extent, 1].filled(image).view(), visit: fn(mut lo1: Lowering, mut fx1: Fx, base: clif::Value, end: clif::Value) {
-        let bumped = mut fx1.b.iadd_imm_s(base, y: i64.fit(MEMORY_CHUNK) - 1)
-        let aligned = mut fx1.b.band_imm_s(bumped, y: -i64.fit(MEMORY_CHUNK))
-        let top = mut fx1.offset(aligned, offset: BOOT_AREA)
-        let fits = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: top, y: end)
-        let held = mut fx1.b.use_var(lowest)
-        let lower = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: aligned, y: held)
-        let chosen = mut fx1.b.band(fits, y: lower)
-        let next = mut fx1.b.select(chosen, x: aligned, y: held)
-        mut fx1.b.def_var(lowest, val: next)
-    })
-    let area = mut fx.b.use_var(lowest)
+    let bytes = mut fx.b.iadd_imm_s(extension.bytes, y: i64.fit(BOOT_AREA))
+    let area = mut self.carve(mut fx, bytes, held: Array[Extent, 1].filled(image).view())
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: area, y: -1)
     unavailable_if(mut fx, condition: missing)
     let tables = mut fx.offset(area, offset: BOOT_HEAP)
     let len = mut fx.ptr(RUNTIME_SYSTEM_TABLE_BYTES)
     heap_clear(mut self, mut fx, base: tables, len)
+    let root_tables = mut fx.offset(area, offset: BOOT_AREA)
+    mut self.write_root_extension(mut fx, extension, tables: root_tables)
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        let root_data = mut self.entry_root()
+        let root = mut self.data_address(mut fx, id: root_data)
+        discard mut self.call_stub(mut fx, stub: Stub.WriteTtbr0, args: Array[clif::Value, 1].filled(root).view())
+    }
     return area
 } Lowering.carve_boot_area
+
+/// `exit_services`'s extension of the entry root before installing it, with its tables carved
+/// from usable memory outside the image, trapping (`trap.exhausted`) when none holds them.
+fn Lowering.extend_entry_root(mut self, mut fx: Fx) {
+    let extension = mut self.root_extension(mut fx)
+    let image = mut self.image_extent(mut fx)
+    let tables = mut self.carve(mut fx, bytes: extension.bytes, held: Array[Extent, 1].filled(image).view())
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: tables, y: -1)
+    mut fx.if_true(missing, then: fn[mut self](mut fx1: Fx) {
+        raise_kind(mut self, fx: mut fx1, kind: "trap.exhausted")
+    })
+    mut self.write_root_extension(mut fx, extension, tables)
+} Lowering.extend_entry_root
+
+/// The lowest chunk-aligned address of usable memory outside the `held` ranges from which
+/// `bytes` lie wholly in that usable memory below 4 GiB, where the entry root's own tables map
+/// them; all ones when there is none.
+fn Lowering.carve(mut self, mut fx: Fx, bytes: clif::Value, held: Slice[Extent]) -> clif::Value {
+    let none = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+    let lowest = mut fx.variable(PTR, initial: none)
+    let mapped = mut fx.ptr(MACHINE_MAPPED)
+    mut self.usable_memory(mut fx, held, visit: fn(mut lo1: Lowering, mut fx1: Fx, base: clif::Value, end: clif::Value) {
+        let bumped = mut fx1.b.iadd_imm_s(base, y: i64.fit(MEMORY_CHUNK) - 1)
+        let aligned = mut fx1.b.band_imm_s(bumped, y: -i64.fit(MEMORY_CHUNK))
+        let top = mut fx1.b.iadd(aligned, y: bytes)
+        let below = mut fx1.b.umin(end, y: mapped)
+        let fits = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: top, y: below)
+        let lowest_held = mut fx1.b.use_var(lowest)
+        let lower = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: aligned, y: lowest_held)
+        let chosen = mut fx1.b.band(fits, y: lower)
+        let next = mut fx1.b.select(chosen, x: aligned, y: lowest_held)
+        mut fx1.b.def_var(lowest, val: next)
+    })
+    return mut fx.b.use_var(lowest)
+} Lowering.carve
+
+/// The extension of the entry root over the usable memory the platform lists above 4 GiB, up to
+/// its end rounded up to a gigabyte: its upper tables, one per 512 GiB past the root's own, and
+/// on x86_64, when the CPU maps no 1 GiB pages, a page directory per gigabyte past 4 GiB.
+fn Lowering.root_extension(mut self, mut fx: Fx) -> RootExtension {
+    let floor = mut fx.ptr(MACHINE_MAPPED)
+    let top = mut fx.variable(PTR, initial: floor)
+    mut self.usable_memory(mut fx, held: mem::List[Extent].empty(self.alloc).view(), visit: fn(mut lo1: Lowering, mut fx1: Fx, base: clif::Value, end: clif::Value) {
+        let top_held = mut fx1.b.use_var(top)
+        let present = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: base, y: end)
+        let higher = mut fx1.b.umax(top_held, y: end)
+        let next = mut fx1.b.select(present, x: higher, y: top_held)
+        mut fx1.b.def_var(top, val: next)
+    })
+    let top_value = mut fx.b.use_var(top)
+    let bumped = mut fx.b.iadd_imm_s(top_value, y: i64.fit(ONE_GIGABYTE) - 1)
+    let gigabytes = mut fx.b.ushr_imm_s(bumped, y: 30)
+    let bumped_gigabytes = mut fx.b.iadd_imm_s(gigabytes, y: 511)
+    let spanned = mut fx.b.ushr_imm_s(bumped_gigabytes, y: 9)
+    let uppers = mut fx.b.iadd_imm_s(spanned, y: -1)
+    var pages: Option[clif::Value] = None
+    var tables = uppers
+    if self.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        let given = mut self.call_stub(mut fx, stub: Stub.GigabytePages, args: mem::List[clif::Value].empty(fx.alloc).view())
+        expect given.len() > 0
+        let zero_value = mut fx.ptr(0)
+        let past = mut fx.b.iadd_imm_s(gigabytes, y: -i64.fit(MACHINE_MAPPED / ONE_GIGABYTE))
+        let directories = mut fx.b.select(given[0], x: zero_value, y: past)
+        pages = Some(given[0])
+        tables = mut fx.b.iadd(uppers, y: directories)
+    }
+    let bytes = mut fx.b.ishl_imm_s(tables, y: 12)
+    return RootExtension(gigabytes: gigabytes, uppers: uppers, pages: pages, bytes: bytes)
+} Lowering.root_extension
+
+/// Extends the entry root in place over the gigabytes past the first 4 that `extension` maps,
+/// with its tables at `tables`, zero-filled first, whose extent it records in the runtime state.
+/// Each gigabyte gets an entry in its upper table, the root's own for the first 512 GiB: on
+/// AArch64 a 1 GiB block, on x86_64 a 1 GiB page or, when the CPU maps none, a page directory of
+/// 2 MiB pages, the directories following the upper tables.
+fn Lowering.write_root_extension(mut self, mut fx: Fx, extension: RootExtension, tables: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    mut fx.store(tables, addr: state_address, offset: STATE_ENTRY_TABLES)
+    let end = mut fx.b.iadd(tables, y: extension.bytes)
+    mut fx.store(end, addr: state_address, offset: STATE_ENTRY_TABLES_END)
+    heap_clear(mut self, mut fx, base: tables, len: extension.bytes)
+    let root_data = mut self.entry_root()
+    let root = mut self.data_address(mut fx, id: root_data)
+    let own = mut fx.offset(root, offset: PAGE_TABLE)
+    let skipped = mut fx.b.ishl_imm_s(extension.uppers, y: 12)
+    let directories = mut fx.b.iadd(tables, y: skipped)
+    var link = MACHINE_WRITABLE | MACHINE_PRESENT
+    var block = MACHINE_LARGE | MACHINE_WRITABLE | MACHINE_PRESENT
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        link = A64_VALID | A64_TABLE
+        block = A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL
+    }
+    let start = mut fx.ptr(MACHINE_MAPPED / ONE_GIGABYTE)
+    mut fx.each(start, end: extension.gigabytes, body: fn(mut fx1: Fx, gigabyte: clif::Value) {
+        let index = mut fx1.b.ushr_imm_s(gigabyte, y: 9)
+        let offset = mut fx1.b.ishl_imm_s(index, y: 12)
+        let added_at = mut fx1.b.iadd(tables, y: offset)
+        let added = mut fx1.b.iadd_imm_s(added_at, y: -i64.fit(PAGE_TABLE))
+        let first_upper = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: 0)
+        let upper = mut fx1.b.select(first_upper, x: own, y: added)
+        let linked = mut fx1.b.bor_imm_s(upper, y: i64.fit(link))
+        let slot_offset = mut fx1.b.ishl_imm_s(index, y: 3)
+        let slot = mut fx1.b.iadd(root, y: slot_offset)
+        mut fx1.store(linked, addr: slot, offset: 0)
+        let address = mut fx1.b.ishl_imm_s(gigabyte, y: 30)
+        var entry = mut fx1.b.bor_imm_s(address, y: i64.fit(block))
+        match extension.pages {
+            Some(pages) => {
+                let past_index = mut fx1.b.iadd_imm_s(gigabyte, y: -i64.fit(MACHINE_MAPPED / ONE_GIGABYTE))
+                let past = mut fx1.b.ishl_imm_s(past_index, y: 12)
+                let directory = mut fx1.b.iadd(directories, y: past)
+                let small = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: pages, y: 0)
+                mut fx1.if_true(small, then: fn(mut fx2: Fx) {
+                    let zero_value = mut fx2.ptr(0)
+                    let count = mut fx2.ptr(PAGE_TABLE / 8)
+                    mut fx2.each(zero_value, end: count, body: fn(mut fx3: Fx, page: clif::Value) {
+                        let page_offset = mut fx3.b.ishl_imm_s(page, y: 21)
+                        let at = mut fx3.b.iadd(address, y: page_offset)
+                        let large = mut fx3.b.bor_imm_s(at, y: i64.fit(block))
+                        let page_slot_offset = mut fx3.b.ishl_imm_s(page, y: 3)
+                        let page_slot = mut fx3.b.iadd(directory, y: page_slot_offset)
+                        mut fx3.store(large, addr: page_slot, offset: 0)
+                    })
+                })
+                let directory_link = mut fx1.b.bor_imm_s(directory, y: i64.fit(link))
+                entry = mut fx1.b.select(pages, x: entry, y: directory_link)
+            }
+            None => {}
+        }
+        let within_index = mut fx1.b.band_imm_s(gigabyte, y: 511)
+        let within = mut fx1.b.ishl_imm_s(within_index, y: 3)
+        let entry_slot = mut fx1.b.iadd(upper, y: within)
+        mut fx1.store(entry, addr: entry_slot, offset: 0)
+    })
+} Lowering.write_root_extension
 
 /// The boot area in the zeroed data the image reserves for it with one chunk more, so that it
 /// aligns to a chunk wherever the image is loaded.
@@ -132,9 +292,9 @@ fn Lowering.reserve_boot_area(mut self, mut fx: Fx) -> clif::Value {
     return mut fx.b.band_imm_s(bumped, y: -i64.fit(MEMORY_CHUNK))
 } Lowering.reserve_boot_area
 
-/// Visits the usable memory the platform lists below the 4 GiB the entry root maps, in its
-/// parts outside the `held` ranges, outside the first MiB on x86_64 and outside the device
-/// tree and the ranges it reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the
+/// Visits the usable memory the platform lists below 128 TiB, in its parts outside the `held`
+/// ranges, outside the first MiB on x86_64 and outside the device tree and the ranges it
+/// reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the
 /// usable entries of the start information's memory map, on `aarch64-bare`, the ranges of the
 /// device tree's memory nodes and, on a UEFI target, the usable entries of the firmware's
 /// final memory map. `visit` receives each range's first address and last address plus one;
@@ -195,7 +355,7 @@ fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(m
 
 /// Visits the parts of the usable memory `range` outside the `held` ranges and the ranges the
 /// device tree's memory reservation block at `reserved` lists, clipped to start past the first
-/// MiB on x86_64 and to end below the 4 GiB the entry root maps. Each pass visits the part before
+/// MiB on x86_64 and to end below 128 TiB. Each pass visits the part before
 /// the one of those ranges overlapping the rest that starts lowest, then skips past that range.
 fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Option[clif::Value], range: Extent, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     var clipped_base = range.start
@@ -203,8 +363,8 @@ fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Opt
         let low = mut fx.ptr(u64.fit(LOW_MEMORY))
         clipped_base = mut fx.b.umax(range.start, y: low)
     }
-    let mapped = mut fx.ptr(MACHINE_MAPPED)
-    let clipped_end = mut fx.b.umin(range.end, y: mapped)
+    let limit = mut fx.ptr(REACHABLE)
+    let clipped_end = mut fx.b.umin(range.end, y: limit)
     discard mut fx.repeat(fx.list1(clipped_base).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
         expect current.len() > 0
         let rest = Extent(start: current[0], end: clipped_end)

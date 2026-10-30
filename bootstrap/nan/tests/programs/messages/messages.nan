@@ -1,0 +1,57 @@
+//! A lookup holding Untrusted fields, encoded and decoded in both formats, read by a validator.
+
+pub closed enum Scope derives Encode {
+    Local
+    Remote(host: Untrusted[text::String])
+} Scope
+
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+    pub tags: mem::List[Untrusted[mem::Bytes]]
+    pub scope: Scope
+} Lookup
+
+validator fn text_of(field: Untrusted[text::String], alloc: mem::Alloc) -> text::String {
+    return text::String.of(field.inspect().as_str(), alloc)
+} text_of
+
+fn lookup(alloc: mem::Alloc) -> Lookup {
+    var tag = mem::Bytes.empty(alloc)
+    mut tag.append(b"\x00\xFF")
+    var tags = mem::List[Untrusted[mem::Bytes]].empty(alloc)
+    mut tags.push(Untrusted.of(take tag))
+    let host = Untrusted.of(text::String.of("peer", alloc))
+    return Lookup(id: 7, path: Untrusted.of(text::String.of("/srv/notes", alloc)), tags: take tags, scope: Scope.Remote(host: take host))
+} lookup
+
+fn report(log: sys::Log, format: Str, decoded: Result[Lookup, core::DecodeError], alloc: mem::Alloc) {
+    match decoded {
+        Ok(found) => {
+            log.info(format, value: found.id)
+            log.info("path", value: text_of(found.path, alloc))
+            log.info("tags", value: found.tags.len())
+            match found.scope {
+                Scope.Remote(host: host) => log.info("host", value: text_of(host, alloc))
+                Scope.Local => log.info("host", value: "none")
+            }
+        }
+        Err(error) => log.info(format, value: error)
+    }
+} report
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let sent = lookup(alloc)
+    var wire = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Lookup].encode(sent, out: mut wire)
+    world.log.info("wire bytes", value: wire.len())
+    report(world.log, format: "wire", decoded: attempt mem::wire::Codec[Lookup].decode(Untrusted.of(wire.view()), alloc), alloc)
+    var json = text::String.empty(alloc)
+    text::json::Codec[Lookup].encode(sent, out: mut json)
+    world.log.info("json", value: json.as_str())
+    let bytes = take json.into_bytes()
+    report(world.log, format: "json", decoded: attempt text::json::Codec[Lookup].decode(Untrusted.of(bytes.view()), alloc), alloc)
+    let invalid = b"{\"id\":7,\"path\":\"\xFF\",\"scope\":\"Local\",\"tags\":[]}"
+    report(world.log, format: "invalid", decoded: attempt text::json::Codec[Lookup].decode(Untrusted.of(take invalid), alloc), alloc)
+} main

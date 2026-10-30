@@ -349,6 +349,7 @@ impl Checker<'_> {
                             && all_args(interface)
                     }
                     ("core::Untrusted", "Render") => true,
+                    ("core::Untrusted", "Encode") => all_args(interface),
                     ("core::Untrusted", "Generate") => ty.type_arg(0).is_some_and(|inner| {
                         self.implements(inner, interface) && self.has(inner, Property::Inert)
                     }),

@@ -19,6 +19,11 @@ pub open struct Config derives Eq, Encode {
     pub verbose: bool
 } Config
 
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
 pub closed enum Signal derives Eq, Encode {
     Idle
     Level(u16)
@@ -60,6 +65,22 @@ pub fn wire_bytes(value: Signal, alloc: mem::Alloc) -> mem::Bytes
     mem::wire::Codec[Signal].encode(value, mut out)
     return out
 } wire_bytes
+
+pub fn wire_lookup(path: Str, alloc: mem::Alloc) -> mem::Bytes
+    example wire_lookup("a/b", alloc: testing::world().alloc).view() == b"\x02\x02id\x01\x07\x04path\x04\x03a/b"
+{
+    var out = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Lookup].encode(Lookup(id: 7, path: Untrusted.of(text::String.of(path, alloc))), mut out)
+    return out
+} wire_lookup
+
+pub validator fn json_lookup_path(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String fails core::DecodeError
+    example (attempt json_lookup_path(Untrusted.of(b"{\"path\":\"a/b\",\"id\":7}"), alloc: testing::world().alloc)) == Ok(text::String.of("a/b", alloc: testing::world().alloc))
+    example (attempt json_lookup_path(Untrusted.of(b"{\"path\":7,\"id\":7}"), alloc: testing::world().alloc)) == Err(core::DecodeError.Malformed)
+{
+    let lookup = try text::json::Codec[Lookup].decode(raw, alloc)
+    return text::String.of(lookup.path.inspect().as_str(), alloc)
+} json_lookup_path
 
 pub fn json_text(value: Probe, alloc: mem::Alloc) -> text::String
     example json_text(Probe(seq: 5, hops: 3), alloc: testing::world().alloc).as_str() == "{\"hops\":3,\"seq\":5}"

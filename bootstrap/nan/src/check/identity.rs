@@ -239,6 +239,12 @@ impl Checker<'_> {
         let seen = self.consumer_props(item);
         let promised = |property: Property| public && seen.has(property);
         let token = self.is_state_token(&own);
+        let derived = match &ast.kind {
+            ItemKind::Struct(structure) => &structure.derives,
+            ItemKind::Enum(enumeration) => &enumeration.derives,
+            _ => unreachable!("a struct or enum"),
+        };
+        let encodes = derived.iter().any(|name| name.text == "Encode");
         let generics = &self.sig(item).generics;
         let facts: Vec<String> = [
             ("linear", props.linear, Some(Property::Linear)),
@@ -254,6 +260,11 @@ impl Checker<'_> {
                 Some(Property::AnyBits),
             ),
             ("parsing", public && self.is_parsing(&own), None),
+            (
+                "holds-untrusted",
+                public && encodes && self.holds_untrusted(&own),
+                None,
+            ),
         ]
         .into_iter()
         .filter(|(_, holds, _)| *holds)

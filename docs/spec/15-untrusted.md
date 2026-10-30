@@ -1,6 +1,6 @@
 # Untrusted data
 
-This chapter defines Untrusted values, `Untrusted.of` and the sources of Untrusted data, their opacity, the content-blind operations on them, validators and `inspect`, the parsing and declassifying classes of validators and decoders, and the `allow validate` grants that validators, decoders and their users need.
+This chapter defines Untrusted values, `Untrusted.of` and the sources of Untrusted data, their opacity, the content-blind operations on them, validators and `inspect`, the parsing and declassifying classes of validators, decoders and uses of encoders, and the `allow validate` grants that validators, decoders and the users of validators, decoders and encoders need.
 
 ## Untrusted values
 
@@ -71,10 +71,11 @@ pub fn read_frame(mut conn: sys::net::Conn, alloc: mem::Alloc) -> Untrusted[mem:
 
 ## Opacity
 
-- Apart from the [property interfaces](05-properties.md#property-interfaces), which follow its structural properties, `Untrusted[T]` implements exactly two std interfaces: `Render` for every `T`, and `Generate` when `T` implements `Generate` and is Inert. Comparing or ordering an Untrusted value is therefore an error (`interface.not-implemented`), as is passing it where a bound names another std interface (`generic.unsatisfied-bound`) or deriving such an interface for a type holding it (`derive.constituent-missing`).
+- Apart from the [property interfaces](05-properties.md#property-interfaces), which follow its structural properties, `Untrusted[T]` implements exactly three std interfaces: `Render` for every `T`, `Encode` when `T` implements `Encode`, and `Generate` when `T` implements `Generate` and is Inert. Comparing or ordering an Untrusted value is therefore an error (`interface.not-implemented`), as is passing it where a bound names another std interface (`generic.unsatisfied-bound`) or deriving such an interface for a type holding it (`derive.constituent-missing`).
 - Its [render](13-text-encode.md#render) writes the text `<untrusted>`, whatever `T` and the contents are.
 - Its [generator](22-testing.md#generation) generates a `T` value and wraps it.
-- Only `inspect` yields the contents. `into_cleared` yields them only after setting every byte to 0, and `testing::same` compares them only in tests and examples ([simulated capabilities](22-testing.md#simulated-capabilities)).
+- It [encodes](13-text-encode.md#std-encodings) as its contents, and its decoder decodes a `T` value and wraps it, so that what a decoder reads into it stays opaque.
+- Only `inspect` yields the contents. `into_cleared` yields them only after setting every byte to 0, encoders write them out only under a [validate grant](#validate-grants), and `testing::same` compares them only in tests and examples ([simulated capabilities](22-testing.md#simulated-capabilities)).
 
 ```nan
 pub fn note_frame(log: sys::Log, frame: Untrusted[mem::Bytes]) {
@@ -234,6 +235,8 @@ A validator or decoder is either parsing or declassifying:
 - A use of a decoder is parsing exactly when the instantiation it decodes is a parsing type.
 - The `decode` method of a std type implementing `Encode` is classified and granted as a decoder of that type.
 
+An **encoder** is the `encode` method of a type implementing `Encode`; it writes out the contents of every Untrusted value it encodes. A use of an encoder is declassifying exactly when the instantiation it encodes holds an Untrusted instantiation: is one, has one as a type argument at any depth, or has one among the constituent types of a struct or enum it instantiates, its type arguments substituted. Whether a `pub` struct or enum deriving `Encode` holds one, decided from its full definition, is an [interface fact](05-properties.md#interface-facts).
+
 Classes are computed, never written. A declassifying validator and the declassifying decoder of a type item are [trust escapes](31-trust.md#trust-escapes); parsing ones are not.
 
 ```nan
@@ -266,10 +269,10 @@ pub validator fn tally_zeros(raw: Untrusted[Slice[u8]], mut tally: Tally) {
 
 ## Validate grants
 
-A module **uses** a validator or decoder when one of its items:
+A module **uses** a validator, decoder or encoder when one of its items:
 
 - calls it or names it as a function value; or
-- names an instantiation of a generic item with a type argument `A` that is not a type parameter, where a call that the generic item makes through a bound on the type parameter `A` fixes, directly or by passing that parameter as a type argument to further generic items, resolves to it once `A` is substituted: `mem::wire::Codec[Note].decode` uses `Note.decode`.
+- names an instantiation of a generic item with a type argument `A` that is not a type parameter, where a call that the generic item makes through a bound on the type parameter `A` fixes, directly or by passing that parameter as a type argument to further generic items, resolves to it once `A` is substituted: `mem::wire::Codec[Note].decode` uses `Note.decode`, and `mem::wire::Codec[Note].encode` uses `Note.encode`.
 
 A call through a bound on a type parameter, or through `Dyn`, is not itself a use.
 
@@ -278,9 +281,9 @@ A call through a bound on a type parameter, or through `Dyn`, is not itself a us
 - the declaration of a validator, on its head;
 - the declaration of a type item whose decoder is declassifying, on the line of its `derives` clause;
 - an impl line naming `core::Decoder`;
-- a use of a validator or of a declassifying decoder, on the line holding the call, function value or instantiation.
+- a use of a validator, or a declassifying use of a decoder or encoder, on the line holding the call, function value or instantiation.
 
-`Untrusted.of`, `inspect`, the content-blind operations and uses of parsing decoders need no grant.
+`Untrusted.of`, `inspect`, the content-blind operations and the other uses of decoders and encoders need no grant.
 
 ```nan
 // file: notes/package.nan
@@ -309,6 +312,36 @@ pub fn load_note(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Note fails cor
 pub fn load_name(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String fails core::DecodeError {
     return try mem::wire::Codec[text::String].decode(raw, alloc) // error: authority.ungranted
 } load_name
+```
+
+```nan
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
+pub fn load_lookup(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Lookup fails core::DecodeError {
+    return try mem::wire::Codec[Lookup].decode(raw, alloc)
+} load_lookup
+
+test lookup_path_stays_untrusted for load_lookup {
+    let world = testing::world()
+    let lookup = try load_lookup(Untrusted.of(b"\x02\x02id\x01\x07\x04path\x04\x03a/b"), alloc: world.alloc)
+    let expected = Untrusted.of(text::String.of("a/b", alloc: world.alloc))
+    expect lookup.id == 7
+    expect testing::same(lookup.path, expected)
+} lookup_path_stays_untrusted
+```
+
+```nan
+pub closed struct Lookup derives Encode {
+    pub id: u64
+    pub path: Untrusted[text::String]
+} Lookup
+
+pub fn store_lookup(lookup: Lookup, mut out: mem::Bytes) {
+    mem::wire::Codec[Lookup].encode(lookup, mut out) // error: authority.ungranted
+} store_lookup
 ```
 
 ## Diagnostics

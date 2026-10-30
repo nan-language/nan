@@ -460,7 +460,7 @@ pub open struct Level derives AnyBits { // error: prop.promise-unmet
 
 ### Interface facts
 
-The **interface facts** of a type are whether it is linear, a view, a state token or a type containing a state token, whether it derives `Copy`, its promises when it is `pub`, whether it is a [parsing type](15-untrusted.md#validator-classes) when it is a `pub` struct or enum, and the dependent parameters on which each of these rests. They enter the type's [interface hash](29-identity-versioning.md#hashes).
+The **interface facts** of a type are whether it is linear, a view, a state token or a type containing a state token, whether it derives `Copy`, its promises when it is `pub`, whether it is a [parsing type](15-untrusted.md#validator-classes) when it is a `pub` struct or enum, whether it [holds an Untrusted instantiation](15-untrusted.md#validator-classes) when it is a `pub` struct or enum deriving `Encode`, and the dependent parameters on which each of these rests. They enter the type's [interface hash](29-identity-versioning.md#hashes).
 
 ## Property interfaces
 

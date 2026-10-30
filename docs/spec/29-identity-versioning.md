@@ -87,7 +87,7 @@ The **interface hash** is the hash of the UTF-8 bytes `interface`, LF and the it
 | `test` | the line `test <name> for <target>` |
 | `package` | the `package` line and the `language` and `targets` directives |
 
-- The **facts line** is `facts` followed, each after one space, by those of `linear`, `view`, `token` (a state token), `holds-token` (containing one), `Copy`, `Send`, `Inert`, `AnyBits` and `parsing` (a `pub` struct or enum that is a [parsing type](15-untrusted.md#validator-classes)) that the type's [interface facts](05-properties.md#interface-facts) state, in that order, each fact resting on dependent parameters followed by their names in `[ ]`, separated by `, `.
+- The **facts line** is `facts` followed, each after one space, by those of `linear`, `view`, `token` (a state token), `holds-token` (containing one), `Copy`, `Send`, `Inert`, `AnyBits`, `parsing` (a `pub` struct or enum that is a [parsing type](15-untrusted.md#validator-classes)) and `holds-untrusted` (a `pub` struct or enum deriving `Encode` that [holds an Untrusted instantiation](15-untrusted.md#validator-classes)) that the type's [interface facts](05-properties.md#interface-facts) state, in that order, each fact resting on dependent parameters followed by their names in `[ ]`, separated by `, `.
 - Bodies, `decreases`, `waive` and clause-region `todo` clauses never enter an interface form; a change confined to a body changes the item hash and never the interface hash. [Dyn-usability](08-generics-interfaces.md#dynamic-dispatch) follows from the method heads.
 
 The next item's normalised form is the first text and its interface form the second.

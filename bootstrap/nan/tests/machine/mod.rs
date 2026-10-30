@@ -3,7 +3,6 @@
 //! status `nan run` ends with.
 
 use std::io::Read;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,17 +18,23 @@ pub struct Booted {
     pub written: String,
 }
 
-/// Boots the image `launch` starts in `root` until the emulator ends, failing when it runs past
+/// Boots the image `launch` starts until the emulator ends, failing when it runs past
 /// `BOOT_LIMIT`.
-pub fn boot(launch: &nan::Launch, root: &Path) -> Result<Booted, String> {
-    let mut emulator = Command::new(&launch.program)
+pub fn boot(launch: &nan::Launch) -> Result<Booted, String> {
+    let machine = launch
+        .machine
+        .as_ref()
+        .ok_or("an image launched without the emulator")?;
+    let mut command = Command::new(&launch.program);
+    command
         .args(&launch.args)
-        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut boot = machine
+        .boot(command)
         .map_err(|error| format!("starting {}: {error}", launch.program.display()))?;
+    let emulator = &mut boot.emulator;
     let mut serial = emulator.stdout.take().expect("the serial port's output");
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();

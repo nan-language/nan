@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::command::Launch;
-use crate::emulator::{self, Writes};
+use crate::emulator::{self, Boots};
 use crate::lower::test_image::{RUN_FILE, RUN_START, TIMED_OUT, frame, outcome};
 use crate::workspace::Target;
 
@@ -23,11 +23,11 @@ pub enum Image {
 
 impl Image {
     /// The test image at a path, as its runs on a run target start it: a machine image's boot
-    /// volume is made once, and every run finds it as it was made.
+    /// volume and machine are made once, and every run finds them as they were made.
     pub fn new(target: Target, path: PathBuf) -> io::Result<Image> {
         Ok(match target.is_machine() {
             true => {
-                let launch = emulator::launch(target, &path, &[], Writes::Dropped)?;
+                let launch = emulator::launch(target, &path, &[], Boots::Fresh)?;
                 Image::Machine(path, launch)
             }
             false => Image::Host(path),
@@ -40,7 +40,7 @@ impl Image {
         }
     }
 
-    /// Removes the image and its boot volume.
+    /// Removes the image with its boot volume and machine.
     pub fn discard(self) -> io::Result<()> {
         match self {
             Image::Host(path) => fs::remove_file(path),

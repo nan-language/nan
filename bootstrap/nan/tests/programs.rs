@@ -85,7 +85,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 launch
                     .args
                     .extend(extra.split_whitespace().map(str::to_owned));
-                let booted = machine::boot(&launch, &root)?;
+                let booted = machine::boot(&launch)?;
                 runs.push((extra, booted.status, booted.written));
             }
             runs

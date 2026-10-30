@@ -1,0 +1,540 @@
+//! Writes a sector of the disk and reads it back, draws random bytes from the TPM, finds the console port's UART, then arms the watchdog, whose reset ends the run.
+
+/// The vendor and device ids of the modern virtio block device and of the watchdog.
+const VIRTIO_VENDOR: u32 = 0x1AF4
+
+const BLOCK_MODERN: u32 = 0x1042
+
+const INTEL_VENDOR: u32 = 0x8086
+
+const WATCHDOG_DEVICE: u32 = 0x25AB
+
+/// The PCI configuration offsets the kernel reads: the ids, the command and status word, the
+/// first base address register and the capability list's head; the status bit announcing that
+/// list, the command bits enabling memory decoding and bus mastering, the watchdog's
+/// configuration register with the bits disabling its interrupt, and its lock register with its
+/// enabling bit.
+const PCI_IDS: u32 = 0x00
+
+const PCI_COMMAND: u32 = 0x04
+
+const PCI_BARS: u32 = 0x10
+
+const PCI_CAPABILITIES: u32 = 0x34
+
+const HAS_CAPABILITIES: u32 = 0x10_0000
+
+const MEMORY_AND_MASTER: u32 = 0x6
+
+const WATCHDOG_CONFIG: u32 = 0x60
+
+const NO_INTERRUPT: u16 = 0x3
+
+const WATCHDOG_LOCK: u32 = 0x68
+
+const WATCHDOG_ENABLE: u8 = 0x2
+
+/// The vendor-specific capability id, and the virtio configuration kinds the kernel uses.
+const VENDOR_CAPABILITY: u32 = 0x09
+
+const COMMON_KIND: u32 = 1
+
+const NOTIFY_KIND: u32 = 2
+
+/// The device status bits a driver sets as it initialises the device, and the feature bits, in
+/// the second feature word, of virtio 1 and of a device whose DMA the platform translates.
+const ACKNOWLEDGE: u8 = 1
+
+const DRIVER: u8 = 2
+
+const DRIVER_OK: u8 = 4
+
+const FEATURES_OK: u8 = 8
+
+const VERSION_1: u32 = 1
+
+const ACCESS_PLATFORM: u32 = 2
+
+/// The entries of the block device's virtqueue, the flags of a descriptor followed by another
+/// and of one the device writes, the kinds of a request reading and writing sectors, and the
+/// polls of the used ring before the kernel gives up.
+const QUEUE_SIZE: u16 = 4
+
+const NEXT: u16 = 1
+
+const DEVICE_WRITES: u16 = 2
+
+const READ: u32 = 0
+
+const WRITE: u32 = 1
+
+const USED_POLLS: u32 = 50_000_000
+
+/// The sector the kernel writes and reads back, and the bytes of a sector.
+const SECTOR: u64 = 1
+
+const SECTOR_BYTES: usize = 512
+
+/// The TPM's CRB interface, the bits requesting its locality, readying it for a command and
+/// starting one, the command drawing random bytes, and the polls of its start register before
+/// the kernel gives up.
+const CRB_BASE: u64 = 0xFED4_0000
+
+const REQUEST_ACCESS: u32 = 1
+
+const COMMAND_READY: u32 = 1
+
+const START_COMMAND: u32 = 1
+
+const GET_RANDOM: Slice[u8] = b"\x80\x01\x00\x00\x00\x0C\x00\x00\x01\x7B\x00\x08"
+
+const RANDOM_BYTES: u8 = 8
+
+const CRB_POLLS: u32 = 50_000_000
+
+/// The magic words the watchdog's reload register takes before a write to its other registers,
+/// and the preload of each of its two stages, about 100 ms at its 1 kHz scale.
+const UNLOCK_FIRST: u16 = 0x80
+
+const UNLOCK_SECOND: u16 = 0x86
+
+const PRELOAD: u32 = 100
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The scratch register of a 16550 UART.
+registers Scratch {
+    scratch: u8 at 0x7 read write
+} Scratch
+
+/// PCI configuration mechanism #1, with a double word, a word or a byte as its data.
+registers PciConfig {
+    address: u32 at 0x0 write
+    data: u32 at 0x4 read write
+} PciConfig
+
+registers PciWord {
+    address: u32 at 0x0 write
+    data: u16 at 0x4 write
+} PciWord
+
+registers PciByte {
+    address: u32 at 0x0 write
+    data: u8 at 0x4 write
+} PciByte
+
+/// The virtio common configuration.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+    driver_feature_select: u32 at 0x8 read write
+    driver_feature: u32 at 0xC read write
+    status: u8 at 0x14 read write
+    queue_select: u16 at 0x16 read write
+    queue_size: u16 at 0x18 read write
+    queue_enable: u16 at 0x1C read write
+    queue_notify_off: u16 at 0x1E read
+    queue_desc_low: u32 at 0x20 read write
+    queue_desc_high: u32 at 0x24 read write
+    queue_driver_low: u32 at 0x28 read write
+    queue_driver_high: u32 at 0x2C read write
+    queue_device_low: u32 at 0x30 read write
+    queue_device_high: u32 at 0x34 read write
+} Common
+
+/// A queue's notification register.
+registers Notify {
+    queue: u16 at 0x0 write
+} Notify
+
+/// The locality 0 registers of a TPM's CRB interface and the start of its command buffer.
+registers Crb {
+    locality: u32 at 0x08 write
+    request: u32 at 0x40 write
+    start: u32 at 0x4C read write
+    buffer: Array[u8, 32] at 0x80 stride 1 read write
+} Crb
+
+/// The memory-mapped registers of the watchdog.
+registers Watchdog {
+    first_preload: u32 at 0x0 write
+    second_preload: u32 at 0x4 write
+    reload: u16 at 0xC write
+} Watchdog
+
+layout Descriptor: bytes 16 le {
+    address: u64 at 0
+    length: u32 at 8
+    flags: u16 at 12
+    next: u16 at 14
+} Descriptor
+
+layout UsedEntry: bytes 8 le {
+    id: u32 at 0
+    length: u32 at 4
+} UsedEntry
+
+/// The virtqueue and its one request: the descriptor table, the driver area and the device area
+/// at the alignments virtio requires of them, then the request's header, status and sector.
+layout Queue: bytes 672 le {
+    descriptors: Array[Descriptor, 4] at 0
+    avail_flags: u16 at 64
+    avail_index: u16 at 66
+    avail_ring: Array[u16, 4] at 68
+    avail_pad: Array[u8, 4] at 76
+    used_flags: u16 at 80
+    used_index: u16 at 82
+    used_ring: Array[UsedEntry, 4] at 84
+    used_pad: Array[u8, 12] at 116
+    kind: u32 at 128
+    reserved: u32 at 132
+    sector: u64 at 136
+    status: u8 at 144
+    status_pad: Array[u8, 15] at 145
+    data: Array[u8, 512] at 160
+} Queue
+
+/// The offsets in a `Queue` of the driver and device areas, of the request's header, status and
+/// sector, and its size.
+const DRIVER_AREA: u64 = 64
+
+const DEVICE_AREA: u64 = 80
+
+const HEADER: u64 = 128
+
+const STATUS_AREA: u64 = 144
+
+const DATA: u64 = 160
+
+const QUEUE_BYTES: u64 = 672
+
+pub closed enum DeviceError derives Render {
+    NoDevice
+    NoCapability
+    Unsupported
+    Misaligned
+    NoResponse
+    Refused
+} DeviceError
+
+/// Where a virtio device's configuration structures lie: its common configuration, and its
+/// notification registers with the multiplier of each queue's offset among them.
+struct Device {
+    common: u64
+    notify: u64
+    multiplier: u32
+} Device
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    match attempt round_trip(k.alloc()) {
+        Ok(_) => say(text: "disk: sector 1 written and read back\n")
+        Err(error) => {
+            say(text: "disk: failed\n")
+            discard error
+        }
+    }
+    match attempt random() {
+        Ok(_) => say(text: "tpm: drew 8 random bytes\n")
+        Err(error) => {
+            say(text: "tpm: failed\n")
+            discard error
+        }
+    }
+    if console_answers() {
+        say(text: "console: a UART answers at port 0x2F8\n")
+    }
+    match attempt arm_watchdog() {
+        Ok(_) => say(text: "watchdog: armed\n")
+        Err(error) => {
+            say(text: "watchdog: failed\n")
+            discard error
+        }
+    }
+    var spins: u64 = 0
+    loop {
+        spins = spins.wrapping_add(1)
+    }
+} main
+
+/// Whether a UART at port 0x2F8 keeps what its scratch register is written.
+fn console_answers() -> bool {
+    var uart = trusted "the board decodes port 0x2F8 to its second 16550 UART and nothing else maps it" { hw::Ports[Scratch].map(0x2F8) }
+    mut uart.write(Scratch.scratch, value: 0x5A)
+    let kept = mut uart.read(Scratch.scratch)
+    take uart.unmap()
+    return kept == 0x5A
+} console_answers
+
+/// Sends the TPM a command drawing random bytes through its CRB interface, and checks that it
+/// answers with them.
+fn random() fails DeviceError {
+    var crb = trusted "the board decodes 0xFED4_0000 to the TPM's CRB interface, uncached in the entry root, and nothing else maps it" { hw::Mmio[Crb].map(CRB_BASE) }
+    defer take crb.unmap()
+    mut crb.write(Crb.locality, value: REQUEST_ACCESS)
+    mut crb.write(Crb.request, value: COMMAND_READY)
+    for at in 0..<GET_RANDOM.len() {
+        mut crb.write_at(Crb.buffer, index: at, value: GET_RANDOM[at])
+    }
+    mut crb.write(Crb.start, value: START_COMMAND)
+    var polls: u32 = 0
+    while (mut crb.read(Crb.start) & START_COMMAND) != 0 {
+        polls += 1
+        if polls == CRB_POLLS {
+            fail DeviceError.NoResponse
+        }
+    }
+    var code: u32 = 0
+    for at in 6..<10usize {
+        code = (code << 8) | u32.widen(mut crb.read_at(Crb.buffer, index: at))
+    }
+    if code != 0 or mut crb.read_at(Crb.buffer, index: 11) != RANDOM_BYTES {
+        fail DeviceError.Refused
+    }
+} random
+
+/// Arms the watchdog's two stages without its interrupt, the second resetting the machine once
+/// it expires.
+fn arm_watchdog() fails DeviceError {
+    var config = trusted "the board's PCI configuration mechanism #1 lies at ports 0xCF8 to 0xCFF and nothing else maps them" { hw::Ports[PciConfig].map(0xCF8) }
+    let found = attempt find(mut config, vendor: INTEL_VENDOR, product: WATCHDOG_DEVICE)
+    let slot = match found {
+        Ok(slot) => slot
+        Err(error) => {
+            take config.unmap()
+            fail error
+        }
+    }
+    let bar = read_config(mut config, slot, offset: PCI_BARS) & 0xFFFF_FFF0
+    take config.unmap()
+    var watchdog = trusted "the watchdog's registers lie at its first base address, uncached in the entry root, and nothing else maps them" { hw::Mmio[Watchdog].map(u64.widen(bar)) }
+    unlock(mut watchdog)
+    mut watchdog.write(Watchdog.first_preload, value: PRELOAD)
+    unlock(mut watchdog)
+    mut watchdog.write(Watchdog.second_preload, value: PRELOAD)
+    take watchdog.unmap()
+    var setting = trusted "the board's PCI configuration mechanism #1 lies at ports 0xCF8 to 0xCFF and nothing else maps them" { hw::Ports[PciWord].map(0xCF8) }
+    mut setting.write(PciWord.address, value: 0x8000_0000 | (slot << 11) | WATCHDOG_CONFIG)
+    mut setting.write(PciWord.data, value: NO_INTERRUPT)
+    take setting.unmap()
+    var lock = trusted "the board's PCI configuration mechanism #1 lies at ports 0xCF8 to 0xCFF and nothing else maps them" { hw::Ports[PciByte].map(0xCF8) }
+    mut lock.write(PciByte.address, value: 0x8000_0000 | (slot << 11) | WATCHDOG_LOCK)
+    mut lock.write(PciByte.data, value: WATCHDOG_ENABLE)
+    take lock.unmap()
+} arm_watchdog
+
+/// Writes the magic words that let the next write reach the watchdog's other registers.
+fn unlock(mut watchdog: hw::Mmio[Watchdog]) {
+    mut watchdog.write(Watchdog.reload, value: UNLOCK_FIRST)
+    mut watchdog.write(Watchdog.reload, value: UNLOCK_SECOND)
+} unlock
+
+/// The slot of the first device of PCI bus 0 with the given ids, with its memory decoding and bus
+/// mastering enabled.
+fn find(mut config: hw::Ports[PciConfig], vendor: u32, product: u32) -> u32 fails DeviceError {
+    for slot in 0u32..<32 {
+        let ids = read_config(mut config, slot, offset: PCI_IDS)
+        if (ids & 0xFFFF) == vendor and (ids >> 16) == product {
+            let command = read_config(mut config, slot, offset: PCI_COMMAND)
+            write_config(mut config, slot, offset: PCI_COMMAND, value: (command & 0xFFFF) | MEMORY_AND_MASTER)
+            return slot
+        }
+    }
+    fail DeviceError.NoDevice
+} find
+
+fn read_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32) -> u32 {
+    mut config.write(PciConfig.address, value: 0x8000_0000 | (slot << 11) | (offset & 0xFC))
+    return mut config.read(PciConfig.data)
+} read_config
+
+fn write_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32, value: u32) {
+    mut config.write(PciConfig.address, value: 0x8000_0000 | (slot << 11) | (offset & 0xFC))
+    mut config.write(PciConfig.data, value)
+} write_config
+
+/// Writes a pattern to sector `SECTOR` of the disk, reads the sector back and checks that it
+/// holds the pattern.
+fn round_trip(alloc: mem::Alloc) fails DeviceError {
+    var config = trusted "the board's PCI configuration mechanism #1 lies at ports 0xCF8 to 0xCFF and nothing else maps them" { hw::Ports[PciConfig].map(0xCF8) }
+    let found = attempt located(mut config)
+    take config.unmap()
+    let device = match found {
+        Ok(device) => device
+        Err(error) => fail error
+    }
+    let heap = mem::Heap.of(alloc)
+    var queue = hw::DmaShared.of(heap.boxed(Queue.from_bits(Array[u8, 672].filled(0))))
+    let outcome = attempt exchange(device, mut queue)
+    discard take queue.into_box()
+    let Err(error) = outcome else {
+        return
+    }
+    fail error
+} round_trip
+
+/// The configuration structures of the block device.
+fn located(mut config: hw::Ports[PciConfig]) -> Device fails DeviceError {
+    let slot = try find(mut config, vendor: VIRTIO_VENDOR, product: BLOCK_MODERN)
+    return try structures(mut config, slot, status: read_config(mut config, slot, offset: PCI_COMMAND))
+} located
+
+/// The common and notification structures a device's vendor-specific capabilities name.
+fn structures(mut config: hw::Ports[PciConfig], slot: u32, status: u32) -> Device fails DeviceError {
+    if (status & HAS_CAPABILITIES) == 0 {
+        fail DeviceError.NoCapability
+    }
+    var common: u64 = 0
+    var notify: u64 = 0
+    var multiplier: u32 = 0
+    var at = read_config(mut config, slot, offset: PCI_CAPABILITIES) & 0xFC
+    for _ in 0u32..<48 {
+        invariant at <= 0xFC
+        if at == 0 {
+            break
+        }
+        let head = read_config(mut config, slot, offset: at)
+        let kind = (head >> 24) & 0xFF
+        if (head & 0xFF) == VENDOR_CAPABILITY and (kind == COMMON_KIND or kind == NOTIFY_KIND) {
+            let bar = read_config(mut config, slot, offset: at + 4) & 0xFF
+            let offset = read_config(mut config, slot, offset: at + 8)
+            let Some(base) = bar_base(mut config, slot, bar) else {
+                fail DeviceError.NoCapability
+            }
+            let Some(address) = base.checked_add(u64.widen(offset)) else {
+                fail DeviceError.NoCapability
+            }
+            if kind == COMMON_KIND {
+                common = address
+            } else {
+                notify = address
+                multiplier = read_config(mut config, slot, offset: at + 16)
+            }
+        }
+        at = (head >> 8) & 0xFC
+    }
+    if common == 0 or notify == 0 {
+        fail DeviceError.NoCapability
+    }
+    return Device(common: common, notify: notify, multiplier: multiplier)
+} structures
+
+/// The memory address a device's base address register `bar` holds, both words of a 64-bit one;
+/// none when `bar` names none of the six registers.
+fn bar_base(mut config: hw::Ports[PciConfig], slot: u32, bar: u32) -> Option[u64] {
+    if bar > 5 {
+        return None
+    }
+    let low = read_config(mut config, slot, offset: PCI_BARS + 4 * bar)
+    let base = u64.widen(low & 0xFFFF_FFF0)
+    if ((low >> 1) & 0x3) != 2 {
+        return Some(base)
+    }
+    let high = read_config(mut config, slot, offset: PCI_BARS + 4 * bar + 4)
+    return Some(base | (u64.widen(high) << 32))
+} bar_base
+
+/// The byte the pattern holds at an offset of the sector.
+fn pattern(at: usize) -> u8 = u8.truncate(at) ^ 0xA5
+
+/// Initialises the device with its virtqueue in `queue`, writes the pattern to the sector, then
+/// reads the sector back over it and checks it.
+fn exchange(device: Device, mut queue: hw::DmaShared[Queue]) fails DeviceError {
+    let bus = queue.bus_addr().value
+    if bus % 16 != 0 or bus > ~0u64 - QUEUE_BYTES {
+        fail DeviceError.Misaligned
+    }
+    var common = trusted "the device's common configuration lies at device.common, uncached in the entry root, and nothing else maps it" { hw::Mmio[Common].map(device.common) }
+    defer take common.unmap()
+    try start(mut common, table: bus, avail: bus + DRIVER_AREA, used: bus + DEVICE_AREA)
+    let notify_off = mut common.read(Common.queue_notify_off)
+    let Some(doorbell) = device.notify.checked_add(u64.widen(notify_off) * u64.widen(device.multiplier)) else {
+        fail DeviceError.NoCapability
+    }
+    for at in 0..<SECTOR_BYTES {
+        mut queue.write_release_at(Queue.data, index: at, value: pattern(at))
+    }
+    try request(mut queue, doorbell, kind: WRITE, done: 1)
+    for at in 0..<SECTOR_BYTES {
+        mut queue.write_release_at(Queue.data, index: at, value: 0)
+    }
+    try request(mut queue, doorbell, kind: READ, done: 2)
+    for at in 0..<SECTOR_BYTES {
+        if mut queue.read_acquire_at(Queue.data, index: at) != pattern(at) {
+            fail DeviceError.Refused
+        }
+    }
+} exchange
+
+/// Makes the request of kind `kind` on the sector through the queue's three descriptors, rings
+/// the doorbell, and waits for the device to have used `done` requests and report success.
+fn request(mut queue: hw::DmaShared[Queue], doorbell: u64, kind: u32, done: u16) fails DeviceError {
+    let bus = queue.bus_addr().value
+    var data_flags = NEXT
+    if kind == READ {
+        data_flags = NEXT | DEVICE_WRITES
+    }
+    mut queue.write_release(Queue.kind, value: kind)
+    mut queue.write_release(Queue.sector, value: SECTOR)
+    mut queue.write_release(Queue.status, value: 0xFF)
+    mut queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(address: bus + HEADER, length: 16, flags: NEXT, next: 1))
+    mut queue.write_release_at(Queue.descriptors, index: 1, value: Descriptor(address: bus + DATA, length: 512, flags: data_flags, next: 2))
+    mut queue.write_release_at(Queue.descriptors, index: 2, value: Descriptor(address: bus + STATUS_AREA, length: 1, flags: DEVICE_WRITES, next: 0))
+    mut queue.write_release_at(Queue.avail_ring, index: usize.widen(done - 1) % 4, value: 0)
+    mut queue.write_release(Queue.avail_index, value: done)
+    var notify = trusted "the device's notification registers lie at doorbell, uncached in the entry root, and nothing else maps them" { hw::Mmio[Notify].map(doorbell) }
+    mut notify.write(Notify.queue, value: 0)
+    take notify.unmap()
+    for _ in 0..<USED_POLLS {
+        if mut queue.read_acquire(Queue.used_index) == done {
+            if mut queue.read_acquire(Queue.status) != 0 {
+                fail DeviceError.Refused
+            }
+            return
+        }
+    }
+    fail DeviceError.NoResponse
+} request
+
+/// Resets the device, negotiates virtio 1 and the platform's translation of its DMA, and sets up
+/// queue 0 of `QUEUE_SIZE` entries with its descriptor table, driver area and device area at the
+/// bus addresses `table`, `avail` and `used`, leaving the device running.
+fn start(mut common: hw::Mmio[Common], table: u64, avail: u64, used: u64) fails DeviceError {
+    mut common.write(Common.status, value: 0)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER)
+    mut common.write(Common.device_feature_select, value: 1)
+    let wanted = VERSION_1 | ACCESS_PLATFORM
+    if (mut common.read(Common.device_feature) & wanted) != wanted {
+        fail DeviceError.Unsupported
+    }
+    mut common.write(Common.driver_feature_select, value: 0)
+    mut common.write(Common.driver_feature, value: 0)
+    mut common.write(Common.driver_feature_select, value: 1)
+    mut common.write(Common.driver_feature, value: wanted)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK)
+    if (mut common.read(Common.status) & FEATURES_OK) == 0 {
+        fail DeviceError.Unsupported
+    }
+    mut common.write(Common.queue_select, value: 0)
+    if mut common.read(Common.queue_size) < QUEUE_SIZE {
+        fail DeviceError.Unsupported
+    }
+    mut common.write(Common.queue_size, value: QUEUE_SIZE)
+    mut common.write(Common.queue_desc_low, value: u32.truncate(table))
+    mut common.write(Common.queue_desc_high, value: u32.truncate(table >> 32))
+    mut common.write(Common.queue_driver_low, value: u32.truncate(avail))
+    mut common.write(Common.queue_driver_high, value: u32.truncate(avail >> 32))
+    mut common.write(Common.queue_device_low, value: u32.truncate(used))
+    mut common.write(Common.queue_device_high, value: u32.truncate(used >> 32))
+    mut common.write(Common.queue_enable, value: 1)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+} start

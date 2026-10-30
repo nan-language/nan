@@ -7,7 +7,7 @@ use std::process::Command;
 
 use super::{Invocation, Name, Outcome, Trace, record};
 use crate::diagnostic::{Class, Code};
-use crate::emulator::{self, Writes};
+use crate::emulator::{self, Boots, Machine};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
@@ -18,8 +18,9 @@ use crate::workspace::{Kind, Target, Workspace};
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<String>,
-    /// Whether the program is the emulator, whose end gives the run's status.
-    pub emulated: bool,
+    /// The machine directory of the emulator, whose end gives the run's status; none for an
+    /// image.
+    pub machine: Option<Machine>,
 }
 
 impl Launch {
@@ -27,8 +28,8 @@ impl Launch {
     /// it and its status is the run's; the emulator runs as a child, and the status the run ends
     /// with is given once it ends.
     pub fn start(&self) -> i32 {
-        if self.emulated {
-            return emulator::run(self);
+        if let Some(machine) = &self.machine {
+            return emulator::run(self, machine);
         }
         let error = Command::new(&self.program).args(&self.args).exec();
         panic!("starting {}: {error}", self.program.display());
@@ -55,9 +56,11 @@ pub fn run(
         let manifest = workspace.packages[*program].manifest.as_ref();
         manifest.is_some_and(|manifest| manifest.targets.iter().any(|target| target.is_host()))
     });
+    let resets = invocation.flag("--keep-resets");
     let unusable = programs.is_empty()
         || (invocation.name == Name::Run && !single)
-        || (compared.is_some() && (!single || !host));
+        || (compared.is_some() && (!single || !host))
+        || (resets && host);
     if unusable {
         return Ok(Outcome::Output(
             invocation.tool_error(Code::ToolUsage, &written),
@@ -92,16 +95,20 @@ pub fn run(
         if !emulator::available(target) {
             return Ok(Outcome::Ended(emulator::OTHER_END));
         }
+        let boots = || Boots::Kept {
+            dir: workspace.root.join(".nan/machine").join(target.name()),
+            resets,
+        };
         let launch = match target.kind() {
             Some(Kind::Uefi) => {
                 let files = volume_files(workspace, target, &path)?;
-                emulator::launch(target, &path, &files, Writes::Kept)?
+                emulator::launch(target, &path, &files, boots())?
             }
-            Some(Kind::Bare) => emulator::launch(target, &path, &[], Writes::Kept)?,
+            Some(Kind::Bare) => emulator::launch(target, &path, &[], boots())?,
             _ => Launch {
                 program: path,
                 args: invocation.passed.to_vec(),
-                emulated: false,
+                machine: None,
             },
         };
         return Ok(Outcome::Launch(launch));

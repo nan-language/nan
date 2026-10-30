@@ -32,7 +32,7 @@ sudo add-apt-repository ppa:nanlang/nan
 sudo apt install nan
 ```
 
-Building programs for the host target of the machine's architecture requires a C compiler available as `cc`, which links them, and for the other host target the GNU cross compiler, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`), and the `uefi` targets their firmware, OVMF and AAVMF. The packages list most of these tools as optional dependencies.
+Building programs for the host target of the machine's architecture requires a C compiler available as `cc`, which links them, and for the other host target the GNU cross compiler, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`) and `swtpm`, and the `uefi` targets their firmware, OVMF and AAVMF. The packages list most of these tools as optional dependencies.
 
 ## Specification
 
@@ -49,7 +49,7 @@ nan run
 nan test
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting a UEFI or bare image under QEMU with its serial port on the terminal. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names. `nan show <path> --api` prints the head, contracts and digest of any item, std included, and `nan primer` the primer.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting a UEFI or bare image under QEMU with its serial port on the terminal; the machine keeps its disk, firmware variables and TPM state in `.nan/machine/<target>/`, where `socat - UNIX-CONNECT:.nan/machine/<target>/console.sock` reaches its console port, and `--keep-resets` reboots it on a reset instead of ending the run. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names. `nan show <path> --api` prints the head, contracts and digest of any item, std included, and `nan primer` the primer.
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 

@@ -876,7 +876,7 @@ fn compare_boots(
     let launch = run
         .launch
         .ok_or_else(|| format!("nan run {program} reports\n{}", run.output))?;
-    let booted = machine::boot(&launch, bootstrap)?;
+    let booted = machine::boot(&launch)?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let mut command = Command::new(&toolchain.image);
     command

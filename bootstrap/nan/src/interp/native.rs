@@ -482,12 +482,14 @@ pub fn conformance(
     at: (ItemId, Span),
     site: Site,
 ) -> Exec<Flow> {
+    let own = type_args.get(1).and_then(Arg::ty);
     match method {
-        "render" => render::builtin(interp, ty, &args, at, site)?,
-        "hash" => {
-            let hasher = type_args.get(1).and_then(Arg::ty);
-            hashing::builtin(interp, ty, hasher, &args, at, site)?;
+        "encode" | "decode" => {
+            let own = own.expect("an encoder or decoder type");
+            return codecs::through(interp, ty, own, method, &args, at, site);
         }
+        "render" => render::builtin(interp, ty, &args, at, site)?,
+        "hash" => hashing::builtin(interp, ty, own, &args, at, site)?,
         _ => {}
     }
     let values: Vec<Val> = args.iter().map(|arg| interp.deref(arg)).collect();
@@ -557,8 +559,8 @@ pub fn ordering_value(item: ItemId, order: Ordering) -> Val {
 }
 
 /// A method a derive writes for a type: equality and order over its fields or variants in
-/// declaration order, its rendering and hash, and the default of a struct; a run reaching
-/// another ends missing.
+/// declaration order, its rendering, hash and encoding, and the default of a struct; a run
+/// reaching another ends missing.
 pub fn derived(
     interp: &mut Interpreter,
     owner: ItemId,
@@ -569,6 +571,12 @@ pub fn derived(
     site: Site,
 ) -> Exec<Flow> {
     match method {
+        "encode" | "decode" => {
+            let count = interp.ck.sig(owner).generics.len();
+            let ty = Ty::item(owner, type_args[..count].to_vec());
+            let own = type_args[count].ty().expect("an encoder or decoder type");
+            return codecs::through(interp, &ty, own, method, &args, at, site);
+        }
         "render" => render::derived(interp, owner, type_args, &args, at, site)?,
         "hash" => hashing::derived(interp, owner, type_args, &args, at, site)?,
         _ => {}

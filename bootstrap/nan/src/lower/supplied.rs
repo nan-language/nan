@@ -163,15 +163,15 @@ pub fn element_at(
     fx.b.ins().iadd(start, offset)
 }
 
-/// Defines the lowered function of a std function without a body.
-pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Args) {
+/// The result address, failure address and parameters a function of an ABI receives.
+pub fn entry(fx: &mut Fx, abi: &Abi) -> (Option<Value>, Option<Value>, Vec<Held>) {
     let incoming = fx.entry();
     let mut incoming = incoming.into_iter();
     let sret = (abi.returned == Returned::Indirect).then(|| incoming.next().expect("a result"));
     let failure = abi
         .flagged
         .then(|| incoming.next().expect("a failure address"));
-    let params: Vec<Held> = abi
+    let params = abi
         .params
         .iter()
         .map(|(_, repr)| match repr {
@@ -180,6 +180,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
             Repr::Empty => Held::Empty,
         })
         .collect();
+    (sret, failure, params)
+}
+
+/// Defines the lowered function of a std function without a body.
+pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Args) {
+    let (sret, failure, params) = entry(fx, abi);
     for (position, ((nty, _), held)) in abi.params.iter().zip(&params).enumerate() {
         if let (Ty::Fn(_), Held::Address(address)) = (nty.ty(), held) {
             fx.fn_params.insert(*address, position);

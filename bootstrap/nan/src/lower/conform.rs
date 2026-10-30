@@ -1,13 +1,13 @@
 //! Conformances lowering writes: the methods derives write for structs and enums, and the
 //! conformances the toolchain supplies to scalars and std types, of `Eq`, `Ord`, `Hash`,
-//! `Default` and `Render`; and the calls generated code makes of interface methods.
+//! `Default`, `Render` and `Encode`; and the calls generated code makes of interface methods.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::Lowering;
 use super::abi::{Abi, Repr, Returned};
 use super::body::Held;
-use super::call::{Invoked, adapt_value};
+use super::call::{Called, Invoked, adapt_value};
 use super::fx::{Fx, PTR};
 use super::layout::Shape;
 use crate::check::db::ItemId;
@@ -35,7 +35,11 @@ impl Lowering<'_, '_> {
     /// method's own type arguments.
     pub fn conformance_head(&mut self, ty: &Ty, method: &str, own: &Args) -> FnTy {
         let interface = self.core_interface(method_interface(method));
-        self.method_head(ty, interface, own, 0).0
+        let index = self
+            .ck
+            .interface_method(interface, method)
+            .expect("a method of the interface");
+        self.method_head(ty, interface, own, index as u32).0
     }
 
     /// Calls method `method` of a core interface on a value of a concrete type, with `own`
@@ -49,19 +53,30 @@ impl Lowering<'_, '_> {
         args: &[Held],
     ) -> Held {
         let interface = self.core_interface(interface);
+        self.call_interface(fx, ty, interface, 0, own, args).result
+    }
+
+    /// Calls method `method` of an interface on a value of a concrete type, with `own` type
+    /// arguments of the method.
+    pub fn call_interface(
+        &mut self,
+        fx: &mut Fx,
+        ty: &Ty,
+        interface: ItemId,
+        method: u32,
+        own: Vec<Arg>,
+        args: &[Held],
+    ) -> Called {
         let mut fn_args = vec![Arg::Ty(ty.clone())];
         fn_args.extend(own);
         let fn_ref = FnRef {
-            callable: Callable::Method {
-                interface,
-                method: 0,
-            },
+            callable: Callable::Method { interface, method },
             args: fn_args.into(),
         };
         let instance = self.callable_instance(&fn_ref, false);
         let abi = self.abi(&instance);
         let id = self.instance(instance);
-        self.invoke(fx, Invoked::Direct(id), &abi, args).result
+        self.invoke(fx, Invoked::Direct(id), &abi, args)
     }
 
     /// Whether two values of a type at addresses are equal by `Eq.eq`.
@@ -98,7 +113,7 @@ fn method_interface(method: &str) -> &'static str {
         "hash" => "Hash",
         "default" => "Default",
         "render" => "Render",
-        "write" => "Encode",
+        "encode" | "decode" => "Encode",
         "generate" => "Generate",
         other => panic!("the conformance method {other}"),
     }
@@ -115,6 +130,7 @@ pub fn derived(
 ) {
     let (ty, _) = derived_parts(lo, owner, args);
     match method {
+        "encode" | "decode" => super::supplied::codecs::calls::through(lo, fx, abi, &ty, method),
         "render" => super::supplied::render::define_render(lo, fx, abi, &ty),
         "generate" => super::supplied::generate::derived(lo, fx, abi, &ty),
         _ => composite(lo, fx, abi, &ty, method),
@@ -131,6 +147,10 @@ fn derived_parts(lo: &Lowering, owner: ItemId, args: &Args) -> (Ty, Args) {
 
 /// Defines a conformance the toolchain supplies.
 pub fn supplied(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty, method: &str) {
+    if let "encode" | "decode" = method {
+        super::supplied::codecs::calls::through(lo, fx, abi, ty, method);
+        return;
+    }
     if method == "render" {
         super::supplied::render::define_render(lo, fx, abi, ty);
         return;

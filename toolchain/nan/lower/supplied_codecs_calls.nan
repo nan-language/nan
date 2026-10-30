@@ -1,0 +1,421 @@
+//! `T.encode(self, mut e)` and `T.decode(mut d, alloc)` of the types whose `Encode` a derive writes or the toolchain supplies, through the calls of an encoder or decoder of any type: per encoder type and type, an encoding function makes the calls of `core::Encoder` a value's kind states, given the value's address and the encoder's; decoding runs the decoding functions of the format of a decoder's calls, whose reader holds the decoder's address in place of the input's position.
+
+/// What a call of a decoder's method gives: its result, and the code of the failure it raises,
+/// zero for none.
+struct CallRead derives Copy {
+    result: Held
+    failed: clif::Value
+} CallRead
+
+/// Defines `encode` or `decode` of a type, whose encoder or decoder is the type of its other
+/// parameter.
+fn codecs_through(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty, method: Str) {
+    let entry = supply_entry(mut fx, abi, alloc: lo.alloc)
+    var path = text::String.of("core::Encode.", alloc: lo.alloc)
+    mut path.append(method)
+    let supply = Supply(abi: abi.copy(lo.alloc), args: lo.ck.types().args(mem::List[ty::Arg].empty(lo.alloc)), path: take path, owner: None, sret: entry.sret, failure: entry.failure, params: take entry.params, wrap: None)
+    expect abi.params.len() == 2
+    if method == "encode" {
+        let encoder_ty = abi.params[1].nty.ty()
+        let value = tasks_address_of(mut lo, mut fx, ty, held: supply.param(0))
+        let function = calls_encoder(mut lo, encoder_ty, ty)
+        let call_args = fx.list2(value, b: supply.param(1).address_value())
+        discard codecs_call(mut lo, mut fx, function, args: call_args.view())
+        supply.done(mut lo, mut fx)
+        return
+    }
+    let decoder_ty = abi.params[0].nty.ty()
+    let alloc = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+    let state = mut fx.slot(READER_SIZE, align: 8)
+    let address = supply.param(0).address_value()
+    mut fx.store(address, addr: state, offset: READER_POS)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: state, offset: READER_DEPTH)
+    let laid = mut lo.layout_of(ty)
+    var target = zero
+    match supply.sret {
+        Some(sret) => {
+            target = sret
+        }
+        None => {
+            target = mut fx.slot(laid.contents().size, align: laid.contents().align)
+        }
+    }
+    let function = decoder(mut lo, format: DecodeFormat.Calls(decoder_ty), ty)
+    let call_args = fx.list3(state, b: alloc, c: target)
+    let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
+    expect codes.len() == 1
+    codecs_returned(mut lo, mut fx, supply, ty, target, code: codes[0])
+} codecs_through
+
+/// Calls method `name` of `core::Encoder` on the encoder at an address.
+fn calls_write(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, target: clif::Value, name: Str, args: Slice[Held]) {
+    let interface_item = lo.core_interface("Encoder")
+    let Some(method) = lo.ck.interface_method(interface_item, name) else {
+        expect false
+        return
+    }
+    var all = mem::List[Held].empty(lo.alloc)
+    mut all.push(Held.Address(target))
+    for arg in args {
+        mut all.push(arg)
+    }
+    discard mut lo.call_interface(mut fx, ty: encoder_ty, interface_item, method: u32.fit(method), own: mem::List[ty::Arg].empty(lo.alloc), args: all.view())
+} calls_write
+
+/// A view of `len` bytes from `start`, as a `Str` or slice of bytes is held.
+fn calls_view(mut fx: Fx, start: clif::Value, len: clif::Value) -> Held {
+    let view = mut fx.slot(16, align: 8)
+    mut fx.store(start, addr: view, offset: 0)
+    mut fx.store(len, addr: view, offset: 8)
+    return Held.Address(view)
+} calls_view
+
+/// The encoding function of a type through an encoder of a type: given the value's address and
+/// the encoder's.
+fn calls_encoder(mut lo: Lowering, encoder_ty: ty::Ty, ty: ty::Ty) -> object::FuncId {
+    let bare = unwrapped(lo, ty)
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    return mut lo.glue_function(Glue.EncodeCalls(encoder: encoder_ty, ty: bare), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let kind = kind_of(mut lo1, ty: bare)
+        calls_encode_kind(mut lo1, fx: mut fx1, encoder_ty, ty: bare, kind, value: params[0], target: params[1])
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} calls_encoder
+
+fn calls_encode_kind(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, ty: ty::Ty, kind: CodecsKind, value: clif::Value, target: clif::Value) {
+    match kind {
+        CodecsKind.Bool => {
+            let flag = mut fx.load(clif::Type.Int8, addr: value, offset: 0)
+            let args = Array[Held, 1].filled(Held.Scalar(flag))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_bool", args: args.view())
+        }
+        CodecsKind.Unsigned(scalar) => calls_encode_integer(mut lo, mut fx, encoder_ty, scalar, signed: false, value, target)
+        CodecsKind.Signed(scalar) => calls_encode_integer(mut lo, mut fx, encoder_ty, scalar, signed: true, value, target)
+        CodecsKind.Char => {
+            let scalar = mut fx.load(clif::Type.Int32, addr: value, offset: 0)
+            let args = Array[Held, 1].filled(Held.Scalar(scalar))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_char", args: args.view())
+        }
+        CodecsKind.Float(scalar) => {
+            let loaded = mut fx.load(scalar_type(scalar), addr: value, offset: 0)
+            var wide = loaded
+            if scalar == ty::Scalar.Float32 {
+                wide = mut fx.b.fpromote(clif::Type.Float64, x: loaded)
+            }
+            let args = Array[Held, 1].filled(Held.Scalar(wide))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_float", args: args.view())
+        }
+        CodecsKind.Text(fixed) => {
+            let text = text_of(mut lo, mut fx, ty, fixed, value)
+            let args = Array[Held, 1].filled(calls_view(mut fx, start: text.start, len: text.len))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_text", args: args.view())
+        }
+        CodecsKind.Bytes => {
+            let start = mut fx.load(PTR, addr: value, offset: VECTOR_DATA)
+            let len = mut fx.load(PTR, addr: value, offset: VECTOR_LEN)
+            let args = Array[Held, 1].filled(calls_view(mut fx, start, len))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_bytes", args: args.view())
+        }
+        CodecsKind.Sequence(element: element, form: form) => calls_encode_sequence(mut lo, mut fx, encoder_ty, ty, element, form, value, target)
+        CodecsKind.Map(key: key, value: value_ty) => calls_encode_map(mut lo, mut fx, encoder_ty, key, value_ty, value, target)
+        CodecsKind.Contents(inner: inner, shared: _) => {
+            let contents = contents_of(mut lo, mut fx, ty, value)
+            let function = calls_encoder(mut lo, encoder_ty, ty: inner)
+            let call_args = fx.list2(contents, b: target)
+            discard codecs_call(mut lo, mut fx, function, args: call_args.view())
+        }
+        CodecsKind.Id => {
+            let loaded = mut fx.load(clif::Type.Int32, addr: value, offset: 0)
+            let index = mut fx.b.uextend(clif::Type.Int64, x: loaded)
+            let args = Array[Held, 1].filled(Held.Scalar(index))
+            calls_write(mut lo, mut fx, encoder_ty, target, name: "write_unsigned", args: args.view())
+        }
+        CodecsKind.Record(record) => calls_encode_record(mut lo, mut fx, encoder_ty, record, value, target)
+        CodecsKind.Variant(cases) => {
+            let index = mut lo.variant_index(mut fx, ty, address: value)
+            for position in 0..<cases.len() {
+                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+                let case = cases[position]
+                mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+                    calls_encode_case(mut lo, fx: mut fx1, encoder_ty, ty, case, value, target)
+                })
+            }
+        }
+    }
+} calls_encode_kind
+
+/// Writes a sequence: its count, then its elements, each through its type's encoding function.
+fn calls_encode_sequence(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, ty: ty::Ty, element: ty::Ty, form: CodecsForm, value: clif::Value, target: clif::Value) {
+    let elements = elements_of(mut lo, mut fx, ty, form, value)
+    let shape = Element.of(mut lo, ty: element)
+    let function = calls_encoder(mut lo, encoder_ty, ty: element)
+    let args = Array[Held, 1].filled(Held.Scalar(elements.len))
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "begin_sequence", args: args.view())
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: elements.len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data: elements.start, index)
+        let call_args = fx1.list2(at, b: target)
+        discard codecs_call(mut lo, fx: mut fx1, function, args: call_args.view())
+    })
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "end", args: mem::List[Held].empty(lo.alloc).view())
+} calls_encode_sequence
+
+/// Writes a map: its count, then its entries, each a key and a value.
+fn calls_encode_map(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, key: ty::Ty, value_ty: ty::Ty, value: clif::Value, target: clif::Value) {
+    let entries = Entries.of_map(mut lo, key, value: value_ty)
+    let value_field = mut lo.layouts.field(lo.ck, ty: entries.entry, variant: None, label: "value")
+    let value_at = value_field.offset
+    let head = mut fx.load(PTR, addr: value, offset: VECTOR_DATA)
+    let count = mut fx.load(PTR, addr: value, offset: VECTOR_LEN)
+    let key_function = calls_encoder(mut lo, encoder_ty, ty: key)
+    let value_function = calls_encoder(mut lo, encoder_ty, ty: value_ty)
+    let args = Array[Held, 1].filled(Held.Scalar(count))
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "begin_map", args: args.view())
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let entry = entries.shape.at(mut fx1, data: head, index)
+        let key_address = mut fx1.offset(entry, offset: entries.key_at)
+        let value_address = mut fx1.offset(entry, offset: value_at)
+        let key_args = fx1.list2(key_address, b: target)
+        discard codecs_call(mut lo, fx: mut fx1, function: key_function, args: key_args.view())
+        let value_args = fx1.list2(value_address, b: target)
+        discard codecs_call(mut lo, fx: mut fx1, function: value_function, args: value_args.view())
+    })
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "end", args: mem::List[Held].empty(lo.alloc).view())
+} calls_encode_map
+
+/// Writes an unsigned or signed integer of a scalar type at `value`, widened to 64 bits.
+fn calls_encode_integer(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, scalar: ty::Scalar, signed: bool, value: clif::Value, target: clif::Value) {
+    let loaded = mut fx.load(scalar_type(scalar), addr: value, offset: 0)
+    var wide = loaded
+    if scalar.bits() < 64 {
+        if signed {
+            wide = mut fx.b.sextend(clif::Type.Int64, x: loaded)
+        } else {
+            wide = mut fx.b.uextend(clif::Type.Int64, x: loaded)
+        }
+    }
+    var name = "write_unsigned"
+    if signed {
+        name = "write_signed"
+    }
+    let args = Array[Held, 1].filled(Held.Scalar(wide))
+    calls_write(mut lo, mut fx, encoder_ty, target, name, args: args.view())
+} calls_encode_integer
+
+/// Writes a variant of an enum value: its key, then its payload when it has one.
+fn calls_encode_case(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, ty: ty::Ty, case: Case, value: clif::Value, target: clif::Value) {
+    let key = mut lo.view_literal(mut fx, contents: case.key.as_bytes())
+    var payload = true
+    match case.payload {
+        CasePayload.None => {
+            payload = false
+        }
+        else => {}
+    }
+    var flag: i64 = 0
+    if payload {
+        flag = 1
+    }
+    let follows = mut fx.int(clif::Type.Int8, value: flag)
+    var args = Array[Held, 2].filled(key)
+    args[1] = Held.Scalar(follows)
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "begin_variant", args: args.view())
+    match case.payload {
+        CasePayload.None => {}
+        CasePayload.Single(payload_ty) => {
+            let address = mut lo.payload_address(mut fx, ty, variant: case.key.as_str(), label: "", address: value)
+            let function = calls_encoder(mut lo, encoder_ty, ty: payload_ty)
+            let call_args = fx.list2(address, b: target)
+            discard codecs_call(mut lo, mut fx, function, args: call_args.view())
+        }
+        CasePayload.Labelled(record) => calls_encode_record(mut lo, mut fx, encoder_ty, record, value, target)
+    }
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "end", args: mem::List[Held].empty(lo.alloc).view())
+} calls_encode_case
+
+/// Writes a record: per field, in ascending byte order of keys, its key and value.
+fn calls_encode_record(mut lo: Lowering, mut fx: Fx, encoder_ty: ty::Ty, record: Record, value: clif::Value, target: clif::Value) {
+    let fields = by_key(record, alloc: lo.alloc)
+    let count = mut fx.ptr(u64.widen(fields.len()))
+    let counted = Array[Held, 1].filled(Held.Scalar(count))
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "begin_record", args: counted.view())
+    for field in fields {
+        let field_at = mut fx.offset(value, offset: field.offset)
+        let key = Array[Held, 1].filled(mut lo.view_literal(mut fx, contents: field.key.as_bytes()))
+        calls_write(mut lo, mut fx, encoder_ty, target, name: "write_key", args: key.view())
+        let function = calls_encoder(mut lo, encoder_ty, ty: field.ty)
+        let call_args = fx.list2(field_at, b: target)
+        discard codecs_call(mut lo, mut fx, function, args: call_args.view())
+    }
+    calls_write(mut lo, mut fx, encoder_ty, target, name: "end", args: mem::List[Held].empty(lo.alloc).view())
+} calls_encode_record
+
+/// Calls method `name` of `core::Decoder` on the decoder a reader holds: its result, and the
+/// code of the failure it raises, zero for none and for an implementing function that cannot
+/// fail.
+fn calls_read(mut lo: Lowering, mut fx: Fx, decoder_ty: ty::Ty, reader_state: clif::Value, name: Str, args: Slice[Held]) -> CallRead {
+    let interface_item = lo.core_interface("Decoder")
+    let Some(method) = lo.ck.interface_method(interface_item, name) else {
+        expect false
+        return CallRead(result: Held.Empty, failed: reader_state)
+    }
+    let address = mut fx.load(PTR, addr: reader_state, offset: READER_POS)
+    var all = mem::List[Held].empty(lo.alloc)
+    mut all.push(Held.Address(address))
+    for arg in args {
+        mut all.push(arg)
+    }
+    let called = mut lo.call_interface(mut fx, ty: decoder_ty, interface_item, method: u32.fit(method), own: mem::List[ty::Arg].empty(lo.alloc), args: all.view())
+    let Some(failed) = called.failed else {
+        return CallRead(result: called.result, failed: mut fx.int(clif::Type.Int32, value: 0))
+    }
+    let Some(error) = called.failure else {
+        return CallRead(result: called.result, failed: mut fx.int(clif::Type.Int32, value: 0))
+    }
+    let results = fx.types1(clif::Type.Int32)
+    let codes = mut fx.choose_in(mut lo, condition: failed, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let error_ty = lo1.std_ty("core", type_name: "DecodeError", args: mem::List[ty::Ty].empty(lo1.alloc))
+        let index = mut lo1.variant_index(mut fx1, ty: error_ty, address: error)
+        let code = mut fx1.b.iadd_imm_s(index, y: 1)
+        let narrow = mut fx1.b.ireduce(clif::Type.Int32, x: code)
+        return fx1.list1(narrow)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int32, value: 0)
+        return fx1.list1(none)
+    })
+    expect codes.len() == 1
+    return CallRead(result: called.result, failed: codes[0])
+} calls_read
+
+/// Calls a decoder's method `name` that gives a scalar, returning from the decoding function
+/// after `undo` when it fails.
+fn calls_read_scalar(mut lo: Lowering, mut fx: Fx, decoder_ty: ty::Ty, reader_state: clif::Value, name: Str, undo: fn(mut lo: Lowering, mut fx: Fx)) -> clif::Value {
+    let read = calls_read(mut lo, mut fx, decoder_ty, reader_state, name, args: mem::List[Held].empty(lo.alloc).view())
+    check(mut lo, mut fx, code: read.failed, undo)
+    return read.result.scalar_value()
+} calls_read_scalar
+
+/// The key a decoder's call `name` gives, and the position of the field or variant it names.
+struct CallKey {
+    key: mem::Bytes
+    field: usize
+} CallKey
+
+/// The position among `names` of the field or variant the key a decoder reads through its
+/// method `name` names, directly or through an alias, -1 for none: the keys it is given are the
+/// names, then the old keys of the aliases of names. Returns from the decoding function after
+/// `undo` when the call fails.
+fn calls_read_key(mut lo: Lowering, mut fx: Fx, decoder_ty: ty::Ty, reader_state: clif::Value, name: Str, names: Slice[mem::Bytes], aliases: Slice[KeyAlias], undo: fn(mut lo: Lowering, mut fx: Fx)) -> clif::Value {
+    var keys = mem::List[CallKey].empty(lo.alloc)
+    for position in 0..<names.len() {
+        var key = mem::Bytes.empty(lo.alloc)
+        mut key.append(names[position].view())
+        mut keys.push(CallKey(key: take key, field: position))
+    }
+    for alias in aliases {
+        for position in 0..<names.len() {
+            if names[position].view() == alias.current.view() {
+                var key = mem::Bytes.empty(lo.alloc)
+                mut key.append(alias.old.view())
+                mut keys.push(CallKey(key: take key, field: position))
+                break
+            }
+        }
+    }
+    var room = u64.widen(keys.len())
+    if room < 1 {
+        room = 1
+    }
+    let array = mut fx.slot(16 * room, align: 8)
+    for index in 0..<keys.len() {
+        let literal = mut lo.view_literal(mut fx, contents: keys[index].key.view())
+        let start = mut fx.load(PTR, addr: literal.address_value(), offset: 0)
+        let len = mut fx.ptr(u64.widen(keys[index].key.len()))
+        mut fx.store(start, addr: array, offset: 16 * u64.widen(index))
+        mut fx.store(len, addr: array, offset: 16 * u64.widen(index) + 8)
+    }
+    let count = mut fx.ptr(u64.widen(keys.len()))
+    let keys_view = Array[Held, 1].filled(calls_view(mut fx, start: array, len: count))
+    let read = calls_read(mut lo, mut fx, decoder_ty, reader_state, name, args: keys_view.view())
+    check(mut lo, mut fx, code: read.failed, undo)
+    var option_args = mem::List[ty::Ty].empty(lo.alloc)
+    mut option_args.push(ty::Ty.scalar(ty::Scalar.UnsignedSize))
+    let option = lo.std_ty("core", type_name: "Option", args: take option_args)
+    let found = tasks_address_of(mut lo, mut fx, ty: option, held: read.result)
+    let variant = mut lo.variant_index(mut fx, ty: option, address: found)
+    let some = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: variant, y: 0)
+    let payload = mut lo.payload_address(mut fx, ty: option, variant: "Some", label: "", address: found)
+    let index = mut fx.load(PTR, addr: payload, offset: 0)
+    var matched = mut fx.int(PTR, value: -1)
+    for position in 0..<keys.len() {
+        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+        let field = mut fx.int(PTR, value: i64.fit(keys[position].field))
+        matched = mut fx.b.select(this, x: field, y: matched)
+    }
+    let none = mut fx.int(PTR, value: -1)
+    return mut fx.b.select(some, x: matched, y: none)
+} calls_read_key
+
+/// Reads text or bytes into the empty string or bytes at `target`, drawn for exactly them, or
+/// into a fixed text of at most so many bytes: the length a decoder's `begin_text` or
+/// `begin_bytes` gives, then the bytes its `read_chunk` fills in, which must be well-formed
+/// UTF-8 for text.
+fn calls_decode_text(mut lo: Lowering, mut fx: Fx, decoder_ty: ty::Ty, reader_state: clif::Value, ty: ty::Ty, fixed: Option[u64], text: bool, target: clif::Value) {
+    var begin = "begin_bytes"
+    if text {
+        begin = "begin_text"
+    }
+    let len = calls_read_scalar(mut lo, mut fx, decoder_ty, reader_state, name: begin, undo: fn(mut lo1: Lowering, mut fx1: Fx) {})
+    var start = len
+    match fixed {
+        Some(capacity) => {
+            let over = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: len, y: i64.fit(capacity))
+            mut fx.if_true(over, then: fn(mut fx1: Fx) {
+                codecs_fail(mut fx1, code: FAILURE_OUT_OF_RANGE)
+            })
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
+            mut fx.store(len, addr: target, offset: len_field.offset)
+            start = mut fx.offset(target, offset: bytes_field.offset)
+        }
+        None => {
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+                let drawn = vector_resize(mut lo, fx: mut fx1, address: target, capacity: len, element: CODECS_BYTE)
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+                mut fx1.if_true(failed, then: fn(mut fx2: Fx) {
+                    codecs_fail(mut fx2, code: FAILURE_OUT_OF_MEMORY)
+                })
+            })
+            mut fx.store(len, addr: target, offset: VECTOR_LEN)
+            start = mut fx.load(PTR, addr: target, offset: VECTOR_DATA)
+        }
+    }
+    let drawn = fixed.is_none()
+    let zero = mut fx.ptr(0)
+    let fill_args = fx.list3(start, b: zero, c: len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let out = Array[Held, 1].filled(calls_view(mut fx, start, len))
+    let read = calls_read(mut lo, mut fx, decoder_ty, reader_state, name: "read_chunk", args: out.view())
+    check(mut lo, mut fx, code: read.failed, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
+        if drawn {
+            free_storage(mut lo1, fx: mut fx1, address: target)
+        }
+    })
+    if text {
+        let valid = utf8_valid(mut lo, mut fx, start, len)
+        let invalid = mut fx.b.bxor_imm_s(valid, y: 1)
+        mut fx.if_true(invalid, then: fn[mut lo](mut fx1: Fx) {
+            if drawn {
+                free_storage(mut lo, fx: mut fx1, address: target)
+            }
+            codecs_fail(mut fx1, code: FAILURE_INVALID_TEXT)
+        })
+    }
+} calls_decode_text

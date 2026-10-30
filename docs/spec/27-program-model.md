@@ -448,7 +448,7 @@ A **support routine** is one of these fixed routines of the implementation, each
 | `stack_switch` | creates, switches and frees task stacks, and runs each executor's choice of ready tasks | every concrete target |
 | `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the host targets it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack and reports `trap.stack-overflow` | every concrete target |
 | `settle` | performs [settlement](11-errors-domains.md#settlement) | the host targets |
-| `cap_table` | mints capabilities, checks generations, revokes, keeps cells, chunk draws and the outbox table, and dispatches each target-dependent operation to the platform function its table entry records ([platform packages](28-stdlib.md#platform-packages)) | every concrete target |
+| `cap_table` | mints capabilities, revokes, keeps cells, chunk draws and the outbox table, and dispatches each target-dependent operation to the platform function its table entry records ([platform packages](28-stdlib.md#platform-packages)) | every concrete target |
 | `mem_op` | copies, fills and compares byte ranges for lowering | every concrete target |
 | `replay` | runs the seeded scheduler and records [replay tokens](22-testing.md#replay), in test runs only | every concrete target |
 | `anchor` | installs and reaches the [anchor](24-kernel.md#anchor) | the machine targets |

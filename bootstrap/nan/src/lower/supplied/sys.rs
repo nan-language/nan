@@ -15,7 +15,7 @@ use super::super::Lowering;
 use super::super::body::{Body, Held};
 use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{entry, kind};
+use super::super::runtime::tables::{entry, kind, live_entry};
 use super::super::runtime::{Routine, holdings};
 use super::super::transfer;
 use super::Supply;
@@ -68,7 +68,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
 /// `Revoked.Stale` when its handle is stale.
 fn checked(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) -> Value {
     let handle = fx.load(PTR, capability, 0);
-    let record = lo.call_routine(fx, Routine::Check, &[handle])[0];
+    let record = live_entry(lo, fx, handle);
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
     record
@@ -380,7 +380,7 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let handle = fx.load(PTR, capability, 0);
-    let record = lo.call_routine(fx, Routine::Check, &[handle])[0];
+    let record = live_entry(lo, fx, handle);
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     match supply.member() {
         "elapsed_ms" => {
@@ -418,7 +418,7 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let handle = fx.load(PTR, capability, 0);
-    let record = lo.call_routine(fx, Routine::Check, &[handle])[0];
+    let record = live_entry(lo, fx, handle);
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
     let value_ty = supply.type_arg(0);
     let level = supply.member().to_owned();

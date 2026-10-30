@@ -10,7 +10,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::entry;
+use super::super::runtime::tables::{entry, live_entry};
 use super::super::runtime::{Routine, tasks};
 use super::super::{CALL_CONV, Lowering};
 use super::Supply;
@@ -39,7 +39,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
 /// The cell of the executor whose handle is at an address, and whether the handle is live.
 pub fn executor(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
     let handle = fx.load(PTR, handle, 0);
-    let record = lo.call_routine(fx, Routine::Check, &[handle])[0];
+    let record = live_entry(lo, fx, handle);
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
     let zero = fx.ptr(0);
     let cell = fx.choose(

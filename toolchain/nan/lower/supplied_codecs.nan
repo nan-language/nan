@@ -1,9 +1,17 @@
-//! The codecs `mem::wire::Codec` and `text::json::Codec`: per format and type, an encoding function writes a value through a writer and a decoding function reads one through a reader, laid out as the kinds of `core::Encoder` and `core::Decoder` are (a struct as a record of its fields in ascending byte order of their keys, an enum value as a variant, and each std type as its encoding states); a decoding function gives zero, or one plus the index of the `core::DecodeError` variant it fails with, having released what it read.
+//! The codecs `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`: per format and type, an encoding function writes a value through a writer and a decoding function reads one through a reader, laid out as the kinds of `core::Encoder` and `core::Decoder` are (a struct as a record of its fields in ascending byte order of their keys, an enum value as a variant, and each std type as its encoding states); a decoding function gives zero, or one plus the index of the `core::DecodeError` variant it fails with, having released what it read.
 
+/// A format values encode in.
 enum Format derives Copy, Eq, Hash {
     Wire
     Json
 } Format
+
+/// A format values decode from.
+enum DecodeFormat derives Copy, Eq, Hash {
+    Wire
+    Json
+    Construction
+} DecodeFormat
 
 /// The words of a writer: the buffer bytes go to, zero while measuring, and the count of bytes
 /// written.
@@ -144,7 +152,7 @@ enum CasePayload {
 
 /// A decoding function's reader and allocator handle, in a format.
 struct Decoding derives Copy {
-    format: Format
+    format: DecodeFormat
     reader: clif::Value
     alloc: clif::Value
 } Decoding
@@ -165,17 +173,28 @@ fn codecs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             break
         }
     }
-    var format = Format.Wire
+    var encoding: Option[Format] = Some(Format.Wire)
+    var decoding = DecodeFormat.Wire
     if owner == "text::json::Codec" {
-        format = Format.Json
+        encoding = Some(Format.Json)
+        decoding = DecodeFormat.Json
+    } else if owner == "text::construction::Codec" {
+        encoding = None
+        decoding = DecodeFormat.Construction
     } else if owner != "mem::wire::Codec" {
         return false
     }
     let member = supply.member()
+    if member == "decode" {
+        decode(mut lo, mut fx, supply, format: decoding)
+        return true
+    }
+    let Some(format) = encoding else {
+        expect false
+        return true
+    }
     if member == "encode" or member == "try_encode" {
         encode(mut lo, mut fx, supply, format)
-    } else if member == "decode" {
-        decode(mut lo, mut fx, supply, format)
     } else {
         expect false
     }
@@ -237,7 +256,7 @@ fn codecs_call(mut lo: Lowering, mut fx: Fx, function: object::FuncId, args: Sli
 } codecs_call
 
 /// `Codec.decode(raw, alloc)`: one value read, failing with `Trailing` on what is left.
-fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: Format) {
+fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: DecodeFormat) {
     let ty = supply.type_arg(lo, index: 0)
     let raw = supply.param(0).address_value()
     let start = mut fx.load(PTR, addr: raw, offset: 0)
@@ -267,7 +286,7 @@ fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: Format) {
     let read = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: 0)
     let results = fx.types1(clif::Type.Int32)
     let checked = mut fx.choose(read, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
-        if format == Format.Json {
+        if format != DecodeFormat.Wire {
             space(mut fx1, state)
         }
         let pos = mut fx1.load(PTR, addr: state, offset: READER_POS)
@@ -835,7 +854,7 @@ fn encode_case(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, case: C
 
 /// The decoding function of a type in a format: given a reader, the allocator handle values
 /// draw through and the address the value goes to, the code of its failure, zero for none.
-fn decoder(mut lo: Lowering, format: Format, ty: ty::Ty) -> object::FuncId {
+fn decoder(mut lo: Lowering, format: DecodeFormat, ty: ty::Ty) -> object::FuncId {
     let bare = unwrapped(lo, ty)
     var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -1040,10 +1059,12 @@ fn decode_kind(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, kin
     match kind {
         CodecsKind.Bool => {
             var read = Reading(value: reader_state, failed: reader_state)
-            if decoding.format == Format.Wire {
+            if decoding.format == DecodeFormat.Wire {
                 read = wire_read_bool(mut fx, state: reader_state)
-            } else {
+            } else if decoding.format == DecodeFormat.Json {
                 read = json_read_bool(mut lo, mut fx, state: reader_state)
+            } else {
+                read = construction_read_bool(mut lo, mut fx, state: reader_state)
             }
             check_alone(mut lo, mut fx, code: read.failed)
             mut fx.store(read.value, addr: target, offset: 0)
@@ -1052,10 +1073,12 @@ fn decode_kind(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, kin
         CodecsKind.Signed(scalar) => decode_integer(mut lo, mut fx, decoding, scalar, signed: true, target)
         CodecsKind.Float(scalar) => {
             var read = Reading(value: reader_state, failed: reader_state)
-            if decoding.format == Format.Wire {
+            if decoding.format == DecodeFormat.Wire {
                 read = wire_read_float(mut fx, state: reader_state)
-            } else {
+            } else if decoding.format == DecodeFormat.Json {
                 read = json_read_float(mut lo, mut fx, state: reader_state)
+            } else {
+                read = construction_read_float(mut lo, mut fx, state: reader_state)
             }
             check_alone(mut lo, mut fx, code: read.failed)
             var value = read.value
@@ -1080,7 +1103,7 @@ fn decode_kind(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, kin
             mut fx.store(index, addr: target, offset: 0)
         }
         CodecsKind.Record(record) => {
-            decode_record(mut lo, mut fx, decoding, record, target)
+            decode_record(mut lo, mut fx, decoding, record, labelled: false, target)
             match record.owner {
                 Some(owner) => check_predicates(mut lo, mut fx, ty, item: owner.item, args: owner.args, target)
                 None => {}
@@ -1114,12 +1137,16 @@ fn decode_integer(mut lo: Lowering, mut fx: Fx, decoding: Decoding, scalar: ty::
 /// Reads a char into `target`, failing with `Invalid` on a surrogate or a value above U+10FFFF.
 fn decode_char(mut lo: Lowering, mut fx: Fx, decoding: Decoding, target: clif::Value) {
     var scalar = target
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let value = codecs_read_integer(mut lo, mut fx, decoding, signed: false)
         let most = mut fx.int(clif::Type.Int64, value: 0xFFFF_FFFF)
         scalar = mut fx.b.umin(value, y: most)
-    } else {
+    } else if decoding.format == DecodeFormat.Json {
         let read = read_char(mut lo, mut fx, state: decoding.reader)
+        check_alone(mut lo, mut fx, code: read.failed)
+        scalar = read.value
+    } else {
+        let read = construction_read_char(mut lo, mut fx, state: decoding.reader)
         check_alone(mut lo, mut fx, code: read.failed)
         scalar = read.value
     }
@@ -1136,15 +1163,19 @@ fn decode_char(mut lo: Lowering, mut fx: Fx, decoding: Decoding, target: clif::V
 /// Reads bytes into empty bytes drawn through the allocator at `target`.
 fn decode_bytes(mut lo: Lowering, mut fx: Fx, decoding: Decoding, target: clif::Value) {
     vector_empty(mut fx, address: target, alloc: decoding.alloc, element: CODECS_BYTE)
-    var failed = target
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let framed = read_framed(mut lo, mut fx, state: decoding.reader)
         check_alone(mut lo, mut fx, code: framed.failed)
-        failed = fill(mut lo, mut fx, target, start: framed.start, len: framed.len)
+        let failed = fill(mut lo, mut fx, target, start: framed.start, len: framed.len)
+        check_alone(mut lo, mut fx, code: failed)
+    } else if decoding.format == DecodeFormat.Json {
+        let failed = read_base64(mut lo, mut fx, state: decoding.reader, target)
+        check_alone(mut lo, mut fx, code: failed)
     } else {
-        failed = read_base64(mut lo, mut fx, state: decoding.reader, target)
+        let measured = measure_literal(mut lo, mut fx, state: decoding.reader, kind: ConstructionLiteral.Bytes)
+        check_alone(mut lo, mut fx, code: measured.failed)
+        draw_measured(mut lo, mut fx, decoding, source: Measured.Literal(ConstructionLiteral.Bytes), len: measured.value, target)
     }
-    check_alone(mut lo, mut fx, code: failed)
 } decode_bytes
 
 /// Reads the contents of a box or shared value into a new allocation whose address goes to
@@ -1192,10 +1223,12 @@ fn decode_contents(mut lo: Lowering, mut fx: Fx, decoding: Decoding, inner: ty::
 /// An unsigned or signed value in 64 bits, returning from the decoding function on failure.
 fn codecs_read_integer(mut lo: Lowering, mut fx: Fx, decoding: Decoding, signed: bool) -> clif::Value {
     var read = Reading(value: decoding.reader, failed: decoding.reader)
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         read = wire_read_integer(mut lo, mut fx, state: decoding.reader, signed)
-    } else {
+    } else if decoding.format == DecodeFormat.Json {
         read = json_read_integer(mut lo, mut fx, state: decoding.reader, signed)
+    } else {
+        read = construction_read_integer(mut lo, mut fx, state: decoding.reader, signed)
     }
     check_alone(mut lo, mut fx, code: read.failed)
     return read.value
@@ -1251,9 +1284,9 @@ fn check_predicates(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, 
 /// text of at most so many bytes.
 fn decode_text(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, fixed: Option[u64], target: clif::Value) {
     let reader_state = decoding.reader
-    var start: Option[clif::Value] = None
+    var source = Measured.Json
     var len = reader_state
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let framed = read_framed(mut lo, mut fx, state: reader_state)
         check_alone(mut lo, mut fx, code: framed.failed)
         let valid = utf8_valid(mut lo, mut fx, start: framed.start, len: framed.len)
@@ -1261,22 +1294,44 @@ fn decode_text(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, fix
         mut fx.if_true(invalid, then: fn(mut fx1: Fx) {
             codecs_fail(mut fx1, code: FAILURE_INVALID_TEXT)
         })
-        start = Some(framed.start)
+        source = Measured.Input(framed.start)
         len = framed.len
-    } else {
+    } else if decoding.format == DecodeFormat.Json {
         let measured = measure_string(mut lo, mut fx, state: reader_state)
         check_alone(mut lo, mut fx, code: measured.failed)
         len = measured.value
+    } else {
+        let measured = measure_literal(mut lo, mut fx, state: reader_state, kind: ConstructionLiteral.Text)
+        check_alone(mut lo, mut fx, code: measured.failed)
+        source = Measured.Literal(ConstructionLiteral.Text)
+        len = measured.value
     }
     match fixed {
-        Some(capacity) => decode_fixed(mut lo, mut fx, reader_state, ty, capacity, start, len, target)
-        None => decode_string(mut lo, mut fx, decoding, start, len, target)
+        Some(capacity) => decode_fixed(mut lo, mut fx, reader_state, ty, capacity, source, len, target)
+        None => {
+            vector_empty(mut fx, address: target, alloc: decoding.alloc, element: CODECS_BYTE)
+            match source {
+                Measured.Input(from) => {
+                    let failed = fill(mut lo, mut fx, target, start: from, len)
+                    check_alone(mut lo, mut fx, code: failed)
+                }
+                else => draw_measured(mut lo, mut fx, decoding, source, len, target)
+            }
+        }
     }
 } decode_text
 
-/// Writes text of `len` bytes, at `start` or the JSON string that follows, into the fixed text
-/// of `capacity` bytes at `target`.
-fn decode_fixed(mut lo: Lowering, mut fx: Fx, reader_state: clif::Value, ty: ty::Ty, capacity: u64, start: Option[clif::Value], len: clif::Value, target: clif::Value) {
+/// Where the bytes of text read come from: the input, or a JSON string or construction
+/// literal that follows, measured before.
+enum Measured derives Copy {
+    Input(clif::Value)
+    Json
+    Literal(ConstructionLiteral)
+} Measured
+
+/// Writes text of `len` bytes from `source` into the fixed text of `capacity` bytes at
+/// `target`.
+fn decode_fixed(mut lo: Lowering, mut fx: Fx, reader_state: clif::Value, ty: ty::Ty, capacity: u64, source: Measured, len: clif::Value, target: clif::Value) {
     let over = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: len, y: i64.fit(capacity))
     mut fx.if_true(over, then: fn(mut fx1: Fx) {
         codecs_fail(mut fx1, code: FAILURE_OUT_OF_RANGE)
@@ -1285,64 +1340,79 @@ fn decode_fixed(mut lo: Lowering, mut fx: Fx, reader_state: clif::Value, ty: ty:
     let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
     mut fx.store(len, addr: target, offset: len_field.offset)
     let destination = mut fx.offset(target, offset: bytes_field.offset)
-    match start {
-        Some(from) => {
+    write_measured(mut lo, mut fx, reader_state, source, destination, len)
+} decode_fixed
+
+/// Writes the `len` bytes of read text to `destination`.
+fn write_measured(mut lo: Lowering, mut fx: Fx, reader_state: clif::Value, source: Measured, destination: clif::Value, len: clif::Value) {
+    match source {
+        Measured.Input(from) => {
             let copy_args = fx.list3(destination, b: from, c: len)
             discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
         }
-        None => write_string(mut lo, mut fx, state: reader_state, destination, len)
+        Measured.Json => write_string(mut lo, mut fx, state: reader_state, destination, len)
+        Measured.Literal(kind) => write_literal(mut lo, mut fx, state: reader_state, kind, destination, len)
     }
-} decode_fixed
+} write_measured
 
-/// Writes text of `len` bytes, at `start` or the JSON string that follows, into a string drawn
-/// through the allocator at `target`.
-fn decode_string(mut lo: Lowering, mut fx: Fx, decoding: Decoding, start: Option[clif::Value], len: clif::Value, target: clif::Value) {
-    vector_empty(mut fx, address: target, alloc: decoding.alloc, element: CODECS_BYTE)
-    match start {
-        Some(from) => {
-            let failed = fill(mut lo, mut fx, target, start: from, len)
-            check_alone(mut lo, mut fx, code: failed)
-        }
-        None => {
-            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
-            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
-                let drawn = vector_resize(mut lo, fx: mut fx1, address: target, capacity: len, element: CODECS_BYTE)
-                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
-                mut fx1.if_true(failed, then: fn(mut fx2: Fx) {
-                    codecs_fail(mut fx2, code: FAILURE_OUT_OF_MEMORY)
-                })
-            })
-            let data = mut fx.load(PTR, addr: target, offset: VECTOR_DATA)
-            write_string(mut lo, mut fx, state: decoding.reader, destination: data, len)
-            mut fx.store(len, addr: target, offset: VECTOR_LEN)
-        }
-    }
-} decode_string
+/// Reads the `len` bytes of read text into the empty string or bytes at `target`, drawn for
+/// exactly them.
+fn draw_measured(mut lo: Lowering, mut fx: Fx, decoding: Decoding, source: Measured, len: clif::Value, target: clif::Value) {
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let drawn = vector_resize(mut lo, fx: mut fx1, address: target, capacity: len, element: CODECS_BYTE)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+        mut fx1.if_true(failed, then: fn(mut fx2: Fx) {
+            codecs_fail(mut fx2, code: FAILURE_OUT_OF_MEMORY)
+        })
+    })
+    let data = mut fx.load(PTR, addr: target, offset: VECTOR_DATA)
+    write_measured(mut lo, mut fx, reader_state: decoding.reader, source, destination: data, len)
+    mut fx.store(len, addr: target, offset: VECTOR_LEN)
+} draw_measured
 
 /// Whether the element at `index` of a sequence, map or record follows, returning from the
 /// decoding function after `undo` on failure: in the wire format while fewer than its count
-/// have been read; in JSON until the closing byte, which is passed over, a comma before each
-/// element after the first.
+/// have been read; in the text formats until the closing byte, which is passed over, a comma
+/// before each element after the first, and in construction text never when `count` is zero.
 fn codecs_element_follows(mut lo: Lowering, mut fx: Fx, decoding: Decoding, index: clif::Value, count: clif::Value, close: u8, undo: fn(mut lo: Lowering, mut fx: Fx)) -> clif::Value {
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         return mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
     }
-    let read = json_element_follows(mut lo, mut fx, state: decoding.reader, index, close)
-    check(mut lo, mut fx, code: read.failed, undo)
-    return read.value
+    if decoding.format == DecodeFormat.Json {
+        let read = json_element_follows(mut lo, mut fx, state: decoding.reader, index, close)
+        check(mut lo, mut fx, code: read.failed, undo)
+        return read.value
+    }
+    let open = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    let results = fx.types2(clif::Type.Int8, b: clif::Type.Int32)
+    let parts = mut fx.choose_in(mut lo, condition: open, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let read = json_element_follows(mut lo1, fx: mut fx1, state: decoding.reader, index, close)
+        return fx1.list2(read.value, b: read.failed)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        let none = mut fx1.int(clif::Type.Int32, value: 0)
+        return fx1.list2(no, b: none)
+    })
+    expect parts.len() == 2
+    check(mut lo, mut fx, code: parts[1], undo)
+    return parts[0]
 } codecs_element_follows
 
-/// Opens a sequence, map or record: the wire format's count, or JSON's opening byte, returning
-/// from the decoding function on failure.
+/// Opens a sequence, map or record: the wire format's count, or a text format's opening byte,
+/// returning from the decoding function on failure.
 fn codecs_open(mut lo: Lowering, mut fx: Fx, decoding: Decoding, opening: u8) -> clif::Value {
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let read = read_count(mut lo, mut fx, state: decoding.reader)
         check_alone(mut lo, mut fx, code: read.failed)
         return read.value
     }
     let failed = expect_code(mut lo, mut fx, state: decoding.reader, expected: opening)
     check_alone(mut lo, mut fx, code: failed)
-    return mut fx.ptr(0)
+    if decoding.format == DecodeFormat.Json {
+        return mut fx.ptr(0)
+    }
+    return mut fx.ptr(1)
 } codecs_open
 
 /// Where a sequence being read keeps its elements: their storage, the offset of a bounded
@@ -1551,15 +1621,22 @@ fn decode_map(mut lo: Lowering, mut fx: Fx, decoding: Decoding, key: ty::Ty, val
     let entries = Entries.of_map(mut lo, key, value)
     let value_field = mut lo.layouts.field(lo.ck, ty: entries.entry, variant: None, label: "value")
     let value_at = value_field.offset
+    let construction = decoding.format == DecodeFormat.Construction
+    var opening = b'['
+    var close = b']'
+    if construction {
+        opening = b'{'
+        close = b'}'
+    }
     nest(mut fx, reader_state)
-    let count = codecs_open(mut lo, mut fx, decoding, opening: b'[')
+    let count = codecs_open(mut lo, mut fx, decoding, opening)
     vector_empty(mut fx, address: target, alloc: decoding.alloc, element: entries.shape)
     let zero = mut fx.ptr(0)
     let initial = fx.list1(zero)
     let ended = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
         expect current.len() == 1
         let index = current[0]
-        let follows = codecs_element_follows(mut lo, fx: mut fx1, decoding, index, count, close: b']', undo: fn(mut lo2: Lowering, mut fx2: Fx) {
+        let follows = codecs_element_follows(mut lo, fx: mut fx1, decoding, index, count, close, undo: fn(mut lo2: Lowering, mut fx2: Fx) {
             release_map(mut lo2, fx: mut fx2, target, entry: entries.entry)
         })
         mut fx1.if_true(follows, then: fn[mut lo](mut fx2: Fx) {
@@ -1593,7 +1670,8 @@ fn release_map_key(mut lo: Lowering, mut fx: Fx, target: clif::Value, entry: ty:
 /// Reads the entry at `index` of a map into its storage: its key, then its value.
 fn map_entry(mut lo: Lowering, mut fx: Fx, decoding: Decoding, key: ty::Ty, value: ty::Ty, entries: Entries, value_at: u64, target: clif::Value, index: clif::Value) {
     let reader_state = decoding.reader
-    let json = decoding.format == Format.Json
+    let json = decoding.format == DecodeFormat.Json
+    let construction = decoding.format == DecodeFormat.Construction
     let needed = mut fx.b.iadd_imm_s(index, y: 1)
     let drawn = vector_reserve(mut lo, mut fx, address: target, needed, element: entries.shape)
     let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
@@ -1614,8 +1692,12 @@ fn map_entry(mut lo: Lowering, mut fx: Fx, decoding: Decoding, key: ty::Ty, valu
     check(mut lo, mut fx, code: key_failed, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
         release_map(mut lo1, fx: mut fx1, target, entry: entries.entry)
     })
-    if json {
-        let comma = expect_code(mut lo, mut fx, state: reader_state, expected: b',')
+    if json or construction {
+        var separator = b':'
+        if json {
+            separator = b','
+        }
+        let comma = expect_code(mut lo, mut fx, state: reader_state, expected: separator)
         check(mut lo, mut fx, code: comma, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
             release_map_key(mut lo1, fx: mut fx1, target, entry: entries.entry, key, key_slot)
         })
@@ -1651,9 +1733,10 @@ fn key_room(record: Record) -> u64 {
     return u64.widen(longest) + 1
 } key_room
 
-/// Reads a record into the fields at their offsets from `target`, as the decoding rules state
-/// for unknown, repeated and missing keys; on failure every field read is released.
-fn decode_record(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Record, target: clif::Value) {
+/// Reads a record, or a variant's labelled payload, into the fields at their offsets from
+/// `target`, as the decoding rules state for unknown, repeated and missing keys; on failure
+/// every field read is released.
+fn decode_record(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Record, labelled: bool, target: clif::Value) {
     let reader_state = decoding.reader
     var count = u64.widen(record.fields.len())
     if count < 1 {
@@ -1667,7 +1750,11 @@ fn decode_record(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
     nest(mut fx, reader_state)
     let room = key_room(record)
     let key_buffer = mut fx.slot(room, align: 1)
-    let left = codecs_open(mut lo, mut fx, decoding, opening: b'{')
+    let left = record_open(mut lo, mut fx, decoding, labelled)
+    var close = b'}'
+    if decoding.format == DecodeFormat.Construction {
+        close = b')'
+    }
     let last = mut fx.slot(16, align: 8)
     let none = mut fx.int(PTR, value: -1)
     mut fx.store(none, addr: last, offset: 8)
@@ -1676,7 +1763,7 @@ fn decode_record(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
     discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
         expect current.len() == 1
         let index = current[0]
-        let follows = codecs_element_follows(mut lo, fx: mut fx1, decoding, index, count: left, close: b'}', undo: fn(mut lo2: Lowering, mut fx2: Fx) {
+        let follows = codecs_element_follows(mut lo, fx: mut fx1, decoding, index, count: left, close, undo: fn(mut lo2: Lowering, mut fx2: Fx) {
             release_fields(mut lo2, fx: mut fx2, record, read, target)
         })
         mut fx1.if_true(follows, then: fn[mut lo](mut fx2: Fx) {
@@ -1697,6 +1784,20 @@ fn decode_record(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
         })
     }
 } decode_record
+
+/// Opens a record: a construction text labelled payload is open already, a construction text
+/// record holds fields when `(` follows its name, and another opens as `codecs_open` does.
+fn record_open(mut lo: Lowering, mut fx: Fx, decoding: Decoding, labelled: bool) -> clif::Value {
+    if decoding.format != DecodeFormat.Construction {
+        return codecs_open(mut lo, mut fx, decoding, opening: b'{')
+    }
+    if labelled {
+        return mut fx.ptr(1)
+    }
+    let read = open_record(mut lo, mut fx, state: decoding.reader)
+    check_alone(mut lo, mut fx, code: read.failed)
+    return mut fx.b.uextend(PTR, x: read.value)
+} record_open
 
 /// Releases each field of a record being read that has been read.
 fn release_fields(mut lo: Lowering, mut fx: Fx, record: Record, read: clif::Value, target: clif::Value) {
@@ -1720,7 +1821,7 @@ fn record_member(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
     var key_start = key_buffer
     var key_len = key_buffer
     var value_end: Option[clif::Value] = None
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let key = wire_read_key(mut lo, mut fx, state: reader_state, last)
         check(mut lo, mut fx, code: key.failed, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
             release_fields(mut lo1, fx: mut fx1, record, read, target)
@@ -1730,7 +1831,12 @@ fn record_member(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
         value_end = Some(key.end)
     } else {
         let capacity = mut fx.ptr(room)
-        let key = json_read_key(mut lo, mut fx, state: reader_state, buffer: key_buffer, capacity)
+        var key = Reading(value: key_buffer, failed: key_buffer)
+        if decoding.format == DecodeFormat.Json {
+            key = json_read_key(mut lo, mut fx, state: reader_state, buffer: key_buffer, capacity)
+        } else {
+            key = construction_read_key(mut lo, mut fx, state: reader_state, buffer: key_buffer, capacity)
+        }
         check(mut lo, mut fx, code: key.failed, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
             release_fields(mut lo1, fx: mut fx1, record, read, target)
         })
@@ -1747,7 +1853,12 @@ fn record_member(mut lo: Lowering, mut fx: Fx, decoding: Decoding, record: Recor
         match value_end {
             Some(end) => mut fx1.store(end, addr: reader_state, offset: READER_POS)
             None => {
-                let skipped = skip_value(mut lo, fx: mut fx1, state: reader_state)
+                var skipped = reader_state
+                if decoding.format == DecodeFormat.Construction {
+                    skipped = construction_skip(mut lo, fx: mut fx1, state: reader_state)
+                } else {
+                    skipped = skip_value(mut lo, fx: mut fx1, state: reader_state)
+                }
                 check(mut lo, fx: mut fx1, code: skipped, undo: fn(mut lo2: Lowering, mut fx2: Fx) {
                     release_fields(mut lo2, fx: mut fx2, record, read, target)
                 })
@@ -1888,18 +1999,24 @@ fn decode_variant(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, 
     let key_buffer = mut fx.slot(room, align: 1)
     var key_start = key_buffer
     var key_len = key_buffer
-    var json_payload: Option[clif::Value] = None
-    if decoding.format == Format.Wire {
+    var text_payload: Option[clif::Value] = None
+    if decoding.format == DecodeFormat.Wire {
         let framed = read_framed(mut lo, mut fx, state: reader_state)
         check_alone(mut lo, mut fx, code: framed.failed)
         key_start = framed.start
         key_len = framed.len
-    } else {
+    } else if decoding.format == DecodeFormat.Json {
         let capacity = mut fx.ptr(room)
         let variant = read_variant(mut lo, mut fx, state: reader_state, buffer: key_buffer, capacity)
         check_alone(mut lo, mut fx, code: variant.failed)
         key_len = variant.len
-        json_payload = Some(variant.payload)
+        text_payload = Some(variant.payload)
+    } else {
+        let capacity = mut fx.ptr(room)
+        let variant = construction_read_variant(mut lo, mut fx, state: reader_state, buffer: key_buffer, capacity)
+        check_alone(mut lo, mut fx, code: variant.failed)
+        key_len = variant.len
+        text_payload = Some(variant.payload)
     }
     let matched = match_key(mut lo, mut fx, record, start: key_start, len: key_len)
     let unknown = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: matched, y: -1)
@@ -1908,13 +2025,13 @@ fn decode_variant(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, 
     })
     var follows = matched
     var payload_end: Option[clif::Value] = None
-    if decoding.format == Format.Wire {
+    if decoding.format == DecodeFormat.Wire {
         let flag = read_payload_flag(mut lo, mut fx, state: reader_state)
         check_alone(mut lo, mut fx, code: flag.failed)
         follows = flag.follows
         payload_end = Some(flag.end)
     } else {
-        let Some(payload) = json_payload else {
+        let Some(payload) = text_payload else {
             expect false
             return
         }
@@ -1952,7 +2069,18 @@ fn variant_case(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, ca
             let failed = decode_into(mut lo, mut fx, decoding, ty: payload_ty, target: payload)
             check_alone(mut lo, mut fx, code: failed)
         }
-        CasePayload.Labelled(labelled) => decode_record(mut lo, mut fx, decoding, record: labelled, target)
+        CasePayload.Labelled(labelled) => decode_record(mut lo, mut fx, decoding, record: labelled, labelled: true, target)
+    }
+    var closing: Option[u8] = None
+    if decoding.format == DecodeFormat.Json {
+        closing = Some(b'}')
+    } else if decoding.format == DecodeFormat.Construction {
+        match case.payload {
+            CasePayload.Single(_) => {
+                closing = Some(b')')
+            }
+            else => {}
+        }
     }
     if expected {
         match payload_end {
@@ -1964,12 +2092,16 @@ fn variant_case(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, ca
                     codecs_fail(mut fx1, code: FAILURE_MALFORMED)
                 })
             }
-            None => {
-                let failed = expect_code(mut lo, mut fx, state: reader_state, expected: b'}')
+            None => {}
+        }
+        match closing {
+            Some(byte) => {
+                let failed = expect_code(mut lo, mut fx, state: reader_state, expected: byte)
                 check(mut lo, mut fx, code: failed, undo: fn(mut lo1: Lowering, mut fx1: Fx) {
                     release_payload(mut lo1, fx: mut fx1, ty, case, target)
                 })
             }
+            None => {}
         }
     }
     mut lo.write_variant_tag(mut fx, ty, address: target, variant: case.key.as_str())

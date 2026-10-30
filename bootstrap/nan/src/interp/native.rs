@@ -81,7 +81,7 @@ pub fn call(
         return flow;
     }
     if let Some(flow) = (owner == "core::Renderer")
-        .then(|| render::renderer(interp, member, &args))
+        .then(|| render::renderer(interp, member, type_args, &args, at, site))
         .flatten()
     {
         return flow;

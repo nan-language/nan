@@ -1,5 +1,5 @@
 //! Rendering: renderers and their budgets, the renderings of scalars, std types and derived
-//! `Render`, `text::fmt` templates, and `Dyn` views.
+//! `Render`, nested renderings, `text::fmt` templates, and `Dyn` views.
 //!
 //! A renderer is the address of its state: the buffer kept bytes go to (zero while measuring),
 //! the render budget, the bytes the full rendering holds so far, the bytes kept, the position
@@ -9,18 +9,20 @@
 //! A `Dyn[I]` value is the address of the value and of its method table: the release of the
 //! value's type, its size and alignment, then each of `I`'s methods.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
 use cranelift_module::{DataDescription, Linkage, Module};
 
 use super::super::abi::{Abi, Repr};
 use super::super::body::{Body, Held};
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::Routine;
-use super::super::{Instance, Lowering};
+use super::super::runtime::report::decode_utf8;
+use super::super::{CALL_CONV, Glue, Instance, Lowering};
 use super::Supply;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Args, Scalar, Subst, Ty};
 use crate::nir::{Literal, Operand};
+use crate::syntax::grammar::REJECTED;
 
 /// The bytes of the buffer the host platform writes a float's text into.
 const FLOAT_TEXT: u64 = 40;
@@ -204,6 +206,128 @@ pub fn append_decimal(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, val
     append(lo, fx, renderer_value, start, len);
 }
 
+/// Appends the uppercase hexadecimal digits of an unsigned 64-bit value, without leading zeros.
+fn append_hex(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, value: Value) {
+    let digits = fx.slot(16, 8);
+    let end = fx.ptr(16);
+    let state = fx.repeat(&[value, end], |fx, state| {
+        let (rest, at) = (state[0], state[1]);
+        let nibble = fx.b.ins().band_imm_s(rest, 0xF);
+        let letter =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, nibble, 10);
+        let digit = fx.b.ins().iadd_imm_s(nibble, i64::from(b'0'));
+        let upper = fx.b.ins().iadd_imm_s(nibble, i64::from(b'A') - 10);
+        let ascii = fx.b.ins().select(letter, upper, digit);
+        let ascii = fx.b.ins().ireduce(types::I8, ascii);
+        let at = fx.b.ins().iadd_imm_s(at, -1);
+        let place = fx.b.ins().iadd(digits, at);
+        fx.store(ascii, place, 0);
+        let rest = fx.b.ins().ushr_imm_s(rest, 4);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rest, 0);
+        (more, vec![rest, at])
+    });
+    let start = fx.b.ins().iadd(digits, state[1]);
+    let len = fx.b.ins().isub(end, state[1]);
+    append(lo, fx, renderer_value, start, len);
+}
+
+/// Whether a scalar value is a rejected code point.
+pub fn rejected(lo: &mut Lowering, fx: &mut Fx, scalar: Value) -> Value {
+    let mut signature = Signature::new(CALL_CONV);
+    signature.params.push(AbiParam::new(PTR));
+    signature.returns.push(AbiParam::new(types::I8));
+    let function = lo.glue_function(Glue::Rejected, signature, |_, fx| {
+        let scalar = fx.entry()[0];
+        let mut found = fx.int(types::I8, 0);
+        for (low, high) in REJECTED {
+            let above =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, scalar, i64::from(low));
+            let below =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, scalar, i64::from(high));
+            let inside = fx.b.ins().band(above, below);
+            found = fx.b.ins().bor(found, inside);
+        }
+        fx.b.ins().return_(&[found]);
+    });
+    let reference = lo.func_ref(fx, function);
+    let call = fx.b.ins().call(reference, &[scalar]);
+    fx.b.inst_results(call)[0]
+}
+
+/// Appends UTF-8 text as a char or text literal of a quote: `\`, the quote and the named
+/// escapes escaped, every other rejected code point written `\u{H}`.
+fn append_literal(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    renderer_value: Value,
+    (start, len): (Value, Value),
+    quote: u8,
+) {
+    let mut signature = Signature::new(CALL_CONV);
+    for _ in 0..3 {
+        signature.params.push(AbiParam::new(PTR));
+    }
+    let function = lo.glue_function(Glue::RenderLiteral(quote), signature, |lo, fx| {
+        let params = fx.entry();
+        let (renderer_value, start, len) = (params[0], params[1], params[2]);
+        let quoted = (quote as char).to_string();
+        append_text(lo, fx, renderer_value, &quoted);
+        let zero = fx.ptr(0);
+        fx.repeat(&[zero], |fx, state| {
+            let at = state[0];
+            let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, at, len);
+            let next = fx.choose_in(
+                lo,
+                inside,
+                &[PTR],
+                |lo, fx| {
+                    let place = fx.b.ins().iadd(start, at);
+                    let first = fx.load(types::I8, place, 0);
+                    let first = fx.b.ins().uextend(PTR, first);
+                    let (scalar, width) = decode_utf8(fx, place, first);
+                    let quote_escape = format!("\\{quoted}");
+                    let mut handled = fx.int(types::I8, 0);
+                    for (point, text) in [
+                        (b'\\', "\\\\"),
+                        (quote, quote_escape.as_str()),
+                        (b'\n', "\\n"),
+                        (b'\r', "\\r"),
+                        (b'\t', "\\t"),
+                        (0, "\\0"),
+                    ] {
+                        let is =
+                            fx.b.ins()
+                                .icmp_imm_s(IntCC::Equal, scalar, i64::from(point));
+                        fx.when(is, |fx| append_text(lo, fx, renderer_value, text));
+                        handled = fx.b.ins().bor(handled, is);
+                    }
+                    let outside = rejected(lo, fx, scalar);
+                    let plain = fx.b.ins().bxor_imm_s(handled, 1);
+                    let escaped = fx.b.ins().band(outside, plain);
+                    fx.when(escaped, |fx| {
+                        append_text(lo, fx, renderer_value, "\\u{");
+                        append_hex(lo, fx, renderer_value, scalar);
+                        append_text(lo, fx, renderer_value, "}");
+                    });
+                    let written = fx.b.ins().bor(handled, outside);
+                    let raw = fx.b.ins().bxor_imm_s(written, 1);
+                    fx.when(raw, |fx| append(lo, fx, renderer_value, place, width));
+                    vec![fx.b.ins().iadd(at, width)]
+                },
+                |_, _| vec![at],
+            )[0];
+            (inside, vec![next])
+        });
+        append_text(lo, fx, renderer_value, &quoted);
+        fx.b.ins().return_(&[]);
+    });
+    let reference = lo.func_ref(fx, function);
+    fx.b.ins().call(reference, &[renderer_value, start, len]);
+}
+
 /// Appends the UTF-8 encoding of a char.
 fn append_char(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, c: Value) {
     let buffer = fx.slot(4, 4);
@@ -299,6 +423,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             append_char(lo, fx, renderer_value, c);
             supply.done(lo, fx);
         }
+        "write_nested" => {
+            let ty = supply.type_arg(0);
+            render_nested(lo, fx, &ty, supply.param(1), renderer_value);
+            supply.done(lo, fx);
+        }
         "remaining" | "is_elided" => {
             let state = fx.load(PTR, renderer_value, 0);
             let budget = fx.load(PTR, state, renderer::BUDGET);
@@ -340,20 +469,11 @@ pub fn render_to(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_
         Ty::Item(item, args) => {
             let path = lo.ck.db.canonical(*item);
             match path.as_str() {
-                "core::Str" | "text::String" => {
-                    let address = value.address();
-                    let start = fx.load(PTR, address, 0);
-                    let len = fx.load(PTR, address, 8);
+                "core::Str" | "text::String" | "text::Fixed" => {
+                    let (start, len) = text_parts(lo, fx, ty, value);
                     append(lo, fx, renderer_value, start, len);
                 }
-                "text::Fixed" => {
-                    let address = value.address();
-                    let len_at = lo.layouts.field(lo.ck, ty, None, "len").offset;
-                    let bytes_at = lo.layouts.field(lo.ck, ty, None, "bytes").offset;
-                    let len = fx.load(PTR, address, len_at);
-                    let start = fx.offset(address, bytes_at);
-                    append(lo, fx, renderer_value, start, len);
-                }
+                "core::Untrusted" => append_text(lo, fx, renderer_value, "<untrusted>"),
                 "core::Slice" | "core::SliceMut" | "mem::List" | "mem::Set" => {
                     let element = args[0].ty().cloned().expect("an element type");
                     let address = value.address();
@@ -390,11 +510,7 @@ pub fn render_to(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_
                     render_entries(lo, fx, &entry, start, len, renderer_value);
                 }
                 "mem::Box" | "mem::Shared" => {
-                    let inner = args[0].ty().cloned().expect("a content type");
-                    let address = value.address();
-                    let contents = fx.load(PTR, address, 0);
-                    let contents = super::mem::stores::contents_address(lo, fx, ty, contents);
-                    let held = lo.held_at(fx, &inner, contents);
+                    let (inner, held) = contents(lo, fx, ty, value);
                     render_via(lo, fx, &inner, held, renderer_value);
                 }
                 _ => render_composite(lo, fx, ty, *item, args, value, renderer_value),
@@ -405,6 +521,53 @@ pub fn render_to(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_
             render_dyn(fx, address, renderer_value);
         }
         other => panic!("a rendering of {other:?}"),
+    }
+}
+
+/// The start and length of a `Str`, `text::String` or `text::Fixed` value's bytes.
+fn text_parts(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held) -> (Value, Value) {
+    let address = value.address();
+    if !lo.ck.is_std(ty, "text::Fixed") {
+        return (fx.load(PTR, address, 0), fx.load(PTR, address, 8));
+    }
+    let len_at = lo.layouts.field(lo.ck, ty, None, "len").offset;
+    let bytes_at = lo.layouts.field(lo.ck, ty, None, "bytes").offset;
+    (fx.offset(address, bytes_at), fx.load(PTR, address, len_at))
+}
+
+/// The contents of a `mem::Box` or `mem::Shared` value, with their type.
+fn contents(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held) -> (Ty, Held) {
+    let inner = ty.type_arg(0).expect("a content type").clone();
+    let address = value.address();
+    let contents = fx.load(PTR, address, 0);
+    let contents = super::mem::stores::contents_address(lo, fx, ty, contents);
+    let held = lo.held_at(fx, &inner, contents);
+    (inner, held)
+}
+
+/// Writes the nested rendering of a value of a type to a renderer: a char or text as its
+/// literal, the contents of a box or shared value nested, any other value through its `Render`.
+fn render_nested(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_value: Value) {
+    let path = match ty {
+        Ty::Item(item, _) => lo.ck.db.canonical(*item),
+        _ => String::new(),
+    };
+    match (ty, path.as_str()) {
+        (Ty::Scalar(Scalar::Char), _) => {
+            let buffer = fx.slot(4, 4);
+            let c = super::super::body::widen(fx, value.scalar());
+            let len = encode_utf8(fx, c, buffer);
+            append_literal(lo, fx, renderer_value, (buffer, len), b'\'');
+        }
+        (_, "core::Str" | "text::String" | "text::Fixed") => {
+            let parts = text_parts(lo, fx, ty, value);
+            append_literal(lo, fx, renderer_value, parts, b'"');
+        }
+        (_, "mem::Box" | "mem::Shared") => {
+            let (inner, held) = contents(lo, fx, ty, value);
+            render_nested(lo, fx, &inner, held, renderer_value);
+        }
+        _ => render_via(lo, fx, ty, value, renderer_value),
     }
 }
 
@@ -491,7 +654,7 @@ fn render_elements(
         let offset = fx.b.ins().imul_imm_s(index, size as i64);
         let at = fx.b.ins().iadd(start, offset);
         let held = lo.held_at(fx, element, at);
-        render_via(lo, fx, element, held, renderer_value);
+        render_nested(lo, fx, element, held, renderer_value);
     });
     append_text(lo, fx, renderer_value, "]");
 }
@@ -517,11 +680,11 @@ fn render_entries(
         let at = fx.b.ins().iadd(start, offset);
         let key_at = fx.offset(at, key.offset);
         let held = lo.held_at(fx, &key.ty, key_at);
-        render_via(lo, fx, &key.ty, held, renderer_value);
+        render_nested(lo, fx, &key.ty, held, renderer_value);
         append_text(lo, fx, renderer_value, ": ");
         let value_at = fx.offset(at, value.offset);
         let held = lo.held_at(fx, &value.ty, value_at);
-        render_via(lo, fx, &value.ty, held, renderer_value);
+        render_nested(lo, fx, &value.ty, held, renderer_value);
     });
     append_text(lo, fx, renderer_value, "}");
 }
@@ -615,7 +778,7 @@ fn render_composite(
                 let at = lo.layouts.field(lo.ck, ty, None, &field.name).offset;
                 let field_at = fx.offset(address, at);
                 let held = lo.held_at(fx, &field_ty, field_at);
-                render_via(lo, fx, &field_ty, held, renderer_value);
+                render_nested(lo, fx, &field_ty, held, renderer_value);
             }
             append_text(lo, fx, renderer_value, ")");
         }
@@ -642,7 +805,7 @@ fn render_composite(
                             let at = lo.layouts.field(lo.ck, ty, Some(&variant.name), "").offset;
                             let field_at = fx.offset(address, at);
                             let held = lo.held_at(fx, &payload_ty, field_at);
-                            render_via(lo, fx, &payload_ty, held, renderer_value);
+                            render_nested(lo, fx, &payload_ty, held, renderer_value);
                             append_text(lo, fx, renderer_value, ")");
                         }
                         Payload::Labelled(fields) => {
@@ -659,7 +822,7 @@ fn render_composite(
                                     .offset;
                                 let field_at = fx.offset(address, at);
                                 let held = lo.held_at(fx, &field_ty, field_at);
-                                render_via(lo, fx, &field_ty, held, renderer_value);
+                                render_nested(lo, fx, &field_ty, held, renderer_value);
                             }
                             append_text(lo, fx, renderer_value, ")");
                         }

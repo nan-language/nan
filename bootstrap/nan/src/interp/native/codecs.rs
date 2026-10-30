@@ -1,7 +1,9 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec` and `text::json::Codec`. A value
-//! encodes into the tree of kinds `core::Encoder` writes, which each format then writes out;
-//! decoding reads a format through the calls of `core::Decoder`, in the order the std
-//! encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and
+//! `text::construction::Codec`. A value encodes into the tree of kinds `core::Encoder` writes,
+//! which each format then writes out; decoding reads a format through the calls of
+//! `core::Decoder`, in the order the std encodings and derived decoders make them.
+
+mod construction;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -30,9 +32,10 @@ pub fn member(
     at: (ItemId, Span),
     site: Site,
 ) -> Option<Exec<Flow>> {
-    let json = match owner {
-        "mem::wire::Codec" => false,
-        "text::json::Codec" => true,
+    let format = match owner {
+        "mem::wire::Codec" => Format::Wire,
+        "text::json::Codec" => Format::Json,
+        "text::construction::Codec" => Format::Construction,
         _ => return None,
     };
     let ty = type_args
@@ -42,12 +45,13 @@ pub fn member(
         .unwrap_or(Ty::Unit);
     Some(match member {
         "encode" | "try_encode" => {
-            let tree = encoded(interp, &args[0], &ty);
+            let write = match format {
+                Format::Wire => write_wire,
+                Format::Json => write_json,
+                Format::Construction => return None,
+            };
             let mut out = Vec::new();
-            match json {
-                true => write_json(&tree, &mut out),
-                false => write_wire(&tree, &mut out),
-            }
+            write(&encoded(interp, &args[0], &ty), &mut out);
             let bytes: Vec<Val> = out
                 .into_iter()
                 .map(|byte| Val::Int(i128::from(byte)))
@@ -63,9 +67,10 @@ pub fn member(
             let raw = interp.deref(&args[0]).fields()[0].clone();
             let input = interp.bytes(&raw);
             let cell = cell_of(interp, &args[1]);
-            let mut reader: Box<dyn Reader> = match json {
-                true => Box::new(JsonReader::new(input)),
-                false => Box::new(WireReader::new(input)),
+            let mut reader: Box<dyn Reader> = match format {
+                Format::Wire => Box::new(WireReader::new(input)),
+                Format::Json => Box::new(JsonReader::new(input)),
+                Format::Construction => Box::new(construction::ConstructionReader::new(input)),
             };
             let mut decoding = Decoding {
                 interp,
@@ -91,6 +96,12 @@ pub fn member(
         }
         _ => return None,
     })
+}
+
+enum Format {
+    Wire,
+    Json,
+    Construction,
 }
 
 /// An encoded value, as the kinds of `core::Encoder` write it.
@@ -441,14 +452,18 @@ trait Reader {
     fn begin_sequence(&mut self) -> Decoded<()>;
     fn begin_map(&mut self) -> Decoded<()>;
     fn begin_record(&mut self) -> Decoded<()>;
+    /// Begins the record of a variant's labelled payload.
+    fn begin_labelled(&mut self) -> Decoded<()> {
+        self.begin_record()
+    }
     fn next_follows(&mut self) -> Decoded<bool>;
     /// Between a map entry's key and its value.
     fn map_value(&mut self) -> Decoded<()>;
     fn read_key(&mut self) -> Decoded<Vec<u8>>;
     fn read_variant(&mut self) -> Decoded<Vec<u8>>;
     fn payload_follows(&mut self) -> Decoded<bool>;
-    /// Passes over the value of the field whose key was just read.
-    fn skip(&mut self) -> Decoded<()>;
+    /// Passes over the value of the field whose key was just read, at a nesting depth.
+    fn skip(&mut self, depth: usize) -> Decoded<()>;
     fn end(&mut self) -> Decoded<()>;
     /// Fails on what is left after the value.
     fn finish(&mut self) -> Decoded<()>;
@@ -666,7 +681,7 @@ impl Decoding<'_, '_, '_, '_> {
                     .iter()
                     .map(|field| (field.name.clone(), subst.ty(&field.ty)))
                     .collect();
-                let values = self.record(&named, open, &aliases)?;
+                let values = self.record(&named, open, false, &aliases)?;
                 let value = Val::Struct(item, Rc::new(values));
                 let ty = Ty::item(item, args.to_vec());
                 match self.interp.predicates_hold(item, true, &value, &ty) {
@@ -693,7 +708,7 @@ impl Decoding<'_, '_, '_, '_> {
                             .iter()
                             .map(|(name, ty)| (name.clone(), subst.ty(ty)))
                             .collect();
-                        self.record(&named, false, &BTreeMap::new())?
+                        self.record(&named, false, true, &BTreeMap::new())?
                     }
                     _ => return fail("Malformed"),
                 };
@@ -705,15 +720,20 @@ impl Decoding<'_, '_, '_, '_> {
         }
     }
 
-    /// The values of a record's named fields in order, as the decoding rules read them.
+    /// The values of a record's named fields in order, as the decoding rules read them, given
+    /// whether it decodes as open and whether it is a labelled payload.
     fn record(
         &mut self,
         named: &[(String, Ty)],
         open: bool,
+        labelled: bool,
         aliases: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Decoded<Vec<Val>> {
         self.nest()?;
-        self.reader.begin_record()?;
+        match labelled {
+            true => self.reader.begin_labelled()?,
+            false => self.reader.begin_record()?,
+        }
         let mut values: Vec<Option<Val>> = vec![None; named.len()];
         while self.reader.next_follows()? {
             let key = self.reader.read_key()?;
@@ -721,7 +741,7 @@ impl Decoding<'_, '_, '_, '_> {
             match named.iter().position(|(name, _)| name.as_bytes() == key) {
                 Some(index) if values[index].is_some() => return fail("DuplicateKey"),
                 Some(index) => values[index] = Some(self.value(&named[index].1)?),
-                None if open => self.reader.skip()?,
+                None if open => self.reader.skip(self.depth)?,
                 None => return fail("UnknownKey"),
             }
         }
@@ -838,6 +858,33 @@ impl Input {
         let taken = self.bytes[self.at..self.at + count].to_vec();
         self.at += count;
         Ok(taken)
+    }
+
+    /// Passes over the whitespace of the text formats.
+    fn space(&mut self) {
+        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.bytes.get(self.at) {
+            self.at += 1;
+        }
+    }
+
+    /// The next byte after whitespace, not passed over.
+    fn peek(&mut self) -> Decoded<u8> {
+        self.space();
+        self.bytes
+            .get(self.at)
+            .copied()
+            .ok_or(Failure::Decode("Truncated"))
+    }
+
+    /// Passes over a byte after whitespace.
+    fn expect(&mut self, byte: u8) -> Decoded<()> {
+        match self.peek()? == byte {
+            true => {
+                self.at += 1;
+                Ok(())
+            }
+            false => fail("Malformed"),
+        }
     }
 }
 
@@ -1032,7 +1079,7 @@ impl Reader for WireReader {
         }
     }
 
-    fn skip(&mut self) -> Decoded<()> {
+    fn skip(&mut self, _: usize) -> Decoded<()> {
         if let Some(WireFrame::Record { value_end, .. }) = self.frames.last_mut()
             && let Some(end) = value_end.take()
         {
@@ -1084,33 +1131,8 @@ impl JsonReader {
         }
     }
 
-    fn space(&mut self) {
-        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.input.bytes.get(self.input.at) {
-            self.input.at += 1;
-        }
-    }
-
-    fn peek(&mut self) -> Decoded<u8> {
-        self.space();
-        self.input
-            .bytes
-            .get(self.input.at)
-            .copied()
-            .ok_or(Failure::Decode("Truncated"))
-    }
-
-    fn expect(&mut self, byte: u8) -> Decoded<()> {
-        match self.peek()? == byte {
-            true => {
-                self.input.at += 1;
-                Ok(())
-            }
-            false => fail("Malformed"),
-        }
-    }
-
     fn literal(&mut self, word: &[u8]) -> bool {
-        self.space();
+        self.input.space();
         let found = self.input.bytes[self.input.at..].starts_with(word);
         if found {
             self.input.at += word.len();
@@ -1120,7 +1142,7 @@ impl JsonReader {
 
     /// A JSON string's bytes, its escapes resolved.
     fn string(&mut self) -> Decoded<Vec<u8>> {
-        self.expect(b'"')?;
+        self.input.expect(b'"')?;
         let mut text = String::new();
         loop {
             let start = self.input.at;
@@ -1180,7 +1202,7 @@ impl JsonReader {
 
     /// The text of a JSON number, checked against the RFC 8259 grammar.
     fn number(&mut self) -> Decoded<String> {
-        self.space();
+        self.input.space();
         let start = self.input.at;
         let bytes = &self.input.bytes;
         let mut at = start;
@@ -1231,23 +1253,27 @@ impl JsonReader {
 
     /// Passes over any JSON value.
     fn skip_value(&mut self) -> Decoded<()> {
-        match self.peek()? {
+        match self.input.peek()? {
             b'"' => self.string().map(|_| ()),
             b'{' | b'[' => {
-                let close = if self.peek()? == b'{' { b'}' } else { b']' };
+                let close = if self.input.peek()? == b'{' {
+                    b'}'
+                } else {
+                    b']'
+                };
                 let object = close == b'}';
                 self.input.at += 1;
-                if self.peek()? == close {
+                if self.input.peek()? == close {
                     self.input.at += 1;
                     return Ok(());
                 }
                 loop {
                     if object {
                         self.string()?;
-                        self.expect(b':')?;
+                        self.input.expect(b':')?;
                     }
                     self.skip_value()?;
-                    match self.peek()? {
+                    match self.input.peek()? {
                         b',' => self.input.at += 1,
                         byte if byte == close => {
                             self.input.at += 1;
@@ -1274,11 +1300,11 @@ impl JsonReader {
             ) => std::mem::replace(started, true),
             _ => return fail("Malformed"),
         };
-        if self.peek()? == close {
+        if self.input.peek()? == close {
             return Ok(false);
         }
         if started {
-            self.expect(b',')?;
+            self.input.expect(b',')?;
         }
         Ok(true)
     }
@@ -1305,7 +1331,7 @@ impl Reader for JsonReader {
     }
 
     fn read_float(&mut self) -> Decoded<f64> {
-        if self.peek()? == b'"' {
+        if self.input.peek()? == b'"' {
             return match self.string()?.as_slice() {
                 b"NaN" => Ok(f64::NAN),
                 b"inf" => Ok(f64::INFINITY),
@@ -1337,19 +1363,19 @@ impl Reader for JsonReader {
     }
 
     fn begin_sequence(&mut self) -> Decoded<()> {
-        self.expect(b'[')?;
+        self.input.expect(b'[')?;
         self.frames.push(JsonFrame::Array { started: false });
         Ok(())
     }
 
     fn begin_map(&mut self) -> Decoded<()> {
-        self.expect(b'[')?;
+        self.input.expect(b'[')?;
         self.frames.push(JsonFrame::Map { started: false });
         Ok(())
     }
 
     fn begin_record(&mut self) -> Decoded<()> {
-        self.expect(b'{')?;
+        self.input.expect(b'{')?;
         self.frames.push(JsonFrame::Object { started: false });
         Ok(())
     }
@@ -1359,11 +1385,11 @@ impl Reader for JsonReader {
             Some(JsonFrame::Object { .. }) => self.element_follows(b'}'),
             Some(JsonFrame::Map { started }) => {
                 if *started {
-                    self.expect(b']')?;
+                    self.input.expect(b']')?;
                 }
                 let follows = self.element_follows(b']')?;
                 if follows {
-                    self.expect(b'[')?;
+                    self.input.expect(b'[')?;
                 }
                 Ok(follows)
             }
@@ -1372,23 +1398,23 @@ impl Reader for JsonReader {
     }
 
     fn map_value(&mut self) -> Decoded<()> {
-        self.expect(b',')
+        self.input.expect(b',')
     }
 
     fn read_key(&mut self) -> Decoded<Vec<u8>> {
         let key = self.string()?;
-        self.expect(b':')?;
+        self.input.expect(b':')?;
         Ok(key)
     }
 
     fn read_variant(&mut self) -> Decoded<Vec<u8>> {
-        if self.peek()? == b'"' {
+        if self.input.peek()? == b'"' {
             self.frames.push(JsonFrame::Variant { payload: false });
             return self.string();
         }
-        self.expect(b'{')?;
+        self.input.expect(b'{')?;
         let key = self.string()?;
-        self.expect(b':')?;
+        self.input.expect(b':')?;
         self.frames.push(JsonFrame::Variant { payload: true });
         Ok(key)
     }
@@ -1400,23 +1426,23 @@ impl Reader for JsonReader {
         }
     }
 
-    fn skip(&mut self) -> Decoded<()> {
+    fn skip(&mut self, _: usize) -> Decoded<()> {
         self.skip_value()
     }
 
     fn end(&mut self) -> Decoded<()> {
         match self.frames.pop() {
-            Some(JsonFrame::Array { .. }) => self.expect(b']'),
-            Some(JsonFrame::Object { .. }) => self.expect(b'}'),
-            Some(JsonFrame::Map { .. }) => self.expect(b']'),
-            Some(JsonFrame::Variant { payload: true }) => self.expect(b'}'),
+            Some(JsonFrame::Array { .. }) => self.input.expect(b']'),
+            Some(JsonFrame::Object { .. }) => self.input.expect(b'}'),
+            Some(JsonFrame::Map { .. }) => self.input.expect(b']'),
+            Some(JsonFrame::Variant { payload: true }) => self.input.expect(b'}'),
             Some(JsonFrame::Variant { payload: false }) => Ok(()),
             None => fail("Malformed"),
         }
     }
 
     fn finish(&mut self) -> Decoded<()> {
-        self.space();
+        self.input.space();
         match self.input.at == self.input.bytes.len() {
             true => Ok(()),
             false => fail("Trailing"),

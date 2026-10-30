@@ -1,6 +1,6 @@
 # Text, rendering and Encode
 
-This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema hashes, and the formats `mem::wire` and `text::json`.
+This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema hashes, the formats `mem::wire` and `text::json`, and the construction text that `text::construction` decodes.
 
 ## Text types
 
@@ -307,6 +307,8 @@ pub fn Renderer.write_char(mut self, c: char) limits pure, notrap, terminates
 pub fn Renderer.remaining(self) -> usize limits pure, notrap, terminates
 
 pub fn Renderer.is_elided(self) -> bool limits pure, notrap, terminates
+
+pub fn Renderer.write_nested[T: Render](mut self, value: T) limits pure, terminates
 ```
 
 The full rendering R is the concatenation, in call order, of every text and char written to one renderer. With render budget B:
@@ -314,6 +316,7 @@ The full rendering R is the concatenation, in call order, of every text and char
 - When R holds at most B bytes, the output is R.
 - Otherwise the output is P followed by D, where D is `...` cut to its first `min(3, B)` bytes and P is the longest prefix of R ending at a char boundary with at most B − |D| bytes. The rendering is then elided.
 - `remaining()` is B minus the bytes written so far, or 0 when that is negative. `is_elided()` is true once more than B bytes have been written.
+- `write_nested(value)` writes the **nested rendering** of `value`, the form it takes inside the rendering of another value. A `char` is written as a char literal and a `Str`, `text::String` or `text::Fixed[N]` as a text literal ([text literals](01-lexical.md#text-literals)): each character as itself, except `\` and the literal's quote, written `\\` and `\'` or `\"`; U+000A, U+000D, U+0009 and U+0000, written `\n`, `\r`, `\t` and `\0`; and every other character outside `CHARACTER`, written `\u{H}` with `H` in uppercase hexadecimal digits without leading zeros. The contents of a `mem::Box[T]` or `mem::Shared[T]` are written in their nested rendering, and any other value as its `render` writes it.
 
 Core and std types render as follows:
 
@@ -325,8 +328,8 @@ Core and std types render as follows:
 | `char`, `Str`, `text::String`, `text::Fixed[N]` | their characters |
 | `Unit` | `Unit` |
 | `Option[T]`, `Result[T, E]` | `None`, `Some(v)`, `Ok(v)`, `Err(e)` |
-| `Array[T, N]`, `Slice[T]`, `SliceMut[T]`, `mem::List[T]`, `mem::Bounded[T, N]`, `mem::Set[T]` | `[1, 2]`: the elements, separated by `, `, in brackets |
-| `mem::Map[K, V]`, `mem::HashMap[K, V]` | `{k: v, k: v}`, in iteration order |
+| `Array[T, N]`, `Slice[T]`, `SliceMut[T]`, `mem::List[T]`, `mem::Bounded[T, N]`, `mem::Set[T]` | `[1, 2]`: the nested renderings of the elements, separated by `, `, in brackets |
+| `mem::Map[K, V]`, `mem::HashMap[K, V]` | `{k: v, k: v}`: the nested renderings of the keys and values, in iteration order |
 | `mem::Bytes` | `b"`, each byte, then `"`: bytes `0x20` to `0x7E` as themselves, except `"` and `\` written `\"` and `\\`; `\n`, `\r`, `\t` and `\0` for their bytes; uppercase `\xHH` for the rest |
 | `mem::Box[T]`, `mem::Shared[T]` | the rendering of the contents |
 
@@ -339,6 +342,7 @@ Core and std types render as follows:
 
 - A struct renders as its name, `(`, then each field as `name: value` in declaration order separated by `, `, then `)`: `Header(kind: Kind.Ack, seq: 7)`. A struct without fields renders as `Name()`.
 - An enum value renders as `Name.Variant`, followed by `(value)` for a `V(T)` payload or by `(label: value, ...)` for labelled payloads in declaration order. The variants of `Option` and `Result` render without `Name.`.
+- Each field and payload value is written in its nested rendering: `Link(name: "eth0", mtu: 1500)`.
 - Generic arguments do not appear. Private fields render like public ones.
 
 ```nan
@@ -362,6 +366,24 @@ test header_line_shows_fields for header_line {
     header_line(Header(kind: Kind.Ack, seq: 7), mut out)
     expect out.as_str() == "Header(kind: Kind.Ack, seq: 7)"
 } header_line_shows_fields
+```
+
+```nan
+pub closed struct Link derives Eq, Render {
+    pub name: text::String
+    pub mtu: u32
+} Link
+
+pub fn link_line(link: Link, mut out: text::String) {
+    mut out.write(text::fmt("{link} {name}", link, name: link.name), budget: 64)
+} link_line
+
+test link_line_quotes_nested_text for link_line {
+    let world = testing::world()
+    var out = text::String.empty(world.alloc)
+    link_line(Link(name: text::String.of("eth\t0", alloc: world.alloc), mtu: 1_500), mut out)
+    expect out.as_str() == "Link(name: \"eth\\t0\", mtu: 1500) eth\t0"
+} link_line_quotes_nested_text
 ```
 
 ```nan
@@ -803,6 +825,90 @@ test probe_json_accepts_spacing for load_probe_json {
     let loaded = attempt load_probe_json(Untrusted.of(b"{ \"seq\": 5, \"hops\": 3 }"), alloc: world.alloc)
     expect loaded == Ok(Probe(seq: 5, hops: 3))
 } probe_json_accepts_spacing
+```
+
+## Construction text
+
+**Construction text** is the text form of values that [derived Render](#derived-render) and the std renderings write, as in `Config(mtu: 1500, dhcp: true)`. `text::construction` decodes it.
+
+```nan-api
+// module: text::construction
+
+pub open struct Codec[T: Encode] {
+} Codec
+
+pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+```
+
+`decode` reads exactly one value; bytes other than whitespace left after it fail with `Trailing`. Whitespace, U+0020, U+0009, U+000A and U+000D, may stand before and after each token: a word, a number, a literal, or one of `-inf`, `(`, `)`, `[`, `]`, `{`, `}`, `,`, `:` and `.`. A name or key is a `WORD` ([identifiers](01-lexical.md#identifiers)). Each kind reads as follows:
+
+| Kind | Construction text |
+| --- | --- |
+| bool | `true`, `false` |
+| unsigned, signed | `-` optionally, then a `DEC_INT` |
+| float | `NaN`, `inf`, `-inf`, or `-` optionally, a `DEC_INT`, optionally `.` and `DEC_DIGITS`, then optionally `e`, `-` optionally and one or more `DIGIT` |
+| char, text, bytes | a `CHAR`, a `TEXT`, a `BYTES` ([text literals](01-lexical.md#text-literals)) |
+| sequence | `[`, the elements separated by `,`, `]` |
+| map | `{`, each entry as its key, `:` and its value, entries separated by `,`, `}` |
+| record | a name, then optionally `(`, each field as its key, `:` and its value, fields separated by `,`, `)` |
+| variant | optionally a name and `.`, the key, then for a payload `(`, the payload, `)` |
+
+- A name before a record or variant key is not checked. A record without `(` has no fields, as in `Unit`. A labelled payload is read as the fields of a record without its name and parentheses: `Shape.Rect(w: 2, h: 3)`.
+- An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float is rounded to `f64` by roundTiesToEven. A char literal holds exactly one char; `_` separates digits and carries no meaning.
+- A field that an open type skips is any value of these forms.
+- Input that is not well-formed UTF-8 inside a literal, or a `\u{H}` escape naming a surrogate or a value above `10FFFF`, fails with `InvalidText`. Other input outside these forms, `\xHH` above `7F` in a char or text included, fails with `Malformed`.
+
+Decoding the rendering of a value within a render budget that does not elide it gives the value back when its type implements `Encode` and every value it renders, itself included, renders as the tables and derived Render above state, holds no `Untrusted` value, whose `<untrusted>` decodes as no kind, and is not text or a char at the top level, which renders as its characters.
+
+```nan
+// file: ports/package.nan
+//! Port records read back from their rendering.
+
+package ports {
+    language 1
+    targets any
+    allow validate in ports
+} ports
+
+// file: ports/ports.nan
+//! Ports and their media.
+
+pub closed enum Medium derives Eq, Render, Encode {
+    Copper
+    Fiber(lanes: u8)
+} Medium
+
+pub closed struct Port derives Eq, Render, Encode {
+    pub name: text::String
+    pub mtu: u16 where mtu >= 576
+    pub medium: Medium
+} Port
+
+pub fn load_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[Port, core::DecodeError] {
+    return attempt text::construction::Codec[Port].decode(raw, alloc)
+} load_port
+
+test port_reads_its_rendering for load_port {
+    let world = testing::world()
+    let port = Port(name: text::String.of("eth0", alloc: world.alloc), mtu: 1_500, medium: Medium.Fiber(lanes: 4))
+    var out = text::String.empty(world.alloc)
+    mut out.write(text::fmt("{port}", port), budget: 128)
+    expect out.as_str() == "Port(name: \"eth0\", mtu: 1500, medium: Medium.Fiber(lanes: 4))"
+    let loaded = load_port(Untrusted.of(out.as_bytes()), alloc: world.alloc)
+    let expected: Result[Port, core::DecodeError] = Ok(take port)
+    expect loaded == expected
+} port_reads_its_rendering
+
+test port_text_is_checked for load_port {
+    let world = testing::world()
+    let spaced = load_port(Untrusted.of(b"Port( mtu: 9_000, name: \"lo\", medium: Copper )"), alloc: world.alloc)
+    let small = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 500, medium: Medium.Copper)"), alloc: world.alloc)
+    let unknown = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 1500, medium: Medium.Radio)"), alloc: world.alloc)
+    let expected: Result[Port, core::DecodeError] = Ok(Port(name: text::String.of("lo", alloc: world.alloc), mtu: 9_000, medium: Medium.Copper))
+    expect spaced == expected
+    expect small == Err(core::DecodeError.Invalid)
+    expect unknown == Err(core::DecodeError.UnknownVariant)
+} port_text_is_checked
 ```
 
 ## Diagnostics

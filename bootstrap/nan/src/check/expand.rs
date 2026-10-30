@@ -441,7 +441,7 @@ impl Derived {
                     Payload::Single => vec![
                         format!("    {} => {{", payload.pattern(variant, "value")),
                         format!("        {}", write(&format!("{variant}("))),
-                        "        value.render(mut out)".to_owned(),
+                        "        mut out.write_nested(value)".to_owned(),
                         format!("        {}", write(")")),
                         "    }".to_owned(),
                     ],
@@ -455,7 +455,7 @@ impl Derived {
                                 ", ".to_owned()
                             };
                             arm.push(format!("        {}", write(&format!("{opener}{label}: "))));
-                            arm.push(format!("        value_{label}.render(mut out)"));
+                            arm.push(format!("        mut out.write_nested(value_{label})"));
                         }
                         arm.push(format!("        {}", write(")")));
                         arm.push("    }".to_owned());
@@ -476,7 +476,7 @@ impl Derived {
                     ", ".to_owned()
                 };
                 body.push(format!("mut out.write(\"{opener}{name}: \")"));
-                body.push(format!("self.{name}.render(mut out)"));
+                body.push(format!("mut out.write_nested(self.{name})"));
                 if index + 1 == fields.len() {
                     body.push("mut out.write(\")\")".to_owned());
                 }

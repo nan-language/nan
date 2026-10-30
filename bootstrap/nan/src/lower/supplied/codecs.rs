@@ -1,14 +1,15 @@
-//! The codecs `mem::wire::Codec` and `text::json::Codec`. Per format and type, an encoding
-//! function writes a value through a writer and a decoding function reads one through a
-//! reader, laid out as the kinds of `core::Encoder` and `core::Decoder` are: a struct as a
-//! record of its fields in ascending byte order of their keys, an enum value as a variant, and
-//! each std type as its encoding states.
+//! The codecs `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`. Per
+//! format and type, an encoding function writes a value through a writer and a decoding
+//! function reads one through a reader, laid out as the kinds of `core::Encoder` and
+//! `core::Decoder` are: a struct as a record of its fields in ascending byte order of their
+//! keys, an enum value as a variant, and each std type as its encoding states.
 //!
 //! A writer is the buffer bytes go to, zero while measuring, and the count of bytes written. A
 //! reader is the address of the next byte, the end of the input and the nesting depth. A
 //! decoding function gives zero, or one plus the index of the `core::DecodeError` variant it
 //! fails with, having released what it read.
 
+pub mod construction;
 mod json;
 mod wire;
 
@@ -27,10 +28,19 @@ use crate::check::ty::{Arg, Scalar, Subst, Ty};
 use crate::nir::Role;
 use crate::syntax::ast::TypeModifier;
 
+/// A format values encode in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Format {
     Wire,
     Json,
+}
+
+/// A format values decode from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecodeFormat {
+    Wire,
+    Json,
+    Construction,
 }
 
 pub mod writer {
@@ -85,15 +95,16 @@ const BYTE: Element = Element { size: 1, align: 1 };
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
-    let format = match owner {
-        "mem::wire::Codec" => Format::Wire,
-        "text::json::Codec" => Format::Json,
+    let (encoding, decoding) = match owner {
+        "mem::wire::Codec" => (Some(Format::Wire), DecodeFormat::Wire),
+        "text::json::Codec" => (Some(Format::Json), DecodeFormat::Json),
+        "text::construction::Codec" => (None, DecodeFormat::Construction),
         _ => return false,
     };
-    match supply.member() {
-        "encode" | "try_encode" => encode(lo, fx, supply, format),
-        "decode" => decode(lo, fx, supply, format),
-        member => panic!("no lowering of {owner}.{member}"),
+    match (supply.member(), encoding) {
+        ("encode" | "try_encode", Some(format)) => encode(lo, fx, supply, format),
+        ("decode", _) => decode(lo, fx, supply, decoding),
+        (member, _) => panic!("no lowering of {owner}.{member}"),
     }
     true
 }
@@ -145,7 +156,7 @@ fn call(lo: &mut Lowering, fx: &mut Fx, function: FuncId, args: &[Value]) -> Vec
 }
 
 /// `Codec.decode(raw, alloc)`: one value read, failing with `Trailing` on what is left.
-fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: Format) {
+fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: DecodeFormat) {
     let ty = supply.type_arg(0);
     let raw = supply.param(0).address();
     let start = fx.load(PTR, raw, 0);
@@ -169,7 +180,7 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: Format) {
         read,
         &[types::I32],
         |lo, fx| {
-            if format == Format::Json {
+            if format != DecodeFormat::Wire {
                 json::space(fx, state);
             }
             let pos = fx.load(PTR, state, reader::POS);
@@ -770,7 +781,7 @@ fn encode_case(
 
 /// The decoding function of a type in a format: given a reader, the allocator handle values
 /// draw through and the address the value goes to, the code of its failure, zero for none.
-fn decoder(lo: &mut Lowering, format: Format, ty: &Ty) -> FuncId {
+fn decoder(lo: &mut Lowering, format: DecodeFormat, ty: &Ty) -> FuncId {
     let mut signature = Signature::new(CALL_CONV);
     for _ in 0..3 {
         signature.params.push(AbiParam::new(PTR));
@@ -797,7 +808,7 @@ fn decoder(lo: &mut Lowering, format: Format, ty: &Ty) -> FuncId {
 
 /// A decoding function's reader and allocator handle, in a format.
 struct Decoding {
-    format: Format,
+    format: DecodeFormat,
     reader: Value,
     alloc: Value,
 }
@@ -961,8 +972,9 @@ fn decode_kind(
     match kind {
         Kind::Bool => {
             let (flag, failed) = match decoding.format {
-                Format::Wire => wire::read_bool(fx, reader_state),
-                Format::Json => json::read_bool(lo, fx, reader_state),
+                DecodeFormat::Wire => wire::read_bool(fx, reader_state),
+                DecodeFormat::Json => json::read_bool(lo, fx, reader_state),
+                DecodeFormat::Construction => construction::read_bool(lo, fx, reader_state),
             };
             check(lo, fx, failed, |_, _| {});
             fx.store(flag, target, 0);
@@ -994,8 +1006,9 @@ fn decode_kind(
         }
         Kind::Float(scalar) => {
             let (value, failed) = match decoding.format {
-                Format::Wire => wire::read_float(fx, reader_state),
-                Format::Json => json::read_float(lo, fx, reader_state),
+                DecodeFormat::Wire => wire::read_float(fx, reader_state),
+                DecodeFormat::Json => json::read_float(lo, fx, reader_state),
+                DecodeFormat::Construction => construction::read_float(lo, fx, reader_state),
             };
             check(lo, fx, failed, |_, _| {});
             let value = match scalar {
@@ -1006,13 +1019,18 @@ fn decode_kind(
         }
         Kind::Char => {
             let scalar = match decoding.format {
-                Format::Wire => {
+                DecodeFormat::Wire => {
                     let value = read_integer(lo, fx, decoding, false);
                     let most = fx.int(types::I64, i64::from(u32::MAX));
                     fx.b.ins().umin(value, most)
                 }
-                Format::Json => {
+                DecodeFormat::Json => {
                     let (scalar, failed) = json::read_char(lo, fx, reader_state);
+                    check(lo, fx, failed, |_, _| {});
+                    scalar
+                }
+                DecodeFormat::Construction => {
+                    let (scalar, failed) = construction::read_char(lo, fx, reader_state);
                     check(lo, fx, failed, |_, _| {});
                     scalar
                 }
@@ -1029,15 +1047,25 @@ fn decode_kind(
         Kind::Text(fixed) => decode_text(lo, fx, decoding, ty, *fixed, target),
         Kind::Bytes => {
             vector::empty(fx, target, decoding.alloc, BYTE);
-            let failed = match decoding.format {
-                Format::Wire => {
+            match decoding.format {
+                DecodeFormat::Wire => {
                     let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
                     check(lo, fx, failed, |_, _| {});
-                    fill(lo, fx, target, start, len)
+                    let failed = fill(lo, fx, target, start, len);
+                    check(lo, fx, failed, |_, _| {});
                 }
-                Format::Json => json::read_base64(lo, fx, reader_state, target),
-            };
-            check(lo, fx, failed, |_, _| {});
+                DecodeFormat::Json => {
+                    let failed = json::read_base64(lo, fx, reader_state, target);
+                    check(lo, fx, failed, |_, _| {});
+                }
+                DecodeFormat::Construction => {
+                    let literal = construction::Literal::Bytes;
+                    let (len, failed) =
+                        construction::measure_literal(lo, fx, reader_state, literal);
+                    check(lo, fx, failed, |_, _| {});
+                    draw_measured(lo, fx, decoding, Measured::Literal(literal), len, target);
+                }
+            }
         }
         Kind::Sequence(element, form) => {
             decode_sequence(lo, fx, decoding, ty, element, *form, target)
@@ -1078,7 +1106,7 @@ fn decode_kind(
             fx.store(index, target, 0);
         }
         Kind::Record(record) => {
-            decode_record(lo, fx, decoding, record, target);
+            decode_record(lo, fx, decoding, record, false, target);
             if let Some((item, args)) = &record.owner {
                 check_predicates(lo, fx, ty, *item, args, target);
             }
@@ -1090,8 +1118,9 @@ fn decode_kind(
 /// An unsigned or signed value in 64 bits, returning from the decoding function on failure.
 fn read_integer(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, signed: bool) -> Value {
     let (value, failed) = match decoding.format {
-        Format::Wire => wire::read_integer(lo, fx, decoding.reader, signed),
-        Format::Json => json::read_integer(lo, fx, decoding.reader, signed),
+        DecodeFormat::Wire => wire::read_integer(lo, fx, decoding.reader, signed),
+        DecodeFormat::Json => json::read_integer(lo, fx, decoding.reader, signed),
+        DecodeFormat::Construction => construction::read_integer(lo, fx, decoding.reader, signed),
     };
     check(lo, fx, failed, |_, _| {});
     value
@@ -1168,19 +1197,25 @@ fn decode_text(
     target: Value,
 ) {
     let reader_state = decoding.reader;
-    let (start, len) = match decoding.format {
-        Format::Wire => {
+    let (source, len) = match decoding.format {
+        DecodeFormat::Wire => {
             let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
             let valid = utf8_valid(lo, fx, start, len);
             let invalid = fx.b.ins().bxor_imm_s(valid, 1);
             fx.when(invalid, |fx| fail(fx, failure::INVALID_TEXT));
-            (Some(start), len)
+            (Measured::Input(start), len)
         }
-        Format::Json => {
+        DecodeFormat::Json => {
             let (len, failed) = json::measure_string(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
-            (None, len)
+            (Measured::Json, len)
+        }
+        DecodeFormat::Construction => {
+            let literal = construction::Literal::Text;
+            let (len, failed) = construction::measure_literal(lo, fx, reader_state, literal);
+            check(lo, fx, failed, |_, _| {});
+            (Measured::Literal(literal), len)
         }
     };
     match fixed {
@@ -1193,40 +1228,75 @@ fn decode_text(
             let bytes_at = lo.layouts.field(lo.ck, ty, None, "bytes").offset;
             fx.store(len, target, len_at);
             let destination = fx.offset(target, bytes_at);
-            match start {
-                Some(start) => {
-                    lo.call_routine(fx, Routine::Copy, &[destination, start, len]);
-                }
-                None => json::write_string(lo, fx, reader_state, destination, len),
-            }
+            write_measured(lo, fx, reader_state, source, destination, len);
         }
         None => {
             vector::empty(fx, target, decoding.alloc, BYTE);
-            match start {
-                Some(start) => {
+            match source {
+                Measured::Input(start) => {
                     let failed = fill(lo, fx, target, start, len);
                     check(lo, fx, failed, |_, _| {});
                 }
-                None => {
-                    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, len, 0);
-                    fx.when(present, |fx| {
-                        let drawn = vector::resize(lo, fx, target, len, BYTE);
-                        let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
-                        fx.when(failed, |fx| fail(fx, failure::OUT_OF_MEMORY));
-                    });
-                    let data = fx.load(PTR, target, vector::DATA);
-                    json::write_string(lo, fx, reader_state, data, len);
-                    fx.store(len, target, vector::LEN);
-                }
+                _ => draw_measured(lo, fx, decoding, source, len, target),
             }
         }
     }
 }
 
+/// Where the bytes of text read come from: the input, or a JSON string or construction
+/// literal that follows, measured before.
+#[derive(Clone, Copy)]
+enum Measured {
+    Input(Value),
+    Json,
+    Literal(construction::Literal),
+}
+
+/// Writes the `len` bytes of read text to `destination`.
+fn write_measured(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    reader_state: Value,
+    source: Measured,
+    destination: Value,
+    len: Value,
+) {
+    match source {
+        Measured::Input(start) => {
+            lo.call_routine(fx, Routine::Copy, &[destination, start, len]);
+        }
+        Measured::Json => json::write_string(lo, fx, reader_state, destination, len),
+        Measured::Literal(literal) => {
+            construction::write_literal(lo, fx, reader_state, literal, destination, len)
+        }
+    }
+}
+
+/// Reads the `len` bytes of read text into the empty string or bytes at `target`, drawn for
+/// exactly them.
+fn draw_measured(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    decoding: &Decoding,
+    source: Measured,
+    len: Value,
+    target: Value,
+) {
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, len, 0);
+    fx.when(present, |fx| {
+        let drawn = vector::resize(lo, fx, target, len, BYTE);
+        let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
+        fx.when(failed, |fx| fail(fx, failure::OUT_OF_MEMORY));
+    });
+    let data = fx.load(PTR, target, vector::DATA);
+    write_measured(lo, fx, decoding.reader, source, data, len);
+    fx.store(len, target, vector::LEN);
+}
+
 /// Whether the element at `index` of a sequence, map or record follows, returning from the
 /// decoding function after `undo` on failure: in the wire format while fewer than its count
-/// have been read; in JSON until the closing byte, which is passed over, a comma before each
-/// element after the first.
+/// have been read; in the text formats until the closing byte, which is passed over, a comma
+/// before each element after the first, and in construction text never when `count` is zero.
 #[allow(clippy::too_many_arguments)]
 fn element_follows(
     lo: &mut Lowering,
@@ -1238,28 +1308,49 @@ fn element_follows(
     undo: impl FnOnce(&mut Lowering, &mut Fx),
 ) -> Value {
     match decoding.format {
-        Format::Wire => fx.b.ins().icmp(IntCC::UnsignedLessThan, index, count),
-        Format::Json => {
+        DecodeFormat::Wire => fx.b.ins().icmp(IntCC::UnsignedLessThan, index, count),
+        DecodeFormat::Json => {
             let (follows, failed) = json::element_follows(lo, fx, decoding.reader, index, close);
             check(lo, fx, failed, undo);
             follows
         }
+        DecodeFormat::Construction => {
+            let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
+            let parts = fx.choose_in(
+                lo,
+                open,
+                &[types::I8, types::I32],
+                |lo, fx| {
+                    let (follows, failed) =
+                        json::element_follows(lo, fx, decoding.reader, index, close);
+                    vec![follows, failed]
+                },
+                |_, fx| vec![fx.int(types::I8, 0), fx.int(types::I32, 0)],
+            );
+            check(lo, fx, parts[1], undo);
+            parts[0]
+        }
     }
 }
 
-/// Opens a sequence, map or record: the wire format's count, or JSON's opening byte, returning
-/// from the decoding function on failure.
+/// Opens a sequence, map or record: the wire format's count, or a text format's opening byte,
+/// returning from the decoding function on failure.
 fn open(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, opening: u8) -> Value {
     match decoding.format {
-        Format::Wire => {
+        DecodeFormat::Wire => {
             let (count, failed) = wire::read_count(lo, fx, decoding.reader);
             check(lo, fx, failed, |_, _| {});
             count
         }
-        Format::Json => {
+        DecodeFormat::Json => {
             let failed = json::expect_code(lo, fx, decoding.reader, opening);
             check(lo, fx, failed, |_, _| {});
             fx.ptr(0)
+        }
+        DecodeFormat::Construction => {
+            let failed = json::expect_code(lo, fx, decoding.reader, opening);
+            check(lo, fx, failed, |_, _| {});
+            fx.ptr(1)
         }
     }
 }
@@ -1448,19 +1539,24 @@ fn decode_map(
         .layouts
         .field(lo.ck, &entries.entry, None, "value")
         .offset;
+    let construction = decoding.format == DecodeFormat::Construction;
+    let (opening, close) = match construction {
+        true => (b'{', b'}'),
+        false => (b'[', b']'),
+    };
     nest(fx, reader_state);
-    let count = open(lo, fx, decoding, b'[');
+    let count = open(lo, fx, decoding, opening);
     vector::empty(fx, target, decoding.alloc, entries.shape);
     let entry_ty = entries.entry.clone();
     let release_read = |lo: &mut Lowering, fx: &mut Fx| {
         let zero = fx.ptr(0);
         vector::release(lo, fx, target, &entry_ty, zero);
     };
-    let json = decoding.format == Format::Json;
+    let json = decoding.format == DecodeFormat::Json;
     let zero = fx.ptr(0);
     let read = fx.repeat(&[zero], |fx, state| {
         let index = state[0];
-        let follows = element_follows(lo, fx, decoding, index, count, b']', |lo, fx| {
+        let follows = element_follows(lo, fx, decoding, index, count, close, |lo, fx| {
             release_read(lo, fx)
         });
         fx.when(follows, |fx| {
@@ -1484,8 +1580,9 @@ fn decode_map(
                 lo.release(fx, key, key_slot);
                 release_read(lo, fx);
             };
-            if json {
-                let failed = json::expect_code(lo, fx, reader_state, b',');
+            if json || construction {
+                let separator = if json { b',' } else { b':' };
+                let failed = json::expect_code(lo, fx, reader_state, separator);
                 check(lo, fx, failed, release_key);
             }
             let value_slot = fx.offset(entry, value_at);
@@ -1527,13 +1624,15 @@ fn key_room(record: &Record) -> u64 {
     longest as u64 + 1
 }
 
-/// Reads a record into the fields at their offsets from `target`, as the decoding rules state
-/// for unknown, repeated and missing keys; on failure every field read is released.
+/// Reads a record, or a variant's labelled payload, into the fields at their offsets from
+/// `target`, as the decoding rules state for unknown, repeated and missing keys; on failure
+/// every field read is released.
 fn decode_record(
     lo: &mut Lowering,
     fx: &mut Fx,
     decoding: &Decoding,
     record: &Record,
+    labelled: bool,
     target: Value,
 ) {
     let reader_state = decoding.reader;
@@ -1558,24 +1657,43 @@ fn decode_record(
     nest(fx, reader_state);
     let room = key_room(record);
     let key_buffer = fx.slot(room, 1);
-    let left = open(lo, fx, decoding, b'{');
+    let left = match (decoding.format, labelled) {
+        (DecodeFormat::Construction, true) => fx.ptr(1),
+        (DecodeFormat::Construction, false) => {
+            let (parens, failed) = construction::open_record(lo, fx, reader_state);
+            check(lo, fx, failed, |_, _| {});
+            fx.b.ins().uextend(PTR, parens)
+        }
+        _ => open(lo, fx, decoding, b'{'),
+    };
+    let close = match decoding.format {
+        DecodeFormat::Construction => b')',
+        _ => b'}',
+    };
     let last = fx.slot(16, 8);
     let none = fx.int(PTR, -1);
     fx.store(none, last, 8);
     let zero = fx.ptr(0);
     fx.repeat(&[zero], |fx, state| {
         let index = state[0];
-        let follows = element_follows(lo, fx, decoding, index, left, b'}', release_read);
+        let follows = element_follows(lo, fx, decoding, index, left, close, release_read);
         fx.when(follows, |fx| {
             let (key_start, key_len, value_end) = match decoding.format {
-                Format::Wire => {
+                DecodeFormat::Wire => {
                     let (start, len, end, failed) = wire::read_key(lo, fx, reader_state, last);
                     check(lo, fx, failed, release_read);
                     (start, len, Some(end))
                 }
-                Format::Json => {
+                DecodeFormat::Json => {
                     let capacity = fx.ptr(room);
                     let (len, failed) = json::read_key(lo, fx, reader_state, key_buffer, capacity);
+                    check(lo, fx, failed, release_read);
+                    (key_buffer, len, None)
+                }
+                DecodeFormat::Construction => {
+                    let capacity = fx.ptr(room);
+                    let (len, failed) =
+                        construction::read_key(lo, fx, reader_state, key_buffer, capacity);
                     check(lo, fx, failed, release_read);
                     (key_buffer, len, None)
                 }
@@ -1591,7 +1709,12 @@ fn decode_record(
                 match value_end {
                     Some(end) => fx.store(end, reader_state, reader::POS),
                     None => {
-                        let failed = json::skip_value(lo, fx, reader_state);
+                        let failed = match decoding.format {
+                            DecodeFormat::Construction => {
+                                construction::skip_value(lo, fx, reader_state)
+                            }
+                            _ => json::skip_value(lo, fx, reader_state),
+                        };
                         check(lo, fx, failed, release_read);
                     }
                 }
@@ -1719,16 +1842,23 @@ fn decode_variant(
     nest(fx, reader_state);
     let room = key_room(&record);
     let key_buffer = fx.slot(room, 1);
-    let (key_start, key_len, json_payload) = match decoding.format {
-        Format::Wire => {
+    let (key_start, key_len, text_payload) = match decoding.format {
+        DecodeFormat::Wire => {
             let (start, len, failed) = wire::read_framed(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
             (start, len, None)
         }
-        Format::Json => {
+        DecodeFormat::Json => {
             let capacity = fx.ptr(room);
             let (len, payload, failed) =
                 json::read_variant(lo, fx, reader_state, key_buffer, capacity);
+            check(lo, fx, failed, |_, _| {});
+            (key_buffer, len, Some(payload))
+        }
+        DecodeFormat::Construction => {
+            let capacity = fx.ptr(room);
+            let (len, payload, failed) =
+                construction::read_variant(lo, fx, reader_state, key_buffer, capacity);
             check(lo, fx, failed, |_, _| {});
             (key_buffer, len, Some(payload))
         }
@@ -1737,12 +1867,12 @@ fn decode_variant(
     let unknown = fx.b.ins().icmp_imm_s(IntCC::Equal, matched, -1);
     fx.when(unknown, |fx| fail(fx, failure::UNKNOWN_VARIANT));
     let (follows, payload_end) = match decoding.format {
-        Format::Wire => {
+        DecodeFormat::Wire => {
             let (follows, end, failed) = wire::read_payload_flag(lo, fx, reader_state);
             check(lo, fx, failed, |_, _| {});
             (follows, Some(end))
         }
-        Format::Json => (json_payload.expect("a JSON variant's form"), None),
+        _ => (text_payload.expect("a text variant's form"), None),
     };
     for (position, case) in cases.iter().enumerate() {
         let this =
@@ -1763,7 +1893,7 @@ fn decode_variant(
                     check(lo, fx, failed, |_, _| {});
                 }
                 CasePayload::Labelled(labelled) => {
-                    decode_record(lo, fx, decoding, labelled, target)
+                    decode_record(lo, fx, decoding, labelled, true, target)
                 }
             }
             let release_payload = |lo: &mut Lowering, fx: &mut Fx| match &case.payload {
@@ -1779,20 +1909,23 @@ fn decode_variant(
                 }
                 CasePayload::None => {}
             };
+            let closing = match (decoding.format, &case.payload) {
+                (DecodeFormat::Json, _) => Some(b'}'),
+                (DecodeFormat::Construction, CasePayload::Single(_)) => Some(b')'),
+                _ => None,
+            };
             if expected {
-                match payload_end {
-                    Some(end) => {
-                        let pos = fx.load(PTR, reader_state, reader::POS);
-                        let short = fx.b.ins().icmp(IntCC::NotEqual, pos, end);
-                        fx.when(short, |fx| {
-                            release_payload(lo, fx);
-                            fail(fx, failure::MALFORMED);
-                        });
-                    }
-                    None => {
-                        let failed = json::expect_code(lo, fx, reader_state, b'}');
-                        check(lo, fx, failed, release_payload);
-                    }
+                if let Some(end) = payload_end {
+                    let pos = fx.load(PTR, reader_state, reader::POS);
+                    let short = fx.b.ins().icmp(IntCC::NotEqual, pos, end);
+                    fx.when(short, |fx| {
+                        release_payload(lo, fx);
+                        fail(fx, failure::MALFORMED);
+                    });
+                }
+                if let Some(closing) = closing {
+                    let failed = json::expect_code(lo, fx, reader_state, closing);
+                    check(lo, fx, failed, release_payload);
                 }
             }
             lo.write_variant_tag(fx, ty, target, &case.key);

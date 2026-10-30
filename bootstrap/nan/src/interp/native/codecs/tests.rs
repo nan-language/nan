@@ -24,7 +24,7 @@ pub closed struct Lookup derives Encode {
     pub path: Untrusted[text::String]
 } Lookup
 
-pub closed enum Signal derives Eq, Encode {
+pub closed enum Signal derives Eq, Render, Encode {
     Idle
     Level(u16)
     Pair(left: u8, right: i8)
@@ -130,6 +130,60 @@ pub fn json_map(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[mem::Map
     return attempt text::json::Codec[mem::Map[u8, u16]].decode(raw, alloc)
 } json_map
 
+pub closed struct Port derives Eq, Render, Encode {
+    pub name: text::String
+    pub tag: char
+    pub raw: mem::Bytes
+    pub signal: Signal
+    pub level: i32
+    pub unit: Unit
+} Port
+
+pub fn construction_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[Port, core::DecodeError]
+    example construction_port(Untrusted.of(b"Port(name: \"a\\t\\u{E9}\", tag: '\\'', raw: b\"\\xFF\", signal: Signal.Pair(left: 1, right: -2), level: -1_5, unit: Unit)"), alloc: testing::world().alloc).is_ok()
+    example construction_port(Untrusted.of(b"Port ( unit: Unit, level: 0, signal: Level( 7 ), raw: b\"\", tag: 'x', name: \"\" )"), alloc: testing::world().alloc).is_ok()
+    example construction_port(Untrusted.of(b"Port(name: \"a\", tag: 'x', raw: b\"\", signal: Signal.Idle, level: 1, unit: Unit"), alloc: testing::world().alloc) == Err(core::DecodeError.Truncated)
+    example construction_port(Untrusted.of(b"Port(name: \"\\u{D800}\", tag: 'x', raw: b\"\", signal: Signal.Idle, level: 1, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.InvalidText)
+    example construction_port(Untrusted.of(b"Port(name: \"\t\", tag: 'x', raw: b\"\", signal: Signal.Idle, level: 1, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+    example construction_port(Untrusted.of(b"Port(name: \"a\", tag: 'xy', raw: b\"\", signal: Signal.Idle, level: 1, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+    example construction_port(Untrusted.of(b"Port(name: \"a\", tag: 'x', raw: b\"\", signal: Signal.Level, level: 1, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+    example construction_port(Untrusted.of(b"Port(name: \"a\", tag: 'x', raw: b\"\", signal: Signal.Idle, level: 1.5u8, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+    example construction_port(Untrusted.of(b"Port(name: <untrusted>, tag: 'x', raw: b\"\", signal: Signal.Idle, level: 1, unit: Unit)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+{
+    return attempt text::construction::Codec[Port].decode(raw, alloc)
+} construction_port
+
+pub fn construction_round_trip(port: Port, alloc: mem::Alloc) -> bool
+    example construction_round_trip(Port(name: text::String.of("\"\u{200B}\n", alloc: testing::world().alloc), tag: '\'', raw: mem::Bytes.empty(testing::world().alloc), signal: Signal.Pair(left: 3, right: -4), level: -7, unit: Unit), alloc: testing::world().alloc)
+{
+    var out = text::String.empty(alloc)
+    mut out.write(text::fmt("{port}", port), budget: 256)
+    return attempt text::construction::Codec[Port].decode(Untrusted.of(out.as_bytes()), alloc) == Ok(port)
+} construction_round_trip
+
+pub fn construction_float(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> f64
+    example construction_float(Untrusted.of(b"-1.5e-7"), alloc: testing::world().alloc) == -0.00000015
+    example construction_float(Untrusted.of(b" 2.0e16"), alloc: testing::world().alloc) == 20_000_000_000_000_000.0
+    example construction_float(Untrusted.of(b"1_000"), alloc: testing::world().alloc) == 1_000.0
+    example construction_float(Untrusted.of(b"-inf"), alloc: testing::world().alloc) == -1.0 / 0.0
+    example construction_float(Untrusted.of(b"- inf"), alloc: testing::world().alloc).is_nan()
+    example construction_float(Untrusted.of(b"1.5E3"), alloc: testing::world().alloc).is_nan()
+{
+    match attempt text::construction::Codec[f64].decode(raw, alloc) {
+        Ok(value) => return value
+        Err(_) => return 0.0 / 0.0
+    }
+} construction_float
+
+pub fn construction_config(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[Config, core::DecodeError]
+    example construction_config(Untrusted.of(b"Config(mode: Mode.Fast([{1: \"a\"}], deep: b\"\", n: -inf), retries: 3)"), alloc: testing::world().alloc) == Ok(Config(retries: 3, verbose: false))
+    example construction_config(Untrusted.of(b"Config(retries: 1_0, verbose: true) x"), alloc: testing::world().alloc) == Err(core::DecodeError.Trailing)
+    example construction_config(Untrusted.of(b"Config(retries: 1__0)"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+    example construction_config(Untrusted.of(b"Config(retries: -1)"), alloc: testing::world().alloc) == Err(core::DecodeError.OutOfRange)
+{
+    return attempt text::construction::Codec[Config].decode(raw, alloc)
+} construction_config
+
 pub fn json_bytes(raw: Slice[u8], alloc: mem::Alloc) -> text::String
     example json_bytes(b"\x00\xFF", alloc: testing::world().alloc).as_str() == "\"AP8=\""
 {
@@ -142,7 +196,7 @@ pub fn json_bytes(raw: Slice[u8], alloc: mem::Alloc) -> text::String
 "#;
 
 #[test]
-fn wire_and_json_encode_and_decode_as_their_formats_state() {
+fn wire_json_and_construction_text_encode_and_decode_as_their_formats_state() {
     let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", CASES)]);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let found: Vec<String> = reported(&workspace, &Scope::Workspace)

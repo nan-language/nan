@@ -1,4 +1,4 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec` and `text::json::Codec`. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out; decoding reads a format through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out; decoding reads a format through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const DECODE_DEPTH_LIMIT: usize = 128
@@ -101,6 +101,12 @@ struct JsonReader {
     frames: mem::List[JsonFrame]
 } JsonReader
 
+enum CodecFormat derives Copy, Eq {
+    Wire
+    Json
+    Construction
+} CodecFormat
+
 /// A format read through the calls of `core::Decoder`.
 interface Reader {
     fn read_bool(mut self) -> bool fails Failure
@@ -114,14 +120,16 @@ interface Reader {
     fn begin_sequence(mut self) fails Failure
     fn begin_map(mut self) fails Failure
     fn begin_record(mut self) fails Failure
+    /// Begins the record of a variant's labelled payload.
+    fn begin_labelled(mut self) fails Failure
     fn next_follows(mut self) -> bool fails Failure
     /// Between a map entry's key and its value.
     fn map_value(mut self) fails Failure
     fn read_key(mut self) -> mem::Bytes fails Failure
     fn read_variant(mut self) -> mem::Bytes fails Failure
     fn payload_follows(mut self) -> bool fails Failure
-    /// Passes over the value of the field whose key was just read.
-    fn skip(mut self) fails Failure
+    /// Passes over the value of the field whose key was just read, at a nesting depth.
+    fn skip(mut self, depth: usize) fails Failure
     fn end(mut self) fails Failure
     /// Fails on what is left after the value.
     fn finish(mut self) fails Failure
@@ -130,6 +138,8 @@ interface Reader {
 impl WireReader: Reader
 
 impl JsonReader: Reader
+
+impl ConstructionReader: Reader
 
 /// A variant key a decoding accepts, with its payload's type when it has one.
 struct VariantKey {
@@ -154,20 +164,26 @@ fn Interpreter.codec_member(
     site: RunSite,
     ) -> Option[InterpFlow] fails End {
     let alloc = self.alloc
-    var json = false
+    var format = CodecFormat.Wire
     match owner {
         "mem::wire::Codec" => {}
         "text::json::Codec" => {
-            json = true
+            format = CodecFormat.Json
+        }
+        "text::construction::Codec" => {
+            format = CodecFormat.Construction
         }
         else => return None
     }
     expect args.len() > 1
     let ty = type_arg_or_unit(type_args, index: 0)
     if member == "encode" or member == "try_encode" {
+        if format == CodecFormat.Construction {
+            return None
+        }
         let tree = self.encoded(args[0], ty)
         var out = mem::Bytes.empty(alloc)
-        if json {
+        if format == CodecFormat.Json {
             tree.write_json(mut out, alloc)
         } else {
             tree.write_wire(mut out, alloc)
@@ -186,7 +202,7 @@ fn Interpreter.codec_member(
     let raw = wrapped.fields()[0].copy(alloc)
     let input = mut self.bytes(raw)
     let cell = self.cell_of(args[1])
-    let decoded = attempt mut self.decode_value(json, take input, cell, ty, at, site)
+    let decoded = attempt mut self.decode_value(format, take input, cell, ty, at, site)
     match decoded {
         Ok(value) => return Some(InterpFlow.Return(take value))
         Err(Failure.Decode(kind)) => {
@@ -201,7 +217,7 @@ fn Interpreter.codec_member(
 /// The value of a type a codec's input holds, the decoding failing on what follows it.
 fn Interpreter.decode_value(
     mut self,
-    json: bool,
+    format: CodecFormat,
     take input: mem::Bytes,
     cell: u32,
     ty: ty::Ty,
@@ -209,9 +225,13 @@ fn Interpreter.decode_value(
     site: RunSite,
     ) -> Val fails Failure {
     var decoding = Decoding(cell: cell, depth: 0, at: at, site: site)
-    if json {
+    if format == CodecFormat.Json {
         var json_reader = JsonReader.new(take input, alloc: self.alloc)
         return try mut decoding.whole(mut self, reader: mut json_reader, ty)
+    }
+    if format == CodecFormat.Construction {
+        var construction_reader = ConstructionReader.new(take input, grammar: self.ck.session().grammar.share(), alloc: self.alloc)
+        return try mut decoding.whole(mut self, reader: mut construction_reader, ty)
     }
     var wire_reader = WireReader.new(take input, alloc: self.alloc)
     return try mut decoding.whole(mut self, reader: mut wire_reader, ty)
@@ -1010,7 +1030,7 @@ fn Decoding.declared[R: Reader](mut self, mut interp: Interpreter, mut reader: R
             for field in fields {
                 mut named.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
             }
-            let values = try mut self.record(mut interp, mut reader, named: named.view(), open, aliases)
+            let values = try mut self.record(mut interp, mut reader, named: named.view(), open, labelled: false, aliases)
             let value = Val.Struct(item: item, fields: mem::Shared.of(take values, alloc))
             var type_args = mem::List[ty::Arg].empty(alloc)
             for arg in args {
@@ -1078,7 +1098,7 @@ fn Decoding.declared_variant[R: Reader](
             for label in labels {
                 mut named.push(LabelledTy(name: text::String.of(label.name.as_str(), alloc), ty: subst.ty(ck.types(), ty: label.ty)))
             }
-            payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc))
+            payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, labelled: true, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc))
         }
     }
     try mut reader.end()
@@ -1101,19 +1121,25 @@ fn name_copy(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     return copied
 } name_copy
 
-/// The values of a record's named fields in order, as the decoding rules read them.
+/// The values of a record's named fields in order, as the decoding rules read them, given
+/// whether it decodes as open and whether it is a labelled payload.
 fn Decoding.record[R: Reader](
     mut self,
     mut interp: Interpreter,
     mut reader: R,
     named: Slice[LabelledTy],
     open: bool,
+    labelled: bool,
     aliases: mem::HashMap[mem::Bytes, mem::Bytes],
     ) -> mem::List[Val] fails Failure {
     let alloc = interp.alloc
     let outer = self.depth
     try mut self.nest()
-    try mut reader.begin_record()
+    if labelled {
+        try mut reader.begin_labelled()
+    } else {
+        try mut reader.begin_record()
+    }
     var values = mem::List[Option[Val]].empty(alloc)
     for _ in 0..<named.len() {
         mut values.push(None)
@@ -1140,7 +1166,7 @@ fn Decoding.record[R: Reader](
                 if not open {
                     fail Failure.Decode(DecodeKind.UnknownKey)
                 }
-                try mut reader.skip()
+                try mut reader.skip(self.depth)
             }
         }
     }
@@ -1274,6 +1300,37 @@ fn CodecInput.next_bytes(mut self, count: usize) -> mem::Bytes fails Failure
     return taken
 } CodecInput.next_bytes
 
+/// Passes over the whitespace of the text formats.
+fn CodecInput.space(mut self) {
+    while self.at < self.bytes.len() {
+        let byte = self.bytes[self.at]
+        if byte != b' ' and byte != b'\t' and byte != b'\n' and byte != b'\r' {
+            return
+        }
+        self.at += 1
+    }
+} CodecInput.space
+
+/// The next byte after whitespace, not passed over.
+fn CodecInput.peek(mut self) -> u8 fails Failure
+    ensures self.at < self.bytes.len()
+{
+    mut self.space()
+    if self.at >= self.bytes.len() {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    return self.bytes[self.at]
+} CodecInput.peek
+
+/// Passes over a byte after whitespace.
+fn CodecInput.expect_byte(mut self, byte: u8) fails Failure {
+    let next = try mut self.peek()
+    if next != byte {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    self.at += 1
+} CodecInput.expect_byte
+
 fn WireReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> WireReader {
     return WireReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[WireFrame].empty(alloc))
 } WireReader.new
@@ -1393,6 +1450,10 @@ fn WireReader.begin_record(mut self) fails Failure {
     mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: None))
 } WireReader.begin_record
 
+fn WireReader.begin_labelled(mut self) fails Failure {
+    try mut self.begin_record()
+} WireReader.begin_labelled
+
 fn WireReader.next_follows(mut self) -> bool fails Failure {
     try mut self.close_value()
     let Some(frame) = mut self.frames.pop() else {
@@ -1467,7 +1528,7 @@ fn WireReader.payload_follows(mut self) -> bool fails Failure {
     return true
 } WireReader.payload_follows
 
-fn WireReader.skip(mut self) fails Failure {
+fn WireReader.skip(mut self, depth: usize) fails Failure {
     let Some(frame) = mut self.frames.pop() else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
@@ -1523,36 +1584,8 @@ fn JsonReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> JsonReader {
     return JsonReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[JsonFrame].empty(alloc))
 } JsonReader.new
 
-fn JsonReader.space(mut self) {
-    while self.input.at < self.input.bytes.len() {
-        let byte = self.input.bytes[self.input.at]
-        if byte != b' ' and byte != b'\t' and byte != b'\n' and byte != b'\r' {
-            return
-        }
-        self.input.at += 1
-    }
-} JsonReader.space
-
-fn JsonReader.peek(mut self) -> u8 fails Failure
-    ensures self.input.at < self.input.bytes.len()
-{
-    mut self.space()
-    if self.input.at >= self.input.bytes.len() {
-        fail Failure.Decode(DecodeKind.Truncated)
-    }
-    return self.input.bytes[self.input.at]
-} JsonReader.peek
-
-fn JsonReader.expect_byte(mut self, byte: u8) fails Failure {
-    let next = try mut self.peek()
-    if next != byte {
-        fail Failure.Decode(DecodeKind.Malformed)
-    }
-    self.input.at += 1
-} JsonReader.expect_byte
-
 fn JsonReader.literal(mut self, word: Slice[u8]) -> bool {
-    mut self.space()
+    mut self.input.space()
     let start = self.input.at
     let Some(end) = start.checked_add(word.len()) else {
         return false
@@ -1572,7 +1605,7 @@ fn JsonReader.literal(mut self, word: Slice[u8]) -> bool {
 
 /// A JSON string's bytes, its escapes resolved.
 fn JsonReader.string(mut self) -> mem::Bytes fails Failure {
-    try mut self.expect_byte(b'"')
+    try mut self.input.expect_byte(b'"')
     var decoded = mem::Bytes.empty(self.input.alloc)
     loop {
         let start = self.input.at
@@ -1688,7 +1721,7 @@ fn hex_value(byte: u8) -> Option[u32]
 
 /// The text of a JSON number, checked against the RFC 8259 grammar.
 fn JsonReader.number(mut self) -> text::String fails Failure {
-    mut self.space()
+    mut self.input.space()
     let start = self.input.at
     let Some(end) = number_end(self.input.bytes.view(), start) else {
         fail Failure.Decode(DecodeKind.Malformed)
@@ -1879,7 +1912,7 @@ fn JsonReader.integer(mut self) -> wide::Wide fails Failure {
 
 /// Passes over any JSON value.
 fn JsonReader.skip_value(mut self) fails Failure {
-    let next = try mut self.peek()
+    let next = try mut self.input.peek()
     if next == b'"' {
         discard try mut self.string()
         return
@@ -1911,7 +1944,7 @@ fn JsonReader.skip_container(mut self, object: bool) fails Failure {
     if object {
         close = b'}'
     }
-    let next = try mut self.peek()
+    let next = try mut self.input.peek()
     if next == close {
         self.input.at += 1
         return
@@ -1919,10 +1952,10 @@ fn JsonReader.skip_container(mut self, object: bool) fails Failure {
     loop {
         if object {
             discard try mut self.string()
-            try mut self.expect_byte(b':')
+            try mut self.input.expect_byte(b':')
         }
         try mut self.skip_value()
-        let after = try mut self.peek()
+        let after = try mut self.input.peek()
         if after == b',' {
             self.input.at += 1
         } else if after == close {
@@ -1957,12 +1990,12 @@ fn JsonReader.element_follows(mut self, close: u8) -> bool fails Failure {
         }
         JsonFrame.Variant(payload: _) => fail Failure.Decode(DecodeKind.Malformed)
     }
-    let next = try mut self.peek()
+    let next = try mut self.input.peek()
     if next == close {
         return false
     }
     if started {
-        try mut self.expect_byte(b',')
+        try mut self.input.expect_byte(b',')
     }
     return true
 } JsonReader.element_follows
@@ -1994,7 +2027,7 @@ fn JsonReader.read_signed(mut self) -> i64 fails Failure {
 } JsonReader.read_signed
 
 fn JsonReader.read_float(mut self) -> f64 fails Failure {
-    let next = try mut self.peek()
+    let next = try mut self.input.peek()
     if next == b'"' {
         let written = try mut self.string()
         if written.view() == b"NaN" {
@@ -2039,19 +2072,23 @@ fn JsonReader.read_bytes(mut self) -> mem::Bytes fails Failure {
 } JsonReader.read_bytes
 
 fn JsonReader.begin_sequence(mut self) fails Failure {
-    try mut self.expect_byte(b'[')
+    try mut self.input.expect_byte(b'[')
     mut self.frames.push(JsonFrame.Array(started: false))
 } JsonReader.begin_sequence
 
 fn JsonReader.begin_map(mut self) fails Failure {
-    try mut self.expect_byte(b'[')
+    try mut self.input.expect_byte(b'[')
     mut self.frames.push(JsonFrame.Map(started: false))
 } JsonReader.begin_map
 
 fn JsonReader.begin_record(mut self) fails Failure {
-    try mut self.expect_byte(b'{')
+    try mut self.input.expect_byte(b'{')
     mut self.frames.push(JsonFrame.Object(started: false))
 } JsonReader.begin_record
+
+fn JsonReader.begin_labelled(mut self) fails Failure {
+    try mut self.begin_record()
+} JsonReader.begin_labelled
 
 fn JsonReader.next_follows(mut self) -> bool fails Failure {
     let count = self.frames.len()
@@ -2061,11 +2098,11 @@ fn JsonReader.next_follows(mut self) -> bool fails Failure {
             JsonFrame.Object(started: _) => return try mut self.element_follows(close: b'}')
             JsonFrame.Map(started: started) => {
                 if started {
-                    try mut self.expect_byte(b']')
+                    try mut self.input.expect_byte(b']')
                 }
                 let follows = try mut self.element_follows(close: b']')
                 if follows {
-                    try mut self.expect_byte(b'[')
+                    try mut self.input.expect_byte(b'[')
                 }
                 return follows
             }
@@ -2076,24 +2113,24 @@ fn JsonReader.next_follows(mut self) -> bool fails Failure {
 } JsonReader.next_follows
 
 fn JsonReader.map_value(mut self) fails Failure {
-    try mut self.expect_byte(b',')
+    try mut self.input.expect_byte(b',')
 } JsonReader.map_value
 
 fn JsonReader.read_key(mut self) -> mem::Bytes fails Failure {
     let key = try mut self.string()
-    try mut self.expect_byte(b':')
+    try mut self.input.expect_byte(b':')
     return key
 } JsonReader.read_key
 
 fn JsonReader.read_variant(mut self) -> mem::Bytes fails Failure {
-    let next = try mut self.peek()
+    let next = try mut self.input.peek()
     if next == b'"' {
         mut self.frames.push(JsonFrame.Variant(payload: false))
         return try mut self.string()
     }
-    try mut self.expect_byte(b'{')
+    try mut self.input.expect_byte(b'{')
     let key = try mut self.string()
-    try mut self.expect_byte(b':')
+    try mut self.input.expect_byte(b':')
     mut self.frames.push(JsonFrame.Variant(payload: true))
     return key
 } JsonReader.read_variant
@@ -2109,7 +2146,7 @@ fn JsonReader.payload_follows(mut self) -> bool fails Failure {
     fail Failure.Decode(DecodeKind.Malformed)
 } JsonReader.payload_follows
 
-fn JsonReader.skip(mut self) fails Failure {
+fn JsonReader.skip(mut self, depth: usize) fails Failure {
     try mut self.skip_value()
 } JsonReader.skip
 
@@ -2118,19 +2155,19 @@ fn JsonReader.end(mut self) fails Failure {
         fail Failure.Decode(DecodeKind.Malformed)
     }
     match frame {
-        JsonFrame.Array(started: _) => try mut self.expect_byte(b']')
-        JsonFrame.Object(started: _) => try mut self.expect_byte(b'}')
-        JsonFrame.Map(started: _) => try mut self.expect_byte(b']')
+        JsonFrame.Array(started: _) => try mut self.input.expect_byte(b']')
+        JsonFrame.Object(started: _) => try mut self.input.expect_byte(b'}')
+        JsonFrame.Map(started: _) => try mut self.input.expect_byte(b']')
         JsonFrame.Variant(payload: payload) => {
             if payload {
-                try mut self.expect_byte(b'}')
+                try mut self.input.expect_byte(b'}')
             }
         }
     }
 } JsonReader.end
 
 fn JsonReader.finish(mut self) fails Failure {
-    mut self.space()
+    mut self.input.space()
     if self.input.at != self.input.bytes.len() {
         fail Failure.Decode(DecodeKind.Trailing)
     }

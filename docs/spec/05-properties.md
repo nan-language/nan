@@ -132,6 +132,11 @@ pub closed linear struct Lease {
     pub slot: u32
 } Lease
 
+pub closed linear struct Booking {
+    pub lease: Lease
+    pub guests: u8
+} Booking
+
 pub fn either[T](take primary: Option[T], take backup: T) -> T {
     let Some(value) = primary else {
         return backup
@@ -139,9 +144,25 @@ pub fn either[T](take primary: Option[T], take backup: T) -> T {
     return value
 } either
 
-pub fn pick(take primary: Option[Lease], take backup: Lease) -> Lease {
+pub fn pick(take primary: Option[Booking], take backup: Booking) -> Booking {
     return either(take primary, take backup) // error: prop.linear-argument
 } pick
+```
+
+The [record](08-generics-interfaces.md#instantiation) names the parameter, the argument and the field making it linear:
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error prop.linear-argument example/example.nan:19 example::pick
+        return either(take primary, take backup) // error: prop.linear-argument
+    expected: a droppable type for T of either
+    found: Booking
+    because declared example/example.nan:7 example::Booking lease: Lease
+        pub lease: Lease
+    because declared example/example.nan:2 example::Lease Lease
+    pub closed linear struct Lease {
+failed check example: errors 1, incomplete 0
 ```
 
 ## Views

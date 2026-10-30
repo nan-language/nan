@@ -1961,7 +1961,8 @@ impl Body<'_, '_> {
             if let Some(Arg::Ty(arg)) = callable.infer.subst.get(def.param)
                 && let Some(code) = self.ck.argument_problem(def, arg, &callable.infer.subst)
             {
-                self.report(token, code);
+                self.ck
+                    .report_argument(self.item, token, def, arg, &callable.infer.subst, code);
                 return;
             }
         }

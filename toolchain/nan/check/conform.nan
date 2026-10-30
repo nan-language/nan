@@ -1121,15 +1121,16 @@ fn Checker.constituent_ambiguous(self, instantiated: ty::Ty) -> bool {
 /// breaks its parameter's bounds, or records the instantiation of an item with const
 /// parameters.
 fn Checker.check_arguments(self, item: ty::ItemId, token: u32, target: ty::ItemId, args: ty::Args) {
+    let held = self.sig(target)
+    let generics = held.contents().generics
     match self.arguments_problem(target, args) {
-        Some(code) => {
-            self.report(item, token, code)
+        Some(problem) => {
+            self.report_argument(item, token, def: generics[problem.index], arg: problem.arg, subst: problem.subst, code: problem.code)
             return
         }
         None => {}
     }
-    let held = self.sig(target)
-    for def in held.contents().generics {
+    for def in generics {
         if def.constant.is_some() {
             self.instantiated(item, token, target, args)
             return
@@ -1137,18 +1138,22 @@ fn Checker.check_arguments(self, item: ty::ItemId, token: u32, target: ty::ItemI
     }
 } Checker.check_arguments
 
-/// The rule the first of a generic type's or interface's arguments breaks for its parameter.
-fn Checker.arguments_problem(self, target: ty::ItemId, args: ty::Args) -> Option[diagnostic::Code] {
-    let types = self.types()
-    let alloc = self.alloc()
+/// A type argument breaking a rule of its generic parameter: the parameter's index, the
+/// argument, the substitution of its instantiation's arguments and the rule's code.
+struct ArgumentProblem {
+    index: usize
+    arg: ty::Ty
+    subst: ty::Subst
+    code: diagnostic::Code
+} ArgumentProblem
+
+/// The first of a generic type's or interface's arguments that breaks a rule of its
+/// parameter.
+fn Checker.arguments_problem(self, target: ty::ItemId, args: ty::Args) -> Option[ArgumentProblem] {
     let held = self.sig(target)
     let generics = held.contents().generics
-    let listed = types.arg_list(args)
-    var params = mem::List[ty::Param].empty(alloc)
-    for def in generics {
-        mut params.push(def.param)
-    }
-    let subst = ty::Subst.of(params.view(), args: listed, alloc)
+    let listed = self.types().arg_list(args)
+    let subst = self.sig_subst(generics.view(), args)
     for index in 0..<generics.len() {
         if index >= listed.len() {
             break
@@ -1157,12 +1162,179 @@ fn Checker.arguments_problem(self, target: ty::ItemId, args: ty::Args) -> Option
             continue
         }
         match self.argument_problem(generics[index], arg: arg_ty, subst) {
-            Some(code) => return Some(code)
+            Some(code) => return Some(ArgumentProblem(index: index, arg: arg_ty, subst: take subst, code: code))
             None => {}
         }
     }
     return None
 } Checker.arguments_problem
+
+/// Reports a type argument breaking the rule `code` of its generic parameter, with what the
+/// parameter requires, the argument and the chain to the root of the property it breaks.
+fn Checker.report_argument(self, item: ty::ItemId, token: u32, def: GenericDef, arg: ty::Ty, subst: ty::Subst, code: diagnostic::Code) {
+    let alloc = self.alloc()
+    let from = self.db().module_of(item)
+    let because = match code {
+        diagnostic::Code.PropLinearArgument => self.property_root(arg, from, has: fn(ck: Checker, ty: ty::Ty) => ck.has(ty, property: Property.Linear))
+        diagnostic::Code.PropViewArgument => self.property_root(arg, from, has: fn(ck: Checker, ty: ty::Ty) => ck.has(ty, property: Property.View))
+        diagnostic::Code.PropTokenArgument => self.property_root(arg, from, has: fn(ck: Checker, ty: ty::Ty) => ck.holds_token(ty))
+        else => mem::List[diagnostic::Reason].empty(alloc)
+    }
+    var expected = match code {
+        diagnostic::Code.PropLinearArgument => text::String.of("a droppable type", alloc)
+        diagnostic::Code.PropViewArgument => text::String.of("a type that is not a view", alloc)
+        diagnostic::Code.PropTokenArgument => text::String.of("a type holding no state token", alloc)
+        else => self.unsatisfied_bound(def, arg, subst, from)
+    }
+    mut expected.append(" for ")
+    mut expected.append(def.name.as_str())
+    mut expected.append(" of ")
+    let owner = self.item_written(def.param.owner, from)
+    mut expected.append(owner.as_str())
+    self.report_record(item, token, code, expected: Some(take expected), found: Some(self.show(arg, from)), take because)
+} Checker.report_argument
+
+/// The requirement of the first bound of a generic parameter, implied ones last, that a type
+/// argument does not satisfy.
+fn Checker.unsatisfied_bound(self, def: GenericDef, arg: ty::Ty, subst: ty::Subst, from: ty::ModuleId) -> text::String {
+    let alloc = self.alloc()
+    let types = self.types()
+    for bound in def.bounds {
+        let substituted = subst.bound(types, bound)
+        if not self.satisfies(arg, bound: substituted) {
+            var shown = text::String.of("a type implementing ", alloc)
+            let interface_name = self.item_written(substituted.item, from)
+            mut shown.append(interface_name.as_str())
+            let written = self.show_args(types.arg_list(substituted.args), from)
+            mut shown.append(written.as_str())
+            return shown
+        }
+    }
+    if self.implied(def.param).failure and not self.is_failure_type(arg) {
+        return text::String.of("a failure type", alloc)
+    }
+    return text::String.of("a cancellable type", alloc)
+} Checker.unsatisfied_bound
+
+/// The `declared` reasons leading from a type to the root of a property it has.
+fn Checker.property_root(self, ty: ty::Ty, from: ty::ModuleId, has: fn(ck: Checker, ty: ty::Ty) -> bool) -> mem::List[diagnostic::Reason] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let db = self.db()
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    var passed = mem::List[ty::ItemId].empty(alloc)
+    var current = ty
+    loop {
+        let ty::TyKind.Item(item: item, args: args) = types.kind(current) else {
+            break
+        }
+        if passed.position(fn(value: ty::ItemId) => value == item).is_some() {
+            break
+        }
+        mut passed.push(item)
+        if db.is_std(item) {
+            var next: Option[ty::Ty] = None
+            for arg in types.arg_list(args) {
+                let ty::Arg.Ty(arg_ty) = arg else {
+                    continue
+                }
+                if has(self, ty: arg_ty) {
+                    next = Some(arg_ty)
+                    break
+                }
+            }
+            let Some(found) = next else {
+                break
+            }
+            current = found
+            continue
+        }
+        let held = self.sig(item)
+        let subst = self.sig_subst(held.contents().generics.view(), args)
+        let Some(found) = self.constituent_with(item, subst, from, has) else {
+            mut because.push(self.reason(item, token: db.ast(item).token, role: diagnostic::Role.Declared, subject: self.show(current, from)))
+            break
+        }
+        mut because.push(self.reason(item, token: found.token, role: diagnostic::Role.Declared, subject: take found.subject))
+        current = found.ty
+    }
+    return because
+} Checker.property_root
+
+/// A field or variant of a struct or enum whose type has a property: its token, the field
+/// written `name: Type` or the variant `Variant(Type)` or `Variant(label: Type)`, and that type.
+struct Constituent {
+    token: u32
+    subject: text::String
+    ty: ty::Ty
+} Constituent
+
+/// The first field or variant of a struct or enum, in source order, whose type has a property.
+fn Checker.constituent_with(self, item: ty::ItemId, subst: ty::Subst, from: ty::ModuleId, has: fn(ck: Checker, ty: ty::Ty) -> bool) -> Option[Constituent] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let held = self.sig(item)
+    match held.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            for field in fields {
+                let field_ty = subst.ty(types, ty: field.ty)
+                if has(self, ty: field_ty) {
+                    var subject = text::String.of(field.name.as_str(), alloc)
+                    mut subject.append(": ")
+                    let written = self.show(field_ty, from)
+                    mut subject.append(written.as_str())
+                    return Some(Constituent(token: field.token, subject: take subject, ty: field_ty))
+                }
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                match self.variant_with(variant, subst, from, has) {
+                    Some(found) => return Some(take found)
+                    None => {}
+                }
+            }
+        }
+        else => {}
+    }
+    return None
+} Checker.constituent_with
+
+/// A variant whose payload or first labelled field with a property has it, written
+/// `Variant(Type)` or `Variant(label: Type)`.
+fn Checker.variant_with(self, variant: VariantSig, subst: ty::Subst, from: ty::ModuleId, has: fn(ck: Checker, ty: ty::Ty) -> bool) -> Option[Constituent] {
+    let types = self.types()
+    var subject = text::String.of(variant.name.as_str(), alloc: self.alloc())
+    mut subject.push('(')
+    var found: Option[ty::Ty] = None
+    match variant.payload {
+        Payload.None => {}
+        Payload.Single(payload_ty) => {
+            let substituted = subst.ty(types, ty: payload_ty)
+            if has(self, ty: substituted) {
+                found = Some(substituted)
+            }
+        }
+        Payload.Labelled(labelled) => {
+            for field in labelled {
+                let substituted = subst.ty(types, ty: field.ty)
+                if has(self, ty: substituted) {
+                    mut subject.append(field.name.as_str())
+                    mut subject.append(": ")
+                    found = Some(substituted)
+                    break
+                }
+            }
+        }
+    }
+    let Some(variant_ty) = found else {
+        return None
+    }
+    let written = self.show(variant_ty, from)
+    mut subject.append(written.as_str())
+    mut subject.push(')')
+    return Some(Constituent(token: variant.token, subject: take subject, ty: variant_ty))
+} Checker.variant_with
 
 /// The constituent types of a struct or enum instantiation, its arguments substituted.
 fn Checker.constituents_of(self, ty: ty::Ty) -> mem::List[ty::Ty] {

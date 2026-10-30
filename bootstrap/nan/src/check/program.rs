@@ -13,7 +13,8 @@ impl Checker<'_> {
     /// The rules of a package's `targets`, `entry` and `dep` directives: a program declares one
     /// concrete target and an entry function `main` of its root module, and each dependency in
     /// the workspace covers every target the package declares and is no program, unless its
-    /// `dep` directive lacks a grant its package needs.
+    /// `dep` directive lacks a grant its package needs; a failed `targets` directive declares
+    /// unknown targets, which satisfy the rules of targets.
     pub fn check_program(&self, package: PackageId) {
         let data = self.db.package(package);
         let Some(manifest) = &data.source.manifest else {
@@ -23,6 +24,7 @@ impl Checker<'_> {
         let concrete = matches!(&manifest.targets[..], [target] if *target != Target::Any);
         if let Some((_, line)) = &manifest.entry
             && manifest.targets_line.is_some()
+            && !manifest.targets_failed
             && !concrete
         {
             self.report_file(path, *line, Code::TargetProgramTargets);
@@ -52,7 +54,8 @@ impl Checker<'_> {
             let covers = |target: &Target| {
                 declared.targets.contains(target) || declared.targets.contains(&Target::Any)
             };
-            if !manifest.targets.iter().all(covers) {
+            let failed = manifest.targets_failed || declared.targets_failed;
+            if !failed && !manifest.targets.iter().all(covers) {
                 self.report_file(path, dep.line, Code::TargetDependencyUncovered);
             } else if declared.entry.is_some() {
                 self.report_file(path, dep.line, Code::TargetDepProgram);
@@ -70,10 +73,7 @@ impl Checker<'_> {
         let Some(sig) = self.fn_sig(item) else {
             return;
         };
-        let failed = sig.params.iter().any(|param| param.ty.has_error())
-            || sig.result.has_error()
-            || sig.fails.as_ref().is_some_and(Ty::has_error);
-        if failed || self.reported_at(item, ast.token) {
+        if sig.has_error() || self.reported_at(item, ast.token) {
             return;
         }
         let Some(kind) = self.db.target.kind() else {

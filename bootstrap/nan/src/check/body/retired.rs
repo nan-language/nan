@@ -63,7 +63,8 @@ impl Checker<'_> {
                 }
                 let frame = body.frames[0].clone();
                 let clauses = Clauses::of(head, false);
-                body.check_effects(rewrite.token, &frame, &sig.fn_ty(), &clauses, false);
+                let exempt = typed.holds_failure();
+                body.check_effects(rewrite.token, &frame, &sig.fn_ty(), &clauses, exempt);
                 body.finish(Some(typed))
             })
         };

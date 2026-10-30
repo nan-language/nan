@@ -359,6 +359,9 @@ impl Body<'_, '_> {
                 if !jump =>
             {
                 self.report(token, Code::ExprMisplacedJump);
+                if let ExprKind::Break(_) | ExprKind::Continue(_) = &expr.kind {
+                    self.name_every_loop(matches!(expr.kind, ExprKind::Break(_)));
+                }
                 TExpr::failed(token)
             }
             ExprKind::Return(value) => self.return_expr(token, value.as_deref()),
@@ -1793,6 +1796,7 @@ impl Body<'_, '_> {
         };
         self.pop_scope();
         let frame = self.frames.pop().expect("the closure's frame");
+        let failed = body.holds_failure();
         let closure_ty = FnTy {
             kind: if task { FnKind::Task } else { FnKind::Plain },
             params,
@@ -1836,7 +1840,7 @@ impl Body<'_, '_> {
                 &frame,
                 &closure_ty,
                 &Clauses::of_closure(closure),
-                false,
+                failed,
             );
         }
         let captures = frame
@@ -1858,6 +1862,7 @@ impl Body<'_, '_> {
                 .iter()
                 .any(|(outer, _)| self.local(*outer).name == *name);
             if !used
+                && !failed
                 && let Some(capture) = closure
                     .captures
                     .iter()
@@ -2128,6 +2133,7 @@ impl Body<'_, '_> {
                     .find(|index| self.loops[*index].label.as_deref() == Some(label.text.as_str()));
                 if found.is_none() {
                     self.report(label.token, Code::StmtUnknownLabel);
+                    self.name_every_loop(breaks);
                     return None;
                 }
                 if let Some(index) = found {
@@ -2147,6 +2153,16 @@ impl Body<'_, '_> {
             self.loops[index].broken = true;
         }
         found
+    }
+
+    /// Records a failed `break` or `continue` as naming every loop of the frame, and leaving
+    /// each when it breaks.
+    fn name_every_loop(&mut self, breaks: bool) {
+        let base = self.frame().loops;
+        for enclosing in &mut self.loops[base..] {
+            enclosing.label_used = true;
+            enclosing.broken |= breaks;
+        }
     }
 
     fn fail(&mut self, token: Tok, value: &ast::Expr) -> TExpr {
@@ -2290,7 +2306,7 @@ impl Body<'_, '_> {
     }
 
     /// An assignment target: a place, a local and a path of fields and indexes from it, the
-    /// target of `=` when `assigned`.
+    /// target of `=` when `assigned`; none when it names no place and has not failed.
     pub fn place(&mut self, target: &ast::Expr, assigned: bool) -> Option<TExpr> {
         match &target.kind {
             ExprKind::Path { path, args: None } if path.segments.len() == 1 => {
@@ -2302,17 +2318,13 @@ impl Body<'_, '_> {
                         ty: self.local(local).ty.clone(),
                         kind: TKind::Local(local),
                     }),
-                    None => {
-                        self.expr(target, None);
-                        None
-                    }
+                    None => self.failed_place(target),
                 }
             }
             ExprKind::SelfValue => Some(self.expr(target, None)),
             ExprKind::Field { base, name } => {
                 if self.type_target(base).is_some() {
-                    self.expr(target, None);
-                    return None;
+                    return self.failed_place(target);
                 }
                 let base = self.place(base, false)?;
                 Some(self.field_of(target.token, base, name, !assigned))
@@ -2321,11 +2333,15 @@ impl Body<'_, '_> {
                 let typed = self.index(target.token, base, index, true);
                 Some(typed)
             }
-            _ => {
-                self.expr(target, None);
-                None
-            }
+            _ => self.failed_place(target),
         }
+    }
+
+    /// A target written as no place, typed as an expression: when it failed, the failed
+    /// expression standing for a place.
+    fn failed_place(&mut self, target: &ast::Expr) -> Option<TExpr> {
+        let typed = self.expr(target, None);
+        matches!(typed.kind, TKind::Failed).then_some(typed)
     }
 }
 

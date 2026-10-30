@@ -103,10 +103,10 @@ pub fn check(package: &Package, manifest: &Manifest) -> Vec<Diagnostic> {
                     .selector
                     .as_deref()
                     .expect("a variant has a selector");
-                if !matches(selector)
+                let matched = matches(selector)
                     .iter()
-                    .any(|target| concrete.contains(target))
-                {
+                    .any(|target| concrete.contains(target));
+                if !matched && !manifest.targets_failed {
                     found.push(Diagnostic::at(
                         Code::ModuleVariantUnmatched,
                         &variant.first_file,

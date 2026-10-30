@@ -2,13 +2,14 @@
 //! expression uses, the fields no item reads, the dependencies no item names and the manifest
 //! grants nothing uses.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId};
 use super::props::Property;
 use super::testing::Target;
-use super::tir::{Local, LocalId, LocalKind, TExpr, TKind};
+use super::tir::{Local, LocalId, LocalKind, TExpr};
 use crate::diagnostic::{Code, Diagnostic, Fix, Replacement};
 use crate::syntax::ast::{FnModifier, ItemKind, StructMember, Tok, Visibility};
 use crate::syntax::grammar::{Punct, Rule};
@@ -83,12 +84,68 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether an item holds a construct that failed a rule: a failed type in its signature, or
+    /// a failed construct in a body, method body, predicate or `where` condition it holds.
+    pub fn holds_failure(&self, item: ItemId) -> bool {
+        let failed = |conditions: &[TExpr]| conditions.iter().any(TExpr::holds_failure);
+        let held = match &self.db.ast(item).kind {
+            ItemKind::Interface(interface) => {
+                let bodies = self.method_bodies.borrow();
+                (0..interface.methods.len()).any(|index| {
+                    bodies
+                        .get(&(item, index))
+                        .is_some_and(|body| body.holds_failure())
+                })
+            }
+            ItemKind::Struct(_) => self
+                .typed_predicates
+                .borrow()
+                .get(&item)
+                .is_some_and(|typed| failed(&typed.conditions)),
+            _ => self.typed(item).is_some_and(|body| body.holds_failure()),
+        };
+        held || self.sig(item).has_error()
+            || self
+                .typed_wheres
+                .borrow()
+                .get(&item)
+                .is_some_and(|typed| failed(&typed.conditions))
+    }
+
+    /// Whether a module holds an item holding a failed construct or abandoned at a syntax
+    /// failure.
+    pub fn module_holds_failure(&self, module: ModuleId) -> bool {
+        let data = self.db.module(module);
+        data.abandoned || data.items.iter().any(|item| self.holds_failure(*item))
+    }
+
     /// The unused code of a package: its private items no reachable item names, its fields no
-    /// item reads, its dependencies no item names and its grants nothing uses.
+    /// item reads, its dependencies no item names and its grants nothing uses. A failed
+    /// construct may name any item and read any field, and code under the unknown targets a
+    /// failed `targets` directive declares may use any field, dependency or grant.
     pub fn check_unused(&self, package: PackageId) {
-        for &module in &self.db.package(package).modules {
+        let data = self.db.package(package);
+        let targets_failed = data
+            .source
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.targets_failed);
+        let failed = OnceCell::new();
+        let package_failed = || {
+            *failed.get_or_init(|| {
+                data.modules
+                    .iter()
+                    .any(|module| self.module_holds_failure(*module))
+            })
+        };
+        for &module in &data.modules {
             self.check_unused_items(module);
-            self.check_unused_fields(module);
+            if !targets_failed {
+                self.check_unused_fields(module, &package_failed);
+            }
+        }
+        if targets_failed {
+            return;
         }
         let unused_grants = self.unused_grants(package);
         self.check_unused_dependencies(package, &unused_grants);
@@ -159,7 +216,8 @@ impl Checker<'_> {
     /// line with the fix deleting it. Reachable are its items that are not private, its tests,
     /// impl lines, contributions and const asserts, its landing fns, the function its package's
     /// `entry` directive names, and each private item a reachable item names, a test naming its
-    /// target; a tombstone is neither reachable nor unused.
+    /// target; a tombstone is neither reachable nor unused. None is reported when a reachable
+    /// item holds a failed construct or the module an item abandoned at a syntax failure.
     fn check_unused_items(&self, module: ModuleId) {
         let items = &self.db.module(module).items;
         let private = |item: ItemId| {
@@ -203,10 +261,18 @@ impl Checker<'_> {
                 }
             }
         }
-        for &item in items {
-            if !private(item) || reached.contains(&item) {
-                continue;
-            }
+        let unreached: Vec<ItemId> = items
+            .iter()
+            .copied()
+            .filter(|item| private(*item) && !reached.contains(item))
+            .collect();
+        if unreached.is_empty()
+            || self.db.module(module).abandoned
+            || reached.iter().any(|item| self.holds_failure(*item))
+        {
+            return;
+        }
+        for item in unreached {
             let data = self.db.item(item);
             let syntax = data.syntax();
             let line = *syntax.item_lines(&syntax.items[data.index]).start();
@@ -225,8 +291,9 @@ impl Checker<'_> {
     /// of `pub` structs, each reported on its first line. A field is read by an access other
     /// than the target of `=`, a struct pattern giving it a pattern other than `_`, a predicate
     /// naming it, and the methods its struct's derives of `Eq`, `Ord`, `Hash`, `Render` and
-    /// `Encode` write.
-    fn check_unused_fields(&self, module: ModuleId) {
+    /// `Encode` write. None is reported when `package_failed`: a module of the package holds a
+    /// failed construct.
+    fn check_unused_fields(&self, module: ModuleId, package_failed: &dyn Fn() -> bool) {
         for &item in &self.db.module(module).items {
             let ast = self.db.ast(item);
             let ItemKind::Struct(structure) = &ast.kind else {
@@ -260,6 +327,7 @@ impl Checker<'_> {
                 if exempt
                     || predicated.contains(&field.name.text)
                     || self.fields_read.borrow().contains(&key)
+                    || package_failed()
                 {
                     continue;
                 }
@@ -382,7 +450,7 @@ impl Checker<'_> {
         usage: &Usage,
         roots: &[&TExpr],
     ) {
-        if roots.iter().any(|root| holds_failure(root)) {
+        if roots.iter().any(|root| root.holds_failure()) {
             return;
         }
         let alternative = |id: &LocalId| {
@@ -477,11 +545,4 @@ fn scope_end(tree: &Tree, token: Tok) -> Option<Tok> {
         .filter(|(first, last)| (*first..=*last).contains(&token))
         .min_by_key(|(first, last)| last - first)
         .map(|(_, last)| last)
-}
-
-/// Whether a typed expression holds a construct that failed a rule.
-fn holds_failure(expr: &TExpr) -> bool {
-    let mut failed = matches!(expr.kind, TKind::Failed);
-    expr.each_child(&mut |child| failed |= holds_failure(child));
-    failed
 }

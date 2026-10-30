@@ -1137,7 +1137,8 @@ impl Checker<'_> {
             let entry = self.names_entry(item);
             let fixable = !entry || self.db.target.is_host();
             let clauses = Clauses::of(&function.head, fixable);
-            body.check_effects(token, &frame, &sig.fn_ty(), &clauses, entry);
+            let exempt = entry || root.as_ref().is_some_and(TExpr::holds_failure);
+            body.check_effects(token, &frame, &sig.fn_ty(), &clauses, exempt);
         }
         body.finish(root)
     }

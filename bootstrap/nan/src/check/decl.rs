@@ -500,8 +500,8 @@ impl Checker<'_> {
         }
     }
 
-    /// The decreases clauses of a function: one is needed when it belongs to a cycle, and every
-    /// other is unneeded, its fix deleting it.
+    /// The decreases clauses of a function: one is needed when it belongs to a cycle or reaches
+    /// a failed construct, and every other is unneeded, its fix deleting it.
     fn check_decreases(&self, item: ItemId, function: &ast::FnItem) {
         let clauses = function
             .clauses
@@ -510,8 +510,9 @@ impl Checker<'_> {
                 ast::ClauseKind::Decreases(measure) => Some((clause.token, measure.last)),
                 _ => None,
             });
-        let needed = usize::from(self.in_cycle(item));
-        for (first, last) in clauses.skip(needed) {
+        let mut clauses = clauses.peekable();
+        let needed = self.in_cycle(item) || clauses.peek().is_some() && self.reaches_failure(item);
+        for (first, last) in clauses.skip(usize::from(needed)) {
             let fix = self.fix_deleting_lines(item, first, last);
             self.report_fixed(
                 item,
@@ -744,12 +745,13 @@ impl Checker<'_> {
         }
     }
 
-    /// Each generic parameter of a function's or method's own list occurs in a parameter's type.
+    /// Each generic parameter of a function's or method's own list occurs in a parameter's type,
+    /// a failed type holding each.
     fn check_unused_generics(&self, item: ItemId, sig: &super::sig::FnSig) {
         let unused = sig.own_generics().iter().any(|def| {
             !sig.params
                 .iter()
-                .any(|param| param.ty.mentions(&|param| param == def.param))
+                .any(|param| param.ty.has_error() || param.ty.mentions(&|param| param == def.param))
         });
         if unused {
             self.report(item, self.db.ast(item).token, Code::GenericParameterUnused);

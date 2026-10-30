@@ -73,13 +73,114 @@ fn Checker.record_label(self, owner: ty::ItemId, field: Str, label: FieldLabel) 
     discard labels.push(label)
 } Checker.record_label
 
+/// Whether an item holds a construct that failed a rule: a failed type in its signature, or
+/// a failed construct in a body, method body, predicate or `where` condition it holds.
+fn Checker.holds_failure(self, item: ty::ItemId) -> bool {
+    let state = self.state.contents()
+    let types = self.types()
+    let held = match self.db().ast(item).kind {
+        ast::ItemKind.Interface(declared) => self.methods_hold_failure(item, count: declared.methods.len())
+        ast::ItemKind.Struct(_) => match state.typed_predicates.get(item) {
+            Some(typed) => conditions_hold_failure(typed.contents().conditions.view())
+            None => false
+        }
+        else => match self.typed(item) {
+            Some(body) => body.contents().holds_failure(types)
+            None => false
+        }
+    }
+    if held or self.sig(item).contents().has_error(types) {
+        return true
+    }
+    return match state.typed_wheres.get(item) {
+        Some(typed) => conditions_hold_failure(typed.contents().conditions.view())
+        None => false
+    }
+} Checker.holds_failure
+
+/// Whether the body of one of an interface's `count` methods holds a failed construct.
+fn Checker.methods_hold_failure(self, item: ty::ItemId, count: usize) -> bool {
+    let state = self.state.contents()
+    let types = self.types()
+    for index in 0..<count {
+        match state.method_bodies.get(MethodKey(item: item, method: index)) {
+            Some(body) => {
+                if body.contents().holds_failure(types) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    return false
+} Checker.methods_hold_failure
+
+/// Whether a typed condition holds a failed construct.
+fn conditions_hold_failure(conditions: Slice[TExpr]) -> bool {
+    for condition in conditions {
+        if condition.holds_failure() {
+            return true
+        }
+    }
+    return false
+} conditions_hold_failure
+
+/// Whether a module holds an item holding a failed construct or abandoned at a syntax
+/// failure.
+fn Checker.module_holds_failure(self, module: ty::ModuleId) -> bool {
+    let data = self.db().module(module)
+    if data.abandoned {
+        return true
+    }
+    for item in data.items {
+        if self.holds_failure(item) {
+            return true
+        }
+    }
+    return false
+} Checker.module_holds_failure
+
+/// Whether a module of a package holds a failed construct, found once asked.
+struct PackageFailure {
+    package_id: ty::PackageId
+    found: Option[bool]
+} PackageFailure
+
+fn Checker.package_failed(self, mut failure: PackageFailure) -> bool {
+    match failure.found {
+        Some(found) => return found
+        None => {}
+    }
+    var found = false
+    for module in self.db().package_data(failure.package_id).modules {
+        if self.module_holds_failure(module) {
+            found = true
+            break
+        }
+    }
+    failure.found = Some(found)
+    return found
+} Checker.package_failed
+
 /// The unused code of a package: its private items no reachable item names, its fields no
-/// item reads, its dependencies no item names and its grants nothing uses.
+/// item reads, its dependencies no item names and its grants nothing uses. A failed
+/// construct may name any item and read any field, and code under the unknown targets a
+/// failed `targets` directive declares may use any field, dependency or grant.
 fn Checker.check_unused(self, package_id: ty::PackageId) {
     let db = self.db()
+    let targets_failed = match db.source(package_id).manifest {
+        Some(declared) => declared.targets_failed
+        None => false
+    }
+    var failure = PackageFailure(package_id: package_id, found: None)
     for module in db.package_data(package_id).modules {
         self.check_unused_items(module)
-        self.check_unused_fields(module)
+        if not targets_failed {
+            self.check_unused_fields(module, failure: mut failure)
+        }
+    }
+    if targets_failed {
+        return
     }
     let unused_grants = self.unused_grants(package_id)
     self.check_unused_dependencies(package_id, unused_grants: unused_grants.view())
@@ -137,7 +238,8 @@ fn Checker.check_unused_dependencies(self, package_id: ty::PackageId, unused_gra
 /// line with the fix deleting it. Reachable are its items that are not private, its tests,
 /// impl lines, contributions and const asserts, its landing fns, the function its package's
 /// `entry` directive names, and each private item a reachable item names, a test naming its
-/// target; a tombstone is neither reachable nor unused.
+/// target; a tombstone is neither reachable nor unused. None is reported when a reachable
+/// item holds a failed construct or the module an item abandoned at a syntax failure.
 fn Checker.check_unused_items(self, module: ty::ModuleId) {
     let alloc = self.alloc()
     let db = self.db()
@@ -183,10 +285,21 @@ fn Checker.check_unused_items(self, module: ty::ModuleId) {
             }
         }
     }
+    var unreached = mem::List[ty::ItemId].empty(alloc)
     for item in items {
-        if not self.private_item(item) or reached.contains(item) {
-            continue
+        if self.private_item(item) and not reached.contains(item) {
+            mut unreached.push(item)
         }
+    }
+    if unreached.len() == 0 or db.module(module).abandoned {
+        return
+    }
+    for item in reached {
+        if self.holds_failure(item) {
+            return
+        }
+    }
+    for item in unreached {
         let data = db.item(item)
         let syntax = db.syntax(item)
         expect data.index < syntax.items.len()
@@ -201,8 +314,8 @@ fn Checker.check_unused_items(self, module: ty::ModuleId) {
 /// of `pub` structs, each reported on its first line. A field is read by an access other
 /// than the target of `=`, a struct pattern giving it a pattern other than `_`, a predicate
 /// naming it, and the methods its struct's derives of `Eq`, `Ord`, `Hash`, `Render` and
-/// `Encode` write.
-fn Checker.check_unused_fields(self, module: ty::ModuleId) {
+/// `Encode` write. None is reported when a module of the package holds a failed construct.
+fn Checker.check_unused_fields(self, module: ty::ModuleId, mut failure: PackageFailure) {
     let alloc = self.alloc()
     let db = self.db()
     for item in db.module(module).items {
@@ -221,7 +334,7 @@ fn Checker.check_unused_fields(self, module: ty::ModuleId) {
                 continue
             }
             let key = FieldKey(owner: item, name: text::String.of(name, alloc))
-            if self.state.contents().fields_read.get(key).is_some() {
+            if self.state.contents().fields_read.get(key).is_some() or self.package_failed(mut failure) {
                 continue
             }
             let syntax = db.syntax(item)
@@ -389,20 +502,6 @@ fn scope_end(tree: syntax::Tree, token: u32, alloc: mem::Alloc) -> Option[u32] {
     }
     return found
 } scope_end
-
-/// Whether a typed expression holds a construct that failed a rule.
-fn TExpr.holds_failure(self) -> bool {
-    var failed = match self.kind {
-        TKind.Failed => true
-        else => false
-    }
-    self.each_child(fn[mut failed](child: TExpr) {
-        if child.holds_failure() {
-            failed = true
-        }
-    })
-    return failed
-} TExpr.holds_failure
 
 /// Reports an unused binding: a `let` or `var` statement binding one name, with the fix writing
 /// `discard` in place of its binding, or nothing for a `Unit` or `Never` initializer, unless a

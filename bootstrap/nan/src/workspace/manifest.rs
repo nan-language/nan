@@ -164,6 +164,8 @@ pub struct Manifest {
     /// The declared targets this implementation knows.
     pub targets: Vec<Target>,
     pub targets_line: Option<u32>,
+    /// Whether a rule reports the `targets` directive's list, which so declares unknown targets.
+    pub targets_failed: bool,
     /// Whether the package's language version is one this implementation implements.
     pub supported: bool,
     /// The language version the `language` directive states, and its line.
@@ -314,6 +316,7 @@ impl Reader<'_> {
             line,
             targets: Vec::new(),
             targets_line: None,
+            targets_failed: false,
             supported: true,
             language: None,
             entry: None,
@@ -378,12 +381,16 @@ impl Reader<'_> {
                             None => self.report(line, Code::ManifestUnknownTarget),
                         }
                     }
-                    if names.iter().any(|name| name == "any") && names.len() > 1 {
+                    let any_not_alone = names.iter().any(|name| name == "any") && names.len() > 1;
+                    if any_not_alone {
                         self.report(line, Code::ManifestAnyNotAlone);
                     }
-                    if has_repeat(&names) {
+                    let repeated = has_repeat(&names);
+                    if repeated {
                         self.report(line, Code::ManifestDuplicate);
                     }
+                    manifest.targets_failed =
+                        manifest.targets.len() < names.len() || any_not_alone || repeated;
                 }
                 Rule::EntryDirective => {
                     if std::mem::replace(&mut entry, true) {

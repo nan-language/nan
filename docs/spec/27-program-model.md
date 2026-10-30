@@ -331,6 +331,24 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package hello {
     language 1
+    targets x86_64-hots // error: manifest.unknown-target
+    entry main
+} hello
+
+// file: hello/hello.nan
+//! Entry of the greeting program.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("answer", value: 42u32)
+} main
+```
+
+```nan
+// file: hello/package.nan
+//! Greets on the host log.
+
+package hello {
+    language 1
     targets x86_64-host
     entry main
 } hello

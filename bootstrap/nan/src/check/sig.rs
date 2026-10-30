@@ -96,6 +96,13 @@ impl FnSig {
         &self.generics[self.inherited..]
     }
 
+    /// Whether a type of the head failed.
+    pub fn has_error(&self) -> bool {
+        self.params.iter().any(|param| param.ty.has_error())
+            || self.result.has_error()
+            || self.fails.as_ref().is_some_and(Ty::has_error)
+    }
+
     /// The function type of the head.
     pub fn fn_ty(&self) -> FnTy {
         let kind = match self.modifier {
@@ -199,6 +206,34 @@ pub struct Sig {
     pub generics: Vec<GenericDef>,
     pub kind: SigKind,
     pub problems: Problems,
+}
+
+impl Sig {
+    /// Whether a type the signature declares failed.
+    pub fn has_error(&self) -> bool {
+        let fields = |fields: &[FieldSig]| fields.iter().any(|field| field.ty.has_error());
+        match &self.kind {
+            SigKind::Fn(sig) => sig.has_error(),
+            SigKind::Struct { fields: declared } => fields(declared),
+            SigKind::Enum { variants } => variants.iter().any(|variant| match &variant.payload {
+                Payload::None => false,
+                Payload::Single(ty) => ty.has_error(),
+                Payload::Labelled(labelled) => labelled.iter().any(|(_, ty)| ty.has_error()),
+            }),
+            SigKind::Interface { methods } => methods.iter().any(|method| method.sig.has_error()),
+            SigKind::Impl { target_ty, .. } => target_ty.has_error(),
+            SigKind::Layout {
+                fields: declared,
+                bits,
+                ..
+            } => fields(declared) || bits.as_ref().is_some_and(Ty::has_error),
+            SigKind::Registers { registers } => {
+                registers.iter().any(|register| register.ty.has_error())
+            }
+            SigKind::Const { ty } | SigKind::Registry { entry: ty } => ty.has_error(),
+            SigKind::Other => false,
+        }
+    }
 }
 
 /// The offset of an interface method's own generic parameters in their owner's numbering.

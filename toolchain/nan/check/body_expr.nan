@@ -340,6 +340,11 @@ fn Body.jump_expr(mut self, expr: ast::Expr, jump: bool) -> TExpr {
     let token = expr.token
     if not jump {
         self.report(token, code: diagnostic::Code.ExprMisplacedJump)
+        match expr.kind {
+            ast::ExprKind.Break(_) => mut self.name_every_loop(breaks: true)
+            ast::ExprKind.Continue(_) => mut self.name_every_loop(breaks: false)
+            else => {}
+        }
         return TExpr.failed(token)
     }
     match expr.kind {
@@ -1879,8 +1884,9 @@ fn Body.closure(mut self, token: u32, closure: ast::Closure, wanted: Option[ty::
     }
     let item = self.item
     let closure_ty = ty::FnTy(kind: kind, params: take params, result: body_result, failure: failure, wait: wait, limit_set: limit_demands(closure.limit_set, interrupt_fn: false, token_text: fn(at: u32) => text::String.of(ck.db().text(item, token: at), alloc)), convention: None)
-    self.closure_rules(token, closure, frame, closure_ty)
-    let captures = self.closure_captures(closure, frame)
+    let failed = body.holds_failure()
+    self.closure_rules(token, closure, frame, closure_ty, failed)
+    let captures = self.closure_captures(closure, frame, failed)
     let lent = match written {
         Written.Lent(scope) => Some(scope)
         else => None
@@ -1954,8 +1960,8 @@ fn Body.note_captures(mut self, closure: ast::Closure) {
 
 /// The rules of a closure's head once its body is typed: its limits, its function type, a
 /// stack size under a kernel target for a task closure, its failure type, and the effects its
-/// body has.
-fn Body.closure_rules(self, token: u32, closure: ast::Closure, frame: Frame, closure_ty: ty::FnTy) {
+/// body has, the unneeded ones judged unless its body holds a failed construct.
+fn Body.closure_rules(self, token: u32, closure: ast::Closure, frame: Frame, closure_ty: ty::FnTy, failed: bool) {
     let ck = self.ck.share()
     let alloc = ck.alloc()
     let item = self.item
@@ -2001,13 +2007,13 @@ fn Body.closure_rules(self, token: u32, closure: ast::Closure, frame: Frame, clo
                 self.report_fixed(nir::Span(head: short.token, last: short.last), code: diagnostic::Code.ClosureShortEffect, take fixes)
             }
         }
-        ast::ClosureBody.Block(_) => self.check_effects(token, frame, head: closure_ty, clauses: Clauses.of_closure(closure), exempt: false)
+        ast::ClosureBody.Block(_) => self.check_effects(token, frame, head: closure_ty, clauses: Clauses.of_closure(closure), exempt: failed)
     }
 } Body.closure_rules
 
 /// The captures of a closure's frame, each with its entry in the capture list, the entries
-/// that capture nothing reported.
-fn Body.closure_captures(self, closure: ast::Closure, frame: Frame) -> mem::List[TCapture] {
+/// that capture nothing reported unless its body holds a failed construct.
+fn Body.closure_captures(self, closure: ast::Closure, frame: Frame, failed: bool) -> mem::List[TCapture] {
     let alloc = self.ck.alloc()
     var captures = mem::List[TCapture].empty(alloc)
     for capture in frame.captures {
@@ -2029,7 +2035,7 @@ fn Body.closure_captures(self, closure: ast::Closure, frame: Frame) -> mem::List
                 break
             }
         }
-        if used {
+        if used or failed {
             continue
         }
         for capture in closure.captures {
@@ -2309,6 +2315,7 @@ fn Body.jump_target(mut self, token: u32, label: Option[ast::Name], breaks: bool
             }
             let Some(at) = found else {
                 self.report(written.token, code: diagnostic::Code.StmtUnknownLabel)
+                mut self.name_every_loop(breaks)
                 return None
             }
             self.loops[at].label_used = true
@@ -2333,6 +2340,17 @@ fn Body.jump_target(mut self, token: u32, label: Option[ast::Name], breaks: bool
     }
     return found
 } Body.jump_target
+
+/// Records a failed `break` or `continue` as naming every loop of the frame, and leaving
+/// each when it breaks.
+fn Body.name_every_loop(mut self, breaks: bool) {
+    for index in self.frame().loops..<self.loops.len() {
+        self.loops[index].label_used = true
+        if breaks {
+            self.loops[index].broken = true
+        }
+    }
+} Body.name_every_loop
 
 fn Body.fail_expr(mut self, token: u32, value: ast::Expr) -> TExpr {
     if self.cx.example {
@@ -2478,14 +2496,13 @@ fn Body.when_place(mut self, access: ast::WhenAccess, mut values: mem::List[ty::
 } Body.when_place
 
 /// An assignment target: a place, a local and a path of fields and indexes from it, the
-/// target of `=` when `assigned`.
+/// target of `=` when `assigned`; none when it names no place and has not failed.
 fn Body.place(mut self, target: ast::Expr, assigned: bool) -> Option[TExpr] {
     match first target.kind {
         ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => {
             let found = mut self.lookup_local(path.segments[0].text.as_str())
             let Some(local) = found else {
-                discard mut self.expr(target, expected: None)
-                return None
+                return mut self.failed_place(target)
             }
             return Some(TExpr(token: target.token, last: target.last, ty: self.local(local).ty, kind: TKind.Local(local)))
         }
@@ -2493,8 +2510,7 @@ fn Body.place(mut self, target: ast::Expr, assigned: bool) -> Option[TExpr] {
         ast::ExprKind.Field(base: base, name: name) => {
             let names_type = mut self.type_target(base.contents())
             if names_type.is_some() {
-                discard mut self.expr(target, expected: None)
-                return None
+                return mut self.failed_place(target)
             }
             let Some(typed_base) = mut self.place(base.contents(), assigned: false) else {
                 return None
@@ -2502,12 +2518,19 @@ fn Body.place(mut self, target: ast::Expr, assigned: bool) -> Option[TExpr] {
             return Some(mut self.field_of(target.token, base: take typed_base, name, read: not assigned))
         }
         ast::ExprKind.Index(base: base, index: index) => return Some(mut self.index(target.token, base: base.contents(), index: index.contents(), write: true))
-        else => {
-            discard mut self.expr(target, expected: None)
-            return None
-        }
+        else => return mut self.failed_place(target)
     }
 } Body.place
+
+/// A target written as no place, typed as an expression: when it failed, the failed
+/// expression standing for a place.
+fn Body.failed_place(mut self, target: ast::Expr) -> Option[TExpr] {
+    let typed = mut self.expr(target, expected: None)
+    return match typed.kind {
+        TKind.Failed => Some(take typed)
+        else => None
+    }
+} Body.failed_place
 
 /// Whether two types are the same, a failed part matching anything.
 fn same_type(left: ty::Ty, right: ty::Ty, types: ty::Types) -> bool {

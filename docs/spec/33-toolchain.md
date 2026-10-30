@@ -7,11 +7,11 @@ This chapter defines the commands, the output contract, envelopes, exit classes 
 A **command** is a `nan` subcommand. Every command runs in a **workspace**, the directory tree under its root, whose packages are the directories outside every `.nan` directory that hold a `package.nan`. The **workspace root** is the parent of the outermost directory at or above the current directory that holds a `package.nan`, or else the current directory. A workspace without a [package](03-packages-modules.md#packages) is an error (`tool.no-workspace`).
 
 - A path a command takes or prints is relative to the workspace root and separated by `/`, except the versions `nan diff` and `nan merge` compare and the files of `--from` and `--compare-with`, which are relative to the current directory. A file outside the workspace is printed as its package's name, `/` and its path in its package. A **location** is `<path>:<line>`, lines counting from 1. A path in the [user directory](36-builds.md#cache) prints as `~/.nan/` followed by its path in it, and a `--compare-with` image as given. A [trap report](11-errors-domains.md#trap-reports) quoted in a record keeps the path form trap reports give.
-- The files `.nan/write`, `.nan/journal`, `.nan/repro/<n>`, `.nan/green/<agent>` and `.nan/images/<target>/` lie in the `.nan` directory of the workspace root; they are neither source files nor [machine files](35-format.md#machine-files).
+- The files `.nan/write`, `.nan/journal`, `.nan/repro/<n>`, `.nan/green/<agent>`, `.nan/images/<target>/` and `.nan/machine/<target>/` lie in the `.nan` directory of the workspace root; they are neither source files nor [machine files](35-format.md#machine-files).
 - In records, `<item>` is an item's or member's path as tool output writes [canonical paths](29-identity-versioning.md#canonical-paths) for the scope's package, or its canonical path when the scope holds several packages. A path naming a module, item or member, in a scope or an `<item>` argument, is its canonical path or, when the current directory lies inside a package, the path that package's root module would write for it; a text that is both is read as a canonical path. A package, and its `package` item, are named by the package name.
 - A command's **scope** is the argument naming what it acts on: `.` for the workspace; the path of a package, module, item or member; a file path ending in `.nan`, for that file's items; or a location, for the item holding that line. An omitted scope is the package holding the current directory, or `.` at the workspace root. A scope naming nothing is an error (`tool.unknown-scope`).
 - Every command accepts `--json` ([JSON Lines](#json-lines)), `--budget N` and `--skip N` ([output budgets](#output-budgets)). Any other option, argument or value outside its synopsis and the forms this chapter allows is an error (`tool.usage`).
-- No configuration file or environment variable affects a command, except `PATH`, through which a final build finds `cc`, and, in a [VCS workspace](31-trust.md#author-rule), the git configuration the author rule reads.
+- No configuration file or environment variable affects a command, except `PATH`, through which a final build finds `cc` and runs under the emulator find QEMU and `swtpm`, and, in a [VCS workspace](31-trust.md#author-rule), the git configuration the author rule reads.
 
 The commands are:
 
@@ -36,7 +36,7 @@ The commands are:
 - `nan publish --local <dir> [--name <store name>] [--breaking <item>... <reason>]`
 - `nan upgrade [<package>]`, `nan upgrade --language <N> [<scope>]`
 - `nan build [<scope>] [--compare-with <image>]`
-- `nan run [<package>] [-- <argument>...]`
+- `nan run [<package>] [--keep-resets] [-- <argument>...]`
 - `nan primer [<topic> or tools]`
 
 ### Checking commands
@@ -92,7 +92,34 @@ ok show core::Option.is_some --api: records 1
 - `nan dep sync` and `nan upgrade` without `--language` print a record `release <package> <old code root> <new code root> <class>` per package whose locked release changes, `-` for an absent release, holding `epoch <item> <epoch>` per epoch bump and `widening <entry>` per [widening](14-authority.md#authority-summaries) as a lock's `approved` record writes it. `nan publish` prints `published <store name> <code root> <release class> <encode class>`.
 - `nan diff <old> <new>` compares two versions of the workspace, or with `--path` two versions of one file. It prints a record `changed <item> <location>` per changed item, located in the new version or, when removed, the old, followed by its [change classes](31-trust.md#change-classes) in order and by `weakening` or `widening` when the change is one. It holds the old and new texts merged along their longest common subsequence of lines with the least old, then new, line numbers in lexicographic order: kept lines prefixed with 2 spaces, removed ones `- `, added ones `+ `, removals first. For the `package` item of a final-link root, the record also holds the `approved` and `epoch` records its lock gains or loses, merged as texts are. `nan diff --green` prints such a record, merging `api` lines, per item of its scope whose interface hash differs from its [last-green](#last-green) entry.
 - `nan build` performs the [final build](27-program-model.md#final-builds) of each program in its scope, writing its [image](27-program-model.md#images) into `.nan/images/<target>/`; a scope without a program is `tool.usage`. With `--compare-with`, the final build also performs [stage comparison](36-builds.md#stage-comparison) once its checking step reports no error, and writes no image when the comparison reports an error.
-- `nan run` performs the final build of one program, any other scope being `tool.usage`. When the build fails, it prints as `nan build` does; otherwise it prints nothing, the output contract not applying, and starts the image: on a host target as a process with the arguments after `--` and the command's environment and standard streams, unless the machine running the toolchain has another architecture than the target's, when it starts nothing and ends with status 70; on a machine target under the [descriptor](27-program-model.md#descriptors)'s emulator, with the boot volume the descriptor gives `nan run`, its serial port on standard output. On a host target it passes a termination request on and ends with the process's exit status. Under the emulator, a write of byte v to the [exit port](27-program-model.md#descriptors) ends the run with status v mod 128; a termination request with signal number n stops the emulator and ends the run with status 128 + n; any other end of the emulator ends it with status 70.
+- `nan run` performs the final build of one program, any other scope being `tool.usage`. When the build fails, it prints as `nan build` does; otherwise it prints nothing, the output contract not applying, and starts the image: on a host target as a process with the arguments after `--` and the command's environment and standard streams, unless the machine running the toolchain has another architecture than the target's, when it starts nothing and ends with status 70; on a machine target under the [descriptor](27-program-model.md#descriptors)'s emulator, with the boot volume the descriptor gives `nan run`, its serial port on standard input and standard output, and its console port on the socket `console.sock` of its **machine directory** `.nan/machine/<target>/`. On a host target it passes a termination request on and ends with the process's exit status. Under the emulator, a write of byte v to the [exit port](27-program-model.md#descriptors) ends the run with status v mod 128; a termination request with signal number n stops the emulator and ends the run with status 128 + n; any other end of the emulator, a reset included, ends it with status 70.
+- The machine directory keeps the machine's state across runs: its disk `disk.raw`, made blank when missing; on a UEFI target, the firmware's variables `vars.fd`, made from the firmware's template when missing; and its TPM's state `tpm/`. With `--keep-resets`, a reset reboots the machine, which finds its boot volume, disk, variables and TPM state as the run left them; `--keep-resets` on a host target is `tool.usage`.
+
+```nan
+// file: hello/package.nan
+//! Greets.
+
+package hello {
+    language 1
+    targets x86_64-host
+    entry main
+} hello
+
+// file: hello/hello.nan
+//! Greets.
+
+fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
+    world.log.info("hello", value: 0u8)
+    return 0
+} main
+```
+
+```text
+$ nan run hello --keep-resets
+invalid run hello --keep-resets: files 0, errors 1, incomplete 0
+error tool.usage - -
+invalid run hello --keep-resets: files 0, errors 1, incomplete 0
+```
 
 ## Output contract
 

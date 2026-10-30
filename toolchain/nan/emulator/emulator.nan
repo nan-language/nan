@@ -1,12 +1,17 @@
-//! The emulator the machine targets' descriptors name: whether a target's images can run on this machine, the invocation booting a machine image under the emulator, and boots bounded in host processor time.
+//! The emulator the machine targets' descriptors name: whether a target's images can run on this machine, the invocation booting a machine image under the emulator, its boots with the TPM emulator serving them, and boots bounded in host processor time.
 
-/// The firmware an `x86_64-uefi` image boots through, and its fallbacks across distributions,
-/// separated by spaces.
-const OVMF: Str = "/usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd"
+/// The firmware an `x86_64-uefi` image boots through, its codes and the templates of their
+/// variables, paired by position, and their fallbacks across distributions, separated by spaces.
+const OVMF_CODE: Str = "/usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd"
 
-/// The firmware an `aarch64-uefi` image boots through, each a flash image padded to the size of
-/// the `virt` board's flash, and its fallbacks across distributions, separated by spaces.
-const AAVMF: Str = "/usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw"
+const OVMF_VARS: Str = "/usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/x64/OVMF_VARS.4m.fd"
+
+/// The firmware an `aarch64-uefi` image boots through, its codes and the templates of their
+/// variables, paired by position, each a flash image padded to the size of the `virt` board's
+/// flash, and their fallbacks across distributions, separated by spaces.
+const AAVMF_CODE: Str = "/usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw"
+
+const AAVMF_VARS: Str = "/usr/share/AAVMF/AAVMF_VARS.fd /usr/share/edk2/aarch64/vars-template-pflash.raw"
 
 /// The emulator program of an architecture's machine targets.
 fn program(arch: workspace::Arch, alloc: mem::Alloc) -> text::String {
@@ -16,6 +21,24 @@ fn program(arch: workspace::Arch, alloc: mem::Alloc) -> text::String {
     }
     return text::String.of(name, alloc)
 } program
+
+/// The TPM emulator serving each boot's TPM, and its arguments, separated by spaces.
+const TPM_PROGRAM: Str = "swtpm"
+
+const TPM_ARGS: Str = "socket --tpm2 --tpmstate dir=tpm --ctrl type=unixio,path=tpm.sock --terminate"
+
+/// The files of a machine directory, which the emulator and the TPM emulator run in: the disk,
+/// the firmware's variables, the TPM's state directory and the TPM's socket.
+const DISK: Str = "disk.raw"
+
+const VARS: Str = "vars.fd"
+
+const TPM_STATE: Str = "tpm"
+
+const TPM_SOCKET: Str = "tpm.sock"
+
+/// The size of a machine's disk.
+const DISK_BYTES: u64 = 268_435_456
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pkg const OTHER_END: u8 = 70
@@ -27,8 +50,12 @@ const PROCESSOR_TIME: u64 = 10_000
 /// its processor time reaches it.
 const WALL_TIME: u64 = 120_000_000_000
 
-/// The milliseconds between two readings of a bounded boot's processor time.
+/// The milliseconds between two readings of a bounded boot's processor time, and between two
+/// looks for the TPM emulator's socket.
 const POLL: i32 = 5
+
+/// The nanoseconds the TPM emulator may take to open its socket.
+const TPM_WAIT: u64 = 10_000_000_000
 
 /// The clock ticks per second of the processor times `/proc` gives, USER_HZ.
 const TICKS_PER_SECOND: u64 = 100
@@ -39,20 +66,53 @@ const USER_TIME: usize = 11
 
 const SYSTEM_TIME: usize = 12
 
-/// The emulator arguments common to every machine run of an architecture: the machine, on x86_64
-/// accelerated by KVM where the host offers it, processors, memory, entropy device, exit port,
-/// serial port on the standard streams, no display or reboot, and an end with the process that
-/// starts it.
-fn base_args(arch: workspace::Arch, alloc: mem::Alloc) -> mem::List[text::String] {
-    let machine = match arch {
-        workspace::Arch.Amd64 => "-machine q35 -accel kvm -accel tcg -device virtio-rng-pci -device isa-debug-exit,iobase=0xf4,iosize=0x01"
-        workspace::Arch.Aarch64 => "-machine virt,gic-version=3 -cpu cortex-a72 -accel tcg -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native"
+/// How a launch boots a machine.
+pkg enum Boots {
+    /// The boots of a run: the machine's disk, firmware variables and TPM state persist in the
+    /// machine directory `dir`, its console port is the socket there, and a reset reboots the
+    /// machine when `resets` holds and ends the run otherwise.
+    Kept(dir: text::String, resets: bool)
+    /// The boots of a test run: each finds the machine as the launch made it, its network
+    /// restricted to the machine and its console port unconnected, and a reset ends it.
+    Fresh
+} Boots
+
+/// The emulator arguments common to every machine run of an architecture: the machine with its
+/// IOMMU first, on x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy
+/// device, exit port, TPM, watchdog, disk and network device, each virtio PCI device modern and
+/// behind the IOMMU, no display, the serial port on the standard streams then the console port,
+/// and an end with the process that starts it. `kept` holds whether a run's boots keep resets,
+/// and is none for a test run's.
+fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Alloc) -> mem::List[text::String] {
+    var written = text::String.of("-run-with exit-with-parent=on ", alloc)
+    match arch {
+        workspace::Arch.Amd64 => {
+            mut written.append("-machine q35 -device intel-iommu,intremap=on,aw-bits=48 ")
+            if kvm {
+                mut written.append("-accel kvm,kernel-irqchip=split -cpu host,+invtsc")
+            } else {
+                mut written.append("-accel tcg -cpu max")
+            }
+            mut written.append(" -smp 4 -m 512M -device virtio-rng-pci,iommu_platform=on,disable-legacy=on -device isa-debug-exit,iobase=0xf4,iosize=0x01 -device tpm-crb,tpmdev=tpm")
+        }
+        workspace::Arch.Aarch64 => mut written.append("-machine virt,gic-version=3,its=on,iommu=smmuv3 -accel tcg -cpu cortex-a72 -smp 4 -m 512M -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native -device tpm-tis-device,tpmdev=tpm")
     }
-    var written = text::String.of("-run-with exit-with-parent=on -smp 4 -m 512M ", alloc)
-    mut written.append(machine)
-    mut written.append(" -display none -no-reboot -nodefaults -serial stdio -monitor none")
+    mut written.append(" -chardev socket,id=tpm,path=tpm.sock -tpmdev emulator,id=tpm,chardev=tpm -device i6300esb -device virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on -device virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on -display none -nodefaults -monitor none -serial stdio")
+    match kept {
+        Some(_) => mut written.append(" -serial unix:console.sock,server=on,wait=off -drive if=none,id=disk,format=raw,file=disk.raw -netdev user,id=net")
+        None => mut written.append(" -serial null -drive if=none,id=disk,format=raw,file=disk.raw,snapshot=on -netdev user,id=net,restrict=on")
+    }
+    if kept != Some(true) {
+        mut written.append(" -no-reboot")
+    }
     return words_of(written.as_str(), alloc)
 } base_args
+
+/// Whether the emulator accelerates an architecture's machines with KVM: x86_64 ones when this
+/// machine is x86_64 and this process may read and write `/dev/kvm`.
+fn kvm_usable(arch: workspace::Arch) -> bool {
+    return arch == workspace::Arch.Amd64 and workspace::Arch.running() == arch and platform::may_read_write("/dev/kvm")
+} kvm_usable
 
 /// The words of a text separated by spaces.
 fn words_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -73,13 +133,21 @@ fn words_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     return parts
 } words_of
 
+/// The machine directory a launch boots in, holding the machine's disk, firmware variables, TPM
+/// state and sockets, and whether every boot makes its TPM state anew.
+pkg struct Machine {
+    pkg dir: text::String
+    fresh: bool
+} Machine
+
 /// What `nan run` starts once it has built an image: the image on a host target, the emulator
 /// booting it on a machine target, and its arguments.
 pkg struct Launch {
     pkg program: text::String
     pkg args: mem::List[text::String]
-    /// Whether the program is the emulator, whose end gives the run's status.
-    pkg emulated: bool
+    /// The machine directory of the emulator, whose end gives the run's status; none for an
+    /// image.
+    pkg machine: Option[Machine]
 } Launch
 
 /// Starts the program and gives the status the run ends with: the image replaces this process,
@@ -87,8 +155,9 @@ pkg struct Launch {
 /// the system refuses to start it; the emulator runs as a child, and the status the run ends with
 /// is given once it ends.
 pkg fn Launch.start(self, alloc: mem::Alloc) -> u8 {
-    if self.emulated {
-        return run(self, alloc)
+    match self.machine {
+        Some(machine) => return run(self, machine, alloc)
+        None => {}
     }
     discard platform::replace_process(self.program.as_str(), args: self.args.view(), alloc)
     return 101
@@ -96,7 +165,8 @@ pkg fn Launch.start(self, alloc: mem::Alloc) -> u8 {
 
 /// Whether a target's images can run on this machine: a host target's when the machine has its
 /// architecture, and a machine target's when its emulator can start, the emulator program running
-/// and able to end with the process that starts it, and the firmware present for a UEFI target.
+/// and able to end with the process that starts it, the TPM emulator running, and the firmware
+/// present for a UEFI target.
 pkg fn available(target: workspace::Target, alloc: mem::Alloc) -> bool {
     let Some(arch) = target.arch() else {
         return false
@@ -109,7 +179,13 @@ pkg fn available(target: workspace::Target, alloc: mem::Alloc) -> bool {
         Ok(ran) => holds(ran.stdout.view(), wanted: b"exit-with-parent")
         Err(_) => false
     }
-    return runs and (target.kind() != Some(workspace::Kind.Uefi) or platform::exists(firmware(arch, alloc).as_str()))
+    let version = words_of("--version", alloc)
+    let tpm = match attempt platform::run_output(TPM_PROGRAM, args: version.view(), input: None, capture_errors: false, alloc) {
+        Ok(ran) => ran.status.is_success()
+        Err(_) => false
+    }
+    let pair = firmware(arch, alloc)
+    return runs and tpm and (target.kind() != Some(workspace::Kind.Uefi) or (platform::exists(pair.code.as_str()) and platform::exists(pair.vars.as_str())))
 } available
 
 /// Whether bytes hold a run of bytes.
@@ -131,10 +207,15 @@ fn holds(bytes: Slice[u8], wanted: Slice[u8]) -> bool {
     return false
 } holds
 
-/// Boots the emulator as `given` gives, with the standard streams of this process, and gives the
-/// status the run ends with once the emulator ends.
-fn run(given: Launch, alloc: mem::Alloc) -> u8 {
-    return run_status(attempt platform::run_attached(given.program.as_str(), args: given.args.view(), alloc))
+/// Boots the emulator as `given` gives on `machine`, with the standard streams of this process,
+/// and gives the status the run ends with once the emulator ends.
+fn run(given: Launch, machine: Machine, alloc: mem::Alloc) -> u8 {
+    let Ok(tpm) = attempt start_tpm(machine, alloc) else {
+        return OTHER_END
+    }
+    let ended = attempt platform::run_attached(given.program.as_str(), args: given.args.view(), dir: machine.dir.as_str(), alloc)
+    tpm.end()
+    return run_status(ended)
 } run
 
 /// The status a run under the emulator ends with: v mod 128 when the machine wrote the byte v to
@@ -150,65 +231,131 @@ fn run_status(ended: Result[platform::Status, platform::IoError]) -> u8 {
     }
 } run_status
 
-/// The firmware of an architecture's UEFI target: the first of its paths present on the host, or
-/// the first of them when none is.
-fn firmware(arch: workspace::Arch, alloc: mem::Alloc) -> text::String {
-    let listed = match arch {
-        workspace::Arch.Amd64 => OVMF
-        workspace::Arch.Aarch64 => AAVMF
+/// The firmware of a UEFI target: its code and the template of its variables.
+struct Firmware {
+    code: text::String
+    vars: text::String
+} Firmware
+
+/// The firmware of an architecture's UEFI target: the first pair present on the host, or the
+/// first pair when none is.
+fn firmware(arch: workspace::Arch, alloc: mem::Alloc) -> Firmware {
+    var codes = words_of(OVMF_CODE, alloc)
+    var templates = words_of(OVMF_VARS, alloc)
+    if arch == workspace::Arch.Aarch64 {
+        codes = words_of(AAVMF_CODE, alloc)
+        templates = words_of(AAVMF_VARS, alloc)
     }
-    var paths = words_of(listed, alloc)
-    for path in paths {
-        if platform::exists(path.as_str()) {
-            return text::String.of(path.as_str(), alloc)
+    var chosen: usize = 0
+    for at in 0..<codes.len() {
+        let Some(template) = templates.get(at) else {
+            break
+        }
+        if platform::exists(codes[at].as_str()) and platform::exists(template.as_str()) {
+            chosen = at
+            break
         }
     }
-    return mut paths.remove(0)
+    let Some(code) = codes.get(chosen) else {
+        expect false
+        return Firmware(code: text::String.empty(alloc), vars: text::String.empty(alloc))
+    }
+    let Some(template) = templates.get(chosen) else {
+        expect false
+        return Firmware(code: text::String.empty(alloc), vars: text::String.empty(alloc))
+    }
+    return Firmware(code: text::String.of(code.as_str(), alloc), vars: text::String.of(template.as_str(), alloc))
 } firmware
 
-/// What becomes of what a machine writes to its boot volume.
-pkg enum Writes derives Copy, Eq {
-    /// The volume's directory keeps it.
-    Kept
-    /// It lasts until the emulator ends, so that every boot finds the volume as it was made.
-    Dropped
-} Writes
+/// Starts the TPM emulator on the machine's TPM state, made anew for a fresh machine, in the
+/// machine directory, and waits for its socket.
+fn start_tpm(machine: Machine, alloc: mem::Alloc) -> platform::Background fails platform::IoError {
+    let dir = machine.dir.as_str()
+    let state = platform::join(dir, name: TPM_STATE, alloc)
+    if machine.fresh and platform::exists(state.as_str()) {
+        try platform::remove_dir_all(state.as_str(), alloc)
+    }
+    try platform::create_dir_all(state.as_str(), alloc)
+    let socket = platform::join(dir, name: TPM_SOCKET, alloc)
+    if platform::exists(socket.as_str()) {
+        try platform::remove_file(socket.as_str())
+    }
+    let args = words_of(TPM_ARGS, alloc)
+    let tpm = try platform::start_background(TPM_PROGRAM, args: args.view(), dir, alloc)
+    let started = platform::monotonic_nanos()
+    while not platform::exists(socket.as_str()) {
+        let running = attempt tpm.running()
+        if running != Ok(true) or platform::monotonic_nanos().wrapping_sub(started) >= TPM_WAIT {
+            tpm.end()
+            fail platform::IoError.Other(0)
+        }
+        platform::sleep_ms(POLL)
+    }
+    return tpm
+} start_tpm
 
-/// The emulator invocation that boots a machine image: a bare image directly, by the PVH boot
-/// protocol on x86_64 and by loading its segments on AArch64, and a UEFI image through the
-/// firmware from a FAT volume holding it at the default boot path and each of `files` at `/`
-/// followed by its name.
-pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String], writes: Writes, alloc: mem::Alloc) -> Launch fails platform::IoError {
+/// The emulator invocation that boots a machine image, in a machine directory holding a disk made
+/// blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by loading
+/// its segments on AArch64, and a UEFI image through the firmware from a FAT volume holding it at
+/// the default boot path and each of `files` at `/` followed by its name.
+pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String], take boots: Boots, alloc: mem::Alloc) -> Launch fails platform::IoError {
     let Some(arch) = target.arch() else {
         expect false
         fail platform::IoError.NotFound
     }
-    var args = base_args(arch, alloc)
+    var dir = machine_of(image, alloc)
+    var kept: Option[bool] = None
+    match boots {
+        Boots.Kept(dir: given, resets: resets) => {
+            dir = given
+            kept = Some(resets)
+        }
+        Boots.Fresh => {}
+    }
+    try platform::create_dir_all(dir.as_str(), alloc)
+    let disk_path = platform::join(dir.as_str(), name: DISK, alloc)
+    if not platform::exists(disk_path.as_str()) {
+        try platform::write_sized(disk_path.as_str(), bytes: DISK_BYTES)
+    }
+    var args = base_args(arch, kvm: kvm_usable(arch), kept, alloc)
     if target.kind() == Some(workspace::Kind.Uefi) {
+        let pair = firmware(arch, alloc)
         let volume = try boot_volume(arch, image, files, alloc)
-        mut args.push(text::String.of("-drive", alloc))
-        var drive = text::String.of("if=pflash,format=raw,unit=0,readonly=on,file=", alloc)
-        mut drive.append(firmware(arch, alloc).as_str())
-        mut args.push(take drive)
-        mut args.push(text::String.of("-drive", alloc))
-        var disk = text::String.empty(alloc)
-        match writes {
-            Writes.Kept => {
-                mut disk.append("format=raw,file=fat:rw:")
-                mut disk.append(volume.as_str())
+        var code = text::String.of("if=pflash,format=raw,unit=0,readonly=on,file=", alloc)
+        mut code.append(pair.code.as_str())
+        var vars_drive = text::String.of("if=pflash,format=raw,unit=1,file=", alloc)
+        var boot_drive = text::String.of("if=none,id=boot,format=raw,file=fat:", alloc)
+        match kept {
+            Some(_) => {
+                let held = platform::join(dir.as_str(), name: VARS, alloc)
+                if not platform::exists(held.as_str()) {
+                    try copy_file(pair.vars.as_str(), to: held.as_str(), alloc)
+                }
+                mut vars_drive.append(VARS)
+                mut boot_drive.append("rw:")
+                mut boot_drive.append(volume.as_str())
             }
-            Writes.Dropped => {
-                mut disk.append("format=raw,file=fat:")
-                mut disk.append(volume.as_str())
-                mut disk.append(",snapshot=on")
+            None => {
+                mut vars_drive.append(pair.vars.as_str())
+                mut vars_drive.append(",snapshot=on")
+                mut boot_drive.append(volume.as_str())
+                mut boot_drive.append(",snapshot=on")
             }
         }
-        mut args.push(take disk)
+        mut args.push(text::String.of("-drive", alloc))
+        mut args.push(take code)
+        mut args.push(text::String.of("-drive", alloc))
+        mut args.push(take vars_drive)
+        mut args.push(text::String.of("-drive", alloc))
+        mut args.push(take boot_drive)
+        mut args.push(text::String.of("-device", alloc))
+        mut args.push(text::String.of("virtio-blk-pci,drive=boot,bootindex=0,iommu_platform=on,disable-legacy=on", alloc))
     } else {
         mut args.push(text::String.of("-kernel", alloc))
         mut args.push(text::String.of(image, alloc))
     }
-    return Launch(program: program(arch, alloc), args: take args, emulated: true)
+    let machine = Machine(dir: take dir, fresh: kept.is_none())
+    return Launch(program: program(arch, alloc), args: take args, machine: Some(take machine))
 } launch
 
 /// The FAT boot volume of a UEFI image: a directory beside it holding the image as the default
@@ -246,11 +393,20 @@ fn volume_of(image: Str, alloc: mem::Alloc) -> text::String {
     return platform::replaced_extension(image, extension: "boot", alloc)
 } volume_of
 
-/// Removes a machine image and any boot volume a launch made for it.
+/// The machine directory of a test run's launch of an image.
+fn machine_of(image: Str, alloc: mem::Alloc) -> text::String {
+    return platform::replaced_extension(image, extension: "machine", alloc)
+} machine_of
+
+/// Removes a test image with the boot volume and machine directory a launch made for it.
 pkg fn remove_image(image: Str, alloc: mem::Alloc) fails platform::IoError {
     let volume = volume_of(image, alloc)
     if platform::exists(volume.as_str()) {
         try platform::remove_dir_all(volume.as_str(), alloc)
+    }
+    let machine = machine_of(image, alloc)
+    if platform::exists(machine.as_str()) {
+        try platform::remove_dir_all(machine.as_str(), alloc)
     }
     try platform::remove_file(image)
 } remove_image
@@ -259,6 +415,10 @@ pkg fn remove_image(image: Str, alloc: mem::Alloc) fails platform::IoError {
 /// and gives how it ended, its serial output and its diagnostics; none once it has used more than
 /// `PROCESSOR_TIME` of host processor time, or lasted `WALL_TIME`.
 pkg fn boot(given: Launch, name: Str, path: Str, alloc: mem::Alloc) -> Option[platform::Output] fails platform::IoError {
+    let Some(machine) = given.machine else {
+        expect false
+        fail platform::IoError.NotFound
+    }
     var args = mem::List[text::String].empty(alloc)
     for arg in given.args {
         mut args.push(text::String.of(arg.as_str(), alloc))
@@ -269,11 +429,17 @@ pkg fn boot(given: Launch, name: Str, path: Str, alloc: mem::Alloc) -> Option[pl
     mut configuration.append(",file=")
     mut configuration.append(path)
     mut args.push(take configuration)
+    let tpm = try start_tpm(machine, alloc)
     let started = platform::monotonic_nanos()
-    return try platform::run_bounded(given.program.as_str(), args: args.view(), poll_ms: POLL, within: fn(id: u32) -> bool fails platform::IoError {
+    let booted = attempt platform::run_bounded(given.program.as_str(), args: args.view(), dir: machine.dir.as_str(), poll_ms: POLL, within: fn(id: u32) -> bool fails platform::IoError {
         let used = try processor_time_of(id, alloc)
         return used <= PROCESSOR_TIME and platform::monotonic_nanos().wrapping_sub(started) < WALL_TIME
     }, alloc)
+    tpm.end()
+    return match booted {
+        Ok(output) => output
+        Err(error) => fail error
+    }
 } boot
 
 /// Whether a byte is ASCII white space.
@@ -333,3 +499,28 @@ test a_run_ends_with_the_byte_written_to_the_exit_port_and_otherwise_with_70 for
     expect run_status(Ok(platform::Status.Signalled(9))) == OTHER_END
     expect run_status(Err(platform::IoError.NotFound)) == OTHER_END
 } a_run_ends_with_the_byte_written_to_the_exit_port_and_otherwise_with_70
+
+/// The arguments of a machine run, separated by spaces.
+fn joined(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for arg in base_args(arch, kvm, kept, alloc) {
+        if written.byte_len() > 0 {
+            mut written.append(" ")
+        }
+        mut written.append(arg.as_str())
+    }
+    return written
+} joined
+
+test a_machine_keeps_its_iommu_first_and_a_test_run_drops_its_writes for base_args {
+    let alloc = testing::world().alloc
+    let accelerated = joined(workspace::Arch.Amd64, kvm: true, kept: None, alloc)
+    expect holds(accelerated.as_bytes(), wanted: b"-machine q35 -device intel-iommu,intremap=on,aw-bits=48 -accel kvm,kernel-irqchip=split -cpu host,+invtsc ")
+    expect holds(accelerated.as_bytes(), wanted: b"-serial stdio -serial null -drive if=none,id=disk,format=raw,file=disk.raw,snapshot=on -netdev user,id=net,restrict=on -no-reboot")
+    let tcg = joined(workspace::Arch.Amd64, kvm: false, kept: Some(false), alloc)
+    expect holds(tcg.as_bytes(), wanted: b"-accel tcg -cpu max ")
+    expect holds(tcg.as_bytes(), wanted: b"-serial unix:console.sock,server=on,wait=off -drive if=none,id=disk,format=raw,file=disk.raw -netdev user,id=net -no-reboot")
+    let kept = joined(workspace::Arch.Aarch64, kvm: true, kept: Some(true), alloc)
+    expect holds(kept.as_bytes(), wanted: b"-machine virt,gic-version=3,its=on,iommu=smmuv3 -accel tcg -cpu cortex-a72 ")
+    expect not holds(kept.as_bytes(), wanted: b"-no-reboot")
+} a_machine_keeps_its_iommu_first_and_a_test_run_drops_its_writes

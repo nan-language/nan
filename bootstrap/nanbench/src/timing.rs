@@ -99,16 +99,22 @@ fn kernel(source: &Path, root: &Path) -> Result<BTreeMap<String, u64>, String> {
     let Some(launch) = run.launch else {
         return Err(format!("nan run kernelbench reports\n{}", run.output));
     };
-    let mut emulator = Command::new("taskset")
+    let machine = launch
+        .machine
+        .as_ref()
+        .ok_or("an image launched without the emulator")?;
+    let mut command = Command::new("taskset");
+    command
         .args(["-c", PROCESSORS])
         .arg(&launch.program)
         .args(&launch.args)
-        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut boot = machine
+        .boot(command)
         .map_err(|error| format!("the emulator: {error}"))?;
+    let emulator = &mut boot.emulator;
     let serial = emulator.stdout.take().ok_or("the serial port's output")?;
     let (lines, received) = mpsc::channel();
     std::thread::spawn(move || {

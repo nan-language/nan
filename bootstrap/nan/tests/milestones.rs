@@ -365,14 +365,15 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
     let Some(launch) = run.launch else {
         panic!("nan run {program} reports\n{}", run.output);
     };
-    let mut emulator = Command::new(&launch.program)
+    let mut command = Command::new(&launch.program);
+    command
         .args(&launch.args)
-        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the emulator started");
+        .stderr(Stdio::piped());
+    let machine = launch.machine.as_ref().expect("the emulator's machine");
+    let mut boot = machine.boot(command).expect("the emulator started");
+    let emulator = &mut boot.emulator;
     let serial = emulator.stdout.take().expect("the serial port's output");
     let mut diagnostics = emulator.stderr.take().expect("the emulator's diagnostics");
     let diagnosed = std::thread::spawn(move || {

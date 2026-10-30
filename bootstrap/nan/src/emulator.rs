@@ -1,30 +1,50 @@
 //! The emulator the machine targets' descriptors name: whether a target's images can run on this
-//! machine, the invocation booting a machine image under the emulator, and boots bounded in host
-//! processor time.
+//! machine, the invocation booting a machine image under the emulator, its boots with the TPM
+//! emulator serving them, and boots bounded in host processor time.
 
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::command::Launch;
 use crate::workspace::{Arch, Kind, Target};
 
-/// The firmware an `x86_64-uefi` image boots through, and its fallbacks across distributions.
-const OVMF: [&str; 4] = [
-    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE_4M.fd",
-    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+/// The firmware an `x86_64-uefi` image boots through, its code and the template of its
+/// variables, and their fallbacks across distributions.
+const OVMF: [(&str, &str); 4] = [
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    ),
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    ),
 ];
 
-/// The firmware an `aarch64-uefi` image boots through, each a flash image padded to the size of
-/// the `virt` board's flash, and its fallbacks across distributions.
-const AAVMF: [&str; 2] = [
-    "/usr/share/AAVMF/AAVMF_CODE.fd",
-    "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+/// The firmware an `aarch64-uefi` image boots through, its code and the template of its
+/// variables, each a flash image padded to the size of the `virt` board's flash, and their
+/// fallbacks across distributions.
+const AAVMF: [(&str, &str); 2] = [
+    (
+        "/usr/share/AAVMF/AAVMF_CODE.fd",
+        "/usr/share/AAVMF/AAVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+        "/usr/share/edk2/aarch64/vars-template-pflash.raw",
+    ),
 ];
 
 /// The emulator program of an architecture's machine targets.
@@ -34,6 +54,21 @@ fn program(arch: Arch) -> &'static str {
         Arch::Aarch64 => "qemu-system-aarch64",
     }
 }
+
+/// The TPM emulator serving each boot's TPM.
+const TPM_PROGRAM: &str = "swtpm";
+
+/// The files of a machine directory, which the emulator and the TPM emulator run in: the disk,
+/// the firmware's variables, the TPM's state directory, and the sockets of the TPM and of the
+/// console port.
+const DISK: &str = "disk.raw";
+const VARS: &str = "vars.fd";
+const TPM_STATE: &str = "tpm";
+const TPM_SOCKET: &str = "tpm.sock";
+const CONSOLE_SOCKET: &str = "console.sock";
+
+/// The size of a machine's disk.
+const DISK_BYTES: u64 = 256 << 20;
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pub const OTHER_END: i32 = 70;
@@ -45,8 +80,11 @@ const PROCESSOR_TIME: Duration = Duration::from_secs(10);
 /// processor time reaches it.
 const WALL_TIME: Duration = Duration::from_secs(120);
 
-/// How often a bounded boot's processor time is read.
+/// How often a bounded boot's processor time is read, and the TPM emulator's socket looked for.
 const POLL: Duration = Duration::from_millis(5);
+
+/// The longest the TPM emulator may take to open its socket.
+const TPM_WAIT: Duration = Duration::from_secs(10);
 
 /// The clock ticks per second of the processor times `/proc` gives, USER_HZ.
 const TICKS_PER_SECOND: u64 = 100;
@@ -56,67 +94,138 @@ const TICKS_PER_SECOND: u64 = 100;
 const USER_TIME: usize = 11;
 const SYSTEM_TIME: usize = 12;
 
-/// The emulator arguments common to every machine run of an architecture: the machine, on x86_64
-/// accelerated by KVM where the host offers it, processors, memory, entropy device, exit port,
-/// serial port on the standard streams, no display or reboot, and an end with the process that
-/// starts it.
-fn base_args(arch: Arch) -> Vec<String> {
-    let machine: &[&str] = match arch {
-        Arch::Amd64 => &[
+/// How a launch boots a machine.
+pub enum Boots {
+    /// The boots of a run: the machine's disk, firmware variables and TPM state persist in the
+    /// machine directory `dir`, its console port is the socket there, and a reset reboots the
+    /// machine when `resets` holds and ends the run otherwise.
+    Kept { dir: PathBuf, resets: bool },
+    /// The boots of a test run: each finds the machine as the launch made it, its network
+    /// restricted to the machine and its console port unconnected, and a reset ends it.
+    Fresh,
+}
+
+/// The emulator arguments common to every machine run of an architecture: the machine with its
+/// IOMMU first, on x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy
+/// device, exit port, TPM, watchdog, disk and network device, each virtio PCI device modern and
+/// behind the IOMMU, no display, the serial port on the standard streams then the console port,
+/// and an end with the process that starts it. `kept` holds whether a run's boots keep resets,
+/// and is none for a test run's.
+fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
+    let machine: &[&str] = match (arch, kvm) {
+        (Arch::Amd64, true) => &[
             "-machine",
             "q35",
+            "-device",
+            "intel-iommu,intremap=on,aw-bits=48",
             "-accel",
-            "kvm",
+            "kvm,kernel-irqchip=split",
+            "-cpu",
+            "host,+invtsc",
+        ],
+        (Arch::Amd64, false) => &[
+            "-machine",
+            "q35",
+            "-device",
+            "intel-iommu,intremap=on,aw-bits=48",
             "-accel",
             "tcg",
-            "-device",
-            "virtio-rng-pci",
-            "-device",
-            "isa-debug-exit,iobase=0xf4,iosize=0x01",
+            "-cpu",
+            "max",
         ],
-        Arch::Aarch64 => &[
+        (Arch::Aarch64, _) => &[
             "-machine",
-            "virt,gic-version=3",
+            "virt,gic-version=3,its=on,iommu=smmuv3",
+            "-accel",
+            "tcg",
             "-cpu",
             "cortex-a72",
-            "-accel",
-            "tcg",
+        ],
+    };
+    let devices: &[&str] = match arch {
+        Arch::Amd64 => &[
+            "-device",
+            "virtio-rng-pci,iommu_platform=on,disable-legacy=on",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x01",
+            "-device",
+            "tpm-crb,tpmdev=tpm",
+        ],
+        Arch::Aarch64 => &[
             "-global",
             "virtio-mmio.force-legacy=false",
             "-device",
             "virtio-rng-device",
             "-semihosting-config",
             "enable=on,target=native",
+            "-device",
+            "tpm-tis-device,tpmdev=tpm",
         ],
     };
-    [
-        "-run-with",
-        "exit-with-parent=on",
-        "-smp",
-        "4",
-        "-m",
-        "512M",
-    ]
-    .iter()
-    .chain(machine)
-    .chain(&[
-        "-display",
-        "none",
-        "-no-reboot",
-        "-nodefaults",
-        "-serial",
-        "stdio",
-        "-monitor",
-        "none",
-    ])
-    .map(|argument| (*argument).to_owned())
-    .collect()
+    let (disk, network, console) = match kept {
+        Some(_) => (
+            format!("if=none,id=disk,format=raw,file={DISK}"),
+            "user,id=net".to_owned(),
+            format!("unix:{CONSOLE_SOCKET},server=on,wait=off"),
+        ),
+        None => (
+            format!("if=none,id=disk,format=raw,file={DISK},snapshot=on"),
+            "user,id=net,restrict=on".to_owned(),
+            "null".to_owned(),
+        ),
+    };
+    let mut args: Vec<String> = ["-run-with", "exit-with-parent=on"]
+        .iter()
+        .chain(machine)
+        .chain(&["-smp", "4", "-m", "512M"])
+        .chain(devices)
+        .chain(&[
+            "-chardev",
+            "socket,id=tpm,path=tpm.sock",
+            "-tpmdev",
+            "emulator,id=tpm,chardev=tpm",
+            "-device",
+            "i6300esb",
+            "-device",
+            "virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on",
+            "-device",
+            "virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on",
+            "-display",
+            "none",
+            "-nodefaults",
+            "-monitor",
+            "none",
+            "-serial",
+            "stdio",
+        ])
+        .map(|argument| (*argument).to_owned())
+        .collect();
+    for (option, value) in [("-serial", console), ("-drive", disk), ("-netdev", network)] {
+        args.push(option.to_owned());
+        args.push(value);
+    }
+    if kept != Some(true) {
+        args.push("-no-reboot".to_owned());
+    }
+    args
+}
+
+/// Whether the emulator accelerates an architecture's machines with KVM: x86_64 ones when this
+/// machine is x86_64 and this process may read and write `/dev/kvm`.
+fn kvm_usable(arch: Arch) -> bool {
+    arch == Arch::Amd64
+        && Arch::running() == arch
+        && fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
 }
 
 /// Whether a target's images can run on this machine: a host target's when the machine has its
 /// architecture, and a machine target's when its emulator can start, the emulator program
-/// running and able to end with the process that starts it, and the firmware present for a UEFI
-/// target.
+/// running and able to end with the process that starts it, the TPM emulator running, and the
+/// firmware present for a UEFI target.
 pub fn available(target: Target) -> bool {
     let Some(arch) = target.arch() else {
         return false;
@@ -129,13 +238,28 @@ pub fn available(target: Target) -> bool {
         .stderr(Stdio::null())
         .output()
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("exit-with-parent"));
-    runs && (target.kind() != Some(Kind::Uefi) || Path::new(firmware(arch)).exists())
+    let tpm = Command::new(TPM_PROGRAM)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let (code, vars) = firmware(arch);
+    runs && tpm
+        && (target.kind() != Some(Kind::Uefi)
+            || (Path::new(code).exists() && Path::new(vars).exists()))
 }
 
-/// Boots the emulator as `launch` gives, with the standard streams of this process, and gives
-/// the status the run ends with once the emulator ends.
-pub fn run(launch: &Launch) -> i32 {
-    run_status(Command::new(&launch.program).args(&launch.args).status())
+/// Boots the emulator as `launch` gives on `machine`, with the standard streams of this process,
+/// and gives the status the run ends with once the emulator ends.
+pub fn run(launch: &Launch, machine: &Machine) -> i32 {
+    let mut command = Command::new(&launch.program);
+    command.args(&launch.args);
+    run_status(
+        machine
+            .boot(command)
+            .and_then(|mut boot| boot.emulator.wait()),
+    )
 }
 
 /// The status a run under the emulator ends with: v mod 128 when the machine wrote the byte v to
@@ -148,53 +272,141 @@ fn run_status(ended: io::Result<ExitStatus>) -> i32 {
     }
 }
 
-/// The firmware of an architecture's UEFI target: the first of its paths present on the host,
-/// or the first of them when none is.
-fn firmware(arch: Arch) -> &'static str {
-    let paths: &[&'static str] = match arch {
+/// The firmware of an architecture's UEFI target, its code and the template of its variables:
+/// the first pair present on the host, or the first pair when none is.
+fn firmware(arch: Arch) -> (&'static str, &'static str) {
+    let pairs: &[(&'static str, &'static str)] = match arch {
         Arch::Amd64 => &OVMF,
         Arch::Aarch64 => &AAVMF,
     };
-    paths
+    pairs
         .iter()
         .copied()
-        .find(|path| Path::new(path).exists())
-        .unwrap_or(paths[0])
+        .find(|(code, vars)| Path::new(code).exists() && Path::new(vars).exists())
+        .unwrap_or(pairs[0])
 }
 
-/// What becomes of what a machine writes to its boot volume.
-pub enum Writes {
-    /// The volume's directory keeps it.
-    Kept,
-    /// It lasts until the emulator ends, so that every boot finds the volume as it was made.
-    Dropped,
+/// The machine directory a launch boots in, holding the machine's disk, firmware variables, TPM
+/// state and sockets, and whether every boot makes its TPM state anew.
+pub struct Machine {
+    pub dir: PathBuf,
+    fresh: bool,
 }
 
-/// The emulator invocation that boots a machine image: a bare image directly, by the PVH boot
-/// protocol on x86_64 and by loading its segments on AArch64, and a UEFI image through the
-/// firmware from a FAT volume holding it at the default boot path and each of `files` at `/`
-/// followed by its name.
-pub fn launch(
-    target: Target,
-    image: &Path,
-    files: &[PathBuf],
-    writes: Writes,
-) -> io::Result<Launch> {
+/// A boot of the emulator, and the TPM emulator serving it; dropping it ends both.
+pub struct Boot {
+    pub emulator: Child,
+    tpm: Child,
+}
+
+impl Machine {
+    /// Starts the TPM emulator on the machine's TPM state, made anew for a fresh machine, waits
+    /// for its socket, then starts `command`, both in the machine directory.
+    pub fn boot(&self, mut command: Command) -> io::Result<Boot> {
+        let state = self.dir.join(TPM_STATE);
+        if self.fresh && state.exists() {
+            fs::remove_dir_all(&state)?;
+        }
+        fs::create_dir_all(&state)?;
+        let socket = self.dir.join(TPM_SOCKET);
+        if socket.exists() {
+            fs::remove_file(&socket)?;
+        }
+        let mut tpm = Command::new(TPM_PROGRAM)
+            .args(["socket", "--tpm2", "--tpmstate"])
+            .arg(format!("dir={TPM_STATE}"))
+            .args(["--ctrl"])
+            .arg(format!("type=unixio,path={TPM_SOCKET}"))
+            .arg("--terminate")
+            .current_dir(&self.dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let started = Instant::now();
+        let listening = loop {
+            if socket.exists() {
+                break Ok(());
+            }
+            match tpm.try_wait() {
+                Ok(None) if started.elapsed() < TPM_WAIT => thread::sleep(POLL),
+                Ok(_) => break Err(io::Error::other("the TPM emulator opens no socket")),
+                Err(error) => break Err(error),
+            }
+        };
+        let emulator = listening.and_then(|()| command.current_dir(&self.dir).spawn());
+        match emulator {
+            Ok(emulator) => Ok(Boot { emulator, tpm }),
+            Err(error) => {
+                drop(tpm.kill());
+                drop(tpm.wait());
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for Boot {
+    fn drop(&mut self) {
+        for child in [&mut self.emulator, &mut self.tpm] {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
+
+/// The emulator invocation that boots a machine image, in a machine directory holding a disk
+/// made blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by
+/// loading its segments on AArch64, and a UEFI image through the firmware from a FAT volume
+/// holding it at the default boot path and each of `files` at `/` followed by its name.
+pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> io::Result<Launch> {
     let arch = target.arch().expect("a machine target's architecture");
-    let mut args = base_args(arch);
+    let (dir, kept) = match boots {
+        Boots::Kept { dir, resets } => (dir, Some(resets)),
+        Boots::Fresh => (machine_of(image), None),
+    };
+    fs::create_dir_all(&dir)?;
+    let disk = dir.join(DISK);
+    if !disk.exists() {
+        fs::File::create(&disk)?.set_len(DISK_BYTES)?;
+    }
+    let mut args = base_args(arch, kvm_usable(arch), kept);
     match target.kind() {
         Some(Kind::Uefi) => {
-            let firmware = firmware(arch);
+            let (code, template) = firmware(arch);
             let volume = boot_volume(arch, image, files)?.display().to_string();
-            args.push("-drive".to_owned());
-            args.push(format!(
-                "if=pflash,format=raw,unit=0,readonly=on,file={firmware}"
-            ));
-            args.push("-drive".to_owned());
-            args.push(match writes {
-                Writes::Kept => format!("format=raw,file=fat:rw:{volume}"),
-                Writes::Dropped => format!("format=raw,file=fat:{volume},snapshot=on"),
-            });
+            let (vars, volume) = match kept {
+                Some(_) => {
+                    let vars = dir.join(VARS);
+                    if !vars.exists() {
+                        fs::copy(template, vars)?;
+                    }
+                    (
+                        format!("if=pflash,format=raw,unit=1,file={VARS}"),
+                        format!("if=none,id=boot,format=raw,file=fat:rw:{volume}"),
+                    )
+                }
+                None => (
+                    format!("if=pflash,format=raw,unit=1,file={template},snapshot=on"),
+                    format!("if=none,id=boot,format=raw,file=fat:{volume},snapshot=on"),
+                ),
+            };
+            for (option, value) in [
+                (
+                    "-drive",
+                    format!("if=pflash,format=raw,unit=0,readonly=on,file={code}"),
+                ),
+                ("-drive", vars),
+                ("-drive", volume),
+                (
+                    "-device",
+                    "virtio-blk-pci,drive=boot,bootindex=0,iommu_platform=on,disable-legacy=on"
+                        .to_owned(),
+                ),
+            ] {
+                args.push(option.to_owned());
+                args.push(value);
+            }
         }
         _ => {
             args.push("-kernel".to_owned());
@@ -204,7 +416,10 @@ pub fn launch(
     Ok(Launch {
         program: program(arch).into(),
         args,
-        emulated: true,
+        machine: Some(Machine {
+            dir,
+            fresh: kept.is_none(),
+        }),
     })
 }
 
@@ -234,11 +449,17 @@ fn volume_of(image: &Path) -> PathBuf {
     image.with_extension("boot")
 }
 
-/// Removes a machine image and any boot volume a launch made for it.
+/// The machine directory of a test run's launch of an image.
+fn machine_of(image: &Path) -> PathBuf {
+    image.with_extension("machine")
+}
+
+/// Removes a test image with the boot volume and machine directory a launch made for it.
 pub fn discard(image: &Path) -> io::Result<()> {
-    let volume = volume_of(image);
-    if volume.exists() {
-        fs::remove_dir_all(volume)?;
+    for directory in [volume_of(image), machine_of(image)] {
+        if directory.exists() {
+            fs::remove_dir_all(directory)?;
+        }
     }
     fs::remove_file(image)
 }
@@ -247,14 +468,17 @@ pub fn discard(image: &Path) -> io::Result<()> {
 /// `name`, and gives how it ended, its serial output and its diagnostics; none once it has used
 /// more than `PROCESSOR_TIME` of host processor time, or lasted `WALL_TIME`.
 pub fn boot(launch: &Launch, (name, path): (&str, &Path)) -> io::Result<Option<Output>> {
-    let mut child = Command::new(&launch.program)
+    let machine = launch.machine.as_ref().expect("a machine image's launch");
+    let mut command = Command::new(&launch.program);
+    command
         .args(&launch.args)
         .arg("-fw_cfg")
         .arg(format!("name={name},file={}", path.display()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut boot = machine.boot(command)?;
+    let child = &mut boot.emulator;
     let stdout = drain(child.stdout.take().expect("the emulator's piped output"));
     let stderr = drain(
         child

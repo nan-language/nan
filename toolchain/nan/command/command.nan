@@ -29,6 +29,9 @@ enum Name derives Copy, Eq {
     Upgrade
     Diff
     Seal
+    KeyNew
+    KeyShow
+    KeyTrust
 } Name
 
 /// A command a command line names, and how many of its words name it.
@@ -43,7 +46,7 @@ fn Name.read(args: Slice[text::String]) -> Option[Named] {
         return None
     }
     let leading = args[0].as_str()
-    if leading == "edit" or leading == "api" or leading == "dep" {
+    if leading == "edit" or leading == "api" or leading == "dep" or leading == "key" {
         if args.len() < 2 {
             return None
         }
@@ -78,7 +81,7 @@ fn Name.read(args: Slice[text::String]) -> Option[Named] {
     return Some(Named(name: name, taken: 1))
 } Name.read
 
-/// The command named by two words, the first being `edit`, `api` or `dep`.
+/// The command named by two words, the first being `edit`, `api`, `dep` or `key`.
 fn paired(leading: Str, second: Str) -> Option[Name] {
     if leading == "edit" {
         return match second {
@@ -93,6 +96,14 @@ fn paired(leading: Str, second: Str) -> Option[Name] {
             return Some(Name.ApiUpdate)
         }
         return None
+    }
+    if leading == "key" {
+        return match second {
+            "new" => Some(Name.KeyNew)
+            "show" => Some(Name.KeyShow)
+            "trust" => Some(Name.KeyTrust)
+            else => None
+        }
     }
     return match second {
         "add" => Some(Name.DepAdd)
@@ -132,6 +143,9 @@ proj fn Name.words(self) -> Str {
         Name.Upgrade => "upgrade"
         Name.Diff => "diff"
         Name.Seal => "seal"
+        Name.KeyNew => "key new"
+        Name.KeyShow => "key show"
+        Name.KeyTrust => "key trust"
     }
 } Name.words
 
@@ -156,7 +170,7 @@ proj fn Name.valued(self) -> Str {
         Name.Build => "--compare-with"
         Name.EditReplace => "--expect --from"
         Name.Test => "--replay"
-        Name.Publish => "--local --name"
+        Name.Publish => "--local --name --as"
         Name.Merge => "--path"
         Name.Upgrade => "--language"
         Name.Diff => "--path --agent"
@@ -169,7 +183,7 @@ proj fn Name.valued(self) -> Str {
 fn Name.is_listing(self, arg: Str) -> bool {
     return match self {
         Name.ApiUpdate => arg == "--confirm-docs"
-        Name.Publish => arg == "--breaking"
+        Name.Publish => arg == "--breaking" or arg == "--author"
         else => false
     }
 } Name.is_listing
@@ -177,7 +191,7 @@ fn Name.is_listing(self, arg: Str) -> bool {
 /// The most operands the command takes.
 fn Name.operands(self) -> usize {
     return match self {
-        Name.Find or Name.EditRename or Name.EditMove or Name.DepAdd or Name.Diff => 2
+        Name.Find or Name.EditRename or Name.EditMove or Name.DepAdd or Name.Diff or Name.KeyTrust => 2
         Name.Merge => 3
         else => 1
     }
@@ -197,6 +211,7 @@ fn Name.scoped(self) -> bool {
     return match self {
         Name.Find or Name.Show or Name.Read or Name.Context or Name.Explain or Name.Expand or Name.EditReplace or Name.EditRename => false
         Name.EditMove or Name.Primer or Name.DepAdd or Name.Publish or Name.Merge or Name.Diff or Name.Seal => false
+        Name.KeyNew or Name.KeyShow or Name.KeyTrust => false
         else => true
     }
 } Name.scoped
@@ -205,14 +220,15 @@ fn Name.scoped(self) -> bool {
 fn Name.writes(self) -> bool {
     return match self {
         Name.Check or Name.Find or Name.Holes or Name.Show or Name.Read or Name.Context or Name.Explain or Name.Expand => false
-        Name.Primer or Name.Diff => false
+        Name.Primer or Name.Diff or Name.KeyNew or Name.KeyShow => false
         else => true
     }
 } Name.writes
 
-/// Whether the command checks or loads work its crew may share; `nan primer` only prints.
+/// Whether the command checks or loads work its crew may share; `nan primer` only prints, and
+/// `nan key new` and `nan key show` read only the user directory.
 fn Name.crewed(self) -> bool {
-    return self != Name.Primer
+    return self != Name.Primer and self != Name.KeyNew and self != Name.KeyShow
 } Name.crewed
 
 /// The names of the counts its summary gives, separated by spaces.
@@ -221,8 +237,8 @@ proj fn Name.counts(self) -> Str {
         Name.Check or Name.Fix => "errors incomplete"
         Name.Test or Name.Verify => "errors incomplete tests failed"
         Name.Fmt or Name.EditReplace or Name.EditRename or Name.EditMove or Name.Build or Name.Run or Name.ApiUpdate => "files errors incomplete"
-        Name.DepAdd or Name.DepSync or Name.DepApprove or Name.Publish or Name.Upgrade or Name.Seal => "files errors incomplete"
-        Name.Find or Name.Holes or Name.Show or Name.Read or Name.Explain or Name.Expand or Name.Primer or Name.Diff => "records"
+        Name.DepAdd or Name.DepSync or Name.DepApprove or Name.Publish or Name.Upgrade or Name.Seal or Name.KeyNew or Name.KeyTrust => "files errors incomplete"
+        Name.Find or Name.Holes or Name.Show or Name.Read or Name.Explain or Name.Expand or Name.Primer or Name.Diff or Name.KeyShow => "records"
         Name.Context => "entries radius"
         Name.Merge => "files conflicts errors"
     }
@@ -596,7 +612,7 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 f
     let Ok(current) = attempt text::String.try_from_utf8(directory.view(), alloc) else {
         return 101
     }
-    let ran = try await run(take args, take current, home, exec: world.exec, clock: world.clock, alloc)
+    let ran = try await run(take args, take current, home, exec: world.exec, clock: world.clock, random: world.random, alloc)
     match ran.launch {
         Some(launch) => return launch.start(alloc)
         None => {}
@@ -609,7 +625,15 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 f
 /// starts. The command runs in a domain of its own, so that a trap of its implementation is an
 /// internal error, beside a worker task per other processor, up to `CREW_WORKERS`, serving the
 /// crew of its checks and loads, each drawing on a cell of its own, when it has a crew.
-fn run(take args: mem::List[text::String], take current: text::String, home: Option[cache::HomeOverride], exec: task::Executor, clock: sys::Clock, alloc: mem::Alloc) -> Ran fails task::Cancelled uses wait {
+fn run(
+    take args: mem::List[text::String],
+    take current: text::String,
+    home: Option[cache::HomeOverride],
+    exec: task::Executor,
+    clock: sys::Clock,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Ran fails task::Cancelled uses wait {
     let Some(invocation) = read_command(args.view(), alloc) else {
         return usage(args.view(), alloc)
     }
@@ -640,7 +664,7 @@ fn run(take args: mem::List[text::String], take current: text::String, home: Opt
                     try await served.serve(clock, alloc: budget.alloc())
                 }, stack: COMMAND_STACK)
             }
-            outcome = attempt execute(read, current: current.as_str(), home: user, trace: given.contents(), crew, alloc)
+            outcome = attempt execute(read, current: current.as_str(), home: user, trace: given.contents(), crew, random, alloc)
             s.cancel()
         })
         return outcome
@@ -794,9 +818,23 @@ fn numbered(repro: Str, number: u32, alloc: mem::Alloc) -> text::String {
 
 /// Runs the command: `nan merge` and the workspace form of `nan diff` outside a workspace, every
 /// other command in the session of the workspace holding `current`, under the workspace lock.
-fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], trace: Trace, crew: Crew, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+fn execute(
+    invocation: Invocation,
+    current: Str,
+    home: Option[cache::HomeOverride],
+    trace: Trace,
+    crew: Crew,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Outcome fails platform::IoError {
     if invocation.name == Name.Merge {
         return Outcome.Output(try merge_run(invocation, current, home, trace, alloc))
+    }
+    if invocation.name == Name.KeyNew {
+        return Outcome.Output(try key_new(invocation, home, random, alloc))
+    }
+    if invocation.name == Name.KeyShow {
+        return Outcome.Output(try key_show(invocation, home, alloc))
     }
     if invocation.name == Name.Diff and invocation.value("--path").is_none() and not invocation.flag("--green") {
         return Outcome.Output(try diff_workspaces(invocation, current, home, trace, alloc))
@@ -842,6 +880,11 @@ fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverrid
         Name.Upgrade => try dep_upgrade(invocation, session, current, trace, alloc)
         Name.Diff => diff_run(invocation, session, current, trace, alloc)
         Name.Seal => try seal_run(invocation, session, current, trace, alloc)
+        Name.KeyTrust => try key_trust(invocation, session, current, trace, alloc)
+        Name.KeyNew or Name.KeyShow => {
+            expect false
+            return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: ".", alloc))
+        }
     }
     return Outcome.Output(take written)
 } execute

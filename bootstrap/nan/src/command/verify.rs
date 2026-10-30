@@ -26,7 +26,7 @@ pub fn run(
     };
     trace.scope = Some(written.clone());
     let packages = gated(workspace, &scope);
-    let (diagnostics, report) = judged(workspace, &packages)?;
+    let (diagnostics, report) = judged(workspace, &packages, &[])?;
     let count = |class: Class| {
         diagnostics
             .iter()
@@ -59,8 +59,13 @@ pub fn run(
 }
 
 /// What the release gate reports on packages: their check diagnostics, then, when none is an
-/// error, their tests' report, and their gate diagnostics; by path, line and code.
-pub fn judged(workspace: &Workspace, packages: &[usize]) -> io::Result<(Vec<Diagnostic>, Report)> {
+/// error, their tests' report, and their gate diagnostics, `authors` being the author principals
+/// a publication names; by path, line and code.
+pub fn judged(
+    workspace: &Workspace,
+    packages: &[usize],
+    authors: &[String],
+) -> io::Result<(Vec<Diagnostic>, Report)> {
     let mut diagnostics: Vec<Diagnostic> = check::reported(workspace, &Scope::Workspace)
         .into_iter()
         .filter(|diagnostic| within(workspace, packages, diagnostic))
@@ -93,7 +98,7 @@ pub fn judged(workspace: &Workspace, packages: &[usize]) -> io::Result<(Vec<Diag
         }
     }
     for index in packages {
-        diagnostics.extend(check::gate(workspace, &workspace.packages[*index]));
+        diagnostics.extend(check::gate(workspace, &workspace.packages[*index], authors));
     }
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))

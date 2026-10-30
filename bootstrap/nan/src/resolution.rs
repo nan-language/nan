@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
+use crate::artefact;
 use crate::cache::{Cache, Exposed};
 use crate::check;
 use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, Fix};
@@ -314,6 +315,12 @@ impl Resolver<'_> {
                         pending_root(source.dir.as_deref().unwrap_or_default())
                     }
                     Candidate::Stored(entry) => entry.root(),
+                },
+                signer: match candidate {
+                    Candidate::Current(_) => None,
+                    Candidate::Stored(entry) => artefact::decode(&entry.artefact)
+                        .ok()
+                        .and_then(|decoded| decoded.publisher_key()),
                 },
                 line: 0,
             })

@@ -1,6 +1,6 @@
 # 0011. One release gate
 
-Status: accepted
+Status: accepted; unsigned seals and the reserved signature field superseded by 0082
 
 ## Context
 

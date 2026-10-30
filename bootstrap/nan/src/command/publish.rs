@@ -1,6 +1,6 @@
 //! `nan publish --local <dir>`: runs the release gate on the package in `<dir>`, moves the
-//! tombstones of its source into its history, builds its artefact and appends it to the local
-//! store as a named release whose parent is the history head.
+//! tombstones of its source into its history, builds its artefact, signed with `--as`, and
+//! appends it to the local store as a named release whose parent is the history head.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -8,20 +8,23 @@ use std::path::Path;
 
 use super::test::fail_records;
 use super::verify::judged;
-use super::{Invocation, Trace, record};
+use super::{Invocation, Trace, key, record};
+use crate::artefact::{self, Publication};
 use crate::cache::Cache;
 use crate::check;
 use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic};
 use crate::format;
 use crate::journal;
 use crate::machine::history::History;
+use crate::machine::principals::is_principal;
 use crate::output::{Output, Record, Verdict};
 use crate::release;
 use crate::scope::Scope;
+use crate::sign;
 use crate::store::{Append, Class, Entry, Store, Summary};
 use crate::syntax::grammar::Rule;
 use crate::syntax::items::Item;
-use crate::workspace::{Member, Workspace};
+use crate::workspace::{Member, Package, Workspace};
 
 pub fn run(
     invocation: &Invocation,
@@ -43,7 +46,9 @@ pub fn run(
     };
     let mut breaking = invocation.listed("--breaking");
     let reason = breaking.pop();
-    if invocation.listed("--breaking").len() == 1 {
+    let publisher = invocation.value("--as");
+    let named = invocation.listed("--author");
+    if invocation.listed("--breaking").len() == 1 || (publisher.is_none() && !named.is_empty()) {
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     }
     trace.scope = Some(written.clone());
@@ -53,7 +58,28 @@ pub fn run(
         .as_ref()
         .expect("a package with a manifest");
     let manifest_path = format!("{}/package.nan", package.dir);
-    let (diagnostics, report) = judged(workspace, &[index])?;
+    let mut authors: Vec<String> = match named.is_empty() {
+        true => publisher.into_iter().map(str::to_owned).collect(),
+        false => named.iter().map(|author| (*author).to_owned()).collect(),
+    };
+    authors.sort();
+    authors.dedup();
+    let seed = match publisher {
+        Some(principal) => match publishing_key(package, principal, &authors)? {
+            Ok(seed) => Some((principal, seed)),
+            Err(diagnostic) => {
+                return Ok(refusal(
+                    invocation,
+                    &written,
+                    workspace,
+                    index,
+                    &[diagnostic],
+                ));
+            }
+        },
+        None => None,
+    };
+    let (diagnostics, report) = judged(workspace, &[index], &authors)?;
     if !diagnostics.is_empty() || !report.failures.is_empty() {
         let mut records: Vec<Record> = diagnostics
             .iter()
@@ -220,12 +246,43 @@ pub fn run(
         authority,
         functions,
     };
+    let artefact = match seed {
+        Some((principal, seed)) => artefact::published(
+            &built.artefact,
+            &Publication {
+                principal,
+                seed: &seed,
+                toolchain: crate::toolchain::hash(1),
+                closure: closure
+                    .members
+                    .iter()
+                    .map(|(package, member)| {
+                        let root = match member {
+                            Member::Source(_) => artefact::decode(&built.artefact)
+                                .map(|decoded| decoded.root_hash())
+                                .expect("an artefact the toolchain wrote decodes"),
+                            Member::Release(at) => moved_workspace.releases[*at].root,
+                        };
+                        (package.clone(), root)
+                    })
+                    .collect(),
+                authors,
+                lock: moved_package
+                    .machine
+                    .lock
+                    .as_ref()
+                    .map(|lock| lock.bytes.clone())
+                    .unwrap_or_default(),
+            },
+        ),
+        None => built.artefact,
+    };
     let appended = store.append(Append {
         package: manifest.name.clone(),
         name: Some(name.clone()),
         parent: parent.map(Entry::root),
         summary: Some(summary),
-        artefact: built.artefact,
+        artefact,
         sources: built.sources,
     })?;
     let entry = match appended {
@@ -272,6 +329,25 @@ pub fn run(
         lines: Vec::new(),
     }));
     Ok(output(invocation, &written, records, &[], &changes))
+}
+
+/// The seed of the publisher's secret key, or why the package is not published: a principal out
+/// of form, or a key the user directory lacks or whose public key differs from the one the
+/// package's principals file gives the publisher.
+fn publishing_key(
+    package: &Package,
+    publisher: &str,
+    authors: &[String],
+) -> io::Result<Result<[u8; 32], Diagnostic>> {
+    if !is_principal(publisher) || !authors.iter().all(|author| is_principal(author)) {
+        return Ok(Err(Diagnostic::new(Code::SealBadPrincipal)));
+    }
+    let expected = package.machine.principals().key(publisher).copied();
+    Ok(match key::secret_key(publisher)? {
+        Ok(Some(seed)) if expected.is_none_or(|key| key == sign::public_key(&seed)) => Ok(seed),
+        Ok(_) => Err(Diagnostic::new(Code::KeyMissing)),
+        Err(exposed) => Err(key::exposed_diagnostic(exposed)),
+    })
 }
 
 /// The store a staged release's workspace reads: the entries already read.

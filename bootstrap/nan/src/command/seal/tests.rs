@@ -1,6 +1,8 @@
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::command::key::tests::TestPrincipal;
 use crate::command::tests::run_in;
 use crate::workspace::tests::Scratch;
 
@@ -76,4 +78,41 @@ fn a_seal_accepts_the_first_requires_of_a_private_function() {
     assert!(verdict("verify").contains("\nincomplete api.weakening-pending levels/levels.nan:3 "));
     assert!(verdict("seal levels::halved --as ana-review").starts_with("ok seal"));
     assert!(verdict("verify").starts_with("ok verify"));
+}
+
+#[test]
+fn a_seal_by_a_principal_the_package_keys_is_signed_and_current_while_its_signature_verifies() {
+    let scratch = Scratch::new(&[
+        ("procinfo/package.nan", MANIFEST),
+        ("procinfo/procinfo.nan", SOURCE),
+    ]);
+    let dir = &scratch.0;
+    let package = dir.join("procinfo");
+    run_in(dir, "api update");
+    let seed = [7; 32];
+    let reviewer = TestPrincipal::new("reviewer", Some(seed));
+    let name = &reviewer.0;
+    run_in(
+        &package,
+        &format!("key trust {name} {}", TestPrincipal::key_of(seed)),
+    );
+    let sealed = run_in(dir, &format!("seal procinfo::getpid --as {name}")).output;
+    assert!(sealed.starts_with("ok seal"), "{sealed}");
+    let snapshot = fs::read_to_string(package.join(".nan/api/procinfo.nan")).expect("the snapshot");
+    assert!(snapshot.contains("\nsignature \""), "{snapshot}");
+    assert!(run_in(dir, "verify").output.starts_with("ok verify"));
+    run_in(
+        &package,
+        &format!("key trust {name} {}", TestPrincipal::key_of([8; 32])),
+    );
+    let lapsed = run_in(dir, "verify").output;
+    assert!(
+        lapsed.contains("\nincomplete trust.unsealed procinfo/procinfo.nan:3 "),
+        "{lapsed}"
+    );
+    assert!(
+        run_in(dir, &format!("seal procinfo::getpid --as {name}"))
+            .output
+            .contains("\nerror key.missing - -\n")
+    );
 }

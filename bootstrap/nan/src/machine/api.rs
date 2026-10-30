@@ -102,8 +102,8 @@ pub struct Seal {
     pub closure: Hash,
     /// In byte order of path, then kind, then hash.
     pub entries: Vec<ClosureEntry>,
-    /// The reserved signature field, which the toolchain never writes.
-    pub signature: Option<String>,
+    /// The principal's signature of the seal.
+    pub signature: Option<[u8; 64]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -229,7 +229,10 @@ impl Entry {
                 )
             }));
             if let Some(signature) = &seal.signature {
-                lines.push(format!("signature {}", escaped(signature)));
+                lines.push(format!(
+                    "signature {}",
+                    escaped(&crate::sign::signature_form(signature))
+                ));
             }
         }
         lines
@@ -450,11 +453,20 @@ fn read_entry(path: &str, records: &[&Record]) -> Result<Entry, u32> {
                 let path = cursor.text().ok_or(fail)?.to_owned();
                 let hash = cursor.hash().ok_or(fail)?;
                 let seal = entry.seals.last_mut().ok_or(fail)?;
+                if seal.signature.is_some() {
+                    return Err(fail);
+                }
                 seal.entries.push(ClosureEntry { path, body, hash });
             }
             "signature" => {
-                let signature = cursor.text().ok_or(fail)?.to_owned();
-                entry.seals.last_mut().ok_or(fail)?.signature = Some(signature);
+                let signature = cursor
+                    .text()
+                    .and_then(crate::sign::read_signature)
+                    .ok_or(fail)?;
+                let seal = entry.seals.last_mut().ok_or(fail)?;
+                if seal.signature.replace(signature).is_some() {
+                    return Err(fail);
+                }
             }
             _ => return Err(fail),
         }

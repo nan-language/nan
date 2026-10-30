@@ -1,6 +1,6 @@
-//! The user directory and its build cache: cache entries, each a file never rewritten, and cache
-//! records, each a file later runs replace whole; both hold their contents followed by their
-//! BLAKE3-256 digest.
+//! The user directory: its build cache, of cache entries, each a file never rewritten, and cache
+//! records, each a file later runs replace whole, both holding their contents followed by their
+//! BLAKE3-256 digest; and the secret keys of its principals.
 
 use std::fs::{self, DirBuilder, Metadata, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
@@ -27,6 +27,7 @@ pub fn use_home(home: PathBuf, store: Option<PathBuf>) {
 pub struct Cache {
     dir: Option<PathBuf>,
     store: Option<PathBuf>,
+    keys: Option<PathBuf>,
     home: PathBuf,
     uid: u32,
 }
@@ -69,6 +70,7 @@ impl Cache {
             return Ok(Ok(Cache {
                 dir: None,
                 store: None,
+                keys: None,
                 home: PathBuf::new(),
                 uid,
             }));
@@ -100,6 +102,7 @@ impl Cache {
         Ok(Ok(Cache {
             dir: Some(user.join("cache")),
             store: Some(store),
+            keys: Some(user.join("keys")),
             home,
             uid,
         }))
@@ -166,6 +169,70 @@ impl Cache {
         file.write_all(&blake3(contents))?;
         fs::rename(fresh, dir.join(name))
     }
+
+    /// The secret seed `keys/<principal>.key` holds: none when the file is missing or does not
+    /// hold 32 bytes.
+    pub fn secret_key(&self, principal: &str) -> io::Result<Result<Option<[u8; 32]>, Exposed>> {
+        let Some(keys) = &self.keys else {
+            return Ok(Ok(None));
+        };
+        let file = keys.join(format!("{principal}.key"));
+        for path in [keys, &file] {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if secret_exposed(&metadata, self.uid) => {
+                    return Ok(Err(Exposed(shown(&self.home, path))));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Ok(None)),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Ok(fs::read(&file)?.try_into().ok()))
+    }
+
+    /// Writes the secret seed of a principal that has no key file, creating `keys` when it is
+    /// missing: false, writing nothing, when the file exists. Gives the file's path as
+    /// `~/.nan/...`.
+    pub fn new_key(
+        &self,
+        principal: &str,
+        seed: &[u8; 32],
+    ) -> io::Result<Result<(bool, String), Exposed>> {
+        let Some(keys) = &self.keys else {
+            return Err(io::Error::other(
+                "the user database gives no home directory",
+            ));
+        };
+        match DirBuilder::new().mode(0o700).create(keys) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        if secret_exposed(&fs::symlink_metadata(keys)?, self.uid) {
+            return Ok(Err(Exposed(shown(&self.home, keys))));
+        }
+        let file = keys.join(format!("{principal}.key"));
+        let shown = shown(&self.home, &file);
+        let opened = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file);
+        match opened {
+            Ok(mut written) => {
+                written.write_all(seed)?;
+                Ok(Ok((true, shown)))
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(Ok((false, shown))),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether the directory of secret keys or a key file is a symbolic link, belongs to another
+/// user, or is accessible to its group or to others.
+fn secret_exposed(metadata: &Metadata, uid: u32) -> bool {
+    metadata.file_type().is_symlink() || metadata.uid() != uid || metadata.mode() & 0o077 != 0
 }
 
 /// Whether a part of the user directory is a symbolic link, belongs to another user, or is

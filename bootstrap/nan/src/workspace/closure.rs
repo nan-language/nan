@@ -8,6 +8,7 @@ use std::io;
 
 use super::Package;
 use super::manifest::{relative, resolve};
+use crate::artefact;
 use crate::diagnostic::{Code, Diagnostic};
 use crate::hash::Hash;
 use crate::store::Entry;
@@ -193,15 +194,23 @@ impl Reader<'_> {
                 .unwrap_or(manifest.line);
             let held = self.store.entry(&line.root)?;
             let mismatched = held.as_ref().is_some_and(|entry| entry.root() != line.root);
+            let forged = held.as_ref().is_some_and(|entry| {
+                artefact::decode(&entry.artefact).is_ok_and(|decoded| {
+                    !decoded.accepted(line.signer.as_ref(), package.machine.principals())
+                })
+            });
             if mismatched {
                 self.report(Code::ArtefactRootMismatch, package, reaching);
+            } else if forged {
+                self.report(Code::ArtefactBadSignature, package, reaching);
             }
+            let refused = mismatched || forged;
             let missing = |reader: &mut Reader| {
-                if !mismatched {
+                if !refused {
                     reader.report(Code::DepReleaseMissing, package, reaching);
                 }
             };
-            let entry = held.filter(|_| !mismatched);
+            let entry = held.filter(|_| !refused);
             let member = if line.source.starts_with('.') {
                 let dir = resolve(&package.dir, &line.source);
                 let source = self.at(&dir).filter(|at| {

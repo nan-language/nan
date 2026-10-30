@@ -8,7 +8,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 | Package | Holds | Modules below the root |
 | --- | --- | --- |
-| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products | `core::atomic` |
+| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures | `core::atomic`, `core::crypto` |
 | `mem` | allocators, budgets, stores, ids, handles, boxes, shared values, collections, once maps | `mem::wire` |
 | `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
@@ -60,6 +60,7 @@ The table names every pub std type, interface, free function and registry with t
 | `core` | `Untrusted`, `core::Parts` | [Untrusted values](15-untrusted.md#untrusted-values), [Content-blind operations](15-untrusted.md#content-blind-operations) |
 | `core` | `Generate`, `core::Choices` | [Generation](22-testing.md#generation) |
 | `core` | `core::atomic::AtomicU8`, `core::atomic::AtomicU16`, `core::atomic::AtomicU32`, `core::atomic::AtomicU64`, `core::atomic::AtomicUsize`, `core::atomic::AtomicBool` | [Atomics](16-concurrency.md#atomics) |
+| `core` | `core::crypto::PublicKey`, `core::crypto::Signature`, `core::crypto::SecretKey` | [Signatures](31-trust.md#signatures) |
 | `mem` | `mem::Alloc`, `mem::Budget`, `mem::OutOfMemory` | [Allocators](12-memory.md#allocators), [Budgets](12-memory.md#budgets), [Growth](12-memory.md#growth) |
 | `mem` | `mem::Heap`, `mem::Arena`, `mem::Id`, `mem::Pool`, `mem::Handle` | [Stores](12-memory.md#stores) |
 | `mem` | `mem::Box` | [Box](07-ownership.md#box); `from_box` in [Dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch) |

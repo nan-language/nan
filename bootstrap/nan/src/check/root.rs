@@ -145,7 +145,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
         .collect();
     let views: Vec<(Target, &Checker)> =
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
-    let items = Items::of(&views, &name);
+    let items = Items::of(&views, package);
     let computed = super::computed_snapshots(workspace, package, &items, &[]);
     let interface: Vec<(String, String)> = computed
         .modules
@@ -280,6 +280,9 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
                     .iter()
                     .map(|closure| (closure.body, closure.path.clone(), closure.hash))
                     .collect(),
+                signed: seal
+                    .signature
+                    .zip(items.principals.key(&seal.principal).copied()),
             })
         })
         .collect();
@@ -322,20 +325,7 @@ pub fn package_files(package: &Package) -> Vec<(String, Vec<u8>)> {
             Some((within.to_owned(), file.syntax.source.clone()))
         })
         .collect();
-    let machine = &package.machine;
-    let lock = machine
-        .lock
-        .iter()
-        .map(|loaded| (&loaded.path, &loaded.bytes));
-    let history = machine
-        .history
-        .iter()
-        .map(|loaded| (&loaded.path, &loaded.bytes));
-    let snapshots = machine
-        .snapshots
-        .iter()
-        .map(|(_, loaded)| (&loaded.path, &loaded.bytes));
-    for (path, content) in lock.chain(history).chain(snapshots) {
+    for (path, content) in package.machine.files() {
         if let Some(within) = path.strip_prefix(&prefix) {
             files.push((within.to_owned(), content.clone()));
         }

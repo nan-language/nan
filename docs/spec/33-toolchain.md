@@ -31,9 +31,10 @@ The commands are:
 - `nan merge <base> <ours> <theirs> [--path <path>]`
 - `nan diff <old> <new> [--path <path>]`, `nan diff --green [<scope>] [--agent <name>]`
 - `nan seal <item> --as <principal>`
+- `nan key new <principal>`, `nan key show <principal>`, `nan key trust <principal> <key>`
 - `nan api update [<scope>] [--confirm-docs <item>...]`
 - `nan dep add <alias> <source>`, `nan dep sync [<package>]`, `nan dep approve [<package>]`
-- `nan publish --local <dir> [--name <store name>] [--breaking <item>... <reason>]`
+- `nan publish --local <dir> [--name <store name>] [--as <principal> [--author <principal>...]] [--breaking <item>... <reason>]`
 - `nan upgrade [<package>]`, `nan upgrade --language <N> [<scope>]`
 - `nan build [<scope>] [--compare-with <image>]`
 - `nan run [<package>] [--keep-resets] [-- <argument>...]`
@@ -88,7 +89,7 @@ ok show core::Option.is_some --api: records 1
 
 ### Writing commands
 
-- `nan seal`, `nan api update`, `nan dep`, `nan publish` and `nan upgrade` act as [Trust and the release gate](31-trust.md), [Identity and versioning](29-identity-versioning.md) and [language upgrades](37-evolution.md#language-upgrades) define. In `nan publish`, the last argument after `--breaking` is the reason and the others are items. `nan dep add` writes the `dep` directive into the manifest of the current directory's package, `tool.usage` outside every package, then performs `nan dep sync`.
+- `nan seal`, `nan key`, `nan api update`, `nan dep`, `nan publish` and `nan upgrade` act as [Trust and the release gate](31-trust.md), [Identity and versioning](29-identity-versioning.md) and [language upgrades](37-evolution.md#language-upgrades) define. In `nan publish`, the last argument after `--breaking` is the reason and the others are items. `nan dep add` writes the `dep` directive into the manifest of the current directory's package, `tool.usage` outside every package, then performs `nan dep sync`. `nan key new` and `nan key show` run in any directory, a workspace or not.
 - `nan dep sync` and `nan upgrade` without `--language` print a record `release <package> <old code root> <new code root> <class>` per package whose locked release changes, `-` for an absent release, holding `epoch <item> <epoch>` per epoch bump and `widening <entry>` per [widening](14-authority.md#authority-summaries) as a lock's `approved` record writes it. `nan publish` prints `published <store name> <code root> <release class> <encode class>`.
 - `nan diff <old> <new>` compares two versions of the workspace, or with `--path` two versions of one file. It prints a record `changed <item> <location>` per changed item, located in the new version or, when removed, the old, followed by its [change classes](31-trust.md#change-classes) in order and by `weakening` or `widening` when the change is one. It holds the old and new texts merged along their longest common subsequence of lines with the least old, then new, line numbers in lexicographic order: kept lines prefixed with 2 spaces, removed ones `- `, added ones `+ `, removals first. For the `package` item of a final-link root, the record also holds the `approved` and `epoch` records its lock gains or loses, merged as texts are. `nan diff --green` prints such a record, merging `api` lines, per item of its scope whose interface hash differs from its [last-green](#last-green) entry.
 - `nan build` performs the [final build](27-program-model.md#final-builds) of each program in its scope, writing its [image](27-program-model.md#images) into `.nan/images/<target>/`; a scope without a program is `tool.usage`. With `--compare-with`, the final build also performs [stage comparison](36-builds.md#stage-comparison) once its checking step reports no error, and writes no image when the comparison reports an error.
@@ -311,7 +312,7 @@ Files match by path and absence counts as a version; a file other than a source 
 4. When one side deleted X and wrote `retired X => Y preserves` and the other changed X, the driver merges that change into Y, X's base and changed versions renamed to Y. In the file form, a Y outside the file is a conflict.
 5. Items and members keep ours' order; one only theirs holds follows the nearest preceding one in theirs that the result holds, after those ours added there, or comes first.
 
-The lock takes the version with the later [snapshot](29-identity-versioning.md#lock), ours when neither is later; the history takes the union of the tombstones, ours' winning for equal identities, and the `name` and `head` records of the version that changed them from the base, ours' when both did; an API snapshot merges per entry as items do, an entry both sides changed differently taking ours' records and theirs' `pending` records. In the workspace form, the driver then checks the merged workspace and prints its diagnostics.
+The lock takes the version with the later [snapshot](29-identity-versioning.md#lock), ours when neither is later; the history takes the union of the tombstones, ours' winning for equal identities, and the `name` and `head` records of the version that changed them from the base, ours' when both did; an API snapshot merges per entry as items do, an entry both sides changed differently taking ours' records and theirs' `pending` records; the principals file merges as one unit. In the workspace form, the driver then checks the merged workspace and prints its diagnostics.
 
 ### Order-free members
 

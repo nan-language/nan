@@ -1,0 +1,173 @@
+//! `nan key new <principal>`, `nan key show <principal>` and `nan key trust <principal> <key>`: the secret keys of the user directory and the principals file of a package.
+
+/// `nan key new`: writes a principal's secret key from a random seed and prints its public key.
+fn key_new(invocation: Invocation, home: Option[cache::HomeOverride], random: sys::Random, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let principal = invocation.operands[0].as_str()
+    if not machine::is_principal(principal) {
+        return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.SealBadPrincipal, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+    }
+    let user_cache = match try cache::Cache.open(cache::copied_override(home, alloc), alloc) {
+        Ok(opened) => opened
+        Err(exposed) => return key_refused(invocation, written: written.as_str(), refused: exposed_line(take exposed, alloc), alloc)
+    }
+    var seed = Array[u8, 32].filled(0)
+    let Ok(_) = attempt random.fill(mut seed.view_mut()) else {
+        fail platform::IoError.Other(0)
+    }
+    let made = match try user_cache.new_key(principal, seed) {
+        Ok(found) => found
+        Err(exposed) => return key_refused(invocation, written: written.as_str(), refused: exposed_line(take exposed, alloc), alloc)
+    }
+    let cache::NewKey(made: wrote, path: path) = made
+    if not wrote {
+        return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.KeyExists, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+    }
+    var records = mem::List[output::Record].empty(alloc)
+    mut records.push(key_record(principal, key: core::crypto::SecretKey.of_seed(seed).public_key(), alloc))
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(take path)
+    mut records.push(output::Record(word: text::String.of("wrote", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    return key_output(invocation, written: written.as_str(), take records, files: 1, alloc)
+} key_new
+
+/// `nan key show`: prints the public key of a principal's secret key.
+fn key_show(invocation: Invocation, home: Option[cache::HomeOverride], alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let principal = invocation.operands[0].as_str()
+    if not machine::is_principal(principal) {
+        return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.SealBadPrincipal, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+    }
+    let seed = match try secret_key_of(home, principal, alloc) {
+        Ok(Some(held)) => held
+        Ok(None) => return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.KeyMissing, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+        Err(exposed) => return key_refused(invocation, written: written.as_str(), refused: exposed_line(take exposed, alloc), alloc)
+    }
+    var records = mem::List[output::Record].empty(alloc)
+    mut records.push(key_record(principal, key: core::crypto::SecretKey.of_seed(seed).public_key(), alloc))
+    return key_output(invocation, written: written.as_str(), take records, files: 0, alloc)
+} key_show
+
+/// `nan key trust`: gives the principal the public key in the principals file of the current
+/// directory's package.
+fn key_trust(invocation: Invocation, session: check::Session, current: Str, trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    let held = session.workspace.contents()
+    let holding = held.packages.position(fn(candidate: workspace::Package) -> bool {
+        let base = platform::join(held.root.as_str(), name: candidate.dir.as_str(), alloc)
+        return platform::strip_prefix(current, base: base.as_str(), alloc).is_some()
+    })
+    let Some(index) = holding else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scoped(written.as_str(), alloc)
+    let principal = invocation.operands[0].as_str()
+    if not machine::is_principal(principal) {
+        return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.SealBadPrincipal, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+    }
+    let Some(key) = sign::read_key(invocation.operands[1].as_str(), alloc) else {
+        return key_refused(invocation, written: written.as_str(), refused: unlocated(diagnostic::Code.KeyBadForm, lines: mem::List[text::String].empty(alloc), alloc), alloc)
+    }
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    var path = text::String.of(source.dir.as_str(), alloc)
+    mut path.append("/.nan/principals.nan")
+    let Some(content) = source.machine.principals(alloc).trusting(principal, key, alloc).bytes(grammar: session.grammar.contents(), alloc) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let unchanged = match held.bytes(path.as_str()) {
+        Some(bytes) => bytes == content.view()
+        None => false
+    }
+    var changes = mem::List[journal::Change].empty(alloc)
+    if not unchanged {
+        mut changes.push(journal::Change(path: take path, content: Some(take content)))
+    }
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+    return written_output(invocation, written: written.as_str(), records: mem::List[output::Record].empty(alloc), changes: changes.view(), alloc)
+} key_trust
+
+/// The secret seed of a principal's key in the user directory, or the part of it that is exposed.
+fn secret_key_of(home: Option[cache::HomeOverride], principal: Str, alloc: mem::Alloc) -> Result[Option[Array[u8, 32]], cache::Exposed] fails platform::IoError {
+    return match try cache::Cache.open(cache::copied_override(home, alloc), alloc) {
+        Ok(opened) => try opened.secret_key(principal)
+        Err(exposed) => Err(take exposed)
+    }
+} secret_key_of
+
+/// The secret key whose public key a principals file gives a principal, none when it gives the
+/// principal no key, or the diagnostic of a key the user directory lacks.
+fn seal_signer(session: check::Session, source: workspace::Package, principal: Str, alloc: mem::Alloc) -> Result[Option[core::crypto::SecretKey], diagnostic::Diagnostic] fails platform::IoError {
+    let Some(key) = source.machine.principals(alloc).key(principal) else {
+        return Ok(None)
+    }
+    let seed = match try secret_key_of(session.home, principal, alloc) {
+        Ok(Some(held)) => held
+        Ok(None) => return Err(diagnostic::Diagnostic.new(diagnostic::Code.KeyMissing, alloc))
+        Err(exposed) => return Err(exposed_diagnostic(take exposed, alloc))
+    }
+    let secret = core::crypto::SecretKey.of_seed(seed)
+    if secret.public_key() != key {
+        return Err(diagnostic::Diagnostic.new(diagnostic::Code.KeyMissing, alloc))
+    }
+    return Ok(Some(take secret))
+} seal_signer
+
+/// The record of an exposed part of the user directory.
+fn exposed_line(take exposed: cache::Exposed, alloc: mem::Alloc) -> output::Record {
+    let cache::Exposed(path: path) = exposed
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(text::String.of(diagnostic::Code.BuildCacheExposed.name(), alloc))
+    mut fields.push(take path)
+    mut fields.push(text::String.of("-", alloc))
+    return output::Record(word: text::String.of(diagnostic::Class.Error.word(), alloc), fields: take fields, lines: mem::List[text::String].empty(alloc))
+} exposed_line
+
+/// The `key <principal> <key>` record of a principal's public key.
+fn key_record(principal: Str, key: core::crypto::PublicKey, alloc: mem::Alloc) -> output::Record {
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(text::String.of(principal, alloc))
+    mut fields.push(sign::key_form(key, alloc))
+    return output::Record(word: text::String.of("key", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc))
+} key_record
+
+/// The output of a key command that reports one error and writes nothing.
+fn key_refused(invocation: Invocation, written: Str, take refused: output::Record, alloc: mem::Alloc) -> output::Output {
+    var records = mem::List[output::Record].empty(alloc)
+    mut records.push(take refused)
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: output::Verdict.Failed, summary: key_summary(invocation, files: 0, errors: 1, records: 1, alloc), records: take records)
+} key_refused
+
+fn key_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], files: usize, alloc: mem::Alloc) -> output::Output {
+    let count = records.len()
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: output::Verdict.Ok, summary: key_summary(invocation, files, errors: 0, records: count, alloc), records: take records)
+} key_output
+
+/// The counts of a key command's summary.
+fn key_summary(invocation: Invocation, files: usize, errors: usize, records: usize, alloc: mem::Alloc) -> mem::List[output::Count] {
+    var summary = mem::List[output::Count].empty(alloc)
+    for name in take split_spaces(invocation.counts(), alloc) {
+        var value: usize = 0
+        if name.as_str() == "files" {
+            value = files
+        } else if name.as_str() == "errors" {
+            value = errors
+        } else if name.as_str() == "records" {
+            value = records
+        }
+        mut summary.push(output::Count(name: take name, value: value))
+    }
+    return summary
+} key_summary

@@ -1,4 +1,4 @@
-//! The machine files of a package as loaded: its lock, its history and the API snapshots of its modules, each with its bytes and what it reads as.
+//! The machine files of a package as loaded: its lock, its history, the API snapshots of its modules and its principals file, each with its bytes and what it reads as.
 
 /// A machine file: its path relative to the workspace root, its bytes, and what it reads as.
 pkg struct Loaded[T: Send] {
@@ -34,6 +34,7 @@ pkg struct Machine {
     pkg history_file: Option[Loaded[machine::History]]
     /// The API snapshots, by the module name their file is named after, in byte order.
     pkg snapshots: mem::List[NamedSnapshot]
+    pkg principals_file: Option[Loaded[machine::Principals]]
 } Machine
 
 /// Loads the machine files at `paths`, those of the package directory `dir`.
@@ -44,7 +45,7 @@ fn Machine.load(
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Machine fails platform::IoError {
-    var loaded = Machine(lock_file: None, history_file: None, snapshots: mem::List[NamedSnapshot].empty(alloc))
+    var loaded = Machine(lock_file: None, history_file: None, snapshots: mem::List[NamedSnapshot].empty(alloc), principals_file: None)
     var prefix = text::String.of(dir, alloc)
     mut prefix.append("/.nan/")
     for path in paths {
@@ -64,6 +65,12 @@ fn Machine.load(
             let bytes = try source(path.as_str())
             let read = machine::History.read(bytes.view(), grammar, alloc)
             loaded.history_file = Some(Loaded(path: text::String.of(path.as_str(), alloc), bytes: take bytes, read: take read))
+            continue
+        }
+        if within == "principals.nan" {
+            let bytes = try source(path.as_str())
+            let read = machine::Principals.read(bytes.view(), grammar, alloc)
+            loaded.principals_file = Some(Loaded(path: text::String.of(path.as_str(), alloc), bytes: take bytes, read: take read))
             continue
         }
         if not within.starts_with("api/") or not within.ends_with(".nan") or within.byte_len() < 8 {
@@ -95,6 +102,10 @@ fn Machine.diagnostics(self, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnos
     for snapshot in self.snapshots {
         add_invalid(mut found, path: snapshot.loaded.path.as_str(), invalid: snapshot.loaded.invalid(), alloc)
     }
+    match self.principals_file {
+        Some(principals) => add_invalid(mut found, path: principals.path.as_str(), invalid: principals.invalid(), alloc)
+        None => {}
+    }
     return found
 } Machine.diagnostics
 
@@ -118,6 +129,25 @@ pkg proj fn Machine.history(self) -> Option[machine::History] {
     }
     return loaded.valid()
 } Machine.history
+
+/// A copy of the principals file, empty when the package has none or it is not valid.
+pkg fn Machine.principals(self, alloc: mem::Alloc) -> machine::Principals {
+    var keys = mem::List[machine::Trusted].empty(alloc)
+    match self.principals_file {
+        Some(loaded) => {
+            match loaded.valid() {
+                Some(principals) => {
+                    for held in principals.keys {
+                        mut keys.push(machine::Trusted(principal: text::String.of(held.principal.as_str(), alloc), key: held.key))
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    return machine::Principals(keys: take keys)
+} Machine.principals
 
 /// The valid API snapshot of a module, by its name.
 pkg proj fn Machine.snapshot(self, module: Str) -> Option[machine::Snapshot] {
@@ -160,6 +190,14 @@ pkg proj fn Machine.bytes(self, path: Str) -> Option[Slice[u8]] {
         if snapshot.loaded.path.as_str() == path {
             return Some(snapshot.loaded.bytes.view())
         }
+    }
+    match self.principals_file {
+        Some(principals) => {
+            if principals.path.as_str() == path {
+                return Some(principals.bytes.view())
+            }
+        }
+        None => {}
     }
     return None
 } Machine.bytes

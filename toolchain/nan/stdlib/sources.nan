@@ -8,6 +8,8 @@ pkg enum StdFile derives Copy, Eq {
     BootPackage
     CoreAtomicAtomic
     CoreCore
+    CoreCryptoCrypto
+    CoreCryptoTests
     CoreEncode
     CoreGenerate
     CoreNumbers
@@ -58,6 +60,8 @@ pkg fn StdFile.all(alloc: mem::Alloc) -> mem::List[StdFile] {
     mut files.push(StdFile.BootPackage)
     mut files.push(StdFile.CoreAtomicAtomic)
     mut files.push(StdFile.CoreCore)
+    mut files.push(StdFile.CoreCryptoCrypto)
+    mut files.push(StdFile.CoreCryptoTests)
     mut files.push(StdFile.CoreEncode)
     mut files.push(StdFile.CoreGenerate)
     mut files.push(StdFile.CoreNumbers)
@@ -109,6 +113,8 @@ pkg proj fn StdFile.path(self) -> Str {
         StdFile.BootPackage => "boot/package.nan"
         StdFile.CoreAtomicAtomic => "core/atomic/atomic.nan"
         StdFile.CoreCore => "core/core.nan"
+        StdFile.CoreCryptoCrypto => "core/crypto/crypto.nan"
+        StdFile.CoreCryptoTests => "core/crypto/tests.nan"
         StdFile.CoreEncode => "core/encode.nan"
         StdFile.CoreGenerate => "core/generate.nan"
         StdFile.CoreNumbers => "core/numbers.nan"
@@ -160,6 +166,8 @@ pkg proj fn StdFile.text(self) -> Str {
         StdFile.BootPackage => TEXT_BOOT_PACKAGE
         StdFile.CoreAtomicAtomic => TEXT_CORE_ATOMIC_ATOMIC
         StdFile.CoreCore => TEXT_CORE_CORE
+        StdFile.CoreCryptoCrypto => TEXT_CORE_CRYPTO_CRYPTO
+        StdFile.CoreCryptoTests => TEXT_CORE_CRYPTO_TESTS
         StdFile.CoreEncode => TEXT_CORE_ENCODE
         StdFile.CoreGenerate => TEXT_CORE_GENERATE
         StdFile.CoreNumbers => TEXT_CORE_NUMBERS
@@ -645,6 +653,669 @@ const TEXT_CORE_CORE: Str =
     \\pub interface BitNot[O] {
     \\    fn bit_not(self) -> O limits pure, terminates
     \\} BitNot
+    \\
+
+const TEXT_CORE_CRYPTO_CRYPTO: Str =
+    \\//! Ed25519 signatures over SHA-512, as RFC 8032 defines them, verified strictly.
+    \\
+    \\/// A public key: the encoding of a curve point.
+    \\pub closed struct PublicKey derives Copy, Eq, Ord, Hash {
+    \\    pub bytes: Array[u8, 32]
+    \\} PublicKey
+    \\
+    \\/// A signature: the encoding of the point R, then the scalar S, least significant byte first.
+    \\pub closed struct Signature derives Copy, Eq {
+    \\    pub bytes: Array[u8, 64]
+    \\} Signature
+    \\
+    \\/// A secret key: the scalar and the prefix its seed expands to, with its public key.
+    \\pub open struct SecretKey {
+    \\    scalar: Array[u8, 32]
+    \\    prefix: Array[u8, 32]
+    \\    public: PublicKey
+    \\} SecretKey
+    \\
+    \\/// The key of a 32-byte secret seed.
+    \\pub fn SecretKey.of_seed(seed: Array[u8, 32]) -> SecretKey limits pure, terminates {
+    \\    var hasher = Sha512.empty()
+    \\    mut hasher.update(seed.view())
+    \\    let digest = hasher.finish()
+    \\    var scalar = Array[u8, 32].filled(0)
+    \\    var prefix = Array[u8, 32].filled(0)
+    \\    for at in 0..<32usize {
+    \\        scalar[at] = digest[at]
+    \\        prefix[at] = digest[at + 32]
+    \\    }
+    \\    scalar[0] = scalar[0] & 248
+    \\    scalar[31] = (scalar[31] & 127) | 64
+    \\    let public = PublicKey(bytes: scalar_mul(base(), scalar).encoded())
+    \\    return SecretKey(scalar: scalar, prefix: prefix, public: public)
+    \\} SecretKey.of_seed
+    \\
+    \\pub fn SecretKey.public_key(self) -> PublicKey limits pure, notrap, terminates {
+    \\    return self.public
+    \\} SecretKey.public_key
+    \\
+    \\/// The signature of a message by this key.
+    \\pub fn SecretKey.sign(self, message: Slice[u8]) -> Signature limits pure, terminates {
+    \\    var nonce = Sha512.empty()
+    \\    mut nonce.update(self.prefix.view())
+    \\    mut nonce.update(message)
+    \\    let r = reduced(nonce.finish())
+    \\    let point = scalar_mul(base(), scalar: r).encoded()
+    \\    let k = challenge(point, key: self.public, message)
+    \\    var x = Array[i64, 64].filled(0)
+    \\    for i in 0..<32usize {
+    \\        x[i] = i64.widen(r[i])
+    \\    }
+    \\    for i in 0..<32usize {
+    \\        for j in 0..<32usize {
+    \\            x[i + j] = x[i + j].wrapping_add(i64.widen(k[i]).wrapping_mul(i64.widen(self.scalar[j])))
+    \\        }
+    \\    }
+    \\    let s = reduced_limbs(x)
+    \\    var bytes = Array[u8, 64].filled(0)
+    \\    for at in 0..<32usize {
+    \\        bytes[at] = point[at]
+    \\        bytes[at + 32] = s[at]
+    \\    }
+    \\    return Signature(bytes: bytes)
+    \\} SecretKey.sign
+    \\
+    \\/// Whether `signature` is a signature of `message` by this key: the key and R are canonical
+    \\/// encodings, S is below the group order, the key does not have small order, and
+    \\/// `[S]B - [k]A` encodes as R.
+    \\pub fn PublicKey.verify(self, message: Slice[u8], signature: Signature) -> bool limits pure, terminates {
+    \\    let Some(point) = decoded(self.bytes) else {
+    \\        return false
+    \\    }
+    \\    var r = Array[u8, 32].filled(0)
+    \\    var s = Array[u8, 32].filled(0)
+    \\    for at in 0..<32usize {
+    \\        r[at] = signature.bytes[at]
+    \\        s[at] = signature.bytes[at + 32]
+    \\    }
+    \\    if not below_order(s) {
+    \\        return false
+    \\    }
+    \\    let four = point.plus(point).plus(point.plus(point))
+    \\    if four.plus(four).encoded() == neutral().encoded() {
+    \\        return false
+    \\    }
+    \\    let negated = Point(x: ZERO.minus(point.x), y: point.y, z: point.z, t: ZERO.minus(point.t))
+    \\    let k = challenge(r, key: self, message)
+    \\    let check = scalar_mul(negated, scalar: k).plus(scalar_mul(base(), scalar: s))
+    \\    return check.encoded() == r
+    \\} PublicKey.verify
+    \\
+    \\/// The scalar of the digest of R, the public key and the message.
+    \\fn challenge(r: Array[u8, 32], key: PublicKey, message: Slice[u8]) -> Array[u8, 32] {
+    \\    var hasher = Sha512.empty()
+    \\    mut hasher.update(r.view())
+    \\    mut hasher.update(key.bytes.view())
+    \\    mut hasher.update(message)
+    \\    return reduced(hasher.finish())
+    \\} challenge
+    \\
+    \\/// A field element modulo 2^255 - 19: sixteen limbs of 16 bits, least significant first, each
+    \\/// possibly out of range between operations.
+    \\struct Field derives Copy {
+    \\    limbs: Array[i64, 16]
+    \\} Field
+    \\
+    \\/// The field element whose limbs the four 64-bit words hold, least significant first.
+    \\fn field_of(w0: u64, w1: u64, w2: u64, w3: u64) -> Field {
+    \\    var limbs = Array[i64, 16].filled(0)
+    \\    for j in 0..<4u32 {
+    \\        let at = usize.widen(j)
+    \\        limbs[at] = i64.widen(u16.truncate(w0 >> (16 * j)))
+    \\        limbs[at + 4] = i64.widen(u16.truncate(w1 >> (16 * j)))
+    \\        limbs[at + 8] = i64.widen(u16.truncate(w2 >> (16 * j)))
+    \\        limbs[at + 12] = i64.widen(u16.truncate(w3 >> (16 * j)))
+    \\    }
+    \\    return Field(limbs: limbs)
+    \\} field_of
+    \\
+    \\const ZERO: Field = field_of(0, w1: 0, w2: 0, w3: 0)
+    \\
+    \\const ONE: Field = field_of(1, w1: 0, w2: 0, w3: 0)
+    \\
+    \\/// The curve constant d = -121665/121666, and twice it.
+    \\const CURVE_D: Field = field_of(0x75EB_4DCA_1359_78A3, w1: 0x0070_0A4D_4141_D8AB, w2: 0x8CC7_4079_7779_E898, w3: 0x5203_6CEE_2B6F_FE73)
+    \\
+    \\const CURVE_D2: Field = field_of(0xEBD6_9B94_26B2_F159, w1: 0x00E0_149A_8283_B156, w2: 0x198E_80F2_EEF3_D130, w3: 0x2406_D9DC_56DF_FCE7)
+    \\
+    \\/// The coordinates of the base point B.
+    \\const BASE_X: Field = field_of(0xC956_2D60_8F25_D51A, w1: 0x692C_C760_9525_A7B2, w2: 0xC0A4_E231_FDD6_DC5C, w3: 0x2169_36D3_CD6E_53FE)
+    \\
+    \\const BASE_Y: Field = field_of(0x6666_6666_6666_6658, w1: 0x6666_6666_6666_6666, w2: 0x6666_6666_6666_6666, w3: 0x6666_6666_6666_6666)
+    \\
+    \\/// A square root of -1.
+    \\const SQRT_M1: Field = field_of(0xC4EE_1B27_4A0E_A0B0, w1: 0x2F43_1806_AD2F_E478, w2: 0x2B4D_0099_3DFB_D7A7, w3: 0x2B83_2480_4FC1_DF0B)
+    \\
+    \\fn Field.carried(self) -> Field {
+    \\    var o = self.limbs
+    \\    for i in 0..<16usize {
+    \\        o[i] = o[i].wrapping_add(65_536)
+    \\        let c = o[i].shr_arith(16)
+    \\        if i == 15 {
+    \\            o[0] = o[0].wrapping_add(c.wrapping_sub(1).wrapping_mul(38))
+    \\        } else {
+    \\            o[i + 1] = o[i + 1].wrapping_add(c.wrapping_sub(1))
+    \\        }
+    \\        o[i] = o[i].wrapping_sub(c.wrapping_shl(16))
+    \\    }
+    \\    return Field(limbs: o)
+    \\} Field.carried
+    \\
+    \\fn Field.plus(self, other: Field) -> Field {
+    \\    var o = self.limbs
+    \\    for i in 0..<16usize {
+    \\        o[i] = o[i].wrapping_add(other.limbs[i])
+    \\    }
+    \\    return Field(limbs: o)
+    \\} Field.plus
+    \\
+    \\fn Field.minus(self, other: Field) -> Field {
+    \\    var o = self.limbs
+    \\    for i in 0..<16usize {
+    \\        o[i] = o[i].wrapping_sub(other.limbs[i])
+    \\    }
+    \\    return Field(limbs: o)
+    \\} Field.minus
+    \\
+    \\fn Field.times(self, other: Field) -> Field {
+    \\    var t = Array[i64, 31].filled(0)
+    \\    for i in 0..<16usize {
+    \\        for j in 0..<16usize {
+    \\            t[i + j] = t[i + j].wrapping_add(self.limbs[i].wrapping_mul(other.limbs[j]))
+    \\        }
+    \\    }
+    \\    var o = Array[i64, 16].filled(0)
+    \\    for i in 0..<15usize {
+    \\        o[i] = t[i].wrapping_add(t[i + 16].wrapping_mul(38))
+    \\    }
+    \\    o[15] = t[15]
+    \\    return Field(limbs: o).carried().carried()
+    \\} Field.times
+    \\
+    \\/// The element raised to p - 2, the inverse of a nonzero element.
+    \\fn Field.inverted(self) -> Field {
+    \\    var c = self
+    \\    for step in 0..<254u32 {
+    \\        let bit = 253 - step
+    \\        c = c.times(c)
+    \\        if bit != 2 and bit != 4 {
+    \\            c = c.times(self)
+    \\        }
+    \\    }
+    \\    return c
+    \\} Field.inverted
+    \\
+    \\/// The element raised to (p - 5) / 8.
+    \\fn Field.pow_p58(self) -> Field {
+    \\    var c = self
+    \\    for step in 0..<251u32 {
+    \\        let bit = 250 - step
+    \\        c = c.times(c)
+    \\        if bit != 1 {
+    \\            c = c.times(self)
+    \\        }
+    \\    }
+    \\    return c
+    \\} Field.pow_p58
+    \\
+    \\/// The canonical encoding: the value below 2^255 - 19, least significant byte first.
+    \\fn Field.packed(self) -> Array[u8, 32] {
+    \\    var t = self.carried().carried().carried().limbs
+    \\    for _ in 0..<2usize {
+    \\        var m = Array[i64, 16].filled(0)
+    \\        m[0] = t[0].wrapping_sub(0xFFED)
+    \\        for i in 1..<15usize {
+    \\            m[i] = t[i].wrapping_sub(0xFFFF).wrapping_sub(m[i - 1].shr_arith(16) & 1)
+    \\            m[i - 1] = m[i - 1] & 0xFFFF
+    \\        }
+    \\        m[15] = t[15].wrapping_sub(0x7FFF).wrapping_sub(m[14].shr_arith(16) & 1)
+    \\        let borrow = m[15].shr_arith(16) & 1
+    \\        m[14] = m[14] & 0xFFFF
+    \\        if borrow == 0 {
+    \\            t = m
+    \\        }
+    \\    }
+    \\    var out = Array[u8, 32].filled(0)
+    \\    for i in 0..<16usize {
+    \\        out[2 * i] = u8.truncate(t[i] & 0xFF)
+    \\        out[2 * i + 1] = u8.truncate(t[i].shr_arith(8))
+    \\    }
+    \\    return out
+    \\} Field.packed
+    \\
+    \\/// The element of the low 255 bits of an encoding.
+    \\fn Field.unpacked(bytes: Array[u8, 32]) -> Field {
+    \\    var o = Array[i64, 16].filled(0)
+    \\    for i in 0..<16usize {
+    \\        o[i] = i64.widen(bytes[2 * i]) | i64.widen(bytes[2 * i + 1]).wrapping_shl(8)
+    \\    }
+    \\    o[15] = o[15] & 0x7FFF
+    \\    return Field(limbs: o)
+    \\} Field.unpacked
+    \\
+    \\fn Field.same(self, other: Field) -> bool {
+    \\    return self.packed() == other.packed()
+    \\} Field.same
+    \\
+    \\/// The low bit of the canonical value.
+    \\fn Field.parity(self) -> u8 {
+    \\    return self.packed()[0] & 1
+    \\} Field.parity
+    \\
+    \\/// Swaps the limbs of two elements when `swap` is 1, in time independent of it.
+    \\fn swapped(mut p: Array[i64, 16], mut q: Array[i64, 16], swap: i64) {
+    \\    let mask = ~(swap.wrapping_sub(1))
+    \\    for i in 0..<16usize {
+    \\        let t = mask & (p[i] ^ q[i])
+    \\        p[i] = p[i] ^ t
+    \\        q[i] = q[i] ^ t
+    \\    }
+    \\} swapped
+    \\
+    \\/// A point in extended coordinates: x = X/Z, y = Y/Z and xy = T/Z.
+    \\struct Point derives Copy {
+    \\    x: Field
+    \\    y: Field
+    \\    z: Field
+    \\    t: Field
+    \\} Point
+    \\
+    \\fn neutral() -> Point {
+    \\    return Point(x: ZERO, y: ONE, z: ONE, t: ZERO)
+    \\} neutral
+    \\
+    \\fn base() -> Point {
+    \\    return Point(x: BASE_X, y: BASE_Y, z: ONE, t: BASE_X.times(BASE_Y))
+    \\} base
+    \\
+    \\fn Point.plus(self, other: Point) -> Point {
+    \\    let a = self.y.minus(self.x).times(other.y.minus(other.x))
+    \\    let b = self.x.plus(self.y).times(other.x.plus(other.y))
+    \\    let c = self.t.times(other.t).times(CURVE_D2)
+    \\    let zz = self.z.times(other.z)
+    \\    let d = zz.plus(zz)
+    \\    let e = b.minus(a)
+    \\    let f = d.minus(c)
+    \\    let g = d.plus(c)
+    \\    let h = b.plus(a)
+    \\    return Point(x: e.times(f), y: h.times(g), z: g.times(f), t: e.times(h))
+    \\} Point.plus
+    \\
+    \\fn Point.encoded(self) -> Array[u8, 32] {
+    \\    let inverse = self.z.inverted()
+    \\    var out = self.y.times(inverse).packed()
+    \\    out[31] = out[31] ^ (self.x.times(inverse).parity() << 7)
+    \\    return out
+    \\} Point.encoded
+    \\
+    \\/// The point times a scalar, least significant byte first, by a ladder in time independent of
+    \\/// the scalar.
+    \\fn scalar_mul(point: Point, scalar: Array[u8, 32]) -> Point {
+    \\    var p = neutral()
+    \\    var q = point
+    \\    for step in 0..<256usize {
+    \\        let bit = 255 - step
+    \\        let swap = i64.widen((scalar[bit / 8] >> u32.truncate(bit % 8)) & 1)
+    \\        swap_points(mut p, mut q, swap)
+    \\        q = q.plus(p)
+    \\        p = p.plus(p)
+    \\        swap_points(mut p, mut q, swap)
+    \\    }
+    \\    return p
+    \\} scalar_mul
+    \\
+    \\fn swap_points(mut p: Point, mut q: Point, swap: i64) {
+    \\    swapped(mut p.x.limbs, q: mut q.x.limbs, swap)
+    \\    swapped(mut p.y.limbs, q: mut q.y.limbs, swap)
+    \\    swapped(mut p.z.limbs, q: mut q.z.limbs, swap)
+    \\    swapped(mut p.t.limbs, q: mut q.t.limbs, swap)
+    \\} swap_points
+    \\
+    \\/// The point an encoding names: none when its y is not below 2^255 - 19, no x satisfies the
+    \\/// curve equation, or x is 0 with the sign bit set.
+    \\fn decoded(bytes: Array[u8, 32]) -> Option[Point] {
+    \\    let y = Field.unpacked(bytes)
+    \\    var low = bytes
+    \\    low[31] = low[31] & 0x7F
+    \\    if y.packed() != low {
+    \\        return None
+    \\    }
+    \\    let y2 = y.times(y)
+    \\    let u = y2.minus(ONE)
+    \\    let v = y2.times(CURVE_D).plus(ONE)
+    \\    let v3 = v.times(v).times(v)
+    \\    var x = v3.times(v3).times(v).times(u).pow_p58().times(v3).times(u)
+    \\    let check = x.times(x).times(v)
+    \\    if not check.same(u) {
+    \\        if not check.same(ZERO.minus(u)) {
+    \\            return None
+    \\        }
+    \\        x = x.times(SQRT_M1)
+    \\    }
+    \\    let sign = bytes[31] >> 7
+    \\    if x.same(ZERO) and sign == 1 {
+    \\        return None
+    \\    }
+    \\    if x.parity() != sign {
+    \\        x = ZERO.minus(x)
+    \\    }
+    \\    return Some(Point(x: x, y: y, z: ONE, t: x.times(y)))
+    \\} decoded
+    \\
+    \\/// The group order L, least significant byte first.
+    \\const ORDER: Array[i64, 32] = order_bytes()
+    \\
+    \\fn order_bytes() -> Array[i64, 32] {
+    \\    let words = field_of(0x5812_631A_5CF5_D3ED, w1: 0x14DE_F9DE_A2F7_9CD6, w2: 0, w3: 0x1000_0000_0000_0000)
+    \\    var bytes = Array[i64, 32].filled(0)
+    \\    for i in 0..<16usize {
+    \\        bytes[2 * i] = words.limbs[i] & 0xFF
+    \\        bytes[2 * i + 1] = words.limbs[i].shr_arith(8)
+    \\    }
+    \\    return bytes
+    \\} order_bytes
+    \\
+    \\/// Whether a scalar, least significant byte first, is below L.
+    \\fn below_order(s: Array[u8, 32]) -> bool {
+    \\    for step in 0..<32usize {
+    \\        let at = 31 - step
+    \\        let limb = u8.truncate(ORDER[at])
+    \\        if s[at] != limb {
+    \\            return s[at] < limb
+    \\        }
+    \\    }
+    \\    return false
+    \\} below_order
+    \\
+    \\/// A 64-byte number, least significant byte first, modulo L.
+    \\fn reduced(digest: Array[u8, 64]) -> Array[u8, 32] {
+    \\    var x = Array[i64, 64].filled(0)
+    \\    for at in 0..<64usize {
+    \\        x[at] = i64.widen(digest[at])
+    \\    }
+    \\    return reduced_limbs(x)
+    \\} reduced
+    \\
+    \\/// The value of 64 limbs of 8 bits, least significant first, modulo L.
+    \\fn reduced_limbs(limbs: Array[i64, 64]) -> Array[u8, 32] {
+    \\    var x = limbs
+    \\    for step in 0..<32usize {
+    \\        let i = 63 - step
+    \\        var c: i64 = 0
+    \\        for j in (i - 32)..<(i - 12) {
+    \\            x[j] = x[j].wrapping_add(c.wrapping_sub(x[i].wrapping_mul(16).wrapping_mul(ORDER[j - (i - 32)])))
+    \\            c = x[j].wrapping_add(128).shr_arith(8)
+    \\            x[j] = x[j].wrapping_sub(c.wrapping_shl(8))
+    \\        }
+    \\        x[i - 12] = x[i - 12].wrapping_add(c)
+    \\        x[i] = 0
+    \\    }
+    \\    var c: i64 = 0
+    \\    for j in 0..<32usize {
+    \\        x[j] = x[j].wrapping_add(c.wrapping_sub(x[31].shr_arith(4).wrapping_mul(ORDER[j])))
+    \\        c = x[j].shr_arith(8)
+    \\        x[j] = x[j] & 255
+    \\    }
+    \\    for j in 0..<32usize {
+    \\        x[j] = x[j].wrapping_sub(c.wrapping_mul(ORDER[j]))
+    \\    }
+    \\    var out = Array[u8, 32].filled(0)
+    \\    for i in 0..<32usize {
+    \\        x[i + 1] = x[i + 1].wrapping_add(x[i].shr_arith(8))
+    \\        out[i] = u8.truncate(x[i] & 255)
+    \\    }
+    \\    return out
+    \\} reduced_limbs
+    \\
+    \\/// A SHA-512 computation: the chaining state, the pending block and the bytes hashed so far.
+    \\struct Sha512 derives Copy {
+    \\    state: Array[u64, 8]
+    \\    block: Array[u8, 128]
+    \\    length: u64
+    \\} Sha512
+    \\
+    \\fn Sha512.empty() -> Sha512 {
+    \\    var state = Array[u64, 8].filled(0)
+    \\    state[0] = 0x6A09_E667_F3BC_C908
+    \\    state[1] = 0xBB67_AE85_84CA_A73B
+    \\    state[2] = 0x3C6E_F372_FE94_F82B
+    \\    state[3] = 0xA54F_F53A_5F1D_36F1
+    \\    state[4] = 0x510E_527F_ADE6_82D1
+    \\    state[5] = 0x9B05_688C_2B3E_6C1F
+    \\    state[6] = 0x1F83_D9AB_FB41_BD6B
+    \\    state[7] = 0x5BE0_CD19_137E_2179
+    \\    return Sha512(state: state, block: Array[u8, 128].filled(0), length: 0)
+    \\} Sha512.empty
+    \\
+    \\fn Sha512.update(mut self, data: Slice[u8]) {
+    \\    for byte in data {
+    \\        let at = usize.widen(self.length % 128)
+    \\        self.block[at] = byte
+    \\        if at == 127 {
+    \\            self.state = compressed(self.state, block: self.block)
+    \\        }
+    \\        self.length = self.length.wrapping_add(1)
+    \\    }
+    \\} Sha512.update
+    \\
+    \\/// The digest: the padding and the length in bits hashed, most significant byte first.
+    \\fn Sha512.finish(self) -> Array[u8, 64] {
+    \\    var hasher = self
+    \\    let bits = self.length
+    \\    mut hasher.update(b"\\x80")
+    \\    for _ in 0..<128usize {
+    \\        if hasher.length % 128 == 112 {
+    \\            break
+    \\        }
+    \\        mut hasher.update(b"\\x00")
+    \\    }
+    \\    var tail = Array[u8, 16].filled(0)
+    \\    tail[7] = u8.truncate(bits >> 61)
+    \\    for at in 0..<8u32 {
+    \\        tail[usize.widen(15 - at)] = u8.truncate((bits << 3) >> (8 * at))
+    \\    }
+    \\    mut hasher.update(tail.view())
+    \\    var out = Array[u8, 64].filled(0)
+    \\    for word in 0..<8usize {
+    \\        for at in 0..<8u32 {
+    \\            out[8 * word + usize.widen(at)] = u8.truncate(hasher.state[word] >> (56 - 8 * at))
+    \\        }
+    \\    }
+    \\    return out
+    \\} Sha512.finish
+    \\
+    \\fn rotated(value: u64, by: u32) -> u64
+    \\    requires by > 0 and by < 64
+    \\{
+    \\    return (value >> by) | (value << (64 - by))
+    \\} rotated
+    \\
+    \\fn compressed(state: Array[u64, 8], block: Array[u8, 128]) -> Array[u64, 8] {
+    \\    var w = Array[u64, 80].filled(0)
+    \\    for i in 0..<16usize {
+    \\        w[i] = block.view().u64_be(8 * i)
+    \\    }
+    \\    for i in 16..<80usize {
+    \\        let s0 = rotated(w[i - 15], by: 1) ^ rotated(w[i - 15], by: 8) ^ (w[i - 15] >> 7)
+    \\        let s1 = rotated(w[i - 2], by: 19) ^ rotated(w[i - 2], by: 61) ^ (w[i - 2] >> 6)
+    \\        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1)
+    \\    }
+    \\    var v = state
+    \\    for i in 0..<80usize {
+    \\        let e = v[4]
+    \\        let a = v[0]
+    \\        let sum1 = rotated(e, by: 14) ^ rotated(e, by: 18) ^ rotated(e, by: 41)
+    \\        let choice = (e & v[5]) ^ ((~e) & v[6])
+    \\        let t1 = v[7].wrapping_add(sum1).wrapping_add(choice).wrapping_add(ROUND[i]).wrapping_add(w[i])
+    \\        let sum0 = rotated(a, by: 28) ^ rotated(a, by: 34) ^ rotated(a, by: 39)
+    \\        let majority = (a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2])
+    \\        v[7] = v[6]
+    \\        v[6] = v[5]
+    \\        v[5] = e
+    \\        v[4] = v[3].wrapping_add(t1)
+    \\        v[3] = v[2]
+    \\        v[2] = v[1]
+    \\        v[1] = a
+    \\        v[0] = t1.wrapping_add(sum0.wrapping_add(majority))
+    \\    }
+    \\    var out = state
+    \\    for i in 0..<8usize {
+    \\        out[i] = out[i].wrapping_add(v[i])
+    \\    }
+    \\    return out
+    \\} compressed
+    \\
+    \\/// The round constants of SHA-512.
+    \\const ROUND: Array[u64, 80] = round_constants()
+    \\
+    \\fn round_constants() -> Array[u64, 80]
+    \\    waive length "one line per round constant"
+    \\{
+    \\    var k = Array[u64, 80].filled(0)
+    \\    k[0] = 0x428A_2F98_D728_AE22
+    \\    k[1] = 0x7137_4491_23EF_65CD
+    \\    k[2] = 0xB5C0_FBCF_EC4D_3B2F
+    \\    k[3] = 0xE9B5_DBA5_8189_DBBC
+    \\    k[4] = 0x3956_C25B_F348_B538
+    \\    k[5] = 0x59F1_11F1_B605_D019
+    \\    k[6] = 0x923F_82A4_AF19_4F9B
+    \\    k[7] = 0xAB1C_5ED5_DA6D_8118
+    \\    k[8] = 0xD807_AA98_A303_0242
+    \\    k[9] = 0x1283_5B01_4570_6FBE
+    \\    k[10] = 0x2431_85BE_4EE4_B28C
+    \\    k[11] = 0x550C_7DC3_D5FF_B4E2
+    \\    k[12] = 0x72BE_5D74_F27B_896F
+    \\    k[13] = 0x80DE_B1FE_3B16_96B1
+    \\    k[14] = 0x9BDC_06A7_25C7_1235
+    \\    k[15] = 0xC19B_F174_CF69_2694
+    \\    k[16] = 0xE49B_69C1_9EF1_4AD2
+    \\    k[17] = 0xEFBE_4786_384F_25E3
+    \\    k[18] = 0x0FC1_9DC6_8B8C_D5B5
+    \\    k[19] = 0x240C_A1CC_77AC_9C65
+    \\    k[20] = 0x2DE9_2C6F_592B_0275
+    \\    k[21] = 0x4A74_84AA_6EA6_E483
+    \\    k[22] = 0x5CB0_A9DC_BD41_FBD4
+    \\    k[23] = 0x76F9_88DA_8311_53B5
+    \\    k[24] = 0x983E_5152_EE66_DFAB
+    \\    k[25] = 0xA831_C66D_2DB4_3210
+    \\    k[26] = 0xB003_27C8_98FB_213F
+    \\    k[27] = 0xBF59_7FC7_BEEF_0EE4
+    \\    k[28] = 0xC6E0_0BF3_3DA8_8FC2
+    \\    k[29] = 0xD5A7_9147_930A_A725
+    \\    k[30] = 0x06CA_6351_E003_826F
+    \\    k[31] = 0x1429_2967_0A0E_6E70
+    \\    k[32] = 0x27B7_0A85_46D2_2FFC
+    \\    k[33] = 0x2E1B_2138_5C26_C926
+    \\    k[34] = 0x4D2C_6DFC_5AC4_2AED
+    \\    k[35] = 0x5338_0D13_9D95_B3DF
+    \\    k[36] = 0x650A_7354_8BAF_63DE
+    \\    k[37] = 0x766A_0ABB_3C77_B2A8
+    \\    k[38] = 0x81C2_C92E_47ED_AEE6
+    \\    k[39] = 0x9272_2C85_1482_353B
+    \\    k[40] = 0xA2BF_E8A1_4CF1_0364
+    \\    k[41] = 0xA81A_664B_BC42_3001
+    \\    k[42] = 0xC24B_8B70_D0F8_9791
+    \\    k[43] = 0xC76C_51A3_0654_BE30
+    \\    k[44] = 0xD192_E819_D6EF_5218
+    \\    k[45] = 0xD699_0624_5565_A910
+    \\    k[46] = 0xF40E_3585_5771_202A
+    \\    k[47] = 0x106A_A070_32BB_D1B8
+    \\    k[48] = 0x19A4_C116_B8D2_D0C8
+    \\    k[49] = 0x1E37_6C08_5141_AB53
+    \\    k[50] = 0x2748_774C_DF8E_EB99
+    \\    k[51] = 0x34B0_BCB5_E19B_48A8
+    \\    k[52] = 0x391C_0CB3_C5C9_5A63
+    \\    k[53] = 0x4ED8_AA4A_E341_8ACB
+    \\    k[54] = 0x5B9C_CA4F_7763_E373
+    \\    k[55] = 0x682E_6FF3_D6B2_B8A3
+    \\    k[56] = 0x748F_82EE_5DEF_B2FC
+    \\    k[57] = 0x78A5_636F_4317_2F60
+    \\    k[58] = 0x84C8_7814_A1F0_AB72
+    \\    k[59] = 0x8CC7_0208_1A64_39EC
+    \\    k[60] = 0x90BE_FFFA_2363_1E28
+    \\    k[61] = 0xA450_6CEB_DE82_BDE9
+    \\    k[62] = 0xBEF9_A3F7_B2C6_7915
+    \\    k[63] = 0xC671_78F2_E372_532B
+    \\    k[64] = 0xCA27_3ECE_EA26_619C
+    \\    k[65] = 0xD186_B8C7_21C0_C207
+    \\    k[66] = 0xEADA_7DD6_CDE0_EB1E
+    \\    k[67] = 0xF57D_4F7F_EE6E_D178
+    \\    k[68] = 0x06F0_67AA_7217_6FBA
+    \\    k[69] = 0x0A63_7DC5_A2C8_98A6
+    \\    k[70] = 0x113F_9804_BEF9_0DAE
+    \\    k[71] = 0x1B71_0B35_131C_471B
+    \\    k[72] = 0x28DB_77F5_2304_7D84
+    \\    k[73] = 0x32CA_AB7B_40C7_2493
+    \\    k[74] = 0x3C9E_BE0A_15C9_BEBC
+    \\    k[75] = 0x431D_67C4_9C10_0D4C
+    \\    k[76] = 0x4CC5_D4BE_CB3E_42B6
+    \\    k[77] = 0x597F_299C_FC65_7E2A
+    \\    k[78] = 0x5FCB_6FAB_3AD6_FAEC
+    \\    k[79] = 0x6C44_198C_4A47_5817
+    \\    return k
+    \\} round_constants
+    \\
+
+const TEXT_CORE_CRYPTO_TESTS: Str =
+    \\//! Signatures against the test vectors of RFC 8032.
+    \\
+    \\test keys_and_signatures_match_rfc_8032 for SecretKey.sign {
+    \\    expect signs(b"\\x9D\\x61\\xB1\\x9D\\xEF\\xFD\\x5A\\x60\\xBA\\x84\\x4A\\xF4\\x92\\xEC\\x2C\\xC4\\x44\\x49\\xC5\\x69\\x7B\\x32\\x69\\x19\\x70\\x3B\\xAC\\x03\\x1C\\xAE\\x7F\\x60", key: b"\\xD7\\x5A\\x98\\x01\\x82\\xB1\\x0A\\xB7\\xD5\\x4B\\xFE\\xD3\\xC9\\x64\\x07\\x3A\\x0E\\xE1\\x72\\xF3\\xDA\\xA6\\x23\\x25\\xAF\\x02\\x1A\\x68\\xF7\\x07\\x51\\x1A", message: b"", signature: b"\\xE5\\x56\\x43\\x00\\xC3\\x60\\xAC\\x72\\x90\\x86\\xE2\\xCC\\x80\\x6E\\x82\\x8A\\x84\\x87\\x7F\\x1E\\xB8\\xE5\\xD9\\x74\\xD8\\x73\\xE0\\x65\\x22\\x49\\x01\\x55\\x5F\\xB8\\x82\\x15\\x90\\xA3\\x3B\\xAC\\xC6\\x1E\\x39\\x70\\x1C\\xF9\\xB4\\x6B\\xD2\\x5B\\xF5\\xF0\\x59\\x5B\\xBE\\x24\\x65\\x51\\x41\\x43\\x8E\\x7A\\x10\\x0B")
+    \\    expect signs(b"\\x4C\\xCD\\x08\\x9B\\x28\\xFF\\x96\\xDA\\x9D\\xB6\\xC3\\x46\\xEC\\x11\\x4E\\x0F\\x5B\\x8A\\x31\\x9F\\x35\\xAB\\xA6\\x24\\xDA\\x8C\\xF6\\xED\\x4F\\xB8\\xA6\\xFB", key: b"\\x3D\\x40\\x17\\xC3\\xE8\\x43\\x89\\x5A\\x92\\xB7\\x0A\\xA7\\x4D\\x1B\\x7E\\xBC\\x9C\\x98\\x2C\\xCF\\x2E\\xC4\\x96\\x8C\\xC0\\xCD\\x55\\xF1\\x2A\\xF4\\x66\\x0C", message: b"\\x72", signature: b"\\x92\\xA0\\x09\\xA9\\xF0\\xD4\\xCA\\xB8\\x72\\x0E\\x82\\x0B\\x5F\\x64\\x25\\x40\\xA2\\xB2\\x7B\\x54\\x16\\x50\\x3F\\x8F\\xB3\\x76\\x22\\x23\\xEB\\xDB\\x69\\xDA\\x08\\x5A\\xC1\\xE4\\x3E\\x15\\x99\\x6E\\x45\\x8F\\x36\\x13\\xD0\\xF1\\x1D\\x8C\\x38\\x7B\\x2E\\xAE\\xB4\\x30\\x2A\\xEE\\xB0\\x0D\\x29\\x16\\x12\\xBB\\x0C\\x00")
+    \\    expect signs(b"\\xC5\\xAA\\x8D\\xF4\\x3F\\x9F\\x83\\x7B\\xED\\xB7\\x44\\x2F\\x31\\xDC\\xB7\\xB1\\x66\\xD3\\x85\\x35\\x07\\x6F\\x09\\x4B\\x85\\xCE\\x3A\\x2E\\x0B\\x44\\x58\\xF7", key: b"\\xFC\\x51\\xCD\\x8E\\x62\\x18\\xA1\\xA3\\x8D\\xA4\\x7E\\xD0\\x02\\x30\\xF0\\x58\\x08\\x16\\xED\\x13\\xBA\\x33\\x03\\xAC\\x5D\\xEB\\x91\\x15\\x48\\x90\\x80\\x25", message: b"\\xAF\\x82", signature: b"\\x62\\x91\\xD6\\x57\\xDE\\xEC\\x24\\x02\\x48\\x27\\xE6\\x9C\\x3A\\xBE\\x01\\xA3\\x0C\\xE5\\x48\\xA2\\x84\\x74\\x3A\\x44\\x5E\\x36\\x80\\xD7\\xDB\\x5A\\xC3\\xAC\\x18\\xFF\\x9B\\x53\\x8D\\x16\\xF2\\x90\\xAE\\x67\\xF7\\x60\\x98\\x4D\\xC6\\x59\\x4A\\x7C\\x15\\xE9\\x71\\x6E\\xD2\\x8D\\xC0\\x27\\xBE\\xCE\\xEA\\x1E\\xC4\\x0A")
+    \\} keys_and_signatures_match_rfc_8032
+    \\
+    \\test seeds_give_their_rfc_8032_keys for SecretKey.of_seed {
+    \\    let secret = SecretKey.of_seed(array32(b"\\x9D\\x61\\xB1\\x9D\\xEF\\xFD\\x5A\\x60\\xBA\\x84\\x4A\\xF4\\x92\\xEC\\x2C\\xC4\\x44\\x49\\xC5\\x69\\x7B\\x32\\x69\\x19\\x70\\x3B\\xAC\\x03\\x1C\\xAE\\x7F\\x60"))
+    \\    expect secret.public_key().bytes == array32(b"\\xD7\\x5A\\x98\\x01\\x82\\xB1\\x0A\\xB7\\xD5\\x4B\\xFE\\xD3\\xC9\\x64\\x07\\x3A\\x0E\\xE1\\x72\\xF3\\xDA\\xA6\\x23\\x25\\xAF\\x02\\x1A\\x68\\xF7\\x07\\x51\\x1A")
+    \\} seeds_give_their_rfc_8032_keys
+    \\
+    \\test public_keys_verify_their_secret_keys_signatures for SecretKey.public_key {
+    \\    let secret = SecretKey.of_seed(array32(b"\\x4C\\xCD\\x08\\x9B\\x28\\xFF\\x96\\xDA\\x9D\\xB6\\xC3\\x46\\xEC\\x11\\x4E\\x0F\\x5B\\x8A\\x31\\x9F\\x35\\xAB\\xA6\\x24\\xDA\\x8C\\xF6\\xED\\x4F\\xB8\\xA6\\xFB"))
+    \\    expect secret.public_key().verify(b"\\x72", signature: secret.sign(b"\\x72"))
+    \\    expect not secret.public_key().verify(b"\\x73", signature: secret.sign(b"\\x72"))
+    \\} public_keys_verify_their_secret_keys_signatures
+    \\
+    \\test verification_rejects_tampering_malleability_and_weak_keys for PublicKey.verify {
+    \\    let key = PublicKey(bytes: array32(b"\\xD7\\x5A\\x98\\x01\\x82\\xB1\\x0A\\xB7\\xD5\\x4B\\xFE\\xD3\\xC9\\x64\\x07\\x3A\\x0E\\xE1\\x72\\xF3\\xDA\\xA6\\x23\\x25\\xAF\\x02\\x1A\\x68\\xF7\\x07\\x51\\x1A"))
+    \\    let signature = Signature(bytes: array64(b"\\xE5\\x56\\x43\\x00\\xC3\\x60\\xAC\\x72\\x90\\x86\\xE2\\xCC\\x80\\x6E\\x82\\x8A\\x84\\x87\\x7F\\x1E\\xB8\\xE5\\xD9\\x74\\xD8\\x73\\xE0\\x65\\x22\\x49\\x01\\x55\\x5F\\xB8\\x82\\x15\\x90\\xA3\\x3B\\xAC\\xC6\\x1E\\x39\\x70\\x1C\\xF9\\xB4\\x6B\\xD2\\x5B\\xF5\\xF0\\x59\\x5B\\xBE\\x24\\x65\\x51\\x41\\x43\\x8E\\x7A\\x10\\x0B"))
+    \\    expect key.verify(b"", signature)
+    \\    expect not key.verify(b"x", signature)
+    \\    var flipped = signature
+    \\    flipped.bytes[0] = flipped.bytes[0] ^ 1
+    \\    expect not key.verify(b"", signature: flipped)
+    \\    expect not key.verify(b"", signature: Signature(bytes: array64(b"\\xE5\\x56\\x43\\x00\\xC3\\x60\\xAC\\x72\\x90\\x86\\xE2\\xCC\\x80\\x6E\\x82\\x8A\\x84\\x87\\x7F\\x1E\\xB8\\xE5\\xD9\\x74\\xD8\\x73\\xE0\\x65\\x22\\x49\\x01\\x55\\x4C\\x8C\\x78\\x72\\xAA\\x06\\x4E\\x04\\x9D\\xBB\\x30\\x13\\xFB\\xF2\\x93\\x80\\xD2\\x5B\\xF5\\xF0\\x59\\x5B\\xBE\\x24\\x65\\x51\\x41\\x43\\x8E\\x7A\\x10\\x1B")))
+    \\    expect not PublicKey(bytes: array32(b"\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00")).verify(b"", signature)
+    \\    expect decoded(array32(b"\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x80")).is_none()
+    \\    expect decoded(array32(b"\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00")).is_some()
+    \\    expect decoded(array32(b"\\xF2\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\xFF\\x7F")).is_none()
+    \\} verification_rejects_tampering_malleability_and_weak_keys
+    \\
+    \\/// Whether the key of a seed is `key` and signs `message` as `signature`, which it verifies.
+    \\fn signs(seed: Slice[u8], key: Slice[u8], message: Slice[u8], signature: Slice[u8]) -> bool {
+    \\    let secret = SecretKey.of_seed(array32(seed))
+    \\    let signed = secret.sign(message)
+    \\    return secret.public_key().bytes == array32(key) and signed.bytes == array64(signature) and secret.public_key().verify(message, signature: signed)
+    \\} signs
+    \\
+    \\fn array32(held: Slice[u8]) -> Array[u8, 32] {
+    \\    var bytes = Array[u8, 32].filled(0)
+    \\    mut bytes.view_mut().copy_from(held)
+    \\    return bytes
+    \\} array32
+    \\
+    \\fn array64(held: Slice[u8]) -> Array[u8, 64] {
+    \\    var bytes = Array[u8, 64].filled(0)
+    \\    mut bytes.view_mut().copy_from(held)
+    \\    return bytes
+    \\} array64
     \\
 
 const TEXT_CORE_ENCODE: Str =

@@ -225,12 +225,14 @@ impl<'w> History<'w> {
     }
 
     /// The `seal.same-author` incompleteness of each item of `escaping`, which hold trust
-    /// escapes, whose current seals all break the author rule.
+    /// escapes, whose current seals all break the author rule: each by one of `authors`, the
+    /// author principals a publication names, or sharing an author with the sealed code.
     pub fn same_author(
         &self,
         package: &Package,
         items: &Items,
         escaping: &[String],
+        authors: &[String],
     ) -> Vec<Diagnostic> {
         let name = package.name().unwrap_or_default();
         let recorded = self.recorded(&Change::Uncommitted);
@@ -252,6 +254,10 @@ impl<'w> History<'w> {
             }
             let mut shared = Vec::new();
             for seal in &seals {
+                if authors.contains(&seal.principal) {
+                    shared.push(format!("{} {}", seal.principal, seal.principal));
+                    continue;
+                }
                 let written = |change: &Change| {
                     self.recorded(change)
                         .entries
@@ -439,7 +445,7 @@ impl Checked {
             let checkers = package_checkers(workspace, std, package);
             let views: Vec<(Target, &Checker)> =
                 checkers.iter().map(|(target, ck)| (*target, ck)).collect();
-            let items = Items::of(&views, name);
+            let items = Items::of(&views, package);
             for (path, variants) in &items.by_path {
                 let first = &variants[0];
                 let hashes = first.ck.hashes(first.item);
@@ -478,7 +484,7 @@ fn held_hash(entry: &ClosureEntry, item: Hash, interface: Option<Hash>) -> bool 
 }
 
 /// The file and first line of an item of a package: the package item's on its `package` line.
-fn location(items: &Items, package: &Package, path: &str) -> Option<(String, u32)> {
+pub fn location(items: &Items, package: &Package, path: &str) -> Option<(String, u32)> {
     if items.package_path() == Some(path) {
         let line = package.manifest.as_ref()?.line;
         return Some((format!("{}/package.nan", package.dir), line));

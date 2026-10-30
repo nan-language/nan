@@ -1,10 +1,11 @@
-//! Machine files: the lock, the history and the API snapshots the toolchain writes in a package's
-//! `.nan` directory. Each is a kind line, one record per logical line, and a check line holding
-//! the hash of every byte before it.
+//! Machine files: the lock, the history, the API snapshots and the principals file the toolchain
+//! writes in a package's `.nan` directory. Each is a kind line, one record per logical line, and a
+//! check line holding the hash of every byte before it.
 
 pub mod api;
 pub mod history;
 pub mod lock;
+pub mod principals;
 
 use crate::diagnostic::Code;
 use crate::hash::{Hash, parse_form};
@@ -17,6 +18,7 @@ pub enum Kind {
     Lock,
     History,
     Api,
+    Principals,
 }
 
 impl Kind {
@@ -25,6 +27,7 @@ impl Kind {
             Kind::Lock => "lock",
             Kind::History => "history",
             Kind::Api => "api",
+            Kind::Principals => "principals",
         }
     }
 }

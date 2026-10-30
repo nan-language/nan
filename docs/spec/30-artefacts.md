@@ -1,6 +1,6 @@
 # Artefacts
 
-This chapter defines artefacts with their attestation files, code roots, the reserved sections, the host ELF section `.nan`, reuse, lowering with type layout, niche packing and the ABI, and host symbol names.
+This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, reuse, lowering with type layout, niche packing and the ABI, and host symbol names.
 
 ## Artefacts
 
@@ -13,7 +13,7 @@ An artefact is written in the forms of the [canonical NIR encoding](19-nir.md#en
 uvar                 format version, 1 in language 1
 bytes                code root
 bytes                attestation file
-record               reserved sections
+record               sections
 ```
 
 - A hash is bytes holding its 33 bytes ([hash values](29-identity-versioning.md#hash-values)), and a path or name is a text; the other forms are the NIR encoding's.
@@ -37,7 +37,7 @@ The attestation file is a record with these keys:
 | 3 | its [sealed item hash](31-trust.md#seals) |
 | 4 | its closure hash |
 | 5 | its closure entries, each a record of 1 a uvar, 0 for an entry with an interface hash and 1 for one with an item hash, 2 the canonical path and 3 the hash |
-| 6 | the reserved signature field, which language 1 never writes |
+| 6 | its [signature](31-trust.md#signatures), as bytes, and 7 the public key the package's [principals file](31-trust.md#principals) gives its principal, as bytes; both present exactly when the seal holds a signature and the principals file gives its principal a key |
 
 The attestation file is not part of release identity: artefacts with equal code roots are artefacts of one release.
 
@@ -81,9 +81,19 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 - A unit holds its digests and its `example` functions, and the units of [reliance tests](22-testing.md#reliance-tests) are in part 4.
 - Trap reports and diagnostics quote the lines of a package whose units come from an artefact from its line tables.
 
-## Reserved sections
+## Sections
 
-The reserved sections record of an artefact reserves keys 1 signature, 2 native cache, 3 availability, 4 certificate and 5 provenance. An implementation of language 1 writes the record empty, and an artefact whose record holds a field with one of these keys is an error (`artefact.reserved-section`).
+The sections record of an artefact holds none of its fields, or exactly fields 1, 4 and 5, which `nan publish --as` writes ([publishing](29-identity-versioning.md#publishing)); keys 2, native cache, and 3, availability, are reserved. A sections record holding key 2 or 3 is an error (`artefact.reserved-section`), and one holding another set of keys is `artefact.malformed`.
+
+| Key | Section | Content |
+| --- | --- | --- |
+| 1 | signature | the publisher's signature: a record of 1 the principal, 2 its public key, as bytes, and 3 the [signature](31-trust.md#signatures), as bytes, of `nan artefact 1`, the principal, the [key form](31-trust.md#principals) of the public key, and the full forms of the hashes of the code root, of the attestation file and of the provenance section, each followed by LF |
+| 4 | certificate | the builder's attestation that the package's dependency closure passed the [release gate](31-trust.md#release-gate) under a toolchain: a record of 1 the principal, 2 its public key, as bytes, 3 the toolchain hash, 4 a list of pairs, one per package of the closure, the package itself included and std excluded, of its package name and code root hash, and 5 the signature, as bytes, of `nan certificate 1` and LF followed by the encoding of the record of fields 1 to 4 |
+| 5 | provenance | a record of 1 the author principals, a list of texts, and 2 the package's [lock](29-identity-versioning.md#lock) as bytes, empty when it has none |
+
+An artefact **verifies** when every signature it holds [verifies](31-trust.md#signatures) by the public key beside it: each signed seal's of its seal message, the publisher's, and the builder's, whose certificate names the publisher's principal and key and lists the artefact's code root hash. Its bytes alone decide it, so a device verifies an artefact without the toolchain. A key binds a signature to a principal only for a verifier that gives that principal that key: a package **accepts** the artefact of a release that its lock locks when the artefact verifies, its publisher key is the one its lock line records, none when it records none, its [principals file](31-trust.md#principals) gives its publisher exactly the key the artefact holds, and it gives the principal of each signed seal that key or none, such a seal then counting for nothing more than an unsigned one.
+
+- An artefact of a locked release that the locking package does not accept is an error (`artefact.bad-signature`), and its release is not read: a signature by a principal the package does not trust, by another key under a trusted principal's name, or sections stripped from or added to the release its lock records.
 
 ## Host ELF section
 
@@ -210,9 +220,10 @@ In the table, `<C>` stands for the package's code root prefix and `<I>` for the 
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `artefact.malformed` | error | [Artefacts](#artefacts) |
+| `artefact.bad-signature` | error | [Sections](#sections) |
+| `artefact.malformed` | error | [Artefacts](#artefacts), [Sections](#sections) |
 | `artefact.recheck-failed` | error | [Reuse](#reuse) |
-| `artefact.reserved-section` | error | [Reserved sections](#reserved-sections) |
+| `artefact.reserved-section` | error | [Sections](#sections) |
 | `artefact.root-mismatch` | error | [Artefacts](#artefacts) |
 | `artefact.symbol-collision` | error | [Host symbol names](#host-symbol-names) |
 | `artefact.version-unsupported` | error | [Artefacts](#artefacts) |

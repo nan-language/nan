@@ -10,6 +10,8 @@ use super::props::Property;
 use super::seal::closure_hash;
 use crate::hash::Hash;
 use crate::machine::api::{Accepted, ClosureEntry, Doc, Entry, Seal, Snapshot};
+use crate::machine::principals::Principals;
+use crate::sign;
 use crate::syntax::ast::ItemKind;
 use crate::workspace::{Package, Target};
 
@@ -23,15 +25,18 @@ pub struct Variant<'c, 'a> {
 }
 
 /// The items of a package across the checkers of its targets, by canonical path, each with the
-/// variants holding it under each target, in byte order of file path, then of target.
+/// variants holding it under each target, in byte order of file path, then of target, with the
+/// package's principals file.
 pub struct Items<'c, 'a> {
     pub by_path: BTreeMap<String, Vec<Variant<'c, 'a>>>,
     /// The package item's hashes and ledger under the first checker.
     pub package: Option<(PackageId, &'c Checker<'a>)>,
+    pub principals: &'c Principals,
 }
 
 impl<'c, 'a> Items<'c, 'a> {
-    pub fn of(checkers: &[(Target, &'c Checker<'a>)], package: &str) -> Items<'c, 'a> {
+    pub fn of(checkers: &[(Target, &'c Checker<'a>)], source: &'c Package) -> Items<'c, 'a> {
+        let package = source.name().unwrap_or_default();
         let mut by_path: BTreeMap<String, Vec<Variant>> = BTreeMap::new();
         let mut first = None;
         for (target, ck) in checkers {
@@ -61,6 +66,7 @@ impl<'c, 'a> Items<'c, 'a> {
         Items {
             by_path,
             package: first,
+            principals: source.machine.principals(),
         }
     }
 
@@ -106,12 +112,22 @@ impl<'c, 'a> Items<'c, 'a> {
             .collect()
     }
 
-    /// Whether a seal of an item is current: it holds no signature and the item's sealed item
-    /// hash and closure hash are those it records.
+    /// Whether a seal of an item is current: the item's sealed item hash and closure hash are
+    /// those it records, and it holds a signature that verifies by the key the principals file
+    /// gives its principal, or no signature when the file gives the principal none.
     pub fn seal_current(&self, path: &str, seal: &Seal) -> bool {
-        seal.signature.is_none()
-            && self.sealed_hash(path) == Some(seal.item)
-            && closure_hash(&self.closure_entries(path)) == seal.closure
+        let hashed = self.sealed_hash(path) == Some(seal.item)
+            && closure_hash(&self.closure_entries(path)) == seal.closure;
+        hashed
+            && match (self.principals.key(&seal.principal), &seal.signature) {
+                (Some(key), Some(signature)) => sign::verify(
+                    key,
+                    &sign::seal_message(&seal.principal, path, seal.item, seal.closure),
+                    signature,
+                ),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// Whether an item holds a trust escape: the package item through its grants.
@@ -260,15 +276,16 @@ pub struct Sealed {
     pub accepted: Option<Accepted>,
 }
 
-/// The snapshot of the module recording the item at `path` once `principal` seals it, from the
-/// snapshots `nan api update` computes: the seal replaces an earlier one of the principal and
-/// accepts the item's pending weakening.
+/// The snapshot of the module recording the item at `path` once `principal` seals it, signing
+/// the seal by the key of `seed` when given, from the snapshots `nan api update` computes: the
+/// seal replaces an earlier one of the principal and accepts the item's pending weakening.
 pub fn sealed(
     items: &Items,
     source: &Package,
     computed: Snapshots,
     path: &str,
     principal: &str,
+    seed: Option<&[u8; 32]>,
 ) -> Result<Sealed, Unsealed> {
     let module = match items.first(path) {
         _ if items.package_path() == Some(path) => {
@@ -326,12 +343,15 @@ pub fn sealed(
         accepted = Some(entry.accepted.clone());
     }
     let entries = items.closure_entries(path);
+    let item = items.sealed_hash(path).ok_or(Unsealed::Unneeded)?;
+    let closure = closure_hash(&entries);
     let seal = Seal {
         principal: principal.to_owned(),
-        item: items.sealed_hash(path).ok_or(Unsealed::Unneeded)?,
-        closure: closure_hash(&entries),
+        item,
+        closure,
         entries: entries.into_iter().collect(),
-        signature: None,
+        signature: seed
+            .map(|seed| sign::sign(seed, &sign::seal_message(principal, path, item, closure))),
     };
     entry.seals.retain(|kept| kept.principal != principal);
     let at = entry

@@ -1,6 +1,7 @@
 use super::api::{AcceptedTest, ClosureEntry, Doc, DocKey, Entry, Method, Seal, Snapshot};
 use super::history::History;
 use super::lock::{Entry as Approved, Lock, Locked};
+use super::principals::Principals;
 use super::{Invalid, escaped};
 use crate::diagnostic::Code;
 use crate::hash::Hash;
@@ -14,6 +15,7 @@ fn lock() -> Lock {
                 alias: Some("meter".to_owned()),
                 source: "../meter".to_owned(),
                 root: Hash::of(b"meter"),
+                signer: None,
                 line: 0,
             },
             Locked {
@@ -21,6 +23,7 @@ fn lock() -> Lock {
                 alias: None,
                 source: "ring-store".to_owned(),
                 root: Hash::of(b"ring"),
+                signer: Some([3; 32]),
                 line: 0,
             },
         ],
@@ -181,7 +184,7 @@ fn snapshot() -> Snapshot {
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_iter()
                         .collect(),
-                    signature: None,
+                    signature: Some([7; 64]),
                 }],
                 ..Entry::default()
             },
@@ -225,6 +228,26 @@ fn an_api_record_out_of_its_entry_order_is_invalid() {
     );
     let invalid = Snapshot::read(&swapped).unwrap_err();
     assert_eq!(invalid, Invalid::at(interface as u32));
+}
+
+#[test]
+fn a_principals_file_reads_back_as_written_and_keeps_its_principals_ordered() {
+    let principals = Principals::default()
+        .trusting("ben", [2; 32])
+        .trusting("ana", [9; 32])
+        .trusting("ana", [1; 32]);
+    assert_eq!(
+        principals.keys,
+        vec![("ana".to_owned(), [1; 32]), ("ben".to_owned(), [2; 32])]
+    );
+    let bytes = principals.bytes().unwrap();
+    assert_eq!(Principals::read(&bytes).unwrap(), principals);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let ana = text.lines().nth(1).unwrap().to_owned();
+    let swapped = edited(&edited(&bytes, 2, text.lines().nth(2).unwrap()), 3, &ana);
+    assert_eq!(Principals::read(&swapped).unwrap_err(), Invalid::at(3));
+    let unkeyed = edited(&bytes, 2, "principal \"ana\" \"ana\"");
+    assert_eq!(Principals::read(&unkeyed).unwrap_err(), Invalid::at(2));
 }
 
 #[test]

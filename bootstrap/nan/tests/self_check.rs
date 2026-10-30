@@ -10,7 +10,9 @@
 //! the toolchain workspace, which must check without a diagnostic and pass `nan verify` with
 //! both. The toolchain test then checks the self-built toolchain by diverse
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
-//! into the same bytes, and the bootstrap's stage comparison accepts it. The NaN toolchain runs
+//! into the same bytes, and the bootstrap's stage comparison accepts it. The signing test compares
+//! both on the key commands, signed seals and a signed release, with the same secret keys in the
+//! user directories of both. The NaN toolchain runs
 //! beside the bootstrap on a copy of the workspace and local store the bootstrap runs in, on one
 //! processor, or on every one when it builds itself, under an address-space cap, with a user
 //! directory of its own.
@@ -38,6 +40,7 @@ datatest_stable::harness! {
     { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
     { test = toolchain, root = "../../toolchain", pattern = r"^nan/package\.nan$" },
     { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
+    { test = signing, root = "../../docs/spec", pattern = r"^31-trust\.md$" },
 }
 
 /// The root file the toolchain is built with: the command line with the user directory and local
@@ -560,6 +563,17 @@ fn compare(
     store: &Path,
     args: &[&str],
 ) -> Result<(String, Option<i32>), String> {
+    compare_within(toolchain, bootstrap, store, "", args)
+}
+
+/// Compares as `compare` does, both runs starting in the directory `within` of their workspace.
+fn compare_within(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    within: &str,
+    args: &[&str],
+) -> Result<(String, Option<i32>), String> {
     resync(bootstrap, store)?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let home = front_home();
@@ -569,8 +583,8 @@ fn compare(
         asked: &[],
         spread: false,
     };
-    let run = front(toolchain, &front_dir, &given, args)?;
-    let (expected, status) = nan(bootstrap, args)?;
+    let run = front(toolchain, &front_dir.join(within), &given, args)?;
+    let (expected, status) = nan(&bootstrap.join(within), args)?;
     let (printed, code) = run.output()?;
     agree(args, (expected.as_bytes(), status), (&printed, code))?;
     same_files(args, (bootstrap, store), (&front_dir, &front_store))?;
@@ -1247,6 +1261,162 @@ fn double_compiled(second: SelfBuild, outside: &Path) -> Result<(), String> {
 /// runs in, which it reports
 /// as `internal.resource-exhausted` with a reproducer holding the command line and the files the
 /// command read, writing nothing to standard error.
+/// Writes the secret key of a principal from a seed into the user directories of the bootstrap's
+/// runs and of the NaN toolchain's.
+fn secret_key(principal: &str, seed: u8) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    for home in [tmp.join("home"), front_home()] {
+        let keys = home.join(".nan/keys");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&keys)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(keys.join(format!("{principal}.key")))?
+            .write_all(&[seed; 32])?;
+    }
+    Ok(())
+}
+
+/// The public key `nan key show <principal>` prints, compared between both toolchains.
+fn shown_key(
+    toolchain: &Toolchain,
+    dir: &Path,
+    store: &Path,
+    principal: &str,
+) -> Result<String, String> {
+    let (shown, _) = compare(toolchain, dir, store, &["key", "show", principal])?;
+    shown
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix(&format!("key {principal} ")))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("nan key show {principal} prints\n{shown}"))
+}
+
+/// Compares as `compare` does a run of `nan publish`, but the local stores, whose artefacts
+/// each toolchain attests with its own toolchain hash; the next comparison copies the
+/// bootstrap's store for both.
+fn compare_published(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    args: &[&str],
+) -> Result<(String, Option<i32>), String> {
+    resync(bootstrap, store)?;
+    let (front_dir, front_store) = fronts(bootstrap, store);
+    let home = front_home();
+    let given = Given {
+        home: &home,
+        store: &front_store,
+        asked: &[],
+        spread: false,
+    };
+    let run = front(toolchain, &front_dir, &given, args)?;
+    let (expected, status) = nan(bootstrap, args)?;
+    let (printed, code) = run.output()?;
+    agree(args, (expected.as_bytes(), status), (&printed, code))?;
+    if let Some(path) = tree_difference(bootstrap, &front_dir)? {
+        return Err(format!(
+            "after nan {}, {path} differs in {}",
+            args.join(" "),
+            front_dir.display()
+        ));
+    }
+    Ok((expected, status))
+}
+
+/// A package holding a trust escape, and a package reading it from a release.
+const SIGNED_FILES: [(&str, &str); 4] = [
+    (
+        "procinfo/package.nan",
+        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-host\n    allow trusted in procinfo\n} procinfo\n",
+    ),
+    (
+        "procinfo/procinfo.nan",
+        "//! Reads process facts.\n\n/// The process id.\npub foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention \"sysv\"\n",
+    ),
+    (
+        "app/package.nan",
+        "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    dep procinfo \"self-check-signing\"\n    allow trusted in procinfo\n} app\n",
+    ),
+    (
+        "app/app.nan",
+        "//! Apps.\n\npub fn id() -> i32 {\n    return procinfo::getpid()\n} id\n",
+    ),
+];
+
+fn signing(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
+    let store = fresh_store("self-check-signing")?;
+    let toolchain = Toolchain::new(image()?);
+    // Outside every git working tree, the author rule reads only the author principals.
+    let dir = std::env::temp_dir().join(format!("nan-self-check-signing-{}", std::process::id()));
+    drop(fs::remove_dir_all(&dir));
+    for (path, text) in &SIGNED_FILES[..2] {
+        fs::create_dir_all(dir.join(path).parent().expect("a package directory"))?;
+        fs::write(dir.join(path), text)?;
+    }
+    secret_key("signing-sealer", 7)?;
+    secret_key("signing-publisher", 4)?;
+    compare(&toolchain, &dir, &store, &["api", "update"])?;
+    let sealer = shown_key(&toolchain, &dir, &store, "signing-sealer")?;
+    let publisher = shown_key(&toolchain, &dir, &store, "signing-publisher")?;
+    compare(&toolchain, &dir, &store, &["key", "show", "signing-absent"])?;
+    let trust = |key: &str| -> Result<(), String> {
+        let args = ["key", "trust", "signing-sealer", key];
+        compare_within(&toolchain, &dir, &store, "procinfo", &args).map(drop)
+    };
+    trust("notakey")?;
+    trust(&sealer)?;
+    let seal = ["seal", "procinfo::getpid", "--as", "signing-sealer"];
+    compare(&toolchain, &dir, &store, &seal)?;
+    compare(&toolchain, &dir, &store, &["verify"])?;
+    let publish = [
+        "publish",
+        "--local",
+        "procinfo",
+        "--name",
+        "self-check-signing",
+        "--as",
+    ];
+    compare_published(
+        &toolchain,
+        &dir,
+        &store,
+        &[&publish[..], &["signing-sealer"]].concat(),
+    )?;
+    let authored = [
+        &publish[..],
+        &["signing-publisher", "--author", "signing-author"],
+    ]
+    .concat();
+    let (published, _) = compare_published(&toolchain, &dir, &store, &authored)?;
+    if !published.contains("\npublished self-check-signing ") {
+        return Err(format!("nan {} prints\n{published}", authored.join(" ")).into());
+    }
+    for (path, text) in &SIGNED_FILES[2..] {
+        fs::create_dir_all(dir.join(path).parent().expect("a package directory"))?;
+        fs::write(dir.join(path), text)?;
+    }
+    compare_within(&toolchain, &dir, &store, "app", &["dep", "sync"])?;
+    compare(&toolchain, &dir, &store, &["check"])?;
+    let app_trust = ["key", "trust", "signing-publisher", publisher.as_str()];
+    compare_within(&toolchain, &dir, &store, "app", &app_trust)?;
+    compare(&toolchain, &dir, &store, &["check"])?;
+    trust(&publisher)?;
+    compare(&toolchain, &dir, &store, &["verify", "procinfo"])?;
+    compare(&toolchain, &dir, &store, &seal)?;
+    fs::remove_dir_all(&dir)?;
+    fs::remove_dir_all(fronts(&dir, &store).0)?;
+    Ok(())
+}
+
 fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let store = fresh_store("self-check-internal-error")?;
     let starved = Toolchain {

@@ -1,13 +1,15 @@
 //! `nan seal <item> --as <principal>`: records a seal of the principal on the item in its
-//! module's API snapshot, accepting the item's pending weakening.
+//! module's API snapshot, signed when the package's principals file gives the principal a key,
+//! accepting the item's pending weakening.
 
 use std::io;
 use std::path::Path;
 
-use super::{Invocation, Trace, record};
+use super::{Invocation, Trace, key, record};
 use crate::check::{self, Unsealed};
 use crate::diagnostic::{Class, Code, Diagnostic, Reason};
 use crate::journal;
+use crate::machine::principals::is_principal;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::workspace::Workspace;
@@ -50,16 +52,15 @@ pub fn run(
         _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
     };
     let package = &workspace.packages[index];
-    let named_well = (1..=64).contains(&principal.len())
-        && principal
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-@".contains(&byte));
     let mut diagnostics = Vec::new();
     let mut changes = Vec::new();
-    if !named_well {
-        diagnostics.push(Diagnostic::new(Code::SealBadPrincipal));
-    } else {
-        match check::sealed(workspace, package, &path, principal) {
+    let signer = match is_principal(principal) {
+        true => key::signer(package.machine.principals(), principal)?,
+        false => Err(Diagnostic::new(Code::SealBadPrincipal)),
+    };
+    match signer {
+        Err(diagnostic) => diagnostics.push(diagnostic),
+        Ok(seed) => match check::sealed(workspace, package, &path, principal, seed.as_ref()) {
             Ok(sealed) => {
                 let file = format!("{}/.nan/api/{}.nan", package.dir, sealed.module);
                 changes.push((file, sealed.snapshot.bytes()));
@@ -74,7 +75,7 @@ pub fn run(
                 because: vec![Reason::note(&format!("{principal} {author}"))],
                 ..Diagnostic::at(Code::SealSameAuthor, &location.0, location.1)
             }),
-        }
+        },
     }
     journal::apply(&workspace.root, &changes)?;
     let count = |class: Class| {

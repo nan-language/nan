@@ -3,9 +3,10 @@
 //! through the sims, files, listeners and connections, revocation, and the submission of
 //! io_uring operations.
 //!
-//! Each operation checks its capability's entry first. An `Fs` entry's state is its directory's
-//! descriptor, the address and length of its path prefix, and whether it is read-only; a `Net`
-//! entry's is the address and length of the one host it reaches, when restricted. A file,
+//! Each operation checks its capability's entry first, reading its state words through a
+//! snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor,
+//! the address and length of its path prefix, and whether it is read-only; a `Net` entry's is
+//! the address and length of the one host it reaches, when restricted. A file,
 //! listener or connection is the entry it was opened through and the holding of its
 //! descriptor; a revoker is the holding of its entry or cell.
 
@@ -15,7 +16,7 @@ use super::super::Lowering;
 use super::super::body::{Body, Held};
 use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{RESOLUTION, entry, entry_at, kind, live_entry};
+use super::super::runtime::tables::{self, RESOLUTION, entry, live_entry};
 use super::super::runtime::{Routine, holdings, seeded, timers};
 use super::super::transfer;
 use super::Supply;
@@ -23,13 +24,9 @@ use super::render;
 use super::sims;
 use crate::check::ty::Ty;
 
-/// The words of an entry's state.
-mod word {
-    pub const DIRECTORY: u64 = 0;
-    pub const TEXT: u64 = 8;
-    pub const TEXT_LEN: u64 = 16;
-    pub const FLAGS: u64 = 24;
-}
+/// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
+/// whether it is restricted.
+const FLAGS: u64 = entry::STATE + 24;
 
 /// The render budget of a log record's value.
 const LOG_BUDGET: u64 = 1_024;
@@ -65,14 +62,38 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     true
 }
 
-/// The entry record of the capability held at an address, failing the operation with
-/// `Revoked.Stale` when its handle is stale.
-fn checked(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) -> Value {
+/// Fails the operation with `Revoked.Stale` when the handle of the capability held at an
+/// address is stale.
+fn check(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) {
     let handle = fx.load(PTR, capability, 0);
     let record = live_entry(lo, fx, handle);
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-    record
+}
+
+/// The state words of the entry of the capability held at an address, failing the operation
+/// with `Revoked.Stale` when its handle is stale.
+fn checked(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) -> [Value; 4] {
+    let handle = fx.load(PTR, capability, 0);
+    let (live, words) = tables::snapshot(lo, fx, handle);
+    let stale = fx.b.ins().bxor_imm_s(live, 1);
+    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+    words
+}
+
+/// A copy of the text of the entry of the capability held at an address, which the caller
+/// frees, failing the operation with `Revoked.Stale` when its handle is stale.
+pub fn checked_text(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    capability: Value,
+) -> (Value, Value) {
+    let handle = fx.load(PTR, capability, 0);
+    let (copy, len) = tables::copy_text(lo, fx, handle);
+    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
+    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+    (copy, len)
 }
 
 /// Fails with a failure value of the operation's failure type: the variant of that name, or
@@ -120,18 +141,6 @@ fn new_view(fx: &mut Fx, start: Value, len: Value) -> Held {
     fx.store(start, slot, 0);
     fx.store(len, slot, 8);
     Held::Address(slot)
-}
-
-/// A copy of `len` bytes from `start` in runtime memory, as an entry's state keeps texts.
-fn kept_text(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value) -> Value {
-    let size = fx.b.ins().iadd_imm_s(len, 1);
-    let copy = lo.record_alloc(fx, size);
-    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
-    fx.when(failed, |fx| {
-        super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
-    });
-    lo.call_routine(fx, Routine::Copy, &[copy, start, len]);
-    copy
 }
 
 /// Whether a path has the form a `sys::Fs` path has: relative segments separated by `/`, none
@@ -188,13 +197,7 @@ fn valid_path(fx: &mut Fx, start: Value, len: Value) -> Value {
 
 fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let record = checked(lo, fx, supply, capability);
-    let directory = fx.load(PTR, record, entry::STATE + word::DIRECTORY);
-    let directory = fx.b.ins().ireduce(types::I32, directory);
-    let prefix_start = fx.load(PTR, record, entry::STATE + word::TEXT);
-    let prefix_len = fx.load(PTR, record, entry::STATE + word::TEXT_LEN);
-    let prefix = new_view(fx, prefix_start, prefix_len);
-    let flags = fx.load(PTR, record, entry::STATE + word::FLAGS);
+    let [directory, _, _, flags] = checked(lo, fx, supply, capability);
     let member = supply.member();
     if matches!(member, "create" | "write_all" | "remove") {
         let read_only = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flags, 0);
@@ -209,82 +212,59 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let invalid = fx.b.ins().bxor_imm_s(valid, 1);
         fx.when(invalid, |fx| fail_with(lo, fx, supply, "InvalidPath"));
     }
-    let directory = Held::Scalar(directory);
-    if lo.seeded() && !matches!(member, "subdir" | "read_only") {
+    match member {
+        "subdir" => {
+            let (start, len) = view(fx, supply.param(1));
+            let floor = fx.ptr(0);
+            attenuate(lo, fx, supply, FLAGS, floor, Some((start, len)));
+            return;
+        }
+        "read_only" => {
+            let floor = fx.ptr(1);
+            attenuate(lo, fx, supply, FLAGS, floor, None);
+            return;
+        }
+        _ => {}
+    }
+    if lo.seeded() {
         match member {
-            "open" | "create" => sims::fs::open(lo, fx, supply, record, member == "create"),
-            "read_all" => sims::fs::read_all(lo, fx, supply, record),
-            "write_all" => sims::fs::write_all(lo, fx, supply, record),
-            "remove" => sims::fs::remove(lo, fx, supply, record),
+            "open" | "create" => sims::fs::open(lo, fx, supply, directory, member == "create"),
+            "read_all" => sims::fs::read_all(lo, fx, supply, directory),
+            "write_all" => sims::fs::write_all(lo, fx, supply, directory),
+            "remove" => sims::fs::remove(lo, fx, supply, directory),
             member => panic!("no lowering of sys::Fs.{member}"),
         }
         return;
     }
-    match member {
-        "subdir" | "read_only" => {
-            let handle = fx.load(PTR, capability, 0);
-            let kind = fx.ptr(kind::FS as u64);
-            let derived = lo.call_routine(fx, Routine::Derive, &[handle, kind])[0];
-            let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
-            fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-            let record = super::super::runtime::tables::entry_at(lo, fx, derived);
-            if member == "subdir" {
-                let (start, len) = view(fx, supply.param(1));
-                let joined = fx.b.ins().iadd(prefix_len, len);
-                let has_prefix = fx.b.ins().icmp_imm_s(IntCC::NotEqual, prefix_len, 0);
-                let separator = fx.b.ins().uextend(PTR, has_prefix);
-                let joined = fx.b.ins().iadd(joined, separator);
-                let size = fx.b.ins().iadd_imm_s(joined, 1);
-                let text = lo.record_alloc(fx, size);
-                lo.call_routine(fx, Routine::Copy, &[text, prefix_start, prefix_len]);
-                fx.when(has_prefix, |fx| {
-                    let at = fx.b.ins().iadd(text, prefix_len);
-                    let slash = fx.int(types::I8, i64::from(b'/'));
-                    fx.store(slash, at, 0);
-                });
-                let tail = fx.b.ins().iadd(text, prefix_len);
-                let tail = fx.b.ins().iadd(tail, separator);
-                lo.call_routine(fx, Routine::Copy, &[tail, start, len]);
-                fx.store(text, record, entry::STATE + word::TEXT);
-                fx.store(joined, record, entry::STATE + word::TEXT_LEN);
-            } else {
-                let one = fx.ptr(1);
-                fx.store(one, record, entry::STATE + word::FLAGS);
-            }
-            let sret = supply.sret.expect("a capability's address");
-            fx.store(derived, sret, 0);
-            supply.done(lo, fx);
-        }
-        "open" | "create" => {
-            let name = match member {
-                "open" => "fs_open",
-                _ => "fs_create",
-            };
-            let called = lo.platform_call(fx, name, &[directory, prefix, supply.param(1)]);
-            after(lo, fx, supply, &called, |lo, fx, fd| {
-                let handle = fx.load(PTR, capability, 0);
-                let fd = fx.b.ins().sextend(PTR, fd.scalar());
-                ret_resource(lo, fx, supply, handle, fd);
-            });
-        }
-        "read_all" => {
-            let args = [directory, prefix, supply.param(1), supply.param(2)];
-            let called = lo.platform_call(fx, "fs_read_all", &args);
-            after(lo, fx, supply, &called, |lo, fx, bytes| {
-                supply.ret(lo, fx, bytes)
-            });
-        }
-        "write_all" => {
-            let args = [directory, prefix, supply.param(1), supply.param(2)];
-            let called = lo.platform_call(fx, "fs_write_all", &args);
-            after(lo, fx, supply, &called, |lo, fx, _| supply.done(lo, fx));
-        }
-        "remove" => {
-            let called = lo.platform_call(fx, "fs_remove", &[directory, prefix, supply.param(1)]);
-            after(lo, fx, supply, &called, |lo, fx, _| supply.done(lo, fx));
-        }
+    let prefix = checked_text(lo, fx, supply, capability);
+    let directory = fx.b.ins().ireduce(types::I32, directory);
+    let directory = Held::Scalar(directory);
+    let path = new_view(fx, prefix.0, prefix.1);
+    let (name, args) = match member {
+        "open" => ("fs_open", vec![directory, path, supply.param(1)]),
+        "create" => ("fs_create", vec![directory, path, supply.param(1)]),
+        "read_all" => (
+            "fs_read_all",
+            vec![directory, path, supply.param(1), supply.param(2)],
+        ),
+        "write_all" => (
+            "fs_write_all",
+            vec![directory, path, supply.param(1), supply.param(2)],
+        ),
+        "remove" => ("fs_remove", vec![directory, path, supply.param(1)]),
         member => panic!("no lowering of sys::Fs.{member}"),
-    }
+    };
+    let called = lo.platform_call(fx, name, &args);
+    lo.record_free(fx, prefix.0);
+    after(lo, fx, supply, &called, |lo, fx, result| match member {
+        "open" | "create" => {
+            let handle = fx.load(PTR, capability, 0);
+            let fd = fx.b.ins().sextend(PTR, result.scalar());
+            ret_resource(lo, fx, supply, handle, fd);
+        }
+        "read_all" => supply.ret(lo, fx, result),
+        _ => supply.done(lo, fx),
+    });
 }
 
 /// Returns a file, listener or connection: the entry it was opened through and the holding of
@@ -319,33 +299,18 @@ fn descriptor(fx: &mut Fx, address: Value) -> Value {
 
 fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let record = checked(lo, fx, supply, capability);
-    let host_start = fx.load(PTR, record, entry::STATE + word::TEXT);
-    let host_len = fx.load(PTR, record, entry::STATE + word::TEXT_LEN);
-    let restricted = fx.load(PTR, record, entry::STATE + word::FLAGS);
+    let [network, _, _, restricted] = checked(lo, fx, supply, capability);
     let restricted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, restricted, 0);
     match supply.member() {
         "only_host" => {
-            let handle = fx.load(PTR, capability, 0);
-            let kind = fx.ptr(kind::NET as u64);
-            let derived = lo.call_routine(fx, Routine::Derive, &[handle, kind])[0];
-            let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
-            fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-            let record = super::super::runtime::tables::entry_at(lo, fx, derived);
-            let (start, len) = view(fx, supply.param(1));
-            let text = kept_text(lo, fx, start, len);
-            fx.store(text, record, entry::STATE + word::TEXT);
-            fx.store(len, record, entry::STATE + word::TEXT_LEN);
-            let one = fx.ptr(1);
-            fx.store(one, record, entry::STATE + word::FLAGS);
-            let sret = supply.sret.expect("a capability's address");
-            fx.store(derived, sret, 0);
-            supply.done(lo, fx);
+            let host = view(fx, supply.param(1));
+            let floor = fx.ptr(1);
+            attenuate(lo, fx, supply, FLAGS, floor, Some(host));
         }
         "listen" => {
             fx.when(restricted, |fx| fail_with(lo, fx, supply, "Denied"));
             if lo.seeded() {
-                sims::net::listen(lo, fx, supply, record);
+                sims::net::listen(lo, fx, supply, network);
                 return;
             }
             let called = lo.platform_call(fx, "net_listen", &[supply.param(1)]);
@@ -358,13 +323,15 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "connect" => {
             let host = supply.param(1);
             fx.when(restricted, |fx| {
-                let stored = new_view(fx, host_start, host_len);
+                let (copy, len) = checked_text(lo, fx, supply, capability);
+                let stored = new_view(fx, copy, len);
                 let same = lo.views_equal(fx, stored, host);
+                lo.record_free(fx, copy);
                 let other = fx.b.ins().bxor_imm_s(same, 1);
                 fx.when(other, |fx| fail_with(lo, fx, supply, "Denied"));
             });
             if lo.seeded() {
-                sims::net::connect(lo, fx, supply, record);
+                sims::net::connect(lo, fx, supply, network);
                 return;
             }
             let called = lo.platform_call(fx, "net_connect", &[host, supply.param(2)]);
@@ -381,15 +348,14 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let handle = fx.load(PTR, capability, 0);
-    let record = live_entry(lo, fx, handle);
-    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    let (live, [minted, resolution, _, _]) = tables::snapshot(lo, fx, handle);
+    let stale = fx.b.ins().bxor_imm_s(live, 1);
     match supply.member() {
         member @ ("elapsed_ms" | "elapsed_ns") => {
             fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-            let minted = fx.load(PTR, record, entry::STATE);
             let now = lo.now_ns(fx);
             let elapsed = fx.b.ins().isub(now, minted);
-            let elapsed = round_down(fx, record, elapsed);
+            let elapsed = round_down(fx, resolution, elapsed);
             let elapsed = match member {
                 "elapsed_ms" => {
                     let per_ms = fx.ptr(timers::NS_PER_MS);
@@ -405,7 +371,7 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 "sleep" => timers::from_ms(fx, supply.param(1).scalar()),
                 _ => supply.param(1).scalar(),
             };
-            let delay = clock_delay(lo, fx, record, ns);
+            let delay = clock_delay(lo, fx, minted, resolution, ns);
             if lo.seeded() || lo.kernel() {
                 let cancelled = sims::wait(lo, fx, None, |lo, fx, op| match lo.seeded() {
                     true => seeded::arm(lo, fx, op, delay),
@@ -418,7 +384,7 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let called = lo.platform_call(fx, "sleep", &[Held::Scalar(delay)]);
             after(lo, fx, supply, &called, |lo, fx, _| supply.done(lo, fx));
         }
-        "coarse" => coarse(lo, fx, supply, kind::CLOCK, RESOLUTION),
+        "coarse" => coarse(lo, fx, supply, RESOLUTION),
         member => panic!("no lowering of sys::Clock.{member}"),
     }
 }
@@ -426,63 +392,78 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn wall_clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "now_ns" => {
-            let record = checked(lo, fx, supply, supply.param(0).address());
+            let [ahead, resolution, _, _] = checked(lo, fx, supply, supply.param(0).address());
             let now = match lo.seeded() || lo.machine() {
                 true => {
                     let now = lo.now_ns(fx);
-                    let ahead = fx.load(PTR, record, entry::STATE);
                     fx.b.ins().iadd(now, ahead)
                 }
                 false => lo.platform_call(fx, "wall_ns", &[]).result.scalar(),
             };
-            let now = round_down(fx, record, now);
+            let now = round_down(fx, resolution, now);
             supply.ret(lo, fx, Held::Scalar(now));
         }
-        "coarse" => coarse(lo, fx, supply, kind::WALL, RESOLUTION),
+        "coarse" => coarse(lo, fx, supply, RESOLUTION),
         member => panic!("no lowering of sys::WallClock.{member}"),
     }
 }
 
 /// `c.coarse(ns)` of a `Clock`, `WallClock` or `task::Executor`: an entry deriving from `c`'s,
 /// with the coarser of its resolution, held in the state word at `word`, and `ns`.
-pub fn coarse(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entry_kind: i64, word: u64) {
+pub fn coarse(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, word: u64) {
+    let ns = supply.param(1).scalar();
+    attenuate(lo, fx, supply, word, ns, None);
+}
+
+/// Returns an entry deriving from the entry of the capability held at the operation's first
+/// parameter: its state word at offset `word` raised to at least `floor` and its text extended
+/// or replaced by `text`, failing the operation with `Revoked.Stale` when its handle is stale.
+fn attenuate(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    word: u64,
+    floor: Value,
+    text: Option<(Value, Value)>,
+) {
     let handle = fx.load(PTR, supply.param(0).address(), 0);
-    let entry_kind = fx.ptr(entry_kind as u64);
-    let derived = lo.call_routine(fx, Routine::Derive, &[handle, entry_kind])[0];
+    let word = fx.ptr(word);
+    let (text, len) = text.unwrap_or_else(|| (fx.ptr(0), fx.ptr(0)));
+    let derived = lo.call_routine(fx, Routine::Derive, &[handle, word, floor, text, len])[0];
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-    let record = entry_at(lo, fx, derived);
-    let resolution = fx.load(PTR, record, word);
-    let coarser = fx.b.ins().umax(resolution, supply.param(1).scalar());
-    fx.store(coarser, record, word);
     let sret = supply.sret.expect("a capability's address");
     fx.store(derived, sret, 0);
     supply.done(lo, fx);
 }
 
-/// A reading of a clock rounded down to a multiple of its entry's resolution.
-fn round_down(fx: &mut Fx, record: Value, reading: Value) -> Value {
-    let resolution = fx.load(PTR, record, RESOLUTION);
+/// A reading of a clock rounded down to a multiple of its resolution.
+fn round_down(fx: &mut Fx, resolution: Value, reading: Value) -> Value {
     let one = fx.ptr(1);
     let resolution = fx.b.ins().umax(resolution, one);
     let rest = fx.b.ins().urem(reading, resolution);
     fx.b.ins().isub(reading, rest)
 }
 
-/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry,
-/// rounded up so that it ends when the clock's elapsed time is a multiple of its resolution.
-pub fn clock_delay(lo: &mut Lowering, fx: &mut Fx, record: Value, ns: Value) -> Value {
-    let minted = fx.load(PTR, record, entry::STATE);
-    let resolution = fx.load(PTR, record, RESOLUTION);
+/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry
+/// minted at `minted` with a resolution, rounded up so that it ends when the clock's elapsed
+/// time is a multiple of its resolution.
+pub fn clock_delay(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    minted: Value,
+    resolution: Value,
+    ns: Value,
+) -> Value {
     let now = lo.now_ns(fx);
     timers::on_grid(fx, now, minted, resolution, ns)
 }
 
 fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let record = checked(lo, fx, supply, capability);
+    let [stream, _, _, _] = checked(lo, fx, supply, capability);
     match lo.seeded() {
-        true => sims::random_fill(lo, fx, record, supply.param(1)),
+        true => sims::random_fill(lo, fx, stream, supply.param(1)),
         false => {
             lo.platform_call(fx, "random_fill", &[supply.param(1)]);
         }
@@ -512,10 +493,10 @@ fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let record = checked(lo, fx, supply, capability);
+    let [input, _, _, _] = checked(lo, fx, supply, capability);
     if lo.seeded() {
         match supply.member() {
-            "read_in" => sims::stdio_read(lo, fx, supply, record),
+            "read_in" => sims::stdio_read(lo, fx, supply, input),
             _ => sims::stdio_write(lo, fx, supply),
         }
         return;
@@ -560,7 +541,7 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         return;
     }
     if member != "close" {
-        checked(lo, fx, supply, address);
+        check(lo, fx, supply, address);
     }
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
     if lo.seeded() {
@@ -690,10 +671,11 @@ fn revocation(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 let unlimited = fx.int(PTR, -1);
                 lo.call_routine(fx, Routine::Split, &[handle, unlimited])[0]
             } else {
-                let record = checked(lo, fx, supply, capability);
-                let kind = fx.load(types::I32, record, entry::KIND);
-                let kind = fx.b.ins().uextend(PTR, kind);
-                let derived = lo.call_routine(fx, Routine::Derive, &[handle, kind])[0];
+                check(lo, fx, supply, capability);
+                let word = fx.ptr(entry::STATE);
+                let zero = fx.ptr(0);
+                let args = [handle, word, zero, zero, zero];
+                let derived = lo.call_routine(fx, Routine::Derive, &args)[0];
                 let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
                 fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
                 derived

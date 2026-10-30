@@ -1,0 +1,92 @@
+//! Files read through capabilities revoked while the reads run on other threads.
+
+/// How many capabilities the reads go through, each revoked while they run.
+const ROUNDS: u64 = 400
+
+fn main(take world: host::World) fails sys::fs::FsError uses wait {
+    let fs = world.fs
+    try await fs.write_all("near/file", data: b"near")
+    try await fs.write_all("far/file", data: b"far")
+    for round in 0..<ROUNDS {
+        try await revoked_while_read(fs, delay: round % 40 * 2_000, world)
+    }
+    world.log.info("rounds", value: ROUNDS)
+} main
+
+/// Reads `near/file` through a capability that a task revokes after `delay` steps, while
+/// another task derives and revokes capabilities reaching `far`.
+fn revoked_while_read(fs: sys::Fs, delay: u64, world: host::World) fails task::Cancelled uses wait {
+    let Ok(revoker) = attempt sys::revocable(fs) else {
+        return
+    }
+    let Ok(near) = attempt revoker.capability().subdir("near") else {
+        take revoker.revoke()
+        return
+    }
+    let exec = world.exec
+    let clock = world.clock
+    let alloc = world.alloc
+    let log = world.log
+    discard try await task::race(exec, left: fn[take revoker]() -> bool fails task::Cancelled uses wait {
+        discard steps(delay)
+        take revoker.revoke()
+        try await clock.sleep(60_000)
+        return false
+    }, right: fn() -> bool fails task::Cancelled uses wait {
+        try await task::scope(exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
+            discard s.spawn(fn() fails task::Cancelled uses wait {
+                try await churn(fs, alloc)
+            })
+            try await read_until_revoked(near, alloc, log)
+        })
+        return true
+    })
+} revoked_while_read
+
+/// Reads `file` through `near` until the read fails, logging any outcome other than the four
+/// bytes of `near/file` or a failure with `Revoked`.
+fn read_until_revoked(near: sys::Fs, alloc: mem::Alloc, log: sys::Log) fails task::Cancelled uses wait {
+    loop {
+        match attempt await near.read_all("file", alloc) {
+            Ok(read) => {
+                if read.byte_len() != 4 {
+                    log.info("read bytes", value: read.byte_len())
+                }
+            }
+            Err(error) => {
+                match error {
+                    sys::fs::FsError.Revoked(_) => {}
+                    else => log.info("read failed", value: error)
+                }
+                return
+            }
+        }
+    }
+} read_until_revoked
+
+/// Derives capabilities reaching `far`, reads through each and revokes it.
+fn churn(fs: sys::Fs, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    for _ in 0..<8u64 {
+        let Ok(revoker) = attempt sys::revocable(fs) else {
+            return
+        }
+        match attempt revoker.capability().subdir("far") {
+            Ok(far) => {
+                discard attempt await far.read_all("file", alloc)
+            }
+            Err(_) => {}
+        }
+        take revoker.revoke()
+    }
+} churn
+
+/// Counts down `count` steps.
+fn steps(count: u64) -> u64 {
+    var left = count
+    var total: u64 = 0
+    while left > 0 {
+        total = total.wrapping_add(left)
+        left -= 1
+    }
+    return total
+} steps

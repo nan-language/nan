@@ -363,9 +363,9 @@ fn random_stream(lo: &mut Lowering, fx: &mut Fx, seed: Value) -> Value {
     index
 }
 
-/// `sys::Random.fill`: the stream's next bytes, least significant first of each value.
-pub fn random_fill(lo: &mut Lowering, fx: &mut Fx, entry_record: Value, buf: Held) {
-    let index = fx.load(PTR, entry_record, entry::STATE);
+/// `sys::Random.fill` of the stream at `index`: its next bytes, least significant first of each
+/// value.
+pub fn random_fill(lo: &mut Lowering, fx: &mut Fx, index: Value, buf: Held) {
     let record = object_at(lo, fx, index);
     let seed = fx.load(PTR, record, random::SEED);
     let first = fx.load(PTR, record, random::NEXT);
@@ -480,11 +480,10 @@ fn new_input(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value, cell: Val
     index
 }
 
-/// `sys::Stdio.read_in`: the next bytes of the input, none once it has ended or for the
-/// world's empty input.
-pub fn stdio_read(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entry_record: Value) {
+/// `sys::Stdio.read_in` of the input at `index`: its next bytes, none once it has ended or for
+/// the world's empty input at index zero.
+pub fn stdio_read(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, index: Value) {
     cancellation_point(lo, fx, supply);
-    let index = fx.load(PTR, entry_record, entry::STATE);
     let has_input = fx.b.ins().icmp_imm_s(IntCC::NotEqual, index, 0);
     let count = fx.choose_in(
         lo,

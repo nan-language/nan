@@ -152,7 +152,7 @@ A **diagnostic code** is the stable name `family.condition` of the rule a diagno
 | [Targets and program model](27-program-model.md) | `target` |
 | [Identity and versioning](29-identity-versioning.md) | `dep`, `retired`, `version` |
 | [Artefacts](30-artefacts.md) | `artefact` |
-| [Trust and the release gate](31-trust.md) | `api`, `seal`, `trust`, `unused` |
+| [Trust and the release gate](31-trust.md) | `api`, `key`, `seal`, `trust`, `unused` |
 | [Documentation](32-docs.md) | `doc` |
 | [Toolchain](33-toolchain.md) | `edit`, `merge`, `tool` |
 | [Diagnostics](34-diagnostics.md) | `internal`, `syntax` |
@@ -470,8 +470,9 @@ The catalogue lists every diagnostic code by family, in chapter order, linked to
 | `retired` | error | [`retired.ambiguous-use`](29-identity-versioning.md#forwarding), [`retired.bad-rewrite`](29-identity-versioning.md#tombstones), [`retired.foreign-path`](29-identity-versioning.md#tombstones), [`retired.form-taken`](29-identity-versioning.md#tombstones), [`retired.not-preserved`](29-identity-versioning.md#publishing), [`retired.rewrite-hidden`](29-identity-versioning.md#tombstones) |
 | `retired` | incompleteness | [`retired.forwarded-use`](29-identity-versioning.md#forwarding) |
 | `version` | error | [`version.breaking-target`](29-identity-versioning.md#behaviour-epochs), [`version.parent-missing`](29-identity-versioning.md#publishing), [`version.path-dependency`](29-identity-versioning.md#publishing), [`version.store-name-taken`](29-identity-versioning.md#local-store) |
-| `artefact` | error | [`artefact.malformed`](30-artefacts.md#artefacts), [`artefact.recheck-failed`](30-artefacts.md#reuse), [`artefact.reserved-section`](30-artefacts.md#reserved-sections), [`artefact.root-mismatch`](30-artefacts.md#artefacts), [`artefact.symbol-collision`](30-artefacts.md#host-symbol-names), [`artefact.version-unsupported`](30-artefacts.md#artefacts) |
+| `artefact` | error | [`artefact.bad-signature`](30-artefacts.md#sections), [`artefact.malformed`](30-artefacts.md#artefacts), [`artefact.recheck-failed`](30-artefacts.md#reuse), [`artefact.reserved-section`](30-artefacts.md#sections), [`artefact.root-mismatch`](30-artefacts.md#artefacts), [`artefact.symbol-collision`](30-artefacts.md#host-symbol-names), [`artefact.version-unsupported`](30-artefacts.md#artefacts) |
 | `api` | incompleteness | [`api.stale`](31-trust.md#api-snapshots), [`api.weakening-pending`](31-trust.md#weakening) |
+| `key` | error | [`key.bad-form`](31-trust.md#principals), [`key.exists`](31-trust.md#principals), [`key.missing`](31-trust.md#principals) |
 | `seal` | error | [`seal.bad-principal`](31-trust.md#seals), [`seal.unneeded`](31-trust.md#seals) |
 | `seal` | incompleteness | [`seal.same-author`](31-trust.md#author-rule) |
 | `trust` | incompleteness | [`trust.unsealed`](31-trust.md#trust-escapes) |

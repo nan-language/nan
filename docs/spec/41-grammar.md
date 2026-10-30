@@ -415,7 +415,7 @@ check_record = 'check' TEXT ;
 lock_file = COL0 'nan' 'lock' INT NL COL0 lock_tail ;
 lock_tail = lock_record NL COL0 lock_tail | check_record NL EOF ;
 lock_record = 'snapshot' INT
-    | 'dep' IDENT ( 'alias' IDENT )? TEXT TEXT TEXT
+    | 'dep' IDENT ( 'alias' IDENT )? TEXT TEXT ( 'signed' TEXT )? TEXT
     | 'approved' IDENT summary_entry
     | 'epoch' TEXT INT
     | "registry" ( IDENT | INT | TEXT )* {!format.reserved-field}
@@ -449,6 +449,9 @@ api_record = 'item' TEXT
     | 'closure' ( "interface" | 'body' ) TEXT TEXT
     | 'signature' TEXT ;
 promise = IDENT ( "[" IDENT ( "," IDENT )* "]" )? ;
+principals_file = COL0 'nan' 'principals' INT NL COL0 principals_tail ;
+principals_tail = principal_record NL COL0 principals_tail | check_record NL EOF ;
+principal_record = 'principal' TEXT TEXT ;
 ```
 
 ## Start symbols
@@ -456,7 +459,7 @@ promise = IDENT ( "[" IDENT ( "," IDENT )* "]" )? ;
 A **start symbol** is a rule deriving a whole token sequence, using exactly the rules it reaches.
 
 - `source_file` derives a source file, `package.nan` included, without the `DOC` and `FILE_DOC` lines that [Items](02-items.md#item-kinds) reads as plain comments.
-- `lock_file`, `history_file` and `api_file` derive the [machine files](35-format.md#machine-files) `.nan/lock.nan`, `.nan/history.nan` and `.nan/api/<module>.nan`; their single-quoted words match by spelling and are not context words.
+- `lock_file`, `history_file`, `api_file` and `principals_file` derive the [machine files](35-format.md#machine-files) `.nan/lock.nan`, `.nan/history.nan`, `.nan/api/<module>.nan` and `.nan/principals.nan`; their single-quoted words match by spelling and are not context words.
 - `doc_reference` derives a [doc reference](32-docs.md#references).
 - `construction_expr`, `result_expr` and `old_expr` are **classification rules**: the form of a `postfix_expr` or `path_expr` that [construction](04-types.md#construction) or [ensures](18-contracts.md#ensures) classifies as one. No start symbol reaches them; the keyword table counts them as reached from `source_file`.
 

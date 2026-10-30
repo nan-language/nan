@@ -43,7 +43,7 @@ pub fn list<T>(
 
 /// A record being written: its fields, each a key and its content, keys strictly increasing; an
 /// absent field is never added.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Record {
     fields: Vec<(u64, Vec<u8>)>,
 }

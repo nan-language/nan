@@ -1,4 +1,4 @@
-//! The user directory and its build cache, whose files hold their contents, then their checksum.
+//! The user directory: its build cache, whose files hold their contents, then their checksum, and the secret keys of its principals.
 
 /// The home directory a process uses in place of the one the user database gives, and the
 /// directory of its local store in place of the user directory's `store`, as a harness gives
@@ -28,6 +28,7 @@ pkg fn copied_override(home: Option[HomeOverride], alloc: mem::Alloc) -> Option[
 pkg struct Cache {
     dir: Option[text::String]
     store_path: Option[text::String]
+    keys: Option[text::String]
     home: text::String
     uid: u32
     alloc: mem::Alloc
@@ -76,7 +77,7 @@ pkg fn Cache.open(given: Option[HomeOverride], alloc: mem::Alloc) -> Result[Cach
         }
     }
     let Some(home) = found else {
-        return Ok(Cache(dir: None, store_path: None, home: text::String.empty(alloc), uid: uid, alloc: alloc))
+        return Ok(Cache(dir: None, store_path: None, keys: None, home: text::String.empty(alloc), uid: uid, alloc: alloc))
     }
     let user = platform::join(home.as_str(), name: ".nan", alloc)
     let cache = platform::join(user.as_str(), name: "cache", alloc)
@@ -115,7 +116,7 @@ pkg fn Cache.open(given: Option[HomeOverride], alloc: mem::Alloc) -> Result[Cach
             Err(error) => fail error
         }
     }
-    return Ok(Cache(dir: Some(take cache), store_path: Some(take store), home: take home, uid: uid, alloc: alloc))
+    return Ok(Cache(dir: Some(take cache), store_path: Some(take store), keys: Some(platform::join(user.as_str(), name: "keys", alloc)), home: take home, uid: uid, alloc: alloc))
 } Cache.open
 
 /// A copy of an optional text.
@@ -159,7 +160,7 @@ pkg fn Cache.holds(self, key: hashing::HashValue) -> bool {
 
 /// Another handle of the cache.
 pkg fn Cache.copied(self, alloc: mem::Alloc) -> Cache {
-    return Cache(dir: copied_text(self.dir, alloc), store_path: copied_text(self.store_path, alloc), home: text::String.of(self.home.as_str(), alloc), uid: self.uid, alloc: alloc)
+    return Cache(dir: copied_text(self.dir, alloc), store_path: copied_text(self.store_path, alloc), keys: copied_text(self.keys, alloc), home: text::String.of(self.home.as_str(), alloc), uid: self.uid, alloc: alloc)
 } Cache.copied
 
 fn copied_text(held: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
@@ -294,6 +295,93 @@ pkg fn Cache.replace(self, name: Str, contents: Slice[u8]) fails platform::IoErr
     try file.write_all(checksum(contents).view())
     try platform::rename_path(fresh.as_str(), to: platform::join(dir.as_str(), name, alloc: self.alloc).as_str())
 } Cache.replace
+
+/// The secret seed `keys/<principal>.key` holds: none when the file is missing or does not hold
+/// 32 bytes.
+pkg fn Cache.secret_key(self, principal: Str) -> Result[Option[Array[u8, 32]], Exposed] fails platform::IoError {
+    let Some(keys) = self.keys else {
+        return Ok(None)
+    }
+    let file = key_file(keys.as_str(), principal, alloc: self.alloc)
+    let directory = match try self.secret_held(keys.as_str()) {
+        Ok(held) => held
+        Err(found) => return Err(take found)
+    }
+    if not directory {
+        return Ok(None)
+    }
+    let held_file = match try self.secret_held(file.as_str()) {
+        Ok(held) => held
+        Err(found) => return Err(take found)
+    }
+    if not held_file {
+        return Ok(None)
+    }
+    let contents = try platform::read_file(file.as_str(), alloc: self.alloc)
+    if contents.len() != 32 {
+        return Ok(None)
+    }
+    var seed = Array[u8, 32].filled(0)
+    mut seed.view_mut().copy_from(contents.view())
+    return Ok(Some(seed))
+} Cache.secret_key
+
+/// Whether the directory of secret keys or a key file exists, or its path when it is exposed.
+fn Cache.secret_held(self, path: Str) -> Result[bool, Exposed] fails platform::IoError {
+    let held = match first attempt platform::symlink_metadata(path) {
+        Ok(held) => held
+        Err(platform::IoError.NotFound) => return Ok(false)
+        Err(error) => fail error
+    }
+    if secret_exposed(held, uid: self.uid) {
+        return Err(Exposed(path: shown(self.home.as_str(), path, alloc: self.alloc)))
+    }
+    return Ok(true)
+} Cache.secret_held
+
+/// Whether `new_key` wrote a secret key, and the key file's path as `~/.nan/...`.
+pkg struct NewKey {
+    pkg made: bool
+    pkg path: text::String
+} NewKey
+
+/// Writes the secret seed of a principal that has no key file, creating `keys` when it is
+/// missing: not made, writing nothing, when the file exists.
+pkg fn Cache.new_key(self, principal: Str, seed: Array[u8, 32]) -> Result[NewKey, Exposed] fails platform::IoError {
+    let Some(keys) = self.keys else {
+        fail platform::IoError.NotFound
+    }
+    match first attempt platform::create_dir(keys.as_str(), mode: 0b111_000_000) {
+        Ok(_) or Err(platform::IoError.AlreadyExists) => {}
+        Err(error) => fail error
+    }
+    if secret_exposed(try platform::symlink_metadata(keys.as_str()), uid: self.uid) {
+        return Err(Exposed(path: shown(self.home.as_str(), path: keys.as_str(), alloc: self.alloc)))
+    }
+    let file = key_file(keys.as_str(), principal, alloc: self.alloc)
+    let path = shown(self.home.as_str(), path: file.as_str(), alloc: self.alloc)
+    let opened = match first attempt platform::File.create_new(file.as_str(), mode: 0b110_000_000) {
+        Ok(opened) => opened
+        Err(platform::IoError.AlreadyExists) => return Ok(NewKey(made: false, path: take path))
+        Err(error) => fail error
+    }
+    defer take opened.close()
+    try opened.write_all(seed.view())
+    return Ok(NewKey(made: true, path: take path))
+} Cache.new_key
+
+/// The path of a principal's key file in the directory of secret keys.
+fn key_file(keys: Str, principal: Str, alloc: mem::Alloc) -> text::String {
+    var name = text::String.of(principal, alloc)
+    mut name.append(".key")
+    return platform::join(keys, name: name.as_str(), alloc)
+} key_file
+
+/// Whether the directory of secret keys or a key file is a symbolic link, belongs to another
+/// user, or is accessible to its group or to others.
+fn secret_exposed(held: platform::Metadata, uid: u32) -> bool {
+    return held.is_symlink() or held.uid != uid or (held.mode & 0b000_111_111) != 0
+} secret_exposed
 
 /// A path within the home directory, written as `~/` and its path there.
 fn shown(home: Str, path: Str, alloc: mem::Alloc) -> text::String {

@@ -467,7 +467,7 @@ The **local store** is the store of one user's releases, in the user directory (
 
 ### Publishing
 
-`nan publish --local <dir> [--name <store name>]` publishes the package in directory `<dir>`:
+`nan publish --local <dir> [--name <store name>] [--as <principal> [--author <principal>...]]` publishes the package in directory `<dir>`:
 
 1. It runs the [release gate](31-trust.md#release-gate) on the package and stops when the gate rejects it.
 2. A package with a path-source dependency is not published (`version.path-dependency`), reported on that `dep` directive.
@@ -476,12 +476,14 @@ The **local store** is the store of one user's releases, in the user directory (
 5. It applies `--breaking` and computes each exported item's class and epoch, the release class, the encode class and the publish summary.
 6. It records the store name in the history: `--name` when given, else the one recorded, else the package name. It then moves every tombstone in source into the history, except a tombstone keeping an `Encode` [key](13-text-encode.md#keys) of a type that derives `Encode`; then it builds the [artefact](30-artefacts.md#artefacts), appends the release under the store name and records it as the history head.
 
+With `--as`, the publisher is the given principal and the release's **author principals** are the `--author` principals, the publisher alone when none is given. Step 1's release gate then applies the [author rule](31-trust.md#author-rule) to them, and step 6 writes the artefact's [sections](30-artefacts.md#sections): its signature by the publisher, its certificate with the publisher as builder, and its provenance naming the author principals. A principal outside the principal form is an error (`seal.bad-principal`), and so is a publisher without a [secret key](31-trust.md#principals), or whose secret key's public key differs from the one the package's principals file gives it (`key.missing`); the package is then not published. `--author` without `--as` is `tool.usage`.
+
 ## Lock
 
 The **lock** of a package is its machine file `.nan/lock.nan`, written only by `nan dep add`, `nan dep sync`, `nan dep approve`, `nan upgrade` without `--language` and the [merge driver](33-toolchain.md#merge-driver). It records:
 
 - the **snapshot**, the greatest publication index of the local store when the lock was written;
-- one checksummed line per package of the [dependency closure](27-program-model.md#final-builds) other than the package itself and std: the package's name and, for a direct dependency, its alias ([lock syntax](35-format.md#lock)), its source as its `dep` directive writes it with a path source rewritten relative to the locking package's directory, and the code root hash of its **locked release**;
+- one checksummed line per package of the [dependency closure](27-program-model.md#final-builds) other than the package itself and std: the package's name and, for a direct dependency, its alias ([lock syntax](35-format.md#lock)), its source as its `dep` directive writes it with a path source rewritten relative to the locking package's directory, the code root hash of its **locked release**, and, for a release whose artefact holds [sections](30-artefacts.md#sections), the public key of its publisher;
 - for a [final-link root](27-program-model.md#final-builds), its [approvals](#approvals).
 
 [Canonical format and machine files](35-format.md#lock) defines the lock's syntax, validity and reserved fields. The checker reads each other package of the closure but std through its locked release: from source when that release is the current state of its path source, and otherwise from its artefact in the local store.

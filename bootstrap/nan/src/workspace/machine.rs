@@ -1,5 +1,5 @@
-//! The machine files of a package as loaded: its lock, its history and the API snapshots of its
-//! modules, each with its bytes and what it reads as.
+//! The machine files of a package as loaded: its lock, its history, the API snapshots of its
+//! modules and its principals file, each with its bytes and what it reads as.
 
 use std::io;
 
@@ -8,6 +8,7 @@ use crate::machine::Invalid;
 use crate::machine::api::Snapshot;
 use crate::machine::history::History;
 use crate::machine::lock::Lock;
+use crate::machine::principals::Principals;
 
 /// A machine file: its path relative to the workspace root, its bytes, and what it reads as.
 pub struct Loaded<T> {
@@ -36,12 +37,15 @@ impl<T> Loaded<T> {
     }
 }
 
+static NO_PRINCIPALS: Principals = Principals { keys: Vec::new() };
+
 #[derive(Default)]
 pub struct Machine {
     pub lock: Option<Loaded<Lock>>,
     pub history: Option<Loaded<History>>,
     /// The API snapshots, by the module name their file is named after, in byte order.
     pub snapshots: Vec<(String, Loaded<Snapshot>)>,
+    pub principals: Option<Loaded<Principals>>,
 }
 
 impl Machine {
@@ -60,6 +64,9 @@ impl Machine {
                 "lock.nan" => machine.lock = Some(Loaded::load(path, source, Lock::read)?),
                 "history.nan" => {
                     machine.history = Some(Loaded::load(path, source, History::read)?);
+                }
+                "principals.nan" => {
+                    machine.principals = Some(Loaded::load(path, source, Principals::read)?);
                 }
                 _ => {
                     let Some(module) = within
@@ -96,6 +103,9 @@ impl Machine {
         for (_, snapshot) in &self.snapshots {
             add(&snapshot.path, snapshot.read.as_ref().err());
         }
+        if let Some(principals) = &self.principals {
+            add(&principals.path, principals.read.as_ref().err());
+        }
         found
     }
 
@@ -107,6 +117,14 @@ impl Machine {
         self.history.as_ref().and_then(Loaded::valid)
     }
 
+    /// The principals file, empty when the package has none or it is not valid.
+    pub fn principals(&self) -> &Principals {
+        self.principals
+            .as_ref()
+            .and_then(Loaded::valid)
+            .unwrap_or(&NO_PRINCIPALS)
+    }
+
     /// The valid API snapshot of a module, by its name.
     pub fn snapshot(&self, module: &str) -> Option<&Snapshot> {
         self.snapshots
@@ -115,8 +133,8 @@ impl Machine {
             .and_then(|(_, loaded)| loaded.valid())
     }
 
-    /// The bytes of a machine file of the package, by path.
-    pub fn bytes(&self, path: &str) -> Option<&[u8]> {
+    /// Each machine file of the package, by path, with its bytes.
+    pub fn files(&self) -> impl Iterator<Item = (&String, &Vec<u8>)> {
         let lock = self.lock.iter().map(|loaded| (&loaded.path, &loaded.bytes));
         let history = self
             .history
@@ -126,8 +144,16 @@ impl Machine {
             .snapshots
             .iter()
             .map(|(_, loaded)| (&loaded.path, &loaded.bytes));
-        lock.chain(history)
-            .chain(snapshots)
+        let principals = self
+            .principals
+            .iter()
+            .map(|loaded| (&loaded.path, &loaded.bytes));
+        lock.chain(history).chain(snapshots).chain(principals)
+    }
+
+    /// The bytes of a machine file of the package, by path.
+    pub fn bytes(&self, path: &str) -> Option<&[u8]> {
+        self.files()
             .find(|(known, _)| *known == path)
             .map(|(_, bytes)| bytes.as_slice())
     }

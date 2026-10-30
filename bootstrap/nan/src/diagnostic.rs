@@ -46,6 +46,7 @@ macro_rules! codes {
 codes! {
     ApiStale = "api.stale",
     ApiWeakeningPending = "api.weakening-pending",
+    ArtefactBadSignature = "artefact.bad-signature",
     ArtefactMalformed = "artefact.malformed",
     ArtefactRecheckFailed = "artefact.recheck-failed",
     ArtefactReservedSection = "artefact.reserved-section",
@@ -233,6 +234,9 @@ codes! {
     KernelIrqHead = "kernel.irq-head",
     KernelIrqLimit = "kernel.irq-limit",
     KernelIrqWait = "kernel.irq-wait",
+    KeyBadForm = "key.bad-form",
+    KeyExists = "key.exists",
+    KeyMissing = "key.missing",
     LanguageDowngrade = "language.downgrade",
     LanguageNewerDependency = "language.newer-dependency",
     LanguageUnsupported = "language.unsupported",

@@ -871,8 +871,7 @@ pub fn package_snapshots(
     let checkers = package_checkers(workspace, std, package);
     let views: Vec<(Target, &Checker)> =
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
-    let name = package.name().unwrap_or_default();
-    let items = snapshot::Items::of(&views, name);
+    let items = snapshot::Items::of(&views, package);
     computed_snapshots(workspace, package, &items, confirmed)
 }
 
@@ -895,22 +894,23 @@ fn computed_snapshots(
     computed
 }
 
-/// The seal `principal` writes on a package's item at `path`, in a VCS workspace meeting the
-/// author rule, or why `nan seal` writes nothing.
+/// The seal `principal` writes on a package's item at `path`, signed by the key of `seed` when
+/// given, in a VCS workspace meeting the author rule, or why `nan seal` writes nothing.
 pub fn sealed(
     workspace: &Workspace,
     package: &Package,
     path: &str,
     principal: &str,
+    seed: Option<&[u8; 32]>,
 ) -> Result<snapshot::Sealed, snapshot::Unsealed> {
     let std = crate::stdlib::packages();
     let checkers = package_checkers(workspace, std, package);
     let views: Vec<(Target, &Checker)> =
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let name = package.name().unwrap_or_default();
-    let items = snapshot::Items::of(&views, name);
+    let items = snapshot::Items::of(&views, package);
     let computed = computed_snapshots(workspace, package, &items, &[]);
-    let sealed = snapshot::sealed(&items, package, computed, path, principal)?;
+    let sealed = snapshot::sealed(&items, package, computed, path, principal, seed)?;
     let shared = author::History::open(workspace).and_then(|history| {
         history.would_share(name, path, &sealed.seal, sealed.accepted.as_ref())
     });

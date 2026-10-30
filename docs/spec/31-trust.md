@@ -1,6 +1,6 @@
 # Trust and the release gate
 
-This chapter defines incompleteness with its complete list and the unused code it includes, the release gate `nan verify` and how it differs from `nan check` and `nan test`, the ledger, trust escapes, seals with their principals, closure hashes, lapse and author rule, API snapshots with the spec, the accepted spec and `nan api update`, weakening, pending weakenings and acceptances, and the change classes `nan diff` reports.
+This chapter defines incompleteness with its complete list and the unused code it includes, the release gate `nan verify` and how it differs from `nan check` and `nan test`, the ledger, trust escapes, seals with their principals, closure hashes, lapse and author rule, principals files and secret keys, signatures, API snapshots with the spec, the accepted spec and `nan api update`, weakening, pending weakenings and acceptances, and the change classes `nan diff` reports.
 
 ## Incompleteness
 
@@ -26,7 +26,7 @@ The incompleteness codes are exactly:
 | `trust.unsealed` | a trust escape without a current seal | [Trust escapes](#trust-escapes) |
 | `seal.same-author` | a seal breaking the author rule | [Author rule](#author-rule) |
 
-The **gate codes** are the codes of the `api`, `seal` and `trust` families. `nan check` and `nan test` never compute them; `nan verify` reports them, and `nan api update` and `nan seal` report those their rules name.
+The **gate codes** are the codes of the `api`, `seal` and `trust` families. `nan check` and `nan test` never compute them; `nan verify` reports them, and `nan api update`, `nan seal`, `nan key` and `nan publish` report those their rules name.
 
 ```nan
 pub fn retry_delay(retries: u32) -> u32
@@ -146,7 +146,7 @@ The **release gate** is `nan verify`. It accepts a package exactly when, for the
 2. every test passes under `nan test`, [emulator runs](22-testing.md#emulator-runs) included;
 3. every [API snapshot](#api-snapshots) is current (`api.stale`);
 4. no [pending weakening](#weakening) remains (`api.weakening-pending`);
-5. every item holding a trust escape has a current seal (`trust.unsealed`) that, in a VCS workspace, meets the [author rule](#author-rule) (`seal.same-author`);
+5. every item holding a trust escape has a current seal (`trust.unsealed`) that meets the [author rule](#author-rule) (`seal.same-author`);
 6. in a VCS workspace, every acceptance of a weakening was made by a seal of another author (`api.weakening-pending`), as [acceptances](#acceptances) states.
 
 A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing), and `nan verify` checks it no further.
@@ -209,7 +209,7 @@ A **seal** is a record binding a principal to an item; `nan seal <item> --as <pr
 - the canonical path of the item;
 - its **sealed item hash**: its [item hash](29-identity-versioning.md#item-hash-and-interface-hash), or, for an item that two or more [target variants](03-packages-modules.md#target-variants) hold, the hash of the bytes `variants` and LF followed, for each such variant in byte order of its directory's path, by the full form of its item hash and LF;
 - its closure hash, with the closure entries it covers;
-- the signature field, which language 1 reserves: seals are unsigned, and the toolchain never writes the field.
+- its signature, when the package's [principals file](#principals) gives the principal a key: the [signature](#signatures) of its **seal message** by the principal's secret key, the seal message being `nan seal 1`, the principal, the canonical path and the full forms of the sealed item hash and the closure hash, each followed by LF.
 
 A seal is recorded in the [API snapshot](#api-snapshots) of the sealed item's module, a seal of the `package` item in that of the root module.
 
@@ -221,22 +221,76 @@ The **closure entries** of an item are:
 
 The closure entries of an item that variants hold are the union of those of its variants. A `package` item has no unit, so its closure entries are empty. The **closure hash** is the [hash](29-identity-versioning.md#hash-values) of the bytes `closure` and LF, followed by one line per closure entry, sorted by canonical path, then by kind, then by hash: the kind, a space, the canonical path, a space and the full form of the entry's hash, then LF.
 
-- A seal is **current** while it holds no signature field and the item's sealed item hash and closure hash equal those it records; otherwise it has **lapsed**.
+- A seal is **current** while the item's sealed item hash and closure hash equal those it records and, when the package's principals file gives its principal a key, it holds a signature that [verifies](#signatures) by that key, or else it holds none; otherwise it has **lapsed**.
 - A seal binds no toolchain hash and no hash of the module's grants.
 - `nan seal` replaces an earlier seal of the same principal on the item. Several principals may seal one item.
-- A principal outside that form is an error (`seal.bad-principal`), and so is sealing an item that needs no seal (`seal.unneeded`). `nan seal` writes nothing when it reports either, `api.stale` for the item's module snapshot, or `seal.same-author` for the seal it would write; it also reports `seal.same-author`, and writes nothing, when the seal would accept a pending weakening and its author is the author of a change introducing the item's current spec.
+- A principal outside that form is an error (`seal.bad-principal`), and so is sealing an item that needs no seal (`seal.unneeded`). `nan seal` writes nothing when it reports either, `key.missing` for a principal the principals file gives a key when the user directory holds no secret key of the principal with that public key, `api.stale` for the item's module snapshot, or `seal.same-author` for the seal it would write; it also reports `seal.same-author`, and writes nothing, when the seal would accept a pending weakening and its author is the author of a change introducing the item's current spec.
 - When the item has a pending weakening, `nan seal` also sets its accepted spec to its current spec and current head, and removes the pending weakening.
 
 The seal of `first_byte` in the procinfo package lapses when `first_byte` is edited, or when the interface of `hw::Ptr.of_view`, `hw::Ptr.read` or any other item it names changes; an edit of `process_id` leaves it current.
 
 ### Author rule
 
-A **VCS workspace** is a workspace inside a git working tree. In it, a seal meets the **author rule** when the author of each change writing the seal differs from the author of each change introducing the sealed item hash or a hash that one of its closure entries records.
+A **VCS workspace** is a workspace inside a git working tree. A seal meets the **author rule** when it meets each of these conditions that applies:
+
+- in a VCS workspace, the author of each change writing the seal differs from the author of each change introducing the sealed item hash or a hash that one of its closure entries records;
+- when [publishing](29-identity-versioning.md#publishing) names author principals, the seal's principal is none of them.
+
+The first condition reads the git history:
 
 - The changes are the checked-out commit and its ancestors, and the author of each is its author email after ASCII lowercasing. The uncommitted state of the working tree is one more change, whose parent is the checked-out commit and whose author is the email the git configuration gives, or the empty text when it gives none.
 - A change introduces an item hash when the item has that hash in the change's tree and in none of its parents' trees, and writes a seal when the seal's record is in its tree and in none of its parents' trees. It introduces the hash of a closure entry when that entry's item, an item of the workspace, has that hash in the change's tree and in none of its parents' trees, and, for an entry naming an item of a package outside the workspace, when it introduces the checked package's current [lock](29-identity-versioning.md#lock) line for that package, that line being in its tree and in none of its parents' trees.
-- An item holding a trust escape whose current seals all break the author rule is incompleteness (`seal.same-author`), reported on its first line, for an item that variants hold in the first variant directory in byte order of path that holds it, and naming each seal's principal and the author it shares.
-- Outside a VCS workspace the author rule does not apply.
+- An item holding a trust escape whose current seals all break the author rule is incompleteness (`seal.same-author`), reported on its first line, for an item that variants hold in the first variant directory in byte order of path that holds it, and naming each seal's principal and the author it shares, its principal itself for an author principal.
+- Outside a VCS workspace and outside publishing, every seal meets the author rule. An artefact's [provenance](30-artefacts.md#sections) names its author principals beside the seals its attestation file records, so the second condition can be judged from the artefact alone.
+
+### Principals
+
+The **principals file** `.nan/principals.nan` of a package is a [machine file](35-format.md#principals-file) giving principals their public keys: the keys whose signatures the package's seals hold, and those of the publishers and sealers of the releases it reads ([sections](30-artefacts.md#sections)). `nan key trust <principal> <key>` gives the principal the key in the principals file of the current directory's package, in place of any other, `tool.usage` outside every package. A **key form** is the checksummed base32 of a public key's 32 bytes, 54 characters.
+
+The **secret key** of a principal is the 32-byte seed the file `keys/<principal>.key` of the [user directory](36-builds.md#cache) holds; a file of another length holds none. `nan key new <principal>` writes a principal's secret key from random bytes and prints `key <principal> <key>` with its public key's key form, and `nan key show <principal>` prints that record for the principal's secret key. Both read and write only the user directory.
+
+- `nan key new` for a principal that has a secret key is an error (`key.exists`), `nan key show` for one that has none is an error (`key.missing`), and `nan key trust` with a text that is no key form is an error (`key.bad-form`). A principal outside the principal form is `seal.bad-principal`. A command reporting one of these writes nothing.
+- The principals file is part of the package's source tree hash and not of its code root, so trusting a key changes no release.
+
+### Signatures
+
+A **signature** is an Ed25519 signature as RFC 8032 defines it, over SHA-512: 64 bytes, the encoding of a point R then a scalar S, by the public key A, of 32 bytes, that a 32-byte secret seed determines. Signing is deterministic. A signature of a message **verifies** by a key exactly when:
+
+1. A and R are canonical point encodings: the value of their low 255 bits is below 2^255 − 19, a point satisfies the curve equation with it, and the sign bit is clear when x is 0;
+2. S, least significant byte first, is below the group order L;
+3. [8]A is not the neutral point;
+4. [S]B − [k]A encodes as R, B being the base point and k the SHA-512 digest of R, A and the message, least significant byte first, modulo L.
+
+A **signature form** is the checksummed base32 of a signature's 64 bytes, 105 characters. `core::crypto` gives NaN code the same keys, signatures and verification:
+
+```nan-api
+// module: core::crypto
+
+pub closed struct PublicKey derives Copy, Eq, Ord, Hash {
+    pub bytes: Array[u8, 32]
+} PublicKey
+
+pub closed struct Signature derives Copy, Eq {
+    pub bytes: Array[u8, 64]
+} Signature
+
+pub open struct SecretKey {
+} SecretKey
+
+pub fn SecretKey.of_seed(seed: Array[u8, 32]) -> SecretKey limits pure, terminates
+
+pub fn SecretKey.public_key(self) -> PublicKey limits pure, notrap, terminates
+
+pub fn SecretKey.sign(self, message: Slice[u8]) -> Signature limits pure, terminates
+
+pub fn PublicKey.verify(self, message: Slice[u8], signature: Signature) -> bool limits pure, terminates
+```
+
+```nan
+pub fn accepts(key: core::crypto::PublicKey, update: Slice[u8], signature: core::crypto::Signature) -> bool {
+    return key.verify(update, signature)
+} accepts
+```
 
 ## API snapshots
 
@@ -341,7 +395,10 @@ Between the two blocks of [Weakening](#weakening), `clamp_level` is in the inter
 | --- | --- | --- |
 | `api.stale` | incompleteness | [API snapshots](#api-snapshots), [Seals](#seals) |
 | `api.weakening-pending` | incompleteness | [Weakening](#weakening), [Acceptances](#acceptances) |
-| `seal.bad-principal` | error | [Seals](#seals) |
+| `key.bad-form` | error | [Principals](#principals) |
+| `key.exists` | error | [Principals](#principals) |
+| `key.missing` | error | [Principals](#principals), [Seals](#seals), [Publishing](29-identity-versioning.md#publishing) |
+| `seal.bad-principal` | error | [Seals](#seals), [Principals](#principals) |
 | `seal.same-author` | incompleteness | [Author rule](#author-rule), [Seals](#seals) |
 | `seal.unneeded` | error | [Seals](#seals) |
 | `trust.unsealed` | incompleteness | [Trust escapes](#trust-escapes) |

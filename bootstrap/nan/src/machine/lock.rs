@@ -1,5 +1,6 @@
 //! The lock `.nan/lock.nan`: the snapshot of the local store, the locked release of each package
-//! of the dependency closure, and a final-link root's approvals.
+//! of the dependency closure with the publisher key of a signed one, and a final-link root's
+//! approvals.
 
 use super::{Cursor, Invalid, Kind, Parsed, Record, escaped, read, write};
 use crate::diagnostic::Code;
@@ -26,6 +27,8 @@ pub struct Locked {
     pub source: String,
     /// The code root hash of its locked release.
     pub root: Hash,
+    /// The public key of its locked release's publisher, for a signed release.
+    pub signer: Option<[u8; 32]>,
     /// The record's line in the file read, 0 for one not read.
     pub line: u32,
 }
@@ -89,8 +92,12 @@ impl Locked {
             .as_ref()
             .map(|alias| format!(" alias {alias}"))
             .unwrap_or_default();
+        let signer = self
+            .signer
+            .map(|key| format!(" signed {}", escaped(&crate::sign::key_form(&key))))
+            .unwrap_or_default();
         format!(
-            "dep {}{alias} {} {}",
+            "dep {}{alias} {} {}{signer}",
             self.package,
             escaped(&self.source),
             escaped(&self.root.full())
@@ -221,12 +228,17 @@ fn read_dep(record: &Record, cursor: &mut Cursor) -> Option<Locked> {
     };
     let source = cursor.text()?.to_owned();
     let root = cursor.hash()?;
+    let signer = match cursor.takes("signed") {
+        true => Some(crate::sign::read_key(cursor.text()?)?),
+        false => None,
+    };
     let checksum = cursor.hash()?;
     let locked = Locked {
         package,
         alias,
         source,
         root,
+        signer,
         line: record.line,
     };
     (Hash::of(locked.unchecked().as_bytes()) == checksum).then_some(locked)

@@ -442,6 +442,7 @@ Each term links to its home, whose definition governs.
 | [primer](39-primer.md#primer-tiers) | Priced text teaching NaN. |
 | [primitive capability](05-properties.md#capability-types) | Base type that its owning chapter declares a capability. |
 | [principal](31-trust.md#seals) | Identity a seal names. |
+| [principals file](31-trust.md#principals) | Machine file giving principals their public keys. |
 | [privileged intrinsic](23-low-level.md#privileged-intrinsics) | Privileged `hw::Ring0` operation. |
 | [program](27-program-model.md#programs-and-libraries) | Package with `entry`. |
 | [projection](07-ownership.md#projections) | `proj` function, deriving its result from its receiver. |
@@ -480,9 +481,11 @@ Each term links to its home, whose definition governs.
 | [scalar](04-types.md#scalars) | One of 14 built-in types. |
 | [schema hash](13-text-encode.md#schema-hashes) | Hash of an encoded structure. |
 | [seal](31-trust.md#seals) | Binding of a principal to item and closure hashes. |
+| [secret key](31-trust.md#principals) | Seed a principal signs with, in the user directory. |
 | [Send](05-properties.md#send) | Of a type whose values may pass to another task. |
 | [settlement](11-errors-domains.md#domains) | Settling a trapped domain's I/O before freeing. |
 | [shrinking](22-testing.md#property-tests) | Minimising a failing input. |
+| [signature](31-trust.md#signatures) | Ed25519 signature of a seal or an artefact. |
 | [signal](24-kernel.md#signals) | `hw::Signal[T]`, through which interrupt fns wake tasks. |
 | [sim](22-testing.md#simulated-capabilities) | Simulated capability. |
 | [single-line item](02-items.md#item-shape) | Item on one logical line: impl lines, const items, const asserts, registries, contributions, tombstones, transparent functions and foreign fns. |

@@ -1,4 +1,4 @@
-//! The gate codes of the release gate: API snapshots that are not current, pending weakenings, and trust escapes without a current seal.
+//! The gate codes of the release gate: API snapshots that are not current, pending weakenings, trust escapes without a current seal, and seals breaking the author rule.
 
 /// A module's computed snapshot, none when it holds no entry.
 struct ComputedModule {
@@ -12,8 +12,9 @@ struct EntrySeals {
     seals: mem::List[machine::Seal]
 } EntrySeals
 
-/// The diagnostics the release gate reports on a workspace package beyond its checks and tests.
-pkg fn Session.gate(self, package_index: usize) -> mem::List[diagnostic::Diagnostic] {
+/// The diagnostics the release gate reports on a workspace package beyond its checks and tests,
+/// `authors` being the author principals a publication names.
+pkg fn Session.gate(self, package_index: usize, authors: Slice[text::String]) -> mem::List[diagnostic::Diagnostic] {
     let alloc = self.alloc
     var found = mem::List[diagnostic::Diagnostic].empty(alloc)
     let held = self.workspace.contents()
@@ -21,12 +22,8 @@ pkg fn Session.gate(self, package_index: usize) -> mem::List[diagnostic::Diagnos
         return found
     }
     let source = held.packages[package_index]
-    let package_name = match source.name() {
-        Some(name) => name
-        None => ""
-    }
     let checkers = self.package_checkers(package_index)
-    let items = Items.of(checkers.view(), package_name, alloc)
+    let items = Items.of(checkers.view(), source, alloc)
     let computed = self.computed_snapshots(package_index, items, confirmed: mem::List[text::String].empty(alloc).view())
     let Snapshots(modules: modules, recorded: recorded) = computed
     var entry_seals = mem::List[EntrySeals].empty(alloc)
@@ -68,22 +65,8 @@ pkg fn Session.gate(self, package_index: usize) -> mem::List[diagnostic::Diagnos
         }
         None => {}
     }
-    match History.open(self) {
-        Some(history) => {
-            var sealed_escapes = mem::List[text::String].empty(alloc)
-            for path in escaping {
-                if is_sealed(entry_seals.view(), items, path: path.as_str(), alloc) {
-                    mut sealed_escapes.push(text::String.of(path.as_str(), alloc))
-                }
-            }
-            for reported in take history.same_author(package_index, items, escaping: sealed_escapes.view()) {
-                mut found.push(take reported)
-            }
-            for reported in take history.acceptances(package_index, items) {
-                mut found.push(take reported)
-            }
-        }
-        None => {}
+    for reported in take self.author_rule(package_index, items, entry_seals: entry_seals.view(), escaping: escaping.view(), authors) {
+        mut found.push(take reported)
     }
     for path in take escaping {
         if is_sealed(entry_seals.view(), items, path: path.as_str(), alloc) {
@@ -155,6 +138,94 @@ fn stale_location(source: workspace::Package, items: Items, module: Str, path: S
     }
     return diagnostic::At(path: take manifest_path, line: 1)
 } stale_location
+
+/// The diagnostics of the author rule on the items of `escaping`, which hold trust escapes, and,
+/// in a VCS workspace, of the acceptances of their weakenings.
+fn Session.author_rule(
+    self,
+    package_index: usize,
+    items: Items,
+    entry_seals: Slice[EntrySeals],
+    escaping: Slice[text::String],
+    authors: Slice[text::String],
+    ) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.alloc
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var sealed_escapes = mem::List[text::String].empty(alloc)
+    for path in escaping {
+        if is_sealed(entry_seals, items, path: path.as_str(), alloc) {
+            mut sealed_escapes.push(text::String.of(path.as_str(), alloc))
+        }
+    }
+    let Some(history) = History.open(self) else {
+        let source = self.workspace.contents().packages[package_index]
+        for path in sealed_escapes {
+            match same_principals(source, items, entry_seals, path: path.as_str(), authors, alloc) {
+                Some(reported) => mut found.push(take reported)
+                None => {}
+            }
+        }
+        return found
+    }
+    for reported in take history.same_author(package_index, items, escaping: sealed_escapes.view(), authors) {
+        mut found.push(take reported)
+    }
+    for reported in take history.acceptances(package_index, items) {
+        mut found.push(take reported)
+    }
+    return found
+} Session.author_rule
+
+/// The `seal.same-author` incompleteness of an item whose current seals are all by author
+/// principals, outside a VCS workspace.
+fn same_principals(
+    source: workspace::Package,
+    items: Items,
+    entry_seals: Slice[EntrySeals],
+    path: Str,
+    authors: Slice[text::String],
+    alloc: mem::Alloc,
+    ) -> Option[diagnostic::Diagnostic] {
+    var principals = mem::List[text::String].empty(alloc)
+    for held in entry_seals {
+        if held.path.as_str() != path {
+            continue
+        }
+        for seal in held.seals {
+            if items.seal_current(path, seal, alloc) {
+                mut principals.push(text::String.of(seal.principal.as_str(), alloc))
+            }
+        }
+        break
+    }
+    for principal in principals {
+        if not lists_principal(authors, principal: principal.as_str()) {
+            return None
+        }
+    }
+    let Some(at) = location(items, source, path, alloc) else {
+        return None
+    }
+    var reported = diagnostic::Diagnostic.at(diagnostic::Code.SealSameAuthor, path: at.path.as_str(), line: at.line, alloc)
+    for principal in principals {
+        var written = text::String.of(principal.as_str(), alloc)
+        mut written.push(' ')
+        mut written.append(principal.as_str())
+        mut reported.because.push(diagnostic::Reason.note(written.as_str(), alloc))
+    }
+    reported.item = Some(text::String.of(path, alloc))
+    return Some(take reported)
+} same_principals
+
+/// Whether a list of principals holds one.
+pkg fn lists_principal(principals: Slice[text::String], principal: Str) -> bool {
+    for held in principals {
+        if held.as_str() == principal {
+            return true
+        }
+    }
+    return false
+} lists_principal
 
 /// Whether an item's computed entry holds a current seal.
 fn is_sealed(entry_seals: Slice[EntrySeals], items: Items, path: Str, alloc: mem::Alloc) -> bool {

@@ -1,31 +1,16 @@
-//! `nan publish --local <dir>`: runs the release gate on the package in `<dir>`, moves the tombstones of its source into its history, builds its artefact and appends it to the local store as a named release whose parent is the history head.
+//! `nan publish --local <dir>`: runs the release gate on the package in `<dir>`, moves the tombstones of its source into its history, builds its artefact, signed with `--as`, and appends it to the local store as a named release whose parent is the history head.
 
 /// `nan publish`.
 fn publish_run(invocation: Invocation, session: check::Session, current: Str, trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
     let written = invocation.joined_args(alloc)
     let held = session.workspace.contents()
-    let local = match invocation.value("--local") {
-        Some(given) => given
-        None => ""
-    }
-    let local_bytes = local.as_bytes()
-    var dir_end: usize = 0
-    for step in 0..<local_bytes.len() {
-        let at = local_bytes.len() - step
-        if local_bytes[at - 1] != b'/' {
-            dir_end = at
-            break
-        }
-    }
-    let Some(dir) = local.slice_bytes(0, end: dir_end) else {
-        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
-    }
-    let Some(index) = held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir) else {
+    let Some(index) = local_package(invocation, held) else {
         return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
     }
     var breaking = invocation.listed("--breaking", alloc)
     let reason = mut breaking.pop()
-    if invocation.listed("--breaking", alloc).len() == 1 {
+    let unsigned_authors = invocation.value("--as").is_none() and invocation.listed("--author", alloc).len() > 0
+    if invocation.listed("--breaking", alloc).len() == 1 or unsigned_authors {
         return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
     }
     trace.scoped(written.as_str(), alloc)
@@ -39,9 +24,17 @@ fn publish_run(invocation: Invocation, session: check::Session, current: Str, tr
     }
     var manifest_path = text::String.of(source.dir.as_str(), alloc)
     mut manifest_path.append("/package.nan")
+    let signing = match try release_signing(invocation, session, source, alloc) {
+        Ok(chosen) => chosen
+        Err(reported) => {
+            var refused = mem::List[diagnostic::Diagnostic].empty(alloc)
+            mut refused.push(take reported)
+            return refusal(invocation, written: written.as_str(), session, index, diagnostics: refused.view(), alloc)
+        }
+    }
     var packages = mem::List[usize].empty(alloc)
     mut packages.push(index)
-    let gate = try judged(session, packages: packages.view())
+    let gate = try judged(session, packages: packages.view(), authors: signing.authors.view())
     if gate.diagnostics.len() > 0 or gate.report.failures.len() > 0 {
         let std = session.std()
         var records = mem::List[output::Record].empty(alloc)
@@ -78,8 +71,95 @@ fn publish_run(invocation: Invocation, session: check::Session, current: Str, tr
     if refused.len() > 0 {
         return refusal(invocation, written: written.as_str(), session, index, diagnostics: refused.view(), alloc)
     }
-    return try published(invocation, written: written.as_str(), session, index, take staged, local_store, alloc)
+    return try published(invocation, written: written.as_str(), session, index, take staged, local_store, take signing, alloc)
 } publish_run
+
+/// The index of the workspace package in the directory `--local` names, without its trailing
+/// `/`.
+fn local_package(invocation: Invocation, held: workspace::Workspace) -> Option[usize] {
+    let local = match invocation.value("--local") {
+        Some(given) => given
+        None => ""
+    }
+    let local_bytes = local.as_bytes()
+    var dir_end: usize = 0
+    for step in 0..<local_bytes.len() {
+        let at = local_bytes.len() - step
+        if local_bytes[at - 1] != b'/' {
+            dir_end = at
+            break
+        }
+    }
+    let Some(dir) = local.slice_bytes(0, end: dir_end) else {
+        return None
+    }
+    return held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir)
+} local_package
+
+/// The publisher of a release published with `--as`: its principal and secret key.
+struct ReleaseSigner {
+    principal: text::String
+    secret: core::crypto::SecretKey
+} ReleaseSigner
+
+/// How a release is signed: by its publisher, when `--as` names one, naming its author
+/// principals.
+struct ReleaseSigning {
+    signer: Option[ReleaseSigner]
+    authors: mem::List[text::String]
+} ReleaseSigning
+
+/// How `--as` and `--author` sign a release: its author principals, the `--author` ones or the
+/// publisher alone, in byte order; or why the package is not published.
+fn release_signing(invocation: Invocation, session: check::Session, source: workspace::Package, alloc: mem::Alloc) -> Result[ReleaseSigning, diagnostic::Diagnostic] fails platform::IoError {
+    var authors = mem::List[text::String].empty(alloc)
+    for author in invocation.listed("--author", alloc) {
+        if not check::lists_principal(authors.view(), principal: author.as_str()) {
+            mut authors.push(text::String.of(author.as_str(), alloc))
+        }
+    }
+    let Some(principal) = invocation.value("--as") else {
+        return Ok(ReleaseSigning(signer: None, authors: take authors))
+    }
+    if authors.len() == 0 {
+        mut authors.push(text::String.of(principal, alloc))
+    }
+    mut authors.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    let secret = match try publishing_key(session, source, publisher: principal, authors: authors.view(), alloc) {
+        Ok(found) => found
+        Err(reported) => return Err(take reported)
+    }
+    return Ok(ReleaseSigning(signer: Some(ReleaseSigner(principal: text::String.of(principal, alloc), secret: take secret)), authors: take authors))
+} release_signing
+
+/// The secret key of a release's publisher, or why the package is not published: a principal
+/// out of form, or a key the user directory lacks or whose public key differs from the one the
+/// package's principals file gives the publisher.
+fn publishing_key(session: check::Session, source: workspace::Package, publisher: Str, authors: Slice[text::String], alloc: mem::Alloc) -> Result[core::crypto::SecretKey, diagnostic::Diagnostic] fails platform::IoError {
+    var formed = machine::is_principal(publisher)
+    for author in authors {
+        formed = formed and machine::is_principal(author.as_str())
+    }
+    if not formed {
+        return Err(diagnostic::Diagnostic.new(diagnostic::Code.SealBadPrincipal, alloc))
+    }
+    let expected = source.machine.principals(alloc).key(publisher)
+    let seed = match try secret_key_of(session.home, principal: publisher, alloc) {
+        Ok(Some(held)) => held
+        Ok(None) => return Err(diagnostic::Diagnostic.new(diagnostic::Code.KeyMissing, alloc))
+        Err(exposed) => return Err(exposed_diagnostic(take exposed, alloc))
+    }
+    let secret = core::crypto::SecretKey.of_seed(seed)
+    match expected {
+        Some(key) => {
+            if key != secret.public_key() {
+                return Err(diagnostic::Diagnostic.new(diagnostic::Code.KeyMissing, alloc))
+            }
+        }
+        None => {}
+    }
+    return Ok(take secret)
+} publishing_key
 
 /// What a publish decides from the local store before building its release, adding to
 /// `refused` a parent the store does not hold and a store name another package holds.
@@ -153,7 +233,16 @@ struct Staged {
 
 /// Builds the release of a package whose tombstones move into its history, judges its classes
 /// against its parent, appends it to the local store and records it as the history head.
-fn published(invocation: Invocation, written: Str, session: check::Session, index: usize, take staged: Staged, local_store: store::Store, alloc: mem::Alloc) -> output::Output fails platform::IoError
+fn published(
+    invocation: Invocation,
+    written: Str,
+    session: check::Session,
+    index: usize,
+    take staged: Staged,
+    local_store: store::Store,
+    take signing: ReleaseSigning,
+    alloc: mem::Alloc,
+    ) -> output::Output fails platform::IoError
     waive length "one pass over the steps of a publish, in the bootstrap's order"
 {
     let held = session.workspace.contents()
@@ -243,7 +332,8 @@ fn published(invocation: Invocation, written: Str, session: check::Session, inde
         }
         None => {}
     }
-    let check::Built(artefact: artefact_bytes, sources: sources) = built
+    let check::Built(artefact: built_artefact, sources: sources) = built
+    let artefact_bytes = signed_artefact(moved_session, index, closure, built: built_artefact.view(), take signing, alloc)
     let appending = try local_store.append(store::Append(package_name: text::String.of(manifest.name.as_str(), alloc), name: Some(text::String.of(staged.name.as_str(), alloc)), parent: parent_root, summary: Some(take summary), artefact: take artefact_bytes, sources: take sources))
     let added = match appending {
         Ok(stored) => stored
@@ -286,6 +376,48 @@ fn published(invocation: Invocation, written: Str, session: check::Session, inde
     }
     return publish_output(invocation, written, take records, diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc).view(), changes: changes.view(), alloc)
 } published
+
+/// A built artefact, given its sections when its publisher signs it.
+fn signed_artefact(
+    session: check::Session,
+    index: usize,
+    closure: workspace::Closure,
+    built: Slice[u8],
+    take signing: ReleaseSigning,
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(built)
+    let ReleaseSigning(signer: chosen, authors: authors) = signing
+    let Some(publisher) = chosen else {
+        return copy
+    }
+    let Ok(decoded) = artefact::decode(built, alloc) else {
+        expect false
+        return copy
+    }
+    let held = session.workspace.contents()
+    var roots = mem::List[artefact::ClosureRoot].empty(alloc)
+    for member in closure.members {
+        let root = match member.value() {
+            workspace::Member.Source(_) => decoded.root_hash()
+            workspace::Member.Release(at) => held.releases[at].root
+        }
+        mut roots.push(artefact::ClosureRoot(package_name: text::String.of(member.key().as_str(), alloc), root: root))
+    }
+    var lock = mem::Bytes.empty(alloc)
+    match held.packages.get(index) {
+        Some(source) => {
+            match source.machine.lock_file {
+                Some(loaded) => mut lock.append(loaded.bytes.view())
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let ReleaseSigner(principal: principal, secret: secret) = publisher
+    return artefact::published(built, signing: artefact::Publication(principal: take principal, secret: take secret, toolchain: session.toolchain_hash(), closure: take roots, authors: take authors, lock: take lock), alloc)
+} signed_artefact
 
 /// The history head a history records, none without a history.
 fn history_head(history: Option[machine::History]) -> Option[hashing::HashValue] {

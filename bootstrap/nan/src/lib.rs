@@ -24,6 +24,7 @@ mod prover;
 mod release;
 mod resolution;
 mod scope;
+mod sign;
 mod stage;
 mod stdlib;
 mod store;

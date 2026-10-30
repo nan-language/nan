@@ -107,7 +107,7 @@ The **toolchain source tree** is the set of files the toolchain is built from: i
 
 ## Cache
 
-The **user directory** is the directory `.nan` in the home directory that the system's user database gives the user running the toolchain. It holds the **build cache** in its subdirectory `cache`, and the local store in its subdirectory `store`. The toolchain creates each of the three that is missing, accessible to the running user alone.
+The **user directory** is the directory `.nan` in the home directory that the system's user database gives the user running the toolchain. It holds the **build cache** in its subdirectory `cache`, the local store in its subdirectory `store`, and the [secret keys](31-trust.md#principals) of principals in its subdirectory `keys`. The toolchain creates each of the first three that is missing, and `keys` when it first writes a secret key, accessible to the running user alone; it writes each secret key's file readable and writable by that user alone.
 
 The build cache holds:
 
@@ -120,7 +120,7 @@ Every process of the user shares the cache without locks.
 - Each file holds a checksum of its contents. The toolchain fixes the names and encoding of the files, and a file it cannot decode, or whose checksum does not match, is absent.
 - Deleting any file of the cache, or the whole cache, at any time changes only what cache records decide.
 - The toolchain uses a cache entry without checking it again, so the cache is trusted exactly as the installed toolchain is. Only the toolchain writes it, and reads none of the cache from another user's directory or from a location shared between users.
-- Before reading the user directory, `cache`, `store` or a file in them, the toolchain checks it. One that is a symbolic link, is not owned by the running user, or is writable by its group or by others is an error (`build.cache-exposed`), reported without a source line and naming its path relative to the home directory, as `~/.nan/...`. The command then ends, writing nothing to the user directory.
+- Before reading the user directory, `cache`, `store`, `keys` or a file in them, the toolchain checks it. One that is a symbolic link, is not owned by the running user, or is writable by its group or by others, or for `keys` and its files accessible to them, is an error (`build.cache-exposed`), reported without a source line and naming its path relative to the home directory, as `~/.nan/...`. The command then ends, writing nothing to the user directory.
 
 The toolchain fixes the names and encoding of the files in `store`. A command appending to the local store holds an exclusive advisory `flock` lock on `store/write` from reading the greatest publication index until its append completes, and writes each entry whole under a new name before renaming it into place, so a reader sees an entry entirely or not at all.
 

@@ -169,7 +169,7 @@ pub closed struct Level derives Copy, Eq, Ord, Hash, Default, Render {
 
 ## Machine files
 
-A **machine file** is one of these files of a package, written only by the toolchain: the [lock](29-identity-versioning.md#lock) `.nan/lock.nan`, the [history](29-identity-versioning.md#history) `.nan/history.nan`, and the [API snapshot](31-trust.md#api-snapshots) `.nan/api/<module>.nan` of each module that has one. A machine file is not a source file.
+A **machine file** is one of these files of a package, written only by the toolchain: the [lock](29-identity-versioning.md#lock) `.nan/lock.nan`, the [history](29-identity-versioning.md#history) `.nan/history.nan`, the [API snapshot](31-trust.md#api-snapshots) `.nan/api/<module>.nan` of each module that has one, and the [principals file](31-trust.md#principals) `.nan/principals.nan`. A machine file is not a source file.
 
 ### Common syntax
 
@@ -179,7 +179,7 @@ check_record = 'check' TEXT ;
 
 - A machine file is UTF-8 text with LF line ends and a final newline, and lexes into tokens by the rules of [Lexical structure](01-lexical.md). It holds no comment and no blank line.
 - Each record is one logical line whose first token stands at column 0, its tokens separated as [Spacing](#spacing) fixes. Only a tombstone in a history may span several physical lines, as its canonical format gives.
-- The first line is `nan`, the file's kind and its format version: `nan lock 1`, `nan history 1` or `nan api 1`. The kind matches the file's name, and the format version of language 1 is 1.
+- The first line is `nan`, the file's kind and its format version: `nan lock 1`, `nan history 1`, `nan api 1` or `nan principals 1`. The kind matches the file's name, and the format version of language 1 is 1.
 - The last line is a `check_record` whose `TEXT` holds the hash of every byte before that line.
 - A hash is a `TEXT` holding its [full form](29-identity-versioning.md#hash-values), and a [canonical path](29-identity-versioning.md#canonical-paths) a `TEXT` holding the path.
 - In every `TEXT`, `\` is written `\\`, `"` is written `\"`, LF is written `\n`, every other code point below U+0020, U+007F and every [rejected code point](01-lexical.md#rejected-code-points) is written `\u{H}` with uppercase hexadecimal digits and no leading zeros, and every other code point is written as itself.
@@ -197,7 +197,7 @@ A machine file is **valid** when it lexes, its first line names its kind, it par
 lock_file = COL0 'nan' 'lock' INT NL COL0 lock_tail ;
 lock_tail = lock_record NL COL0 lock_tail | check_record NL EOF ;
 lock_record = 'snapshot' INT
-    | 'dep' IDENT ( 'alias' IDENT )? TEXT TEXT TEXT
+    | 'dep' IDENT ( 'alias' IDENT )? TEXT TEXT ( 'signed' TEXT )? TEXT
     | 'approved' IDENT summary_entry
     | 'epoch' TEXT INT
     | "registry" ( IDENT | INT | TEXT )* {!format.reserved-field}
@@ -214,7 +214,7 @@ escape_kind = "trusted" | "assume" | "foreign" | "landing" | "validator" | 'deco
 The records hold the fields of the lock that [Lock](29-identity-versioning.md#lock) defines:
 
 - `snapshot N` holds the snapshot.
-- `dep P alias A S R C` holds the line of package P: A is its alias when it is a direct dependency, and the record has no `alias` part otherwise; S is its source text, a path source being written relative to the lock's package directory; R is the code root of its locked release; and C, the line checksum, is the hash of the bytes of the record before the space preceding C.
+- `dep P alias A S R signed K C` holds the line of package P: A is its alias when it is a direct dependency, and the record has no `alias` part otherwise; S is its source text, a path source being written relative to the lock's package directory; R is the code root of its locked release; K is the [key form](31-trust.md#principals) of its publisher's public key for a release whose artefact holds sections, and the record has no `signed` part otherwise; and C, the line checksum, is the hash of the bytes of the record before the space preceding C.
 - `approved P E` holds one pair of the approved [closure summary](14-authority.md#authority-summaries), P being the package name and E the entry in the form this table gives.
 - `epoch Q N` holds one approved epoch, Q being the canonical path and N the epoch.
 
@@ -291,7 +291,7 @@ An API snapshot holds one **entry** for each item of its module that is `pub`, i
 
 1. For a `pub` item or impl line: one `text` record per line of its interface text; for a struct or enum that promises any of `Copy`, `Send`, `Inert` and `AnyBits` ([promises](05-properties.md#promises)), `promises` with those properties in that order, each followed in brackets by the generic parameters it rests on, if any; `interface H` with its interface hash; for an item with a [digest](10-effects-digests.md#digests), one `digest T D` per declared target T in byte order, D being the digest as `nan show --api` prints it after `digest: `; and one `doc K B D` per [public doc](32-docs.md#doc-binding) of the item and its members in source order, K being the doc's key (absent for the item's own doc, a name for a member, a position for an invariant line), B its bound hash and D its doc text.
 2. For an item whose [accepted spec](31-trust.md#api-snapshots) is not empty: for a function, `head H` with the flat text of its accepted head, one `accepted C` per accepted clause, C being its flat text, in the order of the accepted spec, and one `test Q T H...` per accepted targeting test in byte order of Q, its canonical path, T being its parameter types joined by `, ` and the H its expect hashes in byte order, each as often as it occurs; for a struct, one `accepted C` per accepted field line and invariant line; for an interface, for each method with accepted clauses, in byte order of name N, a `method N` record followed by that method's `head` and `accepted` records. For an item with a pending weakening, after those records, one `pending I W` per weakened part in byte order of W, I being the item hash it is bound to and W the part: `requires`, `predicates`, the flat text of an accepted ensures or example clause, or `test`, a space and the test's canonical path; an interface's are written after the `accepted` records of the method holding the part.
-3. For each seal, in byte order of principal: `seal R I C`, R being the principal, I the [sealed item hash](31-trust.md#seals) and C the closure hash it records; one `closure K P H` per closure entry, in byte order of P, then of K, then of H; and `signature S` when the seal holds the reserved signature field, which the toolchain never writes.
+3. For each seal, in byte order of principal: `seal R I C`, R being the principal, I the [sealed item hash](31-trust.md#seals) and C the closure hash it records; one `closure K P H` per closure entry, in byte order of P, then of K, then of H; and `signature S` when the seal holds a signature, S being its [signature form](31-trust.md#signatures).
 
 The **flat text** of a head, clause, field line or invariant line is its tokens on one line, without comments, spaced as [Spacing](#spacing) fixes, each breakable list flat and each text run written as the text literal that the [normalised form](29-identity-versioning.md#normalised-form) writes for it.
 
@@ -357,6 +357,16 @@ interface "<hash>"
 digest any "effects none | authority none | may-trap no | terminates"
 check "<hash>"
 ```
+
+### Principals file
+
+```ebnf
+principals_file = COL0 'nan' 'principals' INT NL COL0 principals_tail ;
+principals_tail = principal_record NL COL0 principals_tail | check_record NL EOF ;
+principal_record = 'principal' TEXT TEXT ;
+```
+
+Each `principal P K` record gives the principal P the public key whose [key form](31-trust.md#principals) is K, in byte order of P, P being in the principal form.
 
 ## Diagnostics
 

@@ -6,6 +6,7 @@ mod check;
 mod dep;
 mod diff;
 mod edit;
+mod key;
 mod merge;
 mod publish;
 mod read;
@@ -74,6 +75,9 @@ enum Name {
     Upgrade,
     Diff,
     Seal,
+    KeyNew,
+    KeyShow,
+    KeyTrust,
 }
 
 impl Name {
@@ -88,7 +92,10 @@ impl Name {
             ("dep", Some("add")) => Some(Name::DepAdd),
             ("dep", Some("sync")) => Some(Name::DepSync),
             ("dep", Some("approve")) => Some(Name::DepApprove),
-            ("edit" | "api" | "dep", _) => return None,
+            ("key", Some("new")) => Some(Name::KeyNew),
+            ("key", Some("show")) => Some(Name::KeyShow),
+            ("key", Some("trust")) => Some(Name::KeyTrust),
+            ("edit" | "api" | "dep" | "key", _) => return None,
             _ => None,
         };
         if let Some(name) = pair {
@@ -150,6 +157,9 @@ impl Name {
             Name::Upgrade => "upgrade",
             Name::Diff => "diff",
             Name::Seal => "seal",
+            Name::KeyNew => "key new",
+            Name::KeyShow => "key show",
+            Name::KeyTrust => "key trust",
         }
     }
 
@@ -165,7 +175,10 @@ impl Name {
             | Name::Expand
             | Name::EditRename
             | Name::EditMove
-            | Name::Primer => (&[], &[]),
+            | Name::Primer
+            | Name::KeyNew
+            | Name::KeyShow
+            | Name::KeyTrust => (&[], &[]),
             Name::Run => (&["--keep-resets"], &[]),
             Name::Build => (&[], &["--compare-with"]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
@@ -176,7 +189,7 @@ impl Name {
             Name::ApiUpdate | Name::DepAdd | Name::DepSync | Name::DepApprove | Name::Verify => {
                 (&[], &[])
             }
-            Name::Publish => (&[], &["--local", "--name"]),
+            Name::Publish => (&[], &["--local", "--name", "--as"]),
             Name::Merge => (&[], &["--path"]),
             Name::Upgrade => (&[], &["--language"]),
             Name::Diff => (&["--green"], &["--path", "--agent"]),
@@ -184,19 +197,19 @@ impl Name {
         }
     }
 
-    /// The option taking every argument after it up to the next option.
-    fn listing(self) -> Option<&'static str> {
+    /// The options taking every argument after them up to the next option.
+    fn listing(self) -> &'static [&'static str] {
         match self {
-            Name::ApiUpdate => Some("--confirm-docs"),
-            Name::Publish => Some("--breaking"),
-            _ => None,
+            Name::ApiUpdate => &["--confirm-docs"],
+            Name::Publish => &["--breaking", "--author"],
+            _ => &[],
         }
     }
 
     /// The most operands the command takes.
     fn operands(self) -> usize {
         match self {
-            Name::Find | Name::EditRename | Name::EditMove | Name::DepAdd => 2,
+            Name::Find | Name::EditRename | Name::EditMove | Name::DepAdd | Name::KeyTrust => 2,
             Name::Merge => 3,
             Name::Diff => 2,
             _ => 1,
@@ -231,6 +244,9 @@ impl Name {
                 | Name::Merge
                 | Name::Diff
                 | Name::Seal
+                | Name::KeyNew
+                | Name::KeyShow
+                | Name::KeyTrust
         )
     }
 
@@ -255,6 +271,7 @@ impl Name {
                 | Name::Merge
                 | Name::Upgrade
                 | Name::Seal
+                | Name::KeyTrust
         )
     }
 
@@ -275,7 +292,9 @@ impl Name {
             | Name::DepApprove
             | Name::Publish
             | Name::Upgrade
-            | Name::Seal => &["files", "errors", "incomplete"],
+            | Name::Seal
+            | Name::KeyNew
+            | Name::KeyTrust => &["files", "errors", "incomplete"],
             Name::Find
             | Name::Holes
             | Name::Show
@@ -283,7 +302,8 @@ impl Name {
             | Name::Explain
             | Name::Expand
             | Name::Primer
-            | Name::Diff => &["records"],
+            | Name::Diff
+            | Name::KeyShow => &["records"],
             Name::Context => &["entries", "radius"],
             Name::Merge => &["files", "conflicts", "errors"],
         }
@@ -509,7 +529,7 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
                 invocation.format.skip = number(rest.get(index)?)?;
             }
             _ if flags.contains(&arg) && !invocation.flag(arg) => invocation.flags.push(arg),
-            _ if name.listing() == Some(arg) && invocation.listed(arg).is_empty() => {
+            _ if name.listing().contains(&arg) && invocation.listed(arg).is_empty() => {
                 let listed: Vec<&String> = rest[index + 1..]
                     .iter()
                     .take_while(|value| !value.starts_with("--"))
@@ -579,6 +599,12 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
     if invocation.name == Name::Merge {
         return merge::run(invocation, current, trace).map(Outcome::Output);
     }
+    if invocation.name == Name::KeyNew {
+        return key::new(invocation).map(Outcome::Output);
+    }
+    if invocation.name == Name::KeyShow {
+        return key::show(invocation).map(Outcome::Output);
+    }
     if invocation.name == Name::Diff
         && invocation.value("--path").is_none()
         && !invocation.flag("--green")
@@ -621,6 +647,10 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
         Name::Upgrade => dep::upgrade(invocation, &workspace, current, trace),
         Name::Diff => diff::run(invocation, &workspace, current, trace),
         Name::Seal => seal::run(invocation, &workspace, current, trace),
+        Name::KeyTrust => key::trust(invocation, &workspace, current, trace),
+        Name::KeyNew | Name::KeyShow => {
+            unreachable!("key new and key show run outside a workspace")
+        }
     };
     output.map(Outcome::Output)
 }

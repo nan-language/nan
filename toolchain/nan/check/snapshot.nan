@@ -16,14 +16,20 @@ pkg struct CheckedPackage {
 } CheckedPackage
 
 /// The items of a package across the checkers of its targets, by canonical path, each with the
-/// variants holding it under each target, in byte order of file path, then of target.
+/// variants holding it under each target, in byte order of file path, then of target, with the
+/// package's principals file.
 pkg struct Items {
     pkg by_path: mem::Map[text::String, mem::List[Variant]]
     /// The package item's hashes and ledger under the first checker.
     pkg checked_package: Option[CheckedPackage]
+    pkg principals: machine::Principals
 } Items
 
-fn Items.of(checkers: Slice[TargetChecker], package_name: Str, alloc: mem::Alloc) -> Items {
+fn Items.of(checkers: Slice[TargetChecker], source: workspace::Package, alloc: mem::Alloc) -> Items {
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
     var by_path = mem::Map[text::String, mem::List[Variant]].empty(alloc)
     var found_package: Option[CheckedPackage] = None
     for held in checkers {
@@ -54,7 +60,7 @@ fn Items.of(checkers: Slice[TargetChecker], package_name: Str, alloc: mem::Alloc
             }
         }
     }
-    return Items(by_path: take by_path, checked_package: take found_package)
+    return Items(by_path: take by_path, checked_package: take found_package, principals: source.machine.principals(alloc))
 } Items.of
 
 /// Whether a variant comes after one of a file and target: in byte order of file path, then of
@@ -137,10 +143,22 @@ pkg fn Items.closure_entries(self, path: Str, alloc: mem::Alloc) -> mem::Set[mac
     return entries
 } Items.closure_entries
 
-/// Whether a seal of an item is current: it holds no signature and the item's sealed item
-/// hash and closure hash are those it records.
+/// Whether a seal of an item is current: the item's sealed item hash and closure hash are those
+/// it records, and it holds a signature that verifies by the key the principals file gives its
+/// principal, or no signature when the file gives the principal none.
 pkg fn Items.seal_current(self, path: Str, seal: machine::Seal, alloc: mem::Alloc) -> bool {
-    return seal.signature.is_none() and self.sealed_hash(path, alloc) == Some(seal.item) and closure_hash(self.closure_entries(path, alloc), alloc) == seal.closure
+    let hashed = self.sealed_hash(path, alloc) == Some(seal.item) and closure_hash(self.closure_entries(path, alloc), alloc) == seal.closure
+    if not hashed {
+        return false
+    }
+    let key = self.principals.key(seal.principal.as_str())
+    return match key {
+        Some(listed) => match seal.signature {
+            Some(signature) => listed.verify(sign::seal_message(seal.principal.as_str(), path, sealed: seal.item, closure: seal.closure, alloc).as_bytes(), signature)
+            None => false
+        }
+        None => seal.signature.is_none()
+    }
 } Items.seal_current
 
 /// Whether an item holds a trust escape: the package item through its grants.
@@ -329,10 +347,18 @@ pkg struct Sealed {
     pkg accepted: Option[machine::Accepted]
 } Sealed
 
-/// The snapshot of the module recording the item at `path` once `principal` seals it, from the
-/// snapshots `nan api update` computes: the seal replaces an earlier one of the principal and
-/// accepts the item's pending weakening.
-pkg fn Items.sealed(self, source: workspace::Package, take computed: Snapshots, path: Str, principal: Str, alloc: mem::Alloc) -> Result[Sealed, Unsealed] {
+/// The snapshot of the module recording the item at `path` once `principal` seals it, signing
+/// the seal by `signer` when given, from the snapshots `nan api update` computes: the seal
+/// replaces an earlier one of the principal and accepts the item's pending weakening.
+pkg fn Items.sealed(
+    self,
+    source: workspace::Package,
+    take computed: Snapshots,
+    path: Str,
+    principal: Str,
+    signer: Option[core::crypto::SecretKey],
+    alloc: mem::Alloc,
+    ) -> Result[Sealed, Unsealed] {
     let Some(module) = self.sealed_module(path, alloc) else {
         return Err(Unsealed.Unneeded)
     }
@@ -388,7 +414,14 @@ pkg fn Items.sealed(self, source: workspace::Package, take computed: Snapshots, 
     for entry in take entries {
         mut listed.push(take entry)
     }
-    let seal = machine::Seal(principal: text::String.of(principal, alloc), item: item_hash, closure: closure, entries: take listed, signature: None)
+    var signature: Option[core::crypto::Signature] = None
+    match signer {
+        Some(key) => {
+            signature = Some(key.sign(sign::seal_message(principal, path, sealed: item_hash, closure, alloc).as_bytes()))
+        }
+        None => {}
+    }
+    let seal = machine::Seal(principal: text::String.of(principal, alloc), item: item_hash, closure: closure, entries: take listed, signature: signature)
     expect at < snapshot.entries.len()
     mut snapshot.entries[at].seals.retain(fn(kept: machine::Seal) => kept.principal.as_str() != principal)
     var seal_at: usize = 0

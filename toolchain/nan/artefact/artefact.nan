@@ -1,4 +1,4 @@
-//! Artefacts: the code root of a package state, whose hash identifies its release, then its attestation file and the reserved sections.
+//! Artefacts: the code root of a package state, whose hash identifies its release, then its attestation file and its sections: none, or the publisher's signature, the builder's certificate and the provenance.
 
 const MAGIC: Slice[u8] = b"NART"
 
@@ -132,14 +132,22 @@ pkg fn code_root(parts: Parts, alloc: mem::Alloc) -> mem::Bytes {
 } code_root
 
 /// A seal an attestation file records: principal, item, sealed item hash, closure hash and closure
-/// entries.
+/// entries; for a signed seal of a principal the package's principals file gives a key, its
+/// signature and that key.
 pkg struct AttestedSeal {
     pkg principal: text::String
     pkg item: text::String
     pkg sealed: hashing::HashValue
     pkg closure: hashing::HashValue
     pkg entries: mem::List[SealEntry]
+    pkg signed: Option[SealSignature]
 } AttestedSeal
+
+/// The signature of a seal and the public key it verifies by.
+pkg struct SealSignature derives Copy {
+    pkg signature: core::crypto::Signature
+    pkg key: core::crypto::PublicKey
+} SealSignature
 
 /// An entry of a seal's closure: whether it covers a body, its canonical path and its hash.
 pkg struct SealEntry {
@@ -178,9 +186,7 @@ pkg fn attestation(toolchain: hashing::HashValue, source_tree: hashing::HashValu
 } attestation
 
 fn hash_bytes(hash: hashing::HashValue, alloc: mem::Alloc) -> mem::Bytes {
-    var out = mem::Bytes.empty(alloc)
-    encoding::bytes(mut out, value: hash.bytes.view())
-    return out
+    return encoded_bytes(hash.bytes.view(), alloc)
 } hash_bytes
 
 /// The encoding of the seals an attestation file records.
@@ -207,31 +213,516 @@ pkg fn seal_list(seals: Slice[AttestedSeal], alloc: mem::Alloc) -> mem::Bytes {
             mut entries.push(take entry_record.finish(alloc))
         }
         mut fields.field(5, content: sorted_list(take entries, alloc))
+        match seal.signed {
+            Some(signed) => {
+                mut fields.field(6, content: encoded_bytes(signed.signature.bytes.view(), alloc))
+                mut fields.field(7, content: encoded_bytes(signed.key.bytes.view(), alloc))
+            }
+            None => {}
+        }
         mut encoded.push(take fields.finish(alloc))
     }
     return sorted_list(take encoded, alloc)
 } seal_list
 
 /// An artefact's bytes: the magic, the format version, the code root, the attestation file and
-/// an empty reserved sections record.
+/// an empty sections record.
 pkg fn artefact(root: Slice[u8], attested: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    return assembled(root, attested, sections: encoding::Record.empty(alloc), alloc)
+} artefact
+
+fn assembled(root: Slice[u8], attested: Slice[u8], take sections: encoding::Record, alloc: mem::Alloc) -> mem::Bytes {
     var out = mem::Bytes.empty(alloc)
     mut out.append(MAGIC)
     encoding::uvar(mut out, value: FORMAT)
     encoding::bytes(mut out, value: root)
     encoding::bytes(mut out, value: attested)
-    mut out.append(encoding::Record.empty(alloc).finish(alloc).view())
+    let finished = take sections.finish(alloc)
+    mut out.append(finished.view())
     return out
-} artefact
+} assembled
 
-/// What an artefact decodes to: its code root.
+/// What `nan publish --as` signs a release with: the principal publishing and building it, its
+/// secret key, the toolchain hash, the package and code root of each package of the checked
+/// closure, the author principals and the package's lock.
+pkg struct Publication {
+    pkg principal: text::String
+    pkg secret: core::crypto::SecretKey
+    pkg toolchain: hashing::HashValue
+    pkg closure: mem::List[ClosureRoot]
+    pkg authors: mem::List[text::String]
+    pkg lock: mem::Bytes
+} Publication
+
+/// A package of a closure and the code root hash of its state.
+pkg struct ClosureRoot {
+    pkg package_name: text::String
+    pkg root: hashing::HashValue
+} ClosureRoot
+
+/// An artefact without sections given the signature, certificate and provenance sections of a
+/// publication.
+pkg fn published(encoded: Slice[u8], signing: Publication, alloc: mem::Alloc) -> mem::Bytes {
+    let Ok(opened) = decode(encoded, alloc) else {
+        expect false
+        return copy_of(encoded, alloc)
+    }
+    let key = signing.secret.public_key()
+    var provenance = encoding::Record.empty(alloc)
+    mut provenance.field(1, content: sorted_list(texts(signing.authors.view(), alloc), alloc))
+    mut provenance.field(2, content: encoded_bytes(signing.lock.view(), alloc))
+    let provenance_bytes = take provenance.finish(alloc)
+    let attested = certificate_message(certificate_fields(signing, key, alloc), alloc)
+    var certificate = certificate_fields(signing, key, alloc)
+    mut certificate.field(5, content: encoded_bytes(signing.secret.sign(attested.view()).bytes.view(), alloc))
+    let message = artefact_message(signing.principal.as_str(), key, root: opened.code_root.view(), attested: opened.attestation.view(), provenance: provenance_bytes.view(), alloc)
+    var signature = encoding::Record.empty(alloc)
+    mut signature.field(1, content: text_of(signing.principal.as_str(), alloc))
+    mut signature.field(2, content: encoded_bytes(key.bytes.view(), alloc))
+    mut signature.field(3, content: encoded_bytes(signing.secret.sign(message.view()).bytes.view(), alloc))
+    var section_record = encoding::Record.empty(alloc)
+    mut section_record.field(1, content: take signature.finish(alloc))
+    mut section_record.field(4, content: take certificate.finish(alloc))
+    mut section_record.field(5, content: take provenance_bytes)
+    return assembled(opened.code_root.view(), attested: opened.attestation.view(), sections: take section_record, alloc)
+} published
+
+/// The fields 1 to 4 of a publication's certificate.
+fn certificate_fields(signing: Publication, key: core::crypto::PublicKey, alloc: mem::Alloc) -> encoding::Record {
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: text_of(signing.principal.as_str(), alloc))
+    mut record.field(2, content: encoded_bytes(key.bytes.view(), alloc))
+    mut record.field(3, content: hash_bytes(signing.toolchain, alloc))
+    var pairs = mem::List[mem::Bytes].empty(alloc)
+    for member in signing.closure {
+        var pair = text_of(member.package_name.as_str(), alloc)
+        mut pair.append(hash_bytes(member.root, alloc).view())
+        mut pairs.push(take pair)
+    }
+    mut record.field(4, content: sorted_list(take pairs, alloc))
+    return record
+} certificate_fields
+
+/// The encoding of bytes.
+fn encoded_bytes(value: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: value)
+    return out
+} encoded_bytes
+
+/// A copy of bytes.
+fn copy_of(value: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(value)
+    return out
+} copy_of
+
+/// The bytes the publisher signs: `nan artefact 1`, its principal, the key form of its public key,
+/// then the full forms of the hashes of the code root, the attestation file and the provenance
+/// section, each followed by LF.
+fn artefact_message(
+    principal: Str,
+    key: core::crypto::PublicKey,
+    root: Slice[u8],
+    attested: Slice[u8],
+    provenance: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var message = copy_of(b"nan artefact 1\n", alloc)
+    mut message.append(principal.as_bytes())
+    mut message.append(b"\n")
+    mut message.append(sign::key_form(key, alloc).as_bytes())
+    mut message.append(b"\n")
+    mut message.append(hashing::HashValue.of(root).full(alloc).as_bytes())
+    mut message.append(b"\n")
+    mut message.append(hashing::HashValue.of(attested).full(alloc).as_bytes())
+    mut message.append(b"\n")
+    mut message.append(hashing::HashValue.of(provenance).full(alloc).as_bytes())
+    mut message.append(b"\n")
+    return message
+} artefact_message
+
+/// The bytes the builder signs: `nan certificate 1` and LF, then the encoding of the record of
+/// the certificate's fields 1 to 4.
+fn certificate_message(take fields: encoding::Record, alloc: mem::Alloc) -> mem::Bytes {
+    var message = copy_of(b"nan certificate 1\n", alloc)
+    let finished = take fields.finish(alloc)
+    mut message.append(finished.view())
+    return message
+} certificate_message
+
+/// What an artefact decodes to: its code root, its attestation file and its sections, when it
+/// holds them.
 pkg struct Decoded {
     pkg code_root: mem::Bytes
+    pkg attestation: mem::Bytes
+    sections: Option[Sections]
 } Decoded
+
+/// The sections of an artefact: the fields of the signature and certificate sections, and the
+/// provenance section's encoding.
+struct Sections {
+    signature: mem::List[ReadField]
+    certificate: mem::List[ReadField]
+    provenance: mem::Bytes
+} Sections
+
+/// A field of a record read: its key and its content.
+struct ReadField {
+    key: u64
+    content: mem::Bytes
+} ReadField
+
+/// The fields of a record read, keys strictly increasing, and the position after it.
+struct ReadRecord {
+    fields: mem::List[ReadField]
+    next: usize
+} ReadRecord
 
 pkg fn Decoded.root_hash(self) -> hashing::HashValue {
     return hashing::HashValue.of(self.code_root.view())
 } Decoded.root_hash
+
+/// Whether the artefact is accepted as the release a lock line pins, whose publisher key is
+/// `pinned`, by a package trusting `principals`: every signature it holds verifies, each signed
+/// seal's over its seal and, when it holds sections, the publisher's over its code root,
+/// attestation file and provenance, and the builder's, the same principal with the same key, over
+/// its certificate, which lists the artefact's own code root; it is signed by the pinned key or
+/// unsigned when none is pinned; its publisher is given its key by `principals`; and each signed
+/// seal's principal is given its key or none.
+pkg fn Decoded.accepted(self, pinned: Option[core::crypto::PublicKey], principals: machine::Principals, alloc: mem::Alloc) -> bool {
+    let Some(seals) = attested_seals(self.attestation.view(), alloc) else {
+        return false
+    }
+    for seal in seals {
+        if not seal.signer.verifies(seal.message.view()) {
+            return false
+        }
+        let listed = principals.key(seal.signer.principal.as_str())
+        if listed.is_some() and listed != Some(seal.signer.key) {
+            return false
+        }
+    }
+    let Some(sections) = self.sections else {
+        return pinned.is_none()
+    }
+    let Some(publisher) = Signer.of(sections.signature.view(), signature: 3, alloc) else {
+        return false
+    }
+    let Some(builder) = Signer.of(sections.certificate.view(), signature: 5, alloc) else {
+        return false
+    }
+    let anchored = pinned == Some(publisher.key) and principals.key(publisher.principal.as_str()) == Some(publisher.key)
+    let consistent = builder.principal == publisher.principal and builder.key == publisher.key
+    if not anchored or not consistent {
+        return false
+    }
+    var certified = encoding::Record.empty(alloc)
+    for read in sections.certificate {
+        if read.key < 5 {
+            mut certified.field(read.key, content: copy_of(read.content.view(), alloc))
+        }
+    }
+    let message = artefact_message(publisher.principal.as_str(), key: publisher.key, root: self.code_root.view(), attested: self.attestation.view(), provenance: sections.provenance.view(), alloc)
+    return self.certified_root(sections.certificate.view(), alloc) and publisher.verifies(message.view()) and builder.verifies(certificate_message(take certified, alloc).view())
+} Decoded.accepted
+
+/// The public key of the artefact's publisher, when it holds sections.
+pkg fn Decoded.publisher_key(self, alloc: mem::Alloc) -> Option[core::crypto::PublicKey] {
+    let Some(sections) = self.sections else {
+        return None
+    }
+    let Some(publisher) = Signer.of(sections.signature.view(), signature: 3, alloc) else {
+        return None
+    }
+    return Some(publisher.key)
+} Decoded.publisher_key
+
+/// Whether a certificate's closure lists the artefact's code root hash.
+fn Decoded.certified_root(self, certificate: Slice[ReadField], alloc: mem::Alloc) -> bool {
+    let Some(pairs) = field_copy(certificate, key: 4, alloc) else {
+        return false
+    }
+    let Some(roots) = read_roots(pairs.view(), alloc) else {
+        return false
+    }
+    let root = self.root_hash()
+    return roots.position(fn(member: ClosureRoot) => member.root == root).is_some()
+} Decoded.certified_root
+
+/// A principal, its public key and a signature by it.
+struct Signer {
+    principal: text::String
+    key: core::crypto::PublicKey
+    signature: core::crypto::Signature
+} Signer
+
+/// The principal in field 1, the key in field 2 and the signature in field `signature` of a
+/// section.
+fn Signer.of(fields: Slice[ReadField], signature: u64, alloc: mem::Alloc) -> Option[Signer] {
+    let Some(principal) = text_field(fields, key: 1, alloc) else {
+        return None
+    }
+    let Some(key) = key_field(fields, key: 2) else {
+        return None
+    }
+    let Some(signed) = signature_field(fields, key: signature) else {
+        return None
+    }
+    return Some(Signer(principal: take principal, key: key, signature: signed))
+} Signer.of
+
+fn Signer.verifies(self, message: Slice[u8]) -> bool {
+    return self.key.verify(message, signature: self.signature)
+} Signer.verifies
+
+/// A copy of the content of the field of a key.
+fn field_copy(fields: Slice[ReadField], key: u64, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    for read in fields {
+        if read.key == key {
+            return Some(copy_of(read.content.view(), alloc))
+        }
+    }
+    return None
+} field_copy
+
+/// The position of the field of a key.
+fn field_at(fields: Slice[ReadField], key: u64) -> Option[usize] {
+    for at in 0..<fields.len() {
+        if fields[at].key == key {
+            return Some(at)
+        }
+    }
+    return None
+} field_at
+
+/// The `N` bytes a field of a key holds as bytes, at their start in its content.
+fn exact_bytes(fields: Slice[ReadField], key: u64, length: usize) -> Option[ExactBytes] {
+    let Some(at) = field_at(fields, key) else {
+        return None
+    }
+    let content = fields[at].content.view()
+    let Some(span) = read_bytes(content, at: 0) else {
+        return None
+    }
+    if span.next != content.len() or span.next - span.start != length {
+        return None
+    }
+    return Some(ExactBytes(field: at, start: span.start))
+} exact_bytes
+
+/// Where bytes of a known length start in the content of a field.
+struct ExactBytes derives Copy {
+    field: usize
+    start: usize
+} ExactBytes
+
+fn key_field(fields: Slice[ReadField], key: u64) -> Option[core::crypto::PublicKey] {
+    let Some(found) = exact_bytes(fields, key, length: 32) else {
+        return None
+    }
+    let content = fields[found.field].content.view()
+    var bytes = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        bytes[at] = content[found.start + at]
+    }
+    return Some(core::crypto::PublicKey(bytes: bytes))
+} key_field
+
+fn signature_field(fields: Slice[ReadField], key: u64) -> Option[core::crypto::Signature] {
+    let Some(found) = exact_bytes(fields, key, length: 64) else {
+        return None
+    }
+    let content = fields[found.field].content.view()
+    var bytes = Array[u8, 64].filled(0)
+    for at in 0..<64usize {
+        bytes[at] = content[found.start + at]
+    }
+    return Some(core::crypto::Signature(bytes: bytes))
+} signature_field
+
+fn hash_field(fields: Slice[ReadField], key: u64) -> Option[hashing::HashValue] {
+    let Some(found) = exact_bytes(fields, key, length: 33) else {
+        return None
+    }
+    let content = fields[found.field].content.view()
+    var bytes = Array[u8, 33].filled(0)
+    for at in 0..<33usize {
+        bytes[at] = content[found.start + at]
+    }
+    return Some(hashing::HashValue(bytes: bytes))
+} hash_field
+
+/// The text a field of a key holds as bytes.
+fn text_field(fields: Slice[ReadField], key: u64, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(at) = field_at(fields, key) else {
+        return None
+    }
+    let content = fields[at].content.view()
+    let Some(span) = read_bytes(content, at: 0) else {
+        return None
+    }
+    if span.next != content.len() {
+        return None
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(span.copy(content, alloc).view(), alloc) else {
+        return None
+    }
+    return Some(take written)
+} text_field
+
+/// The pairs of a package name and a code root hash a list holds.
+fn read_roots(content: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[ClosureRoot]] {
+    let Some(count) = read_uvar(content, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var roots = mem::List[ClosureRoot].empty(alloc)
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(name) = read_bytes(content, at) else {
+            return None
+        }
+        let Some(hash) = read_bytes(content, at: name.next) else {
+            return None
+        }
+        let Ok(package_name) = attempt text::String.try_from_utf8(name.copy(content, alloc).view(), alloc) else {
+            return None
+        }
+        let held_hash = hash.copy(content, alloc)
+        if held_hash.len() != 33 {
+            return None
+        }
+        var bytes = Array[u8, 33].filled(0)
+        mut bytes.view_mut().copy_from(held_hash.view())
+        mut roots.push(ClosureRoot(package_name: take package_name, root: hashing::HashValue(bytes: bytes)))
+        at = hash.next
+        index += 1
+    }
+    if at != content.len() {
+        return None
+    }
+    return Some(take roots)
+} read_roots
+
+/// A signed seal an attestation file records: the message its principal signed and the signer.
+struct SignedSeal {
+    message: mem::Bytes
+    signer: Signer
+} SignedSeal
+
+/// The signed seals an attestation file records; none when one holds only one of the signature
+/// and the key.
+fn attested_seals(attested: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[SignedSeal]] {
+    let Some(fields) = whole_record(attested, alloc) else {
+        return None
+    }
+    let Some(seals) = field_copy(fields.view(), key: 3, alloc) else {
+        return None
+    }
+    let Some(count) = read_uvar(seals.view(), at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var signed = mem::List[SignedSeal].empty(alloc)
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(seal) = read_record(seals.view(), at, alloc) else {
+            return None
+        }
+        at = seal.next
+        index += 1
+        let read = seal.fields.view()
+        let signature = field_at(read, key: 6)
+        let key = field_at(read, key: 7)
+        if signature.is_none() and key.is_none() {
+            continue
+        }
+        let Some(made) = attested_signer(read, alloc) else {
+            return None
+        }
+        mut signed.push(take made)
+    }
+    if at != seals.len() {
+        return None
+    }
+    return Some(take signed)
+} attested_seals
+
+/// The seal message and signer of a signed seal's fields.
+fn attested_signer(read: Slice[ReadField], alloc: mem::Alloc) -> Option[SignedSeal] {
+    let Some(principal) = text_field(read, key: 1, alloc) else {
+        return None
+    }
+    let Some(path) = text_field(read, key: 2, alloc) else {
+        return None
+    }
+    let Some(sealed) = hash_field(read, key: 3) else {
+        return None
+    }
+    let Some(closure) = hash_field(read, key: 4) else {
+        return None
+    }
+    let Some(signature) = signature_field(read, key: 6) else {
+        return None
+    }
+    let Some(key) = key_field(read, key: 7) else {
+        return None
+    }
+    let message = sign::seal_message(principal.as_str(), path: path.as_str(), sealed, closure, alloc)
+    return Some(SignedSeal(message: copy_of(message.as_bytes(), alloc), signer: Signer(principal: take principal, key: key, signature: signature)))
+} attested_signer
+
+/// The fields of the record `encoded` holds whole.
+fn whole_record(encoded: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[ReadField]] {
+    let Some(read) = read_record(encoded, at: 0, alloc) else {
+        return None
+    }
+    if read.next != encoded.len() {
+        return None
+    }
+    let ReadRecord(fields: fields, next: _) = read
+    return Some(take fields)
+} whole_record
+
+/// The record at a position of `bytes`: its fields, keys strictly increasing, and the position
+/// after it.
+fn read_record(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[ReadRecord] {
+    let Some(count) = read_uvar(bytes, at) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var fields = mem::List[ReadField].empty(alloc)
+    var next = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(key) = read_uvar(bytes, at: next) else {
+            return None
+        }
+        let Some(small) = key.value.to_u64() else {
+            return None
+        }
+        let Some(content) = read_bytes(bytes, at: key.next) else {
+            return None
+        }
+        let count_read = fields.len()
+        if count_read > 0 and fields[count_read - 1].key >= small {
+            return None
+        }
+        mut fields.push(ReadField(key: small, content: content.copy(bytes, alloc)))
+        next = content.next
+        index += 1
+    }
+    return Some(ReadRecord(fields: take fields, next: next))
+} read_record
 
 /// Decodes an artefact, or the code of why it does not decode.
 pkg fn decode(encoded: Slice[u8], alloc: mem::Alloc) -> Result[Decoded, diagnostic::Code] {
@@ -254,16 +745,30 @@ pkg fn decode(encoded: Slice[u8], alloc: mem::Alloc) -> Result[Decoded, diagnost
     let Some(attested) = read_bytes(encoded, at: root.next) else {
         return Err(malformed)
     }
-    let Some(fields) = read_uvar(encoded, at: attested.next) else {
+    let Some(read) = read_record(encoded, at: attested.next, alloc) else {
         return Err(malformed)
     }
-    if not fields.value.is_zero() {
+    if read.next != encoded.len() {
+        return Err(malformed)
+    }
+    let fields = read.fields.view()
+    if field_at(fields, key: 2).is_some() or field_at(fields, key: 3).is_some() {
         return Err(diagnostic::Code.ArtefactReservedSection)
     }
-    if fields.next != encoded.len() {
-        return Err(malformed)
+    var sections: Option[Sections] = None
+    if fields.len() > 0 {
+        if fields.len() != 3 or fields[0].key != 1 or fields[1].key != 4 or fields[2].key != 5 {
+            return Err(malformed)
+        }
+        let Some(signature) = whole_record(fields[0].content.view(), alloc) else {
+            return Err(malformed)
+        }
+        let Some(certificate) = whole_record(fields[1].content.view(), alloc) else {
+            return Err(malformed)
+        }
+        sections = Some(Sections(signature: take signature, certificate: take certificate, provenance: copy_of(fields[2].content.view(), alloc)))
     }
-    return Ok(Decoded(code_root: root.copy(encoded, alloc)))
+    return Ok(Decoded(code_root: root.copy(encoded, alloc), attestation: attested.copy(encoded, alloc), sections: take sections))
 } decode
 
 /// A uvar read from bytes: its value, as wide as 128 bits, and the position after it.
@@ -405,7 +910,7 @@ test a_reserved_section_or_another_format_is_its_own_error for decode {
     var reserved = artefact(root.view(), attested: b"", alloc)
     expect reserved.len() > 0
     reserved[reserved.len() - 1] = 1
-    mut reserved.append(b"\x01\x00")
+    mut reserved.append(b"\x02\x00")
     let reserved_code = failure(decode(reserved.view(), alloc))
     expect reserved_code == Some(diagnostic::Code.ArtefactReservedSection)
     var future = artefact(root.view(), attested: b"", alloc)
@@ -426,3 +931,105 @@ test uvars_are_minimal_and_as_wide_as_128_bits for read_uvar {
     expect read_bytes(b"\x03ab", at: 0) == None
     expect read_bytes(b"\x02ab", at: 0) == Some(Chunk(start: 1, next: 3))
 } uvars_are_minimal_and_as_wide_as_128_bits
+
+/// A seal of `meter::f` by `ana`, signed by the key of a seed of fives.
+fn sample_seal(alloc: mem::Alloc) -> AttestedSeal {
+    let secret = core::crypto::SecretKey.of_seed(Array[u8, 32].filled(5))
+    let sealed = hashing::HashValue.of(b"item")
+    let closure = hashing::HashValue.of(b"closure")
+    let message = sign::seal_message("ana", path: "meter::f", sealed, closure, alloc)
+    let signed = SealSignature(signature: secret.sign(message.as_bytes()), key: secret.public_key())
+    return AttestedSeal(principal: text::String.of("ana", alloc), item: text::String.of("meter::f", alloc), sealed: sealed, closure: closure, entries: mem::List[SealEntry].empty(alloc), signed: Some(signed))
+} sample_seal
+
+/// A publication by `ben`, with the key of `seed`, naming `cy` its author, its closure pairing
+/// `meter` with `root`.
+fn sample_publication(root: hashing::HashValue, seed: u8, alloc: mem::Alloc) -> Publication {
+    var closure = mem::List[ClosureRoot].empty(alloc)
+    mut closure.push(ClosureRoot(package_name: text::String.of("meter", alloc), root: root))
+    var authors = mem::List[text::String].empty(alloc)
+    mut authors.push(text::String.of("cy", alloc))
+    return Publication(principal: text::String.of("ben", alloc), secret: core::crypto::SecretKey.of_seed(Array[u8, 32].filled(seed)), toolchain: hashing::HashValue.of(b"toolchain"), closure: take closure, authors: take authors, lock: copy_of(b"nan lock 1\n", alloc))
+} sample_publication
+
+/// The artefact of the sample parts whose attestation records `seals`.
+fn sample_artefact(seals: Slice[AttestedSeal], alloc: mem::Alloc) -> mem::Bytes {
+    let root = code_root(sample_parts(alloc), alloc)
+    let no_files = mem::List[SourceFile].empty(alloc)
+    let attested = attestation(hashing::HashValue.of(b"toolchain"), source_tree: source_tree_hash(no_files.view(), alloc), seals: seal_list(seals, alloc).view(), alloc)
+    return artefact(root.view(), attested: attested.view(), alloc)
+} sample_artefact
+
+/// The public key of a seed of one byte.
+fn seed_key(seed: u8) -> core::crypto::PublicKey {
+    return core::crypto::SecretKey.of_seed(Array[u8, 32].filled(seed)).public_key()
+} seed_key
+
+/// Whether bytes decode to an artefact a package trusting `principals` accepts as the release a
+/// lock line pins with `pinned`.
+fn accepted_by(encoded: Slice[u8], pinned: Option[core::crypto::PublicKey], principals: machine::Principals, alloc: mem::Alloc) -> bool {
+    let Ok(decoded) = decode(encoded, alloc) else {
+        return false
+    }
+    return decoded.accepted(pinned, principals, alloc)
+} accepted_by
+
+/// The principals file trusting `ben` with the key of a seed of threes.
+fn trusting_ben(alloc: mem::Alloc) -> machine::Principals {
+    return machine::Principals.empty(alloc).trusting("ben", key: seed_key(3), alloc)
+} trusting_ben
+
+test a_published_artefact_is_accepted_until_a_signed_byte_changes for Decoded.accepted {
+    let alloc = testing::world().alloc
+    var seals = mem::List[AttestedSeal].empty(alloc)
+    mut seals.push(sample_seal(alloc))
+    let unsigned = sample_artefact(seals.view(), alloc)
+    let accepted = accepted_by(unsigned.view(), pinned: None, principals: machine::Principals.empty(alloc), alloc)
+    expect accepted
+    let root = hashing::HashValue.of(code_root(sample_parts(alloc), alloc).view())
+    let signed = published(unsigned.view(), signing: sample_publication(root, seed: 3, alloc), alloc)
+    let signed_accepted = accepted_by(signed.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc), alloc)
+    expect signed_accepted
+    var forged = copy_of(signed.view(), alloc)
+    var at: usize = 0
+    while at + 1 < forged.len() and not (forged[at] == b'c' and forged[at + 1] == b'y') {
+        at += 1
+    }
+    expect at + 1 < forged.len()
+    forged[at] = b'd'
+    let forged_accepted = accepted_by(forged.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc), alloc)
+    expect not forged_accepted
+    let other = published(unsigned.view(), signing: sample_publication(hashing::HashValue.of(b"another root"), seed: 3, alloc), alloc)
+    let other_accepted = accepted_by(other.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc), alloc)
+    expect not other_accepted
+    var resealed = mem::List[AttestedSeal].empty(alloc)
+    var changed = sample_seal(alloc)
+    changed.closure = hashing::HashValue.of(b"another closure")
+    mut resealed.push(take changed)
+    let resealed_accepted = accepted_by(sample_artefact(resealed.view(), alloc).view(), pinned: None, principals: machine::Principals.empty(alloc), alloc)
+    expect not resealed_accepted
+} a_published_artefact_is_accepted_until_a_signed_byte_changes
+
+test an_artefact_is_accepted_only_from_the_pinned_and_trusted_publisher for Decoded.accepted {
+    let alloc = testing::world().alloc
+    var seals = mem::List[AttestedSeal].empty(alloc)
+    mut seals.push(sample_seal(alloc))
+    let unsigned = sample_artefact(seals.view(), alloc)
+    let root = hashing::HashValue.of(code_root(sample_parts(alloc), alloc).view())
+    let signed = published(unsigned.view(), signing: sample_publication(root, seed: 3, alloc), alloc)
+    let resigned = published(unsigned.view(), signing: sample_publication(root, seed: 9, alloc), alloc)
+    let resigned_pinned = accepted_by(resigned.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc), alloc)
+    expect not resigned_pinned
+    let resigned_repinned = accepted_by(resigned.view(), pinned: Some(seed_key(9)), principals: trusting_ben(alloc), alloc)
+    expect not resigned_repinned
+    let stripped = accepted_by(unsigned.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc), alloc)
+    expect not stripped
+    let unpinned = accepted_by(signed.view(), pinned: None, principals: trusting_ben(alloc), alloc)
+    expect not unpinned
+    let untrusted = accepted_by(signed.view(), pinned: Some(seed_key(3)), principals: machine::Principals.empty(alloc), alloc)
+    expect not untrusted
+    let sealer = accepted_by(signed.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc).trusting("ana", key: seed_key(5), alloc), alloc)
+    expect sealer
+    let impostor = accepted_by(signed.view(), pinned: Some(seed_key(3)), principals: trusting_ben(alloc).trusting("ana", key: seed_key(9), alloc), alloc)
+    expect not impostor
+} an_artefact_is_accepted_only_from_the_pinned_and_trusted_publisher

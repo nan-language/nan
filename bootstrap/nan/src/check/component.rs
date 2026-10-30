@@ -7,9 +7,9 @@ use super::Checker;
 use super::db::{ItemId, TypeKey};
 use super::props::Property;
 use super::sig::{FnSig, SigKind};
-use super::ty::{Arg, Bound, Subst};
+use super::ty::{Arg, Bound, Subst, Ty};
 use crate::diagnostic::{Code, Fix, Offer};
-use crate::syntax::ast::ItemKind;
+use crate::syntax::ast::{ClauseKind, ItemKind};
 use crate::syntax::grammar::Punct;
 use crate::syntax::token::TokenKind;
 
@@ -20,8 +20,9 @@ const DERIVES_ORDER: [&str; 11] = [
 ];
 
 impl Checker<'_> {
-    /// The component state of an impl line naming `sys::Component`: without generic parameters,
-    /// Inert and implementing `Encode`, the first failing check reported on the line.
+    /// The component of an impl line naming `sys::Component`: a state without generic parameters,
+    /// Inert and implementing `Encode`, and an Env the runner can release, the first failing
+    /// check reported on the line.
     pub fn check_component_impl(&self, item: ItemId) {
         let SigKind::Impl {
             target: Some(key),
@@ -45,6 +46,13 @@ impl Checker<'_> {
             Code::ComponentStateNotInert
         } else if encode.is_some_and(|encode| !self.implements(target_ty, encode)) {
             Code::ComponentStateNotEncode
+        } else if bound
+            .args
+            .first()
+            .and_then(Arg::ty)
+            .is_some_and(|env| !self.env_abandonable(item, env))
+        {
+            Code::ComponentEnvNotAbandonable
         } else {
             return;
         };
@@ -56,6 +64,47 @@ impl Checker<'_> {
         };
         let token = self.db.ast(item).token;
         self.report_fixed(item, (token, token), code, fixes, Offer::Each);
+    }
+
+    /// Whether the runner can release the Env of the component an impl line declares: one that
+    /// is not linear, or whose type has an abandon method visible at the line with no requires
+    /// clause that is not disputed. A failed abandon head is accepted.
+    fn env_abandonable(&self, line: ItemId, env: &Ty) -> bool {
+        if env.has_error() || !self.has(env, Property::Linear) {
+            return true;
+        }
+        let Some(abandon) = self.abandon_method(env) else {
+            return false;
+        };
+        if !self.db.visible(self.db.module_of(line), abandon) {
+            return false;
+        }
+        if self
+            .fn_sig(abandon)
+            .is_none_or(|sig| sig.has_error() || !sig.abandon_head())
+        {
+            return true;
+        }
+        let ItemKind::Fn(function) = &self.db.ast(abandon).kind else {
+            return true;
+        };
+        !function
+            .clauses
+            .iter()
+            .any(|clause| !clause.disputed && matches!(clause.kind, ClauseKind::Requires(_)))
+    }
+
+    /// The function named `abandon` after a type item, in the type's module.
+    pub fn abandon_method(&self, ty: &Ty) -> Option<ItemId> {
+        let Ty::Item(item, _) = ty else {
+            return None;
+        };
+        let module = self.db.module_of(*item);
+        self.db
+            .members(TypeKey::Item(*item), "abandon")
+            .iter()
+            .copied()
+            .find(|function| self.db.module_of(*function) == module)
     }
 
     /// The fix adding an entry to a struct's or enum's `derives` clause in canonical order,

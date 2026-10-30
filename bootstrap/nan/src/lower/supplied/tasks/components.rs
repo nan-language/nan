@@ -29,8 +29,9 @@ use super::super::super::{Glue, Instance, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
 use super::scopes::start_task;
+use crate::check::props::Property;
 use crate::check::ty::{Arg, Ty};
-use crate::nir::{Callable, FnRef};
+use crate::nir::{Callable, FnRef, Role};
 
 pub mod runner {
     pub const LOCK: u64 = 0;
@@ -168,6 +169,29 @@ fn call_handler(lo: &mut Lowering, fx: &mut Fx, instance: Instance, args: &[Held
     lo.invoke(fx, Invoked::Direct(id), &abi, args).result
 }
 
+/// Releases a run's Env: through its type's abandon method when the Env is linear, as its end of
+/// scope does otherwise.
+fn release_env(lo: &mut Lowering, fx: &mut Fx, env: &Ty, held: Held) {
+    if lo.ck.has(env, Property::Linear) {
+        let abandon = lo
+            .ck
+            .abandon_method(env)
+            .expect("a linear Env's abandon method");
+        let fn_ref = FnRef {
+            callable: Callable::Item {
+                item: abandon,
+                role: Role::Body,
+                index: 0,
+            },
+            args: env.args().into(),
+        };
+        let instance = lo.callable_instance(&fn_ref, false);
+        call_handler(lo, fx, instance, &[held]);
+    } else if let Held::Address(address) = held {
+        lo.release(fx, env, address);
+    }
+}
+
 /// `host::Runner[S].run(env, exec, alloc, body: b)`.
 fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state_ty = supply.type_arg(0);
@@ -178,9 +202,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let (live, exec_cell) = super::executor(lo, fx, supply.param(1).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
-        if let Held::Address(address) = env {
-            lo.release(fx, &env_ty, address);
-        }
+        release_env(lo, fx, &env_ty, env);
         let none = fx.ptr(0);
         super::fail_cancelled(lo, fx, supply, none);
     });
@@ -370,7 +392,7 @@ fn component_glue(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Func
             )[0];
             (again, Vec::new())
         });
-        lo.release(fx, &env, env_at);
+        release_env(lo, fx, &env, Held::Address(env_at));
         fx.b.ins().return_(&[]);
     })
 }

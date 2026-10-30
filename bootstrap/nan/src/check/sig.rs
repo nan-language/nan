@@ -97,6 +97,19 @@ impl FnSig {
         &self.generics[self.inherited..]
     }
 
+    /// Whether the head is an abandon method's: `fn T.abandon(take self)` without modifier, own
+    /// generic parameters, other parameters, result, `fails` or `uses wait`.
+    pub fn abandon_head(&self) -> bool {
+        let receiver =
+            matches!(&self.params[..], [param] if param.is_self && param.mode == Mode::Take);
+        receiver
+            && self.modifier.is_none()
+            && self.own_generics().is_empty()
+            && self.result == Ty::Unit
+            && self.fails.is_none()
+            && !self.wait
+    }
+
     /// Whether a type of the head failed.
     pub fn has_error(&self) -> bool {
         self.params.iter().any(|param| param.ty.has_error())

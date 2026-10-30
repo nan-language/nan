@@ -1,7 +1,8 @@
 //! Components: the state an impl line naming `sys::Component` declares a component of, and the uses of the runner `host::Runner`.
 
-/// The component state of an impl line naming `sys::Component`: without generic parameters,
-/// Inert and implementing `Encode`, the first failing check reported on the line.
+/// The component of an impl line naming `sys::Component`: a state without generic parameters,
+/// Inert and implementing `Encode`, and an Env the runner can release, the first failing
+/// check reported on the line.
 fn Checker.check_component_impl(self, item: ty::ItemId) {
     let db = self.db()
     let held = self.sig(item)
@@ -24,10 +25,21 @@ fn Checker.check_component_impl(self, item: ty::ItemId) {
             let Some(encode_item) = encode else {
                 return
             }
-            if self.implements(target_ty, interface_item: encode_item) {
-                return
+            if not self.implements(target_ty, interface_item: encode_item) {
+                code = diagnostic::Code.ComponentStateNotEncode
+            } else {
+                let args = self.types().arg_list(bound.args)
+                if args.len() == 0 {
+                    return
+                }
+                let Some(env) = args[0].ty() else {
+                    return
+                }
+                if self.env_abandonable(item, env) {
+                    return
+                }
+                code = diagnostic::Code.ComponentEnvNotAbandonable
             }
-            code = diagnostic::Code.ComponentStateNotEncode
         }
     }
     var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
@@ -44,6 +56,56 @@ fn Checker.check_component_impl(self, item: ty::ItemId) {
     }
     self.report_fixed(item, construct: nir::Span.at(db.ast(item).token), code, take fixes, offer: diagnostic::Offer.Each)
 } Checker.check_component_impl
+
+/// Whether the runner can release the Env of the component an impl line declares: one that
+/// is not linear, or whose type has an abandon method visible at the line with no requires
+/// clause that is not disputed. A failed abandon head is accepted.
+fn Checker.env_abandonable(self, line: ty::ItemId, env: ty::Ty) -> bool {
+    let db = self.db()
+    if self.types().has_error(env) or not self.has(env, property: Property.Linear) {
+        return true
+    }
+    let Some(abandon) = self.abandon_method(env) else {
+        return false
+    }
+    if not db.visible(db.module_of(line), item: abandon) {
+        return false
+    }
+    let Some(sig) = self.fn_sig(abandon) else {
+        return true
+    }
+    if sig.has_error(self.types()) or not sig.abandon_head() {
+        return true
+    }
+    let ast::ItemKind.Fn(function) = db.ast(abandon).kind else {
+        return true
+    }
+    for clause in function.clauses {
+        let required = match clause.kind {
+            ast::ClauseKind.Requires(_) => true
+            else => false
+        }
+        if required and not clause.disputed {
+            return false
+        }
+    }
+    return true
+} Checker.env_abandonable
+
+/// The function named `abandon` after a type item, in the type's module.
+pkg fn Checker.abandon_method(self, ty: ty::Ty) -> Option[ty::ItemId] {
+    let db = self.db()
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(ty) else {
+        return None
+    }
+    let module = db.module_of(item)
+    for function in db.members(TypeKey.Item(item), name: "abandon") {
+        if db.module_of(function) == module {
+            return Some(function)
+        }
+    }
+    return None
+} Checker.abandon_method
 
 /// Whether a component's state item has generic parameters.
 fn Checker.state_generic(self, state_item: Option[ty::ItemId]) -> bool {

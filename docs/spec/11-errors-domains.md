@@ -458,7 +458,7 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 `sys::Domain.run` runs `body` on `exec` as the first task of a new domain D. The calling task waits until D ends: when its first task ends, or once D, abandoned, is settled and freed.
 
 - A [task closure](16-concurrency.md#task-closures) passed as `body` captures by `take` and Copy only ([lending](16-concurrency.md#lending)).
-- Before D starts, the calling task draws through `alloc` the first task's stack, which belongs to D, and the storage of D's trap report, which belongs to the caller's domain; when `alloc` cannot supply them, the call traps (`trap.exhausted`) in the caller's domain. Other tasks of D draw their stacks as [joins](16-concurrency.md#joins) states. When `run` returns `Ok` or fails, it frees that storage before it returns; on `Err` the storage belongs to the returned `sys::Trap` and is freed when that value is released.
+- Before D starts, the calling task draws through `alloc`, which names D's [cell](#domain-memory), the first task's stack, which belongs to D, and the storage of D's trap report, which belongs to the caller's domain; when `alloc` cannot supply them, the call traps (`trap.exhausted`) in the caller's domain. Other tasks of D draw their stacks as [joins](16-concurrency.md#joins) states. When `run` returns `Ok` or fails, it frees that storage before it returns; on `Err` the storage belongs to the returned `sys::Trap` and is freed when that value is released.
 - When `body` returns t, `run` returns `Ok(t)`. When it fails with e, `run` fails with e.
 - When `exec` is stale, `run` starts no task and fails at once with the cancellation of E ([revocation](14-authority.md#revocation)).
 - When D is abandoned, `run` returns `Err(trap)` after settlement and freeing. `trap.kind()` is the variant of `sys::TrapKind` whose name is the trap kind's condition in PascalCase (`DivisionByZero` for `trap.division-by-zero`), and rendering `trap` writes its trap report.
@@ -541,11 +541,12 @@ The runtime settles an abandoned domain D in this order. No user code runs durin
 
 ### Domain memory
 
-A domain owns the stacks of its tasks, the first task's stack of a `sys::Domain` body included, and every [chunk](12-memory.md#budgets) drawn while one of its tasks allocates, through any allocator; the chunk stays charged to that allocator's cell ([chunk ownership](12-memory.md#chunk-ownership)). A value **occupies** the chunks that hold its own memory and the chunks that every value it holds occupies, transitively: its fields, elements and payloads, the contents of its boxes, the storage and entries of a container or store, the contents of a `mem::Shared`, and the storage behind a handle it holds: a cown's value, a channel's buffer, an arena's and a once map's entries, an interner's table and a signal's slot. Interior mutability does not stop occupancy.
+A domain owns the stacks of its tasks, the first task's stack of a `sys::Domain` body included, and every [chunk](12-memory.md#budgets) drawn while one of its tasks allocates, through any allocator; the chunk is charged to that allocator's cell until passing to another domain charges it to that domain's cell ([chunk ownership](12-memory.md#chunk-ownership)). Each domain has a **cell**: the cell of the root grant's allocator for the process and the kernel, the cell `alloc` names for a `sys::Domain` body, and the cell of the simulated world's allocator for a test. A value **occupies** the chunks that hold its own memory and the chunks that every value it holds occupies, transitively: its fields, elements and payloads, the contents of its boxes, the storage and entries of a container or store, the contents of a `mem::Shared`, and the storage behind a handle it holds: a cown's value, a channel's buffer, an arena's and a once map's entries, an interner's table and a signal's slot. Interior mutability does not stop occupancy.
 
 - When `body` returns or fails, the chunks D owns that its result or failure occupies pass to the caller's domain, and D's stacks and other chunks are freed.
 - A std operation that moves a value from a task of D into storage another domain O owns passes the chunks D owns that the value occupies, before it completes, to the innermost domain enclosing both D and O. These operations are a channel send, a message sent through a `sys::Cx` or posted through a `sys::Outbox` ([components](26-components.md#components)), an insertion into a std type with interior mutability, and the end of an `await when` body, for each cown it names whose value lies in chunks that O owns.
 - A std operation that a task of D runs and that draws memory for storage whose chunks another domain O owns, such as growing a container or a channel's buffer, passes each chunk it draws, before it completes, to the innermost domain enclosing both D and O.
+- A chunk passing to a domain O is charged from then on to O's cell instead of the cell it was charged to, when the chains of both cells end at root cells with one supply and O's cell's chain has room for it. The passing subtracts its bytes from the charge of every open cell on the chain of the cell it was charged to; then, when every cell on the chain of O's cell is open and stays at most its limit with the bytes added, it adds them to the charge of each of those cells, and otherwise it adds them back where it subtracted them and the chunk stays charged to its cell. Only the charge stays: the chunk passes to O either way.
 - When D is abandoned, its stacks and chunks are freed. Memory in other domains' chunks that tasks of D owned stays allocated.
 - The value of a cown poisoned by D's abandonment is never released; its memory in chunks of other domains stays allocated.
 
@@ -571,6 +572,30 @@ test squares_outlive_their_domain for squares {
     expect values.len() == 4
     expect values[3] == 9
 } squares_outlive_their_domain
+```
+
+```nan
+pub fn sender_charge(exec: task::Executor, alloc: mem::Alloc) -> usize fails task::Cancelled uses wait {
+    let sender = alloc.split(1_048_576)
+    defer take sender.close()
+    let drawn = sender.alloc()
+    let outcome = try await sys::Domain.run(fn() -> mem::List[u64] {
+        var message = mem::List[u64].empty(drawn)
+        mut message.push(7)
+        return message
+    }, exec, alloc)
+    let Ok(message) = outcome else {
+        return sender.limit()
+    }
+    expect message.len() == 1
+    return sender.charged()
+} sender_charge
+
+test receiver_pays_after_handover for sender_charge {
+    let world = testing::world()
+    let charge = try await sender_charge(world.exec, alloc: world.alloc)
+    expect charge == 0
+} receiver_pays_after_handover
 ```
 
 ## Poisoning

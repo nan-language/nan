@@ -167,8 +167,8 @@ pub struct Nested {
 
 /// Runs the `task fn` value of a type held at `function` as the first task of a new domain
 /// nested in the running task's, its stack, of `stack` usable bytes or else of the size its type
-/// gives, and its trap record drawn through a cell, and waits until that task ends or a trap
-/// abandons the domain; the spawn is a scheduling point when `point` holds.
+/// gives, and its trap record drawn through a cell, the domain's cell, and waits until that task
+/// ends or a trap abandons the domain; the spawn is a scheduling point when `point` holds.
 pub fn run_nested(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -192,6 +192,7 @@ pub fn run_nested(
     });
     fx.store(trap, record, domain::TRAP);
     fx.store(caller_domain, record, domain::PARENT);
+    fx.store(cell, record, domain::CELL);
     let current = tasks::current_task(lo, fx);
     fx.store(current, record, domain::WAITER);
     let parent_lock = fx.offset(caller_domain, domain::LOCK);

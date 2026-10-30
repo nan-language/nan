@@ -1,4 +1,4 @@
-//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A run passes to an enclosing domain when a value it holds leaves the domain owning it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
+//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A run passes to an enclosing domain when a value it holds leaves the domain owning it, charged from then on to that domain's cell when both cells' chains draw from one supply and the new chain has room for it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
 
 const MEMORY_CHUNK: u64 = 65_536
 
@@ -460,7 +460,19 @@ fn walk_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, visit: fn(mut fx:
     })
 } walk_chain
 
-/// Subtracts a returned chunk's bytes from every open cell of the chain from a record.
+/// Adds a chunk's bytes to every open cell of the chain from a record.
+fn charge_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Value) {
+    walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
+        let open_word = mut fx1.load(clif::Type.Int32, addr: record, offset: CELL_OPEN)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: open_word, y: 0)
+        let charge = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
+        let more = mut fx1.b.iadd(charge, y: bytes)
+        let kept = mut fx1.b.select(open, x: more, y: charge)
+        mut fx1.store(kept, addr: record, offset: CELL_CHARGE)
+    })
+} charge_chain
+
+/// Subtracts a chunk's bytes from every open cell of the chain from a record.
 fn uncharge(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Value) {
     walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
         let open_word = mut fx1.load(clif::Type.Int32, addr: record, offset: CELL_OPEN)
@@ -1077,8 +1089,8 @@ fn chunk_of(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> clif::Value {
 fn memory_lift(mut lo: Lowering, mut fx: Fx, address: clif::Value, to: clif::Value) -> clif::Value {
     let record = chunk_of(mut lo, mut fx, address)
     let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
-    let lifted = mut fx.choose(present, results: fx.types1(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let inside = lift_record(mut fx1, record, to)
+    let lifted = mut fx.choose(present, results: fx.types1(clif::Type.Int8).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let inside = lift_record(mut lo, fx: mut fx1, record, to)
         return fx1.list1(inside)
     }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
         let unlifted = mut fx1.int(clif::Type.Int8, value: 0)
@@ -1089,10 +1101,10 @@ fn memory_lift(mut lo: Lowering, mut fx: Fx, address: clif::Value, to: clif::Val
 
 /// Passes a run of chunks by its record to a domain when a domain nested in it owns the run;
 /// nonzero when it passed.
-fn lift_record(mut fx: Fx, record: clif::Value, to: clif::Value) -> clif::Value {
+fn lift_record(mut lo: Lowering, mut fx: Fx, record: clif::Value, to: clif::Value) -> clif::Value {
     let owner = mut fx.load(PTR, addr: record, offset: CHUNK_DOMAIN)
     let inside = nested_in(mut fx, inner: owner, outer: to)
-    mut fx.if_true(inside, then: fn(mut fx1: Fx) {
+    mut fx.if_true(inside, then: fn[mut lo](mut fx1: Fx) {
         detach(mut fx1, record)
         mut fx1.store(to, addr: record, offset: CHUNK_DOMAIN)
         let zero = mut fx1.ptr(0)
@@ -1104,9 +1116,37 @@ fn lift_record(mut fx: Fx, record: clif::Value, to: clif::Value) -> clif::Value 
             mut fx2.store(record, addr: head, offset: CHUNK_PREVIOUS)
         })
         mut fx1.store(record, addr: to, offset: DOMAIN_CHUNKS)
+        recharge(mut lo, fx: mut fx1, record, to)
     })
     return inside
 } lift_record
+
+/// Charges a run of chunks passed to a domain to the domain's cell instead of the cell it is
+/// charged to, when the chains of both draw from one supply and, once its bytes leave the old
+/// chain, every cell of the new one is open and has room for them; otherwise they return to the
+/// old chain.
+fn recharge(mut lo: Lowering, mut fx: Fx, record: clif::Value, to: clif::Value) {
+    let old = mut fx.load(PTR, addr: record, offset: CHUNK_CELL)
+    let new = mut fx.load(PTR, addr: to, offset: DOMAIN_CELL)
+    let from = memory_cell_record(mut lo, mut fx, handle: old)
+    let into = memory_cell_record(mut lo, mut fx, handle: new)
+    let supply = mut fx.load(PTR, addr: from, offset: CELL_SUPPLY)
+    let wanted = mut fx.load(PTR, addr: into, offset: CELL_SUPPLY)
+    let shared = mut fx.b.icmp(clif::IntCC.Equal, x: supply, y: wanted)
+    let differ = mut fx.b.icmp(clif::IntCC.NotEqual, x: old, y: new)
+    let moves = mut fx.b.band(shared, y: differ)
+    mut fx.if_true(moves, then: fn[mut lo](mut fx1: Fx) {
+        let count = mut fx1.load(PTR, addr: record, offset: CHUNK_COUNT)
+        let bytes = mut fx1.b.imul_imm_s(count, y: i64.fit(MEMORY_CHUNK))
+        uncharge(mut lo, fx: mut fx1, head: from, bytes)
+        let open = mut fx1.int(clif::Type.Int8, value: 1)
+        let fits = chain_fits(mut lo, fx: mut fx1, head: into, bytes, start: open)
+        let chain = mut fx1.b.select(fits, x: into, y: from)
+        charge_chain(mut lo, fx: mut fx1, head: chain, bytes)
+        let handle = mut fx1.b.select(fits, x: new, y: old)
+        mut fx1.store(handle, addr: record, offset: CHUNK_CELL)
+    })
+} recharge
 
 /// Frees every run of chunks a domain owns, and its pools.
 fn free_chunks(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {

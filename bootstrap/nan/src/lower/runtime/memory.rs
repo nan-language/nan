@@ -9,8 +9,9 @@
 //! found from the address of its first chunk through the chunk map: its cell handle, its domain,
 //! its live allocation count, the offset of its free bytes, its chunk count, its links in its
 //! domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A
-//! run passes to an enclosing domain when a value it holds leaves the domain owning it, and the
-//! runs a domain still owns are freed when it ends.
+//! run passes to an enclosing domain when a value it holds leaves the domain owning it, charged
+//! from then on to that domain's cell when both cells' chains draw from one supply and the new
+//! chain has room for it, and the runs a domain still owns are freed when it ends.
 //!
 //! A carved allocation starts at a granule and rounds up to a size class; the mark of its first
 //! granule names its class, with the freed bit once it is freed. A freed allocation joins its
@@ -456,7 +457,19 @@ fn walk_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, visit: impl FnOnce(&
     });
 }
 
-/// Subtracts a returned chunk's bytes from every open cell of the chain from a record.
+/// Adds a chunk's bytes to every open cell of the chain from a record.
+fn charge_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value) {
+    walk_chain(lo, fx, first, |fx, record| {
+        let open = fx.load(types::I32, record, cell::OPEN);
+        let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, open, 0);
+        let charge = fx.load(PTR, record, cell::CHARGE);
+        let more = fx.b.ins().iadd(charge, bytes);
+        let kept = fx.b.ins().select(open, more, charge);
+        fx.store(kept, record, cell::CHARGE);
+    });
+}
+
+/// Subtracts a chunk's bytes from every open cell of the chain from a record.
 fn uncharge(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value) {
     walk_chain(lo, fx, first, |fx, record| {
         let open = fx.load(types::I32, record, cell::OPEN);
@@ -1096,11 +1109,39 @@ fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, to: Value) -> Value {
                 let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
                 fx.when(has_head, |fx| fx.store(record, head, chunk::PREVIOUS));
                 fx.store(record, to, tasks::domain::CHUNKS);
+                recharge(lo, fx, record, to);
             });
             vec![inside]
         },
         |fx| vec![fx.int(types::I8, 0)],
     )[0]
+}
+
+/// Charges a run of chunks passed to a domain to the domain's cell instead of the cell it is
+/// charged to, when the chains of both draw from one supply and, once its bytes leave the old
+/// chain, every cell of the new one is open and has room for them; otherwise they return to the
+/// old chain.
+fn recharge(lo: &mut Lowering, fx: &mut Fx, record: Value, to: Value) {
+    let old = fx.load(PTR, record, chunk::CELL);
+    let new = fx.load(PTR, to, tasks::domain::CELL);
+    let from = cell_record(lo, fx, old);
+    let into = cell_record(lo, fx, new);
+    let supply = fx.load(PTR, from, cell::SUPPLY);
+    let wanted = fx.load(PTR, into, cell::SUPPLY);
+    let shared = fx.b.ins().icmp(IntCC::Equal, supply, wanted);
+    let differ = fx.b.ins().icmp(IntCC::NotEqual, old, new);
+    let moves = fx.b.ins().band(shared, differ);
+    fx.when(moves, |fx| {
+        let count = fx.load(PTR, record, chunk::COUNT);
+        let bytes = fx.b.ins().imul_imm_s(count, CHUNK as i64);
+        uncharge(lo, fx, from, bytes);
+        let open = fx.int(types::I8, 1);
+        let fits = chain_fits(lo, fx, into, bytes, open);
+        let chain = fx.b.ins().select(fits, into, from);
+        charge_chain(lo, fx, chain, bytes);
+        let handle = fx.b.ins().select(fits, new, old);
+        fx.store(handle, record, chunk::CELL);
+    });
 }
 
 /// Frees every run of chunks a domain owns, and its pools.

@@ -54,11 +54,11 @@ pub fn Budget.close(take self)
 - `sys::revocable(alloc)` ([revocation](14-authority.md#revocation)) adds an open cell with limit 2^64 − 1 and charge 0, whose parent is the cell `alloc` names and whose owner is the returned `sys::Revoker`, and never fails. Its `capability()` is the allocator naming that cell, and `take revoker.revoke()` closes the cell as `close` does.
 - `budget.alloc()` returns the allocator naming the budget's cell; every call returns the same handle. `limit()` is the cell's limit.
 - A **draw** of n chunks through an allocator succeeds exactly when every cell on the chain of the cell it names is open and has a charge that, with n × 65,536 bytes added, is at most its limit, and the root cell's supply yields n chunks. It then adds n × 65,536 bytes to the charge of every cell on that chain. Otherwise it charges nothing; a failed draw is **exhaustion**.
-- Draws, returns and closes are atomic: concurrent draws through cells sharing an ancestor never take that ancestor past its limit, and a draw either completes before the close of a cell on its chain or fails.
+- Draws, returns, closes and the passing of charges ([domain memory](11-errors-domains.md#domain-memory)) are atomic: concurrent draws and passings through cells sharing an ancestor never take that ancestor past its limit, and a draw or passing either completes before the close of a cell on its chain or fails.
 - A return has no [digest fact](10-effects-digests.md#digests), so code under `noalloc` may release values. On the machine targets, each draw and return runs with maskable interrupts disabled on its CPU.
 - `take budget.close()` closes the budget's cell, making its allocator stale, so no draw succeeds through an allocator whose cell's chain holds that cell. Memory already drawn stays usable.
-- A chunk **returns** to its root cell's supply once no allocation in it is live, or when its domain is freed ([chunk ownership](#chunk-ownership)). A return subtracts 65,536 bytes from the charge of every open cell on the chain of the cell it was drawn through.
-- `charged()` is the cell's charge: 65,536 bytes for each chunk not yet returned that was drawn through the cell or through a cell whose chain holds it.
+- A chunk **returns** to its root cell's supply once no allocation in it is live, or when its domain is freed ([chunk ownership](#chunk-ownership)). A return subtracts 65,536 bytes from the charge of every open cell on the chain of the cell it is charged to: the cell it was drawn through, until [domain memory](11-errors-domains.md#domain-memory) passes its charge to another.
+- `charged()` is the cell's charge: 65,536 bytes for each chunk not yet returned that is charged to the cell or to a cell whose chain holds it.
 - An **allocation** is the memory that one draw of a std operation obtains for one purpose: a box, the storage of a container at one capacity, the slot storage of a store, or the contents of a `mem::Shared`. It is live until the operation that releases or replaces it frees it: the release of its box, container, store or shared value, or growth moving the elements into a new allocation.
 - An allocation of at most 64 KiB lies inside one chunk, which other allocations may share. A larger one occupies ⌈size ÷ 64 KiB⌉ consecutive chunks drawn together for it alone. Which chunk an allocation of at most 64 KiB lies in, when a draw happens for one, and how much memory a container or store draws for its contents beyond the capacities [growth](#growth) fixes, are the implementation's choice.
 - Each choice of this chapter left to the implementation is identical for one [toolchain hash](36-builds.md#toolchain-hash), so `charged()` and the points of exhaustion are reproducible.
@@ -375,7 +375,7 @@ pub fn region_heap(take region: hw::Region) -> mem::Heap {
 
 ## Chunk ownership
 
-Every chunk belongs to exactly one domain: the domain whose task draws it, until [domain memory](11-errors-domains.md#domain-memory) passes it to another.
+Every chunk belongs to exactly one domain: the domain whose task draws it, until [domain memory](11-errors-domains.md#domain-memory) passes it to another, charging it to that domain's cell when the two cells draw from one supply and that cell's chain has room for it.
 
 - An allocation lies in chunks of the domain whose task makes it until [domain memory](11-errors-domains.md#domain-memory) passes them, so allocations share a chunk only when tasks of one domain make them through allocators naming one cell.
 - When a domain is freed, each chunk it owns returns as [budgets](#budgets) states, whatever allocations it still holds.

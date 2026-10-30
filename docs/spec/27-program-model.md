@@ -298,7 +298,7 @@ A program run on a host target is one Linux process:
 
 ### Machine runs
 
-A program run on a machine target is one boot of one machine. The program entry seam switches to the **boot stack**, which the image reserves, on a bare target installs the [entry root](24-kernel.md#physical-memory) and, on `x86_64-bare`, loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
+A program run on a machine target is one boot of one machine. The program entry seam switches to the **boot stack**, which the image reserves, on a bare target installs the [entry root](24-kernel.md#physical-memory), places the [boot area](24-kernel.md#physical-memory) and, on `x86_64-bare`, loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
 
 ## Programs and libraries
 

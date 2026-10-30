@@ -144,8 +144,8 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
 
 /// Starts the run of a test image that `count` NUL-terminated texts name, their addresses at
 /// `texts`: the `RUN_TEXTS` naming the run, its test's number, its index and seed and its replay
-/// token, then for a rerun its forced draws. Sets up the runtime, then starts the entry task,
-/// which runs `entry`; ends with status 71 when the runtime cannot start.
+/// token, then for a rerun its forced draws. On the runtime its seam has set up, starts the entry
+/// task, which runs `entry`; ends with status 71 when the task cannot start.
 pub fn start_run(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -153,9 +153,6 @@ pub fn start_run(
     count: Value,
     texts: Value,
 ) {
-    let failed = lo.call_routine(fx, Routine::Init, &[])[0];
-    let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-    fx.when(unavailable, |fx| system::unavailable(lo, fx));
     let text = |fx: &mut Fx, index: u64| fx.load(PTR, texts, 8 * index);
     let mut run = [fx.ptr(0); 3];
     for (field, index) in run.iter_mut().zip(0..) {
@@ -223,9 +220,9 @@ fn decimal(fx: &mut Fx, text: Value) -> Value {
     })[1]
 }
 
-/// The entry seam of a machine test image, whose boot glue ignores the platform's values,
-/// disables maskable interrupts, the firmware's included, and reads the texts naming its run,
-/// each NUL-terminated, from the emulator configuration file `RUN_FILE`.
+/// The entry seam of a machine test image, whose boot glue disables maskable interrupts, the
+/// firmware's included, starts as a final build's does, and reads the texts naming its run, each
+/// NUL-terminated, from the emulator configuration file `RUN_FILE`.
 fn machine_seam(lo: &mut Lowering, entry: FuncId) {
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
@@ -239,8 +236,9 @@ fn machine_seam(lo: &mut Lowering, entry: FuncId) {
         signature,
         lines::HIDDEN | lines::CRITICAL,
         |lo, fx| {
-            fx.entry();
+            let params = fx.entry();
             lo.call_stub(fx, Stub::Cli, &[]);
+            lo.start_boot(fx, &params);
             let start = lo.view_literal(fx, RUN_START).address();
             let (text, len) = (fx.load(PTR, start, 0), fx.load(PTR, start, 8));
             super::runtime::system::write_stream(lo, fx, 1, text, len);

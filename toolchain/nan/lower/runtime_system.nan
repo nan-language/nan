@@ -12,9 +12,15 @@ enum SystemTable derives Copy, Eq {
     Root
 } SystemTable
 
-/// The tables `Init` sets up, by the field of the runtime state addressing each, its size and
-/// the name of the data a machine image reserves for it.
+/// The tables `Init` sets up, by the field of the runtime state addressing each and its size.
 const RUNTIME_SYSTEM_TABLES: Array[SystemTable, 5] = system_tables()
+
+/// The alignment of each table in a machine image's boot area.
+const RUNTIME_SYSTEM_TABLE_ALIGN: u64 = 64
+
+/// The bytes the tables take in a machine image's boot area, which holds them one after another
+/// after the boot heap.
+const RUNTIME_SYSTEM_TABLE_BYTES: u64 = laid_out_table_bytes()
 
 fn system_tables() -> Array[SystemTable, 5] {
     var listed = Array[SystemTable, 5].filled(SystemTable.Cells)
@@ -45,15 +51,13 @@ fn SystemTable.size(self) -> u64 {
     }
 } SystemTable.size
 
-proj fn SystemTable.name(self) -> Str {
-    return match self {
-        SystemTable.Cells => "_NScells"
-        SystemTable.ChunkMap => "_NSchunk_map"
-        SystemTable.Entries => "_NSentries"
-        SystemTable.Process => "_NSprocess"
-        SystemTable.Root => "_NSroot_region"
+fn laid_out_table_bytes() -> u64 {
+    var bytes: u64 = 0
+    for table in RUNTIME_SYSTEM_TABLES {
+        bytes += next_multiple_of(table.size(), multiple: RUNTIME_SYSTEM_TABLE_ALIGN)
     }
-} SystemTable.name
+    return bytes
+} laid_out_table_bytes
 
 /// Defines `Init`, `Exit` and the record routines.
 fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
@@ -71,21 +75,30 @@ fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
 } system_define
 
 /// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
-/// which a machine image reserves, then the executors of the platform; nonzero when the runtime
-/// cannot start.
+/// which a machine image's boot area holds after its boot heap, then the executors of the
+/// platform; nonzero when the runtime cannot start.
 fn init(mut lo: Lowering, mut fx: Fx) {
     discard mut fx.entry()
     let state_address = mut lo.state(mut fx)
+    var area: Option[clif::Value] = None
+    if lo.machine() {
+        area = Some(mut lo.boot_area(mut fx))
+    }
+    var offset = BOOT_HEAP
     for table in RUNTIME_SYSTEM_TABLES {
-        if lo.machine() {
-            let address = mut lo.reserved(mut fx, data_name: table.name(), size: table.size(), align: 64)
-            mut fx.store(address, addr: state_address, offset: table.field())
-        } else {
-            let size = mut fx.ptr(table.size())
-            let address = mut lo.record_alloc(mut fx, size)
-            unavailable_unless(mut fx, address)
-            mut fx.store(address, addr: state_address, offset: table.field())
+        var address = state_address
+        match area {
+            Some(base) => {
+                address = mut fx.offset(base, offset)
+            }
+            None => {
+                let size = mut fx.ptr(table.size())
+                address = mut lo.record_alloc(mut fx, size)
+                unavailable_unless(mut fx, address)
+            }
         }
+        offset += next_multiple_of(table.size(), multiple: RUNTIME_SYSTEM_TABLE_ALIGN)
+        mut fx.store(address, addr: state_address, offset: table.field())
     }
     let one = mut fx.ptr(1)
     let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
@@ -100,14 +113,29 @@ fn init(mut lo: Lowering, mut fx: Fx) {
     mut fx.b.ret(fx.list1(zero).view())
 } init
 
+/// Calls `Init`, writing that the runtime is unavailable and ending with status 71 when it
+/// cannot start.
+fn system_start(mut lo: Lowering, mut fx: Fx) {
+    let failed = first_result(mut lo.call_routine(mut fx, routine: Routine.Init, args: mem::List[clif::Value].empty(fx.alloc).view()))
+    let unavailable = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed, y: 0)
+    mut fx.if_true(unavailable, then: fn[mut lo](mut fx1: Fx) {
+        system_unavailable(mut lo, fx: mut fx1)
+    })
+} system_start
+
 /// Returns 1 from `Init` when an address is zero.
 fn unavailable_unless(mut fx: Fx, address: clif::Value) {
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
-    mut fx.if_true(missing, then: fn(mut fx1: Fx) {
+    unavailable_if(mut fx, condition: missing)
+} unavailable_unless
+
+/// Returns 1 from `Init` when `condition` is nonzero.
+fn unavailable_if(mut fx: Fx, condition: clif::Value) {
+    mut fx.if_true(condition, then: fn(mut fx1: Fx) {
         let one = mut fx1.ptr(1)
         mut fx1.b.ret(fx1.list1(one).view())
     })
-} unavailable_unless
+} unavailable_if
 
 /// Writes that the runtime is unavailable and ends with status 71.
 fn system_unavailable(mut lo: Lowering, mut fx: Fx) {

@@ -151,9 +151,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         .expect("the program entry seam");
     lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
         let params = fx.entry();
-        let failed = lo.call_routine(fx, Routine::Init, &[])[0];
-        let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-        fx.when(unavailable, |fx| system::unavailable(lo, fx));
+        system::start(lo, fx);
         let world_ty = lo.std_ty("host", "World", Vec::new());
         let layout = lo.layout(&world_ty);
         let world = fx.slot(layout.size, layout.align);
@@ -204,6 +202,7 @@ pub fn test_seam(lo: &mut Lowering, entry: cranelift_module::FuncId) {
         .expect("the test entry seam");
     lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
         let params = fx.entry();
+        system::start(lo, fx);
         let count = fx.b.ins().uextend(PTR, params[0]);
         let count = fx.b.ins().iadd_imm_s(count, -1);
         let texts = fx.b.ins().iadd_imm_s(params[1], 8);

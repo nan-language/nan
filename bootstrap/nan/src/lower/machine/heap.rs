@@ -1,19 +1,20 @@
-//! The boot heap a machine image reserves, from which its runtime draws its records and the
-//! chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a record is a block of
-//! a power-of-two size class behind a 16-byte header naming the class, carved from chunks the map
-//! hands out. A freed block joins its class's free list, from which a later record of the class
-//! takes it. Every record and chunk is cleared once its lock is released.
+//! The boot heap, which starts a machine image's boot area and from which its runtime draws its
+//! records and the chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a
+//! record is a block of a power-of-two size class behind a 16-byte header naming the class,
+//! carved from chunks the map hands out. A freed block joins its class's free list, from which a
+//! later record of the class takes it. Every record and chunk is cleared once its lock is
+//! released.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::Routine;
 use super::super::runtime::memory::CHUNK;
+use super::super::runtime::{Routine, state};
 use super::stubs::Stub;
 
 /// The bytes of the boot heap.
-const BOOT_HEAP: u64 = 16 * 1024 * 1024;
+pub const BOOT_HEAP: u64 = 16 * 1024 * 1024;
 
 /// The chunks of the boot heap.
 const CHUNKS: u64 = BOOT_HEAP / CHUNK;
@@ -156,12 +157,10 @@ pub fn clear(lo: &mut Lowering, fx: &mut Fx, base: Value, len: Value) {
     lo.call_routine(fx, Routine::Fill, &[base, zero, len]);
 }
 
-/// The address of the first chunk of the boot heap: the heap is reserved with one chunk more, so
-/// that its chunks align to their size wherever the image is loaded.
+/// The address of the first chunk of the boot heap, the boot area's address.
 fn boot_heap(lo: &mut Lowering, fx: &mut Fx) -> Value {
-    let reserved = lo.reserved(fx, "_NSboot_heap", BOOT_HEAP + CHUNK, 4_096);
-    let bumped = fx.b.ins().iadd_imm_s(reserved, CHUNK as i64 - 1);
-    fx.b.ins().band_imm_s(bumped, -(CHUNK as i64))
+    let state_address = lo.state(fx);
+    fx.load(PTR, state_address, state::BOOT_AREA)
 }
 
 /// The boot heap as a supply of chunks, its map in the allocators' state at `state`.

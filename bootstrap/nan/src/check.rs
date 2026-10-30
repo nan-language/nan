@@ -459,6 +459,9 @@ impl<'a> Checker<'a> {
         for (ty, token) in &problems.instantiations {
             self.check_instantiation(item, ty, *token);
         }
+        for (bound, token) in &problems.bounds {
+            self.check_arguments(item, *token, bound.interface, &bound.args);
+        }
         for (construct, tombstone) in &problems.renamed {
             self.report_renamed_path(item, *construct, *tombstone);
         }

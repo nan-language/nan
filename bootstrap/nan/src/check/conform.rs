@@ -749,6 +749,9 @@ impl Checker<'_> {
     pub fn check_instantiation(&self, item: ItemId, ty: &Ty, token: Tok) {
         if let Ty::Dyn(bound) = ty
             && !self.dyn_usable(bound.interface)
+            && self
+                .arguments_problem(bound.interface, &bound.args)
+                .is_none()
         {
             self.report(item, token, Code::InterfaceNotDynUsable);
             return;
@@ -779,22 +782,38 @@ impl Checker<'_> {
             self.report(item, token, Code::ErrorFromAmbiguous);
             return;
         }
-        let Ty::Item(target, args) = ty else {
-            return;
-        };
-        let generics = &self.sig(*target).generics;
+        if let Ty::Item(target, args) = ty {
+            self.check_arguments(item, token, *target, args);
+        }
+    }
+
+    /// Reports, for an item, the first argument it writes for a generic type or interface that
+    /// breaks its parameter's bounds, or records the instantiation of an item with const
+    /// parameters.
+    pub fn check_arguments(&self, item: ItemId, token: Tok, target: ItemId, args: &Args) {
+        if let Some(code) = self.arguments_problem(target, args) {
+            self.report(item, token, code);
+        } else if self
+            .sig(target)
+            .generics
+            .iter()
+            .any(|def| def.constant.is_some())
+        {
+            self.instantiated(item, token, target, args.clone());
+        }
+    }
+
+    /// The rule the first of a generic type's or interface's arguments breaks for its parameter.
+    fn arguments_problem(&self, target: ItemId, args: &Args) -> Option<Code> {
+        let generics = &self.sig(target).generics;
         let subst = Subst::of(generics.iter().map(|def| def.param), args);
-        for (def, arg) in generics.iter().zip(args.iter()) {
-            if let Arg::Ty(arg) = arg
-                && let Some(code) = self.argument_problem(def, arg, &subst)
-            {
-                self.report(item, token, code);
-                return;
-            }
-        }
-        if generics.iter().any(|def| def.constant.is_some()) {
-            self.instantiated(item, token, *target, args.clone());
-        }
+        generics
+            .iter()
+            .zip(args.iter())
+            .find_map(|(def, arg)| match arg {
+                Arg::Ty(arg) => self.argument_problem(def, arg, &subst),
+                Arg::Const(_) => None,
+            })
     }
 }
 

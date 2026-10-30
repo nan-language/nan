@@ -16,23 +16,29 @@ use super::{Routine, memory, state, tables, tasks};
 /// The text written when the runtime cannot start.
 const UNAVAILABLE: &str = "nan: runtime unavailable\n";
 
-/// The tables `Init` sets up, by the field of the runtime state addressing each, its size and
-/// the name of the data a machine image reserves for it.
-const TABLES: [(u64, u64, &str); 5] = [
-    (
-        state::CELLS,
-        memory::CELLS * memory::CELL_RECORD,
-        "_NScells",
-    ),
-    (state::CHUNK_MAP, memory::MAP_ROOTS * 8, "_NSchunk_map"),
-    (
-        state::ENTRIES,
-        tables::ENTRIES * tables::ENTRY_RECORD,
-        "_NSentries",
-    ),
-    (state::PROCESS, tasks::domain::SIZE, "_NSprocess"),
-    (state::ROOT, region::SIZE, "_NSroot_region"),
+/// The tables `Init` sets up, by the field of the runtime state addressing each and its size.
+const TABLES: [(u64, u64); 5] = [
+    (state::CELLS, memory::CELLS * memory::CELL_RECORD),
+    (state::CHUNK_MAP, memory::MAP_ROOTS * 8),
+    (state::ENTRIES, tables::ENTRIES * tables::ENTRY_RECORD),
+    (state::PROCESS, tasks::domain::SIZE),
+    (state::ROOT, region::SIZE),
 ];
+
+/// The alignment of each table in a machine image's boot area.
+const TABLE_ALIGN: u64 = 64;
+
+/// The bytes the tables take in a machine image's boot area, which holds them one after another
+/// after the boot heap.
+pub const TABLE_BYTES: u64 = {
+    let mut bytes = 0;
+    let mut index = 0;
+    while index < TABLES.len() {
+        bytes += TABLES[index].1.next_multiple_of(TABLE_ALIGN);
+        index += 1;
+    }
+    bytes
+};
 
 /// Defines `Init`, `Exit` and the record routines.
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
@@ -48,21 +54,24 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 }
 
 /// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
-/// which a machine image reserves, then the executors of the platform; nonzero when the runtime
-/// cannot start.
+/// which a machine image's boot area holds after its boot heap, then the executors of the
+/// platform; nonzero when the runtime cannot start.
 fn init(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let state_address = lo.state(fx);
-    for (field, size, name) in TABLES {
-        let address = match lo.machine() {
-            true => lo.reserved(fx, name, size, 64),
-            false => {
+    let area = lo.machine().then(|| lo.boot_area(fx));
+    let mut offset = heap::BOOT_HEAP;
+    for (field, size) in TABLES {
+        let address = match area {
+            Some(area) => fx.offset(area, offset),
+            None => {
                 let size = fx.ptr(size);
                 let address = lo.record_alloc(fx, size);
                 unavailable_unless(fx, address);
                 address
             }
         };
+        offset += size.next_multiple_of(TABLE_ALIGN);
         fx.store(address, state_address, field);
     }
     let one = fx.ptr(1);
@@ -77,10 +86,23 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().return_(&[zero]);
 }
 
+/// Calls `Init`, writing that the runtime is unavailable and ending with status 71 when it
+/// cannot start.
+pub fn start(lo: &mut Lowering, fx: &mut Fx) {
+    let failed = lo.call_routine(fx, Routine::Init, &[])[0];
+    let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+    fx.when(unavailable, |fx| self::unavailable(lo, fx));
+}
+
 /// Returns 1 from `Init` when an address is zero.
 pub fn unavailable_unless(fx: &mut Fx, address: Value) {
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, address, 0);
-    fx.when(missing, |fx| {
+    unavailable_if(fx, missing);
+}
+
+/// Returns 1 from `Init` when `condition` is nonzero.
+pub fn unavailable_if(fx: &mut Fx, condition: Value) {
+    fx.when(condition, |fx| {
         let one = fx.ptr(1);
         fx.b.ins().return_(&[one]);
     });

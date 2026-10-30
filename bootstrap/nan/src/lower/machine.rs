@@ -8,6 +8,7 @@ mod aarch64;
 mod cpus;
 pub mod heap;
 mod interrupts;
+mod memory;
 mod ports;
 mod stubs;
 
@@ -15,13 +16,13 @@ pub use interrupts::{IDT_BYTES, binding, device};
 pub use stubs::Stub;
 
 use cranelift_codegen::binemit::Reloc;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 
 use super::body::Held;
 use super::call::Invoked;
 use super::fx::{Fx, PTR};
-use super::runtime::{Routine, state, system};
+use super::runtime::{state, system};
 use super::{Instance, Lowering, Program, lines};
 use crate::nir::Role;
 use crate::workspace::{Arch, Target};
@@ -374,12 +375,7 @@ impl Lowering<'_, '_> {
         };
         self.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
             let params = fx.entry();
-            let state_address = lo.state(fx);
-            fx.store(params[0], state_address, state::PLATFORM);
-            fx.store(params[1], state_address, state::PLATFORM_TABLE);
-            let failed = lo.call_routine(fx, Routine::Init, &[])[0];
-            let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-            fx.when(unavailable, |fx| system::unavailable(lo, fx));
+            lo.start_boot(fx, &params);
             let landing_abi = lo.abi(&landing);
             let args: Vec<Held> = params
                 .iter()
@@ -396,6 +392,15 @@ impl Lowering<'_, '_> {
             fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
         });
         id
+    }
+
+    /// The start of a boot glue: records the two values the platform entered the image with,
+    /// then sets up the runtime, ending with status 71 when it cannot start.
+    pub fn start_boot(&mut self, fx: &mut Fx, params: &[Value]) {
+        let state_address = self.state(fx);
+        fx.store(params[0], state_address, state::PLATFORM);
+        fx.store(params[1], state_address, state::PLATFORM_TABLE);
+        system::start(self, fx);
     }
 
     /// The entry root, the page tables the image holds mapping the first 4 GiB writable at their

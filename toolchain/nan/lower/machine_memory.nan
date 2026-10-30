@@ -1,0 +1,434 @@
+//! The physical memory of a machine image: the usable memory its platform lists, and the boot area, which holds the boot heap and then the runtime tables `Init` sets up. A bare target carves the boot area from usable memory as it starts; a UEFI target's image reserves it.
+
+/// The bytes of the boot area: the boot heap, then the runtime tables.
+const BOOT_AREA: u64 = BOOT_HEAP + RUNTIME_SYSTEM_TABLE_BYTES
+
+/// The first mebibyte, which usable memory leaves out on x86_64.
+const LOW_MEMORY: i64 = 0x10_0000
+
+/// The usable entries of the `x86_64-bare` start information's memory map, which version 1 of
+/// it has: the offsets of the map's address and entry count, an entry's size, and in an entry
+/// the offsets of its address, size and type, and the type of usable memory.
+const START_MAP_VERSION: u64 = 4
+
+const START_MAP_ADDRESS: u64 = 40
+
+const START_MAP_COUNT: u64 = 48
+
+const START_MAP_ENTRY: i64 = 24
+
+const START_MAP_BASE: u64 = 0
+
+const START_MAP_SIZE: u64 = 8
+
+const START_MAP_KIND: u64 = 16
+
+const START_MAP_USABLE: i64 = 1
+
+/// The usable entries of a UEFI memory map: in a descriptor the offsets of its type, physical
+/// start and page count, and the types of conventional memory and of boot services' code and
+/// data, which `exit_services` frees.
+const FIRMWARE_MAP_KIND: u64 = 0
+
+const FIRMWARE_MAP_BASE: u64 = 8
+
+const FIRMWARE_MAP_PAGES: u64 = 24
+
+const FIRMWARE_MAP_USABLE: Array[i64, 3] = listed_usable_kinds()
+
+fn listed_usable_kinds() -> Array[i64, 3] {
+    var listed = Array[i64, 3].filled(3)
+    listed[1] = 4
+    listed[2] = 7
+    return listed
+} listed_usable_kinds
+
+/// The flattened device tree `aarch64-bare` enters with, whose words are big-endian: the offsets
+/// in its header of its size and of the offsets of its structure, strings and memory reservation
+/// blocks; the structure block's tokens opening and closing a node, starting a property and
+/// ending the block, any other being one word; in a property the offsets of its value's length,
+/// of its name's offset in the strings block and of its value; a reservation's size and the
+/// offset of its length; and the root's cells of an address and of a size when it states none.
+const DEVICE_TREE_SIZE: u64 = 4
+
+const DEVICE_TREE_STRUCTURE: u64 = 8
+
+const DEVICE_TREE_STRINGS: u64 = 12
+
+const DEVICE_TREE_RESERVED: u64 = 16
+
+const DEVICE_TREE_BEGIN_NODE: i64 = 1
+
+const DEVICE_TREE_END_NODE: i64 = 2
+
+const DEVICE_TREE_PROPERTY: i64 = 3
+
+const DEVICE_TREE_END: i64 = 9
+
+const DEVICE_TREE_LEN: u64 = 4
+
+const DEVICE_TREE_NAME: u64 = 8
+
+const DEVICE_TREE_VALUE: i64 = 12
+
+const DEVICE_TREE_RESERVATION: i64 = 16
+
+const DEVICE_TREE_RESERVATION_LEN: u64 = 8
+
+const DEVICE_TREE_ADDRESS_CELLS: u64 = 2
+
+const DEVICE_TREE_SIZE_CELLS: u64 = 1
+
+/// `Init`'s placement of the boot area, aligned to a chunk, whose address it records in the
+/// runtime state and gives: carved on a bare target, reserved by the image on a UEFI target.
+fn Lowering.boot_area(mut self, mut fx: Fx) -> clif::Value {
+    let area = match self.ck.db().target.kind() {
+        Some(workspace::Kind.Bare) => mut self.carve_boot_area(mut fx)
+        else => mut self.reserve_boot_area(mut fx)
+    }
+    let state_address = mut self.state(mut fx)
+    mut fx.store(area, addr: state_address, offset: STATE_BOOT_AREA)
+    return area
+} Lowering.boot_area
+
+/// The boot area's first address and last address plus one.
+fn Lowering.boot_area_extent(mut self, mut fx: Fx) -> Extent {
+    let state_address = mut self.state(mut fx)
+    let area = mut fx.load(PTR, addr: state_address, offset: STATE_BOOT_AREA)
+    return Extent(start: area, end: mut fx.offset(area, offset: BOOT_AREA))
+} Lowering.boot_area_extent
+
+/// The boot area at the lowest chunk-aligned address of usable memory outside the image from
+/// which it fits in usable memory, its tables zero-filled; `Init` returns 1 when none is.
+fn Lowering.carve_boot_area(mut self, mut fx: Fx) -> clif::Value {
+    let image = mut self.image_extent(mut fx)
+    let none = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+    let lowest = mut fx.variable(PTR, initial: none)
+    mut self.usable_memory(mut fx, held: Array[Extent, 1].filled(image).view(), visit: fn(mut lo1: Lowering, mut fx1: Fx, base: clif::Value, end: clif::Value) {
+        let bumped = mut fx1.b.iadd_imm_s(base, y: i64.fit(MEMORY_CHUNK) - 1)
+        let aligned = mut fx1.b.band_imm_s(bumped, y: -i64.fit(MEMORY_CHUNK))
+        let top = mut fx1.offset(aligned, offset: BOOT_AREA)
+        let fits = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: top, y: end)
+        let held = mut fx1.b.use_var(lowest)
+        let lower = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: aligned, y: held)
+        let chosen = mut fx1.b.band(fits, y: lower)
+        let next = mut fx1.b.select(chosen, x: aligned, y: held)
+        mut fx1.b.def_var(lowest, val: next)
+    })
+    let area = mut fx.b.use_var(lowest)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: area, y: -1)
+    unavailable_if(mut fx, condition: missing)
+    let tables = mut fx.offset(area, offset: BOOT_HEAP)
+    let len = mut fx.ptr(RUNTIME_SYSTEM_TABLE_BYTES)
+    heap_clear(mut self, mut fx, base: tables, len)
+    return area
+} Lowering.carve_boot_area
+
+/// The boot area in the zeroed data the image reserves for it with one chunk more, so that it
+/// aligns to a chunk wherever the image is loaded.
+fn Lowering.reserve_boot_area(mut self, mut fx: Fx) -> clif::Value {
+    let reserved = mut self.reserved(mut fx, data_name: "_NSboot_area", size: BOOT_AREA + MEMORY_CHUNK, align: 4_096)
+    let bumped = mut fx.b.iadd_imm_s(reserved, y: i64.fit(MEMORY_CHUNK) - 1)
+    return mut fx.b.band_imm_s(bumped, y: -i64.fit(MEMORY_CHUNK))
+} Lowering.reserve_boot_area
+
+/// Visits the usable memory the platform lists below the 4 GiB the entry root maps, in its
+/// parts outside the `held` ranges, outside the first MiB on x86_64 and outside the device
+/// tree and the ranges it reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the
+/// usable entries of the start information's memory map, on `aarch64-bare`, the ranges of the
+/// device tree's memory nodes and, on a UEFI target, the usable entries of the firmware's
+/// final memory map. `visit` receives each range's first address and last address plus one;
+/// the range may be empty.
+fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+    let state_address = mut self.state(mut fx)
+    match self.ck.db().target {
+        workspace::Target.X64Uefi or workspace::Target.Aarch64Uefi => {
+            let map = mut fx.load(PTR, addr: state_address, offset: STATE_MEMORY_MAP)
+            let size = mut fx.load(PTR, addr: state_address, offset: STATE_MAP_SIZE)
+            let stride = mut fx.load(PTR, addr: state_address, offset: STATE_MAP_STRIDE)
+            let count = mut fx.b.udiv(size, y: stride)
+            let zero_value = mut fx.ptr(0)
+            mut fx.each(zero_value, end: count, body: fn[mut self](mut fx1: Fx, index: clif::Value) {
+                let offset = mut fx1.b.imul(index, y: stride)
+                let entry = mut fx1.b.iadd(map, y: offset)
+                let kind = mut fx1.load(clif::Type.Int32, addr: entry, offset: FIRMWARE_MAP_KIND)
+                var free = mut fx1.int(clif::Type.Int8, value: 0)
+                for usable_kind in FIRMWARE_MAP_USABLE {
+                    let same = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: usable_kind)
+                    free = mut fx1.b.bor(free, y: same)
+                }
+                mut fx1.if_true(free, then: fn[mut self](mut fx2: Fx) {
+                    let base = mut fx2.load(PTR, addr: entry, offset: FIRMWARE_MAP_BASE)
+                    let pages = mut fx2.load(PTR, addr: entry, offset: FIRMWARE_MAP_PAGES)
+                    let page_bytes = mut fx2.b.ishl_imm_s(pages, y: 12)
+                    let end = mut fx2.b.iadd(base, y: page_bytes)
+                    visit_unheld(mut self, fx: mut fx2, held, reserved: None, range: Extent(start: base, end: end), visit)
+                })
+            })
+        }
+        workspace::Target.Aarch64Bare => tree_memory(mut self, mut fx, state_address, held, visit)
+        else => {
+            let info = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+            let version = mut fx.load(clif::Type.Int32, addr: info, offset: START_MAP_VERSION)
+            let mapped = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: version, y: 1)
+            mut fx.if_true(mapped, then: fn[mut self](mut fx1: Fx) {
+                let map = mut fx1.load(PTR, addr: info, offset: START_MAP_ADDRESS)
+                let count_word = mut fx1.load(clif::Type.Int32, addr: info, offset: START_MAP_COUNT)
+                let count = mut fx1.b.uextend(PTR, x: count_word)
+                let zero_value = mut fx1.ptr(0)
+                mut fx1.each(zero_value, end: count, body: fn[mut self](mut fx2: Fx, index: clif::Value) {
+                    let offset = mut fx2.b.imul_imm_s(index, y: START_MAP_ENTRY)
+                    let entry = mut fx2.b.iadd(map, y: offset)
+                    let kind = mut fx2.load(clif::Type.Int32, addr: entry, offset: START_MAP_KIND)
+                    let free = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: START_MAP_USABLE)
+                    mut fx2.if_true(free, then: fn[mut self](mut fx3: Fx) {
+                        let base = mut fx3.load(PTR, addr: entry, offset: START_MAP_BASE)
+                        let size = mut fx3.load(PTR, addr: entry, offset: START_MAP_SIZE)
+                        let end = mut fx3.b.iadd(base, y: size)
+                        visit_unheld(mut self, fx: mut fx3, held, reserved: None, range: Extent(start: base, end: end), visit)
+                    })
+                })
+            })
+        }
+    }
+} Lowering.usable_memory
+
+/// Visits the parts of the usable memory `range` outside the `held` ranges and the ranges the
+/// device tree's memory reservation block at `reserved` lists, clipped to start past the first
+/// MiB on x86_64 and to end below the 4 GiB the entry root maps. Each pass visits the part before
+/// the one of those ranges overlapping the rest that starts lowest, then skips past that range.
+fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Option[clif::Value], range: Extent, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+    var clipped_base = range.start
+    if lo.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
+        let low = mut fx.ptr(u64.fit(LOW_MEMORY))
+        clipped_base = mut fx.b.umax(range.start, y: low)
+    }
+    let mapped = mut fx.ptr(MACHINE_MAPPED)
+    let clipped_end = mut fx.b.umin(range.end, y: mapped)
+    discard mut fx.repeat(fx.list1(clipped_base).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let rest = Extent(start: current[0], end: clipped_end)
+        var lowest = Extent(start: clipped_end, end: clipped_end)
+        for range_held in held {
+            lowest = lowest_overlap(mut fx1, lowest, range: range_held, rest)
+        }
+        match reserved {
+            Some(block) => {
+                let found = mut fx1.repeat(fx1.list3(block, b: lowest.start, c: lowest.end).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+                    expect state.len() > 2
+                    let entry = state[0]
+                    let start = mut fx2.load_ordered(PTR, addr: entry, offset: 0, unaligned_access: false, big: true)
+                    let len = mut fx2.load_ordered(PTR, addr: entry, offset: DEVICE_TREE_RESERVATION_LEN, unaligned_access: false, big: true)
+                    let stop = mut fx2.b.iadd(start, y: len)
+                    let listed_lowest = lowest_overlap(mut fx2, lowest: Extent(start: state[1], end: state[2]), range: Extent(start: start, end: stop), rest)
+                    let listed = mut fx2.b.bor(start, y: len)
+                    let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: listed, y: 0)
+                    let next = mut fx2.b.iadd_imm_s(entry, y: DEVICE_TREE_RESERVATION)
+                    return Pass(again: more, next: fx2.list3(next, b: listed_lowest.start, c: listed_lowest.end))
+                })
+                lowest = Extent(start: found[1], end: found[2])
+            }
+            None => {}
+        }
+        visit(mut lo, fx: mut fx1, base: rest.start, end: lowest.start)
+        let after = mut fx1.b.umax(rest.start, y: lowest.end)
+        let more = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: after, y: clipped_end)
+        return Pass(again: more, next: fx1.list1(after))
+    })
+} visit_unheld
+
+/// Whichever of `lowest` and `range` starts lower, `range` only where it overlaps `rest`.
+fn lowest_overlap(mut fx: Fx, lowest: Extent, range: Extent, rest: Extent) -> Extent {
+    let start = mut fx.b.umax(range.start, y: rest.start)
+    let stop = mut fx.b.umin(range.end, y: rest.end)
+    let overlaps = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: start, y: stop)
+    let below = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: range.start, y: lowest.start)
+    let chosen = mut fx.b.band(overlaps, y: below)
+    let chosen_start = mut fx.b.select(chosen, x: range.start, y: lowest.start)
+    let chosen_end = mut fx.b.select(chosen, x: range.end, y: lowest.end)
+    return Extent(start: chosen_start, end: chosen_end)
+} lowest_overlap
+
+/// A walk of the device tree's structure block: the strings block naming its properties, the
+/// memory reservation block, and the variables holding the depth of the node it is in, whether
+/// that node is a memory node, and the root's cells of an address and of a size.
+struct TreeWalk derives Copy {
+    strings: clif::Value
+    reserved: clif::Value
+    depth: clif::Variable
+    memory: clif::Variable
+    address_cells: clif::Variable
+    size_cells: clif::Variable
+} TreeWalk
+
+/// The usable memory of `aarch64-bare`: the ranges in the `reg` property of each memory node of
+/// the device tree, a child of its root named `memory` or `memory@` and a unit address, read in
+/// the root's cells, visited outside the device tree and the `held` ranges.
+fn tree_memory(mut lo: Lowering, mut fx: Fx, state_address: clif::Value, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+    let tree = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+    let structure = tree_address(mut fx, tree, field: DEVICE_TREE_STRUCTURE)
+    let strings = tree_address(mut fx, tree, field: DEVICE_TREE_STRINGS)
+    let reserved = tree_address(mut fx, tree, field: DEVICE_TREE_RESERVED)
+    let tree_end = tree_address(mut fx, tree, field: DEVICE_TREE_SIZE)
+    var all_held = mem::List[Extent].empty(lo.alloc)
+    mut all_held.push(Extent(start: tree, end: tree_end))
+    for range in held {
+        mut all_held.push(range)
+    }
+    let zero_value = mut fx.ptr(0)
+    let depth = mut fx.variable(PTR, initial: zero_value)
+    let no = mut fx.int(clif::Type.Int8, value: 0)
+    let memory = mut fx.variable(clif::Type.Int8, initial: no)
+    let address_count = mut fx.ptr(DEVICE_TREE_ADDRESS_CELLS)
+    let address_cells = mut fx.variable(PTR, initial: address_count)
+    let size_count = mut fx.ptr(DEVICE_TREE_SIZE_CELLS)
+    let size_cells = mut fx.variable(PTR, initial: size_count)
+    let walk = TreeWalk(strings: strings, reserved: reserved, depth: depth, memory: memory, address_cells: address_cells, size_cells: size_cells)
+    discard mut fx.repeat(fx.list1(structure).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let at = current[0]
+        let token = tree_cell(mut fx1, at, offset: 0)
+        let name = mut fx1.b.iadd_imm_s(at, y: 4)
+        let next = mut fx1.variable(PTR, initial: name)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: token, y: DEVICE_TREE_BEGIN_NODE)
+        mut fx1.if_true(open, then: fn(mut fx2: Fx) {
+            let parent = mut fx2.b.use_var(depth)
+            let child = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: parent, y: 1)
+            let named = memory_node(mut fx2, name)
+            let found = mut fx2.b.band(child, y: named)
+            mut fx2.b.def_var(memory, val: found)
+            let inner = mut fx2.b.iadd_imm_s(parent, y: 1)
+            mut fx2.b.def_var(depth, val: inner)
+            let after = name_end(mut fx2, name)
+            mut fx2.b.def_var(next, val: after)
+        })
+        let close = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: token, y: DEVICE_TREE_END_NODE)
+        mut fx1.if_true(close, then: fn(mut fx2: Fx) {
+            let inner = mut fx2.b.use_var(depth)
+            let outer = mut fx2.b.iadd_imm_s(inner, y: -1)
+            mut fx2.b.def_var(depth, val: outer)
+        })
+        let property = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: token, y: DEVICE_TREE_PROPERTY)
+        mut fx1.if_true(property, then: fn[mut lo](mut fx2: Fx) {
+            let after = tree_property(mut lo, fx: mut fx2, walk, held: all_held.view(), visit, at)
+            mut fx2.b.def_var(next, val: after)
+        })
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: token, y: DEVICE_TREE_END)
+        let following = mut fx1.b.use_var(next)
+        return Pass(again: more, next: fx1.list1(following))
+    })
+} tree_memory
+
+/// Reads the property at `at` of the device tree's structure block and gives the address after
+/// it: the root's `#address-cells` and `#size-cells` set the walk's cells, and the `reg` of a
+/// memory node visits the parts of the ranges it lists outside the `held` ranges and the ranges
+/// the memory reservation block lists.
+fn tree_property(mut lo: Lowering, mut fx: Fx, walk: TreeWalk, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value), at: clif::Value) -> clif::Value {
+    let len = tree_cell(mut fx, at, offset: DEVICE_TREE_LEN)
+    let name_offset = tree_cell(mut fx, at, offset: DEVICE_TREE_NAME)
+    let name = mut fx.b.iadd(walk.strings, y: name_offset)
+    let value = mut fx.b.iadd_imm_s(at, y: DEVICE_TREE_VALUE)
+    let depth = mut fx.b.use_var(walk.depth)
+    let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: depth, y: 1)
+    let stated = tree_cell(mut fx, at: value, offset: 0)
+    let addresses_named = starts_with(mut fx, at: name, text: b"#address-cells\0")
+    let addresses = mut fx.b.band(root, y: addresses_named)
+    mut fx.if_true(addresses, then: fn(mut fx1: Fx) {
+        mut fx1.b.def_var(walk.address_cells, val: stated)
+    })
+    let sizes_named = starts_with(mut fx, at: name, text: b"#size-cells\0")
+    let sizes = mut fx.b.band(root, y: sizes_named)
+    mut fx.if_true(sizes, then: fn(mut fx1: Fx) {
+        mut fx1.b.def_var(walk.size_cells, val: stated)
+    })
+    let node = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: depth, y: 2)
+    let memory = mut fx.b.use_var(walk.memory)
+    let inside = mut fx.b.band(node, y: memory)
+    let reg_named = starts_with(mut fx, at: name, text: b"reg\0")
+    let reg = mut fx.b.band(inside, y: reg_named)
+    mut fx.if_true(reg, then: fn[mut lo](mut fx1: Fx) {
+        let address_cells = mut fx1.b.use_var(walk.address_cells)
+        let size_cells = mut fx1.b.use_var(walk.size_cells)
+        let cells = mut fx1.b.iadd(address_cells, y: size_cells)
+        let pair = mut fx1.b.ishl_imm_s(cells, y: 2)
+        let size_offset = mut fx1.b.ishl_imm_s(address_cells, y: 2)
+        let count = mut fx1.b.udiv(len, y: pair)
+        let zero_value = mut fx1.ptr(0)
+        mut fx1.each(zero_value, end: count, body: fn[mut lo](mut fx2: Fx, index: clif::Value) {
+            let offset = mut fx2.b.imul(index, y: pair)
+            let base_at = mut fx2.b.iadd(value, y: offset)
+            let base = tree_number(mut fx2, at: base_at, count: address_cells)
+            let size_at = mut fx2.b.iadd(base_at, y: size_offset)
+            let size = tree_number(mut fx2, at: size_at, count: size_cells)
+            let end = mut fx2.b.iadd(base, y: size)
+            visit_unheld(mut lo, fx: mut fx2, held, reserved: Some(walk.reserved), range: Extent(start: base, end: end), visit)
+        })
+    })
+    let rounded = mut fx.b.iadd_imm_s(len, y: 3)
+    let padded = mut fx.b.band_imm_s(rounded, y: -4)
+    return mut fx.b.iadd(value, y: padded)
+} tree_property
+
+/// The address `tree` plus the device tree's header word at `field`: that of one of its blocks,
+/// or its end.
+fn tree_address(mut fx: Fx, tree: clif::Value, field: u64) -> clif::Value {
+    let offset = tree_cell(mut fx, at: tree, offset: field)
+    return mut fx.b.iadd(tree, y: offset)
+} tree_address
+
+/// The big-endian cell at `offset` past `at`, widened to an address.
+fn tree_cell(mut fx: Fx, at: clif::Value, offset: u64) -> clif::Value {
+    let cell = mut fx.load_ordered(clif::Type.Int32, addr: at, offset, unaligned_access: false, big: true)
+    return mut fx.b.uextend(PTR, x: cell)
+} tree_cell
+
+/// The number the `count` cells at `at` hold, the most significant first, to 64 bits.
+fn tree_number(mut fx: Fx, at: clif::Value, count: clif::Value) -> clif::Value {
+    let zero_value = mut fx.ptr(0)
+    let number = mut fx.variable(PTR, initial: zero_value)
+    mut fx.each(zero_value, end: count, body: fn(mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.ishl_imm_s(index, y: 2)
+        let cell_at = mut fx1.b.iadd(at, y: offset)
+        let cell = tree_cell(mut fx1, at: cell_at, offset: 0)
+        let high = mut fx1.b.use_var(number)
+        let shifted = mut fx1.b.ishl_imm_s(high, y: 32)
+        let joined = mut fx1.b.bor(shifted, y: cell)
+        mut fx1.b.def_var(number, val: joined)
+    })
+    return mut fx.b.use_var(number)
+} tree_number
+
+/// Whether the node name at `name` is `memory`, alone or followed by `@` and a unit address.
+fn memory_node(mut fx: Fx, name: clif::Value) -> clif::Value {
+    let memory = starts_with(mut fx, at: name, text: b"memory")
+    let after = mut fx.load(clif::Type.Int8, addr: name, offset: 6)
+    let alone = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: after, y: 0)
+    let unit = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: after, y: i64.widen(b'@'))
+    let either = mut fx.b.bor(alone, y: unit)
+    return mut fx.b.band(memory, y: either)
+} memory_node
+
+/// The address after the node name at `name`, which a zero byte ends and zeros pad to whole
+/// words: past the first word whose last byte is zero.
+fn name_end(mut fx: Fx, name: clif::Value) -> clif::Value {
+    let ended = mut fx.repeat(fx.list1(name).view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let last = mut fx1.load(clif::Type.Int8, addr: current[0], offset: 3)
+        let next = mut fx1.b.iadd_imm_s(current[0], y: 4)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: last, y: 0)
+        return Pass(again: more, next: fx1.list1(next))
+    })
+    return ended[0]
+} name_end
+
+/// Whether the bytes at `at` start with `text`.
+fn starts_with(mut fx: Fx, at: clif::Value, text: Slice[u8]) -> clif::Value {
+    var same = mut fx.int(clif::Type.Int8, value: 1)
+    for offset in 0..<text.len() {
+        let found = mut fx.load(clif::Type.Int8, addr: at, offset: u64.widen(offset))
+        let equal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found, y: i64.widen(text[offset]))
+        same = mut fx.b.band(same, y: equal)
+    }
+    return same
+} starts_with
+

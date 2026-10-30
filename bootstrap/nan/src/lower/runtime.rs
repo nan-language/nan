@@ -367,6 +367,9 @@ pub mod state {
     /// zeroed, linked through their first words, and their count.
     pub const KEPT_CHUNKS: u64 = 328;
     pub const KEPT_COUNT: u64 = 336;
+    /// On a machine target, the address of the boot area, which holds the boot heap and then
+    /// the tables `Init` sets up.
+    pub const BOOT_AREA: u64 = 344;
     pub const SIZE: u64 = 384;
 }
 

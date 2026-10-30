@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state and the kernel lowering of waiting; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -10,6 +10,10 @@ The **anchor** is the one value per kernel that `boot::Kernel.anchor` installs. 
 // module: boot
 
 pub fn Kernel.alloc(self) -> mem::Alloc
+
+pub fn Kernel.clock(self) -> sys::Clock
+
+pub fn Kernel.wall_clock(self) -> Option[sys::WallClock]
 
 pub fn Kernel.regions(mut self) -> mem::List[hw::Region]
 
@@ -31,6 +35,8 @@ pub fn cpu_count() -> u32 limits pure, notrap, terminates
 
 - The [entry function](27-program-model.md#entry) of a bare target's image starts on the boot CPU with maskable interrupts disabled and every other CPU stopped, on `x86_64-bare` with SSE enabled and AVX enabled when the CPU has it, and on `aarch64-bare` with floating point and Advanced SIMD enabled.
 - `k.alloc()` is the root allocator of `boot::Kernel` ([allocators](12-memory.md#allocators)). Its root cell's supply is the **boot heap**, which the [boot area](#physical-memory) holds in the size its target's [descriptor](27-program-model.md#descriptors) states. Every call returns the same handle.
+- `k.clock()` is the kernel's clock ([kernel time](#kernel-time)), whose nanoseconds count from the minting of the root grant. Every call returns the same handle.
+- `k.wall_clock()` returns `Some` of the kernel's wall clock when the wall clock source of its target's [descriptor](27-program-model.md#descriptors) gave a time as the root grant was minted, the same handle on every call, and `None` otherwise. Its reading is that time, taken as UTC, advanced by the kernel clock.
 - The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64 and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on `x86_64-bare`, the entries of type 1 of the start-info memory map, on `aarch64-bare`, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable. CPUs are numbered from 0, the boot CPU being 0.
@@ -41,7 +47,7 @@ pub fn cpu_count() -> u32 limits pure, notrap, terminates
 
 1. It moves `state` into storage the image reserves and installs it as the anchor, visible to every CPU from then on.
 2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded and an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
-3. It runs `f` as the first kernel task on that executor, whose value it passes as `exec`. The executor draws task stacks and records through `k.alloc()` ([executors](16-concurrency.md#executors)), and `f` is a [task closure](16-concurrency.md#task-closures), capturing by `take` and Copy only; the executor records no clock ([capability tables](14-authority.md#capability-tables)).
+3. It runs `f` as the first kernel task on that executor, whose value it passes as `exec`. The executor draws task stacks and records through `k.alloc()` ([executors](16-concurrency.md#executors)), and `f` is a [task closure](16-concurrency.md#task-closures), capturing by `take` and Copy only; the executor records `k.clock()` ([capability tables](14-authority.md#capability-tables)).
 4. When `f` returns or fails, the kernel halts ([kernel halts](#kernel-halts)).
 
 The anchor is never moved, released or accessed by `mut` or `take`. Its parts change only through their own operations, so its mutable parts are values with [interior mutability](12-memory.md#interior-mutability) such as `hw::SpinLock`, `hw::PerCpu` and the `core::atomic` types.
@@ -544,6 +550,39 @@ On the machine targets, the [platform package](28-stdlib.md#platform-packages) c
 3. When a later switch resumes the thread, the landing fn returns, and the seam restores the saved state and resumes the thread.
 
 A kernel task's stack is drawn through the executor's allocator as the task starts. It holds at least the N of its entry's `limits stack N` ([task stacks](17-suspension-io.md#task-stacks)), plus the stack use of the `hw::preempt` landing fn, plus one [seam frame](27-program-model.md#descriptors).
+
+### Kernel time
+
+The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline.
+
+- Each CPU's timer fires at its **pacing ticks**, 10 ms apart, and at the earliest deadline, whichever comes first. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
+- A deadline armed on a CPU ahead of every other deadline programs that CPU's timer to fire at it.
+- Cancelling a task that sleeps ends its sleep at once, and a deadline that its construct no longer needs leaves the deadlines at once.
+
+```nan
+// file: pacer/package.nan
+//! A bare kernel pausing on its clock.
+
+package pacer {
+    language 1
+    targets x86_64-bare
+    entry main
+} pacer
+
+// file: pacer/pacer.nan
+//! The first task pauses for 500 µs at a time, each pause under a 1 ms deadline.
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let clock = k.clock()
+    take k.anchor(Unit, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        loop {
+            discard try await task::within_ns(clock, ns: 1_000_000, body: fn() fails task::Cancelled uses wait {
+                try await clock.sleep_ns(500_000)
+            })
+        }
+    })
+} main
+```
 
 ## Physical memory
 

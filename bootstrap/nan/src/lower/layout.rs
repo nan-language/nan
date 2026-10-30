@@ -196,7 +196,7 @@ const POINTERS: [&str; 15] = [
 ];
 
 /// The base types that are generational handles: a slot index and its generation.
-const HANDLES: [&str; 11] = [
+const HANDLES: [&str; 12] = [
     "mem::Alloc",
     "mem::Heap",
     "mem::Handle",
@@ -204,6 +204,7 @@ const HANDLES: [&str; 11] = [
     "sys::Fs",
     "sys::Net",
     "sys::Clock",
+    "sys::WallClock",
     "sys::Random",
     "sys::Log",
     "sys::Stdio",
@@ -499,14 +500,16 @@ impl Layouts {
             "task::Poisoned" | "sys::Domain" | "host::Runner" | "hw::Anchor" | "hw::IrqContext" => {
                 empty()
             }
-            // A machine root grant: the handles of its root allocator and executor, and whether
-            // its regions and its `hw::Ring0` were taken; `boot::Machine` carries them into the
-            // `boot::Kernel` its `exit_services` returns.
+            // A machine root grant: the handles of its root allocator, executor, clock and wall
+            // clock, and whether its regions and its `hw::Ring0` were taken; `boot::Machine`
+            // carries them into the `boot::Kernel` its `exit_services` returns.
             "boot::Kernel" | "boot::Machine" => self.record(
                 ck,
                 &[
                     ("alloc".to_owned(), Ty::Scalar(Scalar::U64)),
                     ("exec".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("clock".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("wall".to_owned(), Ty::Scalar(Scalar::U64)),
                     ("regions".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("ring0".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],

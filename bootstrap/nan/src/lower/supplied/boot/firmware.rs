@@ -1,7 +1,7 @@
 //! The firmware services of `x86_64-uefi`, reached through the system table the program entry
 //! seam recorded and called under the Microsoft x64 convention on the boot stack: console
-//! output, files of the volume the image was loaded from, and the end of boot services, after
-//! which the image runs on its own entry root and descriptor tables.
+//! output, files of the volume the image was loaded from, the end of boot services, after which
+//! the image runs on its own entry root and descriptor tables, and the time.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
 use cranelift_codegen::isa::CallConv;
@@ -17,11 +17,14 @@ use super::super::mem::vector::{self, Element};
 use super::super::{Supply, sys};
 use crate::workspace::Arch;
 
-/// The offsets in the system table of its console-output protocol and its boot services; in
-/// the console-output protocol of its string output; in the boot services of `GetMemoryMap`,
-/// `HandleProtocol` and `ExitBootServices`.
+/// The offsets in the system table of its console-output protocol, its runtime services and its
+/// boot services; in the console-output protocol of its string output; in the runtime services
+/// of `GetTime`; in the boot services of `GetMemoryMap`, `HandleProtocol` and
+/// `ExitBootServices`.
 const CONSOLE_OUT: u64 = 64;
+const RUNTIME_SERVICES: u64 = 88;
 const BOOT_SERVICES: u64 = 96;
+const GET_TIME: u64 = 24;
 const OUTPUT_STRING: u64 = 8;
 const GET_MEMORY_MAP: u64 = 56;
 const HANDLE_PROTOCOL: u64 = 152;
@@ -257,6 +260,31 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let layout = lo.layout(&grant);
     lo.copy(fx, kernel, machine, layout.size, layout.align);
     supply.ret(lo, fx, Held::Address(kernel));
+}
+
+/// The firmware's time from `GetTime`: whether it gave one, its year, month, day, hour, minute
+/// and second, and its nanoseconds.
+pub fn time(lo: &mut Lowering, fx: &mut Fx) -> (Value, [Value; 6], Value) {
+    let arch = lo.ck.db.target.arch();
+    let table = system_table(lo, fx);
+    let services = fx.load(PTR, table, RUNTIME_SERVICES);
+    let get_time = fx.load(PTR, services, GET_TIME);
+    let time = fx.slot(16, 8);
+    let zero = fx.ptr(0);
+    fx.store(zero, time, 0);
+    fx.store(zero, time, 8);
+    let status = firmware_call(arch, fx, get_time, &[time, zero]);
+    let valid = fx.b.ins().icmp_imm_s(IntCC::Equal, status, EFI_SUCCESS);
+    let year = fx.load(types::I16, time, 0);
+    let year = fx.b.ins().uextend(PTR, year);
+    let mut fields = [year; 6];
+    for (index, offset) in [2, 3, 4, 5, 6].into_iter().enumerate() {
+        let byte = fx.load(types::I8, time, offset);
+        fields[index + 1] = fx.b.ins().uextend(PTR, byte);
+    }
+    let nanoseconds = fx.load(types::I32, time, 8);
+    let nanoseconds = fx.b.ins().uextend(PTR, nanoseconds);
+    (valid, fields, nanoseconds)
 }
 
 /// The system table the program entry seam recorded.

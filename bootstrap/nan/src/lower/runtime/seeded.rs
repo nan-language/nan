@@ -1,8 +1,8 @@
 //! The seeded scheduler of test images: one executor thread runs one task at a time. At each
 //! scheduling point it takes the ready task at position w mod k among the k ready tasks, in the
 //! order they became ready, w being the next value of the run's scheduling stream. Its virtual
-//! clock starts at 0 and advances only when no task is ready, to the earliest pending deadline;
-//! with none pending the run stalls.
+//! clock starts at 0 nanoseconds and advances only when no task is ready, to the earliest
+//! pending deadline; with none pending the run stalls.
 //!
 //! Value n of stream s is the first 8 bytes, little-endian, of the BLAKE3 hash of the run's seed,
 //! s and n as 8 bytes little-endian each. The pending deadlines are the virtual clock's timers,
@@ -15,7 +15,7 @@ use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::tasks::thread;
 use super::tasks::{self, CANCELED, EXPIRED, operation, run, task};
-use super::{Routine, state};
+use super::{Routine, state, timers};
 
 /// The stream serving scheduling choices.
 const SCHEDULING: u64 = 1;
@@ -128,7 +128,7 @@ fn mix(
 }
 
 /// The next order in which a task becomes ready or a timer is armed.
-fn next_order(lo: &mut Lowering, fx: &mut Fx) -> Value {
+pub fn next_order(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let state_address = lo.state(fx);
     let order = fx.load(PTR, state_address, state::ORDER);
     let order = fx.b.ins().iadd_imm_s(order, 1);
@@ -349,86 +349,17 @@ pub fn scheduling_point(lo: &mut Lowering, fx: &mut Fx) {
     }
 }
 
-/// The virtual clock's milliseconds.
+/// The virtual clock's nanoseconds.
 pub fn now(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let state_address = lo.state(fx);
     fx.load(PTR, state_address, state::NOW)
 }
 
-/// Arms a timer due `ms` milliseconds from now, after every timer due no later.
-pub fn arm(lo: &mut Lowering, fx: &mut Fx, op: Value, ms: Value) {
+/// Arms a timer due `ns` nanoseconds from now.
+pub fn arm(lo: &mut Lowering, fx: &mut Fx, op: Value, ns: Value) {
     let clock = now(lo, fx);
-    let (due, overflow) = fx.b.ins().uadd_overflow(clock, ms);
-    let latest = fx.int(PTR, -1);
-    let due = fx.b.ins().select(overflow, latest, due);
-    fx.store(due, op, operation::DUE);
-    let order = next_order(lo, fx);
-    fx.store(order, op, operation::ORDER);
-    let zero = fx.ptr(0);
-    fx.store(zero, op, operation::WITHDRAW);
-    fx.store(zero, op, operation::DONE);
-    let state_address = lo.state(fx);
-    let head = fx.load(PTR, state_address, state::TIMERS);
-    let found = fx.repeat(&[head, zero], |fx, state| {
-        let (current, previous) = (state[0], state[1]);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
-        let earlier = fx.choose(
-            present,
-            &[types::I8],
-            |fx| {
-                let other = fx.load(PTR, current, operation::DUE);
-                vec![fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, other, due)]
-            },
-            |fx| vec![fx.int(types::I8, 0)],
-        )[0];
-        let next = fx.choose(
-            earlier,
-            &[PTR, PTR],
-            |fx| vec![fx.load(PTR, current, operation::NEXT), current],
-            |_| vec![current, previous],
-        );
-        (earlier, next)
-    });
-    let (after, before) = (found[0], found[1]);
-    fx.store(after, op, operation::NEXT);
-    fx.store(before, op, operation::PREVIOUS);
-    let has_after = fx.b.ins().icmp_imm_s(IntCC::NotEqual, after, 0);
-    fx.when(has_after, |fx| fx.store(op, after, operation::PREVIOUS));
-    let first = fx.b.ins().icmp_imm_s(IntCC::Equal, before, 0);
-    fx.choose(
-        first,
-        &[],
-        |fx| {
-            fx.store(op, state_address, state::TIMERS);
-            Vec::new()
-        },
-        |fx| {
-            fx.store(op, before, operation::NEXT);
-            Vec::new()
-        },
-    );
-}
-
-/// Takes a timer out of the virtual clock's timers.
-fn disarm(lo: &mut Lowering, fx: &mut Fx, op: Value) {
-    let state_address = lo.state(fx);
-    let next = fx.load(PTR, op, operation::NEXT);
-    let previous = fx.load(PTR, op, operation::PREVIOUS);
-    let first = fx.b.ins().icmp_imm_s(IntCC::Equal, previous, 0);
-    fx.choose(
-        first,
-        &[],
-        |fx| {
-            fx.store(next, state_address, state::TIMERS);
-            Vec::new()
-        },
-        |fx| {
-            fx.store(next, previous, operation::NEXT);
-            Vec::new()
-        },
-    );
-    let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
-    fx.when(has_next, |fx| fx.store(previous, next, operation::PREVIOUS));
+    let due = timers::due_after(fx, clock, ns);
+    timers::arm(lo, fx, op, due);
 }
 
 /// Completes an operation in flight with a result, delivered when the scheduler next reaps.
@@ -479,7 +410,7 @@ pub fn cancel(lo: &mut Lowering, fx: &mut Fx, op: Value) {
                 Vec::new()
             },
             |lo, fx| {
-                disarm(lo, fx, op);
+                timers::disarm(lo, fx, op);
                 Vec::new()
             },
         );
@@ -532,7 +463,7 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
             |fx| vec![fx.int(types::I8, 0)],
         )[0];
         fx.when(expires, |fx| {
-            disarm(lo, fx, head);
+            timers::disarm(lo, fx, head);
             let expired = fx.int(types::I32, EXPIRED);
             complete(lo, fx, head, expired);
         });

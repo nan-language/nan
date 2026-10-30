@@ -312,10 +312,12 @@ pub fn record_twice(counter: task::Cown[Counter], exec: task::Executor) fails ta
 
 pub fn within[T, E](clock: sys::Clock, ms: u64, body: fn() -> T fails E uses wait) -> Option[T] fails E uses wait
 
+pub fn within_ns[T, E](clock: sys::Clock, ns: u64, body: fn() -> T fails E uses wait) -> Option[T] fails E uses wait
+
 pub fn race[T: Send, E: Send](exec: Executor, take left: task fn() -> T fails E uses wait, take right: task fn() -> T fails E uses wait) -> T fails E uses wait
 ```
 
-`task::within(clock, ms, body: b)` runs `b` on the calling task with a deadline `ms` milliseconds after the call starts, as `sys::Clock.elapsed_ms` measures time for `clock`. When `clock` is stale at the call or becomes stale while `b` runs ([capability tables](14-authority.md#capability-tables)), the deadline passes at that moment.
+`task::within_ns(clock, ns, body: b)` runs `b` on the calling task with a deadline at the first moment, at least `ns` nanoseconds after the call starts, at which `sys::Clock.elapsed_ns` of `clock` reaches a multiple of its resolution ([std capabilities](14-authority.md#std-capabilities)); `task::within(clock, ms, body: b)` is `within_ns` with `ms` converted to nanoseconds. When `clock` is stale at the call or becomes stale while `b` runs ([capability tables](14-authority.md#capability-tables)), the deadline passes at that moment.
 
 - When the deadline passes before `b` ends, the call cancels. Its region is the calling task while it runs `b`.
 - When `b` returns t, the call returns `Some(t)`, whether or not the deadline has passed.
@@ -327,7 +329,7 @@ pub fn race[T: Send, E: Send](exec: Executor, take left: task fn() -> T fails E 
 2. The first of them whose end the runtime records decides the race, and the call then cancels.
 3. Once both have ended, the call returns the deciding task's result or fails with its failure. The other task's result or failure is released.
 
-`within` and `race` are cancelling constructs ([origin and absorption](11-errors-domains.md#origin-and-absorption)).
+`within`, `within_ns` and `race` are cancelling constructs ([origin and absorption](11-errors-domains.md#origin-and-absorption)).
 
 ```nan
 pub closed enum PollError derives Render {
@@ -675,10 +677,13 @@ An **executor** is a `task::Executor`, the [capability](14-authority.md#capabili
 
 pub open struct Executor {
 } Executor
+
+pub fn Executor.coarse(self, ns: u64) -> Executor fails sys::Revoked
 ```
 
 - `task::Executor` is a primitive capability: Copy and Send, and never linear, a view, Inert or AnyBits.
 - An executor is revoked as [revocation](14-authority.md#revocation) states.
+- An executor has a resolution, 1 ns for a root grant's. `exec.coarse(ns)` returns an executor running on the same allocator and recording the same clock with the greater of `exec`'s resolution and `ns` ([attenuation](14-authority.md#attenuation)), and fails with `sys::Revoked.Stale` when `exec` is stale. A delay timed on the clock an executor records ends only when that clock's elapsed nanoseconds are a multiple of the executor's resolution ([component context](26-components.md#component-context)), so nothing an executor offers times finer than its resolution.
 - A root grant mints its executor together with its allocator ([root grants](14-authority.md#root-grants)). `spawn` and `task::race` draw the stacks and task records of the tasks they start on an executor through that allocator.
 - An executor runs its ready tasks concurrently, on one or more processors. A task is ready when it has not ended and is not suspended at a [suspension point](17-suspension-io.md#stackful-tasks). The runtime chooses which ready task runs, on which processor and for how long; on the seeded scheduler of tests the seed fixes that choice ([replay](22-testing.md#replay)).
 

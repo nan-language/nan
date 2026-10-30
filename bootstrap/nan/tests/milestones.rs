@@ -431,12 +431,14 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
 }
 
 /// What the M4 kernel and loader of either architecture write once they show their behaviour.
-const KERNEL_SHOWS: [&str; 5] = [
+const KERNEL_SHOWS: [&str; 7] = [
     "kernel: running on 4 cpus",
     "smp: tasks ran on every one of 4 cpus",
     "preempt: 5 tasks that never await all ran",
     "uart: reader woke on byte 78",
     "virtio-rng: received 16 bytes",
+    "clock: slept 2 ms and a deadline ended a wait",
+    "clock: the wall clock reads a time after 2020",
 ];
 const LOADER_SHOWS: [&str; 1] =
     ["loader: copied 3 loadable segments of kernel.elf to their physical addresses"];

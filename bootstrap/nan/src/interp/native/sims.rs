@@ -1,5 +1,6 @@
 //! The capabilities interpreter runs see: `testing::world()` and the sims, operated without
-//! waiting; the random streams of the seeded scheduler, the virtual clock, the path checks of
+//! waiting; the random streams of the seeded scheduler, the virtual clock and the virtual wall
+//! clock reading it, the path checks of
 //! file systems, attenuations, logs, whose test trace example runs discard, and revocation.
 //!
 //! A capability holds a reference to its capability table entry, which records whether it is
@@ -73,10 +74,12 @@ pub fn member(
                 .set(&next, Val::Int(i128::from(start + view.len as u64)));
             Val::Unit
         }
-        ("sys::Clock", "elapsed_ms") => match stale(interp) {
-            true => return Some(Ok(Flow::Fail(revoked(interp)))),
-            false => Val::Int(0),
-        },
+        ("sys::Clock", "elapsed_ms" | "elapsed_ns") | ("sys::WallClock", "now_ns") => {
+            match stale(interp) {
+                true => return Some(Ok(Flow::Fail(revoked(interp)))),
+                false => Val::Int(0),
+            }
+        }
         ("sys::Fs", "subdir") => {
             if stale(interp) {
                 let error = interp.ty_item("sys::fs", "FsError");
@@ -96,7 +99,9 @@ pub fn member(
             }
             derived(interp, &args[0])
         }
-        ("sys::Fs", "read_only") | ("sys::Net", "only_host") => match stale(interp) {
+        ("sys::Fs", "read_only")
+        | ("sys::Net", "only_host")
+        | ("sys::Clock" | "sys::WallClock" | "task::Executor", "coarse") => match stale(interp) {
             true => return Some(Ok(Flow::Fail(revoked(interp)))),
             false => derived(interp, &args[0]),
         },

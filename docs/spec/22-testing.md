@@ -240,7 +240,7 @@ pub fn world() -> host::World
 pub fn same[T: Any](actual: T, expected: T) -> bool limits pure, notrap, terminates
 ```
 
-On every target, `testing::world()` returns its run's one `host::World`: `fs` is a `sys::sim::fs` without size limit storing through `alloc`, `net` a `sys::sim::net()`, `clock` the virtual clock and `random` the random stream of the [seeded scheduler](#seeded-scheduler), which is `exec`; `log` and `stdio` write to the [test trace](#debug-output), with empty input; `alloc` names a root cell as a root grant's does ([allocators](12-memory.md#allocators)); `args` and `environment` are empty. In [example runs](21-interpreter.md#example-runs), the world is as example runs state.
+On every target, `testing::world()` returns its run's one `host::World`: `fs` is a `sys::sim::fs` without size limit storing through `alloc`, `net` a `sys::sim::net()`, `clock` the virtual clock, `wall` the virtual wall clock and `random` the random stream of the [seeded scheduler](#seeded-scheduler), which is `exec`; `log` and `stdio` write to the [test trace](#debug-output), with empty input; `alloc` names a root cell as a root grant's does ([allocators](12-memory.md#allocators)); `args` and `environment` are empty. In [example runs](21-interpreter.md#example-runs), the world is as example runs state.
 
 `testing::same(actual, expected)` is true exactly when the values are structurally equal: scalars and layout values by bits, structs by fields, enum values by variant and payload, Untrusted values, boxes, shared values and text by contents, arrays, views and collections by elements in order, function values by function, and other std open types, capabilities included, by being the same table entry, cell or memory. Stored allocators are ignored.
 
@@ -342,8 +342,8 @@ pub fn average(total: u32, count: u32) -> u32 {
 The **seeded scheduler** is the executor of every run ([executors](16-concurrency.md#executors)). It runs one task at a time on one processor.
 
 - Its scheduling points are [suspension points](17-suspension-io.md#stackful-tasks), atomic operations, spawns and task ends. At each, it chooses uniformly among the ready tasks, in the order they became ready.
-- A **pending deadline** is the end of a `sys::Clock.sleep`, of a `task::within` deadline or of a `sys::Cx.after` delay that has not yet been reached.
-- The **virtual clock** starts at 0 and advances only when no task is ready, to the earliest pending deadline.
+- A **pending deadline** is the end of a `sys::Clock` sleep, of a `task::within` or `task::within_ns` deadline or of a `sys::Cx.after` or `after_ns` delay that has not yet been reached.
+- The **virtual clock** starts at 0 nanoseconds and advances only when no task is ready, to the earliest pending deadline. The **virtual wall clock** reads the virtual clock's nanoseconds as the time since the Unix epoch.
 - A run's **seed** is the first 8 bytes, little-endian, of the BLAKE3-256 hash of the 33 bytes of the test's [item hash](29-identity-versioning.md#hashes), the run target's UTF-8 name and the run's index as 8 bytes little-endian.
 - Value n of stream s is the first 8 bytes, little-endian, of the BLAKE3-256 hash of the seed, s and n as 8 bytes little-endian each; stream 0 serves draws, 1 scheduling and 2 random bytes, least significant first. A uniform choice among k ordered options picks position w mod k, w being its stream's next value.
 - A test without parameters runs schedules 0 to 63, each a run of that index, stopping after a run in which no scheduling point found two ready tasks. Case i of a property test is the run of index i.

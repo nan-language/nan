@@ -1,5 +1,5 @@
 //! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the
-//! descriptor names, the virtual timer that paces the kernel, and the vectors the dispatcher of
+//! descriptor names, the virtual timer of each CPU, and the vectors the dispatcher of
 //! `interrupts.rs` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every
 //! exception switches to `SP_EL1`, the CPU's interrupt stack.
 
@@ -231,11 +231,9 @@ const CLASS_SHIFT: i64 = 26;
 const ABORT_CLASS_BITS: i64 = 0x3A;
 const ABORT_CLASS: i64 = 0x20;
 
-/// The virtual timer's private interrupt, which paces the kernel on every CPU and fires a
-/// hundred times a second; the interrupt controller reports a spurious interrupt with an
-/// identifier of at least `SPURIOUS`.
+/// The virtual timer's private interrupt; the interrupt controller reports a spurious interrupt
+/// with an identifier of at least `SPURIOUS`.
 const TIMER_INTID: i64 = 27;
-const TIMER_HZ: u64 = 100;
 const SPURIOUS: i64 = 1020;
 
 pub(super) const VECTORS: Vectors = Vectors {
@@ -282,8 +280,8 @@ const STOP_INTID: u64 = 0;
 const STOP_SGI: u64 = (1 << 40) | (STOP_INTID << 24);
 
 /// The system-register encodings the `ReadSysReg` and `WriteSysReg` stubs hold to reach the GIC
-/// CPU interface, the vector base and the virtual timer, as the `mrs` and `msr` instructions
-/// encode them.
+/// CPU interface, the vector base, the virtual timer and the virtual counter, as the `mrs` and
+/// `msr` instructions encode them.
 const ICC_SRE_EL1: u16 = 0x4665;
 const ICC_PMR_EL1: u16 = 0x4230;
 const ICC_IGRPEN0_EL1: u16 = 0x4666;
@@ -296,12 +294,13 @@ const ICC_SGI0R_EL1: u16 = 0x465F;
 const VBAR_EL1: u16 = 0x4600;
 const CNTV_TVAL_EL0: u16 = 0x5F18;
 const CNTV_CTL_EL0: u16 = 0x5F19;
-const CNTFRQ_EL0: u16 = 0x5F00;
+pub(super) const CNTFRQ_EL0: u16 = 0x5F00;
+pub(super) const CNTVCT_EL0: u16 = 0x5F02;
 
 impl Lowering<'_, '_> {
-    /// Reads a GIC CPU-interface, vector-base or timer system register through the `ReadSysReg`
-    /// stub.
-    fn read_sysreg(&mut self, fx: &mut Fx, register: u16) -> Value {
+    /// Reads a GIC CPU-interface, vector-base, timer or counter system register through the
+    /// `ReadSysReg` stub.
+    pub(super) fn read_sysreg(&mut self, fx: &mut Fx, register: u16) -> Value {
         self.call_stub(fx, Stub::ReadSysReg(register), &[])[0]
     }
 
@@ -399,7 +398,8 @@ impl Lowering<'_, '_> {
     /// table into `VBAR_EL1`. It then wakes its redistributor, puts the stop interrupt in group 0
     /// and its other software-generated and private interrupts in group 1, enables the stop
     /// interrupt, the timer's and the private interrupts in `private`, enables its GIC CPU
-    /// interface at the lowest priority, unmasks fast interrupts and starts its virtual timer.
+    /// interface at the lowest priority, unmasks fast interrupts, and starts and enables its
+    /// virtual timer.
     /// Maskable interrupts stay disabled until the executor enables them.
     fn aarch64_cpu_prepare(&mut self, vbar: FuncId, private: u64) -> FuncId {
         let signature = Signature::new(super::super::CALL_CONV);
@@ -450,28 +450,31 @@ impl Lowering<'_, '_> {
             lo.write_sysreg(fx, ICC_IGRPEN1_EL1, one);
             lo.write_sysreg(fx, ICC_IGRPEN0_EL1, one);
             lo.call_stub(fx, Stub::FiqOn, &[]);
-            lo.aarch64_arm_timer(fx);
+            lo.start_timer(fx);
+            let one = fx.ptr(1);
+            lo.write_sysreg(fx, CNTV_CTL_EL0, one);
             fx.b.ins().return_(&[]);
         });
         id
     }
 
-    /// Arms the virtual timer to fire after a hundredth of a second and enables it.
-    fn aarch64_arm_timer(&mut self, fx: &mut Fx) {
+    /// The ticks the virtual counter counts in a millisecond.
+    pub(super) fn aarch64_timer_rate(&mut self, fx: &mut Fx) -> Value {
         let frequency = self.read_sysreg(fx, CNTFRQ_EL0);
-        let hz = fx.ptr(TIMER_HZ);
-        let period = fx.b.ins().udiv(frequency, hz);
-        self.write_sysreg(fx, CNTV_TVAL_EL0, period);
-        let one = fx.ptr(1);
-        self.write_sysreg(fx, CNTV_CTL_EL0, one);
+        let thousand = fx.ptr(1_000);
+        fx.b.ins().udiv(frequency, thousand)
+    }
+
+    /// Sets the virtual timer to fire once `ticks` of the virtual counter have passed.
+    pub(super) fn aarch64_set_timer(&mut self, fx: &mut Fx, ticks: Value) {
+        self.write_sysreg(fx, CNTV_TVAL_EL0, ticks);
     }
 
     /// The vector of what the seam took, from the kind of exception it passes: for an IRQ the
     /// interrupt the controller signals, which this acknowledges; for a synchronous exception
     /// the abort vector or the other one as its syndrome's class gives, and the SError vector for
     /// an SError interrupt. A fast interrupt is the stop a halting CPU sends, which stops this
-    /// one; a spurious IRQ returns from the dispatcher at once. The virtual timer is one-shot, so
-    /// its interrupt rearms it before any interrupt fn runs.
+    /// one; a spurious IRQ returns from the dispatcher at once.
     pub(super) fn aarch64_vector(&mut self, fx: &mut Fx, kind: Value, saved: Value) -> Value {
         let fiq = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, KIND_FIQ);
         fx.when(fiq, |fx| {
@@ -493,8 +496,6 @@ impl Lowering<'_, '_> {
                     let zero = fx.ptr(0);
                     fx.b.ins().return_(&[zero]);
                 });
-                let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, intid, TIMER_INTID);
-                fx.when(timer, |fx| lo.aarch64_arm_timer(fx));
                 vec![intid]
             },
             |_, fx| {

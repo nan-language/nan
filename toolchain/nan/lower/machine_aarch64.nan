@@ -1,4 +1,4 @@
-//! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the descriptor names, the virtual timer that paces the kernel, and the vectors the dispatcher of `machine_interrupts.nan` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every exception switches to `SP_EL1`, the CPU's interrupt stack.
+//! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the descriptor names, the virtual timer of each CPU, and the vectors the dispatcher of `machine_interrupts.nan` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every exception switches to `SP_EL1`, the CPU's interrupt stack.
 
 /// The EL1 exception vector table and the common seam that follows it. An exception taken from
 /// kernel code enters one of the first four entries on the CPU's interrupt stack, one taken
@@ -64,12 +64,9 @@ const AARCH64_ABORT_CLASS_BITS: i64 = 0x3A
 
 const AARCH64_ABORT_CLASS: i64 = 0x20
 
-/// The virtual timer's private interrupt, which paces the kernel on every CPU and fires a
-/// hundred times a second; the interrupt controller reports a spurious interrupt with an
-/// identifier of at least `AARCH64_SPURIOUS`.
+/// The virtual timer's private interrupt; the interrupt controller reports a spurious interrupt
+/// with an identifier of at least `AARCH64_SPURIOUS`.
 const AARCH64_TIMER_INTID: i64 = 27
-
-const AARCH64_TIMER_HZ: u64 = 100
 
 const AARCH64_SPURIOUS: i64 = 1020
 
@@ -150,14 +147,16 @@ const CNTV_CTL_EL0: u16 = 0x5F19
 
 const CNTFRQ_EL0: u16 = 0x5F00
 
+const CNTVCT_EL0: u16 = 0x5F02
+
 /// What the dispatcher knows of the AArch64 vectors.
 fn aarch64_vectors() -> Vectors = Vectors(stop: None, timer: AARCH64_TIMER_INTID, spurious: None, abort_mask: 1u64 << u32.fit(AARCH64_SERROR_VECTOR), page_fault: AARCH64_ABORT_VECTOR, installable_end: Some(256))
 
 /// The layout of the frame the AArch64 vector seam saves.
 fn aarch64_frame() -> SavedFrame = SavedFrame(code: AARCH64_FRAME_ESR, ip: AARCH64_FRAME_ELR, state: AARCH64_FRAME_SPSR, sp: AARCH64_FRAME_SP)
 
-/// Reads a GIC CPU-interface, vector-base or timer system register through the `ReadSysReg`
-/// stub.
+/// Reads a GIC CPU-interface, vector-base, timer or counter system register through the
+/// `ReadSysReg` stub.
 fn Lowering.read_sysreg(mut self, mut fx: Fx, register: u16) -> clif::Value {
     let results = mut self.call_stub(mut fx, stub: Stub.ReadSysReg(register), args: mem::List[clif::Value].empty(fx.alloc).view())
     expect results.len() > 0
@@ -247,8 +246,8 @@ fn Lowering.aarch64_vector_seam(mut self, dispatch: object::FuncId, preempt: obj
 /// `VBAR_EL1`. It then wakes its redistributor, puts the stop interrupt in group 0 and its other
 /// software-generated and private interrupts in group 1, enables the stop interrupt, the timer's
 /// and the private interrupts in `private`, enables its GIC CPU interface at the lowest priority,
-/// unmasks fast interrupts and starts its virtual timer. Maskable interrupts stay disabled until
-/// the executor enables them.
+/// unmasks fast interrupts, and starts and enables its virtual timer. Maskable interrupts stay
+/// disabled until the executor enables them.
 fn Lowering.aarch64_cpu_prepare(mut self, vbar: object::FuncId, private: u64) -> object::FuncId {
     let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     let id = mut self.module.declare_function("_NScpu_prepare", linkage: object::Linkage.Local, signature)
@@ -295,28 +294,31 @@ fn Lowering.aarch64_cpu_prepare(mut self, vbar: object::FuncId, private: u64) ->
         mut lo1.write_sysreg(mut fx1, register: ICC_IGRPEN1_EL1, value: one)
         mut lo1.write_sysreg(mut fx1, register: ICC_IGRPEN0_EL1, value: one)
         discard mut lo1.call_stub(mut fx1, stub: Stub.FiqOn, args: mem::List[clif::Value].empty(fx1.alloc).view())
-        mut lo1.aarch64_arm_timer(mut fx1)
+        mut lo1.start_timer(mut fx1)
+        let enabled = mut fx1.ptr(1)
+        mut lo1.write_sysreg(mut fx1, register: CNTV_CTL_EL0, value: enabled)
         mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
     })
     return id
 } Lowering.aarch64_cpu_prepare
 
-/// Arms the virtual timer to fire after a hundredth of a second and enables it.
-fn Lowering.aarch64_arm_timer(mut self, mut fx: Fx) {
+/// The ticks the virtual counter counts in a millisecond.
+fn Lowering.aarch64_timer_rate(mut self, mut fx: Fx) -> clif::Value {
     let frequency = mut self.read_sysreg(mut fx, register: CNTFRQ_EL0)
-    let hz = mut fx.ptr(AARCH64_TIMER_HZ)
-    let period = mut fx.b.udiv(frequency, y: hz)
-    mut self.write_sysreg(mut fx, register: CNTV_TVAL_EL0, value: period)
-    let one = mut fx.ptr(1)
-    mut self.write_sysreg(mut fx, register: CNTV_CTL_EL0, value: one)
-} Lowering.aarch64_arm_timer
+    let thousand = mut fx.ptr(1_000)
+    return mut fx.b.udiv(frequency, y: thousand)
+} Lowering.aarch64_timer_rate
+
+/// Sets the virtual timer to fire once `ticks` of the virtual counter have passed.
+fn Lowering.aarch64_set_timer(mut self, mut fx: Fx, ticks: clif::Value) {
+    mut self.write_sysreg(mut fx, register: CNTV_TVAL_EL0, value: ticks)
+} Lowering.aarch64_set_timer
 
 /// The vector of what the seam took, from the kind of exception it passes: for an IRQ the
 /// interrupt the controller signals, which this acknowledges; for a synchronous exception the
 /// abort vector or the other one as its syndrome's class gives, and the SError vector for an
 /// SError interrupt. A fast interrupt is the stop a halting CPU sends, which stops this one; a
-/// spurious IRQ returns from the dispatcher at once. The virtual timer is one-shot, so its
-/// interrupt rearms it before any interrupt fn runs.
+/// spurious IRQ returns from the dispatcher at once.
 fn Lowering.aarch64_vector(mut self, mut fx: Fx, kind: clif::Value, saved: clif::Value) -> clif::Value {
     let fiq = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: AARCH64_KIND_FIQ)
     mut fx.if_true(fiq, then: fn[mut self](mut fx1: Fx) {
@@ -331,10 +333,6 @@ fn Lowering.aarch64_vector(mut self, mut fx: Fx, kind: clif::Value, saved: clif:
         mut fx1.if_true(spurious, then: fn(mut fx2: Fx) {
             let zero_value = mut fx2.ptr(0)
             mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
-        })
-        let timer = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: intid, y: AARCH64_TIMER_INTID)
-        mut fx1.if_true(timer, then: fn[mut lo1](mut fx2: Fx) {
-            mut lo1.aarch64_arm_timer(mut fx2)
         })
         return fx1.list1(intid)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {

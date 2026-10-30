@@ -118,7 +118,7 @@ fn capability(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entry_kind: i64, 
 
 /// Mints the run's world in runtime memory: its address. Its file system has no size limit
 /// and stores through its allocator, whose root cell has none either; its random stream is the
-/// run's.
+/// run's, and its wall clock reads the virtual clock.
 pub fn mint_world(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let world_ty = lo.std_ty("host", "World", Vec::new());
     let layout = lo.layout(&world_ty);
@@ -142,6 +142,7 @@ pub fn mint_world(lo: &mut Lowering, fx: &mut Fx) -> Value {
         ("log", kind::LOG, none),
         ("stdio", kind::STDIO, none),
         ("exec", kind::EXECUTOR, cell),
+        ("wall", kind::WALL, none),
     ];
     let mut handles = Vec::new();
     for (field, entry_kind, sim) in entries {
@@ -250,10 +251,10 @@ pub fn draw(lo: &mut Lowering, fx: &mut Fx, cell: Value, size: Value) -> Value {
     )[0]
 }
 
-/// Waits at a cancellation point for the operation that `enqueue` records in a sim, or in the
-/// virtual clock without a waiter slot, the running task parking until it completes; gives
-/// whether the wait ended by the cancellation of the call. A call cancelled at its start waits
-/// for nothing.
+/// Waits at a cancellation point for the operation that `enqueue` records in a sim, or among the
+/// timers of the virtual clock or a kernel's clock without a waiter slot, the running task
+/// parking until it completes; gives whether the wait ended by the cancellation of the call. A
+/// call cancelled at its start waits for nothing.
 pub fn wait(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -353,14 +354,6 @@ pub fn cancellation_point(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// Writes byte ranges to the test trace as one entry.
 pub fn trace(lo: &mut Lowering, fx: &mut Fx, parts: &[(Value, Value)]) {
     test_image::write_frame(lo, fx, frame::TRACE, parts);
-}
-
-/// `sys::Clock.sleep` on the virtual clock: a timer due `ms` milliseconds from now wakes the
-/// task, or its cancellation fails the call.
-pub fn sleep(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, ms: Value) {
-    let cancelled = wait(lo, fx, None, |lo, fx, op| seeded::arm(lo, fx, op, ms));
-    fx.when(cancelled, |fx| fail_cancelled(lo, fx, supply));
-    supply.done(lo, fx);
 }
 
 /// A new random stream of a seed: its index.

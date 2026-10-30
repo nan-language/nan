@@ -1,0 +1,459 @@
+//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earlier of its next pacing tick and the earliest timer due; and the wall clock source a machine root grant reads once. On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 at `0x0901_0000` on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
+
+/// The nanoseconds between a CPU's pacing ticks.
+const PACING_PERIOD: u64 = 10_000_000
+
+/// The PIT's input clock, the count its channel 2 counts down while the time-stamp counter is
+/// measured, and the nanoseconds that count takes; its ports: channel 2's data port, the mode
+/// port and the system control port, whose bit 0 gates channel 2, bit 1 enables the speaker and
+/// bit 5 reads channel 2's output; and the mode selecting channel 2, both bytes of its count,
+/// its interrupt on terminal count and a binary count.
+const PIT_HZ: u64 = 1_193_182
+
+const PIT_LATCH: u64 = 11_932
+
+const PIT_WINDOW: u64 = PIT_LATCH * 1_000_000_000 / PIT_HZ
+
+const PIT_CHANNEL_2: u64 = 0x42
+
+const PIT_MODE: u64 = 0x43
+
+const SYSTEM_CONTROL: u64 = 0x61
+
+const CHANNEL_2_ONE_SHOT: u64 = 0xB0
+
+const PIT_GATE: i64 = 0x01
+
+const SPEAKER: i64 = 0x02
+
+const CHANNEL_2_OUT: i64 = 0x20
+
+/// The CMOS clock's index and data ports, its registers of seconds, minutes, hours, day of the
+/// month, month and year, and its status registers A, whose bit 7 is set during an update, and
+/// B, whose bit 1 selects 24-hour hours and bit 2 binary values over BCD; and the bit of a
+/// 12-hour hour set after noon.
+const CMOS_INDEX: u64 = 0x70
+
+const CMOS_DATA: u64 = 0x71
+
+const CMOS_FIELDS: Array[u64, 6] = cmos_registers()
+
+const CMOS_STATUS_A: u64 = 0x0A
+
+const CMOS_STATUS_B: u64 = 0x0B
+
+const CMOS_UPDATING: i64 = 0x80
+
+const CMOS_24_HOUR: i64 = 0x02
+
+const CMOS_BINARY: i64 = 0x04
+
+const CMOS_AFTERNOON: i64 = 0x80
+
+/// The PL031 of `aarch64-bare`, whose data register at its base counts the seconds since the
+/// Unix epoch.
+const PL031: u64 = 0x0901_0000
+
+/// The nanoseconds of a second.
+const NS_PER_SECOND: u64 = 1_000_000_000
+
+fn cmos_registers() -> Array[u64, 6] {
+    var fields = Array[u64, 6].filled(0x00)
+    fields[1] = 0x02
+    fields[2] = 0x04
+    fields[3] = 0x07
+    fields[4] = 0x08
+    fields[5] = 0x09
+    return fields
+} cmos_registers
+
+/// What a wall clock source gave: whether it gave a time, and that time in nanoseconds since
+/// the Unix epoch.
+struct WallSource derives Copy {
+    valid: clif::Value
+    now: clif::Value
+} WallSource
+
+/// Starts the clock in `Init`: its counter now is its base, and on x86_64 the time-stamp
+/// counter's rate is measured against the PIT.
+fn Lowering.start_clock(mut self, mut fx: Fx) {
+    let state_address = mut self.state(mut fx)
+    var base = state_address
+    var scale = state_address
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => {
+            let control_port = mut fx.ptr(SYSTEM_CONTROL)
+            let control = mut self.port_in(mut fx, width: 1, port: control_port)
+            let quiet = mut fx.b.band_imm_s(control, y: ~SPEAKER)
+            let gated = mut fx.b.bor_imm_s(quiet, y: PIT_GATE)
+            mut self.port_out(mut fx, width: 1, port: control_port, value: gated)
+            let mode_port = mut fx.ptr(PIT_MODE)
+            let mode = mut fx.ptr(CHANNEL_2_ONE_SHOT)
+            mut self.port_out(mut fx, width: 1, port: mode_port, value: mode)
+            for shift in 0u32..<2 {
+                let data_port = mut fx.ptr(PIT_CHANNEL_2)
+                let byte_value = mut fx.ptr((PIT_LATCH >> (8 * shift)) & 0xFF)
+                mut self.port_out(mut fx, width: 1, port: data_port, value: byte_value)
+            }
+            let started = mut self.call_stub(mut fx, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx.alloc).view())
+            expect started.len() > 0
+            let start = started[0]
+            discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+                let poll_port = mut fx1.ptr(SYSTEM_CONTROL)
+                let polled = mut self.port_in(mut fx1, width: 1, port: poll_port)
+                let out = mut fx1.b.band_imm_s(polled, y: CHANNEL_2_OUT)
+                let low = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: out, y: 0)
+                return Pass(again: low, next: mem::List[clif::Value].empty(fx1.alloc))
+            })
+            let ended = mut self.call_stub(mut fx, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx.alloc).view())
+            expect ended.len() > 0
+            let end = ended[0]
+            let counted = mut fx.b.isub(end, y: start)
+            let one = mut fx.ptr(1)
+            let ticks = mut fx.b.umax(counted, y: one)
+            let window = mut fx.ptr(PIT_WINDOW << 32)
+            base = end
+            scale = mut fx.b.udiv(window, y: ticks)
+        }
+        workspace::Arch.Aarch64 => {
+            let frequency = mut self.read_sysreg(mut fx, register: CNTFRQ_EL0)
+            let second = mut fx.ptr(NS_PER_SECOND << 32)
+            scale = mut fx.b.udiv(second, y: frequency)
+            base = mut self.read_sysreg(mut fx, register: CNTVCT_EL0)
+        }
+    }
+    mut fx.store(base, addr: state_address, offset: STATE_CLOCK_BASE)
+    mut fx.store(scale, addr: state_address, offset: STATE_CLOCK_SCALE)
+} Lowering.start_clock
+
+/// `ClockNow() -> nanoseconds`: the counter's ticks since the base, as nanoseconds, raised to the
+/// latest reading of any CPU when they are fewer.
+fn define_clock_now(mut lo: Lowering, mut fx: Fx) {
+    discard mut fx.entry()
+    let count = mut lo.clock_count(mut fx)
+    let state_address = mut lo.state(mut fx)
+    let base = mut fx.load(PTR, addr: state_address, offset: STATE_CLOCK_BASE)
+    let scale = mut fx.load(PTR, addr: state_address, offset: STATE_CLOCK_SCALE)
+    let before = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: count, y: base)
+    let elapsed = mut fx.b.isub(count, y: base)
+    let zero = mut fx.ptr(0)
+    let ticks = mut fx.b.select(before, x: zero, y: elapsed)
+    let low = mut fx.b.imul(ticks, y: scale)
+    let high = mut fx.b.umulhi(ticks, y: scale)
+    let fraction = mut fx.b.ushr_imm_s(low, y: 32)
+    let whole = mut fx.b.ishl_imm_s(high, y: 32)
+    let read = mut fx.b.bor(whole, y: fraction)
+    let last = mut fx.offset(state_address, offset: STATE_CLOCK_LAST)
+    let now = mut fx.repeat(fx.list1(zero).view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let latest = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: last)
+        let behind = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: read, y: latest)
+        let result = mut fx1.choose(behind, results: fx1.types2(clif::Type.Int8, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let settled = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list2(settled, b: latest)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let seen = mut fx2.b.atomic_cas(clif::MemFlags.owned(), p: last, e: latest, x: read)
+            let raced = mut fx2.b.icmp(clif::IntCC.NotEqual, x: seen, y: latest)
+            return fx2.list2(raced, b: read)
+        })
+        expect result.len() > 1
+        return Pass(again: result[0], next: fx1.list1(result[1]))
+    })
+    expect now.len() > 0
+    mut fx.b.ret(fx.list1(now[0]).view())
+} define_clock_now
+
+/// The clock's counter: the time-stamp counter on x86_64, the virtual counter on AArch64.
+fn Lowering.clock_count(mut self, mut fx: Fx) -> clif::Value {
+    if self.machine_arch() == workspace::Arch.Amd64 {
+        let read = mut self.call_stub(mut fx, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx.alloc).view())
+        expect read.len() > 0
+        return read[0]
+    }
+    return mut self.read_sysreg(mut fx, register: CNTVCT_EL0)
+} Lowering.clock_count
+
+/// Starts the running CPU's timer as it starts taking interrupts: its rate measured on x86_64,
+/// its first pacing tick a period from now.
+fn Lowering.start_timer(mut self, mut fx: Fx) {
+    let rate = match self.machine_arch() {
+        workspace::Arch.Amd64 => mut self.x64_timer_rate(mut fx)
+        workspace::Arch.Aarch64 => mut self.aarch64_timer_rate(mut fx)
+    }
+    let record = mut self.running_cpu(mut fx)
+    mut fx.store(rate, addr: record, offset: CPU_TIMER_RATE)
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let pace = mut fx.b.iadd_imm_s(read[0], y: i64.fit(PACING_PERIOD))
+    mut fx.store(pace, addr: record, offset: CPU_NEXT_PACE)
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    mut self.program_timer(mut fx)
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+} Lowering.start_timer
+
+/// Programs the running CPU's timer to fire at the earlier of its next pacing tick and the
+/// earliest timer due, at once when that has passed. The caller holds the timer lock.
+fn Lowering.program_timer(mut self, mut fx: Fx) {
+    let record = mut self.running_cpu(mut fx)
+    let pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
+    let state_address = mut self.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let targets = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let due = mut fx1.load(PTR, addr: head, offset: OPERATION_DUE)
+        let earlier = mut fx1.b.umin(due, y: pace)
+        return fx1.list1(earlier)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(pace)
+    })
+    let target = targets[0]
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let now = read[0]
+    let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: target, y: now)
+    let remaining = mut fx.b.isub(target, y: now)
+    let zero = mut fx.ptr(0)
+    let delay = mut fx.b.select(ahead, x: remaining, y: zero)
+    let rate = mut fx.load(PTR, addr: record, offset: CPU_TIMER_RATE)
+    let scaled = mut fx.b.imul(delay, y: rate)
+    let per_ms = mut fx.ptr(NS_PER_MS)
+    let counted = mut fx.b.udiv(scaled, y: per_ms)
+    let one = mut fx.ptr(1)
+    let least = mut fx.b.umax(counted, y: one)
+    let most = mut fx.ptr(0xFFFF_FFFF)
+    let ticks = mut fx.b.umin(least, y: most)
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => mut self.x64_set_timer(mut fx, ticks)
+        workspace::Arch.Aarch64 => mut self.aarch64_set_timer(mut fx, ticks)
+    }
+} Lowering.program_timer
+
+/// What the running CPU's timer interrupt does before any interrupt fn runs: the timers due
+/// expire, a pacing tick that has come moves the next a period on, and the timer is programmed
+/// again. Gives whether the interrupt is a pacing tick.
+fn Lowering.timer_interrupt(mut self, mut fx: Fx) -> clif::Value {
+    mut self.expire_timers(mut fx)
+    let record = mut self.running_cpu(mut fx)
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let now = read[0]
+    let pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
+    let pacing = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: now, y: pace)
+    mut fx.if_true(pacing, then: fn(mut fx1: Fx) {
+        let next = mut fx1.b.iadd_imm_s(pace, y: i64.fit(PACING_PERIOD))
+        let late = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: next, y: now)
+        let fresh = mut fx1.b.iadd_imm_s(now, y: i64.fit(PACING_PERIOD))
+        let chosen = mut fx1.b.select(late, x: fresh, y: next)
+        mut fx1.store(chosen, addr: record, offset: CPU_NEXT_PACE)
+    })
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    mut self.program_timer(mut fx)
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return pacing
+} Lowering.timer_interrupt
+
+/// Takes each timer due out of the timers, one at a time under the timer lock, and delivers its
+/// expiry outside it.
+fn Lowering.expire_timers(mut self, mut fx: Fx) {
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let now = read[0]
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let state_address = mut self.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_TIMER_LOCK)
+        discard mut self.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let head = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
+        let armed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        let decided = mut fx1.choose(armed, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let due_at = mut fx2.load(PTR, addr: head, offset: OPERATION_DUE)
+            let passed = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: due_at, y: now)
+            return fx2.list1(passed)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        let due = decided[0]
+        mut fx1.if_true(due, then: fn[mut self](mut fx2: Fx) {
+            disarm(mut self, fx: mut fx2, op: head)
+            claim_timer(mut fx2, op: head)
+        })
+        discard mut self.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        mut fx1.if_true(due, then: fn[mut self](mut fx2: Fx) {
+            let expired = mut fx2.int(clif::Type.Int32, value: TASKS_EXPIRED)
+            deliver(mut self, fx: mut fx2, op: head, result: expired)
+        })
+        return Pass(again: due, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.expire_timers
+
+/// Arms a timer of the clock due `ns` nanoseconds from now; when it is the earliest, the running
+/// CPU's timer is programmed again.
+fn Lowering.kernel_arm(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let due = due_after(mut fx, now: read[0], delay: ns)
+    arm(mut self, mut fx, op, due)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let earliest = mut fx.b.icmp(clif::IntCC.Equal, x: head, y: op)
+    mut fx.if_true(earliest, then: fn[mut self](mut fx1: Fx) {
+        mut self.program_timer(mut fx1)
+    })
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+} Lowering.kernel_arm
+
+/// Cancels a timer of the clock that is armed and has not expired: it leaves the timers and
+/// completes cancelled.
+fn Lowering.kernel_cancel(mut self, mut fx: Fx, op: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let done = mut fx.load(PTR, addr: op, offset: OPERATION_DONE)
+    let pending = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+    let order = mut fx.load(PTR, addr: op, offset: OPERATION_ORDER)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: order, y: 0)
+    let in_flight = mut fx.b.band(pending, y: armed)
+    mut fx.if_true(in_flight, then: fn[mut self](mut fx1: Fx) {
+        disarm(mut self, fx: mut fx1, op)
+        claim_timer(mut fx1, op)
+    })
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    mut fx.if_true(in_flight, then: fn[mut self](mut fx1: Fx) {
+        let cancelled = mut fx1.int(clif::Type.Int32, value: CANCELED)
+        deliver(mut self, fx: mut fx1, op, result: cancelled)
+    })
+} Lowering.kernel_cancel
+
+/// Reads the target's wall clock source.
+fn Lowering.wall_source(mut self, mut fx: Fx) -> WallSource {
+    match self.ck.db().target {
+        workspace::Target.X64Bare => {
+            let valid = mut fx.int(clif::Type.Int8, value: 1)
+            let now = mut self.cmos_time(mut fx)
+            return WallSource(valid: valid, now: now)
+        }
+        workspace::Target.Aarch64Bare => {
+            let address = mut fx.ptr(PL031)
+            let seconds = mut self.mmio_read(mut fx, width: 4, address)
+            let valid = mut fx.int(clif::Type.Int8, value: 1)
+            let now = mut fx.b.imul_imm_s(seconds, y: i64.fit(NS_PER_SECOND))
+            return WallSource(valid: valid, now: now)
+        }
+        else => {
+            let time = firmware_time(mut self, mut fx)
+            let seconds = civil_seconds(mut fx, civil: time.fields)
+            let whole = mut fx.b.imul_imm_s(seconds, y: i64.fit(NS_PER_SECOND))
+            let now = mut fx.b.iadd(whole, y: time.nanoseconds)
+            return WallSource(valid: time.valid, now: now)
+        }
+    }
+} Lowering.wall_source
+
+/// The CMOS clock's time in nanoseconds since the Unix epoch, read once no update runs, its year
+/// in the century from 2000.
+fn Lowering.cmos_time(mut self, mut fx: Fx) -> clif::Value {
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let status = mut self.cmos(mut fx1, register: CMOS_STATUS_A)
+        let updating = mut fx1.b.band_imm_s(status, y: CMOS_UPDATING)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: updating, y: 0)
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let earliest_field = mut self.cmos(mut fx, register: CMOS_FIELDS[0])
+    var raw = Array[clif::Value, 6].filled(earliest_field)
+    for index in 1usize..<6 {
+        raw[index] = mut self.cmos(mut fx, register: CMOS_FIELDS[index])
+    }
+    let format = mut self.cmos(mut fx, register: CMOS_STATUS_B)
+    let binary_bit = mut fx.b.band_imm_s(format, y: CMOS_BINARY)
+    let binary = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: binary_bit, y: 0)
+    let afternoon_bit = mut fx.b.band_imm_s(raw[2], y: CMOS_AFTERNOON)
+    let afternoon = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: afternoon_bit, y: 0)
+    var fields = raw
+    for index in 0usize..<6 {
+        let value = if index == 2 {
+            mut fx.b.band_imm_s(raw[index], y: ~CMOS_AFTERNOON)
+        } else {
+            raw[index]
+        }
+        let low = mut fx.b.band_imm_s(value, y: 0x0F)
+        let high = mut fx.b.ushr_imm_s(value, y: 4)
+        let tens = mut fx.b.imul_imm_s(high, y: 10)
+        let from_bcd = mut fx.b.iadd(low, y: tens)
+        fields[index] = mut fx.b.select(binary, x: value, y: from_bcd)
+    }
+    let hours = mut fx.b.band_imm_s(format, y: CMOS_24_HOUR)
+    let twelve = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: hours, y: 0)
+    let noon = mut fx.ptr(12)
+    let hour = mut fx.b.urem(fields[2], y: noon)
+    let later = mut fx.b.iadd_imm_s(hour, y: 12)
+    let clock_hour = mut fx.b.select(afternoon, x: later, y: hour)
+    fields[2] = mut fx.b.select(twelve, x: clock_hour, y: fields[2])
+    fields[5] = mut fx.b.iadd_imm_s(fields[5], y: 2000)
+    var civil = Array[clif::Value, 6].filled(fields[5])
+    civil[1] = fields[4]
+    civil[2] = fields[3]
+    civil[3] = fields[2]
+    civil[4] = fields[1]
+    civil[5] = fields[0]
+    let seconds = civil_seconds(mut fx, civil)
+    return mut fx.b.imul_imm_s(seconds, y: i64.fit(NS_PER_SECOND))
+} Lowering.cmos_time
+
+/// A register of the CMOS clock.
+fn Lowering.cmos(mut self, mut fx: Fx, register: u64) -> clif::Value {
+    let index = mut fx.ptr(CMOS_INDEX)
+    let selected = mut fx.ptr(register)
+    mut self.port_out(mut fx, width: 1, port: index, value: selected)
+    let data = mut fx.ptr(CMOS_DATA)
+    return mut self.port_in(mut fx, width: 1, port: data)
+} Lowering.cmos
+
+/// Marks a timer taken out of the timers as completed, so no other CPU delivers it.
+fn claim_timer(mut fx: Fx, op: clif::Value) {
+    let completed = mut fx.ptr(u64.fit(OPERATION_COMPLETED))
+    mut fx.store(completed, addr: op, offset: OPERATION_DONE)
+} claim_timer
+
+/// The seconds since the Unix epoch of a time from 2000 on: its year, month, day, hour, minute
+/// and second, counting days as the proleptic Gregorian calendar does.
+fn civil_seconds(mut fx: Fx, civil: Array[clif::Value, 6]) -> clif::Value {
+    let month = civil[1]
+    let early = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: month, y: 2)
+    let borrow = mut fx.b.uextend(PTR, x: early)
+    let year = mut fx.b.isub(civil[0], y: borrow)
+    let era_length = mut fx.ptr(400)
+    let era = mut fx.b.udiv(year, y: era_length)
+    let start = mut fx.b.imul_imm_s(era, y: 400)
+    let of_era = mut fx.b.isub(year, y: start)
+    let shifted = mut fx.b.iadd_imm_s(month, y: -3)
+    let wrapped = mut fx.b.iadd_imm_s(month, y: 9)
+    let march_based = mut fx.b.select(early, x: wrapped, y: shifted)
+    let spread = mut fx.b.imul_imm_s(march_based, y: 153)
+    let rounded = mut fx.b.iadd_imm_s(spread, y: 2)
+    let five = mut fx.ptr(5)
+    let month_days = mut fx.b.udiv(rounded, y: five)
+    let through = mut fx.b.iadd(month_days, y: civil[2])
+    let of_year = mut fx.b.iadd_imm_s(through, y: -1)
+    let years = mut fx.b.imul_imm_s(of_era, y: 365)
+    let four = mut fx.ptr(4)
+    let leap = mut fx.b.udiv(of_era, y: four)
+    let hundred = mut fx.ptr(100)
+    let centuries = mut fx.b.udiv(of_era, y: hundred)
+    let with_leap = mut fx.b.iadd(years, y: leap)
+    let in_era = mut fx.b.isub(with_leap, y: centuries)
+    let of_days = mut fx.b.iadd(in_era, y: of_year)
+    let eras = mut fx.b.imul_imm_s(era, y: 146_097)
+    let total = mut fx.b.iadd(eras, y: of_days)
+    let days = mut fx.b.iadd_imm_s(total, y: -719_468)
+    let day_seconds = mut fx.b.imul_imm_s(days, y: 86_400)
+    let hours = mut fx.b.imul_imm_s(civil[3], y: 3_600)
+    let minutes = mut fx.b.imul_imm_s(civil[4], y: 60)
+    let with_hours = mut fx.b.iadd(day_seconds, y: hours)
+    let with_minutes = mut fx.b.iadd(with_hours, y: minutes)
+    return mut fx.b.iadd(with_minutes, y: civil[5])
+} civil_seconds

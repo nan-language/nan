@@ -259,13 +259,15 @@ pub open view struct Cx[M: Any and Send] {
 pub fn Cx.send(mut self, take message: M)
 
 pub fn Cx.after(mut self, ms: u64, take send: M)
+
+pub fn Cx.after_ns(mut self, ns: u64, take send: M)
 ```
 
 - `sys::Cx[M]` is a base type: a [view](05-properties.md#views), and never linear, Copy, Send, Inert or AnyBits. Only the runner creates one, for one call of `on`; `start` receives none.
 - `mut cx.send(m)` appends `m` to the intake.
-- `mut cx.after(ms: n, send: m)` appends `m` to the intake as soon as at least `n` milliseconds have elapsed since the call, so at once when `n` is 0. The milliseconds are those that `sys::Clock.elapsed_ms` counts for the clock that the runner's executor records ([capability tables](14-authority.md#capability-tables)); on the [seeded scheduler](22-testing.md#seeded-scheduler) the end of the delay is a pending deadline of the virtual clock. Messages whose delays end at the same time enter in the order of their `after` calls.
-- The operations of a component context never wait. `send` and `after` draw the message's intake entry through the runner's allocator, and trap when it is exhausted (`trap.exhausted`); the entry is released when the message leaves the intake.
-- When the intake stops, every message still delayed by `after` is released, and a later `send` or `after` releases its message.
+- `mut cx.after_ns(ns: n, send: m)` appends `m` to the intake as soon as at least `n` nanoseconds have elapsed since the call, so at once when `n` is 0, and `mut cx.after(ms: n, send: m)` does so after `n` milliseconds. The nanoseconds are those that `sys::Clock.elapsed_ns` counts for the clock that the runner's executor records, and the delay ends only once they are a multiple of the executor's resolution ([executors](16-concurrency.md#executors)) ([capability tables](14-authority.md#capability-tables)); on the [seeded scheduler](22-testing.md#seeded-scheduler) the end of the delay is a pending deadline of the virtual clock. Messages whose delays end at the same time enter in the order of their `after` and `after_ns` calls.
+- The operations of a component context never wait. `send`, `after` and `after_ns` draw the message's intake entry through the runner's allocator, and trap when it is exhausted (`trap.exhausted`); the entry is released when the message leaves the intake.
+- When the intake stops, every message still delayed by `after` or `after_ns` is released, and a later `send`, `after` or `after_ns` releases its message.
 
 ```nan
 pub closed struct Env {

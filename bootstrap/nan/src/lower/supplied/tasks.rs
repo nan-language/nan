@@ -10,7 +10,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{entry, live_entry};
+use super::super::runtime::tables::{self, entry, live_entry};
 use super::super::runtime::{Routine, tasks};
 use super::super::{CALL_CONV, Lowering};
 use super::Supply;
@@ -24,10 +24,16 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         .rsplit_once('.')
         .map_or(supply.path.as_str(), |(owner, _)| owner);
     match owner {
-        "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::race" => {
-            scopes::lower(lo, fx, supply)
-        }
+        "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::within_ns"
+        | "task::race" => scopes::lower(lo, fx, supply),
         "task::Cown" => cowns::lower(lo, fx, supply),
+        "task::Executor" => super::sys::coarse(
+            lo,
+            fx,
+            supply,
+            tables::kind::EXECUTOR,
+            tables::EXECUTOR_RESOLUTION,
+        ),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
         "sys::Domain" | "sys::Trap" => domains::lower(lo, fx, supply),
         "host::Runner" | "sys::Cx" | "sys::Outbox" => components::lower(lo, fx, supply),

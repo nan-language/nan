@@ -14,7 +14,7 @@ use super::super::super::call::adapt_value;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::regions::{self, region};
 use super::super::super::runtime::tasks::{self, flag, kind, operation, task};
-use super::super::super::runtime::{Routine, report, tables};
+use super::super::super::runtime::{Routine, report, tables, timers};
 use super::super::super::{Glue, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
@@ -47,7 +47,7 @@ mod race {
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
         "task::scope" => scope_call(lo, fx, supply),
-        "task::within" => within(lo, fx, supply),
+        "task::within" | "task::within_ns" => within(lo, fx, supply),
         "task::race" => race_call(lo, fx, supply),
         "task::Scope.cancel" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -739,12 +739,15 @@ pub fn release_join(lo: &mut Lowering, fx: &mut Fx, address: Value, result: &Ty)
     });
 }
 
-/// `task::within(clock, ms, body: b)`: runs `b` in a region that a deadline cancels; `None`
-/// when `b` fails with a cancellation of that region.
+/// `task::within(clock, ms, body: b)` and `task::within_ns(clock, ns, body: b)`: runs `b` in a
+/// region that a deadline cancels; `None` when `b` fails with a cancellation of that region.
 fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let body_ty = fn_param(supply, 2);
     let clock = fx.load(PTR, supply.param(0).address(), 0);
-    let ms = supply.param(1).scalar();
+    let ns = match supply.path.as_str() {
+        "task::within" => timers::from_ms(fx, supply.param(1).scalar()),
+        _ => supply.param(1).scalar(),
+    };
     let size = fx.ptr(region::SIZE);
     let record = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
     let timer = fx.slot(tables::deadline::SIZE, 8);
@@ -760,7 +763,9 @@ fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         live,
         &[],
         |lo, fx| {
-            arm_deadline(lo, fx, timer, ms);
+            let record = tables::entry_at(lo, fx, clock);
+            let delay = super::super::sys::clock_delay(lo, fx, record, ns);
+            arm_deadline(lo, fx, timer, delay);
             Vec::new()
         },
         |lo, fx| {
@@ -821,15 +826,15 @@ fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, held);
 }
 
-/// Arms a deadline's timer of `ms` milliseconds, whose expiry cancels its region, first among
+/// Arms a deadline's timer of `ns` nanoseconds, whose expiry cancels its region, first among
 /// the deadlines the running task armed.
-fn arm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value, ms: Value) {
+fn arm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value, ns: Value) {
     let current = tasks::current_task(lo, fx);
     let armed = fx.load(PTR, current, task::DEADLINES);
     fx.store(armed, timer, operation::LINK);
     fx.store(timer, current, task::DEADLINES);
     let spec = fx.offset(timer, operation::SIZE);
-    lo.arm_timer(fx, timer, ms, spec);
+    lo.arm_timer(fx, timer, ns, spec);
 }
 
 /// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it

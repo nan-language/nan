@@ -23,7 +23,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
-- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -76,13 +76,13 @@ The table names every pub std type, interface, free function and registry with t
 | `text` | `text::construction::Codec` | [Construction text](13-text-encode.md#construction-text) |
 | `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` and `spawn_sized` in [Joins](16-concurrency.md#joins) |
 | `task` | `task::Join` | [Joins](16-concurrency.md#joins) |
-| `task` | `task::within`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
+| `task` | `task::within`, `task::within_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
 | `task` | `task::Cown`, `task::Poisoned` | [Cowns](16-concurrency.md#cowns), [Poisoned cowns](16-concurrency.md#poisoned-cowns) |
 | `task` | `task::Channel`, `task::Sender`, `task::Receiver`, `task::SendError` | [Channels](16-concurrency.md#channels) |
 | `task` | `task::Executor` | [Executors](16-concurrency.md#executors) |
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
-| `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
+| `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Domain`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
 | `sys` | `sys::Component` | [Components](26-components.md#components) |
@@ -282,7 +282,7 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 ## Std authority
 
-The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn` and `sys::Revoker[C]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]` and `hw::IrqShared[T]` ([kernel types](24-kernel.md#kernel-types)). The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
+The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn` and `sys::Revoker[C]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]` and `hw::IrqShared[T]` ([kernel types](24-kernel.md#kernel-types)). The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
 
 The [authority summary](14-authority.md#authority-summaries) of each std package, published in its artefact, holds only entries of its row. "Trusted code" covers trusted blocks and expressions and `assume`; "decoders" are the decoders that the package's types derive.
 
@@ -294,7 +294,7 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `task` | `task::Executor`, `sys::Clock` | `alloc` | none | trusted code |
 | `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
-| `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
+| `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `host` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
 | `testing` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | trusted code |
 | platform packages | every primitive capability | `alloc`, `device`, `priv` | none | trusted code, foreign fns, landing fns, its `priv` grant |
@@ -432,7 +432,7 @@ Std names follow the [naming conventions](03-packages-modules.md#naming-conventi
 - A `mut` projection beside a read one adds the suffix `_mut` (`at_mut`, `view_mut`, `get_by_mut`). A function taking a function that orders or selects elements adds the suffix `_by` (`sort_by`, `get_by`). The consuming form of a read projection adds the prefix `into_` (`into_cursor`, `into_contents`).
 - An error enum is named after its subject followed by `Error` (`FsError`, `NetError`, `DecodeError`). A failure type of one condition is named after that condition (`mem::OutOfMemory`, `sys::Revoked`, `task::Cancelled`, `task::Poisoned`), and a function whose only failure is that condition fails with that type directly.
 - A variant of a std error enum holding `task::Cancelled` is `Cancelled(task::Cancelled) from`, and one holding `sys::Revoked` is `Revoked(sys::Revoked) from`.
-- A duration is a `u64` count of milliseconds whose name ends in `ms` (`ms`, `elapsed_ms`).
+- A duration or time is a `u64` count of milliseconds whose name ends in `ms` (`ms`, `elapsed_ms`) or of nanoseconds whose name ends in `ns` (`ns`, `elapsed_ns`, `now_ns`).
 
 ```nan
 pub fn record_all(mut history: mem::List[u32], values: Slice[u32]) fails mem::OutOfMemory {

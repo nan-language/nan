@@ -254,7 +254,7 @@ pub closed struct Journal {
 
 ### Origin and absorption
 
-A **cancelling construct** is a task scope ([task scopes](16-concurrency.md#task-scopes)), a `task::within` or `task::race` call ([deadlines and races](16-concurrency.md#deadlines-and-races)), or a runtime action that cancels tasks: a termination request ([host runs](27-program-model.md#host-runs)) or the cancellation of a [keyed task](26-components.md#keyed-tasks). Its **region**, stated where it is defined, is a set of tasks and bodies, and holds every task of the task scopes, races and domains opened within it.
+A **cancelling construct** is a task scope ([task scopes](16-concurrency.md#task-scopes)), a `task::within`, `task::within_ns` or `task::race` call ([deadlines and races](16-concurrency.md#deadlines-and-races)), or a runtime action that cancels tasks: a termination request ([host runs](27-program-model.md#host-runs)) or the cancellation of a [keyed task](26-components.md#keyed-tasks). Its **region**, stated where it is defined, is a set of tasks and bodies, and holds every task of the task scopes, races and domains opened within it.
 
 - Each `task::Cancelled` value records its **origin**, which only the runtime reads: the outermost cancelling construct that has cancelled and whose region holds the call that fails with it, or none when no such construct exists, as for a cancellation through a stale executor ([revocation](14-authority.md#revocation)); a cancellation without an origin passes through every construct.
 - A cancellation reaching its origin, as the failure of a task or body in its region, is **absorbed**: the origin does not pass it on and completes as its definition gives for cancellation.

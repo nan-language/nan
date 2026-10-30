@@ -1,4 +1,4 @@
-//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. An outbox's state is its runner's record, its key and whether it is a keyed task's. A `Clock` entry also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers.
+//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records and its resolution in nanoseconds, zero standing for one. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution.
 
 /// The capability table's capacity.
 const TABLES_ENTRIES: u64 = 65_536
@@ -47,6 +47,14 @@ const TABLES_KIND_EXECUTOR: i64 = 7
 
 const TABLES_KIND_OUTBOX: i64 = 8
 
+const TABLES_KIND_WALL: i64 = 9
+
+/// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
+/// executor's entry.
+const TABLES_RESOLUTION: u64 = TABLES_ENTRY_STATE + 8
+
+const TABLES_EXECUTOR_RESOLUTION: u64 = TABLES_ENTRY_STATE + 16
+
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100
 
@@ -59,19 +67,21 @@ enum RootCapability derives Copy, Eq {
     Log
     Stdio
     Exec
+    Wall
 } RootCapability
 
 /// The capabilities of the root grant, in the order their entries are minted.
-const ROOT_CAPABILITIES: Array[RootCapability, 7] = minted_capabilities()
+const ROOT_CAPABILITIES: Array[RootCapability, 8] = minted_capabilities()
 
-fn minted_capabilities() -> Array[RootCapability, 7] {
-    var listed = Array[RootCapability, 7].filled(RootCapability.Fs)
+fn minted_capabilities() -> Array[RootCapability, 8] {
+    var listed = Array[RootCapability, 8].filled(RootCapability.Fs)
     listed[1] = RootCapability.Net
     listed[2] = RootCapability.Clock
     listed[3] = RootCapability.Random
     listed[4] = RootCapability.Log
     listed[5] = RootCapability.Stdio
     listed[6] = RootCapability.Exec
+    listed[7] = RootCapability.Wall
     return listed
 } minted_capabilities
 
@@ -85,6 +95,7 @@ proj fn RootCapability.field(self) -> Str {
         RootCapability.Log => "log"
         RootCapability.Stdio => "stdio"
         RootCapability.Exec => "exec"
+        RootCapability.Wall => "wall"
     }
 } RootCapability.field
 
@@ -98,6 +109,7 @@ fn RootCapability.kind(self) -> i64 {
         RootCapability.Log => TABLES_KIND_LOG
         RootCapability.Stdio => TABLES_KIND_STDIO
         RootCapability.Exec => TABLES_KIND_EXECUTOR
+        RootCapability.Wall => TABLES_KIND_WALL
     }
 } RootCapability.kind
 
@@ -469,12 +481,10 @@ fn tables_mint_root(mut lo: Lowering, mut fx: Fx, world: clif::Value) {
         return
     }
     let world_ty = lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(lo.alloc))
-    let state_address = mut lo.state(mut fx)
     let limit = mut fx.int(PTR, value: -1)
     let parent = mut fx.int(PTR, value: -1)
     let cell = new_cell(mut lo, mut fx, limit, parent)
-    let now = mut lo.call_platform_now(mut fx)
-    mut fx.store(now, addr: state_address, offset: STATE_MINTED)
+    let now = mut lo.now_ns(mut fx)
     var handles = mem::List[MintedEntry].empty(fx.alloc)
     for capability in ROOT_CAPABILITIES {
         let kind_value = mut fx.ptr(u64.fit(capability.kind()))
@@ -497,22 +507,44 @@ fn tables_mint_root(mut lo: Lowering, mut fx: Fx, world: clif::Value) {
 } tables_mint_root
 
 /// A machine target's root grant: a root cell without a limit, whose supply is the boot heap,
-/// made the process domain's, and an executor drawing through it that records no clock; its
-/// regions and `hw::Ring0` are not yet taken.
+/// made the process domain's; an executor drawing through it that records the kernel's clock, a
+/// `Clock` entry minted now; a `WallClock` entry when the target's wall clock source gives a
+/// time, its field all ones otherwise; its regions and `hw::Ring0` are not yet taken.
 fn mint_machine_root(mut lo: Lowering, mut fx: Fx, grant: clif::Value) {
     let grant_ty = lo.root_grant()
     let unlimited = mut fx.int(PTR, value: -1)
     let cell = new_cell(mut lo, mut fx, limit: unlimited, parent: unlimited)
+    let clock_kind = mut fx.ptr(u64.fit(TABLES_KIND_CLOCK))
+    let clock = tables_new_entry(mut lo, mut fx, kind: clock_kind)
+    let now = mut lo.now_ns(mut fx)
+    let clock_record = entry_at(mut lo, mut fx, handle: clock)
+    mut fx.store(now, addr: clock_record, offset: TABLES_ENTRY_STATE)
     let executor = mut fx.ptr(u64.fit(TABLES_KIND_EXECUTOR))
     let exec = tables_new_entry(mut lo, mut fx, kind: executor)
     let record = entry_at(mut lo, mut fx, handle: exec)
     mut fx.store(cell, addr: record, offset: TABLES_ENTRY_STATE)
-    let zero = mut fx.ptr(0)
-    mut fx.store(zero, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    mut fx.store(clock, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    let source = mut lo.wall_source(mut fx)
+    let walls = mut fx.choose_in(mut lo, condition: source.valid, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let wall_kind = mut fx1.ptr(u64.fit(TABLES_KIND_WALL))
+        let wall = tables_new_entry(mut lo1, fx: mut fx1, kind: wall_kind)
+        let wall_record = entry_at(mut lo1, fx: mut fx1, handle: wall)
+        let ahead = mut fx1.b.isub(source.now, y: now)
+        mut fx1.store(ahead, addr: wall_record, offset: TABLES_ENTRY_STATE)
+        return fx1.list1(wall)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(PTR, value: -1)
+        return fx1.list1(none)
+    })
+    let wall = walls[0]
     let alloc_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "alloc")
     mut fx.store(cell, addr: grant, offset: alloc_field.offset)
     let exec_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "exec")
     mut fx.store(exec, addr: grant, offset: exec_field.offset)
+    let clock_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "clock")
+    mut fx.store(clock, addr: grant, offset: clock_field.offset)
+    let wall_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "wall")
+    mut fx.store(wall, addr: grant, offset: wall_field.offset)
     let untaken = mut fx.int(clif::Type.Int8, value: 0)
     let regions_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "regions")
     mut fx.store(untaken, addr: grant, offset: regions_field.offset)
@@ -562,12 +594,6 @@ fn mint(mut lo: Lowering, mut fx: Fx, kind: clif::Value) -> clif::Value {
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
     return handle
 } mint
-
-/// The milliseconds of the monotonic clock, from the host platform.
-fn Lowering.call_platform_now(mut self, mut fx: Fx) -> clif::Value {
-    let called = mut self.platform_call(mut fx, name: "now_ms", args: mem::List[Held].empty(fx.alloc).view())
-    return called.result.scalar_value()
-} Lowering.call_platform_now
 
 /// Calls the function of the host platform package named `name` with values held as it takes
 /// them.

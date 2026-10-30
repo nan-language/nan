@@ -11,7 +11,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 23] = [
+const DRAWING: [&str; 24] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "text::json::Codec.decode",
@@ -24,6 +24,7 @@ const DRAWING: [&str; 23] = [
     "sys::Domain.run_sized",
     "sys::Cx.send",
     "sys::Cx.after",
+    "sys::Cx.after_ns",
     "sys::Cx.spawn",
     "sys::sim::fs",
     "sys::sim::stdio",
@@ -43,7 +44,7 @@ const FAILING_DRAWS: [&str; 1] = ["boot::Services.read_file"];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows, and exhausted capability tables and cells.
-const TRAPPING: [&str; 17] = [
+const TRAPPING: [&str; 20] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -51,10 +52,13 @@ const TRAPPING: [&str; 17] = [
     "mem::Pool.remove",
     "text::Interner.resolve",
     "task::Join.join",
+    "task::Executor.coarse",
     "sys::revocable",
     "sys::Fs.subdir",
     "sys::Fs.read_only",
     "sys::Net.only_host",
+    "sys::Clock.coarse",
+    "sys::WallClock.coarse",
     "sys::sim::net",
     "sys::sim::random",
     "hw::sim::Registers.mmio",

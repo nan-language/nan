@@ -211,6 +211,149 @@ fn append_decimal(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, val
     render_append(mut lo, mut fx, renderer_value, text: start, len)
 } append_decimal
 
+/// Appends the uppercase hexadecimal digits of an unsigned 64-bit value, without leading zeros.
+fn append_hex(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, value: clif::Value) {
+    let digits = mut fx.slot(16, align: 8)
+    let end = mut fx.ptr(16)
+    let initial = fx.list2(value, b: end)
+    let state = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let remaining = current[0]
+        let position = current[1]
+        let nibble = mut fx1.b.band_imm_s(remaining, y: 0xF)
+        let letter = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: nibble, y: 10)
+        let digit = mut fx1.b.iadd_imm_s(nibble, y: i64.widen(b'0'))
+        let upper = mut fx1.b.iadd_imm_s(nibble, y: i64.widen(b'A') - 10)
+        let chosen = mut fx1.b.select(letter, x: upper, y: digit)
+        let ascii = mut fx1.b.ireduce(clif::Type.Int8, x: chosen)
+        let at = mut fx1.b.iadd_imm_s(position, y: -1)
+        let place = mut fx1.b.iadd(digits, y: at)
+        mut fx1.store(ascii, addr: place, offset: 0)
+        let rest = mut fx1.b.ushr_imm_s(remaining, y: 4)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
+        return Pass(again: more, next: fx1.list2(rest, b: at))
+    })
+    expect state.len() == 2
+    let start = mut fx.b.iadd(digits, y: state[1])
+    let len = mut fx.b.isub(end, y: state[1])
+    render_append(mut lo, mut fx, renderer_value, text: start, len)
+} append_hex
+
+/// Whether a scalar value is a rejected code point.
+fn rejected(mut lo: Lowering, mut fx: Fx, scalar: clif::Value) -> clif::Value {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+    let ranges = syntax::rejected_ranges(grammar: lo.ck.grammar(), alloc: lo.alloc)
+    let function = mut lo.glue_function(Glue.Rejected, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        var found = mut fx1.int(clif::Type.Int8, value: 0)
+        for range in ranges {
+            let above = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: params[0], y: i64.widen(range.low))
+            let below = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: params[0], y: i64.widen(range.high))
+            let inside = mut fx1.b.band(above, y: below)
+            found = mut fx1.b.bor(found, y: inside)
+        }
+        let returned = fx1.list1(found)
+        mut fx1.b.ret(returned.view())
+    })
+    let reference = mut lo.func_ref(mut fx, id: function)
+    let call_args = fx.list1(scalar)
+    let call = mut fx.b.call(reference, args: call_args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 1
+    return results[0]
+} rejected
+
+/// Appends UTF-8 text as a char or text literal of a quote: `\`, the quote and the named
+/// escapes escaped, every other rejected code point written `\u{H}`.
+fn append_literal(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, start: clif::Value, len: clif::Value, quote: u8) {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let function = mut lo.glue_function(Glue.RenderLiteral(quote), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        literal_render_glue(mut lo1, fx: mut fx1, quote)
+    })
+    let reference = mut lo.func_ref(mut fx, id: function)
+    let call_args = fx.list3(renderer_value, b: start, c: len)
+    discard mut fx.b.call(reference, args: call_args.view())
+} append_literal
+
+/// The body of the function appending text as a literal of a quote: receives the renderer, the
+/// text's start and its length.
+fn literal_render_glue(mut lo: Lowering, mut fx: Fx, quote: u8) {
+    let params = mut fx.entry()
+    expect params.len() == 3
+    let renderer_value = params[0]
+    let start = params[1]
+    let len = params[2]
+    var quoted = text::String.empty(lo.alloc)
+    mut quoted.push(char.checked_from_bits(u32.widen(quote)).value_or('"'))
+    render_append_text(mut lo, mut fx, renderer_value, text: quoted.as_str())
+    let zero = mut fx.ptr(0)
+    let initial = fx.list1(zero)
+    discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let at = current[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: at, y: len)
+        let results = fx1.types1(PTR)
+        let next = mut fx1.choose_in(mut lo, condition: inside, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let advanced = literal_render_char(mut lo2, fx: mut fx2, renderer_value, start, at, quote, quoted: quoted.as_str())
+            return fx2.list1(advanced)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(at)
+        })
+        expect next.len() == 1
+        return Pass(again: inside, next: fx1.list1(next[0]))
+    })
+    render_append_text(mut lo, mut fx, renderer_value, text: quoted.as_str())
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} literal_render_glue
+
+/// Appends the char of text at `at` past `start` to a literal of a quote, escaped as it needs:
+/// the position past it.
+fn literal_render_char(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, start: clif::Value, at: clif::Value, quote: u8, quoted: Str) -> clif::Value {
+    let place = mut fx.b.iadd(start, y: at)
+    let loaded = mut fx.load(clif::Type.Int8, addr: place, offset: 0)
+    let lead = mut fx.b.uextend(PTR, x: loaded)
+    let decoded = decode_utf8(mut fx, place, head: lead)
+    var quote_escape = text::String.of("\\", alloc: lo.alloc)
+    mut quote_escape.append(quoted)
+    var handled = mut fx.int(clif::Type.Int8, value: 0)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: b'\\', escaped: "\\\\", handled)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: quote, escaped: quote_escape.as_str(), handled)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: b'\n', escaped: "\\n", handled)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: b'\r', escaped: "\\r", handled)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: b'\t', escaped: "\\t", handled)
+    handled = literal_escape_point(mut lo, mut fx, renderer_value, scalar: decoded.point, point: 0, escaped: "\\0", handled)
+    let outside = rejected(mut lo, mut fx, scalar: decoded.point)
+    let plain = mut fx.b.bxor_imm_s(handled, y: 1)
+    let escaped = mut fx.b.band(outside, y: plain)
+    mut fx.if_true(escaped, then: fn[mut lo](mut fx1: Fx) {
+        render_append_text(mut lo, fx: mut fx1, renderer_value, text: "\\u{")
+        append_hex(mut lo, fx: mut fx1, renderer_value, value: decoded.point)
+        render_append_text(mut lo, fx: mut fx1, renderer_value, text: "}")
+    })
+    let written = mut fx.b.bor(handled, y: outside)
+    let raw = mut fx.b.bxor_imm_s(written, y: 1)
+    mut fx.if_true(raw, then: fn[mut lo](mut fx1: Fx) {
+        render_append(mut lo, fx: mut fx1, renderer_value, text: place, len: decoded.len)
+    })
+    return mut fx.b.iadd(at, y: decoded.len)
+} literal_render_char
+
+/// Appends `escaped` when the scalar value is `point`: whether a char was handled, `handled` or
+/// this test.
+fn literal_escape_point(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, scalar: clif::Value, point: u8, escaped: Str, handled: clif::Value) -> clif::Value {
+    let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: scalar, y: i64.widen(point))
+    mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+        render_append_text(mut lo, fx: mut fx1, renderer_value, text: escaped)
+    })
+    return mut fx.b.bor(handled, y: is)
+} literal_escape_point
+
 /// Appends the UTF-8 encoding of a char.
 fn append_char(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, c: clif::Value) {
     let buffer = mut fx.slot(4, align: 4)
@@ -304,6 +447,11 @@ fn render_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             append_char(mut lo, mut fx, renderer_value, c)
             supply.done(mut lo, mut fx)
         }
+        "write_nested" => {
+            let nested_ty = supply.type_arg(lo, index: 0)
+            render_nested(mut lo, mut fx, ty: nested_ty, value: supply.param(1), renderer_value)
+            supply.done(mut lo, mut fx)
+        }
         "remaining" or "is_elided" => {
             let state = mut fx.load(PTR, addr: renderer_value, offset: 0)
             let budget = mut fx.load(PTR, addr: state, offset: RENDERER_BUDGET)
@@ -357,22 +505,11 @@ fn render_to(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held, renderer_val
 fn render_item(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, args: ty::Args, value: Held, renderer_value: clif::Value) {
     let path = lo.ck.db().canonical(item)
     match path.as_str() {
-        "core::Str" or "text::String" => {
-            let address = value.address_value()
-            let start = mut fx.load(PTR, addr: address, offset: 0)
-            let len = mut fx.load(PTR, addr: address, offset: 8)
-            render_append(mut lo, mut fx, renderer_value, text: start, len)
+        "core::Str" or "text::String" or "text::Fixed" => {
+            let parts = text_parts(mut lo, mut fx, ty, value)
+            render_append(mut lo, mut fx, renderer_value, text: parts.start, len: parts.len)
         }
-        "text::Fixed" => {
-            let address = value.address_value()
-            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
-            let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
-            let len_at = len_field.offset
-            let bytes_at = bytes_field.offset
-            let len = mut fx.load(PTR, addr: address, offset: len_at)
-            let start = mut fx.offset(address, offset: bytes_at)
-            render_append(mut lo, mut fx, renderer_value, text: start, len)
-        }
+        "core::Untrusted" => render_append_text(mut lo, mut fx, renderer_value, text: "<untrusted>")
         "core::Slice" or "core::SliceMut" or "mem::List" or "mem::Set" => {
             let element = arg_type(lo, args, index: 0)
             let address = value.address_value()
@@ -414,15 +551,65 @@ fn render_item(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, args:
         }
         "mem::Box" or "mem::Shared" => {
             let inner = arg_type(lo, args, index: 0)
-            let address = value.address_value()
-            let first_word = mut fx.load(PTR, addr: address, offset: 0)
-            let contents = contents_address(mut lo, mut fx, ty, pointer: first_word)
-            let held = mut lo.held_at(mut fx, ty: inner, address: contents)
+            let held = box_contents(mut lo, mut fx, ty, inner, value)
             render_via(mut lo, mut fx, ty: inner, value: held, renderer_value)
         }
         else => render_composite(mut lo, mut fx, ty, item, args, value, renderer_value)
     }
 } render_item
+
+/// The bytes of a `Str`, `text::String` or `text::Fixed` value.
+fn text_parts(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held) -> Stretch {
+    let address = value.address_value()
+    if not lo.ck.is_std(ty, path: "text::Fixed") {
+        let start = mut fx.load(PTR, addr: address, offset: 0)
+        let len = mut fx.load(PTR, addr: address, offset: 8)
+        return Stretch(start: start, len: len)
+    }
+    let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+    let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
+    let start = mut fx.offset(address, offset: bytes_field.offset)
+    let len = mut fx.load(PTR, addr: address, offset: len_field.offset)
+    return Stretch(start: start, len: len)
+} text_parts
+
+/// The contents of a `mem::Box` or `mem::Shared` value, whose contents are of type `inner`.
+fn box_contents(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, inner: ty::Ty, value: Held) -> Held {
+    let address = value.address_value()
+    let first_word = mut fx.load(PTR, addr: address, offset: 0)
+    let contents = contents_address(mut lo, mut fx, ty, pointer: first_word)
+    return mut lo.held_at(mut fx, ty: inner, address: contents)
+} box_contents
+
+/// Writes the nested rendering of a value of a type to a renderer: a char or text as its
+/// literal, the contents of a box or shared value nested, any other value through its `Render`.
+fn render_nested(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held, renderer_value: clif::Value) {
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Scalar(ty::Scalar.Char) => {
+            let buffer = mut fx.slot(4, align: 4)
+            let c = body_widen(mut fx, value: value.scalar_value())
+            let len = encode_utf8(mut fx, c, buffer)
+            append_literal(mut lo, mut fx, renderer_value, start: buffer, len, quote: b'\'')
+            return
+        }
+        ty::TyKind.Item(item: item, args: args) => {
+            let path = lo.ck.db().canonical(item)
+            if path.as_str() == "core::Str" or path.as_str() == "text::String" or path.as_str() == "text::Fixed" {
+                let parts = text_parts(mut lo, mut fx, ty, value)
+                append_literal(mut lo, mut fx, renderer_value, start: parts.start, len: parts.len, quote: b'"')
+                return
+            }
+            if path.as_str() == "mem::Box" or path.as_str() == "mem::Shared" {
+                let inner = arg_type(lo, args, index: 0)
+                let held = box_contents(mut lo, mut fx, ty, inner, value)
+                render_nested(mut lo, mut fx, ty: inner, value: held, renderer_value)
+                return
+            }
+        }
+        else => {}
+    }
+    render_via(mut lo, mut fx, ty, value, renderer_value)
+} render_nested
 
 /// The type argument at `index` of an argument list.
 fn arg_type(lo: Lowering, args: ty::Args, index: usize) -> ty::Ty {
@@ -509,7 +696,7 @@ fn render_elements(mut lo: Lowering, mut fx: Fx, element: ty::Ty, start: clif::V
         let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(size))
         let at = mut fx1.b.iadd(start, y: offset)
         let held = mut lo.held_at(mut fx1, ty: element, address: at)
-        render_via(mut lo, fx: mut fx1, ty: element, value: held, renderer_value)
+        render_nested(mut lo, fx: mut fx1, ty: element, value: held, renderer_value)
     })
     render_append_text(mut lo, mut fx, renderer_value, text: "]")
 } render_elements
@@ -531,11 +718,11 @@ fn render_entries(mut lo: Lowering, mut fx: Fx, entry: ty::Ty, start: clif::Valu
         let at = mut fx1.b.iadd(start, y: offset)
         let key_at = mut fx1.offset(at, offset: key.offset)
         let key_held = mut lo.held_at(mut fx1, ty: key.ty, address: key_at)
-        render_via(mut lo, fx: mut fx1, ty: key.ty, value: key_held, renderer_value)
+        render_nested(mut lo, fx: mut fx1, ty: key.ty, value: key_held, renderer_value)
         render_append_text(mut lo, fx: mut fx1, renderer_value, text: ": ")
         let value_at = mut fx1.offset(at, offset: value.offset)
         let value_held = mut lo.held_at(mut fx1, ty: value.ty, address: value_at)
-        render_via(mut lo, fx: mut fx1, ty: value.ty, value: value_held, renderer_value)
+        render_nested(mut lo, fx: mut fx1, ty: value.ty, value: value_held, renderer_value)
     })
     render_append_text(mut lo, mut fx, renderer_value, text: "}")
 } render_entries
@@ -635,7 +822,7 @@ fn render_composite(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, 
                 let laid_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: field.name.as_str())
                 let field_at = mut fx.offset(address, offset: laid_field.offset)
                 let held = mut lo.held_at(mut fx, ty: field_ty, address: field_at)
-                render_via(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
+                render_nested(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
             }
             render_append_text(mut lo, mut fx, renderer_value, text: ")")
         }
@@ -673,7 +860,7 @@ fn render_variant(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, name: Str, core: boo
             let laid_field = mut lo.layouts.field(lo.ck, ty, variant: Some(variant.name.as_str()), label: "")
             let field_at = mut fx.offset(address, offset: laid_field.offset)
             let held = mut lo.held_at(mut fx, ty: payload_ty, address: field_at)
-            render_via(mut lo, mut fx, ty: payload_ty, value: held, renderer_value)
+            render_nested(mut lo, mut fx, ty: payload_ty, value: held, renderer_value)
             render_append_text(mut lo, mut fx, renderer_value, text: ")")
         }
         check::Payload.Labelled(fields) => {
@@ -690,7 +877,7 @@ fn render_variant(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, name: Str, core: boo
                 let laid_field = mut lo.layouts.field(lo.ck, ty, variant: Some(variant.name.as_str()), label: field.name.as_str())
                 let field_at = mut fx.offset(address, offset: laid_field.offset)
                 let held = mut lo.held_at(mut fx, ty: field_ty, address: field_at)
-                render_via(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
+                render_nested(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
             }
             render_append_text(mut lo, mut fx, renderer_value, text: ")")
         }

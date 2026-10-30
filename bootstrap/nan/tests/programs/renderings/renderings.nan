@@ -1,0 +1,88 @@
+//! Ports rendered as construction text, decoded back, and decoded from text that fails.
+
+pub closed enum Medium derives Eq, Render, Encode {
+    Copper
+    Fiber(lanes: u8)
+    Named(text::String)
+} Medium
+
+pub closed struct Port derives Eq, Render, Encode {
+    pub name: text::String
+    pub tag: char
+    pub mtu: u16 where mtu >= 576
+    pub level: i32
+    pub medium: Medium
+    pub raw: mem::Bytes
+    pub peers: mem::Map[text::String, Option[u8]]
+    pub unit: Unit
+} Port
+
+pub open struct Settings derives Eq, Render, Encode {
+    pub retries: u8
+    pub verbose: bool
+} Settings
+
+pub closed struct Sealed derives Render, Encode {
+    pub secret: Untrusted[text::String]
+} Sealed
+
+fn port(alloc: mem::Alloc) -> Port {
+    var raw = mem::Bytes.empty(alloc)
+    mut raw.append(b"\x00\"\xFF")
+    var peers = mem::Map[text::String, Option[u8]].empty(alloc)
+    discard mut peers.insert(text::String.of("a\tb", alloc), value: Some(7))
+    discard mut peers.insert(text::String.of("c", alloc), value: None)
+    let medium = Medium.Named(text::String.of("fiber \"x\"", alloc))
+    return Port(name: text::String.of("eth0\u{200B}é\\", alloc), tag: '\'', mtu: 1_500, level: -12, medium: take medium, raw: take raw, peers: take peers, unit: Unit)
+} port
+
+fn shown(log: sys::Log, label: Str, decoded: Result[Port, core::DecodeError]) {
+    match decoded {
+        Ok(found) => log.info(label, value: found)
+        Err(error) => log.info(label, value: error)
+    }
+} shown
+
+fn read(log: sys::Log, label: Str, take raw: Slice[u8], alloc: mem::Alloc) {
+    shown(log, label, decoded: attempt text::construction::Codec[Port].decode(Untrusted.of(take raw), alloc))
+} read
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let sent = port(alloc)
+    var out = text::String.empty(alloc)
+    mut out.write(text::fmt("{sent}", sent), budget: 512)
+    world.log.info("rendered", value: out.as_str())
+    match attempt text::construction::Codec[Port].decode(Untrusted.of(out.as_bytes()), alloc) {
+        Ok(back) => world.log.info("round trip", value: back == sent)
+        Err(error) => world.log.info("round trip", value: error)
+    }
+    read(world.log, label: "spaced", raw: b" Port ( unit: Unit, peers: { }, raw: b\"\", medium: Fiber( lanes: 4 ), level: -1_000, mtu: 9_000, tag: '\\u{E9}', name: \"lo\" ) ", alloc)
+    read(world.log, label: "small", raw: b"Port(name: \"lo\", tag: 'x', mtu: 500, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "unknown", raw: b"Port(name: \"lo\", tag: 'x', mtu: 600, level: 0, medium: Medium.Radio, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "range", raw: b"Port(name: \"lo\", tag: 'x', mtu: 70_000, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "control", raw: b"Port(name: \"\t\", tag: 'x', mtu: 600, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "surrogate", raw: b"Port(name: \"\\u{D800}\", tag: 'x', mtu: 600, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "utf8", raw: b"Port(name: \"\xC3\", tag: 'x', mtu: 600, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit)", alloc)
+    read(world.log, label: "truncated", raw: b"Port(name: \"lo\", tag: 'x', mtu: 600, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit", alloc)
+    read(world.log, label: "trailing", raw: b"Port(name: \"lo\", tag: 'x', mtu: 600, level: 0, medium: Medium.Copper, raw: b\"\", peers: {}, unit: Unit) x", alloc)
+    read(world.log, label: "duplicate", raw: b"Port(name: \"lo\", name: \"lo\")", alloc)
+    let settings = attempt text::construction::Codec[Settings].decode(Untrusted.of(b"Settings(mode: Mode.Fast([{1: \"a\"}], deep: b\"\\x00\", n: -inf, c: '\\''), retries: 3)"), alloc)
+    match settings {
+        Ok(found) => world.log.info("skipped", value: found)
+        Err(error) => world.log.info("skipped", value: error)
+    }
+    match attempt text::construction::Codec[f64].decode(Untrusted.of(b"-1.5e-7"), alloc) {
+        Ok(found) => world.log.info("float", value: found)
+        Err(error) => world.log.info("float", value: error)
+    }
+    let sealed = Sealed(secret: Untrusted.of(text::String.of("key", alloc)))
+    world.log.info("untrusted", value: sealed.secret)
+    var hidden = text::String.empty(alloc)
+    mut hidden.write(text::fmt("{sealed}", sealed), budget: 64)
+    world.log.info("sealed", value: hidden.as_str())
+    match attempt text::construction::Codec[Sealed].decode(Untrusted.of(hidden.as_bytes()), alloc) {
+        Ok(_) => world.log.info("sealed", value: "decoded")
+        Err(error) => world.log.info("sealed", value: error)
+    }
+} main

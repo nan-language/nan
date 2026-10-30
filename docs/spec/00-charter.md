@@ -275,6 +275,7 @@ Each term links to its home, whose definition governs.
 | [const item](02-items.md#constants) | Named value computed at check time. |
 | [constituent type](05-properties.md#structural-properties) | Field or payload type of a struct or enum, with type arguments substituted. |
 | [construction](04-types.md#construction) | Expression labelling every field. |
+| [construction text](13-text-encode.md#construction-text) | Text form of values that derived `Render` writes and `text::construction` decodes. |
 | [consumer](03-packages-modules.md#visibility) | Code outside an item's package using it. |
 | [content-blind operation](15-untrusted.md#untrusted-values) | Untrusted operation revealing nothing of the contents. |
 | [context pack](33-toolchain.md#context) | Output of `nan context`. |
@@ -410,6 +411,7 @@ Each term links to its home, whose definition governs.
 | [named conversion](09-numbers.md#conversions) | Built-in function changing a value's type, as `T.fit(x)`. |
 | [NaN toolchain](38-self-hosting.md#nan-toolchain) | Toolchain written in NaN, checked against the bootstrap once it builds itself. |
 | [nanbench](37-evolution.md#nanbench) | Benchmark gating language versions. |
+| [nested rendering](13-text-encode.md#render) | Rendering of a value inside another's, text and chars as literals. |
 | [niche](04-types.md#niches) | Bit pattern a type never holds. |
 | [NIR](19-nir.md#nir) | Specified checked intermediate representation. |
 | [obligation](18-contracts.md#obligations) | Condition required at a program point. |

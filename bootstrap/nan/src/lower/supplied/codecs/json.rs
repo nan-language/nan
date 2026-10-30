@@ -586,6 +586,12 @@ pub fn read_char(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value)
     let buffer = fx.slot(8, 1);
     let capacity = fx.ptr(8);
     let (len, failed) = string(lo, fx, state, buffer, capacity);
+    one_char(fx, buffer, len, failed)
+}
+
+/// The scalar value of text read into `buffer` with the code `failed`, which must be exactly
+/// one char: the code, `Malformed` when it is not.
+pub fn one_char(fx: &mut Fx, buffer: Value, len: Value, failed: Value) -> (Value, Value) {
     let lead = fx.load(types::I8, buffer, 0);
     let lead = fx.b.ins().uextend(types::I64, lead);
     let two =

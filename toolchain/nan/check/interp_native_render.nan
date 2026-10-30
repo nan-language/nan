@@ -1,4 +1,4 @@
-//! Rendering in interpreter runs: renderers, the `text::fmt` template, and the renderings of derived and built-in `Render` conformances. A renderer holds a reference to its state, the bytes written so far and the render budget.
+//! Rendering in interpreter runs: renderers, the `text::fmt` template, nested renderings, and the renderings of derived and built-in `Render` conformances. A renderer holds a reference to its state, the bytes written so far and the render budget.
 
 /// The positions of a renderer state's parts: the bytes written and the render budget.
 const RENDERER_WRITTEN: usize = 0
@@ -98,8 +98,26 @@ fn Interpreter.render_template(mut self, types: Slice[ty::Arg], args: Slice[Val]
 } Interpreter.render_template
 
 /// A member of `core::Renderer`; none for another member.
-fn Interpreter.renderer_member(mut self, member: Str, args: Slice[Val]) -> Option[InterpFlow] {
+fn Interpreter.renderer_member(
+    mut self,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
     let alloc = self.alloc
+    if member == "write_nested" {
+        expect args.len() > 1
+        if type_args.len() == 0 {
+            return None
+        }
+        let Some(nested_ty) = type_args[0].ty() else {
+            return None
+        }
+        try mut self.render_nested(args[1], ty: nested_ty, out: args[0], at, site)
+        return Some(InterpFlow.Return(Val.Unit))
+    }
     if member == "write" {
         expect args.len() > 1
         let text = mut self.bytes(args[1])
@@ -237,6 +255,94 @@ fn Interpreter.render_value(
     }
 } Interpreter.render_value
 
+/// Writes the nested rendering of a value of a type: a char or text as its literal, a box's or
+/// shared value's contents nested, anything else through its `Render`.
+fn Interpreter.render_nested(
+    mut self,
+    value: Val,
+    ty: ty::Ty,
+    out: Val,
+    at: ItemSpan,
+    site: RunSite,
+    ) fails End {
+    let alloc = self.alloc
+    let inner = self.deref(value)
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Scalar(ty::Scalar.Char) => {
+            let Val.Char(c) = inner else {
+                expect false
+                fail End.Missing
+            }
+            var held = text::String.empty(alloc)
+            mut held.push(c)
+            let written = text_literal(held.as_str(), quote: '\'', grammar: self.ck.grammar(), alloc)
+            mut self.render_write(out, bytes: written.as_bytes())
+            return
+        }
+        ty::TyKind.Item(item: item, args: item_args) => {
+            let canonical = self.ck.db().canonical(item)
+            let path = canonical.as_str()
+            if path == "core::Str" or path == "text::String" or path == "text::Fixed" {
+                let bytes = mut self.text_bytes(inner, path)
+                let Ok(held) = attempt text::String.try_from_utf8(bytes.view(), alloc) else {
+                    expect false
+                    fail End.Missing
+                }
+                let written = text_literal(held.as_str(), quote: '"', grammar: self.ck.grammar(), alloc)
+                mut self.render_write(out, bytes: written.as_bytes())
+                return
+            }
+            if path == "mem::Box" or path == "mem::Shared" {
+                expect inner.fields().len() > 0
+                let contents = self.deref(inner.fields()[0])
+                try mut self.render_nested(contents, ty: type_arg_at(self.ck.types(), args: item_args, index: 0), out, at, site)
+                return
+            }
+        }
+        else => {}
+    }
+    try mut self.render_value(value, ty, out, at, site)
+} Interpreter.render_nested
+
+/// A text as a char or text literal quoted by `quote`: `\`, the quote and the named escapes
+/// escaped, and every other code point outside `CHARACTER` written `\u{H}`.
+fn text_literal(written: Str, quote: char, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var literal = text::String.empty(alloc)
+    mut literal.push(quote)
+    for c in written {
+        if c == '\\' {
+            mut literal.append("\\\\")
+        } else if c == '\n' {
+            mut literal.append("\\n")
+        } else if c == '\r' {
+            mut literal.append("\\r")
+        } else if c == '\t' {
+            mut literal.append("\\t")
+        } else if c == '\0' {
+            mut literal.append("\\0")
+        } else if c == quote {
+            mut literal.push('\\')
+            mut literal.push(c)
+        } else if syntax::is_rejected(c, grammar) {
+            mut literal.append("\\u{")
+            let point = c.to_bits()
+            var started = false
+            for position in 0..<6u32 {
+                let digit = u8.truncate((point >> (20 - 4 * position)) & 0xF)
+                if digit != 0 or started or position == 5 {
+                    started = true
+                    mut literal.push(upper_hex_digit(digit))
+                }
+            }
+            mut literal.push('}')
+        } else {
+            mut literal.push(c)
+        }
+    }
+    mut literal.push(quote)
+    return literal
+} text_literal
+
 /// The rendering a derive writes: a struct's name and fields, or an enum's name, variant and
 /// payload, the variants of `Option` and `Result` without the name.
 fn Interpreter.render_derived(
@@ -292,7 +398,7 @@ fn Interpreter.render_derived(
                 Payload.Single(payload_ty) => {
                     mut self.render_write(out, bytes: b"(")
                     expect payload.contents().len() > 0
-                    try mut self.render_value(payload.contents()[0], ty: subst.ty(self.ck.types(), ty: payload_ty), out, at, site)
+                    try mut self.render_nested(payload.contents()[0], ty: subst.ty(self.ck.types(), ty: payload_ty), out, at, site)
                     mut self.render_write(out, bytes: b")")
                 }
                 Payload.Labelled(labels) => {
@@ -329,7 +435,7 @@ fn Interpreter.render_labelled(
         var label = text::String.of(labelled[index].name.as_str(), alloc: self.alloc)
         mut label.append(": ")
         mut self.render_write(out, bytes: label.as_bytes())
-        try mut self.render_value(values[index], ty: labelled[index].ty, out, at, site)
+        try mut self.render_nested(values[index], ty: labelled[index].ty, out, at, site)
         index += 1
     }
 } Interpreter.render_labelled
@@ -589,9 +695,9 @@ fn Interpreter.render_entries(mut self, value: Val, args: ty::Args, out: Val, at
         }
         let parts = entries[index].fields()
         expect parts.len() > 1
-        try mut self.render_value(parts[0], ty: type_arg_at(self.ck.types(), args, index: 0), out, at, site)
+        try mut self.render_nested(parts[0], ty: type_arg_at(self.ck.types(), args, index: 0), out, at, site)
         mut self.render_write(out, bytes: b": ")
-        try mut self.render_value(parts[1], ty: type_arg_at(self.ck.types(), args, index: 1), out, at, site)
+        try mut self.render_nested(parts[1], ty: type_arg_at(self.ck.types(), args, index: 1), out, at, site)
     }
     mut self.render_write(out, bytes: b"}")
 } Interpreter.render_entries
@@ -619,7 +725,7 @@ fn Interpreter.render_elements(mut self, value: Val, path: Str, args: ty::Args, 
         if index > 0 {
             mut self.render_write(out, bytes: b", ")
         }
-        try mut self.render_value(elements[index], ty: element_ty, out, at, site)
+        try mut self.render_nested(elements[index], ty: element_ty, out, at, site)
     }
     mut self.render_write(out, bytes: b"]")
 } Interpreter.render_elements

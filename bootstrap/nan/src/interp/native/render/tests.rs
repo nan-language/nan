@@ -83,6 +83,24 @@ pub fn values(alloc: mem::Alloc) -> text::String
     return out
 } values
 
+pub closed struct Named derives Render {
+    pub name: text::String
+    pub mark: char
+    pub shared: mem::Shared[text::String]
+    pub words: mem::Map[text::String, Option[char]]
+} Named
+
+pub fn nested(alloc: mem::Alloc) -> text::String
+    example nested(testing::world().alloc).as_str() == "Named(name: \"a\\\"\\\\\\u{7F}\\u{200B}\u{E9}\\r\\0\", mark: '\\'', shared: \"'\", words: {\"k\": Some('\"')}) a\"\\\u{7F}"
+{
+    var words = mem::Map[text::String, Option[char]].empty(alloc)
+    discard mut words.insert(text::String.of("k", alloc), value: Some('"'))
+    let named = Named(name: text::String.of("a\"\\\u{7F}\u{200B}\u{E9}\r\0", alloc), mark: '\'', shared: mem::Shared.of(text::String.of("'", alloc), alloc), words: take words)
+    var out = text::String.empty(alloc)
+    mut out.write(text::fmt("{named} {text}", named, text: "a\"\\\u{7F}"), budget: 200)
+    return out
+} nested
+
 pub fn fixed(alloc: mem::Alloc) -> text::Fixed[6]
     example fixed(testing::world().alloc).as_str() == "ab12"
 {

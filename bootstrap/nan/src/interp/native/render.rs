@@ -1,6 +1,6 @@
-//! Rendering in interpreter runs: renderers, the `text::fmt` template, and the renderings of
-//! derived and built-in `Render` conformances. A renderer holds a reference to its state, the
-//! bytes written so far and the render budget.
+//! Rendering in interpreter runs: renderers, the `text::fmt` template, nested renderings, and
+//! the renderings of derived and built-in `Render` conformances. A renderer holds a reference to
+//! its state, the bytes written so far and the render budget.
 
 use std::rc::Rc;
 
@@ -11,6 +11,7 @@ use crate::check::db::ItemId;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Scalar, Subst, Ty};
 use crate::nir::{Builtin, Callable, FnRef, Span};
+use crate::syntax::lexer::is_rejected;
 
 /// The positions of a renderer state's parts: the bytes written and the render budget.
 const WRITTEN: usize = 0;
@@ -88,8 +89,21 @@ fn template(
 }
 
 /// A member of `core::Renderer`; none for another member.
-pub fn renderer(interp: &mut Interpreter, member: &str, args: &[Val]) -> Option<Exec<Flow>> {
+pub fn renderer(
+    interp: &mut Interpreter,
+    member: &str,
+    type_args: &[Arg],
+    args: &[Val],
+    at: (ItemId, Span),
+    site: Site,
+) -> Option<Exec<Flow>> {
     let value = match member {
+        "write_nested" => {
+            let ty = type_args.first().and_then(Arg::ty).cloned()?;
+            return Some(
+                nested(interp, &args[1], &ty, &args[0], at, site).map(|()| Flow::Return(Val::Unit)),
+            );
+        }
         "write" => {
             let text = interp.bytes(&args[1]);
             write(interp, &args[0], &text);
@@ -205,6 +219,83 @@ pub fn render(
     }
 }
 
+/// Writes the nested rendering of a value of a type: a char or text as its literal, a box's or
+/// shared value's contents nested, anything else through its `Render`.
+fn nested(
+    interp: &mut Interpreter,
+    value: &Val,
+    ty: &Ty,
+    out: &Val,
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<()> {
+    let inner = interp.deref(value);
+    match ty {
+        Ty::Scalar(Scalar::Char) => {
+            let Val::Char(c) = inner else {
+                panic!("a char value");
+            };
+            write(interp, out, literal(&c.to_string(), '\'').as_bytes());
+        }
+        Ty::Item(item, args) => match interp.ck.db.canonical(*item).as_str() {
+            path @ ("core::Str" | "text::String" | "text::Fixed") => {
+                let bytes = text_bytes(interp, &inner, path);
+                let text = String::from_utf8(bytes).expect("well-formed text");
+                write(interp, out, literal(&text, '"').as_bytes());
+            }
+            "mem::Box" | "mem::Shared" => {
+                let contents = interp.deref(&inner.fields()[0]);
+                let element = args.first().and_then(Arg::ty).cloned().unwrap_or(Ty::Unit);
+                nested(interp, &contents, &element, out, at, site)?;
+            }
+            _ => render(interp, value, ty, out, at, site)?,
+        },
+        _ => render(interp, value, ty, out, at, site)?,
+    }
+    Ok(())
+}
+
+/// A text as a char or text literal quoted by `quote`: `\`, the quote and the named escapes
+/// escaped, and every other code point outside `CHARACTER` written `\u{H}`.
+fn literal(text: &str, quote: char) -> String {
+    let mut out = String::from(quote);
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if is_rejected(c) => out.push_str(&format!("\\u{{{:X}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// The bytes of a `Str`, `text::String` or `text::Fixed` value.
+fn text_bytes(interp: &mut Interpreter, value: &Val, path: &str) -> Vec<u8> {
+    match path {
+        "text::Fixed" => {
+            let len = value.fields()[1].int() as usize;
+            value.fields()[0].fields()[..len]
+                .iter()
+                .map(|byte| byte.int() as u8)
+                .collect()
+        }
+        "text::String" => entries(interp, value)
+            .iter()
+            .map(|byte| byte.int() as u8)
+            .collect(),
+        _ => interp.bytes(value),
+    }
+}
+
 /// The rendering a derive writes: a struct's name and fields, or an enum's name, variant and
 /// payload, the variants of `Option` and `Result` without the name.
 pub fn derived(
@@ -246,7 +337,7 @@ pub fn derived(
                 Payload::None => {}
                 Payload::Single(ty) => {
                     write(interp, out, b"(");
-                    render(interp, &payload[0], &subst.ty(ty), out, at, site)?;
+                    nested(interp, &payload[0], &subst.ty(ty), out, at, site)?;
                     write(interp, out, b")");
                 }
                 Payload::Labelled(labels) => {
@@ -279,7 +370,7 @@ fn labelled_values(
             write(interp, out, b", ");
         }
         write(interp, out, format!("{label}: ").as_bytes());
-        render(interp, value, ty, out, at, site)?;
+        nested(interp, value, ty, out, at, site)?;
     }
     Ok(())
 }
@@ -313,21 +404,8 @@ pub fn builtin(
         }
         Ty::Unit => write(interp, out, b"Unit"),
         Ty::Item(item, args) => match interp.ck.db.canonical(*item).as_str() {
-            "core::Str" | "text::String" | "text::Fixed" => {
-                let bytes = match interp.ck.db.canonical(*item).as_str() {
-                    "text::Fixed" => {
-                        let len = value.fields()[1].int() as usize;
-                        value.fields()[0].fields()[..len]
-                            .iter()
-                            .map(|byte| byte.int() as u8)
-                            .collect()
-                    }
-                    "text::String" => entries(interp, &value)
-                        .iter()
-                        .map(|byte| byte.int() as u8)
-                        .collect(),
-                    _ => interp.bytes(&value),
-                };
+            path @ ("core::Str" | "text::String" | "text::Fixed") => {
+                let bytes = text_bytes(interp, &value, path);
                 write(interp, out, &bytes);
             }
             "core::Untrusted" => write(interp, out, b"<untrusted>"),
@@ -359,9 +437,9 @@ pub fn builtin(
                         write(interp, out, b", ");
                     }
                     let parts = entry.fields();
-                    render(interp, &parts[0], &arg(args, 0), out, at, site)?;
+                    nested(interp, &parts[0], &arg(args, 0), out, at, site)?;
                     write(interp, out, b": ");
-                    render(interp, &parts[1], &arg(args, 1), out, at, site)?;
+                    nested(interp, &parts[1], &arg(args, 1), out, at, site)?;
                 }
                 write(interp, out, b"}");
             }
@@ -381,7 +459,7 @@ pub fn builtin(
                     if index > 0 {
                         write(interp, out, b", ");
                     }
-                    render(interp, element, &arg(args, 0), out, at, site)?;
+                    nested(interp, element, &arg(args, 0), out, at, site)?;
                 }
                 write(interp, out, b"]");
             }

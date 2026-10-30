@@ -124,7 +124,7 @@ pub enum Glue {
     /// Writes a value of a type in a codec's format.
     Encode(supplied::codecs::Format, Ty),
     /// Reads a value of a type in a codec's format.
-    Decode(supplied::codecs::Format, Ty),
+    Decode(supplied::codecs::DecodeFormat, Ty),
     /// Reads a uvar of the wire format.
     WireUvar,
     /// Reads a JSON number's text.
@@ -133,10 +133,24 @@ pub enum Glue {
     JsonString,
     /// Passes over a JSON value.
     JsonSkip,
+    /// Reads a word of construction text.
+    ConstructionWord,
+    /// Reads a number of construction text.
+    ConstructionNumber,
+    /// Reads a float of construction text.
+    ConstructionFloat,
+    /// Reads a literal of construction text.
+    ConstructionLiteral(supplied::codecs::construction::Literal),
+    /// Passes over a value of construction text.
+    ConstructionSkip,
     /// Decodes base64 text.
     Base64,
     /// Whether bytes are well-formed UTF-8.
     Utf8Valid,
+    /// Whether a scalar value is a rejected code point.
+    Rejected,
+    /// Writes UTF-8 text to a renderer as a char or text literal of a quote.
+    RenderLiteral(u8),
     /// Writes a value of a type in a trap report.
     Written(Ty),
     /// Withdraws a stopped sender's wait for room in a channel.

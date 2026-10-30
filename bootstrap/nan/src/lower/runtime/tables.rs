@@ -314,20 +314,23 @@ pub fn unlink_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value) {
     lo.call_routine(fx, Routine::Unlock, &[lock]);
 }
 
-/// Frees an entry: its generation advances and it heads the free entries. The caller holds the
-/// lock.
+/// Frees an entry: its generation advances and it heads the free entries, unless that
+/// generation is 2^32 − 1, which retires it. The caller holds the lock.
 fn free_entry(lo: &mut Lowering, fx: &mut Fx, record: Value, index: Value) {
     let dead = fx.int(types::I32, 0);
     fx.store(dead, record, entry::LIVE);
     let generation = fx.load(types::I32, record, entry::GENERATION);
     let generation = fx.b.ins().iadd_imm_s(generation, 1);
     fx.store(generation, record, entry::GENERATION);
-    let state_address = lo.state(fx);
-    let free = fx.load(PTR, state_address, state::FREE_ENTRY);
-    let free = fx.b.ins().ireduce(types::I32, free);
-    fx.store(free, record, entry::SOURCE);
-    let head = fx.b.ins().iadd_imm_s(index, 1);
-    fx.store(head, state_address, state::FREE_ENTRY);
+    let reusable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, generation, -1);
+    fx.when(reusable, |fx| {
+        let state_address = lo.state(fx);
+        let free = fx.load(PTR, state_address, state::FREE_ENTRY);
+        let free = fx.b.ins().ireduce(types::I32, free);
+        fx.store(free, record, entry::SOURCE);
+        let head = fx.b.ins().iadd_imm_s(index, 1);
+        fx.store(head, state_address, state::FREE_ENTRY);
+    });
 }
 
 /// Makes every outbox of a runner stale.

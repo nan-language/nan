@@ -178,10 +178,10 @@ pub fn read_file(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// `take m.exit_services()`: reads the firmware's final memory map into a runtime record the
 /// runtime state keeps, in a record grown while the map does not fit it, and ends boot services
 /// with its key, reading the map again while they refuse; then, with maskable interrupts
-/// disabled, installs the entry root, on x86_64 with the boot CPU's descriptor tables and AVX
-/// enabled when the CPU has it, on AArch64 with the memory attributes and translation control
-/// the entry root needs; and gives the machine's `boot::Kernel`, which holds what the
-/// `boot::Machine` held.
+/// disabled, extends the entry root over usable memory above 4 GiB and installs it, on x86_64
+/// with the boot CPU's descriptor tables and AVX enabled when the CPU has it, on AArch64 with the
+/// memory attributes and translation control the entry root needs; and gives the machine's
+/// `boot::Kernel`, which holds what the `boot::Machine` held.
 pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let arch = lo.ck.db.target.arch();
     let machine = supply.param(0).address();
@@ -237,6 +237,7 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(used, state_address, state::MAP_SIZE);
     let described = fx.load(PTR, stride, 0);
     fx.store(described, state_address, state::MAP_STRIDE);
+    lo.extend_entry_root(fx);
     let root = lo.entry_root();
     let root = lo.data_address(fx, root);
     match arch {

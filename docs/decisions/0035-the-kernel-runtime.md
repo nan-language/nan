@@ -1,6 +1,6 @@
 # 0035. The kernel runtime
 
-Status: accepted
+Status: accepted; its entry root superseded by 0074
 
 ## Context
 

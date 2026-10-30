@@ -370,6 +370,10 @@ pub mod state {
     /// On a machine target, the address of the boot area, which holds the boot heap and then
     /// the tables `Init` sets up.
     pub const BOOT_AREA: u64 = 344;
+    /// On a machine target, the first address and last address plus one of the tables extending
+    /// the entry root over usable memory above 4 GiB.
+    pub const ENTRY_TABLES: u64 = 352;
+    pub const ENTRY_TABLES_END: u64 = 360;
     pub const SIZE: u64 = 384;
 }
 

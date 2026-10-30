@@ -293,21 +293,29 @@ impl<'a> Checker<'a> {
         expected: String,
         found: String,
     ) {
-        self.report_diagnostic(
-            item,
-            Diagnostic {
-                expected: Some(expected),
-                found: Some(found),
-                ..self.on(item, (token, token), code)
-            },
-        );
+        self.report_record(item, token, code, Some(expected), Some(found), Vec::new());
     }
 
     /// Reports a diagnostic with its because-chain.
     pub fn report_because(&self, item: ItemId, token: Tok, code: Code, because: Vec<Reason>) {
+        self.report_record(item, token, code, None, None, because);
+    }
+
+    /// Reports a diagnostic with its expected and found texts, when given, and its because-chain.
+    pub fn report_record(
+        &self,
+        item: ItemId,
+        token: Tok,
+        code: Code,
+        expected: Option<String>,
+        found: Option<String>,
+        because: Vec<Reason>,
+    ) {
         self.report_diagnostic(
             item,
             Diagnostic {
+                expected,
+                found,
                 because,
                 ..self.on(item, (token, token), code)
             },

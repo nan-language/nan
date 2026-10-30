@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::Checker;
-use super::db::{ItemId, TypeKey};
+use super::db::{ItemId, ModuleId, TypeKey};
 use super::props::Property;
-use super::sig::{FnSig, GenericDef, SigKind, param_arg};
+use super::sig::{FnSig, GenericDef, Payload, SigKind, param_arg};
 use super::ty::{Arg, Args, Bound, Const, Param, Scalar, Subst, Ty, no_args};
-use crate::diagnostic::Code;
+use crate::diagnostic::{Code, Reason, Role as ReasonRole};
 use crate::interp::{End, Interpreter, Val};
 use crate::nir::Role;
 use crate::syntax::ast::{ItemKind, Tok};
@@ -791,30 +791,191 @@ impl Checker<'_> {
     /// breaks its parameter's bounds, or records the instantiation of an item with const
     /// parameters.
     pub fn check_arguments(&self, item: ItemId, token: Tok, target: ItemId, args: &Args) {
-        if let Some(code) = self.arguments_problem(target, args) {
-            self.report(item, token, code);
-        } else if self
-            .sig(target)
-            .generics
-            .iter()
-            .any(|def| def.constant.is_some())
-        {
+        let generics = &self.sig(target).generics;
+        if let Some(problem) = self.arguments_problem(target, args) {
+            self.report_argument(
+                item,
+                token,
+                &generics[problem.index],
+                &problem.arg,
+                &problem.subst,
+                problem.code,
+            );
+        } else if generics.iter().any(|def| def.constant.is_some()) {
             self.instantiated(item, token, target, args.clone());
         }
     }
 
-    /// The rule the first of a generic type's or interface's arguments breaks for its parameter.
-    fn arguments_problem(&self, target: ItemId, args: &Args) -> Option<Code> {
+    /// The first of a generic type's or interface's arguments that breaks a rule of its
+    /// parameter.
+    fn arguments_problem(&self, target: ItemId, args: &Args) -> Option<ArgumentProblem> {
         let generics = &self.sig(target).generics;
         let subst = Subst::of(generics.iter().map(|def| def.param), args);
         generics
             .iter()
             .zip(args.iter())
-            .find_map(|(def, arg)| match arg {
-                Arg::Ty(arg) => self.argument_problem(def, arg, &subst),
+            .enumerate()
+            .find_map(|(index, (def, arg))| match arg {
+                Arg::Ty(arg) => {
+                    self.argument_problem(def, arg, &subst)
+                        .map(|code| ArgumentProblem {
+                            index,
+                            arg: arg.clone(),
+                            subst: subst.clone(),
+                            code,
+                        })
+                }
                 Arg::Const(_) => None,
             })
     }
+
+    /// Reports a type argument breaking the rule `code` of its generic parameter, with what the
+    /// parameter requires, the argument and the chain to the root of the property it breaks.
+    pub fn report_argument(
+        &self,
+        item: ItemId,
+        token: Tok,
+        def: &GenericDef,
+        arg: &Ty,
+        subst: &Subst,
+        code: Code,
+    ) {
+        let from = self.db.module_of(item);
+        let (requirement, because) = match code {
+            Code::PropLinearArgument => (
+                "a droppable type".to_owned(),
+                self.property_root(arg, from, &|ty| self.has(ty, Property::Linear)),
+            ),
+            Code::PropViewArgument => (
+                "a type that is not a view".to_owned(),
+                self.property_root(arg, from, &|ty| self.has(ty, Property::View)),
+            ),
+            Code::PropTokenArgument => (
+                "a type holding no state token".to_owned(),
+                self.property_root(arg, from, &|ty| self.holds_token(ty)),
+            ),
+            _ => (self.unsatisfied_bound(def, arg, subst, from), Vec::new()),
+        };
+        let expected = format!(
+            "{requirement} for {} of {}",
+            def.name,
+            self.item_written(def.param.owner, from)
+        );
+        self.report_record(
+            item,
+            token,
+            code,
+            Some(expected),
+            Some(self.show(arg, from)),
+            because,
+        );
+    }
+
+    /// The requirement of the first bound of a generic parameter, implied ones last, that a
+    /// type argument does not satisfy.
+    fn unsatisfied_bound(
+        &self,
+        def: &GenericDef,
+        arg: &Ty,
+        subst: &Subst,
+        from: ModuleId,
+    ) -> String {
+        if let Some(bound) = def
+            .bounds
+            .iter()
+            .map(|bound| subst.bound(bound))
+            .find(|bound| !self.satisfies(arg, bound))
+        {
+            return format!(
+                "a type implementing {}{}",
+                self.item_written(bound.interface, from),
+                self.show_args(&bound.args, from)
+            );
+        }
+        match self.implied(def.param).failure && !self.is_failure_type(arg) {
+            true => "a failure type".to_owned(),
+            false => "a cancellable type".to_owned(),
+        }
+    }
+
+    /// The `declared` reasons leading from a type to the root of a property it has.
+    fn property_root(&self, ty: &Ty, from: ModuleId, has: &dyn Fn(&Ty) -> bool) -> Vec<Reason> {
+        let mut because = Vec::new();
+        let mut passed = Vec::new();
+        let mut current = ty.clone();
+        while let Ty::Item(item, args) = &current
+            && !passed.contains(item)
+        {
+            passed.push(*item);
+            let next = if self.db.is_std(*item) {
+                args.iter()
+                    .filter_map(Arg::ty)
+                    .find(|arg| has(arg))
+                    .cloned()
+            } else {
+                let subst = Subst::of(self.sig(*item).generics.iter().map(|def| def.param), args);
+                let found = self.constituent_with(*item, &subst, from, has);
+                let (token, subject) = match &found {
+                    Some((token, subject, _)) => (*token, subject.clone()),
+                    None => (self.db.ast(*item).token, self.show(&current, from)),
+                };
+                because.push(self.reason(*item, token, ReasonRole::Declared, subject));
+                found.map(|(_, _, ty)| ty)
+            };
+            let Some(next) = next else {
+                break;
+            };
+            current = next;
+        }
+        because
+    }
+
+    /// The first field or variant of a struct or enum, in source order, whose type has a
+    /// property: its token, the field written `name: Type` or the variant `Variant(Type)` or
+    /// `Variant(label: Type)`, and that type.
+    fn constituent_with(
+        &self,
+        item: ItemId,
+        subst: &Subst,
+        from: ModuleId,
+        has: &dyn Fn(&Ty) -> bool,
+    ) -> Option<(Tok, String, Ty)> {
+        match &self.sig(item).kind {
+            SigKind::Struct { fields } => fields.iter().find_map(|field| {
+                let ty = subst.ty(&field.ty);
+                has(&ty).then(|| {
+                    (
+                        field.token,
+                        format!("{}: {}", field.name, self.show(&ty, from)),
+                        ty,
+                    )
+                })
+            }),
+            SigKind::Enum { variants } => variants.iter().find_map(|variant| {
+                let payload: Vec<(String, Ty)> = match &variant.payload {
+                    Payload::None => Vec::new(),
+                    Payload::Single(ty) => vec![(String::new(), subst.ty(ty))],
+                    Payload::Labelled(fields) => fields
+                        .iter()
+                        .map(|(label, ty)| (format!("{label}: "), subst.ty(ty)))
+                        .collect(),
+                };
+                let (label, ty) = payload.into_iter().find(|(_, ty)| has(ty))?;
+                let subject = format!("{}({label}{})", variant.name, self.show(&ty, from));
+                Some((variant.token, subject, ty))
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A type argument breaking a rule of its generic parameter: the parameter's index, the
+/// argument, the substitution of its instantiation's arguments and the rule's code.
+struct ArgumentProblem {
+    index: usize,
+    arg: Ty,
+    subst: Subst,
+    code: Code,
 }
 
 impl Checker<'_> {

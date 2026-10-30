@@ -67,9 +67,9 @@ impl Checker<'_> {
 
     /// The names a package's manifest grants list that nothing uses under the target checked,
     /// with the lines of their directives: a module performing none of the authority's
-    /// operations directly, the alias of a dependency not granted the authority, and in a
-    /// `contribute` grant, the alias of a package declaring the registry or contributing nothing
-    /// to it.
+    /// operations directly and holding no failed construct, the alias of a dependency not
+    /// granted the authority, and in a `contribute` grant, the alias of a package declaring the
+    /// registry or contributing nothing to it.
     pub fn unused_grants(&self, package: PackageId) -> Vec<(u32, String)> {
         let data = self.db.package(package);
         let Some(manifest) = &data.source.manifest else {
@@ -88,10 +88,12 @@ impl Checker<'_> {
                 let dep = data.deps.get(name);
                 let used = match (registry, self.db.module_named(package, name), dep) {
                     (Some(registry), _, Some(&Some(dep))) => self.contributes(dep, registry),
-                    (None, Some(module), _) => self
-                        .performed
-                        .borrow()
-                        .contains(&(module, allow.authority.clone())),
+                    (None, Some(module), _) => {
+                        self.performed
+                            .borrow()
+                            .contains(&(module, allow.authority.clone()))
+                            || self.module_holds_failure(module)
+                    }
                     (None, None, Some(&Some(dep))) => self.grants_any(dep, &allow.authority),
                     _ => true,
                 };

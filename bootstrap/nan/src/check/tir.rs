@@ -149,6 +149,26 @@ impl TExpr {
         }
     }
 
+    /// Whether the expression holds a construct that failed a rule: a failed expression or
+    /// pattern.
+    pub fn holds_failure(&self) -> bool {
+        let mut failed = matches!(self.kind, TKind::Failed);
+        self.each_pattern(&mut |pattern| failed |= pattern.holds_failure());
+        self.each_child(&mut |child| failed |= child.holds_failure());
+        failed
+    }
+
+    /// Visits each pattern this expression holds directly, those of its blocks' statements
+    /// included.
+    fn each_pattern<'e>(&'e self, visit: &mut dyn FnMut(&'e TPattern)) {
+        match &self.kind {
+            TKind::Match { arms, .. } => arms.iter().flat_map(|arm| &arm.patterns).for_each(visit),
+            TKind::If { then, .. } => then.each_pattern(visit),
+            TKind::Block(block) => block.each_pattern(visit),
+            _ => {}
+        }
+    }
+
     /// Visits each expression this one holds directly, those of its blocks' statements included.
     pub fn each_child<'e>(&'e self, visit: &mut dyn FnMut(&'e TExpr)) {
         match &self.kind {
@@ -233,6 +253,30 @@ impl TBlock {
     pub fn each_child<'e>(&'e self, visit: &mut dyn FnMut(&'e TExpr)) {
         for stmt in &self.stmts {
             stmt.each_child(visit);
+        }
+    }
+
+    /// Visits each pattern the block's statements hold directly, those of their blocks included.
+    fn each_pattern<'e>(&'e self, visit: &mut dyn FnMut(&'e TPattern)) {
+        for stmt in &self.stmts {
+            match &stmt.kind {
+                TStmtKind::Let {
+                    pattern, otherwise, ..
+                } => {
+                    visit(pattern);
+                    if let Some(otherwise) = otherwise {
+                        otherwise.each_pattern(visit);
+                    }
+                }
+                TStmtKind::For { pattern, body, .. } => {
+                    visit(pattern);
+                    body.each_pattern(visit);
+                }
+                TStmtKind::While { body, .. } | TStmtKind::Loop { body, .. } => {
+                    body.each_pattern(visit);
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -559,5 +603,33 @@ pub struct TBody {
 impl TBody {
     pub fn local(&self, id: LocalId) -> &Local {
         &self.locals[id.0 as usize]
+    }
+
+    /// Whether the body holds a construct that failed a rule: in its code, clauses or examples,
+    /// or as the type of a local.
+    pub fn holds_failure(&self) -> bool {
+        self.root.as_ref().is_some_and(TExpr::holds_failure)
+            || self
+                .clauses
+                .iter()
+                .any(|clause| clause.expr.holds_failure())
+            || self
+                .examples
+                .iter()
+                .any(|example| example.body.holds_failure())
+            || self.locals.iter().any(|local| local.ty.has_error())
+    }
+}
+
+impl TPattern {
+    /// Whether the pattern holds a pattern that failed a rule.
+    fn holds_failure(&self) -> bool {
+        match &self.kind {
+            TPatternKind::Failed => true,
+            TPatternKind::Fields(_, fields) => {
+                fields.iter().any(|(_, pattern)| pattern.holds_failure())
+            }
+            TPatternKind::Wildcard | TPatternKind::Binding(_) | TPatternKind::Value(..) => false,
+        }
     }
 }

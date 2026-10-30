@@ -164,7 +164,7 @@ A **diagnostic code** is the stable name `family.condition` of the rule a diagno
 
 The checker reports each defect once, at its root cause, and never a diagnostic that only follows from another.
 
-1. The reported construct of an error is **failed**. A check depending on a failed construct reports nothing: a failed expression or pattern satisfies every type, property, mode and limit its position requires; every use of a failed name, head, type or item is accepted; and every fact computed from a failed construct, such as a type, a structural property or a digest, satisfies every rule checking it.
+1. The reported construct of an error is **failed**. A check depending on a failed construct reports nothing: a failed expression or pattern satisfies every type, property, mode and limit its position requires; every use of a failed name, head, type or item is accepted; and every fact computed from a failed construct, such as a type, a structural property or a digest, satisfies every rule checking it. A fact that a construct lacks something is computed from every construct it holds: a body holding a failed construct may fail and may wait, a failed `break` or `continue` names every enclosing loop, and a failed `break` leaves each; a function reaching such a body may belong to a cycle; a failed type mentions every generic parameter; and an item holding a failed construct, or a module holding an item abandoned at a syntax failure, may name every item, read every field and perform every authority. A failed `targets` directive declares unknown targets: no rule judging the targets a package declares reports it, in its package or in a package depending on it, and no field, dependency or grant of its package is unused.
 2. When several rules report one construct, only the first in this order reports it: the lexical rules; the rules reporting [syntax failures](02-items.md#resynchronisation), whichever chapter owns their codes; the other rules of each chapter, in chapter order; and the rules applying only to a [final build](27-program-model.md#final-builds). Among the rules of one chapter, the rule stated first reports. A rule that states it is reported in place of, or before, the rule of another chapter takes that position: [`text.integer-index` and `text.bare-len`](13-text-encode.md#lengths-and-slicing), the checks of [deferred calls](17-suspension-io.md#defer), and [`merge.unresolved`](33-toolchain.md#conflicts), which replaces every other diagnostic, lexical ones included, on the lines of a conflict block.
 3. A rule that a declaration breaks is reported at the declaration, never at its uses.
 4. A line holding a lexical diagnostic, and an item abandoned at a syntax failure, report only what [line-local lexing](01-lexical.md#line-local-lexing) and resynchronisation allow.
@@ -181,6 +181,25 @@ pub closed struct Meter {
 pub fn Meter.add(mut self, amount: u46) { // error: name.unknown
     self.total += amount
 } Meter.add
+```
+
+In the next example the misspelt call is the root cause; the `fails` clause of `first_digit` is not unneeded, since a body holding the failed call may fail.
+
+```nan
+pub closed enum ParseError derives Render {
+    Empty
+} ParseError
+
+pub fn parse_digit(code: u8) -> u8 fails ParseError {
+    if code == 0 {
+        fail ParseError.Empty
+    }
+    return code
+} parse_digit
+
+pub fn first_digit(code: u8) -> u8 fails ParseError {
+    return try parse_digt(code) // error: name.unknown
+} first_digit
 ```
 
 ## Exact fixes

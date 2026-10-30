@@ -86,6 +86,16 @@ pub fn double(load: u32) -> u32 {
 ```
 
 ```nan
+fn halve(load: u32) -> u32 {
+    return load / 2
+} halve
+
+pub fn half_load(load: u32) -> u32 {
+    return halv(load) // error: name.unknown
+} half_load
+```
+
+```nan
 struct Reading {
     level: u32
     sensor: u8 // incomplete: unused.field

@@ -139,6 +139,18 @@ pub fn reset(mut counts: SliceMut[u32]) {
 } reset
 ```
 
+```nan
+pub fn count_hits(hits: Slice[bool]) -> u32 {
+    var count: u32 = 0
+    for hit in hits {
+        if hit {
+            cuont += 1 // error: name.unknown
+        }
+    }
+    return count
+} count_hits
+```
+
 ## Expression statements
 
 An **expression statement** is an `expr_stmt` without an assignment operator. An expression is in **statement position** when it is the whole expression of an expression statement other than the value statement of a branch ([Value-yielding if and match](#value-yielding-if-and-match)), or the expression body of an arm of a `match` in statement position.
@@ -247,6 +259,22 @@ pub fn leading_spaces(line: Slice[u8]) -> usize {
     }
     return count
 } leading_spaces
+```
+
+```nan
+pub fn first_zero(values: Slice[u32]) -> Option[usize] {
+    var index: usize = 0
+    loop as scan {
+        if index >= values.len() {
+            return None
+        }
+        if values[index] == 0 {
+            break scna // error: stmt.unknown-label
+        }
+        index += 1
+    }
+    return Some(index)
+} first_zero
 ```
 
 ```nan

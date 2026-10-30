@@ -337,6 +337,43 @@ fn TExpr.failed(token: u32) -> TExpr {
     return TExpr(token: token, last: token, ty: ty::Ty.error(), kind: TKind.Failed)
 } TExpr.failed
 
+/// Whether the expression holds a construct that failed a rule: a failed expression or
+/// pattern.
+fn TExpr.holds_failure(self) -> bool {
+    var failed = match self.kind {
+        TKind.Failed => true
+        else => false
+    }
+    self.each_pattern(fn[mut failed](pattern: TPattern) {
+        if pattern.holds_failure() {
+            failed = true
+        }
+    })
+    self.each_child(fn[mut failed](child: TExpr) {
+        if child.holds_failure() {
+            failed = true
+        }
+    })
+    return failed
+} TExpr.holds_failure
+
+/// Visits each pattern this expression holds directly, those of its blocks' statements
+/// included.
+fn TExpr.each_pattern(self, visit: fn(pattern: TPattern)) {
+    match self.kind {
+        TKind.Match(scrutinee: _, arms: arms) => {
+            for arm in arms {
+                for pattern in arm.patterns {
+                    visit(pattern)
+                }
+            }
+        }
+        TKind.If(condition: _, then: then, otherwise: _) => then.each_pattern(visit)
+        TKind.Block(block) => block.each_pattern(visit)
+        else => {}
+    }
+} TExpr.each_pattern
+
 /// Visits each expression this one holds directly, those of its blocks' statements included.
 fn TExpr.each_child(self, visit: fn(child: TExpr)) {
     match self.kind {
@@ -408,6 +445,27 @@ fn TBlock.each_child(self, visit: fn(child: TExpr)) {
     }
 } TBlock.each_child
 
+/// Visits each pattern the block's statements hold directly, those of their blocks included.
+fn TBlock.each_pattern(self, visit: fn(pattern: TPattern)) {
+    for stmt in self.stmts {
+        match stmt.kind {
+            TStmtKind.Let(pattern: pattern, value: _, otherwise: otherwise) => {
+                visit(pattern.contents())
+                match otherwise {
+                    Some(block) => block.each_pattern(visit)
+                    None => {}
+                }
+            }
+            TStmtKind.For(pattern: pattern, mode: _, iterated: _, cursor: _, invariants: _, body: body) => {
+                visit(pattern.contents())
+                body.each_pattern(visit)
+            }
+            TStmtKind.While(condition: _, invariants: _, body: body) or TStmtKind.Loop(invariants: _, body: body) => body.each_pattern(visit)
+            else => {}
+        }
+    }
+} TBlock.each_pattern
+
 /// Visits each expression the statement holds directly, those of its blocks included.
 fn TStmt.each_child(self, visit: fn(child: TExpr)) {
     match self.kind {
@@ -447,6 +505,54 @@ fn TStmt.each_child(self, visit: fn(child: TExpr)) {
         }
     }
 } TStmt.each_child
+
+/// Whether the body holds a construct that failed a rule: in its code, clauses or examples,
+/// or as the type of a local.
+fn TBody.holds_failure(self, types: ty::Types) -> bool {
+    match self.root {
+        Some(root) => {
+            if root.holds_failure() {
+                return true
+            }
+        }
+        None => {}
+    }
+    for clause in self.clauses {
+        if clause.expr.holds_failure() {
+            return true
+        }
+    }
+    for example in self.examples {
+        if example.body.contents().holds_failure(types) {
+            return true
+        }
+    }
+    for local in self.locals {
+        if types.has_error(local.ty) {
+            return true
+        }
+    }
+    return false
+} TBody.holds_failure
+
+/// Whether the pattern holds a pattern that failed a rule.
+fn TPattern.holds_failure(self) -> bool {
+    return match self.kind {
+        TPatternKind.Failed => true
+        TPatternKind.Fields(variant: _, fields: fields) => fields_hold_failure(fields.view())
+        else => false
+    }
+} TPattern.holds_failure
+
+/// Whether a field pattern holds a pattern that failed a rule.
+fn fields_hold_failure(fields: Slice[TFieldPattern]) -> bool {
+    for field in fields {
+        if field.pattern.holds_failure() {
+            return true
+        }
+    }
+    return false
+} fields_hold_failure
 
 pkg proj fn TBody.local(self, id: LocalId) -> Local {
     expect usize.widen(id.index) < self.locals.len()

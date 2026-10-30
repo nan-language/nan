@@ -546,6 +546,28 @@ impl Checker<'_> {
             .any(|dependency| *dependency == target || self.reaches(*dependency, target, seen))
     }
 
+    /// Whether a function, or a function it reaches through its dependencies, holds a failed
+    /// construct, which may name any function.
+    pub fn reaches_failure(&self, item: ItemId) -> bool {
+        let mut seen = HashSet::from([item]);
+        let mut pending = vec![item];
+        while let Some(current) = pending.pop() {
+            if self.holds_failure(current) {
+                return true;
+            }
+            for dependency in self
+                .body_dependencies(current)
+                .iter()
+                .flat_map(|found| found.iter())
+            {
+                if seen.insert(*dependency) {
+                    pending.push(*dependency);
+                }
+            }
+        }
+        false
+    }
+
     /// The dependencies of a function with a body, in order of occurrence; reading them reads
     /// the function as `typed_body` does.
     fn body_dependencies(&self, item: ItemId) -> Option<Rc<Vec<ItemId>>> {

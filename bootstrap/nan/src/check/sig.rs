@@ -339,6 +339,12 @@ impl Checker<'_> {
                 let owner = self.db.owners.get(&item).copied();
                 let mut inherited = owner.map(|key| self.type_generics(key)).unwrap_or_default();
                 self.add_impl_bounds(item, &mut inherited);
+                if self.db.is_std(item) && self.db.canonical_member_droppable(item) {
+                    for def in &mut inherited {
+                        def.bounds
+                            .retain(|bound| self.db.canonical(bound.interface) != "core::Any");
+                    }
+                }
                 let self_ty = owner.map(|key| self.key_ty(key));
                 let sig = self.head_sig(
                     module,

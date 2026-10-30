@@ -109,3 +109,42 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$TAG" nan-"$TAG"-*-linux nan-"$TAG"-*-linux.sha256 --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
+
+  aur:
+    needs: publish
+    runs-on: ubuntu-26.04
+    container: archlinux:base-devel
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      # Building the package checks the published assets against the SHA-256 of the built images.
+      - name: Write the package
+        run: |
+          useradd -m builder
+          install -d -o builder /home/builder/nan-bin
+          sed -e "s/@VERSION@/${TAG#v}/" \
+              -e "s/@SHA256_X86_64@/$(cut -d' ' -f1 "nan-$TAG-x86_64-linux.sha256")/" \
+              -e "s/@SHA256_AARCH64@/$(cut -d' ' -f1 "nan-$TAG-aarch64-linux.sha256")/" \
+              .github/aur/PKGBUILD > /home/builder/nan-bin/PKGBUILD
+          cd /home/builder/nan-bin
+          runuser -u builder -- makepkg
+          runuser -u builder -- makepkg --printsrcinfo > .SRCINFO
+      - name: Push the package to the AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+          install -m 600 /dev/null "$RUNNER_TEMP/aur_key"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur_key"
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > "$RUNNER_TEMP/aur_known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/aur_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/aur_known_hosts"
+          git clone ssh://aur@aur.archlinux.org/nan-bin.git "$RUNNER_TEMP/aur"
+          cp /home/builder/nan-bin/PKGBUILD /home/builder/nan-bin/.SRCINFO "$RUNNER_TEMP/aur"
+          cd "$RUNNER_TEMP/aur"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m "Update to ${TAG#v}"
+          git push origin HEAD:master

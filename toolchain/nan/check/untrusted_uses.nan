@@ -1,0 +1,540 @@
+//! The uses of decoders, encoders and validators that a body names: the codec uses of a function, which each instantiation naming it substitutes, and the declassifying uses, each needing a `validate` grant on its line.
+
+/// What a use of a type's codec runs.
+enum Codec derives Copy, Eq, Ord, Hash {
+    Decode
+    Encode
+} Codec
+
+/// A type parameter whose decoder or encoder a body uses.
+struct CodecUse derives Copy, Eq, Ord, Hash {
+    param: ty::Param
+    codec: Codec
+} CodecUse
+
+/// A body: a function's, test's, const's or other item's own, or the default body and clauses of
+/// an interface's method by index.
+struct UsesKey derives Copy, Eq, Hash {
+    item: ty::ItemId
+    method: Option[usize]
+} UsesKey
+
+/// A call of an interface method, by index, with its type arguments, its own from `own_from` on.
+struct CalledMethod derives Copy {
+    method: usize
+    type_args: ty::Args
+    own_from: usize
+} CalledMethod
+
+/// What a body uses.
+struct Uses derives Eq {
+    /// The type parameters of the body whose decoders or encoders it uses.
+    codecs: mem::Set[CodecUse]
+    /// The tokens of its declassifying uses of decoders and encoders, and of its uses of
+    /// validators through conformances.
+    declassifying: mem::Set[u32]
+} Uses
+
+/// The uses of the bodies a task is computing.
+struct UsesSearch {
+    /// The numbers of the computations under way, outermost first.
+    open: cell::Swap[mem::List[u32]]
+    /// Each computation, by number.
+    computations: mem::Arena[UsesComputation]
+} UsesSearch
+
+struct UsesComputation {
+    key: UsesKey
+    /// The uses its last walk found.
+    last: cell::Swap[mem::Shared[Uses]]
+    /// The lowest number among the computations under way that its walk read, `NO_ID` for none.
+    low: core::atomic::AtomicU32
+} UsesComputation
+
+fn Uses.empty(alloc: mem::Alloc) -> Uses {
+    return Uses(codecs: mem::Set[CodecUse].empty(alloc), declassifying: mem::Set[u32].empty(alloc))
+} Uses.empty
+
+fn UsesSearch.empty(alloc: mem::Alloc) -> UsesSearch {
+    return UsesSearch(open: cell::Swap.of(mem::List[u32].empty(alloc), alloc), computations: mem::Arena[UsesComputation].empty(alloc))
+} UsesSearch.empty
+
+/// Records that the innermost computation read the one numbered `number`.
+fn UsesSearch.read(self, number: u32) {
+    let open = self.open.get()
+    let count = open.len()
+    if count == 0 {
+        return
+    }
+    let innermost = self.computations.at(mem::Id[UsesComputation].of(open[count - 1]))
+    if number < innermost.low.load() {
+        innermost.low.store(number)
+    }
+} UsesSearch.read
+
+fn UsesSearch.open_number(self, key: UsesKey) -> Option[u32] {
+    for number in self.open.get() {
+        if self.computations.at(mem::Id[UsesComputation].of(number)).key == key {
+            return Some(number)
+        }
+    }
+    return None
+} UsesSearch.open_number
+
+/// Reports the `validate` grant each declassifying use in an item's bodies needs.
+fn Checker.check_uses(self, item: ty::ItemId) {
+    var keys = mem::List[UsesKey].empty(self.alloc())
+    match self.sig(item).contents().kind {
+        SigKind.Interface(methods: methods) => {
+            for index in 0..<methods.len() {
+                mut keys.push(UsesKey(item: item, method: Some(index)))
+            }
+        }
+        else => mut keys.push(UsesKey(item: item, method: None))
+    }
+    for key in keys {
+        let found = self.body_uses(key)
+        for token in found.contents().declassifying {
+            self.require(item, token, authority: workspace::Authority.Validate)
+        }
+    }
+} Checker.check_uses
+
+/// The codec uses of a function: of its body, or for a supplied `Codec` member of `mem::wire`,
+/// `text::json` or `text::construction`, the decoder of `T` for `decode` and its encoder
+/// otherwise.
+fn Checker.codec_uses(self, function: ty::ItemId) -> mem::List[CodecUse] {
+    var found = mem::List[CodecUse].empty(self.alloc())
+    let Some(head) = self.fn_sig(function) else {
+        return found
+    }
+    if head.generics.len() == 0 {
+        return found
+    }
+    let db = self.db()
+    if db.ast(function).kind.is_fn_with_body() {
+        let body = self.body_uses(UsesKey(item: function, method: None))
+        for codec_use in body.contents().codecs {
+            mut found.push(codec_use)
+        }
+        return found
+    }
+    if not db.is_std(function) {
+        return found
+    }
+    let codec = match db.canonical(function).as_str() {
+        "mem::wire::Codec.decode" or "text::json::Codec.decode" or "text::construction::Codec.decode" => Codec.Decode
+        "mem::wire::Codec.encode" or "mem::wire::Codec.try_encode" or "text::json::Codec.encode" or "text::json::Codec.try_encode" => Codec.Encode
+        else => return found
+    }
+    mut found.push(CodecUse(param: head.generics[0].param, codec: codec))
+    return found
+} Checker.codec_uses
+
+/// The uses of a body, computed once; within a cycle of bodies reaching each other, again until
+/// the outermost one's are the same as its last walk's.
+fn Checker.body_uses(self, key: UsesKey) -> mem::Shared[Uses] {
+    let alloc = self.alloc()
+    self.db().note(key.item)
+    self.trace_read(key.item)
+    let done = self.state.contents().body_uses
+    match done.get(key) {
+        Some(found) => return found.share()
+        None => {}
+    }
+    let search = self.underway.contents().uses_search
+    match search.open_number(key) {
+        Some(open) => {
+            search.read(open)
+            return search.computations.at(mem::Id[UsesComputation].of(open)).last.get().share()
+        }
+        None => {}
+    }
+    let started = search.computations.push(UsesComputation(key: key, last: cell::Swap.of(mem::Shared.of(Uses.empty(alloc), alloc), alloc), low: core::atomic::AtomicU32.of(NO_ID)))
+    let number = started.index()
+    var open = mem::List[u32].empty(alloc)
+    for held in search.open.get() {
+        mut open.push(held)
+    }
+    mut open.push(number)
+    let outer = search.open.replace(take open)
+    loop {
+        let found = mem::Shared.of(self.about(Some(key.item), compute: fn() => self.walk_uses(key)), alloc)
+        let computation = search.computations.at(started)
+        let low = computation.low.load()
+        if low < number {
+            search.open.restore(outer)
+            search.read(low)
+            return found
+        }
+        if low == number and computation.last.get().contents() != found.contents() {
+            discard computation.last.replace(take found)
+            continue
+        }
+        search.open.restore(outer)
+        return done.insert(key, value: take found).share()
+    }
+} Checker.body_uses
+
+fn Checker.walk_uses(self, key: UsesKey) -> Uses {
+    let alloc = self.alloc()
+    var own = mem::List[ty::Param].empty(alloc)
+    var body: Option[mem::Shared[TBody]] = None
+    match key.method {
+        None => {
+            match self.fn_sig(key.item) {
+                Some(head) => {
+                    for def in head.generics {
+                        mut own.push(def.param)
+                    }
+                }
+                None => {}
+            }
+            body = self.typed(key.item)
+        }
+        Some(method) => {
+            let bodies = self.state.contents().method_bodies
+            let method_key = MethodKey(item: key.item, method: method)
+            if bodies.get(method_key).is_none() {
+                discard self.typed(key.item)
+            }
+            match bodies.get(method_key) {
+                Some(held) => {
+                    body = Some(held.share())
+                }
+                None => {}
+            }
+            let sig = self.sig(key.item)
+            for def in sig.contents().generics {
+                mut own.push(def.param)
+            }
+            match sig.contents().kind {
+                SigKind.Interface(methods: methods) => {
+                    for def in methods[method].sig.generics {
+                        mut own.push(def.param)
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+    var walk = UsesWalk(ck: self.share(), item: key.item, own: take own, found: Uses.empty(alloc))
+    match body {
+        Some(held) => mut walk.body(held.contents())
+        None => {}
+    }
+    return walk.found
+} Checker.walk_uses
+
+struct UsesWalk {
+    ck: Checker
+    item: ty::ItemId
+    /// The type parameters of the body.
+    own: mem::List[ty::Param]
+    found: Uses
+} UsesWalk
+
+fn UsesWalk.body(mut self, body: TBody) {
+    for clause in body.clauses {
+        mut self.expr(clause.expr)
+    }
+    for example in body.examples {
+        mut self.body(example.body.contents())
+    }
+    match body.root {
+        Some(root) => mut self.expr(root)
+        None => {}
+    }
+} UsesWalk.body
+
+fn UsesWalk.expr(mut self, expr: TExpr) {
+    let ck = self.ck.share()
+    match expr.kind {
+        TKind.Call(call) or TKind.Index(call) => {
+            ck.db().on_line(ck.db().line(self.item, token: expr.token), compute: fn[mut self]() => mut self.call(call.contents()))
+        }
+        TKind.FnValue(item: function, type_args: type_args) => {
+            ck.db().on_line(ck.db().line(self.item, token: expr.token), compute: fn[mut self]() => mut self.named(expr.token, function, args: ck.types().arg_list(type_args)))
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut self](child: TExpr) => mut self.expr(child))
+} UsesWalk.expr
+
+/// The uses a call names: those of the instantiation it calls, of the decoder or encoder an
+/// `Encode` method runs, and of the conformances of its receiver and its type arguments to their
+/// bounds, or of a type viewed as `Dyn`.
+fn UsesWalk.call(mut self, call: Call) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let token = call.token
+    match call.callee {
+        Callee.Function(item: function) => mut self.named(token, function, args: types.arg_list(call.type_args))
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: false) => {
+            if ck.db().core_item("Encode") == Some(bound.item) {
+                if ck.interface_method(bound.item, name: "decode") == Some(method) {
+                    mut self.codec(token, ty: self_ty, codec: Codec.Decode)
+                } else if ck.interface_method(bound.item, name: "encode") == Some(method) {
+                    mut self.codec(token, ty: self_ty, codec: Codec.Encode)
+                }
+            }
+            let own_from = 1 + types.arg_list(bound.args).len()
+            let called = CalledMethod(method: method, type_args: call.type_args, own_from: own_from)
+            if ck.db().core_item("Encode") != Some(bound.item) and not is_type_param(types, ty: self_ty) {
+                mut self.conforms(token, ty: self_ty, interface_item: bound.item, called: Some(called))
+            }
+            match ck.method_head(bound, method, self_ty) {
+                Some(head) => mut self.bounded(token, generics: head.generics.view(), args: types.arg_list(call.type_args), own_from: own_from)
+                None => {}
+            }
+        }
+        Callee.Builtin(Builtin.DynView) => {
+            if call.args.len() == 0 {
+                return
+            }
+            let arg_ty = call.args[0].expr.contents().ty
+            var viewed: Option[ty::Ty] = Some(arg_ty)
+            var view: ty::Ty = call.head.result
+            match types.kind(call.head.result) {
+                ty::TyKind.Dyn(_) => {}
+                else => {
+                    viewed = types.type_arg(arg_ty, index: 0)
+                    view = types.type_arg(call.head.result, index: 0).value_or(call.head.result)
+                }
+            }
+            let Some(shown) = viewed else {
+                return
+            }
+            let ty::TyKind.Dyn(bound) = types.kind(view) else {
+                return
+            }
+            if not is_type_param(types, ty: shown) {
+                mut self.conforms(token, ty: shown, interface_item: bound.item, called: None)
+            }
+        }
+        else => {}
+    }
+} UsesWalk.call
+
+/// The uses of naming an instantiation of a function: those of the conformances of its type
+/// arguments to their bounds, and of the decoders and encoders its codec uses substitute.
+fn UsesWalk.named(mut self, token: u32, function: ty::ItemId, args: Slice[ty::Arg]) {
+    let ck = self.ck.share()
+    let Some(head) = ck.fn_sig(function) else {
+        return
+    }
+    if head.generics.len() == 0 {
+        return
+    }
+    mut self.bounded(token, generics: head.generics.view(), args, own_from: 0)
+    let types = ck.types()
+    let subst = ty::Subst.of(generic_params(head.generics.view(), alloc: ck.alloc()).view(), args, alloc: ck.alloc())
+    for codec_use in ck.codec_uses(function) {
+        mut self.codec(token, ty: subst.ty(types, ty: types.intern(ty::TyKind.Param(codec_use.param))), codec: codec_use.codec)
+    }
+} UsesWalk.named
+
+/// The uses of the conformances of type arguments that are no type parameters, from `args` at
+/// `own_from` on, to the bounds of the generic parameters they are given to.
+fn UsesWalk.bounded(mut self, token: u32, generics: Slice[GenericDef], args: Slice[ty::Arg], own_from: usize) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    for index in 0..<generics.len() {
+        if own_from + index >= args.len() {
+            return
+        }
+        let Some(arg) = args[own_from + index].ty() else {
+            continue
+        }
+        if is_type_param(types, ty: arg) {
+            continue
+        }
+        for bound in generics[index].bounds {
+            mut self.conforms(token, ty: arg, interface_item: bound.item, called: None)
+        }
+    }
+} UsesWalk.bounded
+
+/// The uses of a type's conformance to an interface other than `Encode` and the property
+/// interfaces, a call of one of its methods with its own type arguments `called` included:
+/// through an impl line, those its implementing functions and default bodies name; through a
+/// derive, those of its constituent types' conformances; through the toolchain, those of its
+/// type arguments'.
+fn UsesWalk.conforms(mut self, token: u32, ty: ty::Ty, interface_item: ty::ItemId, called: Option[CalledMethod]) {
+    let ck = self.ck.share()
+    let db = ck.db()
+    if db.core_item("Encode") == Some(interface_item) or db.core_item("Any") == Some(interface_item) {
+        return
+    }
+    if ck.property_interface(interface_item).is_some() {
+        return
+    }
+    var seen = mem::List[ty::Ty].empty(ck.alloc())
+    mut self.conforms_from(token, ty, interface_item, called, seen: mut seen)
+} UsesWalk.conforms
+
+fn UsesWalk.conforms_from(mut self, token: u32, ty: ty::Ty, interface_item: ty::ItemId, called: Option[CalledMethod], mut seen: mem::List[ty::Ty]) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    if types.has_error(ty) or seen.position(fn(earlier: ty::Ty) => earlier == ty).is_some() {
+        return
+    }
+    mut seen.push(ty)
+    let Some(conforming) = ck.conformance(ty, interface_item) else {
+        return
+    }
+    match conforming.how {
+        Conformance.Impl(line: line, subst: _) => mut self.implemented(token, ty, line, interface_item, args: types.arg_list(conforming.args), called)
+        Conformance.Derive => {
+            for constituent in ck.constituents_of(ty) {
+                mut self.conforms_from(token, ty: constituent, interface_item, called, seen: mut seen)
+            }
+        }
+        Conformance.Builtin => {
+            for arg in types.arg_list(types.args_of(ty)) {
+                let Some(arg_ty) = arg.ty() else {
+                    continue
+                }
+                mut self.conforms_from(token, ty: arg_ty, interface_item, called, seen: mut seen)
+            }
+        }
+        Conformance.Bound => {}
+    }
+} UsesWalk.conforms_from
+
+/// The uses of a type's conformance through an impl line with the interface's arguments `args`:
+/// each implementing function that is a validator, and what each implementing function or
+/// default body names with the type's arguments substituted, and the own type arguments of the
+/// method `called`.
+fn UsesWalk.implemented(mut self, token: u32, ty: ty::Ty, line: ty::ItemId, interface_item: ty::ItemId, args: Slice[ty::Arg], called: Option[CalledMethod]) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let sig = ck.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return
+    }
+    for index in 0..<methods.len() {
+        let method = methods[index]
+        match ck.implementing_function(line, name: method.name.as_str()) {
+            Some(function) => {
+                if ck.is_validator(function) {
+                    discard mut self.found.declassifying.insert(token)
+                }
+                let Some(head) = ck.fn_sig(function) else {
+                    continue
+                }
+                var inherited = mem::List[ty::Param].empty(alloc)
+                for position in 0..<head.inherited {
+                    mut inherited.push(head.generics[position].param)
+                }
+                var subst = ty::Subst.of(inherited.view(), args: types.arg_list(types.args_of(ty)), alloc)
+                for position in head.inherited..<head.generics.len() {
+                    match own_arg(types, called, method: index, position: position - head.inherited) {
+                        Some(arg) => mut subst.insert(head.generics[position].param, arg: arg)
+                        None => {}
+                    }
+                }
+                for codec_use in ck.codec_uses(function) {
+                    mut self.codec(token, ty: subst.ty(types, ty: types.intern(ty::TyKind.Param(codec_use.param))), codec: codec_use.codec)
+                }
+            }
+            None => {
+                if not method.default {
+                    continue
+                }
+                var params = mem::List[ty::Param].empty(alloc)
+                for def in sig.contents().generics {
+                    if not def.param.is_self() {
+                        mut params.push(def.param)
+                    }
+                }
+                var subst = ty::Subst.of(params.view(), args, alloc)
+                mut subst.insert(ty::Param(owner: interface_item, index: ty::SELF_INDEX), arg: ty::Arg.Ty(ty))
+                for position in 0..<method.sig.generics.len() {
+                    match own_arg(types, called, method: index, position) {
+                        Some(arg) => mut subst.insert(method.sig.generics[position].param, arg: arg)
+                        None => {}
+                    }
+                }
+                let found = ck.body_uses(UsesKey(item: interface_item, method: Some(index)))
+                for codec_use in found.contents().codecs {
+                    mut self.codec(token, ty: subst.ty(types, ty: types.intern(ty::TyKind.Param(codec_use.param))), codec: codec_use.codec)
+                }
+            }
+        }
+    }
+} UsesWalk.implemented
+
+/// A use of the decoder or encoder of `ty`: of a type parameter of the body, one of its codec
+/// uses; of a type parameter of another item, which no argument substituted, declassifying; of
+/// another type, declassifying when it decodes no parsing type or encodes one holding an
+/// Untrusted instantiation, and a use of the same codec of each type parameter of the body the
+/// type holds.
+fn UsesWalk.codec(mut self, token: u32, ty: ty::Ty, codec: Codec) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    if types.has_error(ty) {
+        return
+    }
+    match types.kind(ty) {
+        ty::TyKind.Param(param) => {
+            if self.owns(param) {
+                discard mut self.found.codecs.insert(CodecUse(param: param, codec: codec))
+            } else {
+                discard mut self.found.declassifying.insert(token)
+            }
+            return
+        }
+        else => {}
+    }
+    let declassifying = match codec {
+        Codec.Decode => not ck.is_parsing(ty)
+        Codec.Encode => ck.holds_untrusted(ty)
+    }
+    if declassifying {
+        discard mut self.found.declassifying.insert(token)
+    }
+    var held = mem::List[ty::Param].empty(ck.alloc())
+    discard ck.any_part(ty, test_part: fn[mut held](part: ty::Ty) -> bool {
+        match types.kind(part) {
+            ty::TyKind.Param(param) => mut held.push(param)
+            else => {}
+        }
+        return false
+    })
+    for param in held {
+        if self.owns(param) {
+            discard mut self.found.codecs.insert(CodecUse(param: param, codec: codec))
+        }
+    }
+} UsesWalk.codec
+
+/// Whether a type parameter is one of the body's.
+fn UsesWalk.owns(self, param: ty::Param) -> bool {
+    return self.own.position(fn(value: ty::Param) => value == param).is_some()
+} UsesWalk.owns
+
+/// The own type argument at `position` that a call gives the interface method `method`, if
+/// `called` calls it.
+fn own_arg(types: ty::Types, called: Option[CalledMethod], method: usize, position: usize) -> Option[ty::Arg] {
+    let Some(held) = called else {
+        return None
+    }
+    if held.method != method {
+        return None
+    }
+    let args = types.arg_list(held.type_args)
+    if held.own_from + position >= args.len() {
+        return None
+    }
+    return Some(args[held.own_from + position])
+} own_arg
+
+/// Whether a type is a type parameter.
+fn is_type_param(types: ty::Types, ty: ty::Ty) -> bool {
+    return match types.kind(ty) {
+        ty::TyKind.Param(_) => true
+        else => false
+    }
+} is_type_param

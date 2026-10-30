@@ -123,6 +123,7 @@ pub struct Checker<'a> {
     /// The impl lines each function implements a method of, once found.
     implemented: RefCell<HashMap<ItemId, Vec<ItemId>>>,
     digests: RefCell<digest::Digests>,
+    body_uses: RefCell<untrusted::uses::Cache>,
     cycles: RefCell<digest::Cycles>,
     /// The authorities each module performs directly, as far as checked.
     performed: RefCell<HashSet<(ModuleId, Authority)>>,
@@ -236,6 +237,7 @@ impl<'a> Checker<'a> {
             body_dependencies: RefCell::new(HashMap::new()),
             implemented: RefCell::new(HashMap::new()),
             digests: RefCell::new(digest::Digests::default()),
+            body_uses: RefCell::new(untrusted::uses::Cache::default()),
             cycles: RefCell::new(digest::Cycles::default()),
             performed: RefCell::new(HashSet::new()),
             module_values: RefCell::new(HashMap::new()),

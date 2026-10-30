@@ -1680,124 +1680,77 @@ impl Body<'_, '_> {
         }
     }
 
-    /// The rules a call obeys for what it calls: the grant its operation needs, the uses of
-    /// validators, decoders and encoders, and where `inspect` and `Untrusted.of` stand.
+    /// The rules a call obeys for what it calls: the grant its operation needs, the calls of
+    /// validators, and where `inspect` and `Untrusted.of` stand.
     fn check_callee(&self, token: Tok, callable: &Callable) {
         let subst = &callable.infer.subst;
-        match &callable.callee {
-            Callee::Function { item, .. } => {
-                let item = *item;
-                if self.ck.is_trusted_primitive(item) && !self.cx.trusted {
-                    self.report(token, Code::TrustedPrimitiveOutside);
-                }
-                if let Some(authority) = self.ck.call_authority(item) {
-                    self.ck.require(self.item, token, authority);
-                }
-                self.ck.check_validator_use(self.item, token, item);
-                if !self.ck.db.is_std(item) {
-                    return;
-                }
-                let path = self.ck.db.canonical(item);
-                let wrapped = callable
-                    .head
-                    .generics
-                    .first()
-                    .and_then(|def| subst.get(def.param));
-                if path
-                    .strip_prefix("hw::Ptr.")
-                    .is_some_and(|member| member.starts_with("atomic_"))
-                {
-                    let integer = matches!(
-                        wrapped,
-                        Some(Arg::Ty(Ty::Scalar(
-                            Scalar::U8 | Scalar::U16 | Scalar::U32 | Scalar::U64 | Scalar::Usize
-                        )))
-                    );
-                    if !integer && !matches!(wrapped, Some(Arg::Ty(Ty::Error))) {
-                        self.report(token, Code::HwAtomicType);
-                    }
-                }
-                match path.as_str() {
-                    "hw::Anchor.with" if !self.ck.is_entry_context(self.item) => {
-                        self.report(token, Code::KernelAnchorOutsideEntry);
-                    }
-                    "sys::Domain.run" | "sys::Domain.run_sized"
-                        if self.ck.db.target.is_machine() =>
-                    {
-                        self.report(token, Code::DomainUnavailable);
-                    }
-                    "hw::Ports.map" if self.ck.db.target.arch() == Some(Arch::Aarch64) => {
-                        self.report(token, Code::RegisterPortTarget);
-                    }
-                    _ if INTRINSIC_ARCHS.iter().any(|(intrinsic, arch)| {
-                        *intrinsic == path && self.ck.db.target.arch().is_some_and(|of| of != *arch)
-                    }) =>
-                    {
-                        self.report(token, Code::HwIntrinsicTarget);
-                    }
-                    "host::Runner.run" => {
-                        if let Some(code) = self.ck.runner_problem(&callable.head, subst) {
-                            self.report(token, code);
-                        }
-                    }
-                    "core::Untrusted.inspect" if !self.inspecting() => {
-                        self.report(token, Code::UntrustedInspectOutsideValidator);
-                    }
-                    "core::Untrusted.of" => {
-                        if let Some(Arg::Ty(wrapped)) = wrapped
-                            && !self.ck.wraps_untrusted(wrapped)
-                        {
-                            self.report(token, Code::UntrustedWrappedAlias);
-                        }
-                    }
-                    _ if path.ends_with(".decode") || path.ends_with("::decode") => {
-                        for decoded in self.encoded_args(callable) {
-                            self.ck.check_decoder_use(self.item, token, &decoded);
-                        }
-                    }
-                    _ if path.ends_with(".encode") || path.ends_with(".try_encode") => {
-                        for encoded in self.encoded_args(callable) {
-                            self.ck.check_encoder_use(self.item, token, &encoded);
-                        }
-                    }
-                    _ => {}
+        let Callee::Function { item, .. } = &callable.callee else {
+            return;
+        };
+        let item = *item;
+        if self.ck.is_trusted_primitive(item) && !self.cx.trusted {
+            self.report(token, Code::TrustedPrimitiveOutside);
+        }
+        if let Some(authority) = self.ck.call_authority(item) {
+            self.ck.require(self.item, token, authority);
+        }
+        self.ck.check_validator_use(self.item, token, item);
+        if !self.ck.db.is_std(item) {
+            return;
+        }
+        let path = self.ck.db.canonical(item);
+        let wrapped = callable
+            .head
+            .generics
+            .first()
+            .and_then(|def| subst.get(def.param));
+        if path
+            .strip_prefix("hw::Ptr.")
+            .is_some_and(|member| member.starts_with("atomic_"))
+        {
+            let integer = matches!(
+                wrapped,
+                Some(Arg::Ty(Ty::Scalar(
+                    Scalar::U8 | Scalar::U16 | Scalar::U32 | Scalar::U64 | Scalar::Usize
+                )))
+            );
+            if !integer && !matches!(wrapped, Some(Arg::Ty(Ty::Error))) {
+                self.report(token, Code::HwAtomicType);
+            }
+        }
+        match path.as_str() {
+            "hw::Anchor.with" if !self.ck.is_entry_context(self.item) => {
+                self.report(token, Code::KernelAnchorOutsideEntry);
+            }
+            "sys::Domain.run" | "sys::Domain.run_sized" if self.ck.db.target.is_machine() => {
+                self.report(token, Code::DomainUnavailable);
+            }
+            "hw::Ports.map" if self.ck.db.target.arch() == Some(Arch::Aarch64) => {
+                self.report(token, Code::RegisterPortTarget);
+            }
+            _ if INTRINSIC_ARCHS.iter().any(|(intrinsic, arch)| {
+                *intrinsic == path && self.ck.db.target.arch().is_some_and(|of| of != *arch)
+            }) =>
+            {
+                self.report(token, Code::HwIntrinsicTarget);
+            }
+            "host::Runner.run" => {
+                if let Some(code) = self.ck.runner_problem(&callable.head, subst) {
+                    self.report(token, code);
                 }
             }
-            Callee::Method {
-                interface,
-                method,
-                self_ty,
-                dynamic: false,
-            } if Some(interface.interface) == self.ck.db.core_item("Encode") => {
-                let named =
-                    |name| self.ck.interface_method(interface.interface, name) == Some(*method);
-                if named("decode") {
-                    self.ck.check_decoder_use(self.item, token, self_ty);
-                } else if named("encode") {
-                    self.ck.check_encoder_use(self.item, token, self_ty);
+            "core::Untrusted.inspect" if !self.inspecting() => {
+                self.report(token, Code::UntrustedInspectOutsideValidator);
+            }
+            "core::Untrusted.of" => {
+                if let Some(Arg::Ty(wrapped)) = wrapped
+                    && !self.ck.wraps_untrusted(wrapped)
+                {
+                    self.report(token, Code::UntrustedWrappedAlias);
                 }
             }
             _ => {}
         }
-    }
-
-    /// The type arguments a call gives its callee's type parameters bounded by `Encode`.
-    fn encoded_args(&self, callable: &Callable) -> Vec<Ty> {
-        let encode = self.ck.db.core_item("Encode");
-        callable
-            .head
-            .generics
-            .iter()
-            .filter(|def| {
-                def.bounds
-                    .iter()
-                    .any(|bound| Some(bound.interface) == encode)
-            })
-            .filter_map(|def| match callable.infer.subst.get(def.param) {
-                Some(Arg::Ty(ty)) => Some(ty.clone()),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The role of a closure written as the argument for a parameter of a call: the body of a

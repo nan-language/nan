@@ -484,6 +484,7 @@ impl Checker<'_> {
                 self.check_float_use(item, &body);
             }
             self.bodies.borrow_mut().insert(item, body.clone());
+            self.check_uses(item);
             if ast.kind.is_fn_with_body() {
                 self.check_limits(item, &body);
             }
@@ -494,6 +495,9 @@ impl Checker<'_> {
             if let ItemKind::Test(test) = &ast.kind {
                 self.check_property_test(item, test, &body);
             }
+        }
+        if let ItemKind::Interface(_) = &ast.kind {
+            self.check_uses(item);
         }
         if self.is_entry(item) {
             self.check_entry_head(item);

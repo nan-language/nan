@@ -8,6 +8,7 @@ use super::resolve::{Named, is_core_vocabulary};
 use super::sig::SigKind;
 use super::tir::{Callee, TExpr, TKind, TPattern, TPatternKind, TStmtKind};
 use super::ty::Ty;
+use super::untrusted::uses::Codec;
 use crate::format::normal::{
     Forms, Known, Numbering, Reach, flat_text, forms, interface_text, normalised_fragment,
 };
@@ -89,10 +90,14 @@ impl Checker<'_> {
     pub fn forms(&self, item: ItemId) -> Forms {
         let data = self.db.item(item);
         let resolve = |segments: &[&str]| self.canonically(data.module, segments);
+        let known = Known {
+            facts: self.facts_line(item),
+            ..self.known(item, &resolve, None)
+        };
         forms(
             &data.file.syntax,
             &data.file.syntax.items[data.index],
-            &self.known(item, &resolve, None),
+            &known,
         )
     }
 
@@ -158,7 +163,7 @@ impl Checker<'_> {
                 Visibility::Pkg => Reach::Package,
                 Visibility::Pub => Reach::Consumer,
             },
-            facts: self.facts_line(item),
+            facts: None,
         }
     }
 
@@ -227,9 +232,13 @@ impl Checker<'_> {
     }
 
     /// The facts line of a struct or enum: `facts`, then its interface facts in order, each
-    /// resting on dependent parameters followed by their names in brackets.
+    /// resting on dependent parameters followed by their names in brackets; of a function with
+    /// codec uses, `decode` and `encode` resting on the type parameters it uses those of.
     fn facts_line(&self, item: ItemId) -> Option<String> {
         let ast = self.db.ast(item);
+        if let ItemKind::Fn(_) = ast.kind {
+            return self.codec_facts(item);
+        }
         if !matches!(ast.kind, ItemKind::Struct(_) | ItemKind::Enum(_)) {
             return None;
         }
@@ -287,6 +296,27 @@ impl Checker<'_> {
         } else {
             format!("facts {}", facts.join(", "))
         })
+    }
+
+    /// The facts line of a function's codec uses, none without any.
+    fn codec_facts(&self, function: ItemId) -> Option<String> {
+        let uses = self.codec_uses(function);
+        if uses.is_empty() {
+            return None;
+        }
+        let generics = self.fn_sig(function)?.generics;
+        let facts: Vec<String> = [("decode", Codec::Decode), ("encode", Codec::Encode)]
+            .into_iter()
+            .filter_map(|(name, codec)| {
+                let resting: Vec<&str> = generics
+                    .iter()
+                    .filter(|def| uses.contains(&(def.param, codec)))
+                    .map(|def| def.name.as_str())
+                    .collect();
+                (!resting.is_empty()).then(|| format!("{name}[{}]", resting.join(", ")))
+            })
+            .collect();
+        Some(format!("facts {}", facts.join(", ")))
     }
 
     /// Whether code of `holder` unfolds calls to a transparent function: every field, item and

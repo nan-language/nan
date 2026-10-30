@@ -45,7 +45,7 @@ fn Checker.read_interface_hash(self, item: ty::ItemId, take reading: format::Ite
     let module = data.module
     expect data.index < syntax.items.len()
     let parsed = syntax.items[data.index]
-    let known = self.known(item, viewer: None)
+    let known = self.known(item, viewer: None, facts: self.facts_line(item))
     match db.ast(item).kind {
         ast::ItemKind.Const(_) => return self.hashes_of(item, forms: format::Forms.read(syntax, item: parsed, take reading, known, resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), alloc: self.alloc())).interface_hash
         else => {}
@@ -143,7 +143,7 @@ fn Checker.forms(self, item: ty::ItemId) -> format::Forms {
     let syntax = db.syntax(item)
     let module = data.module
     expect data.index < syntax.items.len()
-    return format::Forms.of(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), alloc: self.alloc())
+    return format::Forms.of(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None, facts: self.facts_line(item)), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), alloc: self.alloc())
 } Checker.forms
 
 /// The interface text of an item, as its canonical format writes it: what consumers see, or
@@ -153,7 +153,7 @@ fn Checker.interface_text(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) 
     let data = db.item(item)
     let syntax = db.syntax(item)
     expect data.index < syntax.items.len()
-    return format::interface_text(syntax, item: syntax.items[data.index], known: self.known(item, viewer), alloc: self.alloc())
+    return format::interface_text(syntax, item: syntax.items[data.index], known: self.known(item, viewer, facts: None), alloc: self.alloc())
 } Checker.interface_text
 
 /// What reading an item's syntax gives its forms and its interface text, none for an item the
@@ -173,7 +173,7 @@ fn Checker.read_interface_text(self, item: ty::ItemId, viewer: Option[ty::Module
     let data = db.item(item)
     let syntax = db.syntax(item)
     expect data.index < syntax.items.len()
-    return format::read_interface_text(syntax, item: syntax.items[data.index], reading, known: self.known(item, viewer), alloc: self.alloc())
+    return format::read_interface_text(syntax, item: syntax.items[data.index], reading, known: self.known(item, viewer, facts: None), alloc: self.alloc())
 } Checker.read_interface_text
 
 /// The tokens `range` of an item as its normalised form writes them, on one line, with its
@@ -184,7 +184,7 @@ fn Checker.fragment(self, item: ty::ItemId, range: nir::Span, numbering: format:
     let syntax = db.syntax(item)
     let module = data.module
     expect data.index < syntax.items.len()
-    return format::normalised_fragment(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), range: syntax::TokenSpan(head: range.head, last: range.last), numbering, alloc: self.alloc())
+    return format::normalised_fragment(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None, facts: None), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), range: syntax::TokenSpan(head: range.head, last: range.last), numbering, alloc: self.alloc())
 } Checker.fragment
 
 /// The flat text of the tokens `range` of an item.
@@ -197,8 +197,9 @@ fn Checker.flat(self, item: ty::ItemId, range: nir::Span) -> text::String {
 } Checker.flat
 
 /// What the forms of an item write beyond its syntax and the paths it resolves; the fields and
-/// transparent body seen wherever the item is visible, or from the module `viewer`.
-fn Checker.known(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> format::Known {
+/// transparent body seen wherever the item is visible, or from the module `viewer`, and the
+/// facts line `facts`.
+fn Checker.known(self, item: ty::ItemId, viewer: Option[ty::ModuleId], take facts: Option[text::String]) -> format::Known {
     let db = self.db()
     let data = db.item(item)
     var fields = format::Reach.Consumer
@@ -218,7 +219,7 @@ fn Checker.known(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> format
             }
         }
     }
-    return format::Known(own: self.own_path(item), transparent: self.transparent_seen(item, viewer), fields: fields, facts: self.facts_line(item))
+    return format::Known(own: self.own_path(item), transparent: self.transparent_seen(item, viewer), fields: fields, facts: take facts)
 } Checker.known
 
 /// The canonical path of the item a path written in a module names, or the core vocabulary
@@ -279,11 +280,16 @@ fn Checker.own_path(self, item: ty::ItemId) -> Option[text::String] {
 } Checker.own_path
 
 /// The facts line of a struct or enum: `facts`, then its interface facts in order, each
-/// resting on dependent parameters followed by their names in brackets.
+/// resting on dependent parameters followed by their names in brackets; of a function with
+/// codec uses, `decode` and `encode` resting on the type parameters it uses those of.
 fn Checker.facts_line(self, item: ty::ItemId) -> Option[text::String] {
     let alloc = self.alloc()
     let db = self.db()
     let declared = db.ast(item)
+    match declared.kind {
+        ast::ItemKind.Fn(_) => return self.codec_facts(item)
+        else => {}
+    }
     let is_type = match declared.kind {
         ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
         else => false
@@ -331,6 +337,58 @@ fn Checker.facts_line(self, item: ty::ItemId) -> Option[text::String] {
     }
     return Some(take line)
 } Checker.facts_line
+
+/// The facts line of a function's codec uses, none without any.
+fn Checker.codec_facts(self, function: ty::ItemId) -> Option[text::String] {
+    let alloc = self.alloc()
+    let codecs = self.codec_uses(function)
+    if codecs.len() == 0 {
+        return None
+    }
+    let Some(head) = self.fn_sig(function) else {
+        return None
+    }
+    var facts = mem::List[text::String].empty(alloc)
+    push_codec_fact(mut facts, name: "decode", codec: Codec.Decode, codecs: codecs.view(), generics: head.generics.view(), alloc)
+    push_codec_fact(mut facts, name: "encode", codec: Codec.Encode, codecs: codecs.view(), generics: head.generics.view(), alloc)
+    var line = text::String.of("facts", alloc)
+    for index in 0..<facts.len() {
+        if index == 0 {
+            mut line.push(' ')
+        } else {
+            mut line.append(", ")
+        }
+        mut line.append(facts[index].as_str())
+    }
+    return Some(take line)
+} Checker.codec_facts
+
+/// Adds the fact of a codec when a codec use marks any type parameter with it, followed by the
+/// names of those parameters in brackets.
+fn push_codec_fact(mut facts: mem::List[text::String], name: Str, codec: Codec, codecs: Slice[CodecUse], generics: Slice[GenericDef], alloc: mem::Alloc) {
+    var fact = text::String.of(name, alloc)
+    var listed = false
+    for def in generics {
+        var marked = false
+        for value in codecs {
+            marked = marked or value == CodecUse(param: def.param, codec: codec)
+        }
+        if not marked {
+            continue
+        }
+        if listed {
+            mut fact.append(", ")
+        } else {
+            mut fact.push('[')
+        }
+        mut fact.append(def.name.as_str())
+        listed = true
+    }
+    if listed {
+        mut fact.push(']')
+        mut facts.push(take fact)
+    }
+} push_codec_fact
 
 /// Whether code of `holder` unfolds calls to a transparent function: every field, item and
 /// member its body names is visible to it.

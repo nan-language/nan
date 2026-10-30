@@ -14,7 +14,7 @@ use super::super::body::Held;
 use super::super::call::Invoked;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tasks::{self, task};
-use super::super::runtime::{report, state};
+use super::super::runtime::{Routine, report, state};
 use super::super::{Instance, Lowering};
 use super::SEAM_FRAME;
 use super::aarch64;
@@ -159,7 +159,7 @@ const GATE: i64 = 0x8E00;
 /// The local APIC, in the memory the entry root maps uncached, and the registers the kernel
 /// programs: its id, the spurious-interrupt vector, the end-of-interrupt register, the
 /// interrupt command register's two halves, the timer's local vector table entry, its divide
-/// configuration and its initial count.
+/// configuration, its initial count and its current count.
 const APIC: u64 = 0xFEE0_0000;
 const APIC_ID: u64 = 0x20;
 const APIC_SPURIOUS: u64 = 0xF0;
@@ -169,6 +169,7 @@ const APIC_DESTINATION: u64 = 0x310;
 const APIC_LVT_TIMER: u64 = 0x320;
 const APIC_TIMER_DIVIDE: u64 = 0x3E0;
 const APIC_TIMER_COUNT: u64 = 0x380;
+const APIC_TIMER_CURRENT: u64 = 0x390;
 
 /// The interrupt command register's delivery-pending bit, and the commands the kernel sends: an
 /// INIT and a startup IPI to one CPU, and a non-maskable interrupt to every other CPU.
@@ -178,15 +179,17 @@ pub const IPI_STARTUP: u64 = 0x4600;
 const IPI_NMI_OTHERS: u64 = 0xC_4400;
 
 /// The local APIC's software-enable bit in its spurious-interrupt register, the divide
-/// configuration slowing its timer's clock by 16, and the timer mode firing periodically.
+/// configuration slowing its timer's clock by 16, and the mask bit of a local vector table
+/// entry.
 const APIC_ENABLED: u64 = 0x100;
 const DIVIDE_BY_16: u64 = 0x3;
-const PERIODIC: u64 = 0x2_0000;
+const MASKED: u64 = 0x1_0000;
 
-/// The interrupt vector each CPU's local APIC timer fires, periodically, the initial count that
-/// paces it on the emulator, and the vector of the local APIC's spurious interrupts.
+/// The interrupt vector each CPU's local APIC timer fires, one-shot, the nanoseconds of the
+/// clock over which a CPU counts its timer's ticks, and the vector of the local APIC's spurious
+/// interrupts.
 const TIMER_VECTOR: i64 = 0x20;
-const TIMER_COUNT: u64 = 0x10_0000;
+const TIMER_MEASURE: u64 = 1_000_000;
 const SPURIOUS_VECTOR: i64 = 0xFF;
 
 /// The vector of non-maskable interrupts, and those whose interrupt fn's return halts the
@@ -421,8 +424,8 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a CPU runs to take interrupts: it draws its interrupt stack and one for each of
-    /// `stacks`, the nonzero `ist` values bindings use, loads the interrupt descriptor table and
-    /// enables its local APIC, its timer firing `TIMER_VECTOR`.
+    /// `stacks`, the nonzero `ist` values bindings use, loads the interrupt descriptor table,
+    /// enables its local APIC and starts its timer, firing `TIMER_VECTOR`.
     fn cpu_interrupts(&mut self, stacks: &[u8]) -> FuncId {
         let signature = Signature::new(super::super::CALL_CONV);
         let id = self
@@ -449,9 +452,7 @@ impl Lowering<'_, '_> {
             let idt = lo.reserved(fx, "_NSidt", IDT_BYTES, 16);
             lo.load_idt(fx, idt);
             lo.apic_write(fx, APIC_SPURIOUS, APIC_ENABLED | SPURIOUS_VECTOR as u64);
-            lo.apic_write(fx, APIC_TIMER_DIVIDE, DIVIDE_BY_16);
-            lo.apic_write(fx, APIC_LVT_TIMER, TIMER_VECTOR as u64 | PERIODIC);
-            lo.apic_write(fx, APIC_TIMER_COUNT, TIMER_COUNT);
+            lo.start_timer(fx);
             fx.b.ins().return_(&[]);
         });
         id
@@ -630,9 +631,10 @@ impl Lowering<'_, '_> {
     /// Dispatches a fired vector with its saved frame: calls the interrupt fn the final build
     /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
     /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
-    /// binds. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with maskable
-    /// interrupts enabled and the anchor is installed, the task is preempted. An unbound timer
-    /// interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
+    /// binds. A timer interrupt first serves the kernel's clock, and reaches an interrupt fn on a
+    /// pacing tick alone. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
+    /// maskable interrupts enabled and the anchor is installed, the task is preempted. An unbound
+    /// timer interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
     /// unbound vector, the kernel halts at the interrupted instruction.
     fn dispatch_vector(&mut self, bound: &[Bound], signature: Signature) -> FuncId {
         let id = self
@@ -649,6 +651,15 @@ impl Lowering<'_, '_> {
                 fx.when(stopping, |fx| lo.stop_if_halting(fx));
             }
             let zero = fx.ptr(0);
+            let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, vectors.timer);
+            fx.when(timer, |fx| {
+                let pacing = lo.timer_interrupt(fx);
+                let early = fx.b.ins().bxor_imm_s(pacing, 1);
+                fx.when(early, |fx| {
+                    lo.end_of_interrupt(fx);
+                    fx.b.ins().return_(&[zero]);
+                });
+            });
             for entry in bound {
                 let this = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, entry.vector);
                 fx.when(this, |fx| {
@@ -844,6 +855,39 @@ impl Lowering<'_, '_> {
         let at = fx.ptr(APIC + register);
         let value = fx.ptr(value);
         self.mmio_write(fx, 4, at, value);
+    }
+
+    /// The ticks the running CPU's local APIC timer counts in a millisecond, measured with its
+    /// interrupt masked, after which the timer fires `TIMER_VECTOR` one-shot.
+    pub(super) fn x64_timer_rate(&mut self, fx: &mut Fx) -> Value {
+        self.apic_write(fx, APIC_TIMER_DIVIDE, DIVIDE_BY_16);
+        self.apic_write(fx, APIC_LVT_TIMER, TIMER_VECTOR as u64 | MASKED);
+        self.apic_write(fx, APIC_TIMER_COUNT, 0xFFFF_FFFF);
+        let start = self.call_routine(fx, Routine::ClockNow, &[])[0];
+        let end = fx.repeat(&[start], |fx, _| {
+            let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
+            let elapsed = fx.b.ins().isub(now, start);
+            let short =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, elapsed, TIMER_MEASURE as i64);
+            (short, vec![now])
+        })[0];
+        let at = fx.ptr(APIC + APIC_TIMER_CURRENT);
+        let left = self.mmio_read(fx, 4, at);
+        let full = fx.ptr(0xFFFF_FFFF);
+        let ticks = fx.b.ins().isub(full, left);
+        let ticks =
+            fx.b.ins()
+                .imul_imm_s(ticks, super::super::runtime::timers::NS_PER_MS as i64);
+        let elapsed = fx.b.ins().isub(end, start);
+        self.apic_write(fx, APIC_LVT_TIMER, TIMER_VECTOR as u64);
+        fx.b.ins().udiv(ticks, elapsed)
+    }
+
+    /// Starts the running CPU's local APIC timer counting down `ticks`.
+    pub(super) fn x64_set_timer(&mut self, fx: &mut Fx, ticks: Value) {
+        let at = fx.ptr(APIC + APIC_TIMER_COUNT);
+        self.mmio_write(fx, 4, at, ticks);
     }
 
     /// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the

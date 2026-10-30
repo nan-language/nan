@@ -1,4 +1,4 @@
-//! Components: `host::Runner.run`, which runs a component's handlers on a task of their own while a body runs, the operations of the component context, keyed tasks and posts through outboxes. A runner's record, drawn through the run's allocator, holds its lock, the intake from its oldest to its newest entry, whether the intake has stopped, the component task and whether it waits for a message, the task waiting for the run's tasks, the delayed entries in the order they enter the intake, the timers in flight and their count, the keyed tasks and the count of those not ended, the count of what references the record, its allocator and executor cells, the number of `after` calls so far, whether the component task has ended and the body's outbox; the state and the Env follow. An intake entry holds its links, the task posting it (zero for a message the component sends itself), its status, its deadline and order while delayed, whether a keyed outbox posted it and that outbox's key, and the message; a posted entry lies on the posting task's stack, any other is drawn through the runner's allocator. A keyed task's node holds its links, its task, key, outbox and region, whether its key was superseded and whether it has ended.
+//! Components: `host::Runner.run`, which runs a component's handlers on a task of their own while a body runs, the operations of the component context, keyed tasks and posts through outboxes. A runner's record, drawn through the run's allocator, holds its lock, the intake from its oldest to its newest entry, whether the intake has stopped, the component task and whether it waits for a message, the task waiting for the run's tasks, the delayed entries in the order they enter the intake, the timers in flight and their count, the keyed tasks and the count of those not ended, the count of what references the record, its allocator and executor cells, the number of `after` calls so far, whether the component task has ended, the body's outbox, and the nanosecond at which the executor's clock was minted with the executor's resolution, on whose grid delays end; the state and the Env follow. An intake entry holds its links, the task posting it (zero for a message the component sends itself), its status, its deadline and order while delayed, whether a keyed outbox posted it and that outbox's key, and the message; a posted entry lies on the posting task's stack, any other is drawn through the runner's allocator. A keyed task's node holds its links, its task, key, outbox and region, whether its key was superseded and whether it has ended.
 
 const RUNNER_LOCK: u64 = 0
 
@@ -36,7 +36,11 @@ const RUNNER_ENDED: u64 = 128
 
 const RUNNER_INBOX: u64 = 136
 
-const RUNNER_HEADER: u64 = 144
+const RUNNER_ORIGIN: u64 = 144
+
+const RUNNER_RESOLUTION: u64 = 152
+
+const RUNNER_HEADER: u64 = 160
 
 const COMPONENTS_ENTRY_NEXT: u64 = 0
 
@@ -98,7 +102,7 @@ fn components_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             send_now(mut lo, mut fx, supply, record, held: supply.param(1))
         }
-        "sys::Cx.after" => components_after(mut lo, mut fx, supply)
+        "sys::Cx.after" or "sys::Cx.after_ns" => components_after(mut lo, mut fx, supply)
         "sys::Cx.spawn" => components_spawn(mut lo, mut fx, supply)
         "sys::Cx.cancel" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -220,6 +224,14 @@ fn components_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.store(one, addr: record, offset: RUNNER_REFS)
     mut fx.store(cell, addr: record, offset: RUNNER_CELL)
     mut fx.store(executor.cell, addr: record, offset: RUNNER_EXECUTOR)
+    let exec_handle = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+    let exec_record = entry_at(mut lo, mut fx, handle: exec_handle)
+    let resolution = mut fx.load(PTR, addr: exec_record, offset: TABLES_EXECUTOR_RESOLUTION)
+    mut fx.store(resolution, addr: record, offset: RUNNER_RESOLUTION)
+    let clock_handle = mut fx.load(PTR, addr: exec_record, offset: TABLES_ENTRY_STATE + 8)
+    let clock_record = entry_at(mut lo, mut fx, handle: clock_handle)
+    let origin = mut fx.load(PTR, addr: clock_record, offset: TABLES_ENTRY_STATE)
+    mut fx.store(origin, addr: record, offset: RUNNER_ORIGIN)
     let withdraw = withdraw_run(mut lo)
     let none = mut fx.ptr(0)
     enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: none)
@@ -734,14 +746,20 @@ fn send_now(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, h
     supply.done(mut lo, mut fx)
 } send_now
 
-/// `mut cx.after(ms: n, send: m)`: `m` enters the intake once `n` milliseconds have elapsed,
-/// through a timer whose expiry moves the messages due.
+/// `mut cx.after(ms: n, send: m)` and `mut cx.after_ns(ns: n, send: m)`: `m` enters the intake
+/// once `n` milliseconds or nanoseconds have elapsed and the elapsed time of the executor's clock
+/// is a multiple of the executor's resolution, through a timer whose expiry moves the messages
+/// due.
 fn components_after(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let message = supply.type_arg(lo, index: 0)
     let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let ms = supply.param(1).scalar_value()
+    let ns = if supply.path.as_str() == "sys::Cx.after" {
+        from_ms(mut fx, ms: supply.param(1).scalar_value())
+    } else {
+        supply.param(1).scalar_value()
+    }
     let held = supply.param(2)
-    let immediate = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ms, y: 0)
+    let immediate = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ns, y: 0)
     mut fx.if_true(immediate, then: fn[mut lo](mut fx1: Fx) {
         send_now(mut lo, fx: mut fx1, supply, record, held)
     })
@@ -756,10 +774,11 @@ fn components_after(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.store(after_kind, addr: op, offset: OPERATION_KIND)
     mut fx.store(record, addr: op, offset: OPERATION_TASK)
     let spec = mut fx.offset(op, offset: TIMER_SPEC)
-    let now = mut lo.now_ms(mut fx)
-    let sum = mut fx.b.uadd_overflow(now, y: ms)
-    let latest = mut fx.int(PTR, value: -1)
-    let deadline = mut fx.b.select(sum.flag, x: latest, y: sum.value)
+    let origin = mut fx.load(PTR, addr: record, offset: RUNNER_ORIGIN)
+    let resolution = mut fx.load(PTR, addr: record, offset: RUNNER_RESOLUTION)
+    let now = mut lo.now_ns(mut fx)
+    let delay = on_grid(mut fx, now, origin, resolution, ns)
+    let deadline = due_after(mut fx, now, delay)
     mut fx.store(deadline, addr: node, offset: COMPONENTS_ENTRY_DEADLINE)
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
@@ -788,7 +807,7 @@ fn components_after(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         let count = mut fx1.load(PTR, addr: record, offset: RUNNER_TIMER_COUNT)
         let more = mut fx1.b.iadd_imm_s(count, y: 1)
         mut fx1.store(more, addr: record, offset: RUNNER_TIMER_COUNT)
-        mut lo1.arm_timer(mut fx1, op, ms, spec)
+        mut lo1.arm_timer(mut fx1, op, ns: delay, spec)
         discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
         return mem::List[clif::Value].empty(fx1.alloc)
     })
@@ -854,7 +873,7 @@ fn insert_delayed(mut fx: Fx, record: clif::Value, node: clif::Value, deadline: 
 fn timer_completed(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
     let record = mut fx.load(PTR, addr: op, offset: OPERATION_TASK)
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
-    let now = mut lo.now_ms(mut fx)
+    let now = mut lo.now_ns(mut fx)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
         let first_delayed = mut fx1.load(PTR, addr: record, offset: RUNNER_DELAYED)

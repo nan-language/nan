@@ -70,7 +70,22 @@ pub open struct Clock {
 pub fn Clock.elapsed_ms(self) -> u64 fails Revoked
     example attempt testing::world().clock.elapsed_ms() == Ok(0)
 
+pub fn Clock.elapsed_ns(self) -> u64 fails Revoked
+    example attempt testing::world().clock.elapsed_ns() == Ok(0)
+
 pub fn Clock.sleep(self, ms: u64) fails task::Cancelled uses wait
+
+pub fn Clock.sleep_ns(self, ns: u64) fails task::Cancelled uses wait
+
+pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
+
+pub open struct WallClock {
+} WallClock
+
+pub fn WallClock.now_ns(self) -> u64 fails Revoked
+    example attempt testing::world().wall.now_ns() == Ok(0)
+
+pub fn WallClock.coarse(self, ns: u64) -> WallClock fails Revoked
 
 pub open struct Random {
 } Random
@@ -121,6 +136,8 @@ impl Net: Capability
 
 impl Clock: Capability
 
+impl WallClock: Capability
+
 impl Random: Capability
 
 impl Log: Capability
@@ -152,6 +169,8 @@ pub fn Cx.send(mut self, take message: M)
 
 pub fn Cx.after(mut self, ms: u64, take send: M)
 
+pub fn Cx.after_ns(mut self, ns: u64, take send: M)
+
 pub fn Cx.spawn(mut self, key: u64, take run: task fn(out: Outbox[M]) fails task::Cancelled uses wait)
 
 pub fn Cx.cancel(mut self, key: u64)
@@ -173,6 +192,7 @@ enum ProbeMessage {
     Count
     Echo
     Delay
+    DelayNs
     Spawn(u64)
     Stop
 } ProbeMessage
@@ -188,6 +208,7 @@ fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[
         }
         ProbeMessage.Echo => mut cx.send(ProbeMessage.Count)
         ProbeMessage.Delay => mut cx.after(ms: 10, send: ProbeMessage.Count)
+        ProbeMessage.DelayNs => mut cx.after_ns(ns: 1_500, send: ProbeMessage.Count)
         ProbeMessage.Spawn(ms) => {
             let clock = env.clock
             mut cx.spawn(key: 1, run: fn(out: Outbox[ProbeMessage]) fails task::Cancelled uses wait {
@@ -351,6 +372,50 @@ test sleep_lets_time_pass for Clock.sleep {
     expect finish - start >= 25
 } sleep_lets_time_pass
 
+test elapsed_ns_counts_virtual_nanoseconds for Clock.elapsed_ns {
+    let world = testing::world()
+    try await world.clock.sleep(2)
+    let elapsed = try world.clock.elapsed_ns()
+    expect elapsed == 2_000_000
+} elapsed_ns_counts_virtual_nanoseconds
+
+test sleep_ns_lets_nanoseconds_pass for Clock.sleep_ns {
+    let world = testing::world()
+    let start = try world.clock.elapsed_ns()
+    try await world.clock.sleep_ns(250)
+    let finish = try world.clock.elapsed_ns()
+    expect finish - start == 250
+} sleep_ns_lets_nanoseconds_pass
+
+test coarse_clock_reads_and_wakes_on_its_resolution for Clock.coarse {
+    let world = testing::world()
+    try await world.clock.sleep_ns(1_500)
+    let coarse = try world.clock.coarse(1_000)
+    let read = try coarse.elapsed_ns()
+    try await coarse.sleep_ns(100)
+    let woke = try world.clock.elapsed_ns()
+    let finer = try coarse.coarse(10)
+    let kept = try finer.elapsed_ns()
+    expect read == 1_000
+    expect woke == 2_000
+    expect kept == 2_000
+} coarse_clock_reads_and_wakes_on_its_resolution
+
+test wall_clock_reads_the_virtual_clock for WallClock.now_ns {
+    let world = testing::world()
+    try await world.clock.sleep_ns(42)
+    let now = try world.wall.now_ns()
+    expect now == 42
+} wall_clock_reads_the_virtual_clock
+
+test coarse_wall_clock_rounds_down for WallClock.coarse {
+    let world = testing::world()
+    try await world.clock.sleep_ns(1_500)
+    let wall = try world.wall.coarse(1_000)
+    let now = try wall.now_ns()
+    expect now == 1_000
+} coarse_wall_clock_rounds_down
+
 test revoked_random_cannot_fill for Random.fill {
     let world = testing::world()
     let revoker = try revocable(world.random)
@@ -465,6 +530,38 @@ test delayed_message_waits_for_its_delay for Cx.after {
     expect hurried.handled == 0
     expect patient.handled == 1
 } delayed_message_waits_for_its_delay
+
+test nanosecond_delay_waits_for_its_delay for Cx.after_ns {
+    let world = testing::world()
+    let clock = world.clock
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.DelayNs)
+        try await clock.sleep_ns(1_000)
+    })
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.DelayNs)
+        try await clock.sleep_ns(2_000)
+    })
+    expect hurried.handled == 0
+    expect patient.handled == 1
+} nanosecond_delay_waits_for_its_delay
+
+test coarse_executor_delays_to_its_resolution for Cx.after_ns {
+    let world = testing::world()
+    let clock = world.clock
+    try await clock.sleep_ns(200)
+    let exec = try world.exec.coarse(1_000)
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.DelayNs)
+        try await clock.sleep_ns(1_700)
+    })
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.DelayNs)
+        try await clock.sleep_ns(2_150)
+    })
+    expect hurried.handled == 0
+    expect patient.handled == 1
+} coarse_executor_delays_to_its_resolution
 
 test keyed_task_posts_to_the_component for Cx.spawn {
     let world = testing::world()

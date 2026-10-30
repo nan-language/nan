@@ -1,11 +1,16 @@
-//! The firmware services of `x86_64-uefi`, reached through the system table the program entry seam recorded and called under the Microsoft x64 convention on the boot stack: console output, files of the volume the image was loaded from, and the end of boot services, after which the image runs on its own entry root and descriptor tables.
+//! The firmware services of `x86_64-uefi`, reached through the system table the program entry seam recorded and called under the Microsoft x64 convention on the boot stack: console output, files of the volume the image was loaded from, the end of boot services, after which the image runs on its own entry root and descriptor tables, and the time.
 
-/// The offsets in the system table of its console-output protocol and its boot services; in
-/// the console-output protocol of its string output; in the boot services of `GetMemoryMap`,
-/// `HandleProtocol` and `ExitBootServices`.
+/// The offsets in the system table of its console-output protocol, its runtime services and its
+/// boot services; in the console-output protocol of its string output; in the runtime services
+/// of `GetTime`; in the boot services of `GetMemoryMap`, `HandleProtocol` and
+/// `ExitBootServices`.
 const CONSOLE_OUT: u64 = 64
 
+const RUNTIME_SERVICES: u64 = 88
+
 const BOOT_SERVICES: u64 = 96
+
+const GET_TIME: u64 = 24
 
 const OUTPUT_STRING: u64 = 8
 
@@ -306,6 +311,40 @@ fn exit_services(mut lo: Lowering, mut fx: Fx, supply: Supply)
     mut lo.copy(mut fx, dst: kernel, src: machine, size: laid.contents().size, align: laid.contents().align)
     supply.ret(mut lo, mut fx, held: Held.Address(kernel))
 } exit_services
+
+/// The firmware's time from `GetTime`: whether it gave one, its year, month, day, hour, minute
+/// and second, and its nanoseconds.
+struct FirmwareTime derives Copy {
+    valid: clif::Value
+    fields: Array[clif::Value, 6]
+    nanoseconds: clif::Value
+} FirmwareTime
+
+/// Reads the firmware's time through `GetTime`.
+fn firmware_time(mut lo: Lowering, mut fx: Fx) -> FirmwareTime {
+    let arch = lo.ck.db().target.arch()
+    let table = system_table(mut lo, mut fx)
+    let services = mut fx.load(PTR, addr: table, offset: RUNTIME_SERVICES)
+    let reader = mut fx.load(PTR, addr: services, offset: GET_TIME)
+    let time = mut fx.slot(16, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: time, offset: 0)
+    mut fx.store(zero, addr: time, offset: 8)
+    var call_args = Array[clif::Value, 2].filled(time)
+    call_args[1] = zero
+    let status = firmware_call(arch, mut fx, code: reader, args: call_args.view())
+    let valid = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: EFI_SUCCESS)
+    let year_bits = mut fx.load(clif::Type.Int16, addr: time, offset: 0)
+    let year = mut fx.b.uextend(PTR, x: year_bits)
+    var fields = Array[clif::Value, 6].filled(year)
+    for index in 1usize..<6 {
+        let byte = mut fx.load(clif::Type.Int8, addr: time, offset: u64.widen(index) + 1)
+        fields[index] = mut fx.b.uextend(PTR, x: byte)
+    }
+    let nanosecond_bits = mut fx.load(clif::Type.Int32, addr: time, offset: 8)
+    let nanoseconds = mut fx.b.uextend(PTR, x: nanosecond_bits)
+    return FirmwareTime(valid: valid, fields: fields, nanoseconds: nanoseconds)
+} firmware_time
 
 /// The system table the program entry seam recorded.
 fn system_table(mut lo: Lowering, mut fx: Fx) -> clif::Value {

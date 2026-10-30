@@ -23,7 +23,7 @@ A **capability** is a value conferring authority. The [primitive capabilities](0
 
 | Type | Linear | Copy | Send |
 | --- | --- | --- | --- |
-| `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log`, `sys::Stdio` | no | yes | yes |
+| `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio` | no | yes | yes |
 | `sys::fs::File`, `sys::net::Listener` | no | no | yes |
 | `sys::net::Conn`, `sys::Revoker[C]` | yes | no | yes |
 | `boot::Machine`, `boot::Kernel` | yes | no | no |
@@ -34,7 +34,7 @@ A **capability** is a value conferring authority. The [primitive capabilities](0
 
 Every Copy capability other than `mem::Alloc` is a [generational handle](12-memory.md#generational-handles) naming an entry of a **capability table**; `mem::Alloc` names a cell ([budgets](12-memory.md#budgets)). A capability table is owned by its **minter**: the root grant minted with it, a `sys::Revoker`, or the test or example run whose [sims](22-testing.md#simulated-capabilities) it holds.
 
-- An entry records the authority it confers and the entry it derives from, if any. An executor's entry also records a clock: the `sys::Clock` of the root grant that minted it, the virtual clock of the test or example run whose world holds it, or for an executor made by `sys::revocable` the clock of its source. The kernel executor records none ([anchor](24-kernel.md#anchor)). Every copy of a handle names the same entry.
+- An entry records the authority it confers and the entry it derives from, if any. An executor's entry also records a clock: the `sys::Clock` of the root grant that minted it, the virtual clock of the test or example run whose world holds it, or for an executor made by `sys::revocable` the clock of its source; the kernel executor records the kernel's clock ([anchor](24-kernel.md#anchor)). Every copy of a handle names the same entry.
 - Revoking an entry advances its slot's generation, so every handle to it is stale. An operation through a handle checks at its start that the handle is live; an operation already past its check completes as if the entry were live.
 - Tables are shared by every task and CPU. Checks and revocations are atomic: a check that starts after a revocation completes finds the handle stale.
 - Entries are memory of the [support routines](27-program-model.md#runtime-support), charged to no cell and drawn through no allocator. An operation adding an entry when that memory is exhausted traps (`trap.exhausted`).
@@ -76,7 +76,20 @@ pub open struct Clock {
 
 pub fn Clock.elapsed_ms(self) -> u64 fails Revoked
 
+pub fn Clock.elapsed_ns(self) -> u64 fails Revoked
+
 pub fn Clock.sleep(self, ms: u64) fails task::Cancelled uses wait
+
+pub fn Clock.sleep_ns(self, ns: u64) fails task::Cancelled uses wait
+
+pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
+
+pub open struct WallClock {
+} WallClock
+
+pub fn WallClock.now_ns(self) -> u64 fails Revoked
+
+pub fn WallClock.coarse(self, ns: u64) -> WallClock fails Revoked
 
 pub open struct Random {
 } Random
@@ -165,7 +178,9 @@ pub open enum NetError derives Render {
 - A `sys::Fs` reaches one directory tree. A path is relative, its segments separated by `/`, and names the entry its segments reach from the tree's root; an empty segment, `.`, `..` or a segment holding the char `'\0'` fails with `sys::fs::FsError.InvalidPath`. Resolution never leaves the tree: a symbolic link leading outside it fails with `sys::fs::FsError.Denied`. `subdir` checks only the path's form.
 - `open` opens a file for reading and `create` creates or truncates one for writing; the other direction fails with `sys::fs::FsError.Denied`. `read_all` returns a file's contents, drawn through `alloc`, and traps when `alloc` is exhausted (`trap.exhausted`). `write_all` replaces a file's contents, creating it when missing, `remove` deletes a file and `byte_len` returns a file's length in bytes. `create` and `write_all` create the missing directories of their path. A missing file fails with `sys::fs::FsError.NotFound`, a full device with `sys::fs::FsError.NoSpace`, and a path naming a directory where a file is expected or a refusal by the platform with `sys::fs::FsError.Denied`.
 - `sys::Net.listen` accepts TCP connections on `port` at every local address, failing with `sys::net::NetError.AddressInUse` when the port is taken. `sys::Net.connect` opens one to `host`, an IPv4 or IPv6 address literal or a name the platform resolves, failing with `sys::net::NetError.Refused` when the peer refuses it and with `sys::net::NetError.Unreachable` when the host does not resolve or cannot be reached. Port 0 and a refusal by the platform fail with `sys::net::NetError.Denied`. A read of a connection returns 0 once the peer has closed it and every byte it sent has been read, and fails with `sys::net::NetError.Reset` once the peer has reset it and every byte that reached it has been read; a write on a connection the peer closed or reset fails with `sys::net::NetError.Reset`. `sys::net::Conn.close` sends the data not yet sent, shuts the connection down and returns once the platform reports it closed; `sys::net::Conn.abandon` discards the data not yet sent and resets the connection.
-- `sys::Clock.elapsed_ms` returns the milliseconds since the root grant was minted and never decreases; `sys::Clock.sleep` returns once at least `ms` milliseconds have elapsed.
+- A `sys::Clock` counts monotonic time in nanoseconds from the minting of its root grant, and has a **resolution**, 1 ns for a root grant's clock. `elapsed_ns` returns the nanoseconds elapsed, rounded down to a multiple of the resolution, and never decreases; `elapsed_ms` returns them divided by 1,000,000. `sleep_ns` returns once at least `ns` nanoseconds have elapsed and the elapsed nanoseconds are a multiple of the resolution. `sleep(ms)` is `sleep_ns` of `ms` × 1,000,000, or of the largest `u64` when that product exceeds it; every millisecond form of the clock's waits converts its duration so.
+- `c.coarse(ns)` returns a clock reading the same time with the greater of `c`'s resolution and `ns` ([attenuation](#attenuation)), and fails with `sys::Revoked.Stale` when `c` is stale. Code given only a clock of resolution r can time nothing finer than r.
+- A `sys::WallClock` reads wall-clock time, which may jump: `now_ns` returns the nanoseconds since the Unix epoch, 1970-01-01T00:00:00 UTC, rounded down to a multiple of its resolution. `coarse` derives an entry as `sys::Clock.coarse` does. On the host the root grant's wall clock reads the platform's real-time clock.
 - `sys::Random` draws from the platform's cryptographically secure source.
 - A `sys::Log` call writes one record and never waits or fails. On the host, a record is one line on standard error: the level (`info`, `warn` or `error`), `: `, the message, a space, the rendering of `value` within a [render budget](13-text-encode.md#render) of 1,024 bytes and a line feed, each line feed of the message or rendering written as the two chars `\n`.
 - `read` and `read_in` return the number of bytes written into `buf`, 0 at the end of input. `write` returns the number of bytes written, at least 1 when `data` is not empty. `write_out` and `write_err` write all of `data`. A file keeps one position, starting at 0, that each read and write advances by its count.
@@ -190,6 +205,8 @@ impl Fs: Capability
 impl Net: Capability
 
 impl Clock: Capability
+
+impl WallClock: Capability
 
 impl Random: Capability
 
@@ -222,10 +239,11 @@ An operation through a stale handle behaves as follows:
 | Capability | Operation through a stale handle |
 | --- | --- |
 | `sys::Fs`, `sys::Net`, `sys::Random`, `sys::Stdio` | fails with `sys::Revoked.Stale`, directly or through the `Revoked` variant of its error enum |
-| `sys::Clock` | `elapsed_ms` fails with `sys::Revoked.Stale`; `sleep` returns at once |
+| `sys::Clock` | `elapsed_ms`, `elapsed_ns` and `coarse` fail with `sys::Revoked.Stale`; `sleep` and `sleep_ns` return at once |
+| `sys::WallClock` | `now_ns` and `coarse` fail with `sys::Revoked.Stale` |
 | `sys::Log` | the record is discarded |
 | `mem::Alloc` | draws through it are exhaustion ([budgets](12-memory.md#budgets)) |
-| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). |
+| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`. |
 
 ```nan
 pub fn read_config(fs: sys::Fs, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails sys::fs::FsError uses wait {
@@ -321,6 +339,7 @@ pub open struct World derives Send {
     pub fs: sys::Fs
     pub net: sys::Net
     pub clock: sys::Clock
+    pub wall: sys::WallClock
     pub random: sys::Random
     pub log: sys::Log
     pub stdio: sys::Stdio
@@ -369,7 +388,7 @@ fn main(take world: host::World) fails GreetError uses wait {
 
 ## Attenuation
 
-**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received, and whose `listen` always fails with it; and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
+**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
 
 - A std attenuation other than `split` adds an entry deriving from its source's entry to its source's table and returns a handle to it. The new entry keeps every restriction of its source, and revoking the source revokes it. An implementation may instead return a handle to an existing entry with the same source and restriction.
 - Any code may attenuate: a type whose private field holds a capability and whose methods expose less authority attenuates it.
@@ -387,6 +406,20 @@ pub fn reports_in(fs: sys::Fs) -> ReportDir fails sys::fs::FsError {
 pub fn ReportDir.save(self, name: Str, data: Slice[u8]) fails sys::fs::FsError uses wait {
     try await self.fs.write_all(name, data)
 } ReportDir.save
+```
+
+```nan
+pub fn millisecond_reading(clock: sys::Clock) -> u64 fails sys::Revoked {
+    let coarse = try clock.coarse(1_000_000)
+    return try coarse.elapsed_ns()
+} millisecond_reading
+
+test reading_rounds_down for millisecond_reading {
+    let world = testing::world()
+    try await world.clock.sleep_ns(1_500_000)
+    let reading = try millisecond_reading(world.clock)
+    expect reading == 1_000_000
+} reading_rounds_down
 ```
 
 ## Protocol phases

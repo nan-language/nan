@@ -22,8 +22,9 @@ use crate::workspace::Arch;
 /// The x86_64 stubs are `Lidt`, which loads an interrupt descriptor table; `Wrmsr` and `Rdmsr`,
 /// which write and read a model-specific register; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
 /// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
-/// their pseudo-descriptor; `EnableAvx`; and `GigabytePages`, which gives 1 when the CPU maps
-/// 1 GiB pages and 0 otherwise. The AArch64 stubs are `ReadSysReg` and
+/// their pseudo-descriptor; `EnableAvx`; `GigabytePages`, which gives 1 when the CPU maps
+/// 1 GiB pages and 0 otherwise; and `ReadTsc`, which reads the time-stamp counter once every
+/// earlier instruction has completed. The AArch64 stubs are `ReadSysReg` and
 /// `WriteSysReg`, each naming a system register by its 15-bit encoding, which the instruction
 /// holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base register; `TlbiPage`,
 /// which invalidates a page's translations; `EnterRoot`, which installs the entry root with the
@@ -71,6 +72,7 @@ pub enum Stub {
     LoadTables,
     EnableAvx,
     GigabytePages,
+    ReadTsc,
     ReadSysReg(u16),
     WriteSysReg(u16),
     ReadTtbr0,
@@ -203,6 +205,13 @@ impl Stub {
                     0x48, 0x0d, 0x00, 0x00, 0x04, 0x00, 0x0f, 0x22, 0xe0, 0x31, 0xc9, 0x0f, 0x01,
                     0xd0, 0x83, 0xc8, 0x07, 0x0f, 0x01, 0xd1, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3,
                     0x31, 0xc0, 0xc3,
+                ],
+            ),
+            Stub::ReadTsc => (
+                0,
+                1,
+                &[
+                    0x0f, 0xae, 0xe8, 0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3,
                 ],
             ),
             Stub::Halt => (0, 0, &[0xfa, 0xf4, 0xeb, 0xfd]),
@@ -441,7 +450,8 @@ impl Stub {
             | Stub::Invlpg
             | Stub::LoadTables
             | Stub::EnableAvx
-            | Stub::GigabytePages => panic!("no AArch64 code for the x86_64 stub {self:?}"),
+            | Stub::GigabytePages
+            | Stub::ReadTsc => panic!("no AArch64 code for the x86_64 stub {self:?}"),
             Stub::ReadSysReg(_) | Stub::WriteSysReg(_) => unreachable!("handled before the match"),
         }
     }

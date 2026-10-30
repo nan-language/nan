@@ -193,6 +193,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Fs", COPY_SEND),
     ("sys::Net", COPY_SEND),
     ("sys::Clock", COPY_SEND),
+    ("sys::WallClock", COPY_SEND),
     ("sys::Random", COPY_SEND),
     ("sys::Log", COPY_SEND),
     ("sys::Stdio", COPY_SEND),
@@ -232,7 +233,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 26] = [
+const PRIMITIVE_CAPABILITIES: [&str; 27] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -240,6 +241,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 26] = [
     "sys::Fs",
     "sys::Net",
     "sys::Clock",
+    "sys::WallClock",
     "sys::Random",
     "sys::Log",
     "sys::Stdio",

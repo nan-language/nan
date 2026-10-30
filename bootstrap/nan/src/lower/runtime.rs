@@ -18,6 +18,7 @@ pub mod settle;
 pub mod system;
 pub mod tables;
 pub mod tasks;
+pub mod timers;
 
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -152,6 +153,8 @@ pub enum Routine {
     Yield,
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
     Stream,
+    /// `() -> nanoseconds`: a kernel's clock.
+    ClockNow,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
 }
@@ -214,6 +217,7 @@ impl Routine {
             Routine::Thread => "_NSstack_switch_thread",
             Routine::Yield => "_NSreplay_yield",
             Routine::Stream => "_NSreplay_stream",
+            Routine::ClockNow => "_NSstack_switch_clock_now",
             Routine::Draw => "_NSreplay_draw",
         }
     }
@@ -271,7 +275,7 @@ impl Routine {
             Routine::Park | Routine::Schedule | Routine::Yield => (&[], &[]),
             Routine::Stream => (&[P, P, P], &[P]),
             Routine::Draw => (&[P, P, P, P], &[P]),
-            Routine::Origin | Routine::Init | Routine::Thread => (&[], &[P]),
+            Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
             Routine::IoSubmit => (&[P], &[types::I8, types::I32]),
         }
     }
@@ -317,8 +321,8 @@ pub mod state {
     /// Every live task, linked through their records, and the lock of that list.
     pub const TASKS: u64 = 120;
     pub const TASKS_LOCK: u64 = 128;
-    /// The milliseconds of the monotonic clock when the root grant was minted.
-    pub const MINTED: u64 = 136;
+    /// On a kernel, the lock of the timers.
+    pub const TIMER_LOCK: u64 = 136;
     /// The last rank a cown took.
     pub const RANKS: u64 = 144;
     /// The chunk map's table of roots.
@@ -330,9 +334,9 @@ pub mod state {
     /// The construct that termination requests cancel, whose region is the entry task.
     pub const ROOT: u64 = 176;
     /// On the seeded scheduler: the run's seed, the index of the scheduling stream's next
-    /// value, the virtual clock's milliseconds and its first timer, the last order a task or
-    /// timer took, whether a scheduling point found two ready tasks, and the first and last
-    /// of the completions not yet delivered.
+    /// value and the virtual clock's nanoseconds; there and on a kernel, the first timer and
+    /// the last order a task or timer took; on the seeded scheduler, whether a scheduling point
+    /// found two ready tasks, and the first and last of the completions not yet delivered.
     pub const SEED: u64 = 184;
     pub const PICKS: u64 = 192;
     pub const NOW: u64 = 200;
@@ -370,7 +374,13 @@ pub mod state {
     /// the entry root over usable memory above 4 GiB.
     pub const ENTRY_TABLES: u64 = 352;
     pub const ENTRY_TABLES_END: u64 = 360;
-    pub const SIZE: u64 = 384;
+    /// On a kernel, the clock's counter when the runtime started, the factor turning counter
+    /// ticks into nanoseconds as a fixed-point number of 32 fractional bits, and the latest
+    /// nanoseconds a CPU read.
+    pub const CLOCK_BASE: u64 = 368;
+    pub const CLOCK_SCALE: u64 = 376;
+    pub const CLOCK_LAST: u64 = 384;
+    pub const SIZE: u64 = 392;
 }
 
 impl Lowering<'_, '_> {
@@ -598,6 +608,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
+        Routine::ClockNow => lo.define_clock_now(fx),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
         Routine::Init

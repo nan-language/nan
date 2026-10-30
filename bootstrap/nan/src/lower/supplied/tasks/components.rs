@@ -7,8 +7,9 @@
 //! waits for a message, the task waiting for the run's tasks, the delayed entries in the order
 //! they enter the intake, the timers in flight and their count, the keyed tasks and the count of
 //! those not ended, the count of what references the record, its allocator and executor cells,
-//! the number of `after` calls so far, whether the component task has ended and the body's
-//! outbox; the state and the Env follow. An intake entry holds its links, the task posting it
+//! the number of `after` calls so far, whether the component task has ended, the body's outbox,
+//! and the nanosecond at which the executor's clock was minted with the executor's resolution,
+//! on whose grid delays end; the state and the Env follow. An intake entry holds its links, the task posting it
 //! (zero for a message the component sends itself), its status, its deadline and order while
 //! delayed, whether a keyed outbox posted it and that outbox's key, and the message; a posted
 //! entry lies on the posting task's stack, any other is drawn through the runner's allocator. A
@@ -24,7 +25,7 @@ use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::regions::{WAITING, region};
 use super::super::super::runtime::tables::{self, entry as cap_entry};
 use super::super::super::runtime::tasks::{self, kind, operation, task};
-use super::super::super::runtime::{Routine, fetch_add, report, settle};
+use super::super::super::runtime::{Routine, fetch_add, report, settle, timers};
 use super::super::super::{Glue, Instance, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
@@ -52,7 +53,9 @@ pub mod runner {
     pub const ORDER: u64 = 120;
     pub const ENDED: u64 = 128;
     pub const INBOX: u64 = 136;
-    pub const HEADER: u64 = 144;
+    pub const ORIGIN: u64 = 144;
+    pub const RESOLUTION: u64 = 152;
+    pub const HEADER: u64 = 160;
 }
 
 mod entry {
@@ -103,7 +106,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let runner = fx.load(PTR, supply.param(0).address(), 0);
             send_now(lo, fx, supply, runner, supply.param(1));
         }
-        "sys::Cx.after" => after(lo, fx, supply),
+        "sys::Cx.after" | "sys::Cx.after_ns" => after(lo, fx, supply),
         "sys::Cx.spawn" => spawn(lo, fx, supply),
         "sys::Cx.cancel" => {
             let runner = fx.load(PTR, supply.param(0).address(), 0);
@@ -220,6 +223,14 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(one, record, runner::REFS);
     fx.store(cell, record, runner::CELL);
     fx.store(exec_cell, record, runner::EXECUTOR);
+    let exec = fx.load(PTR, supply.param(1).address(), 0);
+    let exec = tables::entry_at(lo, fx, exec);
+    let resolution = fx.load(PTR, exec, tables::EXECUTOR_RESOLUTION);
+    fx.store(resolution, record, runner::RESOLUTION);
+    let clock = fx.load(PTR, exec, cap_entry::STATE + 8);
+    let clock = tables::entry_at(lo, fx, clock);
+    let origin = fx.load(PTR, clock, cap_entry::STATE);
+    fx.store(origin, record, runner::ORIGIN);
     let withdraw = withdraw_run(lo);
     let none = fx.ptr(0);
     settle::enter_wait(lo, fx, withdraw, record, none);
@@ -716,14 +727,19 @@ fn send_now(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, held
     supply.done(lo, fx);
 }
 
-/// `mut cx.after(ms: n, send: m)`: `m` enters the intake once `n` milliseconds have elapsed,
-/// through a timer whose expiry moves the messages due.
+/// `mut cx.after(ms: n, send: m)` and `mut cx.after_ns(ns: n, send: m)`: `m` enters the intake
+/// once `n` milliseconds or nanoseconds have elapsed and the elapsed time of the executor's clock
+/// is a multiple of the executor's resolution, through a timer whose expiry moves the messages
+/// due.
 fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let message = supply.type_arg(0);
     let record = fx.load(PTR, supply.param(0).address(), 0);
-    let ms = supply.param(1).scalar();
+    let ns = match supply.path.as_str() {
+        "sys::Cx.after" => timers::from_ms(fx, supply.param(1).scalar()),
+        _ => supply.param(1).scalar(),
+    };
     let held = supply.param(2);
-    let immediate = fx.b.ins().icmp_imm_s(IntCC::Equal, ms, 0);
+    let immediate = fx.b.ins().icmp_imm_s(IntCC::Equal, ns, 0);
     fx.when(immediate, |fx| send_now(lo, fx, supply, record, held));
     let node = new_entry(lo, fx, record, &message, held);
     let size = fx.ptr(timer::SIZE);
@@ -734,10 +750,11 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(after_kind, op, operation::KIND);
     fx.store(record, op, operation::TASK);
     let spec = fx.offset(op, timer::SPEC);
-    let now = lo.now_ms(fx);
-    let (deadline, overflow) = fx.b.ins().uadd_overflow(now, ms);
-    let latest = fx.int(PTR, -1);
-    let deadline = fx.b.ins().select(overflow, latest, deadline);
+    let origin = fx.load(PTR, record, runner::ORIGIN);
+    let resolution = fx.load(PTR, record, runner::RESOLUTION);
+    let now = lo.now_ns(fx);
+    let delay = timers::on_grid(fx, now, origin, resolution, ns);
+    let deadline = timers::due_after(fx, now, delay);
     fx.store(deadline, node, entry::DEADLINE);
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -769,7 +786,7 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let count = fx.load(PTR, record, runner::TIMER_COUNT);
             let count = fx.b.ins().iadd_imm_s(count, 1);
             fx.store(count, record, runner::TIMER_COUNT);
-            lo.arm_timer(fx, op, ms, spec);
+            lo.arm_timer(fx, op, delay, spec);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             Vec::new()
         },
@@ -825,7 +842,7 @@ fn insert_delayed(fx: &mut Fx, record: Value, node: Value, deadline: Value) {
 pub fn timer_completed(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     let record = fx.load(PTR, op, operation::TASK);
     let lock = fx.offset(record, runner::LOCK);
-    let now = lo.now_ms(fx);
+    let now = lo.now_ns(fx);
     lo.call_routine(fx, Routine::Lock, &[lock]);
     fx.repeat(&[], |fx, _| {
         let first = fx.load(PTR, record, runner::DELAYED);

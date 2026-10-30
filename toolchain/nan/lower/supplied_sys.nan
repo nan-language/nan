@@ -1,4 +1,4 @@
-//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image through the sims, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of the one host it reaches, when restricted. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
+//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image through the sims, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of the one host it reaches, when restricted. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
 
 /// The words of an entry's state.
 const WORD_DIRECTORY: u64 = 0
@@ -32,6 +32,7 @@ fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "sys::Fs" => sys_fs(mut lo, mut fx, supply)
         "sys::Net" => sys_net(mut lo, mut fx, supply)
         "sys::Clock" => sys_clock(mut lo, mut fx, supply)
+        "sys::WallClock" => sys_wall_clock(mut lo, mut fx, supply)
         "sys::Random" => sys_random(mut lo, mut fx, supply)
         "sys::Log" => sys_log(mut lo, mut fx, supply)
         "sys::Stdio" => sys_stdio(mut lo, mut fx, supply)
@@ -455,34 +456,124 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let handle = mut fx.load(PTR, addr: capability, offset: 0)
     let record = live_entry(mut lo, mut fx, handle)
     let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
-    match supply.member() {
-        "elapsed_ms" => {
+    let member = supply.member()
+    match member {
+        "elapsed_ms" or "elapsed_ns" => {
             mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
             })
             let minted = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
-            let now = mut lo.now_ms(mut fx)
+            let now = mut lo.now_ns(mut fx)
             let elapsed = mut fx.b.isub(now, y: minted)
-            supply.ret(mut lo, mut fx, held: Held.Scalar(elapsed))
+            var result = round_down(mut fx, record, reading: elapsed)
+            if member == "elapsed_ms" {
+                let per_ms = mut fx.ptr(NS_PER_MS)
+                result = mut fx.b.udiv(result, y: per_ms)
+            }
+            supply.ret(mut lo, mut fx, held: Held.Scalar(result))
         }
-        "sleep" => {
+        "sleep" or "sleep_ns" => {
             mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
                 supply.done(mut lo, fx: mut fx1)
             })
-            if lo.seeded() {
-                sleep(mut lo, mut fx, supply, ms: supply.param(1).scalar_value())
+            let ns = if member == "sleep" {
+                from_ms(mut fx, ms: supply.param(1).scalar_value())
+            } else {
+                supply.param(1).scalar_value()
+            }
+            let delay = clock_delay(mut lo, mut fx, record, ns)
+            if lo.seeded() or lo.kernel() {
+                let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
+                    if lo1.seeded() {
+                        seeded_arm(mut lo1, fx: mut fx1, op, ns: delay)
+                    } else {
+                        mut lo1.kernel_arm(mut fx1, op, ns: delay)
+                    }
+                })
+                mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+                    sims_fail_cancelled(mut lo, fx: mut fx1, supply)
+                })
+                supply.done(mut lo, mut fx)
                 return
             }
-            let called = mut lo.platform_call(mut fx, name: "sleep", args: Array[Held, 1].filled(supply.param(1)).view())
+            let called = mut lo.platform_call(mut fx, name: "sleep", args: Array[Held, 1].filled(Held.Scalar(delay)).view())
             sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
                 supply.done(mut lo1, fx: mut fx1)
             })
         }
+        "coarse" => coarse(mut lo, mut fx, supply, entry_kind: TABLES_KIND_CLOCK, word: TABLES_RESOLUTION)
         else => {
             expect false
         }
     }
 } sys_clock
+
+fn sys_wall_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "now_ns" => {
+            let record = sys_checked(mut lo, mut fx, supply, capability: supply.param(0).address_value())
+            var now = record
+            if lo.seeded() or lo.machine() {
+                let clock = mut lo.now_ns(mut fx)
+                let ahead = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+                now = mut fx.b.iadd(clock, y: ahead)
+            } else {
+                let called = mut lo.platform_call(mut fx, name: "wall_ns", args: mem::List[Held].empty(fx.alloc).view())
+                now = called.result.scalar_value()
+            }
+            let rounded = round_down(mut fx, record, reading: now)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(rounded))
+        }
+        "coarse" => coarse(mut lo, mut fx, supply, entry_kind: TABLES_KIND_WALL, word: TABLES_RESOLUTION)
+        else => {
+            expect false
+        }
+    }
+} sys_wall_clock
+
+/// `c.coarse(ns)` of a `Clock`, `WallClock` or `task::Executor`: an entry deriving from `c`'s,
+/// with the coarser of its resolution, held in the state word at `word`, and `ns`.
+fn coarse(mut lo: Lowering, mut fx: Fx, supply: Supply, entry_kind: i64, word: u64) {
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let kind = mut fx.ptr(u64.fit(entry_kind))
+    var derive_args = Array[clif::Value, 2].filled(handle)
+    derive_args[1] = kind
+    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+    expect derived_values.len() == 1
+    let derived = derived_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let record = entry_at(mut lo, mut fx, handle: derived)
+    let resolution = mut fx.load(PTR, addr: record, offset: word)
+    let coarser = mut fx.b.umax(resolution, y: supply.param(1).scalar_value())
+    mut fx.store(coarser, addr: record, offset: word)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(derived, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} coarse
+
+/// A reading of a clock rounded down to a multiple of its entry's resolution.
+fn round_down(mut fx: Fx, record: clif::Value, reading: clif::Value) -> clif::Value {
+    let stated = mut fx.load(PTR, addr: record, offset: TABLES_RESOLUTION)
+    let one = mut fx.ptr(1)
+    let resolution = mut fx.b.umax(stated, y: one)
+    let rest = mut fx.b.urem(reading, y: resolution)
+    return mut fx.b.isub(reading, y: rest)
+} round_down
+
+/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry,
+/// rounded up so that it ends when the clock's elapsed time is a multiple of its resolution.
+fn clock_delay(mut lo: Lowering, mut fx: Fx, record: clif::Value, ns: clif::Value) -> clif::Value {
+    let minted = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+    let resolution = mut fx.load(PTR, addr: record, offset: TABLES_RESOLUTION)
+    let now = mut lo.now_ns(mut fx)
+    return on_grid(mut fx, now, origin: minted, resolution, ns)
+} clock_delay
 
 fn sys_random(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()

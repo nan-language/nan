@@ -97,7 +97,9 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Console port | none | the 16550 UART at I/O port `0x2F8` | the 16550 UART at I/O port `0x2F8` |
 | Exit port | none | I/O port `0xF4` | I/O port `0xF4` |
 | Interrupt controller | none | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` |
-| Timer | none | each CPU's local APIC timer, firing vector `0x20` periodically | each CPU's local APIC timer, firing vector `0x20` periodically |
+| Timer | none | each CPU's local APIC timer, firing vector `0x20` one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's local APIC timer, firing vector `0x20` one-shot ([kernel time](24-kernel.md#kernel-time)) |
+| Clock | none | the time-stamp counter, its rate measured against 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 | the time-stamp counter, its rate measured against 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 |
+| Wall clock | none | the firmware's `GetTime` | the CMOS clock, its year read in the century from 2000 |
 | Emulator | none | QEMU with OVMF firmware | QEMU |
 
 | Field | `aarch64-host` | `aarch64-uefi` | `aarch64-bare` |
@@ -112,7 +114,9 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Console port | none | the PL011 UART at `0x0904_0000` | the PL011 UART at `0x0904_0000` |
 | Exit port | none | the semihosting exit call | the semihosting exit call |
 | Interrupt controller | none | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` |
-| Timer | none | each CPU's virtual timer, firing vector 27 periodically | each CPU's virtual timer, firing vector 27 periodically |
+| Timer | none | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) |
+| Clock | none | the virtual counter, at the rate `CNTFRQ_EL0` gives | the virtual counter, at the rate `CNTFRQ_EL0` gives |
+| Wall clock | none | the firmware's `GetTime` | the PL031 at `0x0901_0000` |
 | Emulator | none | QEMU with AAVMF firmware | QEMU |
 
 - Codegen uses, on x86_64, the x86-64 base instruction set with SSE2 and, on AArch64, the A64 instruction set of Armv8.0-A with floating point and Advanced SIMD, and no later extension. On the machine targets, lowered code never stores below the stack pointer. The codegen field has exactly this one value per architecture; other values are reserved.

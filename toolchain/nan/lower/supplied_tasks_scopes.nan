@@ -43,7 +43,7 @@ struct CaptureSite derives Copy {
 fn scopes_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.path.as_str() {
         "task::scope" => scope_call(mut lo, mut fx, supply)
-        "task::within" => scopes_within(mut lo, mut fx, supply)
+        "task::within" or "task::within_ns" => scopes_within(mut lo, mut fx, supply)
         "task::race" => race_call(mut lo, mut fx, supply)
         "task::Scope.cancel" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -819,12 +819,16 @@ fn release_join(mut lo: Lowering, mut fx: Fx, address: clif::Value, result: ty::
     })
 } release_join
 
-/// `task::within(clock, ms, body: b)`: runs `b` in a region that a deadline cancels; `None`
-/// when `b` fails with a cancellation of that region.
+/// `task::within(clock, ms, body: b)` and `task::within_ns(clock, ns, body: b)`: runs `b` in a
+/// region that a deadline cancels; `None` when `b` fails with a cancellation of that region.
 fn scopes_within(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let body_ty = fn_param(lo, supply, index: 2)
     let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let ms = supply.param(1).scalar_value()
+    let ns = if supply.path.as_str() == "task::within" {
+        from_ms(mut fx, ms: supply.param(1).scalar_value())
+    } else {
+        supply.param(1).scalar_value()
+    }
     let size = mut fx.ptr(REGIONS_REGION_SIZE)
     let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
     expect record_values.len() == 1
@@ -841,7 +845,9 @@ fn scopes_within(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.store(record, addr: timer, offset: OPERATION_TASK)
     let live = link_deadline(mut lo, mut fx, clock, timer)
     discard mut fx.choose_in(mut lo, condition: live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        arm_deadline(mut lo1, fx: mut fx1, timer, ms)
+        let clock_record = entry_at(mut lo1, fx: mut fx1, handle: clock)
+        let delay = clock_delay(mut lo1, fx: mut fx1, record: clock_record, ns)
+        arm_deadline(mut lo1, fx: mut fx1, timer, ns: delay)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
@@ -920,15 +926,15 @@ fn within_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::T
     })
 } within_failed
 
-/// Arms a deadline's timer of `ms` milliseconds, whose expiry cancels its region, first among
+/// Arms a deadline's timer of `ns` nanoseconds, whose expiry cancels its region, first among
 /// the deadlines the running task armed.
-fn arm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value, ms: clif::Value) {
+fn arm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value, ns: clif::Value) {
     let current = current_task(mut lo, mut fx)
     let armed = mut fx.load(PTR, addr: current, offset: TASK_DEADLINES)
     mut fx.store(armed, addr: timer, offset: OPERATION_LINK)
     mut fx.store(timer, addr: current, offset: TASK_DEADLINES)
     let spec = mut fx.offset(timer, offset: OPERATION_SIZE)
-    mut lo.arm_timer(mut fx, op: timer, ms, spec)
+    mut lo.arm_timer(mut fx, op: timer, ns, spec)
 } arm_deadline
 
 /// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it

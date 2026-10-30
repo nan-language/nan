@@ -7,8 +7,13 @@
 //! its kind, its source's index plus one (the next free entry's for a free one), and four words
 //! of state; the second and third words of a `Fs` or `Net` entry hold the address and length of
 //! a text the entry owns. An outbox's state is its runner's record, its key and whether it is a
-//! keyed task's. A `Clock` entry also heads the deadlines in flight that `task::within` calls
-//! armed through it, linked through their timers.
+//! keyed task's. An executor's state is its cell, the handle of the clock it records and its
+//! resolution in nanoseconds, zero standing for one. A `Clock` entry's state is the nanosecond of the clock that delays count at
+//! which its root was minted, then its resolution in nanoseconds, zero standing for one; it also
+//! heads the deadlines in flight that `task::within` calls armed through it, linked through
+//! their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead
+//! of the clock that delays count, which a host's wall clock reads from the platform instead,
+//! then its resolution.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -54,7 +59,13 @@ pub mod kind {
     pub const STDIO: i64 = 6;
     pub const EXECUTOR: i64 = 7;
     pub const OUTBOX: i64 = 8;
+    pub const WALL: i64 = 9;
 }
+
+/// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
+/// executor's entry.
+pub const RESOLUTION: u64 = entry::STATE + 8;
+pub const EXECUTOR_RESOLUTION: u64 = entry::STATE + 16;
 
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100;
@@ -420,12 +431,10 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         return;
     }
     let world_ty = lo.std_ty("host", "World", Vec::new());
-    let state_address = lo.state(fx);
     let limit = fx.int(PTR, -1);
     let parent = fx.int(PTR, -1);
     let cell = memory::new_cell(lo, fx, limit, parent);
-    let now = lo.call_platform_now(fx);
-    fx.store(now, state_address, state::MINTED);
+    let now = lo.now_ns(fx);
     let mut handles = Vec::new();
     for (field, entry_kind) in [
         ("fs", kind::FS),
@@ -435,6 +444,7 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         ("log", kind::LOG),
         ("stdio", kind::STDIO),
         ("exec", kind::EXECUTOR),
+        ("wall", kind::WALL),
     ] {
         let kind_value = fx.ptr(entry_kind as u64);
         let handle = new_entry(lo, fx, kind_value);
@@ -455,19 +465,44 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
 }
 
 /// A machine target's root grant: a root cell without a limit, whose supply is the boot heap,
-/// made the process domain's, and an executor drawing through it that records no clock; its regions and `hw::Ring0` are not
-/// yet taken.
+/// made the process domain's; an executor drawing through it that records the kernel's clock, a
+/// `Clock` entry minted now; a `WallClock` entry when the target's wall clock source gives a
+/// time, its field all ones otherwise; its regions and `hw::Ring0` are not yet taken.
 fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
     let grant_ty = lo.root_grant();
     let unlimited = fx.int(PTR, -1);
     let cell = memory::new_cell(lo, fx, unlimited, unlimited);
+    let clock_kind = fx.ptr(kind::CLOCK as u64);
+    let clock = new_entry(lo, fx, clock_kind);
+    let now = lo.now_ns(fx);
+    let record = entry_at(lo, fx, clock);
+    fx.store(now, record, entry::STATE);
     let executor = fx.ptr(kind::EXECUTOR as u64);
     let exec = new_entry(lo, fx, executor);
     let record = entry_at(lo, fx, exec);
     fx.store(cell, record, entry::STATE);
-    let zero = fx.ptr(0);
-    fx.store(zero, record, entry::STATE + 8);
-    for (field, value) in [("alloc", cell), ("exec", exec)] {
+    fx.store(clock, record, entry::STATE + 8);
+    let (valid, wall_now) = lo.wall_source(fx);
+    let wall = fx.choose_in(
+        lo,
+        valid,
+        &[PTR],
+        |lo, fx| {
+            let wall_kind = fx.ptr(kind::WALL as u64);
+            let wall = new_entry(lo, fx, wall_kind);
+            let record = entry_at(lo, fx, wall);
+            let ahead = fx.b.ins().isub(wall_now, now);
+            fx.store(ahead, record, entry::STATE);
+            vec![wall]
+        },
+        |_, fx| vec![fx.int(PTR, -1)],
+    )[0];
+    for (field, value) in [
+        ("alloc", cell),
+        ("exec", exec),
+        ("clock", clock),
+        ("wall", wall),
+    ] {
         let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
         fx.store(value, grant, at);
     }
@@ -517,11 +552,6 @@ pub fn mint(lo: &mut Lowering, fx: &mut Fx, kind: Value) -> Value {
 }
 
 impl Lowering<'_, '_> {
-    /// The milliseconds of the monotonic clock, from the host platform.
-    fn call_platform_now(&mut self, fx: &mut Fx) -> Value {
-        self.platform_call(fx, "now_ms", &[]).result.scalar()
-    }
-
     /// Calls the function of the host platform package named `name` with values held as it
     /// takes them.
     pub fn platform_call(&mut self, fx: &mut Fx, name: &str, args: &[Held]) -> Called {

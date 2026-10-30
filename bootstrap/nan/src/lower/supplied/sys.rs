@@ -1,5 +1,5 @@
 //! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`,
-//! `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image
+//! `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image
 //! through the sims, files, listeners and connections, revocation, and the submission of
 //! io_uring operations.
 //!
@@ -15,8 +15,8 @@ use super::super::Lowering;
 use super::super::body::{Body, Held};
 use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{entry, kind, live_entry};
-use super::super::runtime::{Routine, holdings};
+use super::super::runtime::tables::{RESOLUTION, entry, entry_at, kind, live_entry};
+use super::super::runtime::{Routine, holdings, seeded, timers};
 use super::super::transfer;
 use super::Supply;
 use super::render;
@@ -53,6 +53,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::Fs" => fs(lo, fx, supply),
         "sys::Net" => net(lo, fx, supply),
         "sys::Clock" => clock(lo, fx, supply),
+        "sys::WallClock" => wall_clock(lo, fx, supply),
         "sys::Random" => random(lo, fx, supply),
         "sys::Log" => log(lo, fx, supply),
         "sys::Stdio" => stdio(lo, fx, supply),
@@ -383,24 +384,98 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let record = live_entry(lo, fx, handle);
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     match supply.member() {
-        "elapsed_ms" => {
+        member @ ("elapsed_ms" | "elapsed_ns") => {
             fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
             let minted = fx.load(PTR, record, entry::STATE);
-            let now = lo.now_ms(fx);
+            let now = lo.now_ns(fx);
             let elapsed = fx.b.ins().isub(now, minted);
+            let elapsed = round_down(fx, record, elapsed);
+            let elapsed = match member {
+                "elapsed_ms" => {
+                    let per_ms = fx.ptr(timers::NS_PER_MS);
+                    fx.b.ins().udiv(elapsed, per_ms)
+                }
+                _ => elapsed,
+            };
             supply.ret(lo, fx, Held::Scalar(elapsed));
         }
-        "sleep" => {
+        member @ ("sleep" | "sleep_ns") => {
             fx.when(stale, |fx| supply.done(lo, fx));
-            if lo.seeded() {
-                sims::sleep(lo, fx, supply, supply.param(1).scalar());
+            let ns = match member {
+                "sleep" => timers::from_ms(fx, supply.param(1).scalar()),
+                _ => supply.param(1).scalar(),
+            };
+            let delay = clock_delay(lo, fx, record, ns);
+            if lo.seeded() || lo.kernel() {
+                let cancelled = sims::wait(lo, fx, None, |lo, fx, op| match lo.seeded() {
+                    true => seeded::arm(lo, fx, op, delay),
+                    false => lo.kernel_arm(fx, op, delay),
+                });
+                fx.when(cancelled, |fx| sims::fail_cancelled(lo, fx, supply));
+                supply.done(lo, fx);
                 return;
             }
-            let called = lo.platform_call(fx, "sleep", &[supply.param(1)]);
+            let called = lo.platform_call(fx, "sleep", &[Held::Scalar(delay)]);
             after(lo, fx, supply, &called, |lo, fx, _| supply.done(lo, fx));
         }
+        "coarse" => coarse(lo, fx, supply, kind::CLOCK, RESOLUTION),
         member => panic!("no lowering of sys::Clock.{member}"),
     }
+}
+
+fn wall_clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    match supply.member() {
+        "now_ns" => {
+            let record = checked(lo, fx, supply, supply.param(0).address());
+            let now = match lo.seeded() || lo.machine() {
+                true => {
+                    let now = lo.now_ns(fx);
+                    let ahead = fx.load(PTR, record, entry::STATE);
+                    fx.b.ins().iadd(now, ahead)
+                }
+                false => lo.platform_call(fx, "wall_ns", &[]).result.scalar(),
+            };
+            let now = round_down(fx, record, now);
+            supply.ret(lo, fx, Held::Scalar(now));
+        }
+        "coarse" => coarse(lo, fx, supply, kind::WALL, RESOLUTION),
+        member => panic!("no lowering of sys::WallClock.{member}"),
+    }
+}
+
+/// `c.coarse(ns)` of a `Clock`, `WallClock` or `task::Executor`: an entry deriving from `c`'s,
+/// with the coarser of its resolution, held in the state word at `word`, and `ns`.
+pub fn coarse(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entry_kind: i64, word: u64) {
+    let handle = fx.load(PTR, supply.param(0).address(), 0);
+    let entry_kind = fx.ptr(entry_kind as u64);
+    let derived = lo.call_routine(fx, Routine::Derive, &[handle, entry_kind])[0];
+    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
+    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+    let record = entry_at(lo, fx, derived);
+    let resolution = fx.load(PTR, record, word);
+    let coarser = fx.b.ins().umax(resolution, supply.param(1).scalar());
+    fx.store(coarser, record, word);
+    let sret = supply.sret.expect("a capability's address");
+    fx.store(derived, sret, 0);
+    supply.done(lo, fx);
+}
+
+/// A reading of a clock rounded down to a multiple of its entry's resolution.
+fn round_down(fx: &mut Fx, record: Value, reading: Value) -> Value {
+    let resolution = fx.load(PTR, record, RESOLUTION);
+    let one = fx.ptr(1);
+    let resolution = fx.b.ins().umax(resolution, one);
+    let rest = fx.b.ins().urem(reading, resolution);
+    fx.b.ins().isub(reading, rest)
+}
+
+/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry,
+/// rounded up so that it ends when the clock's elapsed time is a multiple of its resolution.
+pub fn clock_delay(lo: &mut Lowering, fx: &mut Fx, record: Value, ns: Value) -> Value {
+    let minted = fx.load(PTR, record, entry::STATE);
+    let resolution = fx.load(PTR, record, RESOLUTION);
+    let now = lo.now_ns(fx);
+    timers::on_grid(fx, now, minted, resolution, ns)
 }
 
 fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {

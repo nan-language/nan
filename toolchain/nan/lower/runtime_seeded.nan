@@ -1,4 +1,4 @@
-//! The seeded scheduler of test images: one executor thread runs one task at a time, each scheduling point taking the ready task at position w mod k among the k ready tasks, in the order they became ready, w being the next value of the run's scheduling stream; its virtual clock starts at 0 and advances only when no task is ready, to the earliest pending deadline, the run stalling with none pending. Value n of stream s is the first 8 bytes, little-endian, of the BLAKE3 hash of the run's seed, s and n as 8 bytes little-endian each. The pending deadlines are the virtual clock's timers, ordered by when they are due and then by when they were armed. A completion, of a timer or of a wait in a sim, is queued and delivered when the scheduler next reaps, as a ring's would be.
+//! The seeded scheduler of test images: one executor thread runs one task at a time, each scheduling point taking the ready task at position w mod k among the k ready tasks, in the order they became ready, w being the next value of the run's scheduling stream; its virtual clock starts at 0 nanoseconds and advances only when no task is ready, to the earliest pending deadline, the run stalling with none pending. Value n of stream s is the first 8 bytes, little-endian, of the BLAKE3 hash of the run's seed, s and n as 8 bytes little-endian each. The pending deadlines are the virtual clock's timers, ordered by when they are due and then by when they were armed. A completion, of a timer or of a wait in a sim, is queued and delivered when the scheduler next reaps, as a ring's would be.
 
 /// The stream serving scheduling choices.
 const SEEDED_SCHEDULING: u64 = 1
@@ -372,84 +372,18 @@ fn scheduling_point(mut lo: Lowering, mut fx: Fx) {
     }
 } scheduling_point
 
-/// The virtual clock's milliseconds.
+/// The virtual clock's nanoseconds.
 fn seeded_now(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let state_address = mut lo.state(mut fx)
     return mut fx.load(PTR, addr: state_address, offset: RUNTIME_STATE_NOW)
 } seeded_now
 
-/// Arms a timer due `ms` milliseconds from now, after every timer due no later.
-fn arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, ms: clif::Value) {
+/// Arms a timer due `ns` nanoseconds from now.
+fn seeded_arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
     let clock = seeded_now(mut lo, mut fx)
-    let sum = mut fx.b.uadd_overflow(clock, y: ms)
-    let latest = mut fx.int(PTR, value: -1)
-    let due = mut fx.b.select(sum.flag, x: latest, y: sum.value)
-    mut fx.store(due, addr: op, offset: OPERATION_DUE)
-    let order = next_order(mut lo, mut fx)
-    mut fx.store(order, addr: op, offset: OPERATION_ORDER)
-    let zero = mut fx.ptr(0)
-    mut fx.store(zero, addr: op, offset: OPERATION_WITHDRAW)
-    mut fx.store(zero, addr: op, offset: OPERATION_DONE)
-    let state_address = mut lo.state(mut fx)
-    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
-    let found = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
-        expect state.len() > 1
-        let current = state[0]
-        let previous = state[1]
-        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
-        let compared = mut fx1.choose(present, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let other = mut fx2.load(PTR, addr: current, offset: OPERATION_DUE)
-            let no_later = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: other, y: due)
-            return fx2.list1(no_later)
-        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let no = mut fx2.int(clif::Type.Int8, value: 0)
-            return fx2.list1(no)
-        })
-        let earlier = compared[0]
-        let next = mut fx1.choose(earlier, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let following = mut fx2.load(PTR, addr: current, offset: OPERATION_NEXT)
-            return fx2.list2(following, b: current)
-        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            return fx2.list2(current, b: previous)
-        })
-        return Pass(again: earlier, next: take next)
-    })
-    let after = found[0]
-    let before = found[1]
-    mut fx.store(after, addr: op, offset: OPERATION_NEXT)
-    mut fx.store(before, addr: op, offset: OPERATION_PREVIOUS)
-    let has_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: after, y: 0)
-    mut fx.if_true(has_after, then: fn(mut fx1: Fx) {
-        mut fx1.store(op, addr: after, offset: OPERATION_PREVIOUS)
-    })
-    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 0)
-    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        mut fx1.store(op, addr: state_address, offset: STATE_TIMERS)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        mut fx1.store(op, addr: before, offset: OPERATION_NEXT)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    })
-} arm
-
-/// Takes a timer out of the virtual clock's timers.
-fn disarm(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
-    let state_address = mut lo.state(mut fx)
-    let next = mut fx.load(PTR, addr: op, offset: OPERATION_NEXT)
-    let previous = mut fx.load(PTR, addr: op, offset: OPERATION_PREVIOUS)
-    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
-    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        mut fx1.store(next, addr: state_address, offset: STATE_TIMERS)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        mut fx1.store(next, addr: previous, offset: OPERATION_NEXT)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    })
-    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
-    mut fx.if_true(has_next, then: fn(mut fx1: Fx) {
-        mut fx1.store(previous, addr: next, offset: OPERATION_PREVIOUS)
-    })
-} disarm
+    let due = due_after(mut fx, now: clock, delay: ns)
+    arm(mut lo, mut fx, op, due)
+} seeded_arm
 
 /// Completes an operation in flight with a result, delivered when the scheduler next reaps.
 fn seeded_complete(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {

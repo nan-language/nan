@@ -34,8 +34,10 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// its affinity on AArch64; whether it has started its executor; its global descriptor table, the
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
 /// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
-/// whether it has AVX enabled, which the vector seam reads to save the extended state; and the
-/// frame the vector seam saved for the interrupt it serves, zero outside one.
+/// whether it has AVX enabled, which the vector seam reads to save the extended state; the
+/// frame the vector seam saved for the interrupt it serves, zero outside one; and, on a kernel,
+/// the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
+/// millisecond.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -49,7 +51,9 @@ pub mod cpu {
     pub const ROOT: u64 = 224;
     pub const AVX: u64 = 232;
     pub const FRAME: u64 = 240;
-    pub const SIZE: u64 = 256;
+    pub const NEXT_PACE: u64 = 256;
+    pub const TIMER_RATE: u64 = 264;
+    pub const SIZE: u64 = 320;
 }
 
 /// The model-specific register holding the GS base.
@@ -98,12 +102,15 @@ impl Lowering<'_, '_> {
     }
 
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
-    /// register addresses from now on; on a kernel, a CPU for each processor the platform reports;
-    /// an executor thread record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor
-    /// tables loaded and AVX enabled when it has it.
+    /// register addresses from now on; on a kernel, its clock started and a CPU for each processor
+    /// the platform reports; an executor thread record for each CPU; and, on `x86_64-bare`, the
+    /// boot CPU's descriptor tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
+        if self.kernel() {
+            self.start_clock(fx);
+        }
         let count = match (self.kernel(), self.ck.db.target.arch()) {
             (true, Some(Arch::Amd64)) => self.discover(fx, boot),
             (true, Some(Arch::Aarch64)) => self.aarch64_discover(fx, boot),

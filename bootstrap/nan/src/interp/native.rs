@@ -790,8 +790,8 @@ impl Interpreter<'_, '_> {
             "text::Fixed" => fields[0].fields()[..fields[1].int() as usize].to_vec(),
             "mem::Box" | "mem::Shared" => vec![self.deref(&fields[0])],
             "mem::Pool" | "mem::Arena" | "mem::OnceMap" | "text::Interner" | "sys::Fs"
-            | "sys::Net" | "sys::Clock" | "sys::Random" | "sys::Log" | "sys::Stdio"
-            | "task::Executor" => match &fields[0] {
+            | "sys::Net" | "sys::Clock" | "sys::WallClock" | "sys::Random" | "sys::Log"
+            | "sys::Stdio" | "task::Executor" => match &fields[0] {
                 Val::Ref(loc) => identity(loc),
                 other => vec![other.clone()],
             },

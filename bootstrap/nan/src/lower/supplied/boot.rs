@@ -1,10 +1,10 @@
 //! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root
-//! allocator, `hw::Ring0` and the usable memory of the machine, the firmware services of the
+//! allocator, clocks, `hw::Ring0` and the usable memory of the machine, the firmware services of the
 //! UEFI targets, and the anchor a kernel installs before its executor starts. The installed
 //! anchor lies in storage the image reserves, whose address and the location of the `anchor`
 //! call the runtime state records.
 
-mod firmware;
+pub mod firmware;
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
@@ -28,6 +28,13 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let alloc = fx.offset(grant, at);
             supply.ret(lo, fx, Held::Address(alloc));
         }
+        "boot::Kernel.clock" => {
+            let grant = supply.param(0).address();
+            let at = field(lo, supply, "clock");
+            let clock = fx.offset(grant, at);
+            supply.ret(lo, fx, Held::Address(clock));
+        }
+        "boot::Kernel.wall_clock" => wall_clock(lo, fx, supply),
         "boot::Kernel.ring0" => ring0(lo, fx, supply),
         "boot::Kernel.regions" => regions(lo, fx, supply),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
@@ -48,6 +55,24 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
 fn field(lo: &mut Lowering, supply: &Supply, name: &str) -> u64 {
     let grant = supply.owner.clone().expect("a root grant");
     lo.layouts.field(lo.ck, &grant, None, name).offset
+}
+
+/// `k.wall_clock()`: `Some` of the kernel's wall clock when its source gave a time at the
+/// grant's minting, `None` otherwise.
+fn wall_clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let grant = supply.param(0).address();
+    let at = field(lo, supply, "wall");
+    let wall = fx.load(PTR, grant, at);
+    let option = supply.abi.result.clone();
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, wall, -1);
+    fx.when(present, |fx| {
+        let slot = fx.slot(8, 8);
+        fx.store(wall, slot, 0);
+        let some = lo.variant_value(fx, &option, "Some", &[Held::Address(slot)], None);
+        supply.ret(lo, fx, some);
+    });
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
 }
 
 /// `k.ring0()`: `Some` of the machine's one `hw::Ring0` the first time, `None` after.

@@ -160,7 +160,7 @@ pub mod domain {
 }
 
 /// The offsets of an operation record's fields: what a task waits on at a cancellation point,
-/// or a timer, which a completion, the virtual clock or a sim reaches.
+/// or a timer, which a completion, the virtual clock, a kernel's clock or a sim reaches.
 pub mod operation {
     pub const TASK: u64 = 0;
     pub const RESULT: u64 = 8;
@@ -171,16 +171,17 @@ pub mod operation {
     /// Zero, `REQUESTED` once its cancellation is asked, `SUBMITTED` once submitted.
     pub const CANCEL: u64 = 32;
     pub const KIND: u64 = 40;
-    /// Its links among its thread's operations in flight; on the seeded scheduler, among the
-    /// virtual clock's timers or in the queue of the sim it waits in.
+    /// Its links among its thread's operations in flight; on the seeded scheduler and on a
+    /// kernel, among the timers of its clock or in the queue of the sim it waits in.
     pub const NEXT: u64 = 48;
     pub const PREVIOUS: u64 = 56;
     /// For a deadline, the task to wake once it completes, and the next deadline its task
     /// armed; for a wait in a sim, the sim's record.
     pub const WAITER: u64 = 64;
     pub const LINK: u64 = 72;
-    /// On the seeded scheduler, when a timer is due and the order in which it was armed, and
-    /// for a wait in a sim, the glue withdrawing it from the sim, given the record.
+    /// On the seeded scheduler and on a kernel, when a timer is due and the order in which it
+    /// was armed, and for a wait in a sim, the glue withdrawing it from the sim, given the
+    /// record.
     pub const DUE: u64 = 80;
     pub const ORDER: u64 = 88;
     pub const WITHDRAW: u64 = 96;
@@ -1013,32 +1014,34 @@ pub fn wait_delivered(lo: &mut Lowering, fx: &mut Fx, op: Value) {
 }
 
 impl Lowering<'_, '_> {
-    /// Arms a timer that expires `ms` milliseconds from now: a timeout of the relative time it
-    /// writes at `spec` on the running thread's ring, or on the seeded scheduler a pending
-    /// deadline of the virtual clock.
-    pub fn arm_timer(&mut self, fx: &mut Fx, op: Value, ms: Value, spec: Value) {
+    /// Arms a timer that expires `ns` nanoseconds from now: a timeout of the relative time it
+    /// writes at `spec` on the running thread's ring, or a timer of the virtual clock on the
+    /// seeded scheduler and of the kernel's clock on a kernel.
+    pub fn arm_timer(&mut self, fx: &mut Fx, op: Value, ns: Value, spec: Value) {
         if self.seeded() {
-            super::seeded::arm(self, fx, op, ms);
+            super::seeded::arm(self, fx, op, ns);
             return;
         }
-        let thousand = fx.ptr(1_000);
-        let seconds = fx.b.ins().udiv(ms, thousand);
-        let rest = fx.b.ins().urem(ms, thousand);
-        let nanoseconds = fx.b.ins().imul_imm_s(rest, 1_000_000);
+        if self.kernel() {
+            self.kernel_arm(fx, op, ns);
+            return;
+        }
+        let billion = fx.ptr(1_000_000_000);
+        let seconds = fx.b.ins().udiv(ns, billion);
+        let nanoseconds = fx.b.ins().urem(ns, billion);
         fx.store(seconds, spec, 0);
         fx.store(nanoseconds, spec, 8);
         host::submit_timeout(self, fx, op, spec);
     }
 
     /// Asks once for the cancellation of an operation whose record stays valid during the
-    /// call; on the seeded scheduler one in flight completes cancelled at once.
+    /// call; on the seeded scheduler and on a kernel, where every operation is a wait for a
+    /// timer, one in flight completes cancelled at once.
     pub fn cancel_operation(&mut self, fx: &mut Fx, op: Value) {
         if self.seeded() {
             super::seeded::cancel(self, fx, op);
         } else if self.kernel() {
-            // A kernel task waits only on plain waits, which cancellation wakes, never on an
-            // operation.
-            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+            self.kernel_cancel(fx, op);
         } else {
             host::cancel_operation(self, fx, op);
         }
@@ -1054,12 +1057,15 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The milliseconds of the clock that delays count: the monotonic clock, or on the seeded
-    /// scheduler the virtual clock.
-    pub fn now_ms(&mut self, fx: &mut Fx) -> Value {
-        match self.seeded() {
-            true => super::seeded::now(self, fx),
-            false => self.platform_call(fx, "now_ms", &[]).result.scalar(),
+    /// The nanoseconds of the clock that delays count: the monotonic clock, the virtual clock
+    /// on the seeded scheduler, or the kernel's clock.
+    pub fn now_ns(&mut self, fx: &mut Fx) -> Value {
+        if self.seeded() {
+            return super::seeded::now(self, fx);
+        }
+        match self.kernel() {
+            true => self.call_routine(fx, Routine::ClockNow, &[])[0],
+            false => self.platform_call(fx, "now_ns", &[]).result.scalar(),
         }
     }
 }

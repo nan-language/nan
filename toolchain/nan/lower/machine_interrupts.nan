@@ -140,6 +140,8 @@ const APIC_TIMER_DIVIDE: u64 = 0x3E0
 
 const APIC_TIMER_COUNT: u64 = 0x380
 
+const APIC_TIMER_CURRENT: u64 = 0x390
+
 /// The interrupt command register's delivery-pending bit, and the commands the kernel sends: an
 /// INIT and a startup IPI to one CPU, and a non-maskable interrupt to every other CPU.
 const IPI_PENDING: i64 = 0x1000
@@ -151,18 +153,20 @@ const IPI_STARTUP: u64 = 0x4600
 const IPI_NMI_OTHERS: u64 = 0xC_4400
 
 /// The local APIC's software-enable bit in its spurious-interrupt register, the divide
-/// configuration slowing its timer's clock by 16, and the timer mode firing periodically.
+/// configuration slowing its timer's clock by 16, and the mask bit of a local vector table
+/// entry.
 const APIC_ENABLED: u64 = 0x100
 
 const DIVIDE_BY_16: u64 = 0x3
 
-const PERIODIC: u64 = 0x2_0000
+const APIC_MASKED: u64 = 0x1_0000
 
-/// The interrupt vector each CPU's local APIC timer fires, periodically, the initial count that
-/// paces it on the emulator, and the vector of the local APIC's spurious interrupts.
+/// The interrupt vector each CPU's local APIC timer fires, one-shot, the nanoseconds of the
+/// clock over which a CPU counts its timer's ticks, and the vector of the local APIC's spurious
+/// interrupts.
 const TIMER_VECTOR: i64 = 0x20
 
-const TIMER_COUNT: u64 = 0x10_0000
+const TIMER_MEASURE: u64 = 1_000_000
 
 const SPURIOUS_VECTOR: i64 = 0xFF
 
@@ -428,8 +432,8 @@ fn Lowering.seam(mut self) -> object::FuncId {
 } Lowering.seam
 
 /// The glue a CPU runs to take interrupts: it draws its interrupt stack and one for each of
-/// `stacks`, the nonzero `ist` values bindings use, loads the interrupt descriptor table and
-/// enables its local APIC, its timer firing `TIMER_VECTOR`.
+/// `stacks`, the nonzero `ist` values bindings use, loads the interrupt descriptor table,
+/// enables its local APIC and starts its timer, firing `TIMER_VECTOR`.
 fn Lowering.cpu_interrupts(mut self, stacks: Slice[u8]) -> object::FuncId {
     let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     let id = mut self.module.declare_function("_NScpu_interrupts", linkage: object::Linkage.Local, signature)
@@ -452,9 +456,7 @@ fn Lowering.cpu_interrupts(mut self, stacks: Slice[u8]) -> object::FuncId {
         let idt = mut lo1.reserved(mut fx1, data_name: "_NSidt", size: IDT_BYTES, align: 16)
         mut lo1.load_idt(mut fx1, table: idt)
         mut lo1.apic_write(mut fx1, register: APIC_SPURIOUS, value: APIC_ENABLED | u64.fit(SPURIOUS_VECTOR))
-        mut lo1.apic_write(mut fx1, register: APIC_TIMER_DIVIDE, value: DIVIDE_BY_16)
-        mut lo1.apic_write(mut fx1, register: APIC_LVT_TIMER, value: u64.fit(TIMER_VECTOR) | PERIODIC)
-        mut lo1.apic_write(mut fx1, register: APIC_TIMER_COUNT, value: TIMER_COUNT)
+        mut lo1.start_timer(mut fx1)
         mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
     })
     return id
@@ -624,9 +626,10 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
 /// Dispatches a fired vector with its saved frame: calls the interrupt fn the final build
 /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
 /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
-/// binds. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with maskable
-/// interrupts enabled and the anchor is installed, the task is preempted. An unbound timer
-/// interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
+/// binds. A timer interrupt first serves the kernel's clock, and reaches an interrupt fn on a
+/// pacing tick alone. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
+/// maskable interrupts enabled and the anchor is installed, the task is preempted. An unbound
+/// timer interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
 /// unbound vector, the kernel halts at the interrupted instruction.
 fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif::Signature) -> object::FuncId {
     let id = mut self.module.declare_function("_NSseam_dispatch_vector", linkage: object::Linkage.Local, signature)
@@ -648,6 +651,15 @@ fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif:
             None => {}
         }
         let zero_value = mut fx1.ptr(0)
+        let clocked = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: known.timer)
+        mut fx1.if_true(clocked, then: fn[mut lo1](mut fx2: Fx) {
+            let pacing = mut lo1.timer_interrupt(mut fx2)
+            let early = mut fx2.b.bxor_imm_s(pacing, y: 1)
+            mut fx2.if_true(early, then: fn[mut lo1](mut fx3: Fx) {
+                mut lo1.end_of_interrupt(mut fx3)
+                mut fx3.b.ret(Array[clif::Value, 1].filled(zero_value).view())
+            })
+        })
         for bound_entry in bound {
             let this = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound_entry.vector)
             mut fx1.if_true(this, then: fn[mut lo1](mut fx2: Fx) {
@@ -845,6 +857,38 @@ fn Lowering.apic_write(mut self, mut fx: Fx, register: u64, value: u64)
     let value_word = mut fx.ptr(value)
     mut self.mmio_write(mut fx, width: 4, address: at, value: value_word)
 } Lowering.apic_write
+
+/// The ticks the running CPU's local APIC timer counts in a millisecond, measured with its
+/// interrupt masked, after which the timer fires `TIMER_VECTOR` one-shot.
+fn Lowering.x64_timer_rate(mut self, mut fx: Fx) -> clif::Value {
+    mut self.apic_write(mut fx, register: APIC_TIMER_DIVIDE, value: DIVIDE_BY_16)
+    mut self.apic_write(mut fx, register: APIC_LVT_TIMER, value: u64.fit(TIMER_VECTOR) | APIC_MASKED)
+    mut self.apic_write(mut fx, register: APIC_TIMER_COUNT, value: 0xFFFF_FFFF)
+    let begun = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let start = begun[0]
+    let ended = mut fx.repeat(fx.list1(start).view(), body: fn[mut self](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let read = mut self.call_routine(mut fx1, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        let now = read[0]
+        let elapsed = mut fx1.b.isub(now, y: start)
+        let short = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: elapsed, y: i64.fit(TIMER_MEASURE))
+        return Pass(again: short, next: fx1.list1(now))
+    })
+    let end = ended[0]
+    let at = mut fx.ptr(INTERRUPTS_APIC + APIC_TIMER_CURRENT)
+    let left = mut self.mmio_read(mut fx, width: 4, address: at)
+    let full = mut fx.ptr(0xFFFF_FFFF)
+    let counted = mut fx.b.isub(full, y: left)
+    let ticks = mut fx.b.imul_imm_s(counted, y: i64.fit(NS_PER_MS))
+    let elapsed = mut fx.b.isub(end, y: start)
+    mut self.apic_write(mut fx, register: APIC_LVT_TIMER, value: u64.fit(TIMER_VECTOR))
+    return mut fx.b.udiv(ticks, y: elapsed)
+} Lowering.x64_timer_rate
+
+/// Starts the running CPU's local APIC timer counting down `ticks`.
+fn Lowering.x64_set_timer(mut self, mut fx: Fx, ticks: clif::Value) {
+    let at = mut fx.ptr(INTERRUPTS_APIC + APIC_TIMER_COUNT)
+    mut self.mmio_write(mut fx, width: 4, address: at, value: ticks)
+} Lowering.x64_set_timer
 
 /// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the
 /// local APIC's end-of-interrupt register on x86_64, and the GIC CPU interface's on AArch64.

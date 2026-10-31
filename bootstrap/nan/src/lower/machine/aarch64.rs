@@ -24,8 +24,9 @@ use super::stubs::Stub;
 /// syndrome and the fault address in the frame, unmasks fast interrupts unless it serves one,
 /// and calls the dispatcher with the kind and the frame. When the dispatcher gives zero it
 /// restores the frame and returns from the exception. Otherwise it copies the frame below the
-/// interrupted stack pointer, pops it off the interrupt stack, calls the preemption glue on the
-/// interrupted task's stack and, once that returns, masks IRQs and restores from the copy.
+/// interrupted stack pointer, leaving `RESERVED` bytes between them, pops it off the interrupt
+/// stack, calls the preemption glue on the interrupted task's stack with the copy and what the
+/// dispatcher gave and, once that returns, masks IRQs and restores from the copy.
 pub(super) const VBAR_SEAM: &[u8] = &[
     0xff, 0x83, 0x04, 0xd1, 0xe0, 0x07, 0x00, 0xa9, 0x01, 0x41, 0x38, 0xd5, 0x00, 0x00, 0x80, 0xd2,
     0xff, 0x01, 0x00, 0x14, 0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5,
@@ -162,43 +163,55 @@ pub(super) const VBAR_SEAM: &[u8] = &[
     0xfc, 0x77, 0x0e, 0xa9, 0x22, 0x40, 0x38, 0xd5, 0xfe, 0x0b, 0x0f, 0xa9, 0x02, 0x40, 0x38, 0xd5,
     0xe2, 0x07, 0x10, 0xa9, 0x02, 0x52, 0x38, 0xd5, 0x03, 0x60, 0x38, 0xd5, 0xe2, 0x0f, 0x11, 0xa9,
     0xf3, 0x03, 0x00, 0x91, 0xe1, 0x03, 0x00, 0x91, 0x1f, 0x08, 0x00, 0xf1, 0x40, 0x00, 0x00, 0x54,
-    0xff, 0x41, 0x03, 0xd5, 0x26, 0x00, 0x00, 0x94, 0xc0, 0x02, 0x00, 0xb5, 0xe2, 0x83, 0x40, 0xf9,
+    0xff, 0x41, 0x03, 0xd5, 0x28, 0x00, 0x00, 0x94, 0xc0, 0x02, 0x00, 0xb5, 0xe2, 0x83, 0x40, 0xf9,
     0x02, 0x40, 0x18, 0xd5, 0xfe, 0x0b, 0x4f, 0xa9, 0x22, 0x40, 0x18, 0xd5, 0xe2, 0x0f, 0x41, 0xa9,
     0xe4, 0x17, 0x42, 0xa9, 0xe6, 0x1f, 0x43, 0xa9, 0xe8, 0x27, 0x44, 0xa9, 0xea, 0x2f, 0x45, 0xa9,
     0xec, 0x37, 0x46, 0xa9, 0xee, 0x3f, 0x47, 0xa9, 0xf0, 0x47, 0x48, 0xa9, 0xf2, 0x4f, 0x49, 0xa9,
     0xf4, 0x57, 0x4a, 0xa9, 0xf6, 0x5f, 0x4b, 0xa9, 0xf8, 0x67, 0x4c, 0xa9, 0xfa, 0x6f, 0x4d, 0xa9,
     0xfc, 0x77, 0x4e, 0xa9, 0xe0, 0x07, 0x40, 0xa9, 0xff, 0x83, 0x04, 0x91, 0xe0, 0x03, 0x9f, 0xd6,
-    0x69, 0x86, 0x40, 0xf9, 0x29, 0x81, 0x04, 0xd1, 0xea, 0x03, 0x13, 0xaa, 0xeb, 0x03, 0x09, 0xaa,
+    0x69, 0x86, 0x40, 0xf9, 0x29, 0x81, 0x06, 0xd1, 0xea, 0x03, 0x13, 0xaa, 0xeb, 0x03, 0x09, 0xaa,
     0x4c, 0x02, 0x80, 0xd2, 0x4d, 0x39, 0xc1, 0xa8, 0x6d, 0x39, 0x81, 0xa8, 0x8c, 0x05, 0x00, 0xf1,
     0xa1, 0xff, 0xff, 0x54, 0x7f, 0x82, 0x04, 0x91, 0x09, 0x41, 0x18, 0xd5, 0xbf, 0x40, 0x00, 0xd5,
-    0x04, 0x00, 0x00, 0x94, 0xdf, 0x42, 0x03, 0xd5, 0xdd, 0xff, 0xff, 0x17, 0xc0, 0x03, 0x5f, 0xd6,
-    0xc0, 0x03, 0x5f, 0xd6,
+    0xe1, 0x03, 0x00, 0xaa, 0xe0, 0x03, 0x09, 0xaa, 0x04, 0x00, 0x00, 0x94, 0xdf, 0x42, 0x03, 0xd5,
+    0xdb, 0xff, 0xff, 0x17, 0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6,
 ];
 
 /// The offsets within `VBAR_SEAM` of the common seam's calls of the dispatcher and of the
 /// preemption glue.
 pub(super) const SEAM_DISPATCH: u32 = 0x874;
-pub(super) const SEAM_PREEMPT: u32 = 0x900;
+pub(super) const SEAM_PREEMPT: u32 = 0x908;
 
 /// The size of the vector table, to which the seam's symbol, loaded into `VBAR_EL1`, is aligned.
 const VBAR_BYTES: u64 = 2_048;
 
-/// The offsets in the frame the seam saves, after the thirty-one general registers: the
-/// interrupted return address, the saved processor state, the interrupted stack pointer, the
-/// exception's syndrome and the fault address.
+/// The offsets in the frame the seam saves: the frame pointer and link register among the
+/// thirty-one general registers, then the interrupted return address, the saved processor state,
+/// the interrupted stack pointer, the exception's syndrome and the fault address; and the frame's
+/// size.
 pub(super) mod frame {
+    pub const X29: u64 = 0xE8;
+    pub const X30: u64 = 0xF0;
     pub const ELR: u64 = 0xF8;
     pub const SPSR: u64 = 0x100;
     pub const SP: u64 = 0x108;
     pub const ESR: u64 = 0x110;
     pub const FAR: u64 = 0x118;
+    pub const SIZE: u64 = 0x120;
 }
+
+// The common seam copies frames of this size, as 18 pairs of registers, leaving the reserved
+// bytes above the copy.
+const _: () = assert!(frame::SIZE == 18 * 16 && frame::SIZE + super::interrupts::RESERVED == 0x1a0);
 
 pub(super) const FRAME: SavedFrame = SavedFrame {
     code: frame::ESR,
     ip: frame::ELR,
     state: frame::SPSR,
     sp: frame::SP,
+    fp: frame::X29,
+    link: Some(frame::X30),
+    args: [0, 8, 16, 24],
+    size: frame::SIZE,
 };
 
 /// The IRQ mask bit of the saved processor state.
@@ -236,6 +249,7 @@ pub(super) const VECTORS: Vectors = Vectors {
     page_fault: ABORT_VECTOR,
     installable_end: Some(256),
     lpis: true,
+    exceptions: ABORT_VECTOR + 1,
 };
 
 /// The GICv3 the descriptor names: its distributor, and the first CPU's redistributor, each
@@ -293,6 +307,17 @@ const CNTV_TVAL_EL0: u16 = 0x5F18;
 const CNTV_CTL_EL0: u16 = 0x5F19;
 pub(super) const CNTFRQ_EL0: u16 = 0x5F00;
 pub(super) const CNTVCT_EL0: u16 = 0x5F02;
+
+/// The vector of a synchronous exception, from its syndrome: the abort vector for an instruction
+/// or data abort, the other one otherwise.
+pub(super) fn exception_vector(fx: &mut Fx, syndrome: Value) -> Value {
+    let class = fx.b.ins().ushr_imm_s(syndrome, CLASS_SHIFT);
+    let class = fx.b.ins().band_imm_s(class, ABORT_CLASS_BITS);
+    let abort = fx.b.ins().icmp_imm_s(IntCC::Equal, class, ABORT_CLASS);
+    let aborted = fx.ptr(ABORT_VECTOR as u64);
+    let other = fx.ptr(SYNC_VECTOR as u64);
+    fx.b.ins().select(abort, aborted, other)
+}
 
 impl Lowering<'_, '_> {
     /// Reads a GIC CPU-interface, vector-base, timer or counter system register through the
@@ -506,12 +531,7 @@ impl Lowering<'_, '_> {
             },
             |_, fx| {
                 let syndrome = fx.load(PTR, saved, frame::ESR);
-                let class = fx.b.ins().ushr_imm_s(syndrome, CLASS_SHIFT);
-                let class = fx.b.ins().band_imm_s(class, ABORT_CLASS_BITS);
-                let abort = fx.b.ins().icmp_imm_s(IntCC::Equal, class, ABORT_CLASS);
-                let aborted = fx.ptr(ABORT_VECTOR as u64);
-                let other = fx.ptr(SYNC_VECTOR as u64);
-                let synchronous = fx.b.ins().select(abort, aborted, other);
+                let synchronous = exception_vector(fx, syndrome);
                 let serror = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, KIND_SERROR);
                 let error = fx.ptr(SERROR_VECTOR as u64);
                 vec![fx.b.ins().select(serror, error, synchronous)]

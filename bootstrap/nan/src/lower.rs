@@ -109,6 +109,8 @@ pub enum Glue {
     RaceEnd,
     /// What the executor thread does once a race's task has ended.
     RaceDone,
+    /// What a domain's first task does once its entry ends: closes the domain.
+    DomainEnd,
     /// What the executor thread does once a domain's first task has ended.
     DomainDone,
     /// What the executor thread does once a kernel anchor's first task has ended.
@@ -193,6 +195,7 @@ impl Glue {
                 | Glue::ChildDone
                 | Glue::RaceEnd
                 | Glue::RaceDone
+                | Glue::DomainEnd
                 | Glue::DomainDone
                 | Glue::AnchorDone
                 | Glue::ComponentDone
@@ -210,7 +213,7 @@ impl Glue {
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: [&str; 8] = [
+const CRITICAL_OWNERS: [&str; 9] = [
     "sys::Domain",
     "task::Sender",
     "task::Receiver",
@@ -219,6 +222,7 @@ const CRITICAL_OWNERS: [&str; 8] = [
     "sys::Outbox",
     "mem::Shared",
     "task::Cown",
+    "hw::Ring0",
 ];
 
 /// The outcome of lowering a final closure.
@@ -519,6 +523,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
             .iter()
             .enumerate()
             .filter_map(|(position, (nty, _))| match nty.ty() {
+                Ty::Fn(fn_ty) if fn_ty.kind == crate::syntax::ast::FnKind::Task => {
+                    Some((position, None))
+                }
                 Ty::Fn(fn_ty) => Some((position, fn_ty.limits.stack)),
                 _ => None,
             })
@@ -570,8 +577,8 @@ impl<'c, 'a> Lowering<'c, 'a> {
     /// The line table flags of an instance's function: trap reports leave out the frames of
     /// std items and of the code lowering writes itself, and a stopping task does not stop
     /// inside a std function of a type with interior mutability or of `task::Sender`,
-    /// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared` or
-    /// `task::Cown`.
+    /// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared`, `task::Cown`
+    /// or `hw::Ring0`.
     fn frame_flags(&self, instance: &Instance) -> u32 {
         let (hidden, critical) = match instance {
             Instance::Nir { item, args, .. } | Instance::Supplied { item, args } => {
@@ -708,6 +715,11 @@ impl<'c, 'a> Lowering<'c, 'a> {
         sites
     }
 
+    /// The function of a glue already asked for.
+    pub fn glue(&self, glue: &Glue) -> Option<FuncId> {
+        self.glues.get(glue).copied()
+    }
+
     /// The function of a glue, declared and defined when first asked for.
     pub fn glue_function(
         &mut self,
@@ -728,8 +740,18 @@ impl<'c, 'a> Lowering<'c, 'a> {
             true => lines::HIDDEN | lines::CRITICAL,
             false => lines::HIDDEN,
         };
+        let walked = match &glue {
+            Glue::Transfer(Ty::Item(item, args)) => {
+                let ty = Ty::Item(*item, args.clone());
+                Some(self.ck.show(&ty, self.ck.db.module_of(*item)))
+            }
+            _ => None,
+        };
         self.glues.insert(glue, id);
         self.define(id, signature, flags, build);
+        if let Some(walked) = walked {
+            self.frames.last_mut().expect("the frame just defined").name = walked;
+        }
         id
     }
 

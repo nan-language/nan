@@ -15,7 +15,8 @@ use super::super::body::Held;
 use super::super::call::Invoked;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tasks::{self, task};
-use super::super::runtime::{Routine, report, state};
+use super::super::runtime::{Routine, report, state, stops};
+use super::super::trap::{OPERAND_RECORD, Written, kind_number};
 use super::super::{Instance, Lowering};
 use super::SEAM_FRAME;
 use super::aarch64;
@@ -60,8 +61,9 @@ fn vector_stub(vector: u8, at: u32, entry: u32) -> [u8; VECTOR_STUB as usize] {
 /// holds, unless already on it; its second entry, for the other vectors, whose stack the CPU
 /// switched to, only pushes the registers. Both then call the dispatcher with the vector and the
 /// saved frame. When the dispatcher gives zero they restore the registers and return from the
-/// interrupt; otherwise they copy the frame below the interrupted stack pointer, call the
-/// preemption glue there, and restore from the copy once it returns.
+/// interrupt; otherwise they copy the frame below the interrupted stack pointer, leaving
+/// `RESERVED` bytes between them, call the preemption glue there with the copy and what the
+/// dispatcher gave, and restore from the copy once it returns.
 pub(super) const SEAM_COMMON: &[u8] = &[
     0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x41, 0x53, 0x41, 0x52, 0x41, 0x51, 0x41, 0x50,
     0x57, 0x56, 0x55, 0x53, 0x52, 0x51, 0x50, 0xfc, 0x48, 0x89, 0xe3, 0x65, 0x48, 0x8b, 0x04, 0x25,
@@ -72,41 +74,64 @@ pub(super) const SEAM_COMMON: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x75, 0x20, 0x48, 0x89, 0xdc, 0x58, 0x59, 0x5a, 0x5b,
     0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b, 0x41, 0x5c, 0x41, 0x5d, 0x41,
     0x5e, 0x41, 0x5f, 0x48, 0x83, 0xc4, 0x10, 0x48, 0xcf, 0x48, 0x8b, 0xbb, 0xa0, 0x00, 0x00, 0x00,
-    0x48, 0x81, 0xef, 0xb0, 0x00, 0x00, 0x00, 0x48, 0x83, 0xe7, 0xf0, 0x48, 0x89, 0xde, 0x48, 0x89,
-    0xfb, 0xb9, 0x16, 0x00, 0x00, 0x00, 0xf3, 0x48, 0xa5, 0x48, 0x89, 0xdc, 0xe8, 0x00, 0x00, 0x00,
-    0x00, 0xeb, 0xb6,
+    0x48, 0x81, 0xef, 0x30, 0x01, 0x00, 0x00, 0x48, 0x83, 0xe7, 0xf0, 0x48, 0x89, 0xde, 0x48, 0x89,
+    0xfb, 0xb9, 0x16, 0x00, 0x00, 0x00, 0xf3, 0x48, 0xa5, 0x48, 0x89, 0xdc, 0x48, 0x89, 0xdf, 0x48,
+    0x89, 0xc6, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xeb, 0xb0,
 ];
+
+/// The bytes both architectures' seams leave between a frame they copy for the preemption glue
+/// and the interrupted stack pointer.
+pub(super) const RESERVED: u64 = 128;
+
+// The operands of an exception's trap fit in the reserved bytes.
+const _: () = assert!(3 * OPERAND_RECORD <= RESERVED);
 
 /// The offsets within `SEAM_COMMON` of its entry for vectors on another stack, and of the
 /// displacements of its calls of the dispatcher and the preemption glue.
 pub(super) const SEAM_STAY: u32 = 0x39;
 pub(super) const SEAM_DISPATCH: u32 = 0x60;
-pub(super) const SEAM_PREEMPT: u32 = 0xad;
+pub(super) const SEAM_PREEMPT: u32 = 0xb3;
 
-// The common seam's code reads the CPU record and the saved frame at these offsets.
+// The common seam's code reads the CPU record and the saved frame at these offsets, and copies
+// frames of this size.
 const _: () = assert!(cpu::STACK_TOP == 0x10 && cpu::STACK_BASE == 0x18);
-const _: () = assert!(frame::CODE == 0x80 && frame::RSP == 0xa0);
+const _: () = assert!(frame::VECTOR == 0x78 && frame::CODE == 0x80 && frame::RSP == 0xa0);
+const _: () = assert!(frame::SIZE == 0x16 * 8 && frame::SIZE + RESERVED == 0x130);
 
-/// The offsets in the frame the seam saves of what its readers read: after the 15 saved
-/// registers and the vector, the error code, then the interrupted instruction pointer, flags and
-/// stack pointer.
+/// The offsets in the frame the seam saves of what its readers read: the saved registers the
+/// first four arguments of a call and the frame pointer pass in, the vector after the 15 saved
+/// registers, the error code, then the interrupted instruction pointer, flags and stack
+/// pointer; and the frame's size.
 mod frame {
+    pub const RCX: u64 = 8;
+    pub const RDX: u64 = 16;
+    pub const RBP: u64 = 32;
+    pub const RSI: u64 = 40;
+    pub const RDI: u64 = 48;
+    pub const VECTOR: u64 = 120;
     pub const CODE: u64 = 128;
     pub const RIP: u64 = 136;
     pub const RFLAGS: u64 = 152;
     pub const RSP: u64 = 160;
+    pub const SIZE: u64 = 176;
 }
 
 /// The offsets in the frame an architecture's vector seam saves of what the dispatcher,
-/// `hw::TrapFrame` and halt reports read: the error code or syndrome, the interrupted
+/// `hw::TrapFrame`, halt reports and stops read: the error code or syndrome, the interrupted
 /// instruction's address, the processor state holding whether maskable interrupts were enabled,
-/// and the interrupted stack pointer.
+/// the interrupted stack pointer, frame pointer and link register where the architecture has
+/// one, and those of the registers passing the first four arguments of a call; and the frame's
+/// size.
 #[derive(Clone, Copy)]
 pub struct SavedFrame {
     pub code: u64,
     pub ip: u64,
     pub state: u64,
     pub sp: u64,
+    pub fp: u64,
+    pub link: Option<u64>,
+    pub args: [u64; 4],
+    pub size: u64,
 }
 
 const X64_FRAME: SavedFrame = SavedFrame {
@@ -114,6 +139,10 @@ const X64_FRAME: SavedFrame = SavedFrame {
     ip: frame::RIP,
     state: frame::RFLAGS,
     sp: frame::RSP,
+    fp: frame::RBP,
+    link: None,
+    args: [frame::RDI, frame::RSI, frame::RDX, frame::RCX],
+    size: frame::SIZE,
 };
 
 /// What the dispatcher knows of an architecture's vectors: the vector of the interrupt a halting
@@ -122,7 +151,8 @@ const X64_FRAME: SavedFrame = SavedFrame {
 /// it delivers them as one; the vectors whose interrupt fn's return halts the kernel; the vector
 /// of page faults, whose trap frame holds the faulting address; where the interrupt controller
 /// numbers interrupts past the last vector, the end of the vectors an `hw::IrqShared` installs
-/// on; and whether it delivers LPIs, which the dispatcher receives as their identifiers.
+/// on; whether it delivers LPIs, which the dispatcher receives as their identifiers; and the end
+/// of the exception vectors, numbered from 0.
 pub(super) struct Vectors {
     pub(super) stop: Option<i64>,
     pub(super) timer: i64,
@@ -131,6 +161,7 @@ pub(super) struct Vectors {
     pub(super) page_fault: i64,
     pub(super) installable_end: Option<i64>,
     pub(super) lpis: bool,
+    pub(super) exceptions: i64,
 }
 
 const X64_VECTORS: Vectors = Vectors {
@@ -141,6 +172,7 @@ const X64_VECTORS: Vectors = Vectors {
     page_fault: 14,
     installable_end: None,
     lpis: false,
+    exceptions: 32,
 };
 
 /// The interrupt flag of the saved flags.
@@ -199,6 +231,10 @@ const SPURIOUS_VECTOR: i64 = 0xFF;
 /// kernel.
 const NMI_VECTOR: i64 = 2;
 const ABORT_VECTORS: [i64; 2] = [8, 18];
+
+/// What the dispatcher gives the seam to make the interrupted task trap; it gives 1 to preempt
+/// the task.
+const EXCEPTION_TRAP: i64 = 2;
 
 /// The stack the dispatcher and its glue use beside the interrupt fns they call, a halt report
 /// included.
@@ -524,17 +560,28 @@ impl Lowering<'_, '_> {
         seam
     }
 
-    /// The glue the seam calls on a preempted task's stack: it calls the `hw::preempt` entry's
-    /// landing fn, which returns once a later switch resumes the task.
+    /// The glue the seam calls on an interrupted task's stack with the copy of its saved frame
+    /// and what the dispatcher gave: for `EXCEPTION_TRAP` it makes the frame resume in a trap of
+    /// the task, and otherwise it calls the `hw::preempt` entry's landing fn, which returns once
+    /// a later switch resumes the task.
     pub(super) fn preempt_glue(&mut self) -> FuncId {
-        let signature = Signature::new(super::super::CALL_CONV);
+        let mut signature = Signature::new(super::super::CALL_CONV);
+        signature.params.push(AbiParam::new(PTR));
+        signature.params.push(AbiParam::new(PTR));
         let id = self
             .module
             .declare_function("_NSseam_preempt", Linkage::Local, &signature)
             .expect("the preemption glue");
         let preempt = self.preempt_handler();
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
-            fx.entry();
+            let params = fx.entry();
+            let trap =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, params[1], EXCEPTION_TRAP);
+            fx.when(trap, |fx| {
+                lo.exception_trap(fx, params[0]);
+                fx.b.ins().return_(&[]);
+            });
             if let Some(preempt) = &preempt {
                 let abi = lo.abi(preempt);
                 let id = lo.instance(preempt.clone());
@@ -543,6 +590,68 @@ impl Lowering<'_, '_> {
             fx.b.ins().return_(&[]);
         });
         id
+    }
+
+    /// Makes the interrupted task, whose saved frame the seam copied to `frame` on the task's
+    /// stack, trap with `trap.exception` at the interrupted instruction: the operands, the
+    /// vector, the error code or syndrome and, for a page fault, the faulting address, lie in
+    /// the bytes the seam left above the copy, and the frame resumes in the trap routine as if
+    /// the instruction called it.
+    fn exception_trap(&mut self, fx: &mut Fx, frame: Value) {
+        let layout = self.saved_frame();
+        let code = fx.load(PTR, frame, layout.code);
+        let vector = match self.machine_arch() {
+            Arch::Amd64 => fx.load(PTR, frame, frame::VECTOR),
+            Arch::Aarch64 => aarch64::exception_vector(fx, code),
+        };
+        let page_fault =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, vector, self.vectors().page_fault);
+        let address = fx.choose_in(
+            self,
+            page_fault,
+            &[PTR],
+            |lo, fx| vec![lo.fault_address(fx, frame)],
+            |_, fx| vec![fx.ptr(0)],
+        )[0];
+        let operands = fx.offset(frame, layout.size);
+        let named = [("vector", vector), ("code", code), ("address", address)];
+        for (index, (name, value)) in named.into_iter().enumerate() {
+            let record = fx.offset(operands, index as u64 * OPERAND_RECORD);
+            let text = self.bytes_data(name.as_bytes());
+            let text = self.data_ref(fx, text);
+            let text = fx.b.ins().symbol_value(PTR, text);
+            fx.store(text, record, 0);
+            let len = fx.ptr(name.len() as u64);
+            fx.store(len, record, 8);
+            fx.store(value, record, 16);
+            let how = fx.ptr(Written::Unsigned as u64);
+            fx.store(how, record, 24);
+            let writer = fx.ptr(0);
+            fx.store(writer, record, 32);
+        }
+        let two = fx.ptr(2);
+        let three = fx.ptr(3);
+        let count = fx.b.ins().select(page_fault, three, two);
+        let kind = fx.ptr(kind_number("trap.exception") as u64);
+        let caller = fx.ptr(0);
+        for (at, value) in layout.args.into_iter().zip([kind, operands, count, caller]) {
+            fx.store(value, frame, at);
+        }
+        let ip = fx.load(PTR, frame, layout.ip);
+        let returned = fx.b.ins().iadd_imm_s(ip, 1);
+        match layout.link {
+            Some(link) => fx.store(returned, frame, link),
+            None => {
+                let top = fx.offset(frame, frame::VECTOR);
+                fx.store(returned, top, 0);
+                fx.store(top, frame, layout.sp);
+            }
+        }
+        let raise = self.routine(Routine::TrapRaise);
+        let raise = self.func_ref(fx, raise);
+        let raise = fx.b.ins().func_addr(PTR, raise);
+        fx.store(raise, frame, layout.ip);
     }
 
     /// The interrupt dispatcher the vector seam calls with what fired and the saved frame; it
@@ -622,10 +731,14 @@ impl Lowering<'_, '_> {
     /// binds, or the devices installed on the vector or on the LPI. A timer interrupt first serves
     /// the kernel's clock, and reaches an interrupt fn on a pacing tick alone. The CPU signal
     /// first serves a shootdown on x86_64, and only ends unless bound. When a fn gives
-    /// `hw::IrqExit.Reschedule` while a kernel task ran with
-    /// maskable interrupts enabled and the anchor is installed, the task is preempted. An unbound
-    /// timer interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
-    /// unbound vector, the kernel halts at the interrupted instruction.
+    /// `hw::IrqExit.Reschedule` while a kernel task ran with maskable interrupts enabled and the
+    /// anchor is installed, the task is preempted; a task asked to stop is preempted on any
+    /// interrupt once it may stop, and only then. An unbound exception vector other than an abort
+    /// vector, and an exception vector whose fn gives `hw::IrqExit.Abandon`, trap a kernel task
+    /// that ran with maskable interrupts enabled on its own stack; an exception fn's `Abandon`
+    /// elsewhere halts the kernel. An unbound timer interrupt only ends; after an interrupt fn
+    /// for an abort vector returns, and on any other unbound vector, the kernel halts at the
+    /// interrupted instruction.
     fn dispatch_vector(&mut self, bound: &[Bound], signature: Signature) -> FuncId {
         let id = self
             .module
@@ -640,26 +753,39 @@ impl Lowering<'_, '_> {
                 let stopping = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, stop);
                 fx.when(stopping, |fx| lo.stop_if_halting(fx));
             }
-            let zero = fx.ptr(0);
-            lo.dispatch_signal(fx, bound, vector, zero);
+            let no = fx.int(types::I8, 0);
+            lo.dispatch_signal(fx, bound, vector, saved, preempting);
             let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, vectors.timer);
             fx.when(timer, |fx| {
                 let pacing = lo.timer_interrupt(fx);
                 let early = fx.b.ins().bxor_imm_s(pacing, 1);
                 fx.when(early, |fx| {
                     lo.end_of_interrupt(fx);
-                    fx.b.ins().return_(&[zero]);
+                    let preempt = lo.preempts(fx, no, saved, preempting);
+                    fx.b.ins().return_(&[preempt]);
                 });
             });
             for entry in bound {
                 let this = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, entry.vector);
                 fx.when(this, |fx| {
-                    let reschedule = lo.dispatch_bound(fx, entry, saved);
+                    let (reschedule, abandon) = lo.dispatch_bound(fx, entry, saved);
                     if vectors.aborts.contains(&entry.vector) {
                         let ip = fx.load(PTR, saved, lo.saved_frame().ip);
                         let location = report::location_at(lo, fx, ip);
                         report::halt(lo, fx, "abort-exception", location, None);
                         return;
+                    }
+                    if entry.class != "Irq" {
+                        fx.when(abandon, |fx| {
+                            let traps = lo.traps(fx, saved);
+                            fx.when(traps, |fx| {
+                                let trap = fx.ptr(EXCEPTION_TRAP as u64);
+                                fx.b.ins().return_(&[trap]);
+                            });
+                            let ip = fx.load(PTR, saved, lo.saved_frame().ip);
+                            let location = report::location_at(lo, fx, ip);
+                            report::halt(lo, fx, "unabandonable", location, None);
+                        });
                     }
                     let preempt = lo.preempts(fx, reschedule, saved, preempting);
                     fx.b.ins().return_(&[preempt]);
@@ -697,14 +823,30 @@ impl Lowering<'_, '_> {
             let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, vectors.timer);
             fx.when(timer, |fx| {
                 lo.end_of_interrupt(fx);
-                fx.b.ins().return_(&[zero]);
+                let preempt = lo.preempts(fx, no, saved, preempting);
+                fx.b.ins().return_(&[preempt]);
             });
             if let Some(spurious) = vectors.spurious {
                 let spurious = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, spurious);
                 fx.when(spurious, |fx| {
+                    let zero = fx.ptr(0);
                     fx.b.ins().return_(&[zero]);
                 });
             }
+            let mut exception =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, vector, vectors.exceptions);
+            for other in vectors.stop.iter().chain(vectors.aborts) {
+                let this = fx.b.ins().icmp_imm_s(IntCC::NotEqual, vector, *other);
+                exception = fx.b.ins().band(exception, this);
+            }
+            fx.when(exception, |fx| {
+                let traps = lo.traps(fx, saved);
+                fx.when(traps, |fx| {
+                    let trap = fx.ptr(EXCEPTION_TRAP as u64);
+                    fx.b.ins().return_(&[trap]);
+                });
+            });
             let ip = fx.load(PTR, saved, lo.saved_frame().ip);
             let location = report::location_at(lo, fx, ip);
             report::halt(lo, fx, "unbound-vector", location, Some(("vector", vector)));
@@ -713,8 +855,16 @@ impl Lowering<'_, '_> {
     }
 
     /// Serves the CPU signal when `vector` is its: a shootdown first on x86_64, then, unless a
-    /// contribution binds the vector, the end of the interrupt, returning `zero`.
-    fn dispatch_signal(&mut self, fx: &mut Fx, bound: &[Bound], vector: Value, zero: Value) {
+    /// contribution binds the vector, the end of the interrupt, returning whether a task asked to
+    /// stop is preempted.
+    fn dispatch_signal(
+        &mut self,
+        fx: &mut Fx,
+        bound: &[Bound],
+        vector: Value,
+        saved: Value,
+        preempting: bool,
+    ) {
         let shooting = self.machine_arch() == Arch::Amd64;
         let signal_bound = bound.iter().any(|entry| entry.vector == SIGNAL_VECTOR);
         if !shooting && signal_bound {
@@ -727,7 +877,9 @@ impl Lowering<'_, '_> {
             }
             if !signal_bound {
                 self.end_of_interrupt(fx);
-                fx.b.ins().return_(&[zero]);
+                let no = fx.int(types::I8, 0);
+                let preempt = self.preempts(fx, no, saved, preempting);
+                fx.b.ins().return_(&[preempt]);
             }
         });
     }
@@ -735,8 +887,13 @@ impl Lowering<'_, '_> {
     /// Calls the interrupt fn a contribution binds to the fired vector: an `Irq` handler with a
     /// new `hw::IrqContext`, an exception handler with an `hw::TrapFrame` naming the saved frame
     /// and, for a page fault, holding the faulting address.
-    /// Gives whether its `hw::IrqExit` is `Reschedule`.
-    pub(super) fn dispatch_bound(&mut self, fx: &mut Fx, entry: &Bound, saved: Value) -> Value {
+    /// Gives whether its `hw::IrqExit` is `Reschedule`, and whether it is `Abandon`.
+    pub(super) fn dispatch_bound(
+        &mut self,
+        fx: &mut Fx,
+        entry: &Bound,
+        saved: Value,
+    ) -> (Value, Value) {
         let abi = self.abi(&entry.handler);
         let id = self.instance(entry.handler.clone());
         let arg = match entry.class {
@@ -758,11 +915,20 @@ impl Lowering<'_, '_> {
         };
         let called = self.invoke(fx, Invoked::Direct(id), &abi, &[arg]);
         let exit_ty = abi.result.clone();
-        self.reschedules(fx, &exit_ty, called.result)
+        let exit = self.exit_variant(fx, &exit_ty, called.result);
+        let reschedule = self.is_exit(fx, &exit_ty, exit, "Reschedule");
+        let abandon = self.is_exit(fx, &exit_ty, exit, "Abandon");
+        (reschedule, abandon)
     }
 
     /// Whether an `hw::IrqExit` an interrupt fn gave is `Reschedule`.
     pub fn reschedules(&mut self, fx: &mut Fx, exit_ty: &Ty, exit: Held) -> Value {
+        let exit = self.exit_variant(fx, exit_ty, exit);
+        self.is_exit(fx, exit_ty, exit, "Reschedule")
+    }
+
+    /// The variant index of an `hw::IrqExit` an interrupt fn gave.
+    fn exit_variant(&mut self, fx: &mut Fx, exit_ty: &Ty, exit: Held) -> Value {
         let exit = match exit {
             Held::Address(address) => address,
             other => {
@@ -772,33 +938,25 @@ impl Lowering<'_, '_> {
                 slot
             }
         };
+        self.variant_index(fx, exit_ty, exit)
+    }
+
+    /// Whether an `hw::IrqExit` variant index is the variant named `name`.
+    fn is_exit(&mut self, fx: &mut Fx, exit_ty: &Ty, index: Value, name: &str) -> Value {
         let Ty::Item(item, _) = exit_ty else {
             panic!("an interrupt fn giving hw::IrqExit");
         };
-        let reschedule = self
+        let position = self
             .variant_names(*item)
             .iter()
-            .position(|name| name == "Reschedule")
-            .expect("the Reschedule variant");
-        let index = self.variant_index(fx, exit_ty, exit);
-        fx.b.ins()
-            .icmp_imm_s(IntCC::Equal, index, reschedule as i64)
+            .position(|variant| variant == name)
+            .expect("an hw::IrqExit variant");
+        fx.b.ins().icmp_imm_s(IntCC::Equal, index, position as i64)
     }
 
-    /// Whether the seam preempts the interrupted code: its interrupt fn rescheduled, the final
-    /// build has a `hw::preempt` entry, the code is a kernel task that ran with maskable
-    /// interrupts enabled on its own stack outside `hw::Ring0.wait_for_interrupt`, and the
-    /// anchor is installed. Gives a word.
-    fn preempts(
-        &mut self,
-        fx: &mut Fx,
-        reschedule: Value,
-        saved: Value,
-        preempting: bool,
-    ) -> Value {
-        if !preempting {
-            return fx.ptr(0);
-        }
+    /// Whether the interrupted code is a kernel task's that may trap where it was interrupted:
+    /// it ran with maskable interrupts enabled on its own stack, and the anchor is installed.
+    fn traps(&mut self, fx: &mut Fx, saved: Value) -> Value {
         let enabled = self.interrupts_were_enabled(fx, saved);
         let state_address = self.state(fx);
         let anchor = fx.load(PTR, state_address, state::ANCHOR);
@@ -820,13 +978,59 @@ impl Lowering<'_, '_> {
             },
             |fx| vec![fx.int(types::I8, 0)],
         )[0];
+        let traps = fx.b.ins().band(enabled, installed);
+        fx.b.ins().band(traps, on_stack)
+    }
+
+    /// Whether the seam preempts the interrupted code, giving 1 or zero: the final build
+    /// has a `hw::preempt` entry, the code is a kernel task that may trap where it was
+    /// interrupted, outside `hw::Ring0.wait_for_interrupt`, and the task is asked to stop and
+    /// may stop there, or else is not asked and its interrupt fn rescheduled.
+    fn preempts(
+        &mut self,
+        fx: &mut Fx,
+        reschedule: Value,
+        saved: Value,
+        preempting: bool,
+    ) -> Value {
+        if !preempting {
+            return fx.ptr(0);
+        }
+        let traps = self.traps(fx, saved);
         let cpu_record = self.running_cpu(fx);
         let waiting = fx.load(PTR, cpu_record, cpu::WAITING);
         let free = fx.b.ins().icmp_imm_s(IntCC::Equal, waiting, 0);
-        let preempting = fx.b.ins().band(enabled, installed);
-        let preempting = fx.b.ins().band(preempting, free);
-        let preempting = fx.b.ins().band(preempting, on_stack);
-        let preempting = fx.b.ins().band(preempting, reschedule);
+        let candidate = fx.b.ins().band(traps, free);
+        let layout = self.saved_frame();
+        let preempting = fx.choose_in(
+            self,
+            candidate,
+            &[types::I8],
+            |lo, fx| {
+                let record = tasks::current_task(lo, fx);
+                let asked = tasks::stop_asked(fx, record);
+                fx.choose_in(
+                    lo,
+                    asked,
+                    &[types::I8],
+                    |lo, fx| {
+                        let base = fx.load(PTR, record, task::STACK);
+                        let size = fx.load(PTR, record, task::STACK_SIZE);
+                        let at = stops::Interrupted {
+                            ip: fx.load(PTR, saved, layout.ip),
+                            sp: fx.load(PTR, saved, layout.sp),
+                            fp: fx.load(PTR, saved, layout.fp),
+                            link: layout.link.map(|link| fx.load(PTR, saved, link)),
+                            low: fx.load(PTR, record, task::GUARD),
+                            high: fx.b.ins().iadd(base, size),
+                        };
+                        vec![stops::stoppable(lo, fx, &at)]
+                    },
+                    |_, _| vec![reschedule],
+                )
+            },
+            |_, fx| vec![fx.int(types::I8, 0)],
+        )[0];
         fx.b.ins().uextend(PTR, preempting)
     }
 

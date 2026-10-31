@@ -1770,9 +1770,6 @@ impl Body<'_, '_> {
             "hw::Anchor.with" if !self.ck.is_entry_context(self.item) => {
                 self.report(token, Code::KernelAnchorOutsideEntry);
             }
-            "sys::Domain.run" | "sys::Domain.run_sized" if self.ck.db.target.is_machine() => {
-                self.report(token, Code::DomainUnavailable);
-            }
             "hw::Ports.map" if self.ck.db.target.arch() == Some(Arch::Aarch64) => {
                 self.report(token, Code::RegisterPortTarget);
             }

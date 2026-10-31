@@ -128,7 +128,6 @@ codes! {
     DocSummaryMissing = "doc.summary-missing",
     DocUnresolvedReference = "doc.unresolved-reference",
     DocVariantMismatch = "doc.variant-mismatch",
-    DomainUnavailable = "domain.unavailable",
     EditCheckFailed = "edit.check-failed",
     EditIdentityChanged = "edit.identity-changed",
     EditMoveInvalid = "edit.move-invalid",

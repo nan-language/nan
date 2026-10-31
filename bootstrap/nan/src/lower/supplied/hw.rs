@@ -72,11 +72,11 @@ pub(super) fn forward(
 /// declares in full.
 pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
     Some(match path {
-        "hw::Signal" | "hw::SpinLock" | "hw::IrqShared" => {
+        "hw::Signal" | "hw::SpinLock" => {
             let value = ty.type_arg(0).cloned().expect("a wrapped type");
             lo.transfers(&value)
         }
-        "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => true,
+        "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
         | "hw::PageTableRoot" | "hw::SpinGuard" => false,
         _ => return None,
@@ -104,6 +104,8 @@ pub fn transfer(
         }
         "hw::IrqShared" => {
             let record = fx.load(PTR, address, 0);
+            let holding = fx.offset(record, super::super::machine::device::HOLDING);
+            super::super::transfer::rehome(lo, fx, holding, owner);
             let value = sync::device_value(lo, &wrapped());
             let value = fx.offset(record, value);
             lo.transfer(fx, &wrapped(), value, lift, owner);

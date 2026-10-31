@@ -7,6 +7,17 @@ pub fn Domain.run[T: Send, E: Send](take body: task fn() -> T fails E uses wait,
 
 pub fn Domain.run_sized[T: Send, E: Send](take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
 
+pub open struct Abandoner {
+} Abandoner
+
+pub fn Abandoner.new() -> Abandoner limits pure, notrap, terminates
+
+pub fn Abandoner.run[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.run_sized[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.trigger(self) limits notrap, terminates, noalloc
+
 pub open struct Trap derives Send {
 } Trap
 
@@ -32,6 +43,8 @@ pub closed enum TrapKind derives Copy, Eq, Render {
     StackOverflow
     DuplicateAccess
     Poisoned
+    Exception
+    Abandoned
 } TrapKind
 
 pub open struct Fs {
@@ -308,6 +321,69 @@ test trap_names_its_kind for Trap.kind {
     let kind = trap.kind()
     expect kind == TrapKind.DivisionByZero
 } trap_names_its_kind
+
+test trigger_abandons_the_running_domain for Abandoner.trigger {
+    let world = testing::world()
+    let clock = world.clock
+    let abandoner = mem::Shared.of(Abandoner.new(), alloc: world.alloc)
+    var kind: Option[TrapKind] = None
+    try await task::scope(world.exec, body: fn[mut kind](s: task::Scope) fails task::Cancelled uses wait {
+        let watch = abandoner.share()
+        discard s.spawn(fn[take watch]() fails task::Cancelled uses wait {
+            try await clock.sleep(10)
+            watch.contents().trigger()
+        })
+        let outcome = try await abandoner.contents().run(fn() fails task::Cancelled uses wait {
+            loop {
+                try await clock.sleep(1)
+            }
+        }, exec: world.exec, alloc: world.alloc)
+        let Err(trap) = outcome else {
+            return
+        }
+        kind = Some(trap.kind())
+    })
+    expect kind == Some(TrapKind.Abandoned)
+} trigger_abandons_the_running_domain
+
+test triggered_abandoner_runs_nothing for Abandoner.run {
+    let world = testing::world()
+    let abandoner = Abandoner.new()
+    abandoner.trigger()
+    let outcome = try await abandoner.run(fn() -> u32 {
+        return 1
+    }, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        expect false
+        return
+    }
+    expect trap.kind() == TrapKind.Abandoned
+} triggered_abandoner_runs_nothing
+
+test new_abandoner_runs_its_body for Abandoner.new {
+    let world = testing::world()
+    let outcome = try await Abandoner.new().run(fn() -> u32 {
+        return 7
+    }, exec: world.exec, alloc: world.alloc)
+    let Ok(value) = outcome else {
+        expect false
+        return
+    }
+    expect value == 7
+} new_abandoner_runs_its_body
+
+test sized_run_contains_its_trap for Abandoner.run_sized {
+    let world = testing::world()
+    let divisor: u32 = 0
+    let outcome = try await Abandoner.new().run_sized(fn() -> u32 {
+        return 10 / divisor
+    }, stack: 1_048_576, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        expect false
+        return
+    }
+    expect trap.kind() == TrapKind.DivisionByZero
+} sized_run_contains_its_trap
 
 test read_only_fs_refuses_writes for Fs.read_only {
     let world = testing::world()

@@ -1,6 +1,6 @@
 use super::aarch64::{self, VBAR_SEAM};
 use super::handoff::PVH_TRAMPOLINE;
-use super::interrupts::{SEAM_COMMON, SEAM_DISPATCH, SEAM_PREEMPT, SEAM_STAY};
+use super::interrupts::{RESERVED, SEAM_COMMON, SEAM_DISPATCH, SEAM_PREEMPT, SEAM_STAY};
 use super::stubs::Stub;
 use super::{AARCH64_BARE_SEAM, AARCH64_SEAM_BOOT, AARCH64_SEAM_ROOT, AARCH64_SEAM_STACK};
 use crate::workspace::Arch;
@@ -42,6 +42,12 @@ fn x64_seam_saves_registers_alone_and_calls_where_relocated() {
         [0x41, 0x57],
         "the second entry pushes r15"
     );
+    let mut below = vec![0x48, 0x81, 0xef];
+    below.extend_from_slice(&(176 + RESERVED as u32).to_le_bytes());
+    assert!(
+        SEAM_COMMON.windows(below.len()).any(|bytes| bytes == below),
+        "preemption copies the frame {RESERVED} bytes below the interrupted stack pointer"
+    );
     for call in [SEAM_DISPATCH, SEAM_PREEMPT] {
         let at = call as usize;
         assert_eq!(SEAM_COMMON[at - 1], 0xe8, "a call precedes {call:#x}");
@@ -65,6 +71,11 @@ fn aarch64_seam_frames_hold_the_general_state_alone() {
     );
     let pop = 0x9100_03FF | bytes << 10;
     assert!(code.contains(&pop), "the return pops the frame");
+    let copy = 0xD100_0129 | (bytes + RESERVED as u32) << 10;
+    assert!(
+        code.contains(&copy),
+        "preemption copies the frame {RESERVED} bytes below the interrupted stack pointer"
+    );
     let pairs = 0xD280_000C | (bytes / 16) << 5;
     assert!(
         code.contains(&pairs),

@@ -169,6 +169,7 @@ pub closed struct PageFault derives Copy, Eq {
 pub closed enum IrqExit derives Copy, Eq {
     Resume
     Reschedule
+    Abandon
 } IrqExit
 ```
 
@@ -196,9 +197,11 @@ Contributions bind the interrupt and exception forms through `hw::vectors`, whos
 When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 on x86_64 and at EL1 on AArch64, the CPU enters its seam with maskable interrupts disabled, and:
 
 1. The seam saves the interrupted code's general registers on its interrupt stack, and no [extended state](#floating-point).
-2. For an interrupt that reaches devices `hw::IrqShared` installs ([locks](#locks)), it calls the interrupt fn of each in turn, acquiring that device's lock around the call, with the device and a new `hw::IrqContext`, then ends the interrupt. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
-3. On `hw::IrqExit.Reschedule` from any interrupt fn it called, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
+2. For an interrupt that reaches devices `hw::IrqShared` installs ([locks](#locks)), it calls the interrupt fn of each in turn, acquiring that device's lock around the call, with the device and a new `hw::IrqContext`, then ends the interrupt. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound exception vector other than an abort vector and x86_64's vector 2, the non-maskable interrupt's, makes the interrupted code trap when it may; any other unbound vector, and one whose code may not trap, halts the kernel.
+3. On `hw::IrqExit.Reschedule` from any interrupt fn it called, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`. On `hw::IrqExit.Abandon` from an interrupt fn of an exception vector, the interrupted code traps when it may, and the kernel halts otherwise; from any other interrupt fn, `Abandon` acts as `Resume`.
 4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
+
+Code **may trap** where a vector interrupted it when it is a kernel task's that ran with maskable interrupts enabled on the task's own stack, and the anchor is installed. Its trap there, of kind `trap.exception`, abandons the task's domain ([abandoning a domain](11-errors-domains.md#abandoning-a-domain)); its report locates the interrupted instruction as if it called the trap, with the operand line `vector = v, code = c`, followed by `, address = a` for a page fault, v being the vector, c the error code the CPU pushed on x86_64 or the exception's syndrome on AArch64, and a the faulting address. An exception in a kernel task means that trusted code broke a soundness condition or that the hardware faulted: abandoning the task's domain restores none of the guarantees that broke.
 
 Each CPU has an interrupt stack, reserved by the image, for each `ist` value that its bindings use, those of `hw::IrqShared.install` using 0 ([platform registries](25-registries.md#platform-registries)). A seam entered while its stack is in use on its CPU continues on it below the frames in use.
 
@@ -306,11 +309,11 @@ The kernel stack of a thread that runs user code holds at least the largest stac
 pub open view struct IrqsDisabled {
 } IrqsDisabled
 
-pub fn without_irqs[T: Any, E](body: fn(t: IrqsDisabled) -> T fails E limits notrap) -> T fails E
+pub fn without_irqs[T: Any, E](body: fn(t: IrqsDisabled) -> T fails E limits notrap, terminates) -> T fails E
 ```
 
 - Its values come only from `IrqContext.irqs_disabled`, `TrapFrame.irqs_disabled` and `hw::without_irqs`.
-- `hw::without_irqs(body)` saves whether maskable interrupts are enabled on the current CPU, disables them, calls `body` with a token, restores the saved state and returns what `body` returned or fails with its failure.
+- `hw::without_irqs(body)` saves whether maskable interrupts are enabled on the current CPU, disables them, calls `body` with a token, restores the saved state and returns what `body` returned or fails with its failure. As `body` terminates, a task asked to stop reaches a point where it stops ([abandoning a domain](11-errors-domains.md#abandoning-a-domain)).
 - On the host targets, each executor thread is a CPU for this chapter and has no maskable interrupts: `hw::cpu_count()` is the number of executor threads, `without_irqs` only calls `body`, `IrqContext.complete` does nothing and `hw::IrqShared` installs devices on no interrupt ([locks](#locks)).
 
 ```nan
@@ -434,7 +437,7 @@ pub closed struct MsiRefusal[T: Any and Send] {
 
 - `with` spins until it acquires the lock, calls `body` with exclusive `mut` access to the value, releases the lock and returns `body`'s result. Acquisition orders `body` after every earlier holder's accesses.
 - A `with` on a lock that the calling CPU already holds never returns: the kernel halts, and on the host targets the innermost process or test [domain](11-errors-domains.md#domains) holding the call is [abandoned](11-errors-domains.md#abandoning-a-domain), with the halt report ([kernel halts](#kernel-halts)) in place of a trap report.
-- A spin lock is never [poisoned](11-errors-domains.md#poisoning): its bodies cannot trap, and a trap anywhere in a kernel halts it.
+- A spin lock is never [poisoned](11-errors-domains.md#poisoning): its bodies cannot trap and run with maskable interrupts disabled, where no task stops.
 - An `hw::SpinGuard[T]` is the holding of an acquired spin lock outside a `with` body. Only the kernel executor obtains and releases one, on its run-queue lock ([scheduling](#scheduling)).
 
 `hw::IrqShared[T]` keeps a device of type T behind an IRQ-safe lock that the interrupt path also takes:
@@ -447,6 +450,7 @@ pub closed struct MsiRefusal[T: Any and Send] {
 - On AArch64 the interrupt is one of the 8,192 LPIs of the interrupt controller's ITS, which translates the event the data names, for device id s, to it; `source` is the device id the ITS receives with the device's writes, a PCI function's requester id on the emulator's machine. Its message's address is that of the ITS's `GITS_TRANSLATER` and its data the event. A device id the ITS does not accept, or a machine without an ITS, is `Unsupported`; an ITS keeps at most 256 device ids.
 - `with` reaches the device from other code, as `SpinLock.with` does.
 - `take shared.uninstall()` removes the device from its interrupt, spins until no CPU runs f for it, and returns the device.
+- An installed device is a resource of the domain that holds its `hw::IrqShared`, which the domain's [settlement](11-errors-domains.md#settlement) uninstalls.
 - `install`, `install_on`, `install_msi` and `uninstall` are the device operations that `allow device` covers ([manifest grants](14-authority.md#manifest-grants)).
 
 ```nan
@@ -550,7 +554,7 @@ pub const SIGNAL_VECTOR: u8 = 0xFE
 ```
 
 - `cpu.signal_cpu(n)` sends the CPU signal to CPU n when it is a started CPU, the calling one included, and does nothing otherwise. A CPU takes the signal once it has maskable interrupts enabled; signals sent to it meanwhile may arrive as one.
-- When the signal arrives, the CPU serves the shootdowns posted to it, then calls the interrupt fn that an `hw::vectors` contribution binds to `hw::SIGNAL_VECTOR`, or only ends the interrupt without one.
+- When the signal arrives, the CPU serves the shootdowns posted to it, then calls the interrupt fn that an `hw::vectors` contribution binds to `hw::SIGNAL_VECTOR`, or only ends the interrupt without one. The settlement of an abandoned domain sends it to the CPU of each running task it stops ([preemption](#preemption)).
 - `cpu.invalidate_everywhere(scope)` removes, on every started CPU, the cached translations of the page that `Page` holds under every PCID or ASID, or every cached translation for `All`, and returns once each CPU has. On x86_64 the calling CPU removes its own, posts a **shootdown** of the scope to each other started CPU, sends it the CPU signal and waits, with maskable interrupts enabled, until each has served it; one shootdown runs at a time, and a CPU waiting to start one serves the others meanwhile. On AArch64 one broadcast invalidation reaches every CPU.
 - `invalidate_everywhere` is a cancellation point ([acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation)) whose invalidations acknowledge a cancellation only once done: called cancelled, it fails at once and removes nothing; once started, it completes.
 - Interrupt fns and bodies with maskable interrupts disabled cannot wait, so no CPU waits for a shootdown that waits for it. A CPU that keeps maskable interrupts disabled delays every signal to it and every shootdown waiting for it.
@@ -656,6 +660,8 @@ On the machine targets, the [platform package](28-stdlib.md#platform-packages) c
 1. The seam moves the thread's saved state from the interrupt stack onto the thread's own stack.
 2. It calls the landing fn that the `handler` of the `hw::preempt` entry holds there, with maskable interrupts disabled. That landing fn makes the thread ready and switches the CPU to its next ready thread as [kernel suspension](#kernel-suspension) step 2 does.
 3. When a later switch resumes the thread, the landing fn returns, and the seam restores the saved state and resumes the thread.
+
+A kernel task asked to stop ([abandoning a domain](11-errors-domains.md#abandoning-a-domain)) is preempted at every interrupt reaching its CPU while it runs with maskable interrupts enabled on its own stack, outside `hw::Ring0.wait_for_interrupt` and outside every operation it completes before stopping, whatever its interrupt fn gave, and is never preempted elsewhere. It then stops instead of becoming ready. Each pacing tick of its CPU's timer is such an interrupt.
 
 A kernel task's stack is drawn through the executor's allocator as the task starts. It holds at least the N of its entry's `limits stack N` ([task stacks](17-suspension-io.md#task-stacks)), plus the stack use of the `hw::preempt` landing fn, plus one [seam frame](27-program-model.md#descriptors).
 
@@ -1043,7 +1049,7 @@ pub fn Module.into_region(take self) -> hw::Region
 
 A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
 
-Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no `hw::switch_to` saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception, which halts the kernel unless a binding serves its vector. The entry function starts with the extended state enabled ([anchor](#anchor)).
+Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no `hw::switch_to` saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The entry function starts with the extended state enabled ([anchor](#anchor)).
 
 ```nan
 // file: kernel/package.nan
@@ -1064,7 +1070,7 @@ pub fn doubled(level: f64) -> f64 {
 
 ## Kernel halts
 
-A **kernel halt** ends a kernel domain ([domains](11-errors-domains.md#domains)). The kernel halts on a trap in any of its tasks or contexts, and in these other cases, each named by its cause:
+A **kernel halt** ends a kernel domain ([domains](11-errors-domains.md#domains)). The kernel halts on a trap in the kernel domain, and in these other cases, each named by its cause:
 
 | Cause | Event | Located at |
 | --- | --- | --- |
@@ -1072,6 +1078,7 @@ A **kernel halt** ends a kernel domain ([domains](11-errors-domains.md#domains))
 | `lock-reacquired` | a CPU calls `with` on a spin lock or per-CPU value it is already inside, or reaches its run-queue lock or the cell state of a draw or return while it already holds it | that call, or the interrupted instruction |
 | `unbound-vector` | a vector fires with no binding for its origin | the interrupted instruction |
 | `abort-exception` | an interrupt fn for an abort vector returns | the interrupted instruction |
+| `unabandonable` | an interrupt fn of an exception vector gives `hw::IrqExit.Abandon` for code that may not trap ([interrupt functions](#interrupt-functions)) | the interrupted instruction |
 
 The first CPU to begin a halt performs these steps; a CPU beginning a halt after it stops as step 1 stops the others.
 

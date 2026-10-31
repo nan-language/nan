@@ -205,6 +205,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Minter", LINEAR_SEND),
     ("sys::Cx", VIEW_ONLY),
     ("sys::Outbox", COPY_SEND),
+    ("sys::Abandoner", AFFINE_SEND),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::UserAddr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::Register", [No, No, Yes, Yes, Yes, No]),
@@ -267,7 +268,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 28] = [
 ];
 
 /// The base types with interior mutability, by canonical path.
-pub const INTERIOR: [&str; 14] = [
+pub const INTERIOR: [&str; 15] = [
     "task::Cown",
     "core::atomic::AtomicU8",
     "core::atomic::AtomicU16",
@@ -282,6 +283,7 @@ pub const INTERIOR: [&str; 14] = [
     "hw::IrqShared",
     "hw::PerCpu",
     "hw::Signal",
+    "sys::Abandoner",
 ];
 
 /// The std types whose type parameters other than the first are brands, affecting no property.

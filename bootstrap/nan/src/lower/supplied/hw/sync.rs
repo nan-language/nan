@@ -14,7 +14,7 @@ use super::super::super::fx::{Fx, PTR};
 use super::super::super::machine::{Stub, device, msi};
 use super::super::super::runtime::regions::WAITING;
 use super::super::super::runtime::tasks::{self, thread};
-use super::super::super::runtime::{Routine, report, settle, state};
+use super::super::super::runtime::{Routine, holdings, report, settle, state};
 use super::super::super::{Glue, Lowering};
 use super::super::{Supply, tasks as task_ops};
 use super::forward;
@@ -128,10 +128,10 @@ pub fn device_value(lo: &mut Lowering, value_ty: &Ty) -> u64 {
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
 /// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
 /// target install it on its interrupt, `install_msi` giving the device back in its refusal
-/// otherwise; `message` reads the message the record holds; `with` takes the record's lock
-/// around its body; `uninstall` removes the device from its interrupt and waits until no CPU
-/// runs its interrupt fn, then moves it out of the freed record. A CPU number past the CPUs
-/// traps.
+/// otherwise; the running task's domain then owns the record as a holding. `message` reads the
+/// message the record holds; `with` takes the record's lock around its body; `uninstall` ends
+/// the holding, removes the device from its interrupt and waits until no CPU runs its interrupt
+/// fn, then moves it out of the freed record. A CPU number past the CPUs traps.
 pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let value_at = device_value(lo, &value_ty);
@@ -193,6 +193,8 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "uninstall" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
+            let holding = fx.load(PTR, record, device::HOLDING);
+            lo.call_routine(fx, Routine::Unhold, &[holding]);
             if lo.machine() {
                 lo.uninstall_device(fx, record);
             }
@@ -252,11 +254,19 @@ fn device_record(
     record
 }
 
-/// Returns the `hw::IrqShared` naming a device record.
+/// Returns the `hw::IrqShared` naming a device record installed.
 fn return_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+    hold(lo, fx, record);
     let sret = supply.sret.expect("a shared device's slot");
     fx.store(record, sret, 0);
     supply.ret(lo, fx, Held::Address(sret));
+}
+
+/// Makes a device record installed a holding of the running task's domain.
+fn hold(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    let kind = fx.ptr(holdings::kind::UNINSTALL as u64);
+    let holding = lo.call_routine(fx, Routine::Hold, &[kind, record])[0];
+    fx.store(holding, record, device::HOLDING);
 }
 
 /// Moves the device out of a device record, which it frees.
@@ -287,6 +297,7 @@ fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty) {
     let result_ty = supply.abi.result.clone();
     let installed = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, msi::INSTALLED);
     fx.when(installed, |fx| {
+        hold(lo, fx, record);
         let shared = fx.slot(8, 8);
         fx.store(record, shared, 0);
         let ok = lo.variant_value(fx, &result_ty, "Ok", &[Held::Address(shared)], None);

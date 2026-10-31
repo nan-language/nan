@@ -330,15 +330,17 @@ The **trap kinds** are exactly these, forming the `trap` family:
 | `trap.stack-overflow` | a task stack overflows ([stack overflow](17-suspension-io.md#stack-overflow)) |
 | `trap.duplicate-access` | one exclusive access is claimed twice at once, as by an `await when` naming one cown twice ([cowns](16-concurrency.md#cowns)) |
 | `trap.poisoned` | an `await when` acquires a poisoned cown ([poisoning](#poisoning)) |
+| `trap.exception` | a kernel task's code raises a CPU exception ([interrupt functions](24-kernel.md#interrupt-functions)) |
+| `trap.abandoned` | an abandoner abandons the domain it runs ([domain run](#domain-run)) |
 
 A trap kind appears only in trap reports, in `sys::TrapKind` and in `// traps:` markers; it is never a diagnostic code. [Interpreter](21-interpreter.md#interpreter) runs execute outside every domain; the interpreter defines what a trap there produces.
 
 ### Abandoning a domain
 
-The runtime abandons a domain D when a task of D traps, when a [test run](22-testing.md#test-runs) on D times out, and, on the host targets, when a task calls `with` on a spin lock or per-CPU value its CPU is already inside, D then being the innermost process or test domain holding the task ([locks](24-kernel.md#locks)), whose end writes the [halt report](24-kernel.md#kernel-halts) in place of a trap report. The steps are, in this order:
+The runtime abandons a domain D when a task of D traps, when the abandoner running D is triggered ([domain run](#domain-run)), when a [test run](22-testing.md#test-runs) on D times out, and, on the host targets, when a task calls `with` on a spin lock or per-CPU value its CPU is already inside, D then being the innermost process or test domain holding the task ([locks](24-kernel.md#locks)), whose end writes the [halt report](24-kernel.md#kernel-halts) in place of a trap report. The steps are, in this order:
 
 1. The trapping task, if any, stops at the trapping operation.
-2. Every other task of D stops. A suspended task is never resumed. A running task stops at some point of its execution, once every operation of these kinds that it has begun has completed: a call of a std function of a type with [interior mutability](12-memory.md#interior-mutability) or of `task::Sender`, `task::Receiver`, `task::Scope`, `sys::Cx` or `sys::Outbox`, a change of the count of a `mem::Shared` or of the handles of a `task::Cown`, and a support routine. An `await when` body is not such an operation. What it executes before it stops happens before the steps that follow.
+2. Every other task of D stops. A suspended task is never resumed. A running task stops at some point of its execution, once every operation of these kinds that it has begun has completed: a call of a std function of a type with [interior mutability](12-memory.md#interior-mutability) or of `task::Sender`, `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox` or `hw::Ring0`, a change of the count of a `mem::Shared` or of the handles of a `task::Cown`, and a support routine. An `await when` body is not such an operation. On a kernel, a running task stops only where maskable interrupts are enabled, at an interrupt reaching its CPU ([preemption](24-kernel.md#preemption)). What it executes before it stops happens before the steps that follow.
 3. Every cown that a task of D holds by running an `await when` body naming it is poisoned. Every cown granted to a task of D that has not yet started the `await when` body naming it is released unpoisoned, and every request of a task of D for a cown not yet granted is withdrawn.
 4. D ends as its kind gives in [domains](#domains).
 
@@ -406,14 +408,14 @@ trap.division-by-zero at tally/tally.nan:4 in tally::share
 
 ## Domains
 
-A **domain** is a unit that a trap abandons; a kernel domain also ends at every other [kernel halt](24-kernel.md#kernel-halts). Domains nest: every task belongs to the domain in which it was spawned, and the body of a **domain run**, a call of `sys::Domain.run` or `sys::Domain.run_sized`, starts a new domain nested in the caller's. **Settlement** prepares an abandoned domain for freeing by cancelling its operations in flight and waiting for every acknowledgement ([settlement](#settlement)).
+A **domain** is a unit that a trap abandons; a kernel domain also ends at every other [kernel halt](24-kernel.md#kernel-halts). Domains nest: every task belongs to the domain in which it was spawned, and the body of a **domain run**, a call of `run` or `run_sized` of `sys::Domain` or `sys::Abandoner`, starts a new domain nested in the caller's. **Settlement** prepares an abandoned domain for freeing by cancelling its operations in flight and waiting for every acknowledgement ([settlement](#settlement)).
 
 | Domain | Holds | Abandoning ends it by |
 | --- | --- | --- |
 | process | the tasks of a host target's program outside other domains | writing the trap report to standard error and exiting with status 70 ([host runs](27-program-model.md#host-runs)) |
 | `sys::Domain` body | the body passed to a domain run and its tasks | settlement, then freeing; the domain run returns `Err` |
 | test | one run of a test on a host target ([test runs](22-testing.md#test-runs)) | settlement, then freeing; the run fails with the trap report, or with `test.timeout` and no report when it timed out |
-| kernel | every context of a machine target's image, or of the boot of a test image ([emulator runs](22-testing.md#emulator-runs)) | a [kernel halt](24-kernel.md#kernel-halts) |
+| kernel | every context of a machine target's image, or of the boot of a test image ([emulator runs](22-testing.md#emulator-runs)), outside other domains | a [kernel halt](24-kernel.md#kernel-halts) |
 
 The process and the kernel end without settlement. The domains are exactly these four kinds.
 
@@ -428,6 +430,17 @@ pub open struct Domain {
 pub fn Domain.run[T: Send, E: Send](take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
 
 pub fn Domain.run_sized[T: Send, E: Send](take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub open struct Abandoner {
+} Abandoner
+
+pub fn Abandoner.new() -> Abandoner limits pure, notrap, terminates
+
+pub fn Abandoner.run[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.run_sized[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.trigger(self) limits notrap, terminates, noalloc
 
 pub open struct Trap derives Send {
 } Trap
@@ -452,6 +465,8 @@ pub closed enum TrapKind derives Copy, Eq, Render {
     StackOverflow
     DuplicateAccess
     Poisoned
+    Exception
+    Abandoned
 } TrapKind
 ```
 
@@ -467,7 +482,11 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 
 `sys::Domain.run_sized(body, stack, exec, alloc)` behaves as `run(body, exec, alloc)`, except that the first task's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a body whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run in a domain.
 
-A use of `sys::Domain.run` or `sys::Domain.run_sized` in code checked for a machine target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`domain.unavailable`).
+An **abandoner**, a `sys::Abandoner`, abandons from outside the domain it runs, such as a body that loops without reaching a cancellation point. It is a [base type](05-properties.md#structural-properties), Send and never Copy, linear, a view, Inert or AnyBits, with [interior mutability](12-memory.md#interior-mutability), so tasks share one through a [`mem::Shared`](12-memory.md#shared-values).
+
+- `sys::Abandoner.new()` returns an abandoner that is not triggered and runs no domain.
+- `abandoner.run(body, exec, alloc)` and `abandoner.run_sized(body, stack, exec, alloc)` behave as `sys::Domain.run` and `run_sized`, and the abandoner runs D until the call returns. Called while the abandoner runs another domain, they trap (`trap.duplicate-access`). Called once it is triggered, they abandon D before its first task starts, which then never does, and the trap report locates the call.
+- `abandoner.trigger()` triggers the abandoner for good and abandons the domain it runs, unless that domain's first task has ended. The trap kind is `trap.abandoned`, and the trap report locates the `trigger` call, without an operand line. Its limits let an interrupt fn call it.
 
 ```nan
 pub closed enum JobError derives Render {
@@ -524,10 +543,40 @@ pub fn rate(level: u32) -> u32 fails ProbeError {
 } rate
 
 pub fn contained_rate(level: u32, exec: task::Executor, alloc: mem::Alloc) -> Result[u32, sys::Trap] fails ProbeError uses wait {
-    return try await sys::Domain.run(fn() -> u32 fails ProbeError limits stack 4_096 { // error: domain.unavailable
+    return try await sys::Domain.run(fn() -> u32 fails ProbeError limits stack 4_096 {
         return try rate(level)
     }, exec, alloc)
 } contained_rate
+```
+
+```nan
+pub fn watched(clock: sys::Clock, exec: task::Executor, alloc: mem::Alloc) -> Option[sys::TrapKind] fails task::Cancelled uses wait {
+    let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc)
+    var kind: Option[sys::TrapKind] = None
+    try await task::scope(exec, body: fn[mut kind](s: task::Scope) fails task::Cancelled uses wait {
+        let watch = abandoner.share()
+        discard s.spawn(fn[take watch]() fails task::Cancelled uses wait {
+            try await clock.sleep(10)
+            watch.contents().trigger()
+        })
+        let outcome = try await abandoner.contents().run(fn() fails task::Cancelled uses wait {
+            loop {
+                try await clock.sleep(1)
+            }
+        }, exec, alloc)
+        let Err(trap) = outcome else {
+            return
+        }
+        kind = Some(trap.kind())
+    })
+    return kind
+} watched
+
+test watchdog_abandons_the_run for watched {
+    let world = testing::world()
+    let kind = try await watched(world.clock, exec: world.exec, alloc: world.alloc)
+    expect kind == Some(sys::TrapKind.Abandoned)
+} watchdog_abandons_the_run
 ```
 
 ### Settlement
@@ -535,7 +584,7 @@ pub fn contained_rate(level: u32, exec: task::Executor, alloc: mem::Alloc) -> Re
 The runtime settles an abandoned domain D in this order. No user code runs during settlement.
 
 1. It cancels every operation in flight at a cancellation point of a task of D, ordinary reads and writes as well as completion operations ([completion I/O](17-suspension-io.md#completion-io)), and waits until the kernel or device acknowledges each one.
-2. It releases without waiting every [resource](14-authority.md#resources) that a task of D owns, directly or through the values holding it, an affine one as its end of scope does and a linear one as its [abandon method](17-suspension-io.md#abandoning-resources) does, and revokes every `sys::Revoker` D owns that way ([revocation](14-authority.md#revocation)), and every entry belonging to a `sys::Minter` D owns that way, never releasing the minter's state ([capability kinds](14-authority.md#capability-kinds)), and closes every `mem::Budget` D owns that way, as `close` does ([budgets](12-memory.md#budgets)).
+2. It releases without waiting every [resource](14-authority.md#resources) that a task of D owns, directly or through the values holding it, an affine one as its end of scope does and a linear one as its [abandon method](17-suspension-io.md#abandoning-resources) does, and revokes every `sys::Revoker` D owns that way ([revocation](14-authority.md#revocation)), and every entry belonging to a `sys::Minter` D owns that way, never releasing the minter's state ([capability kinds](14-authority.md#capability-kinds)), closes every `mem::Budget` D owns that way, as `close` does ([budgets](12-memory.md#budgets)), and uninstalls every `hw::IrqShared` D owns that way, as `uninstall` does, never releasing its device ([locks](24-kernel.md#locks)). The memory of every `hw::Region` and `hw::PhysFrame` D owns that way is never used again.
 3. It counts every `task::Sender` and `task::Receiver` that a task of D owns that way as released by its [channel](16-concurrency.md#channels), releasing none of the values in the channel's buffer.
 4. It frees D's memory as [domain memory](#domain-memory) states.
 
@@ -606,7 +655,6 @@ test receiver_pays_after_handover for sender_charge {
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `domain.unavailable` | error | [Domain run](#domain-run) |
 | `error.cancel-unmapped` | error | [Cancellation](#cancellation) |
 | `error.failure-type` | error | [Failures](#failures) |
 | `error.from-ambiguous` | error | [Error enums](#error-enums) |

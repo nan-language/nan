@@ -31,7 +31,8 @@ const ROWS: u64 = MAX_CPUS + 1;
 /// message-signalled interrupt, the LPI's identifier, the glue the dispatcher calls with the
 /// record, the interrupt fn as a function value, the next device of its binding, the binding,
 /// the address and data of its message, zero without one, the ITS device id and CPU of an
-/// AArch64 message-signalled interrupt, and the device from `VALUE` on, at its alignment.
+/// AArch64 message-signalled interrupt, the holding through which its owner's settlement
+/// uninstalls it, and the device from `VALUE` on, at its alignment.
 pub mod device {
     pub const LOCK: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -43,7 +44,8 @@ pub mod device {
     pub const DATA: u64 = 64;
     pub const SOURCE: u64 = 72;
     pub const CPU: u64 = 80;
-    pub const VALUE: u64 = 88;
+    pub const HOLDING: u64 = 88;
+    pub const VALUE: u64 = 96;
 }
 
 /// What `install_msi` gives: the interrupt installed, or the `hw::MsiError` variant refusing it.

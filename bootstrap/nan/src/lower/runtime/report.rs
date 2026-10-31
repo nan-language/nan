@@ -36,6 +36,13 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             fx.b.ins().return_(&[]);
         }
         Routine::TrapRaise => raise(lo, fx),
+        Routine::TrapReport => {
+            let params = fx.entry();
+            let zero = fx.ptr(0);
+            let report = write(lo, fx, params[0], zero, zero, zero);
+            fill(lo, fx, params[1], params[0], report);
+            fx.b.ins().return_(&[]);
+        }
         Routine::ReportScalar => {
             let params = fx.entry();
             Report { out: params[0] }.scalar(fx, lo, params[1], params[2]);
@@ -527,12 +534,34 @@ fn location_record(fx: &mut Fx, locations: Value, number: Value) -> Value {
     fx.b.ins().select(has, location, zero)
 }
 
-/// `TrapRaise(kind, operands, count, caller)`: writes the report of a trap of the running task,
-/// the location numbered `caller` its first caller line when not 0, and its replay token in a
-/// test image, and ends the process domain with status 70.
+/// `TrapRaise(kind, operands, count, caller)`: writes the report of a trap of the running task
+/// and abandons its `sys::Domain` body domain, or ends the process domain with status 70.
 fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (kind, operands, count, caller) = (params[0], params[1], params[2], params[3]);
+    let report = write(lo, fx, kind, operands, count, caller);
+    let task = tasks::current_task(lo, fx);
+    let domain = tasks::current_domain(lo, fx);
+    let state_address = lo.state(fx);
+    let process = fx.load(PTR, state_address, state::PROCESS);
+    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, task, 0);
+    let nested = fx.b.ins().icmp(IntCC::NotEqual, domain, process);
+    let contained = fx.b.ins().band(inside, nested);
+    fx.when(contained, |fx| abandon(lo, fx, task, domain, kind, report));
+    end_with(lo, fx, report);
+}
+
+/// Writes, on the running routine's stack, the report of a trap of a kind located at the call of
+/// the routine's caller, with the operands of a record when `count` is not 0, the location
+/// numbered `caller` its first caller line when not 0, and its replay token in a test image.
+fn write(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    kind: Value,
+    operands: Value,
+    count: Value,
+    caller: Value,
+) -> Report {
     let frames = fx.slot(FRAMES * 16, 8);
     let frame_pointer = fx.b.ins().get_frame_pointer(PTR);
     let zero = fx.ptr(0);
@@ -611,7 +640,12 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let slot = frame_at(fx, first_visible);
     let location = fx.load(PTR, slot, 0);
     report.located(fx, lo, location);
+    // The operands of a trap are those of its operation, which must be the innermost frame,
+    // except those of an exception, which the CPU gives.
     let own = fx.b.ins().icmp_imm_s(IntCC::Equal, first_visible, 0);
+    let exception = super::super::trap::kind_number("trap.exception");
+    let exception = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, exception);
+    let own = fx.b.ins().bor(own, exception);
     let shown = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
     let show = fx.b.ins().band(own, shown);
     let lines: Variable = fx.b.declare_var(PTR);
@@ -714,15 +748,7 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
         report.bytes(fx, lo, token, len);
         report.text(fx, lo, "\n");
     }
-    let task = tasks::current_task(lo, fx);
-    let domain = tasks::current_domain(lo, fx);
-    let state_address = lo.state(fx);
-    let process = fx.load(PTR, state_address, state::PROCESS);
-    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, task, 0);
-    let nested = fx.b.ins().icmp(IntCC::NotEqual, domain, process);
-    let contained = fx.b.ins().band(inside, nested);
-    fx.when(contained, |fx| abandon(lo, fx, task, domain, kind, out));
-    end_with(lo, fx, report);
+    report
 }
 
 /// Ends the process, or halts a machine's kernel, with a report written: a kernel first stops its
@@ -798,7 +824,14 @@ pub fn halt(
 /// Abandons the `sys::Domain` body domain of a trapping task: the first trap of the domain
 /// writes its report into the domain's trap record and wakes the task waiting for the domain,
 /// which settles it; the trapping task releases the locks its thread holds for it and stops.
-fn abandon(lo: &mut Lowering, fx: &mut Fx, task: Value, domain: Value, kind: Value, out: Value) {
+fn abandon(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    task: Value,
+    domain: Value,
+    kind: Value,
+    report: Report,
+) {
     let flag = fx.offset(domain, tasks::domain::ABANDONED);
     let zero = fx.ptr(0);
     let one = fx.ptr(1);
@@ -808,12 +841,7 @@ fn abandon(lo: &mut Lowering, fx: &mut Fx, task: Value, domain: Value, kind: Val
     let first = fx.b.ins().icmp_imm_s(IntCC::Equal, seen, 0);
     fx.when(first, |fx| {
         let record = fx.load(PTR, domain, tasks::domain::TRAP);
-        fx.store(kind, record, trap_record::KIND);
-        let len = fx.load(PTR, out, 0);
-        fx.store(len, record, trap_record::LEN);
-        let target = fx.offset(record, trap_record::BYTES);
-        let bytes = fx.b.ins().iadd_imm_s(out, 8);
-        lo.call_routine(fx, Routine::Copy, &[target, bytes, len]);
+        fill(lo, fx, record, kind, report);
         let lock = fx.offset(domain, tasks::domain::LOCK);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let waiter = fx.load(PTR, domain, tasks::domain::WAITER);
@@ -822,6 +850,16 @@ fn abandon(lo: &mut Lowering, fx: &mut Fx, task: Value, domain: Value, kind: Val
     });
     super::locks::release_held(lo, fx);
     tasks::stop_running(lo, fx, task);
+}
+
+/// Fills a trap record with a kind and a report written.
+fn fill(lo: &mut Lowering, fx: &mut Fx, record: Value, kind: Value, report: Report) {
+    fx.store(kind, record, trap_record::KIND);
+    let len = fx.load(PTR, report.out, 0);
+    fx.store(len, record, trap_record::LEN);
+    let target = fx.offset(record, trap_record::BYTES);
+    let bytes = fx.b.ins().iadd_imm_s(report.out, 8);
+    lo.call_routine(fx, Routine::Copy, &[target, bytes, len]);
 }
 
 /// Traps with a kind and no operands, from code lowering writes itself.

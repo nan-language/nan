@@ -103,10 +103,32 @@ fn transfer_signature(alloc: mem::Alloc) -> clif::Signature {
 } transfer_signature
 
 /// Calls a walk through its address, which is not zero.
-fn call_walker(mut fx: Fx, walker: clif::Value, args: Slice[clif::Value]) {
+fn call_walker(mut fx: Fx, walker: clif::Value, args: Slice[clif::Value]) -> clif::Inst {
     let signature = mut fx.b.import_signature(transfer_signature(fx.alloc))
-    discard mut fx.b.call_indirect(signature, callee: walker, args)
+    return mut fx.b.call_indirect(signature, callee: walker, args)
 } call_walker
+
+/// Moves the captures of the task closure a function value at an address holds, through the
+/// walk its environment names; as the walk of the calling function's own `task fn` parameter at
+/// `own` when given, for stack limits.
+fn move_captures(mut fx: Fx, function: clif::Value, lift: clif::Value, owner: clif::Value, own: Option[usize]) {
+    let env = mut fx.load(PTR, addr: function, offset: 8)
+    let has_env = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: env, y: 0)
+    mut fx.if_true(has_env, then: fn(mut then_fx: Fx) {
+        let walker = mut then_fx.load(PTR, addr: env, offset: 0)
+        let walks = mut then_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: walker, y: 0)
+        mut then_fx.if_true(walks, then: fn(mut walk_fx: Fx) {
+            var walk_args = Array[clif::Value, 3].filled(env)
+            walk_args[1] = lift
+            walk_args[2] = owner
+            let inst = call_walker(mut walk_fx, walker, args: walk_args.view())
+            match own {
+                Some(position) => mut walk_fx.sites.push(CallSite(inst: inst, site: Site(kind: StackKind.Param(position), at: None)))
+                None => {}
+            }
+        })
+    })
+} move_captures
 
 /// Passes the chunks an allocation lies in to `lift` unless it is zero; gives whether they
 /// passed.
@@ -213,18 +235,7 @@ fn transfer_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Valu
             }
         }
         ty::TyKind.Fn(_) => {
-            let env = mut fx.load(PTR, addr: address, offset: 8)
-            let has_env = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: env, y: 0)
-            mut fx.if_true(has_env, then: fn(mut then_fx: Fx) {
-                let walker = mut then_fx.load(PTR, addr: env, offset: 0)
-                let walks = mut then_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: walker, y: 0)
-                mut then_fx.if_true(walks, then: fn(mut walk_fx: Fx) {
-                    var walk_args = Array[clif::Value, 3].filled(env)
-                    walk_args[1] = lift
-                    walk_args[2] = owner
-                    call_walker(mut walk_fx, walker, args: walk_args.view())
-                })
-            })
+            move_captures(mut fx, function: address, lift, owner, own: None)
             return
         }
         else => {}

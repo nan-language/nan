@@ -372,13 +372,24 @@ impl<'c, 'a> Body<'c, 'a> {
             .report_unknown(self.item, (name.token, name.token), candidates, stub);
     }
 
+    /// Reports a value of a type found where another is expected: `secret.public-use` for a
+    /// `core::Secret[T]` where `T` is expected, `type.mismatch` otherwise.
     pub fn report_mismatch(&self, token: Tok, expected: &Ty, found: &Ty) {
-        self.ck.report_expected(
+        let secret = self.ck.is_std(found, "core::Secret") && found.type_arg(0) == Some(expected);
+        let (code, because) = match secret {
+            true => (
+                Code::SecretPublicUse,
+                vec![crate::diagnostic::Reason::note("core::Secret.select")],
+            ),
+            false => (Code::TypeMismatch, Vec::new()),
+        };
+        self.ck.report_record(
             self.item,
             token,
-            Code::TypeMismatch,
-            self.ck.show(expected, self.module),
-            self.ck.show(found, self.module),
+            code,
+            Some(self.ck.show(expected, self.module)),
+            Some(self.ck.show(found, self.module)),
+            because,
         );
     }
 
@@ -1105,6 +1116,16 @@ impl Checker<'_> {
                         interface.methods.iter().zip(methods).enumerate()
                     {
                         self.method_body(item, index, method, &method_sig.sig);
+                    }
+                }
+                None
+            }
+            ItemKind::Protocol(protocol) => {
+                if let SigKind::Protocol { operations, .. } = &sig.kind {
+                    for (index, (operation, head)) in
+                        protocol.operations.iter().zip(operations).enumerate()
+                    {
+                        self.method_body(item, index, &operation.method, &head.sig);
                     }
                 }
                 None

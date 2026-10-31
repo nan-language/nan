@@ -398,10 +398,15 @@ fn Body.call_kind(
                 if position >= abi.params.len() {
                     break
                 }
-                let ty::TyKind.Fn(_) = lo.ck.types().kind(abi.params[position].nty.ty()) else {
+                let ty::TyKind.Fn(param_fn) = lo.ck.types().kind(abi.params[position].nty.ty()) else {
                     continue
                 }
-                let binding = mut self.binding(mut lo, mut fx, operand: operands[position])
+                var binding = Binding.Bounded(None)
+                if lo.ck.types().fn_of(param_fn).kind == ast::FnKind.Task {
+                    binding = mut self.walk_binding(mut lo, mut fx, operand: operands[position])
+                } else {
+                    binding = mut self.binding(mut lo, mut fx, operand: operands[position])
+                }
                 mut bindings.push(ParamBinding(position: position, binding: binding))
             }
             return StackKind.Direct(callee: callee, bindings: take bindings)
@@ -694,6 +699,20 @@ fn Body.binding(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -
     }
 } Body.binding
 
+/// What an operand passes for a `task fn` parameter of a direct call's callee: the walk moving
+/// its captures, which a closure without captures that move and a named function do not need.
+fn Body.walk_binding(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -> Binding {
+    return match mut self.fn_source(mut lo, mut fx, operand) {
+        FnSource.Closure(index) => match lo.known_glue(Glue.Captures(Instance.Nir(item: self.item, role: nir::Role.Closure, index: index, args: self.args))) {
+            Some(walk) => Binding.Walk(walk)
+            None => Binding.Bounded(Some(0))
+        }
+        FnSource.Named(_) => Binding.Bounded(Some(0))
+        FnSource.Param(position) => Binding.Param(position)
+        FnSource.Other(_) => Binding.Bounded(None)
+    }
+} Body.walk_binding
+
 /// Records the `stack N` demand a function type `wanted` makes of the function value an
 /// operand passes where it fits that type.
 fn Body.fit(
@@ -826,6 +845,9 @@ fn Lowering.item_instance(
 /// The instance a call of an interface method through a bound calls: the implementing
 /// function, or the conformance the toolchain supplies.
 fn Lowering.method_instance(mut self, interface_item: ty::ItemId, method: u32, args: ty::Args) -> Instance {
+    if self.ck.is_protocol(interface_item) {
+        return Instance.Operation(protocol: interface_item, method: method)
+    }
     let interface_args = self.ck.types().arg_list(args)
     if interface_args.len() == 0 {
         expect false
@@ -835,7 +857,7 @@ fn Lowering.method_instance(mut self, interface_item: ty::ItemId, method: u32, a
         expect false
         return Instance.Supplied(item: interface_item, args: args)
     }
-    let name = self.method_name(interface_item, method)
+    let name = self.ck.method_name(interface_item, method: usize.widen(method))
     match self.ck.implementation(self_ty, interface_item, method: name.as_str()) {
         Some(implementation) => {
             let through_bound = match implementation.callable {
@@ -857,15 +879,24 @@ fn Lowering.method_instance(mut self, interface_item: ty::ItemId, method: u32, a
     return Instance.Conformance(ty: self_ty, method: take name, args: self.ck.types().args(take rest))
 } Lowering.method_instance
 
-fn Lowering.method_name(self, interface_item: ty::ItemId, method: u32) -> text::String {
-    let sig = self.ck.sig(interface_item)
-    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
-        expect false
-        return text::String.empty(self.alloc)
-    }
-    expect usize.widen(method) < methods.len()
-    return text::String.of(methods[usize.widen(method)].name.as_str(), alloc: self.alloc)
-} Lowering.method_name
+/// A function value naming a function, its arguments concrete: the code calling it through the
+/// ABI of function values, without an environment.
+fn Lowering.function_value(mut self, mut fx: Fx, fn_ref: nir::FnRef) -> Held {
+    let instance = mut self.callable_instance(fn_ref, as_value: true)
+    let instance_fn_ty = mut self.instance_fn_ty(instance)
+    let own_stack = instance_fn_ty.limit_set.stack
+    var inner = mem::List[Instance].empty(self.alloc)
+    mut inner.push(take instance)
+    let glue = mut self.instance(Instance.Value(take inner))
+    mut self.entry_stack(glue, own: own_stack)
+    let reference = mut self.func_ref(mut fx, id: glue)
+    let code = mut fx.b.func_addr(PTR, func_ref: reference)
+    let slot = mut fx.slot(16, align: 8)
+    mut fx.store(code, addr: slot, offset: 0)
+    let no_env = mut fx.ptr(0)
+    mut fx.store(no_env, addr: slot, offset: 8)
+    return Held.Address(slot)
+} Lowering.function_value
 
 /// How calls of a callable give their result, none unless it is a projection.
 fn Lowering.callable_given(self, callable: nir::Callable) -> Option[Given] {
@@ -962,6 +993,16 @@ fn Lowering.instance_fn_ty(mut self, instance: Instance) -> ty::FnTy {
         }
         Instance.Derived(owner: owner, method: method, args: args) => return mut self.derived_head(owner, method: method.as_str(), args)
         Instance.Conformance(ty: ty, method: method, args: args) => return mut self.conformance_head(ty, method: method.as_str(), own: args)
+        Instance.Operation(protocol: protocol, method: method) => {
+            var message = mem::List[ty::Ty].empty(self.alloc)
+            mut message.push(self.ck.types().item(protocol, args: mem::List[ty::Arg].empty(self.alloc)))
+            let outbox = self.std_ty("sys", type_name: "Outbox", args: take message)
+            let Some(head) = self.ck.outbox_head(protocol, method: usize.widen(method), outbox) else {
+                expect false
+                return unit_fn_ty(self.alloc)
+            }
+            return head.fn_ty(self.alloc)
+        }
         else => {
             expect false
             return unit_fn_ty(self.alloc)

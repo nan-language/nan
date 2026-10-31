@@ -216,7 +216,8 @@ impl Checker<'_> {
                 | ItemKind::Enum(_)
                 | ItemKind::Interface(_)
                 | ItemKind::Layout(_)
-                | ItemKind::Registers(_) => types.push((item, name)),
+                | ItemKind::Registers(_)
+                | ItemKind::Protocol(_) => types.push((item, name)),
                 _ => values.push((item, name)),
             }
         }
@@ -277,7 +278,9 @@ impl Checker<'_> {
             SigKind::Struct { fields } | SigKind::Layout { fields, .. } => {
                 fields.iter().any(|field| field.name == name)
             }
-            SigKind::Enum { variants } => variants.iter().any(|variant| variant.name == name),
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
+                variants.iter().any(|variant| variant.name == name)
+            }
             _ => false,
         }
     }
@@ -346,6 +349,9 @@ impl Checker<'_> {
                     self.check_thresholds(item, &function.clauses, block);
                     match function.modifier.map(|(modifier, _)| modifier) {
                         Some(FnModifier::Validator) => self.check_validator(item, fn_sig),
+                        Some(FnModifier::Migrate) => {
+                            self.check_migration(item, function, fn_sig);
+                        }
                         Some(FnModifier::Landing) => {
                             self.check_landing(item, fn_sig);
                             self.require(item, ast.token, Authority::Priv);
@@ -419,6 +425,19 @@ impl Checker<'_> {
                 }
                 self.check_method_clauses(item, interface);
             }
+            ItemKind::Protocol(protocol) => {
+                self.check_type_name(item, &protocol.name);
+                for operation in &protocol.operations {
+                    self.check_case(item, &operation.method.name, Case::Snake);
+                    self.check_params(item, &operation.method.head.params);
+                }
+                if let SigKind::Protocol { operations, .. } = &sig.kind {
+                    for (operation, head) in protocol.operations.iter().zip(operations) {
+                        self.check_fails(item, &head.sig, &operation.method.head, false);
+                    }
+                }
+                self.check_protocol(item, protocol);
+            }
             ItemKind::Layout(layout) => {
                 self.check_layout(item);
                 self.check_type_name(item, &layout.name);
@@ -467,6 +486,7 @@ impl Checker<'_> {
             ItemKind::Retired(_) => self.check_tombstone(item),
             ItemKind::Impl(_) if !self.check_generate_impl(item) && self.check_impl(item) => {
                 self.check_capability_impl(item);
+                self.check_kind_impl(item);
                 self.check_decoder_impl(item);
                 self.check_component_impl(item);
             }
@@ -637,6 +657,13 @@ impl Checker<'_> {
             }
             ItemKind::Const(constant) => types.extend(constant.ty.iter().map(|ty| (ty, own))),
             ItemKind::Registry(registry) => types.push((&registry.entry, own)),
+            ItemKind::Protocol(protocol) => {
+                types.extend(protocol.summary.iter().map(|ty| (ty, own)));
+                for operation in &protocol.operations {
+                    let seen = own.min(openness(operation.visibility));
+                    head_parts(&operation.method.head, seen, &mut types, &mut bounds);
+                }
+            }
             _ => {}
         }
         let module = self.db.module_of(item);
@@ -869,6 +896,7 @@ pub fn declared_name(item: &ast::Item) -> Option<&ast::Name> {
         ItemKind::Registry(item) => &item.name,
         ItemKind::Contribute(item) => &item.name,
         ItemKind::Test(item) => &item.name,
+        ItemKind::Protocol(item) => &item.name,
         _ => return None,
     })
 }

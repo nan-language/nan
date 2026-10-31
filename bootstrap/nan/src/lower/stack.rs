@@ -14,6 +14,10 @@ use crate::nir::Span;
 /// support routine or compiler stub uses.
 pub const STUB_CALL_BOUND: u64 = 256;
 
+/// The stack bound of a function-typed parameter: its bytes, or none with the path of calls
+/// down to the unbounded call site that leaves it so, empty when nothing does.
+type Bound = Result<u64, Vec<(FuncId, usize)>>;
+
 /// Where in source a call or a use lies.
 #[derive(Clone, Copy, Debug)]
 pub struct At {
@@ -36,7 +40,8 @@ pub enum Kind {
         callee: FuncId,
         bindings: Vec<(usize, Binding)>,
     },
-    /// A call through the function's own function-typed parameter at a position.
+    /// A call through the function's own function-typed parameter at a position, or, for a
+    /// `task fn` parameter, the walk moving its captures.
     Param(usize),
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option<u64>),
@@ -49,6 +54,8 @@ pub enum Kind {
 pub enum Binding {
     /// A closure or a named function, by the lowered function its value calls.
     Function(FuncId),
+    /// For a `task fn` parameter, the walk moving a closure's captures, by the glue it calls.
+    Walk(FuncId),
     /// The calling function's own parameter at a position.
     Param(usize),
     /// Another function value, bounded by the `stack N` its type demands.
@@ -56,10 +63,11 @@ pub enum Binding {
 }
 
 /// A lowered function: its frame size, the `stack N` the type of each of its function-typed
-/// parameters demands, by position, and its call sites.
+/// parameters demands, by position, none for a `task fn` one, and its call sites.
 pub struct Frame {
     pub function: FuncId,
-    /// The canonical path naming it in reasons; empty for code lowering writes itself.
+    /// The canonical path naming it in reasons, or the type a move walks; empty for other code
+    /// lowering writes itself.
     pub name: String,
     pub size: u64,
     pub params: Vec<(usize, Option<u64>)>,
@@ -150,7 +158,7 @@ pub fn judge(ck: &Checker, frames: &[Frame], demands: &[Demand]) -> Vec<Diagnost
 
 struct Judge<'f> {
     frames: HashMap<FuncId, &'f Frame>,
-    known: HashMap<(FuncId, Vec<Option<u64>>), Use>,
+    known: HashMap<(FuncId, Vec<Bound>), Use>,
     active: Vec<FuncId>,
 }
 
@@ -209,7 +217,7 @@ impl Judge<'_> {
     }
 
     /// The stack use of a function whose function-typed parameters have bounds, by position.
-    fn function(&mut self, function: FuncId, bounds: &[Option<u64>]) -> Use {
+    fn function(&mut self, function: FuncId, bounds: &[Bound]) -> Use {
         if self.active.contains(&function) {
             return Use::Unbounded(Vec::new());
         }
@@ -245,15 +253,15 @@ impl Judge<'_> {
     }
 
     /// The stack use of a call site under the bounds of its function's parameters.
-    fn site(&mut self, site: &Site, bounds: &[Option<u64>]) -> Use {
-        let bound = |bytes: Option<u64>| match bytes {
-            Some(bytes) => Use::Bounded(bytes, Vec::new()),
-            None => Use::Unbounded(Vec::new()),
+    fn site(&mut self, site: &Site, bounds: &[Bound]) -> Use {
+        let bound = |bytes: Bound| match bytes {
+            Ok(bytes) => Use::Bounded(bytes, Vec::new()),
+            Err(path) => Use::Unbounded(path),
         };
         match &site.kind {
             Kind::Stub => Use::Bounded(STUB_CALL_BOUND, Vec::new()),
-            Kind::Bounded(bytes) => bound(*bytes),
-            Kind::Param(position) => bound(bounds.get(*position).copied().flatten()),
+            Kind::Bounded(bytes) => bound(bytes.ok_or_else(Vec::new)),
+            Kind::Param(position) => bound(bound_at(bounds, *position)),
             Kind::Direct { callee, bindings } => {
                 let mut callee_bounds = match self.frames.get(callee) {
                     Some(frame) => own_bounds(frame),
@@ -261,27 +269,34 @@ impl Judge<'_> {
                 };
                 for (position, binding) in bindings {
                     let passed = match binding {
-                        Binding::Function(function) => {
-                            let own = self
-                                .frames
-                                .get(function)
-                                .map_or_else(Vec::new, |frame| own_bounds(frame));
-                            match self.function(*function, &own) {
-                                Use::Bounded(bytes, _) => Some(bytes),
-                                Use::Unbounded(_) => None,
-                            }
-                        }
-                        Binding::Param(own) => bounds.get(*own).copied().flatten(),
-                        Binding::Bounded(bytes) => *bytes,
+                        Binding::Function(function) => match self.own_use(*function) {
+                            Use::Bounded(bytes, _) => Ok(bytes),
+                            Use::Unbounded(_) => Err(Vec::new()),
+                        },
+                        Binding::Walk(glue) => match self.own_use(*glue) {
+                            Use::Bounded(bytes, _) => Ok(bytes),
+                            Use::Unbounded(path) => Err(path),
+                        },
+                        Binding::Param(own) => bound_at(bounds, *own),
+                        Binding::Bounded(bytes) => bytes.ok_or_else(Vec::new),
                     };
                     if callee_bounds.len() <= *position {
-                        callee_bounds.resize(*position + 1, None);
+                        callee_bounds.resize(*position + 1, Err(Vec::new()));
                     }
                     callee_bounds[*position] = passed;
                 }
                 self.function(*callee, &callee_bounds)
             }
         }
+    }
+
+    /// The stack use of a function under the bounds of its own parameters.
+    fn own_use(&mut self, function: FuncId) -> Use {
+        let own = self
+            .frames
+            .get(&function)
+            .map_or_else(Vec::new, |frame| own_bounds(frame));
+        self.function(function, &own)
     }
 
     /// The because-chain of a call path: a `called` reason per call, and for an unbounded path
@@ -321,18 +336,26 @@ impl Judge<'_> {
 }
 
 /// The bounds a function's parameters have when it is judged on its own.
-fn own_bounds(frame: &Frame) -> Vec<Option<u64>> {
+fn own_bounds(frame: &Frame) -> Vec<Bound> {
     let len = frame
         .params
         .iter()
         .map(|(position, _)| position + 1)
         .max()
         .unwrap_or(0);
-    let mut bounds = vec![None; len];
+    let mut bounds = vec![Err(Vec::new()); len];
     for (position, bytes) in &frame.params {
-        bounds[*position] = *bytes;
+        bounds[*position] = bytes.ok_or_else(Vec::new);
     }
     bounds
+}
+
+/// The bound of the parameter at a position, none past the last.
+fn bound_at(bounds: &[Bound], position: usize) -> Bound {
+    bounds
+        .get(position)
+        .cloned()
+        .unwrap_or_else(|| Err(Vec::new()))
 }
 
 fn prepend(first: (FuncId, usize), mut rest: Vec<(FuncId, usize)>) -> Vec<(FuncId, usize)> {

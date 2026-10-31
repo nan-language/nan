@@ -1,13 +1,10 @@
-//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image through the sims, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of the one host it reaches, when restricted. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
+//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image through the sims, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first, reading its state words through a snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of its host and whether it reaches every host, only that one or none. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
 
-/// The words of an entry's state.
-const WORD_DIRECTORY: u64 = 0
-
-const WORD_TEXT: u64 = 8
-
-const WORD_TEXT_LEN: u64 = 16
-
-const WORD_FLAGS: u64 = 24
+/// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
+/// which hosts it reaches: every host, `SYS_ONLY_HOST` or `SYS_NO_HOST`.
+const SYS_FLAGS: u64 = TABLES_ENTRY_STATE + 24
+const SYS_ONLY_HOST: i64 = 1
+const SYS_NO_HOST: i64 = 2
 
 /// The render budget of a log record's value.
 const SYS_LOG_BUDGET: u64 = 1_024
@@ -44,17 +41,40 @@ fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     return true
 } sys_lower
 
-/// The entry record of the capability held at an address, failing the operation with
-/// `Revoked.Stale` when its handle is stale.
-fn sys_checked(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> clif::Value {
+/// Fails the operation with `Revoked.Stale` when the handle of the capability held at an
+/// address is stale.
+fn sys_check(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) {
     let handle = mut fx.load(PTR, addr: capability, offset: 0)
     let record = live_entry(mut lo, mut fx, handle)
     let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
     mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
     })
-    return record
+} sys_check
+
+/// The state words of the entry of the capability held at an address, failing the operation
+/// with `Revoked.Stale` when its handle is stale.
+fn sys_checked(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> Array[clif::Value, 4] {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let taken = snapshot(mut lo, mut fx, handle)
+    let stale = mut fx.b.bxor_imm_s(taken.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    return taken.words
 } sys_checked
+
+/// A copy of the text of the entry of the capability held at an address, which the caller
+/// frees, failing the operation with `Revoked.Stale` when its handle is stale.
+fn sys_checked_text(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> Stretch {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let copy = copy_text(mut lo, mut fx, handle)
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: copy.start, y: 0)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    return copy
+} sys_checked_text
 
 /// Fails with a failure value of the operation's failure type: the variant of that name, or
 /// for a stale handle `Revoked.Stale` itself or the `Revoked` variant holding it.
@@ -105,21 +125,6 @@ fn new_view(mut fx: Fx, start: clif::Value, len: clif::Value) -> Held {
     mut fx.store(len, addr: slot, offset: 8)
     return Held.Address(slot)
 } new_view
-
-/// A copy of `len` bytes from `start` in runtime memory, as an entry's state keeps texts.
-fn kept_text(mut lo: Lowering, mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
-    let size = mut fx.b.iadd_imm_s(len, y: 1)
-    let copy = mut lo.record_alloc(mut fx, size)
-    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
-    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
-        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
-    })
-    var copied = Array[clif::Value, 3].filled(copy)
-    copied[1] = start
-    copied[2] = len
-    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copied.view())
-    return copy
-} kept_text
 
 /// Whether a path has the form a `sys::Fs` path has: relative segments separated by `/`, none
 /// empty, `.`, `..` or holding a NUL.
@@ -192,16 +197,11 @@ fn valid_path(mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
 
 fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let record = sys_checked(mut lo, mut fx, supply, capability)
-    let directory_word = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_DIRECTORY)
-    let directory_fd = mut fx.b.ireduce(clif::Type.Int32, x: directory_word)
-    let prefix_start = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
-    let prefix_len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
-    let prefix = new_view(mut fx, start: prefix_start, len: prefix_len)
-    let flags = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
+    let words = sys_checked(mut lo, mut fx, supply, capability)
+    let directory = words[0]
     let member = supply.member()
     if member == "create" or member == "write_all" or member == "remove" {
-        let read_only = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flags, y: 0)
+        let read_only = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: words[3], y: 0)
         mut fx.if_true(read_only, then: fn[mut lo](mut fx1: Fx) {
             fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
         })
@@ -214,131 +214,63 @@ fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             fail_with(mut lo, fx: mut fx1, supply, variant: "InvalidPath")
         })
     }
-    let directory = Held.Scalar(directory_fd)
-    if lo.seeded() and not (member == "subdir" or member == "read_only") {
+    if member == "subdir" {
+        let path = sys_view(mut fx, held: supply.param(1))
+        let floor = mut fx.ptr(0)
+        attenuate(mut lo, mut fx, supply, word: SYS_FLAGS, floor, text: Some(path))
+        return
+    }
+    if member == "read_only" {
+        let floor = mut fx.ptr(1)
+        attenuate(mut lo, mut fx, supply, word: SYS_FLAGS, floor, text: None)
+        return
+    }
+    if lo.seeded() {
         match member {
-            "open" or "create" => fs_open(mut lo, mut fx, supply, record, creates: member == "create")
-            "read_all" => read_all(mut lo, mut fx, supply, record)
-            "write_all" => fs_write_all(mut lo, mut fx, supply, record)
-            "remove" => fs_remove(mut lo, mut fx, supply, record)
+            "open" or "create" => fs_open(mut lo, mut fx, supply, index: directory, creates: member == "create")
+            "read_all" => read_all(mut lo, mut fx, supply, index: directory)
+            "write_all" => fs_write_all(mut lo, mut fx, supply, index: directory)
+            "remove" => fs_remove(mut lo, mut fx, supply, index: directory)
             else => {
                 expect false
             }
         }
         return
     }
-    if member == "subdir" or member == "read_only" {
-        fs_attenuate(mut lo, mut fx, supply, capability, prefix: Stretch(start: prefix_start, len: prefix_len))
-        return
+    let prefix = sys_checked_text(mut lo, mut fx, supply, capability)
+    let directory_fd = mut fx.b.ireduce(clif::Type.Int32, x: directory)
+    let directory_held = Held.Scalar(directory_fd)
+    let path = new_view(mut fx, start: prefix.start, len: prefix.len)
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(directory_held)
+    mut args.push(path)
+    mut args.push(supply.param(1))
+    var name = "fs_remove"
+    if member == "open" {
+        name = "fs_open"
+    } else if member == "create" {
+        name = "fs_create"
+    } else if member == "read_all" {
+        name = "fs_read_all"
+        mut args.push(supply.param(2))
+    } else if member == "write_all" {
+        name = "fs_write_all"
+        mut args.push(supply.param(2))
     }
-    fs_call(mut lo, mut fx, supply, capability, directory, prefix)
-} sys_fs
-
-/// `subdir` and `read_only` of `sys::Fs`: a new entry deriving from the capability's, keeping
-/// the joined path prefix or marked read-only.
-fn fs_attenuate(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, prefix: Stretch) {
-    let handle = mut fx.load(PTR, addr: capability, offset: 0)
-    let kind = mut fx.ptr(u64.fit(TABLES_KIND_FS))
-    var derive_args = Array[clif::Value, 2].filled(handle)
-    derive_args[1] = kind
-    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
-    expect derived_values.len() == 1
-    let derived = derived_values[0]
-    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
-    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
-        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    let called = mut lo.platform_call(mut fx, name, args: args.view())
+    mut lo.record_free(mut fx, address: prefix.start)
+    sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+        if member == "open" or member == "create" {
+            let handle = mut fx1.load(PTR, addr: capability, offset: 0)
+            let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
+            ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
+        } else if member == "read_all" {
+            supply.ret(mut lo1, fx: mut fx1, held: result)
+        } else {
+            supply.done(mut lo1, fx: mut fx1)
+        }
     })
-    let record = entry_at(mut lo, mut fx, handle: derived)
-    if supply.member() == "subdir" {
-        let path = sys_view(mut fx, held: supply.param(1))
-        let joined = mut fx.b.iadd(prefix.len, y: path.len)
-        let has_prefix = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: prefix.len, y: 0)
-        let separator = mut fx.b.uextend(PTR, x: has_prefix)
-        let joined_len = mut fx.b.iadd(joined, y: separator)
-        let size = mut fx.b.iadd_imm_s(joined_len, y: 1)
-        let text = mut lo.record_alloc(mut fx, size)
-        var prefix_args = Array[clif::Value, 3].filled(text)
-        prefix_args[1] = prefix.start
-        prefix_args[2] = prefix.len
-        discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: prefix_args.view())
-        mut fx.if_true(has_prefix, then: fn(mut fx1: Fx) {
-            let at = mut fx1.b.iadd(text, y: prefix.len)
-            let slash = mut fx1.int(clif::Type.Int8, value: i64.widen(b'/'))
-            mut fx1.store(slash, addr: at, offset: 0)
-        })
-        let after_prefix = mut fx.b.iadd(text, y: prefix.len)
-        let tail = mut fx.b.iadd(after_prefix, y: separator)
-        var tail_args = Array[clif::Value, 3].filled(tail)
-        tail_args[1] = path.start
-        tail_args[2] = path.len
-        discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: tail_args.view())
-        mut fx.store(text, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
-        mut fx.store(joined_len, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
-    } else {
-        let one = mut fx.ptr(1)
-        mut fx.store(one, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
-    }
-    let Some(sret) = supply.sret else {
-        expect false
-        return
-    }
-    mut fx.store(derived, addr: sret, offset: 0)
-    supply.done(mut lo, mut fx)
-} fs_attenuate
-
-/// The members of `sys::Fs` the host platform performs: opening, creating, reading, writing
-/// and removing files of the capability's directory.
-fn fs_call(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, directory: Held, prefix: Held) {
-    match supply.member() {
-        "open" or "create" => {
-            var platform_name = "fs_create"
-            if supply.member() == "open" {
-                platform_name = "fs_open"
-            }
-            var open_args = Array[Held, 3].filled(directory)
-            open_args[1] = prefix
-            open_args[2] = supply.param(1)
-            let called = mut lo.platform_call(mut fx, name: platform_name, args: open_args.view())
-            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
-                let handle = mut fx1.load(PTR, addr: capability, offset: 0)
-                let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
-                ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
-            })
-        }
-        "read_all" => {
-            var read_args = Array[Held, 4].filled(directory)
-            read_args[1] = prefix
-            read_args[2] = supply.param(1)
-            read_args[3] = supply.param(2)
-            let called = mut lo.platform_call(mut fx, name: "fs_read_all", args: read_args.view())
-            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
-                supply.ret(mut lo1, fx: mut fx1, held: result)
-            })
-        }
-        "write_all" => {
-            var write_args = Array[Held, 4].filled(directory)
-            write_args[1] = prefix
-            write_args[2] = supply.param(1)
-            write_args[3] = supply.param(2)
-            let called = mut lo.platform_call(mut fx, name: "fs_write_all", args: write_args.view())
-            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
-                supply.done(mut lo1, fx: mut fx1)
-            })
-        }
-        "remove" => {
-            var remove_args = Array[Held, 3].filled(directory)
-            remove_args[1] = prefix
-            remove_args[2] = supply.param(1)
-            let called = mut lo.platform_call(mut fx, name: "fs_remove", args: remove_args.view())
-            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
-                supply.done(mut lo1, fx: mut fx1)
-            })
-        }
-        else => {
-            expect false
-        }
-    }
-} fs_call
+} sys_fs
 
 /// Returns a file, listener or connection: the entry it was opened through and the holding of
 /// a descriptor or sim, which settlement closes, or abandons for a connection.
@@ -372,19 +304,25 @@ fn sys_descriptor(mut fx: Fx, address: clif::Value) -> clif::Value {
 
 fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let record = sys_checked(mut lo, mut fx, supply, capability)
-    let host_start = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
-    let host_len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
-    let restricted_word = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
-    let restricted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: restricted_word, y: 0)
+    let words = sys_checked(mut lo, mut fx, supply, capability)
+    let network = words[0]
+    let hosts = words[3]
     match supply.member() {
-        "only_host" => net_only_host(mut lo, mut fx, supply, capability)
+        "only_host" => {
+            let reached = sys_reaches(mut lo, mut fx, supply, capability, hosts, host: supply.param(1))
+            let only = mut fx.int(PTR, value: SYS_ONLY_HOST)
+            let none = mut fx.int(PTR, value: SYS_NO_HOST)
+            let floor = mut fx.b.select(reached, x: only, y: none)
+            let host = sys_view(mut fx, held: supply.param(1))
+            attenuate(mut lo, mut fx, supply, word: SYS_FLAGS, floor, text: Some(host))
+        }
         "listen" => {
+            let restricted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: hosts, y: 0)
             mut fx.if_true(restricted, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
             })
             if lo.seeded() {
-                listen(mut lo, mut fx, supply, record)
+                listen(mut lo, mut fx, supply, network)
                 return
             }
             let called = mut lo.platform_call(mut fx, name: "net_listen", args: Array[Held, 1].filled(supply.param(1)).view())
@@ -396,16 +334,13 @@ fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "connect" => {
             let host = supply.param(1)
-            mut fx.if_true(restricted, then: fn[mut lo](mut fx1: Fx) {
-                let stored = new_view(mut fx1, start: host_start, len: host_len)
-                let same = mut lo.views_equal(mut fx1, left: stored, right: host)
-                let other = mut fx1.b.bxor_imm_s(same, y: 1)
-                mut fx1.if_true(other, then: fn[mut lo](mut fx2: Fx) {
-                    fail_with(mut lo, fx: mut fx2, supply, variant: "Denied")
-                })
+            let reached = sys_reaches(mut lo, mut fx, supply, capability, hosts, host)
+            let denied = mut fx.b.bxor_imm_s(reached, y: 1)
+            mut fx.if_true(denied, then: fn[mut lo](mut fx1: Fx) {
+                fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
             })
             if lo.seeded() {
-                connect(mut lo, mut fx, supply, record)
+                connect(mut lo, mut fx, supply, network)
                 return
             }
             var connect_args = Array[Held, 2].filled(host)
@@ -423,49 +358,40 @@ fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } sys_net
 
-/// `sys::Net.only_host`: a new entry deriving from the capability's, restricted to one host.
-fn net_only_host(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) {
-    let handle = mut fx.load(PTR, addr: capability, offset: 0)
-    let kind = mut fx.ptr(u64.fit(TABLES_KIND_NET))
-    var derive_args = Array[clif::Value, 2].filled(handle)
-    derive_args[1] = kind
-    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
-    expect derived_values.len() == 1
-    let derived = derived_values[0]
-    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
-    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
-        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+/// Whether the `Net` held at `capability`, whose entry's flags word is `hosts`, reaches
+/// `host`: compared byte for byte with its own host when it reaches only that one.
+fn sys_reaches(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, hosts: clif::Value, host: Held) -> clif::Value {
+    let only = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: hosts, y: SYS_ONLY_HOST)
+    let results = fx.types1(clif::Type.Int8)
+    let reached = mut fx.choose(only, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let copy = sys_checked_text(mut lo, fx: mut fx1, supply, capability)
+        let stored = new_view(mut fx1, start: copy.start, len: copy.len)
+        let same = mut lo.views_equal(mut fx1, left: stored, right: host)
+        mut lo.record_free(mut fx1, address: copy.start)
+        return fx1.list1(same)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let unrestricted = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: hosts, y: 0)
+        return fx1.list1(unrestricted)
     })
-    let record = entry_at(mut lo, mut fx, handle: derived)
-    let host = sys_view(mut fx, held: supply.param(1))
-    let text = kept_text(mut lo, mut fx, start: host.start, len: host.len)
-    mut fx.store(text, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
-    mut fx.store(host.len, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
-    let one = mut fx.ptr(1)
-    mut fx.store(one, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
-    let Some(sret) = supply.sret else {
-        expect false
-        return
-    }
-    mut fx.store(derived, addr: sret, offset: 0)
-    supply.done(mut lo, mut fx)
-} net_only_host
+    return reached[0]
+} sys_reaches
 
 fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
     let handle = mut fx.load(PTR, addr: capability, offset: 0)
-    let record = live_entry(mut lo, mut fx, handle)
-    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    let taken = snapshot(mut lo, mut fx, handle)
+    let minted = taken.words[0]
+    let resolution = taken.words[1]
+    let stale = mut fx.b.bxor_imm_s(taken.live, y: 1)
     let member = supply.member()
     match member {
         "elapsed_ms" or "elapsed_ns" => {
             mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
             })
-            let minted = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
             let now = mut lo.now_ns(mut fx)
             let elapsed = mut fx.b.isub(now, y: minted)
-            var result = round_down(mut fx, record, reading: elapsed)
+            var result = round_down(mut fx, resolution, reading: elapsed)
             if member == "elapsed_ms" {
                 let per_ms = mut fx.ptr(NS_PER_MS)
                 result = mut fx.b.udiv(result, y: per_ms)
@@ -481,7 +407,7 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             } else {
                 supply.param(1).scalar_value()
             }
-            let delay = clock_delay(mut lo, mut fx, record, ns)
+            let delay = clock_delay(mut lo, mut fx, minted, resolution, ns)
             if lo.seeded() or lo.kernel() {
                 let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
                     if lo1.seeded() {
@@ -501,7 +427,7 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
                 supply.done(mut lo1, fx: mut fx1)
             })
         }
-        "coarse" => coarse(mut lo, mut fx, supply, entry_kind: TABLES_KIND_CLOCK, word: TABLES_RESOLUTION)
+        "coarse" => coarse(mut lo, mut fx, supply, word: TABLES_RESOLUTION)
         else => {
             expect false
         }
@@ -511,20 +437,19 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 fn sys_wall_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "now_ns" => {
-            let record = sys_checked(mut lo, mut fx, supply, capability: supply.param(0).address_value())
-            var now = record
+            let words = sys_checked(mut lo, mut fx, supply, capability: supply.param(0).address_value())
+            var now = words[0]
             if lo.seeded() or lo.machine() {
                 let clock = mut lo.now_ns(mut fx)
-                let ahead = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
-                now = mut fx.b.iadd(clock, y: ahead)
+                now = mut fx.b.iadd(clock, y: words[0])
             } else {
                 let called = mut lo.platform_call(mut fx, name: "wall_ns", args: mem::List[Held].empty(fx.alloc).view())
                 now = called.result.scalar_value()
             }
-            let rounded = round_down(mut fx, record, reading: now)
+            let rounded = round_down(mut fx, resolution: words[1], reading: now)
             supply.ret(mut lo, mut fx, held: Held.Scalar(rounded))
         }
-        "coarse" => coarse(mut lo, mut fx, supply, entry_kind: TABLES_KIND_WALL, word: TABLES_RESOLUTION)
+        "coarse" => coarse(mut lo, mut fx, supply, word: TABLES_RESOLUTION)
         else => {
             expect false
         }
@@ -533,53 +458,63 @@ fn sys_wall_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 
 /// `c.coarse(ns)` of a `Clock`, `WallClock` or `task::Executor`: an entry deriving from `c`'s,
 /// with the coarser of its resolution, held in the state word at `word`, and `ns`.
-fn coarse(mut lo: Lowering, mut fx: Fx, supply: Supply, entry_kind: i64, word: u64) {
+fn coarse(mut lo: Lowering, mut fx: Fx, supply: Supply, word: u64) {
+    attenuate(mut lo, mut fx, supply, word, floor: supply.param(1).scalar_value(), text: None)
+} coarse
+
+/// Returns an entry deriving from the entry of the capability held at the operation's first
+/// parameter: its state word at offset `word` raised to at least `floor` and its text extended
+/// or replaced by `text`, failing the operation with `Revoked.Stale` when its handle is stale.
+fn attenuate(mut lo: Lowering, mut fx: Fx, supply: Supply, word: u64, floor: clif::Value, text: Option[Stretch]) {
     let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let kind = mut fx.ptr(u64.fit(entry_kind))
-    var derive_args = Array[clif::Value, 2].filled(handle)
-    derive_args[1] = kind
-    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+    let offset = mut fx.ptr(word)
+    var given = Stretch(start: offset, len: offset)
+    match text {
+        Some(stretch) => {
+            given = stretch
+        }
+        None => {
+            let start = mut fx.ptr(0)
+            let len = mut fx.ptr(0)
+            given = Stretch(start: start, len: len)
+        }
+    }
+    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: fx.list5(handle, b: offset, c: floor, d: given.start, e: given.len).view())
     expect derived_values.len() == 1
     let derived = derived_values[0]
     let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
     mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
     })
-    let record = entry_at(mut lo, mut fx, handle: derived)
-    let resolution = mut fx.load(PTR, addr: record, offset: word)
-    let coarser = mut fx.b.umax(resolution, y: supply.param(1).scalar_value())
-    mut fx.store(coarser, addr: record, offset: word)
     let Some(sret) = supply.sret else {
         expect false
         return
     }
     mut fx.store(derived, addr: sret, offset: 0)
     supply.done(mut lo, mut fx)
-} coarse
+} attenuate
 
-/// A reading of a clock rounded down to a multiple of its entry's resolution.
-fn round_down(mut fx: Fx, record: clif::Value, reading: clif::Value) -> clif::Value {
-    let stated = mut fx.load(PTR, addr: record, offset: TABLES_RESOLUTION)
+/// A reading of a clock rounded down to a multiple of its resolution.
+fn round_down(mut fx: Fx, resolution: clif::Value, reading: clif::Value) -> clif::Value {
     let one = mut fx.ptr(1)
-    let resolution = mut fx.b.umax(stated, y: one)
-    let rest = mut fx.b.urem(reading, y: resolution)
+    let divisor = mut fx.b.umax(resolution, y: one)
+    let rest = mut fx.b.urem(reading, y: divisor)
     return mut fx.b.isub(reading, y: rest)
 } round_down
 
-/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry,
-/// rounded up so that it ends when the clock's elapsed time is a multiple of its resolution.
-fn clock_delay(mut lo: Lowering, mut fx: Fx, record: clif::Value, ns: clif::Value) -> clif::Value {
-    let minted = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
-    let resolution = mut fx.load(PTR, addr: record, offset: TABLES_RESOLUTION)
+/// The delay after which `ns` nanoseconds have elapsed on the clock of a live `Clock` entry
+/// minted at `minted` with a resolution, rounded up so that it ends when the clock's elapsed
+/// time is a multiple of its resolution.
+fn clock_delay(mut lo: Lowering, mut fx: Fx, minted: clif::Value, resolution: clif::Value, ns: clif::Value) -> clif::Value {
     let now = mut lo.now_ns(mut fx)
     return on_grid(mut fx, now, origin: minted, resolution, ns)
 } clock_delay
 
 fn sys_random(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let record = sys_checked(mut lo, mut fx, supply, capability)
+    let words = sys_checked(mut lo, mut fx, supply, capability)
     if lo.seeded() {
-        random_fill(mut lo, mut fx, entry_record: record, buf: supply.param(1))
+        random_fill(mut lo, mut fx, index: words[0], buf: supply.param(1))
     } else {
         discard mut lo.platform_call(mut fx, name: "random_fill", args: Array[Held, 1].filled(supply.param(1)).view())
     }
@@ -611,10 +546,10 @@ fn sys_log(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 
 fn sys_stdio(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let record = sys_checked(mut lo, mut fx, supply, capability)
+    let words = sys_checked(mut lo, mut fx, supply, capability)
     if lo.seeded() {
         if supply.member() == "read_in" {
-            stdio_read(mut lo, mut fx, supply, entry_record: record)
+            stdio_read(mut lo, mut fx, supply, index: words[0])
         } else {
             stdio_write(mut lo, mut fx, supply)
         }
@@ -663,7 +598,7 @@ fn resource(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         return
     }
     if member != "close" {
-        discard sys_checked(mut lo, mut fx, supply, capability: address)
+        sys_check(mut lo, mut fx, supply, capability: address)
     }
     let path = supply.path.as_str()
     let Some(owner) = path.slice_bytes(0, end: check::last_dot(path).value_or(0)) else {
@@ -763,19 +698,20 @@ fn sys_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, addres
 /// declares in full.
 fn sys_transfers(owner_path: Str) -> Option[bool] {
     return match owner_path {
-        "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" or "sys::Revoker" => Some(true)
+        "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" or "sys::Revoker" or "sys::Minter" => Some(true)
         else => None
     }
 } sys_transfers
 
-/// Moves a resource or revoker into another domain's reach: its holding passes to `owner`.
+/// Moves a resource, revoker or minter into another domain's reach: its holding passes to
+/// `owner`.
 fn sys_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::Value, owner: clif::Value) -> bool {
     match owner_path {
         "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" => {
             let holding = mut fx.offset(address, offset: 8)
             rehome(mut lo, mut fx, address: holding, owner)
         }
-        "sys::Revoker" => rehome(mut lo, mut fx, address, owner)
+        "sys::Revoker" or "sys::Minter" => rehome(mut lo, mut fx, address, owner)
         else => return false
     }
     return true
@@ -785,7 +721,7 @@ fn sys_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::Va
 fn sys_needs_release(owner_path: Str) -> Option[bool] {
     return match owner_path {
         "sys::fs::File" or "sys::net::Listener" => Some(true)
-        "sys::net::Conn" or "sys::Revoker" => Some(false)
+        "sys::net::Conn" or "sys::Revoker" or "sys::Minter" => Some(false)
         else => None
     }
 } sys_needs_release
@@ -808,12 +744,10 @@ fn revocation(mut lo: Lowering, mut fx: Fx, supply: Supply) {
                 expect derived_values.len() == 1
                 derived = derived_values[0]
             } else {
-                let record = sys_checked(mut lo, mut fx, supply, capability)
-                let kind_word = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
-                let kind = mut fx.b.uextend(PTR, x: kind_word)
-                var derive_args = Array[clif::Value, 2].filled(handle)
-                derive_args[1] = kind
-                let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+                sys_check(mut lo, mut fx, supply, capability)
+                let word = mut fx.ptr(TABLES_ENTRY_STATE)
+                let zero = mut fx.ptr(0)
+                let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: fx.list5(handle, b: word, c: zero, d: zero, e: zero).view())
                 expect derived_values.len() == 1
                 derived = derived_values[0]
                 let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)

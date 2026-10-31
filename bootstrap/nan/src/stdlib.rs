@@ -4,7 +4,7 @@
 include!(concat!(env!("OUT_DIR"), "/std_files.rs"));
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::workspace::{Package, Workspace};
 
@@ -22,7 +22,7 @@ pub fn is_std(name: &str) -> bool {
 }
 
 /// The std packages, loaded once per run.
-pub fn packages() -> &'static [Package] {
+pub fn packages() -> &'static [Arc<Package>] {
     &workspace().packages
 }
 

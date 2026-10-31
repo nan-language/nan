@@ -1,6 +1,7 @@
-//! Authority: the manifest grants a module needs for the device, priv, trusted and validate
-//! operations it performs directly, the grants its dependencies need, the names grants and
-//! denials list, and denied dependencies.
+//! Authority: the manifest grants a module needs for the device, confined, priv, trusted and
+//! validate operations it performs directly and the capability kinds it declares, the grants its
+//! dependencies need, the names grants and denials list, and denied dependencies. A `device`
+//! grant also covers what `confined` does.
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId};
@@ -9,8 +10,9 @@ use crate::syntax::ast::Tok;
 use crate::workspace::Authority;
 
 /// The authorities a manifest grant names that a dependency's grant must be relayed for.
-const RELAYED: [Authority; 4] = [
+const RELAYED: [Authority; 5] = [
     Authority::Device,
+    Authority::Confined,
     Authority::Priv,
     Authority::Trusted,
     Authority::Validate,
@@ -29,7 +31,7 @@ impl Checker<'_> {
                 .iter()
                 .flat_map(|manifest| &manifest.allows)
                 .any(|allow| {
-                    allow.authority == *authority
+                    covers(&allow.authority, authority)
                         && allow
                             .names
                             .iter()
@@ -89,12 +91,16 @@ impl Checker<'_> {
                 let used = match (registry, self.db.module_named(package, name), dep) {
                     (Some(registry), _, Some(&Some(dep))) => self.contributes(dep, registry),
                     (None, Some(module), _) => {
-                        self.performed
-                            .borrow()
-                            .contains(&(module, allow.authority.clone()))
+                        self.performs_under(package, module, &allow.authority)
                             || self.module_holds_failure(module)
                     }
-                    (None, None, Some(&Some(dep))) => self.grants_any(dep, &allow.authority),
+                    (None, None, Some(&Some(dep))) => {
+                        !RELAYED.contains(&allow.authority)
+                            || RELAYED.iter().any(|authority| {
+                                covers(&allow.authority, authority)
+                                    && self.grants_any(dep, authority)
+                            })
+                    }
                     _ => true,
                 };
                 if !used {
@@ -105,19 +111,53 @@ impl Checker<'_> {
         unused
     }
 
-    /// The authority a call of a std function performs: the device operations of register
-    /// windows and DMA, and the privileged intrinsics.
+    /// Whether a module performs an operation that a grant of an authority covers, a `device`
+    /// grant covering confined operations only when no `confined` grant names the module.
+    fn performs_under(&self, package: PackageId, module: ModuleId, authority: &Authority) -> bool {
+        let performed = self.performed.borrow();
+        performed.contains(&(module, authority.clone()))
+            || (*authority == Authority::Device
+                && performed.contains(&(module, Authority::Confined))
+                && !self
+                    .db
+                    .package(package)
+                    .source
+                    .manifest
+                    .iter()
+                    .any(|manifest| {
+                        manifest.allows.iter().any(|allow| {
+                            allow.authority == Authority::Confined
+                                && allow
+                                    .names
+                                    .iter()
+                                    .any(|name| self.db.module_named(package, name) == Some(module))
+                        })
+                    }))
+    }
+
+    /// The authority a call of a std function performs: the device operations, those reaching
+    /// no memory but a device's own and its I/O domain's being confined ones, and the
+    /// privileged intrinsics.
     pub fn call_authority(&self, function: ItemId) -> Option<Authority> {
         if !self.db.is_std(function) {
             return None;
         }
         let path = self.db.canonical(function);
         let (owner, member) = path.rsplit_once('.').unwrap_or((path.as_str(), ""));
-        match owner {
-            "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" => Some(Authority::Device),
-            "hw::IrqShared" if matches!(member, "install" | "uninstall") => Some(Authority::Device),
-            "hw::dma_fence" => Some(Authority::Device),
-            "hw::Ring0" => Some(Authority::Priv),
+        match (owner, member) {
+            ("hw::Mmio" | "hw::Ports", "map")
+            | ("hw::IoSpace", "physical")
+            | ("hw::PciFunction", "attach_physical")
+            | ("hw::IrqShared", "install" | "install_on" | "install_msi") => {
+                Some(Authority::Device)
+            }
+            ("hw::IrqShared", "uninstall")
+            | (
+                "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Iommu"
+                | "hw::IoDomain" | "hw::PciFunction" | "hw::dma_fence",
+                _,
+            ) => Some(Authority::Confined),
+            ("hw::Ring0", _) => Some(Authority::Priv),
             _ => None,
         }
     }
@@ -132,10 +172,14 @@ impl Checker<'_> {
         let module = |name: &str| self.db.module_named(package, name).is_some();
         let alias = |name: &str| data.deps.contains_key(name);
         for allow in &manifest.allows {
+            let named = |name: &str| match allow.authority {
+                Authority::Capability => module(name),
+                _ => module(name) || alias(name),
+            };
             if let Authority::Contribute(_) = allow.authority {
                 continue;
             }
-            if allow.names.iter().any(|name| !module(name) && !alias(name)) {
+            if allow.names.iter().any(|name| !named(name)) {
                 self.report_file(path, allow.line, Code::AuthorityUnknownName);
             }
         }
@@ -177,7 +221,8 @@ impl Checker<'_> {
                 .iter()
                 .flat_map(|manifest| &manifest.allows)
                 .any(|allow| {
-                    allow.authority == *authority && allow.names.iter().any(|name| name == alias)
+                    covers(&allow.authority, authority)
+                        && allow.names.iter().any(|name| name == alias)
                 })
         };
         RELAYED
@@ -227,4 +272,10 @@ impl Checker<'_> {
             self.report(item, self.db.ast(item).token, Code::AuthorityCapabilityImpl);
         }
     }
+}
+
+/// Whether a grant of `granted` covers operations of `authority`: its own, and `device` covers
+/// `confined`.
+fn covers(granted: &Authority, authority: &Authority) -> bool {
+    granted == authority || (*granted == Authority::Device && *authority == Authority::Confined)
 }

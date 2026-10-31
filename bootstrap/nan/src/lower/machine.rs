@@ -1,19 +1,29 @@
 //! Machine targets: the program entry seams of the UEFI and bare targets, which Cranelift
 //! cannot express, and the boot glue the seams call; its submodules hold the other compiler
-//! stubs, the ports the descriptors name, the CPUs, a kernel's clock and interrupt delivery. Each seam and stub is
-//! fixed machine code the implementation emits, with relocations the image writer resolves into
-//! the image's own addresses.
+//! stubs, the ports the descriptors name, the CPUs, a kernel's clock and scheduling, interrupt
+//! delivery with the devices installed on it and the AArch64 ITS, the IOMMU's invalidations and
+//! interrupt remapping, and the CPU signal. Each seam and stub is fixed machine code the
+//! implementation emits, with relocations the image writer resolves into the image's own
+//! addresses.
 
 mod aarch64;
+mod bindings;
 mod clock;
 mod cpus;
+mod handoff;
 pub mod heap;
 mod interrupts;
+mod iommu;
+mod its;
 mod memory;
 mod ports;
+pub mod schedule;
+mod signal;
+pub mod start;
 mod stubs;
 
-pub use interrupts::{IDT_BYTES, binding, device};
+pub use bindings::{device, msi};
+pub use interrupts::IDT_BYTES;
 pub use stubs::Stub;
 
 use cranelift_codegen::binemit::Reloc;
@@ -95,29 +105,30 @@ const UEFI_SEAM: &[u8] = &[
 /// floating point and Advanced SIMD, loads the entry root, the memory attributes and the
 /// translation control, which walks the entry root for the low addresses and no table for the
 /// high ones, its physical address size the processor's up to 48 bits, turns the MMU and caches
-/// on, sets the boot stack, and calls the boot glue with the device tree's address `0x4000_0000`
-/// and zero. Its literal pool, after the code, holds the entry root's address, the memory
-/// attributes, the translation control without its physical address size, the boot stack's top
-/// and the boot glue's address; the image writer patches the first, fourth and fifth.
+/// on, sets the boot stack, and calls the boot glue with the `x0` and `x1` it entered with, `x0`
+/// becoming `0x4000_0000` when both are zero. Its literal pool, after the code, holds the entry
+/// root's address, the memory attributes, the translation control without its physical address
+/// size, the boot stack's top and the boot glue's address; the image writer patches the first,
+/// fourth and fifth.
 const AARCH64_BARE_SEAM: &[u8] = &[
     0x49, 0x10, 0x38, 0xd5, 0x29, 0x05, 0x6c, 0xb2, 0x49, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
-    0x89, 0x03, 0x00, 0x58, 0x09, 0x20, 0x18, 0xd5, 0x89, 0x03, 0x00, 0x58, 0x09, 0xa2, 0x18, 0xd5,
-    0x89, 0x03, 0x00, 0x58, 0x0a, 0x07, 0x38, 0xd5, 0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1,
+    0xc9, 0x03, 0x00, 0x58, 0x09, 0x20, 0x18, 0xd5, 0xc9, 0x03, 0x00, 0x58, 0x09, 0xa2, 0x18, 0xd5,
+    0xc9, 0x03, 0x00, 0x58, 0x0a, 0x07, 0x38, 0xd5, 0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1,
     0xab, 0x00, 0x80, 0xd2, 0x4a, 0x91, 0x8b, 0x9a, 0x29, 0x81, 0x0a, 0xaa, 0x49, 0x20, 0x18, 0xd5,
     0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x37, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x10, 0x38, 0xd5,
     0xaa, 0x00, 0x82, 0xd2, 0x29, 0x01, 0x0a, 0xaa, 0x09, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
-    0xc9, 0x01, 0x00, 0x58, 0x3f, 0x01, 0x00, 0x91, 0x00, 0x00, 0xa8, 0xd2, 0x01, 0x00, 0x80, 0xd2,
-    0x89, 0x01, 0x00, 0x58, 0x20, 0x01, 0x3f, 0xd6, 0x7f, 0x20, 0x03, 0xd5, 0xff, 0xff, 0xff, 0x17,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x10, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x09, 0x02, 0x00, 0x58, 0x3f, 0x01, 0x00, 0x91, 0x60, 0x00, 0x00, 0xb5, 0x41, 0x00, 0x00, 0xb5,
+    0x00, 0x00, 0xa8, 0xd2, 0xa9, 0x01, 0x00, 0x58, 0x20, 0x01, 0x3f, 0xd6, 0x7f, 0x20, 0x03, 0xd5,
+    0xff, 0xff, 0xff, 0x17, 0x1f, 0x20, 0x03, 0xd5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x44, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// The offsets within `AARCH64_BARE_SEAM` of the literal-pool entries the image writer patches:
 /// the entry root's address, the boot stack's top and the boot glue's address.
-const AARCH64_SEAM_ROOT: u32 = 0x80;
-const AARCH64_SEAM_STACK: u32 = 0x98;
-const AARCH64_SEAM_BOOT: u32 = 0xa0;
+const AARCH64_SEAM_ROOT: u32 = 0x88;
+const AARCH64_SEAM_STACK: u32 = 0xa0;
+const AARCH64_SEAM_BOOT: u32 = 0xa8;
 
 /// The `aarch64-uefi` entry seam's machine code: the firmware calls it in the Procedure Call
 /// Standard with the image handle in `x0` and the system table in `x1`, under the MMU it set up;
@@ -165,11 +176,16 @@ pub mod secondary {
 impl Lowering<'_, '_> {
     /// Switches task stacks: saves the running stack's execution to the context at `store`,
     /// restores the one at `load` and resumes it with `payload`. Cranelift lowers the switch on
-    /// x86_64; on AArch64, which Cranelift's backend cannot, the `Switch` compiler stub does.
+    /// x86_64; on AArch64, which Cranelift's backend cannot, a compiler stub does, keeping the
+    /// floating-point registers host code keeps across calls.
     pub fn switch_stacks(&mut self, fx: &mut Fx, store: Value, load: Value, payload: Value) {
         match self.ck.db.target.arch() {
             Some(Arch::Aarch64) => {
-                self.call_stub(fx, Stub::Switch, &[store, load, payload]);
+                let stub = match self.machine() {
+                    true => Stub::MachineSwitch,
+                    false => Stub::Switch,
+                };
+                self.call_stub(fx, stub, &[store, load, payload]);
             }
             _ => {
                 fx.b.ins().stack_switch(store, load, payload);
@@ -398,9 +414,11 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The start of a boot glue: records the two values the platform entered the image with,
-    /// then sets up the runtime, ending with status 71 when it cannot start.
+    /// The start of a boot glue: checks the image's codegen level, records the two values the
+    /// platform entered the image with, then sets up the runtime, ending with status 71 when the
+    /// level or the runtime cannot start.
     pub fn start_boot(&mut self, fx: &mut Fx, params: &[Value]) {
+        self.check_level(fx);
         let state_address = self.state(fx);
         fx.store(params[0], state_address, state::PLATFORM);
         fx.store(params[1], state_address, state::PLATFORM_TABLE);
@@ -551,3 +569,6 @@ impl Lowering<'_, '_> {
         gdtr
     }
 }
+
+#[cfg(test)]
+mod tests;

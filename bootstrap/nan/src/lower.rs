@@ -16,6 +16,7 @@ mod fx;
 mod held;
 pub(crate) mod host;
 mod layout;
+mod levels;
 mod lines;
 pub mod machine;
 mod place;
@@ -45,7 +46,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId, TypeKey};
 use crate::check::ty::{self as ty, Args, Ty};
 use crate::nir::{Role, Span};
-use crate::workspace::{Arch, Target};
+use crate::workspace::{Arch, Level, Target};
 pub use abi::Abi;
 use fx::Fx;
 use layout::Layouts;
@@ -73,6 +74,8 @@ pub enum Instance {
     /// A method of an interface that a type implements through a conformance the toolchain
     /// supplies; `args` are the method's own type arguments.
     Conformance { ty: Ty, method: String, args: Args },
+    /// An operation of a protocol, or its summary, called through an outbox.
+    Operation { protocol: ItemId, method: u32 },
     /// The release of a value of a type.
     Release(Ty),
     /// The code of a function value naming a function: the instance called through the ABI of
@@ -107,6 +110,8 @@ pub enum Glue {
     RaceEnd,
     /// What the executor thread does once a race's task has ended.
     RaceDone,
+    /// What a domain's first task does once its entry ends: closes the domain.
+    DomainEnd,
     /// What the executor thread does once a domain's first task has ended.
     DomainDone,
     /// What the executor thread does once a kernel anchor's first task has ended.
@@ -165,6 +170,8 @@ pub enum Glue {
     WithdrawRun,
     /// Withdraws a stopped poster's entry from a runner's intake.
     WithdrawPost,
+    /// Withdraws a stopped holder's wait on its stepper.
+    WithdrawStepper,
     /// Withdraws a waiting operation from the sim waiter slot its record names.
     SimWithdraw,
     /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
@@ -179,6 +186,8 @@ pub enum Glue {
     /// Moves the captures of a task closure, the closure function's instance, into another
     /// domain's reach.
     Captures(Instance),
+    /// Calls a hook of a kernel policy of a type.
+    Policy(machine::schedule::Hook, Ty),
 }
 
 impl Glue {
@@ -191,6 +200,7 @@ impl Glue {
                 | Glue::ChildDone
                 | Glue::RaceEnd
                 | Glue::RaceDone
+                | Glue::DomainEnd
                 | Glue::DomainDone
                 | Glue::AnchorDone
                 | Glue::ComponentDone
@@ -200,6 +210,7 @@ impl Glue {
                 | Glue::WithdrawWhen
                 | Glue::WithdrawRun
                 | Glue::WithdrawPost
+                | Glue::WithdrawStepper
                 | Glue::SimWithdraw
                 | Glue::WithdrawSignal(_)
         )
@@ -208,7 +219,7 @@ impl Glue {
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: [&str; 8] = [
+const CRITICAL_OWNERS: [&str; 14] = [
     "sys::Domain",
     "task::Sender",
     "task::Receiver",
@@ -217,6 +228,12 @@ const CRITICAL_OWNERS: [&str; 8] = [
     "sys::Outbox",
     "mem::Shared",
     "task::Cown",
+    "hw::Ring0",
+    "hw::Dma",
+    "hw::DmaShared",
+    "hw::Iommu",
+    "hw::IoDomain",
+    "hw::PciFunction",
 ];
 
 /// The outcome of lowering a final closure.
@@ -242,6 +259,8 @@ pub struct Program {
     pub prefixes: HashMap<String, String>,
     /// The content of the image's `.nan` section.
     pub section: Vec<u8>,
+    /// The codegen level of the program's manifest for the target's architecture.
+    pub level: Option<Level>,
 }
 
 pub struct Lowering<'c, 'a> {
@@ -249,6 +268,8 @@ pub struct Lowering<'c, 'a> {
     pub module: ObjectModule,
     pub layouts: Layouts,
     isa: OwnedTargetIsa,
+    /// The codegen level the image's code is generated for, none for the base set.
+    level: Option<Level>,
     prefixes: HashMap<String, String>,
     roots: Vec<PackageId>,
     instances: HashMap<Instance, FuncId>,
@@ -266,8 +287,8 @@ pub struct Lowering<'c, 'a> {
     glue: u32,
     state_id: Option<DataId>,
     thread_id: Option<DataId>,
-    /// A machine image's compiler stubs, its vector seam, the data objects it reserves by name,
-    /// and the sizes of its interrupt stacks once declared.
+    /// The image's compiler stubs, and a machine image's vector seam, the data objects it reserves
+    /// by name and the sizes of its interrupt stacks, once declared.
     machine_stubs: HashMap<machine::Stub, FuncId>,
     vector_seam: Option<FuncId>,
     reserved: HashMap<&'static str, DataId>,
@@ -293,13 +314,13 @@ enum Pending {
 }
 
 /// The settings an image's code is generated with: the base set of its architecture, the x86-64
-/// one with SSE2 or the A64 one of Armv8.0-A, frame pointers in every function, Cranelift's stack
-/// switching where it has it, and the canonical NaN as the NaN every float operation returns. A
-/// host image is position-independent and links against glibc with inline stack probes for its
-/// guard pages; a machine image loads at a fixed address and is not position-independent, so its
-/// code reaches its own functions and data directly, with no global offset table and no stack
-/// probes.
-fn isa(target: Target) -> OwnedTargetIsa {
+/// one with SSE2 or the A64 one of Armv8.0-A, with the extensions of its codegen level, frame
+/// pointers in every function, Cranelift's stack switching where it has it, and the canonical NaN
+/// as the NaN every float operation returns. A host image is position-independent and links
+/// against glibc with inline stack probes for its guard pages; a machine image loads at a fixed
+/// address and is not position-independent, so its code reaches its own functions and data
+/// directly, with no global offset table and no stack probes.
+fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
     let mut flags = settings::builder();
     let host = target.is_host();
     let triple = match (target.arch(), host) {
@@ -322,15 +343,24 @@ fn isa(target: Target) -> OwnedTargetIsa {
     ] {
         flags.set(name, value).expect("a Cranelift setting");
     }
-    cranelift_codegen::isa::lookup_by_name(triple)
-        .expect("the target's backend")
+    let mut builder = cranelift_codegen::isa::lookup_by_name(triple).expect("the target's backend");
+    for extension in level.map_or(&[][..], Level::extensions) {
+        builder.enable(extension).expect("a Cranelift ISA setting");
+    }
+    builder
         .finish(settings::Flags::new(flags))
         .expect("the target's settings")
 }
 
 /// Lowers the reach of a program's final build.
 pub fn lower(ck: &Checker, program: &Program) -> Lowered {
-    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
+    let mut lowering = Lowering::new(
+        ck,
+        program.prefixes.clone(),
+        program.roots.clone(),
+        program.level,
+        None,
+    );
     host::entry_seam(&mut lowering, program);
     lowering.drain();
     lowering.finish(Some(&program.section))
@@ -340,7 +370,13 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
 /// entry landing fn behind the machine entry seam, into an object the image writer turns into an
 /// image.
 pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
-    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
+    let mut lowering = Lowering::new(
+        ck,
+        program.prefixes.clone(),
+        program.roots.clone(),
+        program.level,
+        None,
+    );
     let boot = lowering.boot_glue(program);
     let stack = lowering.boot_stack(program);
     lowering.entry_seam(boot, stack);
@@ -349,14 +385,16 @@ pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
-    /// A lowering into a new object, of a test image when `test` is given.
+    /// A lowering into a new object, for a codegen level when `level` is given, of a test image
+    /// when `test` is given.
     fn new(
         ck: &'c Checker<'a>,
         prefixes: HashMap<String, String>,
         roots: Vec<PackageId>,
+        level: Option<Level>,
         test: Option<test_image::Runtime>,
     ) -> Self {
-        let isa = isa(ck.db.target);
+        let isa = isa(ck.db.target, level);
         let builder = ObjectBuilder::new(
             isa.clone(),
             "nan",
@@ -368,6 +406,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             module: ObjectModule::new(builder),
             layouts: Layouts::new(),
             isa,
+            level,
             prefixes,
             roots,
             instances: HashMap::new(),
@@ -468,6 +507,17 @@ impl<'c, 'a> Lowering<'c, 'a> {
         match instance {
             Instance::Nir {
                 item,
+                role: Role::Body,
+                args,
+                ..
+            } if !self.machine()
+                && self.ck.db.is_std(*item)
+                && supplied::simd::vectorized(&self.ck.db.canonical(*item)) =>
+            {
+                supplied::simd::lower_vector(self, fx, abi, *item, args)
+            }
+            Instance::Nir {
+                item,
                 role,
                 index,
                 args,
@@ -480,6 +530,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
             } => conform::derived(self, fx, abi, *owner, method, args),
             Instance::Conformance { ty, method, .. } => {
                 conform::supplied(self, fx, abi, ty, method)
+            }
+            Instance::Operation { protocol, method } => {
+                supplied::tasks::protocols::call(self, fx, abi, *protocol, *method as usize)
             }
             Instance::Release(ty) => release::define(self, fx, ty),
             Instance::Value(inner) => call::value_glue(self, fx, abi, inner),
@@ -514,6 +567,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
             .iter()
             .enumerate()
             .filter_map(|(position, (nty, _))| match nty.ty() {
+                Ty::Fn(fn_ty) if fn_ty.kind == crate::syntax::ast::FnKind::Task => {
+                    Some((position, None))
+                }
                 Ty::Fn(fn_ty) => Some((position, fn_ty.limits.stack)),
                 _ => None,
             })
@@ -539,8 +595,11 @@ impl<'c, 'a> Lowering<'c, 'a> {
             Role::Body => {
                 demanded.extend(self.ck.fn_sig(item).and_then(|sig| sig.limits.stack));
                 if let Some(implemented) = self.ck.implemented_method(item)
-                    && let crate::check::sig::SigKind::Interface { methods } =
-                        &self.ck.sig(implemented.interface).kind
+                    && let crate::check::sig::SigKind::Interface { methods }
+                    | crate::check::sig::SigKind::Protocol {
+                        operations: methods,
+                        ..
+                    } = &self.ck.sig(implemented.interface).kind
                 {
                     demanded.extend(methods[implemented.method].sig.limits.stack);
                 }
@@ -562,14 +621,15 @@ impl<'c, 'a> Lowering<'c, 'a> {
     /// The line table flags of an instance's function: trap reports leave out the frames of
     /// std items and of the code lowering writes itself, and a stopping task does not stop
     /// inside a std function of a type with interior mutability or of `task::Sender`,
-    /// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared` or
-    /// `task::Cown`.
+    /// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared`, `task::Cown`
+    /// or `hw::Ring0`.
     fn frame_flags(&self, instance: &Instance) -> u32 {
         let (hidden, critical) = match instance {
             Instance::Nir { item, args, .. } | Instance::Supplied { item, args } => {
                 let std = self.ck.db.is_std(*item);
                 (std, std && self.critical_owner(*item, args))
             }
+            Instance::Operation { .. } => (true, true),
             _ => (true, false),
         };
         let hidden = if hidden { lines::HIDDEN } else { 0 };
@@ -699,6 +759,11 @@ impl<'c, 'a> Lowering<'c, 'a> {
         sites
     }
 
+    /// The function of a glue already asked for.
+    pub fn glue(&self, glue: &Glue) -> Option<FuncId> {
+        self.glues.get(glue).copied()
+    }
+
     /// The function of a glue, declared and defined when first asked for.
     pub fn glue_function(
         &mut self,
@@ -719,8 +784,18 @@ impl<'c, 'a> Lowering<'c, 'a> {
             true => lines::HIDDEN | lines::CRITICAL,
             false => lines::HIDDEN,
         };
+        let walked = match &glue {
+            Glue::Transfer(Ty::Item(item, args)) => {
+                let ty = Ty::Item(*item, args.clone());
+                Some(self.ck.show(&ty, self.ck.db.module_of(*item)))
+            }
+            _ => None,
+        };
         self.glues.insert(glue, id);
         self.define(id, signature, flags, build);
+        if let Some(walked) = walked {
+            self.frames.last_mut().expect("the frame just defined").name = walked;
+        }
         id
     }
 

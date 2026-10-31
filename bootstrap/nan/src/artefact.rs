@@ -31,8 +31,18 @@ pub struct Parts {
     /// Each file holding the first line of a span, by path as spans write it, with each such
     /// line's number and text, in line order.
     pub lines: Vec<(String, Vec<(u32, String)>)>,
-    /// Each component state's canonical path and schema hash.
-    pub schemas: Vec<(String, Hash)>,
+    /// The canonical path of each type whose schema tree the code root records, with the
+    /// tree's `mem::wire` encoding.
+    pub schemas: Vec<(String, Vec<u8>)>,
+    pub protocols: Vec<ProtocolRoot>,
+}
+
+/// A `pub` protocol as a code root records it: its canonical path, its protocol hash, and the
+/// name and operation hash of each of its `pub` operations.
+pub struct ProtocolRoot {
+    pub path: String,
+    pub hash: Hash,
+    pub operations: Vec<(String, Hash)>,
 }
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -117,14 +127,34 @@ pub fn code_root(parts: &Parts) -> Vec<u8> {
             parts
                 .schemas
                 .iter()
-                .map(|(path, hash)| {
+                .map(|(path, tree)| {
                     let mut out = text(path);
-                    bytes(&mut out, &hash.0);
+                    bytes(&mut out, tree);
                     out
                 })
                 .collect(),
         ),
     );
+    if !parts.protocols.is_empty() {
+        record.field(
+            11,
+            sorted_list(
+                parts
+                    .protocols
+                    .iter()
+                    .map(|protocol| {
+                        let mut out = text(&protocol.path);
+                        out.extend(hash_bytes(&protocol.hash));
+                        list(&mut out, protocol.operations.iter(), |out, (name, hash)| {
+                            out.extend(text(name));
+                            out.extend(hash_bytes(hash));
+                        });
+                        out
+                    })
+                    .collect(),
+            ),
+        );
+    }
     record.finish()
 }
 
@@ -349,6 +379,27 @@ impl Decoded {
                 .is_none_or(|key| *key == signer.key)
         });
         publisher.as_ref().map(|signer| &signer.key) == pinned && trusted && anchored
+    }
+
+    /// The source tree hash its attestation file records, none when that file holds none.
+    pub fn source_tree(&self) -> Option<Hash> {
+        let fields = owned_record(&self.attestation)?;
+        Some(Hash(held_bytes(field(&fields, 2)?)?))
+    }
+
+    /// The schema tree of each type its code root records, by canonical path, as its `mem::wire`
+    /// encoding; none when the code root holds no such list.
+    pub fn schema_trees(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        let fields = owned_record(&self.code_root)?;
+        let (count, mut rest) = read_uvar(field(&fields, 10)?)?;
+        let mut trees = Vec::new();
+        for _ in 0..count {
+            let (path, after) = read_bytes(rest)?;
+            let (tree, after) = read_bytes(after)?;
+            trees.push((String::from_utf8(path.to_vec()).ok()?, tree.to_vec()));
+            rest = after;
+        }
+        rest.is_empty().then_some(trees)
     }
 
     /// The public key of the artefact's publisher, when it holds sections.

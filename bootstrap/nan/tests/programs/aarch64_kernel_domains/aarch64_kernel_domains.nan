@@ -1,0 +1,91 @@
+//! Runs in domains a division by zero, a faulting load, a spin a watchdog abandons and a trap holding a device.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// An address the entry root leaves unmapped, whose load faults.
+const UNMAPPED: usize = 0x1_0000_0000
+
+/// The shared peripheral interrupt a dead domain's device is installed on for CPU 1, and then a
+/// device for CPU 2.
+const DEVICE_VECTOR: u8 = 40
+
+/// The nanoseconds the watchdog lets the spinning body run.
+const WATCHDOG_NS: u64 = 20_000_000
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+/// Writes a line naming a domain run and how it ended.
+fn outcome(name: Str, ended: Result[u32, sys::Trap]) {
+    say(text: name)
+    let Err(trap) = ended else {
+        say(text: " returned\n")
+        return
+    }
+    match trap.kind() {
+        sys::TrapKind.DivisionByZero => say(text: " trap.division-by-zero\n")
+        sys::TrapKind.Exception => say(text: " trap.exception\n")
+        sys::TrapKind.Abandoned => say(text: " trap.abandoned\n")
+        else => say(text: " another trap\n")
+    }
+} outcome
+
+fn rate(level: u32) -> u32 {
+    return 1_000 / level
+} rate
+
+interrupt fn tally(mut tallied: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    tallied = tallied.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} tally
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        let level = hw::cpu_count() / 8
+        let divided = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            return rate(level)
+        }, exec, alloc)
+        outcome(name: "divided", ended: divided)
+        let faulted = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            let value = trusted "the load faults, the address being unmapped" { hw::Ptr[u64].of_addr(UNMAPPED).read() }
+            return u32.truncate(value)
+        }, exec, alloc)
+        outcome(name: "faulted", ended: faulted)
+        let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc)
+        var spun: Result[u32, sys::Trap] = Ok(0)
+        try await task::scope(exec, body: fn[mut spun](s: task::Scope) fails task::Cancelled uses wait {
+            let watch = abandoner.share()
+            discard s.spawn(fn[take watch]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await clock.sleep_ns(WATCHDOG_NS)
+                watch.contents().trigger()
+            })
+            spun = try await abandoner.contents().run(fn() -> u32 limits stack 4_096 {
+                var spins: u32 = 0
+                loop {
+                    spins = spins.wrapping_add(1)
+                }
+            }, exec, alloc)
+        })
+        outcome(name: "spun", ended: spun)
+        let held = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            let shared = hw::IrqShared.install_on(0u64, cpu: 1, vector: DEVICE_VECTOR, on_irq: tally)
+            let rated = rate(level)
+            discard take shared.uninstall()
+            return rated
+        }, exec, alloc)
+        outcome(name: "held", ended: held)
+        let other = hw::IrqShared.install_on(0u64, cpu: 2, vector: DEVICE_VECTOR, on_irq: tally)
+        discard take other.uninstall()
+        say(text: "vector free again\n")
+    })
+} main

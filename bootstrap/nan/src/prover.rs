@@ -236,7 +236,7 @@ impl Checker<'_> {
                             Role::Requires,
                             index,
                             &implemented.args,
-                            params.clone(),
+                            params[implemented.params.clone()].to_vec(),
                         )
                     {
                         inherited.push(term);
@@ -555,7 +555,8 @@ impl Checker<'_> {
                         walk.predicate_facts(*term, &subst.ty(&param.ty), boundary, &mut facts);
                     }
                     if function.role != Role::Entry {
-                        for requires in self.entry_requires(item) {
+                        let (entry_requires, shared) = self.entry_requires(item);
+                        for requires in entry_requires {
                             let Callable::Item {
                                 item: holder,
                                 index,
@@ -571,8 +572,9 @@ impl Checker<'_> {
                                 continue;
                             }
                             let args = subst.args(&requires.args);
+                            let read = params[shared.clone()].to_vec();
                             if let Some(fact) =
-                                walk.returned(holder, Role::Requires, index, &args, params.clone())
+                                walk.returned(holder, Role::Requires, index, &args, read)
                             {
                                 facts.push(fact);
                             }
@@ -645,7 +647,8 @@ impl Checker<'_> {
                 &mut facts,
             );
         }
-        for requires in self.entry_requires(item) {
+        let (entry_requires, shared) = self.entry_requires(item);
+        for requires in entry_requires {
             let Callable::Item {
                 item: holder,
                 index,
@@ -655,7 +658,8 @@ impl Checker<'_> {
                 continue;
             };
             let args = subst.args(&requires.args);
-            if let Some(fact) = walk.returned(holder, Role::Requires, index, &args, entry.clone()) {
+            let read = entry[shared.clone()].to_vec();
+            if let Some(fact) = walk.returned(holder, Role::Requires, index, &args, read) {
                 facts.push(fact);
             }
         }
@@ -724,7 +728,7 @@ impl Checker<'_> {
         };
         let bodies: Vec<Rc<crate::check::tir::TBody>> = match &self.db.ast(item).kind {
             ItemKind::Fn(_) => self.typed(item).into_iter().collect(),
-            ItemKind::Interface(_) => self.method_typed(item),
+            ItemKind::Interface(_) | ItemKind::Protocol(_) => self.method_typed(item),
             _ => Vec::new(),
         };
         bodies

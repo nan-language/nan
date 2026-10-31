@@ -132,7 +132,11 @@ impl<'a> Walk<'a> {
         let tree = self.tree;
         let children: Vec<NodeId> = tree.child_nodes(node).collect();
         match tree.rule(node) {
-            Rule::FnItem | Rule::TestItem | Rule::InterfaceMember | Rule::RetiredItem => {
+            Rule::FnItem
+            | Rule::TestItem
+            | Rule::InterfaceMember
+            | Rule::ProtocolOperation
+            | Rule::RetiredItem => {
                 let parameters = self.parameters(node);
                 self.found.parameters.extend(parameters.iter().copied());
                 scoped(parameters, children)
@@ -224,8 +228,8 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The name tokens of the parameters a function, test, interface method, tombstone or
-    /// closure declares.
+    /// The name tokens of the parameters a function, test, interface method, operation,
+    /// tombstone or closure declares.
     fn parameters(&self, node: NodeId) -> Vec<u32> {
         let tree = self.tree;
         let params = match tree.rule(node) {
@@ -241,6 +245,9 @@ impl<'a> Walk<'a> {
             ),
             Rule::InterfaceMember => {
                 tree.list_elements(tree.find(node, Rule::ParamList), Rule::Param)
+            }
+            Rule::ProtocolOperation => {
+                tree.list_elements(tree.find(node, Rule::OperationParams), Rule::OperationParam)
             }
             Rule::RetiredItem => tree.list_elements(
                 tree.find(node, Rule::RetiredOld)

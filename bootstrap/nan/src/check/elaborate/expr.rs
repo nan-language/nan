@@ -354,7 +354,7 @@ impl Elab<'_, '_> {
                     fields: ordered,
                 }
             }
-            (SigKind::Enum { variants }, Some(index)) => {
+            (SigKind::Enum { variants } | SigKind::Protocol { variants, .. }, Some(index)) => {
                 let variant = &variants[index];
                 let payload = match &variant.payload {
                     crate::check::sig::Payload::None => Payload::None,

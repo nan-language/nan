@@ -1,6 +1,6 @@
 //! `nan verify`: the release gate over the packages holding its scope and those they reach
-//! through chains of relative-path sources: their checks, their tests, their API snapshots,
-//! pending weakenings and seals.
+//! through chains of relative-path sources: their checks, their tests, the checks of the releases
+//! they reach, their API snapshots, pending weakenings and seals.
 
 use std::io;
 use std::path::Path;
@@ -59,8 +59,9 @@ pub fn run(
 }
 
 /// What the release gate reports on packages: their check diagnostics, then, when none is an
-/// error, their tests' report, and their gate diagnostics, `authors` being the author principals
-/// a publication names; by path, line and code.
+/// error, their tests' report, and the errors of checking the releases they reach and their gate
+/// diagnostics, `authors` being the author principals a publication names; by path, line and
+/// code.
 pub fn judged(
     workspace: &Workspace,
     packages: &[usize],
@@ -98,7 +99,9 @@ pub fn judged(
         }
     }
     for index in packages {
-        diagnostics.extend(check::gate(workspace, &workspace.packages[*index], authors));
+        let package = &workspace.packages[*index];
+        diagnostics.extend(check::release_check(workspace, package));
+        diagnostics.extend(check::gate(workspace, package, authors));
     }
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))

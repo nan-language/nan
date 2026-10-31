@@ -8,12 +8,12 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 | Package | Holds | Modules below the root |
 | --- | --- | --- |
-| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures | `core::atomic`, `core::crypto` |
+| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures, lane types | `core::atomic`, `core::crypto`, `core::simd` |
 | `mem` | allocators, budgets, stores, ids, handles, boxes, shared values, collections, once maps | `mem::wire` |
 | `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
 | `sys` | the sys capabilities, revocation, domains, components | `sys::fs`, `sys::net`, `sys::sim` |
-| `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, scheduling, physical memory, platform registries | `hw::sim` |
+| `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, cross-CPU operations, scheduling, physical memory, platform registries | `hw::sim` |
 | `boot` | the uefi and bare root grants, firmware services | none |
 | `host` | the host root grant, the component runner | none |
 | `testing` | the simulated world, structural comparison | none |
@@ -23,7 +23,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
-- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -58,9 +58,11 @@ The table names every pub std type, interface, free function and registry with t
 | `core` | `Render`, `core::Renderer` | [Render](13-text-encode.md#render) |
 | `core` | `Encode`, `core::Encoder`, `core::Decoder`, `core::DecodeError` | [Encode](13-text-encode.md#encode), [Encoders and decoders](13-text-encode.md#encoders-and-decoders) |
 | `core` | `Untrusted`, `core::Parts` | [Untrusted values](15-untrusted.md#untrusted-values), [Content-blind operations](15-untrusted.md#content-blind-operations) |
+| `core` | `core::Secret`, `core::SecretBits` | [Secret values](15-untrusted.md#secret-values) |
 | `core` | `Generate`, `core::Choices` | [Generation](22-testing.md#generation) |
 | `core` | `core::atomic::AtomicU8`, `core::atomic::AtomicU16`, `core::atomic::AtomicU32`, `core::atomic::AtomicU64`, `core::atomic::AtomicUsize`, `core::atomic::AtomicBool` | [Atomics](16-concurrency.md#atomics) |
 | `core` | `core::crypto::PublicKey`, `core::crypto::Signature`, `core::crypto::SecretKey` | [Signatures](31-trust.md#signatures) |
+| `core` | `core::simd::U8x16`, `core::simd::I8x16`, `core::simd::U16x8`, `core::simd::I16x8`, `core::simd::U32x4`, `core::simd::I32x4`, `core::simd::U64x2`, `core::simd::I64x2`, `core::simd::F32x4`, `core::simd::F16x8`, `core::simd::Mask8x16`, `core::simd::Mask16x8`, `core::simd::Mask32x4`, `core::simd::Mask64x2` | [Lanes](09-numbers.md#lanes) |
 | `mem` | `mem::Alloc`, `mem::Budget`, `mem::OutOfMemory` | [Allocators](12-memory.md#allocators), [Budgets](12-memory.md#budgets), [Growth](12-memory.md#growth) |
 | `mem` | `mem::Heap`, `mem::Arena`, `mem::Id`, `mem::Pool`, `mem::Handle` | [Stores](12-memory.md#stores) |
 | `mem` | `mem::Box` | [Box](07-ownership.md#box); `from_box` in [Dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch) |
@@ -68,7 +70,10 @@ The table names every pub std type, interface, free function and registry with t
 | `mem` | `mem::Entry`, `mem::KeyValue`, `mem::List`, `mem::Bytes`, `mem::Map`, `mem::HashMap`, `mem::Set`, `mem::Bounded` | [Collections](12-memory.md#collections); `get_by`, `get_by_mut` and `contains_by` in [Ordered lookup](#ordered-lookup); `mem::Map.at`, `mem::Map.at_mut`, `mem::HashMap.at` and `mem::HashMap.at_mut` in [Maps and sets](12-memory.md#maps-and-sets) |
 | `mem` | `mem::ArenaCursor`, `mem::PoolCursor`, `mem::ListCursor`, `mem::BoundedCursor`, `mem::MapCursor`, `mem::MapCursorMut`, `mem::MapIntoCursor`, `mem::HashMapCursor`, `mem::HashMapCursorMut`, `mem::HashMapIntoCursor`, `mem::SetCursor`, `mem::SetIntoCursor` | [Memory types](12-memory.md#memory-types) |
 | `mem` | `mem::OnceMap` | [Once maps](12-memory.md#once-maps) |
-| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format) |
+| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format); `schema_hash` and `schema` in [Schema hashes](13-text-encode.md#schema-hashes), `canonical` and `erased` in [Erased decoders](13-text-encode.md#erased-decoders), `decode_from` and `encode_as` in [Migrations](13-text-encode.md#migrations) |
+| `mem` | `mem::wire::Kept` | [Flexible structs](13-text-encode.md#flexible-structs) |
+| `mem` | `mem::wire::SchemaHash`, `mem::wire::Schema`, `mem::wire::SchemaField`, `mem::wire::SchemaVariant` | [Schema hashes](13-text-encode.md#schema-hashes); `mem::wire::Schema.accepts` in [Encode class](29-identity-versioning.md#encode-class) |
+| `mem` | `mem::wire::Erased` | [Erased decoders](13-text-encode.md#erased-decoders) |
 | `text` | `text::String`, `text::Fixed` | [Text types](13-text-encode.md#text-types) |
 | `text` | `text::utf8::Utf8Error`, `text::utf8::valid_prefix`, `text::utf8::is_valid`, `text::utf8::char_at`, `text::utf8::write_char` | [UTF-8](13-text-encode.md#utf-8) |
 | `text` | `text::Symbol`, `text::Interner` | [Interning](13-text-encode.md#interning) |
@@ -80,15 +85,18 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::within`, `task::within_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
 | `task` | `task::Cown`, `task::Poisoned` | [Cowns](16-concurrency.md#cowns), [Poisoned cowns](16-concurrency.md#poisoned-cowns) |
 | `task` | `task::Channel`, `task::Sender`, `task::Receiver`, `task::SendError` | [Channels](16-concurrency.md#channels) |
-| `task` | `task::Executor` | [Executors](16-concurrency.md#executors) |
+| `task` | `task::Executor`, `task::Share`, `task::Account` | [Executors](16-concurrency.md#executors) |
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
 | `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
-| `sys` | `sys::Domain`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
+| `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
+| `sys` | `sys::Domain`, `sys::Abandoner`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
 | `sys` | `sys::Component` | [Components](26-components.md#components) |
 | `sys` | `sys::Cx` | [Component context](26-components.md#component-context); `spawn` and `cancel` in [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
+| `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
+| `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
 | `hw` | `hw::Ptr` | [Pointers](23-low-level.md#pointers); atomic members in [Trusted atomics](23-low-level.md#trusted-atomics) |
 | `hw` | `hw::Order`, `hw::fence` | [Trusted atomics](23-low-level.md#trusted-atomics) |
@@ -96,14 +104,18 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::Register` | [Registers](23-low-level.md#registers) |
 | `hw` | `hw::Mmio`, `hw::Ports` | [Register windows](23-low-level.md#register-windows) |
 | `hw` | `hw::Dma`, `hw::DmaShared`, `hw::dma_fence` | [DMA](23-low-level.md#dma) |
-| `hw` | `hw::Ring0`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
+| `hw` | `hw::Ring0`, `hw::TlbScope`, `hw::CpuidRegs`, `hw::TscRead`, `hw::Protection`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
 | `hw` | `hw::mint_root` | [Landing functions](23-low-level.md#landing-functions) |
-| `hw` | `hw::Anchor`, `hw::cpu_count` | [Anchor](24-kernel.md#anchor) |
+| `hw` | `hw::Anchor`, `hw::cpu_count`, `hw::cpu_hardware_id` | [Anchor](24-kernel.md#anchor) |
 | `hw` | `hw::IrqContext`, `hw::TrapFrame`, `hw::NoCode`, `hw::ErrorCode`, `hw::PageFault`, `hw::IrqExit` | [Interrupt functions](24-kernel.md#interrupt-functions) |
 | `hw` | `hw::IrqsDisabled`, `hw::without_irqs` | [Interrupt state](24-kernel.md#interrupt-state) |
 | `hw` | `hw::Signal` | [Signals](24-kernel.md#signals) |
-| `hw` | `hw::SpinLock`, `hw::SpinGuard`, `hw::IrqShared` | [Locks](24-kernel.md#locks) |
-| `hw` | `hw::RunQueue`, `hw::SavedContext`, `hw::Resumable`, `hw::switch_to`, `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
+| `hw` | `hw::SpinLock`, `hw::IrqShared`, `hw::MsiMessage`, `hw::MsiError`, `hw::MsiRefusal` | [Locks](24-kernel.md#locks) |
+| `hw` | `hw::Iommu`, `hw::IoDomain`, `hw::IoSpace`, `hw::IommuError` | [I/O domains](23-low-level.md#io-domains) |
+| `hw` | `hw::PciFunction`, `hw::PciAddress`, `hw::PciError` | [PCI functions](24-kernel.md#pci-functions) |
+| `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |
+| `hw` | `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
+| `hw` | `hw::Policy`, `hw::TaskView`, `hw::Placement`, `hw::Idle` | [Policies](24-kernel.md#policies) |
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |
 | `hw` | `hw::vectors`, `hw::Vector`, `hw::VectorHandler`, `hw::syscall_entry`, `hw::SyscallEntry`, `hw::preempt`, `hw::PreemptEntry` | [Platform registries](25-registries.md#platform-registries) |
 | `hw` | `hw::sim::Registers` | [Sim constructors](22-testing.md#sim-constructors) |
@@ -278,12 +290,12 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext`, `hw::TrapFrame[V]`, `hw::SpinGuard[T]` and `hw::SavedContext`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
 
-The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn` and `sys::Revoker[C]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]` and `hw::IrqShared[T]` ([kernel types](24-kernel.md#kernel-types)). The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
+The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]`, `hw::Iommu`, `hw::IoDomain` and `hw::PciFunction` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
 
 The [authority summary](14-authority.md#authority-summaries) of each std package, published in its artefact, holds only entries of its row. "Trusted code" covers trusted blocks and expressions and `assume`; "decoders" are the decoders that the package's types derive.
 
@@ -292,8 +304,8 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `core` | none | `alloc` | decoders | trusted code, declassifying decoders |
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
 | `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction` | trusted code, declassifying decoders and validators |
-| `task` | `task::Executor`, `sys::Clock` | `alloc` | none | trusted code |
-| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `task::Executor` | `alloc` | none | trusted code |
+| `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
+| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `host` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
@@ -315,10 +327,11 @@ Apart from [device accesses](10-effects-digests.md#reversibility), the std opera
 
 | Operations | Class |
 | --- | --- |
-| `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console` | `recorded` |
+| `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console`, `boot::Services.measure` | `recorded` |
 | `sys::fs::File.write`, `sys::Net.listen` | `restorable` |
-| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove` | `irreversible(erase)` |
+| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove`, `boot::Services.write_file`, `boot::Services.delete_file`, `boot::Services.set_variable`, `boot::Services.submit_tpm` | `irreversible(erase)` |
 | `sys::Net.connect`, `sys::net::Conn.write`, `sys::net::Conn.close`, `sys::net::Conn.abandon` | `irreversible(emit)` |
+| `hw::Ring0.firmware_call`, `boot::Machine.enter` | `irreversible(emit, actuate, erase, spend)` |
 
 The classes of the operations of the sys capabilities and of the resources they open hold on the host targets and under `any`. On the machine targets, where those capabilities have values only as [sims](22-testing.md#simulated-capabilities), they are `traceless`.
 
@@ -329,8 +342,8 @@ A **platform package** is the package that mints a target's [root grant](14-auth
 | Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
 | `host_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
-| `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services`, through the firmware's boot services |
-| `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the start information, the PVH start information on `x86_64-bare` and the device tree on `aarch64-bare` |
+| `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services` and `boot::Machine.enter`, through the firmware's boot services |
+| `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the [start information](24-kernel.md#start-information) and, on `aarch64-bare`, the device tree |
 
 - A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI, PVH or device trees; no other std item has one.
 - No alias and no `dep` directive names a platform package, so no path outside it reaches its items. The [final closure](27-program-model.md#final-builds) of a program also holds the platform package its descriptor names, and no other.
@@ -459,10 +472,10 @@ pub fn record_all(mut history: mem::List[u32], values: Slice[u32]) fails mem::Ou
 
 ## Reserved std names
 
-The paths `sys::infer`, `sys::load` and `core::simd` are reserved: no std module or item has them, and a path whose first two segments are one of them is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
+The paths `sys::infer` and `sys::load` are reserved: no std module or item has them, and a path whose first two segments are one of them is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
 
 ```nan
-pub fn lane_count(data: Slice[u32]) -> usize {
-    return core::simd::lanes(data) // error: name.reserved
-} lane_count
+pub fn model_size(model: Str) -> usize {
+    return sys::infer::size(model) // error: name.reserved
+} model_size
 ```

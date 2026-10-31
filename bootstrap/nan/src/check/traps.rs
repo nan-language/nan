@@ -162,7 +162,8 @@ impl Checker<'_> {
                             ..
                         } => sources.push(Source::Callee(*callee, span, false)),
                         Callable::Method { interface, method }
-                            if !self.method_limits(*interface, *method).notrap =>
+                            if !self.is_protocol(*interface)
+                                && !self.method_limits(*interface, *method).notrap =>
                         {
                             sources.push(Source::Declared(span));
                         }
@@ -211,7 +212,11 @@ impl Checker<'_> {
 
     fn method_limits(&self, interface: ItemId, method: u32) -> LimitSet {
         match &self.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].sig.limits,
+            SigKind::Interface { methods }
+            | SigKind::Protocol {
+                operations: methods,
+                ..
+            } => methods[method as usize].sig.limits,
             _ => LimitSet::default(),
         }
     }

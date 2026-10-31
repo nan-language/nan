@@ -14,7 +14,7 @@ fn publish_run(invocation: Invocation, session: check::Session, current: Str, tr
         return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
     }
     trace.scoped(written.as_str(), alloc)
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
     }
@@ -93,7 +93,7 @@ fn local_package(invocation: Invocation, held: workspace::Workspace) -> Option[u
     let Some(dir) = local.slice_bytes(0, end: dir_end) else {
         return None
     }
-    return held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir)
+    return held.package_position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir)
 } local_package
 
 /// The publisher of a release published with `--as`: its principal and secret key.
@@ -246,7 +246,7 @@ fn published(
     waive length "one pass over the steps of a publish, in the bootstrap's order"
 {
     let held = session.workspace.contents()
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
     }
@@ -261,7 +261,8 @@ fn published(
     let history = source.machine.history()
     var history_path = text::String.of(source.dir.as_str(), alloc)
     mut history_path.append("/.nan/history.nan")
-    let staged_history = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: history_head(history), modules: moved_modules(history, moved: moved.tombstones.view(), alloc))
+    let none_recorded = mem::List[machine::SchemaRecord].empty(alloc)
+    let staged_history = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: history_head(history), modules: moved_modules(history, moved: moved.tombstones.view(), records: none_recorded.view(), alloc))
     var files = mem::Map[text::String, mem::Bytes].empty(alloc)
     for file in moved.changed {
         var content = mem::Bytes.empty(alloc)
@@ -344,7 +345,8 @@ fn published(
         }
     }
     let root = added.root(alloc)
-    let recorded = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: Some(root), modules: moved_modules(history, moved: moved.tombstones.view(), alloc))
+    let schemas = moved_session.schema_records(index)
+    let recorded = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: Some(root), modules: moved_modules(history, moved: moved.tombstones.view(), records: schemas.view(), alloc))
     let recorded_bytes = match recorded.bytes(grammar, alloc) {
         Some(bytes) => bytes
         None => mem::Bytes.empty(alloc)
@@ -406,7 +408,7 @@ fn signed_artefact(
         mut roots.push(artefact::ClosureRoot(package_name: text::String.of(member.key().as_str(), alloc), root: root))
     }
     var lock = mem::Bytes.empty(alloc)
-    match held.packages.get(index) {
+    match held.package_at(index) {
         Some(source) => {
             match source.machine.lock_file {
                 Some(loaded) => mut lock.append(loaded.bytes.view())
@@ -499,40 +501,59 @@ struct ModuleTombstone {
     text: text::String
 } ModuleTombstone
 
-/// The tombstones of a module of a package's history once a publish adds those it moves out of
-/// the package's source, each module's in byte order.
-fn moved_modules(history: Option[machine::History], moved: Slice[ModuleTombstone], alloc: mem::Alloc) -> mem::List[machine::ModuleTombstones] {
-    var modules = mem::Map[text::String, mem::List[text::String]].empty(alloc)
+/// The modules of a package's history once a publish adds the tombstones it moves out of the
+/// package's source and the schema records of its release, each module's in byte order.
+fn moved_modules(history: Option[machine::History], moved: Slice[ModuleTombstone], records: Slice[machine::SchemaRecord], alloc: mem::Alloc) -> mem::List[machine::HistoryModule] {
+    var modules = mem::Map[text::String, machine::HistoryModule].empty(alloc)
     match history {
         Some(recorded) => {
             for held in recorded.modules {
+                var schemas = mem::List[machine::TypeSchema].empty(alloc)
+                for schema in held.schemas {
+                    mut schemas.push(machine::TypeSchema(ty: text::String.of(schema.ty.as_str(), alloc), hash: schema.hash))
+                }
                 var tombstones = mem::List[text::String].empty(alloc)
                 for tombstone in held.tombstones {
                     mut tombstones.push(text::String.of(tombstone.as_str(), alloc))
                 }
-                discard mut modules.insert(text::String.of(held.module.as_str(), alloc), value: take tombstones)
+                discard mut modules.insert(text::String.of(held.module.as_str(), alloc), value: machine::HistoryModule(module: text::String.of(held.module.as_str(), alloc), schemas: take schemas, tombstones: take tombstones))
             }
         }
         None => {}
     }
     for tombstone in moved {
-        if not modules.contains(tombstone.module) {
-            discard mut modules.insert(text::String.of(tombstone.module.as_str(), alloc), value: mem::List[text::String].empty(alloc))
-        }
-        var held = mut modules.at_mut(tombstone.module)
-        if held.position(fn(known: text::String) => known == tombstone.text).is_none() {
-            mut held.push(text::String.of(tombstone.text.as_str(), alloc))
+        mut ensure_module(mut modules, module: tombstone.module.as_str(), alloc)
+        var moved_into = mut modules.at_mut(tombstone.module)
+        if moved_into.tombstones.position(fn(known: text::String) => known == tombstone.text).is_none() {
+            mut moved_into.tombstones.push(text::String.of(tombstone.text.as_str(), alloc))
         }
     }
-    var found = mem::List[machine::ModuleTombstones].empty(alloc)
-    for held_module in take modules {
-        let mem::KeyValue(key: module, value: tombstones) = held_module
-        var sorted = tombstones
-        mut sorted.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
-        mut found.push(machine::ModuleTombstones(module: take module, tombstones: take sorted))
+    for schema_record in records {
+        mut ensure_module(mut modules, module: schema_record.module.as_str(), alloc)
+        var recorded_in = mut modules.at_mut(schema_record.module)
+        let recorded_schema = machine::TypeSchema(ty: text::String.of(schema_record.ty.as_str(), alloc), hash: schema_record.hash)
+        if recorded_in.schemas.position(fn(known: machine::TypeSchema) => known == recorded_schema).is_none() {
+            mut recorded_in.schemas.push(take recorded_schema)
+        }
+    }
+    var found = mem::List[machine::HistoryModule].empty(alloc)
+    for pair in take modules {
+        let mem::KeyValue(key: _, value: history_module) = pair
+        var sorted = history_module
+        mut sorted.tombstones.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        mut sorted.schemas.sort_by(fn(left: machine::TypeSchema, right: machine::TypeSchema) => left.cmp(right))
+        mut found.push(take sorted)
     }
     return found
 } moved_modules
+
+/// Adds an empty module to a history's modules unless it holds one of that name.
+fn ensure_module(mut modules: mem::Map[text::String, machine::HistoryModule], module: Str, alloc: mem::Alloc) {
+    let name = text::String.of(module, alloc)
+    if not modules.contains(name) {
+        discard mut modules.insert(text::String.of(module, alloc), value: machine::HistoryModule(module: take name, schemas: mem::List[machine::TypeSchema].empty(alloc), tombstones: mem::List[text::String].empty(alloc)))
+    }
+} ensure_module
 
 /// The tombstones of a package's source to move into its history: all but those keeping an
 /// `Encode` key of a type deriving `Encode`.
@@ -540,7 +561,7 @@ fn moved_tombstones(session: check::Session, index: usize, alloc: mem::Alloc) ->
     let held = session.workspace.contents()
     var changed = mem::List[artefact::SourceFile].empty(alloc)
     var moved = mem::List[ModuleTombstone].empty(alloc)
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return MovedTombstones(changed: take changed, tombstones: take moved)
     }

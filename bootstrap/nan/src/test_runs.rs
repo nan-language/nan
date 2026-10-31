@@ -170,7 +170,7 @@ fn scope_targets(workspace: &Workspace, closure: &Closure, scope: &Scope) -> Vec
     let mut targets: Vec<Target> = closure
         .checked
         .iter()
-        .map(|index| &workspace.packages[*index])
+        .map(|index| &*workspace.packages[*index])
         .filter(selects)
         .flat_map(run_targets)
         .collect();
@@ -480,13 +480,18 @@ fn run_package(
 }
 
 /// Lowers and writes the test image of a package's tests for a checker's target, under
-/// `.nan/tests/`, readied for its runs; or the symbol collisions of its lowering.
+/// `.nan/tests/`, readied for its runs; or the errors of checking the releases it reaches, or
+/// else the symbol collisions of its lowering.
 fn build(
     checker: &Checker,
     workspace: &Workspace,
     package: PackageId,
     tests: &[Selected],
 ) -> io::Result<Result<Image, Vec<Diagnostic>>> {
+    let refused = check::release_errors(checker, package);
+    if !refused.is_empty() {
+        return Ok(Err(refused));
+    }
     let lowered = lower(checker, workspace, package, tests);
     let data = checker.db.package(package);
     let collisions = crate::final_build::collisions(data.source, &lowered);

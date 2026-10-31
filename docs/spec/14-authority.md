@@ -1,6 +1,6 @@
 # Capabilities and authority
 
-This chapter defines authority and the absence of ambient authority, capabilities and the capability tables behind Copy capabilities, the std capabilities, revocation, resources, root grants, attenuation, protocol phases, manifest grants, denied dependencies, the trust that device and priv grants carry, and authority summaries with their approval by final-link roots.
+This chapter defines authority and the absence of ambient authority, capabilities and the capability tables behind Copy capabilities, the std capabilities, revocation, resources, root grants, attenuation, capability kinds, protocol phases, manifest grants, denied dependencies, the trust that device and priv grants carry and confined grants do not, and authority summaries with their approval by final-link roots.
 
 ## Authority
 
@@ -8,8 +8,8 @@ This chapter defines authority and the absence of ambient authority, capabilitie
 
 - Code acts outside its own values only through [capabilities](#capabilities) it holds as parameters, captures or values reached from them. A [manifest grant](#manifest-grants) confers no capability; it permits the operations its authority covers.
 - No item holds mutable state: a [const item](02-items.md#constants) is immutable and Inert, so it holds no capability, and every other value an item holds, such as a registry entry, is const data. The one value reachable without being passed is the [kernel anchor](24-kernel.md#anchor), reached only from entry contexts.
-- Every std operation that performs I/O, reads a clock, draws randomness or allocates reaches a capability: its receiver, an argument, or a capability its receiver stores. A device operation that reaches no capability, such as `hw::IrqShared.install`, is permitted only by an `allow device` grant; `hw::Mmio.map` and `hw::Ports.map` are also [trusted primitives](23-low-level.md#trusted-primitives), called inside trusted code of a module that an `allow trusted` grant names as well.
-- Capabilities come only from [root grants](#root-grants), from operations on other capabilities, from [sim](22-testing.md#simulated-capabilities) constructors and `testing::world()`, and from [trusted primitives](23-low-level.md#trusted-primitives); no operation of safe code builds one from bits, integers or text.
+- Every std operation that performs I/O, reads a clock, draws randomness or allocates reaches a capability: its receiver, an argument, or a capability its receiver stores. A device operation that reaches no capability, such as `hw::IrqShared.install`, is permitted only by an `allow device` grant, and a confined one by an `allow confined` or `allow device` grant; `hw::Mmio.map` and `hw::Ports.map` are also [trusted primitives](23-low-level.md#trusted-primitives), called inside trusted code of a module that an `allow trusted` grant names as well.
+- Capabilities come only from [root grants](#root-grants), from operations on other capabilities, from [sim](22-testing.md#simulated-capabilities) constructors and `testing::world()`, from the minters of [capability kinds](#capability-kinds) and from [trusted primitives](23-low-level.md#trusted-primitives); no operation of safe code builds one from bits, integers or text.
 
 ```nan
 pub fn report_level(log: sys::Log, level: u32) {
@@ -25,20 +25,20 @@ A **capability** is a value conferring authority. The [primitive capabilities](0
 | --- | --- | --- | --- |
 | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio` | no | yes | yes |
 | `sys::fs::File`, `sys::net::Listener` | no | no | yes |
-| `sys::net::Conn`, `sys::Revoker[C]` | yes | no | yes |
+| `sys::net::Conn`, `sys::Revoker[C]`, `sys::Minter[C, S, R]` | yes | no | yes |
 | `boot::Machine`, `boot::Kernel` | yes | no | no |
 
-[`mem::Alloc`](12-memory.md#allocators) and [`task::Executor`](16-concurrency.md#executors) are the other Copy capabilities. [Standard library 1.0](28-stdlib.md#std-authority) lists every primitive capability.
+[`mem::Alloc`](12-memory.md#allocators) and [`task::Executor`](16-concurrency.md#executors) are the other Copy capabilities of std, and every [capability kind](#capability-kinds) is Copy and Send. [Standard library 1.0](28-stdlib.md#std-authority) lists every primitive capability.
 
 ### Capability tables
 
-Every Copy capability other than `mem::Alloc` is a [generational handle](12-memory.md#generational-handles) naming an entry of a **capability table**; `mem::Alloc` names a cell ([budgets](12-memory.md#budgets)). A capability table is owned by its **minter**: the root grant minted with it, a `sys::Revoker`, or the test or example run whose [sims](22-testing.md#simulated-capabilities) it holds.
+Every Copy capability other than `mem::Alloc` is a [generational handle](12-memory.md#generational-handles) naming an entry of a **capability table**; `mem::Alloc` names a cell ([budgets](12-memory.md#budgets)). A capability table is owned by its **minter**: the root grant minted with it, a `sys::Revoker`, a `sys::Minter` ([capability kinds](#capability-kinds)), or the test or example run whose [sims](22-testing.md#simulated-capabilities) it holds.
 
-- An entry records the authority it confers and the entry it derives from, if any. An executor's entry also records a clock: the `sys::Clock` of the root grant that minted it, the virtual clock of the test or example run whose world holds it, or for an executor made by `sys::revocable` the clock of its source; the kernel executor records the kernel's clock ([anchor](24-kernel.md#anchor)). Every copy of a handle names the same entry.
+- An entry records the authority it confers and the entry it derives from, if any. An executor's entry also records a clock: the `sys::Clock` of the root grant that minted it, the virtual clock of the test or example run whose world holds it, or for an executor made by `sys::revocable` the clock of its source; the kernel executor records the kernel's clock ([anchor](24-kernel.md#anchor)). An executor's entry also records its share and serial executor and counts the time its tasks ran ([executors](16-concurrency.md#executors)). Every copy of a handle names the same entry.
 - Revoking an entry advances its slot's generation, so every handle to it is stale. An operation through a handle checks at its start that the handle is live; an operation already past its check completes as if the entry were live.
 - Tables are shared by every task and CPU. Checks and revocations are atomic: a check that starts after a revocation completes finds the handle stale.
 - Entries are memory of the [support routines](27-program-model.md#runtime-support), charged to no cell and drawn through no allocator. An operation adding an entry when that memory is exhausted traps (`trap.exhausted`).
-- A table's entries are freed when its minter ends: a `sys::Revoker` at its revocation, a test or example run at its end, and a root grant's table when the program ends.
+- A table's entries are freed when its minter ends: a `sys::Revoker` at its revocation, a `sys::Minter` when it closes or its domain is settled, a test or example run at its end, and a root grant's table when the program ends.
 
 ### Std capabilities
 
@@ -188,7 +188,7 @@ pub open enum NetError derives Render {
 
 ## Revocation
 
-**Revocation** ends every copy of a capability through the linear value that minted it: a `sys::Revoker`, or, for an allocator, its [budget](12-memory.md#budgets).
+**Revocation** ends every copy of a capability through the linear value that minted it: a `sys::Revoker`, a `sys::Minter`, or, for an allocator, its [budget](12-memory.md#budgets).
 
 ```nan-api
 // module: sys
@@ -242,8 +242,9 @@ An operation through a stale handle behaves as follows:
 | `sys::Clock` | `elapsed_ms`, `elapsed_ns` and `coarse` fail with `sys::Revoked.Stale`; `sleep` and `sleep_ns` return at once |
 | `sys::WallClock` | `now_ns` and `coarse` fail with `sys::Revoked.Stale` |
 | `sys::Log` | the record is discarded |
+| a [capability kind](#capability-kinds) | `sys::reach` returns `None` and `sys::derive` fails with `sys::Revoked.Stale` |
 | `mem::Alloc` | draws through it are exhaustion ([budgets](12-memory.md#budgets)) |
-| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`. |
+| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains), `host::Runner.run` and the [stepper](26-components.md#steppers) constructors `start` and `resume` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`, and `split` and `serial` return an account of the stale executor. |
 
 ```nan
 pub fn read_config(fs: sys::Fs, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails sys::fs::FsError uses wait {
@@ -388,7 +389,7 @@ fn main(take world: host::World) fails GreetError uses wait {
 
 ## Attenuation
 
-**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
+**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received and the source's `connect` does not deny that `host`, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
 
 - A std attenuation other than `split` adds an entry deriving from its source's entry to its source's table and returns a handle to it. The new entry keeps every restriction of its source, and revoking the source revokes it. An implementation may instead return a handle to an existing entry with the same source and restriction.
 - Any code may attenuate: a type whose private field holds a capability and whose methods expose less authority attenuates it.
@@ -420,6 +421,227 @@ test reading_rounds_down for millisecond_reading {
     let reading = try millisecond_reading(world.clock)
     expect reading == 1_000_000
 } reading_rounds_down
+```
+
+```nan
+pub fn denies(net: sys::Net, host: Str) -> bool fails task::Cancelled uses wait {
+    let outcome = attempt await net.connect(host, port: 7)
+    var denied = false
+    match outcome {
+        Ok(conn) => take conn.abandon()
+        Err(failure) => {
+            denied = match failure {
+                sys::net::NetError.Denied => true
+                else => false
+            }
+        }
+    }
+    return denied
+} denies
+
+test narrowing_keeps_the_host for denies {
+    let world = testing::world()
+    let narrow = try world.net.only_host("localhost")
+    let same = try narrow.only_host("localhost")
+    let other = try narrow.only_host("127.0.0.1")
+    let kept = try await denies(same, host: "localhost")
+    let moved = try await denies(other, host: "127.0.0.1")
+    expect not kept
+    expect moved
+} narrowing_keeps_the_host
+```
+
+## Capability kinds
+
+A **capability kind** is a primitive capability that a package outside std declares, such as the ports, store views or CPU shares of a kernel. An impl line `impl C: sys::Kind[S, R]` declares the struct C a kind: each value of C is a handle naming an entry of a [capability table](#capability-tables) that keeps a **record** of type R, and each entry belongs to a **minter**, a `sys::Minter[C, S, R]` keeping a **state** of type S. Code acts through a kind only by calling the functions of the module declaring it, which alone reaches the states and records behind its handles.
+
+```nan-api
+// module: sys
+
+pub interface Kind[S: Send, R: AnyBits and Copy] {
+} Kind
+
+pub open linear struct Minter[C: Kind[S, R], S: Send, R: AnyBits and Copy] {
+} Minter
+
+pub fn Minter.of(take state: S, alloc: mem::Alloc) -> Minter[C, S, R]
+
+pub fn Minter.mint(self, record: R) -> C
+
+pub fn Minter.revoke(self, capability: C)
+
+pub fn Minter.close(take self)
+
+pub fn reach[C: Kind[S, R], S: Send, R: AnyBits and Copy, T: Any, E](capability: C, body: fn(state: S, record: R) -> T fails E) -> Option[T] fails E
+
+pub fn derive[C: Kind[S, R], S: Send, R: AnyBits and Copy](capability: C, narrow: fn(state: S, record: R) -> R) -> C fails Revoked
+```
+
+- A kind is a struct without fields, generic parameters, derives or a modifier other than `open`, and its record type is a scalar, a layout, an `hw::Ptr` or an `Array` of these, at most 16 bytes long. A `sys::Kind` impl line naming any other type or record type is an error (`authority.kind-form`), reported on the impl line. A construction of a kind is that error too: a kind's values come only from `mint` and `derive`.
+- A kind is Copy and Send, and never linear, a view, Inert or AnyBits. It implements `sys::Capability`, so `sys::revocable` derives entries from its entries.
+- A use of `sys::Minter.of`, `sys::Minter.mint`, `sys::Minter.revoke`, `sys::Minter.close`, `sys::reach` or `sys::derive` whose C is not a kind that the module of the code using it declares is an error (`authority.kind-foreign`).
+- A module declaring a kind performs `capability` directly ([manifest grants](#manifest-grants)).
+
+A minter owns the table of the entries it mints:
+
+- `sys::Minter.of(state, alloc)` returns a minter keeping `state` in storage drawn through `alloc`, trapping when it is exhausted (`trap.exhausted`). That storage, with the chunks `state` occupies, passes to the outermost domain, the process or the kernel ([domain memory](11-errors-domains.md#domain-memory)).
+- `m.mint(record)` adds an entry recording `record` and returns a handle to it. An entry **belongs** to the minter that minted it, or to the one the entry it derives from belongs to.
+- `m.revoke(c)` revokes `c`'s entry and every entry deriving from it when that entry belongs to `m`, and does nothing otherwise.
+- `take m.close()` revokes every entry belonging to `m`, then releases its state once no `reach` or `derive` holds it. [Settlement](11-errors-domains.md#settlement) revokes them too, but never releases the state.
+
+Only the declaring module reaches through a handle:
+
+- `sys::reach(c, body)` returns `None` when `c` is stale. Otherwise it calls `body` with a read of the state of the minter `c`'s entry belongs to and with the entry's record, holding the state until `body` returns, even once `c` is revoked, and returns `Some` of `body`'s result or fails with its failure.
+- `sys::derive(c, narrow)` calls `narrow` as `reach` calls `body`, then adds an entry deriving from `c`'s entry to its table, recording the record `narrow` returned, and returns a handle to it ([attenuation](#attenuation)). It fails with `sys::Revoked.Stale` when `c` is stale before `narrow` runs or once it has returned.
+- `sys::reach` and `sys::derive` have no effect fact and no capability of their own ([supplied operations](28-stdlib.md#supplied-operations)); `body` and `narrow` charge what they do. `mint` and `derive` trap when the capability tables are full ([capability tables](#capability-tables)).
+- Kinds have no [sims](22-testing.md#simulated-capabilities): tests and dry runs act through handles that the declaring module mints from a minter whose state records what the kind's operations do instead of doing it.
+
+The digest of a function of a kind holds that kind as its capability and hides how the module acts ([digests](10-effects-digests.md#digests)):
+
+```nan
+// file: ports/package.nan
+//! Ports a kernel hands to components.
+
+package ports {
+    language 1
+    targets any
+    allow capability in ports
+} ports
+
+// file: ports/ports.nan
+//! Ports counting the messages sent through them.
+
+pub open struct Port {
+} Port
+
+pub layout Grant: u64 le {
+    slot: u32 at 0
+    send: bit 32
+    reserved: rest
+} Grant
+
+impl Port: sys::Kind[core::atomic::AtomicU64, Grant]
+
+pub fn open_ports(alloc: mem::Alloc) -> sys::Minter[Port, core::atomic::AtomicU64, Grant] {
+    return sys::Minter.of(core::atomic::AtomicU64.of(0), alloc)
+} open_ports
+
+pub fn Port.send(self) -> bool {
+    let sent = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: Grant) -> bool {
+        if not record.send {
+            return false
+        }
+        discard state.fetch_add(1)
+        return true
+    })
+    return sent == Some(true)
+} Port.send
+
+pub fn Port.receive_only(self) -> Port fails sys::Revoked {
+    return try sys::derive(self, narrow: fn(state: core::atomic::AtomicU64, record: Grant) => Grant(slot: record.slot, send: false, reserved: 0))
+} Port.receive_only
+
+test narrowed_port_cannot_send for Port.receive_only {
+    let world = testing::world()
+    let minter = open_ports(world.alloc)
+    defer take minter.close()
+    let port = minter.mint(Grant(slot: 1, send: true, reserved: 0))
+    let narrowed = try port.receive_only()
+    let revoker = try sys::revocable(port)
+    let copy = revoker.capability()
+    take revoker.revoke()
+    let sent = port.send()
+    let narrowed_sent = narrowed.send()
+    let copy_sent = copy.send()
+    minter.revoke(port)
+    let revoked_sent = port.send()
+    expect sent
+    expect not narrowed_sent
+    expect not copy_sent
+    expect not revoked_sent
+} narrowed_port_cannot_send
+```
+
+```text
+$ nan show ports::Port.send --api
+ok show ports::Port.send --api: records 1
+api ports::Port.send ports/ports.nan:18
+    pub fn Port.send(self) -> bool
+    digest: effects none | authority ports::Port | may-trap no | terminates
+ok show ports::Port.send --api: records 1
+```
+
+```nan
+// file: ports/package.nan
+//! Ports a kernel hands to components.
+
+package ports {
+    language 1
+    targets any
+    allow capability in ports
+} ports
+
+// file: ports/ports.nan
+//! Ports naming their slot in a field.
+
+pub open struct Port {
+    pub slot: u32
+} Port
+
+impl Port: sys::Kind[u32, u64] // error: authority.kind-form
+```
+
+```nan
+// file: ports/package.nan
+//! Ports a kernel hands to components.
+
+package ports {
+    language 1
+    targets any
+} ports
+
+// file: ports/ports.nan
+//! Ports declared without a grant.
+
+pub open struct Port {
+} Port
+
+impl Port: sys::Kind[u32, u64] // error: authority.ungranted
+```
+
+```nan
+// file: ports/package.nan
+//! Ports a kernel hands to components.
+
+package ports {
+    language 1
+    targets any
+    allow capability in ports
+} ports
+
+// file: ports/ports.nan
+//! Ports a kernel hands to components.
+
+pub open struct Port {
+} Port
+
+impl Port: sys::Kind[u32, u64]
+
+// file: forger/package.nan
+//! Mints ports it does not declare.
+
+package forger {
+    language 1
+    targets any
+    dep ports "../ports"
+} forger
+
+// file: forger/forger.nan
+//! Mints a port outside the module declaring it.
+
+pub fn forge(minter: sys::Minter[ports::Port, u32, u64]) -> ports::Port {
+    return minter.mint(7) // error: authority.kind-foreign
+} forge
 ```
 
 ## Protocol phases
@@ -464,22 +686,24 @@ pub closed struct Stage {
 
 ## Manifest grants
 
-A **manifest grant** is an `allow <authority> in <names>` [directive](03-packages-modules.md#manifest), granting an authority no value carries. Each name a `device`, `priv`, `trusted` or `validate` grant lists is a module of the package or an alias a `dep` directive of the manifest declares; [contributors](25-registries.md#contributors) fixes the names of a `contribute` grant. In a `deny a -> b` directive, `a` is a module of the package and `b` a module of the package, an alias a `dep` directive declares or a std alias. Any other name is an error (`authority.unknown-name`), whose candidates are ranked as for `name.unknown` ([unknown names](03-packages-modules.md#unknown-names)).
+A **manifest grant** is an `allow <authority> in <names>` [directive](03-packages-modules.md#manifest), granting an authority no value carries. Each name a `device`, `confined`, `priv`, `trusted` or `validate` grant lists is a module of the package or an alias a `dep` directive of the manifest declares, and each name a `capability` grant lists a module of the package; [contributors](25-registries.md#contributors) fixes the names of a `contribute` grant. In a `deny a -> b` directive, `a` is a module of the package and `b` a module of the package, an alias a `dep` directive declares or a std alias. Any other name is an error (`authority.unknown-name`), whose candidates are ranked as for `name.unknown` ([unknown names](03-packages-modules.md#unknown-names)).
 
 A module performs an authority **directly** when one of its items, under a declared target, contains an operation of this table:
 
 | Authority | Operations |
 | --- | --- |
-| `device` | the device operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma) and [locks](24-kernel.md#locks) |
+| `device` | the device operations of [register windows](23-low-level.md#register-windows), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions), and every confined operation |
+| `confined` | the confined operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions) |
 | `priv` | calls of [privileged intrinsics](23-low-level.md#privileged-intrinsics) and declarations of landing fns |
 | `trusted` | [trusted code](23-low-level.md#trusted-code), `assume` and declarations of [foreign fns](23-low-level.md#foreign-functions) |
 | `validate` | the operations that [validate grants](15-untrusted.md#validate-grants) list |
+| `capability` | declarations of [capability kinds](#capability-kinds) |
 
 - A call of a function whose body performs an authority is not itself an operation of that authority.
-- A module performing `device`, `priv`, `trusted` or `validate` directly that no grant of that authority names is an error (`authority.ungranted`), reported on the line of each such operation. Its exact fix adds the module to the authority's `allow` directive, writing the directive when the manifest has none.
-- A package is **granted** `device`, `priv`, `trusted` or `validate` when its manifest grants it to any name. A dependency granted one of these whose alias the dependent's manifest does not list for it is an error (`authority.dependency-ungranted`), reported on the dependency's `dep` directive, with an exact fix adding the alias as for `authority.ungranted`. A std package needs no grant from its dependents.
+- A module performing `device`, `confined`, `priv`, `trusted`, `validate` or `capability` directly that no grant of that authority names is an error (`authority.ungranted`), reported on the line of each such operation, a `device` grant also naming the modules that perform `confined`. Its exact fix adds the module to the authority's `allow` directive, writing the directive when the manifest has none.
+- A package is **granted** `device`, `confined`, `priv`, `trusted` or `validate` when its manifest grants it to any name. A dependency granted one of these whose alias the dependent's manifest does not list for it, under `device` or `confined` for `confined`, is an error (`authority.dependency-ungranted`), reported on the dependency's `dep` directive, with an exact fix adding the alias as for `authority.ungranted`. A std package needs no grant from its dependents.
 - `allow contribute R in <names>` lists the aliases of packages whose contributions to the registry `R` the package admits, as contributors defines.
-- A name a `device`, `priv`, `trusted` or `validate` grant lists is incompleteness (`unused.grant`), reported on the name, when it is a module performing the authority directly under no declared target or the alias of a dependency not granted the authority. Contributors states the rule for `contribute`.
+- A name a `device`, `confined`, `priv`, `trusted`, `validate` or `capability` grant lists is incompleteness (`unused.grant`), reported on the name, when it is a module performing the authority directly under no declared target or the alias of a dependency not granted the authority. A module performing `confined` alone uses a `device` grant naming it when no `confined` grant names it, and the alias of a dependency granted `confined` alone uses one. Contributors states the rule for `contribute`.
 
 ```nan
 // file: uart/package.nan
@@ -659,11 +883,13 @@ pub fn log_total(log: sys::Log, total: u64) { // error: authority.denied-depende
 
 ## Device and priv grants
 
-The device and privileged operations that `device` and `priv` grants permit reach memory and machine state no type describes ([systems guarantees](00-charter.md#systems-guarantees)). A manifest granting `device` or `priv` to any name gives its `package` item a [ledger](31-trust.md#ledger) entry that is a [trust escape](31-trust.md#trust-escapes), so `nan verify` requires a current [seal](31-trust.md#seals) on that item.
+The device and privileged operations that `device` and `priv` grants permit reach memory and machine state no type describes ([systems guarantees](00-charter.md#systems-guarantees)), and the kinds that `capability` grants permit stand for authority that no std capability states. A manifest granting `device`, `priv` or `capability` to any name gives its `package` item a [ledger](31-trust.md#ledger) entry that is a [trust escape](31-trust.md#trust-escapes), so `nan verify` requires a current [seal](31-trust.md#seals) on that item.
+
+The confined operations that a `confined` grant permits reach, through a device, only the memory its [I/O domain](23-low-level.md#io-domains) maps, so a confined driver programming its device wrongly harms its device and its own buffers alone. A manifest granting `confined` gives its `package` item a ledger entry that is no trust escape.
 
 ## Authority summaries
 
-The **authority summary** of a package is the set of these entries, over the [digests](10-effects-digests.md#digests) of its items under every declared target and its items' ledger entries:
+The **authority summary** of a package is the set of these entries, over the [digests](10-effects-digests.md#digests) of its items under every declared target, the digests that the code of the functions of its [capability kinds](#capability-kinds) gives, and its items' ledger entries:
 
 - each primitive capability type in a digest's capabilities set;
 - `alloc`, `device` and `priv`, each when a digest has that fact;
@@ -681,6 +907,8 @@ The **closure summary** of a [final-link root](27-program-model.md#final-builds)
 | `authority.capability-impl` | error | [Revocation](#revocation) |
 | `authority.denied-dependency` | error | [Denied dependencies](#denied-dependencies) |
 | `authority.dependency-ungranted` | error | [Manifest grants](#manifest-grants) |
-| `authority.ungranted` | error | [Manifest grants](#manifest-grants), [Trusted code](23-low-level.md#trusted-code), [Register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [Privileged intrinsics](23-low-level.md#privileged-intrinsics), [Landing functions](23-low-level.md#landing-functions), [Foreign functions](23-low-level.md#foreign-functions) |
+| `authority.kind-foreign` | error | [Capability kinds](#capability-kinds) |
+| `authority.kind-form` | error | [Capability kinds](#capability-kinds) |
+| `authority.ungranted` | error | [Manifest grants](#manifest-grants), [Capability kinds](#capability-kinds), [Trusted code](23-low-level.md#trusted-code), [Register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [Privileged intrinsics](23-low-level.md#privileged-intrinsics), [Landing functions](23-low-level.md#landing-functions), [Foreign functions](23-low-level.md#foreign-functions) |
 | `authority.unknown-name` | error | [Manifest grants](#manifest-grants) |
 | `authority.widening-unapproved` | error | [Authority summaries](#authority-summaries), [Approvals](29-identity-versioning.md#approvals) |

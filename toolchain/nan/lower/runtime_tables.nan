@@ -1,9 +1,9 @@
-//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records and its resolution in nanoseconds, zero standing for one. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution.
+//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record.
 
 /// The capability table's capacity.
 const TABLES_ENTRIES: u64 = 65_536
 
-const TABLES_ENTRY_RECORD: u64 = 64
+const TABLES_ENTRY_RECORD: u64 = 96
 
 const TABLES_ENTRY_GENERATION: u64 = 0
 
@@ -16,6 +16,18 @@ const TABLES_ENTRY_SOURCE: u64 = 12
 const TABLES_ENTRY_STATE: u64 = 16
 
 const TABLES_ENTRY_DEADLINES: u64 = 48
+
+const TABLES_ENTRY_USED: u64 = 48
+
+const TABLES_ENTRY_SERIAL: u64 = 56
+
+const TABLES_ENTRY_TURN: u64 = 64
+
+const TABLES_ENTRY_WAITING: u64 = 72
+
+const TABLES_ENTRY_SEED: u64 = 80
+
+const TABLES_ENTRY_PICKS: u64 = 88
 
 /// The links of a deadline's timer in its clock entry's deadlines and the clock's handle, after
 /// its timeout's time.
@@ -49,11 +61,19 @@ const TABLES_KIND_OUTBOX: i64 = 8
 
 const TABLES_KIND_WALL: i64 = 9
 
+const TABLES_KIND_KIND: i64 = 10
+
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
 /// executor's entry.
 const TABLES_RESOLUTION: u64 = TABLES_ENTRY_STATE + 8
 
 const TABLES_EXECUTOR_RESOLUTION: u64 = TABLES_ENTRY_STATE + 16
+
+/// The state word of an executor's entry holding its share, and the share of a root grant's
+/// executor: a weight of 1 in class 0 reserving nothing.
+const TABLES_EXECUTOR_SHARE: u64 = TABLES_ENTRY_STATE + 24
+
+const ROOT_SHARE: u64 = 1
 
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100
@@ -127,37 +147,34 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
     expect params.len() > 0
     match routine {
         Routine.Derive => {
+            expect params.len() == 5
             let state_address = mut lo.state(mut fx)
             let lock = mut fx.offset(state_address, offset: STATE_LOCK)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             let source = live_entry(mut lo, mut fx, handle: params[0])
             let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
             let derived = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
-                expect params.len() > 1
-                let handle = tables_new_entry(mut lo, fx: mut fx1, kind: params[1])
+                let kind_word = mut fx1.load(clif::Type.Int32, addr: source, offset: TABLES_ENTRY_KIND)
+                let kind = mut fx1.b.uextend(PTR, x: kind_word)
+                let handle = tables_new_entry(mut lo, fx: mut fx1, kind)
                 let record = entry_at(mut lo, fx: mut fx1, handle)
                 for word in 0u64..<4 {
                     let value = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_STATE + 8 * word)
                     mut fx1.store(value, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
                 }
+                let serial = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_SERIAL)
+                mut fx1.store(serial, addr: record, offset: TABLES_ENTRY_SERIAL)
                 let low = mut fx1.b.band_imm_s(params[0], y: 0xFFFF_FFFF)
                 let plus = mut fx1.b.iadd_imm_s(low, y: 1)
                 let index = mut fx1.b.ireduce(clif::Type.Int32, x: plus)
                 mut fx1.store(index, addr: record, offset: TABLES_ENTRY_SOURCE)
-                let text = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+                let raised = mut fx1.b.iadd(record, y: params[1])
+                let value = mut fx1.load(PTR, addr: raised, offset: 0)
+                let floored = mut fx1.b.umax(value, y: params[2])
+                mut fx1.store(floored, addr: raised, offset: 0)
                 let owns = owns_text(mut fx1, record)
-                let held = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: text, y: 0)
-                let owns_held = mut fx1.b.band(owns, y: held)
-                mut fx1.if_true(owns_held, then: fn[mut lo](mut fx2: Fx) {
-                    let len = mut fx2.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 16)
-                    let size = mut fx2.b.iadd_imm_s(len, y: 1)
-                    let copy = mut lo.record_alloc(mut fx2, size)
-                    let failed = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
-                    mut fx2.if_true(failed, then: fn[mut lo](mut fx3: Fx) {
-                        raise_kind(mut lo, fx: mut fx3, kind: "trap.exhausted")
-                    })
-                    discard mut lo.call_routine(mut fx2, routine: Routine.Copy, args: fx2.list3(copy, b: text, c: len).view())
-                    mut fx2.store(copy, addr: record, offset: TABLES_ENTRY_STATE + 8)
+                mut fx1.if_true(owns, then: fn[mut lo](mut fx2: Fx) {
+                    derive_text(mut lo, fx: mut fx2, record, text: params[3], len: params[4])
                 })
                 return fx1.list1(handle)
             }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
@@ -172,6 +189,114 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             let lock = mut fx.offset(state_address, offset: STATE_LOCK)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             revoke(mut lo, mut fx, handle: params[0])
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.KindMint => {
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let kind = mut fx.ptr(u64.fit(TABLES_KIND_KIND))
+            let handle = tables_new_entry(mut lo, mut fx, kind)
+            let record = entry_at(mut lo, mut fx, handle)
+            var word: u64 = 0
+            for value in params {
+                invariant word < 3
+                mut fx.store(value, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
+                word += 1
+            }
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(fx.list1(handle).view())
+        }
+        Routine.KindPin => {
+            expect params.len() == 2
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let record = live_entry(mut lo, mut fx, handle: params[0])
+            let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+            let pinned = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let minter = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+                let one = mut fx1.ptr(1)
+                discard fetch_add(mut fx1, address: minter, amount: one)
+                for word in 1u64..<3 {
+                    let value = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
+                    mut fx1.store(value, addr: params[1], offset: 8 * (word - 1))
+                }
+                return fx1.list1(minter)
+            }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let stale = mut fx1.ptr(0)
+                return fx1.list1(stale)
+            })
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(fx.list1(pinned[0]).view())
+        }
+        Routine.KindDerive => {
+            expect params.len() == 3
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let source = live_entry(mut lo, mut fx, handle: params[0])
+            let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
+            let derived = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+                let kind = mut fx1.ptr(u64.fit(TABLES_KIND_KIND))
+                let handle = tables_new_entry(mut lo, fx: mut fx1, kind)
+                let record = entry_at(mut lo, fx: mut fx1, handle)
+                let minter = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_STATE)
+                mut fx1.store(minter, addr: record, offset: TABLES_ENTRY_STATE)
+                mut fx1.store(params[1], addr: record, offset: TABLES_ENTRY_STATE + 8)
+                mut fx1.store(params[2], addr: record, offset: TABLES_ENTRY_STATE + 16)
+                let low = mut fx1.b.band_imm_s(params[0], y: 0xFFFF_FFFF)
+                let plus = mut fx1.b.iadd_imm_s(low, y: 1)
+                let index = mut fx1.b.ireduce(clif::Type.Int32, x: plus)
+                mut fx1.store(index, addr: record, offset: TABLES_ENTRY_SOURCE)
+                return fx1.list1(handle)
+            }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let stale = mut fx1.int(PTR, value: -1)
+                return fx1.list1(stale)
+            })
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(fx.list1(derived[0]).view())
+        }
+        Routine.KindRevoke => {
+            expect params.len() == 2
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let record = live_entry(mut lo, mut fx, handle: params[0])
+            let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+            mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
+                let minter = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+                let belongs = mut fx1.b.icmp(clif::IntCC.Equal, x: minter, y: params[1])
+                mut fx1.if_true(belongs, then: fn[mut lo](mut fx2: Fx) {
+                    revoke(mut lo, fx: mut fx2, handle: params[0])
+                })
+            })
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.KindClose => {
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let count = mut fx.load(PTR, addr: state_address, offset: STATE_ENTRY_COUNT)
+            let zero = mut fx.ptr(0)
+            mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let record = entry_at(mut lo, fx: mut fx1, handle: index)
+                let kind = mut fx1.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+                let of_kind = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TABLES_KIND_KIND)
+                let live_word = mut fx1.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_LIVE)
+                let live = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: live_word, y: 1)
+                let minter = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+                let belongs = mut fx1.b.icmp(clif::IntCC.Equal, x: minter, y: params[0])
+                let current = mut fx1.b.band(of_kind, y: live)
+                let revoked = mut fx1.b.band(current, y: belongs)
+                mut fx1.if_true(revoked, then: fn(mut fx2: Fx) {
+                    let revoking = mut fx2.int(clif::Type.Int32, value: 2)
+                    mut fx2.store(revoking, addr: record, offset: TABLES_ENTRY_LIVE)
+                })
+            })
+            sweep(mut lo, mut fx)
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
@@ -239,6 +364,45 @@ fn owns_text(mut fx: Fx, record: clif::Value) -> clif::Value {
     return mut fx.b.bor(fs, y: net)
 } owns_text
 
+/// Gives a derived `Fs` or `Net` entry a text of its own in runtime memory: its source's, which
+/// its state words hold, extended by a given text as a path for `Fs` and replaced by it for
+/// `Net`, or kept when the given text's address is zero.
+fn derive_text(mut lo: Lowering, mut fx: Fx, record: clif::Value, text: clif::Value, len: clif::Value) {
+    let source = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    let source_len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 16)
+    let given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: text, y: 0)
+    let kind = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+    let fs = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TABLES_KIND_FS)
+    let net = mut fx.b.bxor_imm_s(fs, y: 1)
+    let replaced = mut fx.b.band(given, y: net)
+    let zero = mut fx.ptr(0)
+    let head_len = mut fx.b.select(replaced, x: zero, y: source_len)
+    let joined = mut fx.b.band(given, y: fs)
+    let has_head = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: source_len, y: 0)
+    let separated = mut fx.b.band(joined, y: has_head)
+    let separator = mut fx.b.uextend(PTR, x: separated)
+    let tail_len = mut fx.b.select(given, x: len, y: zero)
+    let heads = mut fx.b.iadd(head_len, y: separator)
+    let total = mut fx.b.iadd(heads, y: tail_len)
+    let size = mut fx.b.iadd_imm_s(total, y: 1)
+    let copy = mut lo.record_alloc(mut fx, size)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(copy, b: source, c: head_len).view())
+    mut fx.if_true(separated, then: fn(mut fx1: Fx) {
+        let at = mut fx1.b.iadd(copy, y: head_len)
+        let slash = mut fx1.int(clif::Type.Int8, value: i64.widen(b'/'))
+        mut fx1.store(slash, addr: at, offset: 0)
+    })
+    let after_head = mut fx.b.iadd(copy, y: head_len)
+    let tail = mut fx.b.iadd(after_head, y: separator)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(tail, b: text, c: tail_len).view())
+    mut fx.store(copy, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    mut fx.store(total, addr: record, offset: TABLES_ENTRY_STATE + 16)
+} derive_text
+
 /// Revokes the live entry a handle names and every entry deriving from it, transitively: each
 /// becomes free, its generation advanced and its text freed. The caller holds the lock.
 fn revoke(mut lo: Lowering, mut fx: Fx, handle: clif::Value) {
@@ -247,59 +411,69 @@ fn revoke(mut lo: Lowering, mut fx: Fx, handle: clif::Value) {
     mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
         let revoking = mut fx1.int(clif::Type.Int32, value: 2)
         mut fx1.store(revoking, addr: target, offset: TABLES_ENTRY_LIVE)
-        let state_address = mut lo.state(mut fx1)
-        let count = mut fx1.load(PTR, addr: state_address, offset: STATE_ENTRY_COUNT)
-        let no = mut fx1.int(clif::Type.Int8, value: 0)
-        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
-            let start = mut fx2.ptr(0)
-            let changed = mut fx2.variable(clif::Type.Int8, initial: no)
-            mut fx2.each(start, end: count, body: fn[mut lo](mut fx3: Fx, index: clif::Value) {
-                let record = entry_at(mut lo, fx: mut fx3, handle: index)
-                let live_word = mut fx3.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_LIVE)
-                let live = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: live_word, y: 1)
-                let source = mut fx3.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_SOURCE)
-                let derived = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
-                let candidate = mut fx3.b.band(live, y: derived)
-                mut fx3.if_true(candidate, then: fn[mut lo](mut fx4: Fx) {
-                    let source_wide = mut fx4.b.uextend(PTR, x: source)
-                    let source_index = mut fx4.b.iadd_imm_s(source_wide, y: -1)
-                    let parent = entry_at(mut lo, fx: mut fx4, handle: source_index)
-                    let parent_live = mut fx4.load(clif::Type.Int32, addr: parent, offset: TABLES_ENTRY_LIVE)
-                    let spreading = mut fx4.b.icmp_imm_s(clif::IntCC.Equal, x: parent_live, y: 2)
-                    mut fx4.if_true(spreading, then: fn(mut fx5: Fx) {
-                        let spread = mut fx5.int(clif::Type.Int32, value: 2)
-                        mut fx5.store(spread, addr: record, offset: TABLES_ENTRY_LIVE)
-                        let yes = mut fx5.int(clif::Type.Int8, value: 1)
-                        mut fx5.b.def_var(changed, val: yes)
-                    })
-                })
-            })
-            let again = mut fx2.b.use_var(changed)
-            return Pass(again: again, next: mem::List[clif::Value].empty(fx2.alloc))
-        })
-        let zero = mut fx1.ptr(0)
-        mut fx1.each(zero, end: count, body: fn[mut lo](mut fx2: Fx, index: clif::Value) {
-            let record = entry_at(mut lo, fx: mut fx2, handle: index)
-            let live = mut fx2.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_LIVE)
-            let revoked = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: live, y: 2)
-            mut fx2.if_true(revoked, then: fn[mut lo](mut fx3: Fx) {
-                expire_deadlines(mut lo, fx: mut fx3, record)
-                let owns = owns_text(mut fx3, record)
-                mut fx3.if_true(owns, then: fn[mut lo](mut fx4: Fx) {
-                    let text = mut fx4.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
-                    mut lo.record_free(mut fx4, address: text)
-                })
-                free_entry(mut lo, fx: mut fx3, record, index)
-            })
-        })
+        sweep(mut lo, fx: mut fx1)
     })
 } revoke
 
-/// Passes every deadline armed through a revoked clock entry: each one's region is cancelled
+/// Revokes the entries being revoked and every live entry deriving from one, transitively:
+/// each becomes free, its generation advanced and its text freed. The caller holds the lock.
+fn sweep(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_ENTRY_COUNT)
+    let no = mut fx.int(clif::Type.Int8, value: 0)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let start = mut fx1.ptr(0)
+        let changed = mut fx1.variable(clif::Type.Int8, initial: no)
+        mut fx1.each(start, end: count, body: fn[mut lo](mut fx2: Fx, index: clif::Value) {
+            let record = entry_at(mut lo, fx: mut fx2, handle: index)
+            let live_word = mut fx2.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_LIVE)
+            let live = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: live_word, y: 1)
+            let source = mut fx2.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_SOURCE)
+            let derived = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
+            let candidate = mut fx2.b.band(live, y: derived)
+            mut fx2.if_true(candidate, then: fn[mut lo](mut fx3: Fx) {
+                let source_wide = mut fx3.b.uextend(PTR, x: source)
+                let source_index = mut fx3.b.iadd_imm_s(source_wide, y: -1)
+                let parent = entry_at(mut lo, fx: mut fx3, handle: source_index)
+                let parent_live = mut fx3.load(clif::Type.Int32, addr: parent, offset: TABLES_ENTRY_LIVE)
+                let spreading = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: parent_live, y: 2)
+                mut fx3.if_true(spreading, then: fn(mut fx4: Fx) {
+                    let spread = mut fx4.int(clif::Type.Int32, value: 2)
+                    mut fx4.store(spread, addr: record, offset: TABLES_ENTRY_LIVE)
+                    let yes = mut fx4.int(clif::Type.Int8, value: 1)
+                    mut fx4.b.def_var(changed, val: yes)
+                })
+            })
+        })
+        let again = mut fx1.b.use_var(changed)
+        return Pass(again: again, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let record = entry_at(mut lo, fx: mut fx1, handle: index)
+        let live = mut fx1.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_LIVE)
+        let revoked = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: live, y: 2)
+        mut fx1.if_true(revoked, then: fn[mut lo](mut fx2: Fx) {
+            expire_deadlines(mut lo, fx: mut fx2, record)
+            release_waiting(mut lo, fx: mut fx2, owner: record)
+            let owns = owns_text(mut fx2, record)
+            mut fx2.if_true(owns, then: fn[mut lo](mut fx3: Fx) {
+                let text = mut fx3.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+                mut lo.record_free(mut fx3, address: text)
+            })
+            free_entry(mut lo, fx: mut fx2, record, index)
+        })
+    })
+} sweep
+
+/// Passes every deadline armed through a revoked entry of a clock: each one's region is cancelled
 /// and its timer leaves the entry's deadlines. The caller holds the lock.
 fn expire_deadlines(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let head = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_DEADLINES)
-    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let entry_kind = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+    let clock = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: entry_kind, y: TABLES_KIND_CLOCK)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let armed = mut fx.b.band(clock, y: present)
     mut fx.if_true(armed, then: fn[mut lo](mut fx1: Fx) {
         discard mut fx1.repeat(fx1.list1(head).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
             expect state.len() > 0
@@ -317,13 +491,23 @@ fn expire_deadlines(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     })
 } expire_deadlines
 
-/// Links a deadline's timer into the deadlines of its live clock entry, or gives false when the
-/// clock is stale.
-fn link_deadline(mut lo: Lowering, mut fx: Fx, clock: clif::Value, timer: clif::Value) -> clif::Value {
+/// Whether a deadline's clock is live, and the nanosecond at which its root was minted and its
+/// resolution, meaningless when it is stale.
+struct LinkedDeadline {
+    live: clif::Value
+    minted: clif::Value
+    resolution: clif::Value
+} LinkedDeadline
+
+/// Links a deadline's timer into the deadlines of its live clock entry.
+fn link_deadline(mut lo: Lowering, mut fx: Fx, clock: clif::Value, timer: clif::Value) -> LinkedDeadline {
     let state_address = mut lo.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
     mut fx.store(clock, addr: timer, offset: DEADLINE_CLOCK)
+    let slot = entry_at(mut lo, mut fx, handle: clock)
+    let minted = mut fx.load(PTR, addr: slot, offset: TABLES_ENTRY_STATE)
+    let resolution = mut fx.load(PTR, addr: slot, offset: TABLES_RESOLUTION)
     let record = live_entry(mut lo, mut fx, handle: clock)
     let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
     mut fx.if_true(live, then: fn(mut fx1: Fx) {
@@ -338,7 +522,7 @@ fn link_deadline(mut lo: Lowering, mut fx: Fx, clock: clif::Value, timer: clif::
         mut fx1.store(timer, addr: record, offset: TABLES_ENTRY_DEADLINES)
     })
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
-    return live
+    return LinkedDeadline(live: live, minted: minted, resolution: resolution)
 } link_deadline
 
 /// Takes a deadline's timer out of its clock entry's deadlines, unless the clock's revocation
@@ -369,20 +553,23 @@ fn unlink_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value) {
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
 } unlink_deadline
 
-/// Frees an entry: its generation advances and it heads the free entries. The caller holds the
-/// lock.
+/// Frees an entry: its generation advances and it heads the free entries, unless that
+/// generation is 2^32 − 1, which retires it. The caller holds the lock.
 fn free_entry(mut lo: Lowering, mut fx: Fx, record: clif::Value, index: clif::Value) {
     let dead = mut fx.int(clif::Type.Int32, value: 0)
     mut fx.store(dead, addr: record, offset: TABLES_ENTRY_LIVE)
     let generation = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_GENERATION)
     let next_generation = mut fx.b.iadd_imm_s(generation, y: 1)
     mut fx.store(next_generation, addr: record, offset: TABLES_ENTRY_GENERATION)
-    let state_address = mut lo.state(mut fx)
-    let free = mut fx.load(PTR, addr: state_address, offset: STATE_FREE_ENTRY)
-    let free_narrow = mut fx.b.ireduce(clif::Type.Int32, x: free)
-    mut fx.store(free_narrow, addr: record, offset: TABLES_ENTRY_SOURCE)
-    let head = mut fx.b.iadd_imm_s(index, y: 1)
-    mut fx.store(head, addr: state_address, offset: STATE_FREE_ENTRY)
+    let reusable = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next_generation, y: -1)
+    mut fx.if_true(reusable, then: fn[mut lo](mut fx1: Fx) {
+        let state_address = mut lo.state(mut fx1)
+        let free = mut fx1.load(PTR, addr: state_address, offset: STATE_FREE_ENTRY)
+        let free_narrow = mut fx1.b.ireduce(clif::Type.Int32, x: free)
+        mut fx1.store(free_narrow, addr: record, offset: TABLES_ENTRY_SOURCE)
+        let head = mut fx1.b.iadd_imm_s(index, y: 1)
+        mut fx1.store(head, addr: state_address, offset: STATE_FREE_ENTRY)
+    })
 } free_entry
 
 /// Makes every outbox of a runner stale.
@@ -432,6 +619,90 @@ fn live_entry(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> clif::Value 
     return mut fx.b.select(ok, x: record, y: zero)
 } live_entry
 
+/// The state words of an entry, read without the lock, and whether its handle was still live
+/// once they were read, which makes them that entry's.
+struct Snapshot {
+    live: clif::Value
+    words: Array[clif::Value, 4]
+} Snapshot
+
+/// The snapshot of the entry a handle names.
+fn snapshot(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> Snapshot {
+    let record = entry_at(mut lo, mut fx, handle)
+    let flags = clif::MemFlags.owned()
+    var words = Array[clif::Value, 4].filled(record)
+    for word in 0u64..<4 {
+        let at = mut fx.offset(record, offset: TABLES_ENTRY_STATE + 8 * word)
+        words[usize.widen(word)] = mut fx.b.atomic_load(PTR, flags, p: at)
+    }
+    let generation = mut fx.b.atomic_load(clif::Type.Int32, flags, p: record)
+    let live_at = mut fx.offset(record, offset: TABLES_ENTRY_LIVE)
+    let live_word = mut fx.b.atomic_load(clif::Type.Int32, flags, p: live_at)
+    let shifted = mut fx.b.ushr_imm_s(handle, y: 32)
+    let wanted = mut fx.b.ireduce(clif::Type.Int32, x: shifted)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: generation, y: wanted)
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: live_word, y: 0)
+    return Snapshot(live: mut fx.b.band(same, y: live), words: words)
+} snapshot
+
+/// An executor's share and the handle of its serial executor.
+struct ExecutorTerms {
+    share: clif::Value
+    serial: clif::Value
+} ExecutorTerms
+
+/// The share and the serial executor's handle of the executor's entry a handle names, read
+/// without the lock; a root grant's share and none for a stale handle.
+fn executor_terms(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> ExecutorTerms {
+    let record = entry_at(mut lo, mut fx, handle)
+    let flags = clif::MemFlags.owned()
+    let share_at = mut fx.offset(record, offset: TABLES_EXECUTOR_SHARE)
+    let share = mut fx.b.atomic_load(PTR, flags, p: share_at)
+    let serial_at = mut fx.offset(record, offset: TABLES_ENTRY_SERIAL)
+    let serial = mut fx.b.atomic_load(PTR, flags, p: serial_at)
+    let generation = mut fx.b.atomic_load(clif::Type.Int32, flags, p: record)
+    let live_at = mut fx.offset(record, offset: TABLES_ENTRY_LIVE)
+    let live_word = mut fx.b.atomic_load(clif::Type.Int32, flags, p: live_at)
+    let shifted = mut fx.b.ushr_imm_s(handle, y: 32)
+    let wanted = mut fx.b.ireduce(clif::Type.Int32, x: shifted)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: generation, y: wanted)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: live_word, y: 0)
+    let live = mut fx.b.band(same, y: present)
+    let root = mut fx.ptr(ROOT_SHARE)
+    let none = mut fx.ptr(0)
+    let share_held = mut fx.b.select(live, x: share, y: root)
+    let serial_held = mut fx.b.select(live, x: serial, y: none)
+    return ExecutorTerms(share: share_held, serial: serial_held)
+} executor_terms
+
+/// A copy in runtime memory of the text of the live entry a handle names, taken under the lock,
+/// and its length; zero for a stale handle. The caller frees the copy.
+fn copy_text(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> Stretch {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let record = live_entry(mut lo, mut fx, handle)
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let copy = mut fx.choose_in(mut lo, condition: live, results: fx.types2(PTR, b: PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let text = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+        let len = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 16)
+        let size = mut fx1.b.iadd_imm_s(len, y: 1)
+        let copied = mut lo1.record_alloc(mut fx1, size)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: copied, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo1](mut fx2: Fx) {
+            raise_kind(mut lo1, fx: mut fx2, kind: "trap.exhausted")
+        })
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: fx1.list3(copied, b: text, c: len).view())
+        return fx1.list2(copied, b: len)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        let empty = mut fx1.ptr(0)
+        return fx1.list2(none, b: empty)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return Stretch(start: copy[0], len: copy[1])
+} copy_text
+
 /// A new live entry of a kind, a free one when any is, by handle; traps when the table is
 /// full. The caller holds the lock.
 fn tables_new_entry(mut lo: Lowering, mut fx: Fx, kind: clif::Value) -> clif::Value {
@@ -464,7 +735,7 @@ fn tables_new_entry(mut lo: Lowering, mut fx: Fx, kind: clif::Value) -> clif::Va
     let zero32 = mut fx.int(clif::Type.Int32, value: 0)
     mut fx.store(zero32, addr: record, offset: TABLES_ENTRY_SOURCE)
     let zero = mut fx.ptr(0)
-    for word in 0u64..<4 {
+    for word in 0u64..<10 {
         mut fx.store(zero, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
     }
     let generation = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_GENERATION)
@@ -498,6 +769,8 @@ fn tables_mint_root(mut lo: Lowering, mut fx: Fx, world: clif::Value) {
     mut fx.store(now, addr: handles[2].record, offset: TABLES_ENTRY_STATE)
     mut fx.store(cell, addr: handles[6].record, offset: TABLES_ENTRY_STATE)
     mut fx.store(handles[2].handle, addr: handles[6].record, offset: TABLES_ENTRY_STATE + 8)
+    let share = mut fx.ptr(ROOT_SHARE)
+    mut fx.store(share, addr: handles[6].record, offset: TABLES_EXECUTOR_SHARE)
     for minted in handles {
         let laid = mut lo.layouts.field(lo.ck, ty: world_ty, variant: None, label: minted.capability.field())
         mut fx.store(minted.handle, addr: world, offset: laid.offset)
@@ -524,6 +797,8 @@ fn mint_machine_root(mut lo: Lowering, mut fx: Fx, grant: clif::Value) {
     let record = entry_at(mut lo, mut fx, handle: exec)
     mut fx.store(cell, addr: record, offset: TABLES_ENTRY_STATE)
     mut fx.store(clock, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    let share = mut fx.ptr(ROOT_SHARE)
+    mut fx.store(share, addr: record, offset: TABLES_EXECUTOR_SHARE)
     let source = mut lo.wall_source(mut fx)
     let walls = mut fx.choose_in(mut lo, condition: source.valid, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let wall_kind = mut fx1.ptr(u64.fit(TABLES_KIND_WALL))
@@ -550,6 +825,12 @@ fn mint_machine_root(mut lo: Lowering, mut fx: Fx, grant: clif::Value) {
     mut fx.store(untaken, addr: grant, offset: regions_field.offset)
     let ring0_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "ring0")
     mut fx.store(untaken, addr: grant, offset: ring0_field.offset)
+    let modules_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "modules")
+    mut fx.store(untaken, addr: grant, offset: modules_field.offset)
+    let iommu_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "iommu")
+    mut fx.store(untaken, addr: grant, offset: iommu_field.offset)
+    let functions_field = mut lo.layouts.field(lo.ck, ty: grant_ty, variant: None, label: "functions")
+    mut fx.store(untaken, addr: grant, offset: functions_field.offset)
     process_cell(mut lo, mut fx, cell)
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } mint_machine_root
@@ -595,23 +876,40 @@ fn mint(mut lo: Lowering, mut fx: Fx, kind: clif::Value) -> clif::Value {
     return handle
 } mint
 
-/// Calls the function of the host platform package named `name` with values held as it takes
-/// them.
+/// Calls the function of the target's platform package named `name` with values held as it
+/// takes them.
 fn Lowering.platform_call(mut self, mut fx: Fx, name: Str, args: Slice[Held]) -> Called {
-    let instance = mut self.platform_instance(name)
+    let item = self.platform_function(name)
+    return mut self.call_function(mut fx, item, args)
+} Lowering.platform_call
+
+/// Calls the function of the core package named `name` with values held as it takes them.
+fn Lowering.core_call(mut self, mut fx: Fx, name: Str, args: Slice[Held]) -> Called {
+    let Some(item) = self.ck.db().core_item(name) else {
+        expect false
+        return mut self.call_function(mut fx, item: ty::ItemId(index: 0), args)
+    }
+    return mut self.call_function(mut fx, item, args)
+} Lowering.core_call
+
+fn Lowering.call_function(mut self, mut fx: Fx, item: ty::ItemId, args: Slice[Held]) -> Called {
+    let instance = Instance.Nir(item: item, role: nir::Role.Body, index: 0, args: ty::Args.none())
     let abi = mut self.abi(instance)
     let id = mut self.instance(take instance)
     return mut self.invoke(mut fx, invoked: Invoked.Direct(id), abi, args)
-} Lowering.platform_call
+} Lowering.call_function
 
-/// The instance of the function of the host platform package named `name`, which only a host
-/// image holds.
-fn Lowering.platform_instance(mut self, name: Str) -> Instance {
-    expect not self.machine()
+/// The function of the target's platform package named `name`.
+fn Lowering.platform_function(self, name: Str) -> ty::ItemId {
     let db = self.ck.db()
+    let platform = match db.target.kind() {
+        Some(workspace::Kind.Uefi) => "uefi_platform"
+        Some(workspace::Kind.Bare) => "bare_platform"
+        else => "host_platform"
+    }
     var found: Option[ty::ItemId] = None
     for candidate in db.packages {
-        if candidate.name.as_str() == "host_platform" {
+        if candidate.name.as_str() == platform {
             match candidate.root {
                 Some(root) => {
                     found = db.lookup(root, name)
@@ -623,7 +921,7 @@ fn Lowering.platform_instance(mut self, name: Str) -> Instance {
     }
     let Some(item) = found else {
         expect false
-        return Instance.Nir(item: ty::ItemId(index: 0), role: nir::Role.Body, index: 0, args: ty::Args.none())
+        return ty::ItemId(index: 0)
     }
-    return Instance.Nir(item: item, role: nir::Role.Body, index: 0, args: ty::Args.none())
-} Lowering.platform_instance
+    return item
+} Lowering.platform_function

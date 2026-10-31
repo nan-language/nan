@@ -83,6 +83,7 @@ The **interface hash** is the hash of the UTF-8 bytes `interface`, LF and the it
 | `enum` | the whole normalised form, then the facts line |
 | `layout`, `registers`, `impl`, `registry`, `contribute`, `retired`, `const assert` | the whole normalised form |
 | `interface` | the normalised form with each default body replaced by the word `default` |
+| `protocol` | the normalised form without the operations not visible wherever the protocol is visible |
 | `const` | the head, `=` and, separated by single spaces, the lowercase hexadecimal of the [canonical NIR encoding](19-nir.md#encoding) of the value that [const evaluation](21-interpreter.md#const-evaluation) gives under each declared concrete target, in byte order of target name, or once for a package declaring `any` |
 | `test` | the line `test <name> for <target>` |
 | `package` | the `package` line and the `language` and `targets` directives |
@@ -273,7 +274,7 @@ pub fn tally(mut counter: Counter) {
 
 ### History
 
-The **history** of a package is its [machine file](35-format.md#machine-files) `.nan/history.nan`, recording its store name, its [history head](#publishing) and every tombstone [publishing](#publishing) moved out of source; tombstones keeping an `Encode` [key](13-text-encode.md#keys) stay in source while their type derives `Encode`. A release's [code root](30-artefacts.md#code-roots) holds the history's tombstones, never its history head or store name. History tombstones forward, match and take old forms exactly as tombstones in source do.
+The **history** of a package is its [machine file](35-format.md#machine-files) `.nan/history.nan`, recording its store name, its [history head](#publishing), the schema hash of each type whose [schema tree](13-text-encode.md#schema-hashes) the code root of a release [published](#publishing) from it records, which [migrations](13-text-encode.md#migrations) read, and every tombstone publishing moved out of source; tombstones keeping an `Encode` [key](13-text-encode.md#keys) stay in source while their type derives `Encode`. A release's [code root](30-artefacts.md#code-roots) holds the history's tombstones, never its history head, store name or schema hashes. History tombstones forward, match and take old forms exactly as tombstones in source do.
 
 ## Compatibility
 
@@ -299,6 +300,7 @@ An item is compatible with another for a role when their interface hashes are eq
 | --- | --- |
 | A new variant of an open enum that leaves every [promise](05-properties.md#promises) of the enum in place | every role |
 | A new field of an open struct that leaves every promise in place, of a type implementing `Default` when the struct derives `Encode` | every role |
+| A struct declared `open` that becomes `flexible`, or `flexible` that becomes `open` | every role |
 | A new interface method with a default body, the interface staying Dyn-usable if it was | every role |
 | A weaker `requires` or a stronger `ensures` on a function that is not an interface method | `call`, `name` |
 | Changed examples, every example of the old item holding when the [interpreter](21-interpreter.md#interpreter) runs it against the new release | every role |
@@ -373,6 +375,32 @@ The **encode class** of a release is the worst class of the exported types imple
 - in a `Variant` node, each variant of O is matched by a variant of N whose key or aliases include its key, without a payload when O's has none and with a payload accepting O's otherwise;
 - nodes of the other kinds always.
 
+`mem::wire::Schema.accepts` decides it, so code holding two trees, such as those of [code roots](30-artefacts.md#code-roots), compares them without the toolchain.
+
+```nan-api
+// module: mem::wire
+
+pub fn Schema.accepts(self, old: Schema) -> bool
+```
+
+```nan
+pub closed struct Settings derives Encode {
+    pub retries: u8
+} Settings
+
+pub open struct Config derives Encode {
+    pub retries: u8
+    pub verbose: bool
+} Config
+
+pub fn reads_settings(alloc: mem::Alloc) -> bool
+    example reads_settings(testing::world().alloc)
+{
+    let config = mem::wire::Codec[Config].schema(alloc)
+    return config.accepts(mem::wire::Codec[Settings].schema(alloc))
+} reads_settings
+```
+
 ### Publish summaries
 
 The **publish summary** of a release lists its release class and encode class; each exported item with its class and behaviour epoch; each epoch bump with its reason; the entries its [authority summary](14-authority.md#authority-summaries) gains and loses against the parent; and, for each exported function and each target, the methods of primitive capabilities it reaches and its trap sites, each with its [trap kind](11-errors-domains.md#traps), file path and line.
@@ -411,11 +439,10 @@ The **requires-set** of a package records what its acceptance relies on in other
 4. each digest fact, and each capability or validator of a digest set, whose absence the package relied on, the bound it relied on the class staying within, and terminates when it relied on its presence, through a limit, a fit or purity ([digests](10-effects-digests.md#digests));
 5. for each method name resolved on the item as a type, the canonical path of the function [method resolution](08-generics-interfaces.md#method-resolution) found;
 6. the item hash, when the package instantiates the item or unfolds its transparent body;
-7. for an interface the package implements by an impl line, the names of the functions named after that line's impl target in the line's module that are not methods of the interface.
+7. for an interface the package implements by an impl line, the names of the functions named after that line's impl target in the line's module that are not methods of the interface;
+8. for a struct or enum, the schema hashes of its instantiations that the schema trees of the package's [code root](30-artefacts.md#code-roots) make nodes for outside the nodes made for any other instantiation of an item of another package.
 
-A requires-set **is satisfied by** a set of releases, one per package, when for each entry the item of that package's release is compatible for each recorded role, each recorded reliance still holds with digests re-derived across the set, each recorded method name resolves to the same function, no name recorded for an implemented interface is a method of that interface, and each recorded item hash is equal. A release whose requires-set its closure does not satisfy is checked again from its NIR ([reuse](30-artefacts.md#reuse)).
-
-An artefact of an earlier [language version](37-evolution.md#language-versions) holds no value for a fact kind a later version introduces; a toolchain reading it takes that fact at its worst value ([digests](10-effects-digests.md#digests)).
+A package of an earlier [language version](37-evolution.md#language-versions) has no value for a fact kind a later version introduces; a consumer reading it takes that fact at its worst value ([digests](10-effects-digests.md#digests)).
 
 In the next example, the requires-set of `report` has an entry for `meter::Total.add` with role `call`, its interface hash, epoch 0 and the relied absence of alloc, and one for `meter::Total` with role `name` and `add` resolving to `meter::Total.add`.
 
@@ -459,7 +486,7 @@ pub fn add_pair(mut total: meter::Total, left: u64, right: u64) limits noalloc {
 
 ## Local store
 
-The **local store** is the store of one user's releases, in the user directory ([cache](36-builds.md#cache)), whose entries are never removed or rewritten. Each entry is a release with its artefact, package name and **publication index**, 1 for the first entry and increasing by 1; a named release also has its store name, parent and publish summary.
+The **local store** is the store of one user's releases, in the user directory ([cache](36-builds.md#cache)), whose entries are never removed or rewritten. Each entry is a release with its artefact, its **source tree**, the source and machine files that the artefact's [attestation file](30-artefacts.md#artefacts) hashes, its package name and its **publication index**, 1 for the first entry and increasing by 1; a named release also has its store name, parent and publish summary.
 
 - A **named release** is appended by `nan publish --local` under a **store name**, which store-name sources of `dep` directives name ([aliases](03-packages-modules.md#aliases)). Publishing a package under a store name holding releases of another package is an error (`version.store-name-taken`), reported on the `package` line.
 - A **path release** is the state of a path source that `nan dep sync` locks, appended without a store name.
@@ -474,7 +501,7 @@ The **local store** is the store of one user's releases, in the user directory (
 3. The release's **parent** is the **history head**, the code root hash of the release last published from the package; without a history head, it has none. A history head that is not in the local store is an error (`version.parent-missing`), reported on the `package` line.
 4. It checks each `preserves` tombstone that the parent's code root does not hold and whose old form names an exported item or member of the parent. A path rewrite preserves when the replacement, given the old canonical path, has the old item's interface form in the parent, or, for a field or variant, when the live member that the rewrite's member reaches through the release's `preserves` tombstones has the old declaration line with its own name in place of the old one. A head rewrite preserves when the prover proves every obligation of the **forwarding function**, which has the old head, the old item's requires and ensures in the parent, and a body returning the rewrite; or else when the old item has examples and each holds when the interpreter runs it against the new release, its uses of the old item forwarding. Any other such tombstone is an error (`retired.not-preserved`).
 5. It applies `--breaking` and computes each exported item's class and epoch, the release class, the encode class and the publish summary.
-6. It records the store name in the history: `--name` when given, else the one recorded, else the package name. It then moves every tombstone in source into the history, except a tombstone keeping an `Encode` [key](13-text-encode.md#keys) of a type that derives `Encode`; then it builds the [artefact](30-artefacts.md#artefacts), appends the release under the store name and records it as the history head.
+6. It records the store name in the history: `--name` when given, else the one recorded, else the package name. It then moves every tombstone in source into the history, except a tombstone keeping an `Encode` [key](13-text-encode.md#keys) of a type that derives `Encode`; then it builds the [artefact](30-artefacts.md#artefacts), records in the history the schema hash of each type whose schema tree its code root records, appends the release under the store name and records it as the history head.
 
 With `--as`, the publisher is the given principal and the release's **author principals** are the `--author` principals, the publisher alone when none is given. Step 1's release gate then applies the [author rule](31-trust.md#author-rule) to them, and step 6 writes the artefact's [sections](30-artefacts.md#sections): its signature by the publisher, its certificate with the publisher as builder, and its provenance naming the author principals. A principal outside the principal form is an error (`seal.bad-principal`), and so is a publisher without a [secret key](31-trust.md#principals), or whose secret key's public key differs from the one the package's principals file gives it (`key.missing`); the package is then not published. `--author` without `--as` is `tool.usage`.
 
@@ -486,7 +513,7 @@ The **lock** of a package is its machine file `.nan/lock.nan`, written only by `
 - one checksummed line per package of the [dependency closure](27-program-model.md#final-builds) other than the package itself and std: the package's name and, for a direct dependency, its alias ([lock syntax](35-format.md#lock)), its source as its `dep` directive writes it with a path source rewritten relative to the locking package's directory, the code root hash of its **locked release**, and, for a release whose artefact holds [sections](30-artefacts.md#sections), the public key of its publisher;
 - for a [final-link root](27-program-model.md#final-builds), its [approvals](#approvals).
 
-[Canonical format and machine files](35-format.md#lock) defines the lock's syntax, validity and reserved fields. The checker reads each other package of the closure but std through its locked release: from source when that release is the current state of its path source, and otherwise from its artefact in the local store.
+[Canonical format and machine files](35-format.md#lock) defines the lock's syntax, validity and reserved fields. The checker reads each other package of the closure but std through its locked release: from source when that release is the current state of its path source, and otherwise from the source tree its local store entry holds ([releases](30-artefacts.md#releases)).
 
 - A `dep` directive without a lock line for its source, a lock line whose source differs from its directive's, and a missing or surplus line for a package reached through others are errors (`dep.lock-stale`), reported on the directive or else on the `package` line.
 - A locked release that is neither the current state of its path source nor in the local store is an error (`dep.release-missing`), reported on the first `dep` directive, in alias order, that reaches it.
@@ -564,7 +591,7 @@ An **assignment** gives one candidate to each source of P's `dep` directives and
 
 1. its closure holds one release per package name and no cycle;
 2. P and the package of each assigned path release check from source against it without error, with digests re-derived across the closure;
-3. the [reuse](30-artefacts.md#reuse) of every other assigned release reports no error;
+3. the [release check](30-artefacts.md#releases) of every other assigned release, under each target P is checked for, finds no error;
 4. P's [reliance tests](22-testing.md#reliance-tests) and [affected tests](22-testing.md#affected-tests) pass, and so do the reliance tests recorded in each assigned release whose targets lie in a package assigned another release than the lock names.
 
 `nan dep sync` writes the greatest acceptable assignment, comparing assignments by the publication index of each package's release, 0 for a path release or an absent package, over the union of their package names in byte order, the first difference deciding. When none is acceptable, it searches again ignoring P's own errors in condition 2 and, while P has any, P's tests in condition 4, so that a package whose own source does not check still locks its closure; when none is acceptable then either, it is an error (`dep.unresolved`), reported on P's `package` line with the diagnostics of each condition that the assignment of each source's newest candidate fails. For each package whose locked release changes, `nan dep sync` prints both code roots, the release class of the new one with the old as its parent, and the epoch changes and widenings it brings.

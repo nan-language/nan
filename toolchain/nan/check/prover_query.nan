@@ -1334,6 +1334,13 @@ fn Walk.inst_term(
                 mut operands.push(mut self.operand(mut terms, operand: field.operand, contents))
             }
             let ty = self.subst.ty(self.ck.types(), ty: constructed)
+            match self.ck.types().kind(ty) {
+                ty::TyKind.Item(item: item, args: _) => match self.ck.kept_type(item) {
+                    Some(kept) => mut operands.push(mut terms.intern(Term.App(op: Op.Variant(ty: kept, index: 0), args: mem::List[u32].empty(alloc)), ty: kept))
+                    None => {}
+                }
+                else => {}
+            }
             return Some(mut terms.intern(Term.App(op: Op.Construct(ty), args: take operands), ty))
         }
         nir::Op.Variant(ty: variant_ty, variant: variant, payload: payload) => return Some(mut self.variant_term(mut terms, variant_ty, variant: variant.as_str(), payload, contents))
@@ -2093,7 +2100,7 @@ fn Walk.pure_call(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> b
             pure = digest.contents().pure()
         }
         nir::Callable.Method(item: interface_item, method: method) => {
-            pure = self.ck.method_limits(interface_item, method).pure
+            pure = not self.ck.is_protocol(interface_item) and self.ck.method_limits(interface_item, method).pure
         }
         else => {}
     }
@@ -2316,7 +2323,10 @@ fn Walk.call_facts(
         Some(through) => {
             let clauses = self.ck.ensures_clauses(through.item, method: Some(usize.widen(through.method)))
             let modes = self.method_modes(interface_item: through.item, method: usize.widen(through.method))
-            let ensured = mut self.ensures_facts(mut terms, unit: through.item, clauses: clauses.view(), modes: modes.view(), unit_args: through.unit_args, args, after_args: after_args.view(), result)
+            let shared = self.ck.contract_params(interface_item: through.item, method: usize.widen(through.method), count: args.len())
+            let shared_args = terms_within(args, positions: shared, alloc: self.ck.alloc())
+            let shared_after = terms_within(after_args.view(), positions: shared, alloc: self.ck.alloc())
+            let ensured = mut self.ensures_facts(mut terms, unit: through.item, clauses: clauses.view(), modes: modes.view(), unit_args: through.unit_args, args: shared_args.view(), after_args: shared_after.view(), result)
             for fact in ensured {
                 mut self.fact_after(point.block, position: point.position, ok: point.ok, fact)
             }
@@ -2451,19 +2461,27 @@ fn Walk.inherited_facts(
     let sig = self.ck.sig(item)
     let subst = generics_subst(sig.contents().generics.view(), args: types.contents().arg_list(fn_ref.args), alloc)
     let unit_args = subst.args(types.contents(), args: implemented.args)
+    let shared_args = terms_within(args, positions: implemented.params, alloc)
+    let shared_after = terms_within(after_args, positions: implemented.params, alloc)
+    var shared_modes = mem::List[ast::Mode].empty(alloc)
+    for position in implemented.params {
+        if position < modes.len() {
+            mut shared_modes.push(modes[position])
+        }
+    }
     var held = mem::List[u32].empty(alloc)
     for clause in self.ck.method_requires(implemented.item, method: implemented.method) {
         if clause.disputed {
             continue
         }
-        match mut self.returned(mut terms, item: implemented.item, role: nir::Role.Requires, index: clause.index, type_args: unit_args, params: listed_terms(args, alloc)) {
+        match mut self.returned(mut terms, item: implemented.item, role: nir::Role.Requires, index: clause.index, type_args: unit_args, params: listed_terms(shared_args.view(), alloc)) {
             Some(term) => mut held.push(term)
             None => {}
         }
     }
     let guard = mut terms.conjunction(take held)
     let clauses = self.ck.ensures_clauses(implemented.item, method: Some(implemented.method))
-    let inherited = mut self.ensures_facts(mut terms, unit: implemented.item, clauses: clauses.view(), modes, unit_args, args, after_args, result)
+    let inherited = mut self.ensures_facts(mut terms, unit: implemented.item, clauses: clauses.view(), modes: shared_modes.view(), unit_args, args: shared_args.view(), after_args: shared_after.view(), result)
     for fact in inherited {
         let guarded = mut terms.implies(guard, part: fact)
         mut self.fact_after(point.block, position: point.position, ok: point.ok, fact: guarded)
@@ -2511,10 +2529,12 @@ fn Walk.param_modes(self, fn_ref: nir::FnRef) -> mem::List[ast::Mode] {
 fn Walk.method_modes(self, interface_item: ty::ItemId, method: usize) -> mem::List[ast::Mode] {
     var modes = mem::List[ast::Mode].empty(self.ck.alloc())
     let sig = self.ck.sig(interface_item)
-    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+    let Some(methods) = sig.contents().kind.methods() else {
         return modes
     }
-    expect method < methods.len()
+    if method >= methods.len() {
+        return modes
+    }
     for param in methods[method].sig.params {
         mut modes.push(param.mode)
     }

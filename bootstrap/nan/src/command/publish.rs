@@ -15,7 +15,7 @@ use crate::check;
 use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic};
 use crate::format;
 use crate::journal;
-use crate::machine::history::History;
+use crate::machine::history::{History, Module};
 use crate::machine::principals::is_principal;
 use crate::output::{Output, Record, Verdict};
 use crate::release;
@@ -152,23 +152,32 @@ pub fn run(
         changed,
         tombstones: moved,
     } = moved_tombstones(workspace, index);
-    let mut modules: BTreeMap<String, Vec<String>> = history
-        .map(|history| history.modules.iter().cloned().collect())
+    let mut modules: BTreeMap<String, Module> = history
+        .map(|history| {
+            history
+                .modules
+                .iter()
+                .map(|module| (module.name.clone(), module.clone()))
+                .collect()
+        })
         .unwrap_or_default();
     for (module, tombstone) in moved {
-        let held = modules.entry(module).or_default();
-        if !held.contains(&tombstone) {
-            held.push(tombstone);
+        let held = &mut modules.entry(module.clone()).or_insert_with(|| Module {
+            name: module,
+            ..Module::default()
+        });
+        if !held.tombstones.contains(&tombstone) {
+            held.tombstones.push(tombstone);
         }
     }
     for held in modules.values_mut() {
-        held.sort();
+        held.tombstones.sort();
     }
     let history_path = format!("{}/.nan/history.nan", package.dir);
     let staged = History {
         name: name.clone(),
         head: history.and_then(|history| history.head),
-        modules: modules.into_iter().collect(),
+        modules: modules.values().cloned().collect(),
     };
     let mut files: HashMap<String, Vec<u8>> = changed.into_iter().collect();
     files.insert(history_path.clone(), staged.bytes().unwrap_or_default());
@@ -301,8 +310,19 @@ pub fn run(
             ));
         }
     };
+    for (module, ty, hash) in check::schema_records(&moved_workspace, index) {
+        let held = modules.entry(module.clone()).or_insert_with(|| Module {
+            name: module,
+            ..Module::default()
+        });
+        if !held.schemas.contains(&(ty.clone(), hash)) {
+            held.schemas.push((ty, hash));
+            held.schemas.sort();
+        }
+    }
     let recorded = History {
         head: Some(entry.root()),
+        modules: modules.into_values().collect(),
         ..staged
     };
     files.insert(history_path, recorded.bytes().unwrap_or_default());

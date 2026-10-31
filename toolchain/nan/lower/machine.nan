@@ -65,19 +65,20 @@ const UEFI_SEAM: Slice[u8] = b"\x48\xbc\x00\x00\x00\x00\x00\x00\x00\x00\x48\x89\
 /// floating point and Advanced SIMD, loads the entry root, the memory attributes and the
 /// translation control, which walks the entry root for the low addresses and no table for the
 /// high ones, its physical address size the processor's up to 48 bits, turns the MMU and caches
-/// on, sets the boot stack, and calls the boot glue with the device tree's address `0x4000_0000`
-/// and zero. Its literal pool, after the code, holds the entry root's address, the memory
-/// attributes, the translation control without its physical address size, the boot stack's top
-/// and the boot glue's address; the image writer patches the first, fourth and fifth.
-const AARCH64_BARE_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\x89\x03\x00\x58\x09\x20\x18\xd5\x89\x03\x00\x58\x09\xa2\x18\xd5\x89\x03\x00\x58\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x01\x00\x58\x3f\x01\x00\x91\x00\x00\xa8\xd2\x01\x00\x80\xd2\x89\x01\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\xff\x00\x00\x00\x00\x00\x10\x35\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+/// on, sets the boot stack, and calls the boot glue with the `x0` and `x1` it entered with, `x0`
+/// becoming `0x4000_0000` when both are zero. Its literal pool, after the code, holds the entry
+/// root's address, the memory attributes, the translation control without its physical address
+/// size, the boot stack's top and the boot glue's address; the image writer patches the first,
+/// fourth and fifth.
+const AARCH64_BARE_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x03\x00\x58\x09\x20\x18\xd5\xc9\x03\x00\x58\x09\xa2\x18\xd5\xc9\x03\x00\x58\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x02\x00\x58\x3f\x01\x00\x91\x60\x00\x00\xb5\x41\x00\x00\xb5\x00\x00\xa8\xd2\xa9\x01\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x1f\x20\x03\xd5\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\xff\x00\x00\x00\x00\x00\x10\x35\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 
 /// The offsets within `AARCH64_BARE_SEAM` of the literal-pool entries the image writer patches:
 /// the entry root's address, the boot stack's top and the boot glue's address.
-const AARCH64_SEAM_ROOT: u32 = 0x80
+const AARCH64_SEAM_ROOT: u32 = 0x88
 
-const AARCH64_SEAM_STACK: u32 = 0x98
+const AARCH64_SEAM_STACK: u32 = 0xa0
 
-const AARCH64_SEAM_BOOT: u32 = 0xa0
+const AARCH64_SEAM_BOOT: u32 = 0xa8
 
 /// The `aarch64-uefi` entry seam's machine code: the firmware calls it in the Procedure Call
 /// Standard with the image handle in `x0` and the system table in `x1`, under the MMU it set up; it
@@ -143,13 +144,18 @@ fn Lowering.boot_stack(self, program: Program) -> u64 {
 
 /// Switches task stacks: saves the running stack's execution to the context at `store`, restores
 /// the one at `load` and resumes it with `payload`. The x86-64 code generator lowers the switch;
-/// on AArch64, which it cannot, the `Switch` compiler stub does.
+/// on AArch64, which it cannot, a compiler stub does, keeping the floating-point registers host
+/// code keeps across calls.
 fn Lowering.switch_stacks(mut self, mut fx: Fx, store: clif::Value, load: clif::Value, payload: clif::Value) {
     if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
         var args = Array[clif::Value, 3].filled(store)
         args[1] = load
         args[2] = payload
-        discard mut self.call_stub(mut fx, stub: Stub.Switch, args: args.view())
+        var stub = Stub.Switch
+        if self.machine() {
+            stub = Stub.MachineSwitch
+        }
+        discard mut self.call_stub(mut fx, stub, args: args.view())
         return
     }
     discard mut fx.b.stack_switch(store, load_context_ptr: load, in_payload0: payload)
@@ -353,6 +359,7 @@ fn Lowering.aarch64_entry_root(mut self) -> object::DataId {
 /// sets up the runtime, ending with status 71 when it cannot start.
 fn Lowering.start_boot(mut self, mut fx: Fx, params: Slice[clif::Value]) {
     expect params.len() > 1
+    mut self.check_level(mut fx)
     let state_address = mut self.state(mut fx)
     mut fx.store(params[0], addr: state_address, offset: STATE_PLATFORM)
     mut fx.store(params[1], addr: state_address, offset: STATE_PLATFORM_TABLE)

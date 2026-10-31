@@ -203,7 +203,7 @@ fn last_green(
         let writer = scope.package(workspace).and_then(|package| package.name());
         return Ok(changed(
             &entries,
-            &check::greens(workspace, None, errors),
+            &check::greens(workspace, scope, errors),
             writer,
         ));
     }
@@ -211,7 +211,7 @@ fn last_green(
         let (file, line) = entry.location.rsplit_once(':').unwrap_or_default();
         !scope.holds(workspace, file, line.parse().ok())
     });
-    for green in check::greens(workspace, Some(scope), &[]) {
+    for green in check::greens(workspace, scope, &[]) {
         entries.insert(
             green.path.clone(),
             Entry {

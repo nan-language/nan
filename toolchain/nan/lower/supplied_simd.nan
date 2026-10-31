@@ -1,0 +1,237 @@
+//! Lane types: `store` of the lane types of `core::simd`, a copy of the lanes on every target, and the members a host target computes with vector instructions in place of their text, which a machine target lowers lane by lane as it is written. Lane values are held in memory and loaded and stored whole, with no alignment assumed beyond their lanes'.
+
+/// The vector type of the lane or mask type owning a member, named by the member's canonical
+/// path; none for `F16x8` and any other type, which every target computes lane by lane.
+fn simd_vector(path: Str) -> Option[clif::Type] {
+    let Some(owner) = path.slice_bytes(0, end: simd_member_at(path)) else {
+        return None
+    }
+    return match owner {
+        "core::simd::U8x16." or "core::simd::I8x16." or "core::simd::Mask8x16." => Some(clif::Type.Int8x16)
+        "core::simd::U16x8." or "core::simd::I16x8." or "core::simd::Mask16x8." => Some(clif::Type.Int16x8)
+        "core::simd::U32x4." or "core::simd::I32x4." or "core::simd::Mask32x4." => Some(clif::Type.Int32x4)
+        "core::simd::U64x2." or "core::simd::I64x2." or "core::simd::Mask64x2." => Some(clif::Type.Int64x2)
+        "core::simd::F32x4." => Some(clif::Type.Float32x4)
+        else => None
+    }
+} simd_vector
+
+/// The members computed with vector instructions on a host target.
+const VECTORIZED_MEMBERS: Str = "splat load wrapping_add wrapping_sub wrapping_mul saturating_add saturating_sub bit_and bit_or bit_xor bit_not shl shr lanes_eq lanes_lt lanes_gt select add sub mul div sqrt min max from_i32x4 to_i32x4 dot any all bitmask"
+
+/// The index at which the member name after the last `.` of a canonical path starts.
+fn simd_member_at(path: Str) -> usize {
+    let spelling = path.as_bytes()
+    var at = spelling.len()
+    while at > 0 {
+        invariant at <= spelling.len()
+        at -= 1
+        if spelling[at] == b'.' {
+            return at + 1
+        }
+    }
+    return 0
+} simd_member_at
+
+/// The flags of an access to lanes: unable to fault, aligned only as their lanes are.
+fn simd_lanes() -> clif::MemFlags = clif::MemFlags.unaligned()
+
+/// Defines `store` of a lane type: its lanes copied to the elements from `at`.
+fn simd_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    if not supply.path.starts_with("core::simd::") or supply.member() != "store" {
+        return false
+    }
+    let lanes = supply.param(0).address_value()
+    let view = supply.param(1).address_value()
+    let start = mut fx.load(PTR, addr: view, offset: 0)
+    expect supply.abi.params.len() > 0
+    let laid = mut lo.layout_of(supply.abi.params[0].nty.ty())
+    let element = laid.contents().align
+    let offset = mut fx.b.imul_imm_s(supply.param(2).scalar_value(), y: i64.fit(element))
+    let at = mut fx.b.iadd(start, y: offset)
+    mut lo.copy(mut fx, dst: at, src: lanes, size: 16, align: element)
+    supply.done(mut lo, mut fx)
+    return true
+} simd_lower
+
+/// Whether a host target computes a member of `core::simd`, named by its canonical path, with
+/// vector instructions in place of its text.
+fn simd_vectorized(path: Str) -> bool {
+    let Some(member) = path.slice_bytes(simd_member_at(path), end: path.byte_len()) else {
+        return false
+    }
+    return simd_vector(path).is_some() and check::is_listed(VECTORIZED_MEMBERS, word: member)
+} simd_vectorized
+
+/// The lane value a parameter holds, loaded as a vector of `ty`.
+fn simd_operand(mut fx: Fx, supply: Supply, index: usize, ty: clif::Type) -> clif::Value {
+    return mut fx.b.load(ty, flags: simd_lanes(), p: supply.param(index).address_value(), offset: 0)
+} simd_operand
+
+/// Defines a member `simd_vectorized` accepts.
+fn simd_lower_vector(mut lo: Lowering, mut fx: Fx, abi: Abi, item: ty::ItemId, args: ty::Args) {
+    let entry = supply_entry(mut fx, abi, alloc: lo.alloc)
+    let path = lo.ck.db().canonical(item)
+    let Some(member) = path.as_str().slice_bytes(simd_member_at(path.as_str()), end: path.byte_len()) else {
+        expect false
+        return
+    }
+    let Some(ty) = simd_vector(path.as_str()) else {
+        expect false
+        return
+    }
+    let signed = path.starts_with("core::simd::I")
+    let supply = Supply(abi: abi.copy(lo.alloc), args: args, path: text::String.of(path.as_str(), alloc: lo.alloc), owner: None, sret: entry.sret, failure: entry.failure, params: take entry.params, wrap: None)
+    if member == "any" or member == "all" or member == "bitmask" {
+        let a = simd_operand(mut fx, supply, index: 0, ty)
+        let reduced = simd_reduced(mut fx, member, a)
+        supply.ret(mut lo, mut fx, held: Held.Scalar(reduced))
+        return
+    }
+    let result = simd_result(mut fx, supply, member, signed, ty)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.b.store(simd_lanes(), x: result, p: sret, offset: 0)
+    supply.ret(mut lo, mut fx, held: Held.Address(sret))
+} simd_lower_vector
+
+/// `any`, `all` or `bitmask` of a mask's lanes.
+fn simd_reduced(mut fx: Fx, member: Str, a: clif::Value) -> clif::Value {
+    if member == "any" {
+        return mut fx.b.vany_true(a)
+    }
+    if member == "all" {
+        return mut fx.b.vall_true(a)
+    }
+    return mut fx.b.vhigh_bits(clif::Type.Int16, x: a)
+} simd_reduced
+
+/// The lane value a member other than a reduction computes.
+fn simd_result(mut fx: Fx, supply: Supply, member: Str, signed: bool, ty: clif::Type) -> clif::Value {
+    if member == "splat" {
+        return mut fx.b.splat(ty, x: supply.param(0).scalar_value())
+    }
+    if member == "load" {
+        let start = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+        let offset = mut fx.b.imul_imm_s(supply.param(1).scalar_value(), y: i64.widen(ty.lane_type().bytes()))
+        let at = mut fx.b.iadd(start, y: offset)
+        return mut fx.b.load(ty, flags: simd_lanes(), p: at, offset: 0)
+    }
+    if member == "bit_not" or member == "sqrt" or member == "to_i32x4" {
+        let a = simd_operand(mut fx, supply, index: 0, ty)
+        if member == "bit_not" {
+            return mut fx.b.bnot(a)
+        }
+        if member == "sqrt" {
+            return mut fx.b.sqrt(a)
+        }
+        return mut fx.b.fcvt_to_sint_sat(clif::Type.Int32x4, x: a)
+    }
+    if member == "shl" or member == "shr" {
+        let a = simd_operand(mut fx, supply, index: 0, ty)
+        let amount = supply.param(1).scalar_value()
+        if member == "shl" {
+            return mut fx.b.ishl(a, y: amount)
+        }
+        if signed {
+            return mut fx.b.sshr(a, y: amount)
+        }
+        return mut fx.b.ushr(a, y: amount)
+    }
+    if member == "select" {
+        let int_ty = ty.integer()
+        let mask = simd_operand(mut fx, supply, index: 0, ty: int_ty)
+        let if_true = simd_operand(mut fx, supply, index: 1, ty: int_ty)
+        let if_false = simd_operand(mut fx, supply, index: 2, ty: int_ty)
+        return mut fx.b.bitselect(mask, x: if_true, y: if_false)
+    }
+    if member == "from_i32x4" {
+        let value = simd_operand(mut fx, supply, index: 0, ty: clif::Type.Int32x4)
+        return mut fx.b.fcvt_from_sint(clif::Type.Float32x4, x: value)
+    }
+    let a = simd_operand(mut fx, supply, index: 0, ty)
+    let b = simd_operand(mut fx, supply, index: 1, ty)
+    if member == "dot" {
+        let acc = simd_operand(mut fx, supply, index: 2, ty: clif::Type.Int32x4)
+        return simd_dot(mut fx, a, b, acc)
+    }
+    return simd_binary(mut fx, member, signed, ty, a, b)
+} simd_result
+
+/// A member combining two lane values lane by lane.
+fn simd_binary(mut fx: Fx, member: Str, signed: bool, ty: clif::Type, a: clif::Value, b: clif::Value) -> clif::Value {
+    if ty == clif::Type.Float32x4 and (member == "lanes_eq" or member == "lanes_lt" or member == "lanes_gt") {
+        let cond = match member {
+            "lanes_eq" => clif::FloatCC.Equal
+            "lanes_lt" => clif::FloatCC.LessThan
+            else => clif::FloatCC.GreaterThan
+        }
+        return mut fx.b.fcmp(cond, x: a, y: b)
+    }
+    if member == "lanes_eq" {
+        return mut fx.b.icmp(clif::IntCC.Equal, x: a, y: b)
+    }
+    if member == "lanes_lt" {
+        let cond = if signed {
+            clif::IntCC.SignedLessThan
+        } else {
+            clif::IntCC.UnsignedLessThan
+        }
+        return mut fx.b.icmp(cond, x: a, y: b)
+    }
+    if member == "lanes_gt" {
+        let cond = if signed {
+            clif::IntCC.SignedGreaterThan
+        } else {
+            clif::IntCC.UnsignedGreaterThan
+        }
+        return mut fx.b.icmp(cond, x: a, y: b)
+    }
+    if member == "saturating_add" {
+        if signed {
+            return mut fx.b.sadd_sat(a, y: b)
+        }
+        return mut fx.b.uadd_sat(a, y: b)
+    }
+    if member == "saturating_sub" {
+        if signed {
+            return mut fx.b.ssub_sat(a, y: b)
+        }
+        return mut fx.b.usub_sat(a, y: b)
+    }
+    return match member {
+        "wrapping_add" => mut fx.b.iadd(a, y: b)
+        "wrapping_sub" => mut fx.b.isub(a, y: b)
+        "wrapping_mul" => mut fx.b.imul(a, y: b)
+        "bit_and" => mut fx.b.band(a, y: b)
+        "bit_or" => mut fx.b.bor(a, y: b)
+        "bit_xor" => mut fx.b.bxor(a, y: b)
+        "add" => mut fx.b.fadd(a, y: b)
+        "sub" => mut fx.b.fsub(a, y: b)
+        "mul" => mut fx.b.fmul(a, y: b)
+        "div" => mut fx.b.fdiv(a, y: b)
+        "min" => mut fx.b.fmin(a, y: b)
+        else => mut fx.b.fmax(a, y: b)
+    }
+} simd_binary
+
+/// `acc` plus, lane by lane, the sums of the four products of the signed bytes of `a` and `b`
+/// each lane spans, in the form a dot product instruction computes.
+fn simd_dot(mut fx: Fx, a: clif::Value, b: clif::Value, acc: clif::Value) -> clif::Value {
+    let low_a = mut fx.b.swiden_low(a)
+    let low_b = mut fx.b.swiden_low(b)
+    let low = mut fx.b.imul(low_a, y: low_b)
+    let high_a = mut fx.b.swiden_high(a)
+    let high_b = mut fx.b.swiden_high(b)
+    let high = mut fx.b.imul(high_a, y: high_b)
+    let low_first = mut fx.b.swiden_low(low)
+    let low_second = mut fx.b.swiden_high(low)
+    let low_pairs = mut fx.b.iadd_pairwise(low_first, y: low_second)
+    let high_first = mut fx.b.swiden_low(high)
+    let high_second = mut fx.b.swiden_high(high)
+    let high_pairs = mut fx.b.iadd_pairwise(high_first, y: high_second)
+    let pairs = mut fx.b.iadd_pairwise(low_pairs, y: high_pairs)
+    return mut fx.b.iadd(pairs, y: acc)
+} simd_dot

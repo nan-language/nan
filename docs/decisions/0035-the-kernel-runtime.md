@@ -1,6 +1,6 @@
 # 0035. The kernel runtime
 
-Status: accepted; its entry root superseded by 0074, its periodic timer by 0081
+Status: accepted; its entry root superseded by 0074, its periodic timer by 0081, its per-vector binding table by 0099, its run queue by 0107
 
 ## Context
 

@@ -352,6 +352,29 @@ test removed_timer_is_stale for deadline_after_cancel {
 } removed_timer_is_stale
 ```
 
+```nan
+struct Jobs {
+} Jobs
+
+pub fn entries_in_slot_order(alloc: mem::Alloc) -> u32
+    example entries_in_slot_order(testing::world().alloc) == 524
+{
+    var jobs = mem::Pool[u32, Jobs].empty(alloc)
+    let earliest = mut jobs.insert(1)
+    discard mut jobs.insert(2)
+    let latest = mut jobs.insert(3)
+    discard mut jobs.remove(latest)
+    discard mut jobs.remove(earliest)
+    discard mut jobs.insert(4)
+    discard mut jobs.insert(5)
+    var digits: u32 = 0
+    for job in jobs {
+        digits = digits * 10 + job
+    }
+    return digits
+} entries_in_slot_order
+```
+
 ### Regions
 
 `over(take region)` consumes an `hw::Region` ([physical memory](24-kernel.md#physical-memory)) and adds a root cell whose supply is exactly the 64 KiB-aligned chunks lying wholly inside the region and whose limit is their total size. The store's allocator names that cell. Memory of the region outside those chunks is never used, and the region's memory never returns to the platform: a chunk returning to the cell becomes available to that cell's draws again.
@@ -754,7 +777,7 @@ pub fn drop_quiet(mut levels: mem::List[u32], floor: u32) {
 
 ## Interior mutability
 
-**Interior mutability** is mutation of a value's contents through a read access. Exactly these base types have it: `task::Cown[T]` ([cowns](16-concurrency.md#cowns)), the [atomic](16-concurrency.md#atomics) types of `core::atomic`, `mem::Arena[T]`, `mem::OnceMap[K, V]`, `text::Interner` ([interning](13-text-encode.md#interning)), `hw::SpinLock[T]` and `hw::IrqShared[T]` ([locks](24-kernel.md#locks)), `hw::PerCpu[T]` ([scheduling](24-kernel.md#scheduling)) and `hw::Signal[T]` ([signals](24-kernel.md#signals)). A type containing one of them has interior mutability through it; no other type has it.
+**Interior mutability** is mutation of a value's contents through a read access. Exactly these base types have it: `task::Cown[T]` ([cowns](16-concurrency.md#cowns)), the [atomic](16-concurrency.md#atomics) types of `core::atomic`, `mem::Arena[T]`, `mem::OnceMap[K, V]`, `text::Interner` ([interning](13-text-encode.md#interning)), `hw::SpinLock[T]` and `hw::IrqShared[T]` ([locks](24-kernel.md#locks)), `hw::PerCpu[T]` ([scheduling](24-kernel.md#scheduling)), `hw::Signal[T]` ([signals](24-kernel.md#signals)) and `sys::Abandoner` ([domain run](11-errors-domains.md#domain-run)). A type containing one of them has interior mutability through it; no other type has it.
 
 - Each of these types is implemented by trusted code in std, and never moves or frees a value it holds while a view of that value may be live.
 - Each operation on one of them is atomic with respect to every other task.

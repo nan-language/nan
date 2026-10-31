@@ -2,13 +2,15 @@
 //! code of its failure, zero for none.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
+    AbiParam, InstBuilder, MemFlagsData, Signature, Type, Value, condcodes::IntCC, types,
 };
 
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::Routine;
 use super::super::super::{CALL_CONV, Glue, Lowering};
+use super::super::mem::vector;
 use super::{failure, put_byte, put_bytes, reader};
+use crate::check::ty::Ty;
 
 /// Writes a uvar: 7 bits per byte, least significant group first.
 pub fn put_uvar(fx: &mut Fx, state: Value, value: Value) {
@@ -253,6 +255,118 @@ pub fn read_payload_flag(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value
     (parts[0], parts[1], parts[2])
 }
 
+/// A cursor over the kept fields of a flexible struct, the value of type `kept` at an address:
+/// a reader over the bytes they are written as, empty for none.
+pub fn kept_cursor(lo: &mut Lowering, fx: &mut Fx, kept: &Ty, address: Value) -> Value {
+    let cursor = fx.slot(reader::SIZE, 8);
+    let zero = fx.ptr(0);
+    fx.store(zero, cursor, reader::POS);
+    fx.store(zero, cursor, reader::END);
+    let held = lo.variant_is(fx, address, kept, "Fields");
+    let bytes = lo.payload_address(fx, kept, "Fields", "", address);
+    fx.when(held, |fx| {
+        let data = fx.load(PTR, bytes, vector::DATA);
+        let len = fx.load(PTR, bytes, vector::LEN);
+        let end = fx.b.ins().iadd(data, len);
+        fx.store(data, cursor, reader::POS);
+        fx.store(end, cursor, reader::END);
+    });
+    cursor
+}
+
+/// The key of the kept field at a cursor: its first byte's address and its length, the
+/// cursor passing over the field.
+fn kept_field(lo: &mut Lowering, fx: &mut Fx, cursor: Value) -> (Value, Value) {
+    let (key_len, _) = read_uvar(lo, fx, cursor);
+    let key = fx.load(PTR, cursor, reader::POS);
+    let after = fx.b.ins().iadd(key, key_len);
+    fx.store(after, cursor, reader::POS);
+    let (value_len, _) = read_uvar(lo, fx, cursor);
+    let value = fx.load(PTR, cursor, reader::POS);
+    let end = fx.b.ins().iadd(value, value_len);
+    fx.store(end, cursor, reader::POS);
+    (key, key_len)
+}
+
+/// The number of kept fields a cursor has left.
+pub fn kept_count(lo: &mut Lowering, fx: &mut Fx, cursor: Value) -> Value {
+    let walk = fx.slot(reader::SIZE, 8);
+    let pos = fx.load(PTR, cursor, reader::POS);
+    let end = fx.load(PTR, cursor, reader::END);
+    fx.store(pos, walk, reader::POS);
+    fx.store(end, walk, reader::END);
+    let zero = fx.ptr(0);
+    fx.repeat(&[zero], |fx, state| {
+        let count = state[0];
+        let pos = fx.load(PTR, walk, reader::POS);
+        let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, pos, end);
+        let next = fx.choose_in(
+            lo,
+            more,
+            &[types::I64],
+            |lo, fx| {
+                kept_field(lo, fx, walk);
+                vec![fx.b.ins().iadd_imm_s(count, 1)]
+            },
+            |_, _| vec![count],
+        )[0];
+        (more, vec![next])
+    })[0]
+}
+
+/// Writes the kept fields a cursor has left whose keys precede `before` in byte order, or all
+/// of them, the cursor passing over each written.
+pub fn put_kept(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    state: Value,
+    cursor: Value,
+    before: Option<&[u8]>,
+) {
+    let zero = fx.ptr(0);
+    fx.repeat(&[zero], |fx, unchanged| {
+        let pos = fx.load(PTR, cursor, reader::POS);
+        let end = fx.load(PTR, cursor, reader::END);
+        let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, pos, end);
+        let written = fx.choose_in(
+            lo,
+            more,
+            &[types::I8],
+            |lo, fx| {
+                let (key, len) = kept_field(lo, fx, cursor);
+                let earlier = match before {
+                    Some(literal) => key_precedes(lo, fx, key, len, literal),
+                    None => fx.int(types::I8, 1),
+                };
+                let after = fx.load(PTR, cursor, reader::POS);
+                fx.when(earlier, |fx| {
+                    let size = fx.b.ins().isub(after, pos);
+                    put_bytes(lo, fx, state, pos, size);
+                });
+                let later = fx.b.ins().bxor_imm_s(earlier, 1);
+                fx.when(later, |fx| fx.store(pos, cursor, reader::POS));
+                vec![earlier]
+            },
+            |_, fx| vec![fx.int(types::I8, 0)],
+        )[0];
+        (written, vec![unchanged[0]])
+    });
+}
+
+/// Whether a key precedes a literal one in byte order.
+fn key_precedes(lo: &mut Lowering, fx: &mut Fx, key: Value, len: Value, literal: &[u8]) -> Value {
+    let view = lo.view_literal(fx, literal).address();
+    let expected = fx.load(PTR, view, 0);
+    let literal_len = fx.ptr(literal.len() as u64);
+    let shorter = fx.b.ins().umin(len, literal_len);
+    let order = lo.call_routine(fx, Routine::Compare, &[key, expected, shorter])[0];
+    let less = fx.b.ins().icmp_imm_s(IntCC::SignedLessThan, order, 0);
+    let tie = fx.b.ins().icmp_imm_s(IntCC::Equal, order, 0);
+    let shorter_key = fx.b.ins().icmp(IntCC::UnsignedLessThan, len, literal_len);
+    let less_by_len = fx.b.ins().band(tie, shorter_key);
+    fx.b.ins().bor(less, less_by_len)
+}
+
 /// A bool: `Malformed` on a byte other than 0 and 1.
 pub fn read_bool(fx: &mut Fx, state: Value) -> (Value, Value) {
     let (byte, failed) = read_byte(fx, state);
@@ -278,8 +392,9 @@ pub fn read_integer(lo: &mut Lowering, fx: &mut Fx, state: Value, signed: bool) 
     (fx.b.ins().bxor(half, mask), failed)
 }
 
-/// A float: the 8 bytes of an f64 bit pattern, little-endian.
-pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
+/// A float: the 8 bytes of an f64 bit pattern, little-endian, as a value of `float`, the type
+/// holding an f64.
+pub fn read_float(fx: &mut Fx, state: Value, float: Type) -> (Value, Value) {
     let pos = fx.load(PTR, state, reader::POS);
     let left = left(fx, state);
     let enough =
@@ -287,7 +402,7 @@ pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
             .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, left, 8);
     let parts = fx.choose(
         enough,
-        &[types::F64, types::I32],
+        &[float, types::I32],
         |fx| {
             let bits =
                 fx.b.ins()
@@ -295,11 +410,16 @@ pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
             let next = fx.b.ins().iadd_imm_s(pos, 8);
             fx.store(next, state, reader::POS);
             vec![
-                fx.b.ins().bitcast(types::F64, MemFlagsData::new(), bits),
+                super::super::numbers::from_bits(fx, bits, float),
                 code(fx, 0),
             ]
         },
-        |fx| vec![fx.b.ins().f64const(0.0), code(fx, failure::TRUNCATED)],
+        |fx| {
+            vec![
+                super::super::super::body::zero(fx, float),
+                code(fx, failure::TRUNCATED),
+            ]
+        },
     );
     (parts[0], parts[1])
 }

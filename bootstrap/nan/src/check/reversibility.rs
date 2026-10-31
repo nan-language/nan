@@ -181,14 +181,26 @@ pub fn is_volatile(path: &str) -> bool {
     VOLATILE.contains(&path)
 }
 
+/// The firmware's operations whose class is not `traceless`, with that class.
+const FIRMWARE: [(&str, Class); 7] = [
+    ("boot::Services.write_console", Class::Recorded),
+    ("boot::Services.measure", Class::Recorded),
+    ("boot::Services.write_file", Class::Irreversible(ERASE)),
+    ("boot::Services.delete_file", Class::Irreversible(ERASE)),
+    ("boot::Services.set_variable", Class::Irreversible(ERASE)),
+    ("boot::Services.submit_tpm", Class::Irreversible(ERASE)),
+    ("boot::Machine.enter", Class::WORST),
+];
+
 /// The class of a std operation without a body under a target: the greatest for a volatile
-/// call, and on the machine targets, where the sys capabilities are sims, `traceless` for theirs.
+/// call and a firmware call, the firmware's own for its operations, and on the machine targets,
+/// where the sys capabilities are sims, `traceless` for theirs.
 pub fn supplied(path: &str, target: Target) -> Class {
-    if is_volatile(path) {
+    if is_volatile(path) || path == "hw::Ring0.firmware_call" {
         return Class::WORST;
     }
-    if path == "boot::Services.write_console" {
-        return Class::Recorded;
+    if let Some((_, class)) = FIRMWARE.iter().find(|(operation, _)| *operation == path) {
+        return *class;
     }
     if target.is_machine() {
         return Class::Traceless;
@@ -199,10 +211,13 @@ pub fn supplied(path: &str, target: Target) -> Class {
 }
 
 impl Checker<'_> {
-    /// Whether a function has an undo clause, which compensates its digest.
+    /// Whether a function has an undo clause, which compensates its digest, or handles an
+    /// operation with one.
     pub fn compensates(&self, item: ItemId) -> bool {
-        matches!(&self.db.ast(item).kind, ItemKind::Fn(function)
-            if function.clauses.iter().any(|clause| matches!(clause.kind, ClauseKind::Undo { .. })))
+        let own = matches!(&self.db.ast(item).kind, ItemKind::Fn(function)
+            if function.clauses.iter().any(|clause| matches!(clause.kind, ClauseKind::Undo { .. })));
+        own || matches!(self.served(item), Some((_, protocol, super::protocol::Served::Handler(index)))
+            if self.operation_undoes(protocol, index))
     }
 
     /// The undoer an undo clause of a function names: a function item of the function's

@@ -97,16 +97,16 @@ fn numbers_conversion(mut body: Body, mut lo: Lowering, mut fx: Fx, conversion: 
     let repr = mut lo.owned_repr(found.nty.ty())
     let value_held = mut body.adapt(mut lo, mut fx, held: found.held, nty: found.nty, wanted: repr)
     let value = value_held.scalar_value()
-    let target_ty = scalar_type(target)
+    let ty = scalar_type(target, machine: lo.machine())
     let checked = body.checked(block, position)
     match conversion {
-        nir::Conversion.Widen => return Held.Scalar(numbers_widen(mut fx, value, source, target))
-        nir::Conversion.Truncate => return Held.Scalar(place_resize(mut fx, value, target: target_ty))
-        nir::Conversion.Saturate => return Held.Scalar(saturate(mut fx, value, source, target))
-        nir::Conversion.Nearest => return Held.Scalar(nearest(mut fx, value, source, target))
+        nir::Conversion.Widen => return Held.Scalar(numbers_widen(mut fx, value, source, target, ty))
+        nir::Conversion.Truncate => return Held.Scalar(place_resize(mut fx, value, target: ty))
+        nir::Conversion.Saturate => return Held.Scalar(saturate(mut fx, value, source, target, ty))
+        nir::Conversion.Nearest => return Held.Scalar(nearest(mut fx, value, source, target, ty))
         nir::Conversion.Fit or nir::Conversion.CheckedFit => {}
     }
-    let fitted = fit(mut fx, value, source, target)
+    let fitted = fit(mut fx, value, source, target, ty)
     if conversion == nir::Conversion.Fit {
         if checked {
             var shown = mem::List[HeldOperand].empty(lo.alloc)
@@ -129,8 +129,7 @@ fn option_of(mut lo: Lowering, mut fx: Fx, option: ty::Ty, is_some: clif::Value,
     return mut lo.held_at(mut fx, ty: option, address: slot)
 } option_of
 
-fn numbers_widen(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
-    let ty = scalar_type(target)
+fn numbers_widen(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar, ty: clif::Type) -> clif::Value {
     if not source.is_float() and not target.is_float() {
         if source.bits() < target.bits() {
             if source.is_signed() {
@@ -166,8 +165,7 @@ fn integer64(mut fx: Fx, value: clif::Value, scalar: ty::Scalar) -> clif::Value 
 } integer64
 
 /// A conversion that keeps the value exactly, with whether it did.
-fn fit(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> Fitted {
-    let ty = scalar_type(target)
+fn fit(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar, ty: clif::Type) -> Fitted {
     if not source.is_float() and not target.is_float() {
         let range = target.range()
         let widened = integer64(mut fx, value, scalar: source)
@@ -279,8 +277,7 @@ fn trunc(mut fx: Fx, value: clif::Value) -> clif::Value {
     return mut fx.b.select(small, x: signed, y: value)
 } trunc
 
-fn saturate(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
-    let ty = scalar_type(target)
+fn saturate(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar, ty: clif::Type) -> clif::Value {
     if source.is_float() {
         if target.is_signed() {
             return mut fx.b.fcvt_to_sint_sat(ty, x: value)
@@ -303,8 +300,7 @@ fn saturate(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scal
     return mut fx.b.select(fits, x: kept, y: bound)
 } saturate
 
-fn nearest(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
-    let ty = scalar_type(target)
+fn nearest(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar, ty: clif::Type) -> clif::Value {
     if not source.is_float() and target.is_float() {
         let widened = integer64(mut fx, value, scalar: source)
         if source.is_signed() {
@@ -382,6 +378,7 @@ fn numbers_bits(mut body: Body, mut lo: Lowering, mut fx: Fx, conversion: nir::B
     }
 } numbers_bits
 
+/// A float's bit pattern, or the value itself where it already is one.
 fn bits_of(mut fx: Fx, value: clif::Value) -> clif::Value {
     return match fx.b.value_type(value) {
         clif::Type.Float32 => mut fx.b.bitcast(clif::Type.Int32, flags: clif::MemFlags.new(), x: value)
@@ -390,6 +387,8 @@ fn bits_of(mut fx: Fx, value: clif::Value) -> clif::Value {
     }
 } bits_of
 
+/// A bit pattern as a value of `target`: a float's from its pattern, any other type's the pattern
+/// itself.
 fn from_bits(mut fx: Fx, value: clif::Value, target: clif::Type) -> clif::Value {
     return match target {
         clif::Type.Float32 or clif::Type.Float64 => mut fx.b.bitcast(target, flags: clif::MemFlags.new(), x: value)
@@ -494,7 +493,11 @@ fn numbers_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             held = Held.Scalar(mut fx.b.imul(supply.param(0).scalar_value(), y: supply.param(1).scalar_value()))
         }
         "count_ones" => {
-            held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "popcnt")
+            if lo.machine() and lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                held = Held.Scalar(numbers_ones(mut fx, value: supply.param(0).scalar_value()))
+            } else {
+                held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "popcnt")
+            }
         }
         "leading_zeros" => {
             held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "clz")
@@ -540,10 +543,43 @@ fn numbers_count(mut fx: Fx, value: clif::Value, op: Str) -> Held {
     return Held.Scalar(place_resize(mut fx, value: counted, target: clif::Type.Int32))
 } numbers_count
 
+/// The count of set bits without `popcnt`, which AArch64 computes in its vector registers: each
+/// nibble's count by three subtractions of the value shifted and masked, the nibbles summed into
+/// bytes, and the bytes into the top one by a multiplication, in 32 bits for the narrower types.
+fn numbers_ones(mut fx: Fx, value: clif::Value) -> clif::Value {
+    let wide = fx.b.value_type(value) == clif::Type.Int64
+    var widened = value
+    var sevens: i64 = 0x7777_7777
+    var nibbles: i64 = 0x0F0F_0F0F
+    var units: i64 = 0x0101_0101
+    var top: i64 = 24
+    if wide {
+        sevens = 0x7777_7777_7777_7777
+        nibbles = 0x0F0F_0F0F_0F0F_0F0F
+        units = 0x0101_0101_0101_0101
+        top = 56
+    } else {
+        widened = place_resize(mut fx, value, target: clif::Type.Int32)
+    }
+    var count = widened
+    var shifted = widened
+    for _ in 0u32..<3 {
+        let halved = mut fx.b.ushr_imm_s(shifted, y: 1)
+        shifted = mut fx.b.band_imm_s(halved, y: sevens)
+        count = mut fx.b.isub(count, y: shifted)
+    }
+    let folded = mut fx.b.ushr_imm_s(count, y: 4)
+    let pairs = mut fx.b.iadd(folded, y: count)
+    let bytes = mut fx.b.band_imm_s(pairs, y: nibbles)
+    let summed = mut fx.b.imul_imm_s(bytes, y: units)
+    let counted = mut fx.b.ushr_imm_s(summed, y: top)
+    return place_resize(mut fx, value: counted, target: clif::Type.Int32)
+} numbers_ones
+
 fn division(mut lo: Lowering, mut fx: Fx, supply: Supply, scalar: ty::Scalar) -> Held {
     let a = supply.param(0).scalar_value()
     let b = supply.param(1).scalar_value()
-    let ty = scalar_type(scalar)
+    let ty = scalar_type(scalar, machine: lo.machine())
     let zero_divisor = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: b, y: 0)
     mut fx.if_true(zero_divisor, then: fn[mut lo](mut fx1: Fx) {
         raise_kind(mut lo, fx: mut fx1, kind: "trap.division-by-zero")

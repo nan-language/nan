@@ -44,7 +44,7 @@ pub fn build(
     let target = source.program_target();
     let checker = check::checked(workspace, checked, std, target);
     let root = package_id(&checker, source);
-    let closure = closure(&checker, root);
+    let closure = checker.reached(root);
     diagnostics.retain(|diagnostic| {
         diagnostic.path.as_deref().is_none_or(|path| {
             workspace.file(path).is_some_and(|(package, _)| {
@@ -54,6 +54,7 @@ pub fn build(
             })
         })
     });
+    diagnostics.extend(check::release_errors(&checker, root));
     if errors(&diagnostics) {
         return Ok(Build {
             diagnostics,
@@ -71,7 +72,7 @@ pub fn build(
             });
         }
     }
-    let lowered = lower_program(&checker, root, &artefacts);
+    let lowered = lower_program(&checker, source, root, &artefacts);
     diagnostics.extend(collisions(source, &lowered));
     diagnostics.extend(lower::stack::judge(
         &checker,
@@ -111,14 +112,23 @@ pub fn build(
     })
 }
 
-/// The lowering of the program whose package is `root`, for the checker's target, with the
-/// artefacts of its final closure.
+/// The lowering of the program of `source`, whose package is `root`, for the checker's target at
+/// the codegen level its manifest gives for the target's architecture, with the artefacts of its
+/// final closure.
 fn lower_program(
     checker: &check::Checker,
+    source: &Package,
     root: PackageId,
     artefacts: &BTreeMap<String, Vec<u8>>,
 ) -> lower::Lowered {
     let target = checker.db.target;
+    let level = source.manifest.as_ref().and_then(|manifest| {
+        manifest
+            .levels
+            .iter()
+            .copied()
+            .find(|level| target.arch() == Some(level.arch()))
+    });
     let entry = checker
         .db
         .package(root)
@@ -138,6 +148,7 @@ fn lower_program(
         roots: vec![root],
         prefixes: prefixes(artefacts),
         section: section(artefacts),
+        level,
     };
     match target.is_machine() {
         true => lower::lower_machine(checker, &program),
@@ -157,7 +168,7 @@ pub fn lowered_functions(workspace: &Workspace, program: usize) -> Vec<(String, 
     let checker = check::checked(workspace, checked, std, source.program_target());
     let root = package_id(&checker, source);
     let artefacts = artefacts(workspace, &checker, root);
-    lower::dumping(|| lower_program(&checker, root, &artefacts)).1
+    lower::dumping(|| lower_program(&checker, source, root, &artefacts)).1
 }
 
 /// A task a program or test image starts, as the measurements of the freeze read it: where its
@@ -211,7 +222,10 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
         let checker = check::checked(workspace, checked, std, source.program_target());
         let root = package_id(&checker, source);
         let artefacts = artefacts(workspace, &checker, root);
-        found.extend(tasks(&checker, &lower_program(&checker, root, &artefacts)));
+        found.extend(tasks(
+            &checker,
+            &lower_program(&checker, source, root, &artefacts),
+        ));
     }
     found
 }
@@ -283,22 +297,6 @@ fn package_id(checker: &check::Checker, package: &crate::workspace::Package) -> 
     PackageId(index as u32)
 }
 
-/// The workspace packages of a program's dependency closure.
-fn closure(checker: &check::Checker, root: PackageId) -> Vec<PackageId> {
-    let mut found = vec![root];
-    let mut index = 0;
-    while index < found.len() {
-        let package = checker.db.package(found[index]);
-        for dependency in package.deps.values().flatten() {
-            if !found.contains(dependency) {
-                found.push(*dependency);
-            }
-        }
-        index += 1;
-    }
-    found
-}
-
 /// The artefact of each package lowered with the workspace package `root` of a checker's
 /// closure, by package name: of the packages `root` reaches, a workspace package's of its current
 /// state and a release's from the local store, and of each std package the toolchain's.
@@ -307,7 +305,7 @@ pub fn artefacts(
     checker: &check::Checker,
     root: PackageId,
 ) -> BTreeMap<String, Vec<u8>> {
-    let mut packages = closure(checker, root);
+    let mut packages = checker.reached(root);
     packages.extend(
         (0..checker.db.packages.len())
             .map(|index| PackageId(index as u32))

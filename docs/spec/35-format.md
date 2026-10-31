@@ -13,9 +13,9 @@ The **canonical format** of a source file is the one layout `nan fmt` produces f
 
 ### Line breaking
 
-A **breakable list** is the parenthesised list of the parameters of a function item, an interface method, a test, a tombstone's old head, a function type or a closure, of the arguments of a call or construction, of a variant payload, or of field patterns. A breakable list is **flat** when no line break follows its opener or any of its own commas and no comma follows its last element. It is **broken** when its opener and each of its own commas are the last token of their line, a comma follows its last element, and its closer is the first token of its line.
+A **breakable list** is the parenthesised list of the parameters of a function item, an interface method, a protocol's operation, a test, a tombstone's old head, a function type or a closure, of the arguments of a call or construction, of a variant payload, or of field patterns. A breakable list is **flat** when no line break follows its opener or any of its own commas and no comma follows its last element. It is **broken** when its opener and each of its own commas are the last token of their line, a comma follows its last element, and its closer is the first token of its line.
 
-- The parameter list of a function item, an interface method or a test is broken when it has more than 4 parameters, `self` included, or when a comment stands between its opener and its closer; otherwise it is flat.
+- The parameter list of a function item, an interface method, an operation or a test is broken when it has more than 4 parameters, `self` included, or when a comment stands between its opener and its closer; otherwise it is flat.
 - Every other breakable list is broken when, in the source, its opener or one of its own commas is the last token of its line; otherwise it is flat. An empty list is flat.
 - Every other comma-separated list lies on one line: generic parameters and arguments, impl parameters, capture lists, `derives` and `limits` clauses, `when` accesses, `unique` lists, and the target and name lists of directives.
 - Every `{` is the last token of its line and every `}` the first token of its line, except that no line break follows the `{` of a [trusted expression](23-low-level.md#trusted-code) or precedes its `}`.
@@ -69,8 +69,8 @@ Each line holding a token has a **depth**, and its indentation is 4 spaces per u
 
 The first of these rules that applies to a line gives its depth:
 
-1. A line beginning with a closing delimiter has the indent anchor of the delimiter it closes plus 1 when it closes the broken parameter list of a function item, an interface method or a test, or when that indent anchor is 0 and the line is not the closing line of a braced item; otherwise it has that indent anchor.
-2. With d the depth of the first line of the head of a function item or interface method, the first line of each clause of its clause region has depth d + 1, and the body opener after the clause region has depth d.
+1. A line beginning with a closing delimiter has the indent anchor of the delimiter it closes plus 1 when it closes the broken parameter list of a function item, an interface method, an operation or a test, or when that indent anchor is 0 and the line is not the closing line of a braced item; otherwise it has that indent anchor.
+2. With d the depth of the first line of the head of a function item, interface method or operation, the first line of each clause of its clause region has depth d + 1, and the body opener after the clause region has depth d.
 3. A line of a text run after its first line has the depth of the run's first line.
 4. A line whose first token begins a unit has the base depth. Any other line has the depth of the line holding the first token of its unit, plus 1.
 
@@ -247,11 +247,11 @@ history_file = COL0 'nan' 'history' INT NL COL0 history_tail ;
 history_tail = history_record NL COL0 history_tail
     | retired_item COL0 history_tail
     | check_record NL EOF ;
-history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT ;
+history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT | 'schema' IDENT TEXT ;
 ```
 
 - `name S` holds the store name and `head H` the code root of the [history head](29-identity-versioning.md#publishing). Each comes once, in that order.
-- Each `module M` record follows them, in byte order of M, followed by the tombstones of module M that the history holds, in byte order of their text.
+- Each `module M` record follows them, in byte order of M, followed by a `schema T H` record for each type `T` of module M and schema hash `H` that the history holds, in byte order of `T` and then of the bytes of `H`, then by the tombstones of module M that the history holds, in byte order of their text. A module record is followed by at least one of these.
 - A tombstone is written as its `retired` item in canonical format, as it stood in the source of M. Its paths and rewrite resolve as in M.
 
 This diagram shows the history `meter/.nan/history.nan` of a package `meter` first published without `--name`, after a release that moved the tombstone `retired Counter.bump(mut self) => mut self.record() changes "the count saturates instead of trapping"` of its root module out of source, with the head hash written `<...>`:

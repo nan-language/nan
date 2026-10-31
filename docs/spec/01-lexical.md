@@ -284,7 +284,8 @@ The context words of language 1 are exactly these:
 | `depth`, `length` | [waivers](06-statements-expressions.md#waivers) |
 | `as` | `loop as label` ([conditionals and loops](06-statements-expressions.md#conditionals-and-loops)) |
 | `from` | [error enum](11-errors-domains.md#error-enums) variants |
-| `closed`, `open`, `view` | type [modifiers](02-items.md#modifiers) |
+| `closed`, `open`, `flexible`, `view` | type [modifiers](02-items.md#modifiers) |
+| `migrate` | function [modifiers](02-items.md#modifiers) |
 | `wait` | `uses wait` ([waiting](10-effects-digests.md#waiting)) |
 | `task` | `task fn` [function types](10-effects-digests.md#function-types) |
 | `pure`, `notrap`, `terminates`, `noalloc`, `stack`, `traceless`, `recorded`, `restorable`, `irreversible`, `emit`, `actuate`, `erase`, `spend` | [limits](10-effects-digests.md#limits) clauses |
@@ -293,10 +294,11 @@ The context words of language 1 are exactly these:
 | `bit`, `rest`, `bytes`, `le`, `be`, `tags`, `at` | [layouts](23-low-level.md#layouts) |
 | `at`, `stride`, `read`, `write`, `write_one_clear` | [registers](23-low-level.md#registers) items |
 | `keyed`, `by`, `unique` | [registries](25-registries.md#registries) |
+| `protocol`, `summary` | [protocol](26-components.md#protocols) items |
 | `preserves`, `changes`, `manual` | [tombstones](29-identity-versioning.md#tombstones) |
 | `language`, `targets`, `entry`, `dep`, `allow`, `deny`, `device`, `priv`, `validate` | [manifest](03-packages-modules.md#manifest) directives |
 
-The reserved words of language 1 are exactly `stable`, `flexible`, `migrate`, `machine`, `protocol` and `ipc`, reserved in modifier or kind position of an item head ([reserved forms](02-items.md#reserved-forms)), and `bank`, reserved at the start of a member line of a [registers](23-low-level.md#registers) item. The [reservations](37-evolution.md#reservations) register lists them with every other reservation.
+The reserved words of language 1 are exactly `stable`, `machine` and `ipc`, reserved in modifier or kind position of an item head ([reserved forms](02-items.md#reserved-forms)), and `bank`, reserved at the start of a member line of a [registers](23-low-level.md#registers) item. The [reservations](37-evolution.md#reservations) register lists them with every other reservation.
 
 ```nan
 pub closed struct Span {

@@ -1,0 +1,386 @@
+//! The devices `hw::IrqShared` installs: the binding table, whose first row of vectors serves every CPU and whose other rows serve one CPU each; the chains of devices sharing a binding, which the dispatcher runs and installs and uninstalls change under the bindings lock; and the vectors of x86_64 message-signalled interrupts, with their remapping entries once the IOMMU remaps interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to the CPU of its devices.
+
+/// A binding: the record of its first device, zero while none is installed, then the number of
+/// CPUs running its devices.
+const BINDING_RUNNING: u64 = 8
+
+const BINDING_SIZE: u64 = 16
+
+/// The vectors of a row of the binding table, and its rows: the row of every CPU, then one per
+/// CPU.
+const BINDING_VECTORS: u64 = 256
+
+const BINDING_ROWS: u64 = MAX_CPUS + 1
+
+/// The offsets of a device record's fields: the lock word, the vector or, for an AArch64
+/// message-signalled interrupt, the LPI's identifier, the glue the dispatcher calls with the
+/// record, the interrupt fn as a function value, the next device of its binding, the binding,
+/// the address and data of its message, zero without one, the ITS device id and CPU of an
+/// AArch64 message-signalled interrupt, the holding through which its owner's settlement
+/// uninstalls it, and the device from `DEVICE_RECORD_VALUE` on, at its alignment.
+const DEVICE_RECORD_LOCK: u64 = 0
+
+const DEVICE_RECORD_VECTOR: u64 = 8
+
+const DEVICE_RECORD_GLUE: u64 = 16
+
+const DEVICE_RECORD_HANDLER: u64 = 24
+
+const DEVICE_RECORD_NEXT: u64 = 40
+
+const DEVICE_RECORD_BINDING: u64 = 48
+
+const DEVICE_RECORD_MESSAGE: u64 = 56
+
+const DEVICE_RECORD_DATA: u64 = 64
+
+const DEVICE_RECORD_SOURCE: u64 = 72
+
+const DEVICE_RECORD_CPU: u64 = 80
+
+const DEVICE_RECORD_HOLDING: u64 = 88
+
+const DEVICE_RECORD_VALUE: u64 = 96
+
+/// What `install_msi` gives: the interrupt installed, or the `hw::MsiError` variant refusing it.
+const MSI_INSTALLED: i64 = 0
+
+const MSI_EXHAUSTED: i64 = 1
+
+const MSI_UNREACHABLE: i64 = 2
+
+const MSI_UNSUPPORTED: i64 = 3
+
+/// The vectors an x86_64 message-signalled interrupt may take, past the timer's and short of the
+/// CPU signal's, the largest local APIC id a message names, and the base of its address.
+const MSI_FIRST_VECTOR: i64 = 0x21
+
+const MSI_VECTORS_END: i64 = 0xFE
+
+const MSI_ID_MAX: i64 = 255
+
+const MSI_ADDRESS: i64 = 0xFEE0_0000
+
+/// What runs the devices of some bindings gives: whether any ran, and whether any interrupt fn
+/// gave `Reschedule`.
+struct Ran derives Copy {
+    present: clif::Value
+    reschedule: clif::Value
+} Ran
+
+/// The binding of a vector in a row of the binding table.
+fn Lowering.irq_binding(mut self, mut fx: Fx, row: clif::Value, vector: clif::Value) -> clif::Value {
+    let table = mut self.reserved(mut fx, data_name: "_NSirq_bindings", size: BINDING_ROWS * BINDING_VECTORS * BINDING_SIZE, align: 8)
+    let row_start = mut fx.b.imul_imm_s(row, y: i64.fit(BINDING_VECTORS))
+    let index = mut fx.b.iadd(row_start, y: vector)
+    let at = mut fx.b.imul_imm_s(index, y: i64.fit(BINDING_SIZE))
+    return mut fx.b.iadd(table, y: at)
+} Lowering.irq_binding
+
+/// Runs the devices installed on a vector of 32 or more for the running CPU, then those installed
+/// for every CPU.
+fn Lowering.installed_reschedule(mut self, mut fx: Fx, vector: clif::Value) -> Ran {
+    let index = mut self.running_index(mut fx)
+    let row = mut fx.b.iadd_imm_s(index, y: 1)
+    let own = mut self.irq_binding(mut fx, row, vector)
+    let every_row = mut fx.ptr(0)
+    let every = mut self.irq_binding(mut fx, row: every_row, vector)
+    return mut self.run_installed(mut fx, bindings: fx.list2(own, b: every).view())
+} Lowering.installed_reschedule
+
+/// Runs the devices chained in `bindings`, in order, with the interrupt deferred in the running
+/// CPU's record so that their `complete` leaves it to this, then ends it when any device ran.
+fn Lowering.run_installed(mut self, mut fx: Fx, bindings: Slice[clif::Value]) -> Ran {
+    let record = mut self.running_cpu(mut fx)
+    let deferred = mut fx.ptr(1)
+    mut fx.store(deferred, addr: record, offset: CPU_DEFERRED)
+    var present = mut fx.int(clif::Type.Int8, value: 0)
+    var reschedule = mut fx.int(clif::Type.Int8, value: 0)
+    for slot in bindings {
+        let ran = mut self.run_chain(mut fx, slot)
+        present = mut fx.b.bor(present, y: ran.present)
+        reschedule = mut fx.b.bor(reschedule, y: ran.reschedule)
+    }
+    let ended = mut fx.ptr(0)
+    mut fx.store(ended, addr: record, offset: CPU_DEFERRED)
+    mut fx.if_true(present, then: fn[mut self](mut fx1: Fx) {
+        mut self.end_of_interrupt(mut fx1)
+    })
+    return Ran(present: present, reschedule: reschedule)
+} Lowering.run_installed
+
+/// Calls the glue of each device chained in a binding, counting the CPU among the binding's
+/// runners meanwhile so an uninstall waits for it.
+fn Lowering.run_chain(mut self, mut fx: Fx, slot: clif::Value) -> Ran {
+    let running = mut fx.offset(slot, offset: BINDING_RUNNING)
+    let one = mut fx.ptr(1)
+    discard fetch_add(mut fx, address: running, amount: one)
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let chosen = mut fx.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        let done = mut fx1.repeat(fx1.list2(head, b: none).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 1
+            let device = state[0]
+            let at = mut fx2.offset(device, offset: DEVICE_RECORD_NEXT)
+            let next = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: at)
+            let glue = mut fx2.load(PTR, addr: device, offset: DEVICE_RECORD_GLUE)
+            var call_signature = clif::Signature.new(CALL_CONV, alloc: fx2.alloc)
+            mut call_signature.params.push(clif::AbiParam(value_type: PTR))
+            mut call_signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+            let sig_ref = mut fx2.b.import_signature(take call_signature)
+            let inst = mut fx2.b.call_indirect(sig_ref, callee: glue, args: Array[clif::Value, 1].filled(device).view())
+            let results = fx2.b.inst_results(inst, alloc: fx2.alloc)
+            expect results.len() > 0
+            let reschedule = mut fx2.b.bor(state[1], y: results[0])
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+            return Pass(again: more, next: fx2.list2(next, b: reschedule))
+        })
+        expect done.len() > 1
+        return fx1.list1(done[1])
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 0))
+    })
+    let minus = mut fx.int(PTR, value: -1)
+    discard fetch_add(mut fx, address: running, amount: minus)
+    return Ran(present: present, reschedule: chosen[0])
+} Lowering.run_chain
+
+/// Takes the bindings lock, with maskable interrupts disabled so that its holder stays on its
+/// CPU, giving the flags to restore.
+fn Lowering.lock_bindings(mut self, mut fx: Fx) -> clif::Value {
+    let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_IRQ_LOCK)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.ptr(0)
+        let held = mut fx1.ptr(1)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock, e: free, x: held)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    return saved[0]
+} Lowering.lock_bindings
+
+fn Lowering.unlock_bindings(mut self, mut fx: Fx, flags: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_IRQ_LOCK)
+    let free = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: free, p: lock)
+    discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(flags).view())
+} Lowering.unlock_bindings
+
+/// Installs a device record on a vector of CPU `cpu`, or of every CPU for `None`, at the end of
+/// its binding's chain, trapping on a vector the final build binds, the CPU signal's, or, on
+/// AArch64, one whose devices are installed for another CPU, to which the interrupt controller
+/// routes it. The routing CPU of devices installed for every CPU is the boot CPU.
+fn Lowering.install_device(mut self, mut fx: Fx, record: clif::Value, cpu: Option[clif::Value], vector: clif::Value) {
+    let statically = mut self.statically_bound()
+    for bound in statically {
+        let same = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound)
+        mut fx.if_true(same, then: fn[mut self](mut fx1: Fx) {
+            raise_kind(mut self, fx: mut fx1, kind: "trap.duplicate-access")
+        })
+    }
+    let flags = mut self.lock_bindings(mut fx)
+    let row = match cpu {
+        Some(number) => mut fx.b.iadd_imm_s(number, y: 1)
+        None => mut fx.ptr(0)
+    }
+    let target = match cpu {
+        Some(number) => number
+        None => mut fx.ptr(0)
+    }
+    let aarch64 = self.machine_arch() == workspace::Arch.Aarch64
+    if aarch64 {
+        let taken = mut self.installed_for(mut fx, vector, cpu: Some(target))
+        mut fx.if_true(taken, then: fn[mut self](mut fx1: Fx) {
+            raise_kind(mut self, fx: mut fx1, kind: "trap.duplicate-access")
+        })
+    }
+    mut fx.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
+    let slot = mut self.irq_binding(mut fx, row, vector)
+    mut self.chain(mut fx, record, slot)
+    if aarch64 {
+        mut self.aarch64_route(mut fx, vector, cpu: target)
+    }
+    mut self.unlock_bindings(mut fx, flags)
+} Lowering.install_device
+
+/// Whether devices are installed on a vector for a CPU other than `cpu`, or for any CPU for
+/// `None`, the devices installed for every CPU counting as the boot CPU's.
+fn Lowering.installed_for(mut self, mut fx: Fx, vector: clif::Value, cpu: Option[clif::Value]) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let rows = mut fx.b.iadd_imm_s(count, y: 1)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let found = mut fx.variable(clif::Type.Int8, initial: none)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: rows, body: fn[mut self](mut fx1: Fx, row: clif::Value) {
+        let slot = mut self.irq_binding(mut fx1, row, vector)
+        let head = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+        var hit = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        match cpu {
+            Some(number) => {
+                let every = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: row, y: 0)
+                let own = mut fx1.b.iadd_imm_s(row, y: -1)
+                let boot = mut fx1.ptr(0)
+                let owner = mut fx1.b.select(every, x: boot, y: own)
+                let other = mut fx1.b.icmp(clif::IntCC.NotEqual, x: owner, y: number)
+                hit = mut fx1.b.band(hit, y: other)
+            }
+            None => {}
+        }
+        let seen = mut fx1.b.use_var(found)
+        let merged = mut fx1.b.bor(seen, y: hit)
+        mut fx1.b.def_var(found, val: merged)
+    })
+    return mut fx.b.use_var(found)
+} Lowering.installed_for
+
+/// Chains a device record at the end of a binding's devices.
+fn Lowering.chain(mut self, mut fx: Fx, record: clif::Value, slot: clif::Value) {
+    mut fx.store(slot, addr: record, offset: DEVICE_RECORD_BINDING)
+    let link = mut fx.repeat(fx.list1(slot).view(), body: fn(mut fx1: Fx, at: Slice[clif::Value]) -> Pass {
+        expect at.len() > 0
+        let next = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: at[0])
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        let following = mut fx1.b.iadd_imm_s(next, y: i64.fit(DEVICE_RECORD_NEXT))
+        return Pass(again: more, next: fx1.list1(mut fx1.b.select(more, x: following, y: at[0])))
+    })
+    expect link.len() > 0
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: record, p: link[0])
+} Lowering.chain
+
+/// Installs a device record on a new message-signalled interrupt of CPU `cpu`, from the device
+/// `source`, giving one of the `MSI_` outcomes; with interrupt remapping on x86_64, the remapping
+/// entry accepts that device alone when `validated` holds.
+fn Lowering.install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
+    let flags = mut self.lock_bindings(mut fx)
+    let outcome = match self.machine_arch() {
+        workspace::Arch.Amd64 => mut self.x64_install_msi(mut fx, record, cpu, source, validated)
+        workspace::Arch.Aarch64 => mut self.its_install(mut fx, record, cpu, source)
+    }
+    mut self.unlock_bindings(mut fx, flags)
+    return outcome
+} Lowering.install_msi
+
+/// The x86_64 part of `install_msi`: the lowest vector from `MSI_FIRST_VECTOR` short of
+/// `MSI_VECTORS_END` the final build does not bind and no device is installed on for the CPU.
+/// Its message names the CPU's local APIC id, which no message reaches past `MSI_ID_MAX`, or
+/// once the IOMMU remaps interrupts, the remapping entry of the CPU and vector.
+fn Lowering.x64_install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
+    let row = mut fx.b.iadd_imm_s(cpu, y: 1)
+    let statically = mut self.statically_bound()
+    let start = mut fx.ptr(u64.fit(MSI_FIRST_VECTOR))
+    let searched = mut fx.repeat(fx.list1(start).view(), body: fn[mut self](mut fx1: Fx, at: Slice[clif::Value]) -> Pass {
+        expect at.len() > 0
+        let vector = at[0]
+        let own_slot = mut self.irq_binding(mut fx1, row, vector)
+        let own = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: own_slot)
+        let every_row = mut fx1.ptr(0)
+        let every_slot = mut self.irq_binding(mut fx1, row: every_row, vector)
+        let every = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: every_slot)
+        let installed = mut fx1.b.bor(own, y: every)
+        var taken = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: installed, y: 0)
+        for bound in statically {
+            let same = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound)
+            taken = mut fx1.b.bor(taken, y: same)
+        }
+        let next = mut fx1.b.iadd_imm_s(vector, y: 1)
+        let inside = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: MSI_VECTORS_END)
+        let more = mut fx1.b.band(taken, y: inside)
+        return Pass(again: more, next: fx1.list1(mut fx1.b.select(taken, x: next, y: vector)))
+    })
+    expect searched.len() > 0
+    let vector = searched[0]
+    let found = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: MSI_VECTORS_END)
+    let exhausted = mut fx.ptr(u64.fit(MSI_EXHAUSTED))
+    let outcome = mut fx.variable(PTR, initial: exhausted)
+    mut fx.if_true(found, then: fn[mut self](mut fx1: Fx) {
+        let id = mut self.hardware_id(mut fx1, index: cpu)
+        let unit = mut self.iommu_unit(mut fx1)
+        let remapping = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: unit, y: 0)
+        let message = mut fx1.choose_in(mut self, condition: remapping, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let address = mut lo2.remap(mut fx2, unit, cpu, vector, id, source, validated)
+            let data = mut fx2.ptr(0)
+            return fx2.list2(address, b: data)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let shifted = mut fx2.b.ishl_imm_s(id, y: 12)
+            let address = mut fx2.b.bor_imm_s(shifted, y: MSI_ADDRESS)
+            let far = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: id, y: MSI_ID_MAX)
+            let none = mut fx2.ptr(0)
+            let reached = mut fx2.b.select(far, x: none, y: address)
+            return fx2.list2(reached, b: vector)
+        })
+        expect message.len() > 1
+        let reached = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: message[0], y: 0)
+        let installed = mut fx1.ptr(u64.fit(MSI_INSTALLED))
+        let unreachable = mut fx1.ptr(u64.fit(MSI_UNREACHABLE))
+        let chosen = mut fx1.b.select(reached, x: installed, y: unreachable)
+        mut fx1.b.def_var(outcome, val: chosen)
+        mut fx1.if_true(reached, then: fn[mut self](mut fx2: Fx) {
+            mut fx2.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
+            mut fx2.store(message[0], addr: record, offset: DEVICE_RECORD_MESSAGE)
+            mut fx2.store(message[1], addr: record, offset: DEVICE_RECORD_DATA)
+            let slot = mut self.irq_binding(mut fx2, row, vector)
+            mut self.chain(mut fx2, record, slot)
+        })
+    })
+    return mut fx.b.use_var(outcome)
+} Lowering.x64_install_msi
+
+/// Removes a device record from its binding's chain, and on AArch64 disables a shared peripheral
+/// interrupt no device is left on or discards an LPI's translation, then spins until no CPU runs
+/// the binding's devices.
+fn Lowering.uninstall_device(mut self, mut fx: Fx, record: clif::Value) {
+    let flags = mut self.lock_bindings(mut fx)
+    let slot = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_BINDING)
+    let link = mut fx.repeat(fx.list1(slot).view(), body: fn(mut fx1: Fx, at: Slice[clif::Value]) -> Pass {
+        expect at.len() > 0
+        let current = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: at[0])
+        let other = mut fx1.b.icmp(clif::IntCC.NotEqual, x: current, y: record)
+        let following = mut fx1.b.iadd_imm_s(current, y: i64.fit(DEVICE_RECORD_NEXT))
+        return Pass(again: other, next: fx1.list1(mut fx1.b.select(other, x: following, y: at[0])))
+    })
+    expect link.len() > 0
+    let next = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_NEXT)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: next, p: link[0])
+    if self.machine_arch() == workspace::Arch.Amd64 {
+        let message = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MESSAGE)
+        let remapped = mut self.remapped_format(mut fx, message)
+        mut fx.if_true(remapped, then: fn[mut self](mut fx1: Fx) {
+            let unit = mut self.iommu_unit(mut fx1)
+            mut self.unremap(mut fx1, unit, message)
+        })
+    }
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
+        let lpi = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: LPI_BASE)
+        discard mut fx.choose_in(mut self, condition: lpi, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            mut lo1.its_discard(mut fx1, record)
+            return mem::List[clif::Value].empty(fx1.alloc)
+        }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            let installed = mut lo1.installed_for(mut fx1, vector, cpu: None)
+            let unused = mut fx1.b.bxor_imm_s(installed, y: 1)
+            mut fx1.if_true(unused, then: fn[mut lo1](mut fx2: Fx) {
+                mut lo1.aarch64_disable(mut fx2, vector)
+            })
+            return mem::List[clif::Value].empty(fx1.alloc)
+        })
+    }
+    mut self.unlock_bindings(mut fx, flags)
+    let running = mut fx.offset(slot, offset: BINDING_RUNNING)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let count = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: running)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.uninstall_device

@@ -12,9 +12,12 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 24] = [
+const DRAWING: [&str; 39] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
+    "mem::wire::Codec.decode_from",
+    "mem::wire::Codec.encode_as",
+    "mem::wire::Codec.schema",
     "text::json::Codec.decode",
     "text::construction::Codec.decode",
     "task::Scope.spawn",
@@ -23,29 +26,51 @@ const DRAWING: [&str; 24] = [
     "sys::Fs.read_all",
     "sys::Domain.run",
     "sys::Domain.run_sized",
+    "sys::Abandoner.run",
+    "sys::Abandoner.run_sized",
+    "sys::Minter.of",
     "sys::Cx.send",
     "sys::Cx.after",
     "sys::Cx.after_ns",
     "sys::Cx.spawn",
+    "sys::Stepper.start",
+    "sys::Stepper.resume",
+    "sys::Stepper.deliver",
+    "sys::Stepper.step",
     "sys::sim::fs",
     "sys::sim::stdio",
+    "hw::Dma.of",
+    "hw::DmaShared.of",
     "hw::PerCpu.of",
     "hw::sim::Registers.of",
     "hw::sim::Registers.queue",
     "hw::sim::Registers.queue_at",
     "boot::Kernel.regions",
+    "boot::Kernel.modules",
+    "boot::Kernel.pci_functions",
     "boot::Kernel.anchor",
+    "boot::Machine.enter",
     "host::Runner.run",
     "testing::world",
 ];
 
 /// The supplied operations without a `try_` name that draw memory and fail, rather than trap,
 /// when it is exhausted.
-const FAILING_DRAWS: [&str; 1] = ["boot::Services.read_file"];
+const FAILING_DRAWS: [&str; 8] = [
+    "mem::wire::Codec.canonical",
+    "boot::Services.read_file",
+    "boot::Services.list_directory",
+    "boot::Services.boot_device",
+    "boot::Services.get_variable",
+    "boot::Services.event_log",
+    "boot::Services.submit_tpm",
+    "boot::Services.memory_map",
+];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
-/// handles, indexes past an end, duplicate windows, and exhausted capability tables and cells.
-const TRAPPING: [&str; 20] = [
+/// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
+/// exhausted capability tables, cells and runtime records.
+const TRAPPING: [&str; 32] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -54,7 +79,14 @@ const TRAPPING: [&str; 20] = [
     "text::Interner.resolve",
     "task::Join.join",
     "task::Executor.coarse",
+    "task::Executor.split",
+    "task::Executor.serial",
+    "boot::Kernel.policy",
     "sys::revocable",
+    "sys::Minter.mint",
+    "sys::derive",
+    "sys::Abandoner.run",
+    "sys::Abandoner.run_sized",
     "sys::Fs.subdir",
     "sys::Fs.read_only",
     "sys::Net.only_host",
@@ -66,10 +98,23 @@ const TRAPPING: [&str; 20] = [
     "hw::sim::Registers.ports",
     "hw::sim::Registers.set_at",
     "hw::sim::Registers.last_written_at",
+    "hw::IrqShared.install",
+    "hw::IrqShared.install_on",
+    "hw::IrqShared.install_msi",
+    "hw::runtime_record",
+    "hw::hold",
 ];
 
 /// The supplied operations that change an atomic count without a type with interior mutability.
 const COUNTED: [&str; 2] = ["mem::Shared.share", "mem::Shared.make_mut"];
+
+/// The supplied operations calling a component's handlers on the calling task, whose digests
+/// hold the declared digest of a call through `sys::Component`.
+const HANDLING: [&str; 3] = [
+    "sys::Stepper.start",
+    "sys::Stepper.deliver",
+    "sys::Stepper.step",
+];
 
 /// The std types storing their contents inline, which never draw memory.
 const INLINE: [&str; 2] = ["text::Fixed", "mem::Bounded"];
@@ -101,7 +146,8 @@ impl Checker<'_> {
     /// waits; the facts its owning chapter states; drawing memory when it grows or makes
     /// storage; the sync fact on a type with interior mutability or an atomic count; the
     /// primitive capabilities it receives or is a member of, other than allocators; float use
-    /// when its head takes or gives a float; and the class of its operation under the target.
+    /// when its head takes or gives a float; the class of its operation under the target; and
+    /// the declared digest of the handlers it calls.
     /// A head demanding `pure` or `noalloc` leaves out what it excludes.
     pub fn supplied(&self, item: ItemId) -> Digest {
         let Some(head) = self.fn_sig(item) else {
@@ -144,6 +190,9 @@ impl Checker<'_> {
             })
             .collect();
         digest.capabilities = Some(capabilities);
+        if HANDLING.contains(&path.as_str()) {
+            digest.join(&Digest::declared(false, &Default::default()));
+        }
         digest
     }
 

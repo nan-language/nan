@@ -5,12 +5,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::sync::Arc;
 
 use super::Package;
-use super::manifest::{relative, resolve};
+use super::manifest::{Manifest, relative, resolve};
 use crate::artefact;
 use crate::diagnostic::{Code, Diagnostic};
 use crate::hash::Hash;
+use crate::machine::lock::Locked;
 use crate::store::Entry;
 
 /// Where a package of a closure comes from: a workspace package checked from source, or a
@@ -29,16 +31,67 @@ pub struct Closure {
     pub aliases: HashMap<(Member, String), Member>,
 }
 
+impl Closure {
+    /// The part of the closure that checking one workspace package it checks reads: that
+    /// package, the members named like std packages, and each member their `dep` aliases reach.
+    pub fn reached_from(&self, workspace: &super::Workspace, package: usize) -> Closure {
+        let mut reached: Vec<Member> = self
+            .members
+            .iter()
+            .filter(|(name, _)| crate::stdlib::is_std(name))
+            .map(|(_, member)| *member)
+            .collect();
+        reached.push(Member::Source(package));
+        let mut at = 0;
+        while let Some(&member) = reached.get(at) {
+            at += 1;
+            let manifest = workspace.member(member).manifest.as_ref();
+            for dep in manifest.into_iter().flat_map(|manifest| &manifest.deps) {
+                if let Some(next) = self.aliases.get(&(member, dep.alias.clone()))
+                    && !reached.contains(next)
+                {
+                    reached.push(*next);
+                }
+            }
+        }
+        Closure {
+            members: self
+                .members
+                .iter()
+                .filter(|(_, member)| reached.contains(member))
+                .map(|(name, member)| (name.clone(), *member))
+                .collect(),
+            checked: self
+                .checked
+                .iter()
+                .copied()
+                .filter(|index| reached.contains(&Member::Source(*index)))
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .filter(|((member, _), _)| reached.contains(member))
+                .map(|(key, member)| (key.clone(), *member))
+                .collect(),
+        }
+    }
+}
+
 /// A store entry loaded as a package, by the code root of its release.
 pub struct Release {
     pub root: Hash,
     pub entry: Entry,
-    pub package: Package,
+    pub package: Arc<Package>,
 }
 
 /// What reading closures needs: the store entry holding a release, by its code root.
 pub trait Store {
     fn entry(&mut self, root: &Hash) -> io::Result<Option<Entry>>;
+
+    /// The package of a release already loaded into a directory, by its code root.
+    fn loaded(&self, _root: &Hash, _dir: &str) -> Option<Arc<Package>> {
+        None
+    }
 }
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
@@ -51,7 +104,7 @@ pub struct Read {
     pub found: Vec<Diagnostic>,
 }
 
-pub fn closures(packages: &[Package], store: &mut dyn Store) -> io::Result<Read> {
+pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<Read> {
     let mut reader = Reader {
         packages,
         store,
@@ -111,7 +164,7 @@ struct Own {
 }
 
 struct Reader<'a> {
-    packages: &'a [Package],
+    packages: &'a [Arc<Package>],
     store: &'a mut dyn Store,
     releases: Vec<Release>,
     confirmed: Vec<Entry>,
@@ -144,7 +197,10 @@ impl Reader<'_> {
         {
             return Ok(index);
         }
-        let package = Package::from_entry(&entry, dir)?;
+        let package = match self.store.loaded(&root, dir) {
+            Some(package) => package,
+            None => Arc::new(Package::from_entry(&entry, dir)?),
+        };
         self.releases.push(Release {
             root,
             entry,
@@ -185,26 +241,29 @@ impl Reader<'_> {
         };
         let mut lines: HashMap<&str, Member> = HashMap::new();
         for line in &lock.deps {
-            let reaching = manifest
-                .deps
-                .iter()
-                .filter(|dep| dep.written == line.source)
-                .map(|dep| dep.line)
-                .next()
-                .unwrap_or(manifest.line);
+            let reaching = reaching_directive(manifest, line);
             let held = self.store.entry(&line.root)?;
             let mismatched = held.as_ref().is_some_and(|entry| entry.root() != line.root);
-            let forged = held.as_ref().is_some_and(|entry| {
-                artefact::decode(&entry.artefact).is_ok_and(|decoded| {
-                    !decoded.accepted(line.signer.as_ref(), package.machine.principals())
-                })
+            let decoded = held
+                .as_ref()
+                .and_then(|entry| artefact::decode(&entry.artefact).ok());
+            let forged = decoded.as_ref().is_some_and(|decoded| {
+                !decoded.accepted(line.signer.as_ref(), package.machine.principals())
             });
+            let unsourced = held
+                .as_ref()
+                .zip(decoded.as_ref())
+                .is_some_and(|(entry, decoded)| {
+                    decoded.source_tree() != Some(artefact::source_tree_hash(&entry.sources))
+                });
             if mismatched {
                 self.report(Code::ArtefactRootMismatch, package, reaching);
             } else if forged {
                 self.report(Code::ArtefactBadSignature, package, reaching);
+            } else if unsourced {
+                self.report(Code::ArtefactSourceMismatch, package, reaching);
             }
-            let refused = mismatched || forged;
+            let refused = mismatched || forged || unsourced;
             let missing = |reader: &mut Reader| {
                 if !refused {
                     reader.report(Code::DepReleaseMissing, package, reaching);
@@ -376,6 +435,16 @@ impl Reader<'_> {
             }
         }
     }
+}
+
+/// The line of the `dep` directive through which a manifest reaches the package of a line of its
+/// lock: the directive writing the line's source, else the `package` line.
+pub fn reaching_directive(manifest: &Manifest, line: &Locked) -> u32 {
+    manifest
+        .deps
+        .iter()
+        .find(|dep| dep.written == line.source)
+        .map_or(manifest.line, |dep| dep.line)
 }
 
 /// Whether a store entry holds a package's current source files, its machine files aside.

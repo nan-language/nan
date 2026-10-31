@@ -24,9 +24,16 @@ const CELL: usize = 1;
 const CAPACITY: usize = 2;
 const ALLOCATION: usize = 3;
 
+/// The position of a pool's part after its container's: the indexes of its free slots in the
+/// order they were freed.
+const FREED: usize = 4;
+
 /// The positions of a pool slot's parts: its generation and its occupant.
 const GENERATION: usize = 0;
 const OCCUPANT: usize = 1;
+
+/// The generation of a retired pool slot, which never holds an occupant again.
+const RETIRED: i128 = u32::MAX as i128;
 
 /// The positions of a shared value's or cown's parts: its contents, its count, the cell its box
 /// was drawn through and the box's allocation.
@@ -168,7 +175,7 @@ pub fn member(
         ("mem::Id", "index") => interp.deref(&args[0]).fields()[0].clone(),
         ("mem::Pool", "empty") => {
             let cell = cell_of(interp, &args[0]);
-            container(interp, owner, Vec::new(), cell)
+            pool(interp, Vec::new(), cell)
         }
         ("mem::Pool", "len") => {
             let pool = interp.deref(&args[0]);
@@ -185,9 +192,9 @@ pub fn member(
         ("mem::Pool", "reserve" | "try_reserve") => {
             let pool = place(&args[0]);
             let current = interp.memory.get(&pool).clone();
-            let slots = entries(interp, &current);
-            let free = slots.iter().filter(|slot| !occupied(slot)).count();
-            let needed = slots.len() + (args[1].int() as usize).saturating_sub(free);
+            let free = current.fields()[FREED].fields().len();
+            let needed =
+                entries(interp, &current).len() + (args[1].int() as usize).saturating_sub(free);
             let Some(grown) = grow(interp, &current, needed, &element) else {
                 return Some(exhausted(interp, member == "try_reserve", at));
             };
@@ -213,10 +220,17 @@ pub fn member(
                 (_, false) => return Some(Err(interp.trap("trap.stale-handle", at))),
                 ("remove", true) => {
                     let removed = interp.memory.get(&occupant).clone();
-                    let next = Val::Int(generation.int() + 1);
-                    interp
-                        .memory
-                        .set(&storage.with(index as u32), slot(next, Val::Absent));
+                    let next = generation.int() + 1;
+                    interp.memory.set(
+                        &storage.with(index as u32),
+                        slot(Val::Int(next), Val::Absent),
+                    );
+                    if next != RETIRED {
+                        let freed = place(&args[0]).with(FREED as u32);
+                        let mut indexes = interp.memory.get(&freed).fields().to_vec();
+                        indexes.push(Val::Int(index as i128));
+                        interp.memory.set(&freed, Val::Array(Rc::new(indexes)));
+                    }
                     removed
                 }
                 _ => Val::Ref(occupant),
@@ -254,13 +268,27 @@ pub fn member(
     })))
 }
 
-/// Places a value in the earliest freed slot of the pool at a place, or in a new slot, and
-/// returns its handle; none on exhaustion.
+/// A new pool drawing through a cell, holding slots none of which is free.
+pub fn pool(interp: &mut Interpreter, slots: Vec<Val>, cell: u32) -> Val {
+    let Val::Struct(item, parts) = container(interp, "mem::Pool", slots, cell) else {
+        panic!("a pool value");
+    };
+    let mut parts = parts.as_ref().clone();
+    parts.push(Val::Array(Rc::new(Vec::new())));
+    Val::Struct(item, Rc::new(parts))
+}
+
+/// Places a value in the slot freed earliest of the pool at a place, or in a new slot when none
+/// is free, and returns its handle; none on exhaustion.
 fn insert_slot(interp: &mut Interpreter, pool: &Loc, value: Val, element: &Ty) -> Option<Val> {
     let current = interp.memory.get(pool).clone();
     let mut slots = entries(interp, &current);
-    let index = match slots.iter().position(|slot| !occupied(slot)) {
-        Some(index) => index,
+    let index = match current.fields()[FREED].fields().split_first() {
+        Some((first, rest)) => {
+            let rest = Val::Array(Rc::new(rest.to_vec()));
+            interp.memory.set(&pool.with(FREED as u32), rest);
+            first.int() as usize
+        }
         None => {
             let grown = grow(interp, &current, slots.len() + 1, element)?;
             interp.memory.set(pool, grown);
@@ -625,3 +653,6 @@ fn release_container(interp: &mut Interpreter, container: &Val) {
     }
     interp.memory.kill(place(&parts[STORAGE]).extent);
 }
+
+#[cfg(test)]
+mod tests;

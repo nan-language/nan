@@ -128,8 +128,7 @@ An **advisory** is a published notice retracting proofs after a prover soundness
 
 A toolchain carries an advisory when the advisory is part of its source tree, so carrying one changes its [toolchain hash](36-builds.md#toolchain-hash). A toolchain's prover for a version is the procedure amended by every advisory it carries that names that version ([determinism](20-prover.md#determinism)).
 
-- A proven or assumed [status](18-contracts.md#statuses) recorded in an artefact is retracted when the query of its obligation site, built from the unit's NIR, meets the retraction condition of an advisory the toolchain carries that names the artefact's version. [Reuse](30-artefacts.md#reuse) decides that site anew.
-- A diagnostic whose because-chain passes through a retracted status names the number of the advisory that retracted it.
+No status recorded in an artefact is read ([releases](30-artefacts.md#releases)), so an advisory a toolchain carries amends the statuses of every package it checks, releases included.
 
 ## Trade-in
 
@@ -162,19 +161,19 @@ A **reservation** is a word, syntax, name, format or seam space that language 1 
 
 | Reservation | Kind | Position | In language 1 | Owner |
 | --- | --- | --- | --- | --- |
-| `stable`, `flexible`, `migrate`, `machine`, `protocol`, `ipc` | word | item-head modifier or kind | `item.reserved-word` | [Reserved forms](02-items.md#reserved-forms) |
+| `stable`, `machine`, `ipc` | word | item-head modifier or kind | `item.reserved-word` | [Reserved forms](02-items.md#reserved-forms) |
 | `bank` | word | start of a `registers` member line | `register.bank-reserved` | [Registers](23-low-level.md#registers) |
 | `self.{a, b}` | syntax | a `self` parameter | `item.self-field-set` | [Reserved forms](02-items.md#reserved-forms) |
 | `uses` with a word other than `wait` | syntax | a `uses` clause | `effect.uses-unknown` | [Waiting](10-effects-digests.md#waiting) |
 | `ui` | name | first segment of a path of two or more segments | `name.reserved` | [Aliases](03-packages-modules.md#aliases) |
-| `sys::infer`, `sys::load`, `core::simd` | name | first two segments of a path | `name.reserved` | [Reserved std names](28-stdlib.md#reserved-std-names) |
+| `sys::infer`, `sys::load` | name | first two segments of a path | `name.reserved` | [Reserved std names](28-stdlib.md#reserved-std-names) |
 | `x86_64-nanos`, `aarch64-nanos` | name | the `targets` directive | `manifest.reserved-target` | [Manifest](03-packages-modules.md#manifest) |
 | coverage classes other than `sc` | name | the class of a replay token | `test.replay-token` | [Coverage classes](22-testing.md#coverage-classes) |
-| framing of record fields by key, and by length in `mem::wire` | format | Encode records | skipped fields are discarded | [Decoding rules](13-text-encode.md#decoding-rules) |
+| framing of record fields by key in `text::json` and `text::construction` | format | Encode records | skipped fields are discarded | [Decoding rules](13-text-encode.md#decoding-rules) |
+| the wire encoding of protocol messages and of their handle types | format | messages between closures | operations reach the components of their own closure only | [Protocol hashes](26-components.md#protocol-hashes) |
 | sections native cache and availability | format | an artefact | `artefact.reserved-section` | [Sections](30-artefacts.md#sections) |
 | registry snapshot and policy floor fields | format | the lock | `format.reserved-field` | [Lock](35-format.md#lock) |
 | algorithm tags other than `0x01` | format | a hash | the bytes are no hash | [Hash values](29-identity-versioning.md#hash-values) |
-| codegen values other than the base instruction set | format | a descriptor | never selected | [Descriptors](27-program-model.md#descriptors) |
 | the user-origin seams, `hw::Vector.user` and `hw::SyscallEntry.handler` | seam | an exception raised in user mode, and the system call instruction | contributions are checked; the seams are never entered | [User exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) |
 
 ## Diagnostics

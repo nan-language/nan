@@ -11,7 +11,7 @@ use super::fx::PTR;
 use super::layout::{Field, Shape};
 use super::types::Wrap;
 use super::{Instance, trap};
-use crate::check::sig::SigKind;
+use crate::check::sig::{KEPT, SigKind};
 use crate::check::ty::{Arg, Const, Ty};
 use crate::nir::{
     BlockId, Constant, FnRef, NTy, Operand, Payload, Place, Role, Value, is_variant_step,
@@ -116,10 +116,12 @@ impl Body<'_, '_, '_, '_> {
             return false;
         };
         match &self.lo.ck.sig(*item).kind {
-            SigKind::Enum { variants } => variants.iter().any(|candidate| {
-                candidate.name == variant
-                    && matches!(candidate.payload, crate::check::sig::Payload::Labelled(_))
-            }),
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
+                variants.iter().any(|candidate| {
+                    candidate.name == variant
+                        && matches!(candidate.payload, crate::check::sig::Payload::Labelled(_))
+                })
+            }
             _ => false,
         }
     }
@@ -499,6 +501,14 @@ impl Body<'_, '_, '_, '_> {
             let location = self.field_step(target.clone(), name);
             self.write_location(&location, held, &nty);
         }
+        if let Ty::Item(item, _) = ty
+            && let Some(kept) = self.lo.ck.kept_type(*item)
+        {
+            let empty = self.lo.variant_value(self.fx, &kept, "Empty", &[], None);
+            let at = self.lo.layouts.field(self.lo.ck, ty, None, KEPT).offset;
+            let address = self.fx.offset(slot, at);
+            self.lo.store_held(self.fx, address, empty, &kept);
+        }
         Held::Address(slot)
     }
 
@@ -572,17 +582,7 @@ impl Body<'_, '_, '_, '_> {
             callable: fn_ref.callable.clone(),
             args: self.subst.args(&fn_ref.args),
         };
-        let instance = self.lo.callable_instance(&fn_ref, true);
-        let own_stack = self.lo.instance_fn_ty(&instance).limits.stack;
-        let glue = self.lo.instance(Instance::Value(Box::new(instance)));
-        self.lo.entry_stack(glue, own_stack);
-        let reference = self.lo.func_ref(self.fx, glue);
-        let code = self.fx.b.ins().func_addr(PTR, reference);
-        let slot = self.fx.slot(16, 8);
-        self.fx.store(code, slot, 0);
-        let none = self.fx.ptr(0);
-        self.fx.store(none, slot, 8);
-        Held::Address(slot)
+        self.lo.function_value(self.fx, &fn_ref)
     }
 
     /// A closure value: its code and an environment holding its captures, in this frame for a

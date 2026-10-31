@@ -28,18 +28,22 @@ mod head;
 mod identity;
 mod interface;
 mod kernel;
+mod kinds;
 pub(crate) mod ledger;
 pub(crate) mod lowlevel;
 mod measure;
+pub(crate) mod migrate;
 mod newer;
 mod package;
 mod preserved;
 mod program;
 pub(crate) mod props;
+pub(crate) mod protocol;
 mod published;
 mod reading;
 mod references;
 mod registry;
+mod releases;
 pub(crate) mod requires;
 mod resolve;
 pub(crate) mod reversibility;
@@ -68,10 +72,11 @@ mod unused;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub use approval::approvals;
 pub use changes::{Change, changes, semantic_conflicts};
-pub use compatible::{compatible, encode_class};
+pub use compatible::{compatible, encode_class, schema_records};
 pub use context::{Context, Green, context_gaps, contexts, greens};
 use db::{Db, ItemId, ModuleId, PackageId};
 pub use edits::{identity, moved, renamed};
@@ -82,6 +87,7 @@ pub use preserved::not_preserved;
 pub use published::summaries as publish_summaries;
 pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
 pub use references::Relocated;
+pub use releases::{release_check, release_errors};
 pub use root::{nir_streams, package_files as package_sources};
 use sig::{GenericDef, Sig};
 pub use snapshot::{Snapshots, Unsealed};
@@ -150,6 +156,10 @@ pub struct Checker<'a> {
     judged_all: Cell<bool>,
     /// The items checked, each judged alone.
     judged: RefCell<HashSet<ItemId>>,
+    /// The workspace package, by index, that the check is narrowed to: the one package it checks
+    /// whole, its closure's other packages judged item by item as it reads them; none when it
+    /// checks each package its closure checks.
+    narrowed: Option<usize>,
     /// The NIR units elaborated, none for an item without one.
     units: RefCell<HashMap<ItemId, Option<Rc<crate::nir::Unit>>>>,
     /// The values const evaluation computed, none for one that ends without a value.
@@ -251,6 +261,7 @@ impl<'a> Checker<'a> {
             rejections: RefCell::new(HashSet::new()),
             judged_all: Cell::new(false),
             judged: RefCell::new(HashSet::new()),
+            narrowed: None,
             units: RefCell::new(HashMap::new()),
             const_values: RefCell::new(HashMap::new()),
             evaluating: RefCell::new(Vec::new()),
@@ -496,7 +507,7 @@ impl<'a> Checker<'a> {
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = workspace.diagnostics().collect();
-    found.extend(diagnostics(workspace));
+    found.extend(diagnostics(workspace, scope));
     for (_, file) in workspace.files() {
         found.extend(file.syntax.diagnostics.iter().map(|diagnostic| {
             Diagnostic {
@@ -573,18 +584,28 @@ impl Checker<'_> {
                 self.check_proofs(item);
                 self.check_predicates(item);
             }
-            ast::ItemKind::Interface(_) => self.check_proofs(item),
+            ast::ItemKind::Interface(_) | ast::ItemKind::Protocol(_) => self.check_proofs(item),
             _ => {}
         }
     }
 
     /// Whether the checker reports an error on a line of an item. Before every package is
-    /// checked, the item is judged alone.
+    /// checked, and for an item of a package a narrowed check leaves out, the item is judged
+    /// alone.
     pub fn rejected(&self, item: ItemId) -> bool {
-        if !self.judged_all.get() {
+        if !self.judged_all.get() || self.leaves_out(self.db.package_of(item)) {
             self.judge_alone(item);
         }
         self.rejections.borrow().contains(&item)
+    }
+
+    /// Whether the check is narrowed to another package than one it reports on.
+    fn leaves_out(&self, package: PackageId) -> bool {
+        let data = self.db.package(package);
+        let narrowed = self.narrowed.map(crate::workspace::Member::Source);
+        !data.carried
+            && !data.quiet
+            && narrowed.is_some_and(|narrowed| data.member != Some(narrowed))
     }
 
     /// Checks an item unless it is checked, judging it alone: rejected when its syntax errors or
@@ -673,7 +694,8 @@ fn check_targets(package: &Package) -> Vec<Target> {
 }
 
 /// The packages a checker checks under its target: the workspace packages its closure checks
-/// that declare the target, by workspace index, with their ids in its database.
+/// that declare the target, the one it is narrowed to alone, by workspace index, with their ids
+/// in its database.
 fn checked_packages(checker: &Checker) -> Vec<(usize, PackageId)> {
     let target = checker.db.target;
     checker
@@ -688,6 +710,7 @@ fn checked_packages(checker: &Checker) -> Vec<(usize, PackageId)> {
             crate::workspace::Member::Source(index) => Some((index, PackageId(id as u32))),
             crate::workspace::Member::Release(_) => None,
         })
+        .filter(|(index, _)| checker.narrowed.is_none_or(|narrowed| narrowed == *index))
         .collect()
 }
 
@@ -708,7 +731,7 @@ fn closure_targets(workspace: &Workspace, closure: &Closure) -> Vec<Target> {
 pub fn checked<'a>(
     workspace: &'a Workspace,
     closure: &Closure,
-    std: &'a [Package],
+    std: &'a [Arc<Package>],
     target: Target,
 ) -> Checker<'a> {
     let checker = unchecked(workspace, closure, std, target);
@@ -743,7 +766,7 @@ impl Checker<'_> {
 pub fn unchecked<'a>(
     workspace: &'a Workspace,
     closure: &Closure,
-    std: &'a [Package],
+    std: &'a [Arc<Package>],
     target: Target,
 ) -> Checker<'a> {
     let mut db = Db::build(workspace, closure, std, target);
@@ -768,7 +791,7 @@ pub fn proof_cache_mismatches(workspace: &Workspace) -> Vec<String> {
 /// A checked checker of each closure under each target its packages are checked for.
 fn checked_closures<'a>(
     workspace: &'a Workspace,
-    std: &'a [Package],
+    std: &'a [Arc<Package>],
 ) -> Vec<(Target, Checker<'a>)> {
     workspace
         .closures
@@ -781,8 +804,36 @@ fn checked_closures<'a>(
         .collect()
 }
 
+/// Unchecked checkers of what checking a scope runs: for a scope lying in one package, of the
+/// part of the closure checking it that the package reaches, under each target it declares,
+/// narrowed to it; otherwise of each closure under each target its packages are checked for.
+fn scope_checkers<'a>(
+    workspace: &'a Workspace,
+    std: &'a [Arc<Package>],
+    scope: &Scope,
+) -> Vec<(Target, Checker<'a>)> {
+    let Some(index) = scope.package_index(workspace) else {
+        return checkers(workspace, std);
+    };
+    let package = &workspace.packages[index];
+    let Some(closure) = workspace.closure_of(package) else {
+        return Vec::new();
+    };
+    let reached = closure.reached_from(workspace, index);
+    let declared = check_targets(package);
+    closure_targets(workspace, closure)
+        .into_iter()
+        .filter(|target| declared.contains(target))
+        .map(|target| {
+            let mut checker = unchecked(workspace, &reached, std, target);
+            checker.narrowed = Some(index);
+            (target, checker)
+        })
+        .collect()
+}
+
 /// An unchecked checker of each closure under each target its packages are checked for.
-fn checkers<'a>(workspace: &'a Workspace, std: &'a [Package]) -> Vec<(Target, Checker<'a>)> {
+fn checkers<'a>(workspace: &'a Workspace, std: &'a [Arc<Package>]) -> Vec<(Target, Checker<'a>)> {
     workspace
         .closures
         .iter()
@@ -795,19 +846,15 @@ fn checkers<'a>(workspace: &'a Workspace, std: &'a [Package]) -> Vec<(Target, Ch
 }
 
 /// The diagnostics of the workspace's items under each target their packages are checked for,
-/// those of unused code once found under every target checking their file.
-pub fn diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
+/// those of unused code once found under every target checking their file: of the package a
+/// scope lies in, checked alone, or of every package for a scope holding several.
+fn diagnostics(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     let std = crate::stdlib::packages();
     let mut found = Vec::new();
     let mut unused: Vec<(Diagnostic, usize)> = Vec::new();
     let mut checking: HashMap<String, usize> = HashMap::new();
-    let runs = workspace.closures.iter().flat_map(|closure| {
-        closure_targets(workspace, closure)
-            .into_iter()
-            .map(move |target| (closure, target))
-    });
-    for (closure, target) in runs {
-        let checker = checked(workspace, closure, std, target);
+    for (_, checker) in scope_checkers(workspace, std, scope) {
+        checker.check_all();
         for (_, package) in checked_packages(&checker) {
             let data = checker.db.package(package);
             let modules = data.modules.iter().map(|module| checker.db.module(*module));
@@ -849,7 +896,7 @@ pub fn diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
 /// Unchecked checkers of a workspace package's closure under each target it is checked for.
 fn package_checkers<'a>(
     workspace: &'a Workspace,
-    std: &'a [Package],
+    std: &'a [Arc<Package>],
     package: &Package,
 ) -> Vec<(Target, Checker<'a>)> {
     let Some(closure) = workspace.closure_of(package) else {
@@ -888,7 +935,7 @@ fn computed_snapshots(
     if let Some(index) = workspace
         .packages
         .iter()
-        .position(|held| std::ptr::eq(held, package))
+        .position(|held| std::ptr::eq(&**held, package))
     {
         entail::refine(workspace, index, items, &mut computed);
     }
@@ -937,7 +984,8 @@ pub fn has_public_docs(workspace: &Workspace, path: &str) -> bool {
 }
 
 /// The errors checking a closure finds under each target its packages are checked for: on the
-/// packages it checks, and on each of its other members, checked whole.
+/// packages it checks, and on each of its other members, checked whole, with the release checks'
+/// stale schema trees.
 pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnostic> {
     let std = crate::stdlib::packages();
     let mut found = Vec::new();
@@ -947,8 +995,18 @@ pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnosti
             .map(|index| PackageId(index as u32))
             .filter(|package| checker.db.package(*package).quiet)
             .collect();
+        for package in &quiet {
+            checker.check_whole(*package);
+        }
         for package in quiet {
-            checker.check_whole(package);
+            let because = checker.stale_schemas(package);
+            let stale = Diagnostic {
+                because,
+                ..Diagnostic::new(Code::ArtefactRecheckFailed)
+            };
+            if !stale.because.is_empty() && !found.contains(&stale) {
+                found.push(stale);
+            }
         }
         found.extend(
             checker
@@ -994,3 +1052,6 @@ pub fn encode_key_tombstones(workspace: &Workspace, package: &Package) -> Vec<(S
     }
     found
 }
+
+#[cfg(test)]
+mod tests;

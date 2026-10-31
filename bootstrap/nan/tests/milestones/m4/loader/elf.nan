@@ -1,8 +1,10 @@
-//! The ELF64 image of a bare kernel: its loadable segments and their placement.
+//! The ELF64 image of a bare kernel: its loadable segments, their placement and its entry.
 
-/// The program header type of a loadable segment, and the sizes of an image's header and of a
-/// program header.
+/// The program header types of a loadable segment and of notes, and the sizes of an image's
+/// header and of a program header.
 const PT_LOAD: u32 = 1
+
+const PT_NOTE: u32 = 4
 
 const HEADER_BYTES: u64 = 64
 
@@ -11,6 +13,11 @@ const PROGRAM_HEADER_BYTES: u64 = 56
 /// The memory the entry root maps, which segments must lie in.
 const MAPPED: u64 = 0x1_0000_0000
 
+/// The note naming the 32-bit PVH entry: its type, and its owner's name as a little-endian word.
+const PHYS32_ENTRY: u32 = 18
+
+const XEN: u32 = 0x006E_6558
+
 pub closed enum ImageError derives Eq, Render {
     NotElf
     Truncated
@@ -18,6 +25,7 @@ pub closed enum ImageError derives Eq, Render {
     Unmapped
     Unusable
     Misplaced
+    NoEntry
 } ImageError
 
 /// Where an image's program headers lie and how many there are.
@@ -28,7 +36,7 @@ struct Programs {
 
 /// A segment of an image: its type, its bytes' offset in the image, its physical address, and
 /// its sizes in the image and in memory.
-struct Segment {
+struct Segment derives Copy {
     kind: u32
     offset: u64
     address: u64
@@ -36,38 +44,45 @@ struct Segment {
     memory_size: u64
 } Segment
 
-/// Places every loadable segment of an image at its physical address, failing when its memory
-/// lies in none of the `usable` regions, and gives how many it placed.
-fn place_all(raw: Untrusted[Slice[u8]], usable: Slice[hw::Region]) -> u32 fails ImageError {
+/// The loadable segments of an image, each lying in the image and in the mapped memory.
+fn loadable(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[Segment] fails ImageError {
     let programs = try header(raw)
-    var placed: u32 = 0
+    var segments = mem::List[Segment].empty(alloc)
     for index in 0u16..<programs.count {
-        invariant placed <= u32.widen(index)
         let segment = try program(raw, programs, index)
         if segment.kind == PT_LOAD {
-            if not inside(usable, segment) {
-                fail ImageError.Unusable
-            }
-            if not place(raw, segment) {
-                fail ImageError.Misplaced
-            }
-            placed += 1
+            mut segments.push(segment)
         }
     }
-    return placed
+    return segments
+} loadable
+
+/// Allocates the memory of each segment from the firmware and copies the segment there,
+/// zero-filled to its size in memory, giving the regions in the segments' order; frees them
+/// again when one cannot be placed.
+fn place_all(services: boot::Services, raw: Untrusted[Slice[u8]], segments: Slice[Segment], alloc: mem::Alloc) -> mem::List[hw::Region] fails ImageError {
+    var regions = mem::List[hw::Region].empty(alloc)
+    for segment in segments {
+        let Ok(region) = attempt services.allocate(segment.address, byte_len: segment.memory_size) else {
+            release(services, take regions)
+            fail ImageError.Unusable
+        }
+        let placed = place(raw, segment, region)
+        mut regions.push(take region)
+        if not placed {
+            release(services, take regions)
+            fail ImageError.Misplaced
+        }
+    }
+    return regions
 } place_all
 
-/// Whether a segment's memory lies wholly in one of the `usable` regions.
-fn inside(usable: Slice[hw::Region], segment: Segment) -> bool {
-    for region in usable {
-        let base = region.base()
-        let len = region.byte_len()
-        if segment.address >= base and segment.memory_size <= len and segment.address - base <= len - segment.memory_size {
-            return true
-        }
+/// Gives regions back to the firmware.
+fn release(services: boot::Services, take regions: mem::List[hw::Region]) {
+    for region in take regions {
+        discard attempt services.free(take region)
     }
-    return false
-} inside
+} release
 
 /// The program headers of an ELF64 little-endian x86-64 executable.
 validator fn header(raw: Untrusted[Slice[u8]]) -> Programs fails ImageError {
@@ -87,7 +102,7 @@ validator fn header(raw: Untrusted[Slice[u8]]) -> Programs fails ImageError {
 } header
 
 /// Program header `index` of an image, which lies in the image; a loadable segment's bytes lie
-/// in the image and its memory in the mapped memory.
+/// in the image and its memory in the mapped memory, and a note's bytes in the image.
 validator fn program(raw: Untrusted[Slice[u8]], programs: Programs, index: u16) -> Segment fails ImageError {
     let bytes = raw.inspect()
     let Some(table) = bytes.split_at(usize.widen(programs.offset)) else {
@@ -100,24 +115,45 @@ validator fn program(raw: Untrusted[Slice[u8]], programs: Programs, index: u16) 
         fail ImageError.Truncated
     }
     let segment = Segment(kind: entry.u32_le(0), offset: entry.u64_le(8), address: entry.u64_le(24), file_size: entry.u64_le(32), memory_size: entry.u64_le(40))
-    if segment.kind != PT_LOAD {
+    if segment.kind != PT_LOAD and segment.kind != PT_NOTE {
         return segment
     }
-    if segment.file_size > segment.memory_size {
+    if segment.file_size > segment.memory_size and segment.kind == PT_LOAD {
         fail ImageError.Inverted
     }
     if segment.offset > u64.widen(bytes.len()) or segment.file_size > u64.widen(bytes.len()) - segment.offset {
         fail ImageError.Truncated
     }
-    if segment.address > MAPPED or segment.memory_size > MAPPED - segment.address {
+    if segment.kind == PT_LOAD and (segment.address > MAPPED or segment.memory_size > MAPPED - segment.address) {
         fail ImageError.Unmapped
     }
     return segment
 } program
 
-/// Copies a segment's bytes to its physical address and zero-fills it to its size in memory;
-/// gives whether the memory then holds the segment's bytes.
-validator fn place(raw: Untrusted[Slice[u8]], segment: Segment) -> bool {
+/// The 32-bit entry the image's `XEN_ELFNOTE_PHYS32_ENTRY` note names, through which the PVH
+/// boot protocol enters it.
+validator fn pvh_entry(raw: Untrusted[Slice[u8]]) -> u64 fails ImageError {
+    let programs = try header(raw)
+    for index in 0u16..<programs.count {
+        let segment = try program(raw, programs, index)
+        if segment.kind == PT_NOTE {
+            let Some(parts) = raw.inspect().split_at(usize.widen(segment.offset)) else {
+                fail ImageError.Truncated
+            }
+            let Some(notes) = parts.tail.prefix(usize.widen(segment.file_size)) else {
+                fail ImageError.Truncated
+            }
+            if notes.len() >= 24 and notes.u32_le(0) == 4 and notes.u32_le(8) == PHYS32_ENTRY and notes.u32_le(12) == XEN {
+                return u64.widen(notes.u32_le(16))
+            }
+        }
+    }
+    fail ImageError.NoEntry
+} pvh_entry
+
+/// Copies a segment's bytes to its region and zero-fills it to its size in memory; gives whether
+/// the region then holds the segment's bytes.
+validator fn place(raw: Untrusted[Slice[u8]], segment: Segment, region: hw::Region) -> bool {
     let bytes = raw.inspect()
     let Some(parts) = bytes.split_at(usize.widen(segment.offset)) else {
         return false
@@ -125,10 +161,13 @@ validator fn place(raw: Untrusted[Slice[u8]], segment: Segment) -> bool {
     let Some(source) = parts.tail.prefix(usize.widen(segment.file_size)) else {
         return false
     }
+    if region.base() != segment.address or region.byte_len() < segment.memory_size {
+        return false
+    }
     let from = hw::Ptr.of_view(source)
-    let to = hw::Ptr[u8].of_addr(usize.widen(segment.address))
+    let to = hw::Ptr[u8].of_addr(usize.widen(region.base()))
     var same = true
-    trusted "the entry root maps the segment's memory, which nothing else reaches once boot services have ended, the loader calling no runtime service and never sleeping" {
+    trusted "the region is the loader's, mapped at its physical address, and holds the segment's memory" {
         from.copy(to, count: source.len())
         var filled = segment.file_size
         while filled < segment.memory_size {

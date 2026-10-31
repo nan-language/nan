@@ -199,13 +199,23 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         )
     }
 
+    /// The kept fields of a flexible struct value that holds none; none for another item.
+    pub fn kept_empty(&self, item: ItemId) -> Option<Val> {
+        let Ty::Item(kept, _) = self.ck.kept_type(item)? else {
+            return None;
+        };
+        Some(Val::Variant(kept, 0, Rc::new(Vec::new())))
+    }
+
     fn input(&mut self, input: Input) -> Val {
         match input {
             Input::Value(value) => value,
-            Input::Struct(item, fields) => Val::Struct(
-                item,
-                Rc::new(fields.into_iter().map(|field| self.input(field)).collect()),
-            ),
+            Input::Struct(item, fields) => {
+                let mut values: Vec<Val> =
+                    fields.into_iter().map(|field| self.input(field)).collect();
+                values.extend(self.kept_empty(item));
+                Val::Struct(item, Rc::new(values))
+            }
             Input::Variant(item, index, payload) => Val::Variant(
                 item,
                 index,
@@ -315,7 +325,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             Role::Requires => function.index,
             _ => u32::MAX,
         };
-        for requires in self.ck.entry_requires(item) {
+        let (entry_requires, shared) = self.ck.entry_requires(item);
+        for requires in entry_requires {
             let Callable::Item {
                 item: holder,
                 index,
@@ -336,7 +347,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             let passed: Vec<Val> = checked
                 .params
                 .iter()
-                .zip(args)
+                .zip(&args[shared.clone()])
                 .map(|(param, arg)| match checked.ty(param.value) {
                     NTy::Owned(_) => self.deref(arg),
                     _ => arg.clone(),
@@ -581,6 +592,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 if !self.layout_fits(*item, &values) {
                     self.obligation_fails(site, "trap.conversion", at)?;
                 }
+                let mut values = values;
+                values.extend(self.kept_empty(*item));
                 Some(Val::Struct(*item, Rc::new(values)))
             }
             Op::Variant {
@@ -775,10 +788,11 @@ impl<'c, 'a> Interpreter<'c, 'a> {
 
     fn variant_index(&self, item: ItemId, name: &str) -> u32 {
         match &self.ck.sig(item).kind {
-            SigKind::Enum { variants } => variants
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .position(|variant| variant.name == name)
-                .expect("a variant of the enum") as u32,
+                .expect("a variant of the enum")
+                as u32,
             SigKind::Layout { tags, .. } => {
                 tags.iter().position(|tag| tag == name).expect("a tag") as u32
             }

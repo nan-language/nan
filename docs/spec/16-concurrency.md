@@ -1,6 +1,6 @@
 # Structured concurrency
 
-This chapter defines tasks and task scopes, spawning with join handles and reaping, task closures, the lexical lending rule, deadlines and races, cowns with `await when` and poisoned cowns, channels, atomics and executors.
+This chapter defines tasks and task scopes, spawning with join handles and reaping, task closures, the lexical lending rule, deadlines and races, cowns with `await when` and poisoned cowns, channels, atomics, and executors with their shares, accounts and serial executors.
 
 ## Task scopes
 
@@ -149,7 +149,7 @@ pub fn start_fetch(s: task::Scope, counter: task::Cown[Counter]) {
 A **task closure** is a closure written where a `task fn` [function type](10-effects-digests.md#function-types) is expected ([closures](07-ownership.md#closures)).
 
 - A value of a `task fn` type is linear and Send, and never a view, Copy, Inert or AnyBits.
-- Exactly these functions start a task with a `task fn` value: `task::Scope.spawn`, `task::Scope.spawn_sized`, `task::race`, `sys::Domain.run`, `sys::Domain.run_sized`, `sys::Cx.spawn` and `boot::Kernel.anchor`. Each receives the value by `take` and runs it once, as the [entry](17-suspension-io.md#task-stacks) of a new task. Calling a `task fn` value is an error (`task.task-fn-call`).
+- Exactly these functions start a task with a `task fn` value: `task::Scope.spawn`, `task::Scope.spawn_sized`, `task::race`, `run` and `run_sized` of `sys::Domain` and `sys::Abandoner`, `sys::Cx.spawn` and `boot::Kernel.anchor`. Each receives the value by `take` and runs it once, as the [entry](17-suspension-io.md#task-stacks) of a new task. Calling a `task fn` value is an error (`task.task-fn-call`).
 - The value moves into the new task's **task record**, the storage the runtime keeps for the task. The entry owns each `take` capture as a `take` parameter owns its argument, and releases what remains of it when the task ends. A record keeps the task's result once the task ends, and lives until the task has ended and, for a child of a scope, until its join handle has been joined or has reaped it, or, for a task of a race, until the race call returns.
 - Every capture of a task closure has a Send type, and a view is captured only by lending; any other capture is an error (`task.capture-not-send`), reported at the capture's entry in the capture list, or at its first use in the body when it is unlisted.
 - A Copy read capture is copied when the closure is created and a `take` capture moves into it. Any other capture is lending, legal only as [lending](#lending) states.
@@ -679,13 +679,36 @@ pub open struct Executor {
 } Executor
 
 pub fn Executor.coarse(self, ns: u64) -> Executor fails sys::Revoked
+
+pub closed struct Share derives Copy, Eq {
+    pub weight: u32 where weight >= 1
+    pub class: u8
+    pub reserve_ppm: u32 where reserve_ppm <= 1_000_000
+} Share
+
+pub fn Executor.split(self, share: Share) -> Account
+
+pub fn Executor.serial(self, seed: u64) -> Account
+
+pub open linear struct Account {
+} Account
+
+pub fn Account.executor(self) -> Executor
+
+pub fn Account.used_ns(self) -> u64
+
+pub fn Account.close(take self)
 ```
 
-- `task::Executor` is a primitive capability: Copy and Send, and never linear, a view, Inert or AnyBits.
+- `task::Executor` is a primitive capability: Copy and Send, and never linear, a view, Inert or AnyBits. `task::Account` is a primitive capability: linear and Send, and never Copy, a view, Inert or AnyBits.
 - An executor is revoked as [revocation](14-authority.md#revocation) states.
 - An executor has a resolution, 1 ns for a root grant's. `exec.coarse(ns)` returns an executor running on the same allocator and recording the same clock with the greater of `exec`'s resolution and `ns` ([attenuation](14-authority.md#attenuation)), and fails with `sys::Revoked.Stale` when `exec` is stale. A delay timed on the clock an executor records ends only when that clock's elapsed nanoseconds are a multiple of the executor's resolution ([component context](26-components.md#component-context)), so nothing an executor offers times finer than its resolution.
 - A root grant mints its executor together with its allocator ([root grants](14-authority.md#root-grants)). `spawn` and `task::race` draw the stacks and task records of the tasks they start on an executor through that allocator.
-- An executor runs its ready tasks concurrently, on one or more processors. A task is ready when it has not ended and is not suspended at a [suspension point](17-suspension-io.md#stackful-tasks). The runtime chooses which ready task runs, on which processor and for how long; on the seeded scheduler of tests the seed fixes that choice ([replay](22-testing.md#replay)).
+- An executor runs its ready tasks concurrently, on one or more processors. A task is ready when it has not ended and is not suspended at a [suspension point](17-suspension-io.md#stackful-tasks). The runtime chooses which ready task runs, on which processor and for how long; on the seeded scheduler of tests the seed fixes that choice ([replay](22-testing.md#replay)), and on a kernel its [policy](24-kernel.md#policies) does.
+- An executor has a **share**, `Share(weight: 1, class: 0, reserve_ppm: 0)` for a root grant's, which the executors deriving from it keep unless `split` gives them another. The runtime interprets none of its fields; a kernel's policy reads the share of each task's executor to weigh, class and reserve processor time.
+- `exec.split(share)` returns an **account** owning a new executor deriving from `exec`, on the same allocator, recording the same clock and resolution, with the share `share`. `exec.serial(seed)` returns an account owning a new executor deriving from `exec`, with its share, that is serial with that seed. Both trap when the capability table is exhausted (`trap.exhausted`), and for a stale `exec` return an account whose executor is `exec`.
+- `account.executor()` returns the account's executor, the same handle on every call. `account.used_ns()` is the number of nanoseconds that tasks started on that executor, or on an executor deriving from it, have run while their executor was live, each run counted as the task switches away, by the kernel clock on a kernel and the monotonic clock on the host targets; it is 0 under the seeded scheduler and once the executor is stale. `take account.close()` revokes the executor ([revocation](14-authority.md#revocation)), so no task starts on it or on an executor deriving from it; tasks already started run on.
+- A **serial** executor runs at most one task at a time among the tasks started on it or on an executor deriving from it through no other serial executor; these are its tasks. A task of it runs only while it holds the executor's **turn**: a task becoming ready takes the turn when no task holds it, and otherwise waits. When the holder suspends, ends or stops, it passes the turn to a waiting task, or frees it when none waits; a preempted holder keeps it. The task taking the turn is at position w mod k among the k waiting tasks, the one that waited last first, w being value n of stream 1 of the executor's seed as the [seeded scheduler](22-testing.md#seeded-scheduler) computes stream values, where n counts the turn's earlier passes to a waiting task. A run making the same tasks of a serial executor ready in the same order thus passes its turn in the same order, whatever its timing. Once the executor is stale, its tasks run without a turn.
 
 ```nan
 // file: counter/package.nan
@@ -718,6 +741,37 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     })
     let hits = await when counter => counter.hits
     world.log.info("hits", value: hits)
+} main
+```
+
+```nan
+// file: batch/package.nan
+//! Runs a batch of jobs one at a time on the host.
+
+package batch {
+    language 1
+    targets x86_64-host
+    entry main
+} batch
+
+// file: batch/batch.nan
+//! Entry of the batch runner.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let batch = world.exec.serial(7)
+    defer take batch.close()
+    let done = task::Cown.of(0u32, alloc: world.alloc)
+    try await task::scope(batch.executor(), body: fn(s: task::Scope) {
+        for _ in 0..<3u32 {
+            discard s.spawn(fn() fails task::Cancelled uses wait {
+                await when mut done {
+                    done += 1
+                }
+            })
+        }
+    })
+    let jobs = await when done => done
+    world.log.info("jobs", value: jobs)
 } main
 ```
 

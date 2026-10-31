@@ -1,4 +1,4 @@
-//! Task scopes, joins, deadlines, races, cowns, channels and executors.
+//! Task scopes, joins, deadlines, races, cowns, channels, executors and their accounts.
 
 pub open struct Cancelled derives Send {
 } Cancelled
@@ -85,6 +85,25 @@ pub open struct Executor {
 } Executor
 
 pub fn Executor.coarse(self, ns: u64) -> Executor fails sys::Revoked
+
+pub closed struct Share derives Copy, Eq {
+    pub weight: u32 where weight >= 1
+    pub class: u8
+    pub reserve_ppm: u32 where reserve_ppm <= 1_000_000
+} Share
+
+pub fn Executor.split(self, share: Share) -> Account
+
+pub fn Executor.serial(self, seed: u64) -> Account
+
+pub open linear struct Account {
+} Account
+
+pub fn Account.executor(self) -> Executor
+
+pub fn Account.used_ns(self) -> u64
+
+pub fn Account.close(take self)
 
 pub closed struct Completion[B: Any, T: Any, E] {
     pub buf: B
@@ -224,6 +243,72 @@ test stale_executor_cannot_coarsen for Executor.coarse {
     let outcome = attempt exec.coarse(1_000)
     expect outcome.is_err()
 } stale_executor_cannot_coarsen
+
+test split_account_runs_tasks for Executor.split {
+    let world = testing::world()
+    let account = world.exec.split(Share(weight: 3, class: 1, reserve_ppm: 250_000))
+    defer take account.close()
+    var product: u32 = 0
+    try await scope(account.executor(), body: fn[mut product](s: Scope) fails Cancelled uses wait {
+        let job = s.spawn(fn() -> u32 {
+            return 6 * 7
+        })
+        product = try await take job.join()
+    })
+    expect product == 42
+} split_account_runs_tasks
+
+test serial_account_runs_every_task for Executor.serial {
+    let world = testing::world()
+    let account = world.exec.serial(7)
+    defer take account.close()
+    let hits = Cown.of(0u32, alloc: world.alloc)
+    try await scope(account.executor(), body: fn(s: Scope) {
+        for _ in 0..<4u32 {
+            discard s.spawn(fn() fails Cancelled uses wait {
+                await when mut hits {
+                    hits += 1
+                }
+            })
+        }
+    })
+    let total = await when hits => hits
+    expect total == 4
+} serial_account_runs_every_task
+
+test account_executor_is_stale_once_closed for Account.executor {
+    let world = testing::world()
+    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    let exec = account.executor()
+    let live = attempt exec.coarse(1_000)
+    take account.close()
+    let closed = attempt exec.coarse(1_000)
+    expect live.is_ok()
+    expect closed.is_err()
+} account_executor_is_stale_once_closed
+
+test seeded_runs_use_no_time for Account.used_ns {
+    let world = testing::world()
+    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    defer take account.close()
+    try await scope(account.executor(), body: fn(s: Scope) {
+        discard s.spawn(fn() -> u32 {
+            return 1
+        })
+    })
+    let used = account.used_ns()
+    expect used == 0
+} seeded_runs_use_no_time
+
+test closed_account_starts_no_task for Account.close {
+    let world = testing::world()
+    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    let exec = account.executor()
+    take account.close()
+    let outcome = attempt await scope(exec, body: fn(s: Scope) {
+    })
+    expect outcome.is_err()
+} closed_account_starts_no_task
 
 test earlier_end_decides_the_race for race {
     let world = testing::world()

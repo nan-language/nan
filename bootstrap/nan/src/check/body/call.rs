@@ -12,28 +12,49 @@ use crate::check::conform::{Candidate, type_key};
 use crate::check::db::ItemId;
 use crate::check::props::Property;
 use crate::check::resolve::Named;
-use crate::check::sig::{FnSig, ParamSig, Payload, SigKind};
+use crate::check::sig::{FieldSig, FnSig, ParamSig, Payload, SigKind};
 use crate::check::tir::{Builtin, Call, Callee, Form, Lit, LocalKind, TArg, TExpr, TKind};
 use crate::check::ty::{Arg, Args, Const, FnTy, Param, Scalar, Subst, Ty, no_args};
 use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
 use crate::nir::{self, BitConversion, BitsOwner, Conversion};
-use crate::syntax::ast::{
-    self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok, TypeModifier,
-};
+use crate::syntax::ast::{self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok};
 use crate::workspace::{Arch, Authority};
 
 /// The std functions that belong to one architecture's machine targets: its privileged
-/// intrinsics other than `invalidate_page`, and the x86_64 interrupt descriptor table.
-const INTRINSIC_ARCHS: [(&str, Arch); 8] = [
+/// intrinsics other than those both architectures share, and the x86_64 interrupt descriptor
+/// table.
+const INTRINSIC_ARCHS: [(&str, Arch); 30] = [
     ("hw::Ring0.load_idt", Arch::Amd64),
     ("hw::Ring0.write_cr3", Arch::Amd64),
     ("hw::Ring0.read_msr", Arch::Amd64),
     ("hw::Ring0.write_msr", Arch::Amd64),
+    ("hw::Ring0.cpuid", Arch::Amd64),
+    ("hw::Ring0.read_tsc", Arch::Amd64),
+    ("hw::Ring0.read_tscp", Arch::Amd64),
+    ("hw::Ring0.monitor_wait", Arch::Amd64),
+    ("hw::Ring0.invalidate_pcid", Arch::Amd64),
+    ("hw::Ring0.invalidate_pcid_page", Arch::Amd64),
+    ("hw::Ring0.write_cr3_tagged", Arch::Amd64),
+    ("hw::Ring0.read_xcr0", Arch::Amd64),
+    ("hw::Ring0.write_xcr0", Arch::Amd64),
+    ("hw::Ring0.hardware_random", Arch::Amd64),
+    ("hw::Ring0.hardware_seed", Arch::Amd64),
+    ("hw::Ring0.enable_protection", Arch::Amd64),
+    ("hw::Ring0.clear_cpu_buffers", Arch::Amd64),
     ("hw::Idt.of_vectors", Arch::Amd64),
     ("hw::Ring0.write_ttbr0", Arch::Aarch64),
     ("hw::Ring0.read_sysreg", Arch::Aarch64),
     ("hw::Ring0.write_sysreg", Arch::Aarch64),
+    ("hw::Ring0.wait_for_event", Arch::Aarch64),
+    ("hw::Ring0.write_ttbr0_tagged", Arch::Aarch64),
+    ("hw::Ring0.invalidate_asid", Arch::Aarch64),
+    ("hw::Ring0.invalidate_asid_page", Arch::Aarch64),
+    ("hw::Ring0.clean_data_cache", Arch::Aarch64),
+    ("hw::Ring0.clean_invalidate_data_cache", Arch::Aarch64),
+    ("hw::Ring0.invalidate_data_cache", Arch::Aarch64),
+    ("hw::Ring0.sync_instruction_cache", Arch::Aarch64),
+    ("hw::Ring0.firmware_call", Arch::Aarch64),
 ];
 
 /// The named conversions.
@@ -311,7 +332,7 @@ impl Body<'_, '_> {
             }
             ExprKind::Field { base, name } => match self.type_target(base) {
                 Some(TypeTarget::Type(Ty::Item(item, _))) => match &self.ck.sig(item).kind {
-                    SigKind::Enum { variants } => {
+                    SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                         variants.iter().any(|variant| variant.name == name.text)
                     }
                     _ => false,
@@ -905,6 +926,22 @@ impl Body<'_, '_> {
                     args,
                     expected,
                 );
+            }
+            if let SigKind::Protocol { variants, .. } = &self.ck.sig(item).kind
+                && let Some(variant) = variants
+                    .iter()
+                    .position(|variant| variant.name == name.text)
+            {
+                self.no_markers(token, markers);
+                if !self.ck.operation_visible(self.module, item, variant) {
+                    self.report(name.token, Code::NamePrivate);
+                }
+                if self.ck.is_request(item, variant) {
+                    self.report(token, Code::ComponentRequestValue);
+                    self.skim_args(args);
+                    return TExpr::failed(token);
+                }
+                return self.construct(token, item, Some(variant), None, args, expected);
             }
         }
         if let Some(scalar) = ty.scalar()
@@ -1684,6 +1721,16 @@ impl Body<'_, '_> {
     /// validators, and where `inspect` and `Untrusted.of` stand.
     fn check_callee(&self, token: Tok, callable: &Callable) {
         let subst = &callable.infer.subst;
+        if let Callee::Method {
+            interface, method, ..
+        } = &callable.callee
+            && self.ck.is_protocol(interface.interface)
+            && !self
+                .ck
+                .operation_visible(self.module, interface.interface, *method)
+        {
+            self.report(token, Code::NamePrivate);
+        }
         let Callee::Function { item, .. } = &callable.callee else {
             return;
         };
@@ -1704,6 +1751,7 @@ impl Body<'_, '_> {
             .generics
             .first()
             .and_then(|def| subst.get(def.param));
+        self.ck.check_kind_use(self.item, token, item, wrapped);
         if path
             .strip_prefix("hw::Ptr.")
             .is_some_and(|member| member.starts_with("atomic_"))
@@ -1722,9 +1770,6 @@ impl Body<'_, '_> {
             "hw::Anchor.with" if !self.ck.is_entry_context(self.item) => {
                 self.report(token, Code::KernelAnchorOutsideEntry);
             }
-            "sys::Domain.run" | "sys::Domain.run_sized" if self.ck.db.target.is_machine() => {
-                self.report(token, Code::DomainUnavailable);
-            }
             "hw::Ports.map" if self.ck.db.target.arch() == Some(Arch::Aarch64) => {
                 self.report(token, Code::RegisterPortTarget);
             }
@@ -1734,8 +1779,8 @@ impl Body<'_, '_> {
             {
                 self.report(token, Code::HwIntrinsicTarget);
             }
-            "host::Runner.run" => {
-                if let Some(code) = self.ck.runner_problem(&callable.head, subst) {
+            "host::Runner.run" | "sys::Stepper.start" | "sys::Stepper.resume" => {
+                if let Some(code) = self.ck.component_use_problem(&path, &callable.head, subst) {
                     self.report(token, code);
                 }
             }
@@ -1747,6 +1792,19 @@ impl Body<'_, '_> {
                     && !self.ck.wraps_untrusted(wrapped)
                 {
                     self.report(token, Code::UntrustedWrappedAlias);
+                }
+            }
+            "core::Secret.widen" | "core::Secret.truncate" => {
+                let source = callable
+                    .head
+                    .generics
+                    .get(1)
+                    .and_then(|def| subst.get(def.param));
+                if let (Some(Arg::Ty(Ty::Scalar(target))), Some(Arg::Ty(Ty::Scalar(source)))) =
+                    (wrapped, source)
+                    && let Some(code) = secret_conversion(&path, *source, *target)
+                {
+                    self.report(token, code);
                 }
             }
             _ => {}
@@ -2188,12 +2246,19 @@ impl Body<'_, '_> {
         let consumer = self.ck.db.package_of(item) != self.ck.db.module(self.module).package;
         let (fields, labelled): (Vec<(String, Ty)>, bool) = match (&sig.kind, variant) {
             (SigKind::Struct { fields }, None) => {
-                if consumer && self.ck.db.ast(item).has_modifier(TypeModifier::Open) {
+                if consumer && self.ck.db.ast(item).is_open() {
                     self.report(token, Code::TypeOpenConstruction);
                     self.skim_args(args);
                     return TExpr::failed(token);
                 }
-                for field in fields {
+                if self.ck.is_kind(item) {
+                    self.report(token, Code::AuthorityKindForm);
+                    self.skim_args(args);
+                    return TExpr::failed(token);
+                }
+                let fields: Vec<&FieldSig> =
+                    fields.iter().filter(|field| !field.is_kept()).collect();
+                for field in &fields {
                     if !self
                         .ck
                         .db
@@ -2245,6 +2310,10 @@ impl Body<'_, '_> {
                     }
                     (fields.clone(), true)
                 }
+            },
+            (SigKind::Protocol { variants, .. }, Some(index)) => match &variants[index].payload {
+                Payload::Labelled(fields) => (fields.clone(), true),
+                _ => (Vec::new(), true),
             },
             _ => {
                 self.report(token, Code::NameUnknown);
@@ -2918,7 +2987,7 @@ impl Body<'_, '_> {
         args: &[ast::Arg],
         markers: Markers,
     ) -> TExpr {
-        self.ck.require(self.item, token, Authority::Device);
+        self.ck.require(self.item, token, Authority::Confined);
         let layout = receiver.ty.type_arg(0).cloned().unwrap_or(Ty::Error);
         let Some(first) = args.first() else {
             self.report(token, Code::HwDmaOperand);
@@ -3117,6 +3186,23 @@ pub fn is_place(expr: &TExpr) -> bool {
         TKind::Field { base, .. } => is_place(base),
         TKind::Index(call) => call.args.first().is_some_and(|base| is_place(&base.expr)),
         _ => false,
+    }
+}
+
+/// The rule `Secret[T].widen(x)` or `Secret[T].truncate(x)` breaks for `x` of `Secret[S]`, the
+/// rules of named conversions over the integer pair `S`, `T`.
+fn secret_conversion(path: &str, source: Scalar, target: Scalar) -> Option<Code> {
+    let widening = widens(source, target);
+    if !source.is_integer() {
+        Some(Code::NumConversionUndefined)
+    } else if source == target {
+        Some(Code::NumSameTypeConversion)
+    } else if path == "core::Secret.widen" && !widening {
+        Some(Code::NumWidenLossy)
+    } else if path == "core::Secret.truncate" && widening {
+        Some(Code::NumWidenApplies)
+    } else {
+        None
     }
 }
 

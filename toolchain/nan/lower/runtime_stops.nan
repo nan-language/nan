@@ -1,0 +1,81 @@
+//! Where a task asked to stop may stop: at a point of its stack outside every frame of a function a stopping task completes before it stops.
+
+/// The registers of a task interrupted on its stack: its instruction, stack and frame pointers,
+/// its link register where the architecture has one, and the bounds of the stack's usable part.
+struct Interrupted derives Copy {
+    ip: clif::Value
+    sp: clif::Value
+    fp: clif::Value
+    link: Option[clif::Value]
+    low: clif::Value
+    high: clif::Value
+} Interrupted
+
+/// Whether a code address lies in a function a stopping task does not stop inside; an address
+/// outside lowered code counts as one when `unknown` holds.
+fn critical_at(mut lo: Lowering, mut fx: Fx, address: clif::Value, unknown: bool) -> clif::Value {
+    let holding = function_at(mut lo, mut fx, address)
+    let found = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: holding.start, y: 0)
+    let critical_bits = mut fx.b.band_imm_s(holding.flags, y: i64.widen(LINES_CRITICAL))
+    let is_critical = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: critical_bits, y: 0)
+    var unknown_flag: i64 = 0
+    if unknown {
+        unknown_flag = 1
+    }
+    let outside = mut fx.int(clif::Type.Int8, value: unknown_flag)
+    return mut fx.b.select(found, x: is_critical, y: outside)
+} critical_at
+
+/// Whether an interrupted task has no frame of a function it does not stop inside.
+fn stoppable(mut lo: Lowering, mut fx: Fx, at: Interrupted) -> clif::Value {
+    let in_ip = critical_at(mut lo, mut fx, address: at.ip, unknown: true)
+    // The return address of a function interrupted in its prologue or epilogue, before its frame
+    // pointer is set or after it is restored, lives in the link register where the architecture
+    // has one, and otherwise in the two words at the stack pointer.
+    var busy = in_ip
+    match at.link {
+        Some(link) => {
+            let in_link = critical_at(mut lo, mut fx, address: link, unknown: false)
+            busy = mut fx.b.bor(in_ip, y: in_link)
+        }
+        None => {
+            let top = mut fx.load(PTR, addr: at.sp, offset: 0)
+            let in_top = critical_at(mut lo, mut fx, address: top, unknown: false)
+            let next = mut fx.load(PTR, addr: at.sp, offset: 8)
+            let in_next = critical_at(mut lo, mut fx, address: next, unknown: false)
+            let busy_top = mut fx.b.bor(in_ip, y: in_top)
+            busy = mut fx.b.bor(busy_top, y: in_next)
+        }
+    }
+    let free = mut fx.b.bxor_imm_s(busy, y: 1)
+    let chosen = mut fx.choose_in(mut lo, condition: free, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let walked = mut fx1.repeat(fx1.list2(at.fp, b: free).view(), body: fn[mut lo1](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 1
+            let frame = current[0]
+            let walk_free = current[1]
+            let frame_above = mut pass_fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: frame, y: at.low)
+            let end = mut pass_fx.b.iadd_imm_s(frame, y: 16)
+            let frame_below = mut pass_fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: at.high)
+            let inside = mut pass_fx.b.band(frame_above, y: frame_below)
+            let stepped = mut pass_fx.choose_in(mut lo1, condition: inside, results: pass_fx.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+                let address = mut yes_fx.load(PTR, addr: frame, offset: 8)
+                let at_base = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+                let frame_critical = critical_at(mut cx, fx: mut yes_fx, address, unknown: true)
+                let frame_free = mut yes_fx.b.bxor_imm_s(frame_critical, y: 1)
+                let free_or_base = mut yes_fx.b.bor(at_base, y: frame_free)
+                let caller = mut yes_fx.load(PTR, addr: frame, offset: 0)
+                return yes_fx.list2(caller, b: free_or_base)
+            }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+                let none = mut no_fx.ptr(0)
+                return no_fx.list2(none, b: walk_free)
+            })
+            let more = mut pass_fx.b.band(inside, y: stepped[1])
+            return Pass(again: more, next: take stepped)
+        })
+        return fx1.list1(walked[1])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(none)
+    })
+    return chosen[0]
+} stoppable

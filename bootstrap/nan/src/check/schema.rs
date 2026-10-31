@@ -1,13 +1,15 @@
 //! Schema trees: the description of a type's encoded structure, and the schema hash, the hash of
 //! the `mem::wire` encoding of a tree's root node.
 
+use std::collections::BTreeMap;
+
 use super::Checker;
-use super::db::ItemId;
+use super::db::{ItemId, PackageId, TypeKey};
 use super::sig::{Payload, SigKind};
 use super::ty::{Arg, Const, Scalar, Subst, Ty};
 use crate::encoding::uvar;
 use crate::hash::Hash;
-use crate::syntax::ast::{ItemKind, RetiredNew, TypeModifier};
+use crate::syntax::ast::{ItemKind, RetiredNew, Visibility};
 
 /// A node of a schema tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,15 +272,84 @@ fn option(value: Option<Vec<u8>>) -> Vec<u8> {
     }
 }
 
+/// A walk making a schema tree: the struct and enum instantiations enclosing the node being
+/// made, each with the number of `Record` and `Variant` nodes made since it, and the
+/// instantiations found of packages other than `outside`, while outside every other found one.
+#[derive(Default)]
+struct Walk {
+    enclosing: Vec<(Ty, u64)>,
+    outside: Option<PackageId>,
+    found: Vec<Ty>,
+}
+
 impl Checker<'_> {
     /// The schema tree of a type implementing `Encode`.
     pub fn schema(&self, ty: &Ty) -> Node {
-        self.schema_within(ty, &mut Vec::new())
+        self.schema_within(ty, &mut Walk::default())
     }
 
-    /// The schema of a type inside the nodes made for `enclosing` struct and enum instantiations,
-    /// each with the number of `Record` and `Variant` nodes made since it.
-    fn schema_within(&self, ty: &Ty, enclosing: &mut Vec<(Ty, u64)>) -> Node {
+    /// The struct and enum instantiations of packages other than `package` that the schema tree
+    /// of a type makes nodes for, each outside every other.
+    pub fn foreign_schemas(&self, ty: &Ty, package: PackageId) -> Vec<Ty> {
+        let mut walk = Walk {
+            outside: Some(package),
+            ..Walk::default()
+        };
+        self.schema_within(ty, &mut walk);
+        walk.found
+    }
+
+    /// Each non-generic `pub` struct or enum of a package implementing `Encode`, by canonical
+    /// path.
+    pub fn exported_encoded(&self, package: PackageId) -> BTreeMap<String, Ty> {
+        let mut found = BTreeMap::new();
+        let Some(encode) = self.db.core_item("Encode") else {
+            return found;
+        };
+        for &module in &self.db.package(package).modules {
+            for &item in &self.db.module(module).items {
+                let ast = self.db.ast(item);
+                let typed = matches!(ast.kind, ItemKind::Struct(_) | ItemKind::Enum(_));
+                if !typed
+                    || ast.visibility != Visibility::Pub
+                    || !self.sig(item).generics.is_empty()
+                {
+                    continue;
+                }
+                let ty = Ty::item(item, Vec::new());
+                if self.implements(&ty, encode)
+                    && let Some(path) = self.canonical_path(item)
+                {
+                    found.insert(path, ty);
+                }
+            }
+        }
+        found
+    }
+
+    /// The types whose schema trees a package's code root records, by canonical path: its
+    /// exported types implementing `Encode` and each component state it declares, the target of
+    /// an impl line naming `sys::Component`.
+    pub fn recorded_schemas(&self, package: PackageId) -> BTreeMap<String, Ty> {
+        let mut found = self.exported_encoded(package);
+        for module in &self.db.package(package).modules {
+            for item in &self.db.module(*module).items {
+                if let SigKind::Impl {
+                    target: Some(TypeKey::Item(target)),
+                    interface: Some(bound),
+                    ..
+                } = &self.sig(*item).kind
+                    && self.db.canonical(bound.interface) == "sys::Component"
+                {
+                    found.insert(self.db.canonical(*target), Ty::item(*target, Vec::new()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The schema of a type within a walk.
+    fn schema_within(&self, ty: &Ty, walk: &mut Walk) -> Node {
         let width = |scalar: Scalar| u64::from(scalar.bits());
         match ty {
             Ty::Scalar(Scalar::Bool) => return Node::Bool,
@@ -316,11 +387,11 @@ impl Checker<'_> {
             "mem::Bytes" => return Node::Bytes,
             "text::Fixed" => return Node::BoundedText(count(0).unwrap_or_default()),
             "mem::Box" | "mem::Shared" | "core::Untrusted" => {
-                return self.schema_within(&arg(0), enclosing);
+                return self.schema_within(&arg(0), walk);
             }
             "mem::Id" => return Node::Unsigned(32),
             "core::Array" | "mem::Bounded" | "mem::Set" | "mem::List" => {
-                let element = Box::new(self.schema_within(&arg(0), enclosing));
+                let element = Box::new(self.schema_within(&arg(0), walk));
                 return Node::Sequence {
                     element,
                     length: (path == "core::Array").then(|| count(1)).flatten(),
@@ -330,25 +401,36 @@ impl Checker<'_> {
             }
             "mem::Map" => {
                 return Node::Map {
-                    key: Box::new(self.schema_within(&arg(0), enclosing)),
-                    value: Box::new(self.schema_within(&arg(1), enclosing)),
+                    key: Box::new(self.schema_within(&arg(0), walk)),
+                    value: Box::new(self.schema_within(&arg(1), walk)),
                 };
             }
             _ => {}
         }
-        if let Some(at) = enclosing.iter().position(|(known, _)| known == ty) {
-            let depth = enclosing[at..].iter().map(|(_, made)| made).sum::<u64>();
+        if let Some(at) = walk.enclosing.iter().position(|(known, _)| known == ty) {
+            let depth = walk.enclosing[at..]
+                .iter()
+                .map(|(_, made)| made)
+                .sum::<u64>();
             return Node::Back(depth);
+        }
+        let outside = walk.outside;
+        if outside.is_some_and(|package| self.db.package_of(*item) != package) {
+            if !walk.found.contains(ty) {
+                walk.found.push(ty.clone());
+            }
+            walk.outside = None;
         }
         let sig = self.sig(*item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
-        let open = self.db.ast(*item).has_modifier(TypeModifier::Open);
-        enclosing.push((ty.clone(), 1));
+        let open = self.db.ast(*item).is_open();
+        walk.enclosing.push((ty.clone(), 1));
         let node = match &sig.kind {
             SigKind::Struct { fields } => Node::Record {
                 open,
                 fields: fields
                     .iter()
+                    .filter(|field| !field.is_kept())
                     .map(|field| {
                         let value_ty = subst.ty(&field.ty);
                         let defaulted = open && self.implements_default(&value_ty);
@@ -356,7 +438,7 @@ impl Checker<'_> {
                             key: field.name.clone(),
                             aliases: self.key_aliases_of(*item, &field.name),
                             defaulted,
-                            value: self.nested(&value_ty, enclosing),
+                            value: self.nested(&value_ty, walk),
                         }
                     })
                     .collect(),
@@ -370,9 +452,7 @@ impl Checker<'_> {
                         aliases: self.key_aliases_of(*item, &variant.name),
                         payload: match &variant.payload {
                             Payload::None => None,
-                            Payload::Single(payload) => {
-                                Some(self.nested(&subst.ty(payload), enclosing))
-                            }
+                            Payload::Single(payload) => Some(self.nested(&subst.ty(payload), walk)),
                             Payload::Labelled(fields) => Some(Node::Record {
                                 open: false,
                                 fields: fields
@@ -381,7 +461,7 @@ impl Checker<'_> {
                                         key: label.clone(),
                                         aliases: Vec::new(),
                                         defaulted: false,
-                                        value: self.nested(&subst.ty(payload), enclosing),
+                                        value: self.nested(&subst.ty(payload), walk),
                                     })
                                     .collect(),
                             }),
@@ -394,15 +474,16 @@ impl Checker<'_> {
                 fields: Vec::new(),
             },
         };
-        enclosing.pop();
+        walk.enclosing.pop();
+        walk.outside = outside;
         node
     }
 
     /// The node of a constituent, counting the node made for each enclosing instantiation.
-    fn nested(&self, ty: &Ty, enclosing: &mut Vec<(Ty, u64)>) -> Node {
-        let node = self.schema_within(ty, enclosing);
+    fn nested(&self, ty: &Ty, walk: &mut Walk) -> Node {
+        let node = self.schema_within(ty, walk);
         if matches!(node, Node::Record { .. } | Node::Variant { .. })
-            && let Some((_, made)) = enclosing.last_mut()
+            && let Some((_, made)) = walk.enclosing.last_mut()
         {
             *made += 1;
         }
@@ -458,3 +539,6 @@ impl Checker<'_> {
             .is_some_and(|path| format!("{path}.{member}") == target)
     }
 }
+
+#[cfg(test)]
+mod tests;

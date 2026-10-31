@@ -1,0 +1,128 @@
+//! Executors and their accounts: `task::Executor.coarse`, `split` and `serial`, which derive an entry from an executor's, and the members of `task::Account`, which owns the entry `split` or `serial` derived. An executor's share is one word: its weight in the low 32 bits, its class in the next 8 and its reservation in parts per million above them.
+
+/// The bit positions of a share's class and reservation in its word.
+const CLASS_SHIFT: i64 = 32
+
+const RESERVE_SHIFT: i64 = 40
+
+fn accounts_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.path.as_str() {
+        "task::Executor.coarse" => coarse(mut lo, mut fx, supply, word: TABLES_EXECUTOR_RESOLUTION)
+        "task::Executor.split" => accounts_derive(mut lo, mut fx, supply, complete: fn(mut lo1: Lowering, mut fx1: Fx, record: clif::Value) {
+            expect supply.abi.params.len() > 1
+            let share_ty = supply.abi.params[1].nty.ty()
+            let address = held_address(mut lo1, fx: mut fx1, ty: share_ty, held: supply.param(1))
+            let packed = pack_share(mut lo1, fx: mut fx1, share_ty, address)
+            mut fx1.store(packed, addr: record, offset: TABLES_EXECUTOR_SHARE)
+        })
+        "task::Executor.serial" => accounts_derive(mut lo, mut fx, supply, complete: fn(mut lo1: Lowering, mut fx1: Fx, record: clif::Value) {
+            let seed = supply.param(1).scalar_value()
+            mut fx1.store(seed, addr: record, offset: TABLES_ENTRY_SEED)
+        })
+        "task::Account.executor" => {
+            let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(handle, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "task::Account.used_ns" => {
+            let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let state_address = mut lo.state(mut fx)
+            let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let record = live_entry(mut lo, mut fx, handle)
+            let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+            let used = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let counted = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_USED)
+                return fx1.list1(counted)
+            }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let none = mut fx1.ptr(0)
+                return fx1.list1(none)
+            })
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(used[0]))
+        }
+        "task::Account.close" => {
+            let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            discard mut lo.call_routine(mut fx, routine: Routine.Revoke, args: fx.list1(handle).view())
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} accounts_lower
+
+/// Returns the account owning an entry derived from the executor at the operation's first
+/// parameter, which `complete` completes under the lock before any task reads it; for `serial`, the
+/// entry names itself as its tasks' serial executor. An account of a stale executor holds that
+/// executor's handle.
+fn accounts_derive(mut lo: Lowering, mut fx: Fx, supply: Supply, complete: fn(mut lo: Lowering, mut fx: Fx, record: clif::Value)) {
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let word = mut fx.ptr(TABLES_EXECUTOR_RESOLUTION)
+    let zero = mut fx.ptr(0)
+    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: fx.list5(handle, b: word, c: zero, d: zero, e: zero).view())
+    expect derived_values.len() == 1
+    let derived = derived_values[0]
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: derived, y: -1)
+    mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
+        let state_address = mut lo.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let record = entry_at(mut lo, fx: mut fx1, handle: derived)
+        if supply.path.as_str() == "task::Executor.serial" {
+            mut fx1.store(derived, addr: record, offset: TABLES_ENTRY_SERIAL)
+        }
+        complete(mut lo, fx: mut fx1, record)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+    })
+    let owned = mut fx.b.select(live, x: derived, y: handle)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(owned, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} accounts_derive
+
+/// The word of a `task::Share` at an address.
+fn pack_share(mut lo: Lowering, mut fx: Fx, share_ty: ty::Ty, address: clif::Value) -> clif::Value {
+    let fields = share_fields(mut lo, share_ty)
+    let weight_word = mut fx.load(clif::Type.Int32, addr: address, offset: fields[0])
+    let weight = mut fx.b.uextend(PTR, x: weight_word)
+    let class_byte = mut fx.load(clif::Type.Int8, addr: address, offset: fields[1])
+    let class_wide = mut fx.b.uextend(PTR, x: class_byte)
+    let class = mut fx.b.ishl_imm_s(class_wide, y: CLASS_SHIFT)
+    let reserve_word = mut fx.load(clif::Type.Int32, addr: address, offset: fields[2])
+    let reserve_wide = mut fx.b.uextend(PTR, x: reserve_word)
+    let reserve = mut fx.b.ishl_imm_s(reserve_wide, y: RESERVE_SHIFT)
+    let packed = mut fx.b.bor(weight, y: class)
+    return mut fx.b.bor(packed, y: reserve)
+} pack_share
+
+/// Writes the `task::Share` of a word at an address.
+fn unpack_share(mut lo: Lowering, mut fx: Fx, share_ty: ty::Ty, packed: clif::Value, address: clif::Value) {
+    let fields = share_fields(mut lo, share_ty)
+    let weight = mut fx.b.ireduce(clif::Type.Int32, x: packed)
+    mut fx.store(weight, addr: address, offset: fields[0])
+    let class_wide = mut fx.b.ushr_imm_s(packed, y: CLASS_SHIFT)
+    let class = mut fx.b.ireduce(clif::Type.Int8, x: class_wide)
+    mut fx.store(class, addr: address, offset: fields[1])
+    let reserve_wide = mut fx.b.ushr_imm_s(packed, y: RESERVE_SHIFT)
+    let reserve = mut fx.b.ireduce(clif::Type.Int32, x: reserve_wide)
+    mut fx.store(reserve, addr: address, offset: fields[2])
+} unpack_share
+
+/// The offsets of a `task::Share`'s weight, class and reservation.
+fn share_fields(mut lo: Lowering, share_ty: ty::Ty) -> Array[u64, 3] {
+    let weight_field = mut lo.layouts.field(lo.ck, ty: share_ty, variant: None, label: "weight")
+    let class_field = mut lo.layouts.field(lo.ck, ty: share_ty, variant: None, label: "class")
+    let reserve_field = mut lo.layouts.field(lo.ck, ty: share_ty, variant: None, label: "reserve_ppm")
+    var offsets = Array[u64, 3].filled(weight_field.offset)
+    offsets[1] = class_field.offset
+    offsets[2] = reserve_field.offset
+    return offsets
+} share_fields

@@ -38,7 +38,7 @@ pub fn language(
         .packages
         .iter()
         .filter(|package| match scope.package(workspace) {
-            Some(scoped) => std::ptr::eq(*package, scoped),
+            Some(scoped) => std::ptr::eq(&***package, scoped),
             None => true,
         });
     for package in packages {

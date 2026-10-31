@@ -1,4 +1,4 @@
-//! The synchronisation primitives of `hw`: `hw::without_irqs`, spin locks, devices behind an IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of the CPU holding it plus one, each executor thread being a CPU on `x86_64-host`, so a CPU acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and vectors to bind a device to.
+//! The synchronisation primitives of `hw`: `hw::without_irqs`, spin locks, devices behind an IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of the CPU holding it plus one, each executor thread being a CPU on `x86_64-host`, so a CPU acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and interrupts to install a device on.
 
 /// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it on
 /// a machine target and their state restored after.
@@ -113,35 +113,59 @@ fn device_value(mut lo: Lowering, value_ty: ty::Ty) -> u64 {
 } device_value
 
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
-/// `install` moves the device into a new record, and on a machine target binds its vector to
-/// it, unless the final build or another installation binds that vector; `with` takes the
-/// record's lock around its body; `uninstall` unbinds the vector and waits until no CPU runs the
-/// interrupt fn for it, then moves the device out of the freed record. On AArch64, where the
-/// interrupt controller delivers only the interrupts enabled on it, binding a vector from 32 up
-/// enables its interrupt and unbinding disables it.
+/// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
+/// target install it on its interrupt, `install_msi` giving the device back in its refusal
+/// otherwise; the running task's domain then owns the record as a holding. `message` reads the
+/// message the record holds; `with` takes the record's lock around its body; `uninstall` ends
+/// the holding, removes the device from its interrupt and waits until no CPU runs its interrupt
+/// fn, then moves it out of the freed record. A CPU number past the CPUs traps.
 fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let value_ty = supply.type_arg(lo, index: 0)
     let value_at = device_value(mut lo, value_ty)
     match supply.member() {
         "install" => {
-            let laid = mut lo.layout_of(value_ty)
-            let size = mut fx.ptr(value_at + laid.contents().size)
-            let record = mut lo.record_alloc(mut fx, size)
-            let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
-            mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
-                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
-            })
-            let value = mut fx.offset(record, offset: value_at)
-            mut lo.store_held(mut fx, address: value, held: supply.param(0), ty: value_ty)
+            let record = device_record(mut lo, mut fx, supply, value_ty, handler: 2)
             if lo.machine() {
-                bind(mut lo, mut fx, supply, value_ty, record)
+                let vector_byte = supply.param(1).scalar_value()
+                let vector = mut fx.b.uextend(PTR, x: vector_byte)
+                mut lo.install_device(mut fx, record, cpu: None, vector)
             }
-            let Some(sret) = supply.sret else {
-                expect false
-                return
+            return_shared(mut lo, mut fx, supply, record)
+        }
+        "install_on" => {
+            let cpu = cpu_number(mut lo, mut fx, supply)
+            let record = device_record(mut lo, mut fx, supply, value_ty, handler: 3)
+            if lo.machine() {
+                let vector_byte = supply.param(2).scalar_value()
+                let vector = mut fx.b.uextend(PTR, x: vector_byte)
+                mut lo.install_device(mut fx, record, cpu: Some(cpu), vector)
             }
-            mut fx.store(record, addr: sret, offset: 0)
-            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+            return_shared(mut lo, mut fx, supply, record)
+        }
+        "install_msi" => shared_install_msi(mut lo, mut fx, supply, value_ty, validated: false)
+        "install_validated" => shared_install_msi(mut lo, mut fx, supply, value_ty, validated: true)
+        "message" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let option = supply.abi.result
+            let address = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MESSAGE)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: address, y: 0)
+            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+                let Some(message_ty) = lo.ck.types().type_arg(option, index: 0) else {
+                    expect false
+                    return
+                }
+                let laid = mut lo.layout_of(message_ty)
+                let message = mut fx1.slot(laid.contents().size, align: laid.contents().align)
+                let address_field = mut lo.layouts.field(lo.ck, ty: message_ty, variant: None, label: "address")
+                mut fx1.store(address, addr: message, offset: address_field.offset)
+                let data = mut fx1.load(clif::Type.Int32, addr: record, offset: DEVICE_RECORD_DATA)
+                let data_field = mut lo.layouts.field(lo.ck, ty: message_ty, variant: None, label: "data")
+                mut fx1.store(data, addr: message, offset: data_field.offset)
+                let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(message)).view(), wrapped: None)
+                supply.ret(mut lo, fx: mut fx1, held: some)
+            })
+            let none = mut lo.none_value(mut fx, option)
+            supply.ret(mut lo, mut fx, held: none)
         }
         "with" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -155,15 +179,12 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "uninstall" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let holding = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_HOLDING)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(holding).view())
             if lo.machine() {
-                unbind(mut lo, mut fx, record)
+                mut lo.uninstall_device(mut fx, record)
             }
-            let laid = mut lo.layout_of(value_ty)
-            let kept = mut fx.slot(laid.contents().size, align: laid.contents().align)
-            let value = mut fx.offset(record, offset: value_at)
-            mut lo.copy(mut fx, dst: kept, src: value, size: laid.contents().size, align: laid.contents().align)
-            mut lo.record_free(mut fx, address: record)
-            let held = mut lo.held_at(mut fx, ty: value_ty, address: kept)
+            let held = take_device(mut lo, mut fx, value_ty, record)
             supply.ret(mut lo, mut fx, held)
         }
         else => {
@@ -172,71 +193,147 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } irq_shared
 
-/// Binds the vector `install` names to a device record, trapping when the final build or
-/// another installation binds that vector.
-fn bind(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty, record: clif::Value) {
-    let vector_byte = supply.param(1).scalar_value()
-    let vector = mut fx.b.uextend(PTR, x: vector_byte)
-    let statically = mut lo.statically_bound()
-    for bound in statically {
-        let same = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound)
-        mut fx.if_true(same, then: fn[mut lo](mut fx1: Fx) {
-            raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
-        })
-    }
-    expect supply.abi.params.len() > 2
-    let handler_fn_ty = supply.abi.params[2].nty.ty()
+/// The CPU number an install names, as a word, trapping when it is not below the CPU count.
+fn cpu_number(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
+    let number_word = supply.param(1).scalar_value()
+    let cpu = mut fx.b.uextend(PTR, x: number_word)
+    let state_address = mut lo.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let outside = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: cpu, y: count)
+    mut fx.if_true(outside, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+    })
+    return cpu
+} cpu_number
+
+/// A new device record holding the device an install takes, with the interrupt fn its parameter
+/// `handler` gives and the glue calling it.
+fn device_record(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty, handler: usize) -> clif::Value {
+    let value_at = device_value(mut lo, value_ty)
+    let laid = mut lo.layout_of(value_ty)
+    let size = mut fx.ptr(value_at + laid.contents().size)
+    let record = mut lo.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let value = mut fx.offset(record, offset: value_at)
+    mut lo.store_held(mut fx, address: value, held: supply.param(0), ty: value_ty)
+    expect supply.abi.params.len() > handler
+    let handler_fn_ty = supply.abi.params[handler].nty.ty()
     let ty::TyKind.Fn(handler_ty) = lo.ck.types().kind(handler_fn_ty) else {
         expect false
-        return
+        return record
     }
     let handler_layout = mut lo.layout_of(handler_fn_ty)
     let handler_at = mut fx.offset(record, offset: DEVICE_RECORD_HANDLER)
-    mut lo.copy(mut fx, dst: handler_at, src: supply.param(2).address_value(), size: handler_layout.contents().size, align: handler_layout.contents().align)
+    mut lo.copy(mut fx, dst: handler_at, src: supply.param(handler).address_value(), size: handler_layout.contents().size, align: handler_layout.contents().align)
     let glue_id = device_glue(mut lo, value_ty, handler_ty)
     let glue_ref = mut lo.func_ref(mut fx, id: glue_id)
     let glue = mut fx.b.func_addr(PTR, func_ref: glue_ref)
     mut fx.store(glue, addr: record, offset: DEVICE_RECORD_GLUE)
-    mut fx.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
-    let slot = mut lo.irq_binding(mut fx, vector)
-    let unbound = mut fx.ptr(0)
-    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: slot, e: unbound, x: record)
-    let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
-    mut fx.if_true(taken, then: fn[mut lo](mut fx1: Fx) {
-        raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
-    })
-    if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
-        let shared = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: 32)
-        mut fx.if_true(shared, then: fn[mut lo](mut fx1: Fx) {
-            mut lo.aarch64_enable(mut fx1, vector)
-        })
-    }
-} bind
+    return record
+} device_record
 
-/// Unbinds a device record's vector and waits until no CPU runs its interrupt fn.
-fn unbind(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
-    let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
-    if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
-        let shared = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: 32)
-        mut fx.if_true(shared, then: fn[mut lo](mut fx1: Fx) {
-            mut lo.aarch64_disable(mut fx1, vector)
-        })
+/// Returns the `hw::IrqShared` naming a device record installed.
+fn return_shared(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    hold_device(mut lo, mut fx, record)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
     }
-    let slot = mut lo.irq_binding(mut fx, vector)
-    let unbound = mut fx.ptr(0)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: unbound, p: slot)
-    let running = mut fx.offset(slot, offset: BINDING_RUNNING)
-    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
-        let count = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: running)
-        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
-        mut fx1.if_true(busy, then: fn[mut lo](mut fx2: Fx) {
-            mut lo.relax(mut fx2)
-        })
-        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
-    })
-} unbind
+    mut fx.store(record, addr: sret, offset: 0)
+    supply.ret(mut lo, mut fx, held: Held.Address(sret))
+} return_shared
 
-/// The glue the dispatcher calls with a device's record when its vector fires: it takes the
+/// Makes a device record installed a holding of the running task's domain.
+fn hold_device(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let kind = mut fx.ptr(u64.fit(HOLDINGS_KIND_UNINSTALL))
+    let held = mut lo.call_routine(mut fx, routine: Routine.Hold, args: fx.list2(kind, b: record).view())
+    expect held.len() == 1
+    mut fx.store(held[0], addr: record, offset: DEVICE_RECORD_HOLDING)
+} hold_device
+
+/// Moves the device out of a device record, which it frees.
+fn take_device(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, record: clif::Value) -> Held {
+    let laid = mut lo.layout_of(value_ty)
+    let kept = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let value_at = device_value(mut lo, value_ty)
+    let value = mut fx.offset(record, offset: value_at)
+    mut lo.copy(mut fx, dst: kept, src: value, size: laid.contents().size, align: laid.contents().align)
+    mut lo.record_free(mut fx, address: record)
+    return mut lo.held_at(mut fx, ty: value_ty, address: kept)
+} take_device
+
+/// `install_msi`, and `install_validated` whose interrupt its source alone raises: `Ok` of the
+/// shared device once installed on a message-signalled interrupt of a machine target, or `Err`
+/// of a refusal giving back the device with the `hw::MsiError` variant of the outcome,
+/// `Unsupported` on the host.
+fn shared_install_msi(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty, validated: bool) {
+    let cpu = cpu_number(mut lo, mut fx, supply)
+    let record = device_record(mut lo, mut fx, supply, value_ty, handler: 3)
+    let outcome = msi_outcome(mut lo, mut fx, supply, record, cpu, validated)
+    let result_ty = supply.abi.result
+    let installed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_INSTALLED)
+    mut fx.if_true(installed, then: fn[mut lo](mut fx1: Fx) {
+        hold_device(mut lo, fx: mut fx1, record)
+        let shared = mut fx1.slot(8, align: 8)
+        mut fx1.store(record, addr: shared, offset: 0)
+        let ok = mut lo.variant_value(mut fx1, ty: result_ty, variant: "Ok", payload_values: Array[Held, 1].filled(Held.Address(shared)).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: ok)
+    })
+    let Some(refusal_ty) = lo.ck.types().type_arg(result_ty, index: 1) else {
+        expect false
+        return
+    }
+    let error_field = mut lo.layouts.field(lo.ck, ty: refusal_ty, variant: None, label: "error")
+    let laid = mut lo.layout_of(refusal_ty)
+    let refusal = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let dev_field = mut lo.layouts.field(lo.ck, ty: refusal_ty, variant: None, label: "dev")
+    let dev = take_device(mut lo, mut fx, value_ty, record)
+    let dev_address = mut fx.offset(refusal, offset: dev_field.offset)
+    mut lo.store_held(mut fx, address: dev_address, held: dev, ty: value_ty)
+    let refused = Refused(result_ty: result_ty, error_ty: error_field.ty, error: mut fx.offset(refusal, offset: error_field.offset), refusal: refusal)
+    let exhausted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_EXHAUSTED)
+    mut fx.if_true(exhausted, then: fn[mut lo](mut fx1: Fx) {
+        return_refusal(mut lo, fx: mut fx1, supply, refused, variant: "Exhausted")
+    })
+    let unreachable = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_UNREACHABLE)
+    mut fx.if_true(unreachable, then: fn[mut lo](mut fx1: Fx) {
+        return_refusal(mut lo, fx: mut fx1, supply, refused, variant: "Unreachable")
+    })
+    return_refusal(mut lo, mut fx, supply, refused, variant: "Unsupported")
+} shared_install_msi
+
+/// The outcome of installing a device record on a message-signalled interrupt: the machine
+/// target's, `Unsupported` on the host.
+fn msi_outcome(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, cpu: clif::Value, validated: bool) -> clif::Value {
+    if not lo.machine() {
+        return mut fx.ptr(u64.fit(MSI_UNSUPPORTED))
+    }
+    let source_word = supply.param(2).scalar_value()
+    let source = mut fx.b.uextend(PTR, x: source_word)
+    return mut lo.install_msi(mut fx, record, cpu, source, validated)
+} msi_outcome
+
+/// Where `install_msi` builds its refusal: its result type, the type of the error and where it
+/// lies in the refusal, and the refusal holding the device.
+struct Refused derives Copy {
+    result_ty: ty::Ty
+    error_ty: ty::Ty
+    error: clif::Value
+    refusal: clif::Value
+} Refused
+
+/// Returns `Err` of the refusal with the `hw::MsiError` variant `variant`.
+fn return_refusal(mut lo: Lowering, mut fx: Fx, supply: Supply, refused: Refused, variant: Str) {
+    let error = mut lo.variant_value(mut fx, ty: refused.error_ty, variant, payload_values: mem::List[Held].empty(fx.alloc).view(), wrapped: None)
+    mut lo.store_held(mut fx, address: refused.error, held: error, ty: refused.error_ty)
+    let err = mut lo.variant_value(mut fx, ty: refused.result_ty, variant: "Err", payload_values: Array[Held, 1].filled(Held.Address(refused.refusal)).view(), wrapped: None)
+    supply.ret(mut lo, mut fx, held: err)
+} return_refusal
+
+/// The glue the dispatcher calls with a device's record when its interrupt fires: it takes the
 /// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext`, releases
 /// the lock and gives whether the fn's `hw::IrqExit` is `Reschedule`.
 fn device_glue(mut lo: Lowering, value_ty: ty::Ty, handler_ty: ty::FnTyId) -> object::FuncId {

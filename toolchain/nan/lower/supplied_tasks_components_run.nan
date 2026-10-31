@@ -1,0 +1,227 @@
+//! The runner `host::Runner`: its run, whose component task handles the intake while the body runs, and the settlement of a run whose caller has stopped.
+
+/// `host::Runner[S].run(env, exec, alloc, body: b)`.
+fn components_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let state_ty = supply.type_arg(lo, index: 0)
+    let env_ty = supply.type_arg(lo, index: 1)
+    let message_ty = supply.type_arg(lo, index: 2)
+    let body_ty = fn_param(lo, supply, index: 3)
+    let env = supply.param(0)
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(1).address_value())
+    let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        release_env(mut lo, fx: mut fx1, env: env_ty, held: env)
+        let none = mut fx1.ptr(0)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
+    })
+    let cell = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let shape = components_shape(mut lo, state: state_ty, env: env_ty, message: message_ty)
+    let exec = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+    let record = draw_record(mut lo, mut fx, shape, cell, exec, exec_cell: executor.words[0], clock: executor.words[1], resolution: executor.words[2])
+    let withdraw = withdraw_run(mut lo)
+    let none = mut fx.ptr(0)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: none)
+    let env_at = mut fx.offset(record, offset: shape.env_at)
+    mut lo.store_held(mut fx, address: env_at, held: env, ty: env_ty)
+    let start = components_handler(mut lo, method: "start", state: state_ty, env: env_ty, message: message_ty)
+    let state = call_handler(mut lo, mut fx, instance: take start, args: Array[Held, 1].filled(Held.Address(env_at)).view())
+    let state_at = mut fx.offset(record, offset: shape.state_at)
+    mut lo.store_held(mut fx, address: state_at, held: state, ty: state_ty)
+    protocols_publish(mut lo, mut fx, record, shape, state: state_ty)
+    start_component(mut lo, mut fx, record, exec_cell: executor.words[0], state: state_ty, env: env_ty, message: message_ty)
+    let zero = mut fx.ptr(0)
+    var mint_args = Array[clif::Value, 3].filled(record)
+    mint_args[1] = zero
+    mint_args[2] = zero
+    let inbox_values = mut lo.call_routine(mut fx, routine: Routine.OutboxMint, args: mint_args.view())
+    expect inbox_values.len() == 1
+    let inbox = inbox_values[0]
+    mut fx.store(inbox, addr: record, offset: RUNNER_INBOX)
+    let inbox_slot = mut fx.slot(8, align: 8)
+    mut fx.store(inbox, addr: inbox_slot, offset: 0)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(3).address_value(), args: Array[Held, 1].filled(Held.Address(inbox_slot)).view())
+    run_end(mut lo, mut fx, supply, record, inbox, state_at, called, state_ty, message_ty, body_failure: body_ty.failure)
+} components_run
+
+/// Ends a run once its body has returned or failed: the intake stops, the component task and
+/// the timers end, every keyed task is superseded and ends, and the state is the run's result,
+/// unless the body failed.
+fn run_end(
+    mut lo: Lowering,
+    mut fx: Fx,
+    supply: Supply,
+    record: clif::Value,
+    inbox: clif::Value,
+    state_at: clif::Value,
+    called: Called,
+    state_ty: ty::Ty,
+    message_ty: ty::Ty,
+    body_failure: Option[ty::Ty],
+    ) {
+    components_stop(mut lo, mut fx, record, message: message_ty)
+    wait_for(mut lo, mut fx, record, condition: fn(mut fx1: Fx) -> clif::Value {
+        let ended_word = mut fx1.load(PTR, addr: record, offset: RUNNER_ENDED)
+        let ended = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: ended_word, y: 0)
+        let timers = mut fx1.load(PTR, addr: record, offset: RUNNER_TIMER_COUNT)
+        let settled = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: timers, y: 0)
+        return mut fx1.b.band(ended, y: settled)
+    })
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    supersede_all(mut lo, mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    wait_for(mut lo, mut fx, record, condition: fn(mut fx1: Fx) -> clif::Value {
+        let live = mut fx1.load(PTR, addr: record, offset: RUNNER_LIVE_KEYED)
+        return mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: live, y: 0)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.OutboxRetire, args: Array[clif::Value, 1].filled(inbox).view())
+    let state_laid = mut lo.layout_of(state_ty)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(state_laid.contents().size, align: state_laid.contents().align)
+    }
+    match called.failed {
+        Some(failed) => {
+            match called.failure {
+                Some(failure) => {
+                    match body_failure {
+                        Some(failure_ty) => {
+                            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                                mut lo.release(mut fx1, ty: state_ty, address: state_at)
+                                leave_wait(mut lo, fx: mut fx1)
+                                components_unreference(mut lo, fx: mut fx1, record)
+                                let held = mut lo.held_at(mut fx1, ty: failure_ty, address: failure)
+                                let Some(target) = supply.failure else {
+                                    expect false
+                                    return
+                                }
+                                mut lo.store_held(mut fx1, address: target, held, ty: failure_ty)
+                                supply.raise_failure(mut fx1)
+                            })
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    mut lo.copy(mut fx, dst: result, src: state_at, size: state_laid.contents().size, align: state_laid.contents().align)
+    leave_wait(mut lo, mut fx)
+    components_unreference(mut lo, mut fx, record)
+    let held = mut lo.held_at(mut fx, ty: state_ty, address: result)
+    supply.ret(mut lo, mut fx, held)
+} run_end
+
+/// Starts the component task of a runner on its executor, in the running task's domain and
+/// region.
+fn start_component(mut lo: Lowering, mut fx: Fx, record: clif::Value, exec_cell: clif::Value, state: ty::Ty, env: ty::Ty, message: ty::Ty) {
+    let glue = component_glue(mut lo, state, env, message)
+    let glue_ref = mut lo.func_ref(mut fx, id: glue)
+    let glue_address = mut fx.b.func_addr(PTR, func_ref: glue_ref)
+    let zero = mut fx.ptr(0)
+    let stack = mut fx.ptr(TASKS_STACK)
+    let domain = current_domain(mut lo, mut fx)
+    let current = current_task(mut lo, mut fx)
+    let region = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+    var spawn_args = Array[clif::Value, 8].filled(glue_address)
+    spawn_args[1] = zero
+    spawn_args[2] = record
+    spawn_args[3] = zero
+    spawn_args[4] = stack
+    spawn_args[5] = exec_cell
+    spawn_args[6] = domain
+    spawn_args[7] = region
+    let component_values = mut lo.call_routine(mut fx, routine: Routine.Spawn, args: spawn_args.view())
+    expect component_values.len() == 1
+    let component = component_values[0]
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: component, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let exec = mut fx.load(PTR, addr: record, offset: RUNNER_HANDLE)
+    record_executor(mut lo, mut fx, record: component, exec)
+    let done = component_done(mut lo)
+    let done_ref = mut lo.func_ref(mut fx, id: done)
+    let done_address = mut fx.b.func_addr(PTR, func_ref: done_ref)
+    mut fx.store(done_address, addr: component, offset: TASK_DONE)
+    mut fx.store(component, addr: record, offset: RUNNER_COMPONENT)
+    spawned(mut lo, mut fx, record: component)
+} start_component
+
+/// The component task: removes the intake's messages one at a time, oldest first, and handles
+/// each, until the intake has stopped and is empty; then releases the Env.
+fn component_glue(mut lo: Lowering, state: ty::Ty, env: ty::Ty, message: ty::Ty) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.Component(state: state, env: env, message: message), signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = mut fx1.load(PTR, addr: params[0], offset: TASK_ENV)
+        let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo1](mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+            let oldest = mut fx2.load(PTR, addr: record, offset: RUNNER_OLDEST)
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: oldest, y: 0)
+            let again_values = mut fx2.choose_in(mut lo1, condition: present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                handle_oldest(mut lo3, fx: mut fx3, record, oldest, state, env, message)
+                var handled = mem::List[clif::Value].empty(fx3.alloc)
+                mut handled.push(mut fx3.int(clif::Type.Int8, value: 1))
+                return handled
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let stopped = mut fx3.load(PTR, addr: record, offset: RUNNER_STOPPED)
+                let open = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: stopped, y: 0)
+                mut fx3.if_true(open, then: fn(mut fx4: Fx) {
+                    let one = mut fx4.ptr(1)
+                    mut fx4.store(one, addr: record, offset: RUNNER_IDLE)
+                })
+                discard mut lo3.call_routine(mut fx3, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+                mut fx3.if_true(open, then: fn[mut lo3](mut fx4: Fx) {
+                    discard mut lo3.call_routine(mut fx4, routine: Routine.Park, args: mem::List[clif::Value].empty(fx4.alloc).view())
+                })
+                var waits = mem::List[clif::Value].empty(fx3.alloc)
+                mut waits.push(open)
+                return waits
+            })
+            expect again_values.len() == 1
+            let again = again_values[0]
+            return Pass(again: again, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+        let shape = components_shape(mut lo1, state, env, message)
+        let env_at = mut fx1.offset(record, offset: shape.env_at)
+        release_env(mut lo1, fx: mut fx1, env, held: Held.Address(env_at))
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} component_glue
+
+/// What the executor thread does once a component task has ended: the run's caller wakes and
+/// the task's record is freed.
+fn component_done(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.ComponentDone, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let component = params[0]
+        let record = mut fx1.load(PTR, addr: component, offset: TASK_ENV)
+        let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: RUNNER_ENDED)
+        wake_waiter(mut lo1, fx: mut fx1, record)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut lo1.record_free(mut fx1, address: component)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} component_done
+
+/// Settles a runner whose run a stopped task makes.
+fn withdraw_run(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawRun, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = mut fx1.load(PTR, addr: params[0], offset: WAIT_OBJECT)
+        components_withdraw(mut lo1, fx: mut fx1, record)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_run

@@ -1,0 +1,56 @@
+//! A record's schema hash and tree, a tree accepting an older one, and records checked through an erased decoder.
+
+pub closed struct Probe derives Encode {
+    pub seq: u32
+    pub hops: u8 where hops < 16
+} Probe
+
+retired Probe.ttl => Probe.hops preserves
+
+pub closed struct Legacy derives Encode {
+    pub seq: u32
+} Legacy
+
+pub open struct Route derives Encode {
+    pub seq: u32
+    pub hops: u8
+} Route
+
+pub registry decoders: mem::wire::Erased keyed by schema
+
+contribute decoders probe_decoder = mem::wire::Codec[Probe].erased()
+
+const PROBE_SCHEMA: mem::wire::SchemaHash = mem::wire::Codec[Probe].schema_hash()
+
+/// The canonical bytes of a record, checked by the decoder registered for its schema hash.
+fn checked(schema: mem::wire::SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError {
+    for decoder in decoders {
+        if decoder.schema == schema {
+            return try (decoder.canonical)(raw, alloc)
+        }
+    }
+    fail core::DecodeError.UnknownVariant
+} checked
+
+fn report(log: sys::Log, record: Str, outcome: Result[Untrusted[mem::Bytes], core::DecodeError]) {
+    match outcome {
+        Ok(bytes) => log.info(record, value: bytes.byte_len())
+        Err(error) => log.info(record, value: error)
+    }
+} report
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    world.log.info("hash", value: PROBE_SCHEMA.bytes)
+    world.log.info("same", value: mem::wire::Codec[Probe].schema_hash() == PROBE_SCHEMA)
+    var tree = mem::Bytes.empty(alloc)
+    mem::wire::Codec[mem::wire::Schema].encode(mem::wire::Codec[Probe].schema(alloc), out: mut tree)
+    world.log.info("tree", value: tree.view())
+    let route = mem::wire::Codec[Route].schema(alloc)
+    world.log.info("route reads legacy", value: route.accepts(mem::wire::Codec[Legacy].schema(alloc)))
+    world.log.info("legacy reads route", value: mem::wire::Codec[Legacy].schema(alloc).accepts(route))
+    report(world.log, record: "renamed", outcome: attempt checked(PROBE_SCHEMA, raw: Untrusted.of(b"\x02\x03seq\x01\x05\x03ttl\x01\x03"), alloc))
+    report(world.log, record: "far", outcome: attempt checked(PROBE_SCHEMA, raw: Untrusted.of(b"\x02\x04hops\x01\x13\x03seq\x01\x05"), alloc))
+    report(world.log, record: "trailing", outcome: attempt checked(PROBE_SCHEMA, raw: Untrusted.of(b"\x02\x04hops\x01\x03\x03seq\x01\x05\x00"), alloc))
+    report(world.log, record: "unknown", outcome: attempt checked(mem::wire::Codec[Legacy].schema_hash(), raw: Untrusted.of(b"\x01\x03seq\x01\x05"), alloc))
+} main

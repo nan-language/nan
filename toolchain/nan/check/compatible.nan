@@ -30,7 +30,7 @@ pkg fn Session.compatible(self, index: usize, parent: mem::Map[text::String, mac
     let Some(closure) = held.closure_of(index) else {
         return compatible
     }
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return compatible
     }
@@ -178,13 +178,13 @@ fn Checker.judging(self, item: ty::ItemId, old: machine::ApiEntry, new: machine:
     match sig.contents().kind {
         SigKind.Fn(_) => return function_judging(old, new, old_head: old_head.as_str(), new_head: new_head.as_str(), alloc)
         SigKind.Enum(variants: _) => {
-            if opened_type(old_head.as_str(), new: new_head.as_str()) and held_lines(old.text.view(), entry: new) {
+            if opened_type(old_head.as_str(), new: new_head.as_str(), alloc) and old_body_held(old, new) {
                 return CompatibleJudging.Compatible
             }
             return CompatibleJudging.Breaking
         }
         SigKind.Struct(fields: fields) => {
-            if not opened_type(old_head.as_str(), new: new_head.as_str()) or not held_lines(old.text.view(), entry: new) {
+            if not opened_type(old_head.as_str(), new: new_head.as_str(), alloc) or not old_body_held(old, new) {
                 return CompatibleJudging.Breaking
             }
             if self.added_fields_defaulted(old, new, encoded: new_head.find("Encode").is_some(), fields: fields.view()) {
@@ -271,7 +271,8 @@ fn Checker.added_fields_defaulted(self, old: machine::ApiEntry, new: machine::Ap
         return true
     }
     let default = self.db().core_item("Default")
-    for line in new.text {
+    for index in 1..<new.text.len() {
+        let line = new.text[index]
         if old.text.position(fn(held: text::String) => held == line).is_some() {
             continue
         }
@@ -324,10 +325,42 @@ fn starts_with_pub(line: Str, start: usize, end: usize) -> bool {
     return rest.starts_with("pub ")
 } starts_with_pub
 
-/// Whether a struct or enum keeps its declaration line and is open.
-fn opened_type(old: Str, new: Str) -> bool {
-    return old == new and new.find(" open ").is_some()
+/// Whether a struct or enum keeps its declaration line and is open, `open` and `flexible`
+/// replacing each other.
+fn opened_type(old: Str, new: Str, alloc: mem::Alloc) -> bool {
+    let opened = opened_line(new, alloc)
+    return opened_line(old, alloc) == opened and opened.as_str().find(" open ").is_some()
 } opened_type
+
+/// A declaration line with its first `flexible` read as `open`.
+fn opened_line(line: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    let Some(at) = line.find(" flexible ") else {
+        mut written.append(line)
+        return written
+    }
+    let Some(before) = line.slice_bytes(0, end: at) else {
+        return written
+    }
+    let Some(after) = line.slice_bytes(at.saturating_add(10), end: line.byte_len()) else {
+        return written
+    }
+    mut written.append(before)
+    mut written.append(" open ")
+    mut written.append(after)
+    return written
+} opened_line
+
+/// Whether every line of an old interface text but its declaration line stands in the new one.
+fn old_body_held(old: machine::ApiEntry, new: machine::ApiEntry) -> bool {
+    for index in 1..<old.text.len() {
+        let line = old.text[index]
+        if new.text.position(fn(held: text::String) => held == line).is_none() {
+            return false
+        }
+    }
+    return true
+} old_body_held
 
 /// A function's head line without its limits, its limits other than a class, and its class.
 struct LimitsSplit {
@@ -420,7 +453,7 @@ pkg fn Session.encode_class(self, index: usize, parent: Option[mem::Shared[store
         return store::Class.Additive
     }
     let held = self.workspace.contents()
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return store::Class.Breaking
     }
@@ -460,8 +493,8 @@ pkg fn Session.encode_class(self, index: usize, parent: Option[mem::Shared[store
 } Session.encode_class
 
 /// The class of a type's new schema tree against its old one.
-fn tree_class(tree: SchemaNode, old: SchemaNode, alloc: mem::Alloc) -> store::Class {
-    if old.hash(alloc) == tree.hash(alloc) {
+fn tree_class(tree: mem::wire::Schema, old: mem::wire::Schema, alloc: mem::Alloc) -> store::Class {
+    if schema_hash(old, alloc) == schema_hash(tree, alloc) {
         return store::Class.Identical
     }
     if tree.accepts(old) {
@@ -470,13 +503,49 @@ fn tree_class(tree: SchemaNode, old: SchemaNode, alloc: mem::Alloc) -> store::Cl
     return store::Class.Breaking
 } tree_class
 
+/// The schema hash of each type whose schema tree the code root of the workspace package at
+/// `index` records, with its module's and its own name, as its history records them.
+pkg fn Session.schema_records(self, index: usize) -> mem::List[machine::SchemaRecord] {
+    let alloc = self.alloc
+    var records = mem::List[machine::SchemaRecord].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(source) = held.package_at(index) else {
+        return records
+    }
+    let Some(closure) = held.closure_of(index) else {
+        return records
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return records
+    }
+    let checker = self.checked(closure, target)
+    let Some(name) = source.name() else {
+        return records
+    }
+    let Some(package_id) = checker.package_named(name) else {
+        return records
+    }
+    let db = checker.db()
+    for entry in checker.recorded_schemas(package_id) {
+        let ty::TyKind.Item(item: item, args: _) = checker.types().kind(entry.value()) else {
+            continue
+        }
+        let Some(declared) = db.ast(item).name(alloc) else {
+            continue
+        }
+        let module = text::String.of(db.module(db.module_of(item)).name.as_str(), alloc)
+        mut records.push(machine::SchemaRecord(module: take module, ty: take declared, hash: schema_hash(checker.schema(entry.value()), alloc)))
+    }
+    return records
+} Session.schema_records
+
 /// The schema tree of each exported type implementing `Encode` of the workspace package at
 /// `index`, by canonical path.
-fn Session.encoded(self, index: usize) -> mem::Map[text::String, SchemaNode] {
+fn Session.encoded(self, index: usize) -> mem::Map[text::String, mem::wire::Schema] {
     let alloc = self.alloc
-    var trees = mem::Map[text::String, SchemaNode].empty(alloc)
+    var trees = mem::Map[text::String, mem::wire::Schema].empty(alloc)
     let held = self.workspace.contents()
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         return trees
     }
     let Some(closure) = held.closure_of(index) else {
@@ -492,29 +561,8 @@ fn Session.encoded(self, index: usize) -> mem::Map[text::String, SchemaNode] {
     let Some(package_id) = checker.package_named(name) else {
         return trees
     }
-    let db = checker.db()
-    let Some(encode) = db.core_item("Encode") else {
-        return trees
-    }
-    for module in db.package_data(package_id).modules {
-        for item in db.module(module).items {
-            let declared = db.ast(item)
-            let typed = match declared.kind {
-                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
-                else => false
-            }
-            if not typed or declared.visibility != ast::Visibility.Pub or checker.sig(item).contents().generics.len() > 0 {
-                continue
-            }
-            let ty = checker.types().item(item, args: mem::List[ty::Arg].empty(alloc))
-            if not checker.implements(ty, interface_item: encode) {
-                continue
-            }
-            let Some(path) = checker.canonical_path(item) else {
-                continue
-            }
-            discard mut trees.insert(take path, value: checker.schema(ty))
-        }
+    for entry in checker.exported_encoded(package_id) {
+        discard mut trees.insert(text::String.of(entry.key().as_str(), alloc), value: checker.schema(entry.value()))
     }
     return trees
 } Session.encoded

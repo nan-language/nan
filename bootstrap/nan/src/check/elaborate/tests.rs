@@ -55,6 +55,27 @@ fn an_ensures_clause_is_checked_at_each_return() {
 }
 
 #[test]
+fn an_operation_call_checks_the_requires_of_its_operation_over_the_arguments_after_the_outbox() {
+    let source = "pub protocol Cell {\n    pub fn write(value: u32) limits pure\n        requires value > 0\n} Cell\n\npub fn fill(inbox: sys::Outbox[Cell], value: u32) fails task::SendError uses wait {\n    try await inbox.write(value: value)\n} fill\n";
+    assert_eq!(
+        unit_text(source, "example::fill"),
+        "unit example::fill\n\nfn body (read %0: sys::Outbox[example::Cell], read %1: u32) fails task::SendError uses wait\n^0:\n    %2 = call example::Cell requires 0(%1)\n    check requires, %2\n    call await example::Cell.write[sys::Outbox[example::Cell]](%0, %1) ok ^1 fail ^2\n^1(%3: Unit):\n    return\n^2(%4: task::SendError):\n    fail %4\n"
+    );
+}
+
+#[test]
+fn a_failure_exit_checks_no_predicate_of_the_result_type() {
+    let text = unit_text(
+        "pub closed struct Level {\n    pub n: u8 where n >= 2\n} Level\n\npub closed enum Low {\n    Below\n} Low\n\npub fn level(n: u8) -> Level fails Low {\n    if n < 2 {\n        fail Low.Below\n    }\n    return Level(n: n)\n} level\n",
+        "example::level",
+    );
+    assert_eq!(
+        text,
+        "unit example::level\n\nfn body (read %0: u8) -> example::Level fails example::Low\n^0:\n    %1 = lt %0, 2u8\n    branch %1, ^1, ^2\n^1:\n    %2 = variant example::Low.Below\n    fail %2\n^2:\n    %3 = construct example::Level(n: %0)\n    %4 = call example::Level predicate 0(%3)\n    check predicate, %4\n    %5 = call example::Level predicate 0(%3)\n    check predicate, %5\n    return %3\n"
+    );
+}
+
+#[test]
 fn a_for_loop_holds_its_cursor_in_a_slot() {
     let text = unit_text(
         "pub fn total(values: Slice[u32]) -> u64 {\n    var sum: u64 = 0\n    for value in values {\n        sum += u64.widen(value)\n    }\n    return sum\n} total\n",
@@ -103,7 +124,7 @@ fn matches_run_as_their_arms_test_and_bind() {
     );
     let scratch = scratch(&source);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
-    let reported: Vec<_> = crate::check::diagnostics(&workspace)
+    let reported: Vec<_> = crate::check::reported(&workspace, &crate::scope::Scope::Workspace)
         .into_iter()
         .map(|diagnostic| (diagnostic.line, diagnostic.code))
         .collect();
@@ -276,10 +297,7 @@ impl crate::nir::Names for UnitNames<'_, '_> {
     }
 
     fn method(&self, interface: ItemId, method: u32) -> String {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].name.clone(),
-            _ => "_".to_owned(),
-        }
+        self.ck.method_name(interface, method as usize)
     }
 
     fn register(&self, block: ItemId, register: u32) -> String {

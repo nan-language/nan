@@ -1,0 +1,496 @@
+//! PCI functions: the endpoints of bus 0, their configuration, the register windows of their memory BARs, their attachment to I/O domains, and their MSI-X interrupts.
+
+/// A function record's offsets: past its holding and tag, its requester id, the ECAM base its
+/// configuration is read through, zero for port I/O, the space it is attached to, its taken
+/// BARs, its MSI-X capability's offset, the offset from its BARs' bus addresses to the CPU's,
+/// then each BAR's base, size and kind.
+const FUNCTION_REQUESTER: u64 = 16
+
+const FUNCTION_ECAM: u64 = 24
+
+const FUNCTION_ATTACHED: u64 = 32
+
+const FUNCTION_TAKEN: u64 = 40
+
+const FUNCTION_MSIX: u64 = 48
+
+const FUNCTION_WINDOW: u64 = 56
+
+const FUNCTION_BARS: u64 = 64
+
+const BAR_BYTES: u64 = 24
+
+const BARS: u64 = 6
+
+const FUNCTION_RECORD: u64 = 208
+
+/// The attachment of a function attached to physical memory.
+const ATTACHED_PHYSICAL: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The kinds of a BAR: none, 32-bit memory, I/O and 64-bit memory.
+const NO_BAR: u64 = 0
+
+const MEMORY32: u64 = 1
+
+const IO_BAR: u64 = 2
+
+const MEMORY64: u64 = 3
+
+/// The configuration offsets the runtime reads and writes: the ids, the command and status,
+/// the class and revision, the header type, the first BAR and the capability list's head; the
+/// command bits decoding memory, mastering the bus and disabling INTx; the status bit
+/// announcing capabilities; the class of bridges; and the MSI-X capability's id with its
+/// enable and function mask bits.
+const IDS_OFFSET: u32 = 0x00
+
+const COMMAND_OFFSET: u32 = 0x04
+
+const CLASS_OFFSET: u32 = 0x08
+
+const HEADER_OFFSET: u32 = 0x0C
+
+const FIRST_BAR: u32 = 0x10
+
+const CAPABILITIES_OFFSET: u32 = 0x34
+
+const MEMORY: u32 = 0x2
+
+const BUS_MASTER: u32 = 0x4
+
+const INTX_DISABLE: u32 = 0x400
+
+const HAS_CAPABILITIES: u32 = 0x10
+
+const BRIDGE: u32 = 0x06
+
+const MSIX_ID: u32 = 0x11
+
+const MSIX_ENABLE: u32 = 0x8000_0000
+
+const MSIX_MASKED: u32 = 0x4000_0000
+
+/// The configuration space of a bus in an ECAM, and the memory the entry root maps as device
+/// memory: the last gigabyte below 4 GiB on x86_64, the first gigabyte on AArch64.
+const BUS_BYTES: u64 = 0x10_0000
+
+const X86_DEVICES: u64 = 0xC000_0000
+
+const X86_DEVICES_END: u64 = 0x1_0000_0000
+
+const AARCH64_DEVICES_END: u64 = 0x4000_0000
+
+/// The bus address window of 32-bit memory a device tree's `ranges` names, by the space code of
+/// its first cell, and an entry's bytes.
+const MEMORY_SPACE: u32 = 2
+
+const RANGE_BYTES: u64 = 28
+
+/// An MSI-X table entry.
+registers MsixEntry {
+    address_low: u32 at 0x0 write
+    address_high: u32 at 0x4 write
+    data: u32 at 0x8 write
+    control: u32 at 0xC write
+} MsixEntry
+
+/// A function of PCI bus 0.
+pub open linear struct PciFunction {
+    record: u64
+} PciFunction
+
+pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
+    pub bus: u8
+    pub device: u8
+    pub function: u8
+} PciAddress
+
+pub closed enum PciError derives Copy, Eq, Render {
+    NotMemory
+    TooSmall
+    Taken
+    Unmapped
+} PciError
+
+/// The bus addresses of 32-bit memory BARs are assigned from, with the offset turning a bus
+/// address into the CPU's; an empty window assigns none.
+struct BusWindow {
+    start: u64
+    end: u64
+    offset: u64
+} BusWindow
+
+pub fn PciFunction.address(self) -> PciAddress {
+    let requester = peek(self.record + FUNCTION_REQUESTER)
+    return PciAddress(bus: 0, device: u8.truncate(requester >> 3), function: u8.truncate(requester & 0x7))
+} PciFunction.address
+
+pub fn PciFunction.config_read(self, offset: u8) -> u32
+    requires offset % 4 == 0
+{
+    return config(self.record, offset: u32.widen(offset))
+} PciFunction.config_read
+
+pub fn Mmio.of_bar(mut function: PciFunction, index: u8) -> Mmio[R] fails PciError {
+    let record = function.record
+    if u64.widen(index) >= BARS {
+        fail PciError.NotMemory
+    }
+    let bar = record + FUNCTION_BARS + u64.widen(index) * BAR_BYTES
+    let kind = peek(bar + 16)
+    if kind != MEMORY32 and kind != MEMORY64 {
+        fail PciError.NotMemory
+    }
+    let bit = 1u64 << u32.widen(index)
+    if (peek(record + FUNCTION_TAKEN) & bit) != 0 {
+        fail PciError.Taken
+    }
+    let size = peek(bar + 8)
+    if Mmio[R].extent() > size {
+        fail PciError.TooSmall
+    }
+    let base = peek(bar).wrapping_add(peek(record + FUNCTION_WINDOW))
+    if not device_memory(base, size) {
+        fail PciError.Unmapped
+    }
+    poke(record + FUNCTION_TAKEN, value: peek(record + FUNCTION_TAKEN) | bit)
+    set_command(record, set: MEMORY, clear: 0)
+    return trusted "the BAR holds the function's R registers, at an address the entry root maps uncached, and only this window maps it" { Mmio[R].map(base) }
+} Mmio.of_bar
+
+pub fn PciFunction.attach(mut self, space: IoSpace) fails IommuError {
+    if space.key == PHYSICAL_KEY {
+        fail IommuError.Physical
+    }
+    let unit = iommu_unit()
+    let requester = peek(self.record + FUNCTION_REQUESTER)
+    if not covered(unit, requester) {
+        fail IommuError.Unsupported
+    }
+    let flags = iommu_lock()
+    let domain = live(unit, key: space.key)
+    if domain == 0 {
+        iommu_unlock(flags)
+        fail IommuError.Closed
+    }
+    if on_aarch64() and not map_range(unit, domain, address: ITS_PAGE, bytes: PAGE_BYTES, device: true) {
+        iommu_unlock(flags)
+        fail IommuError.Exhausted
+    }
+    set_entry(unit, requester, domain)
+    iommu_flush()
+    iommu_unlock(flags)
+    poke(self.record + FUNCTION_ATTACHED, value: space.key)
+    set_command(self.record, set: BUS_MASTER, clear: 0)
+} PciFunction.attach
+
+pub fn PciFunction.attach_physical(mut self) fails IommuError {
+    let unit = iommu_unit()
+    let requester = peek(self.record + FUNCTION_REQUESTER)
+    if unit != 0 and covered(unit, requester) {
+        if peek(unit + UNIT_KIND) == VTD and (peek(unit + UNIT_FLAGS) & PASS_THROUGH) == 0 {
+            fail IommuError.Unsupported
+        }
+        let flags = iommu_lock()
+        set_entry(unit, requester, domain: 0)
+        iommu_flush()
+        iommu_unlock(flags)
+    }
+    poke(self.record + FUNCTION_ATTACHED, value: ATTACHED_PHYSICAL)
+    set_command(self.record, set: BUS_MASTER, clear: 0)
+} PciFunction.attach_physical
+
+pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    let record = self.record
+    let table = msix_table_entry(record, entry: u64.widen(entry))
+    if table == 0 {
+        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    }
+    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
+    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
+        Ok(shared) => {
+            match shared.message() {
+                Some(message) => program_entry(record, table, message)
+                None => {}
+            }
+            return Ok(take shared)
+        }
+        Err(refusal) => return Err(take refusal)
+    }
+} PciFunction.msix
+
+pub fn PciFunction.release(take self) {
+    let PciFunction(record: record) = self
+    unhold(peek(record + RECORD_HOLDING))
+    cut_off(record)
+} PciFunction.release
+
+/// The register window extent of R: the bytes from its first register to past its last.
+pkg fn Mmio.extent() -> u64
+
+/// A double word of a function's configuration through an ECAM, or through the configuration
+/// ports for a zero `ecam`, and its write.
+pkg fn config_read(ecam: u64, requester: u32, offset: u32) -> u32
+
+pkg fn config_write(ecam: u64, requester: u32, offset: u32, value: u32)
+
+/// Installs a device on a new message-signalled interrupt of CPU `cpu` from requester `source`,
+/// which interrupt remapping lets that requester alone raise.
+pkg fn IrqShared.install_validated(take dev: T, cpu: u32, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+/// What `boot::Kernel.pci_functions` lists: the endpoints of PCI bus 0, segment 0, each with
+/// bus mastering and memory decoding off and INTx disabled, their unassigned memory BARs given
+/// addresses from the device tree's window on AArch64.
+pkg fn enumerated(alloc: mem::Alloc) -> mem::List[PciFunction] {
+    var functions = mem::List[PciFunction].empty(alloc)
+    var ecam: u64 = 0
+    var window = BusWindow(start: 0, end: 0, offset: 0)
+    if on_aarch64() {
+        let node = tree_node(compatible: "pci-host-ecam-generic")
+        if node.reg == 0 {
+            return functions
+        }
+        ecam = u64_be_at(node.reg)
+        if ecam + BUS_BYTES > AARCH64_DEVICES_END {
+            return functions
+        }
+        window = memory_window(node)
+    }
+    var records = mem::List[u64].empty(alloc)
+    for device in 0u32..<32 {
+        for function in 0u32..<8 {
+            let requester = (device << 3) | function
+            let ids = config_read(ecam, requester, offset: IDS_OFFSET)
+            let header = (config_read(ecam, requester, offset: HEADER_OFFSET) >> 16) & 0xFF
+            if (ids & 0xFFFF) != 0xFFFF and (header & 0x7F) == 0 and (config_read(ecam, requester, offset: CLASS_OFFSET) >> 24) != BRIDGE {
+                let record = found(ecam, requester, window)
+                mut records.push(record)
+                mut functions.push(PciFunction(record: record))
+            }
+            if function == 0 and ((ids & 0xFFFF) == 0xFFFF or (header & 0x80) == 0) {
+                break
+            }
+        }
+    }
+    assign(records.view(), window)
+    return functions
+} enumerated
+
+/// A function's record, its BARs sized, its MSI-X capability found and its command cleared.
+fn found(ecam: u64, requester: u32, window: BusWindow) -> u64 {
+    let command = config_read(ecam, requester, offset: COMMAND_OFFSET) & 0xFFFF
+    config_write(ecam, requester, offset: COMMAND_OFFSET, value: (command & ~(BUS_MASTER | MEMORY)) | INTX_DISABLE)
+    let record = runtime_record(FUNCTION_RECORD)
+    poke(record + RECORD_TAG, value: FUNCTION_TAG)
+    poke(record + FUNCTION_REQUESTER, value: u64.widen(requester))
+    poke(record + FUNCTION_ECAM, value: ecam)
+    poke(record + FUNCTION_WINDOW, value: window.offset)
+    var index: u64 = 0
+    while index < BARS {
+        index += size_bar(record, index)
+    }
+    poke(record + FUNCTION_MSIX, value: u64.widen(msix_capability(record)))
+    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
+    return record
+} found
+
+/// Records BAR `index` of a function, giving the BARs it occupies: two for 64-bit memory.
+fn size_bar(record: u64, index: u64) -> u64 {
+    let at = FIRST_BAR + u32.fit(index * 4)
+    let low = config(record, offset: at)
+    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    if (low & 0x1) != 0 {
+        poke(bar + 16, value: IO_BAR)
+        return 1
+    }
+    let wide = ((low >> 1) & 0x3) == 2 and index + 1 < BARS
+    let low_mask = probe(record, offset: at, value: low) & 0xFFFF_FFF0
+    var high: u32 = 0
+    var high_mask: u32 = 0xFFFF_FFFF
+    if wide {
+        high = config(record, offset: at + 4)
+        high_mask = probe(record, offset: at + 4, value: high)
+    }
+    let mask = (u64.widen(high_mask) << 32) | u64.widen(low_mask)
+    if low_mask != 0 {
+        poke(bar, value: (u64.widen(high) << 32) | u64.widen(low & 0xFFFF_FFF0))
+        poke(bar + 8, value: (~mask).wrapping_add(1))
+        var kind = MEMORY32
+        if wide {
+            kind = MEMORY64
+        }
+        poke(bar + 16, value: kind)
+    }
+    if wide {
+        return 2
+    }
+    return 1
+} size_bar
+
+/// The bits a BAR keeps of all ones, the BAR then given back `value`.
+fn probe(record: u64, offset: u32, value: u32) -> u32 {
+    set_config(record, offset, value: 0xFFFF_FFFF)
+    let kept = config(record, offset)
+    set_config(record, offset, value)
+    return kept
+} probe
+
+/// The offset of a function's MSI-X capability, zero without one.
+fn msix_capability(record: u64) -> u32 {
+    if ((config(record, offset: COMMAND_OFFSET) >> 16) & HAS_CAPABILITIES) == 0 {
+        return 0
+    }
+    var at = config(record, offset: CAPABILITIES_OFFSET) & 0xFC
+    for _ in 0u32..<48 {
+        if at == 0 {
+            return 0
+        }
+        let head = config(record, offset: at)
+        if (head & 0xFF) == MSIX_ID {
+            return at
+        }
+        at = (head >> 8) & 0xFC
+    }
+    return 0
+} msix_capability
+
+/// The window of 32-bit memory a PCI host's `ranges` names, empty without one.
+fn memory_window(node: NodeValues) -> BusWindow {
+    var at = node.ranges
+    while at + RANGE_BYTES <= node.ranges + node.ranges_len {
+        let space = (u32_be_at(at) >> 24) & 0x3
+        if space == MEMORY_SPACE {
+            let bus = u64_be_at(at + 4)
+            let cpu = u64_be_at(at + 12)
+            return BusWindow(start: bus, end: bus + u64_be_at(at + 20), offset: cpu.wrapping_sub(bus))
+        }
+        at += RANGE_BYTES
+    }
+    return BusWindow(start: 0, end: 0, offset: 0)
+} memory_window
+
+/// Gives each unassigned memory BAR of the functions an address of the window, aligned to its
+/// size, above every BAR the window already holds.
+fn assign(records: Slice[u64], window: BusWindow) {
+    var next = window.start
+    for record in records {
+        for index in 0..<BARS {
+            let bar = record + FUNCTION_BARS + index * BAR_BYTES
+            let base = peek(bar)
+            let end = base + peek(bar + 8)
+            if peek(bar + 16) != NO_BAR and base >= window.start and base < window.end and end > next {
+                next = end
+            }
+        }
+    }
+    for record in records {
+        for index in 0..<BARS {
+            next = assign_bar(record, index, next, window)
+        }
+    }
+} assign
+
+/// Gives BAR `index` of a function an address from `next` when it is an unassigned memory BAR
+/// the window holds, giving the window's next free address.
+fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow) -> u64 {
+    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    let kind = peek(bar + 16)
+    let size = peek(bar + 8)
+    if peek(bar) != 0 or (kind != MEMORY32 and kind != MEMORY64) or size == 0 {
+        return next
+    }
+    let aligned = (next + size - 1) & ~(size - 1)
+    if aligned + size > window.end {
+        return next
+    }
+    let at = FIRST_BAR + u32.fit(index * 4)
+    set_config(record, offset: at, value: u32.truncate(aligned))
+    if kind == MEMORY64 {
+        set_config(record, offset: at + 4, value: u32.truncate(aligned >> 32))
+    }
+    poke(bar, value: aligned)
+    return aligned + size
+} assign_bar
+
+/// Whether the entry root maps a range as device memory.
+fn device_memory(base: u64, size: u64) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return false
+    }
+    if on_aarch64() {
+        return end <= AARCH64_DEVICES_END
+    }
+    return base >= X86_DEVICES and end <= X86_DEVICES_END
+} device_memory
+
+/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function is not
+/// attached, has no such entry or its table lies outside device memory.
+fn msix_table_entry(record: u64, entry: u64) -> u64 {
+    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
+    if capability == 0 or peek(record + FUNCTION_ATTACHED) == 0 {
+        return 0
+    }
+    if entry > u64.widen((config(record, offset: capability) >> 16) & 0x7FF) {
+        return 0
+    }
+    let location = config(record, offset: capability + 4)
+    let index = u64.widen(location & 0x7)
+    if index >= BARS {
+        return 0
+    }
+    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    let offset = u64.widen(location & 0xFFFF_FFF8) + entry * 16
+    let kind = peek(bar + 16)
+    if (kind != MEMORY32 and kind != MEMORY64) or offset + 16 > peek(bar + 8) {
+        return 0
+    }
+    let address = peek(bar).wrapping_add(peek(record + FUNCTION_WINDOW)) + offset
+    if not device_memory(address, size: 16) {
+        return 0
+    }
+    return address
+} msix_table_entry
+
+/// Writes a message to an MSI-X table entry, unmasked, and enables MSI-X without the function
+/// mask.
+fn program_entry(record: u64, table: u64, message: MsiMessage) {
+    set_command(record, set: MEMORY, clear: 0)
+    var entry = trusted "the MSI-X entry lies in the function's memory BAR, which the entry root maps uncached; a window of the BAR may also write it, and interrupt remapping or the ITS lets only this function's messages through" { Mmio[MsixEntry].map(table) }
+    mut entry.write(MsixEntry.control, value: 1)
+    mut entry.write(MsixEntry.address_low, value: u32.truncate(message.address))
+    mut entry.write(MsixEntry.address_high, value: u32.truncate(message.address >> 32))
+    mut entry.write(MsixEntry.data, value: message.data)
+    mut entry.write(MsixEntry.control, value: 0)
+    take entry.unmap()
+    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
+    let control = config(record, offset: capability)
+    set_config(record, offset: capability, value: (control | MSIX_ENABLE) & ~MSIX_MASKED)
+} program_entry
+
+/// Cuts a function off: no longer mastering the bus or decoding memory, its context or stream
+/// reaching nothing once the IOMMU no longer caches it; then frees its record.
+fn cut_off(record: u64) {
+    set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
+    let unit = iommu_unit()
+    if unit != 0 and peek(record + FUNCTION_ATTACHED) != 0 {
+        let flags = iommu_lock()
+        clear_entry(unit, requester: peek(record + FUNCTION_REQUESTER))
+        iommu_flush()
+        iommu_unlock(flags)
+    }
+    free_record(record)
+} cut_off
+
+/// Sets and clears bits of a function's command register, leaving its status.
+fn set_command(record: u64, set: u32, clear: u32) {
+    let command = config(record, offset: COMMAND_OFFSET) & 0xFFFF
+    set_config(record, offset: COMMAND_OFFSET, value: (command & ~clear) | set)
+} set_command
+
+/// A double word of a function's configuration, and its write.
+fn config(record: u64, offset: u32) -> u32 {
+    return config_read(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset)
+} config
+
+fn set_config(record: u64, offset: u32, value: u32) {
+    config_write(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset, value)
+} set_config

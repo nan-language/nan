@@ -317,6 +317,7 @@ pub fn derived(
             write(interp, out, format!("{name}(").as_bytes());
             let labelled: Vec<(String, Ty)> = fields
                 .iter()
+                .filter(|field| !field.is_kept())
                 .map(|field| (field.name.clone(), subst.ty(&field.ty)))
                 .collect();
             labelled_values(interp, &labelled, value.fields(), out, at, site)?;

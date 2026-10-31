@@ -341,7 +341,7 @@ impl<'w> History<'w> {
             .current
             .packages
             .iter()
-            .position(|held| std::ptr::eq(held, package));
+            .position(|held| std::ptr::eq(&**held, package));
         let mut left = match index {
             Some(index) if !weakened.is_empty() => entail::left(self.current, index, &weakened),
             _ => Vec::new(),

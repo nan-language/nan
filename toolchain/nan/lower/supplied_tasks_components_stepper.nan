@@ -1,0 +1,385 @@
+//! Steppers: `sys::Stepper`, whose holder handles the messages of a component's intake on its own task, one call at a time, and decides when its keyed tasks start. A stepper's value is its runner's record, a holding of the domain that started it, which settlement withdraws.
+
+/// The state, Env and message types of a stepper.
+struct StepperTypes derives Copy {
+    state: ty::Ty
+    env: ty::Ty
+    message: ty::Ty
+} StepperTypes
+
+fn stepper_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "start" => stepper_open(mut lo, mut fx, supply, resumed: false)
+        "resume" => stepper_open(mut lo, mut fx, supply, resumed: true)
+        "outbox" => {
+            let record = stepper_record(mut fx, supply)
+            let inbox = mut fx.load(PTR, addr: record, offset: RUNNER_INBOX)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(inbox, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "deliver" => stepper_deliver(mut lo, mut fx, supply)
+        "step" => stepper_step(mut lo, mut fx, supply)
+        "incoming" => {
+            let record = stepper_record(mut fx, supply)
+            stepper_wait(mut lo, mut fx, supply, record, until_idle: false)
+        }
+        "ready" => {
+            let record = stepper_record(mut fx, supply)
+            stepper_wait(mut lo, mut fx, supply, record, until_idle: true)
+        }
+        "start_keyed" => stepper_start_keyed(mut lo, mut fx, supply)
+        "idle" => stepper_is_idle(mut lo, mut fx, supply)
+        "state" => {
+            let record = stepper_record(mut fx, supply)
+            let types = stepper_types(lo, supply)
+            let shape = components_shape(mut lo, state: types.state, env: types.env, message: types.message)
+            let state_at = mut fx.offset(record, offset: shape.state_at)
+            supply.ret(mut lo, mut fx, held: Held.Address(state_at))
+        }
+        "end" => {
+            let record = stepper_record(mut fx, supply)
+            stepper_end(mut lo, mut fx, supply, record)
+        }
+        "abandon" => {
+            let record = stepper_record(mut fx, supply)
+            stepper_abandon(mut lo, mut fx, supply, record)
+        }
+        else => {
+            expect false
+        }
+    }
+} stepper_lower
+
+/// `mut s.deliver(m)`: handles `m` on the calling task.
+fn stepper_deliver(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let types = stepper_types(lo, supply)
+    let laid = mut lo.layout_of(types.message)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.store_held(mut fx, address: slot, held: supply.param(1), ty: types.message)
+    components_handle(mut lo, mut fx, record, state: types.state, env: types.env, message: types.message, slot, node: None)
+    supply.done(mut lo, mut fx)
+} stepper_deliver
+
+/// `mut s.step()`: handles the oldest message of the intake, giving whether there was one.
+fn stepper_step(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let types = stepper_types(lo, supply)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let oldest = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: oldest, y: 0)
+    discard mut fx.choose_in(mut lo, condition: present, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        handle_oldest(mut lo1, fx: mut fx1, record, oldest, state: types.state, env: types.env, message: types.message)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    supply.ret(mut lo, mut fx, held: Held.Scalar(present))
+} stepper_step
+
+/// `mut s.start_keyed()`: starts the held keyed tasks, giving how many.
+fn stepper_start_keyed(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let started = start_held(mut lo, mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    scheduling_point(mut lo, mut fx)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(started))
+} stepper_start_keyed
+
+/// `s.idle()`: whether the stepper is idle.
+fn stepper_is_idle(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let idle = stepper_idle(mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    supply.ret(mut lo, mut fx, held: Held.Scalar(idle))
+} stepper_is_idle
+
+/// The record of the stepper an operation receives first.
+fn stepper_record(mut fx: Fx, supply: Supply) -> clif::Value {
+    return mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+} stepper_record
+
+/// The state, Env and message types of a stepper.
+fn stepper_types(lo: Lowering, supply: Supply) -> StepperTypes {
+    return StepperTypes(state: supply.type_arg(lo, index: 0), env: supply.type_arg(lo, index: 1), message: supply.type_arg(lo, index: 2))
+} stepper_types
+
+/// `Stepper.start(env, exec, alloc)`, which calls `start` for the state, and
+/// `Stepper.resume(state, env, exec, alloc)`: a new record holding the state and the Env, a
+/// holding of the running task's domain, with its outbox and the summary published. Fails with
+/// the cancellation, releasing what it took, when `exec` is stale.
+fn stepper_open(mut lo: Lowering, mut fx: Fx, supply: Supply, resumed: bool) {
+    let types = stepper_types(lo, supply)
+    var taken: usize = 0
+    if resumed {
+        taken = 1
+    }
+    let env = supply.param(taken)
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(taken + 1).address_value())
+    let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        if resumed {
+            match supply.param(0) {
+                Held.Address(state) => mut lo.release(mut fx1, ty: types.state, address: state)
+                else => {}
+            }
+        }
+        release_env(mut lo, fx: mut fx1, env: types.env, held: env)
+        let none = mut fx1.ptr(0)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
+    })
+    let cell = mut fx.load(PTR, addr: supply.param(taken + 2).address_value(), offset: 0)
+    let shape = components_shape(mut lo, state: types.state, env: types.env, message: types.message)
+    let exec = mut fx.load(PTR, addr: supply.param(taken + 1).address_value(), offset: 0)
+    let record = draw_record(mut lo, mut fx, shape, cell, exec, exec_cell: executor.words[0], clock: executor.words[1], resolution: executor.words[2])
+    let kind = mut fx.ptr(u64.fit(HOLDINGS_KIND_STEPPER))
+    var hold_args = Array[clif::Value, 2].filled(kind)
+    hold_args[1] = record
+    let holding_values = mut lo.call_routine(mut fx, routine: Routine.Hold, args: hold_args.view())
+    expect holding_values.len() == 1
+    mut fx.store(holding_values[0], addr: record, offset: RUNNER_HOLDING)
+    let env_at = mut fx.offset(record, offset: shape.env_at)
+    mut lo.store_held(mut fx, address: env_at, held: env, ty: types.env)
+    var state = supply.param(0)
+    if not resumed {
+        let start = components_handler(mut lo, method: "start", state: types.state, env: types.env, message: types.message)
+        state = call_handler(mut lo, mut fx, instance: take start, args: Array[Held, 1].filled(Held.Address(env_at)).view())
+    }
+    let state_at = mut fx.offset(record, offset: shape.state_at)
+    mut lo.store_held(mut fx, address: state_at, held: state, ty: types.state)
+    protocols_publish(mut lo, mut fx, record, shape, state: types.state)
+    let zero = mut fx.ptr(0)
+    var mint_args = Array[clif::Value, 3].filled(record)
+    mint_args[1] = zero
+    mint_args[2] = zero
+    let inbox_values = mut lo.call_routine(mut fx, routine: Routine.OutboxMint, args: mint_args.view())
+    expect inbox_values.len() == 1
+    mut fx.store(inbox_values[0], addr: record, offset: RUNNER_INBOX)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(record, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} stepper_open
+
+/// Whether a runner's record is idle: its intake is empty, no message waits for its delay and no
+/// keyed task is held or running. The caller holds the lock.
+fn stepper_idle(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let oldest = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
+    let delayed = mut fx.load(PTR, addr: record, offset: RUNNER_DELAYED)
+    let live = mut fx.load(PTR, addr: record, offset: RUNNER_LIVE_KEYED)
+    let waiting = mut fx.b.bor(oldest, y: delayed)
+    let pending = mut fx.b.bor(waiting, y: live)
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: pending, y: 0)
+} stepper_idle
+
+/// `s.incoming()` and `s.ready()`: a cancellation point waiting until a message waits in the
+/// intake, or, for `ready`, until the stepper is idle, giving whether a message waits.
+fn stepper_wait(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, until_idle: bool) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    let current = current_task(mut lo, mut fx)
+    let withdraw = withdraw_stepper(mut lo)
+    let none = mut fx.ptr(0)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: none)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let oldest = mut fx1.load(PTR, addr: record, offset: RUNNER_OLDEST)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: oldest, y: 0)
+        var done = present
+        if until_idle {
+            let idle = stepper_idle(mut fx1, record)
+            done = mut fx1.b.bor(done, y: idle)
+        }
+        let origin = tasks_origin(mut lo, fx: mut fx1)
+        let cancelled = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+        let leaving = mut fx1.b.bor(done, y: cancelled)
+        mut fx1.if_true(leaving, then: fn[mut lo](mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: record, offset: RUNNER_COMPONENT)
+            mut fx2.store(zero, addr: record, offset: RUNNER_IDLE)
+            mut fx2.store(zero, addr: record, offset: RUNNER_WAITER)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            leave_wait(mut lo, fx: mut fx2)
+            waiting_on(mut lo, fx: mut fx2, what: 0)
+            mut fx2.if_true(done, then: fn[mut lo](mut fx3: Fx) {
+                var given = Held.Empty
+                if until_idle {
+                    given = Held.Scalar(present)
+                }
+                supply.ret(mut lo, fx: mut fx3, held: given)
+            })
+            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
+        })
+        mut fx1.store(current, addr: record, offset: RUNNER_COMPONENT)
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: RUNNER_IDLE)
+        if until_idle {
+            mut fx1.store(current, addr: record, offset: RUNNER_WAITER)
+        }
+        waiting_on(mut lo, fx: mut fx1, what: REGIONS_WAITING)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        discard mut lo.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        return Pass(again: mut fx1.int(clif::Type.Int8, value: 1), next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} stepper_wait
+
+/// Closes a stepper: its intake stops, its posts failing as closed and its other messages
+/// released, every key is superseded and every held keyed task started.
+fn stepper_close(mut lo: Lowering, mut fx: Fx, record: clif::Value, message: ty::Ty) {
+    components_stop(mut lo, mut fx, record, message)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let zero = mut fx.ptr(0)
+    let oldest = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
+    mut fx.store(zero, addr: record, offset: RUNNER_OLDEST)
+    mut fx.store(zero, addr: record, offset: RUNNER_NEWEST)
+    var initial = Array[clif::Value, 2].filled(oldest)
+    initial[1] = zero
+    let walked = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let node = walk_state[0]
+        let sent = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        var results = Array[clif::Type, 2].filled(PTR)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_node = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            let poster = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+            let posted = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: poster, y: 0)
+            let kept = mut fx2.choose_in(mut lo2, condition: posted, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let removed = mut fx3.ptr(u64.fit(STATUS_REMOVED))
+                mut fx3.store(removed, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+                discard mut lo3.call_routine(mut fx3, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
+                var chained = mem::List[clif::Value].empty(fx3.alloc)
+                mut chained.push(sent)
+                return chained
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                mut fx3.store(sent, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+                var chained = mem::List[clif::Value].empty(fx3.alloc)
+                mut chained.push(node)
+                return chained
+            })
+            expect kept.len() == 1
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_node)
+            mut stepped.push(kept[0])
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            mut ended.push(sent)
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect walked.len() == 2
+    supersede_all(mut lo, mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    discard mut fx.repeat(Array[clif::Value, 1].filled(walked[1]).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let node = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_node = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            let held = mut fx2.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+            mut lo2.release(mut fx2, ty: message, address: held)
+            discard mut lo2.call_routine(mut fx2, routine: Routine.Free, args: Array[clif::Value, 1].filled(node).view())
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_node)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+} stepper_close
+
+/// Makes a closed stepper's outbox stale and ends its holding.
+fn stepper_retire(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let inbox = mut fx.load(PTR, addr: record, offset: RUNNER_INBOX)
+    discard mut lo.call_routine(mut fx, routine: Routine.OutboxRetire, args: Array[clif::Value, 1].filled(inbox).view())
+    let holding = mut fx.load(PTR, addr: record, offset: RUNNER_HOLDING)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+} stepper_retire
+
+/// `take s.end()`: closes the stepper, then, once every keyed task and timer has ended, retires
+/// it and gives the state and the Env.
+fn stepper_end(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    let types = stepper_types(lo, supply)
+    stepper_close(mut lo, mut fx, record, message: types.message)
+    let withdraw = withdraw_stepper(mut lo)
+    let none = mut fx.ptr(0)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: none)
+    wait_for(mut lo, mut fx, record, condition: fn(mut fx1: Fx) -> clif::Value {
+        let live = mut fx1.load(PTR, addr: record, offset: RUNNER_LIVE_KEYED)
+        let timers = mut fx1.load(PTR, addr: record, offset: RUNNER_TIMER_COUNT)
+        let pending = mut fx1.b.bor(live, y: timers)
+        return mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: pending, y: 0)
+    })
+    leave_wait(mut lo, mut fx)
+    stepper_retire(mut lo, mut fx, record)
+    let shape = components_shape(mut lo, state: types.state, env: types.env, message: types.message)
+    let stopped = supply.abi.result
+    let Some(result) = supply.sret else {
+        expect false
+        return
+    }
+    let state_field = mut lo.layouts.field(lo.ck, ty: stopped, variant: None, label: "state")
+    let state_laid = mut lo.layout_of(types.state)
+    let state_target = mut fx.offset(result, offset: state_field.offset)
+    let state_source = mut fx.offset(record, offset: shape.state_at)
+    mut lo.copy(mut fx, dst: state_target, src: state_source, size: state_laid.contents().size, align: state_laid.contents().align)
+    let env_field = mut lo.layouts.field(lo.ck, ty: stopped, variant: None, label: "env")
+    let env_laid = mut lo.layout_of(types.env)
+    let env_target = mut fx.offset(result, offset: env_field.offset)
+    let env_source = mut fx.offset(record, offset: shape.env_at)
+    mut lo.copy(mut fx, dst: env_target, src: env_source, size: env_laid.contents().size, align: env_laid.contents().align)
+    components_unreference(mut lo, mut fx, record)
+    supply.done(mut lo, mut fx)
+} stepper_end
+
+/// `take s.abandon()`: closes and retires the stepper at once and releases the state and the
+/// Env; its keyed tasks and timers end on their own.
+fn stepper_abandon(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    let types = stepper_types(lo, supply)
+    stepper_close(mut lo, mut fx, record, message: types.message)
+    stepper_retire(mut lo, mut fx, record)
+    let shape = components_shape(mut lo, state: types.state, env: types.env, message: types.message)
+    let state_at = mut fx.offset(record, offset: shape.state_at)
+    mut lo.release(mut fx, ty: types.state, address: state_at)
+    let env_at = mut fx.offset(record, offset: shape.env_at)
+    release_env(mut lo, mut fx, env: types.env, held: Held.Address(env_at))
+    components_unreference(mut lo, mut fx, record)
+    supply.done(mut lo, mut fx)
+} stepper_abandon
+
+/// Withdraws a stopped holder's wait on its stepper.
+fn withdraw_stepper(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawStepper, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = mut fx1.load(PTR, addr: params[0], offset: WAIT_OBJECT)
+        let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: RUNNER_COMPONENT)
+        mut fx1.store(zero, addr: record, offset: RUNNER_IDLE)
+        mut fx1.store(zero, addr: record, offset: RUNNER_WAITER)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_stepper

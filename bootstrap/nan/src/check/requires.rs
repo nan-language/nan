@@ -43,6 +43,9 @@ pub struct Entry {
     /// For an interface the package implements, the names of the functions named after an impl
     /// line's target in its module that are not its methods.
     pub implementers: BTreeSet<String>,
+    /// The schema hashes of the instantiations of the item that the schema trees of the code
+    /// root make nodes for.
+    pub schemas: BTreeSet<Hash>,
 }
 
 impl Entry {
@@ -96,6 +99,14 @@ impl Entry {
                 }),
             );
         }
+        if !self.schemas.is_empty() {
+            record.field(
+                10,
+                content(&|out| {
+                    list(out, self.schemas.iter(), |out, hash| bytes(out, &hash.0));
+                }),
+            );
+        }
         record.finish()
     }
 }
@@ -143,6 +154,7 @@ impl Checker<'_> {
                         methods: BTreeMap::new(),
                         item_hash: None,
                         implementers: BTreeSet::new(),
+                        schemas: BTreeSet::new(),
                     },
                 );
             }
@@ -177,6 +189,18 @@ impl Checker<'_> {
                 }
             }
             self.record_implements(item, package, &mut entries, &mut entry);
+        }
+        for ty in self.recorded_schemas(package).values() {
+            for embedded in self.foreign_schemas(ty, package) {
+                let Ty::Item(item, _) = &embedded else {
+                    continue;
+                };
+                if let Some(path) = entry(*item, &mut entries) {
+                    let found = entries.get_mut(&path).expect("an entry");
+                    found.roles.insert(Role::Name);
+                    found.schemas.insert(self.schema(&embedded).hash());
+                }
+            }
         }
         for (named, _, member) in self.members_named.borrow().iter() {
             let (Member::Function(function), true) = (member, own.contains(named)) else {

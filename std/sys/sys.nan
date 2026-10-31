@@ -7,6 +7,17 @@ pub fn Domain.run[T: Send, E: Send](take body: task fn() -> T fails E uses wait,
 
 pub fn Domain.run_sized[T: Send, E: Send](take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
 
+pub open struct Abandoner {
+} Abandoner
+
+pub fn Abandoner.new() -> Abandoner limits pure, notrap, terminates
+
+pub fn Abandoner.run[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.run_sized[T: Send, E: Send](self, take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Abandoner.trigger(self) limits notrap, terminates, noalloc
+
 pub open struct Trap derives Send {
 } Trap
 
@@ -32,6 +43,8 @@ pub closed enum TrapKind derives Copy, Eq, Render {
     StackOverflow
     DuplicateAccess
     Poisoned
+    Exception
+    Abandoned
 } TrapKind
 
 pub open struct Fs {
@@ -157,6 +170,24 @@ pub fn Revoker.capability(self) -> C
 
 pub fn Revoker.revoke(take self)
 
+pub interface Kind[S: Send, R: AnyBits and Copy] {
+} Kind
+
+pub open linear struct Minter[C: Kind[S, R], S: Send, R: AnyBits and Copy] {
+} Minter
+
+pub fn Minter.of(take state: S, alloc: mem::Alloc) -> Minter[C, S, R]
+
+pub fn Minter.mint(self, record: R) -> C
+
+pub fn Minter.revoke(self, capability: C)
+
+pub fn Minter.close(take self)
+
+pub fn reach[C: Kind[S, R], S: Send, R: AnyBits and Copy, T: Any, E](capability: C, body: fn(state: S, record: R) -> T fails E) -> Option[T] fails E
+
+pub fn derive[C: Kind[S, R], S: Send, R: AnyBits and Copy](capability: C, narrow: fn(state: S, record: R) -> R) -> C fails Revoked
+
 pub interface Component[Env: Any and Send, M: Send] {
     fn start(mut env: Env) -> Self
     fn on(mut self, take message: M, mut env: Env, mut cx: Cx[M])
@@ -180,12 +211,51 @@ pub open struct Outbox[M: Any] {
 
 pub fn Outbox.post(self, take message: M) fails task::SendError uses wait
 
+pub open linear struct Stepper[S, Env: Any, M: Any] {
+} Stepper
+
+pub closed struct Stopped[S, Env: Any] {
+    pub state: S
+    pub env: Env
+} Stopped
+
+pub fn Stepper.start(take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
+
+pub fn Stepper.resume(take state: S, take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
+
+pub fn Stepper.outbox(self) -> Outbox[M]
+
+pub fn Stepper.deliver(mut self, take message: M)
+
+pub fn Stepper.step(mut self) -> bool
+
+pub fn Stepper.incoming(self) fails task::Cancelled uses wait
+
+pub fn Stepper.ready(self) -> bool fails task::Cancelled uses wait
+
+pub fn Stepper.start_keyed(mut self) -> usize
+
+pub fn Stepper.idle(self) -> bool
+
+pub proj fn Stepper.state(self) -> S
+
+pub fn Stepper.end(take self) -> Stopped[S, Env] fails task::Cancelled uses wait
+
+pub fn Stepper.abandon(take self)
+
+pub closed enum CallError[E: Send] derives Render {
+    Failed(E)
+    Closed(task::SendError) from
+    Cancelled(task::Cancelled) from
+} CallError
+
 struct Probe derives Encode {
     handled: u64
 } Probe
 
 struct ProbeEnv {
     clock: Clock
+    counted: u64
 } ProbeEnv
 
 enum ProbeMessage {
@@ -199,12 +269,29 @@ enum ProbeMessage {
 
 impl Probe: Component[ProbeEnv, ProbeMessage]
 
+struct Tally {
+} Tally
+
+impl Tally: Kind[core::atomic::AtomicU64, u64]
+
+fn tallies(start: u64, alloc: mem::Alloc) -> Minter[Tally, core::atomic::AtomicU64, u64] {
+    return Minter.of(core::atomic::AtomicU64.of(start), alloc)
+} tallies
+
+fn tally_record(state: core::atomic::AtomicU64, record: u64) -> u64 = record
+
+fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
+    discard state.fetch_add(record)
+    return state.load()
+} tally_count
+
 fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0)
 
 fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
     match message {
         ProbeMessage.Count => {
             self.handled += 1
+            env.counted += 1
         }
         ProbeMessage.Echo => mut cx.send(ProbeMessage.Count)
         ProbeMessage.Delay => mut cx.after(ms: 10, send: ProbeMessage.Count)
@@ -268,6 +355,69 @@ test trap_names_its_kind for Trap.kind {
     let kind = trap.kind()
     expect kind == TrapKind.DivisionByZero
 } trap_names_its_kind
+
+test trigger_abandons_the_running_domain for Abandoner.trigger {
+    let world = testing::world()
+    let clock = world.clock
+    let abandoner = mem::Shared.of(Abandoner.new(), alloc: world.alloc)
+    var kind: Option[TrapKind] = None
+    try await task::scope(world.exec, body: fn[mut kind](s: task::Scope) fails task::Cancelled uses wait {
+        let watch = abandoner.share()
+        discard s.spawn(fn[take watch]() fails task::Cancelled uses wait {
+            try await clock.sleep(10)
+            watch.contents().trigger()
+        })
+        let outcome = try await abandoner.contents().run(fn() fails task::Cancelled uses wait {
+            loop {
+                try await clock.sleep(1)
+            }
+        }, exec: world.exec, alloc: world.alloc)
+        let Err(trap) = outcome else {
+            return
+        }
+        kind = Some(trap.kind())
+    })
+    expect kind == Some(TrapKind.Abandoned)
+} trigger_abandons_the_running_domain
+
+test triggered_abandoner_runs_nothing for Abandoner.run {
+    let world = testing::world()
+    let abandoner = Abandoner.new()
+    abandoner.trigger()
+    let outcome = try await abandoner.run(fn() -> u32 {
+        return 1
+    }, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        expect false
+        return
+    }
+    expect trap.kind() == TrapKind.Abandoned
+} triggered_abandoner_runs_nothing
+
+test new_abandoner_runs_its_body for Abandoner.new {
+    let world = testing::world()
+    let outcome = try await Abandoner.new().run(fn() -> u32 {
+        return 7
+    }, exec: world.exec, alloc: world.alloc)
+    let Ok(value) = outcome else {
+        expect false
+        return
+    }
+    expect value == 7
+} new_abandoner_runs_its_body
+
+test sized_run_contains_its_trap for Abandoner.run_sized {
+    let world = testing::world()
+    let divisor: u32 = 0
+    let outcome = try await Abandoner.new().run_sized(fn() -> u32 {
+        return 10 / divisor
+    }, stack: 1_048_576, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        expect false
+        return
+    }
+    expect trap.kind() == TrapKind.DivisionByZero
+} sized_run_contains_its_trap
 
 test read_only_fs_refuses_writes for Fs.read_only {
     let world = testing::world()
@@ -335,6 +485,25 @@ test narrowed_net_cannot_listen for Net.only_host {
     }
     expect denied
 } narrowed_net_cannot_listen
+
+test net_narrowed_to_two_hosts_reaches_none for Net.only_host {
+    let world = testing::world()
+    let narrow = try world.net.only_host("localhost")
+    let none = try narrow.only_host("127.0.0.1")
+    let again = try none.only_host("localhost")
+    let outcome = attempt await again.connect("localhost", port: 4_100)
+    var denied = false
+    match outcome {
+        Ok(conn) => take conn.abandon()
+        Err(failure) => {
+            denied = match failure {
+                net::NetError.Denied => true
+                else => false
+            }
+        }
+    }
+    expect denied
+} net_narrowed_to_two_hosts_reaches_none
 
 test taken_port_cannot_be_listened_on for Net.listen {
     let world = testing::world()
@@ -508,9 +677,88 @@ test revoke_reaches_derived_capabilities for Revoker.revoke {
     expect revoked
 } revoke_reaches_derived_capabilities
 
+test new_minter_keeps_its_state for Minter.of {
+    let world = testing::world()
+    let minter = tallies(5, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(0)
+    let start = reach(tally, body: fn(state: core::atomic::AtomicU64, record: u64) => state.load())
+    expect start == Some(5)
+} new_minter_keeps_its_state
+
+test minted_handle_keeps_its_record for Minter.mint {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(7)
+    let record = reach(tally, body: fn(state: core::atomic::AtomicU64, record: u64) => record)
+    expect record == Some(7)
+} minted_handle_keeps_its_record
+
+test revoke_reaches_only_its_own_entries for Minter.revoke {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let other = tallies(0, alloc: world.alloc)
+    defer take other.close()
+    let tally = minter.mint(1)
+    let kept = minter.mint(2)
+    let stranger = other.mint(3)
+    let narrowed = try derive(tally, narrow: tally_record)
+    minter.revoke(tally)
+    minter.revoke(stranger)
+    expect reach(tally, body: tally_record) == None
+    expect reach(narrowed, body: tally_record) == None
+    expect reach(kept, body: tally_record) == Some(2)
+    expect reach(stranger, body: tally_record) == Some(3)
+} revoke_reaches_only_its_own_entries
+
+test closed_minter_stales_its_handles for Minter.close {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(1)
+    let revoker = try revocable(tally)
+    let copy = revoker.capability()
+    undefer minter
+    take minter.close()
+    expect reach(tally, body: tally_record) == None
+    expect reach(copy, body: tally_record) == None
+    take revoker.revoke()
+} closed_minter_stales_its_handles
+
+test reaches_share_their_minter_state for reach {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    discard reach(minter.mint(2), body: tally_count)
+    let revoker = try revocable(minter.mint(3))
+    let copy = revoker.capability()
+    let total = reach(copy, body: tally_count)
+    take revoker.revoke()
+    let after = reach(copy, body: tally_count)
+    expect total == Some(5)
+    expect after == None
+} reaches_share_their_minter_state
+
+test derived_handle_records_the_narrowed_record for derive {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(6)
+    let half = try derive(tally, narrow: fn(state: core::atomic::AtomicU64, record: u64) => record / 2)
+    expect reach(half, body: tally_record) == Some(3)
+    minter.revoke(tally)
+    let stale = match attempt derive(tally, narrow: tally_record) {
+        Err(Revoked.Stale) => true
+        else => false
+    }
+    expect stale
+} derived_handle_records_the_narrowed_record
+
 test sent_message_is_handled for Cx.send {
     let world = testing::world()
-    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.Echo)
         try await inbox.post(ProbeMessage.Count)
     })
@@ -520,10 +768,10 @@ test sent_message_is_handled for Cx.send {
 test delayed_message_waits_for_its_delay for Cx.after {
     let world = testing::world()
     let clock = world.clock
-    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.Delay)
     })
-    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.Delay)
         try await clock.sleep(50)
     })
@@ -534,11 +782,11 @@ test delayed_message_waits_for_its_delay for Cx.after {
 test nanosecond_delay_waits_for_its_delay for Cx.after_ns {
     let world = testing::world()
     let clock = world.clock
-    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.DelayNs)
         try await clock.sleep_ns(1_000)
     })
-    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.DelayNs)
         try await clock.sleep_ns(2_000)
     })
@@ -551,11 +799,11 @@ test coarse_executor_delays_to_its_resolution for Cx.after_ns {
     let clock = world.clock
     try await clock.sleep_ns(200)
     let exec = try world.exec.coarse(1_000)
-    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.DelayNs)
         try await clock.sleep_ns(1_700)
     })
-    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.DelayNs)
         try await clock.sleep_ns(2_150)
     })
@@ -566,7 +814,7 @@ test coarse_executor_delays_to_its_resolution for Cx.after_ns {
 test keyed_task_posts_to_the_component for Cx.spawn {
     let world = testing::world()
     let clock = world.clock
-    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.Spawn(0))
         try await clock.sleep(50)
     })
@@ -576,7 +824,7 @@ test keyed_task_posts_to_the_component for Cx.spawn {
 test cancelled_keyed_task_posts_nothing for Cx.cancel {
     let world = testing::world()
     let clock = world.clock
-    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         try await inbox.post(ProbeMessage.Spawn(1_000))
         try await inbox.post(ProbeMessage.Stop)
         try await clock.sleep(2_000)
@@ -586,10 +834,165 @@ test cancelled_keyed_task_posts_nothing for Cx.cancel {
 
 test posted_messages_are_all_handled for Outbox.post {
     let world = testing::world()
-    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
         for _ in 0..<3u32 {
             try await inbox.post(ProbeMessage.Count)
         }
     })
     expect last.handled == 3
 } posted_messages_are_all_handled
+
+test resumed_state_continues_its_checkpoint for Stepper.resume {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(ProbeMessage.Count)
+    mut stepper.deliver(ProbeMessage.Count)
+    var checkpoint = mem::Bytes.empty(world.alloc)
+    mem::wire::Codec[Probe].encode(stepper.state(), out: mut checkpoint)
+    let Stopped(state: _, env: env) = try await take stepper.end()
+    let restored = try mem::wire::Codec[Probe].decode(Untrusted.of(checkpoint.view()), alloc: world.alloc)
+    var resumed = try Stepper[Probe, ProbeEnv, ProbeMessage].resume(take restored, take env, exec: world.exec, alloc: world.alloc)
+    mut resumed.deliver(ProbeMessage.Count)
+    let last = try await take resumed.end()
+    expect last.state.handled == 3
+} resumed_state_continues_its_checkpoint
+
+test end_gives_the_env_back for Stepper.end {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(ProbeMessage.Echo)
+    let echoed = mut stepper.step()
+    let emptied = mut stepper.step()
+    let last = try await take stepper.end()
+    expect echoed and not emptied
+    expect last.state.handled == 1
+    expect last.env.counted == 1
+} end_gives_the_env_back
+
+test keyed_task_waits_until_started for Stepper.start_keyed {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(ProbeMessage.Spawn(0))
+    try await world.clock.sleep(10)
+    let early = mut stepper.step()
+    let busy = not stepper.idle()
+    let started = mut stepper.start_keyed()
+    let posted = try await stepper.ready()
+    let handled = mut stepper.step()
+    let waiting = try await stepper.ready()
+    undefer stepper
+    let last = try await take stepper.end()
+    expect not early and busy and started == 1
+    expect posted and handled and not waiting
+    expect last.state.handled == 1
+} keyed_task_waits_until_started
+
+test superseded_held_task_posts_nothing for Stepper.ready {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(ProbeMessage.Spawn(1_000))
+    mut stepper.deliver(ProbeMessage.Stop)
+    let started = mut stepper.start_keyed()
+    let waiting = try await stepper.ready()
+    let idle = stepper.idle()
+    undefer stepper
+    let last = try await take stepper.end()
+    expect started == 1 and not waiting and idle
+    expect last.state.handled == 0
+} superseded_held_task_posts_nothing
+
+test started_stepper_holds_the_start_state for Stepper.start {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    let idle = stepper.idle()
+    let last = try await take stepper.end()
+    expect idle
+    expect last.state.handled == 0 and last.env.counted == 0
+} started_stepper_holds_the_start_state
+
+test delivered_messages_are_handled_at_once for Stepper.deliver {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(ProbeMessage.Count)
+    mut stepper.deliver(ProbeMessage.Count)
+    let last = try await take stepper.end()
+    expect last.state.handled == 2 and last.env.counted == 2
+} delivered_messages_are_handled_at_once
+
+test steps_take_the_intake_oldest_first for Stepper.step {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(ProbeMessage.Echo)
+    mut stepper.deliver(ProbeMessage.Echo)
+    let earliest = mut stepper.step()
+    let latest = mut stepper.step()
+    let none = mut stepper.step()
+    let last = try await take stepper.end()
+    expect earliest and latest and not none
+    expect last.state.handled == 2
+} steps_take_the_intake_oldest_first
+
+test incoming_waits_for_a_delayed_message for Stepper.incoming {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(ProbeMessage.Delay)
+    let early = mut stepper.step()
+    try await stepper.incoming()
+    let handled = mut stepper.step()
+    undefer stepper
+    let last = try await take stepper.end()
+    expect not early and handled
+    expect last.state.handled == 1
+} incoming_waits_for_a_delayed_message
+
+test pending_delays_keep_a_stepper_busy for Stepper.idle {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(ProbeMessage.Delay)
+    let busy = not stepper.idle()
+    try await stepper.incoming()
+    discard mut stepper.step()
+    let idle = stepper.idle()
+    undefer stepper
+    discard try await take stepper.end()
+    expect busy and idle
+} pending_delays_keep_a_stepper_busy
+
+test state_shows_what_the_handlers_did for Stepper.state {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(ProbeMessage.Count)
+    let handled = stepper.state().handled
+    discard try await take stepper.end()
+    expect handled == 1
+} state_shows_what_the_handlers_did
+
+test posts_reach_the_stepper_through_its_outbox for Stepper.outbox {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    let inbox = stepper.outbox()
+    try await task::scope(world.exec, body: fn[mut stepper](s: task::Scope) fails task::Cancelled uses wait {
+        discard s.spawn(fn[take inbox]() fails task::Cancelled uses wait {
+            discard attempt await inbox.post(ProbeMessage.Count)
+        })
+        try await stepper.incoming()
+        discard mut stepper.step()
+    })
+    undefer stepper
+    let last = try await take stepper.end()
+    expect last.state.handled == 1
+} posts_reach_the_stepper_through_its_outbox
+
+test abandoned_stepper_refuses_posts for Stepper.abandon {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    let inbox = stepper.outbox()
+    take stepper.abandon()
+    let outcome = attempt await inbox.post(ProbeMessage.Count)
+    expect outcome.is_err()
+} abandoned_stepper_refuses_posts

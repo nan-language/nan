@@ -1,0 +1,107 @@
+//! Runs in domains a division by zero, a faulting read, a spin a watchdog abandons and a trap holding a device, then faults.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// An address outside the canonical half of the address space, whose read faults.
+const NON_CANONICAL: usize = 0x8000_0000_0000_0000
+
+/// The nanoseconds the watchdog lets the spinning body run.
+const WATCHDOG_NS: u64 = 20_000_000
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+/// Writes a line naming a domain run and how it ended.
+fn outcome(name: Str, ended: Result[u32, sys::Trap]) {
+    say(text: name)
+    let Err(trap) = ended else {
+        say(text: " returned\n")
+        return
+    }
+    match trap.kind() {
+        sys::TrapKind.DivisionByZero => say(text: " trap.division-by-zero\n")
+        sys::TrapKind.Exception => say(text: " trap.exception\n")
+        sys::TrapKind.Abandoned => say(text: " trap.abandoned\n")
+        else => say(text: " another trap\n")
+    }
+} outcome
+
+fn rate(level: u32) -> u32 {
+    return 1_000 / level
+} rate
+
+interrupt fn tally(mut tallied: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    tallied = tallied.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} tally
+
+/// The data of the message of a device installed on a message-signalled interrupt of CPU 1, which
+/// is then uninstalled.
+fn message_data() -> u32 {
+    let shared = match hw::IrqShared.install_msi(0u64, cpu: 1, source: 0, on_irq: tally) {
+        Ok(shared) => shared
+        Err(_) => return 0
+    }
+    let data = match shared.message() {
+        Some(message) => message.data
+        None => 0
+    }
+    discard take shared.uninstall()
+    return data
+} message_data
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        let level = hw::cpu_count() / 8
+        let divided = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            return rate(level)
+        }, exec, alloc)
+        outcome(name: "divided", ended: divided)
+        let faulted = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            let value = trusted "the read faults, the address being non-canonical" { hw::Ptr[u64].of_addr(NON_CANONICAL).read() }
+            return u32.truncate(value)
+        }, exec, alloc)
+        outcome(name: "faulted", ended: faulted)
+        let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc)
+        var spun: Result[u32, sys::Trap] = Ok(0)
+        try await task::scope(exec, body: fn[mut spun](s: task::Scope) fails task::Cancelled uses wait {
+            let watch = abandoner.share()
+            discard s.spawn(fn[take watch]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await clock.sleep_ns(WATCHDOG_NS)
+                watch.contents().trigger()
+            })
+            spun = try await abandoner.contents().run(fn() -> u32 limits stack 4_096 {
+                var spins: u32 = 0
+                loop {
+                    spins = spins.wrapping_add(1)
+                }
+            }, exec, alloc)
+        })
+        outcome(name: "spun", ended: spun)
+        let before = message_data()
+        let held = try await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+            let shared = match hw::IrqShared.install_msi(0u64, cpu: 1, source: 0, on_irq: tally) {
+                Ok(shared) => shared
+                Err(_) => return 0
+            }
+            let rated = rate(level)
+            discard take shared.uninstall()
+            return rated
+        }, exec, alloc)
+        outcome(name: "held", ended: held)
+        if message_data() == before {
+            say(text: "vector free again\n")
+        }
+        discard trusted "the read faults, the address being non-canonical" { hw::Ptr[u64].of_addr(NON_CANONICAL).read() }
+    })
+} main

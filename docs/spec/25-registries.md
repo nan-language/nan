@@ -365,7 +365,7 @@ pub closed struct PreemptEntry {
 The `hw::vectors` entry whose key field is a vector **binds** that vector, except that it binds an exception raised in user code only when its `user` is not `None`. The seams use the tables as follows:
 
 - On x86_64 the gate of each vector holds the entry's `ist` as its interrupt stack table index, 0 selecting none; on AArch64 every vector's seam runs on the CPU's interrupt stack of `ist` 0.
-- The seam of a bound vector calls the interrupt fn of `handler` ([interrupt functions](24-kernel.md#interrupt-functions)), or, for an exception raised in user code, the landing fn of `user`, with the arguments [user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) gives. Interrupt functions fixes what the seam of an unbound vector does.
+- The seam of a bound vector calls the interrupt fn of `handler` ([interrupt functions](24-kernel.md#interrupt-functions)), that of `hw::SIGNAL_VECTOR` once the CPU has served its shootdowns ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), or, for an exception raised in user code, the landing fn of `user`, with the arguments [user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) gives. Interrupt functions fixes what the seam of an unbound vector does.
 - The syscall seam calls the `handler` of the `hw::syscall_entry` entry with the arguments user exceptions and syscalls gives. Without an entry, the image leaves the `syscall` instruction disabled on x86_64, and an `svc` instruction in user mode halts the kernel on AArch64.
 - The vector seams call the `handler` of the `hw::preempt` entry, which the platform package contributes, where [preemption](24-kernel.md#preemption) has the interrupted thread yield.
 

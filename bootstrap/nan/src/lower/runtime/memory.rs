@@ -1088,6 +1088,17 @@ fn chunk_of(lo: &mut Lowering, fx: &mut Fx, address: Value) -> Value {
     )[0]
 }
 
+/// The cell handle an allocation was drawn through.
+pub fn cell_of(lo: &mut Lowering, fx: &mut Fx, address: Value) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let record = chunk_of(lo, fx, address);
+    let cell = fx.load(PTR, record, chunk::CELL);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    cell
+}
+
 /// `Lift(address, domain) -> lifted`: passes the run of chunks an allocation lies in to a
 /// domain when a domain nested in it owns the run; nonzero when it passed.
 fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, to: Value) -> Value {

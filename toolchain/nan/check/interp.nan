@@ -181,11 +181,29 @@ fn Interpreter.confirm(mut self, item: ty::ItemId, site: RunSite, take inputs: m
     }
 } Interpreter.confirm
 
+/// The kept fields of a flexible struct value that holds none; none for another item.
+pkg fn Interpreter.kept_empty(self, item: ty::ItemId) -> Option[Val] {
+    let Some(kept) = self.ck.kept_type(item) else {
+        return None
+    }
+    let ty::TyKind.Item(item: kept_item, args: _) = self.ck.types().kind(kept) else {
+        return None
+    }
+    return Some(Val.Variant(item: kept_item, index: 0, fields: mem::Shared.of(mem::List[Val].empty(self.alloc), alloc: self.alloc)))
+} Interpreter.kept_empty
+
 fn Interpreter.input(mut self, take input: Input) -> Val {
     let alloc = self.alloc
     match input {
         Input.Value(value) => return value
-        Input.Struct(item: item, fields: fields) => return Val.Struct(item: item, fields: mem::Shared.of(mut self.inputs(take fields), alloc))
+        Input.Struct(item: item, fields: fields) => {
+            var values = mut self.inputs(take fields)
+            match self.kept_empty(item) {
+                Some(kept) => mut values.push(take kept)
+                None => {}
+            }
+            return Val.Struct(item: item, fields: mem::Shared.of(take values, alloc))
+        }
         Input.Variant(item: item, index: index, fields: fields) => return Val.Variant(item: item, index: index, fields: mem::Shared.of(mut self.inputs(take fields), alloc))
         Input.Array(elements) => return Val.Array(mem::Shared.of(mut self.inputs(take elements), alloc))
         Input.Slice(elements: elements, writable: writable) => {
@@ -236,14 +254,20 @@ fn Interpreter.entry_facts(mut self, item: ty::ItemId, function: nir::Function, 
         before = function.index
     }
     let entry = ck.entry_requires(item)
-    for clause in entry {
+    var shared = mem::List[Val].empty(self.alloc)
+    for at in entry.params {
+        if at < args.len() {
+            mut shared.push(args[at].copy(self.alloc))
+        }
+    }
+    for clause in entry.refs {
         let nir::Callable.Item(item: holder, role: _, index: index) = clause.callable else {
             continue
         }
         if holder == item and index >= before {
             continue
         }
-        if not mut self.requires_hold(item, holder, index, requires_args: clause.args, args, type_args) {
+        if not mut self.requires_hold(item, holder, index, requires_args: clause.args, args: shared.view(), type_args) {
             return false
         }
     }
@@ -729,6 +753,10 @@ fn Interpreter.construct(
     if not self.layout_fits(item, values: values.view()) {
         try self.obligation_fails(site, kind: "trap.conversion", at)
     }
+    match self.kept_empty(item) {
+        Some(kept) => mut values.push(take kept)
+        None => {}
+    }
     return Val.Struct(item: item, fields: mem::Shared.of(take values, alloc: self.alloc))
 } Interpreter.construct
 
@@ -918,7 +946,7 @@ fn Interpreter.substituted(self, frame: InterpFrame, fn_ref: nir::FnRef) -> nir:
 fn Interpreter.variant_index(self, item: ty::ItemId, name: Str) -> u32 {
     let sig = self.ck.sig(item)
     match sig.contents().kind {
-        SigKind.Enum(variants: variants) => {
+        SigKind.Enum(variants: variants) or SigKind.Protocol(operations: _, variants: variants, summary: _) => {
             for index in 0..<variants.len() {
                 if variants[index].name.as_str() == name {
                     return u32.fit(index)

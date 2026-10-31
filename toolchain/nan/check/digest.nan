@@ -25,7 +25,7 @@ struct DigestSite {
 
 /// What brings the facts of a site.
 enum Brought derives Copy, Eq {
-    /// An operation of the code itself.
+    /// An operation of the code itself, or the float use a call of a std function brings.
     Operation
     /// A call, or a function supplied as an argument: the function with a body it names, if any.
     Call(Option[ty::ItemId])
@@ -181,6 +181,14 @@ fn Digest.pure(self) -> bool {
     return capabilities.len() == 0 and validators.len() == 0
 } Digest.pure
 
+/// The digest of a function of a capability kind as code reaching it sees it: without the
+/// device, priv and sync facts, with the kind as its one capability and no validators.
+fn Digest.kind_view(self, kind: ty::ItemId, alloc: mem::Alloc) -> Digest {
+    var capabilities = mem::Set[ty::ItemId].empty(alloc)
+    discard mut capabilities.insert(kind)
+    return Digest(wait: self.wait, alloc: self.alloc, device: false, privileged: false, sync: false, terminates: self.terminates, float: self.float, capabilities: Some(take capabilities), validators: Some(mem::Set[ty::ItemId].empty(alloc)), class: self.class)
+} Digest.kind_view
+
 /// The code of the rule a limit demanding facts this digest lacks breaks.
 fn Digest.broken(self, limit_set: ty::LimitSet) -> Option[diagnostic::Code] {
     if limit_set.pure and not self.pure() {
@@ -246,9 +254,20 @@ fn extended_set(set: Option[mem::Set[ty::ItemId]], item: ty::ItemId, alloc: mem:
     return extended
 } extended_set
 
-/// The digest of a function item: computed from its body, supplied for a std function
-/// without one, and otherwise declared; compensated when the function has an undo clause.
+/// The digest of a function item: its code's, which a function of a capability kind gives as
+/// the kind's view of it.
 fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
+    let digest = self.code_digest(item)
+    let Some(kind) = self.kind_member(item) else {
+        return digest
+    }
+    return mem::Shared.of(digest.contents().kind_view(kind, alloc: self.alloc()), alloc: self.alloc())
+} Checker.digest
+
+/// The digest a function item's code gives: computed from its body, supplied for a std
+/// function without one, and otherwise declared; compensated when the function has an undo
+/// clause.
+fn Checker.code_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let digest = self.uncompensated_digest(item)
     if not self.compensates(item) {
         return digest
@@ -256,7 +275,7 @@ fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     var compensated = digest.contents().copy(self.alloc())
     compensated.class = compensated.class.compensated()
     return mem::Shared.of(take compensated, alloc: self.alloc())
-} Checker.digest
+} Checker.code_digest
 
 fn Checker.uncompensated_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let db = self.db()
@@ -1059,6 +1078,23 @@ fn Checker.check_limits(self, item: ty::ItemId, body: mem::Shared[TBody]) {
         }
         else => {}
     }
+    match self.served(item) {
+        Some(by) => {
+            match by.served {
+                Served.Handler(index) => {
+                    let protocol_sig = self.sig(by.protocol)
+                    match protocol_sig.contents().kind {
+                        SigKind.Protocol(operations: operations, variants: _, summary: _) => demand(mut limit_set, demanded: operations[index].sig.limit_set)
+                        else => {}
+                    }
+                }
+                Served.Summary => {
+                    limit_set.pure = true
+                }
+            }
+        }
+        None => {}
+    }
     for line in self.implemented_lines(item) {
         let sig = self.sig(line)
         let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
@@ -1317,6 +1353,18 @@ fn DigestWalk.expr(mut self, expr: TExpr) {
     match expr.kind {
         TKind.Call(call) or TKind.Index(call) => mut self.call(call.contents())
         TKind.Closure(_) => return
+        TKind.Construct(variant: Some(variant), values: _, wrapped: _) => {
+            match self.ck.types().kind(expr.ty) {
+                ty::TyKind.Item(item: protocol, args: _) => {
+                    if self.ck.is_protocol(protocol) {
+                        var facts = Digest.none(self.ck.alloc())
+                        facts.class = self.ck.operation_class(protocol, index: variant)
+                        mut self.site(expr.token, digest: take facts, brought: Brought.Operation)
+                    }
+                }
+                else => {}
+            }
+        }
         TKind.When(attempted: _, accesses: _, body: _) => {
             var facts = Digest.none(self.ck.alloc())
             facts.wait = true
@@ -1442,23 +1490,36 @@ fn DigestWalk.float(mut self, token: u32, ty: ty::Ty) {
     }
 } DigestWalk.float
 
+/// The site of a call of an interface method, with its declared digest, or of a method an
+/// outbox of a protocol calls: waiting and the class of an operation, nothing for `summary`.
+fn DigestWalk.method_site(mut self, token: u32, bound: ty::Bound, method: usize) {
+    let alloc = self.ck.alloc()
+    if self.ck.is_protocol(bound.item) {
+        var facts = Digest.none(alloc)
+        if self.ck.is_operation(bound.item, method) {
+            facts.wait = true
+            facts.terminates = false
+            facts.class = self.ck.operation_class(bound.item, index: method)
+        }
+        mut self.site(token, digest: take facts, brought: Brought.Operation)
+        return
+    }
+    let sig = self.ck.sig(bound.item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return
+    }
+    expect method < methods.len()
+    let head = methods[method].sig
+    mut self.site(token, digest: Digest.declared(head.wait, limit_set: head.limit_set, alloc), brought: Brought.Call(None))
+} DigestWalk.method_site
+
 /// A call: the facts of what it calls, and of each function argument it supplies.
 fn DigestWalk.call(mut self, call: Call) {
     let token = call.token
     let alloc = self.ck.alloc()
     match call.callee {
         Callee.Function(item: function) => mut self.function_site(token, function)
-        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
-            let sig = self.ck.sig(bound.item)
-            match sig.contents().kind {
-                SigKind.Interface(methods: methods) => {
-                    expect method < methods.len()
-                    let head = methods[method].sig
-                    mut self.site(token, digest: Digest.declared(head.wait, limit_set: head.limit_set, alloc), brought: Brought.Call(None))
-                }
-                else => {}
-            }
-        }
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => mut self.method_site(token, bound, method)
         Callee.Value(value) => {
             let callee = value.contents()
             if not self.own_parameter(callee) {
@@ -1478,7 +1539,8 @@ fn DigestWalk.call(mut self, call: Call) {
 } DigestWalk.call
 
 /// The site of a call of a function item: its digest, with the primitive capability a std
-/// member of one adds, and the validator it is.
+/// member of one adds, and the validator it is; and the float use of a std function as an
+/// operation.
 fn DigestWalk.function_site(mut self, token: u32, function: ty::ItemId) {
     let alloc = self.ck.alloc()
     var facts = self.ck.digest(function).contents().copy(alloc)
@@ -1494,6 +1556,11 @@ fn DigestWalk.function_site(mut self, token: u32, function: ty::ItemId) {
     let brought = match self.ck.db().ast(function).kind.is_fn_with_body() {
         true => Brought.Call(Some(function))
         false => Brought.Call(None)
+    }
+    if facts.float and self.ck.db().is_std(function) {
+        var float = Digest.none(alloc)
+        float.float = true
+        mut self.site(token, digest: take float, brought: Brought.Operation)
     }
     mut self.site(token, digest: take facts, brought: brought)
 } DigestWalk.function_site

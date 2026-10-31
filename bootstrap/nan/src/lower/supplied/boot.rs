@@ -1,8 +1,9 @@
 //! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root
-//! allocator, clocks, `hw::Ring0` and the usable memory of the machine, the firmware services of the
-//! UEFI targets, and the anchor a kernel installs before its executor starts. The installed
-//! anchor lies in storage the image reserves, whose address and the location of the `anchor`
-//! call the runtime state records.
+//! allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start
+//! information, the IOMMU and PCI functions std's `hw` enables and lists, the firmware services of the UEFI targets, the anchor a kernel installs before
+//! its executor starts, and what the start information and the firmware's tables give std. The
+//! installed anchor lies in storage the image reserves, whose address and the location of the
+//! `anchor` call the runtime state records.
 
 pub mod firmware;
 
@@ -10,7 +11,7 @@ use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, type
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::machine::Stub;
+use super::super::machine::{Stub, start};
 use super::super::runtime::tasks::task;
 use super::super::runtime::{Routine, report, state};
 use super::super::{Glue, Lowering};
@@ -19,6 +20,7 @@ use super::hw::region;
 use super::mem::vector::{self, Element};
 use super::tasks::scopes;
 use crate::check::ty::Ty;
+use crate::workspace::{Kind, Target};
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     match supply.path.as_str() {
@@ -35,24 +37,115 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             supply.ret(lo, fx, Held::Address(clock));
         }
         "boot::Kernel.wall_clock" => wall_clock(lo, fx, supply),
-        "boot::Kernel.ring0" => ring0(lo, fx, supply),
+        "boot::Kernel.ring0" | "boot::Machine.ring0" => ring0(lo, fx, supply),
         "boot::Kernel.regions" => regions(lo, fx, supply),
+        "boot::Kernel.modules" => modules(lo, fx, supply),
+        "boot::Kernel.iommu" => iommu(lo, fx, supply),
+        "boot::Kernel.pci_functions" => pci_functions(lo, fx, supply),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
+        "boot::Kernel.policy" => lo.install_policy(fx, supply),
+        "boot::Module.contents" => module_contents(lo, fx, supply),
+        "boot::start_info" => {
+            let info = lo.start_info(fx);
+            supply.ret(lo, fx, Held::Scalar(info));
+        }
+        "boot::tree_address" => {
+            let tree = tree_address(lo, fx);
+            supply.ret(lo, fx, Held::Scalar(tree));
+        }
+        "boot::rsdp_address" => {
+            let rsdp = lo.rsdp(fx);
+            supply.ret(lo, fx, Held::Scalar(rsdp));
+        }
+        "boot::system_table_address" => {
+            let table = match lo.ck.db.target.kind() {
+                Some(Kind::Uefi) => {
+                    let state_address = lo.state(fx);
+                    fx.load(PTR, state_address, state::PLATFORM_TABLE)
+                }
+                _ => fx.ptr(0),
+            };
+            supply.ret(lo, fx, Held::Scalar(table));
+        }
         "boot::Machine.with_services" => firmware::with_services(lo, fx, supply),
         "boot::Machine.exit_services" => firmware::exit_services(lo, fx, supply),
-        "boot::Services.write_console" => firmware::write_console(lo, fx, supply),
-        "boot::Services.read_file" => firmware::read_file(lo, fx, supply),
+        "boot::Machine.enter" => firmware::enter(lo, fx, supply),
         "bare_platform::yield_task" | "uefi_platform::yield_task" => {
             super::super::runtime::tasks::yield_preempted(lo, fx);
             supply.done(lo, fx);
         }
+        "boot::Services.free" => firmware::free(lo, fx, supply),
+        path if path.starts_with("boot::Services.") => firmware::service(lo, fx, supply),
+        path if path.starts_with("uefi_platform::") => firmware::platform(lo, fx, supply),
         _ => return false,
     }
     true
 }
 
+/// The address of the flattened device tree the image started with, zero without one.
+pub fn tree_address(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    match lo.ck.db.target {
+        Target::Aarch64Bare => {
+            let state_address = lo.state(fx);
+            fx.load(PTR, state_address, state::PLATFORM)
+        }
+        _ => fx.ptr(0),
+    }
+}
+
+/// Whether a flag of the root grant was set, setting it.
+fn first_take(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, name: &str) -> Value {
+    let grant = supply.param(0).address();
+    let at = field(lo, supply, name);
+    let taken = fx.load(types::I8, grant, at);
+    let yes = fx.int(types::I8, 1);
+    fx.store(yes, grant, at);
+    fx.b.ins().icmp_imm_s(IntCC::Equal, taken, 0)
+}
+
+/// `k.iommu()`: the first time, what std's `hw` gives on enabling the machine's IOMMU on a
+/// kernel; `None` after, and on a test image.
+fn iommu(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let option = supply.abi.result.clone();
+    if lo.kernel() {
+        let first = first_take(lo, fx, supply, "iommu");
+        fx.when(first, |fx| {
+            let started = super::hw::iommu::call_hw(lo, fx, "started", &[]);
+            supply.ret(lo, fx, started);
+        });
+    }
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
+}
+
+/// `k.pci_functions()`: the first time, the functions std's `hw` enumerates on a kernel, drawn
+/// through the root allocator; an empty list after, and on a test image.
+fn pci_functions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let grant = supply.param(0).address();
+    let alloc = fx.offset(grant, field(lo, supply, "alloc"));
+    if lo.kernel() {
+        let first = first_take(lo, fx, supply, "functions");
+        fx.when(first, |fx| {
+            let functions =
+                super::hw::iommu::call_hw(lo, fx, "enumerated", &[Held::Address(alloc)]);
+            supply.ret(lo, fx, functions);
+        });
+    }
+    let list = supply.sret.expect("the functions' address");
+    let function_ty = supply
+        .abi
+        .result
+        .type_arg(0)
+        .cloned()
+        .expect("the function type");
+    let element = Element::of(lo, &function_ty);
+    let cell = fx.load(PTR, alloc, 0);
+    vector::empty(fx, list, cell, element);
+    supply.ret(lo, fx, Held::Address(list));
+}
+
 /// The offset of a field of the root grant the operation is named after.
-fn field(lo: &mut Lowering, supply: &Supply, name: &str) -> u64 {
+pub(super) fn field(lo: &mut Lowering, supply: &Supply, name: &str) -> u64 {
     let grant = supply.owner.clone().expect("a root grant");
     lo.layouts.field(lo.ck, &grant, None, name).offset
 }
@@ -123,6 +216,69 @@ fn regions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, Held::Address(list));
 }
 
+/// `k.modules()`: the first time, the modules the start information lists, in its order, drawn
+/// through the root allocator; an empty list after, and on a target without a start information.
+fn modules(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let grant = supply.param(0).address();
+    let at = field(lo, supply, "modules");
+    let taken = fx.load(types::I8, grant, at);
+    let yes = fx.int(types::I8, 1);
+    fx.store(yes, grant, at);
+    let list = supply.sret.expect("the modules' address");
+    let module_ty = supply
+        .abi
+        .result
+        .type_arg(0)
+        .cloned()
+        .expect("the module type");
+    let element = Element::of(lo, &module_ty);
+    let cell = fx.load(PTR, grant, field(lo, supply, "alloc"));
+    vector::empty(fx, list, cell, element);
+    let info = lo.start_info(fx);
+    let untaken = fx.b.ins().icmp_imm_s(IntCC::Equal, taken, 0);
+    let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
+    let first = fx.b.ins().band(untaken, given);
+    fx.when(first, |fx| {
+        let count = start::count(fx, info, start::info::MODULE_COUNT);
+        let entries = fx.load(PTR, info, start::info::MODULES);
+        let room = vector::reserve(lo, fx, list, count, element);
+        let short = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
+        fx.when(short, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+        let data = fx.load(PTR, list, vector::DATA);
+        let region_at = lo.layouts.field(lo.ck, &module_ty, None, "region").offset;
+        let name_at = lo.layouts.field(lo.ck, &module_ty, None, "name_at").offset;
+        let zero = fx.ptr(0);
+        fx.each(zero, count, |fx, index| {
+            let offset = fx.b.ins().imul_imm_s(index, start::module::BYTES);
+            let entry = fx.b.ins().iadd(entries, offset);
+            let at = element.at(fx, data, index);
+            let region = fx.offset(at, region_at);
+            let address = fx.load(PTR, entry, start::module::ADDRESS);
+            fx.store(address, region, region::BASE);
+            let size = fx.load(PTR, entry, start::module::SIZE);
+            fx.store(size, region, region::LEN);
+            let name = fx.load(PTR, entry, start::module::NAME);
+            fx.store(name, at, name_at);
+        });
+        fx.store(count, list, vector::LEN);
+    });
+    supply.ret(lo, fx, Held::Address(list));
+}
+
+/// `module.contents()`: a view of the module's memory.
+fn module_contents(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let module = supply.param(0).address();
+    let module_ty = supply.owner.clone().expect("the module type");
+    let region_at = lo.layouts.field(lo.ck, &module_ty, None, "region").offset;
+    let region = fx.offset(module, region_at);
+    let base = fx.load(PTR, region, region::BASE);
+    let len = fx.load(PTR, region, region::LEN);
+    let sret = supply.sret.expect("a view's address");
+    fx.store(base, sret, 0);
+    fx.store(len, sret, 8);
+    supply.done(lo, fx);
+}
+
 /// Inserts the region from `base` to `end`, when it is not empty, into a list of regions in
 /// address order, trapping when the list cannot grow.
 fn push_region(
@@ -167,8 +323,9 @@ fn push_region(
 }
 
 /// `take k.anchor(take state, run: f)`: moves `state` into the storage the image reserves for
-/// the anchor and installs it, then starts the kernel executor on every CPU and runs `f` as its
-/// first kernel task, given the executor. The kernel halts once that task ends.
+/// the anchor and installs it, then starts the kernel executor on every CPU, floating point
+/// disabled, and runs `f` as its first kernel task, given the executor. The kernel halts once
+/// that task ends.
 fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state_ty = supply.type_arg(0);
     let layout = lo.layout(&state_ty);
@@ -181,6 +338,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let prepare = lo.interrupt_setup(fx);
     let call = lo.func_ref(fx, prepare);
     fx.b.ins().call(call, &[]);
+    lo.call_stub(fx, Stub::DisableFloats, &[]);
     let boot = lo.cpu_records(fx);
     lo.cpu_started(fx, boot);
     lo.start_cpus(fx, prepare);
@@ -196,7 +354,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let root = fx.load(PTR, state_address, state::ROOT);
     let done = first_task_done(lo);
     let first = scopes::start_task(
-        lo, fx, &run_ty, function, cell, process, root, process, None, None, done,
+        lo, fx, &run_ty, function, exec, cell, process, root, process, None, None, done,
     );
     fx.store(exec, first, task::ARGUMENT);
     fx.store(first, state_address, state::ENTRY_TASK);

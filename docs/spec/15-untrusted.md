@@ -1,6 +1,6 @@
-# Untrusted data
+# Untrusted and secret data
 
-This chapter defines Untrusted values, `Untrusted.of` and the sources of Untrusted data, their opacity, the content-blind operations on them, validators and `inspect`, the parsing and declassifying classes of validators, decoders and uses of encoders, and the `allow validate` grants that validators, decoders and the users of validators, decoders and encoders need.
+This chapter defines Untrusted values, `Untrusted.of` and the sources of Untrusted data, their opacity, the content-blind operations on them, validators and `inspect`, the parsing and declassifying classes of validators, decoders and uses of encoders, the `allow validate` grants that validators, decoders and the users of validators, decoders and encoders need, and Secret values with their constant-time operations and lowering.
 
 ## Untrusted values
 
@@ -277,7 +277,7 @@ A module **uses** a validator, decoder or encoder when one of its items:
 
 A call through a bound on a type parameter, or through `Dyn`, is not itself a use.
 
-The **codec uses** of a function are the type parameters whose decoders and encoders its code uses, each marked `decode`, `encode` or both. A use, as above, of a codec of a type parameter of the code holding it, a call of its `decode` or `encode` through its bound included, is no use of a decoder or encoder: it marks the parameter with that codec. A use of a codec of another type marks with that codec each type parameter that the type holds as a type argument at any depth. `Codec.decode` of `mem::wire`, `text::json` and `text::construction` marks `T` `decode`, and the `encode` and `try_encode` of `mem::wire` and `text::json` mark it `encode`. The codec uses of a function are [interface facts](05-properties.md#interface-facts) of it.
+The **codec uses** of a function are the type parameters whose decoders and encoders its code uses, each marked `decode`, `encode` or both. A use, as above, of a codec of a type parameter of the code holding it, a call of its `decode` or `encode` through its bound included, is no use of a decoder or encoder: it marks the parameter with that codec. A use of a codec of another type marks with that codec each type parameter that the type holds as a type argument at any depth. `Codec.decode` of `mem::wire`, `text::json` and `text::construction` and the `canonical`, `erased` and `decode_from` of `mem::wire` mark `T` `decode`, and the `encode` and `try_encode` of `mem::wire` and `text::json` and the `encode_as` of `mem::wire` mark it `encode`. A use of the decoder of a type with [forward migrations](13-text-encode.md#migrations) is also a use of the decoder of each frozen shape they convert from, and a use of the encoder of a type with inverses one of the encoder of each frozen shape they convert to. The codec uses of a function are [interface facts](05-properties.md#interface-facts) of it.
 
 `validate` is the [manifest grant](14-authority.md#manifest-grants) for reading Untrusted contents. A module performs it directly exactly when it holds one of these operations, each located on the line given:
 
@@ -459,10 +459,118 @@ pub fn keep_count(count: u32, mut out: mem::Bytes) {
 } keep_count
 ```
 
+## Secret values
+
+**Secret** is the core type `core::Secret[T: core::SecretBits]`: a value of `T`, such as a key, whose operations take the same steps and the same time whatever value it holds. `core::SecretBits` is the core interface that exactly the integer types, `bool` and the integer [lane types](09-numbers.md#lanes) implement; an impl line naming it is an error (`secret.bits-impl`).
+
+```nan-api
+// module: core
+
+pub interface SecretBits {
+} SecretBits
+
+pub fn Secret.of(value: T) -> Secret[T] limits pure, notrap, terminates
+    example Secret.of(7u8).reveal() == 7
+
+pub fn Secret.reveal(self) -> T limits pure, notrap, terminates
+    example Secret.of(true).reveal()
+```
+
+- A Secret value has no fields or variants that any code sees and holds exactly a `T` value. `Secret[T]` is a [base type](05-properties.md#structural-properties) that is Copy, Send and Inert, neither linear nor a view, and not AnyBits.
+- Apart from the property interfaces, `Secret[T]` implements no std interface: comparing, ordering, hashing, rendering, encoding or generating a Secret value is an error (`interface.not-implemented`), as is passing one where a bound names another std interface (`generic.unsatisfied-bound`) or deriving such an interface for a type holding one (`derive.constituent-missing`).
+- `Secret.of(v)` wraps a value and `reveal` yields it. A value revealed is ordinary data, which may decide branches, indexes and output.
+- An expression of type `Secret[T]` where the expected type is `T`, such as the condition of an `if`, an operand of `and`, an index or an argument, is an error (`secret.public-use`), reported in place of `type.mismatch`. Its because-chain is one `note` reason, `core::Secret.select`, the member that chooses between Secret values without a branch.
+- Besides `of` and `reveal`, std declares exactly these members of Secret, each only for the receivers `Secret[T]` its table row lists. On another instantiation the name is unknown (`name.unknown`).
+
+| Head | Receivers `Secret[T]` |
+| --- | --- |
+| `fn wrapping_add(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates`, and `wrapping_sub` alike | integer `T`, integer lane type `T` |
+| `fn wrapping_mul(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates` | integer `T`, integer lane type `T` of 16-bit lanes or wider |
+| `fn mul_high(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates` | `u64`, `i64` |
+| `fn bit_and(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates`, and `bit_or` and `bit_xor` alike | every `T` |
+| `fn bit_not(self) -> Secret[T] limits pure, notrap, terminates` | every `T` |
+| `fn shl(self, amount: u32) -> Secret[T] limits pure, terminates`, and `shr` alike | integer `T`, integer lane type `T` |
+| `fn rotate_left(self, amount: u32) -> Secret[T] limits pure, notrap, terminates`, and `rotate_right` alike | integer `T` |
+| `fn eq(self, other: Secret[T]) -> Secret[bool] limits pure, notrap, terminates`, and `ne` alike | every `T` |
+| `fn lt(self, other: Secret[T]) -> Secret[bool] limits pure, notrap, terminates`, and `le`, `gt` and `ge` alike | integer `T` |
+| `fn select[V: SecretBits](self, if_true: Secret[V], if_false: Secret[V]) -> Secret[V] limits pure, notrap, terminates` | `bool` |
+| `fn widen[S: SecretBits](value: Secret[S]) -> Secret[T] limits pure, notrap, terminates`, and `truncate` alike | integer `T` |
+| `fn equal(a: Slice[Secret[T]], b: Slice[Secret[T]]) -> Secret[bool] limits pure, terminates` | every `T` |
+| `fn copy_if(mut target: SliceMut[Secret[T]], source: Slice[Secret[T]], choice: Secret[bool]) limits pure, terminates` | every `T` |
+
+Each member computes on the values its Secret operands hold and wraps its result, for w the width of `T`:
+
+- `wrapping_add`, `wrapping_sub` and `wrapping_mul` compute as the `wrapping_op` of [overflow](09-numbers.md#overflow), and `mul_high` as the `high` of [`wide_mul`](09-numbers.md#wide-multiplication).
+- `bit_and`, `bit_or`, `bit_xor` and `bit_not` compute as `&`, `|`, `^` and `~`; on `bool` they are and, or, exclusive or and negation.
+- `shl` and `shr` trap when the amount n is at least w (`trap.shift`). Otherwise `shl` is the value congruent to a × 2^n modulo 2^w, and `shr` is a ÷ 2^n rounded toward negative infinity. `rotate_left` and `rotate_right` rotate the w bits by n modulo w.
+- `eq`, `ne`, `lt`, `le`, `gt` and `ge` compare as `==`, `!=`, `<`, `<=`, `>` and `>=` on `T`.
+- On an integer lane type, `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shl` and `shr` compute lane by lane as the lane type's members of those names, `shl` and `shr` trapping when n is at least the lane width, and `eq` holds when every lane is equal.
+- `c.select(a, if_false: b)` is `a` when `c` holds `true`, and `b` otherwise.
+- `Secret[T].widen(x)` and `Secret[T].truncate(x)`, for `x` of `Secret[S]`, convert as `T.widen` and `T.truncate` of [conversions](09-numbers.md#conversions). A source `S` that is no integer type is an error (`num.conversion-undefined`), as are `S` equal to `T` (`num.same-type-conversion`), `widen` on a pair that is not a widening pair (`num.widen-lossy`) and `truncate` on a widening pair (`num.widen-applies`).
+- `equal` requires `a.len() == b.len()` and holds `true` exactly when every element of `a` equals the element of `b` at its position. `copy_if` requires `target.len() == source.len()` and, when `choice` holds `true`, copies every element of `source` into `target`; otherwise it leaves `target` unchanged.
+
+```nan
+pub fn mixed_lanes(swap: core::Secret[bool], a: core::Secret[core::simd::U32x4], b: core::Secret[core::simd::U32x4]) -> core::Secret[core::simd::U32x4]
+    example mixed_lanes(core::Secret.of(true), a: core::Secret.of(core::simd::U32x4.splat(1)), b: core::Secret.of(core::simd::U32x4.splat(2))).reveal().lane(0) == 3
+{
+    return swap.select(a.wrapping_add(b), if_false: a.bit_xor(b).shl(4))
+} mixed_lanes
+
+pub fn conditional_swap(swap: core::Secret[bool], mut a: core::Secret[u64], mut b: core::Secret[u64]) {
+    let mask = swap.select(core::Secret.of(~0u64), if_false: core::Secret.of(0))
+    let flip = a.bit_xor(b).bit_and(mask)
+    a = a.bit_xor(flip)
+    b = b.bit_xor(flip)
+} conditional_swap
+
+test swaps_only_when_asked for conditional_swap {
+    var a = core::Secret.of(3u64)
+    var b = core::Secret.of(9u64)
+    conditional_swap(core::Secret.of(true), mut a, mut b)
+    expect a.reveal() == 9 and b.reveal() == 3
+    conditional_swap(core::Secret.of(false), mut a, mut b)
+    expect a.reveal() == 9
+} swaps_only_when_asked
+```
+
+```nan
+pub fn tag_matches(tag: Slice[core::Secret[u8]], expected: Slice[core::Secret[u8]]) -> bool {
+    if tag.len() != expected.len() {
+        return false
+    }
+    return core::Secret.equal(tag, b: expected).reveal()
+} tag_matches
+```
+
+```nan
+pub fn key_matches(key: core::Secret[u64], guess: core::Secret[u64]) -> bool {
+    if key.eq(guess) { // error: secret.public-use
+        return true
+    }
+    return false
+} key_matches
+```
+
+```nan
+pub closed struct Limb derives Copy {
+    pub bits: u64
+} Limb
+
+impl Limb: core::SecretBits // error: secret.bits-impl
+```
+
+### Constant-time lowering
+
+[Lowering](30-artefacts.md#lowering) gives each member of Secret other than `equal` and `copy_if` a fixed sequence of integer additions, subtractions, multiplications, bitwise operations, shifts, rotations, comparisons giving a flag, conditional moves (`cmov` on x86_64, `csel` on AArch64), extensions and truncations; over a lane type, those operations lane by lane, in vector registers on a host target with broadcasts and bitwise selects, and the loads and stores of its lanes at its operands' addresses. That sequence holds no branch, no division and no memory access whose address depends on an operand; its only branch is the check of the amount of `shl` and `shr`, which depends on the amount alone. `equal` and `copy_if` branch and index only on the lengths of their slices and the positions within them. A function computing on Secret values through these members thus branches, divides and addresses memory independently of the values they hold.
+
+The time each of these instructions takes is independent of its operands on a processor whose data-independent timing mode is on and that lists the instruction under that mode; the [runtime](27-program-model.md#runtime-support) turns that mode on where the program can. The guarantee covers the instructions lowering emits, not speculative execution, power or frequency variation, nor the clearing of Secret values from registers and memory.
+
 ## Diagnostics
 
 | Code | Class | Rule |
 | --- | --- | --- |
+| `secret.bits-impl` | error | [Secret values](#secret-values) |
+| `secret.public-use` | error | [Secret values](#secret-values) |
 | `untrusted.inspect-outside-validator` | error | [Validators](#validators) |
 | `untrusted.validator-interface` | error | [Validators](#validators) |
 | `untrusted.validator-no-input` | error | [Validators](#validators) |

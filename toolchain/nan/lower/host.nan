@@ -115,6 +115,11 @@ const SIGINFO: u64 = 128
 
 const SIGPIPE: i64 = 13
 
+/// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
+const AT_HWCAP: u64 = 16
+
+const HWCAP_DIT: i64 = 1 << 24
+
 fn termination_signals() -> Array[i64, 3] {
     var listed = Array[i64, 3].filled(1)
     listed[1] = 2
@@ -154,6 +159,7 @@ fn entry_seam(mut lo: Lowering, program: Program) {
     let id = mut lo.module.declare_function("main", linkage: object::Linkage.Export, signature)
     mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
         let incoming = mut seam_fx.entry()
+        mut seam_lo.check_level(fx: mut seam_fx)
         system_start(mut seam_lo, fx: mut seam_fx)
         let world_ty = seam_lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(seam_lo.alloc))
         let laid = mut seam_lo.layout_of(world_ty)
@@ -420,21 +426,6 @@ fn install_handler(mut lo: Lowering, mut fx: Fx, signal_number: i32, routine: Ro
     discard mut lo.call_libc(mut fx, name: "sigaction", args: action_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
 } install_handler
 
-/// Whether a code address lies in a function a stopping task does not stop inside; an address
-/// outside lowered code counts as one when `unknown` holds.
-fn critical_at(mut lo: Lowering, mut fx: Fx, address: clif::Value, unknown: bool) -> clif::Value {
-    let holding = function_at(mut lo, mut fx, address)
-    let found = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: holding.start, y: 0)
-    let critical_bits = mut fx.b.band_imm_s(holding.flags, y: i64.widen(LINES_CRITICAL))
-    let is_critical = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: critical_bits, y: 0)
-    var unknown_flag: i64 = 0
-    if unknown {
-        unknown_flag = 1
-    }
-    let outside = mut fx.int(clif::Type.Int8, value: unknown_flag)
-    return mut fx.b.select(found, x: is_critical, y: outside)
-} critical_at
-
 /// `Preempt(signal, info, context)`: the handler of the stop signal. When the task the thread
 /// runs is asked to stop, holds no lock and has no frame of a function it does not stop inside,
 /// the handler makes it resume in `Stop` on its own stack, below the interrupted frame; otherwise
@@ -468,98 +459,49 @@ fn host_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
     let on_stack = mut fx.b.band(above, y: below)
     let stopping = mut fx.b.band(asked_unlocked, y: on_stack)
     mut fx.if_true(stopping, then: fn[mut lo](mut stop_fx: Fx) {
-        let in_ip = critical_at(mut lo, fx: mut stop_fx, address: ip, unknown: true)
-        // The return address of a function interrupted in its prologue or epilogue, before its
-        // frame pointer is set or after it is restored, lives in the link register where the
-        // architecture has one, and otherwise in the two words at the stack pointer.
-        var busy = in_ip
+        var link: Option[clif::Value] = None
         match ctx.link {
-            Some(link) => {
-                let address = mut stop_fx.load(PTR, addr: context, offset: link)
-                let in_link = critical_at(mut lo, fx: mut stop_fx, address, unknown: false)
-                busy = mut stop_fx.b.bor(in_ip, y: in_link)
+            Some(offset) => {
+                link = Some(mut stop_fx.load(PTR, addr: context, offset))
             }
-            None => {
-                let top = mut stop_fx.load(PTR, addr: sp, offset: 0)
-                let in_top = critical_at(mut lo, fx: mut stop_fx, address: top, unknown: false)
-                let next = mut stop_fx.load(PTR, addr: sp, offset: 8)
-                let in_next = critical_at(mut lo, fx: mut stop_fx, address: next, unknown: false)
-                let busy_top = mut stop_fx.b.bor(in_ip, y: in_top)
-                busy = mut stop_fx.b.bor(busy_top, y: in_next)
-            }
+            None => {}
         }
-        let free = mut stop_fx.b.bxor_imm_s(busy, y: 1)
-        mut stop_fx.if_true(free, then: fn[mut lo](mut free_fx: Fx) {
-            preempt_frames(mut lo, fx: mut free_fx, ctx, context, record, sp, fp, low, high, free)
+        let at = Interrupted(ip: ip, sp: sp, fp: fp, link: link, low: low, high: high)
+        let free = stoppable(mut lo, fx: mut stop_fx, at)
+        mut stop_fx.if_true(free, then: fn[mut lo](mut then_fx: Fx) {
+            preempt_resume(mut lo, fx: mut then_fx, ctx, context, record, sp)
         })
     })
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } host_preempt
 
-/// The rest of `Preempt` once neither the interrupted code nor the return address of a function
-/// interrupted in its prologue or epilogue forbids stopping, `free` holding: walks the frame
-/// pointers from `fp` down the task's stack, between `low` and `high`, and when no frame forbids
-/// it, makes the task resume in `Stop`.
-fn preempt_frames(mut lo: Lowering, mut fx: Fx, ctx: Context, context: clif::Value, record: clif::Value, sp: clif::Value, fp: clif::Value, low: clif::Value, high: clif::Value, free: clif::Value) {
-    var walk_start = Array[clif::Value, 2].filled(fp)
-    walk_start[1] = free
-    let walked = mut fx.repeat(walk_start.view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
-        expect current.len() > 1
-        let frame = current[0]
-        let walk_free = current[1]
-        let frame_above = mut pass_fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: frame, y: low)
-        let end = mut pass_fx.b.iadd_imm_s(frame, y: 16)
-        let frame_below = mut pass_fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: high)
-        let inside = mut pass_fx.b.band(frame_above, y: frame_below)
-        var stepped_types = Array[clif::Type, 2].filled(PTR)
-        stepped_types[1] = clif::Type.Int8
-        let stepped = mut pass_fx.choose_in(mut lo, condition: inside, results: stepped_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-            let address = mut yes_fx.load(PTR, addr: frame, offset: 8)
-            let at_base = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
-            let frame_critical = critical_at(mut cx, fx: mut yes_fx, address, unknown: true)
-            let frame_free = mut yes_fx.b.bxor_imm_s(frame_critical, y: 1)
-            let free_or_base = mut yes_fx.b.bor(at_base, y: frame_free)
-            var caller = mem::List[clif::Value].empty(yes_fx.alloc)
-            mut caller.push(mut yes_fx.load(PTR, addr: frame, offset: 0))
-            mut caller.push(free_or_base)
-            return caller
-        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-            var outside_stack = mem::List[clif::Value].empty(no_fx.alloc)
-            mut outside_stack.push(mut no_fx.ptr(0))
-            mut outside_stack.push(walk_free)
-            return outside_stack
-        })
-        let more = mut pass_fx.b.band(inside, y: stepped[1])
-        return Pass(again: more, next: take stepped)
-    })
-    let walked_free = walked[1]
-    mut fx.if_true(walked_free, then: fn[mut lo](mut then_fx: Fx) {
-        // Resume in `Stop` below the interrupted frame: where the return address lives on the
-        // stack, past the red zone and behind a null return; where it lives in the link register,
-        // at the aligned stack pointer with that register cleared.
-        var resumed = sp
-        match ctx.link {
-            Some(link) => {
-                resumed = mut then_fx.b.band_imm_s(sp, y: -16)
-                let zero_word = mut then_fx.ptr(0)
-                mut then_fx.store(zero_word, addr: context, offset: link)
-            }
-            None => {
-                let lowered = mut then_fx.b.iadd_imm_s(sp, y: -128)
-                let aligned = mut then_fx.b.band_imm_s(lowered, y: -16)
-                resumed = mut then_fx.b.iadd_imm_s(aligned, y: -8)
-                let zero_word = mut then_fx.ptr(0)
-                mut then_fx.store(zero_word, addr: resumed, offset: 0)
-            }
+/// The rest of `Preempt` once no frame forbids stopping: makes the task resume in `Stop` below
+/// the interrupted frame: where the return address lives on the stack, past the red zone and
+/// behind a null return; where it lives in the link register, at the aligned stack pointer with
+/// that register cleared.
+fn preempt_resume(mut lo: Lowering, mut fx: Fx, ctx: Context, context: clif::Value, record: clif::Value, sp: clif::Value) {
+    var resumed = sp
+    match ctx.link {
+        Some(link) => {
+            resumed = mut fx.b.band_imm_s(sp, y: -16)
+            let zero_word = mut fx.ptr(0)
+            mut fx.store(zero_word, addr: context, offset: link)
         }
-        mut then_fx.store(resumed, addr: context, offset: ctx.sp)
-        let stop_id = mut lo.routine(Routine.Stop)
-        let stop_ref = mut lo.func_ref(mut then_fx, id: stop_id)
-        let stop_address = mut then_fx.b.func_addr(PTR, func_ref: stop_ref)
-        mut then_fx.store(stop_address, addr: context, offset: ctx.ip)
-        mut then_fx.store(record, addr: context, offset: ctx.arg)
-    })
-} preempt_frames
+        None => {
+            let lowered = mut fx.b.iadd_imm_s(sp, y: -128)
+            let aligned = mut fx.b.band_imm_s(lowered, y: -16)
+            resumed = mut fx.b.iadd_imm_s(aligned, y: -8)
+            let zero_word = mut fx.ptr(0)
+            mut fx.store(zero_word, addr: resumed, offset: 0)
+        }
+    }
+    mut fx.store(resumed, addr: context, offset: ctx.sp)
+    let stop_id = mut lo.routine(Routine.Stop)
+    let stop_ref = mut lo.func_ref(mut fx, id: stop_id)
+    let stop_address = mut fx.b.func_addr(PTR, func_ref: stop_ref)
+    mut fx.store(stop_address, addr: context, offset: ctx.ip)
+    mut fx.store(record, addr: context, offset: ctx.arg)
+} preempt_resume
 
 /// `Overflow(signal, info, context)`: the handler of a fault. A fault in the guard region of
 /// the running task's stack resumes in `OverflowRaise` on the thread's trap stack, as if
@@ -671,11 +613,13 @@ fn overflow_caller(mut fx: Fx, ctx: Context, context: clif::Value, entering: cli
 } overflow_caller
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
-/// calling thread being the first, and the reading of termination requests; returns 1 from
-/// `Init` when the system refuses the first thread's ring or the second thread. Each other
+/// calling thread being the first, and the reading of termination requests, after the
+/// data-independent timing mode, which they inherit; returns 1 from `Init` when the system
+/// refuses the first thread's ring or the second thread. Each other
 /// thread sets up its own ring and starts the next, as `ThreadMain` does, so that starting
 /// costs the calling thread one ring and one thread whatever the processors.
 fn start_threads(mut lo: Lowering, mut fx: Fx) {
+    host_constant_time(mut lo, mut fx)
     let state_address = mut lo.state(mut fx)
     if lo.seeded() {
         start_seeded(mut lo, mut fx)
@@ -783,6 +727,21 @@ fn thread_start(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         system_unavailable(mut lo, fx: mut then_fx)
     })
 } thread_start
+
+/// Turns on `PSTATE.DIT` on an AArch64 host whose kernel reports `HWCAP_DIT`, and so emulates the
+/// stub's read of `ID_AA64PFR0_EL1`. An x86_64 process cannot turn on DOITM, which is the
+/// kernel's.
+fn host_constant_time(mut lo: Lowering, mut fx: Fx) {
+    if lo.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        return
+    }
+    let kind = mut fx.ptr(AT_HWCAP)
+    let hwcap = first_result(mut lo.call_libc(mut fx, name: "getauxval", args: Array[clif::Value, 1].filled(kind).view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    let dit = mut fx.b.band_imm_s(hwcap, y: HWCAP_DIT)
+    mut fx.if_true(dit, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} host_constant_time
 
 /// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
 /// thread, without a ring; a fault reports a stack overflow, and the run ends with status

@@ -1,16 +1,16 @@
 //! The `text::json` format's writing and reading of each kind. A reading gives its values and
 //! the code of its failure, zero for none.
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, Signature, Type, Value, condcodes::IntCC, types,
+};
 
-use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::Routine;
 use super::super::super::{CALL_CONV, Glue, Lowering};
 use super::super::mem::vector;
 use super::super::render::encode_utf8;
 use super::{failure, put_byte, put_bytes, put_literal, reader, utf8_valid};
-use crate::check::ty::Scalar;
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -54,16 +54,8 @@ pub fn put_integer(lo: &mut Lowering, fx: &mut Fx, state: Value, value: Value, s
 }
 
 /// Writes a float as its rendering, `NaN`, `inf` and `-inf` as JSON strings.
-pub fn put_float(lo: &mut Lowering, fx: &mut Fx, state: Value, scalar: Scalar, value: Value) {
-    let buffer = fx.slot(40, 8);
-    let name = match scalar {
-        Scalar::F32 => "f32_text",
-        _ => "f64_text",
-    };
-    let len = lo
-        .platform_call(fx, name, &[Held::Scalar(value), Held::Address(buffer)])
-        .result
-        .scalar();
+pub fn put_float(lo: &mut Lowering, fx: &mut Fx, state: Value, value: Value) {
+    let (buffer, len) = super::super::floats::text(lo, fx, value);
     let first = fx.load(types::I8, buffer, 0);
     let second = fx.load(types::I8, buffer, 1);
     let nan = fx.b.ins().icmp_imm_s(IntCC::Equal, first, i64::from(b'N'));
@@ -506,25 +498,26 @@ pub fn read_integer(lo: &mut Lowering, fx: &mut Fx, state: Value, signed: bool) 
     (parts[0], parts[1])
 }
 
-/// A float: any number rounded to f64, or one of the strings `NaN`, `inf` and `-inf`.
-pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value) {
+/// A float: any number rounded to f64, or one of the strings `NaN`, `inf` and `-inf`, as a value
+/// of `float`, the type holding an f64.
+pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value, float: Type) -> (Value, Value) {
     let (byte, failed) = peek(fx, state);
     let ok = succeeded(fx, failed);
     let quoted = fx.b.ins().icmp_imm_s(IntCC::Equal, byte, i64::from(b'"'));
     let parts = fx.choose_in(
         lo,
         ok,
-        &[types::F64, types::I32],
+        &[types::I64, types::I32],
         |lo, fx| {
             fx.choose_in(
                 lo,
                 quoted,
-                &[types::F64, types::I32],
+                &[types::I64, types::I32],
                 |lo, fx| {
                     let buffer = fx.slot(8, 1);
                     let capacity = fx.ptr(8);
                     let (len, failed) = string(lo, fx, state, buffer, capacity);
-                    let mut value = fx.b.ins().f64const(0.0);
+                    let mut bits = fx.int(types::I64, 0);
                     let mut known = fx.int(types::I8, 0);
                     for (word, float) in [
                         (b"NaN".as_slice(), f64::NAN),
@@ -532,15 +525,15 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
                         (b"-inf", f64::NEG_INFINITY),
                     ] {
                         let same = super::bytes_equal(lo, fx, buffer, len, word);
-                        let constant = fx.b.ins().f64const(float);
-                        value = fx.b.ins().select(same, constant, value);
+                        let constant = fx.int(types::I64, float.to_bits() as i64);
+                        bits = fx.b.ins().select(same, constant, bits);
                         known = fx.b.ins().bor(known, same);
                     }
                     let ok = succeeded(fx, failed);
                     let malformed = code(fx, failure::MALFORMED);
                     let none = code(fx, 0);
                     let checked = fx.b.ins().select(known, none, malformed);
-                    vec![value, fx.b.ins().select(ok, checked, failed)]
+                    vec![bits, fx.b.ins().select(ok, checked, failed)]
                 },
                 |lo, fx| {
                     let (start, end, _, failed) = number(lo, fx, state);
@@ -548,37 +541,23 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
                     fx.choose_in(
                         lo,
                         ok,
-                        &[types::F64, types::I32],
+                        &[types::I64, types::I32],
                         |lo, fx| {
                             let len = fx.b.ins().isub(end, start);
-                            let size = fx.b.ins().iadd_imm_s(len, 1);
-                            let text = lo.record_alloc(fx, size);
-                            let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, text, 0);
-                            fx.choose_in(
-                                lo,
-                                missing,
-                                &[types::F64, types::I32],
-                                |_, fx| {
-                                    vec![fx.b.ins().f64const(0.0), code(fx, failure::OUT_OF_MEMORY)]
-                                },
-                                |lo, fx| {
-                                    lo.call_routine(fx, Routine::Copy, &[text, start, len]);
-                                    let none = fx.ptr(0);
-                                    let value =
-                                        lo.call_libc(fx, "strtod", &[text, none], &[types::F64])[0];
-                                    lo.record_free(fx, text);
-                                    vec![value, code(fx, 0)]
-                                },
-                            )
+                            let bits = super::super::floats::parse(lo, fx, start, len);
+                            vec![bits, code(fx, 0)]
                         },
-                        |_, fx| vec![fx.b.ins().f64const(0.0), failed],
+                        |_, fx| vec![fx.int(types::I64, 0), failed],
                     )
                 },
             )
         },
-        |_, fx| vec![fx.b.ins().f64const(0.0), failed],
+        |_, fx| vec![fx.int(types::I64, 0), failed],
     );
-    (parts[0], parts[1])
+    (
+        super::super::numbers::from_bits(fx, parts[0], float),
+        parts[1],
+    )
 }
 
 /// A char: a JSON string of exactly one char, its scalar value in 64 bits.

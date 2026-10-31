@@ -409,7 +409,7 @@ pub fn reading_count(readings: Slice[Reading]) -> usize {
 
 ## Capability types
 
-A **primitive capability** is a base type that its owning chapter declares a [capability](14-authority.md#capabilities); [Standard library 1.0](28-stdlib.md) lists every one. A **capability type** is a primitive capability, a struct or enum with a capability type among its constituent types, or an instantiation of a type of the table or a base type whose type argument at a dependent parameter of Inert is a capability type. An allocator that a std base type stores is no constituent type, so it makes no capability type.
+A **primitive capability** is a base type that its owning chapter declares a [capability](14-authority.md#capabilities), which [Standard library 1.0](28-stdlib.md) lists, or a [capability kind](14-authority.md#capability-kinds). A **capability type** is a primitive capability, a struct or enum with a capability type among its constituent types, or an instantiation of a type of the table or a base type whose type argument at a dependent parameter of Inert is a capability type. An allocator that a std base type stores is no constituent type, so it makes no capability type.
 
 - `derives Default`, `derives Encode` or `derives Generate` on a capability type is an error (`prop.capability-derive`). It is the only code that entry produces.
 

@@ -1,6 +1,6 @@
 # Numbers
 
-This chapter defines the operators on number types, integer overflow and its named alternatives, division, shifts, bit counts, wide multiplication, the iteration of ranges, named conversions with bit patterns, floats and their total order.
+This chapter defines the operators on number types, integer overflow and its named alternatives, division, shifts, bit counts, wide multiplication, the iteration of ranges, named conversions with bit patterns, floats and their total order, and lane types.
 
 ## Number operators
 
@@ -592,16 +592,266 @@ pub fn precedes(left: f64, right: f64) -> bool
 } precedes
 ```
 
+## Lanes
+
+The module `core::simd` declares the **lane types**, each 128 bits split into lanes of one type: `U8x16`, `I8x16`, `U16x8`, `I16x8`, `U32x4`, `I32x4`, `U64x2` and `I64x2`, whose lanes have the integer type their name gives, `F32x4`, of four `f32` lanes, and `F16x8`, of eight IEEE 754 binary16 lanes held as their `u16` bit patterns. It also declares the **mask types** `Mask8x16`, `Mask16x8`, `Mask32x4` and `Mask64x2`, each lane of which is all ones or all zeros; comparing the lanes of a lane type of lane width w gives the mask type of width w. Every lane type and mask type is Copy, and the integer lane types and the mask types are Eq, comparing every lane. Lanes are numbered from 0: `of` and `to_array` take and give them in order, and `to_bytes` and `from_bytes` give and take the bytes of each lane in turn, least significant first.
+
+Each member computes lane by lane, as the scalar operation of [Overflow](#overflow), [Shifts](#shifts), [Conversions](#conversions) and [Floats](#floats) it names computes on the lanes in the same position:
+
+- `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `saturating_add` and `saturating_sub` are the integer methods of those names; `bit_and`, `bit_or`, `bit_xor` and `bit_not` are `&`, `|`, `^` and `~`; `shl` is `<<`, or `wrapping_shl` on a signed lane type, and `shr` is `>>`, or `shr_arith` on a signed lane type, by an amount below the lane width, which `requires` states.
+- `lanes_eq`, `lanes_lt` and `lanes_gt` give the mask whose lane is all ones where `==`, `<` or `>` holds; on `F32x4` a NaN compares false. `select(mask, if_true, if_false)` takes each bit from `if_true` where the mask's bit is 1 and from `if_false` elsewhere.
+- `F32x4`'s `add`, `sub`, `mul`, `div` and `sqrt` are `+`, `-`, `*`, `/` and `f32.sqrt`, with the rounding, the absence of contraction and the canonical NaN of [Floats](#floats). `min` and `max` are the minimum and maximum of IEEE 754-2019: the canonical NaN when either lane is a NaN, and `-0.0` below `0.0`. `F32x4.from_i32x4` is `f32.nearest` and `to_i32x4` is `i32.saturate` of each lane.
+- `F16x8`'s `widen_low` and `widen_high` convert lanes 0 to 3 and lanes 4 to 7 exactly to `f32`, a NaN giving the canonical NaN. `F16x8.narrow(low, high)` rounds the lanes of `low` into lanes 0 to 3 and those of `high` into lanes 4 to 7 by roundTiesToEven, a NaN giving `0x7E00` and a value beyond the binary16 range an infinity.
+- `I8x16.dot(other, acc)` gives the `I32x4` whose lane k is lane k of `acc` plus, wrapping, the sum of the four products of lanes 4k to 4k + 3 of `self` and `other`, computed exactly in `i32`.
+- `wrapping_sum` adds the lanes, wrapping. `F32x4.sum` adds lanes 0 and 1, then lanes 2 and 3, then the two sums: `(l0 + l1) + (l2 + l3)`, each addition rounded.
+- A mask's `any` and `all` say whether some lane or every lane is all ones, and `bitmask` gives the `u16` whose bit i is the top bit of lane i.
+- `load(from, at)` and `store(to, at)` read and write the elements of a slice from `at`, one per lane; `lane` and `replace_lane` read and replace one lane.
+
+Every result is the same in the interpreter, on every target and at every [codegen level](27-program-model.md#codegen-levels). Lowering for a host target computes the members of the integer lane types, `F32x4` and the mask types with the vector instructions of its codegen level; lowering for a machine target computes every member lane by lane in general registers, and the members whose text operates on `f32` values have the float use [digest fact](10-effects-digests.md#digests) ([floating point](24-kernel.md#floating-point)).
+
+`core::simd` declares these items for `U32x4`, and the same items for the other integer lane types with that type's name in place of `U32x4`, its lane type in place of `u32`, its lane count in place of 4, its lane width in place of 32 and its mask type in place of `Mask32x4`, except that `U8x16` and `I8x16` have no `wrapping_mul`, only the 8- and 16-bit lane types have `saturating_add` and `saturating_sub`, and `U8x16` has no `to_bytes` and no `from_bytes`.
+
+```nan-api
+// module: core::simd
+
+pub open struct U32x4 derives Copy, Eq {
+} U32x4
+
+pub fn U32x4.splat(value: u32) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(7).lane(3) == 7
+
+pub fn U32x4.of(lanes: Array[u32, 4]) -> U32x4 limits pure, notrap, terminates
+    example U32x4.of(Array[u32, 4].filled(2)) == U32x4.splat(2)
+
+pub fn U32x4.to_array(self) -> Array[u32, 4] limits pure, notrap, terminates
+    example U32x4.splat(2).to_array()[0] == 2
+
+pub fn U32x4.load(from: Slice[u32], at: usize) -> U32x4 limits pure, notrap, terminates
+    requires at <= from.len() and from.len() - at >= 4
+    example U32x4.load(Array[u32, 5].filled(3).view(), at: 1) == U32x4.splat(3)
+
+pub fn U32x4.store(self, mut to: SliceMut[u32], at: usize) limits pure, notrap, terminates
+    requires at <= to.len() and to.len() - at >= 4
+
+pub fn U32x4.lane(self, index: usize) -> u32 limits pure, notrap, terminates
+    requires index < 4
+    example U32x4.splat(5).replace_lane(1, value: 6).lane(1) == 6
+
+pub fn U32x4.replace_lane(self, index: usize, value: u32) -> U32x4 limits pure, notrap, terminates
+    requires index < 4
+    example U32x4.splat(5).replace_lane(0, value: 6).lane(1) == 5
+
+pub fn U32x4.wrapping_add(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(~0).wrapping_add(U32x4.splat(2)) == U32x4.splat(1)
+
+pub fn U32x4.wrapping_sub(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(0).wrapping_sub(U32x4.splat(1)) == U32x4.splat(~0)
+
+pub fn U32x4.wrapping_mul(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(~0).wrapping_mul(U32x4.splat(2)) == U32x4.splat(~1)
+
+pub fn U32x4.bit_and(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(0b1100).bit_and(U32x4.splat(0b1010)) == U32x4.splat(0b1000)
+
+pub fn U32x4.bit_or(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(0b1100).bit_or(U32x4.splat(0b1010)) == U32x4.splat(0b1110)
+
+pub fn U32x4.bit_xor(self, other: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(0b1100).bit_xor(U32x4.splat(0b1010)) == U32x4.splat(0b0110)
+
+pub fn U32x4.bit_not(self) -> U32x4 limits pure, notrap, terminates
+    example U32x4.splat(0).bit_not() == U32x4.splat(~0)
+
+pub fn U32x4.shl(self, amount: u32) -> U32x4 limits pure, notrap, terminates
+    requires amount < 32
+    example U32x4.splat(3).shl(31) == U32x4.splat(0x8000_0000)
+
+pub fn U32x4.shr(self, amount: u32) -> U32x4 limits pure, notrap, terminates
+    requires amount < 32
+    example U32x4.splat(0x8000_0000).shr(31) == U32x4.splat(1)
+
+pub fn U32x4.lanes_eq(self, other: U32x4) -> Mask32x4 limits pure, notrap, terminates
+    example U32x4.splat(1).replace_lane(0, value: 2).lanes_eq(U32x4.splat(1)).bitmask() == 0b1110
+
+pub fn U32x4.lanes_lt(self, other: U32x4) -> Mask32x4 limits pure, notrap, terminates
+    example U32x4.splat(1).lanes_lt(U32x4.splat(2)).all()
+
+pub fn U32x4.lanes_gt(self, other: U32x4) -> Mask32x4 limits pure, notrap, terminates
+    example not U32x4.splat(1).lanes_gt(U32x4.splat(1)).any()
+
+pub fn U32x4.select(mask: Mask32x4, if_true: U32x4, if_false: U32x4) -> U32x4 limits pure, notrap, terminates
+    example U32x4.select(U32x4.splat(1).lanes_lt(U32x4.splat(2)), if_true: U32x4.splat(3), if_false: U32x4.splat(4)) == U32x4.splat(3)
+
+pub fn U32x4.wrapping_sum(self) -> u32 limits pure, notrap, terminates
+    example U32x4.splat(3).wrapping_sum() == 12
+
+pub fn U32x4.to_bytes(self) -> U8x16 limits pure, notrap, terminates
+    example U32x4.splat(1).to_bytes().lane(0) == 1
+
+pub fn U32x4.from_bytes(bytes: U8x16) -> U32x4 limits pure, notrap, terminates
+    example U32x4.from_bytes(U8x16.splat(0)) == U32x4.splat(0)
+```
+
+`I8x16` also declares:
+
+```nan-api
+// module: core::simd
+
+pub fn I8x16.dot(self, other: I8x16, acc: I32x4) -> I32x4 limits pure, notrap, terminates
+    example I8x16.splat(-128).dot(I8x16.splat(-128), acc: I32x4.splat(1)) == I32x4.splat(65_537)
+```
+
+`core::simd` declares these items for `Mask32x4`, and the same items for the other mask types with that type's name in place of `Mask32x4`.
+
+```nan-api
+// module: core::simd
+
+pub open struct Mask32x4 derives Copy, Eq {
+} Mask32x4
+
+pub fn Mask32x4.bit_and(self, other: Mask32x4) -> Mask32x4 limits pure, notrap, terminates
+    example not U32x4.splat(1).lanes_eq(U32x4.splat(1)).bit_and(U32x4.splat(1).lanes_eq(U32x4.splat(2))).any()
+
+pub fn Mask32x4.bit_or(self, other: Mask32x4) -> Mask32x4 limits pure, notrap, terminates
+    example U32x4.splat(1).lanes_eq(U32x4.splat(1)).bit_or(U32x4.splat(1).lanes_eq(U32x4.splat(2))).any()
+
+pub fn Mask32x4.bit_xor(self, other: Mask32x4) -> Mask32x4 limits pure, notrap, terminates
+    example U32x4.splat(1).lanes_eq(U32x4.splat(1)).bit_xor(U32x4.splat(1).lanes_eq(U32x4.splat(2))).any()
+
+pub fn Mask32x4.bit_not(self) -> Mask32x4 limits pure, notrap, terminates
+    example U32x4.splat(1).lanes_eq(U32x4.splat(2)).bit_not().all()
+
+pub fn Mask32x4.any(self) -> bool limits pure, notrap, terminates
+    example U32x4.splat(1).replace_lane(1, value: 2).lanes_eq(U32x4.splat(2)).any()
+
+pub fn Mask32x4.all(self) -> bool limits pure, notrap, terminates
+    example not U32x4.splat(1).replace_lane(1, value: 2).lanes_eq(U32x4.splat(2)).all()
+
+pub fn Mask32x4.bitmask(self) -> u16 limits pure, notrap, terminates
+    example U32x4.splat(1).replace_lane(1, value: 2).lanes_eq(U32x4.splat(2)).bitmask() == 0b10
+```
+
+`F32x4` declares `splat`, `of`, `to_array`, `load`, `store`, `lane`, `replace_lane`, `select`, `to_bytes` and `from_bytes` as `U32x4` does, with `F32x4` in place of `U32x4` and `f32` in place of `u32`, and these items:
+
+```nan-api
+// module: core::simd
+
+pub open struct F32x4 derives Copy {
+} F32x4
+
+pub fn F32x4.add(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(1.5).add(F32x4.splat(2.0)).lane(0) == 3.5
+
+pub fn F32x4.sub(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(1.5).sub(F32x4.splat(2.0)).lane(0) == -0.5
+
+pub fn F32x4.mul(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(1.5).mul(F32x4.splat(2.0)).lane(0) == 3.0
+
+pub fn F32x4.div(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(0.0).div(F32x4.splat(0.0)).lane(0).to_bits() == 0x7FC0_0000
+
+pub fn F32x4.min(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(0.0).min(F32x4.splat(-0.0)).lane(0).to_bits() == 0x8000_0000
+
+pub fn F32x4.max(self, other: F32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(1.0).max(F32x4.splat(0.0 / 0.0)).lane(0).to_bits() == 0x7FC0_0000
+
+pub fn F32x4.sqrt(self) -> F32x4 limits pure, notrap, terminates
+    example F32x4.splat(2.25).sqrt().lane(2) == 1.5
+
+pub fn F32x4.lanes_eq(self, other: F32x4) -> Mask32x4 limits pure, notrap, terminates
+    example not F32x4.splat(0.0 / 0.0).lanes_eq(F32x4.splat(0.0 / 0.0)).any()
+
+pub fn F32x4.lanes_lt(self, other: F32x4) -> Mask32x4 limits pure, notrap, terminates
+    example F32x4.splat(-0.5).lanes_lt(F32x4.splat(0.0)).all()
+
+pub fn F32x4.lanes_gt(self, other: F32x4) -> Mask32x4 limits pure, notrap, terminates
+    example not F32x4.splat(-0.0).lanes_gt(F32x4.splat(0.0)).any()
+
+pub fn F32x4.sum(self) -> f32 limits pure, notrap, terminates
+    example F32x4.splat(1.0).replace_lane(0, value: 100_000_000.0).replace_lane(2, value: -100_000_000.0).sum() == 0.0
+
+pub fn F32x4.from_i32x4(value: I32x4) -> F32x4 limits pure, notrap, terminates
+    example F32x4.from_i32x4(I32x4.splat(16_777_217)).lane(0) == 16_777_216.0
+
+pub fn F32x4.to_i32x4(self) -> I32x4 limits pure, notrap, terminates
+    example F32x4.splat(-2.5).replace_lane(1, value: 3_000_000_000.0).replace_lane(2, value: 0.0 / 0.0).to_i32x4() == I32x4.splat(-2).replace_lane(1, value: 2_147_483_647).replace_lane(2, value: 0)
+```
+
+```nan-api
+// module: core::simd
+
+pub open struct F16x8 derives Copy {
+} F16x8
+
+pub fn F16x8.of_bits(bits: Array[u16, 8]) -> F16x8 limits pure, notrap, terminates
+    example F16x8.of_bits(Array[u16, 8].filled(0x3C00)).widen_low().lane(0) == 1.0
+
+pub fn F16x8.to_bits(self) -> Array[u16, 8] limits pure, notrap, terminates
+    example F16x8.narrow(F32x4.splat(1.0), high: F32x4.splat(-2.0)).to_bits()[4] == 0xC000
+
+pub fn F16x8.load(from: Slice[u16], at: usize) -> F16x8 limits pure, notrap, terminates
+    requires at <= from.len() and from.len() - at >= 8
+    example F16x8.load(Array[u16, 9].filled(0x3C00).view(), at: 1).widen_high().lane(3) == 1.0
+
+pub fn F16x8.store(self, mut to: SliceMut[u16], at: usize) limits pure, notrap, terminates
+    requires at <= to.len() and to.len() - at >= 8
+
+pub fn F16x8.to_bytes(self) -> U8x16 limits pure, notrap, terminates
+    example F16x8.of_bits(Array[u16, 8].filled(0x3C00)).to_bytes().lane(1) == 0x3C
+
+pub fn F16x8.from_bytes(bytes: U8x16) -> F16x8 limits pure, notrap, terminates
+    example F16x8.from_bytes(U8x16.splat(0)).to_bits()[7] == 0
+
+pub fn F16x8.widen_low(self) -> F32x4 limits pure, notrap, terminates
+    example F16x8.of_bits(Array[u16, 8].filled(0x0001)).widen_low().lane(0).to_bits() == 0x3380_0000
+
+pub fn F16x8.widen_high(self) -> F32x4 limits pure, notrap, terminates
+    example F16x8.of_bits(Array[u16, 8].filled(0x7C01)).widen_high().lane(0).to_bits() == 0x7FC0_0000
+
+pub fn F16x8.narrow(low: F32x4, high: F32x4) -> F16x8 limits pure, notrap, terminates
+    example F16x8.narrow(F32x4.splat(65_520.0), high: F32x4.splat(0.00000001)).to_bits()[0] == 0x7C00
+    example F16x8.narrow(F32x4.splat(1.00048828125), high: F32x4.splat(0.0)).to_bits()[0] == 0x3C00
+```
+
+```nan
+pub fn mix(state: core::simd::U32x4, word: core::simd::U32x4) -> core::simd::U32x4
+    example mix(core::simd::U32x4.splat(1), word: core::simd::U32x4.splat(2)).lane(0) == 0x0030_0000
+{
+    let sum = state.wrapping_add(word)
+    return sum.shl(20).bit_or(sum.shr(12))
+} mix
+
+pub fn dot_product(weights: Slice[i8], inputs: Slice[i8]) -> i32
+    requires weights.len() == 16 and inputs.len() == 16
+    example dot_product(Array[i8, 16].filled(-128).view(), inputs: Array[i8, 16].filled(-128).view()) == 262_144
+{
+    let weighed = core::simd::I8x16.load(weights, at: 0)
+    let products = weighed.dot(core::simd::I8x16.load(inputs, at: 0), acc: core::simd::I32x4.splat(0))
+    return products.wrapping_sum()
+} dot_product
+
+pub fn doubled(values: Array[u32, 4]) -> Array[u32, 4]
+    example doubled(Array[u32, 4].filled(3))[2] == 6
+{
+    var out = Array[u32, 4].filled(0)
+    let lanes = core::simd::U32x4.of(values)
+    lanes.wrapping_add(lanes).store(mut out.view_mut(), at: 0)
+    return out
+} doubled
+```
+
 ## Diagnostics
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `num.conversion-undefined` | error | [Conversions](#conversions) |
+| `num.conversion-undefined` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |
 | `num.conversion-value` | error | [Conversions](#conversions) |
 | `num.from-bits-not-anybits` | error | [Bit patterns](#bit-patterns) |
-| `num.same-type-conversion` | error | [Conversions](#conversions), [Bit patterns](#bit-patterns) |
+| `num.same-type-conversion` | error | [Conversions](#conversions), [Bit patterns](#bit-patterns), [Secret values](15-untrusted.md#secret-values) |
 | `num.signed-division` | error | [Division](#division), [Number operators](#number-operators) |
 | `num.signed-shift-right` | error | [Shifts](#shifts), [Number operators](#number-operators) |
 | `num.unsigned-negation` | error | [Overflow](#overflow), [Number operators](#number-operators) |
-| `num.widen-applies` | error | [Conversions](#conversions) |
-| `num.widen-lossy` | error | [Conversions](#conversions) |
+| `num.widen-applies` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |
+| `num.widen-lossy` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |

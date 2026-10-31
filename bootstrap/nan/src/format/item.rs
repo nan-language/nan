@@ -108,6 +108,14 @@ impl Facts {
             let tokens: Vec<u32> = tree.child_tokens(node).collect();
             let rule = tree.rule(node);
             match rule {
+                Rule::ProtocolOperation => facts.paren_list(
+                    file,
+                    tree,
+                    node,
+                    Rule::OperationParams,
+                    Rule::OperationParam,
+                    ListKind::Params,
+                ),
                 Rule::FnHead | Rule::InterfaceMember | Rule::TestParams | Rule::RetiredHead => {
                     let kind = if rule == Rule::RetiredHead {
                         ListKind::Breakable
@@ -208,6 +216,7 @@ impl Facts {
                 | Rule::LayoutItem
                 | Rule::RegistersItem
                 | Rule::PackageItem
+                | Rule::ProtocolItem
                 | Rule::FnBody => {
                     facts
                         .closing
@@ -226,6 +235,15 @@ impl Facts {
                     }
                 }
                 Rule::ExampleClause => facts.example_words.extend(tokens.first()),
+                Rule::ProtocolOperation => {
+                    let member_head = (tokens.iter().copied())
+                        .find(|token| kind(*token) == TokenKind::Keyword(Keyword::Fn));
+                    if let (Some(region), Some(member_head)) =
+                        (tree.find(node, Rule::ClauseRegion), member_head)
+                    {
+                        facts.clauses(tree, region, member_head);
+                    }
+                }
                 Rule::InterfaceMember => {
                     let member_head = tokens.iter().copied().find(|token| {
                         matches!(
@@ -257,7 +275,7 @@ impl Facts {
                         let rank = |modifier: &NodeId| match text(
                             tree.span(*modifier).expect("a modifier").0,
                         ) {
-                            "closed" | "open" => 0,
+                            "closed" | "open" | "flexible" => 0,
                             "linear" => 1,
                             _ => 2,
                         };
@@ -281,13 +299,14 @@ impl Facts {
                             Rule::LanguageDirective => (0, String::new()),
                             Rule::TargetsDirective => (1, String::new()),
                             Rule::EntryDirective => (2, String::new()),
-                            Rule::DepDirective => (3, idents.join(" ")),
+                            Rule::CodegenDirective => (3, String::new()),
+                            Rule::DepDirective => (4, idents.join(" ")),
                             Rule::AllowDirective => {
                                 let authority =
                                     tree.find(inner, Rule::Authority).expect("an authority");
-                                (4, joined(file, tree, authority))
+                                (5, joined(file, tree, authority))
                             }
-                            _ => (5, idents.join(" ")),
+                            _ => (6, idents.join(" ")),
                         }
                     });
                 }

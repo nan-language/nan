@@ -1,6 +1,6 @@
 # Text, rendering and Encode
 
-This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema hashes, the formats `mem::wire` and `text::json`, and the construction text that `text::construction` decodes.
+This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules and flexible structs, schema trees and hashes, the formats `mem::wire` and `text::json`, erased decoders, migrations, and the construction text that `text::construction` decodes.
 
 ## Text types
 
@@ -334,7 +334,7 @@ Core and std types render as follows:
 | `mem::Box[T]`, `mem::Shared[T]` | the rendering of the contents |
 
 - A finite float renders as `-` when its sign bit is set, then the shortest digits d1…dk and exponent e for which d1.d2…dk × 10^e rounds to its magnitude m in its own type by roundTiesToEven, choosing the nearest to m, then an even last digit. For m 0 or in [10^-5, 10^16) the digits are positional with at least one each side of `.` (`0.1`, `100.0`, `-0.0`); otherwise they are d1, `.`, d2…dk or `0`, `e`, then e with `-` when negative (`1.5e-7`, `2.0e16`).
-- The generic types of the table implement `Render` when their type arguments do. Other core and std types implement it only as their declarations state; `Untrusted[T]` renders as [Untrusted data](15-untrusted.md#opacity) defines.
+- The generic types of the table implement `Render` when their type arguments do. Other core and std types implement it only as their declarations state; `Untrusted[T]` renders as [Untrusted and secret data](15-untrusted.md#opacity) defines.
 
 ### Derived Render
 
@@ -587,6 +587,7 @@ pub open enum DecodeError derives Copy, Eq, Hash, Render {
     InvalidText
     Invalid
     OutOfMemory
+    UnknownSchema
 } DecodeError
 ```
 
@@ -719,13 +720,13 @@ test probe_reads_old_key for load_probe {
 
 ## Decoding rules
 
-A struct or enum declared `open` decodes as open; every other type, and every labelled payload, decodes as closed.
+A struct or enum declared `open` and a struct declared `flexible` decode as open; every other type, and every labelled payload, decodes as closed.
 
-- A record key that is neither a field's key nor an alias fails a closed type with `UnknownKey`. An open type skips the field and discards it.
+- A record key that is neither a field's key nor an alias fails a closed type with `UnknownKey`. An open type skips the field: `mem::wire` keeps it in a [flexible struct](#flexible-structs), and every other decoding discards it.
 - A field given twice, by its key or its aliases, fails with `DuplicateKey`.
 - A missing field of an open type whose field type implements `Default` takes that default. Any other missing field fails with `MissingField`.
 - An unknown variant key fails closed and open types alike with `UnknownVariant`.
-- Each format frames a record field by its key, and `mem::wire` also by its byte length. This framing is the format space reserved for keeping skipped fields, which no language 1 decoder keeps.
+- `text::json` and `text::construction` frame a record field by its key. This framing is the format space reserved for keeping skipped fields in those formats, which no language 1 decoder keeps.
 
 ```nan
 pub open struct Config derives Eq, Encode {
@@ -744,23 +745,149 @@ test config_tolerates_new_fields for load_config {
 } config_tolerates_new_fields
 ```
 
+## Flexible structs
+
+A **flexible** struct keeps the record fields that decoding it from `mem::wire` skips. Beside its declared fields, each of its values holds its **kept fields** in a field of type `mem::wire::Kept` that no source names: `Empty`, or `Fields` holding them as `mem::wire` writes the fields of a record, in ascending byte order of keys and without their count.
+
+```nan-api
+// module: mem::wire
+
+pub open enum Kept {
+    Empty
+    Fields(Untrusted[mem::Bytes])
+} Kept
+```
+
+- `flexible` on an enum, or on a struct that does not derive `Encode`, is an error (`encode.flexible`).
+- A construction, `Default` and a generator give a value holding `Kept.Empty`, and patterns and derived `Render` pass over its kept fields. `Kept` implements `Eq`, `Ord` and `Hash` with all its values equal, so the derived ones of a flexible struct compare and hash its declared fields alone. A flexible struct holds an Untrusted instantiation, so encoding it is declassifying, and it is not Copy.
+- `Codec.decode` of `mem::wire` keeps each field it skips, its key and the bytes of its value, without decoding the value. `Codec.encode` writes the kept fields among the declared ones, all in ascending byte order of keys. Encoding a value that `mem::wire` decoded thus gives back the bytes decoded, except for aliased keys, missing fields taking defaults and `f32` values.
+- Every other format, and the calls of an encoder or decoder, treat a flexible struct as open: decoding discards the fields it skips, and encoding writes its declared fields alone.
+- A flexible struct has the schema tree of the same struct declared `open`.
+
+```nan
+// file: settings/package.nan
+//! Settings that older releases rewrite.
+
+package settings {
+    language 1
+    targets any
+    allow validate in settings
+} settings
+
+// file: settings/settings.nan
+//! A configuration record re-encoded with the fields of newer releases.
+
+pub flexible struct Config derives Eq, Encode {
+    pub retries: u8
+} Config
+
+pub fn reencode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError {
+    let config = try mem::wire::Codec[Config].decode(raw, alloc)
+    var out = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Config].encode(config, mut out)
+    return out
+} reencode
+
+test newer_field_survives for reencode {
+    let world = testing::world()
+    let out = attempt reencode(Untrusted.of(b"\x02\x04mode\x01\x07\x07retries\x01\x03"), alloc: world.alloc)
+    let Ok(bytes) = out else {
+        expect false
+        return
+    }
+    expect bytes.view() == b"\x02\x04mode\x01\x07\x07retries\x01\x03"
+} newer_field_survives
+```
+
+```nan
+pub flexible enum Mode derives Encode { // error: encode.flexible
+    Idle
+    Busy
+} Mode
+```
+
 ## Schema hashes
 
-The **schema hash** of a type implementing `Encode` is the [hash](29-identity-versioning.md#hash-values) of the `mem::wire` encoding of the root node of its schema tree, the description of its encoded structure. A node encodes as a variant keyed by its name, with a record of its fields as payload when it has fields:
+The **schema tree** of a type implementing `Encode` is the `mem::wire::Schema` describing its encoded structure, and its **schema hash** is the [hash](29-identity-versioning.md#hash-values) of the tree's `mem::wire` encoding.
 
-| Node | Fields | Made for |
-| --- | --- | --- |
-| `Bool`, `Char`, `Text`, `Bytes` | none | `bool`, `char`, `text::String`, `mem::Bytes` |
-| `Unsigned`, `Signed`, `Float` | `width: u8`, in bits, 64 for `usize` and `isize` | integers and floats |
-| `BoundedText` | `capacity: u64` | `text::Fixed[N]` |
-| `Sequence` | `element`, a node; `length: Option[u64]`; `capacity: Option[u64]`; `unique: bool` | `Array` (length), `mem::Bounded` (capacity), `mem::Set` (unique), `mem::List` |
-| `Map` | `key`, `value`: nodes | `mem::Map` |
-| `Record` | `open: bool`; `fields`, a sequence of records with `key: Str`, `aliases`, a sequence of texts in byte order, `defaulted: bool` and `value`, a node | structs, labelled payloads, `Unit` |
-| `Variant` | `open: bool`; `variants`, a sequence of records with `key: Str`, `aliases` and `payload: Option` of a node | enums, `Option`, `Result` |
-| `Back` | `depth: u64` | recursion |
+```nan-api
+// module: mem::wire
 
-- `Record` fields and `Variant` variants appear in ascending byte order of keys. `defaulted` is true when the field takes a default when missing. `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
+pub closed struct SchemaHash derives Copy, Eq, Ord, Hash, Encode {
+    pub bytes: Array[u8, 33]
+} SchemaHash
+
+pub closed enum Schema derives Encode {
+    Bool
+    Char
+    Text
+    Bytes
+    Unsigned(width: u8)
+    Signed(width: u8)
+    Float(width: u8)
+    BoundedText(capacity: u64)
+    Sequence(element: mem::Box[Schema], length: Option[u64], capacity: Option[u64], unique: bool)
+    Map(key: mem::Box[Schema], value: mem::Box[Schema])
+    Record(open: bool, fields: mem::List[SchemaField])
+    Variant(open: bool, variants: mem::List[SchemaVariant])
+    Back(depth: u64)
+} Schema
+
+pub closed struct SchemaField derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub defaulted: bool
+    pub value: Schema
+} SchemaField
+
+pub closed struct SchemaVariant derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub payload: Option[Schema]
+} SchemaVariant
+
+pub fn Codec.schema_hash() -> SchemaHash limits pure, notrap, terminates
+
+pub fn Codec.schema(alloc: mem::Alloc) -> Schema
+```
+
+| Node | Made for |
+| --- | --- |
+| `Bool`, `Char`, `Text`, `Bytes` | `bool`, `char`, `text::String`, `mem::Bytes` |
+| `Unsigned`, `Signed`, `Float` | integers and floats, `width` in bits, 64 for `usize` and `isize` |
+| `BoundedText` | `text::Fixed[N]`, of `capacity` N |
+| `Sequence` | `Array` with its `length`, `mem::Bounded` with its `capacity`, `mem::Set`, which is `unique`, and `mem::List` |
+| `Map` | `mem::Map` |
+| `Record` | structs, labelled payloads, `Unit` |
+| `Variant` | enums, `Option`, `Result` |
+| `Back` | recursion |
+
+- A `Record` or `Variant` node is `open` when its type is declared `open`. Its fields, one per field of the struct or label of the payload, and its variants, one per variant of the enum, appear in ascending byte order of keys, each with the aliases of its key in byte order. A field is `defaulted` when it takes a default when missing; a variant's `payload` is the node of its payload.
+- `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
 - Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
+- `schema_hash` gives the schema hash of `T`, and `schema` its schema tree drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`).
+
+```nan
+pub closed struct Probe derives Encode {
+    pub seq: u32
+    pub hops: u8
+} Probe
+
+pub const PROBE_SCHEMA: mem::wire::SchemaHash = mem::wire::Codec[Probe].schema_hash()
+
+pub fn hop_width(alloc: mem::Alloc) -> u8
+    example hop_width(testing::world().alloc) == 8
+    example PROBE_SCHEMA != mem::wire::Codec[u32].schema_hash()
+{
+    let mem::wire::Schema.Record(open: _, fields: fields) = mem::wire::Codec[Probe].schema(alloc) else {
+        return 0
+    }
+    let mem::wire::Schema.Unsigned(width: width) = fields[0].value else {
+        return 0
+    }
+    return width
+} hop_width
+```
 
 ## Wire format
 
@@ -818,6 +945,153 @@ test signal_bytes for load_signal {
     expect level == Ok(Signal.Level(300))
     expect trailing == Err(core::DecodeError.Trailing)
 } signal_bytes
+```
+
+## Erased decoders
+
+An **erased decoder** is a `mem::wire::Erased`: the schema hash of a type and a function checking `mem::wire` bytes against the type, whose caller need not name it.
+
+```nan-api
+// module: mem::wire
+
+pub open struct Erased derives Copy {
+    pub schema: SchemaHash
+    pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
+} Erased
+
+pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
+
+pub fn Codec.erased() -> Erased limits pure, notrap, terminates
+```
+
+- `canonical` reads one value as `decode` does, then gives the bytes `encode` writes for it, drawn through `alloc`, failing with `OutOfMemory` when it cannot draw them. Its result stays Untrusted, so it reads no contents for its caller.
+- `erased` gives the schema hash of `T` and `Codec[T].canonical`.
+- A package exports the erased decoders of its types by contributing them to a [registry](25-registries.md#registries), through which code checks records by their schema hashes without naming their types.
+
+```nan
+pub closed struct Probe derives Encode {
+    pub seq: u32
+    pub hops: u8 where hops < 16
+} Probe
+
+retired Probe.ttl => Probe.hops preserves
+
+pub registry decoders: mem::wire::Erased keyed by schema
+
+contribute decoders probe_decoder = mem::wire::Codec[Probe].erased()
+
+pub fn checked(schema: mem::wire::SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError {
+    for decoder in decoders {
+        if decoder.schema == schema {
+            return try (decoder.canonical)(raw, alloc)
+        }
+    }
+    fail core::DecodeError.Invalid
+} checked
+
+test probes_are_checked for checked {
+    let world = testing::world()
+    let schema = mem::wire::Codec[Probe].schema_hash()
+    let legacy = attempt checked(schema, raw: Untrusted.of(b"\x02\x03seq\x01\x05\x03ttl\x01\x03"), alloc: world.alloc)
+    let far = attempt checked(schema, raw: Untrusted.of(b"\x02\x04hops\x01\x13\x03seq\x01\x05"), alloc: world.alloc)
+    let Ok(canonical) = legacy else {
+        expect false
+        return
+    }
+    let current = attempt mem::wire::Codec[Probe].decode(canonical.view(), alloc: world.alloc)
+    expect canonical.byte_len() == 14
+    expect current.is_ok()
+    expect far.is_err()
+} probes_are_checked
+```
+
+## Migrations
+
+A **migration** is a function declared `migrate` converting the values of a struct or enum `T` from or to a **frozen shape**: a type whose schema tree is one that `T` had, recorded in its package's [history](29-identity-versioning.md#history). A **forward** migration converts from a frozen shape, an **inverse** to one.
+
+- A forward migration has the parameters `take old: S` and optionally `alloc: mem::Alloc` and the result `T`; an inverse has the parameters `self` and optionally `alloc: mem::Alloc` and the result `S`. Either may fail with `mem::OutOfMemory`, and the names of its parameters are free. `T` and the frozen shape `S` are distinct structs or enums of the migration's package without type parameters, each deriving `Encode`. A migration of another form is an error (`encode.migrate-form`).
+- A migration demands `notrap` and `terminates`; one that does not is an error (`encode.migrate-limits`), whose exact fix adds them. One whose digest has an effect fact other than alloc, a capability or validator, or a class other than `traceless` is an error (`encode.migrate-effect`).
+- The schema hash of `S` is one that the history records for `T` and not `T`'s own; another is an error (`encode.migrate-schema`).
+- Of the forward migrations of `T` from frozen shapes of one schema hash, and of its inverses to such shapes, each but the first by file path and line is an error (`encode.migrate-duplicate`). An inverse to a frozen shape whose schema hash no forward migration of `T` converts from is an error (`encode.migrate-inverse-alone`).
+
+```nan-api
+// module: mem::wire
+
+pub fn Codec.decode_from(schema: SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+
+pub fn Codec.encode_as(value: T, schema: SchemaHash, mut out: mem::Bytes, alloc: mem::Alloc) -> bool
+```
+
+- `decode_from` reads one value as `decode` does when `schema` is the schema hash of `T`. When it is that of a frozen shape a forward migration of `T` converts from, it reads one value of that shape as `decode` does and gives the migration's conversion of it, drawn through `alloc`, failing with `OutOfMemory` when the migration fails. Otherwise it fails with `UnknownSchema`.
+- `encode_as` appends `value` as `encode` does and gives `true` when `schema` is the schema hash of `T`. When it is that of a frozen shape an inverse of `T` converts to, it appends the encoding of the inverse's conversion of `value`, drawn through `alloc`, and gives `true`. Otherwise it gives `false` and leaves `out` unchanged. It traps when memory is exhausted (`trap.exhausted`).
+
+```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "ahp37ganadyzqu6xs3ebh5st5xa5x4g56uumirr2tiglvgkifvyyi43"
+check "afih66hobkrodcs6u7hsifjemt3242epjbzeciviyckgq7j5stdv2x5"
+
+// file: settings/settings.nan
+//! The settings record and the shape of its first release.
+
+pub closed struct Settings derives Eq, Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates {
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
+
+migrate fn Settings.to_first(self) -> FirstSettings limits notrap, terminates {
+    return FirstSettings(retries: self.retries)
+} Settings.to_first
+
+pub fn load(schema: mem::wire::SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Settings fails core::DecodeError {
+    return try mem::wire::Codec[Settings].decode_from(schema, raw, alloc)
+} load
+
+test first_records_load for load {
+    let world = testing::world()
+    let older = mem::wire::Codec[FirstSettings].schema_hash()
+    let loaded = attempt load(older, raw: Untrusted.of(b"\x01\x07retries\x01\x03"), alloc: world.alloc)
+    let unknown = attempt load(mem::wire::Codec[u8].schema_hash(), raw: Untrusted.of(b"\x03"), alloc: world.alloc)
+    var out = mem::Bytes.empty(world.alloc)
+    let written = mem::wire::Codec[Settings].encode_as(Settings(retries: 4, backoff: 50), schema: older, mut out, alloc: world.alloc)
+    expect loaded == Ok(Settings(retries: 3, backoff: 100))
+    expect unknown == Err(core::DecodeError.UnknownSchema)
+    expect written
+    expect out.view() == b"\x01\x07retries\x01\x04"
+} first_records_load
+```
+
+```nan
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates { // error: encode.migrate-schema
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
 ```
 
 ## JSON
@@ -940,8 +1214,8 @@ pub closed struct Port derives Eq, Render, Encode {
     pub medium: Medium
 } Port
 
-pub fn load_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[Port, core::DecodeError] {
-    return attempt text::construction::Codec[Port].decode(raw, alloc)
+pub fn load_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Port fails core::DecodeError {
+    return try text::construction::Codec[Port].decode(raw, alloc)
 } load_port
 
 test port_reads_its_rendering for load_port {
@@ -950,16 +1224,16 @@ test port_reads_its_rendering for load_port {
     var out = text::String.empty(world.alloc)
     mut out.write(text::fmt("{port}", port), budget: 128)
     expect out.as_str() == "Port(name: \"eth0\", mtu: 1500, medium: Medium.Fiber(lanes: 4))"
-    let loaded = load_port(Untrusted.of(out.as_bytes()), alloc: world.alloc)
+    let loaded = attempt load_port(Untrusted.of(out.as_bytes()), alloc: world.alloc)
     let expected: Result[Port, core::DecodeError] = Ok(take port)
     expect loaded == expected
 } port_reads_its_rendering
 
 test port_text_is_checked for load_port {
     let world = testing::world()
-    let spaced = load_port(Untrusted.of(b"Port( mtu: 9_000, name: \"lo\", medium: Copper )"), alloc: world.alloc)
-    let small = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 500, medium: Medium.Copper)"), alloc: world.alloc)
-    let unknown = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 1500, medium: Medium.Radio)"), alloc: world.alloc)
+    let spaced = attempt load_port(Untrusted.of(b"Port( mtu: 9_000, name: \"lo\", medium: Copper )"), alloc: world.alloc)
+    let small = attempt load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 500, medium: Medium.Copper)"), alloc: world.alloc)
+    let unknown = attempt load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 1500, medium: Medium.Radio)"), alloc: world.alloc)
     let expected: Result[Port, core::DecodeError] = Ok(Port(name: text::String.of("lo", alloc: world.alloc), mtu: 9_000, medium: Medium.Copper))
     expect spaced == expected
     expect small == Err(core::DecodeError.Invalid)
@@ -977,8 +1251,15 @@ pub fn load_mtus(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[mem::Li
 
 | Code | Class | Rule |
 | --- | --- | --- |
+| `encode.flexible` | error | [Flexible structs](#flexible-structs) |
 | `encode.linear` | error | [Requirements](#requirements) |
 | `encode.manual-impl` | error | [Requirements](#requirements) |
+| `encode.migrate-duplicate` | error | [Migrations](#migrations) |
+| `encode.migrate-effect` | error | [Migrations](#migrations) |
+| `encode.migrate-form` | error | [Migrations](#migrations) |
+| `encode.migrate-inverse-alone` | error | [Migrations](#migrations) |
+| `encode.migrate-limits` | error | [Migrations](#migrations) |
+| `encode.migrate-schema` | error | [Migrations](#migrations) |
 | `encode.not-inert` | error | [Requirements](#requirements) |
 | `encode.view` | error | [Requirements](#requirements) |
 | `text.argument-duplicate` | error | [Templates](#templates) |

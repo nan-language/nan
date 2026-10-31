@@ -1,4 +1,4 @@
-//! The float operations the x86-64 base set with SSE2 has no instruction for, computed exactly in integer arithmetic over the operands' bit patterns: the remainder of a division, and the fused multiply-add, rounded once. Each is a function per float width that lowered code calls.
+//! The float operations the x86-64 base set with SSE2 has no instruction for, computed exactly in integer arithmetic over the operands' bit patterns: the remainder of a division, and the fused multiply-add, rounded once. Each is a function per float width that lowered code calls. The conversions between f32 and f64 are computed the same way, inline, where code holds floats as bit patterns, and the decimal text of floats by core's functions over bit patterns.
 
 /// A float width: the bits of its fraction and exponent fields.
 enum Width derives Copy, Eq, Hash {
@@ -104,6 +104,40 @@ fn Width.fraction_mask(self) -> i64 {
     return (1i64 << u32.fit(self.fraction())) - 1
 } Width.fraction_mask
 
+/// A float's text in a buffer, and its length.
+struct FloatText derives Copy {
+    buffer: clif::Value
+    len: clif::Value
+} FloatText
+
+/// The text `Render` writes for a float or its bit pattern, by core's function of its width: a
+/// buffer of 40 bytes holding it, and its length.
+fn floats_text(mut lo: Lowering, mut fx: Fx, value: clif::Value) -> FloatText {
+    let bits = bits_of(mut fx, value)
+    var name = "f64_text"
+    if fx.b.value_type(bits) == clif::Type.Int32 {
+        name = "f32_text"
+    }
+    let buffer = mut fx.slot(40, align: 8)
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(Held.Scalar(bits))
+    mut args.push(Held.Address(buffer))
+    let called = mut lo.core_call(mut fx, name, args: args.view())
+    return FloatText(buffer: buffer, len: called.result.scalar_value())
+} floats_text
+
+/// The bit pattern of the f64 nearest a decimal number's text of `len` bytes from `start`, by
+/// core's function.
+fn floats_parse(mut lo: Lowering, mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
+    let text = mut fx.slot(16, align: 8)
+    mut fx.store(start, addr: text, offset: 0)
+    mut fx.store(len, addr: text, offset: 8)
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(Held.Address(text))
+    let called = mut lo.core_call(mut fx, name: "f64_bits_of", args: args.view())
+    return called.result.scalar_value()
+} floats_parse
+
 /// Calls the remainder function of a width on two floats.
 fn floats_remainder(mut lo: Lowering, mut fx: Fx, a: clif::Value, b: clif::Value) -> clif::Value {
     let width = Width.of(fx.b.value_type(a))
@@ -127,6 +161,82 @@ fn fused_mul_add(mut lo: Lowering, mut fx: Fx, a: clif::Value, b: clif::Value, c
     expect results.len() == 1
     return results[0]
 } fused_mul_add
+
+/// An f32 widened to f64 as `fpromote` widens it, a NaN made canonical: on its bit pattern where
+/// the code holds floats as bit patterns.
+fn floats_promote(mut fx: Fx, value: clif::Value) -> clif::Value {
+    if fx.b.value_type(value) == clif::Type.Float32 {
+        return mut fx.b.fpromote(clif::Type.Float64, x: value)
+    }
+    let from = Width.Single
+    let to = Width.Double
+    let bits = floats_widen(mut fx, width: from, bits: value)
+    let sign = mut fx.b.ushr_imm_s(bits, y: from.sign_bit())
+    let magnitude = mut fx.b.band_imm_s(bits, y: from.magnitude_mask())
+    let field = mut fx.b.ushr_imm_s(magnitude, y: from.fraction())
+    let ordinary = floats_ordinary(mut fx, width: from, magnitude, field)
+    let results = fx.types1(clif::Type.Int64)
+    let parts = mut fx.choose(ordinary, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let scaled = floats_significand(mut fx1, width: from, magnitude, field)
+        let fraction = mut fx1.b.band_imm_s(scaled.significand, y: from.fraction_mask())
+        let shifted = mut fx1.b.ishl_imm_s(fraction, y: to.fraction() - from.fraction())
+        let biased = mut fx1.b.iadd_imm_s(scaled.exponent, y: to.bias() - from.bias())
+        let placed = mut fx1.b.ishl_imm_s(biased, y: to.fraction())
+        let signed = mut fx1.b.ishl_imm_s(sign, y: to.sign_bit())
+        let unsigned = mut fx1.b.bor(placed, y: shifted)
+        return fx1.list1(mut fx1.b.bor(unsigned, y: signed))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(floats_special(mut fx1, from, to, sign, magnitude))
+    })
+    expect parts.len() == 1
+    return parts[0]
+} floats_promote
+
+/// An f64 narrowed to f32 as `fdemote` narrows it, by roundTiesToEven, a NaN made canonical: on
+/// its bit pattern where the code holds floats as bit patterns.
+fn floats_demote(mut fx: Fx, value: clif::Value) -> clif::Value {
+    if fx.b.value_type(value) == clif::Type.Float64 {
+        return mut fx.b.fdemote(clif::Type.Float32, x: value)
+    }
+    let from = Width.Double
+    let to = Width.Single
+    let sign = mut fx.b.ushr_imm_s(value, y: from.sign_bit())
+    let magnitude = mut fx.b.band_imm_s(value, y: from.magnitude_mask())
+    let field = mut fx.b.ushr_imm_s(magnitude, y: from.fraction())
+    let ordinary = floats_ordinary(mut fx, width: from, magnitude, field)
+    let results = fx.types1(clif::Type.Int64)
+    let parts = mut fx.choose(ordinary, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let scaled = floats_significand(mut fx1, width: from, magnitude, field)
+        let top = mut fx1.b.ishl_imm_s(scaled.significand, y: 62 - from.fraction())
+        let e = mut fx1.b.iadd_imm_s(scaled.exponent, y: 0 - (from.bias() + 62))
+        return fx1.list1(floats_round(mut fx1, width: to, sign, top, e))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(floats_special(mut fx1, from, to, sign, magnitude))
+    })
+    expect parts.len() == 1
+    return floats_narrow(mut fx, width: to, bits: parts[0])
+} floats_demote
+
+/// Whether a magnitude of a width is finite and nonzero, its exponent field being `field`.
+fn floats_ordinary(mut fx: Fx, width: Width, magnitude: clif::Value, field: clif::Value) -> clif::Value {
+    let nonzero = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: magnitude, y: 0)
+    let finite = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: field, y: width.top())
+    return mut fx.b.band(nonzero, y: finite)
+} floats_ordinary
+
+/// The bit pattern of a width `to`, in 64 bits, of a zero, infinite or NaN magnitude of a width
+/// `from`: a canonical NaN for a NaN, and the signed zero or infinity otherwise.
+fn floats_special(mut fx: Fx, from: Width, to: Width, sign: clif::Value, magnitude: clif::Value) -> clif::Value {
+    let nan = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: magnitude, y: from.infinity())
+    let infinite = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: magnitude, y: from.infinity())
+    let infinity = mut fx.int(clif::Type.Int64, value: to.infinity())
+    let zero = mut fx.int(clif::Type.Int64, value: 0)
+    let unsigned = mut fx.b.select(infinite, x: infinity, y: zero)
+    let shifted = mut fx.b.ishl_imm_s(sign, y: to.sign_bit())
+    let signed = mut fx.b.bor(unsigned, y: shifted)
+    let canonical = mut fx.int(clif::Type.Int64, value: to.canonical_nan())
+    return mut fx.b.select(nan, x: canonical, y: signed)
+} floats_special
 
 fn floats_signature(width: Width, count: usize, alloc: mem::Alloc) -> clif::Signature {
     var signature = clif::Signature.new(CALL_CONV, alloc)

@@ -14,6 +14,7 @@ use super::super::runtime::memory::CHUNK;
 use super::super::runtime::system::{self, unavailable_unless};
 use super::super::runtime::tasks::thread;
 use super::super::runtime::{Routine, report, state};
+use super::start::info;
 use super::stubs::Stub;
 use crate::workspace::{Arch, Kind, Target};
 
@@ -33,11 +34,16 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
 /// its affinity on AArch64; whether it has started its executor; its global descriptor table, the
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
-/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
-/// whether it has AVX enabled, which the vector seam reads to save the extended state; the
-/// frame the vector seam saved for the interrupt it serves, zero outside one; and, on a kernel,
-/// the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
-/// millisecond.
+/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root; whether a
+/// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
+/// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
+/// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
+/// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
+/// interrupts; whether the dispatcher running installed devices defers the end of the
+/// interrupt their `hw::IrqContext.complete` would make; its queue of ready tasks, the lock of
+/// that queue and the key of its first task; the key of the task it runs, zero for none, and the
+/// nanosecond that task's slice ends, zero for none; whether it idles; and whether it runs a hook
+/// of the kernel's policy.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -49,11 +55,21 @@ pub mod cpu {
     pub const GDTR: u64 = 104;
     pub const TSS: u64 = 120;
     pub const ROOT: u64 = 224;
-    pub const AVX: u64 = 232;
+    pub const SHOOTDOWN: u64 = 232;
     pub const FRAME: u64 = 240;
+    pub const FEATURES: u64 = 248;
     pub const NEXT_PACE: u64 = 256;
     pub const TIMER_RATE: u64 = 264;
-    pub const SIZE: u64 = 320;
+    pub const WAITING: u64 = 272;
+    pub const DEFERRED: u64 = 280;
+    pub const QUEUE: u64 = 288;
+    pub const QUEUE_LOCK: u64 = 296;
+    pub const HEAD_KEY: u64 = 304;
+    pub const RUNNING_KEY: u64 = 312;
+    pub const SLICE_END: u64 = 320;
+    pub const IDLE: u64 = 328;
+    pub const HOOK: u64 = 336;
+    pub const SIZE: u64 = 384;
 }
 
 /// The model-specific register holding the GS base.
@@ -89,6 +105,12 @@ impl Lowering<'_, '_> {
         fx.b.ins().iadd(cpus, offset)
     }
 
+    /// The hardware id recorded for CPU `index`.
+    pub fn hardware_id(&mut self, fx: &mut Fx, index: Value) -> Value {
+        let record = self.cpu_record(fx, index);
+        fx.load(PTR, record, cpu::HARDWARE_ID)
+    }
+
     /// The number of the CPU running the caller.
     pub fn running_index(&mut self, fx: &mut Fx) -> Value {
         let thread_record = self.thread(fx);
@@ -102,17 +124,23 @@ impl Lowering<'_, '_> {
     }
 
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
-    /// register addresses from now on; on a kernel, its clock started and a CPU for each processor
-    /// the platform reports; an executor thread record for each CPU; and, on `x86_64-bare`, the
-    /// boot CPU's descriptor tables loaded and AVX enabled when it has it.
+    /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
+    /// its clock started, on x86_64 the local APICs' mode chosen, and a CPU for each processor
+    /// the platform reports; an executor thread
+    /// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
+    /// the boot CPU's descriptor tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
+        self.call_stub(fx, Stub::ConstantTime, &[]);
         if self.kernel() {
             self.start_clock(fx);
         }
         let count = match (self.kernel(), self.ck.db.target.arch()) {
-            (true, Some(Arch::Amd64)) => self.discover(fx, boot),
+            (true, Some(Arch::Amd64)) => {
+                self.choose_apic_mode(fx);
+                self.discover(fx, boot)
+            }
             (true, Some(Arch::Aarch64)) => self.aarch64_discover(fx, boot),
             _ => fx.ptr(1),
         };
@@ -134,16 +162,13 @@ impl Lowering<'_, '_> {
             let cpu = self.cpu_record(fx, index);
             fx.store(record, cpu, cpu::THREAD);
         });
+        if self.ck.db.target.arch() == Some(Arch::Amd64) {
+            self.call_stub(fx, Stub::CpuFeatures, &[zero]);
+        }
         if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
-            self.enable_avx(fx, boot);
+            self.call_stub(fx, Stub::EnableAvx, &[]);
         }
-    }
-
-    /// Enables AVX on the running CPU when it has it, recording whether in the CPU's record.
-    pub fn enable_avx(&mut self, fx: &mut Fx, record: Value) {
-        let enabled = self.call_stub(fx, Stub::EnableAvx, &[])[0];
-        fx.store(enabled, record, cpu::AVX);
     }
 
     /// Writes a CPU's global descriptor table, task-state segment and pseudo-descriptor into its
@@ -180,17 +205,20 @@ impl Lowering<'_, '_> {
 
     /// Installs `root` as the running CPU's page-table root, with maskable interrupts disabled so
     /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
-    /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub.
-    pub fn swap_root(&mut self, fx: &mut Fx, root: Value) -> Value {
+    /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub, which
+    /// receives `tagged` instead when given: the root with a PCID or ASID, whose translations
+    /// stay cached.
+    pub fn swap_root(&mut self, fx: &mut Fx, root: Value, tagged: Option<Value>) -> Value {
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let record = self.running_cpu(fx);
         let replaced = fx.load(PTR, record, cpu::ROOT);
         fx.store(root, record, cpu::ROOT);
-        let install = match self.ck.db.target.arch() {
-            Some(Arch::Aarch64) => Stub::WriteTtbr0,
+        let install = match (self.ck.db.target.arch(), tagged) {
+            (Some(Arch::Aarch64), Some(_)) => Stub::WriteTtbr0Tagged,
+            (Some(Arch::Aarch64), None) => Stub::WriteTtbr0,
             _ => Stub::WriteCr3,
         };
-        self.call_stub(fx, install, &[root]);
+        self.call_stub(fx, install, &[tagged.unwrap_or(root)]);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);
         replaced
     }
@@ -259,7 +287,7 @@ impl Lowering<'_, '_> {
 
     /// The number of CPUs the platform reports as usable, at least 1 and at most `MAX_CPUS`,
     /// recording each one's local APIC id in its record: the boot CPU's first, then the others
-    /// in the order of the MADT.
+    /// in the order of the MADT's local APIC and local x2APIC entries.
     fn discover(&mut self, fx: &mut Fx, boot: Value) -> Value {
         let own = self.local_apic_id(fx);
         fx.store(own, boot, cpu::HARDWARE_ID);
@@ -284,13 +312,19 @@ impl Lowering<'_, '_> {
                         let kind = fx.b.ins().load(types::I8, unaligned(), at, 0);
                         let len = fx.b.ins().load(types::I8, unaligned(), at, 1);
                         let len = fx.b.ins().uextend(PTR, len);
-                        let processor = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+                        let apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+                        let x2apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, MADT_X2APIC);
+                        let processor = fx.b.ins().bor(apic, x2apic);
                         fx.when(processor, |fx| {
-                            let flags = load_u32(fx, at, 4);
+                            let short_flags = load_u32(fx, at, 4);
+                            let wide_flags = load_u32(fx, at, 8);
+                            let flags = fx.b.ins().select(x2apic, wide_flags, short_flags);
                             let usable = fx.b.ins().band_imm_s(flags, PROCESSOR_ENABLED);
                             let usable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, usable, 0);
-                            let id = fx.b.ins().load(types::I8, unaligned(), at, 3);
-                            let id = fx.b.ins().uextend(PTR, id);
+                            let short_id = fx.b.ins().load(types::I8, unaligned(), at, 3);
+                            let short_id = fx.b.ins().uextend(PTR, short_id);
+                            let wide_id = load_u32(fx, at, 4);
+                            let id = fx.b.ins().select(x2apic, wide_id, short_id);
                             let other = fx.b.ins().icmp(IntCC::NotEqual, id, own);
                             let counted = fx.b.use_var(count);
                             let room = fx.b.ins().icmp_imm_s(
@@ -321,23 +355,30 @@ impl Lowering<'_, '_> {
     }
 
     /// The address of the ACPI root system description pointer, zero when the platform gives
-    /// none: on `x86_64-bare` the one the start information names, or else the one found in the
-    /// BIOS area; on `x86_64-uefi` the one the firmware's configuration table names.
-    fn rsdp(&mut self, fx: &mut Fx) -> Value {
+    /// none: on a bare target the one the start information names, or else on `x86_64-bare` the
+    /// one found in the BIOS area; on a UEFI target the one the firmware's configuration table
+    /// names.
+    pub fn rsdp(&mut self, fx: &mut Fx) -> Value {
         let state_address = self.state(fx);
-        if self.ck.db.target.kind() == Some(Kind::Uefi) {
-            let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
-            return self.configured_rsdp(fx, table);
+        match self.ck.db.target.kind() {
+            Some(Kind::Uefi) => {
+                let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
+                return self.configured_rsdp(fx, table);
+            }
+            Some(Kind::Bare) => {}
+            _ => return fx.ptr(0),
         }
-        let info = fx.load(PTR, state_address, state::PLATFORM);
-        let magic = load_u32(fx, info, 0);
-        let valid = fx.b.ins().icmp_imm_s(IntCC::Equal, magic, START_INFO_MAGIC);
+        let info = self.start_info(fx);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
         let given = fx.choose(
-            valid,
+            present,
             &[PTR],
-            |fx| vec![fx.load(PTR, info, START_INFO_RSDP)],
+            |fx| vec![fx.load(PTR, info, info::RSDP)],
             |fx| vec![fx.ptr(0)],
         )[0];
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            return given;
+        }
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, given, 0);
         fx.choose(missing, &[PTR], |fx| vec![scan_rsdp(fx)], |_| vec![given])[0]
     }
@@ -420,10 +461,6 @@ impl Lowering<'_, '_> {
     }
 }
 
-/// The magic number of a PVH start information structure and the offset of its RSDP address.
-const START_INFO_MAGIC: i64 = 0x336E_C578;
-const START_INFO_RSDP: u64 = 32;
-
 /// The offsets in a UEFI system table of its configuration table's entry count and address, the
 /// size of an entry, a GUID then the table's address, and the GUIDs of the ACPI tables, each as
 /// its two little-endian words.
@@ -438,7 +475,10 @@ const SDT_HEADER: u64 = 36;
 const MADT_SIGNATURE: i64 = 0x4349_5041;
 const MADT_ENTRIES: u64 = 44;
 
-/// The flag of a MADT processor entry saying its processor is enabled and ready for use.
+/// The kind of a MADT local x2APIC entry, whose id and flags are words at offsets 4 and 8
+/// where a local APIC entry has a byte id at 3 and its flags at 4, and the flag of either saying
+/// its processor is enabled and ready for use.
+const MADT_X2APIC: i64 = 9;
 const PROCESSOR_ENABLED: i64 = 1;
 
 /// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.
@@ -661,8 +701,9 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a started CPU calls with its record: it points its base register at the record,
-    /// on x86_64 loads its descriptor tables and enables AVX when it has it, prepares its
-    /// interrupt delivery through `prepare`, records that it started and runs the executor's
+    /// sets its data-independent timing mode, on x86_64 records its features, loads its
+    /// descriptor tables and enables AVX when it has it, prepares its interrupt delivery through
+    /// `prepare`, disables floating point, records that it started and runs the executor's
     /// scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
@@ -678,12 +719,16 @@ impl Lowering<'_, '_> {
             |lo, fx| {
                 let record = fx.entry()[0];
                 lo.set_cpu_base(fx, record);
+                lo.call_stub(fx, Stub::ConstantTime, &[]);
                 if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
+                    let index = lo.running_index(fx);
+                    lo.call_stub(fx, Stub::CpuFeatures, &[index]);
                     lo.load_cpu_tables(fx, record);
-                    lo.enable_avx(fx, record);
+                    lo.call_stub(fx, Stub::EnableAvx, &[]);
                 }
                 let prepare = lo.func_ref(fx, prepare);
                 fx.b.ins().call(prepare, &[]);
+                lo.call_stub(fx, Stub::DisableFloats, &[]);
                 lo.cpu_started(fx, record);
                 lo.call_routine(fx, Routine::Schedule, &[]);
                 fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));

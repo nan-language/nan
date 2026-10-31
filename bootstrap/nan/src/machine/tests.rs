@@ -1,5 +1,5 @@
 use super::api::{AcceptedTest, ClosureEntry, Doc, DocKey, Entry, Method, Seal, Snapshot};
-use super::history::History;
+use super::history::{History, Module};
 use super::lock::{Entry as Approved, Lock, Locked};
 use super::principals::Principals;
 use super::{Invalid, escaped};
@@ -112,13 +112,14 @@ fn a_history_reads_back_as_written() {
     let history = History {
         name: "meter".to_owned(),
         head: Some(Hash::of(b"head")),
-        modules: vec![(
-            "meter".to_owned(),
-            vec![
+        modules: vec![Module {
+            name: "meter".to_owned(),
+            schemas: vec![("Counter".to_owned(), Hash::of(b"schema"))],
+            tombstones: vec![
                 "retired Counter.bump(mut self) => mut self.record() changes \"saturates\""
                     .to_owned(),
             ],
-        )],
+        }],
     };
     let bytes = history.bytes().unwrap();
     assert_eq!(History::read(&bytes).unwrap(), history);

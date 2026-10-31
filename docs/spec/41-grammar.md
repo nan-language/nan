@@ -90,11 +90,12 @@ item_kind = fn_item
     | "const" ( const_item | const_assert_item )
     | registry_item
     | contribute_item
+    | protocol_item
     | test_item
     | retired_item
     | package_item ;
-type_modifier = 'closed' | 'open' | "linear" | 'view' ;
-fn_modifier = "proj" | "interrupt" | "landing" | "foreign" | "validator" ;
+type_modifier = 'closed' | 'open' | 'flexible' | "linear" | 'view' ;
+fn_modifier = "proj" | "interrupt" | "landing" | "foreign" | "validator" | 'migrate' ;
 fn_item = "fn" fn_head fn_end ;
 fn_head = item_label generic_params? "(" param_list? ")" fn_result? fails_clause? uses_clause? limits_clause? ;
 fn_result = "->" type_expr ;
@@ -116,7 +117,7 @@ clause_line = requires_clause
 const_item = IDENT ( ":" type_expr "=" expr NL | "=" expr NL {!item.const-untyped} ) ;
 const_assert_item = "assert" expr NL ;
 self_field_set = "." "{" IDENT ( "," IDENT )* "}" {!item.self-field-set} ;
-reserved_head_word = ( 'stable' | 'flexible' | 'migrate' | 'machine' | 'protocol' | 'ipc' ) {!item.reserved-word} ;
+reserved_head_word = ( 'stable' | 'machine' | 'ipc' ) {!item.reserved-word} ;
 ```
 
 ### Packages and names
@@ -126,15 +127,16 @@ From [Packages, modules and names](03-packages-modules.md).
 ```ebnf
 package_item = "package" IDENT "{" directive* COL0 "}" item_label NL ;
 directive = language_directive | targets_directive | entry_directive
-    | dep_directive | allow_directive | deny_directive ;
+    | codegen_directive | dep_directive | allow_directive | deny_directive ;
 language_directive = 'language' INT NL ;
 targets_directive = 'targets' target_list NL ;
 target_list = target ( "," target )* ;
 target = IDENT ( "-" IDENT )? ;
 entry_directive = 'entry' IDENT NL ;
+codegen_directive = 'codegen' target_list NL ;
 dep_directive = 'dep' IDENT TEXT NL ;
 allow_directive = 'allow' authority "in" name_list NL ;
-authority = 'device' | 'priv' | "trusted" | 'validate' | "contribute" path ;
+authority = 'device' | 'confined' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;
 name_list = IDENT ( "," IDENT )* ;
 deny_directive = 'deny' IDENT "->" IDENT NL ;
 path = IDENT ( "::" IDENT )* ;
@@ -390,6 +392,17 @@ unique_list = 'unique' IDENT ( "," IDENT )* ;
 contribute_item = "contribute" path IDENT "=" expr NL ;
 ```
 
+### Components
+
+From [Components](26-components.md).
+
+```ebnf
+protocol_item = 'protocol' IDENT ( 'summary' type_expr )? "{" protocol_operation+ COL0 "}" item_label NL ;
+protocol_operation = ( DOC NL )* visibility? "fn" IDENT "(" operation_params? ")" fn_result? fails_clause? limits_clause? NL clause_region? ;
+operation_params = operation_param ( "," operation_params? )? ;
+operation_param = IDENT ":" type_expr ;
+```
+
 ### Tombstones
 
 From [Identity and versioning](29-identity-versioning.md).
@@ -435,7 +448,7 @@ history_file = COL0 'nan' 'history' INT NL COL0 history_tail ;
 history_tail = history_record NL COL0 history_tail
     | retired_item COL0 history_tail
     | check_record NL EOF ;
-history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT ;
+history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT | 'schema' IDENT TEXT ;
 api_file = COL0 'nan' 'api' INT NL COL0 api_tail ;
 api_tail = api_record NL COL0 api_tail | check_record NL EOF ;
 api_record = 'item' TEXT
@@ -479,8 +492,8 @@ Generated as [Keywords](01-lexical.md#keywords) states:
 | Class | Words |
 | --- | --- |
 | hard keywords | the 67 words of `HARD_KEYWORD` |
-| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `changes`, `closed`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `manual`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
-| reserved words | `bank`, `flexible`, `ipc`, `machine`, `migrate`, `protocol`, `stable` |
+| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `capability`, `changes`, `closed`, `confined`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `flexible`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `manual`, `migrate`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `protocol`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `summary`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
+| reserved words | `bank`, `ipc`, `machine`, `stable` |
 
 ## One-token lookahead
 

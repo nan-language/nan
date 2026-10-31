@@ -653,7 +653,7 @@ fn run(
         if not read.name.crewed() {
             workers = 0
         }
-        let crew = Crew(checks: mem::Shared.of(check::Crew.empty(alloc), alloc), parses: mem::Shared.of(workspace::Parsing.empty(served: workers > 0, alloc), alloc))
+        let crew = Crew(checks: mem::Shared.of(check::Crew.empty(served: workers > 0, alloc), alloc), parses: mem::Shared.of(workspace::Parsing.empty(served: workers > 0, alloc), alloc))
         var outcome: Result[Outcome, platform::IoError] = Err(platform::IoError.Other(0))
         try await task::scope(exec, body: fn[mut outcome](s: task::Scope) {
             for _ in 0..<workers {
@@ -903,7 +903,7 @@ fn writer_of(workspace: workspace::Workspace, scope: scope::Scope, alloc: mem::A
     let Some(index) = scope.package_index(workspace) else {
         return None
     }
-    let Some(pack) = workspace.packages.get(index) else {
+    let Some(pack) = workspace.package_at(index) else {
         expect false
         return None
     }
@@ -1031,7 +1031,8 @@ fn stated(mut lines: mem::List[text::String], label: Str, value: Option[text::St
 } stated
 
 /// Adds the lines of a reason: `because <role> <location> <item> <subject>`, then the line it
-/// lies on, in the workspace or else in `std`.
+/// lies on: a `diagnostic` reason's in a release the workspace's locks read, any other's in the
+/// workspace, and otherwise in `std`.
 fn because(mut lines: mem::List[text::String], workspace: workspace::Workspace, std: workspace::Workspace, writer: Option[text::String], reason: diagnostic::Reason, alloc: mem::Alloc) {
     let Some(at) = reason.at else {
         var line = text::String.of("because ", alloc)
@@ -1041,27 +1042,54 @@ fn because(mut lines: mem::List[text::String], workspace: workspace::Workspace, 
         mut lines.push(take line)
         return
     }
-    if workspace.file(at.path.as_str()).is_some() {
-        located_because(mut lines, home: workspace, writer, reason, at, alloc)
-    } else {
-        located_because(mut lines, home: std, writer, reason, at, alloc)
+    let path = at.path.as_str()
+    let released = workspace.release_file(path)
+    if reason.role == diagnostic::Role.Diagnostic {
+        match released {
+            Some(held) => {
+                let pack = workspace.releases[held.release_index].pack.contents()
+                located_because(mut lines, pack, file: pack.files[held.file_index], writer, reason, at, alloc)
+                return
+            }
+            None => {}
+        }
     }
+    match workspace.file(path) {
+        Some(held) => {
+            located_because(mut lines, pack: workspace.packages[held.package_index].contents(), file: workspace.file_at(held), writer, reason, at, alloc)
+            return
+        }
+        None => {}
+    }
+    match released {
+        Some(held) => {
+            let pack = workspace.releases[held.release_index].pack.contents()
+            located_because(mut lines, pack, file: pack.files[held.file_index], writer, reason, at, alloc)
+            return
+        }
+        None => {}
+    }
+    let Some(held) = std.file(path) else {
+        expect false
+        return
+    }
+    located_because(mut lines, pack: std.packages[held.package_index].contents(), file: std.file_at(held), writer, reason, at, alloc)
 } because
 
-/// Adds the lines of a reason lying at `at` in a file of `home`.
-fn located_because(mut lines: mem::List[text::String], home: workspace::Workspace, writer: Option[text::String], reason: diagnostic::Reason, at: diagnostic::At, alloc: mem::Alloc) {
+/// Adds the lines of a reason lying at `at` in a file of a package.
+fn located_because(mut lines: mem::List[text::String], pack: workspace::Package, file: workspace::File, writer: Option[text::String], reason: diagnostic::Reason, at: diagnostic::At, alloc: mem::Alloc) {
     var line = text::String.of("because ", alloc)
     mut line.append(reason.role.word())
     mut line.push(' ')
     mut line.append(located(at.path.as_str(), line: at.line, alloc).as_str())
     mut line.push(' ')
-    mut line.append(item_written(home, writer, path: at.path.as_str(), line: at.line, known: None, alloc).as_str())
+    let item = match pack.item_at(file, line: at.line, alloc) {
+        Some(found) => written_for(found.canonical(alloc).as_str(), writer, alloc)
+        None => text::String.of("-", alloc)
+    }
+    mut line.append(item.as_str())
     mut line.push(' ')
     mut line.append(reason.subject.as_str())
     mut lines.push(take line)
-    let Some(file) = home.file(at.path.as_str()) else {
-        expect false
-        return
-    }
-    mut lines.push(output::printable(home.file_at(file).syntax.line_text(at.line), alloc))
+    mut lines.push(output::printable(file.syntax.line_text(at.line), alloc))
 } located_because

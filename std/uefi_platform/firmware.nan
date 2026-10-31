@@ -1,0 +1,305 @@
+//! Calls into the firmware: its tables, protocols, statuses, GUIDs and UTF-16 texts.
+
+/// The offsets in the system table of its console input and output protocols, its runtime
+/// services and its boot services.
+const CONSOLE_IN: u64 = 48
+
+const CONSOLE_OUT: u64 = 64
+
+const RUNTIME_SERVICES: u64 = 88
+
+const BOOT_SERVICES: u64 = 96
+
+/// The offsets in the boot services of the functions the platform calls.
+const ALLOCATE_PAGES: u64 = 40
+
+const FREE_PAGES: u64 = 48
+
+const GET_MEMORY_MAP: u64 = 56
+
+const CREATE_EVENT: u64 = 80
+
+const SET_TIMER: u64 = 88
+
+const WAIT_FOR_EVENT: u64 = 96
+
+const CLOSE_EVENT: u64 = 112
+
+const HANDLE_PROTOCOL: u64 = 152
+
+const EXIT_BOOT_SERVICES: u64 = 232
+
+const LOCATE_PROTOCOL: u64 = 320
+
+/// The offsets in the runtime services of `GetVariable` and `SetVariable`.
+const VARIABLE_GET: u64 = 72
+
+const VARIABLE_SET: u64 = 88
+
+/// The bit marking an error status, and the error statuses the platform tells apart.
+const ERROR: u64 = 0x8000_0000_0000_0000
+
+const INVALID_PARAMETER: u64 = 0x8000_0000_0000_0002
+
+const UNSUPPORTED: u64 = 0x8000_0000_0000_0003
+
+const BAD_BUFFER_SIZE: u64 = 0x8000_0000_0000_0004
+
+const BUFFER_TOO_SMALL: u64 = 0x8000_0000_0000_0005
+
+const NOT_READY: u64 = 0x8000_0000_0000_0006
+
+const WRITE_PROTECTED: u64 = 0x8000_0000_0000_0008
+
+const OUT_OF_RESOURCES: u64 = 0x8000_0000_0000_0009
+
+const NOT_FOUND: u64 = 0x8000_0000_0000_000E
+
+const ACCESS_DENIED: u64 = 0x8000_0000_0000_000F
+
+const SECURITY_VIOLATION: u64 = 0x8000_0000_0000_001A
+
+/// The most UTF-16 code units of a path or variable name, its NUL excluded.
+const NAME_LIMIT: usize = 255
+
+/// A GUID as the firmware lays it out.
+layout EfiGuid: bytes 16 le {
+    data1: u32 at 0
+    data2: u16 at 4
+    data3: u16 at 6
+    data4: GuidTail at 8
+} EfiGuid
+
+/// The last 8 bytes of a GUID, in the order its text writes them.
+layout GuidTail: bytes 8 be {
+    value: u64 at 0
+} GuidTail
+
+/// Calls the firmware function at an address with five arguments, under the firmware's
+/// calling convention on the boot stack, and gives its result; a function taking fewer
+/// arguments ignores the others.
+pkg fn call(function: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> u64
+
+/// The system table and the image handle the firmware entered the image with.
+pkg fn system_table() -> u64
+
+pkg fn image_handle() -> u64
+
+/// The word at an address of the firmware's tables.
+fn word(at: u64) -> u64 {
+    return trusted "the firmware's tables lie in memory it maps, aligned, and change only through its calls" { hw::Ptr[u64].of_addr(usize.widen(at)).read() }
+} word
+
+/// The byte at an address the firmware wrote.
+fn byte_at(at: u64) -> u8 {
+    return trusted "the firmware wrote that byte" { hw::Ptr[u8].of_addr(usize.widen(at)).read() }
+} byte_at
+
+/// The function at an offset of the boot services and of the runtime services.
+fn boot_service(offset: u64) -> u64 {
+    return word(word(system_table() + BOOT_SERVICES) + offset)
+} boot_service
+
+fn runtime_service(offset: u64) -> u64 {
+    return word(word(system_table() + RUNTIME_SERVICES) + offset)
+} runtime_service
+
+/// The address of the first element of a view the firmware reads.
+fn src(items: Slice[u8]) -> u64 = u64.widen(hw::Ptr.of_view(items).addr())
+
+fn src_units(items: Slice[u16]) -> u64 = u64.widen(hw::Ptr.of_view(items).addr())
+
+/// The address of the first element of a view the firmware writes.
+fn dst(mut items: SliceMut[u8]) -> u64 = u64.widen(hw::Ptr.of_view_mut(mut items).addr())
+
+fn dst_words(mut items: SliceMut[u64]) -> u64 = u64.widen(hw::Ptr.of_view_mut(mut items).addr())
+
+fn dst_units(mut items: SliceMut[u16]) -> u64 = u64.widen(hw::Ptr.of_view_mut(mut items).addr())
+
+/// Fails with the error a status names when it is an error: `NotFound` for `EFI_NOT_FOUND`,
+/// `OutOfMemory` for `EFI_OUT_OF_RESOURCES`, `Denied` for `EFI_ACCESS_DENIED`,
+/// `EFI_WRITE_PROTECTED` and `EFI_SECURITY_VIOLATION`, `Unsupported` for `EFI_UNSUPPORTED`,
+/// `Invalid` for `EFI_INVALID_PARAMETER` and `EFI_BAD_BUFFER_SIZE`, and `DeviceError` for any
+/// other.
+fn success(status: u64) fails boot::ServiceError {
+    if (status & ERROR) == 0 {
+        return
+    }
+    fail failure(status)
+} success
+
+fn failure(status: u64) -> boot::ServiceError {
+    return match status {
+        NOT_FOUND => boot::ServiceError.NotFound
+        OUT_OF_RESOURCES => boot::ServiceError.OutOfMemory
+        ACCESS_DENIED or WRITE_PROTECTED or SECURITY_VIOLATION => boot::ServiceError.Denied
+        UNSUPPORTED => boot::ServiceError.Unsupported
+        INVALID_PARAMETER or BAD_BUFFER_SIZE => boot::ServiceError.Invalid
+        else => boot::ServiceError.DeviceError
+    }
+} failure
+
+/// A GUID in the firmware's layout.
+fn guid_bits(guid: boot::Guid) -> Array[u8, 16] {
+    return EfiGuid(data1: guid.data1, data2: guid.data2, data3: guid.data3, data4: GuidTail(value: guid.data4)).to_bits()
+} guid_bits
+
+/// The GUID the firmware laid out at an address.
+fn guid_at(at: u64) -> boot::Guid {
+    var tail: u64 = 0
+    for index in 8u64..<16 {
+        tail = (tail << 8) | u64.widen(byte_at(at + index))
+    }
+    return boot::Guid(data1: u32.fit(bytes_at(at, count: 4)), data2: u16.fit(bytes_at(at + 4, count: 2)), data3: u16.fit(bytes_at(at + 6, count: 2)), data4: tail)
+} guid_at
+
+/// The interface of the one protocol with a GUID the firmware locates, failing with
+/// `Unsupported` when it has none.
+fn protocol(guid: boot::Guid) -> u64 fails boot::ServiceError {
+    let bits = guid_bits(guid)
+    var found = Array[u64, 1].filled(0)
+    let status = call(boot_service(LOCATE_PROTOCOL), a: src(bits.view()), b: 0, c: dst_words(mut found.view_mut()), d: 0, e: 0)
+    if status == NOT_FOUND {
+        fail boot::ServiceError.Unsupported
+    }
+    try success(status)
+    return found[0]
+} protocol
+
+/// The interface of a protocol with a GUID on a handle.
+fn on_handle(handle: u64, guid: boot::Guid) -> u64 fails boot::ServiceError {
+    let bits = guid_bits(guid)
+    var found = Array[u64, 1].filled(0)
+    let status = call(boot_service(HANDLE_PROTOCOL), a: handle, b: src(bits.view()), c: dst_words(mut found.view_mut()), d: 0, e: 0)
+    try success(status)
+    return found[0]
+} on_handle
+
+/// The loaded image protocol of the image.
+fn loaded_image() -> u64 fails boot::ServiceError {
+    return try on_handle(image_handle(), guid: boot::Guid(data1: 0x5B1B_31A1, data2: 0x9562, data3: 0x11D2, data4: 0x8E3F_00A0_C969_723B))
+} loaded_image
+
+/// Writes `text` into `units` as NUL-terminated UTF-16, each `/` as `\` when `path` holds,
+/// failing with `Invalid` when it holds more than `NAME_LIMIT` code units.
+fn wide(text: Str, path: bool, mut units: Array[u16, 256]) fails boot::ServiceError {
+    var at: usize = 0
+    for c in text {
+        var point = c.to_bits()
+        if path and point == 0x2F {
+            point = 0x5C
+        }
+        if point >= 0x1_0000 {
+            if at + 2 > NAME_LIMIT {
+                fail boot::ServiceError.Invalid
+            }
+            let offset = point - 0x1_0000
+            units[at] = u16.fit(0xD800 + (offset >> 10))
+            units[at + 1] = u16.fit(0xDC00 + (offset & 0x3FF))
+            at += 2
+        } else {
+            if at + 1 > NAME_LIMIT {
+                fail boot::ServiceError.Invalid
+            }
+            units[at] = u16.fit(point)
+            at += 1
+        }
+    }
+    units[at] = 0
+} wide
+
+/// The little-endian number of `count` bytes at an address, which need not be aligned.
+fn bytes_at(at: u64, count: u64) -> u64 {
+    var value: u64 = 0
+    for index in 0..<count {
+        value = value | (u64.widen(byte_at(at + index)) << u32.fit(index * 8))
+    }
+    return value
+} bytes_at
+
+/// Appends the UTF-8 encoding of the UTF-16 text at an address, of at most `limit` code units
+/// and ending at a NUL, to `out`, each unpaired surrogate as U+FFFD; for a path, each `\` as `/`
+/// with the leading ones left out. Fails with `OutOfMemory` when `out` cannot grow.
+fn narrow(at: u64, limit: u64, path: bool, mut out: mem::Bytes) fails boot::ServiceError {
+    var next = at
+    let end = at + limit * 2
+    while next < end {
+        let unit = u32.fit(bytes_at(next, count: 2))
+        if unit == 0 {
+            return
+        }
+        next += 2
+        var point = unit
+        if unit >= 0xD800 and unit < 0xDC00 and next < end {
+            let low = u32.fit(bytes_at(next, count: 2))
+            if low >= 0xDC00 and low < 0xE000 {
+                point = 0x1_0000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                next += 2
+            }
+        }
+        if path and point == 0x5C {
+            point = 0x2F
+        }
+        if not (path and point == 0x2F and out.len() == 0) {
+            try push_char(point, mut out)
+        }
+    }
+} narrow
+
+/// Appends the UTF-8 encoding of a code point to `out`, U+FFFD for a surrogate.
+fn push_char(point: u32, mut out: mem::Bytes) fails boot::ServiceError {
+    let Some(c) = char.checked_from_bits(point) else {
+        try grown(mut out, bytes: "\u{FFFD}".as_bytes())
+        return
+    }
+    var encoded = Array[u8, 4].filled(0)
+    let len = c.utf8_len()
+    var rest = point
+    for index in 0..<len {
+        let at = len - 1 - index
+        encoded[at] = u8.fit(0x80 | (rest & 0x3F))
+        rest = rest >> 6
+    }
+    let lead = match len {
+        1 => 0u8
+        2 => 0xC0u8
+        3 => 0xE0u8
+        else => 0xF0u8
+    }
+    if len > 1 {
+        encoded[0] = (encoded[0] & 0x3F) | lead
+    } else {
+        encoded[0] = u8.fit(point)
+    }
+    let Some(bytes) = encoded.view().prefix(len) else {
+        return
+    }
+    try grown(mut out, bytes)
+} push_char
+
+/// Appends bytes to `out`, failing with `OutOfMemory` when it cannot grow.
+fn grown(mut out: mem::Bytes, bytes: Slice[u8]) fails boot::ServiceError {
+    let Ok(_) = attempt mut out.try_append(bytes) else {
+        fail boot::ServiceError.OutOfMemory
+    }
+} grown
+
+/// The `len` bytes at an address, drawn through `alloc`, failing with `OutOfMemory` when it
+/// cannot hold them.
+fn drawn(at: u64, len: u64, alloc: mem::Alloc) -> mem::Bytes fails boot::ServiceError {
+    var bytes = try zeroed(len, alloc)
+    let count = bytes.len()
+    let to = hw::Ptr.of_view_mut(mut bytes.view_mut())
+    trusted "the firmware gave `len` bytes at `at`, and `to` holds as many" {
+        hw::Ptr[u8].of_addr(usize.widen(at)).copy(to, count)
+    }
+    return bytes
+} drawn
+
+/// `len` zero bytes drawn through `alloc`, failing with `OutOfMemory` when it cannot hold them.
+fn zeroed(len: u64, alloc: mem::Alloc) -> mem::Bytes fails boot::ServiceError {
+    let Ok(bytes) = attempt mem::Bytes.try_zeroed(usize.widen(len), alloc) else {
+        fail boot::ServiceError.OutOfMemory
+    }
+    return bytes
+} zeroed

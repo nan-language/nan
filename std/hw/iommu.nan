@@ -1,0 +1,908 @@
+//! I/O domains: the machine's IOMMU, which translates the DMA of each PCI function through the domain it is attached to, its domains and their spaces, the mappings of DMA buffers in them, and what settlement releases.
+
+/// The kinds of IOMMU the runtime drives: Intel VT-d and Arm SMMUv3.
+const VTD: u64 = 1
+
+const SMMU: u64 = 2
+
+/// The offsets of the unit record, a chunk the runtime's flush and interrupt routines read too:
+/// its kind, register base, command queue, the queue's next entry, the interrupt remapping
+/// table, its flags, then past the runtime's lock and wait words, the table of bus 0's contexts
+/// or streams, the free table pages, a bit per function of bus 0 it translates, and the domain
+/// slots, each a domain record and a generation.
+const UNIT_KIND: u64 = 0
+
+const UNIT_REGISTERS: u64 = 8
+
+const UNIT_QUEUE: u64 = 16
+
+const UNIT_REMAPPING: u64 = 32
+
+const UNIT_FLAGS: u64 = 40
+
+const UNIT_STREAMS: u64 = 64
+
+const UNIT_FREE: u64 = 72
+
+const UNIT_COVERED: u64 = 80
+
+const COVERED_WORDS: u64 = 4
+
+const UNIT_SLOTS: u64 = 128
+
+const SLOTS: u64 = 256
+
+const SLOT_BYTES: u64 = 16
+
+/// The unit's flags: interrupt remapping in extended mode, reads and writes drained by an
+/// invalidation, table walks that miss the caches, and pass-through translation.
+const EXTENDED_MODE: u64 = 1
+
+const DRAIN_READS: u64 = 2
+
+const DRAIN_WRITES: u64 = 4
+
+const UNCOHERENT: u64 = 8
+
+const PASS_THROUGH: u64 = 16
+
+/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function
+/// and a mapping. Every such record holds its holding at offset 0.
+const DOMAIN_TAG: u64 = 1
+
+const FUNCTION_TAG: u64 = 2
+
+const MAPPING_TAG: u64 = 3
+
+const RECORD_HOLDING: u64 = 0
+
+const RECORD_TAG: u64 = 8
+
+/// The holding kinds settlement releases through `settled`.
+const UNMAP: u64 = 9
+
+const DETACH: u64 = 10
+
+/// A domain record, a table page: its slot and its root table; its SMMU context descriptor from
+/// `DOMAIN_CONTEXT`.
+const DOMAIN_SLOT: u64 = 16
+
+const DOMAIN_ROOT: u64 = 24
+
+const DOMAIN_CONTEXT: u64 = 64
+
+/// A mapping record: its space's key, its first address and its bytes.
+const MAPPING_KEY: u64 = 16
+
+const MAPPING_ADDRESS: u64 = 24
+
+const MAPPING_BYTES: u64 = 32
+
+const MAPPING_RECORD: u64 = 40
+
+/// The bytes of a page, of a chunk, and of a cache line; the entries of a table and the bits of
+/// an entry holding the next table or page.
+const PAGE_BYTES: u64 = 4_096
+
+const CHUNK: u64 = 65_536
+
+const LINE_BYTES: u64 = 64
+
+const ENTRIES: u64 = 512
+
+const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000
+
+/// The bits of a present table entry, and of a present page entry: readable and writable on
+/// VT-d; on SMMUv3 a page of normal memory, inner shareable, accessed, not global and
+/// reachable by unprivileged requests, or such a page of device memory.
+const TABLE_ENTRY: u64 = 0x3
+
+const VTD_PAGE: u64 = 0x3
+
+const SMMU_PAGE: u64 = 0xF43
+
+const SMMU_DEVICE_PAGE: u64 = 0xF47
+
+/// The key of the physical space.
+const PHYSICAL_KEY: u64 = 0
+
+/// The domain id of functions VT-d passes through, and the first one of a slot's domain.
+const PASS_DOMAIN: u64 = 1
+
+const FIRST_DOMAIN: u64 = 2
+
+/// The registers of VT-d that the runtime reads and writes, with the global command bits it
+/// sets: translation, the root table pointer, queued invalidation, interrupt remapping and the
+/// remapping table pointer; the status bits that stay set across a command; and the
+/// capability and extended capability bits it needs.
+registers VtdRegisters {
+    capability: u64 at 0x08 read
+    extended: u64 at 0x10 read
+    command: u32 at 0x18 write
+    status: u32 at 0x1C read
+    root: u64 at 0x20 read write
+    queue_tail: u64 at 0x88 read write
+    queue_address: u64 at 0x90 read write
+    remapping: u64 at 0xB8 read write
+} VtdRegisters
+
+const TRANSLATE: u32 = 0x8000_0000
+
+const SET_ROOT: u32 = 0x4000_0000
+
+const QUEUED: u32 = 0x0400_0000
+
+const REMAP: u32 = 0x0200_0000
+
+const SET_REMAPPING: u32 = 0x0100_0000
+
+const KEPT_STATUS: u32 = 0x96FF_FFFF
+
+const FOUR_LEVELS: u64 = 0x400
+
+const DRAINS_READS: u64 = 0x80_0000_0000_0000
+
+const DRAINS_WRITES: u64 = 0x40_0000_0000_0000
+
+const COHERENT: u64 = 0x1
+
+const QUEUES: u64 = 0x2
+
+const REMAPS: u64 = 0x8
+
+const EXTENDS: u64 = 0x10
+
+const PASSES: u64 = 0x40
+
+/// The remapping table: 2^14 entries, one per CPU and vector, its size field, and the bit
+/// selecting the extended mode.
+const REMAPPING_CHUNKS: u64 = 4
+
+const REMAPPING_SIZE: u64 = 13
+
+const REMAPPING_EXTENDED: u64 = 0x800
+
+/// The remapping structures of the DMAR table: where they start, the kinds of a remapping
+/// unit and of a reserved memory region, the flag of a unit including every PCI function, and
+/// the table flag saying the platform remaps interrupts; where a unit's device scopes start, the
+/// kind of an endpoint's scope and the length of one naming a device of its start bus.
+const DMAR_STRUCTURES: u64 = 48
+
+const DMAR_SCOPES: u64 = 16
+
+const ENDPOINT_SCOPE: u8 = 1
+
+const ONE_HOP: u64 = 8
+
+const DMAR_UNIT: u32 = 0
+
+const DMAR_RESERVED: u32 = 1
+
+const ALL_FUNCTIONS: u8 = 1
+
+const REMAPS_INTERRUPTS: u8 = 1
+
+/// The registers of SMMUv3 that the runtime reads and writes.
+registers SmmuRegisters {
+    identity0: u32 at 0x0 read
+    identity1: u32 at 0x4 read
+    identity5: u32 at 0x14 read
+    control: u32 at 0x20 read write
+    control_ack: u32 at 0x24 read
+    control1: u32 at 0x28 read write
+    bypass: u32 at 0x44 read write
+    streams: u64 at 0x80 read write
+    streams_config: u32 at 0x88 read write
+    queue_base: u64 at 0x90 read write
+    queue_produce: u32 at 0x98 read write
+    queue_consume: u32 at 0x9C read write
+} SmmuRegisters
+
+/// The identity bits SMMUv3 needs: stage 1, AArch64 tables, coherent table walks, 4 KiB pages,
+/// and the stream id bits; the control bits enabling it and its command queue; the bypass
+/// register's update and abort bits; the read-allocate hint of a base register; inner
+/// shareable write-back tables and queues; and a stream table and command queue of 2^8
+/// entries.
+const STAGE1: u32 = 0x2
+
+const AARCH64_TABLES: u32 = 0x8
+
+const WALKS_COHERENT: u32 = 0x10
+
+const GRANULE_4K: u32 = 0x10
+
+const ENABLED: u32 = 0x1
+
+const COMMANDS: u32 = 0x8
+
+const UPDATE: u32 = 0x8000_0000
+
+const ABORT: u32 = 0x10_0000
+
+const READ_ALLOCATE: u64 = 0x4000_0000_0000_0000
+
+const SHARED_CACHED: u32 = 0xD75
+
+const LOG2_ENTRIES: u64 = 8
+
+/// A stream table entry's words: valid, then translated by stage 1 through one context
+/// descriptor or bypassing translation; the inner shareable write-back walks of its second word.
+const STREAM_BYTES: u64 = 64
+
+const STREAM_TRANSLATED: u64 = 0xB
+
+const STREAM_BYPASS: u64 = 0x9
+
+const STREAM_WALKS: u64 = 0xD4
+
+/// A context descriptor's first word, a 48-bit space of 4 KiB pages walked inner shareable
+/// write-back, the upper table disabled, valid, AArch64 tables, aborting faults, its output
+/// size at `CONTEXT_SIZE` and its ASID at `CONTEXT_ASID`; its memory attributes, index 0
+/// normal write-back and index 1 device memory.
+const CONTEXT_FIRST: u64 = 0x0000_C200_C000_3510
+
+const CONTEXT_SIZE: u32 = 32
+
+const CONTEXT_ASID: u32 = 48
+
+const CONTEXT_ATTRIBUTES: u64 = 0xFF
+
+/// The ITS page a message-signalled interrupt writes, which a domain's functions reach.
+const ITS_PAGE: u64 = 0x0809_0000
+
+/// The machine's IOMMU.
+pub open linear struct Iommu {
+} Iommu
+
+/// A domain of the IOMMU, which a slot of the unit names.
+pub open linear struct IoDomain {
+    record: u64
+} IoDomain
+
+/// The addresses a function attached to a domain reaches, or physical memory.
+pub open struct IoSpace derives Copy, Send {
+    key: u64
+} IoSpace
+
+pub closed enum IommuError derives Copy, Eq, Render {
+    Exhausted
+    Physical
+    Closed
+    Unsupported
+} IommuError
+
+pub fn Iommu.domain(self) -> IoDomain fails IommuError {
+    let unit = iommu_unit()
+    let flags = iommu_lock()
+    var slot: u64 = SLOTS
+    for index in 0..<SLOTS {
+        let entry = unit + UNIT_SLOTS + index * SLOT_BYTES
+        if slot == SLOTS and peek(entry) == 0 and peek(entry + 8) != 0xFFFF_FFFF {
+            slot = index
+        }
+    }
+    var record: u64 = 0
+    var root: u64 = 0
+    if slot != SLOTS {
+        record = table_page(unit)
+        root = table_page(unit)
+    }
+    if root == 0 {
+        if record != 0 {
+            free_page(unit, page: record)
+        }
+        iommu_unlock(flags)
+        fail IommuError.Exhausted
+    }
+    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    poke(entry, value: record)
+    poke(record + RECORD_TAG, value: DOMAIN_TAG)
+    poke(record + DOMAIN_SLOT, value: slot)
+    poke(record + DOMAIN_ROOT, value: root)
+    if peek(unit + UNIT_KIND) == SMMU {
+        let context = record + DOMAIN_CONTEXT
+        let size = (peek(unit + UNIT_FLAGS) >> 8) & 0x7
+        poke(context, value: CONTEXT_FIRST | (size << CONTEXT_SIZE) | ((slot + FIRST_DOMAIN) << CONTEXT_ASID))
+        poke(context + 8, value: root)
+        poke(context + 24, value: CONTEXT_ATTRIBUTES)
+    }
+    iommu_unlock(flags)
+    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
+    return IoDomain(record: record)
+} Iommu.domain
+
+pub fn IoDomain.space(self) -> IoSpace {
+    let unit = iommu_unit()
+    let slot = peek(self.record + DOMAIN_SLOT)
+    let generation = peek(unit + UNIT_SLOTS + slot * SLOT_BYTES + 8)
+    return IoSpace(key: (slot + 1) | (generation << 32))
+} IoDomain.space
+
+pub fn IoDomain.close(take self) {
+    let IoDomain(record: record) = self
+    unhold(peek(record + RECORD_HOLDING))
+    close_domain(record)
+} IoDomain.close
+
+pub fn IoSpace.physical() -> IoSpace {
+    return IoSpace(key: PHYSICAL_KEY)
+} IoSpace.physical
+
+/// The unit record the runtime keeps, zero before `boot::Kernel.iommu` enables the IOMMU.
+pkg fn iommu_unit() -> u64
+
+/// Records the unit record of the enabled IOMMU.
+pkg fn iommu_ready(unit: u64)
+
+/// Takes the unit's lock with maskable interrupts disabled, giving the state to restore.
+pkg fn iommu_lock() -> u64
+
+pkg fn iommu_unlock(flags: u64)
+
+/// Invalidates every context, translation and interrupt entry the unit caches, under its lock,
+/// and waits until it has.
+pkg fn iommu_flush()
+
+/// `count` zeroed chunks of 64 KiB aligned to their size, zero when none is left.
+pkg fn chunks(count: u64) -> u64
+
+/// A zeroed runtime record of `bytes` bytes, trapping with `trap.exhausted` when none is left,
+/// and its release.
+pkg fn runtime_record(bytes: u64) -> u64
+
+pkg fn free_record(address: u64)
+
+/// A holding of a kind and payload, owned by the running task's domain, and its release.
+pkg fn hold(kind: u64, payload: u64) -> u64
+
+pkg fn unhold(holding: u64)
+
+/// Writes the cache line holding an address back to memory.
+pkg fn flush_line(address: u64)
+
+/// Traps with `trap.exhausted`.
+pkg fn exhausted() -> Never
+
+/// Whether the local APICs run in x2APIC mode.
+pkg fn x2apic() -> bool
+
+/// The addresses of the ACPI root system description pointer and of the device tree the
+/// platform gives, zero when none.
+pkg fn rsdp_address() -> u64
+
+pkg fn tree_address() -> u64
+
+/// Whether the image runs on AArch64.
+pkg fn on_aarch64() -> bool
+
+/// What `boot::Kernel.iommu` enables: the machine's IOMMU, with interrupt remapping on VT-d.
+pkg fn started() -> Option[Iommu] {
+    if on_aarch64() {
+        return started_smmu()
+    }
+    return started_vtd()
+} started
+
+/// Maps the pages from `address` holding `bytes` bytes in a space's domain at their own
+/// addresses, giving the mapping's record held for settlement; zero for the physical space.
+/// A closed domain's space maps nothing.
+pkg fn mapped(space: IoSpace, address: u64, bytes: u64) -> u64 {
+    if space.key == PHYSICAL_KEY {
+        return 0
+    }
+    let unit = iommu_unit()
+    let flags = iommu_lock()
+    let domain = live(unit, key: space.key)
+    if domain != 0 {
+        if not map_range(unit, domain, address, bytes, device: false) {
+            unmap_range(unit, domain, address, bytes)
+            iommu_unlock(flags)
+            exhausted()
+        }
+        iommu_flush()
+    }
+    iommu_unlock(flags)
+    let mapping = runtime_record(MAPPING_RECORD)
+    poke(mapping + RECORD_TAG, value: MAPPING_TAG)
+    poke(mapping + MAPPING_KEY, value: space.key)
+    poke(mapping + MAPPING_ADDRESS, value: address)
+    poke(mapping + MAPPING_BYTES, value: bytes)
+    poke(mapping + RECORD_HOLDING, value: hold(UNMAP, payload: mapping))
+    return mapping
+} mapped
+
+/// Ends a mapping `mapped` gave, waiting until the IOMMU no longer translates its pages.
+pkg fn unmapped(mapping: u64) {
+    unhold(peek(mapping + RECORD_HOLDING))
+    end_mapping(mapping)
+} unmapped
+
+/// Releases what a holding of an abandoned domain holds: a mapping ends, and a domain or
+/// function is cut off from memory.
+pkg fn settled(kind: u64, payload: u64) {
+    let tag = peek(payload + RECORD_TAG)
+    if kind == UNMAP {
+        end_mapping(payload)
+    } else if tag == DOMAIN_TAG {
+        close_domain(payload)
+    } else {
+        cut_off(payload)
+    }
+} settled
+
+/// Unmaps a mapping's pages when its domain is live, and frees its record.
+fn end_mapping(mapping: u64) {
+    let unit = iommu_unit()
+    if unit != 0 {
+        let flags = iommu_lock()
+        let domain = live(unit, key: peek(mapping + MAPPING_KEY))
+        if domain != 0 {
+            unmap_range(unit, domain, address: peek(mapping + MAPPING_ADDRESS), bytes: peek(mapping + MAPPING_BYTES))
+            iommu_flush()
+        }
+        iommu_unlock(flags)
+    }
+    free_record(mapping)
+} end_mapping
+
+/// Ends a domain: every function attached to it stops reaching memory, its slot takes a new
+/// generation, and once the unit no longer caches its translations its tables are freed.
+fn close_domain(record: u64) {
+    let unit = iommu_unit()
+    let flags = iommu_lock()
+    let slot = peek(record + DOMAIN_SLOT)
+    for requester in 0..<256u64 {
+        if attached_domain(unit, requester) == slot + FIRST_DOMAIN {
+            clear_entry(unit, requester)
+        }
+    }
+    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    poke(entry, value: 0)
+    poke(entry + 8, value: peek(entry + 8) + 1)
+    iommu_flush()
+    free_tables(unit, root: peek(record + DOMAIN_ROOT))
+    free_page(unit, page: record)
+    iommu_unlock(flags)
+} close_domain
+
+/// The record of the domain a space's key names, zero when the key is stale or names no slot.
+fn live(unit: u64, key: u64) -> u64 {
+    let slot = (key & 0xFFFF_FFFF).wrapping_sub(1)
+    if slot >= SLOTS {
+        return 0
+    }
+    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    if peek(entry + 8) != (key >> 32) {
+        return 0
+    }
+    return peek(entry)
+} live
+
+/// The domain id a requester's context or stream reaches, zero when it reaches none: the
+/// pass-through id, or a slot's plus `FIRST_DOMAIN`.
+fn attached_domain(unit: u64, requester: u64) -> u64 {
+    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    let head = peek(entry)
+    if (head & 1) == 0 {
+        return 0
+    }
+    if peek(unit + UNIT_KIND) == VTD {
+        return (peek(entry + 8) >> 8) & 0xFFFF
+    }
+    if (head & 0xE) == (STREAM_BYPASS & 0xE) {
+        return PASS_DOMAIN
+    }
+    let context = head & 0x000F_FFFF_FFFF_FFC0
+    return peek(context - DOMAIN_CONTEXT + DOMAIN_SLOT) + FIRST_DOMAIN
+} attached_domain
+
+/// The bytes of a context entry or stream table entry.
+fn entry_bytes(unit: u64) -> u64 {
+    if peek(unit + UNIT_KIND) == VTD {
+        return 16
+    }
+    return STREAM_BYTES
+} entry_bytes
+
+/// Points a requester's context or stream at a domain, or passes it through for zero, under
+/// the unit's lock; the first word, holding the valid bit, is written last.
+fn set_entry(unit: u64, requester: u64, domain: u64) {
+    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    if peek(unit + UNIT_KIND) == VTD {
+        if domain == 0 {
+            poke(entry + 8, value: 0x2 | (PASS_DOMAIN << 8))
+            poke(entry, value: 0x9)
+        } else {
+            poke(entry + 8, value: 0x2 | ((peek(domain + DOMAIN_SLOT) + FIRST_DOMAIN) << 8))
+            poke(entry, value: peek(domain + DOMAIN_ROOT) | 0x1)
+        }
+    } else if domain == 0 {
+        poke(entry + 8, value: STREAM_WALKS)
+        poke(entry, value: STREAM_BYPASS)
+    } else {
+        poke(entry + 8, value: STREAM_WALKS)
+        poke(entry, value: (domain + DOMAIN_CONTEXT) | STREAM_TRANSLATED)
+    }
+    publish(unit, address: entry, bytes: 16)
+} set_entry
+
+/// Makes a requester's DMA reach nothing, under the unit's lock.
+fn clear_entry(unit: u64, requester: u64) {
+    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    poke(entry, value: 0)
+    publish(unit, address: entry, bytes: 8)
+} clear_entry
+
+/// Maps the pages of a range at their own addresses in a domain's tables, as device memory on
+/// SMMUv3 when `device` holds, under the unit's lock; false when no table page is left.
+fn map_range(unit: u64, domain: u64, address: u64, bytes: u64, device: bool) -> bool {
+    var leaf = VTD_PAGE
+    if peek(unit + UNIT_KIND) == SMMU and device {
+        leaf = SMMU_DEVICE_PAGE
+    } else if peek(unit + UNIT_KIND) == SMMU {
+        leaf = SMMU_PAGE
+    }
+    let root = peek(domain + DOMAIN_ROOT)
+    var page = address & ~(PAGE_BYTES - 1)
+    while page < address + bytes {
+        let entry = leaf_entry(unit, root, address: page, create: true)
+        if entry == 0 {
+            return false
+        }
+        poke(entry, value: page | leaf)
+        publish(unit, address: entry, bytes: 8)
+        page += PAGE_BYTES
+    }
+    return true
+} map_range
+
+/// Unmaps the pages of a range in a domain's tables, under the unit's lock.
+fn unmap_range(unit: u64, domain: u64, address: u64, bytes: u64) {
+    let root = peek(domain + DOMAIN_ROOT)
+    var page = address & ~(PAGE_BYTES - 1)
+    while page < address + bytes {
+        let entry = leaf_entry(unit, root, address: page, create: false)
+        if entry != 0 {
+            poke(entry, value: 0)
+            publish(unit, address: entry, bytes: 8)
+        }
+        page += PAGE_BYTES
+    }
+} unmap_range
+
+/// The address of the last-level entry of a page in a four-level table from `root`, adding the
+/// missing tables when `create` holds; zero when one is missing or no table page is left.
+fn leaf_entry(unit: u64, root: u64, address: u64, create: bool) -> u64 {
+    var table = root
+    for level in 0u32..<3 {
+        let entry = table + ((address >> (39 - 9 * level)) & (ENTRIES - 1)) * 8
+        var next = peek(entry)
+        if (next & 1) == 0 {
+            if not create {
+                return 0
+            }
+            next = table_page(unit)
+            if next == 0 {
+                return 0
+            }
+            poke(entry, value: next | TABLE_ENTRY)
+            publish(unit, address: entry, bytes: 8)
+        }
+        table = next & FRAME_MASK
+    }
+    return table + ((address >> 12) & (ENTRIES - 1)) * 8
+} leaf_entry
+
+/// Frees the tables of a four-level table from `root`, under the unit's lock.
+fn free_tables(unit: u64, root: u64) {
+    for index in 0..<ENTRIES {
+        let entry = peek(root + index * 8)
+        if (entry & 1) != 0 {
+            free_middle(unit, table: entry & FRAME_MASK, levels: 2)
+        }
+    }
+    free_page(unit, page: root)
+} free_tables
+
+/// Frees a table holding `levels` levels of tables below it, and those tables.
+fn free_middle(unit: u64, table: u64, levels: u64) {
+    if levels != 0 {
+        for index in 0..<ENTRIES {
+            let entry = peek(table + index * 8)
+            if (entry & 1) != 0 {
+                free_leaves(unit, table: entry & FRAME_MASK, levels: levels - 1)
+            }
+        }
+    }
+    free_page(unit, page: table)
+} free_middle
+
+fn free_leaves(unit: u64, table: u64, levels: u64) {
+    if levels != 0 {
+        for index in 0..<ENTRIES {
+            let entry = peek(table + index * 8)
+            if (entry & 1) != 0 {
+                free_page(unit, page: entry & FRAME_MASK)
+            }
+        }
+    }
+    free_page(unit, page: table)
+} free_leaves
+
+/// A zeroed table page the hardware sees as zeroed, drawn from the unit's free pages or from a
+/// new chunk; zero when none is left. The caller holds the unit's lock.
+fn table_page(unit: u64) -> u64 {
+    var page = peek(unit + UNIT_FREE)
+    if page != 0 {
+        poke(unit + UNIT_FREE, value: peek(page))
+        poke(page, value: 0)
+    } else {
+        page = chunks(1)
+        if page == 0 {
+            return 0
+        }
+        var rest = page + PAGE_BYTES
+        while rest < page + CHUNK {
+            free_page(unit, page: rest)
+            rest += PAGE_BYTES
+        }
+    }
+    publish(unit, address: page, bytes: PAGE_BYTES)
+    return page
+} table_page
+
+/// Returns a page to the unit's free pages, zeroed but for the link in its first word.
+fn free_page(unit: u64, page: u64) {
+    for index in 1..<ENTRIES {
+        poke(page + index * 8, value: 0)
+    }
+    poke(page, value: peek(unit + UNIT_FREE))
+    poke(unit + UNIT_FREE, value: page)
+} free_page
+
+/// Writes the lines of a range back to memory when the unit's table walks miss the caches.
+fn publish(unit: u64, address: u64, bytes: u64) {
+    if (peek(unit + UNIT_FLAGS) & UNCOHERENT) == 0 {
+        return
+    }
+    var line = address & ~(LINE_BYTES - 1)
+    while line < address + bytes {
+        flush_line(line)
+        line += LINE_BYTES
+    }
+} publish
+
+/// Enables VT-d: the remapping unit of the DMAR table, when it is the only one, the table lists
+/// no reserved memory region, and the unit remaps interrupts, queues invalidations and walks
+/// four-level tables. Every function's DMA then reaches nothing until it is attached,
+/// and interrupts reach CPUs only through the remapping table.
+fn started_vtd() -> Option[Iommu] {
+    let drhd = vtd_unit()
+    if drhd == 0 {
+        return None
+    }
+    let base = u64_at(drhd + 8)
+    var regs = trusted "the DMAR table names the remapping unit's registers, which the entry root maps uncached, and nothing else maps them" { Mmio[VtdRegisters].map(base) }
+    let caps = mut regs.read(VtdRegisters.capability)
+    let features = mut regs.read(VtdRegisters.extended)
+    let needed = QUEUES | REMAPS
+    if (features & needed) != needed or (caps & FOUR_LEVELS) == 0 {
+        take regs.unmap()
+        return None
+    }
+    let unit = chunks(1)
+    let remapping = chunks(REMAPPING_CHUNKS)
+    if unit == 0 or remapping == 0 {
+        take regs.unmap()
+        return None
+    }
+    var flags: u64 = 0
+    if (features & EXTENDS) != 0 and x2apic() {
+        flags |= EXTENDED_MODE
+    }
+    if (caps & DRAINS_READS) != 0 {
+        flags |= DRAIN_READS
+    }
+    if (caps & DRAINS_WRITES) != 0 {
+        flags |= DRAIN_WRITES
+    }
+    if (features & COHERENT) == 0 {
+        flags |= UNCOHERENT
+    }
+    if (features & PASSES) != 0 {
+        flags |= PASS_THROUGH
+    }
+    poke(unit + UNIT_KIND, value: VTD)
+    poke(unit + UNIT_REGISTERS, value: base)
+    poke(unit + UNIT_REMAPPING, value: remapping)
+    poke(unit + UNIT_FLAGS, value: flags)
+    cover_scopes(unit, drhd)
+    let root = table_page(unit)
+    let contexts = table_page(unit)
+    poke(unit + UNIT_QUEUE, value: table_page(unit))
+    poke(unit + UNIT_STREAMS, value: contexts)
+    poke(root, value: contexts | 0x1)
+    publish(unit, address: root, bytes: 16)
+    publish(unit, address: remapping, bytes: REMAPPING_CHUNKS * CHUNK)
+    mut regs.write(VtdRegisters.root, value: root)
+    vtd_command(mut regs, bit: SET_ROOT)
+    mut regs.write(VtdRegisters.queue_tail, value: 0)
+    mut regs.write(VtdRegisters.queue_address, value: peek(unit + UNIT_QUEUE))
+    vtd_command(mut regs, bit: QUEUED)
+    iommu_ready(unit)
+    var remapped = remapping | REMAPPING_SIZE
+    if (flags & EXTENDED_MODE) != 0 {
+        remapped |= REMAPPING_EXTENDED
+    }
+    mut regs.write(VtdRegisters.remapping, value: remapped)
+    vtd_command(mut regs, bit: SET_REMAPPING)
+    let held = iommu_lock()
+    iommu_flush()
+    iommu_unlock(held)
+    vtd_command(mut regs, bit: REMAP)
+    vtd_command(mut regs, bit: TRANSLATE)
+    take regs.unmap()
+    return Some(Iommu())
+} started_vtd
+
+/// Sets a bit of VT-d's global command, keeping the persistent ones its status reports, and
+/// waits until its status reports it.
+fn vtd_command(mut regs: Mmio[VtdRegisters], bit: u32) {
+    let status = mut regs.read(VtdRegisters.status) & KEPT_STATUS
+    mut regs.write(VtdRegisters.command, value: status | bit)
+    while (mut regs.read(VtdRegisters.status) & bit) == 0 {
+    }
+} vtd_command
+
+/// The DMAR table's one remapping unit when it lies in segment 0, the table lists no reserved
+/// memory region and the platform remaps interrupts; zero otherwise.
+fn vtd_unit() -> u64 {
+    let dmar = listed_table(0x5241_4D44)
+    if dmar == 0 or (byte_at(dmar + 37) & REMAPS_INTERRUPTS) == 0 {
+        return 0
+    }
+    let end = dmar + u64.widen(u32_at(dmar + 4))
+    var at = dmar + DMAR_STRUCTURES
+    var unit: u64 = 0
+    var units: u32 = 0
+    while at + 4 <= end {
+        let kind = u32_at(at) & 0xFFFF
+        let length = u64.widen(u32_at(at) >> 16)
+        if length == 0 or kind == DMAR_RESERVED {
+            return 0
+        }
+        if kind == DMAR_UNIT {
+            units += 1
+            if (u32_at(at + 4) >> 16) == 0 {
+                unit = at
+            }
+        }
+        at += length
+    }
+    if units != 1 {
+        return 0
+    }
+    return unit
+} vtd_unit
+
+/// Records in the unit the functions of bus 0 a remapping unit translates: every one when it
+/// includes every PCI function, otherwise the endpoints its device scopes name on bus 0.
+fn cover_scopes(unit: u64, drhd: u64) {
+    if (byte_at(drhd + 4) & ALL_FUNCTIONS) != 0 {
+        cover_all(unit)
+        return
+    }
+    let end = drhd + u64.widen(u32_at(drhd) >> 16)
+    var at = drhd + DMAR_SCOPES
+    while at + 2 <= end {
+        let length = u64.widen(byte_at(at + 1))
+        if length == 0 {
+            return
+        }
+        if byte_at(at) == ENDPOINT_SCOPE and length == ONE_HOP and byte_at(at + 5) == 0 {
+            let requester = (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
+            cover(unit, requester)
+        }
+        at += length
+    }
+} cover_scopes
+
+/// Records that the unit translates every function of bus 0.
+fn cover_all(unit: u64) {
+    for word in 0..<COVERED_WORDS {
+        poke(unit + UNIT_COVERED + word * 8, value: 0xFFFF_FFFF_FFFF_FFFF)
+    }
+} cover_all
+
+/// Records that the unit translates a requester of bus 0.
+fn cover(unit: u64, requester: u64) {
+    let at = unit + UNIT_COVERED + (requester >> 6) * 8
+    poke(at, value: peek(at) | (1u64 << u32.truncate(requester & 0x3F)))
+} cover
+
+/// Whether the unit translates a requester of bus 0.
+fn covered(unit: u64, requester: u64) -> bool {
+    let bits = peek(unit + UNIT_COVERED + (requester >> 6) * 8)
+    return ((bits >> u32.truncate(requester & 0x3F)) & 1) != 0
+} covered
+
+/// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
+/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0. Every
+/// function's DMA then reaches nothing until it is attached.
+fn started_smmu() -> Option[Iommu] {
+    let node = tree_node(compatible: "arm,smmu-v3")
+    if node.reg == 0 {
+        return None
+    }
+    let base = u64_be_at(node.reg)
+    var regs = trusted "the device tree names the SMMU's registers, which the entry root maps as device memory, and nothing else maps them" { Mmio[SmmuRegisters].map(base) }
+    let identity = mut regs.read(SmmuRegisters.identity0)
+    let needed = STAGE1 | WALKS_COHERENT
+    let sizes = mut regs.read(SmmuRegisters.identity5)
+    let stream_bits = u64.widen(mut regs.read(SmmuRegisters.identity1) & 0x3F)
+    if (identity & needed) != needed or (identity & AARCH64_TABLES) == 0 or (sizes & GRANULE_4K) == 0 or stream_bits < LOG2_ENTRIES {
+        take regs.unmap()
+        return None
+    }
+    let unit = chunks(1)
+    let streams = chunks(1)
+    if unit == 0 or streams == 0 {
+        take regs.unmap()
+        return None
+    }
+    poke(unit + UNIT_KIND, value: SMMU)
+    poke(unit + UNIT_REGISTERS, value: base)
+    poke(unit + UNIT_FLAGS, value: u64.widen(sizes & 0x7) << 8)
+    poke(unit + UNIT_STREAMS, value: streams)
+    cover_all(unit)
+    let queue = table_page(unit)
+    poke(unit + UNIT_QUEUE, value: queue)
+    mut regs.write(SmmuRegisters.control, value: 0)
+    while mut regs.read(SmmuRegisters.control_ack) != 0 {
+    }
+    mut regs.write(SmmuRegisters.bypass, value: UPDATE | ABORT)
+    while (mut regs.read(SmmuRegisters.bypass) & UPDATE) != 0 {
+    }
+    mut regs.write(SmmuRegisters.control1, value: SHARED_CACHED)
+    mut regs.write(SmmuRegisters.streams, value: streams | READ_ALLOCATE)
+    mut regs.write(SmmuRegisters.streams_config, value: u32.truncate(LOG2_ENTRIES))
+    mut regs.write(SmmuRegisters.queue_base, value: queue | READ_ALLOCATE | LOG2_ENTRIES)
+    mut regs.write(SmmuRegisters.queue_produce, value: 0)
+    mut regs.write(SmmuRegisters.queue_consume, value: 0)
+    smmu_control(mut regs, value: COMMANDS)
+    iommu_ready(unit)
+    let held = iommu_lock()
+    iommu_flush()
+    iommu_unlock(held)
+    smmu_control(mut regs, value: COMMANDS | ENABLED)
+    take regs.unmap()
+    return Some(Iommu())
+} started_smmu
+
+/// Writes SMMUv3's control register and waits until it acknowledges the value.
+fn smmu_control(mut regs: Mmio[SmmuRegisters], value: u32) {
+    mut regs.write(SmmuRegisters.control, value)
+    while mut regs.read(SmmuRegisters.control_ack) != value {
+    }
+} smmu_control
+
+/// The word at an address of runtime memory.
+fn peek(address: u64) -> u64 {
+    return trusted "the unit's records and tables lie in runtime memory that the running root maps" { Ptr[u64].of_addr(usize.widen(address)).read() }
+} peek
+
+fn poke(address: u64, value: u64) {
+    trusted "the unit's records and tables lie in runtime memory that the running root maps, which only the unit's lock holder writes" {
+        Ptr[u64].of_addr(usize.widen(address)).write(value)
+    }
+} poke
+
+test physical_space_keeps_a_buffer_in_place for IoSpace.physical {
+    let heap = mem::Heap.of(testing::world().alloc)
+    let contents = heap.boxed(Array[u8, 4].filled(7))
+    let address = u64.widen(Ptr.of_view(contents.contents().view()).addr())
+    let buffer = Dma.of(take contents, space: IoSpace.physical())
+    let bus = buffer.bus_addr()
+    discard take buffer.into_box()
+    expect bus.value == address
+} physical_space_keeps_a_buffer_in_place

@@ -185,10 +185,10 @@ fn LayoutShape.is_empty(self) -> bool {
 const VIEW_PAIRS: Str = "core::Slice core::SliceMut core::Str core::SliceCursor core::SliceCursorMut core::CharCursor"
 
 /// The base types holding one pointer to state the runtime keeps.
-const POINTERS: Str = "core::Renderer core::Choices mem::Budget mem::Arena mem::Shared mem::OnceMap text::Interner task::Cown task::Sender task::Receiver task::Join task::Scope sys::Revoker sys::Cx sys::Trap"
+const POINTERS: Str = "core::Renderer core::Choices mem::Budget mem::Arena mem::Shared mem::OnceMap text::Interner task::Cown task::Sender task::Receiver task::Join task::Scope sys::Revoker sys::Minter sys::Cx sys::Stepper sys::Trap"
 
-/// The base types that are generational handles: a slot index and its generation.
-const LAYOUT_HANDLES: Str = "mem::Alloc mem::Heap mem::Handle task::Executor sys::Fs sys::Net sys::Clock sys::WallClock sys::Random sys::Log sys::Stdio sys::Outbox"
+/// The base types that are generational handles, as capability kinds are.
+const LAYOUT_HANDLES: Str = "mem::Alloc mem::Heap mem::Handle task::Executor task::Account sys::Fs sys::Net sys::Clock sys::WallClock sys::Random sys::Log sys::Stdio sys::Outbox"
 
 /// The base types holding storage, its length, its capacity and its allocator.
 const VECTORS: Str = "mem::List mem::Bytes mem::Map mem::Set text::String"
@@ -232,7 +232,7 @@ fn Layouts.of(mut self, ck: check::Checker, ty: ty::Ty) -> mem::Shared[Layout] {
 fn Layouts.compute(mut self, ck: check::Checker, ty: ty::Ty) -> Layout {
     let alloc = ck.alloc()
     match ck.types().kind(ty) {
-        ty::TyKind.Scalar(scalar) => return scalar_layout(scalar)
+        ty::TyKind.Scalar(scalar) => return scalar_layout(scalar, machine: ck.db().target.is_machine())
         ty::TyKind.Unit or ty::TyKind.Never => return layout_empty()
         ty::TyKind.Fn(_) => return layout_pointers(2, null: None, alloc)
         ty::TyKind.Dyn(_) => return layout_pointers(2, null: Some(0), alloc)
@@ -257,6 +257,9 @@ fn Layouts.item(mut self, ck: check::Checker, item: ty::ItemId, args: Slice[ty::
         ast::ItemKind.Layout(laid) => return mut self.layout_item(ck, item, repr: laid.repr)
         else => {}
     }
+    if ck.is_kind(item) {
+        return layout_handle(alloc)
+    }
     let sig = ck.sig(item)
     let params = check::generic_params(sig.contents().generics.view(), alloc)
     let subst = ty::Subst.of(params.view(), args, alloc)
@@ -269,7 +272,7 @@ fn Layouts.item(mut self, ck: check::Checker, item: ty::ItemId, args: Slice[ty::
             }
             return mut self.record(ck, types: declared.view())
         }
-        check::SigKind.Enum(variants: variants) => {
+        check::SigKind.Enum(variants: variants) or check::SigKind.Protocol(operations: _, variants: variants, summary: _) => {
             var declared = mem::List[DeclaredVariant].empty(alloc)
             for variant in variants {
                 var fields = mem::List[DeclaredField].empty(alloc)
@@ -339,11 +342,7 @@ fn Layouts.base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Ar
         return Some(layout_pointers(1, null: None, alloc))
     }
     if check::is_listed(LAYOUT_HANDLES, word: canonical) {
-        let unsigned32 = ty::Ty.scalar(ty::Scalar.Unsigned32)
-        var fields = mem::List[Field].empty(alloc)
-        mut fields.push(layout_field("index", ty: unsigned32, offset: 0, alloc))
-        mut fields.push(layout_field("generation", ty: unsigned32, offset: 4, alloc))
-        return Some(Layout(size: 8, align: 4, shape: LayoutShape.Record(take fields), niche: None))
+        return Some(layout_handle(alloc))
     }
     if check::is_listed(VECTORS, word: canonical) {
         return Some(layout_words("data len capacity alloc", alloc))
@@ -361,7 +360,7 @@ fn Layouts.base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Ar
         return Some(layout_words("data len capacity alloc seed index slots", alloc))
     }
     if canonical == "mem::Pool" {
-        return Some(layout_words("data len capacity alloc count", alloc))
+        return Some(layout_words("data len capacity alloc count free first last", alloc))
     }
     if check::is_listed(RESOURCES, word: canonical) {
         let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
@@ -408,7 +407,7 @@ fn Layouts.std_base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty
             mut fields.push(DeclaredField.of("array", ty: core_array(ck, element, count: args[1]), alloc))
             return Some(mut self.record(ck, types: fields.view()))
         }
-        "core::Untrusted" => {
+        "core::Untrusted" or "core::Secret" => {
             let Some(inner) = type_arg_at(args, index: 0) else {
                 expect false
                 return None
@@ -494,7 +493,7 @@ fn Layouts.collection_base(mut self, ck: check::Checker, canonical: Str, args: S
         "core::atomic::AtomicUsize" => ty::Scalar.UnsignedSize
         else => ty::Scalar.Bool
     }
-    let inner = scalar_layout(scalar)
+    let inner = scalar_layout(scalar, machine: ck.db().target.is_machine())
     var fields = mem::List[Field].empty(alloc)
     mut fields.push(layout_field("value", ty: ty::Ty.scalar(scalar), offset: 0, alloc))
     return Some(Layout(size: inner.size, align: inner.align, shape: LayoutShape.Record(take fields), niche: None))
@@ -508,17 +507,7 @@ fn Layouts.machine_base(mut self, ck: check::Checker, canonical: Str, args: Slic
     let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
     var fields = mem::List[DeclaredField].empty(alloc)
     match canonical {
-        // A machine root grant: the handles of its root allocator, executor, clock and wall
-        // clock, and whether its regions and its `hw::Ring0` were taken; `boot::Machine`
-        // carries them into the `boot::Kernel` its `exit_services` returns.
-        "boot::Kernel" or "boot::Machine" => {
-            mut fields.push(DeclaredField.of("alloc", ty: unsigned64, alloc))
-            mut fields.push(DeclaredField.of("exec", ty: unsigned64, alloc))
-            mut fields.push(DeclaredField.of("clock", ty: unsigned64, alloc))
-            mut fields.push(DeclaredField.of("wall", ty: unsigned64, alloc))
-            mut fields.push(DeclaredField.of("regions", ty: ty::Ty.scalar(ty::Scalar.Bool), alloc))
-            mut fields.push(DeclaredField.of("ring0", ty: ty::Ty.scalar(ty::Scalar.Bool), alloc))
-        }
+        "boot::Kernel" or "boot::Machine" => root_grant_fields(mut fields, alloc)
         // A physical frame, a page-table root owning one, and a user address are one
         // address; an installed table's token holds the table's box.
         "hw::PhysFrame" or "hw::PageTableRoot" or "hw::UserAddr" => {
@@ -544,26 +533,19 @@ fn Layouts.machine_base(mut self, ck: check::Checker, canonical: Str, args: Slic
         // A register window and a simulated register block each hold one pointer: the sim
         // block its window reaches, or on a machine target the mapped address or port.
         "hw::Mmio" or "hw::Ports" or "hw::sim::Registers" => return Some(layout_pointers(1, null: None, alloc))
-        // A DMA buffer holds its box, whose contents never move.
-        "hw::Dma" or "hw::DmaShared" => return Some(layout_pointers(1, null: Some(0), alloc))
+        // A DMA buffer holds its box, whose contents never move, and the record of its mapping
+        // in an I/O domain, zero in the physical space.
+        "hw::Dma" or "hw::DmaShared" => return Some(layout_pointers(2, null: Some(0), alloc))
         // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
         // that of its storage.
         "hw::IrqShared" or "hw::PerCpu" => return Some(layout_pointers(1, null: None, alloc))
-        // A spin lock is its lock word, then its value; a guard, which no code holds, its
-        // value.
+        // A spin lock is its lock word, then its value.
         "hw::SpinLock" => {
             let Some(value) = type_arg_at(args, index: 0) else {
                 expect false
                 return None
             }
             mut fields.push(DeclaredField.of("lock", ty: word, alloc))
-            mut fields.push(DeclaredField.of("value", ty: value, alloc))
-        }
-        "hw::SpinGuard" => {
-            let Some(value) = type_arg_at(args, index: 0) else {
-                expect false
-                return None
-            }
             mut fields.push(DeclaredField.of("value", ty: value, alloc))
         }
         // A one-slot mailbox: its lock word, whether it holds a value, the waiting task and
@@ -578,10 +560,34 @@ fn Layouts.machine_base(mut self, ck: check::Checker, canonical: Str, args: Slic
             mut fields.push(DeclaredField.of("waiter", ty: word, alloc))
             mut fields.push(DeclaredField.of("value", ty: value, alloc))
         }
+        "sys::Abandoner" => {
+            // A domain run's abandoner: its lock word, whether it was triggered, and the record of
+            // the domain it runs.
+            mut fields.push(DeclaredField.of("lock", ty: word, alloc))
+            mut fields.push(DeclaredField.of("triggered", ty: word, alloc))
+            mut fields.push(DeclaredField.of("domain", ty: word, alloc))
+        }
         else => return None
     }
     return Some(mut self.record(ck, types: fields.view()))
 } Layouts.machine_base
+
+/// A machine root grant's fields: the handles of its root allocator, executor, clock and wall
+/// clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU and its PCI functions
+/// were taken; `boot::Machine` carries them into the `boot::Kernel` its `exit_services` returns.
+fn root_grant_fields(mut fields: mem::List[DeclaredField], alloc: mem::Alloc) {
+    let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
+    let flag = ty::Ty.scalar(ty::Scalar.Bool)
+    mut fields.push(DeclaredField.of("alloc", ty: unsigned64, alloc))
+    mut fields.push(DeclaredField.of("exec", ty: unsigned64, alloc))
+    mut fields.push(DeclaredField.of("clock", ty: unsigned64, alloc))
+    mut fields.push(DeclaredField.of("wall", ty: unsigned64, alloc))
+    mut fields.push(DeclaredField.of("regions", ty: flag, alloc))
+    mut fields.push(DeclaredField.of("ring0", ty: flag, alloc))
+    mut fields.push(DeclaredField.of("modules", ty: flag, alloc))
+    mut fields.push(DeclaredField.of("iommu", ty: flag, alloc))
+    mut fields.push(DeclaredField.of("functions", ty: flag, alloc))
+} root_grant_fields
 
 /// The layout of a type wrapping another without changing its representation.
 fn Layouts.transparent(mut self, ck: check::Checker, inner: ty::Ty) -> Layout {
@@ -732,7 +738,7 @@ fn Layouts.layout_item(mut self, ck: check::Checker, item: ty::ItemId, repr: ast
                 return layout_empty()
             }
             let big = is_big_endian(order)
-            let base = scalar_layout(scalar)
+            let base = scalar_layout(scalar, machine: ck.db().target.is_machine())
             let LayoutShape.Scalar(ty: integer, big: _) = base.shape else {
                 expect false
                 return layout_empty()
@@ -948,6 +954,15 @@ fn layout_words(names: Str, alloc: mem::Alloc) -> Layout {
     return Layout(size: 8 * u64.widen(fields.len()), align: 8, shape: LayoutShape.Record(take fields), niche: None)
 } layout_words
 
+/// A generational handle: a slot index and its generation.
+fn layout_handle(alloc: mem::Alloc) -> Layout {
+    let unsigned32 = ty::Ty.scalar(ty::Scalar.Unsigned32)
+    var fields = mem::List[Field].empty(alloc)
+    mut fields.push(layout_field("index", ty: unsigned32, offset: 0, alloc))
+    mut fields.push(layout_field("generation", ty: unsigned32, offset: 4, alloc))
+    return Layout(size: 8, align: 4, shape: LayoutShape.Record(take fields), niche: None)
+} layout_handle
+
 fn layout_empty() -> Layout {
     return Layout(size: 0, align: 1, shape: LayoutShape.Empty, niche: None)
 } layout_empty
@@ -979,7 +994,15 @@ fn next_multiple_of(value: u64, multiple: u64) -> u64 {
     return value + (multiple - rest)
 } next_multiple_of
 
-fn scalar_type(scalar: ty::Scalar) -> clif::Type {
+/// The type of a scalar's values. Code for a machine target uses no floating-point register, so
+/// there a float is held as its bit pattern.
+fn scalar_type(scalar: ty::Scalar, machine: bool) -> clif::Type {
+    if machine and scalar == ty::Scalar.Float32 {
+        return clif::Type.Int32
+    }
+    if machine and scalar == ty::Scalar.Float64 {
+        return clif::Type.Int64
+    }
     return match scalar {
         ty::Scalar.Unsigned8 or ty::Scalar.Signed8 or ty::Scalar.Bool => clif::Type.Int8
         ty::Scalar.Unsigned16 or ty::Scalar.Signed16 => clif::Type.Int16
@@ -990,8 +1013,8 @@ fn scalar_type(scalar: ty::Scalar) -> clif::Type {
     }
 } scalar_type
 
-fn scalar_layout(scalar: ty::Scalar) -> Layout {
-    let scalar_ty = scalar_type(scalar)
+fn scalar_layout(scalar: ty::Scalar, machine: bool) -> Layout {
+    let scalar_ty = scalar_type(scalar, machine)
     let size = u64.widen(scalar_ty.bytes())
     var niche: Option[Niche] = None
     match scalar {

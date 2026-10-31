@@ -17,7 +17,7 @@ A **unit** is the NIR of one item other than a `package` or `retired` item, or o
 3. the targets it is checked for;
 4. its visibility;
 5. its head: modifiers, generic parameters with their bounds and, for a function, its parameters with modes and NIR types, result, failure type, `uses wait`, limits, convention, and whether consumers unfold its [transparent](02-items.md#transparent-functions) body;
-6. its declaration: fields, variants and payloads with visibility and types; a layout's bits and bytes; registers; interface method heads; an impl line's type and interface; a registry's entry type, key and `unique` fields; a contribution's registry and entry name; a const's type and value; a test's target;
+6. its declaration: fields, variants and payloads with visibility and types; a layout's bits and bytes; registers; interface method heads; a protocol's summary type and operation heads with their visibilities; an impl line's type and interface; a registry's entry type, key and `unique` fields; a contribution's registry and entry name; a const's type and value; a test's target;
 7. the structural properties of a declared type and the Dyn-usability of an interface;
 8. its functions, by role in the role table's order, then by index;
 9. per target, the digest of each `body`, `closure` and `default` function;
@@ -47,7 +47,7 @@ A unit holds **NIR functions**, each identified by a role and an index from 0:
 | `where` | a const parameter's condition | the const parameters | parameter order |
 | `default` | an interface method's default body | the method's | declaration order |
 
-- An interface's unit numbers each role across its methods in declaration order.
+- An interface's or protocol's unit numbers each role across its methods or operations in declaration order.
 - `requires`, `ensures`, `example`, `invariant`, `assume`, `predicate` and `where` functions return `bool`. Parameters of roles other than `body`, `entry`, `closure` and `default` are read parameters.
 - An `entry` function makes the requires checks a direct call makes, then calls `body`, returning its result or failure.
 - A closure's captures are its capture list, then its unlisted read captures in order of first use.
@@ -63,7 +63,7 @@ NIR types are the types of source plus `ref T` and `ref mut T`, designating a pl
 
 ### Places
 
-A **NIR place** is a value, its root, and steps naming a field (`.seq`), the unlabelled payload of a variant (`.Some`) or a labelled payload field (`.Data.len`); [naming conventions](03-packages-modules.md#naming-conventions) tell fields from variants. A step reaching a reference continues at the place it designates, so a place's type is never a reference type. A root is a slot, a reference or an owned value.
+A **NIR place** is a value, its root, and steps naming a field (`.seq`), the [kept fields](13-text-encode.md#flexible-structs) of a flexible struct (`.#kept`), the unlabelled payload of a variant (`.Some`) or a labelled payload field (`.Data.len`); [naming conventions](03-packages-modules.md#naming-conventions) tell fields from variants. A step reaching a reference continues at the place it designates, so a place's type is never a reference type. A root is a slot, a reference or an owned value.
 
 ### Instructions
 
@@ -78,7 +78,7 @@ The instructions, with their results and behaviour, are:
 - `release P`: releases what P still holds ([end of scope](07-ownership.md#ownership)).
 - `fnref F[A]`: F instantiated with A as a value, called through F's `entry` function if any.
 - `constant C`: the value of the const item, contribution or const parameter C.
-- `construct T(f: o, ...)`: a struct value, fields in declaration order; for a layout, obligation `conversion` on each ranged `bit` field and each `rest` field ([layout values](23-low-level.md#layout-values)).
+- `construct T(f: o, ...)`: a struct value, fields in declaration order, without [kept fields](13-text-encode.md#flexible-structs); for a layout, obligation `conversion` on each ranged `bit` field and each `rest` field ([layout values](23-low-level.md#layout-values)).
 - `variant E.V`, `variant E.V(...)`: an enum value.
 - `is P, E.V`: whether the enum value at P is variant V.
 - `closure K(o, ...)`: a value of the unit's `closure K` holding the capture operands.
@@ -89,7 +89,7 @@ The instructions, with their results and behaviour, are:
 - `band`, `bor`, `bxor`, `inv`: bitwise and, or, exclusive or, inversion.
 - `eq`, `ne`, `lt`, `le`, `gt`, `ge`: comparison of two scalars of one type, IEEE on floats; `eq` and `ne` also compare two `Str` or two `Slice[u8]` by length and bytes.
 - `not`: boolean negation.
-- `call F[A](o, ...)`: a direct call, `call await` when marked `await`, with the obligation a built-in callee's rule states. F is a function item, a NIR function, or an interface method called through a bound, whose type parameter is then the first of A.
+- `call F[A](o, ...)`: a direct call, `call await` when marked `await`, with the obligation a built-in callee's rule states. F is a function item, a NIR function, an interface method called through a bound, whose type parameter is then the first of A, or a protocol's operation or `summary` called through an outbox, its outbox type then being A ([operation calls](26-components.md#operation-calls)).
 - `call v(o, ...)`: an [indirect call](10-effects-digests.md#indirect-calls) through the function value v.
 - `call dyn P I.m(o, ...)`: method m of interface I on the `Dyn[I]` at P.
 - `check K, o`: an obligation of kind K that o is `true`.
@@ -405,7 +405,7 @@ region = "{" nir_block+ "}" ;
 operands = operand ( "," operand )* ;
 operand = value | literal | ( 'read' | "mut" | "take" ) place ;
 labelled = IDENT ":" operand ;
-place = value ( "." IDENT )* ;
+place = value ( "." ( IDENT | "#kept" ) )* ;
 value = "%" INT ;
 label = "^" INT ;
 literal = INT | FLOAT | TEXT | BYTES | CHAR | BYTE | "true" | "false" | 'Unit' ;
@@ -431,7 +431,7 @@ Its parts are:
 - A unit is a record whose keys 1 to 12 are the parts of [Units](#units) in order, its targets sorted by name. Parts 5 to 7 are records keyed from 1 by their elements in the order Units lists them, elements of one kind forming a list in declaration order and structural properties being booleans in their [table](05-properties.md#structural-properties)'s order. Each element is a record of its parts in the order its source grammar writes them: names as texts, types and literals as here, and words by their position among their rule's alternatives. A limit is a record of 1 its position among the alternatives of `limit` and 2 the N of `stack N`, or a class encoded as a digest's key 11.
 - A function is a record whose keys 1 to 7 are its role's position in the role table, its index (0 when its role has none), its parameters as pairs of a mode and a type, its result type, failure type, wait flag and blocks. A `closure` function also has key 8: a record of 1 its kind, a uvar 0 for a closure and 1 for a [task closure](16-concurrency.md#task-closures), and 2 its limits, encoded as the limits of part 5. A block is its parameter types, its instructions and its terminator.
 - An instruction is its opcode, a uvar 0, or 1 plus its premise index when trusted, then its parts in notation order after the operation word, without slot names or labels, labelled operands in declaration order; a word the notation may omit or vary (`await`, `mut` after `ref`, `attempt`, `..=` for `..<`) is a uvar 0 or 1. Opcodes number the names of [Instructions](#instructions) from 0 in list order, each distinct name of an entry in turn and each `call` entry once, then the entries of [Terminators](#terminators), whose failing call holds its call as an instruction, then the query forms of the [proof cache](20-prover.md#proof-cache), in this order: `ite` (condition and two values), quotient and remainder (dividend and divisor), tag (its term), then fresh, skolem and bound symbols (their numbers).
-- An operand is a uvar 0 and a value's number, 1 and a literal, or 2, a mode and a place, which is its root's number and its steps as texts. `constant` holds a uvar 0 and a canonical path, or 1 and a const parameter's position. A function reference is a canonical path, a role and index (`body` and 0 for a function item, built-in or interface method), and type arguments.
+- An operand is a uvar 0 and a value's number, 1 and a literal, or 2, a mode and a place, which is its root's number and its steps as texts. `constant` holds a uvar 0 and a canonical path, or 1 and a const parameter's position. A function reference is a canonical path, a role and index (`body` and 0 for a function item, built-in, interface method or operation), and type arguments.
 - A type is a uvar constructor and its content: 0 a [scalar](04-types.md#scalars), its position in the scalar table; 1 `Unit`; 2 `Never`; 3 a named type, its canonical path and arguments; 4 a generic parameter, its position in the unit's; 5 a const argument, its literal; 6 a function type, a uvar 0, 1 or 2 for plain, `interrupt fn` or `task fn`, then its head as a function's part 5; 7 `ref` and 8 `ref mut`, with their type.
 - A literal is its type and its value: an integer as an svar, or a uvar for unsigned types; a float as its bits in 4 or 8 bytes, least significant first; a `bool` or `char` as a uvar; text and bytes as bytes; `Unit` as nothing. A const's value follows its type: a scalar or `Unit` as a literal's value, a struct as its fields in declaration order, an enum value as its variant's position and payload, an `Array` or `Slice` as the list of its elements, a `Str` as bytes, and a function value as its function reference.
 - Part 9 holds, for each function it covers in order, a list of pairs of a target name and a digest, sorted by name. A digest is a record keyed from 1 by the rows of the [digest](10-effects-digests.md#digests) table; booleans are uvars, and a set is a uvar 0 and its sorted paths, or 1 for the unbounded set. Key 11, the class, is omitted when it is `traceless`, and is otherwise its position from 0 in the [class table](10-effects-digests.md#reversibility), followed for an irreversible class by the list of its kinds' positions in kind order.

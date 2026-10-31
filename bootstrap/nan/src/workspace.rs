@@ -9,12 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-pub use closure::{Closure, Member, Release, Store as ReleaseStore, holds_sources};
+pub use closure::{
+    Closure, Member, Release, Store as ReleaseStore, holds_sources, reaching_directive,
+};
 pub use machine::Machine;
 pub use manifest::{
-    Arch, Authority, Kind, Manifest, Target, relative as relative_source, resolve as resolve_source,
+    Arch, Authority, Kind, Level, Manifest, Target, relative as relative_source,
+    resolve as resolve_source,
 };
 pub use modules::Module;
 
@@ -26,7 +29,9 @@ use crate::syntax::items::Item;
 
 pub struct Workspace {
     pub root: PathBuf,
-    pub packages: Vec<Package>,
+    /// The packages, each shared with the workspaces changed from this one that leave its files
+    /// unchanged.
+    pub packages: Vec<Arc<Package>>,
     /// The releases of the local store that the packages' locks read.
     pub releases: Vec<Release>,
     /// The store entries confirming that path sources' current states are the releases their
@@ -128,6 +133,24 @@ pub fn holds_package(root: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// The packages of a layout, loaded from their files.
+fn loaded(
+    layout: &[Found],
+    source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+) -> io::Result<Vec<Arc<Package>>> {
+    layout
+        .iter()
+        .map(|found| Package::load(found.clone(), source).map(Arc::new))
+        .collect()
+}
+
+/// The package directory of a layout holding a path: the nearest above it.
+fn holder(layout: &[Found], path: &str) -> Option<usize> {
+    (0..layout.len())
+        .filter(|index| path.starts_with(&format!("{}/", layout[*index].dir)))
+        .max_by_key(|index| layout[*index].dir.len())
+}
+
 fn is_manifest(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
@@ -152,9 +175,11 @@ impl Workspace {
             read.push(path.to_owned());
             fs::read(root.join(path))
         };
+        let packages = loaded(&layout, &mut source)?;
         Workspace::build(
             root.clone(),
             layout,
+            packages,
             stray,
             &mut source,
             &mut UserStore::default(),
@@ -163,22 +188,9 @@ impl Workspace {
 
     /// The workspace with the files of `changed` holding their new sources, read from memory.
     pub fn with_sources(&self, changed: &HashMap<String, Vec<u8>>) -> Workspace {
-        let mut source = |path: &str| {
-            Ok(changed.get(path).cloned().unwrap_or_else(|| {
-                self.bytes(path)
-                    .expect("a change reads workspace files")
-                    .to_vec()
-            }))
-        };
         let mut releases = HeldReleases(&self.releases, &self.confirmed);
-        Workspace::build(
-            self.root.clone(),
-            self.layout_with(changed),
-            self.stray_paths(),
-            &mut source,
-            &mut releases,
-        )
-        .expect("sources in memory read without failing")
+        self.rebuilt(changed, &mut releases)
+            .expect("sources in memory read without failing")
     }
 
     /// The layout with the files of `changed` the workspace does not hold added to their
@@ -186,11 +198,7 @@ impl Workspace {
     fn layout_with(&self, changed: &HashMap<String, Vec<u8>>) -> Vec<Found> {
         let mut layout = self.layout.clone();
         for path in changed.keys() {
-            let Some(found) = layout
-                .iter_mut()
-                .filter(|found| path.starts_with(&format!("{}/", found.dir)))
-                .max_by_key(|found| found.dir.len())
-            else {
+            let Some(found) = holder(&self.layout, path).map(|index| &mut layout[index]) else {
                 continue;
             };
             let held = match path.starts_with(&format!("{}/.nan/", found.dir)) {
@@ -219,9 +227,22 @@ impl Workspace {
                     .to_vec()
             }))
         };
+        let touched: HashSet<usize> = changed
+            .keys()
+            .filter_map(|path| holder(&self.layout, path))
+            .collect();
+        let packages = layout
+            .iter()
+            .enumerate()
+            .map(|(index, found)| match touched.contains(&index) {
+                true => Package::load(found.clone(), &mut source).map(Arc::new),
+                false => Ok(Arc::clone(&self.packages[index])),
+            })
+            .collect::<io::Result<_>>()?;
         Workspace::build(
             self.root.clone(),
             layout,
+            packages,
             self.stray_paths(),
             &mut source,
             store,
@@ -280,21 +301,19 @@ impl Workspace {
                 .expect("a file of the workspace");
             Ok(bytes.to_vec())
         };
-        Workspace::build(root, layout, stray, &mut source, store)
+        let packages = loaded(&layout, &mut source)?;
+        Workspace::build(root, layout, packages, stray, &mut source, store)
     }
 
+    /// The workspace of the packages loaded from a layout, one per directory.
     fn build(
         root: PathBuf,
         layout: Vec<Found>,
+        packages: Vec<Arc<Package>>,
         stray: Vec<String>,
         source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
         store: &mut dyn closure::Store,
     ) -> io::Result<Workspace> {
-        let packages: Vec<Package> = layout
-            .iter()
-            .cloned()
-            .map(|found| Package::load(found, source))
-            .collect::<io::Result<_>>()?;
         let read = closure::closures(&packages, store)?;
         let stray = stray
             .into_iter()
@@ -337,7 +356,7 @@ impl Workspace {
         let index = self
             .packages
             .iter()
-            .position(|candidate| std::ptr::eq(candidate, package))?;
+            .position(|candidate| std::ptr::eq(&**candidate, package))?;
         self.closures
             .iter()
             .find(|closure| closure.checked.contains(&index))
@@ -366,13 +385,30 @@ impl Workspace {
     pub fn files(&self) -> impl Iterator<Item = (&Package, &File)> {
         self.packages
             .iter()
-            .flat_map(|package| package.files.iter().map(move |file| (package, file)))
+            .flat_map(|package| package.files.iter().map(move |file| (&**package, file)))
+    }
+
+    /// The index of the package holding a file, by path.
+    pub fn file_package(&self, path: &str) -> Option<usize> {
+        self.paths.get(path).map(|(package, _)| *package)
     }
 
     pub fn file(&self, path: &str) -> Option<(&Package, &File)> {
         let &(package, file) = self.paths.get(path)?;
         let package = &self.packages[package];
         Some((package, &package.files[file]))
+    }
+
+    /// A source file of a release the packages' locks read, by path.
+    pub fn release_file(&self, path: &str) -> Option<(&Package, &File)> {
+        self.releases.iter().find_map(|release| {
+            let file = release
+                .package
+                .files
+                .iter()
+                .find(|file| file.path == path)?;
+            Some((&*release.package, file))
+        })
     }
 
     /// The bytes of a source or machine file of the workspace, by path.
@@ -415,14 +451,7 @@ impl Workspace {
     /// computes.
     pub fn item_at(&self, path: &str, line: u32) -> Option<ItemPath> {
         let (package, file) = self.file(path)?;
-        let item = file.syntax.item_at(line)?;
-        package.item_path(
-            file,
-            Item {
-                file: &file.syntax,
-                tree: item.tree.as_ref()?,
-            },
-        )
+        package.item_at(file, line)
     }
 }
 
@@ -489,6 +518,13 @@ impl closure::Store for HeldReleases<'_> {
             .map(|release| &release.entry)
             .or_else(|| self.1.iter().find(|entry| entry.root() == *root))
             .cloned())
+    }
+
+    fn loaded(&self, root: &crate::hash::Hash, dir: &str) -> Option<Arc<Package>> {
+        self.0
+            .iter()
+            .find(|release| release.root == *root && release.package.dir == dir)
+            .map(|release| Arc::clone(&release.package))
     }
 }
 
@@ -715,6 +751,19 @@ impl Package {
             module,
             name: None,
         })
+    }
+
+    /// The path of the item holding a line of one of its files, if that item has one this
+    /// implementation computes.
+    pub fn item_at(&self, file: &File, line: u32) -> Option<ItemPath> {
+        let item = file.syntax.item_at(line)?;
+        self.item_path(
+            file,
+            Item {
+                file: &file.syntax,
+                tree: item.tree.as_ref()?,
+            },
+        )
     }
 
     /// The canonical path of an item of `file`, when it is named and the path of a function named

@@ -1,11 +1,14 @@
 //! The float operations the x86-64 base set with SSE2 has no instruction for, computed exactly
 //! in integer arithmetic over the operands' bit patterns: the remainder of a division, and the
 //! fused multiply-add, rounded once. Each is a function per float width that lowered code calls.
+//! The conversions between f32 and f64 are computed the same way, inline, where code holds floats
+//! as bit patterns, and the decimal text of floats by core's functions over bit patterns.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, Type, Value, types};
 use cranelift_module::FuncId;
 
+use super::super::body::Held;
 use super::super::fx::Fx;
 use super::super::{CALL_CONV, Glue, Lowering};
 
@@ -74,6 +77,30 @@ impl Width {
     }
 }
 
+/// The text `Render` writes for a float or its bit pattern, by core's function of its width: a
+/// buffer of 40 bytes holding it, and its length.
+pub fn text(lo: &mut Lowering, fx: &mut Fx, value: Value) -> (Value, Value) {
+    let bits = super::numbers::to_bits(fx, value);
+    let name = match fx.b.func.dfg.value_type(bits) {
+        types::I32 => "f32_text",
+        _ => "f64_text",
+    };
+    let buffer = fx.slot(40, 8);
+    let called = lo.core_call(fx, name, &[Held::Scalar(bits), Held::Address(buffer)]);
+    (buffer, called.result.scalar())
+}
+
+/// The bit pattern of the f64 nearest a decimal number's text of `len` bytes from `start`, by
+/// core's function.
+pub fn parse(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value) -> Value {
+    let text = fx.slot(16, 8);
+    fx.store(start, text, 0);
+    fx.store(len, text, 8);
+    lo.core_call(fx, "f64_bits_of", &[Held::Address(text)])
+        .result
+        .scalar()
+}
+
 /// Calls the remainder function of a width on two floats.
 pub fn remainder(lo: &mut Lowering, fx: &mut Fx, a: Value, b: Value) -> Value {
     let width = Width::of(fx.b.func.dfg.value_type(a));
@@ -90,6 +117,88 @@ pub fn fused_mul_add(lo: &mut Lowering, fx: &mut Fx, a: Value, b: Value, c: Valu
     let reference = lo.func_ref(fx, function);
     let call = fx.b.ins().call(reference, &[a, b, c]);
     fx.b.inst_results(call)[0]
+}
+
+/// An f32 widened to f64 as `fpromote` widens it, a NaN made canonical: on its bit pattern where
+/// the code holds floats as bit patterns.
+pub fn promote(fx: &mut Fx, value: Value) -> Value {
+    if fx.b.func.dfg.value_type(value) == types::F32 {
+        return fx.b.ins().fpromote(types::F64, value);
+    }
+    let (from, to) = (Width::Single, Width::Double);
+    let bits = widen(fx, from, value);
+    let sign = fx.b.ins().ushr_imm_s(bits, from.sign_bit());
+    let magnitude = fx.b.ins().band_imm_s(bits, from.magnitude_mask());
+    let field = fx.b.ins().ushr_imm_s(magnitude, from.fraction());
+    let ordinary = ordinary(fx, from, magnitude, field);
+    fx.choose(
+        ordinary,
+        &[types::I64],
+        |fx| {
+            let (significand, field) = significand(fx, from, magnitude, field);
+            let fraction =
+                fx.b.ins()
+                    .band_imm_s(significand, (1i64 << from.fraction()) - 1);
+            let fraction =
+                fx.b.ins()
+                    .ishl_imm_s(fraction, to.fraction() - from.fraction());
+            let biased = fx.b.ins().iadd_imm_s(field, to.bias() - from.bias());
+            let biased = fx.b.ins().ishl_imm_s(biased, to.fraction());
+            let sign = fx.b.ins().ishl_imm_s(sign, to.sign_bit());
+            let unsigned = fx.b.ins().bor(biased, fraction);
+            vec![fx.b.ins().bor(unsigned, sign)]
+        },
+        |fx| vec![special(fx, from, to, sign, magnitude)],
+    )[0]
+}
+
+/// An f64 narrowed to f32 as `fdemote` narrows it, by roundTiesToEven, a NaN made canonical: on
+/// its bit pattern where the code holds floats as bit patterns.
+pub fn demote(fx: &mut Fx, value: Value) -> Value {
+    if fx.b.func.dfg.value_type(value) == types::F64 {
+        return fx.b.ins().fdemote(types::F32, value);
+    }
+    let (from, to) = (Width::Double, Width::Single);
+    let sign = fx.b.ins().ushr_imm_s(value, from.sign_bit());
+    let magnitude = fx.b.ins().band_imm_s(value, from.magnitude_mask());
+    let field = fx.b.ins().ushr_imm_s(magnitude, from.fraction());
+    let ordinary = ordinary(fx, from, magnitude, field);
+    let bits = fx.choose(
+        ordinary,
+        &[types::I64],
+        |fx| {
+            let (significand, field) = significand(fx, from, magnitude, field);
+            let top = fx.b.ins().ishl_imm_s(significand, 62 - from.fraction());
+            let e = fx.b.ins().iadd_imm_s(field, -(from.bias() + 62));
+            vec![round(fx, to, sign, top, e)]
+        },
+        |fx| vec![special(fx, from, to, sign, magnitude)],
+    )[0];
+    narrow(fx, to, bits)
+}
+
+/// Whether a magnitude of a width is finite and nonzero, its exponent field being `field`.
+fn ordinary(fx: &mut Fx, width: Width, magnitude: Value, field: Value) -> Value {
+    let nonzero = fx.b.ins().icmp_imm_s(IntCC::NotEqual, magnitude, 0);
+    let finite = fx.b.ins().icmp_imm_s(IntCC::NotEqual, field, width.top());
+    fx.b.ins().band(nonzero, finite)
+}
+
+/// The bit pattern of a width `to`, in 64 bits, of a zero, infinite or NaN magnitude of a width
+/// `from`: a canonical NaN for a NaN, and the signed zero or infinity otherwise.
+fn special(fx: &mut Fx, from: Width, to: Width, sign: Value, magnitude: Value) -> Value {
+    let infinite = from.top() << from.fraction();
+    let nan =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, magnitude, infinite);
+    let is_infinite = fx.b.ins().icmp_imm_s(IntCC::Equal, magnitude, infinite);
+    let infinity = fx.ptr((to.top() << to.fraction()) as u64);
+    let zero = fx.ptr(0);
+    let unsigned = fx.b.ins().select(is_infinite, infinity, zero);
+    let sign = fx.b.ins().ishl_imm_s(sign, to.sign_bit());
+    let signed = fx.b.ins().bor(unsigned, sign);
+    let canonical = fx.ptr(to.canonical_nan() as u64);
+    fx.b.ins().select(nan, canonical, signed)
 }
 
 fn signature(width: Width, count: usize) -> Signature {

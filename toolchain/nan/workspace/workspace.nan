@@ -2,7 +2,9 @@
 
 pkg struct Workspace {
     pkg root: text::String
-    pkg packages: mem::List[Package]
+    /// The packages, each shared with the workspaces changed from this one that leave its files
+    /// unchanged.
+    pkg packages: mem::List[mem::Shared[Package]]
     /// The releases of the local store that the packages' locks read.
     pkg releases: mem::List[Release]
     /// The store entries confirming that path sources' current states are the releases their
@@ -235,16 +237,18 @@ fn Walked.loaded(
         discard read.push(text::String.of(path, alloc))
         let absolute = platform::join(root, name: path, alloc)
         return try platform::read_file(absolute.as_str(), alloc)
-    }, syntaxes, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+    }, syntaxes, reused: fn(index: usize) -> Option[mem::Shared[Package]] {
+        return None
+    }, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
         return try mut user.entry(held, given)
+    }, loaded_release: fn(root_hash: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]] {
+        return None
     }, grammar, alloc)
 } Walked.loaded
 
 /// The workspace with the files of `changed` holding their new sources, read from memory.
 pkg fn Workspace.overlaid(self, changed: mem::Map[text::String, mem::Bytes], grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
-    let built = attempt Workspace.build(text::String.of(self.root.as_str(), alloc), walked: self.layout_with(changed, alloc), stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
-        return self.changed_source(changed, path, alloc)
-    }, syntaxes: Syntaxes.parsing(), store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+    let built = attempt self.rebuilt(changed, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
         return held_entry(self.releases.view(), confirmed: self.confirmed.view(), root: held, alloc)
     }, grammar, alloc)
     let Ok(workspace) = built else {
@@ -270,7 +274,7 @@ fn Workspace.changed_source(self, changed: mem::Map[text::String, mem::Bytes], p
 
 /// A workspace without packages, for a load that cannot fail.
 fn Workspace.empty(root: Str, alloc: mem::Alloc) -> Workspace {
-    return Workspace(root: text::String.of(root, alloc), packages: mem::List[Package].empty(alloc), releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), closures: mem::List[Closure].empty(alloc), locked: mem::List[diagnostic::Diagnostic].empty(alloc), stray: mem::List[StrayFile].empty(alloc), paths: mem::Map[text::String, FileAt].empty(alloc), walked: mem::List[Found].empty(alloc))
+    return Workspace(root: text::String.of(root, alloc), packages: mem::List[mem::Shared[Package]].empty(alloc), releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), closures: mem::List[Closure].empty(alloc), locked: mem::List[diagnostic::Diagnostic].empty(alloc), stray: mem::List[StrayFile].empty(alloc), paths: mem::Map[text::String, FileAt].empty(alloc), walked: mem::List[Found].empty(alloc))
 } Workspace.empty
 
 /// The layout with the files of `changed` the workspace does not hold added to their
@@ -335,8 +339,28 @@ pkg fn Workspace.rebuilt(
     let walked = self.layout_with(changed, alloc)
     return try Workspace.build(text::String.of(self.root.as_str(), alloc), walked: take walked, stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
         return self.changed_source(changed, path, alloc)
-    }, syntaxes: Syntaxes.parsing(), store_entry, grammar, alloc)
+    }, syntaxes: Syntaxes.parsing(), reused: fn(index: usize) -> Option[mem::Shared[Package]] {
+        if self.touches(changed, package_index: index, alloc) {
+            return None
+        }
+        let Some(held) = self.packages.get(index) else {
+            return None
+        }
+        return Some(held.share())
+    }, store_entry, loaded_release: fn(root_hash: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]] {
+        return held_release(self.releases.view(), root: root_hash, dir)
+    }, grammar, alloc)
 } Workspace.rebuilt
+
+/// Whether `changed` holds a file of the package at an index, as the walk places files.
+fn Workspace.touches(self, changed: mem::Map[text::String, mem::Bytes], package_index: usize, alloc: mem::Alloc) -> bool {
+    for entry in changed {
+        if holder_of(self.walked.view(), path: entry.key().as_str(), alloc) == Some(package_index) {
+            return true
+        }
+    }
+    return false
+} Workspace.touches
 
 /// The workspace of in-memory files, each given by its path relative to `root`: each file
 /// belongs to the package of the nearest directory at or above it holding a `package.nan`.
@@ -539,25 +563,39 @@ fn Workspace.from_files(
         }
         expect false
         return mem::Bytes.empty(alloc)
-    }, syntaxes, store_entry, grammar, alloc)
+    }, syntaxes, reused: fn(index: usize) -> Option[mem::Shared[Package]] {
+        return None
+    }, store_entry, loaded_release: fn(root_hash: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]] {
+        return None
+    }, grammar, alloc)
 } Workspace.from_files
 
+/// The workspace of what a walk found, a package per directory: the one `reused` gives for its
+/// index, else one loaded from its files; its locks reading releases through `store_entry`
+/// unless `loaded_release` holds them loaded.
 fn Workspace.build(
     take root: text::String,
     take walked: mem::List[Found],
     take stray: mem::List[text::String],
     source: fn(path: Str) -> mem::Bytes fails platform::IoError,
     syntaxes: Syntaxes,
+    reused: fn(index: usize) -> Option[mem::Shared[Package]],
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]],
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Workspace fails platform::IoError {
-    var packages = mem::List[Package].empty(alloc)
-    for found in walked {
-        let loaded = try Package.load(found.copied(alloc), source, syntaxes, grammar, alloc)
-        mut packages.push(take loaded)
+    var packages = mem::List[mem::Shared[Package]].empty(alloc)
+    for index in 0..<walked.len() {
+        match reused(index) {
+            Some(held) => mut packages.push(take held)
+            None => {
+                let loaded = try Package.load(walked[index].copied(alloc), source, syntaxes, grammar, alloc)
+                mut packages.push(mem::Shared.of(take loaded, alloc: alloc))
+            }
+        }
     }
-    let read = try read_closures(packages.view(), store_entry, grammar, alloc)
+    let read = try read_closures(packages.view(), store_entry, loaded_release, grammar, alloc)
     var strays = mem::List[StrayFile].empty(alloc)
     for path in take stray {
         let bytes = try source(path.as_str())
@@ -565,8 +603,9 @@ fn Workspace.build(
     }
     var paths = mem::Map[text::String, FileAt].empty(alloc)
     var package_index: usize = 0
-    for pack in packages {
+    for held in packages {
         invariant package_index < packages.len()
+        let pack = held.contents()
         var file_index: usize = 0
         for file in pack.files {
             invariant file_index < pack.files.len()
@@ -584,14 +623,32 @@ pkg proj fn Workspace.member(self, member: Member) -> Package {
     match member {
         Member.Source(index) => {
             expect index < self.packages.len()
-            return self.packages[index]
+            return self.packages[index].contents()
         }
         Member.Release(index) => {
             expect index < self.releases.len()
-            return self.releases[index].pack
+            return self.releases[index].pack.contents()
         }
     }
 } Workspace.member
+
+/// The package at an index.
+pkg proj fn Workspace.package_at(self, index: usize) -> Option[Package] {
+    let Some(held) = self.packages.get(index) else {
+        return None
+    }
+    return Some(held.contents())
+} Workspace.package_at
+
+/// The index of the first package `wanted` accepts.
+pkg fn Workspace.package_position(self, wanted: fn(candidate: Package) -> bool) -> Option[usize] {
+    for index in 0..<self.packages.len() {
+        if wanted(self.packages[index].contents()) {
+            return Some(index)
+        }
+    }
+    return None
+} Workspace.package_position
 
 /// The closure checking a workspace package, by its index.
 pkg proj fn Workspace.closure_of(self, package_index: usize) -> Option[Closure] {
@@ -618,8 +675,8 @@ pkg fn Workspace.diagnostics(self, alloc: mem::Alloc) -> mem::List[diagnostic::D
     for held in self.stray {
         mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ManifestMissing, path: held.path.as_str(), line: 1, alloc))
     }
-    for pack in self.packages {
-        for reported in pack.diagnostics {
+    for held in self.packages {
+        for reported in held.contents().diagnostics {
             mut found.push(reported.copy(alloc))
         }
     }
@@ -636,7 +693,7 @@ pkg proj fn Workspace.files(self) -> WorkspaceFiles {
 
 /// The files of a workspace's packages, in order.
 pkg view struct WorkspaceFiles {
-    packages: Slice[Package]
+    packages: Slice[mem::Shared[Package]]
     package_index: usize
     file_index: usize
 } WorkspaceFiles
@@ -647,7 +704,7 @@ pkg fn WorkspaceFiles.next(mut self) -> Option[FileAt] {
     }
     for pack in parts.tail {
         invariant self.package_index < self.packages.len()
-        if self.file_index < pack.files.len() {
+        if self.file_index < pack.contents().files.len() {
             let at = FileAt(package_index: self.package_index, file_index: self.file_index)
             self.file_index += 1
             return Some(at)
@@ -660,7 +717,7 @@ pkg fn WorkspaceFiles.next(mut self) -> Option[FileAt] {
 
 /// The file at a location of the workspace.
 pkg proj fn Workspace.file_at(self, at: FileAt) -> File {
-    let Some(pack) = self.packages.get(at.package_index) else {
+    let Some(pack) = self.package_at(at.package_index) else {
         expect false
         loop {
         }
@@ -691,8 +748,8 @@ pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
             return Some(held.bytes.view())
         }
     }
-    for pack in self.packages {
-        match pack.machine.bytes(path) {
+    for held in self.packages {
+        match held.contents().machine.bytes(path) {
             Some(bytes) => return Some(take bytes)
             None => {}
         }
@@ -773,7 +830,7 @@ pkg fn Workspace.item_at(self, path: Str, line: u32, alloc: mem::Alloc) -> Optio
     let Some(at) = self.file(path) else {
         return None
     }
-    let Some(pack) = self.packages.get(at.package_index) else {
+    let Some(pack) = self.package_at(at.package_index) else {
         expect false
         return None
     }
@@ -781,14 +838,40 @@ pkg fn Workspace.item_at(self, path: Str, line: u32, alloc: mem::Alloc) -> Optio
         expect false
         return None
     }
+    return pack.item_at(file, line, alloc)
+} Workspace.item_at
+
+/// The path of the item holding a line of one of its files, if that item has one this
+/// implementation computes.
+pkg fn Package.item_at(self, file: File, line: u32, alloc: mem::Alloc) -> Option[ItemPath] {
     let Some(item) = file.syntax.item_at(line) else {
         return None
     }
     let Some(tree) = item.tree else {
         return None
     }
-    return pack.item_path(file, tree, alloc)
-} Workspace.item_at
+    return self.item_path(file, tree, alloc)
+} Package.item_at
+
+/// The location of a source file of a release the packages' locks read: the release's index and
+/// the file's.
+pkg struct ReleaseFileAt derives Copy, Eq {
+    pkg release_index: usize
+    pkg file_index: usize
+} ReleaseFileAt
+
+/// A source file of a release the packages' locks read, by path.
+pkg fn Workspace.release_file(self, path: Str) -> Option[ReleaseFileAt] {
+    for release_index in 0..<self.releases.len() {
+        let files = self.releases[release_index].pack.contents().files
+        for file_index in 0..<files.len() {
+            if files[file_index].path.as_str() == path {
+                return Some(ReleaseFileAt(release_index: release_index, file_index: file_index))
+            }
+        }
+    }
+    return None
+} Workspace.release_file
 
 /// A `dep` directive's alias, its source as written and whether that is a path.
 pkg struct DepSource {
@@ -875,6 +958,16 @@ fn UserStore.entry(mut self, root: hashing::HashValue, given: Option[cache::Home
 
 /// The entry of a release a workspace already read, by its code root, read again for a changed
 /// workspace.
+/// The package of a release already loaded into a directory, by its code root.
+fn held_release(releases: Slice[Release], root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]] {
+    for release in releases {
+        if release.root == root and release.pack.contents().dir.as_str() == dir {
+            return Some(release.pack.share())
+        }
+    }
+    return None
+} held_release
+
 fn held_entry(releases: Slice[Release], confirmed: Slice[mem::Shared[store::Entry]], root: hashing::HashValue, alloc: mem::Alloc) -> Option[mem::Shared[store::Entry]] {
     for release in releases {
         if release.root == root {

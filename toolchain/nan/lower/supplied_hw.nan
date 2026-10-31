@@ -1,6 +1,9 @@
-//! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA buffers, the CPU-facing operations, and physical memory.
+//! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA buffers, the CPU-facing operations, physical memory, and what the IOMMU and PCI code of std needs.
 
 fn hw_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    if iommu_lower(mut lo, mut fx, supply) {
+        return true
+    }
     let written = supply.path.as_str()
     let spelling = written.as_bytes()
     var owner_end = spelling.len()
@@ -33,6 +36,7 @@ fn hw_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "hw::Mmio" or "hw::Ports" => windows_window(mut lo, mut fx, supply)
         "hw::sim::Registers" => windows_registers(mut lo, mut fx, supply)
         "hw::IrqContext" => irq_context(mut lo, mut fx, supply)
+        "hw::cpu_hardware_id" => hw_hardware_id(mut lo, mut fx, supply)
         "hw::Ring0" => cpu_ring0(mut lo, mut fx, supply)
         "hw::Idt" => cpu_idt(mut lo, mut fx, supply)
         "hw::TrapFrame" => cpu_trap_frame(mut lo, mut fx, supply)
@@ -40,9 +44,6 @@ fn hw_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "hw::Region" => lower_region(mut lo, mut fx, supply)
         "hw::PhysFrame" => lower_frame(mut lo, mut fx, supply)
         "hw::PageTableRoot" => page_table_root(mut lo, mut fx, supply)
-        // Only the kernel executor creates the values these take, and it switches threads
-        // through its own routines, so their code never runs.
-        "hw::SavedContext" or "hw::switch_to" or "hw::SpinGuard" => mut fx.b.trap(clif::TrapCode(user: 1))
         else => return false
     }
     return true
@@ -58,13 +59,13 @@ fn hw_forward(mut lo: Lowering, mut fx: Fx, supply: Supply, called: Called) {
 /// declares in full.
 fn hw_transfers(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
     match owner_path {
-        "hw::Signal" or "hw::SpinLock" or "hw::IrqShared" => {
+        "hw::Signal" or "hw::SpinLock" => {
             let wrapped = hw_wrapped(lo, ty)
             let moves = mut lo.transfers(wrapped)
             return Some(moves)
         }
-        "hw::PerCpu" or "hw::Dma" or "hw::DmaShared" or "hw::IdtInstalled" => return Some(true)
-        "hw::Mmio" or "hw::Ports" or "hw::Idt" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" or "hw::SpinGuard" => return Some(false)
+        "hw::IrqShared" or "hw::PerCpu" or "hw::Dma" or "hw::DmaShared" or "hw::IdtInstalled" or "hw::IoDomain" or "hw::PciFunction" => return Some(true)
+        "hw::Mmio" or "hw::Ports" or "hw::Idt" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" => return Some(false)
         else => return None
     }
 } hw_transfers
@@ -82,15 +83,30 @@ fn hw_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, addres
         }
         "hw::IrqShared" => {
             let record = mut fx.load(PTR, addr: address, offset: 0)
+            let holding = mut fx.offset(record, offset: DEVICE_RECORD_HOLDING)
+            rehome(mut lo, mut fx, address: holding, owner)
             let wrapped = hw_wrapped(lo, ty)
             let value_at = device_value(mut lo, value_ty: wrapped)
             let value = mut fx.offset(record, offset: value_at)
             mut lo.transfer(mut fx, ty: wrapped, address: value, lift, owner)
         }
         "hw::PerCpu" => transfer_per_cpu(mut lo, mut fx, value_ty: hw_wrapped(lo, ty), address, lift, owner)
-        "hw::Dma" or "hw::DmaShared" or "hw::IdtInstalled" => {
+        "hw::Dma" or "hw::DmaShared" => {
             let contents = mut fx.load(PTR, addr: address, offset: 0)
             discard transfer_lift(mut lo, mut fx, address: contents, lift)
+            let mapping = mut fx.load(PTR, addr: address, offset: 8)
+            let mapped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mapping, y: 0)
+            mut fx.if_true(mapped, then: fn[mut lo](mut fx1: Fx) {
+                rehome(mut lo, fx: mut fx1, address: mapping, owner)
+            })
+        }
+        "hw::IdtInstalled" => {
+            let contents = mut fx.load(PTR, addr: address, offset: 0)
+            discard transfer_lift(mut lo, mut fx, address: contents, lift)
+        }
+        "hw::IoDomain" or "hw::PciFunction" => {
+            let record = mut fx.load(PTR, addr: address, offset: 0)
+            rehome(mut lo, mut fx, address: record, owner)
         }
         else => return false
     }
@@ -107,7 +123,7 @@ fn hw_needs_release(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[boo
             return Some(releases)
         }
         "hw::PerCpu" => return Some(true)
-        "hw::Mmio" or "hw::Ports" or "hw::Dma" or "hw::DmaShared" or "hw::Idt" or "hw::IdtInstalled" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" or "hw::SpinGuard" or "hw::IrqShared" => return Some(false)
+        "hw::Mmio" or "hw::Ports" or "hw::Dma" or "hw::DmaShared" or "hw::Idt" or "hw::IdtInstalled" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" or "hw::IrqShared" => return Some(false)
         else => return None
     }
 } hw_needs_release

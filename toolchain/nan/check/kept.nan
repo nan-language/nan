@@ -209,7 +209,7 @@ struct CheckState {
     /// The hash of every input of the check, which names its snapshot.
     key: hashing::HashValue
     /// The name of the cache record holding the key of the latest snapshot of the closure under
-    /// the target in this workspace.
+    /// the target in this workspace, narrowed to the package its check is narrowed to.
     latest: text::String
     /// The hash of every input but the source files of the packages checked.
     context: hashing::HashValue
@@ -360,6 +360,13 @@ fn Checker.check_state(self, closure: workspace::Closure) -> CheckState {
     encoding::bytes(mut latest, value: toolchain_hash.bytes.view())
     encoding::bytes(mut latest, value: db.target.name().as_bytes())
     encoding::bytes(mut latest, value: held.root.as_bytes())
+    match self.state.contents().narrowed {
+        Some(package_index) => {
+            expect package_index < held.packages.len()
+            encoding::bytes(mut latest, value: held.packages[package_index].contents().dir.as_bytes())
+        }
+        None => {}
+    }
     var files = mem::List[StateFile].empty(alloc)
     for entry in closure.members {
         encoding::bytes(mut context, value: entry.key().as_bytes())
@@ -562,6 +569,8 @@ fn put_authority(mut out: mem::Bytes, authority: workspace::Authority) {
         workspace::Authority.Priv => encoding::uvar(mut out, value: 1)
         workspace::Authority.Trusted => encoding::uvar(mut out, value: 2)
         workspace::Authority.Validate => encoding::uvar(mut out, value: 3)
+        workspace::Authority.Capability => encoding::uvar(mut out, value: 5)
+        workspace::Authority.Confined => encoding::uvar(mut out, value: 6)
         workspace::Authority.Contribute(path) => {
             encoding::uvar(mut out, value: 4)
             put_text(mut out, value: path.as_str())
@@ -796,6 +805,8 @@ fn Cursor.authority(mut self, alloc: mem::Alloc) -> workspace::Authority {
         1 => workspace::Authority.Priv
         2 => workspace::Authority.Trusted
         3 => workspace::Authority.Validate
+        5 => workspace::Authority.Capability
+        6 => workspace::Authority.Confined
         else => workspace::Authority.Contribute(mut self.text(alloc))
     }
 } Cursor.authority
@@ -1608,12 +1619,13 @@ fn cached_entry(user_cache: cache::Cache, key: hashing::HashValue) -> Option[mem
     return Some(take held)
 } cached_entry
 
-/// The checker of a closure under a target once checked: from the build cache's snapshot of the
-/// state, or of the latest state checked when the two differ in function bodies alone and
-/// checking what those reach gives the facts that snapshot holds; otherwise by a full check.
-pkg fn Session.kept_checked(self, closure: workspace::Closure, target: workspace::Target) -> Checker {
+/// The checker of a closure under a target, narrowed to the workspace package at an index, if
+/// any, once checked: from the build cache's snapshot of the state, or of the latest state
+/// checked when the two differ in function bodies alone and checking what those reach gives the
+/// facts that snapshot holds; otherwise by a full check.
+pkg fn Session.kept_checked(self, closure: workspace::Closure, target: workspace::Target, narrowed: Option[usize]) -> Checker {
     let alloc = self.alloc
-    let checker = self.unchecked(closure, target)
+    let checker = self.unchecked_narrowed(closure, target, narrowed)
     let state = mem::Shared.of(checker.check_state(closure), alloc)
     match latest_snapshot(open_proof_cache(self.home, alloc), state: state.contents(), alloc) {
         Some(found) => {
@@ -1625,7 +1637,7 @@ pkg fn Session.kept_checked(self, closure: workspace::Closure, target: workspace
         }
         None => return take checker.wholly_checked(take state)
     }
-    return self.unchecked(closure, target).wholly_checked(take state)
+    return self.unchecked_narrowed(closure, target, narrowed).wholly_checked(take state)
 } Session.kept_checked
 
 /// The checker once it has checked the state from a snapshot, as `check_restored` does; none,
@@ -1784,6 +1796,7 @@ fn reason_role_number(role: diagnostic::Role) -> u64 {
         diagnostic::Role.Raised => 8
         diagnostic::Role.Command => 9
         diagnostic::Role.Note => 10
+        diagnostic::Role.Diagnostic => 11
     }
 } reason_role_number
 
@@ -1800,6 +1813,7 @@ fn reason_role(number: u64) -> Option[diagnostic::Role] {
         8 => Some(diagnostic::Role.Raised)
         9 => Some(diagnostic::Role.Command)
         10 => Some(diagnostic::Role.Note)
+        11 => Some(diagnostic::Role.Diagnostic)
         else => None
     }
 } reason_role

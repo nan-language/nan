@@ -147,3 +147,125 @@ fn a_release_published_as_a_principal_is_read_only_from_its_pinned_and_trusted_k
         "{forged}"
     );
 }
+
+#[test]
+fn a_release_is_built_only_from_the_sources_its_attestation_hashes_and_that_check_whole() {
+    let scratch = Scratch::new(&[(
+        "meter/package.nan",
+        "//! Meters.\n\npackage meter {\n    language 1\n    targets any\n} meter\n",
+    )]);
+    let dir = &scratch.0;
+    let scratch_name = dir.file_name().expect("a directory name").to_string_lossy();
+    let name = format!("nan-test/{scratch_name}");
+    fs::write(
+        dir.join("meter/meter.nan"),
+        format!("//! Meters.\n\n/// The level of {scratch_name}.\npub fn level() -> u32\n    example level() == 1\n{{\n    return 1\n}} level\n"),
+    )
+    .expect("the meter source");
+    run_in(dir, "api update");
+    run_in(dir, &format!("publish --local meter --name {name}"));
+    fs::create_dir_all(dir.join("app")).expect("the app directory");
+    fs::write(
+        dir.join("app/package.nan"),
+        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets x86_64-host\n    entry main\n    dep meter \"{name}\"\n}} app\n"),
+    )
+    .expect("the app manifest");
+    fs::write(
+        dir.join("app/app.nan"),
+        "//! Apps.\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    world.log.info(\"level\", value: meter::level())\n} main\n",
+    )
+    .expect("the app source");
+    run_in(&dir.join("app"), "dep sync");
+    let cache = crate::cache::Cache::open()
+        .expect("the user directory")
+        .unwrap_or_else(|_| panic!("an exposed user directory"));
+    let entry = crate::store::Store::new(cache.store())
+        .entries()
+        .expect("the store")
+        .unwrap_or_else(|_| panic!("an exposed store"))
+        .into_iter()
+        .find(|entry| entry.name.as_deref() == Some(name.as_str()))
+        .expect("the release's entry");
+    let path = fs::read_dir(std::env::temp_dir().join("nan-test-home/.nan/store"))
+        .expect("the store directory")
+        .map(|file| file.expect("a store file").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|file| file.to_str()?.split_once('-'))
+                .is_some_and(|(index, _)| index == entry.index.to_string())
+        })
+        .expect("the entry's file");
+    let forged = entry
+        .sources
+        .iter()
+        .map(|(path, content)| {
+            let content = String::from_utf8_lossy(content).replace("return 1", "return 2");
+            (path.clone(), content.into_bytes())
+        })
+        .collect::<Vec<_>>();
+    let mut file = fs::read(&path).expect("the entry");
+    let replace = |file: &mut Vec<u8>, from: &[u8], to: &[u8]| {
+        let at = file
+            .windows(from.len())
+            .rposition(|window| window == from)
+            .expect("the replaced bytes");
+        file[at..at + to.len()].copy_from_slice(to);
+        let held = file.len() - 32;
+        let digest = crate::hash::blake3(&file[..held]);
+        file[held..].copy_from_slice(&digest);
+    };
+    replace(&mut file, b"return 1", b"return 2");
+    fs::write(&path, &file).expect("the entry with forged sources");
+    let unsourced = run_in(dir, "check app").output;
+    assert!(
+        unsourced.contains("\nerror artefact.source-mismatch app/package.nan:7 app\n"),
+        "{unsourced}"
+    );
+    let attested = crate::artefact::source_tree_hash(&entry.sources);
+    let forged = crate::artefact::source_tree_hash(&forged);
+    replace(&mut file, &attested.0, &forged.0);
+    fs::write(&path, &file).expect("the entry with a forged attestation");
+    let refused = format!(
+        "\nerror artefact.recheck-failed app/package.nan:7 app\n        dep meter \"{name}\"\n    because diagnostic meter/meter.nan:5 meter::level example.failed\n        example level() == 1\n"
+    );
+    for command in ["build app", "verify app"] {
+        let output = run_in(dir, command).output;
+        assert!(output.contains(&refused), "{output}");
+    }
+}
+
+#[test]
+fn a_release_records_its_schemas_from_which_the_next_migrates() {
+    let scratch = Scratch::new(&[(
+        "settings/package.nan",
+        "//! Settings.\n\npackage settings {\n    language 1\n    targets any\n} settings\n",
+    )]);
+    let dir = &scratch.0;
+    let source = dir.join("settings/settings.nan");
+    let name = format!(
+        "nan-test/{}",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    );
+    fs::write(
+        &source,
+        "//! Settings.\n\n/// Settings.\npub open struct Config derives Encode {\n    pub retries: u8\n} Config\n",
+    )
+    .expect("the first release");
+    run_in(dir, "api update");
+    run_in(dir, &format!("publish --local settings --name {name}"));
+    let history = fs::read_to_string(dir.join("settings/.nan/history.nan")).expect("a history");
+    assert!(history.contains("\nschema Config \""), "{history}");
+    fs::write(
+        &source,
+        "//! Settings.\n\n/// Settings.\npub flexible struct Config derives Encode {\n    pub retries: u8\n    pub verbose: bool\n} Config\n\nopen struct FirstConfig derives Encode {\n    retries: u8\n} FirstConfig\n\nmigrate fn Config.from_first(take old: FirstConfig) -> Config limits notrap, terminates {\n    return Config(retries: old.retries, verbose: true)\n} Config.from_first\n",
+    )
+    .expect("the second release");
+    run_in(dir, "api update --confirm-docs settings::Config");
+    let second = run_in(dir, "publish --local settings");
+    assert_eq!(
+        classes(&second.output),
+        "additive additive",
+        "{}",
+        second.output
+    );
+}

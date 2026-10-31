@@ -1,6 +1,6 @@
 # 0008. Authority as values
 
-Status: accepted
+Status: accepted; its consequence that a driver granted `device` can misprogram DMA until an IOMMU is modelled superseded by 0108
 
 ## Context
 

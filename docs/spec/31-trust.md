@@ -44,7 +44,7 @@ test first_retry_waits for retry_delay {
 
 Each of these rules holds under every declared target: code is used when it is used under at least one. Each diagnostic is reported on the first line of the unused declaration, and its exact fix deletes that declaration unless the rule names another fix.
 
-- The `package` item, every item that is not private, every test, impl line, contribution and const assert, every landing fn and the function the `entry` directive names are **reachable**, and so is each private item that the [unit](19-nir.md#units) of a reachable item names. An impl line also names the methods implementing its interface and, when it names `sys::Component`, the [abandon method](17-suspension-io.md#abandoning-resources) of its Env. A private item that is not reachable is incompleteness (`unused.item`). A tombstone never makes an item reachable and is never an unused item.
+- The `package` item, every item that is not private, every test, impl line, contribution and const assert, every landing fn and [migration](13-text-encode.md#migrations) and the function the `entry` directive names are **reachable**, and so is each private item that the [unit](19-nir.md#units) of a reachable item names. An impl line also names the methods implementing its interface and, when it names `sys::Component`, the [abandon method](17-suspension-io.md#abandoning-resources) of its Env. A private item that is not reachable is incompleteness (`unused.item`). A tombstone never makes an item reachable and is never an unused item.
 - A `var` binding, [pattern binding](06-statements-expressions.md#bindings) or name a `for` pattern binds, whose type is not linear and that no expression in its scope uses, is incompleteness (`unused.local`); its appearance as the target of `=` is not a use. For `let name = e` or `var name = e`, with or without a type, the exact fix writes `discard e`, or `e` alone when `e` has type `Unit` or `Never`, and exists only when no statement assigns the binding; for any other binding it writes `_` in place of the name.
 - A field of a struct is exempt when the field and its struct are both `pub`. Any other field that no item of the package reads is incompleteness (`unused.field`). A field is read by a field access other than the target of `=`, by a struct pattern giving it a pattern other than `_`, by a predicate naming it, and by the methods its struct's derives of `Eq`, `Ord`, `Hash`, `Render` and `Encode` write; construction does not read it. The exact fix also deletes its `label: value` in each construction and struct pattern, and exists only when each such value is a place, a literal or `_`.
 - A `dep` directive is incompleteness (`unused.dependency`) when no item other than the `package` item names its alias and no `allow contribute` directive lists the alias as a name that [contributors](25-registries.md#contributors) does not report as `unused.grant`. The exact fix also deletes the alias from each manifest grant listing it, and each grant it leaves listing nothing.
@@ -147,9 +147,10 @@ The **release gate** is `nan verify`. It accepts a package exactly when, for the
 3. every [API snapshot](#api-snapshots) is current (`api.stale`);
 4. no [pending weakening](#weakening) remains (`api.weakening-pending`);
 5. every item holding a trust escape has a current seal (`trust.unsealed`) that meets the [author rule](#author-rule) (`seal.same-author`);
-6. in a VCS workspace, every acceptance of a weakening was made by a seal of another author (`api.weakening-pending`), as [acceptances](#acceptances) states.
+6. in a VCS workspace, every acceptance of a weakening was made by a seal of another author (`api.weakening-pending`), as [acceptances](#acceptances) states;
+7. the [release check](30-artefacts.md#releases) of each release of its dependency closure finds no error (`artefact.recheck-failed`).
 
-A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing), and `nan verify` checks it no further.
+A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing); `nan verify` judges it only by its release check.
 
 ## Ledger
 
@@ -163,12 +164,13 @@ The **ledger** of an item is the list of its entries of the kinds this table giv
 | `landing` | a [landing fn](23-low-level.md#landing-functions) | none | the landing fn | yes |
 | `validator` | a [validator](15-untrusted.md#validator-classes), a method of an impl of `core::Decoder` included | its class | the validator | when declassifying |
 | `decoder` | a declassifying decoder | none | the type item whose `derives` clause writes it | yes |
-| `grant` | a `device` or `priv` [grant](14-authority.md#device-and-priv-grants) | its authority and the names it lists | the `package` item | yes |
+| `grant` | a `device`, `priv` or `capability` [grant](14-authority.md#device-and-priv-grants) | its authority and the names it lists | the `package` item | yes |
 | `waiver` | a [waiver](06-statements-expressions.md#waivers) | its threshold and reason | the function | no |
 | `todo` | a `todo` | its text | the item containing it | no |
 | `dbg` | a `dbg` | none | the item containing it | no |
 | `class` | a [device premise](10-effects-digests.md#reversibility) | its class | the item containing its function or closure | yes |
 | `undo` | an [undo clause](10-effects-digests.md#compensation) | its undoer and premise | the function | yes |
+| `confined` | a `confined` [grant](14-authority.md#device-and-priv-grants) | the names it lists | the `package` item | no |
 
 ```nan
 // file: procinfo/package.nan

@@ -9,7 +9,7 @@ use super::db::{ItemId, PackageId};
 use super::digest::Digest;
 use super::props::Props;
 use super::reversibility::Class;
-use super::sig::{FnSig, GenericDef, Payload, SigKind};
+use super::sig::{FieldSig, FnSig, GenericDef, Payload, SigKind};
 use super::testing::Target as TestTarget;
 use super::ty::{Arg, Param, Scalar, Ty};
 use crate::encoding::{Record, bytes, list, uvar};
@@ -165,10 +165,7 @@ impl Names for ItemNames<'_, '_> {
     }
 
     fn method(&self, interface: ItemId, method: u32) -> String {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].name.clone(),
-            _ => panic!("a method of an interface"),
-        }
+        self.ck.method_name(interface, method as usize)
     }
 
     fn register(&self, block: ItemId, register: u32) -> String {
@@ -223,6 +220,7 @@ fn kind_position(kind: &ItemKind) -> u64 {
         ItemKind::Test(_) => 11,
         ItemKind::Retired(_) => 12,
         ItemKind::Package => 13,
+        ItemKind::Protocol(_) => 14,
     }
 }
 
@@ -410,19 +408,21 @@ impl<'a> Checker<'a> {
             .map(|(modifier, _)| match modifier {
                 TypeModifier::Closed => 0,
                 TypeModifier::Open => 1,
-                TypeModifier::Linear => 2,
-                TypeModifier::View => 3,
+                TypeModifier::Flexible => 2,
+                TypeModifier::Linear => 3,
+                TypeModifier::View => 4,
             })
             .collect();
         if let ItemKind::Fn(function) = &ast.kind
             && let Some((modifier, _)) = function.modifier
         {
             modifiers.push(match modifier {
-                FnModifier::Proj => 4,
-                FnModifier::Interrupt => 5,
-                FnModifier::Landing => 6,
-                FnModifier::Foreign => 7,
-                FnModifier::Validator => 8,
+                FnModifier::Proj => 5,
+                FnModifier::Interrupt => 6,
+                FnModifier::Landing => 7,
+                FnModifier::Foreign => 8,
+                FnModifier::Validator => 9,
+                FnModifier::Migrate => 10,
             });
         }
         if !modifiers.is_empty() {
@@ -491,7 +491,9 @@ impl<'a> Checker<'a> {
                 declaration.field(
                     1,
                     content(|out| {
-                        list(out, fields.iter(), |out, field| {
+                        let declared: Vec<&FieldSig> =
+                            fields.iter().filter(|field| !field.is_kept()).collect();
+                        list(out, declared.into_iter(), |out, field| {
                             let mut element = Record::default();
                             element.field(1, content(|out| visibility(out, field.visibility)));
                             element.field(2, content(|out| text(out, &field.name)));
@@ -670,6 +672,40 @@ impl<'a> Checker<'a> {
                     declaration.field(10, content(|out| text(out, &target)));
                 }
             }
+            (
+                ItemKind::Protocol(protocol),
+                SigKind::Protocol {
+                    operations,
+                    summary,
+                    ..
+                },
+            ) => {
+                let mut record = Record::default();
+                if let Some(summary) = summary {
+                    record.field(1, content(|out| encoder.ty(out, summary)));
+                }
+                record.field(
+                    2,
+                    content(|out| {
+                        list(
+                            out,
+                            protocol.operations.iter().zip(operations),
+                            |out, (written, operation)| {
+                                let mut element = Record::default();
+                                element
+                                    .field(1, content(|out| visibility(out, written.visibility)));
+                                element.field(2, content(|out| text(out, &operation.name)));
+                                element.field(
+                                    3,
+                                    self.method_head_record(false, &operation.sig, encoder),
+                                );
+                                out.extend(element.finish());
+                            },
+                        );
+                    }),
+                );
+                declaration.field(11, record.finish());
+            }
             _ => {}
         }
         declaration.finish_if_any()
@@ -767,7 +803,10 @@ impl<'a> Checker<'a> {
     fn properties_record(&self, item: ItemId) -> Vec<u8> {
         let mut record = Record::default();
         match &self.db.ast(item).kind {
-            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+            ItemKind::Struct(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Layout(_)
+            | ItemKind::Protocol(_) => {
                 let Props {
                     linear,
                     view,
@@ -965,11 +1004,15 @@ impl<'a> Checker<'a> {
                 let sig = self.sig(*owner);
                 let subst = super::ty::Subst::of(sig.generics.iter().map(|def| def.param), args);
                 let types: Vec<Ty> = match &sig.kind {
-                    SigKind::Struct { fields } | SigKind::Layout { fields, .. } => {
-                        fields.iter().map(|field| subst.ty(&field.ty)).collect()
-                    }
+                    SigKind::Struct { fields } | SigKind::Layout { fields, .. } => fields
+                        .iter()
+                        .filter(|field| !field.is_kept())
+                        .map(|field| subst.ty(&field.ty))
+                        .collect(),
                     _ => Vec::new(),
                 };
+                let fields =
+                    &fields[..fields.len() - usize::from(self.kept_type(*owner).is_some())];
                 for (field, value) in fields
                     .iter()
                     .enumerate()

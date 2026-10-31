@@ -1,16 +1,19 @@
-//! Tasks: scopes, joins, deadlines and races, cowns and `await when`, channels, and domains.
+//! Tasks: scopes, joins, deadlines and races, cowns and `await when`, channels, executors and
+//! their accounts, and domains.
 
+pub mod accounts;
 pub mod channels;
 pub mod components;
 pub mod cowns;
 pub mod domains;
+pub mod protocols;
 pub mod scopes;
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{AbiParam, Signature, Value};
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{self, entry, live_entry};
+use super::super::runtime::tables;
 use super::super::runtime::{Routine, tasks};
 use super::super::{CALL_CONV, Lowering};
 use super::Supply;
@@ -27,34 +30,22 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::within_ns"
         | "task::race" => scopes::lower(lo, fx, supply),
         "task::Cown" => cowns::lower(lo, fx, supply),
-        "task::Executor" => super::sys::coarse(
-            lo,
-            fx,
-            supply,
-            tables::kind::EXECUTOR,
-            tables::EXECUTOR_RESOLUTION,
-        ),
+        "task::Executor" | "task::Account" => accounts::lower(lo, fx, supply),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
-        "sys::Domain" | "sys::Trap" => domains::lower(lo, fx, supply),
-        "host::Runner" | "sys::Cx" | "sys::Outbox" => components::lower(lo, fx, supply),
+        "sys::Domain" | "sys::Abandoner" | "sys::Trap" => domains::lower(lo, fx, supply),
+        "host::Runner" | "sys::Cx" | "sys::Outbox" | "sys::Stepper" => {
+            components::lower(lo, fx, supply)
+        }
         _ => return false,
     }
     true
 }
 
-/// The cell of the executor whose handle is at an address, and whether the handle is live.
-pub fn executor(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
+/// Whether the handle of the executor at an address is live, and the state words of its entry
+/// when it is: its cell, its clock's handle and its resolution.
+pub fn executor(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value; 4]) {
     let handle = fx.load(PTR, handle, 0);
-    let record = live_entry(lo, fx, handle);
-    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
-    let zero = fx.ptr(0);
-    let cell = fx.choose(
-        live,
-        &[PTR],
-        |fx| vec![fx.load(PTR, record, entry::STATE)],
-        |_| vec![zero],
-    )[0];
-    (live, cell)
+    tables::snapshot(lo, fx, handle)
 }
 
 /// The signature of glue given a task's record.
@@ -87,8 +78,10 @@ pub fn origin(lo: &mut Lowering, fx: &mut Fx) -> Value {
 pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "task::Join" | "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Scope" | "task::Executor" | "task::Cancelled" | "task::Poisoned" | "sys::Cx"
-        | "sys::Outbox" => Some(false),
+        "task::Scope" | "task::Executor" | "task::Account" | "task::Cancelled"
+        | "task::Poisoned" | "sys::Cx" | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper" => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -98,7 +91,7 @@ pub fn needs_release(path: &str) -> Option<bool> {
 pub fn transfers(path: &str) -> Option<bool> {
     match path {
         "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Cancelled" | "task::Poisoned" => Some(false),
+        "task::Account" | "task::Cancelled" | "task::Poisoned" | "sys::Abandoner" => Some(false),
         _ => None,
     }
 }

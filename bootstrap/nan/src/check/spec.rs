@@ -19,7 +19,7 @@ fn kind_of(clause: &str) -> &str {
 }
 
 /// The last token of a head: of its parameters' closer, result, failure, `uses` and limits.
-fn head_last(head: &ast::Head) -> ast::Tok {
+pub(super) fn head_last(head: &ast::Head) -> ast::Tok {
     let mut last = head.close;
     for ty in [&head.result, &head.fails].into_iter().flatten() {
         last = last.max(ty.last);

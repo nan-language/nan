@@ -177,7 +177,7 @@ const VIEW_PAIRS: [&str; 6] = [
 ];
 
 /// The base types holding one pointer to state the runtime keeps.
-const POINTERS: [&str; 15] = [
+const POINTERS: [&str; 17] = [
     "core::Renderer",
     "core::Choices",
     "mem::Budget",
@@ -191,16 +191,19 @@ const POINTERS: [&str; 15] = [
     "task::Join",
     "task::Scope",
     "sys::Revoker",
+    "sys::Minter",
     "sys::Cx",
+    "sys::Stepper",
     "sys::Trap",
 ];
 
-/// The base types that are generational handles: a slot index and its generation.
-const HANDLES: [&str; 12] = [
+/// The base types that are generational handles, as capability kinds are.
+const HANDLES: [&str; 13] = [
     "mem::Alloc",
     "mem::Heap",
     "mem::Handle",
     "task::Executor",
+    "task::Account",
     "sys::Fs",
     "sys::Net",
     "sys::Clock",
@@ -270,7 +273,7 @@ impl Layouts {
 
     fn compute(&mut self, ck: &Checker, ty: &Ty) -> Layout {
         match ty {
-            Ty::Scalar(scalar) => scalar_layout(*scalar),
+            Ty::Scalar(scalar) => scalar_layout(*scalar, ck.db.target.is_machine()),
             Ty::Unit | Ty::Never => empty(),
             Ty::Fn(_) => pointers(2, None),
             Ty::Dyn(_) => pointers(2, Some(0)),
@@ -291,6 +294,9 @@ impl Layouts {
         if let ItemKind::Layout(layout) = &ck.db.ast(item).kind {
             return self.layout_item(ck, item, &layout.repr);
         }
+        if ck.is_kind(item) {
+            return handle();
+        }
         let sig = ck.sig(item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
         match &sig.kind {
@@ -301,7 +307,7 @@ impl Layouts {
                     .collect();
                 self.record(ck, &types)
             }
-            SigKind::Enum { variants } => {
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                 let variants: Vec<(String, Vec<(String, Ty)>)> = variants
                     .iter()
                     .map(|variant| {
@@ -338,15 +344,7 @@ impl Layouts {
             return Some(pointers(1, None));
         }
         if HANDLES.contains(&path) {
-            return Some(Layout {
-                size: 8,
-                align: 4,
-                shape: Shape::Record(vec![
-                    field("index", Ty::Scalar(Scalar::U32), 0),
-                    field("generation", Ty::Scalar(Scalar::U32), 4),
-                ]),
-                niche: None,
-            });
+            return Some(handle());
         }
         if VECTORS.contains(&path) {
             return Some(words(&["data", "len", "capacity", "alloc"]));
@@ -366,7 +364,9 @@ impl Layouts {
             ]));
         }
         if path == "mem::Pool" {
-            return Some(words(&["data", "len", "capacity", "alloc", "count"]));
+            return Some(words(&[
+                "data", "len", "capacity", "alloc", "count", "free", "first", "last",
+            ]));
         }
         if RESOURCES.contains(&path) {
             return Some(Layout {
@@ -405,8 +405,8 @@ impl Layouts {
                     ],
                 )
             }
-            "core::Untrusted" => {
-                let inner = ty_arg(0).expect("an Untrusted type argument");
+            "core::Untrusted" | "core::Secret" => {
+                let inner = ty_arg(0).expect("a wrapped type argument");
                 return Some(self.transparent(ck, &inner));
             }
             "hw::Ptr" => Layout {
@@ -489,7 +489,7 @@ impl Layouts {
                     "Usize" => Scalar::Usize,
                     _ => Scalar::Bool,
                 };
-                let inner = scalar_layout(scalar);
+                let inner = scalar_layout(scalar, ck.db.target.is_machine());
                 Layout {
                     size: inner.size,
                     align: inner.align,
@@ -501,8 +501,9 @@ impl Layouts {
                 empty()
             }
             // A machine root grant: the handles of its root allocator, executor, clock and wall
-            // clock, and whether its regions and its `hw::Ring0` were taken; `boot::Machine`
-            // carries them into the `boot::Kernel` its `exit_services` returns.
+            // clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU and its PCI
+            // functions were taken;
+            // `boot::Machine` carries them into the `boot::Kernel` its `exit_services` returns.
             "boot::Kernel" | "boot::Machine" => self.record(
                 ck,
                 &[
@@ -512,6 +513,9 @@ impl Layouts {
                     ("wall".to_owned(), Ty::Scalar(Scalar::U64)),
                     ("regions".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("ring0".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("modules".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("iommu".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("functions".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],
             ),
             // A physical frame, a page-table root owning one, and a user address are one
@@ -552,23 +556,19 @@ impl Layouts {
             // A register window and a simulated register block each hold one pointer: the sim
             // block its window reaches, or on a machine target the mapped address or port.
             "hw::Mmio" | "hw::Ports" | "hw::sim::Registers" => pointers(1, None),
-            // A DMA buffer holds its box, whose contents never move.
-            "hw::Dma" | "hw::DmaShared" => pointers(1, Some(0)),
+            // A DMA buffer holds its box, whose contents never move, and the record of its mapping
+            // in an I/O domain, zero in the physical space.
+            "hw::Dma" | "hw::DmaShared" => pointers(2, Some(0)),
             // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
             // that of its storage.
             "hw::IrqShared" | "hw::PerCpu" => pointers(1, None),
-            // A spin lock is its lock word, then its value; a guard, which no code holds, its
-            // value.
+            // A spin lock is its lock word, then its value.
             "hw::SpinLock" => {
                 let value = ty_arg(0).expect("a wrapped type");
                 self.record(
                     ck,
                     &[("lock".to_owned(), word), ("value".to_owned(), value)],
                 )
-            }
-            "hw::SpinGuard" => {
-                let value = ty_arg(0).expect("a wrapped type");
-                self.record(ck, &[("value".to_owned(), value)])
             }
             // A one-slot mailbox: its lock word, whether it holds a value, the waiting task and
             // the value.
@@ -584,6 +584,16 @@ impl Layouts {
                     ],
                 )
             }
+            // A domain run's abandoner: its lock word, whether it was triggered, and the record
+            // of the domain it runs.
+            "sys::Abandoner" => self.record(
+                ck,
+                &[
+                    ("lock".to_owned(), word.clone()),
+                    ("triggered".to_owned(), word.clone()),
+                    ("domain".to_owned(), word),
+                ],
+            ),
             _ => return None,
         })
     }
@@ -726,7 +736,7 @@ impl Layouts {
             LayoutRepr::Integer { ty, order } => {
                 let scalar = Scalar::from_name(&ty.text).expect("a layout representation");
                 let big = order.as_ref().is_some_and(|order| order.text == "be");
-                let base = scalar_layout(scalar);
+                let base = scalar_layout(scalar, ck.db.target.is_machine());
                 let Shape::Scalar { ty: repr, .. } = base.shape else {
                     unreachable!("an integer representation");
                 };
@@ -894,6 +904,19 @@ fn words(names: &[&str]) -> Layout {
     }
 }
 
+/// A generational handle: a slot index and its generation.
+fn handle() -> Layout {
+    Layout {
+        size: 8,
+        align: 4,
+        shape: Shape::Record(vec![
+            field("index", Ty::Scalar(Scalar::U32), 0),
+            field("generation", Ty::Scalar(Scalar::U32), 4),
+        ]),
+        niche: None,
+    }
+}
+
 fn empty() -> Layout {
     Layout {
         size: 0,
@@ -931,19 +954,23 @@ fn pointers(count: u64, null: Option<u64>) -> Layout {
     }
 }
 
-pub fn scalar_type(scalar: Scalar) -> Type {
+/// The type of a scalar's values. Code for a machine target uses no floating-point register, so
+/// there a float is held as its bit pattern.
+pub fn scalar_type(scalar: Scalar, machine: bool) -> Type {
     match scalar {
         Scalar::U8 | Scalar::I8 | Scalar::Bool => types::I8,
         Scalar::U16 | Scalar::I16 => types::I16,
         Scalar::U32 | Scalar::I32 | Scalar::Char => types::I32,
         Scalar::U64 | Scalar::I64 | Scalar::Usize | Scalar::Isize => types::I64,
+        Scalar::F32 if machine => types::I32,
+        Scalar::F64 if machine => types::I64,
         Scalar::F32 => types::F32,
         Scalar::F64 => types::F64,
     }
 }
 
-fn scalar_layout(scalar: Scalar) -> Layout {
-    let ty = scalar_type(scalar);
+fn scalar_layout(scalar: Scalar, machine: bool) -> Layout {
+    let ty = scalar_type(scalar, machine);
     let size = u64::from(ty.bytes());
     let niche = match scalar {
         Scalar::Bool => Some((2, 254)),

@@ -60,6 +60,21 @@ impl Candidate {
 }
 
 /// The interfaces derives may name, beside `Copy` and the promises.
+/// The integer lane types of `core::simd`, which implement `core::SecretBits`.
+pub const INTEGER_LANES: [&str; 8] = [
+    "core::simd::U8x16",
+    "core::simd::I8x16",
+    "core::simd::U16x8",
+    "core::simd::I16x8",
+    "core::simd::U32x4",
+    "core::simd::I32x4",
+    "core::simd::U64x2",
+    "core::simd::I64x2",
+];
+
+/// Those of 8-bit lanes, which have no product.
+const BYTE_LANES: [&str; 2] = ["core::simd::U8x16", "core::simd::I8x16"];
+
 const DERIVABLE: [&str; 7] = [
     "Eq", "Ord", "Hash", "Default", "Render", "Encode", "Generate",
 ];
@@ -175,6 +190,13 @@ impl Checker<'_> {
             if matches!(name.as_deref(), Some("Eq" | "Hash")) {
                 return Some((Conformance::Builtin, no_args()));
             }
+        }
+        if let Ty::Item(item, _) = ty
+            && self.db.is_std(interface)
+            && self.db.canonical(interface) == "sys::Capability"
+            && self.is_kind(*item)
+        {
+            return Some((Conformance::Builtin, no_args()));
         }
         self.builtin_conformance(ty, interface)
             .map(|args| (Conformance::Builtin, args))
@@ -319,6 +341,7 @@ impl Checker<'_> {
                     }
                     "Neg" if float || scalar.is_signed() => Rc::from(vec![Arg::Ty(ty.clone())]),
                     "BitNot" if integer => Rc::from(vec![Arg::Ty(ty.clone())]),
+                    "SecretBits" if integer || *scalar == Scalar::Bool => no_args(),
                     _ => return None,
                 };
                 Some(args)
@@ -349,6 +372,7 @@ impl Checker<'_> {
                             && all_args(interface)
                     }
                     ("core::Untrusted", "Render") => true,
+                    (lanes, "SecretBits") => INTEGER_LANES.contains(&lanes),
                     ("core::Untrusted", "Encode") => all_args(interface),
                     ("core::Untrusted", "Generate") => ty.type_arg(0).is_some_and(|inner| {
                         self.implements(inner, interface) && self.has(inner, Property::Inert)
@@ -489,6 +513,20 @@ impl Checker<'_> {
                         dynamic: false,
                     });
                 }
+                if let Some(protocol) = self.outbox_protocol(ty)
+                    && let Some(method) = self.outbox_method(protocol, name)
+                {
+                    candidates.push(Candidate::Method {
+                        bound: Bound {
+                            interface: protocol,
+                            args: no_args(),
+                        },
+                        method,
+                        self_ty: ty.clone(),
+                        function: None,
+                        dynamic: false,
+                    });
+                }
             }
         }
         let mut distinct: Vec<Candidate> = Vec::new();
@@ -553,11 +591,25 @@ impl Checker<'_> {
             .collect()
     }
 
-    /// The index of an interface's method of that name.
+    /// The index of an interface's method of that name, or of the method of that name an outbox
+    /// of a protocol calls.
     pub fn interface_method(&self, interface: ItemId, name: &str) -> Option<usize> {
         match &self.sig(interface).kind {
             SigKind::Interface { methods } => methods.iter().position(|method| method.name == name),
+            SigKind::Protocol { .. } => self.outbox_method(interface, name),
             _ => None,
+        }
+    }
+
+    /// The name of an interface's method, or of a method an outbox of a protocol calls.
+    pub fn method_name(&self, interface: ItemId, method: usize) -> String {
+        match &self.sig(interface).kind {
+            SigKind::Interface { methods } => methods[method].name.clone(),
+            SigKind::Protocol { operations, .. } => match operations.get(method) {
+                Some(operation) => operation.name.clone(),
+                None => "summary".to_owned(),
+            },
+            _ => panic!("a method of no interface or protocol"),
         }
     }
 
@@ -577,9 +629,13 @@ impl Checker<'_> {
             .find(|function| self.db.module_of(*function) == module)
     }
 
-    /// The head of an interface method with `Self` and the interface's parameters substituted.
+    /// The head of an interface method with `Self` and the interface's parameters substituted,
+    /// or of a method an outbox of a protocol calls.
     pub fn method_head(&self, bound: &Bound, method: usize, self_ty: &Ty) -> Option<FnSig> {
         let sig = self.sig(bound.interface);
+        if let SigKind::Protocol { .. } = &sig.kind {
+            return self.outbox_head(bound.interface, method, self_ty);
+        }
         let SigKind::Interface { methods } = &sig.kind else {
             return None;
         };
@@ -664,6 +720,14 @@ impl Checker<'_> {
                     .scalar()
                     .is_some_and(|scalar| scalar.is_integer() || scalar == Scalar::Char)
             }),
+            Receivers::Integer => element.and_then(Ty::scalar).is_some_and(Scalar::is_integer),
+            Receivers::Lanes | Receivers::Multiplied => {
+                let lanes = named(&INTEGER_LANES, false)
+                    && (receivers == Receivers::Lanes || !named(&BYTE_LANES, false));
+                lanes || element.and_then(Ty::scalar).is_some_and(Scalar::is_integer)
+            }
+            Receivers::Wide => matches!(element, Some(Ty::Scalar(Scalar::U64 | Scalar::I64))),
+            Receivers::Bool => element == Some(&Ty::Scalar(Scalar::Bool)),
         }
     }
 
@@ -688,6 +752,14 @@ impl Checker<'_> {
             ("core::Untrusted", "append" | "try_append") => Receivers::OwnedBytes,
             ("core::Untrusted", "into_cleared") => Receivers::Clearable,
             ("core::Range", "next") => Receivers::Stepped,
+            ("core::Secret", "wrapping_add" | "wrapping_sub" | "shl" | "shr") => Receivers::Lanes,
+            ("core::Secret", "wrapping_mul") => Receivers::Multiplied,
+            (
+                "core::Secret",
+                "rotate_left" | "rotate_right" | "lt" | "le" | "gt" | "ge" | "widen" | "truncate",
+            ) => Receivers::Integer,
+            ("core::Secret", "mul_high") => Receivers::Wide,
+            ("core::Secret", "select") => Receivers::Bool,
             _ => return None,
         })
     }
@@ -1105,6 +1177,15 @@ enum Receivers {
     OwnedBytes,
     Clearable,
     Stepped,
+    /// The integer types.
+    Integer,
+    /// The integer types and the integer lane types.
+    Lanes,
+    /// The integer types and the integer lane types of 16-bit lanes or wider.
+    Multiplied,
+    /// `u64` and `i64`.
+    Wide,
+    Bool,
 }
 
 impl Receivers {
@@ -1117,6 +1198,8 @@ impl Receivers {
                     Receivers::ByteContents,
                     Receivers::WritableByteContents | Receivers::OwnedBytes
                 ) | (Receivers::WritableByteContents, Receivers::OwnedBytes)
+                    | (Receivers::Lanes, Receivers::Multiplied | Receivers::Integer)
+                    | (Receivers::Multiplied, Receivers::Integer)
             )
     }
 }

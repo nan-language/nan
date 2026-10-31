@@ -1,4 +1,4 @@
-//! Holdings: what a domain owns that settlement releases once the domain is abandoned, each a record linked in its owner's list, which the lock of the cell and capability tables guards: a file or listener, whose descriptor closes; a connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker, whose cell closes; and a channel's sender or receiver, which counts as released. A holding's record is its links, its owner, zero while no domain owns it, its kind and what it holds: a descriptor, a capability or cell handle, or a channel's record.
+//! Holdings: what a domain owns that settlement releases once the domain is abandoned, each a record linked in its owner's list, which the lock of the cell and capability tables guards: a file or listener, whose descriptor closes; a connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker, whose cell closes; a channel's sender or receiver, which counts as released; a minter of a capability kind, which revokes its entries and keeps its state; a device installed behind an IRQ-safe lock, which is uninstalled and whose record is freed, the device left as it is; a stepper, whose record is settled; and on a machine target a DMA buffer's mapping in an I/O domain, an I/O domain or a PCI function, which std's `hw` unmaps, closes or cuts off. A holding's record is its links, its owner, zero while no domain owns it, its kind and what it holds: a descriptor, a capability or cell handle, a channel's record, a minter's state record, a device's record, a stepper's record or the record `hw` keeps.
 
 const HOLDING_NEXT: u64 = 0
 
@@ -23,6 +23,16 @@ const HOLDINGS_KIND_CLOSE_CELL: i64 = 3
 const HOLDINGS_KIND_SENDER: i64 = 4
 
 const HOLDINGS_KIND_RECEIVER: i64 = 5
+
+const HOLDINGS_KIND_MINTER: i64 = 6
+
+const HOLDINGS_KIND_UNINSTALL: i64 = 7
+
+const HOLDINGS_KIND_STEPPER: i64 = 8
+
+const HOLDINGS_KIND_UNMAP: i64 = 9
+
+const HOLDINGS_KIND_DETACH: i64 = 10
 
 fn holdings_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     let params = mut fx.entry()
@@ -160,12 +170,38 @@ fn release_all(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {
     holdings_each(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
         let kind = mut fx1.load(PTR, addr: record, offset: HOLDING_KIND)
         let payload = mut fx1.load(PTR, addr: record, offset: HOLDING_PAYLOAD)
-        release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_CLOSE, platform: "release")
-        release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_ABANDON, platform: "conn_abandon")
+        // A kernel's domains hold no descriptors.
+        if not lo.kernel() {
+            release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_CLOSE, platform: "release")
+            release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_ABANDON, platform: "conn_abandon")
+        }
         release_handle(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_REVOKE, routine: Routine.Revoke)
         release_handle(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_CLOSE_CELL, routine: Routine.Close)
+        release_handle(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_MINTER, routine: Routine.KindClose)
         release_end(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_SENDER, sender: true)
         release_end(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_RECEIVER, sender: false)
+        let uninstall = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: HOLDINGS_KIND_UNINSTALL)
+        mut fx1.if_true(uninstall, then: fn[mut lo](mut fx2: Fx) {
+            if lo.machine() {
+                mut lo.uninstall_device(mut fx2, record: payload)
+            }
+            mut lo.record_free(mut fx2, address: payload)
+        })
+        let stepper = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: HOLDINGS_KIND_STEPPER)
+        mut fx1.if_true(stepper, then: fn[mut lo](mut fx2: Fx) {
+            components_withdraw(mut lo, fx: mut fx2, record: payload)
+        })
+        if lo.machine() {
+            let unmapping = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: HOLDINGS_KIND_UNMAP)
+            let detaching = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: HOLDINGS_KIND_DETACH)
+            let cut = mut fx1.b.bor(unmapping, y: detaching)
+            mut fx1.if_true(cut, then: fn[mut lo](mut fx2: Fx) {
+                var args = mem::List[Held].empty(fx2.alloc)
+                mut args.push(Held.Scalar(kind))
+                mut args.push(Held.Scalar(payload))
+                discard call_hw(mut lo, fx: mut fx2, name: "settled", args: args.view())
+            })
+        }
         mut lo.record_free(mut fx1, address: record)
     })
 } release_all

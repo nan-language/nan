@@ -1,4 +1,4 @@
-//! Register windows, the simulated register blocks of `hw::sim::Registers`, and DMA buffers. A window reaches a simulated block or, on a machine target, a device's port or physical address through compiler stubs; on a machine target each part of a DMA access is a compiler stub too.
+//! Register windows, the simulated register blocks of `hw::sim::Registers`, and DMA buffers. A window reaches a simulated block or, on a machine target, a device's port or physical address through compiler stubs; on a machine target each part of a DMA access is a compiler stub too, and a buffer in an I/O domain's space moves into pages of its own that the domain maps.
 
 /// A simulated register block: whether a window is mapped over it, the cell its queue nodes are
 /// drawn through, then a descriptor per register and the element slots the descriptors point
@@ -40,14 +40,58 @@ const SLOT_NODE_NEXT: u64 = 8
 
 const SLOT_NODE_SIZE: u64 = 16
 
-/// A DMA buffer, whose value is its box's content pointer: its bus address, contents and box are
-/// that pointer; on the host no device reaches it.
+/// A DMA buffer: its box's content pointer, which its bus address, contents and box give, and
+/// the record of its mapping in an I/O domain, zero in the physical space; on the host no device
+/// reaches it.
 fn dma(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
-        "of" or "into_box" => supply.ret(mut lo, mut fx, held: supply.param(0))
-        "contents" or "contents_mut" => {
+        "of" => {
+            let contents = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let none = mut fx.ptr(0)
+            mut fx.store(contents, addr: sret, offset: 0)
+            mut fx.store(none, addr: sret, offset: 8)
+            if lo.machine() {
+                let space_place = supply.param(1).address_value()
+                let space_key = mut fx.load(PTR, addr: space_place, offset: 0)
+                let in_domain = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: space_key, y: 0)
+                mut fx.if_true(in_domain, then: fn[mut lo](mut fx1: Fx) {
+                    let laid = mut lo.layout_of(supply.type_arg(lo, index: 0))
+                    let mapped = map_pages(mut lo, fx: mut fx1, contents, size: laid.contents().size, space_place)
+                    mut fx1.store(mapped.pages, addr: sret, offset: 0)
+                    mut fx1.store(mapped.mapping, addr: sret, offset: 8)
+                })
+            }
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "into_box" => {
+            let place = supply.param(0).address_value()
+            let contents = mut fx.load(PTR, addr: place, offset: 0)
+            if lo.machine() {
+                let mapping = mut fx.load(PTR, addr: place, offset: 8)
+                let mapped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mapping, y: 0)
+                mut fx.if_true(mapped, then: fn[mut lo](mut fx1: Fx) {
+                    discard call_hw(mut lo, fx: mut fx1, name: "unmapped", args: Array[Held, 1].filled(Held.Scalar(mapping)).view())
+                })
+            }
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(contents, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "contents" => {
             let pointer = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             supply.ret(mut lo, mut fx, held: Held.Address(pointer))
+        }
+        "write" => {
+            let pointer = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            mut lo.store_held(mut fx, address: pointer, held: supply.param(1), ty: supply.type_arg(lo, index: 0))
+            supply.done(mut lo, mut fx)
         }
         "bus_addr" => {
             let place = supply.param(0).address_value()
@@ -65,6 +109,46 @@ fn dma(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } dma
 
+/// The pages a buffer's contents moved into and the record of their mapping.
+struct MappedPages derives Copy {
+    pages: clif::Value
+    mapping: clif::Value
+} MappedPages
+
+/// The bytes of a page an I/O domain maps.
+const DMA_PAGE: u64 = 4_096
+
+/// Moves the `size` bytes of a box's contents into whole pages of their own drawn through the
+/// box's allocator, then maps those pages in an I/O space's domain; gives the pages and the
+/// mapping's record.
+fn map_pages(mut lo: Lowering, mut fx: Fx, contents: clif::Value, size: u64, space_place: clif::Value) -> MappedPages {
+    let bytes = next_multiple_of(at_least_one(size), multiple: DMA_PAGE)
+    let cell = memory_cell_of(mut lo, mut fx, address: contents)
+    let length = mut fx.ptr(bytes)
+    let align = mut fx.ptr(DMA_PAGE)
+    let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: fx.list3(cell, b: length, c: align).view())
+    expect drawn.len() > 0
+    let pages = drawn[0]
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: pages, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let moved = mut fx.ptr(size)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(pages, b: contents, c: moved).view())
+    let rest = mut fx.offset(pages, offset: size)
+    let zero = mut fx.ptr(0)
+    let left = mut fx.ptr(bytes - size)
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fx.list3(rest, b: zero, c: left).view())
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: fx.list1(contents).view())
+    let mapped_length = mut fx.ptr(bytes)
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(Held.Address(space_place))
+    mut args.push(Held.Scalar(pages))
+    mut args.push(Held.Scalar(mapped_length))
+    let mapping = call_hw(mut lo, mut fx, name: "mapped", args: args.view())
+    return MappedPages(pages: pages, mapping: mapping.scalar_value())
+} map_pages
+
 /// The bit of a window's word set when the window reaches a simulated block, which a machine
 /// test image holds beside windows mapped over devices; no port, physical address or block's
 /// address has it.
@@ -74,6 +158,15 @@ const WINDOWS_SIMULATED: i64 = i64.from_bits(0x8000_0000_0000_0000)
 /// those of a device: on the host every window is simulated, a machine image's other than a test
 /// image's never are, and a machine test image's word says which one is.
 fn windows_window(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    if supply.member() == "extent" {
+        let ty::TyKind.Registers(block) = lo.ck.types().kind(supply.type_arg(lo, index: 0)) else {
+            expect false
+            return
+        }
+        let extent = mut fx.ptr(registers_extent(mut lo, block))
+        supply.ret(mut lo, mut fx, held: Held.Scalar(extent))
+        return
+    }
     if supply.member() == "map" {
         expect lo.machine()
         let given = supply.param(0).scalar_value()
@@ -559,6 +652,87 @@ fn dma_parts(mut lo: Lowering, ty: ty::Ty) -> mem::List[DmaPart] {
 /// The bytes of a register's entry in the table of its registers block a device window reads:
 /// its byte offset, then its stride, each 4 bytes.
 const REGISTER_ENTRY: u64 = 8
+
+/// The bytes of a registers block from its offset 0 to past its last register or element.
+fn registers_extent(mut lo: Lowering, block: ty::ItemId) -> u64 {
+    var placed = mem::List[PlacedRegister].empty(lo.alloc)
+    let item = lo.ck.db().ast(block)
+    let ast::ItemKind.Registers(declared) = item.kind else {
+        expect false
+        return 0
+    }
+    let sig = lo.ck.sig(block)
+    let check::SigKind.Registers(members: members) = sig.contents().kind else {
+        expect false
+        return 0
+    }
+    for index in 0..<declared.members.len() {
+        expect index < members.len()
+        let member = declared.members[index]
+        var stride: Option[u64] = None
+        match member.stride {
+            Some(token) => {
+                stride = Some(u64.widen(register_number(lo, block, token)))
+            }
+            None => {}
+        }
+        mut placed.push(PlacedRegister(at: u64.widen(register_number(lo, block, token: member.at)), stride: stride, ty: members[index].ty))
+    }
+    var extent: u64 = 0
+    for register in placed {
+        let laid = mut lo.layout_of(register.ty)
+        var size = laid.contents().size
+        var last: u64 = 0
+        match register.stride {
+            Some(stride) => {
+                let element = array_register(mut lo, ty: register.ty)
+                size = element.size
+                last = (element.count - 1) * stride
+            }
+            None => {}
+        }
+        let end = register.at + last + size
+        if end > extent {
+            extent = end
+        }
+    }
+    return extent
+} registers_extent
+
+/// A register's offset, its stride when it is an array register, and its type.
+struct PlacedRegister derives Copy {
+    at: u64
+    stride: Option[u64]
+    ty: ty::Ty
+} PlacedRegister
+
+/// An array register's element size and count, a count of 1 when its type writes none.
+struct ArrayRegister derives Copy {
+    size: u64
+    count: u64
+} ArrayRegister
+
+fn array_register(mut lo: Lowering, ty: ty::Ty) -> ArrayRegister {
+    let ty::TyKind.Item(item: _, args: array_args) = lo.ck.types().kind(ty) else {
+        expect false
+        return ArrayRegister(size: 0, count: 1)
+    }
+    let arg_list = lo.ck.types().arg_list(array_args)
+    expect arg_list.len() > 1
+    let Some(element) = arg_list[0].ty() else {
+        expect false
+        return ArrayRegister(size: 0, count: 1)
+    }
+    var count: u64 = 1
+    match arg_list[1] {
+        ty::Arg.Const(ty::Const.Int(length)) => {
+            count = length.low_bits()
+        }
+        else => {}
+    }
+    let laid = mut lo.layout_of(element)
+    return ArrayRegister(size: laid.contents().size, count: count)
+} array_register
 
 /// The table of a registers block, an entry per register in order.
 fn register_table(mut lo: Lowering, block: ty::ItemId) -> object::DataId {

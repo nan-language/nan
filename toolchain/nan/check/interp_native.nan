@@ -1,4 +1,4 @@
-//! The std operations the interpreter supplies, its supplied operations and intrinsics: named and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the capabilities of the testing world, channels, rendering, and the conformances the toolchain supplies and the methods derives write.
+//! The std operations the interpreter supplies, its supplied operations and intrinsics: named and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`, `Secret` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the capabilities of the testing world, capability kinds, channels, rendering, and the conformances the toolchain supplies and the methods derives write.
 
 /// The width in bytes and byte order of an integer reader such as `u32_le`.
 struct IntegerAccess derives Copy {
@@ -56,6 +56,12 @@ fn Interpreter.native_call(
             None => {}
         }
     }
+    if owner == "core::Secret" {
+        return try mut self.secret_member(member, type_args, args: given, at)
+    }
+    if owner.starts_with("core::simd::") and member == "store" {
+        return InterpFlow.Return(mut self.lanes_store(args: given))
+    }
     if owner == "hw::Ptr" {
         match try mut self.pointer_member(member, type_args, args: given, at) {
             Some(flow) => return flow
@@ -75,6 +81,10 @@ fn Interpreter.native_call(
         None => {}
     }
     match mut self.sim_member(owner, member, type_args, args: given) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match try mut self.kind_member(owner, member, type_args, args: given, at, site) {
         Some(flow) => return flow
         None => {}
     }
@@ -103,6 +113,22 @@ fn Interpreter.native_call(
     }
     return try mut self.core_member(owner, member, type_args, args: given, at, site)
 } Interpreter.native_call
+
+/// `store` of a `core::simd` lane type: its lanes written to the view from the index given.
+fn Interpreter.lanes_store(mut self, args: Slice[Val]) -> Val {
+    expect args.len() >= 3
+    let alloc = self.alloc
+    let held = self.deref(args[0])
+    let view = mut self.view(args[1])
+    let at = usize.widen(args[2].int_value().low_bits())
+    var index: usize = 0
+    for value in held.fields()[0].fields() {
+        expect view.start <= ~0usize - at and view.start + at <= ~0usize - index
+        mut self.memory.set(view.array.with(u32.truncate(view.start + at + index), alloc), stored: value.copy(alloc))
+        index += 1
+    }
+    return Val.Unit
+} Interpreter.lanes_store
 
 /// The members of core's ranges, slices, arrays, texts, cursors, `Option`, `Untrusted` and
 /// totally ordered floats, and `testing::same`; a run reaching another ends missing.
@@ -1039,7 +1065,7 @@ fn Interpreter.equal(self, left: Val, right: Val) -> bool {
 
 /// Structural order: scalars by value, enum values by variant then payload, structs and
 /// arrays part by part in order, the std types the interpreter models by their compared
-/// parts.
+/// parts, and all kept fields equal.
 fn Interpreter.order(self, left: Val, right: Val) -> core::Ordering {
     match left {
         Val.Ref(loc) => return self.order(self.memory.get(loc), right)
@@ -1068,9 +1094,13 @@ fn Interpreter.order(self, left: Val, right: Val) -> core::Ordering {
                 else => {}
             }
         }
-        Val.Variant(item: _, index: a, fields: payload) => {
+        Val.Variant(item: item, index: a, fields: payload) => {
             match right {
                 Val.Variant(item: _, index: b, fields: other_payload) => {
+                    let db = self.ck.db()
+                    if db.is_std(item) and db.canonical(item).as_str() == "mem::wire::Kept" {
+                        return core::Ordering.Equal
+                    }
                     let variants = a.cmp(b)
                     if variants != core::Ordering.Equal {
                         return variants

@@ -1,17 +1,19 @@
 //! The std operations the interpreter supplies, its supplied operations and intrinsics: named
-//! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`
-//! and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
-//! capabilities of the testing world, channels, rendering, and the conformances the toolchain
-//! supplies and the methods derives write.
+//! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`,
+//! `Secret` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
+//! capabilities of the testing world, capability kinds, channels, rendering, and the
+//! conformances the toolchain supplies and the methods derives write.
 
 mod atomics;
 mod codecs;
 mod collections;
 mod hardware;
 mod hashing;
+mod kinds;
 mod numbers;
 mod pointers;
 mod render;
+mod secret;
 mod sims;
 mod stores;
 mod tasks;
@@ -51,6 +53,9 @@ pub fn call(
     if let Some(scalar) = owner.strip_prefix("core::").and_then(Scalar::from_name) {
         return numbers::scalar_member(interp, scalar, member, &args, at);
     }
+    if owner == "core::Secret" {
+        return secret::member(interp, member, type_args, &args, at);
+    }
     if owner == "hw::Ptr"
         && let Some(flow) = pointers::member(interp, member, type_args, &args, at)
     {
@@ -66,6 +71,9 @@ pub fn call(
         return flow;
     }
     if let Some(flow) = sims::member(interp, owner, member, type_args, &args) {
+        return flow;
+    }
+    if let Some(flow) = kinds::member(interp, owner, member, type_args, &args, at, site) {
         return flow;
     }
     if let Some(flow) = codecs::member(interp, owner, member, type_args, &args, at, site) {
@@ -132,6 +140,19 @@ pub fn call(
             for (index, value) in interp.view_values(&source).into_iter().enumerate() {
                 let element = view.array.with((view.start + index) as u32);
                 interp.memory.set(&element, value);
+            }
+            Val::Unit
+        }
+        (lanes, "store") if lanes.starts_with("core::simd::") => {
+            let held = interp.deref(&args[0]);
+            let Val::Array(values) = &held.fields()[0] else {
+                panic!("the lanes of a {lanes}");
+            };
+            let view = interp.view(&args[1]);
+            let at = args[2].int() as usize;
+            for (index, value) in values.iter().enumerate() {
+                let element = view.array.with((view.start + at + index) as u32);
+                interp.memory.set(&element, value.clone());
             }
             Val::Unit
         }
@@ -763,7 +784,7 @@ impl Interpreter<'_, '_> {
 
     /// Structural order: scalars by value, enum values by variant then payload, structs and
     /// arrays part by part in order, the std types the interpreter models by their compared
-    /// parts.
+    /// parts, and all kept fields equal.
     pub(super) fn order(&self, left: &Val, right: &Val) -> Ordering {
         match (self.deref(left), self.deref(right)) {
             (Val::F32(a), Val::F32(b)) => a.total_cmp(&b),
@@ -771,6 +792,11 @@ impl Interpreter<'_, '_> {
             (Val::View(a), Val::View(b)) => {
                 let (a, b) = (self.view_values(&a), self.view_values(&b));
                 self.order_all(&a, &b)
+            }
+            (Val::Variant(item, ..), Val::Variant(..))
+                if self.ck.db.is_std(item) && self.ck.db.canonical(item) == "mem::wire::Kept" =>
+            {
+                Ordering::Equal
             }
             (Val::Variant(_, a, payload_a), Val::Variant(_, b, payload_b)) => a
                 .cmp(&b)

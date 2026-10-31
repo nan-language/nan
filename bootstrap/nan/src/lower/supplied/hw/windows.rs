@@ -1,6 +1,7 @@
 //! Register windows, the simulated register blocks of `hw::sim::Registers`, and DMA buffers. A
 //! window reaches a simulated block or, on a machine target, a device's port or physical address
-//! through compiler stubs; on a machine target each part of a DMA access is a compiler stub too.
+//! through compiler stubs; on a machine target each part of a DMA access is a compiler stub too,
+//! and a buffer in an I/O domain's space moves into pages of its own that the domain maps.
 
 use cranelift_codegen::ir::{InstBuilder, Type, Value, condcodes::IntCC, types};
 use cranelift_module::DataId;
@@ -9,10 +10,12 @@ use super::super::super::Lowering;
 use super::super::super::body::{Body, Held};
 use super::super::super::fx::{Fx, PTR, unaligned};
 use super::super::super::layout::Shape;
-use super::super::super::runtime::report;
+use super::super::super::runtime::memory::cell_of;
+use super::super::super::runtime::{Routine, report};
 use super::super::{Supply, sims};
+use super::iommu;
 use crate::check::db::ItemId;
-use crate::check::sig::int_literal;
+use crate::check::sig::{SigKind, int_literal};
 use crate::check::ty::{Arg, Args, Const, Ty};
 use crate::nir::Operand;
 use crate::syntax::ast::{Access, ItemKind};
@@ -51,10 +54,47 @@ mod slot {
 /// that pointer; on the host no device reaches it.
 pub fn dma(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
-        "of" | "into_box" => supply.ret(lo, fx, supply.param(0)),
-        "contents" | "contents_mut" => {
+        "of" => {
+            let contents = fx.load(PTR, supply.param(0).address(), 0);
+            let sret = supply.sret.expect("a DMA buffer's slot");
+            let none = fx.ptr(0);
+            fx.store(contents, sret, 0);
+            fx.store(none, sret, 8);
+            if lo.machine() {
+                let space = supply.param(1).address();
+                let key = fx.load(PTR, space, 0);
+                let domain = fx.b.ins().icmp_imm_s(IntCC::NotEqual, key, 0);
+                fx.when(domain, |fx| {
+                    let size = lo.layout(&supply.type_arg(0)).size;
+                    let (pages, mapping) = map_pages(lo, fx, contents, size, space);
+                    fx.store(pages, sret, 0);
+                    fx.store(mapping, sret, 8);
+                });
+            }
+            supply.ret(lo, fx, Held::Address(sret));
+        }
+        "into_box" => {
+            let place = supply.param(0).address();
+            let contents = fx.load(PTR, place, 0);
+            if lo.machine() {
+                let mapping = fx.load(PTR, place, 8);
+                let mapped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mapping, 0);
+                fx.when(mapped, |fx| {
+                    iommu::call_hw(lo, fx, "unmapped", &[Held::Scalar(mapping)]);
+                });
+            }
+            let sret = supply.sret.expect("a box's slot");
+            fx.store(contents, sret, 0);
+            supply.ret(lo, fx, Held::Address(sret));
+        }
+        "contents" => {
             let pointer = fx.load(PTR, supply.param(0).address(), 0);
             supply.ret(lo, fx, Held::Address(pointer));
+        }
+        "write" => {
+            let pointer = fx.load(PTR, supply.param(0).address(), 0);
+            lo.store_held(fx, pointer, supply.param(1), &supply.type_arg(0));
+            supply.done(lo, fx);
         }
         "bus_addr" => {
             let place = supply.param(0).address();
@@ -67,6 +107,47 @@ pub fn dma(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
+/// Moves the `size` bytes of a box's contents into whole pages of their own drawn through the
+/// box's allocator, then maps those pages in an I/O space's domain; gives the pages and the
+/// mapping's record.
+fn map_pages(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    contents: Value,
+    size: u64,
+    space: Value,
+) -> (Value, Value) {
+    let bytes = size.max(1).next_multiple_of(PAGE);
+    let cell = cell_of(lo, fx, contents);
+    let length = fx.ptr(bytes);
+    let align = fx.ptr(PAGE);
+    let pages = lo.call_routine(fx, Routine::Alloc, &[cell, length, align])[0];
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, pages, 0);
+    fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+    let moved = fx.ptr(size);
+    lo.call_routine(fx, Routine::Copy, &[pages, contents, moved]);
+    let rest = fx.offset(pages, size);
+    let zero = fx.ptr(0);
+    let left = fx.ptr(bytes - size);
+    lo.call_routine(fx, Routine::Fill, &[rest, zero, left]);
+    lo.call_routine(fx, Routine::Free, &[contents]);
+    let length = fx.ptr(bytes);
+    let mapping = iommu::call_hw(
+        lo,
+        fx,
+        "mapped",
+        &[
+            Held::Address(space),
+            Held::Scalar(pages),
+            Held::Scalar(length),
+        ],
+    );
+    (pages, mapping.scalar())
+}
+
+/// The bytes of a page an I/O domain maps.
+const PAGE: u64 = 4_096;
+
 /// The bit of a window's word set when the window reaches a simulated block, which a machine
 /// test image holds beside windows mapped over devices; no port, physical address or block's
 /// address has it.
@@ -76,6 +157,14 @@ const SIMULATED: i64 = i64::MIN;
 /// those of a device: on the host every window is simulated, a machine image's other than a test
 /// image's never are, and a machine test image's word says which one is.
 pub fn window(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    if supply.member() == "extent" {
+        let Ty::Registers(block) = supply.type_arg(0) else {
+            panic!("a registers block");
+        };
+        let extent = fx.ptr(registers_extent(lo, block));
+        supply.ret(lo, fx, Held::Scalar(extent));
+        return;
+    }
     if supply.member() == "map" {
         assert!(
             lo.machine(),
@@ -524,6 +613,34 @@ fn dma_parts(lo: &mut Lowering, ty: &Ty) -> Vec<(u64, u64)> {
 /// The bytes of a register's entry in the table of its registers block a device window reads:
 /// its byte offset, then its stride, each 4 bytes.
 const REGISTER_ENTRY: u64 = 8;
+
+/// The bytes of a registers block from its offset 0 to past its last register or element.
+fn registers_extent(lo: &mut Lowering, block: ItemId) -> u64 {
+    let ItemKind::Registers(declared) = &lo.ck.db.ast(block).kind else {
+        panic!("a registers item");
+    };
+    let data = lo.ck.db.item(block);
+    let number = |token| int_literal(data.text(token)).unwrap_or(0) as u64;
+    let SigKind::Registers { registers } = &lo.ck.sig(block).kind else {
+        panic!("a registers block");
+    };
+    let mut extent = 0;
+    for (register, sig) in declared.registers.iter().zip(registers) {
+        let (size, last) = match (&sig.ty, register.stride) {
+            (Ty::Item(_, args), Some(stride)) => {
+                let element = args[0].ty().cloned().expect("an array element type");
+                let count = match &args[1] {
+                    Arg::Const(Const::Int(count)) => *count as u64,
+                    _ => 1,
+                };
+                (lo.layout(&element).size, (count - 1) * number(stride))
+            }
+            _ => (lo.layout(&sig.ty).size, 0),
+        };
+        extent = extent.max(number(register.at) + last + size);
+    }
+    extent
+}
 
 /// The table of a registers block, an entry per register in order.
 fn register_table(lo: &mut Lowering, block: ItemId) -> DataId {

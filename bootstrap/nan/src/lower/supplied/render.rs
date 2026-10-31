@@ -24,9 +24,6 @@ use crate::check::ty::{Args, Scalar, Subst, Ty};
 use crate::nir::{Literal, Operand};
 use crate::syntax::grammar::REJECTED;
 
-/// The bytes of the buffer the host platform writes a float's text into.
-const FLOAT_TEXT: u64 = 40;
-
 mod renderer {
     pub const BUFFER: u64 = 0;
     pub const BUDGET: u64 = 8;
@@ -608,13 +605,7 @@ fn render_scalar(
         }
         Scalar::Char => append_char(lo, fx, renderer_value, value),
         Scalar::F32 | Scalar::F64 => {
-            let buffer = fx.slot(FLOAT_TEXT, 8);
-            let name = match scalar {
-                Scalar::F32 => "f32_text",
-                _ => "f64_text",
-            };
-            let args = [Held::Scalar(value), Held::Address(buffer)];
-            let len = lo.platform_call(fx, name, &args).result.scalar();
+            let (buffer, len) = super::floats::text(lo, fx, value);
             append(lo, fx, renderer_value, buffer, len);
         }
         scalar => {
@@ -769,7 +760,7 @@ fn render_composite(
         SigKind::Struct { fields } => {
             let address = value.address();
             append_text(lo, fx, renderer_value, &format!("{name}("));
-            for (index, field) in fields.iter().enumerate() {
+            for (index, field) in fields.iter().filter(|field| !field.is_kept()).enumerate() {
                 if index > 0 {
                     append_text(lo, fx, renderer_value, ", ");
                 }

@@ -1,9 +1,11 @@
 //! Boot, the anchor, the timer and the kernel's first task.
 
-/// What interrupt fns reach: the tick count and the signal posting it to the first task.
+/// What interrupt fns reach: the tick count, the signal posting it to the first task and the
+/// count of CPU signals taken.
 struct State {
     ticks: core::atomic::AtomicU64
     tick: mem::Shared[hw::Signal[u64]]
+    signals: mem::Shared[core::atomic::AtomicU64]
 } State
 
 /// What the kernel's tasks observe: the number of each CPU, the CPUs that ran a spinning task
@@ -30,28 +32,51 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let alloc = k.alloc()
     let clock = k.clock()
     let wall = k.wall_clock()
+    let Some(cpu) = mut k.ring0() else {
+        loop {
+        }
+    }
     let tick = mem::Shared.of(hw::Signal[u64].empty(), alloc)
     let ticks = tick.share()
-    let state = State(ticks: core::atomic::AtomicU64.of(0), tick: take tick)
-    take k.anchor(take state, run: fn[take ticks](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
-        try await run(exec, take ticks, alloc, clock, wall)
+    let signals = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    let counted = signals.share()
+    let state = State(ticks: core::atomic::AtomicU64.of(0), tick: take tick, signals: take signals)
+    let line = k.command_line(alloc)
+    let modules = mut k.modules()
+    take k.anchor(take state, run: fn[take ticks, take counted, take cpu, take line, take modules](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+        let report = started(line, modules: modules.view(), alloc)
+        discard attempt await run(exec, take ticks, signals: take counted, alloc, clock, wall, cpu, report: report.view())
+        loop {
+        }
     })
 } main
 
-/// The kernel's first task: attaches the console, then in one scope wakes a reader through the
-/// UART's loopback, starts the spinning tasks, the entropy driver and the clock checks, and
-/// reports what the spinning tasks show once each tick.
-fn run(exec: task::Executor, take ticks: mem::Shared[hw::Signal[u64]], alloc: mem::Alloc, clock: sys::Clock, wall: Option[sys::WallClock]) fails task::Cancelled uses wait limits stack 24_576 {
+/// The kernel's first task: attaches the console, writes the report of what the kernel started
+/// with and checks the CPU's own operations, then in
+/// one scope wakes a reader through the UART's loopback, starts the spinning tasks, the entropy
+/// driver and the clock checks, and reports what the spinning tasks show once each tick.
+fn run(
+    exec: task::Executor,
+    take ticks: mem::Shared[hw::Signal[u64]],
+    take signals: mem::Shared[core::atomic::AtomicU64],
+    alloc: mem::Alloc,
+    clock: sys::Clock,
+    wall: Option[sys::WallClock],
+    cpu: hw::Ring0,
+    report: Slice[u8],
+    ) fails task::Cancelled uses wait limits stack 24_576 {
     let received = mem::Shared.of(hw::Signal[u8].empty(), alloc)
     let console = attach(received.share())
     defer detach(take console)
+    say_bytes(console, bytes: report)
     say_number(console, before: "kernel: running on ", value: u64.widen(hw::cpu_count()), after: " cpus\n")
+    try await check_cpu(console, cpu, signals, ticks)
     let spinners = usize.widen(hw::cpu_count()) + 1
     var passes = mem::List[core::atomic::AtomicU64].empty(alloc)
     for _ in 0..<spinners {
         mut passes.push(core::atomic::AtomicU64.of(0))
     }
-    let cpus = hw::PerCpu.of(fn(cpu: u32) => cpu, alloc)
+    let cpus = hw::PerCpu.of(fn(index: u32) => index, alloc)
     let probe = Probe(cpus: take cpus, ran: core::atomic::AtomicU64.of(0), passes: take passes)
     try await task::scope(exec, body: fn(s: task::Scope) fails task::Cancelled uses wait limits stack 16_384 {
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {

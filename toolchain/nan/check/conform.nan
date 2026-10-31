@@ -53,7 +53,22 @@ enum Receivers derives Copy, Eq {
     OwnedBytes
     Clearable
     Stepped
+    /// The integer types.
+    Integer
+    /// The integer types and the integer lane types.
+    Lanes
+    /// The integer types and the integer lane types of 16-bit lanes or wider.
+    Multiplied
+    /// `u64` and `i64`.
+    Wide
+    Bool
 } Receivers
+
+/// The integer lane types of `core::simd`, which implement `core::SecretBits`, and those of 8-bit
+/// lanes, which have no product.
+const INTEGER_LANES: Str = "core::simd::U8x16 core::simd::I8x16 core::simd::U16x8 core::simd::I16x8 core::simd::U32x4 core::simd::I32x4 core::simd::U64x2 core::simd::I64x2"
+
+const BYTE_LANES: Str = "core::simd::U8x16 core::simd::I8x16"
 
 /// The core operator and cursor interfaces, which a type implements through std conformances.
 const OPERATOR_INTERFACES: Str = "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg BitNot Cursor"
@@ -191,6 +206,15 @@ pkg fn Checker.conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Opti
                     }
                 }
                 else => {}
+            }
+        }
+        else => {}
+    }
+    match types.kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            let db = self.db()
+            if db.is_std(interface_item) and db.canonical_text(interface_item) == "sys::Capability" and self.is_kind(item) {
+                return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
             }
         }
         else => {}
@@ -441,6 +465,7 @@ fn scalar_conformance(ty: ty::Ty, scalar: ty::Scalar, name: Str, types: ty::Type
         "Shr" if unsigned => conform_pair_args(shift, second: Some(ty), types)
         "Neg" if float or scalar.is_signed() => conform_pair_args(ty, second: None, types)
         "BitNot" if integer => conform_pair_args(ty, second: None, types)
+        "SecretBits" if integer or scalar == ty::Scalar.Bool => ty::Args.none()
         else => return None
     }
     return Some(args)
@@ -491,6 +516,7 @@ fn Checker.std_conformance(self, ty: ty::Ty, path: Str, name: Str, interface_ite
         "mem::Shared" => is_listed("Render Encode", word: name) and self.args_implement(ty, interface_item)
         "mem::Id" => is_listed("Eq Ord Hash Encode Generate", word: name)
         "mem::Handle" or "hw::Ptr" => is_listed("Eq Hash", word: name)
+        lanes if name == "SecretBits" => is_listed(INTEGER_LANES, word: lanes)
         else => false
     }
     if holds {
@@ -653,6 +679,13 @@ fn Checker.conform_candidates(self, ty: ty::Ty, key: TypeKey, name: Str, mut can
         }
         mut candidates.push(Candidate.Method(bound: ty::Bound(item: interface_item, args: args), method: method, self_ty: ty, function: take function, dynamic: false))
     }
+    let Some(protocol) = self.outbox_protocol(ty) else {
+        return
+    }
+    let Some(method) = self.outbox_method(protocol, name) else {
+        return
+    }
+    mut candidates.push(Candidate.Method(bound: ty::Bound(item: protocol, args: ty::Args.none()), method: method, self_ty: ty, function: None, dynamic: false))
 } Checker.conform_candidates
 
 /// The candidates without those standing for an earlier one's function or method.
@@ -797,16 +830,41 @@ fn Checker.found_interfaces(self, key: u8) -> mem::List[ty::ItemId] {
 /// The index of an interface's method of that name.
 pkg fn Checker.interface_method(self, interface_item: ty::ItemId, name: Str) -> Option[usize] {
     let sig = self.sig(interface_item)
-    let SigKind.Interface(methods: methods) = sig.contents().kind else {
-        return None
+    match sig.contents().kind {
+        SigKind.Interface(methods: methods) => {
+            for index in 0..<methods.len() {
+                if methods[index].name.as_str() == name {
+                    return Some(index)
+                }
+            }
+            return None
+        }
+        SigKind.Protocol(operations: _, variants: _, summary: _) => return self.outbox_method(interface_item, name)
+        else => return None
     }
-    for index in 0..<methods.len() {
-        if methods[index].name.as_str() == name {
-            return Some(index)
+} Checker.interface_method
+
+/// The name of an interface's method, or of a method an outbox of a protocol calls.
+pkg fn Checker.method_name(self, interface_item: ty::ItemId, method: usize) -> text::String {
+    let alloc = self.alloc()
+    let sig = self.sig(interface_item)
+    match sig.contents().kind {
+        SigKind.Interface(methods: methods) => {
+            expect method < methods.len()
+            return text::String.of(methods[method].name.as_str(), alloc)
+        }
+        SigKind.Protocol(operations: operations, variants: _, summary: _) => {
+            if method < operations.len() {
+                return text::String.of(operations[method].name.as_str(), alloc)
+            }
+            return text::String.of("summary", alloc)
+        }
+        else => {
+            expect false
+            return text::String.empty(alloc)
         }
     }
-    return None
-} Checker.interface_method
+} Checker.method_name
 
 /// The function `T.m` an impl line's module declares for the impl's target.
 fn Checker.implementing_function(self, line: ty::ItemId, name: Str) -> Option[ty::ItemId] {
@@ -830,6 +888,10 @@ fn Checker.method_head(self, bound: ty::Bound, method: usize, self_ty: ty::Ty) -
     let alloc = self.alloc()
     let held = self.sig(bound.item)
     let sig = held.contents()
+    match sig.kind {
+        SigKind.Protocol(operations: _, variants: _, summary: _) => return self.outbox_head(bound.item, method, outbox: self_ty)
+        else => {}
+    }
     let SigKind.Interface(methods: methods) = sig.kind else {
         return None
     }
@@ -903,8 +965,24 @@ fn Checker.member_exists(self, function: ty::ItemId, ty: ty::Ty) -> bool {
             }
             None => false
         }
+        Receivers.Integer => self.integer_element(element)
+        Receivers.Lanes => self.integer_element(element) or self.element_named(element, names: INTEGER_LANES, bytes_only: false)
+        Receivers.Multiplied => self.integer_element(element) or (self.element_named(element, names: INTEGER_LANES, bytes_only: false) and not self.element_named(element, names: BYTE_LANES, bytes_only: false))
+        Receivers.Wide => element == Some(ty::Ty.scalar(ty::Scalar.Unsigned64)) or element == Some(ty::Ty.scalar(ty::Scalar.Signed64))
+        Receivers.Bool => element == Some(ty::Ty.scalar(ty::Scalar.Bool))
     }
 } Checker.member_exists
+
+/// Whether a receiver's type argument is an integer type.
+fn Checker.integer_element(self, element: Option[ty::Ty]) -> bool {
+    let Some(element_ty) = element else {
+        return false
+    }
+    return match self.types().scalar_of(element_ty) {
+        Some(scalar) => scalar.is_integer()
+        None => false
+    }
+} Checker.integer_element
 
 /// The function whose body or clauses are being typed, when it is named after the type a
 /// receiver's type argument is a parameter of.
@@ -979,6 +1057,11 @@ fn receivers_of(owner: Str, member: Str) -> Option[Receivers] {
         "core::Untrusted" if member == "append" or member == "try_append" => Receivers.OwnedBytes
         "core::Untrusted" if member == "into_cleared" => Receivers.Clearable
         "core::Range" if member == "next" => Receivers.Stepped
+        "core::Secret" if is_listed("wrapping_add wrapping_sub shl shr", word: member) => Receivers.Lanes
+        "core::Secret" if member == "wrapping_mul" => Receivers.Multiplied
+        "core::Secret" if is_listed("rotate_left rotate_right lt le gt ge widen truncate", word: member) => Receivers.Integer
+        "core::Secret" if member == "mul_high" => Receivers.Wide
+        "core::Secret" if member == "select" => Receivers.Bool
         else => return None
     }
     return Some(found)
@@ -1483,6 +1566,8 @@ fn Receivers.include(self, inner: Receivers) -> bool {
     return match self {
         Receivers.ByteContents => inner == Receivers.WritableByteContents or inner == Receivers.OwnedBytes
         Receivers.WritableByteContents => inner == Receivers.OwnedBytes
+        Receivers.Lanes => inner == Receivers.Multiplied or inner == Receivers.Integer
+        Receivers.Multiplied => inner == Receivers.Integer
         else => false
     }
 } Receivers.include

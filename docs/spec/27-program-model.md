@@ -96,7 +96,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Serial port | none | the 16550 UART at I/O port `0x3F8` | the 16550 UART at I/O port `0x3F8` |
 | Console port | none | the 16550 UART at I/O port `0x2F8` | the 16550 UART at I/O port `0x2F8` |
 | Exit port | none | I/O port `0xF4` | I/O port `0xF4` |
-| Interrupt controller | none | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` |
+| Interrupt controller | none | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` |
 | Timer | none | each CPU's local APIC timer, firing vector `0x20` one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's local APIC timer, firing vector `0x20` one-shot ([kernel time](24-kernel.md#kernel-time)) |
 | Clock | none | the time-stamp counter, its rate measured against 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 | the time-stamp counter, its rate measured against 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 |
 | Wall clock | none | the firmware's `GetTime` | the CMOS clock, its year read in the century from 2000 |
@@ -104,7 +104,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 
 | Field | `aarch64-host` | `aarch64-uefi` | `aarch64-bare` |
 | --- | --- | --- | --- |
-| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | UEFI firmware with boot services, on AArch64 at EL1, with PSCI reached by `hvc` | an AArch64 machine whose memory starts at `0x4000_0000`, with PSCI reached by `hvc`, entering the image at EL1 with a flattened device tree at the start of memory |
+| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | UEFI firmware with boot services, on AArch64 at EL1, with PSCI reached by `hvc` | an AArch64 machine whose memory starts at `0x4000_0000`, with PSCI reached by `hvc`, entering the image at EL1 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none; with both zero, the device tree lies at the start of memory |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
 | Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | none | none |
 | Stub call bound | 256 bytes | 256 bytes | 256 bytes |
@@ -113,21 +113,21 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Serial port | none | the PL011 UART at `0x0900_0000` | the PL011 UART at `0x0900_0000` |
 | Console port | none | the PL011 UART at `0x0904_0000` | the PL011 UART at `0x0904_0000` |
 | Exit port | none | the semihosting exit call | the semihosting exit call |
-| Interrupt controller | none | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` |
+| Interrupt controller | none | a GICv3, its distributor at `0x0800_0000`, its redistributors from `0x080A_0000` and, when its distributor reports LPIs, its ITS at `0x0808_0000` | a GICv3, its distributor at `0x0800_0000`, its redistributors from `0x080A_0000` and, when its distributor reports LPIs, its ITS at `0x0808_0000` |
 | Timer | none | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) |
 | Clock | none | the virtual counter, at the rate `CNTFRQ_EL0` gives | the virtual counter, at the rate `CNTFRQ_EL0` gives |
 | Wall clock | none | the firmware's `GetTime` | the PL031 at `0x0901_0000` |
 | Emulator | none | QEMU with AAVMF firmware | QEMU |
 
-- Codegen uses, on x86_64, the x86-64 base instruction set with SSE2 and, on AArch64, the A64 instruction set of Armv8.0-A with floating point and Advanced SIMD, and no later extension. On the machine targets, lowered code never stores below the stack pointer. The codegen field has exactly this one value per architecture; other values are reserved.
+- Codegen uses, on x86_64, the x86-64 base instruction set with SSE2 and, on AArch64, the A64 instruction set of Armv8.0-A with floating point and Advanced SIMD, and no later extension unless a [codegen level](#codegen-levels) adds it. On the machine targets, lowered code never stores below the stack pointer and uses no floating-point, SSE or SIMD register ([floating point](24-kernel.md#floating-point)).
 - A call of a compiler stub or a support routine uses at most the stub call bound of its caller's stack, switching to a stack the image reserves when it needs more. A **seam frame** is the most stack a vector seam uses for the state it saves.
-- The emulator of the x86_64 machine targets is `qemu-system-x86_64` emulating a `q35` machine with an Intel IOMMU remapping interrupts, 4 processors, 512 MiB of memory, a `virtio-rng-pci` device, an `isa-debug-exit` device of width 1 byte at I/O port `0xF4`, a TPM 2.0 with its CRB interface at `0xFED4_0000`, and the devices every machine has. Its processors are those of the host's CPU model with invariant TSC under KVM when the machine running the toolchain is x86_64 and lets it read and write `/dev/kvm`, and those of QEMU's `max` model under TCG otherwise. OVMF loads a `x86_64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTX64.EFI`; QEMU boots a `x86_64-bare` image directly by the PVH boot protocol.
-- The emulator of the AArch64 machine targets is `qemu-system-aarch64` emulating a `virt` machine with a GICv3 and its ITS, an SMMUv3 translating its PCI devices' accesses, 4 Cortex-A72 processors under TCG, 512 MiB of memory, a `virtio-rng-device` on its virtio-mmio transports, semihosting, a TPM 2.0 with its TIS interface on its platform bus, and the devices every machine has. AAVMF loads an `aarch64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTAA64.EFI`; QEMU boots an `aarch64-bare` image by loading its segments and entering it with the device tree it generates at `0x4000_0000`.
+- The emulator of the x86_64 machine targets is `qemu-system-x86_64` emulating a `q35` machine with an Intel VT-d IOMMU at `0xFED9_0000` remapping interrupts, whose DMAR table names the devices of PCI bus 0, 4 processors, 512 MiB of memory, a `virtio-rng-pci` device, an `isa-debug-exit` device of width 1 byte at I/O port `0xF4`, a TPM 2.0 with its CRB interface at `0xFED4_0000`, and the devices every machine has. Its processors are those of the host's CPU model with invariant TSC under KVM when the machine running the toolchain is x86_64 and lets it read and write `/dev/kvm`, and those of QEMU's `max` model under TCG otherwise. OVMF loads a `x86_64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTX64.EFI` and places the memory of every PCI device below 4 GiB; QEMU boots a `x86_64-bare` image directly by the PVH boot protocol.
+- The emulator of the AArch64 machine targets is `qemu-system-aarch64` emulating a `virt` machine with a GICv3 and its ITS, an SMMUv3 at `0x0905_0000` translating its PCI devices' accesses, each device's stream id and ITS device id being its requester id, its PCI configuration space at `0x3F00_0000`, 4 Cortex-A72 processors under TCG, 512 MiB of memory, a `virtio-rng-device` on its virtio-mmio transports, semihosting, a TPM 2.0 with its TIS interface on its platform bus, and the devices every machine has. AAVMF loads an `aarch64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTAA64.EFI`; QEMU boots an `aarch64-bare` image by loading its segments and entering it with the device tree it generates at `0x4000_0000`.
 - Every machine also has an `i6300esb` watchdog, which resets it when it expires, a `virtio-blk-pci` disk of 256 MiB, a `virtio-net-pci` network device on QEMU's user network, no display, and its serial and console ports connected to the toolchain. Each virtio PCI device is a modern device whose accesses the IOMMU translates, so a driver accepts `VIRTIO_F_ACCESS_PLATFORM`. `swtpm` emulates the TPM. A UEFI image's volume is the first boot device, and the firmware keeps its variables in a flash beside its code. A reset ends the emulator, unless `nan run --keep-resets` keeps the machine running ([commands](33-toolchain.md#commands)).
 - Under `nan run` the volume of a UEFI target's image also holds, at `/` followed by its file name, each other image file in the workspace's `.nan/images/` directories of the machine targets of its architecture ([commands](33-toolchain.md#commands)).
 - On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
-- On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`.
-- On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, and vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
+- On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`. Vector `0xFE` is the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), a fixed interrupt of the local APICs.
+- On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, except vector `0xFE`, the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), which software-generated interrupt 1 delivers; vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
 - The `any` descriptor fixes only its environment, which restricts nothing.
 
 ```nan
@@ -293,6 +293,7 @@ A program run on a host target is one Linux process:
 
 | Outcome | Exit status |
 | --- | --- |
+| the processor lacks an extension of the image's [codegen level](#codegen-levels) | 71, after writing `nan: codegen `, the level's name, ` unsupported` and a line feed to standard error |
 | the executor threads, the thread reading termination requests, their io_uring instances or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
 | the entry task traps | 70, after writing the [trap report](11-errors-domains.md#trap-reports) to standard error |
 | the entry task returns or fails after a termination request with signal number n | 128 + n |
@@ -305,7 +306,7 @@ A program run on a host target is one Linux process:
 
 ### Machine runs
 
-A program run on a machine target is one boot of one machine. The program entry seam switches to the **boot stack**, which the image reserves, on a bare target installs the [entry root](24-kernel.md#physical-memory), places the [boot area](24-kernel.md#physical-memory), extends the entry root over usable memory above 4 GiB and, on `x86_64-bare`, loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
+A program run on a machine target is one boot of one machine. When the processor lacks an extension of the image's [codegen level](#codegen-levels), the program entry seam writes `nan: codegen `, the level's name, ` unsupported` and a line feed to the serial port and writes the byte 71 to the exit port. Otherwise it switches to the **boot stack**, which the image reserves, on a bare target installs the [entry root](24-kernel.md#physical-memory), places the [boot area](24-kernel.md#physical-memory), extends the entry root over usable memory above 4 GiB and, on `x86_64-bare`, loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
 
 ## Programs and libraries
 
@@ -394,7 +395,7 @@ The **reach** of a final build is the smallest set of items holding the entry fu
 
 A final build proceeds in this order:
 
-1. It checks every package of the final closure, a package declaring `any` under `any` and every other package for the root's target, reusing checked NIR as [Artefacts](30-artefacts.md#reuse) defines.
+1. It checks every package of the final closure, a package declaring `any` under `any` and every other package for the root's target, and [release-checks](30-artefacts.md#releases) each release of it.
 2. It computes the reach and applies to it the rules of its target's environment that judge reachable code.
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.
@@ -444,6 +445,40 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
 } main
 ```
 
+## Codegen levels
+
+A **codegen level** names extensions beyond the base instruction set of a [descriptor](#descriptors), which code generation may then use. A program selects at most one level per architecture with the `codegen` directive of its manifest ([manifest](03-packages-modules.md#manifest)); its final builds for a target of that architecture use that level, and every other build, test images included, uses the base set.
+
+| Level | Architecture | Extensions |
+| --- | --- | --- |
+| `x86_64-v2` | x86_64 | CMPXCHG16B, POPCNT, SSE3, SSSE3, SSE4.1 and SSE4.2 |
+| `x86_64-v3` | x86_64 | those of `x86_64-v2`, AVX, AVX2, BMI1, BMI2, FMA and LZCNT |
+| `x86_64-v4` | x86_64 | those of `x86_64-v3`, AVX-512F, AVX-512DQ and AVX-512VL |
+| `aarch64-dotprod` | AArch64 | the large system extensions and the dot product instructions (FEAT_LSE and FEAT_DotProd) |
+
+- A level changes no result: lowering gives the same intermediate form at every level, and only the selection of instructions depends on it. On a machine target, code still uses no floating-point, SSE or SIMD register, so a level adds only instructions on general registers.
+- An image of a level checks, before anything else, that its processor has each extension of the level, and on a host target that Linux enables the register state of its AVX and AVX-512 extensions; an image whose check fails ends as [host runs](#host-runs) and [machine runs](#machine-runs) state.
+
+```nan
+// file: mixer/package.nan
+//! A word mixer built for processors with AVX2.
+
+package mixer {
+    language 1
+    targets x86_64-host
+    entry main
+    codegen x86_64-v3
+} mixer
+
+// file: mixer/mixer.nan
+//! Mixes lanes of words.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let mixed = core::simd::U32x4.splat(7).wrapping_mul(core::simd::U32x4.splat(3))
+    world.log.info("mixed", value: mixed.lane(0))
+} main
+```
+
 ## Runtime support
 
 No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the host targets by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
@@ -461,6 +496,8 @@ A **support routine** is one of these fixed routines of the implementation, each
 | `anchor` | installs and reaches the [anchor](24-kernel.md#anchor) | the machine targets |
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
+
+The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-host`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-host` the mode is the kernel's, which a user process cannot set.
 
 ### Host I/O backend
 

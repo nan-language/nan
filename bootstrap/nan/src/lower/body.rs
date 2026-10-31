@@ -879,14 +879,16 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
     fn literal(&mut self, literal: &Literal) -> (Held, NTy) {
         match literal {
             Literal::Int(value, scalar) => {
-                let ty = super::layout::scalar_type(*scalar);
+                let ty = super::layout::scalar_type(*scalar, self.lo.machine());
                 let held = Held::Scalar(self.fx.b.ins().iconst(ty, *value as i64));
                 (held, NTy::Owned(Ty::Scalar(*scalar)))
             }
             Literal::Float(bits, scalar) => {
-                let held = Held::Scalar(match scalar {
-                    Scalar::F32 => self.fx.b.ins().f32const(f32::from_bits(*bits as u32)),
-                    _ => self.fx.b.ins().f64const(f64::from_bits(*bits)),
+                let ty = super::layout::scalar_type(*scalar, self.lo.machine());
+                let held = Held::Scalar(match ty {
+                    types::F32 => self.fx.b.ins().f32const(f32::from_bits(*bits as u32)),
+                    types::F64 => self.fx.b.ins().f64const(f64::from_bits(*bits)),
+                    _ => self.fx.b.ins().iconst(ty, *bits as i64),
                 });
                 (held, NTy::Owned(Ty::Scalar(*scalar)))
             }
@@ -969,7 +971,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         let (high_held, _) = self.operand(high);
         let scalar = low_nty.ty().scalar().expect("an integer range");
         let (low, high) = (low_held.scalar(), high_held.scalar());
-        let ty = super::layout::scalar_type(scalar);
+        let ty = super::layout::scalar_type(scalar, self.lo.machine());
         let less = if scalar.is_signed() {
             IntCC::SignedLessThan
         } else {

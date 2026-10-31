@@ -21,9 +21,10 @@ use cranelift_module::{Linkage, Module};
 
 use super::abi::Returned;
 use super::fx::{Fx, PTR};
+use super::machine::Stub;
 use super::runtime::system::{self, unavailable_unless};
 use super::runtime::tasks::{self, kind, operation, task, thread};
-use super::runtime::{Routine, memory, state};
+use super::runtime::{Routine, memory, state, stops};
 use super::{CALL_CONV, Instance, Lowering, Program, lines};
 use crate::nir::{Role, Span};
 use crate::workspace::{Arch, Target};
@@ -129,6 +130,10 @@ const SIGNALS: [i64; 3] = [1, 2, 15];
 const SIGINFO: u64 = 128;
 const SIGPIPE: i64 = 13;
 
+/// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
+const AT_HWCAP: u64 = 16;
+const HWCAP_DIT: i64 = 1 << 24;
+
 /// Defines the program entry seam `main` and the glue running the entry function as the first
 /// task.
 pub fn entry_seam(lo: &mut Lowering, program: &Program) {
@@ -151,6 +156,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         .expect("the program entry seam");
     lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
         let params = fx.entry();
+        lo.check_level(fx);
         system::start(lo, fx);
         let world_ty = lo.std_ty("host", "World", Vec::new());
         let layout = lo.layout(&world_ty);
@@ -369,17 +375,6 @@ fn install_handler(lo: &mut Lowering, fx: &mut Fx, signal: i32, routine: Routine
     lo.call_libc(fx, "sigaction", &[signal, action, zero], &[types::I32]);
 }
 
-/// Whether a code address lies in a function a stopping task does not stop inside; an address
-/// outside lowered code counts as one when `unknown` holds.
-fn critical_at(lo: &mut Lowering, fx: &mut Fx, address: Value, unknown: bool) -> Value {
-    let (start, flags) = super::runtime::report::function_at(lo, fx, address);
-    let found = fx.b.ins().icmp_imm_s(IntCC::NotEqual, start, 0);
-    let critical = fx.b.ins().band_imm_s(flags, i64::from(lines::CRITICAL));
-    let critical = fx.b.ins().icmp_imm_s(IntCC::NotEqual, critical, 0);
-    let outside = fx.int(types::I8, i64::from(unknown));
-    fx.b.ins().select(found, critical, outside)
-}
-
 /// `Preempt(signal, info, context)`: the handler of the stop signal. When the task the thread
 /// runs is asked to stop, holds no lock and has no frame of a function it does not stop inside,
 /// the handler makes it resume in `Stop` on its own stack, below the interrupted frame; otherwise
@@ -413,80 +408,42 @@ fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
     let on_stack = fx.b.ins().band(above, below);
     let stopping = fx.b.ins().band(stopping, on_stack);
     fx.when(stopping, |fx| {
-        let in_ip = critical_at(lo, fx, ip, true);
-        // The return address of a function interrupted in its prologue or epilogue, before its
-        // frame pointer is set or after it is restored, lives in the link register where the
-        // architecture has one, and otherwise in the two words at the stack pointer.
-        let busy = match ctx.link {
-            Some(link) => {
-                let address = fx.load(PTR, context, link);
-                let in_link = critical_at(lo, fx, address, false);
-                fx.b.ins().bor(in_ip, in_link)
-            }
-            None => {
-                let top = fx.load(PTR, sp, 0);
-                let in_top = critical_at(lo, fx, top, false);
-                let next = fx.load(PTR, sp, 8);
-                let in_next = critical_at(lo, fx, next, false);
-                let busy = fx.b.ins().bor(in_ip, in_top);
-                fx.b.ins().bor(busy, in_next)
-            }
+        let link = ctx.link.map(|link| fx.load(PTR, context, link));
+        let at = stops::Interrupted {
+            ip,
+            sp,
+            fp,
+            link,
+            low,
+            high,
         };
-        let free = fx.b.ins().bxor_imm_s(busy, 1);
+        let free = stops::stoppable(lo, fx, &at);
         fx.when(free, |fx| {
-            let walked = fx.repeat(&[fp, free], |fx, state| {
-                let (frame, free) = (state[0], state[1]);
-                let above =
-                    fx.b.ins()
-                        .icmp(IntCC::UnsignedGreaterThanOrEqual, frame, low);
-                let end = fx.b.ins().iadd_imm_s(frame, 16);
-                let below = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, high);
-                let inside = fx.b.ins().band(above, below);
-                let result = fx.choose_in(
-                    lo,
-                    inside,
-                    &[PTR, types::I8],
-                    |lo, fx| {
-                        let address = fx.load(PTR, frame, 8);
-                        let base = fx.b.ins().icmp_imm_s(IntCC::Equal, address, 0);
-                        let critical = critical_at(lo, fx, address, true);
-                        let free = fx.b.ins().bxor_imm_s(critical, 1);
-                        let free = fx.b.ins().bor(base, free);
-                        vec![fx.load(PTR, frame, 0), free]
-                    },
-                    |_, fx| vec![fx.ptr(0), free],
-                );
-                let more = fx.b.ins().band(inside, result[1]);
-                (more, result)
-            });
-            let free = walked[1];
-            fx.when(free, |fx| {
-                // Resume in `Stop` below the interrupted frame: where the return address lives on
-                // the stack, past the red zone and behind a null return; where it lives in the
-                // link register, at the aligned stack pointer with that register cleared.
-                let resumed = match ctx.link {
-                    Some(link) => {
-                        let aligned = fx.b.ins().band_imm_s(sp, -16);
-                        let zero = fx.ptr(0);
-                        fx.store(zero, context, link);
-                        aligned
-                    }
-                    None => {
-                        let lowered = fx.b.ins().iadd_imm_s(sp, -128);
-                        let aligned = fx.b.ins().band_imm_s(lowered, -16);
-                        let entry = fx.b.ins().iadd_imm_s(aligned, -8);
-                        let zero = fx.ptr(0);
-                        fx.store(zero, entry, 0);
-                        entry
-                    }
-                };
-                fx.store(resumed, context, ctx.sp);
-                let stop = lo.routine(Routine::Stop);
-                let stop = lo.func_ref(fx, stop);
-                let stop = fx.b.ins().func_addr(PTR, stop);
-                fx.store(stop, context, ctx.ip);
-                fx.store(record, context, ctx.arg);
-            });
+            // Resume in `Stop` below the interrupted frame: where the return address lives on
+            // the stack, past the red zone and behind a null return; where it lives in the
+            // link register, at the aligned stack pointer with that register cleared.
+            let resumed = match ctx.link {
+                Some(link) => {
+                    let aligned = fx.b.ins().band_imm_s(sp, -16);
+                    let zero = fx.ptr(0);
+                    fx.store(zero, context, link);
+                    aligned
+                }
+                None => {
+                    let lowered = fx.b.ins().iadd_imm_s(sp, -128);
+                    let aligned = fx.b.ins().band_imm_s(lowered, -16);
+                    let entry = fx.b.ins().iadd_imm_s(aligned, -8);
+                    let zero = fx.ptr(0);
+                    fx.store(zero, entry, 0);
+                    entry
+                }
+            };
+            fx.store(resumed, context, ctx.sp);
+            let stop = lo.routine(Routine::Stop);
+            let stop = lo.func_ref(fx, stop);
+            let stop = fx.b.ins().func_addr(PTR, stop);
+            fx.store(stop, context, ctx.ip);
+            fx.store(record, context, ctx.arg);
         });
     });
     fx.b.ins().return_(&[]);
@@ -591,9 +548,11 @@ fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
 }
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
-/// calling thread being the first, and the reading of termination requests; returns 1 from
-/// `Init` when the system refuses one.
+/// calling thread being the first, and the reading of termination requests, after the
+/// data-independent timing mode, which they inherit; returns 1 from `Init` when the system
+/// refuses one.
 pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
+    constant_time(lo, fx);
     let state_address = lo.state(fx);
     if lo.seeded() {
         start_seeded(lo, fx);
@@ -654,6 +613,21 @@ pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
             let one = fx.ptr(1);
             fx.b.ins().return_(&[one]);
         });
+    });
+}
+
+/// Turns on `PSTATE.DIT` on an AArch64 host whose kernel reports `HWCAP_DIT`, and so emulates the
+/// stub's read of `ID_AA64PFR0_EL1`. An x86_64 process cannot turn on DOITM, which is the
+/// kernel's.
+fn constant_time(lo: &mut Lowering, fx: &mut Fx) {
+    if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
+        return;
+    }
+    let kind = fx.ptr(AT_HWCAP);
+    let hwcap = lo.call_libc(fx, "getauxval", &[kind], &[PTR])[0];
+    let dit = fx.b.ins().band_imm_s(hwcap, HWCAP_DIT);
+    fx.when(dit, |fx| {
+        lo.call_stub(fx, Stub::ConstantTime, &[]);
     });
 }
 

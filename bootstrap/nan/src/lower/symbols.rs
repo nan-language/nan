@@ -51,6 +51,7 @@ fn glue_word(instance: &Instance) -> &'static str {
     match instance {
         Instance::Derived { .. } => "derived",
         Instance::Conformance { .. } => "conformance",
+        Instance::Operation { .. } => "operation",
         Instance::Release(_) => "release",
         Instance::Value(_) => "value",
         Instance::Dyn { .. } => "dyn",

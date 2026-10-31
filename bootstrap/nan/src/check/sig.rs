@@ -11,7 +11,8 @@ use super::ty::{Arg, Args, Bound, Const, FnParam, FnTy, LimitSet, Param, Scalar,
 use crate::diagnostic::Code;
 use crate::interp::Val;
 use crate::syntax::ast::{
-    self, FnKind, FnModifier, GenericArg, ItemKind, LimitKind, Mode, Tok, TypeKind, Visibility,
+    self, FnKind, FnModifier, GenericArg, ItemKind, LimitKind, Mode, Tok, TypeKind, TypeModifier,
+    Visibility,
 };
 
 /// A diagnostic found resolving a signature, reported when its item is checked.
@@ -152,6 +153,16 @@ pub struct FieldSig {
     pub token: Tok,
 }
 
+/// The name of the field of a flexible struct holding its kept fields, which no source names.
+pub const KEPT: &str = "#kept";
+
+impl FieldSig {
+    /// Whether it holds a flexible struct's kept fields.
+    pub fn is_kept(&self) -> bool {
+        self.name == KEPT
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Payload {
     None,
@@ -212,6 +223,13 @@ pub enum SigKind {
     Registry {
         entry: Ty,
     },
+    /// A protocol: the head of each operation as written, and the message of each as the
+    /// variant of an enum holding its parameters.
+    Protocol {
+        operations: Vec<MethodSig>,
+        variants: Vec<VariantSig>,
+        summary: Option<Ty>,
+    },
     Other,
 }
 
@@ -246,6 +264,14 @@ impl Sig {
                 registers.iter().any(|register| register.ty.has_error())
             }
             SigKind::Const { ty } | SigKind::Registry { entry: ty } => ty.has_error(),
+            SigKind::Protocol {
+                operations,
+                summary,
+                ..
+            } => {
+                operations.iter().any(|operation| operation.sig.has_error())
+                    || summary.as_ref().is_some_and(Ty::has_error)
+            }
             SigKind::Other => false,
         }
     }
@@ -300,6 +326,17 @@ impl Checker<'_> {
         );
         self.shapes.borrow_mut().insert(item, shapes.clone());
         shapes
+    }
+
+    /// The type of the kept fields of a flexible struct; none for another item.
+    pub fn kept_type(&self, item: ItemId) -> Option<Ty> {
+        match &self.sig(item).kind {
+            SigKind::Struct { fields } => fields
+                .last()
+                .filter(|field| field.is_kept())
+                .map(|field| field.ty.clone()),
+            _ => None,
+        }
     }
 
     /// The signature of a function item.
@@ -400,7 +437,7 @@ impl Checker<'_> {
                     generics: &generics,
                     self_param: None,
                 };
-                let fields = structure
+                let mut fields: Vec<FieldSig> = structure
                     .fields()
                     .map(|field| FieldSig {
                         name: field.name.text.clone(),
@@ -409,6 +446,21 @@ impl Checker<'_> {
                         token: field.token,
                     })
                     .collect();
+                let flexible = data
+                    .ast
+                    .type_modifiers
+                    .iter()
+                    .find(|(modifier, _)| *modifier == TypeModifier::Flexible);
+                if let Some((_, token)) = flexible
+                    && let Some(kept) = self.db.std_item("mem::wire", "Kept")
+                {
+                    fields.push(FieldSig {
+                        name: KEPT.to_owned(),
+                        ty: Ty::item(kept, Vec::new()),
+                        visibility: Visibility::Private,
+                        token: *token,
+                    });
+                }
                 (generics, SigKind::Struct { fields })
             }
             ItemKind::Enum(enumeration) => {
@@ -662,6 +714,62 @@ impl Checker<'_> {
                 let entry = self.type_expr(ctx, &registry.entry, &mut problems);
                 (Vec::new(), SigKind::Registry { entry })
             }
+            ItemKind::Protocol(protocol) => {
+                let operations: Vec<MethodSig> = protocol
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, operation)| MethodSig {
+                        name: operation.method.name.text.clone(),
+                        sig: self.head_sig(
+                            module,
+                            item,
+                            index + 1,
+                            &operation.method.head,
+                            Vec::new(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            &mut problems,
+                        ),
+                        default: false,
+                    })
+                    .collect();
+                let variants = operations
+                    .iter()
+                    .zip(&protocol.operations)
+                    .map(|(operation, written)| VariantSig {
+                        name: operation.name.clone(),
+                        payload: match operation.sig.params.is_empty() {
+                            true => Payload::None,
+                            false => Payload::Labelled(
+                                (operation.sig.params.iter())
+                                    .map(|param| (param.name.clone(), param.ty.clone()))
+                                    .collect(),
+                            ),
+                        },
+                        from: false,
+                        token: written.method.name.token,
+                    })
+                    .collect();
+                let ctx = TypeCtx {
+                    item,
+                    module,
+                    generics: &[],
+                    self_param: None,
+                };
+                let summary = (protocol.summary.as_ref())
+                    .map(|summary| self.type_expr(ctx, summary, &mut problems));
+                (
+                    Vec::new(),
+                    SigKind::Protocol {
+                        operations,
+                        variants,
+                        summary,
+                    },
+                )
+            }
             _ => (Vec::new(), SigKind::Other),
         };
         Sig {
@@ -704,10 +812,15 @@ impl Checker<'_> {
                     let ItemKind::Impl(implementation) = &self.db.ast(line).kind else {
                         return false;
                     };
-                    self.db.owner_key(module, &implementation.target) == Some(key)
-                        && matches!(self.db.resolve(module, &implementation.interface.path), Ok(Named::Item(interface))
-                            if matches!(&self.db.ast(interface).kind,
-                                ItemKind::Interface(declared) if declared.methods.iter().any(|method| method.name.text == *name)))
+                    if self.db.owner_key(module, &implementation.target) != Some(key) {
+                        return false;
+                    }
+                    if let Some(protocol) = self.written_protocol(module, implementation) {
+                        return name == "start" || self.serves(protocol, name).is_some();
+                    }
+                    matches!(self.db.resolve(module, &implementation.interface.path), Ok(Named::Item(interface))
+                        if matches!(&self.db.ast(interface).kind,
+                            ItemKind::Interface(declared) if declared.methods.iter().any(|method| method.name.text == *name)))
                 })
                 .collect()
         })
@@ -1194,7 +1307,10 @@ impl Checker<'_> {
                             });
                         }
                         match &self.db.ast(item).kind {
-                            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+                            ItemKind::Struct(_)
+                            | ItemKind::Enum(_)
+                            | ItemKind::Layout(_)
+                            | ItemKind::Protocol(_) => {
                                 let params = self.shapes(item);
                                 match self.generic_args(
                                     ctx,

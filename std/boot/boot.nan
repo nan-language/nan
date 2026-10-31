@@ -1,4 +1,69 @@
-//! The UEFI and bare root grants and firmware services.
+//! The UEFI and bare root grants, firmware services and the start information.
+
+/// The offset in a start information of its command line's address.
+const INFO_COMMAND_LINE: u64 = 24
+
+/// The header of an ACPI table: its size; the offsets in the RSDP of its revision, its RSDT's
+/// address and its XSDT's address; and the offsets in the FADT of the 32-bit and 64-bit
+/// addresses of the FACS and the DSDT.
+const HEADER_BYTES: u64 = 36
+
+const RSDP_REVISION: u64 = 15
+
+const RSDP_RSDT: u64 = 16
+
+const RSDP_XSDT: u64 = 24
+
+const FADT_FACS: u64 = 36
+
+const FADT_DSDT: u64 = 40
+
+const FADT_X_FACS: u64 = 132
+
+const FADT_X_DSDT: u64 = 140
+
+/// The signatures of the DSDT, the FACS and the FADT, as little-endian words.
+const DSDT: u32 = 0x5444_5344
+
+const FACS: u32 = 0x5343_4146
+
+const FADT: u32 = 0x5043_4146
+
+/// The flattened device tree's header words, big-endian: its magic, its size and the offsets of
+/// its structure and strings blocks; the structure block's tokens.
+const TREE_MAGIC: u32 = 0xD00D_FEED
+
+const TREE_SIZE: u64 = 4
+
+const TREE_STRUCTURE: u64 = 8
+
+const TREE_STRINGS: u64 = 12
+
+const BEGIN_NODE: u32 = 1
+
+const END_NODE: u32 = 2
+
+const PROPERTY: u32 = 3
+
+const TREE_END: u32 = 9
+
+/// The offsets in the system table of its configuration table's entry count and address, and an
+/// entry's size: a GUID, then the table's address.
+const CONFIGURATION_COUNT: u64 = 104
+
+const CONFIGURATION_TABLE: u64 = 112
+
+const CONFIGURATION_ENTRY: u64 = 24
+
+/// The offset in an ACPI 2.0 RSDP of its length; the offsets in the SMBIOS 3.0 entry point of
+/// its length and of its structure table's maximum size and address.
+const RSDP_LENGTH: u64 = 20
+
+const SMBIOS_ENTRY_LENGTH: u64 = 6
+
+const SMBIOS_TABLE_SIZE: u64 = 12
+
+const SMBIOS_TABLE: u64 = 16
 
 pub open linear struct Machine {
 } Machine
@@ -16,23 +81,451 @@ pub fn Kernel.regions(mut self) -> mem::List[hw::Region]
 
 pub fn Kernel.ring0(mut self) -> Option[hw::Ring0]
 
+pub fn Kernel.policy[P: hw::Policy and Send](mut self, take policy: P)
+
 pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
 
+pub fn Kernel.modules(mut self) -> mem::List[Module]
+
+pub fn Kernel.iommu(mut self) -> Option[hw::Iommu]
+
+pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
+
+pub fn Kernel.command_line(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
+    let info = start_info()
+    if info != 0 {
+        return Untrusted.of(text_at(u64_at(info + INFO_COMMAND_LINE), alloc))
+    }
+    let tree = tree_address()
+    if tree != 0 {
+        return Untrusted.of(boot_arguments(tree, alloc))
+    }
+    return Untrusted.of(mem::Bytes.empty(alloc))
+} Kernel.command_line
+
+pub fn Kernel.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] {
+    let table = acpi_table_address(signature)
+    if table == 0 {
+        return None
+    }
+    return Some(Untrusted.of(copied(table, len: u64.widen(u32_at(table + 4)), alloc)))
+} Kernel.acpi_table
+
+pub fn Kernel.device_tree(self, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] {
+    let tree = tree_address()
+    if tree == 0 {
+        return None
+    }
+    return Some(Untrusted.of(copied(tree, len: u64.widen(u32_be_at(tree + TREE_SIZE)), alloc)))
+} Kernel.device_tree
+
+pub open linear struct Module {
+    region: hw::Region
+    name_at: u64
+} Module
+
+pub fn Module.name(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
+    return Untrusted.of(text_at(self.name_at, alloc))
+} Module.name
+
+pub proj fn Module.contents(self) -> Untrusted[Slice[u8]]
+
+pub fn Module.into_region(take self) -> hw::Region {
+    let Module(region: region, name_at: _) = self
+    return region
+} Module.into_region
+
 pub fn Machine.alloc(self) -> mem::Alloc
+
+pub fn Machine.ring0(mut self) -> Option[hw::Ring0]
 
 pub fn Machine.with_services[T: Any, E](mut self, body: fn(services: Services) -> T fails E) -> T fails E
 
 pub fn Machine.exit_services(take self) -> Kernel
+
+pub fn Machine.enter(take self, take image: Image) -> Never
+
+pub closed linear struct Image {
+    pub entry: u64
+    pub segments: mem::List[hw::Region]
+    pub modules: mem::List[ModuleSource]
+    pub command_line: mem::Bytes
+} Image
+
+pub closed struct ModuleSource {
+    pub name: mem::Bytes
+    pub contents: Untrusted[mem::Bytes]
+} ModuleSource
 
 pub open view struct Services {
 } Services
 
 pub fn Services.write_console(self, text: Str) fails ServiceError
 
+pub fn Services.read_key(self, timeout_ms: u64) -> Option[Key] fails ServiceError
+
 pub fn Services.read_file(self, path: Str, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
+
+pub fn Services.write_file(self, path: Str, data: Slice[u8]) fails ServiceError
+
+pub fn Services.delete_file(self, path: Str) fails ServiceError
+
+pub fn Services.list_directory(self, path: Str, alloc: mem::Alloc) -> mem::List[DirectoryEntry] fails ServiceError
+
+pub fn Services.boot_device(self, alloc: mem::Alloc) -> BootDevice fails ServiceError
+
+pub fn Services.get_variable(self, name: Str, vendor: Guid, alloc: mem::Alloc) -> Variable fails ServiceError
+
+pub fn Services.set_variable(self, name: Str, vendor: Guid, attributes: VariableAttributes, data: Slice[u8]) fails ServiceError
+
+pub fn Services.measure(self, pcr: u32, event_type: u32, data: Slice[u8], event: Slice[u8]) fails ServiceError
+
+pub fn Services.event_log(self, alloc: mem::Alloc) -> EventLog fails ServiceError
+
+pub fn Services.submit_tpm(self, command: Slice[u8], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
+
+pub fn Services.random(self, mut buf: SliceMut[u8]) fails ServiceError
+
+pub fn Services.memory_map(self, alloc: mem::Alloc) -> mem::List[MemoryRange] fails ServiceError
+
+pub fn Services.allocate(self, base: u64, byte_len: u64) -> hw::Region fails ServiceError
+
+pub fn Services.free(self, take region: hw::Region) fails ServiceError
+
+pub fn Services.config_table(self, table: ConfigTable, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError {
+    let guid = match table {
+        ConfigTable.Acpi => Guid(data1: 0x8868_E871, data2: 0xE4F1, data3: 0x11D3, data4: 0xBC22_0080_C73C_8881)
+        ConfigTable.Smbios => Guid(data1: 0xF2FD_1544, data2: 0x9794, data3: 0x4A2C, data4: 0x992E_E5BB_CF20_E394)
+        ConfigTable.DeviceTree => Guid(data1: 0xB1B6_21D5, data2: 0xF19C, data3: 0x41A5, data4: 0x830B_D915_2C69_AAE0)
+    }
+    let address = configured(guid)
+    if address == 0 {
+        fail ServiceError.NotFound
+    }
+    let bytes = match table {
+        ConfigTable.Acpi => try drawn(address, len: u64.widen(u32_at(address + RSDP_LENGTH)), alloc)
+        ConfigTable.Smbios => try smbios(address, alloc)
+        ConfigTable.DeviceTree => try drawn(address, len: u64.widen(u32_be_at(address + TREE_SIZE)), alloc)
+    }
+    return Untrusted.of(take bytes)
+} Services.config_table
+
+pub fn Services.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError {
+    let table = acpi_table_address(signature)
+    if table == 0 {
+        fail ServiceError.NotFound
+    }
+    return Untrusted.of(try drawn(table, len: u64.widen(u32_at(table + 4)), alloc))
+} Services.acpi_table
 
 pub open enum ServiceError derives Render {
     NotFound
     DeviceError
     OutOfMemory
+    Denied
+    Unsupported
+    Invalid
 } ServiceError
+
+pub closed struct Key derives Copy, Eq {
+    pub text: Option[char]
+    pub scan: u16
+} Key
+
+pub closed struct Guid derives Copy, Eq {
+    pub data1: u32
+    pub data2: u16
+    pub data3: u16
+    pub data4: u64
+} Guid
+
+pub layout VariableAttributes: u32 le {
+    non_volatile: bit 0
+    boot_service_access: bit 1
+    runtime_access: bit 2
+    reserved: rest
+} VariableAttributes
+
+pub closed struct Variable {
+    pub attributes: VariableAttributes
+    pub data: Untrusted[mem::Bytes]
+} Variable
+
+pub closed struct EventLog {
+    pub bytes: Untrusted[mem::Bytes]
+    pub truncated: bool
+} EventLog
+
+pub closed enum ConfigTable derives Copy, Eq {
+    Acpi
+    Smbios
+    DeviceTree
+} ConfigTable
+
+pub closed struct DirectoryEntry {
+    pub name: Untrusted[mem::Bytes]
+    pub byte_len: u64
+    pub directory: bool
+} DirectoryEntry
+
+pub closed struct BootDevice {
+    pub file: Untrusted[mem::Bytes]
+    pub partition: Option[Partition]
+} BootDevice
+
+pub closed struct Partition derives Copy, Eq {
+    pub number: u32
+    pub start: u64
+    pub blocks: u64
+    pub signature: PartitionSignature
+} Partition
+
+pub closed enum PartitionSignature derives Copy, Eq {
+    Gpt(Guid)
+    Mbr(u32)
+    Unsigned
+} PartitionSignature
+
+pub closed struct MemoryRange derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+    pub kind: u32
+    pub attributes: u64
+} MemoryRange
+
+/// The address of the PVH-layout start information the image started with, zero when it has
+/// none.
+pkg fn start_info() -> u64
+
+/// The address of the flattened device tree the image started with, zero when it has none.
+pkg fn tree_address() -> u64
+
+/// The address of the ACPI root system description pointer the platform gives, zero when none.
+pkg fn rsdp_address() -> u64
+
+/// The address of the system table the firmware entered the image with, zero when it has no
+/// firmware.
+pkg fn system_table_address() -> u64
+
+/// The address of the table the firmware's configuration table lists under a GUID, zero when
+/// it lists none or the image has no firmware.
+fn configured(guid: Guid) -> u64 {
+    let table = system_table_address()
+    if table == 0 {
+        return 0
+    }
+    let entries = u64_at(table + CONFIGURATION_TABLE)
+    for index in 0..<u64_at(table + CONFIGURATION_COUNT) {
+        let entry = entries + index * CONFIGURATION_ENTRY
+        if same_guid(entry, guid) {
+            return u64_at(entry + 16)
+        }
+    }
+    return 0
+} configured
+
+/// Whether the GUID the firmware laid out at an address is `guid`.
+fn same_guid(at: u64, guid: Guid) -> bool {
+    var tail: u64 = 0
+    for index in 8u64..<16 {
+        tail = (tail << 8) | u64.widen(byte_at(at + index))
+    }
+    let head = u32_at(at + 4)
+    return u32_at(at) == guid.data1 and head == ((u32.widen(guid.data3) << 16) | u32.widen(guid.data2)) and tail == guid.data4
+} same_guid
+
+/// The byte at a physical address.
+fn byte_at(address: u64) -> u8 {
+    return trusted "the platform's tables lie in memory the running root maps, which nothing writes" { hw::Ptr[u8].of_addr(usize.widen(address)).read() }
+} byte_at
+
+/// The little-endian 32-bit and 64-bit numbers at a physical address, and the big-endian 32-bit
+/// one.
+fn u32_at(address: u64) -> u32 {
+    var value: u32 = 0
+    for index in 0u64..<4 {
+        value = value | (u32.widen(byte_at(address + index)) << u32.fit(index * 8))
+    }
+    return value
+} u32_at
+
+fn u64_at(address: u64) -> u64 {
+    return u64.widen(u32_at(address)) | (u64.widen(u32_at(address + 4)) << 32)
+} u64_at
+
+fn u32_be_at(address: u64) -> u32 {
+    var value: u32 = 0
+    for index in 0u64..<4 {
+        value = (value << 8) | u32.widen(byte_at(address + index))
+    }
+    return value
+} u32_be_at
+
+/// The NUL-terminated text at a physical address, its NUL left out; empty at address zero.
+fn text_at(address: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var text = mem::Bytes.empty(alloc)
+    if address == 0 {
+        return text
+    }
+    var at = address
+    loop {
+        let byte = byte_at(at)
+        if byte == 0 {
+            return text
+        }
+        mut text.push(byte)
+        at += 1
+    }
+} text_at
+
+/// The `len` bytes at a physical address.
+fn copied(address: u64, len: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(usize.widen(len), alloc)
+    copy_into(address, to: mut bytes.view_mut())
+    return bytes
+} copied
+
+/// The `len` bytes at a physical address, failing with `OutOfMemory` when `alloc` cannot hold
+/// them.
+fn drawn(address: u64, len: u64, alloc: mem::Alloc) -> mem::Bytes fails ServiceError {
+    let Ok(bytes) = attempt mem::Bytes.try_zeroed(usize.widen(len), alloc) else {
+        fail ServiceError.OutOfMemory
+    }
+    var filled = bytes
+    copy_into(address, to: mut filled.view_mut())
+    return filled
+} drawn
+
+/// Fills `to` with the bytes at a physical address.
+fn copy_into(address: u64, mut to: SliceMut[u8]) {
+    let len = to.len()
+    let target = hw::Ptr.of_view_mut(mut to)
+    trusted "the platform's tables lie in memory the running root maps, and `to` holds `len` bytes" {
+        hw::Ptr[u8].of_addr(usize.widen(address)).copy(target, count: len)
+    }
+} copy_into
+
+/// The SMBIOS 3.0 entry point at an address followed by the structure table it names, of its
+/// stated maximum size.
+fn smbios(entry: u64, alloc: mem::Alloc) -> mem::Bytes fails ServiceError {
+    let entry_len = u64.widen(byte_at(entry + SMBIOS_ENTRY_LENGTH))
+    let table_len = u64.widen(u32_at(entry + SMBIOS_TABLE_SIZE))
+    var bytes = try drawn(entry, len: entry_len, alloc)
+    let table = try drawn(u64_at(entry + SMBIOS_TABLE), len: table_len, alloc)
+    let Ok(_) = attempt mut bytes.try_append(table.view()) else {
+        fail ServiceError.OutOfMemory
+    }
+    return bytes
+} smbios
+
+/// The address of the ACPI table with a signature, zero when the platform gives none: the DSDT
+/// and the FACS through the FADT's 64-bit address, or its 32-bit one when that is zero, any
+/// other the root table lists.
+fn acpi_table_address(signature: Array[u8, 4]) -> u64 {
+    let wanted = signature.view().u32_le(0)
+    if wanted != DSDT and wanted != FACS {
+        return listed_table(wanted)
+    }
+    let facp = listed_table(FADT)
+    if facp == 0 {
+        return 0
+    }
+    var wide = FADT_X_FACS
+    var narrow = FADT_FACS
+    if wanted == DSDT {
+        wide = FADT_X_DSDT
+        narrow = FADT_DSDT
+    }
+    let length = u64.widen(u32_at(facp + 4))
+    if length >= wide + 8 {
+        let address = u64_at(facp + wide)
+        if address != 0 {
+            return address
+        }
+    }
+    return u64.widen(u32_at(facp + narrow))
+} acpi_table_address
+
+/// The address of the table with a signature that the XSDT, or the RSDT for an RSDP of revision
+/// 0 or without an XSDT, lists; zero when none.
+fn listed_table(signature: u32) -> u64 {
+    let rsdp = rsdp_address()
+    if rsdp == 0 {
+        return 0
+    }
+    var root = u64.widen(u32_at(rsdp + RSDP_RSDT))
+    var width: u64 = 4
+    if byte_at(rsdp + RSDP_REVISION) >= 2 and u64_at(rsdp + RSDP_XSDT) != 0 {
+        root = u64_at(rsdp + RSDP_XSDT)
+        width = 8
+    }
+    let end = root + u64.widen(u32_at(root + 4))
+    var at = root + HEADER_BYTES
+    while at + width <= end {
+        var table = u64.widen(u32_at(at))
+        if width == 8 {
+            table = u64_at(at)
+        }
+        if table != 0 and u32_at(table) == signature {
+            return table
+        }
+        at += width
+    }
+    return 0
+} listed_table
+
+/// The value of the `bootargs` property of the device tree's `/chosen` node, empty when it has
+/// none.
+fn boot_arguments(tree: u64, alloc: mem::Alloc) -> mem::Bytes {
+    if u32_be_at(tree) != TREE_MAGIC {
+        return mem::Bytes.empty(alloc)
+    }
+    let strings = tree + u64.widen(u32_be_at(tree + TREE_STRINGS))
+    var at = tree + u64.widen(u32_be_at(tree + TREE_STRUCTURE))
+    var depth: u32 = 0
+    var chosen = false
+    loop {
+        let token = u32_be_at(at)
+        at += 4
+        if token == BEGIN_NODE {
+            depth += 1
+            chosen = depth == 2 and named(at, text: "chosen")
+            at = past_name(at)
+        } else if token == END_NODE {
+            depth -= 1
+            chosen = false
+        } else if token == PROPERTY {
+            let len = u64.widen(u32_be_at(at))
+            let name = strings + u64.widen(u32_be_at(at + 4))
+            if chosen and named(name, text: "bootargs") {
+                return text_at(at + 8, alloc)
+            }
+            at += 8 + (len + 3) / 4 * 4
+        } else if token == TREE_END {
+            return mem::Bytes.empty(alloc)
+        }
+    }
+} boot_arguments
+
+/// Whether the NUL-terminated name at an address is `text`, or `text` followed by `@` and a unit
+/// address.
+fn named(address: u64, text: Str) -> bool {
+    var at = address
+    for byte in text.as_bytes() {
+        if byte_at(at) != byte {
+            return false
+        }
+        at += 1
+    }
+    let next = byte_at(at)
+    return next == 0 or next == b'@'
+} named
+
+/// The address past a node's NUL-terminated name, padded to a word.
+fn past_name(address: u64) -> u64 {
+    var at = address
+    while byte_at(at) != 0 {
+        at += 1
+    }
+    return (at + 4) / 4 * 4
+} past_name

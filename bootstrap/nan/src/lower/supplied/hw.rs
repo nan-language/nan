@@ -1,12 +1,14 @@
 //! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA
-//! buffers, the CPU-facing operations, and physical memory.
+//! buffers, the CPU-facing operations, physical memory, and what the IOMMU and PCI code of std
+//! needs.
 
 mod cpu;
+pub mod iommu;
 mod physical;
 mod sync;
 mod windows;
 
-use cranelift_codegen::ir::{InstBuilder, TrapCode, Value};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
@@ -18,6 +20,9 @@ pub use physical::{region, region_cell};
 pub use windows::dma_access;
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
+    if iommu::lower(lo, fx, supply) {
+        return true;
+    }
     let owner = supply
         .path
         .rsplit_once('.')
@@ -39,6 +44,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::Mmio" | "hw::Ports" => windows::window(lo, fx, supply),
         "hw::sim::Registers" => windows::registers(lo, fx, supply),
         "hw::IrqContext" => cpu::irq_context(lo, fx, supply),
+        "hw::cpu_hardware_id" => cpu::hardware_id(lo, fx, supply),
         "hw::Ring0" => cpu::ring0(lo, fx, supply),
         "hw::Idt" => cpu::idt(lo, fx, supply),
         "hw::TrapFrame" => cpu::trap_frame(lo, fx, supply),
@@ -46,11 +52,6 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::Region" => physical::lower_region(lo, fx, supply),
         "hw::PhysFrame" => physical::lower_frame(lo, fx, supply),
         "hw::PageTableRoot" => physical::page_table_root(lo, fx, supply),
-        // Only the kernel executor creates the values these take, and it switches threads
-        // through its own routines, so their code never runs.
-        "hw::SavedContext" | "hw::switch_to" | "hw::SpinGuard" => {
-            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
-        }
         _ => return false,
     }
     true
@@ -71,13 +72,14 @@ pub(super) fn forward(
 /// declares in full.
 pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
     Some(match path {
-        "hw::Signal" | "hw::SpinLock" | "hw::IrqShared" => {
+        "hw::Signal" | "hw::SpinLock" => {
             let value = ty.type_arg(0).cloned().expect("a wrapped type");
             lo.transfers(&value)
         }
-        "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => true,
+        "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
+        | "hw::IoDomain" | "hw::PciFunction" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
-        | "hw::PageTableRoot" | "hw::SpinGuard" => false,
+        | "hw::PageTableRoot" => false,
         _ => return None,
     })
 }
@@ -103,14 +105,29 @@ pub fn transfer(
         }
         "hw::IrqShared" => {
             let record = fx.load(PTR, address, 0);
+            let holding = fx.offset(record, super::super::machine::device::HOLDING);
+            super::super::transfer::rehome(lo, fx, holding, owner);
             let value = sync::device_value(lo, &wrapped());
             let value = fx.offset(record, value);
             lo.transfer(fx, &wrapped(), value, lift, owner);
         }
         "hw::PerCpu" => sync::transfer_per_cpu(lo, fx, &wrapped(), address, lift, owner),
-        "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => {
+        "hw::Dma" | "hw::DmaShared" => {
             let contents = fx.load(PTR, address, 0);
             super::super::transfer::lift(lo, fx, contents, lift);
+            let mapping = fx.load(PTR, address, 8);
+            let mapped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mapping, 0);
+            fx.when(mapped, |fx| {
+                super::super::transfer::rehome(lo, fx, mapping, owner)
+            });
+        }
+        "hw::IdtInstalled" => {
+            let contents = fx.load(PTR, address, 0);
+            super::super::transfer::lift(lo, fx, contents, lift);
+        }
+        "hw::IoDomain" | "hw::PciFunction" => {
+            let record = fx.load(PTR, address, 0);
+            super::super::transfer::rehome(lo, fx, record, owner);
         }
         _ => return false,
     }
@@ -127,8 +144,7 @@ pub fn needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         }
         "hw::PerCpu" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Idt" | "hw::IdtInstalled"
-        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::SpinGuard"
-        | "hw::IrqShared" => false,
+        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::IrqShared" => false,
         _ => return None,
     })
 }

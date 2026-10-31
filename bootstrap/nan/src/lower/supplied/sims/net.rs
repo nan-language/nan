@@ -8,7 +8,6 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use super::super::super::Lowering;
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::runtime::tables::entry;
 use super::super::super::runtime::{Routine, holdings};
 use super::super::Supply;
 use super::super::sys;
@@ -68,12 +67,6 @@ pub fn new(lo: &mut Lowering, fx: &mut Fx) -> Value {
     new_object(lo, fx, object::NET, network::SIZE).0
 }
 
-/// The network an entry names.
-fn of_entry(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
-    let index = fx.load(PTR, record, entry::STATE);
-    object_at(lo, fx, index)
-}
-
 /// The record of the listener or endpoint a resource at an address names.
 fn held(lo: &mut Lowering, fx: &mut Fx, address: Value) -> Value {
     let holding = fx.offset(address, 8);
@@ -112,13 +105,14 @@ fn listener_on(fx: &mut Fx, net: Value, port: Value) -> Value {
     })[0]
 }
 
-/// `sys::Net.listen`: a listener on a port no held listener of the network has.
-pub fn listen(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+/// `sys::Net.listen` on the network at `network`: a listener on a port no held listener of the
+/// network has.
+pub fn listen(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, network: Value) {
     cancellation_point(lo, fx, supply);
     let port = supply.param(1).scalar();
     let zero_port = fx.b.ins().icmp_imm_s(IntCC::Equal, port, 0);
     fx.when(zero_port, |fx| sys::fail_with(lo, fx, supply, "Denied"));
-    let net = of_entry(lo, fx, record);
+    let net = object_at(lo, fx, network);
     let taken = listener_on(fx, net, port);
     let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, taken, 0);
     fx.when(taken, |fx| sys::fail_with(lo, fx, supply, "AddressInUse"));
@@ -146,7 +140,7 @@ fn new_endpoint(lo: &mut Lowering, fx: &mut Fx) -> (Value, Value) {
 /// `sys::Net.connect`: a connection to the listener on the port, whose accept takes the other
 /// endpoint; a host outside the loopback network is unreachable and a port without a listener
 /// refuses.
-pub fn connect(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+pub fn connect(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, network: Value) {
     cancellation_point(lo, fx, supply);
     let host = supply.param(1);
     let mut loopback = fx.int(types::I8, 0);
@@ -159,7 +153,7 @@ pub fn connect(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
     fx.when(elsewhere, |fx| {
         sys::fail_with(lo, fx, supply, "Unreachable")
     });
-    let net = of_entry(lo, fx, record);
+    let net = object_at(lo, fx, network);
     let target = listener_on(fx, net, supply.param(2).scalar());
     let refused = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);
     fx.when(refused, |fx| sys::fail_with(lo, fx, supply, "Refused"));

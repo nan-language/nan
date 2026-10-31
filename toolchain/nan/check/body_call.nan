@@ -384,7 +384,7 @@ fn Body.is_construction(mut self, callee: ast::Expr) -> bool {
             let ty::TyKind.Item(item: item, args: _) = ck.types().kind(found) else {
                 return false
             }
-            return self.variant_named(item, name: name.text.as_str()).is_some()
+            return self.variant_named(item, name: name.text.as_str()).is_some() or self.operation_named(item, name: name.text.as_str()).is_some()
         }
         else => return false
     }
@@ -398,6 +398,29 @@ fn Body.variant_named(self, item: ty::ItemId, name: Str) -> Option[usize] {
     }
     return variants.position(fn(value: VariantSig) => value.name.as_str() == name)
 } Body.variant_named
+
+/// The index of the operation of that name when an item is a protocol.
+fn Body.operation_named(self, item: ty::ItemId, name: Str) -> Option[usize] {
+    let sig = self.ck.sig(item)
+    let SigKind.Protocol(operations: _, variants: variants, summary: _) = sig.contents().kind else {
+        return None
+    }
+    return variants.position(fn(value: VariantSig) => value.name.as_str() == name)
+} Body.operation_named
+
+/// The message of a one-way operation `P.op(...)`: an operation visible here and no request.
+fn Body.operation_message(mut self, token: u32, item: ty::ItemId, variant: usize, name: ast::Name, args: Slice[ast::Arg], expected: Option[ty::Ty], markers: Markers) -> TExpr {
+    self.no_markers(token, markers)
+    if not self.ck.operation_visible(self.module, protocol: item, index: variant) {
+        self.report(name.token, code: diagnostic::Code.NamePrivate)
+    }
+    if self.ck.is_request(item, index: variant) {
+        self.report(token, code: diagnostic::Code.ComponentRequestValue)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    return mut self.construct(token, item, variant: Some(variant), generic_args: None, args, expected)
+} Body.operation_message
 
 /// A call expression, a construction included.
 fn Body.call(mut self, expr: ast::Expr, expected: Option[ty::Ty], markers: Option[Markers]) -> TExpr {
@@ -1197,6 +1220,10 @@ fn Body.member_call(
             }
             match self.variant_named(item, name: member) {
                 Some(variant) => return mut self.variant_construction(token, item, variant, base, name, args, expected, markers)
+                None => {}
+            }
+            match self.operation_named(item, name: member) {
+                Some(variant) => return mut self.operation_message(token, item, variant, name, args, expected, markers)
                 None => {}
             }
         }
@@ -2329,6 +2356,14 @@ fn Body.fix_failures(self, mut infer: Infer) {
 /// The rules a call obeys for what it calls: the grant its operation needs, the uses of
 /// validators, decoders and encoders, and where `inspect` and `Untrusted.of` stand.
 fn Body.check_callee(self, token: u32, callable: Callable) {
+    match callable.callee {
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
+            if self.ck.is_protocol(bound.item) and not self.ck.operation_visible(self.module, protocol: bound.item, index: method) {
+                self.report(token, code: diagnostic::Code.NamePrivate)
+            }
+        }
+        else => {}
+    }
     let Callee.Function(item: item) = callable.callee else {
         return
     }
@@ -2357,6 +2392,7 @@ fn Body.check_function_callee(self, token: u32, item: ty::ItemId, callable: Call
     if callable.head.generics.len() > 0 {
         wrapped = subst.get(callable.head.generics[0].param)
     }
+    ck.check_kind_use(self.item, token, function: item, kind: wrapped)
     if path.starts_with("hw::Ptr.atomic_") {
         var integer = false
         var failed = false
@@ -2376,12 +2412,11 @@ fn Body.check_function_callee(self, token: u32, item: ty::ItemId, callable: Call
     }
     match first path.as_str() {
         "hw::Anchor.with" if not ck.is_entry_context(self.item) => self.report(token, code: diagnostic::Code.KernelAnchorOutsideEntry)
-        "sys::Domain.run" or "sys::Domain.run_sized" if db.target.is_machine() => self.report(token, code: diagnostic::Code.DomainUnavailable)
         "hw::Ports.map" if db.target.arch() == Some(workspace::Arch.Aarch64) => self.report(token, code: diagnostic::Code.RegisterPortTarget)
-        "hw::Ring0.load_idt" or "hw::Ring0.write_cr3" or "hw::Ring0.read_msr" or "hw::Ring0.write_msr" or "hw::Idt.of_vectors" if db.target.arch() == Some(workspace::Arch.Aarch64) => self.report(token, code: diagnostic::Code.HwIntrinsicTarget)
-        "hw::Ring0.write_ttbr0" or "hw::Ring0.read_sysreg" or "hw::Ring0.write_sysreg" if db.target.arch() == Some(workspace::Arch.Amd64) => self.report(token, code: diagnostic::Code.HwIntrinsicTarget)
-        "host::Runner.run" => {
-            match ck.runner_problem(callable.head, subst) {
+        "hw::Ring0.load_idt" or "hw::Ring0.write_cr3" or "hw::Ring0.read_msr" or "hw::Ring0.write_msr" or "hw::Ring0.cpuid" or "hw::Ring0.read_tsc" or "hw::Ring0.read_tscp" or "hw::Ring0.monitor_wait" or "hw::Ring0.invalidate_pcid" or "hw::Ring0.invalidate_pcid_page" or "hw::Ring0.write_cr3_tagged" or "hw::Ring0.read_xcr0" or "hw::Ring0.write_xcr0" or "hw::Ring0.hardware_random" or "hw::Ring0.hardware_seed" or "hw::Ring0.enable_protection" or "hw::Ring0.clear_cpu_buffers" or "hw::Idt.of_vectors" if db.target.arch() == Some(workspace::Arch.Aarch64) => self.report(token, code: diagnostic::Code.HwIntrinsicTarget)
+        "hw::Ring0.write_ttbr0" or "hw::Ring0.read_sysreg" or "hw::Ring0.write_sysreg" or "hw::Ring0.wait_for_event" or "hw::Ring0.write_ttbr0_tagged" or "hw::Ring0.invalidate_asid" or "hw::Ring0.invalidate_asid_page" or "hw::Ring0.clean_data_cache" or "hw::Ring0.clean_invalidate_data_cache" or "hw::Ring0.invalidate_data_cache" or "hw::Ring0.sync_instruction_cache" or "hw::Ring0.firmware_call" if db.target.arch() == Some(workspace::Arch.Amd64) => self.report(token, code: diagnostic::Code.HwIntrinsicTarget)
+        "host::Runner.run" or "sys::Stepper.start" or "sys::Stepper.resume" => {
+            match ck.component_use_problem(path.as_str(), head: callable.head, subst) {
                 Some(code) => self.report(token, code)
                 None => {}
             }
@@ -2397,9 +2432,51 @@ fn Body.check_function_callee(self, token: u32, item: ty::ItemId, callable: Call
                 else => {}
             }
         }
+        "core::Secret.widen" or "core::Secret.truncate" if callable.head.generics.len() > 1 => self.check_secret_conversion(token, path: path.as_str(), target: wrapped, source: subst.get(callable.head.generics[1].param))
         else => {}
     }
 } Body.check_function_callee
+
+/// Reports the rule a call `Secret[T].widen(x)` or `Secret[T].truncate(x)` breaks, given the
+/// arguments for `T` and for the `S` of `x: Secret[S]`, when both are scalars.
+fn Body.check_secret_conversion(self, token: u32, path: Str, target: Option[ty::Arg], source: Option[ty::Arg]) {
+    let types = self.ck.types()
+    let Some(ty::Arg.Ty(target_ty)) = target else {
+        return
+    }
+    let Some(ty::Arg.Ty(source_ty)) = source else {
+        return
+    }
+    let Some(target_scalar) = types.scalar_of(target_ty) else {
+        return
+    }
+    let Some(source_scalar) = types.scalar_of(source_ty) else {
+        return
+    }
+    match secret_conversion(path, source: source_scalar, target: target_scalar) {
+        Some(code) => self.report(token, code)
+        None => {}
+    }
+} Body.check_secret_conversion
+
+/// The rule `Secret[T].widen(x)` or `Secret[T].truncate(x)` breaks for `x` of `Secret[S]`, the
+/// rules of named conversions over the integer pair `S`, `T`.
+fn secret_conversion(path: Str, source: ty::Scalar, target: ty::Scalar) -> Option[diagnostic::Code] {
+    let widening = widens(source, target)
+    if not source.is_integer() {
+        return Some(diagnostic::Code.NumConversionUndefined)
+    }
+    if source == target {
+        return Some(diagnostic::Code.NumSameTypeConversion)
+    }
+    if path == "core::Secret.widen" and not widening {
+        return Some(diagnostic::Code.NumWidenLossy)
+    }
+    if path == "core::Secret.truncate" and widening {
+        return Some(diagnostic::Code.NumWidenApplies)
+    }
+    return None
+} secret_conversion
 
 /// The role of a closure written as the argument for a parameter of a call to `callee`: the
 /// body of a `task::scope` call, or the task closure of a lexical spawn.
@@ -2984,20 +3061,27 @@ fn Body.construction_fields(
     match sig.kind {
         SigKind.Struct(fields: declared) => {
             if variant.is_none() {
-                if consumer and db.ast(item).has_modifier(ast::TypeModifier.Open) {
+                if consumer and db.ast(item).is_open() {
                     self.report(token, code: diagnostic::Code.TypeOpenConstruction)
                     mut self.skim_args(args)
                     return None
                 }
+                if ck.is_kind(item) {
+                    self.report(token, code: diagnostic::Code.AuthorityKindForm)
+                    mut self.skim_args(args)
+                    return None
+                }
                 for field in declared {
-                    if not db.field_visible(self.module, owner: item, visibility: field.visibility) {
+                    if not field.is_kept() and not db.field_visible(self.module, owner: item, visibility: field.visibility) {
                         self.report(token, code: diagnostic::Code.TypeHiddenField)
                         mut self.skim_args(args)
                         return None
                     }
                 }
                 for field in declared {
-                    mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                    if not field.is_kept() {
+                        mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                    }
                 }
                 return Some(ConstructionFields(fields: take fields, labelled: true))
             }
@@ -3015,6 +3099,23 @@ fn Body.construction_fields(
                 Some(index) => {
                     expect index < variants.len()
                     return mut self.construction_payload(token, payload: variants[index].payload, args)
+                }
+                None => {}
+            }
+        }
+        SigKind.Protocol(operations: _, variants: variants, summary: _) => {
+            match variant {
+                Some(index) => {
+                    expect index < variants.len()
+                    match variants[index].payload {
+                        Payload.Labelled(labelled) => {
+                            for field in labelled {
+                                mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                            }
+                        }
+                        else => {}
+                    }
+                    return Some(ConstructionFields(fields: take fields, labelled: true))
                 }
                 None => {}
             }
@@ -3780,7 +3881,7 @@ fn Body.apply_dma(
     let ck = self.ck.share()
     let types = ck.types()
     let alloc = ck.alloc()
-    ck.require(self.item, token, authority: workspace::Authority.Device)
+    ck.require(self.item, token, authority: workspace::Authority.Confined)
     let bytes_layout = types.type_arg(receiver.ty, index: 0).value_or(ty::Ty.error())
     if args.len() == 0 {
         self.report(token, code: diagnostic::Code.HwDmaOperand)

@@ -1,0 +1,316 @@
+//! Protocols: the calls of an outbox's operations and of its summary, the dispatch of a component serving a protocol to its handlers with the replies of requests, and the publication of its summary. A request's entry holds the address of its reply, a slot of the posting task's stack fitting the operation's result and failure; the component task writes the one the handler gives there before it marks the entry replied or failed and wakes the poster.
+
+/// The protocol a message type is, when it is one.
+fn protocols_served(lo: Lowering, message: ty::Ty) -> Option[ty::ItemId] {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(message) else {
+        return None
+    }
+    if lo.ck.is_protocol(item) {
+        return Some(item)
+    }
+    return None
+} protocols_served
+
+/// The summary type of the protocol a message type is, when it declares one.
+fn protocols_summary_type(lo: Lowering, message: ty::Ty) -> Option[ty::Ty] {
+    let Some(protocol) = protocols_served(lo, message) else {
+        return None
+    }
+    let sig = lo.ck.sig(protocol)
+    let check::SigKind.Protocol(operations: _, variants: _, summary: summary) = sig.contents().kind else {
+        return None
+    }
+    return summary
+} protocols_summary_type
+
+/// The instance of a handler or the summary function of a component state, by name.
+fn protocols_served_instance(mut lo: Lowering, state: ty::Ty, name: Str) -> Instance {
+    let Some(function) = lo.ck.served_function(state, name) else {
+        expect false
+        return Instance.Release(state)
+    }
+    return mut lo.callable_instance(nir::FnRef.item(function, args: ty::Args.none()), as_value: false)
+} protocols_served_instance
+
+/// Passes the message in the slot `args[1]` to its operation's handler, with the state, the Env
+/// and the component context of `args`, and gives a request's reply to the entry `node` that
+/// posted it; a message delivered without an entry is never a request.
+fn protocols_dispatch(mut lo: Lowering, mut fx: Fx, record: clif::Value, protocol: ty::ItemId, state: ty::Ty, args: Slice[Held], node: Option[clif::Value]) {
+    let message = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let sig = lo.ck.sig(protocol)
+    let check::SigKind.Protocol(operations: operations, variants: _, summary: _) = sig.contents().kind else {
+        return
+    }
+    expect args.len() == 4
+    let slot = args[1].address_value()
+    for index in 0..<operations.len() {
+        let operation = operations[index]
+        let is = mut lo.variant_is(mut fx, address: slot, ty: message, variant: operation.name.as_str())
+        mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+            let instance = protocols_served_instance(mut lo, state, name: operation.name.as_str())
+            var passed = mem::List[Held].empty(lo.alloc)
+            mut passed.push(args[0])
+            for param in operation.sig.params {
+                let at = mut lo.payload_address(mut fx1, ty: message, variant: operation.name.as_str(), label: param.name.as_str(), address: slot)
+                mut passed.push(Held.Address(at))
+            }
+            mut passed.push(args[2])
+            mut passed.push(args[3])
+            let abi = mut lo.abi(instance)
+            let id = mut lo.instance(take instance)
+            let called = mut lo.invoke(mut fx1, invoked: Invoked.Direct(id), abi, args: passed.view())
+            match first node {
+                Some(entry) if lo.ck.is_request(protocol, index) => protocols_reply(mut lo, fx: mut fx1, record, node: entry, head: operation.sig, called)
+                else => {}
+            }
+        })
+    }
+} protocols_dispatch
+
+/// Gives a request's handler's result or failure to its poster, unless the poster has stopped,
+/// in which case it is released.
+fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::Value, head: check::FnSig, called: Called) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: RUNNER_CURRENT)
+    let current = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_TAKEN)
+    let reply = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_REPLY)
+    let poster = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+    let reached = ReplyAt(node: node, reply: reply, poster: poster, live: live)
+    var failure_ty: Option[ty::Ty] = None
+    match head.failure {
+        Some(written) => {
+            if written != ty::Ty.never() {
+                failure_ty = Some(written)
+            }
+        }
+        None => {}
+    }
+    let failed = called.failed
+    let failure = called.failure
+    match failure_ty {
+        Some(written_failure) => {
+            match failed {
+                Some(failed_flag) => {
+                    match failure {
+                        Some(failure_address) => {
+                            discard mut fx.choose_in(mut lo, condition: failed_flag, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                                let held = mut lo1.held_at(mut fx1, ty: written_failure, address: failure_address)
+                                protocols_give(mut lo1, fx: mut fx1, reached, ty: written_failure, held, word: STATUS_FAILED)
+                                return mem::List[clif::Value].empty(fx1.alloc)
+                            }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                                protocols_give(mut lo1, fx: mut fx1, reached, ty: head.result, held: called.result, word: STATUS_REPLIED)
+                                return mem::List[clif::Value].empty(fx1.alloc)
+                            })
+                            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+                            return
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    protocols_give(mut lo, mut fx, reached, ty: head.result, held: called.result, word: STATUS_REPLIED)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+} protocols_reply
+
+/// Where a request's reply goes: its entry, its reply slot, its poster, and whether the poster
+/// still waits for it.
+struct ReplyAt derives Copy {
+    node: clif::Value
+    reply: clif::Value
+    poster: clif::Value
+    live: clif::Value
+} ReplyAt
+
+/// Writes a reply of a type to a poster that still waits for it, marked by the status `word`,
+/// and wakes it; releases the reply otherwise. The caller holds the runner's lock.
+fn protocols_give(mut lo: Lowering, mut fx: Fx, reached: ReplyAt, ty: ty::Ty, held: Held, word: i64) {
+    discard mut fx.choose_in(mut lo, condition: reached.live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.store_held(mut fx1, address: reached.reply, held, ty)
+        give_posted(mut lo1, fx: mut fx1, ty, address: reached.reply, poster: reached.poster)
+        let status = mut fx1.ptr(u64.fit(word))
+        mut fx1.store(status, addr: reached.node, offset: COMPONENTS_ENTRY_STATUS)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(reached.poster).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        match held {
+            Held.Address(address) => mut lo1.release(mut fx1, ty, address)
+            else => {}
+        }
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} protocols_give
+
+/// Publishes the summary of a component whose protocol declares one: the value its summary
+/// function gives for the state, kept in the runner's record.
+fn protocols_publish(mut lo: Lowering, mut fx: Fx, record: clif::Value, shape: ComponentsShape, state: ty::Ty) {
+    let Some(summary) = shape.summary else {
+        return
+    }
+    let instance = protocols_served_instance(mut lo, state, name: "summary")
+    let state_at = mut fx.offset(record, offset: shape.state_at)
+    let held = call_handler(mut lo, mut fx, take instance, args: Array[Held, 1].filled(Held.Address(state_at)).view())
+    let target = mut fx.offset(record, offset: shape.summary_at)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    mut lo.store_held(mut fx, address: target, held, ty: summary)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+} protocols_publish
+
+/// Where a runner's record holds the summary of a type.
+fn protocols_summary_offset(mut lo: Lowering, summary: ty::Ty) -> u64 {
+    let laid = mut lo.layout_of(summary)
+    return next_multiple_of(RUNNER_HEADER, multiple: at_least_one(laid.contents().align))
+} protocols_summary_offset
+
+/// Defines the call of an operation of a protocol, or of its summary, through an outbox.
+fn protocols_call(mut lo: Lowering, mut fx: Fx, abi: Abi, protocol: ty::ItemId, method: usize) {
+    let entry = supply_entry(mut fx, abi, alloc: lo.alloc)
+    let types = lo.ck.types()
+    let message = types.item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let name = lo.ck.method_name(protocol, method)
+    var path = text::String.of("sys::Outbox.", alloc: lo.alloc)
+    mut path.append(name.as_str())
+    var message_args = mem::List[ty::Arg].empty(lo.alloc)
+    mut message_args.push(ty::Arg.Ty(message))
+    var outbox_args = mem::List[ty::Ty].empty(lo.alloc)
+    mut outbox_args.push(message)
+    let owner = lo.std_ty("sys", type_name: "Outbox", args: take outbox_args)
+    let supply = Supply(abi: abi.copy(lo.alloc), args: types.args(take message_args), path: take path, owner: Some(owner), sret: entry.sret, failure: entry.failure, params: take entry.params, wrap: None)
+    if not lo.ck.is_operation(protocol, method) {
+        protocols_read_summary(mut lo, mut fx, supply, message)
+        return
+    }
+    var payload = mem::List[Held].empty(lo.alloc)
+    for position in 1..<supply.params.len() {
+        mut payload.push(supply.params[position])
+    }
+    let held = mut lo.variant_value(mut fx, ty: message, variant: name.as_str(), payload_values: payload.view(), wrapped: None)
+    if not lo.ck.is_request(protocol, index: method) {
+        let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: None)
+        await_taken(mut lo, mut fx, supply, message, record: posted.record, node: posted.node)
+        return
+    }
+    let sig = lo.ck.sig(protocol)
+    let check::SigKind.Protocol(operations: operations, variants: _, summary: _) = sig.contents().kind else {
+        return
+    }
+    protocols_request(mut lo, mut fx, supply, message, held, head: operations[method].sig)
+} protocols_call
+
+/// `out.op(...)` for a request: posts its message with a reply slot, then waits until the
+/// handler has given its result or failure there, the component task has stopped, or the
+/// message left the intake untaken.
+fn protocols_request(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, held: Held, head: check::FnSig) {
+    var failure_ty: Option[ty::Ty] = None
+    match head.failure {
+        Some(written) => {
+            if written != ty::Ty.never() {
+                failure_ty = Some(written)
+            }
+        }
+        None => {}
+    }
+    let result_laid = mut lo.layout_of(head.result)
+    var size = result_laid.contents().size
+    var align = result_laid.contents().align
+    match failure_ty {
+        Some(written_failure) => {
+            let failure_laid = mut lo.layout_of(written_failure)
+            if failure_laid.contents().size > size {
+                size = failure_laid.contents().size
+            }
+            if failure_laid.contents().align > align {
+                align = failure_laid.contents().align
+            }
+        }
+        None => {}
+    }
+    let reply = mut fx.slot(at_least_one(size), align: at_least_one(align))
+    let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: Some(reply))
+    let record = posted.record
+    let node = posted.node
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let current = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+        let replied = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_REPLIED)
+        mut fx1.if_true(replied, then: fn[mut lo](mut fx2: Fx) {
+            leave_post(mut lo, fx: mut fx2, record)
+            let result = mut lo.held_at(mut fx2, ty: head.result, address: reply)
+            supply.ret(mut lo, fx: mut fx2, held: result)
+        })
+        match failure_ty {
+            Some(written_failure) => {
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_FAILED)
+                mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+                    leave_post(mut lo, fx: mut fx2, record)
+                    protocols_fail_failed(mut lo, fx: mut fx2, supply, failure_ty: written_failure, reply)
+                })
+            }
+            None => {}
+        }
+        let abandoned = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_ABANDONED)
+        mut fx1.if_true(abandoned, then: fn[mut lo](mut fx2: Fx) {
+            leave_post(mut lo, fx: mut fx2, record)
+            components_fail_closed(mut lo, fx: mut fx2, supply)
+        })
+        leave_untaken(mut lo, fx: mut fx1, supply, message, record, node, status: current, at)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        return Pass(again: mut fx1.int(clif::Type.Int8, value: 1), next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} protocols_request
+
+/// Fails a request with `CallError.Failed` holding the failure its handler gave in the reply
+/// slot.
+fn protocols_fail_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::Ty, reply: clif::Value) {
+    let Some(call_error) = supply.abi.failure else {
+        expect false
+        return
+    }
+    let failure = mut lo.held_at(mut fx, ty: failure_ty, address: reply)
+    let value = mut lo.variant_value(mut fx, ty: call_error, variant: "Failed", payload_values: Array[Held, 1].filled(failure).view(), wrapped: None)
+    let Some(target) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: target, held: value, ty: call_error)
+    supply.raise_failure(mut fx)
+} protocols_fail_failed
+
+/// `out.summary()`: the summary the component published last, failing with `SendError.Closed`
+/// when `out` is stale.
+fn protocols_read_summary(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty) {
+    let Some(summary) = protocols_summary_type(lo, message) else {
+        expect false
+        return
+    }
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.OutboxClaim, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        components_fail_closed(mut lo, fx: mut fx1, supply)
+    })
+    let laid = mut lo.layout_of(summary)
+    let copy = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+    let offset = protocols_summary_offset(mut lo, summary)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let source = mut fx.offset(record, offset: offset)
+    mut lo.copy(mut fx, dst: copy, src: source, size: laid.contents().size, align: laid.contents().align)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    components_unreference(mut lo, mut fx, record)
+    let held = mut lo.held_at(mut fx, ty: summary, address: copy)
+    supply.ret(mut lo, mut fx, held)
+} protocols_read_summary

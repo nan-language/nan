@@ -139,6 +139,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("core::Option", [AnyArg, AnyArg, All, All, All, No]),
     ("core::Result", [AnyArg, AnyArg, All, All, All, No]),
     ("core::Untrusted", [First, First, First, First, First, No]),
+    ("core::Secret", [No, No, Yes, Yes, Yes, No]),
     ("core::Slice", VIEW_SEND_INERT_AS),
     ("core::SliceMut", VIEW_SEND_INERT_AS),
     ("core::Str", [No, Yes, No, Yes, Yes, No]),
@@ -190,6 +191,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("task::Sender", AFFINE_SEND),
     ("task::Receiver", [First, No, No, Yes, No, No]),
     ("task::Executor", COPY_SEND),
+    ("task::Account", LINEAR_SEND),
     ("sys::Fs", COPY_SEND),
     ("sys::Net", COPY_SEND),
     ("sys::Clock", COPY_SEND),
@@ -201,8 +203,11 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::net::Listener", AFFINE_SEND),
     ("sys::net::Conn", LINEAR_SEND),
     ("sys::Revoker", LINEAR_SEND),
+    ("sys::Minter", LINEAR_SEND),
     ("sys::Cx", VIEW_ONLY),
     ("sys::Outbox", COPY_SEND),
+    ("sys::Abandoner", AFFINE_SEND),
+    ("sys::Stepper", LINEAR_ONLY),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::UserAddr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::Register", [No, No, Yes, Yes, Yes, No]),
@@ -215,8 +220,6 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::IdtInstalled", LINEAR_SEND),
     ("hw::Idt", [No, No, No, Yes, Yes, No]),
     ("hw::IrqContext", LINEAR_ONLY),
-    ("hw::SavedContext", LINEAR_ONLY),
-    ("hw::SpinGuard", LINEAR_ONLY),
     ("hw::TrapFrame", [No, No, No, No, No, No]),
     ("hw::Region", LINEAR_SEND),
     ("hw::PhysFrame", LINEAR_SEND),
@@ -224,8 +227,6 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::Signal", AFFINE_SEND),
     ("hw::SpinLock", AFFINE_SEND),
     ("hw::PerCpu", AFFINE_SEND),
-    ("hw::RunQueue", AFFINE_SEND),
-    ("hw::Resumable", COPY_SEND),
     ("hw::Anchor", [No, No, No, No, No, No]),
     ("boot::Machine", LINEAR_ONLY),
     ("boot::Kernel", LINEAR_ONLY),
@@ -233,11 +234,12 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 27] = [
+const PRIMITIVE_CAPABILITIES: [&str; 32] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
     "task::Executor",
+    "task::Account",
     "sys::Fs",
     "sys::Net",
     "sys::Clock",
@@ -249,6 +251,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 27] = [
     "sys::net::Listener",
     "sys::net::Conn",
     "sys::Revoker",
+    "sys::Minter",
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",
@@ -261,10 +264,13 @@ const PRIMITIVE_CAPABILITIES: [&str; 27] = [
     "hw::Region",
     "hw::PhysFrame",
     "hw::IrqShared",
+    "hw::Iommu",
+    "hw::IoDomain",
+    "hw::PciFunction",
 ];
 
 /// The base types with interior mutability, by canonical path.
-pub const INTERIOR: [&str; 14] = [
+pub const INTERIOR: [&str; 15] = [
     "task::Cown",
     "core::atomic::AtomicU8",
     "core::atomic::AtomicU16",
@@ -279,6 +285,7 @@ pub const INTERIOR: [&str; 14] = [
     "hw::IrqShared",
     "hw::PerCpu",
     "hw::Signal",
+    "sys::Abandoner",
 ];
 
 /// The std types whose type parameters other than the first are brands, affecting no property.
@@ -302,8 +309,10 @@ impl Checker<'_> {
         self.base_facts(item).is_some()
     }
 
+    /// Whether a type item is a primitive capability: one std lists, or a capability kind.
     pub fn is_primitive_capability(&self, item: ItemId) -> bool {
         self.db.is_std(item) && PRIMITIVE_CAPABILITIES.contains(&self.db.canonical(item).as_str())
+            || self.is_kind(item)
     }
 
     /// The properties of a type, as code of the item `from` sees them.
@@ -450,6 +459,13 @@ impl Checker<'_> {
     }
 
     fn compute_definition_props(&self, item: ItemId) -> Props {
+        if self.is_kind(item) {
+            return Props {
+                copy: true,
+                send: true,
+                ..Props::default()
+            };
+        }
         let ast = self.db.ast(item);
         let derives = |name: &str| match &ast.kind {
             ItemKind::Struct(structure) => structure.derives.iter().any(|entry| entry.text == name),
@@ -474,10 +490,8 @@ impl Checker<'_> {
             }),
             _ => false,
         };
-        let is_enum = matches!(ast.kind, ItemKind::Enum(_));
-        let foreign_open = !self.db.is_std(item)
-            && ast.has_modifier(TypeModifier::Open)
-            && self.consumer_view(item);
+        let is_enum = matches!(ast.kind, ItemKind::Enum(_) | ItemKind::Protocol(_));
+        let foreign_open = !self.db.is_std(item) && ast.is_open() && self.consumer_view(item);
         let promise = |property: Property, name: &str| {
             if foreign_open {
                 derives(name)
@@ -508,11 +522,25 @@ impl Checker<'_> {
             .is_some_and(|package| package != self.db.package_of(item))
     }
 
-    /// The field and payload types of a struct or enum, over its own type parameters.
+    /// The constituent types of a struct or enum but a flexible struct's kept fields, which
+    /// derived `Render` and `Encode` pass over.
+    pub fn declared_constituents(&self, item: ItemId) -> Vec<Ty> {
+        match &self.sig(item).kind {
+            SigKind::Struct { fields } => fields
+                .iter()
+                .filter(|field| !field.is_kept())
+                .map(|field| field.ty.clone())
+                .collect(),
+            _ => self.constituents(item),
+        }
+    }
+
+    /// The field and payload types of a struct or enum, over its own type parameters, and the
+    /// parameter types of a protocol's operations.
     pub fn constituents(&self, item: ItemId) -> Vec<Ty> {
         match &self.sig(item).kind {
             SigKind::Struct { fields } => fields.iter().map(|field| field.ty.clone()).collect(),
-            SigKind::Enum { variants } => variants
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .flat_map(|variant| match &variant.payload {
                     super::sig::Payload::None => Vec::new(),

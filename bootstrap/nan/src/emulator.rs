@@ -13,8 +13,12 @@ use crate::command::Launch;
 use crate::workspace::{Arch, Kind, Target};
 
 /// The firmware an `x86_64-uefi` image boots through, its code and the template of its
-/// variables, and their fallbacks across distributions.
-const OVMF: [(&str, &str); 4] = [
+/// variables, and their fallbacks across distributions, the builds reaching the TPM first.
+const OVMF: [(&str, &str); 5] = [
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2",
+        "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2",
+    ),
     (
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         "/usr/share/edk2/ovmf/OVMF_VARS.fd",
@@ -33,10 +37,18 @@ const OVMF: [(&str, &str); 4] = [
     ),
 ];
 
+/// The firmware setting that makes OVMF place every PCI device's memory below 4 GiB, where the
+/// entry root maps devices.
+const BARS_BELOW_4_GIB: &str = "name=opt/ovmf/X-PciMmio64Mb,string=0";
+
 /// The firmware an `aarch64-uefi` image boots through, its code and the template of its
 /// variables, each a flash image padded to the size of the `virt` board's flash, and their
-/// fallbacks across distributions.
-const AAVMF: [(&str, &str); 2] = [
+/// fallbacks across distributions, the builds reaching the TPM first.
+const AAVMF: [(&str, &str); 3] = [
+    (
+        "/usr/share/AAVMF/AAVMF_CODE.secboot.fd",
+        "/usr/share/AAVMF/AAVMF_VARS.fd",
+    ),
     (
         "/usr/share/AAVMF/AAVMF_CODE.fd",
         "/usr/share/AAVMF/AAVMF_VARS.fd",
@@ -135,7 +147,7 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
         ],
         (Arch::Aarch64, _) => &[
             "-machine",
-            "virt,gic-version=3,its=on,iommu=smmuv3",
+            "virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off",
             "-accel",
             "tcg",
             "-cpu",
@@ -286,6 +298,16 @@ fn firmware(arch: Arch) -> (&'static str, &'static str) {
         .unwrap_or(pairs[0])
 }
 
+/// The format of a firmware flash image: QEMU's copy-on-write format for a `.qcow2` file, raw
+/// otherwise.
+fn flash_format(path: &str) -> &'static str {
+    if path.ends_with(".qcow2") {
+        "qcow2"
+    } else {
+        "raw"
+    }
+}
+
 /// The machine directory a launch boots in, holding the machine's disk, firmware variables, TPM
 /// state and sockets, and whether every boot makes its TPM state anew.
 pub struct Machine {
@@ -374,6 +396,7 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
     match target.kind() {
         Some(Kind::Uefi) => {
             let (code, template) = firmware(arch);
+            let format = flash_format(code);
             let volume = boot_volume(arch, image, files)?.display().to_string();
             let (vars, volume) = match kept {
                 Some(_) => {
@@ -382,19 +405,23 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
                         fs::copy(template, vars)?;
                     }
                     (
-                        format!("if=pflash,format=raw,unit=1,file={VARS}"),
+                        format!("if=pflash,format={format},unit=1,file={VARS}"),
                         format!("if=none,id=boot,format=raw,file=fat:rw:{volume}"),
                     )
                 }
                 None => (
-                    format!("if=pflash,format=raw,unit=1,file={template},snapshot=on"),
+                    format!("if=pflash,format={format},unit=1,file={template},snapshot=on"),
                     format!("if=none,id=boot,format=raw,file=fat:{volume},snapshot=on"),
                 ),
             };
+            if arch == Arch::Amd64 {
+                args.push("-fw_cfg".to_owned());
+                args.push(BARS_BELOW_4_GIB.to_owned());
+            }
             for (option, value) in [
                 (
                     "-drive",
-                    format!("if=pflash,format=raw,unit=0,readonly=on,file={code}"),
+                    format!("if=pflash,format={format},unit=0,readonly=on,file={code}"),
                 ),
                 ("-drive", vars),
                 ("-drive", volume),

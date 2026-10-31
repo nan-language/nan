@@ -694,7 +694,9 @@ impl Body<'_, '_> {
                 Some(_) => subst.arg(&Arg::Const(crate::check::ty::Const::Param(def.param))),
                 None => Arg::Ty(subst.ty(&Ty::Param(def.param))),
             })
-            .collect();
+            .collect::<crate::check::ty::Args>();
+        self.ck
+            .check_kind_use(self.item, token, item, type_args.first());
         TExpr {
             token,
             last: token,
@@ -922,7 +924,10 @@ impl Body<'_, '_> {
                 Some(TypeTarget::Type(self.type_expr(&type_expr)))
             }
             Named::Item(item) => match &self.ck.db.ast(item).kind {
-                ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+                ItemKind::Struct(_)
+                | ItemKind::Enum(_)
+                | ItemKind::Layout(_)
+                | ItemKind::Protocol(_) => {
                     if !self.ck.db.visible(self.module, item) {
                         self.report(base.token, Code::NamePrivate);
                     }

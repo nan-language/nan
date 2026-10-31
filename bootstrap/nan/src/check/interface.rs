@@ -86,12 +86,8 @@ impl Checker<'_> {
             self.report(item, token, Code::InterfaceImplMisplaced);
             return false;
         }
-        if PROPERTY_INTERFACES.contains(&interface_path.as_str()) {
-            self.report(item, token, Code::PropPropertyImpl);
-            return false;
-        }
-        if interface_path == "core::Encode" && !self.db.is_std(item) {
-            self.report(item, token, Code::EncodeManualImpl);
+        if let Some(code) = impl_interface_problem(&interface_path, self.db.is_std(item)) {
+            self.report(item, token, code);
             return false;
         }
         if self.duplicate_impl(item, key, bound.interface) {
@@ -101,13 +97,16 @@ impl Checker<'_> {
         let SigKind::Interface { methods } = &self.sig(bound.interface).kind else {
             return false;
         };
-        for method in methods {
-            let implemented =
-                self.implementing_function(item, &method.name).is_some() || method.default;
-            if !implemented {
-                self.report(item, token, Code::InterfaceMissingMethod);
-                return true;
-            }
+        let required: Vec<String> = match self.line_protocol(item) {
+            Some(protocol) => self.served_names(protocol),
+            None => (methods.iter())
+                .filter(|method| !method.default)
+                .map(|method| method.name.clone())
+                .collect(),
+        };
+        if (required.iter()).any(|name| self.implementing_function(item, name).is_none()) {
+            self.report(item, token, Code::InterfaceMissingMethod);
+            return true;
         }
         let target_package = target_module.map(|target| self.db.module(target).package);
         let collides = target_module.is_some_and(|target| target != module)
@@ -162,6 +161,23 @@ impl Checker<'_> {
         let ItemKind::Fn(written) = &self.db.ast(function).kind else {
             return;
         };
+        if let Some((line, protocol, served)) = self.served(function) {
+            let SigKind::Impl { target_ty, .. } = &self.sig(line).kind else {
+                return;
+            };
+            let wanted = self.served_head(line, protocol, served, target_ty);
+            if !self.head_matches(sig, &wanted) {
+                self.report(function, token, Code::InterfaceHeadMismatch);
+                return;
+            }
+            let state = match self.db.owners.get(&function) {
+                Some(TypeKey::Item(target)) => self.db.ast(*target).visibility,
+                _ => Visibility::Pub,
+            };
+            let expected = openness(self.served_visibility(protocol, served, state));
+            self.check_implementing_visibility(function, expected);
+            return;
+        }
         for line in self.implemented_lines(function) {
             let SigKind::Impl {
                 target_ty,
@@ -188,26 +204,34 @@ impl Checker<'_> {
             };
             let interface_visibility = self.db.ast(bound.interface).visibility;
             let expected = openness(target_visibility).min(openness(interface_visibility));
-            let written_visibility = self.db.ast(function).visibility;
-            if openness(written_visibility) != expected {
-                let word = ["", "pkg", "pub"][usize::from(expected)];
-                let fix = match (written_visibility, word) {
-                    (Visibility::Private, word) => {
-                        self.fix_inserting(function, token, &format!("{word} "))
-                    }
-                    (_, "") => self.fix_deleting_forward(function, token, token),
-                    (_, word) => self.fix_replacing(function, token, token, word),
-                };
-                self.report_fixed(
-                    function,
-                    (token, token),
-                    Code::InterfaceImplVisibility,
-                    vec![fix],
-                    Offer::Each,
-                );
+            if !self.check_implementing_visibility(function, expected) {
                 return;
             }
         }
+    }
+
+    /// Whether an implementing function has the visibility `expected`, as its openness; any other
+    /// is reported with the fix writing that one.
+    fn check_implementing_visibility(&self, function: ItemId, expected: u8) -> bool {
+        let token = self.db.ast(function).token;
+        let written_visibility = self.db.ast(function).visibility;
+        if openness(written_visibility) == expected {
+            return true;
+        }
+        let word = ["", "pkg", "pub"][usize::from(expected)];
+        let fix = match (written_visibility, word) {
+            (Visibility::Private, word) => self.fix_inserting(function, token, &format!("{word} ")),
+            (_, "") => self.fix_deleting_forward(function, token, token),
+            (_, word) => self.fix_replacing(function, token, token, word),
+        };
+        self.report_fixed(
+            function,
+            (token, token),
+            Code::InterfaceImplVisibility,
+            vec![fix],
+            Offer::Each,
+        );
+        false
     }
 
     /// Whether an implementing function's head matches its method's, `Self` and the interface's
@@ -349,5 +373,19 @@ fn derives(item: &ast::Item) -> &[ast::Name] {
         ItemKind::Struct(structure) => &structure.derives,
         ItemKind::Enum(enumeration) => &enumeration.derives,
         _ => &[],
+    }
+}
+
+/// The rule an impl line breaks by the interface it names alone: a property interface, `Encode`
+/// outside std, or `core::SecretBits`.
+fn impl_interface_problem(path: &str, std: bool) -> Option<Code> {
+    if PROPERTY_INTERFACES.contains(&path) {
+        Some(Code::PropPropertyImpl)
+    } else if path == "core::Encode" && !std {
+        Some(Code::EncodeManualImpl)
+    } else if path == "core::SecretBits" {
+        Some(Code::SecretBitsImpl)
+    } else {
+        None
     }
 }

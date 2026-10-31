@@ -68,7 +68,7 @@ view struct TypeCtx {
 } TypeCtx
 
 pkg struct ParamSig {
-    name: text::String
+    pkg name: text::String
     pkg mode: ast::Mode
     pkg ty: ty::Ty
     token: u32
@@ -95,6 +95,12 @@ pkg struct FieldSig {
     pkg visibility: ast::Visibility
     pkg token: u32
 } FieldSig
+
+/// The name of the field of a flexible struct holding its kept fields, which no source names.
+pkg const KEPT_FIELD: Str = "#kept"
+
+/// Whether it holds a flexible struct's kept fields.
+pkg fn FieldSig.is_kept(self) -> bool = self.name.as_str() == KEPT_FIELD
 
 /// A labelled payload field and its type.
 pkg struct LabelledTy {
@@ -137,6 +143,9 @@ pkg enum SigKind {
     Registers(members: mem::List[RegisterSig])
     Const(ty: ty::Ty)
     Registry(entry: ty::Ty)
+    /// A protocol: the head of each operation as written, and the message of each as the
+    /// variant of an enum holding its parameters.
+    Protocol(operations: mem::List[MethodSig], variants: mem::List[VariantSig], summary: Option[ty::Ty])
     Other
 } SigKind
 
@@ -150,6 +159,23 @@ pkg struct Sig {
 fn Problems.push(mut self, problem: Problem) {
     mut self.found.push(problem)
 } Problems.push
+
+/// The methods an interface declares or the operations a protocol does.
+pkg proj fn SigKind.methods(self) -> Option[Slice[MethodSig]] {
+    return match self {
+        SigKind.Interface(methods: methods) => Some(methods.view())
+        SigKind.Protocol(operations: operations, variants: _, summary: _) => Some(operations.view())
+        else => None
+    }
+} SigKind.methods
+
+/// The variants of an enum, or the messages of a protocol's operations.
+pkg proj fn SigKind.variants(self) -> Option[Slice[VariantSig]] {
+    return match self {
+        SigKind.Enum(variants: variants) or SigKind.Protocol(operations: _, variants: variants, summary: _) => Some(variants.view())
+        else => None
+    }
+} SigKind.variants
 
 pkg fn FnSig.is_proj(self) -> bool {
     return self.modifier == Some(ast::FnModifier.Proj)
@@ -198,9 +224,10 @@ fn Sig.has_error(self, types: ty::Types) -> bool {
         SigKind.Enum(variants: variants) => variants_have_error(variants.view(), types)
         SigKind.Interface(methods: methods) => methods_have_error(methods.view(), types)
         SigKind.Impl(target: _, target_ty: target_ty, bound: _) => types.has_error(target_ty)
-        SigKind.Layout(fields: fields, tags: _, bits: bits) => fields_have_error(fields.view(), types) or bits_have_error(bits, types)
+        SigKind.Layout(fields: fields, tags: _, bits: bits) => fields_have_error(fields.view(), types) or optional_has_error(bits, types)
         SigKind.Registers(members: members) => registers_have_error(members.view(), types)
         SigKind.Const(ty: declared) or SigKind.Registry(entry: declared) => types.has_error(declared)
+        SigKind.Protocol(operations: operations, variants: _, summary: summary) => methods_have_error(operations.view(), types) or optional_has_error(summary, types)
         SigKind.Other => false
     }
 } Sig.has_error
@@ -247,13 +274,13 @@ fn methods_have_error(methods: Slice[MethodSig], types: ty::Types) -> bool {
     return false
 } methods_have_error
 
-/// Whether a layout's bits type failed.
-fn bits_have_error(bits: Option[ty::Ty], types: ty::Types) -> bool {
-    return match bits {
-        Some(bits_ty) => types.has_error(bits_ty)
+/// Whether an optional type failed.
+fn optional_has_error(optional: Option[ty::Ty], types: ty::Types) -> bool {
+    return match optional {
+        Some(found) => types.has_error(found)
         None => false
     }
-} bits_have_error
+} optional_has_error
 
 /// Whether the type of a register failed.
 fn registers_have_error(members: Slice[RegisterSig], types: ty::Types) -> bool {
@@ -334,6 +361,18 @@ fn shape_defs(item: ty::ItemId, params: Slice[ast::GenericParam], alloc: mem::Al
     return defs
 } shape_defs
 
+/// The type of the kept fields of a flexible struct; none for another item.
+pkg fn Checker.kept_type(self, item: ty::ItemId) -> Option[ty::Ty] {
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return None
+    }
+    if fields.len() == 0 or not fields[fields.len() - 1].is_kept() {
+        return None
+    }
+    return Some(fields[fields.len() - 1].ty)
+} Checker.kept_type
+
 /// The signature of a function item.
 pkg fn Checker.fn_sig(self, item: ty::ItemId) -> Option[FnSig] {
     let sig = self.sig(item)
@@ -409,6 +448,7 @@ fn Checker.compute_sig(self, item: ty::ItemId) -> Sig {
             let entry = self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: declared.entry, mut problems)
             return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Registry(entry: entry), problems: take problems)
         }
+        ast::ItemKind.Protocol(declared) => return self.protocol_sig(item, module, declared, take problems)
         else => return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Other, problems: take problems)
     }
 } Checker.compute_sig
@@ -491,6 +531,14 @@ fn Checker.struct_sig(self, item: ty::ItemId, module: ty::ModuleId, structure: a
     for field in structure.fields() {
         mut fields.push(FieldSig(name: text::String.of(field.name.text.as_str(), alloc), ty: self.type_expr(TypeCtx(item: item, module: module, generics: generics.view(), self_param: None), ty: field.ty, mut problems), visibility: field.visibility, token: field.token))
     }
+    for modifier in self.db().ast(item).type_modifiers {
+        if modifier.kind == ast::TypeModifier.Flexible {
+            match self.db().std_item("mem::wire", name: "Kept") {
+                Some(kept) => mut fields.push(FieldSig(name: text::String.of(KEPT_FIELD, alloc), ty: self.types().item(kept, args: mem::List[ty::Arg].empty(alloc)), visibility: ast::Visibility.Private, token: modifier.token))
+                None => {}
+            }
+        }
+    }
     return Sig(generics: take generics, kind: SigKind.Struct(fields: take fields), problems: take problems)
 } Checker.struct_sig
 
@@ -533,6 +581,35 @@ fn Checker.payload_sig(self, ctx: TypeCtx, written: Option[mem::List[ast::Payloa
     }
     return Payload.Labelled(take labelled)
 } Checker.payload_sig
+
+fn Checker.protocol_sig(self, item: ty::ItemId, module: ty::ModuleId, declared: ast::ProtocolItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let none = mem::List[GenericDef].empty(alloc)
+    var operations = mem::List[MethodSig].empty(alloc)
+    var variants = mem::List[VariantSig].empty(alloc)
+    for index in 0..<declared.operations.len() {
+        let method = declared.operations[index].method
+        let sig = self.head_sig(module, owner: item, method: index + 1, head: method.head, inherited: mem::List[GenericDef].empty(alloc), self_ty: None, self_param: None, modifier: None, convention: None, mut problems)
+        var payload = Payload.None
+        if sig.params.len() > 0 {
+            var labelled = mem::List[LabelledTy].empty(alloc)
+            for param in sig.params {
+                mut labelled.push(LabelledTy(name: text::String.of(param.name.as_str(), alloc), ty: param.ty))
+            }
+            payload = Payload.Labelled(take labelled)
+        }
+        mut variants.push(VariantSig(name: text::String.of(method.name.text.as_str(), alloc), payload: take payload, from: false, token: method.name.token))
+        mut operations.push(MethodSig(name: text::String.of(method.name.text.as_str(), alloc), sig: take sig, default: false))
+    }
+    var summary: Option[ty::Ty] = None
+    match declared.summary {
+        Some(written) => {
+            summary = Some(self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: written, mut problems))
+        }
+        None => {}
+    }
+    return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Protocol(operations: take operations, variants: take variants, summary: summary), problems: take problems)
+} Checker.protocol_sig
 
 fn Checker.interface_sig(self, item: ty::ItemId, module: ty::ModuleId, declared: ast::InterfaceItem, take problems: Problems) -> Sig {
     let alloc = self.alloc()
@@ -726,6 +803,10 @@ fn Checker.line_declares(self, module: ty::ModuleId, line: ty::ItemId, key: Type
     }
     if db.owner_key(module, owner: implementation.target) != Some(key) {
         return false
+    }
+    match self.written_protocol(module, line: implementation) {
+        Some(protocol) => return name == "start" or self.serves(protocol, name).is_some()
+        None => {}
     }
     let Ok(Named.Item(interface_item)) = db.resolve(module, path: implementation.bound.path) else {
         return false
@@ -1185,7 +1266,7 @@ fn Checker.path_type(self, ctx: TypeCtx, path: ast::Path, args: Option[mem::List
                 mut problems.push(Problem(code: diagnostic::Code.NamePrivate, token: token))
             }
             match db.ast(item).kind {
-                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Protocol(_) => {
                     let params = self.shapes(item)
                     let Some(written) = self.generic_args(ctx, params: params.contents().view(), args, token, mut problems) else {
                         return ty::Ty.error()

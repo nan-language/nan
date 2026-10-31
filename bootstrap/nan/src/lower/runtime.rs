@@ -4,9 +4,9 @@
 //! record of the executor thread running.
 //!
 //! `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability
-//! tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes
-//! trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the
-//! seeded scheduler of test images.
+//! tables; `stack_switch` keeps tasks, their stacks, the executors' run queues and the turns of
+//! serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned
+//! domains; `replay` runs the seeded scheduler of test images.
 
 pub mod holdings;
 pub mod locks;
@@ -14,7 +14,9 @@ pub mod memory;
 pub mod regions;
 pub mod report;
 pub mod seeded;
+pub mod serial;
 pub mod settle;
+pub mod stops;
 pub mod system;
 pub mod tables;
 pub mod tasks;
@@ -75,7 +77,9 @@ pub enum Routine {
     Rehome,
     /// `(world)`: fills a root grant's capabilities and allocator.
     MintRoot,
-    /// `(handle, kind) -> handle`: a new entry deriving from a capability's entry.
+    /// `(handle, word, floor, text, len) -> handle`: a new entry deriving from a capability's
+    /// live entry, its state word at offset `word` raised to at least `floor` and its text
+    /// extended or replaced by `text` when that is not zero; all ones for a stale handle.
     Derive,
     /// `(handle)`: revokes an entry and every entry deriving from it.
     Revoke,
@@ -86,8 +90,26 @@ pub enum Routine {
     /// `(handle) -> runner`: the runner of a live outbox, taking a reference to its record;
     /// zero for a stale outbox.
     OutboxClaim,
+    /// `(minter, low, high) -> handle`: a new entry of a capability kind belonging to a minter,
+    /// recording the two words of a record.
+    KindMint,
+    /// `(handle, record) -> minter`: for a live entry of a capability kind, its minter, on whose
+    /// state the call counts one holder more, its record's two words written at `record`; zero
+    /// for a stale handle.
+    KindPin,
+    /// `(handle, low, high) -> handle`: a new entry deriving from a live entry of a capability
+    /// kind and recording the two words of a record; all ones for a stale handle.
+    KindDerive,
+    /// `(handle, minter)`: revokes an entry belonging to a minter and every entry deriving from
+    /// it.
+    KindRevoke,
+    /// `(minter)`: revokes every entry belonging to a minter.
+    KindClose,
     /// `(kind, operands, count, caller) -> Never`: traps the running task.
     TrapRaise,
+    /// `(kind, record)`: writes into a trap record the report of a kind, without operands,
+    /// located at the call of the caller.
+    TrapReport,
     /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
     Reacquired,
     /// `(domain)`: settles an abandoned `sys::Domain` body.
@@ -115,6 +137,12 @@ pub enum Routine {
     Spawn,
     /// `(task)`: makes a task ready.
     Wake,
+    /// `(task)`: makes a ready task run once its serial executor's turn admits it.
+    Ready,
+    /// `(task)`: puts a ready task in a run queue.
+    Enqueue,
+    /// `(task)`: passes on the turn of a task's serial executor when the task holds it.
+    Turn,
     /// `()`: suspends the running task until a wake.
     Park,
     /// `(task)`: the first code a task runs on its own stack.
@@ -157,6 +185,8 @@ pub enum Routine {
     ClockNow,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
+    /// `()`: under the IOMMU's lock, invalidates everything it caches and waits until it has.
+    IommuFlush,
 }
 
 impl Routine {
@@ -187,7 +217,13 @@ impl Routine {
             Routine::OutboxMint => "_NScap_table_outbox_mint",
             Routine::OutboxRetire => "_NScap_table_outbox_retire",
             Routine::OutboxClaim => "_NScap_table_outbox_claim",
+            Routine::KindMint => "_NScap_table_kind_mint",
+            Routine::KindPin => "_NScap_table_kind_pin",
+            Routine::KindDerive => "_NScap_table_kind_derive",
+            Routine::KindRevoke => "_NScap_table_kind_revoke",
+            Routine::KindClose => "_NScap_table_kind_close",
             Routine::TrapRaise => "_NStrap_raise",
+            Routine::TrapReport => "_NStrap_report",
             Routine::Reacquired => "_NStrap_reacquired",
             Routine::ReportScalar => "_NStrap_scalar",
             Routine::Settle => "_NSsettle_domain",
@@ -200,6 +236,9 @@ impl Routine {
             Routine::WriteErr => "_NStrap_write_err",
             Routine::Spawn => "_NSstack_switch_spawn",
             Routine::Wake => "_NSstack_switch_wake",
+            Routine::Ready => "_NSstack_switch_ready",
+            Routine::Enqueue => "_NSstack_switch_enqueue",
+            Routine::Turn => "_NSstack_switch_turn",
             Routine::Park => "_NSstack_switch_park",
             Routine::TaskStart => "_NSstack_switch_task_start",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
@@ -219,6 +258,7 @@ impl Routine {
             Routine::Stream => "_NSreplay_stream",
             Routine::ClockNow => "_NSstack_switch_clock_now",
             Routine::Draw => "_NSreplay_draw",
+            Routine::IommuFlush => "_NSiommu_flush",
         }
     }
 
@@ -232,13 +272,15 @@ impl Routine {
         const P: cranelift_codegen::ir::Type = types::I64;
         match self {
             Routine::Copy | Routine::Fill => (&[P, P, P], &[]),
-            Routine::OutboxMint => (&[P, P, P], &[P]),
+            Routine::OutboxMint | Routine::KindMint | Routine::KindDerive => (&[P, P, P], &[P]),
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
             Routine::AllocIn => (&[P, P, P, P], &[P]),
-            Routine::Split | Routine::Derive | Routine::Hold => (&[P, P], &[P]),
+            Routine::Split | Routine::Hold => (&[P, P], &[P]),
+            Routine::Derive => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
-            Routine::Rehome => (&[P, P], &[]),
+            Routine::Rehome | Routine::KindRevoke | Routine::TrapReport => (&[P, P], &[]),
+            Routine::KindPin => (&[P, P], &[P]),
             Routine::Charged
             | Routine::Limit
             | Routine::TaskEnv
@@ -253,8 +295,12 @@ impl Routine {
             | Routine::Unhold
             | Routine::MintRoot
             | Routine::Revoke
+            | Routine::KindClose
             | Routine::OutboxRetire
             | Routine::Wake
+            | Routine::Ready
+            | Routine::Enqueue
+            | Routine::Turn
             | Routine::TaskStart
             | Routine::Cancel
             | Routine::CownRelease
@@ -272,7 +318,7 @@ impl Routine {
             Routine::ReportScalar => (&[P, P, P], &[]),
             Routine::WriteErr => (&[P, P], &[]),
             Routine::Spawn => (&[P, P, P, P, P, P, P, P], &[P]),
-            Routine::Park | Routine::Schedule | Routine::Yield => (&[], &[]),
+            Routine::Park | Routine::Schedule | Routine::Yield | Routine::IommuFlush => (&[], &[]),
             Routine::Stream => (&[P, P, P], &[P]),
             Routine::Draw => (&[P, P, P, P], &[P]),
             Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
@@ -380,7 +426,31 @@ pub mod state {
     pub const CLOCK_BASE: u64 = 368;
     pub const CLOCK_SCALE: u64 = 376;
     pub const CLOCK_LAST: u64 = 384;
-    pub const SIZE: u64 = 392;
+    /// On an x86_64 kernel, whether a CPU holds the shootdown lock, the scope its shootdown
+    /// invalidates and the number of CPUs yet to serve it.
+    pub const SHOOTDOWN_LOCK: u64 = 392;
+    pub const SHOOTDOWN_SCOPE: u64 = 400;
+    pub const SHOOTDOWN_LEFT: u64 = 408;
+    /// On a kernel, the lock of the bindings of installed devices; on an x86_64 kernel, nonzero
+    /// when the local APICs run in x2APIC mode.
+    pub const IRQ_LOCK: u64 = 416;
+    pub const X2APIC: u64 = 424;
+    /// On an AArch64 kernel whose interrupt controller has an ITS: its command queue and the
+    /// offset of the next command, zero without one; the LPI property table; and the number of
+    /// device ids it accepts.
+    pub const ITS_QUEUE: u64 = 432;
+    pub const ITS_WRITE: u64 = 440;
+    pub const ITS_PROPERTIES: u64 = 448;
+    pub const ITS_DEVICES: u64 = 456;
+    /// On a kernel, the record of the policy `boot::Kernel.policy` installed, zero for the
+    /// default one, and the last key the default policy gave.
+    pub const POLICY: u64 = 464;
+    pub const TICKET: u64 = 472;
+    /// On a kernel, the unit record of the IOMMU `boot::Kernel.iommu` enabled, zero before; on
+    /// an x86_64 kernel, the lock of the PCI configuration ports.
+    pub const IOMMU: u64 = 480;
+    pub const PCI_LOCK: u64 = 488;
+    pub const SIZE: u64 = 496;
 }
 
 impl Lowering<'_, '_> {
@@ -588,8 +658,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Revoke
         | Routine::OutboxMint
         | Routine::OutboxRetire
-        | Routine::OutboxClaim => tables::define(lo, fx, routine),
+        | Routine::OutboxClaim
+        | Routine::KindMint
+        | Routine::KindPin
+        | Routine::KindDerive
+        | Routine::KindRevoke
+        | Routine::KindClose => tables::define(lo, fx, routine),
         Routine::TrapRaise
+        | Routine::TrapReport
         | Routine::Reacquired
         | Routine::ReportScalar
         | Routine::ReportText
@@ -598,6 +674,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Settle => settle::define(lo, fx, routine),
         Routine::Spawn
         | Routine::Wake
+        | Routine::Ready
+        | Routine::Enqueue
         | Routine::Park
         | Routine::TaskStart
         | Routine::IoSubmit
@@ -608,9 +686,11 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
+        Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
+        Routine::IommuFlush => lo.define_iommu_flush(fx),
         Routine::Init
         | Routine::Exit
         | Routine::RecordAlloc

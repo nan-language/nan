@@ -2,6 +2,7 @@
 //! call carries, failing calls with `try` and `attempt`, and checking entries.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use super::expr::Out;
 use super::{Elab, Elaborated, Fault, Held};
@@ -35,6 +36,8 @@ struct Evaluated<'c> {
 struct Requires {
     callee: FnRef,
     clauses: Vec<(u32, bool)>,
+    /// The positions of the call's arguments the requires functions read.
+    params: Range<usize>,
 }
 
 impl Elab<'_, '_> {
@@ -357,7 +360,7 @@ impl Elab<'_, '_> {
                 self_ty,
                 ..
             } => {
-                let name = self.method_name(interface.interface, *method)?;
+                let name = self.ck.method_name(interface.interface, *method);
                 match self_ty {
                     Ty::Param(_) => FnRef {
                         callable: Callable::Method {
@@ -408,13 +411,6 @@ impl Elab<'_, '_> {
         })
     }
 
-    fn method_name(&self, interface: ItemId, method: usize) -> Elaborated<String> {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => Ok(methods[method].name.clone()),
-            _ => Err(Fault::Unsupported("a method of no interface".to_owned())),
-        }
-    }
-
     /// The checks a call carries before it runs: the predicates of its arguments, then each
     /// requires of its callee, then its decreases obligation within a cycle.
     fn call_checks(
@@ -459,7 +455,8 @@ impl Elab<'_, '_> {
                     },
                     args: requires.callee.args.clone(),
                 };
-                let value = self.call_value(fn_ref, read.clone(), &Ty::Scalar(Scalar::Bool), span);
+                let passed = read[requires.params.clone()].to_vec();
+                let value = self.call_value(fn_ref, passed, &Ty::Scalar(Scalar::Bool), span);
                 self.emit(
                     Op::Check {
                         kind: CheckKind::Requires,
@@ -578,6 +575,7 @@ impl Elab<'_, '_> {
                 return Some(Requires {
                     callee: callee.clone(),
                     clauses,
+                    params: 0..call.args.len(),
                 });
             }
         }
@@ -594,7 +592,8 @@ impl Elab<'_, '_> {
                 let args = self
                     .ck
                     .interface_args(interface.interface, self_ty, &interface.args);
-                let own = call.type_args.get(args.len()..).unwrap_or_default();
+                let given = self.ck.sig(interface.interface).generics.len().max(1);
+                let own = call.type_args.get(given..).unwrap_or_default();
                 let args = args.iter().chain(own).cloned().collect();
                 (interface.interface, *method, args)
             }
@@ -621,6 +620,7 @@ impl Elab<'_, '_> {
                 args,
             },
             clauses: self.ck.method_requires(interface, method),
+            params: self.ck.contract_params(interface, method, call.args.len()),
         })
     }
 
@@ -742,8 +742,12 @@ impl Elab<'_, '_> {
     }
 
     /// The predicate checks at an exit of a boundary function, for the values reachable from
-    /// its result or failure and its `mut` parameters.
-    pub fn exit_predicate_checks(&mut self, value: Option<&Operand>, span: Span) -> Elaborated<()> {
+    /// the result or failure it carries, of its type, and from its `mut` parameters.
+    pub fn exit_predicate_checks(
+        &mut self,
+        carried: Option<(Operand, Ty)>,
+        span: Span,
+    ) -> Elaborated<()> {
         let boundary = match self.role {
             Role::Closure => true,
             Role::Body | Role::Default => self.ck.is_boundary(self.item),
@@ -752,8 +756,8 @@ impl Elab<'_, '_> {
         if !boundary {
             return Ok(());
         }
-        if let (Some(operand), Some(ty)) = (value, self.exit_ty.clone())
-            && let Some(place) = operand_place(operand)
+        if let Some((operand, ty)) = carried
+            && let Some(place) = operand_place(&operand)
         {
             self.predicate_checks(place, &ty, span)?;
         }

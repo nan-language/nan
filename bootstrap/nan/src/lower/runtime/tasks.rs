@@ -1,6 +1,6 @@
 //! Tasks: their records and stacks, the run queue, the protocol by which a task parks and a
-//! waker makes it ready, the scheduler each executor thread runs, the start and end of a task,
-//! and the waits of tasks on kernel operations.
+//! waker makes it ready, the scheduler each executor thread runs, the time each task runs, the
+//! start and end of a task, and the waits of tasks on kernel operations.
 //!
 //! A task's state word moves from running to parking when it suspends, then to parked once its
 //! executor thread has switched away from its stack; a waker turns new or parked into ready,
@@ -17,9 +17,10 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use super::super::fx::{Fx, PTR};
 use super::super::host;
 use super::super::machine::Stub;
+use super::super::machine::schedule::HOOK_STACK;
 use super::super::{CALL_CONV, Lowering, stack};
 use super::regions::origin;
-use super::{Routine, state, system};
+use super::{Routine, state, system, tables};
 use crate::check::db::ItemId;
 use crate::nir::Span;
 
@@ -88,7 +89,19 @@ pub mod task {
     pub const ORDER: u64 = 272;
     /// On a kernel, nonzero while an interrupt that preempted the task waits to return into it.
     pub const PREEMPTED: u64 = 280;
-    pub const SIZE: u64 = 288;
+    /// The handle of the executor it was started on, and that executor's share, packed.
+    pub const EXECUTOR: u64 = 288;
+    pub const SHARE: u64 = 296;
+    /// The handle of the serial executor whose turn it runs in, zero for none.
+    pub const SERIAL: u64 = 304;
+    /// The nanoseconds it has run.
+    pub const RAN: u64 = 312;
+    /// On a kernel, the key its placement gave, the index plus one of the CPU it last ran on and
+    /// that of the CPU whose queue holds it, zero for none.
+    pub const KEY: u64 = 320;
+    pub const CPU: u64 = 328;
+    pub const QUEUE: u64 = 336;
+    pub const SIZE: u64 = 344;
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
@@ -141,7 +154,8 @@ pub mod domain {
     pub const PARENT: u64 = 0;
     pub const POOLS: u64 = 8;
     pub const CHUNKS: u64 = 16;
-    /// Nonzero once a trap abandons it.
+    /// Zero while it runs, 1 once abandoned, and `CLOSED` once its first task's entry has ended
+    /// first.
     pub const ABANDONED: u64 = 24;
     /// The task waiting for the domain's first task to end, and the lock of that wait.
     pub const WAITER: u64 = 32;
@@ -157,6 +171,7 @@ pub mod domain {
     /// The handle of its cell, which the chunks passing to it are charged to.
     pub const CELL: u64 = 80;
     pub const SIZE: u64 = 88;
+    pub const CLOSED: i64 = 2;
 }
 
 /// The offsets of an operation record's fields: what a task waits on at a cancellation point,
@@ -224,7 +239,7 @@ pub const GUARD: u64 = 4_096;
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library
 /// functions that its calls of support routines run, whose use past the stub call bound the
-/// usable size does not count.
+/// usable size does not count; a kernel task's also holds a call of a policy hook.
 const ROUTINE_RESERVE: u64 = 32_768;
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation
@@ -242,6 +257,19 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Park => {
             fx.entry();
             park(lo, fx);
+            fx.b.ins().return_(&[]);
+        }
+        Routine::Ready => {
+            let params = fx.entry();
+            let admitted = super::serial::admit(lo, fx, params[0]);
+            fx.when(admitted, |fx| {
+                lo.call_routine(fx, Routine::Enqueue, &[params[0]]);
+            });
+            fx.b.ins().return_(&[]);
+        }
+        Routine::Enqueue => {
+            let params = fx.entry();
+            enqueue(lo, fx, params[0]);
             fx.b.ins().return_(&[]);
         }
         Routine::TaskStart => task_start(lo, fx),
@@ -446,9 +474,11 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.when(failed, |fx| {
         super::report::raise_kind(lo, fx, "trap.exhausted")
     });
-    let length =
-        fx.b.ins()
-            .iadd_imm_s(usable, (GUARD + ROUTINE_RESERVE + 15) as i64);
+    let reserve = match lo.kernel() {
+        true => ROUTINE_RESERVE + HOOK_STACK,
+        false => ROUTINE_RESERVE,
+    };
+    let length = fx.b.ins().iadd_imm_s(usable, (GUARD + reserve + 15) as i64);
     let length = fx.b.ins().band_imm_s(length, -16);
     let mapped = fx.b.ins().icmp_imm_s(IntCC::Equal, cell, 0);
     let stack = fx.choose_in(
@@ -658,10 +688,20 @@ pub fn spawned(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     super::seeded::scheduling_point(lo, fx);
 }
 
-/// Appends a ready task to the run queue, waking an idle executor thread.
+/// Makes a ready task run once its serial executor's turn admits it.
 pub fn push_ready(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    lo.call_routine(fx, Routine::Ready, &[record]);
+}
+
+/// Appends a ready task to the run queue, waking an idle executor thread; on a kernel, places it
+/// on a CPU's queue.
+fn enqueue(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     if lo.seeded() {
         super::seeded::push_ready(lo, fx, record);
+        return;
+    }
+    if lo.kernel() {
+        lo.kernel_enqueue(fx, record);
         return;
     }
     let state_address = lo.state(fx);
@@ -710,7 +750,9 @@ pub fn pop_ready(lo: &mut Lowering, fx: &mut Fx) -> Value {
 
 /// The scheduler of an executor thread: runs ready tasks, handling the completions on its ring
 /// between them, and waits for a completion when no task is ready; the seeded scheduler
-/// chooses each task it runs and advances its virtual clock instead of waiting. Never returns.
+/// chooses each task it runs and advances its virtual clock instead of waiting, and a kernel's
+/// CPU takes its tasks from its own queue or steals them, idling as its policy says. Never
+/// returns.
 fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let header = fx.block();
@@ -719,9 +761,10 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     if lo.kernel() {
         lo.call_stub(fx, Stub::Cli, &[]);
     }
-    let record = match lo.seeded() {
-        true => super::seeded::pick(lo, fx),
-        false => pop_ready(lo, fx),
+    let record = match (lo.seeded(), lo.kernel()) {
+        (true, _) => super::seeded::pick(lo, fx),
+        (false, true) => lo.kernel_pick(fx),
+        (false, false) => pop_ready(lo, fx),
     };
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
     fx.choose_in(
@@ -734,9 +777,10 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
             Vec::new()
         },
         |lo, fx| {
-            match lo.seeded() {
-                true => super::seeded::idle(lo, fx),
-                false => system::idle(lo, fx),
+            match (lo.seeded(), lo.kernel()) {
+                (true, _) => super::seeded::idle(lo, fx),
+                (false, true) => lo.kernel_idle(fx),
+                (false, false) => system::idle(lo, fx),
             }
             Vec::new()
         },
@@ -749,7 +793,8 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
 
 /// Switches to a ready task until it parks or ends, then settles its state; an ended task's
 /// stack returns. A task asked to stop is not switched to, and one that parks or is notified
-/// while asked to stop, or that traps, becomes stopped.
+/// while asked to stop, or that traps, becomes stopped. A task that parks, ends or stops passes
+/// on its serial executor's turn.
 fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let asked = stop_asked(fx, record);
@@ -757,7 +802,8 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         lo,
         asked,
         &[],
-        |_, fx| {
+        |lo, fx| {
+            lo.call_routine(fx, Routine::Turn, &[record]);
             let stopped = fx.int(types::I32, run::STOPPED);
             fx.b.ins()
                 .atomic_store(MemFlagsData::trusted(), stopped, word);
@@ -770,7 +816,8 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     );
 }
 
-/// Runs a task on the executor thread until it switches away, then settles its state.
+/// Runs a task on the executor thread until it switches away, charging the time it ran, then
+/// settles its state.
 fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
@@ -779,6 +826,10 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         .atomic_store(MemFlagsData::trusted(), running, word);
     fx.store(record, thread, thread::CURRENT);
     fx.store(thread, record, task::THREAD);
+    let started = (!lo.seeded()).then(|| lo.now_ns(fx));
+    if lo.kernel() {
+        lo.kernel_switch_in(fx, record, started.expect("the time a kernel task starts"));
+    }
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
     if lo.kernel() {
@@ -802,6 +853,14 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         );
     }
     lo.switch_stacks(fx, scheduler, context, record);
+    if lo.kernel() {
+        lo.kernel_switch_out(fx);
+    }
+    if let Some(started) = started {
+        let ended = lo.now_ns(fx);
+        let ran = fx.b.ins().isub(ended, started);
+        charge(lo, fx, record, ran);
+    }
     let thread = lo.thread(fx);
     let zero = fx.ptr(0);
     fx.store(zero, thread, thread::CURRENT);
@@ -820,15 +879,22 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         lo,
         stops,
         &[],
-        |_, fx| {
+        |lo, fx| {
+            lo.call_routine(fx, Routine::Turn, &[record]);
             let stopped = fx.int(types::I32, run::STOPPED);
             fx.b.ins()
                 .atomic_store(MemFlagsData::trusted(), stopped, word);
             Vec::new()
         },
         |lo, fx| {
-            // A task switching away notified was woken after it parked, or was preempted.
+            // A task switching away notified was woken after it parked, or was preempted, and
+            // keeps its serial executor's turn; one parking passes it on before it is parked, so
+            // a wake once parked finds the turn passed.
             let parking = fx.b.ins().icmp_imm_s(IntCC::Equal, state_now, run::PARKING);
+            let ending = fx.b.ins().bor(parking, ended);
+            fx.when(ending, |fx| {
+                lo.call_routine(fx, Routine::Turn, &[record]);
+            });
             let notified =
                 fx.b.ins()
                     .icmp_imm_s(IntCC::Equal, state_now, run::NOTIFIED);
@@ -861,6 +927,47 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             Vec::new()
         },
     );
+}
+
+/// Adds `ns` to the time a task ran and to the time its executor's entry and each entry that
+/// entry derives from account, while the executor's handle is live; a task started outside any
+/// executor records the zero handle.
+fn charge(lo: &mut Lowering, fx: &mut Fx, record: Value, ns: Value) {
+    let ran = fx.load(PTR, record, task::RAN);
+    let ran = fx.b.ins().iadd(ran, ns);
+    fx.store(ran, record, task::RAN);
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let handle = fx.load(PTR, record, task::EXECUTOR);
+    let live = tables::live_entry(lo, fx, handle);
+    let started = fx.b.ins().icmp_imm_s(IntCC::NotEqual, handle, 0);
+    let zero = fx.ptr(0);
+    let first = fx.b.ins().select(started, live, zero);
+    fx.repeat(&[first], |fx, state| {
+        let entry = state[0];
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+        let next = fx.choose_in(
+            lo,
+            present,
+            &[PTR],
+            |lo, fx| {
+                let used = fx.load(PTR, entry, tables::entry::USED);
+                let used = fx.b.ins().iadd(used, ns);
+                fx.store(used, entry, tables::entry::USED);
+                let source = fx.load(types::I32, entry, tables::entry::SOURCE);
+                let source = fx.b.ins().uextend(PTR, source);
+                let derived = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
+                let index = fx.b.ins().iadd_imm_s(source, -1);
+                let parent = tables::entry_at(lo, fx, index);
+                let zero = fx.ptr(0);
+                vec![fx.b.ins().select(derived, parent, zero)]
+            },
+            |_, fx| vec![fx.ptr(0)],
+        )[0];
+        (present, vec![next])
+    });
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
 }
 
 /// Whether the abandoning of a task's domain asks it to stop.

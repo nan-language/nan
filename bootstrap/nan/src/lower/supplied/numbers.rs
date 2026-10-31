@@ -18,6 +18,7 @@ use crate::check::ty::{Scalar, Ty};
 use crate::nir::{
     BitConversion, BitsOwner, BlockId, Callable, Conversion, FnRef, NTy, Operand, Value as NirValue,
 };
+use crate::workspace::Arch;
 
 /// Checks, at a call outside std of a scalar's division or shift method, the conditions on its
 /// operands that the method's rules trap on, so that the report names the call and shows its
@@ -90,17 +91,15 @@ pub fn conversion(
     let source = nty.ty().scalar().expect("a scalar converted");
     let repr = body.lo.owned_repr(nty.ty());
     let value = body.adapt(held, &nty, repr).scalar();
-    let target_ty = scalar_type(target);
+    let ty = scalar_type(target, body.lo.machine());
     let checked = body.checked(block, position);
     match conversion {
-        Conversion::Widen => Held::Scalar(widen(body.fx, value, source, target)),
-        Conversion::Truncate => {
-            Held::Scalar(super::super::place::resize(body.fx, value, target_ty))
-        }
-        Conversion::Saturate => Held::Scalar(saturate(body.fx, value, source, target)),
-        Conversion::Nearest => Held::Scalar(nearest(body.fx, value, source, target)),
+        Conversion::Widen => Held::Scalar(widen(body.fx, value, source, target, ty)),
+        Conversion::Truncate => Held::Scalar(super::super::place::resize(body.fx, value, ty)),
+        Conversion::Saturate => Held::Scalar(saturate(body.fx, value, source, target, ty)),
+        Conversion::Nearest => Held::Scalar(nearest(body.fx, value, source, target, ty)),
         Conversion::Fit | Conversion::CheckedFit => {
-            let (converted, fits) = fit(body.fx, value, source, target);
+            let (converted, fits) = fit(body.fx, value, source, target, ty);
             if conversion == Conversion::Fit {
                 if checked {
                     let operands = Operands::Values(
@@ -125,8 +124,7 @@ pub fn option_of(body: &mut Body, option: &Ty, present: Value, value: Held) -> H
     body.lo.held_at(body.fx, option, slot)
 }
 
-fn widen(fx: &mut Fx, value: Value, source: Scalar, target: Scalar) -> Value {
-    let ty = scalar_type(target);
+fn widen(fx: &mut Fx, value: Value, source: Scalar, target: Scalar, ty: Type) -> Value {
     match (source.is_float(), target.is_float()) {
         (false, false) => match (source.is_signed(), source.bits() < target.bits()) {
             (true, true) => fx.b.ins().sextend(ty, value),
@@ -157,8 +155,7 @@ fn integer64(fx: &mut Fx, value: Value, scalar: Scalar) -> Value {
 }
 
 /// A conversion that keeps the value exactly, with whether it did.
-fn fit(fx: &mut Fx, value: Value, source: Scalar, target: Scalar) -> (Value, Value) {
-    let ty = scalar_type(target);
+fn fit(fx: &mut Fx, value: Value, source: Scalar, target: Scalar, ty: Type) -> (Value, Value) {
     match (source.is_float(), target.is_float()) {
         (false, false) => {
             let (low, high) = target.range();
@@ -274,8 +271,7 @@ pub fn trunc(fx: &mut Fx, value: Value) -> Value {
     fx.b.ins().select(small, signed, value)
 }
 
-fn saturate(fx: &mut Fx, value: Value, source: Scalar, target: Scalar) -> Value {
-    let ty = scalar_type(target);
+fn saturate(fx: &mut Fx, value: Value, source: Scalar, target: Scalar, ty: Type) -> Value {
     if source.is_float() {
         return match target.is_signed() {
             true => fx.b.ins().fcvt_to_sint_sat(ty, value),
@@ -297,8 +293,7 @@ fn saturate(fx: &mut Fx, value: Value, source: Scalar, target: Scalar) -> Value 
     fx.b.ins().select(fits, kept, bound)
 }
 
-fn nearest(fx: &mut Fx, value: Value, source: Scalar, target: Scalar) -> Value {
-    let ty = scalar_type(target);
+fn nearest(fx: &mut Fx, value: Value, source: Scalar, target: Scalar, ty: Type) -> Value {
     match (source.is_float(), target.is_float()) {
         (false, true) => {
             let wide = integer64(fx, value, source);
@@ -379,7 +374,8 @@ pub fn bits(
     }
 }
 
-fn to_bits(fx: &mut Fx, value: Value) -> Value {
+/// A float's bit pattern, or the value itself where it already is one.
+pub fn to_bits(fx: &mut Fx, value: Value) -> Value {
     match fx.b.func.dfg.value_type(value) {
         types::F32 => fx.b.ins().bitcast(types::I32, MemFlagsData::new(), value),
         types::F64 => fx.b.ins().bitcast(types::I64, MemFlagsData::new(), value),
@@ -387,7 +383,9 @@ fn to_bits(fx: &mut Fx, value: Value) -> Value {
     }
 }
 
-fn from_bits(fx: &mut Fx, value: Value, target: Type) -> Value {
+/// A bit pattern as a value of `target`: a float's from its pattern, any other type's the pattern
+/// itself.
+pub fn from_bits(fx: &mut Fx, value: Value, target: Type) -> Value {
     match target {
         types::F32 | types::F64 => fx.b.ins().bitcast(target, MemFlagsData::new(), value),
         _ => value,
@@ -481,6 +479,9 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "wrapping_add" => Held::Scalar(fx.b.ins().iadd(value(0), value(1))),
         "wrapping_sub" => Held::Scalar(fx.b.ins().isub(value(0), value(1))),
         "wrapping_mul" => Held::Scalar(fx.b.ins().imul(value(0), value(1))),
+        "count_ones" if lo.machine() && lo.ck.db.target.arch() == Some(Arch::Aarch64) => {
+            Held::Scalar(ones(fx, value(0)))
+        }
         "count_ones" => count(fx, value(0), "popcnt"),
         "leading_zeros" => count(fx, value(0), "clz"),
         "trailing_zeros" => count(fx, value(0), "ctz"),
@@ -513,9 +514,42 @@ fn count(fx: &mut Fx, value: Value, op: &str) -> Held {
     Held::Scalar(super::super::place::resize(fx, counted, types::I32))
 }
 
+/// The count of set bits without `popcnt`, which AArch64 computes in its vector registers: each
+/// nibble's count by three subtractions of the value shifted and masked, the nibbles summed into
+/// bytes, and the bytes into the top one by a multiplication, in 32 bits for the narrower types.
+fn ones(fx: &mut Fx, value: Value) -> Value {
+    let wide = fx.b.func.dfg.value_type(value) == types::I64;
+    let value = match wide {
+        true => value,
+        false => super::super::place::resize(fx, value, types::I32),
+    };
+    let (sevens, nibbles, units, top) = match wide {
+        true => (
+            0x7777_7777_7777_7777,
+            0x0F0F_0F0F_0F0F_0F0F,
+            0x0101_0101_0101_0101,
+            56,
+        ),
+        false => (0x7777_7777, 0x0F0F_0F0F, 0x0101_0101, 24),
+    };
+    let mut count = value;
+    let mut shifted = value;
+    for _ in 0..3 {
+        let halved = fx.b.ins().ushr_imm_s(shifted, 1);
+        shifted = fx.b.ins().band_imm_s(halved, sevens);
+        count = fx.b.ins().isub(count, shifted);
+    }
+    let folded = fx.b.ins().ushr_imm_s(count, 4);
+    let pairs = fx.b.ins().iadd(folded, count);
+    let bytes = fx.b.ins().band_imm_s(pairs, nibbles);
+    let summed = fx.b.ins().imul_imm_s(bytes, units);
+    let counted = fx.b.ins().ushr_imm_s(summed, top);
+    super::super::place::resize(fx, counted, types::I32)
+}
+
 fn division(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, scalar: Scalar) -> Held {
     let (a, b) = (supply.param(0).scalar(), supply.param(1).scalar());
-    let ty = scalar_type(scalar);
+    let ty = scalar_type(scalar, lo.machine());
     let zero_divisor = fx.b.ins().icmp_imm_s(IntCC::Equal, b, 0);
     fx.when(zero_divisor, |fx| {
         super::super::runtime::report::raise_kind(lo, fx, "trap.division-by-zero")

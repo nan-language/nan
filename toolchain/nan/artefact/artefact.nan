@@ -24,9 +24,25 @@ pkg struct Parts {
     /// Each file holding the first line of a span, by path as spans write it, with each such
     /// line's number and text, in line order.
     pkg lines: mem::List[FileLines]
-    /// Each component state's canonical path and schema hash.
+    /// The canonical path of each type whose schema tree the code root records, with the tree's
+    /// `mem::wire` encoding.
     pkg schemas: mem::List[Schema]
+    pkg protocols: mem::List[ProtocolRoot]
 } Parts
+
+/// A `pub` protocol as a code root records it: its canonical path, its protocol hash, and the
+/// name and operation hash of each of its `pub` operations.
+pkg struct ProtocolRoot {
+    pkg path: text::String
+    pkg hash: hashing::HashValue
+    pkg operations: mem::List[NamedHash]
+} ProtocolRoot
+
+/// A name and a hash.
+pkg struct NamedHash {
+    pkg name: text::String
+    pkg hash: hashing::HashValue
+} NamedHash
 
 /// A module's name and the text of its API snapshot.
 pkg struct Snapshot {
@@ -45,10 +61,10 @@ pkg struct Line {
     pkg text: text::String
 } Line
 
-/// A component state's canonical path and schema hash.
+/// A type's canonical path and the `mem::wire` encoding of its schema tree.
 pkg struct Schema {
     pkg path: text::String
-    pkg hash: hashing::HashValue
+    pkg tree: mem::Bytes
 } Schema
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -124,10 +140,24 @@ pkg fn code_root(parts: Parts, alloc: mem::Alloc) -> mem::Bytes {
     var schemas = mem::List[mem::Bytes].empty(alloc)
     for schema in parts.schemas {
         var out = text_of(schema.path.as_str(), alloc)
-        encoding::bytes(mut out, value: schema.hash.bytes.view())
+        encoding::bytes(mut out, value: schema.tree.view())
         mut schemas.push(take out)
     }
     mut record.field(10, content: sorted_list(take schemas, alloc))
+    if parts.protocols.len() > 0 {
+        var protocols = mem::List[mem::Bytes].empty(alloc)
+        for protocol in parts.protocols {
+            var out = text_of(protocol.path.as_str(), alloc)
+            mut out.append(hash_bytes(protocol.hash, alloc).view())
+            encoding::uvar(mut out, value: u64.widen(protocol.operations.len()))
+            for operation in protocol.operations {
+                mut out.append(text_of(operation.name.as_str(), alloc).view())
+                mut out.append(hash_bytes(operation.hash, alloc).view())
+            }
+            mut protocols.push(take out)
+        }
+        mut record.field(11, content: sorted_list(take protocols, alloc))
+    }
     return take record.finish(alloc)
 } code_root
 
@@ -426,6 +456,53 @@ pkg fn Decoded.accepted(self, pinned: Option[core::crypto::PublicKey], principal
     let message = artefact_message(publisher.principal.as_str(), key: publisher.key, root: self.code_root.view(), attested: self.attestation.view(), provenance: sections.provenance.view(), alloc)
     return self.certified_root(sections.certificate.view(), alloc) and publisher.verifies(message.view()) and builder.verifies(certificate_message(take certified, alloc).view())
 } Decoded.accepted
+
+/// The source tree hash its attestation file records, none when that file holds none.
+pkg fn Decoded.source_tree(self, alloc: mem::Alloc) -> Option[hashing::HashValue] {
+    let Some(fields) = whole_record(self.attestation.view(), alloc) else {
+        return None
+    }
+    return hash_field(fields.view(), key: 2)
+} Decoded.source_tree
+
+/// The schema tree of each type its code root records, by canonical path, as its `mem::wire`
+/// encoding; none when the code root holds no such list.
+pkg fn Decoded.schema_trees(self, alloc: mem::Alloc) -> Option[mem::List[Schema]] {
+    let Some(fields) = whole_record(self.code_root.view(), alloc) else {
+        return None
+    }
+    let Some(content) = field_copy(fields.view(), key: 10, alloc) else {
+        return None
+    }
+    let held = content.view()
+    let Some(count) = read_uvar(held, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var trees = mem::List[Schema].empty(alloc)
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(path) = read_bytes(held, at) else {
+            return None
+        }
+        let Some(tree) = read_bytes(held, at: path.next) else {
+            return None
+        }
+        let Ok(written) = attempt text::String.try_from_utf8(path.copy(held, alloc).view(), alloc) else {
+            return None
+        }
+        mut trees.push(Schema(path: take written, tree: tree.copy(held, alloc)))
+        at = tree.next
+        index += 1
+    }
+    if at != held.len() {
+        return None
+    }
+    return Some(take trees)
+} Decoded.schema_trees
 
 /// The public key of the artefact's publisher, when it holds sections.
 pkg fn Decoded.publisher_key(self, alloc: mem::Alloc) -> Option[core::crypto::PublicKey] {
@@ -862,6 +939,7 @@ fn sample_parts(alloc: mem::Alloc) -> Parts {
         ledger: mem::List[mem::Bytes].empty(alloc),
         lines: take files,
         schemas: mem::List[Schema].empty(alloc),
+        protocols: mem::List[ProtocolRoot].empty(alloc),
     )
 } sample_parts
 

@@ -11,6 +11,8 @@ enum Instance derives Eq, Hash {
     /// A method of an interface that a type implements through a conformance the toolchain
     /// supplies; `args` are the method's own type arguments.
     Conformance(ty: ty::Ty, method: text::String, args: ty::Args)
+    /// An operation of a protocol, or its summary, called through an outbox.
+    Operation(protocol: ty::ItemId, method: u32)
     /// The release of a value of a type.
     Release(ty::Ty)
     /// The code of a function value naming a function: the instance its list holds, called
@@ -40,6 +42,8 @@ enum Glue derives Eq, Hash {
     RaceEnd
     /// What the executor thread does once a race's task has ended.
     RaceDone
+    /// What a domain's first task does once its entry ends: closes the domain.
+    DomainEnd
     /// What the executor thread does once a domain's first task has ended.
     DomainDone
     /// What the executor thread does once a kernel anchor's first task has ended.
@@ -98,6 +102,8 @@ enum Glue derives Eq, Hash {
     WithdrawRun
     /// Withdraws a stopped poster's entry from a runner's intake.
     WithdrawPost
+    /// Withdraws a stopped holder's wait on its stepper.
+    WithdrawStepper
     /// Withdraws a waiting operation from the sim waiter slot its record names.
     SimWithdraw
     /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
@@ -112,20 +118,22 @@ enum Glue derives Eq, Hash {
     /// Moves the captures of a task closure, the closure function's instance, into another
     /// domain's reach.
     Captures(Instance)
+    /// Calls a hook of a kernel policy of a type.
+    Policy(hook: Hook, ty: ty::Ty)
 } Glue
 
 /// Whether a stopping task does not stop inside the glue: one completing the end of a
 /// task or of a construct.
 fn Glue.critical(self) -> bool {
     return match self {
-        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
+        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainEnd or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.WithdrawStepper or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
         else => false
     }
 } Glue.critical
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: Str = "sys::Domain task::Sender task::Receiver task::Scope sys::Cx sys::Outbox mem::Shared task::Cown"
+const CRITICAL_OWNERS: Str = "sys::Domain task::Sender task::Receiver task::Scope sys::Cx sys::Outbox mem::Shared task::Cown hw::Ring0 hw::Dma hw::DmaShared hw::Iommu hw::IoDomain hw::PciFunction"
 
 /// The outcome of lowering a final closure.
 pkg struct Lowered {
@@ -171,11 +179,15 @@ pkg struct Program {
     pkg dump: bool
     /// The code an earlier lowering compiled, as its build cache entry holds it.
     pkg kept: mem::Bytes
+    /// The codegen level of the program's manifest for the target's architecture.
+    pkg level: Option[workspace::Level]
 } Program
 
 struct Lowering {
     ck: check::Checker
     module: object::Module
+    /// The codegen level the image's code is generated for, none for the base set.
+    level: Option[workspace::Level]
     layouts: Layouts
     prefixes: mem::HashMap[text::String, text::String]
     roots: mem::List[ty::PackageId]
@@ -196,8 +208,8 @@ struct Lowering {
     glue: u32
     state_id: Option[object::DataId]
     thread_id: Option[object::DataId]
-    /// A machine image's compiler stubs, its vector seam, the data objects it reserves by name,
-    /// and the sizes of its interrupt stacks once declared.
+    /// The image's compiler stubs, and a machine image's vector seam, the data objects it reserves
+    /// by name and the sizes of its interrupt stacks, once declared.
     machine_stubs: mem::HashMap[Stub, object::FuncId]
     vector_seam_id: Option[object::FuncId]
     reservations: mem::HashMap[text::String, object::DataId]
@@ -248,6 +260,7 @@ fn Instance.copy(self, alloc: mem::Alloc) -> Instance {
         Instance.Supplied(item: item, args: args) => return Instance.Supplied(item: item, args: args)
         Instance.Derived(owner: owner, method: method, args: args) => return Instance.Derived(owner: owner, method: text::String.of(method.as_str(), alloc), args: args)
         Instance.Conformance(ty: ty, method: method, args: args) => return Instance.Conformance(ty: ty, method: text::String.of(method.as_str(), alloc), args: args)
+        Instance.Operation(protocol: protocol, method: method) => return Instance.Operation(protocol: protocol, method: method)
         Instance.Release(ty) => return Instance.Release(ty)
         Instance.Value(inner) => {
             expect inner.len() > 0
@@ -279,7 +292,7 @@ fn Instance.sides_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
 /// artefacts of its `.nan` section.
 pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValue) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     entry_seam(mut lowering, program)
@@ -292,7 +305,7 @@ pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValu
 /// image.
 pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     let boot = mut lowering.boot_glue(program)
@@ -320,13 +333,15 @@ fn copied_roots(roots: Slice[ty::PackageId], alloc: mem::Alloc) -> mem::List[ty:
     return copied
 } copied_roots
 
-/// A lowering into a new object, of a test image when `test_runtime` is given.
-fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], take test_runtime: Option[Runtime]) -> Lowering {
+/// A lowering into a new object, for a codegen level when `level` is given, of a test image when
+/// `test_runtime` is given.
+fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], level: Option[workspace::Level], take test_runtime: Option[Runtime]) -> Lowering {
     let alloc = ck.alloc()
     let target = ck.db().target
     return Lowering(
         ck: take ck,
-        module: object::Module.new(target, alloc),
+        module: object::Module.new(target, level, alloc),
+        level: level,
         layouts: Layouts.new(alloc),
         prefixes: take prefixes,
         roots: take roots,
@@ -455,10 +470,17 @@ fn Lowering.define_instance(mut self, instance: Instance, id: object::FuncId) {
 
 fn Lowering.lower_instance(mut self, mut fx: Fx, instance: Instance, abi: Abi) {
     match instance {
-        Instance.Nir(item: item, role: role, index: index, args: args) => body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
+        Instance.Nir(item: item, role: role, index: index, args: args) => {
+            if role == nir::Role.Body and not self.machine() and self.ck.db().is_std(item) and simd_vectorized(self.ck.db().canonical(item).as_str()) {
+                simd_lower_vector(mut self, mut fx, abi, item, args)
+            } else {
+                body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
+            }
+        }
         Instance.Supplied(item: item, args: args) => supplied_lower(mut self, mut fx, abi, item, args)
         Instance.Derived(owner: owner, method: method, args: args) => conform_derived(mut self, mut fx, abi, owner, method: method.as_str(), args)
         Instance.Conformance(ty: ty, method: method, args: _) => supplied(mut self, mut fx, abi, ty, method: method.as_str())
+        Instance.Operation(protocol: protocol, method: method) => protocols_call(mut self, mut fx, abi, protocol, method: usize.widen(method))
         Instance.Release(ty) => release_define(mut self, mut fx, ty)
         Instance.Value(inner) => {
             expect inner.len() > 0
@@ -485,7 +507,12 @@ fn Lowering.describe_frame(mut self, instance: Instance, abi: Abi, id: object::F
     for position in 0..<abi.params.len() {
         match types.kind(abi.params[position].nty.ty()) {
             ty::TyKind.Fn(fn_ty) => {
-                mut params.push(ParamStack(position: position, stack: types.fn_of(fn_ty).limit_set.stack))
+                let param_fn = types.fn_of(fn_ty)
+                var stack = param_fn.limit_set.stack
+                if param_fn.kind == ast::FnKind.Task {
+                    stack = None
+                }
+                mut params.push(ParamStack(position: position, stack: stack))
             }
             else => {}
         }
@@ -542,7 +569,7 @@ fn Lowering.body_demands(self, mut demanded: mem::List[u64], item: ty::ItemId) {
         return
     }
     let sig = self.ck.sig(implemented.item)
-    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+    let Some(methods) = sig.contents().kind.methods() else {
         return
     }
     expect implemented.method < methods.len()
@@ -560,8 +587,8 @@ fn push_stack(mut demanded: mem::List[u64], stack: Option[u64]) {
 /// The line table flags of an instance's function: trap reports leave out the frames of
 /// std items and of the code lowering writes itself, and a stopping task does not stop
 /// inside a std function of a type with interior mutability or of `task::Sender`,
-/// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared` or
-/// `task::Cown`.
+/// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared`, `task::Cown`,
+/// `hw::Ring0`, `hw::Dma`, `hw::DmaShared`, `hw::Iommu`, `hw::IoDomain` or `hw::PciFunction`.
 fn Lowering.frame_flags(self, instance: Instance) -> u32 {
     var hidden = true
     var critical = false
@@ -573,6 +600,9 @@ fn Lowering.frame_flags(self, instance: Instance) -> u32 {
         Instance.Supplied(item: item, args: args) => {
             hidden = self.ck.db().is_std(item)
             critical = hidden and self.critical_owner(item, args)
+        }
+        Instance.Operation(protocol: _, method: _) => {
+            critical = true
         }
         else => {}
     }
@@ -719,10 +749,33 @@ fn Lowering.glue_function(mut self, take glue: Glue, take signature: clif::Signa
     if glue.critical() {
         flags = LINES_HIDDEN | LINES_CRITICAL
     }
+    var walked: Option[text::String] = None
+    match glue {
+        Glue.Transfer(moved) => {
+            match self.ck.types().kind(moved) {
+                ty::TyKind.Item(item: item, args: _) => {
+                    walked = Some(self.ck.show(moved, from: self.ck.db().module_of(item)))
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
     discard mut self.glues.insert(take glue, value: id)
     mut self.define(id, take signature, flags, build)
+    match walked {
+        Some(walked_name) => {
+            expect self.frames.len() > 0
+            let last = self.frames.len() - 1
+            self.frames[last].name = walked_name
+        }
+        None => {}
+    }
     return id
 } Lowering.glue_function
+
+/// The function of a glue already asked for.
+fn Lowering.known_glue(self, glue: Glue) -> Option[object::FuncId] = self.glues.get(glue)
 
 /// Marks the code `fx` emits next as coming from a span of an item's file.
 fn Lowering.locate(mut self, mut fx: Fx, item: ty::ItemId, span: nir::Span) {

@@ -1,0 +1,231 @@
+//! Routes the PL011's interrupt to CPU 1 and raises it through the UART's loopback, then shares it with a second device, then installs a device on an LPI of CPU 2 and writes its message.
+
+/// The vector of the PL011's interrupt, which the virt board routes to SPI 1.
+const UART_VECTOR: u8 = 33
+
+const PL011_BASE: u64 = 0x0900_0000
+
+/// The control word enabling the UART, its transmitter and receiver; the same in loopback, which
+/// feeds its request to send back as clear to send; and the same requesting to send.
+const UART_ON: u32 = 0x0000_0301
+
+const UART_LOOPBACK: u32 = 0x0000_0381
+
+const REQUEST_TO_SEND: u32 = 0x0000_0800
+
+/// The clear-to-send modem interrupt's mask bit, and every interrupt cleared at once.
+const CLEAR_TO_SEND_INTERRUPT: u32 = 0x0000_0002
+
+const ALL_INTERRUPTS: u32 = 0x0000_07FF
+
+/// The page of the ITS's translation register, the offset of that register in it, and the polls
+/// of a device's runs before the kernel gives up.
+const TRANSLATION_PAGE: u64 = 0x0809_0000
+
+const TRANSLATER: u64 = 0x40
+
+const POLLS: u32 = 50_000_000
+
+registers Pl011 {
+    data: u8 at 0x0 write
+    control: u32 at 0x30 write
+    interrupt_mask: u32 at 0x38 write
+    masked_interrupts: u32 at 0x40 read
+    interrupt_clear: u32 at 0x44 write
+} Pl011
+
+registers Translation {
+    translater: u32 at 0x40 write
+} Translation
+
+/// What an interrupt fn records: the CPU numbers, the runs and the CPU of the last run.
+struct Probe {
+    cpus: hw::PerCpu[u32]
+    runs: u64
+    cpu: u32
+} Probe
+
+/// The UART in loopback and the probe of its clear-to-send interrupt.
+linear struct Console {
+    port: hw::Mmio[Pl011]
+    probe: Probe
+} Console
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it while no console is installed" { hw::Mmio[Pl011].map(PL011_BASE) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+/// Writes `value` in hexadecimal.
+fn say_hex(value: u64) {
+    var digits = Array[u8, 16].filled(b'0')
+    var rest = value
+    var leading: usize = 15
+    for at in 0..<16usize {
+        let digit = u8.truncate(rest & 0xF)
+        let index = 15 - at
+        if digit < 10 {
+            digits[index] = b'0' + digit
+        } else {
+            digits[index] = b'A' + digit - 10
+        }
+        if digit != 0 {
+            leading = index
+        }
+        rest = rest >> 4
+    }
+    say(text: "0x")
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it while no console is installed" { hw::Mmio[Pl011].map(PL011_BASE) }
+    for at in leading..<16usize {
+        mut port.write(Pl011.data, value: digits[at])
+    }
+    take port.unmap()
+} say_hex
+
+/// Counts a run and records the CPU it ran on.
+fn Probe.ran(mut self, t: hw::IrqsDisabled) limits notrap, terminates, noalloc {
+    self.runs = self.runs.wrapping_add(1)
+    self.cpu = self.cpus.with(t, body: fn(mut cpu: u32) -> u32 limits notrap, terminates, noalloc {
+        return cpu
+    })
+} Probe.ran
+
+interrupt fn Probe.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    mut self.ran(irq.irqs_disabled())
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Probe.on_irq
+
+/// Ends the clear-to-send interrupt when it is pending.
+interrupt fn Console.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let pending = mut self.port.read(Pl011.masked_interrupts)
+    if (pending & CLEAR_TO_SEND_INTERRUPT) != 0 {
+        mut self.port.write(Pl011.interrupt_mask, value: 0)
+        mut self.port.write(Pl011.interrupt_clear, value: ALL_INTERRUPTS)
+        mut self.probe.ran(irq.irqs_disabled())
+    }
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Console.on_irq
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 32_768 {
+        if hw::cpu_count() < 3 {
+            say(text: "fewer than 3 cpus\n")
+            return
+        }
+        routed(alloc)
+        message_signalled(alloc)
+    })
+} main
+
+/// A probe with no runs.
+fn probe(alloc: mem::Alloc) -> Probe {
+    return Probe(cpus: hw::PerCpu.of(fn(cpu: u32) => cpu, alloc), runs: 0, cpu: 0)
+} probe
+
+/// Installs the console on the UART's vector for CPU 1 and raises clear to send through the
+/// loopback, then installs a probe on the same vector and raises it again.
+fn routed(alloc: mem::Alloc) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000, routed to SPI 1, and nothing else maps it while the console is installed" { hw::Mmio[Pl011].map(PL011_BASE) }
+    mut port.write(Pl011.control, value: UART_ON)
+    let console = hw::IrqShared.install_on(Console(port: take port, probe: probe(alloc)), cpu: 1, vector: UART_VECTOR, on_irq: Console.on_irq)
+    loop_back(console)
+    let alone = runs(console) == 1
+    let sharing = hw::IrqShared.install_on(probe(alloc), cpu: 1, vector: UART_VECTOR, on_irq: Probe.on_irq)
+    loop_back(console)
+    var shared_runs: u64 = 0
+    for _ in 0..<POLLS {
+        shared_runs = runs(console)
+        if shared_runs == 2 {
+            break
+        }
+    }
+    let Probe(cpus: _, runs: shared, cpu: shared_cpu) = take sharing.uninstall()
+    let Console(port: released, probe: Probe(cpus: _, runs: _, cpu: console_cpu)) = take console.uninstall()
+    var uart = released
+    mut uart.write(Pl011.control, value: UART_ON)
+    take uart.unmap()
+    check(name: "routed spi", held: alone and console_cpu == 1)
+    check(name: "shared spi", held: shared_runs == 2 and shared == 1 and shared_cpu == 1)
+} routed
+
+/// Puts the UART in loopback with clear to send low and its interrupt enabled, then requests to
+/// send, which the loopback raises as clear to send without transmitting a byte.
+fn loop_back(console: hw::IrqShared[Console]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        console.with(t, body: fn(mut device: Console) limits notrap, terminates, noalloc {
+            mut device.port.write(Pl011.control, value: UART_LOOPBACK)
+            mut device.port.write(Pl011.interrupt_mask, value: CLEAR_TO_SEND_INTERRUPT)
+            mut device.port.write(Pl011.control, value: UART_LOOPBACK | REQUEST_TO_SEND)
+        })
+    })
+} loop_back
+
+/// The runs of the console's probe once it has any, or after `POLLS` polls.
+fn runs(console: hw::IrqShared[Console]) -> u64 {
+    var seen: u64 = 0
+    for _ in 0..<POLLS {
+        seen = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+            return console.with(t, body: fn(mut device: Console) -> u64 limits notrap, terminates, noalloc {
+                return device.probe.runs
+            })
+        })
+        if seen != 0 {
+            break
+        }
+    }
+    return seen
+} runs
+
+/// Installs a probe on an LPI of CPU 2 for device id 0, the id the ITS gives the CPUs' writes,
+/// and writes its message to the ITS's translation register.
+fn message_signalled(alloc: mem::Alloc) {
+    match hw::IrqShared.install_msi(probe(alloc), cpu: 2, source: 0, on_irq: Probe.on_irq) {
+        Ok(device) => {
+            let message = device.message()
+            let Some(sent) = message else {
+                say(text: "msi without a message\n")
+                discard take device.uninstall()
+                return
+            }
+            var translation = trusted "the ITS's translation register lies at 0x0809_0040, which the entry root maps uncached, and nothing else maps it" { hw::Mmio[Translation].map(TRANSLATION_PAGE) }
+            mut translation.write(Translation.translater, value: sent.data)
+            take translation.unmap()
+            var ran: u64 = 0
+            for _ in 0..<POLLS {
+                ran = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+                    return device.with(t, body: fn(mut seen: Probe) -> u64 limits notrap, terminates, noalloc {
+                        return seen.runs
+                    })
+                })
+                if ran != 0 {
+                    break
+                }
+            }
+            let Probe(cpus: _, runs: _, cpu: cpu) = take device.uninstall()
+            say(text: "msi data ")
+            say_hex(value: u64.widen(sent.data))
+            say(text: " address ")
+            say_hex(value: sent.address)
+            check(name: "", held: ran == 1 and cpu == 2 and sent.address == TRANSLATION_PAGE + TRANSLATER)
+        }
+        Err(refusal) => {
+            say(text: "msi refused\n")
+            discard refusal
+        }
+    }
+} message_signalled

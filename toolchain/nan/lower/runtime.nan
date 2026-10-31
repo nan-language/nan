@@ -1,4 +1,4 @@
-//! The support routines: the fixed routines of the implementation that lowered code, compiler stubs and seams call, each named `_NS`, its routine's name, `_` and a suffix, with their state in the writable data object `_NSstate` and the thread-local `_NSthread`. `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the seeded scheduler of test images.
+//! The support routines: the fixed routines of the implementation that lowered code, compiler stubs and seams call, each named `_NS`, its routine's name, `_` and a suffix, with their state in the writable data object `_NSstate` and the thread-local `_NSthread`. `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability tables; `stack_switch` keeps tasks, their stacks, the executors' run queues and the turns of serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the seeded scheduler of test images.
 
 /// A support routine.
 enum Routine derives Copy, Eq, Hash {
@@ -61,7 +61,9 @@ enum Routine derives Copy, Eq, Hash {
     Rehome
     /// `(world)`: fills a root grant's capabilities and allocator.
     MintRoot
-    /// `(handle, kind) -> handle`: a new entry deriving from a capability's entry.
+    /// `(handle, word, floor, text, len) -> handle`: a new entry deriving from a capability's
+    /// live entry, its state word at offset `word` raised to at least `floor` and its text
+    /// extended or replaced by `text` when that is not zero; all ones for a stale handle.
     Derive
     /// `(handle)`: revokes an entry and every entry deriving from it.
     Revoke
@@ -72,8 +74,26 @@ enum Routine derives Copy, Eq, Hash {
     /// `(handle) -> runner`: the runner of a live outbox, taking a reference to its record;
     /// zero for a stale outbox.
     OutboxClaim
+    /// `(minter, low, high) -> handle`: a new entry of a capability kind belonging to a minter,
+    /// recording the two words of a record.
+    KindMint
+    /// `(handle, record) -> minter`: for a live entry of a capability kind, its minter, on whose
+    /// state the call counts one holder more, its record's two words written at `record`; zero
+    /// for a stale handle.
+    KindPin
+    /// `(handle, low, high) -> handle`: a new entry deriving from a live entry of a capability
+    /// kind and recording the two words of a record; all ones for a stale handle.
+    KindDerive
+    /// `(handle, minter)`: revokes an entry belonging to a minter and every entry deriving from
+    /// it.
+    KindRevoke
+    /// `(minter)`: revokes every entry belonging to a minter.
+    KindClose
     /// `(kind, operands, count, caller) -> Never`: traps the running task.
     TrapRaise
+    /// `(kind, record)`: writes into a trap record the report of a kind, without operands,
+    /// located at the call of the caller.
+    TrapReport
     /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
     Reacquired
     /// `(domain)`: settles an abandoned `sys::Domain` body.
@@ -101,6 +121,12 @@ enum Routine derives Copy, Eq, Hash {
     Spawn
     /// `(task)`: makes a task ready.
     Wake
+    /// `(task)`: makes a ready task run once its serial executor's turn admits it.
+    Ready
+    /// `(task)`: puts a ready task in a run queue.
+    Enqueue
+    /// `(task)`: passes on the turn of a task's serial executor when the task holds it.
+    Turn
     /// `()`: suspends the running task until a wake.
     Park
     /// `(task)`: the first code a task runs on its own stack.
@@ -143,6 +169,8 @@ enum Routine derives Copy, Eq, Hash {
     ClockNow
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw
+    /// `()`: under the IOMMU's lock, invalidates everything it caches and waits until it has.
+    IommuFlush
 } Routine
 
 /// The parameter and result types of a routine.
@@ -184,7 +212,13 @@ proj fn Routine.name(self) -> Str {
         Routine.OutboxMint => "_NScap_table_outbox_mint"
         Routine.OutboxRetire => "_NScap_table_outbox_retire"
         Routine.OutboxClaim => "_NScap_table_outbox_claim"
+        Routine.KindMint => "_NScap_table_kind_mint"
+        Routine.KindPin => "_NScap_table_kind_pin"
+        Routine.KindDerive => "_NScap_table_kind_derive"
+        Routine.KindRevoke => "_NScap_table_kind_revoke"
+        Routine.KindClose => "_NScap_table_kind_close"
         Routine.TrapRaise => "_NStrap_raise"
+        Routine.TrapReport => "_NStrap_report"
         Routine.Reacquired => "_NStrap_reacquired"
         Routine.ReportScalar => "_NStrap_scalar"
         Routine.Settle => "_NSsettle_domain"
@@ -197,6 +231,9 @@ proj fn Routine.name(self) -> Str {
         Routine.WriteErr => "_NStrap_write_err"
         Routine.Spawn => "_NSstack_switch_spawn"
         Routine.Wake => "_NSstack_switch_wake"
+        Routine.Ready => "_NSstack_switch_ready"
+        Routine.Enqueue => "_NSstack_switch_enqueue"
+        Routine.Turn => "_NSstack_switch_turn"
         Routine.Park => "_NSstack_switch_park"
         Routine.TaskStart => "_NSstack_switch_task_start"
         Routine.IoSubmit => "_NSstack_switch_io_submit"
@@ -216,6 +253,7 @@ proj fn Routine.name(self) -> Str {
         Routine.Stream => "_NSreplay_stream"
         Routine.ClockNow => "_NSstack_switch_clock_now"
         Routine.Draw => "_NSreplay_draw"
+        Routine.IommuFlush => "_NSiommu_flush"
     }
 } Routine.name
 
@@ -225,27 +263,29 @@ fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
     let int32 = clif::Type.Int32
     return match self {
         Routine.Copy or Routine.Fill => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
-        Routine.OutboxMint => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.OutboxMint or Routine.KindMint or Routine.KindDerive => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Compare => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(Some(int32), count: 0, trailing: None, alloc))
         Routine.Alloc => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.AllocIn => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
-        Routine.Split or Routine.Derive or Routine.Hold => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Split or Routine.Hold => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Derive => RoutineTypes(params: type_list(None, count: 5, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Lift => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: None, alloc))
         Routine.PoolAdd => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.PoolDraw or Routine.AllocLarge => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.FreeUnpooled => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.ChunkReturn or Routine.LockWait => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
-        Routine.Rehome => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Rehome or Routine.KindRevoke or Routine.TrapReport => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.KindPin => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.OutboxClaim or Routine.RegionOpen or Routine.RecordAlloc => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.RecordResize => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
-        Routine.Free or Routine.RecordFree or Routine.Close or Routine.TaskEnvFree or Routine.Unhold or Routine.MintRoot or Routine.Revoke or Routine.OutboxRetire or Routine.Wake or Routine.TaskStart or Routine.Cancel or Routine.CownRelease or Routine.Exit or Routine.ThreadMain or Routine.Terminations or Routine.Lock or Routine.Unlock or Routine.Settle or Routine.Reacquired or Routine.Stop => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Free or Routine.RecordFree or Routine.Close or Routine.TaskEnvFree or Routine.Unhold or Routine.MintRoot or Routine.Revoke or Routine.KindClose or Routine.OutboxRetire or Routine.Wake or Routine.Ready or Routine.Enqueue or Routine.Turn or Routine.TaskStart or Routine.Cancel or Routine.CownRelease or Routine.Exit or Routine.ThreadMain or Routine.Terminations or Routine.Lock or Routine.Unlock or Routine.Settle or Routine.Reacquired or Routine.Stop => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Preempt or Routine.Overflow or Routine.CpuLimit => RoutineTypes(params: type_list(Some(int32), count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.OverflowRaise => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.TrapRaise or Routine.ReportText => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.ReportScalar => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.WriteErr => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Spawn => RoutineTypes(params: type_list(None, count: 8, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
-        Routine.Park or Routine.Schedule or Routine.Yield => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Park or Routine.Schedule or Routine.Yield or Routine.IommuFlush => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Stream => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Draw => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Origin or Routine.Init or Routine.Thread or Routine.ClockNow => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
@@ -418,7 +458,44 @@ const STATE_CLOCK_SCALE: u64 = 376
 
 const STATE_CLOCK_LAST: u64 = 384
 
-const STATE_SIZE: u64 = 392
+/// On an x86_64 kernel, whether a CPU holds the shootdown lock, the scope its shootdown
+/// invalidates and the number of CPUs yet to serve it.
+const STATE_SHOOTDOWN_LOCK: u64 = 392
+
+const STATE_SHOOTDOWN_SCOPE: u64 = 400
+
+const STATE_SHOOTDOWN_LEFT: u64 = 408
+
+/// On a kernel, the lock of the bindings of installed devices; on an x86_64 kernel, nonzero
+/// when the local APICs run in x2APIC mode.
+const STATE_IRQ_LOCK: u64 = 416
+
+const STATE_X2APIC: u64 = 424
+
+/// On an AArch64 kernel whose interrupt controller has an ITS: its command queue and the
+/// offset of the next command, zero without one; the LPI property table; and the number of
+/// device ids it accepts.
+const STATE_ITS_QUEUE: u64 = 432
+
+const STATE_ITS_WRITE: u64 = 440
+
+const STATE_ITS_PROPERTIES: u64 = 448
+
+const STATE_ITS_DEVICES: u64 = 456
+
+/// On a kernel, the record of the policy `boot::Kernel.policy` installed, zero for the default
+/// one, and the last key the default policy gave.
+const STATE_POLICY: u64 = 464
+
+const STATE_TICKET: u64 = 472
+
+/// On a kernel, the unit record of the IOMMU `boot::Kernel.iommu` enabled, zero before; on an
+/// x86_64 kernel, the lock of the PCI configuration ports.
+const STATE_IOMMU: u64 = 480
+
+const STATE_PCI_LOCK: u64 = 488
+
+const STATE_SIZE: u64 = 496
 
 /// The function of a routine, declared now and defined once lowering reaches the end of its
 /// queue.
@@ -611,16 +688,18 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.PoolAdd or Routine.PoolDraw or Routine.AllocLarge or Routine.ChunkReturn or Routine.FreeUnpooled or Routine.LockWait => pools_define(mut lo, mut fx, routine)
         Routine.Split or Routine.Close or Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.TaskEnvFree => memory_define(mut lo, mut fx, routine)
         Routine.Hold or Routine.Unhold or Routine.Rehome => holdings_define(mut lo, mut fx, routine)
-        Routine.MintRoot or Routine.Derive or Routine.Revoke or Routine.OutboxMint or Routine.OutboxRetire or Routine.OutboxClaim => tables_define(mut lo, mut fx, routine)
-        Routine.TrapRaise or Routine.Reacquired or Routine.ReportScalar or Routine.ReportText or Routine.WriteErr or Routine.OverflowRaise => report_define(mut lo, mut fx, routine)
+        Routine.MintRoot or Routine.Derive or Routine.Revoke or Routine.OutboxMint or Routine.OutboxRetire or Routine.OutboxClaim or Routine.KindMint or Routine.KindPin or Routine.KindDerive or Routine.KindRevoke or Routine.KindClose => tables_define(mut lo, mut fx, routine)
+        Routine.TrapRaise or Routine.TrapReport or Routine.Reacquired or Routine.ReportScalar or Routine.ReportText or Routine.WriteErr or Routine.OverflowRaise => report_define(mut lo, mut fx, routine)
         Routine.Settle => settle_define(mut lo, mut fx, routine)
-        Routine.Spawn or Routine.Wake or Routine.Park or Routine.TaskStart or Routine.IoSubmit or Routine.Schedule or Routine.ThreadMain or Routine.Thread or Routine.Stop => tasks_define(mut lo, mut fx, routine)
+        Routine.Spawn or Routine.Wake or Routine.Ready or Routine.Enqueue or Routine.Park or Routine.TaskStart or Routine.IoSubmit or Routine.Schedule or Routine.ThreadMain or Routine.Thread or Routine.Stop => tasks_define(mut lo, mut fx, routine)
         Routine.RegionOpen or Routine.Cancel or Routine.Origin => regions_define(mut lo, mut fx, routine)
         Routine.CownRelease => release_routine(mut lo, mut fx)
         Routine.Yield or Routine.Stream => seeded_define(mut lo, mut fx, routine)
+        Routine.Turn => define_turn(mut lo, mut fx)
         Routine.ClockNow => define_clock_now(mut lo, mut fx)
         Routine.Draw => define_draw(mut lo, mut fx)
         Routine.Lock or Routine.Unlock => locks_define(mut lo, mut fx, routine)
+        Routine.IommuFlush => mut lo.define_iommu_flush(mut fx)
         Routine.Init or Routine.Exit or Routine.RecordAlloc or Routine.RecordFree or Routine.RecordResize => system_define(mut lo, mut fx, routine)
         Routine.Preempt or Routine.Overflow or Routine.CpuLimit or Routine.Terminations => host_define(mut lo, mut fx, routine)
     }

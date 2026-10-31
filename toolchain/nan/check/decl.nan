@@ -294,7 +294,7 @@ fn Checker.check_module_names(self, module: ty::ModuleId) {
         }
         discard mut seen.insert(text::String.of(name.text.as_str(), alloc), value: item)
         match node.kind {
-            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Interface(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => mut types.push(DeclaredName(item: item, name: take name))
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Interface(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) or ast::ItemKind.Protocol(_) => mut types.push(DeclaredName(item: item, name: take name))
             else => mut values.push(DeclaredName(item: item, name: take name))
         }
     }
@@ -366,7 +366,7 @@ fn Checker.names_part(self, key: TypeKey, name: Str) -> bool {
     match sig.contents().kind {
         SigKind.Struct(fields: fields) => return holds_field(fields.view(), name)
         SigKind.Layout(fields: fields, tags: _, bits: _) => return holds_field(fields.view(), name)
-        SigKind.Enum(variants: variants) => {
+        SigKind.Enum(variants: variants) or SigKind.Protocol(operations: _, variants: variants, summary: _) => {
             for variant in variants {
                 if variant.name.as_str() == name {
                     return true
@@ -407,6 +407,7 @@ fn Checker.check_item(self, item: ty::ItemId) {
         ast::ItemKind.Struct(structure) => self.check_struct_item(item, structure)
         ast::ItemKind.Enum(enumeration) => self.check_enum_item(item, enumeration)
         ast::ItemKind.Interface(declared) => self.check_interface_item(item, declared, sig)
+        ast::ItemKind.Protocol(declared) => self.check_protocol_item(item, declared, sig)
         ast::ItemKind.Layout(layout_item) => self.check_layout_item(item, layout_item)
         ast::ItemKind.Registers(register_block) => {
             self.check_registers(item)
@@ -436,6 +437,7 @@ fn Checker.check_item(self, item: ty::ItemId) {
         ast::ItemKind.Impl(_) => {
             if not self.check_generate_impl(item) and self.check_impl(item) {
                 self.check_capability_impl(item)
+                self.check_kind_impl(item)
                 self.check_decoder_impl(item)
                 self.check_component_impl(item)
             }
@@ -515,6 +517,7 @@ fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast
     self.check_thresholds(item, clauses: function.clauses.view(), body: lowered)
     match modifier {
         Some(ast::FnModifier.Validator) => self.check_validator(item, sig: fn_sig)
+        Some(ast::FnModifier.Migrate) => self.check_migration(item, function, sig: fn_sig)
         Some(ast::FnModifier.Landing) => {
             self.check_landing(item, sig: fn_sig)
             self.require(item, token: node.token, authority: workspace::Authority.Priv)
@@ -607,6 +610,24 @@ fn Checker.check_interface_item(self, item: ty::ItemId, declared: ast::Interface
     }
     self.check_method_clauses(item, declared)
 } Checker.check_interface_item
+
+/// The rules of a protocol item and its names.
+fn Checker.check_protocol_item(self, item: ty::ItemId, declared: ast::ProtocolItem, sig: Sig) {
+    self.check_type_name(item, name: declared.name)
+    for operation in declared.operations {
+        self.check_case(item, name: operation.method.name, case: Case.Snake)
+        self.check_params(item, params: operation.method.head.params.view())
+    }
+    match sig.kind {
+        SigKind.Protocol(operations: operations, variants: _, summary: _) => {
+            for index in 0..<declared.operations.len() {
+                self.check_fails(item, sig: operations[index].sig, head: declared.operations[index].method.head, bodiless: false)
+            }
+        }
+        else => {}
+    }
+    self.check_protocol(item, protocol: declared)
+} Checker.check_protocol_item
 
 /// The rules of a layout item and its names.
 fn Checker.check_layout_item(self, item: ty::ItemId, layout_item: ast::LayoutItem) {
@@ -799,6 +820,20 @@ fn Checker.check_interface_names(self, item: ty::ItemId) {
             }
         }
         ast::ItemKind.Interface(declared) => self.check_interface_types(item, module, declared, own)
+        ast::ItemKind.Protocol(declared) => {
+            for index in 0..<declared.operations.len() {
+                let operation = declared.operations[declared.operations.len() - 1 - index]
+                var required = openness(operation.visibility)
+                if own < required {
+                    required = own
+                }
+                self.check_head_types(item, module, head: operation.method.head, own: required)
+            }
+            match declared.summary {
+                Some(summary) => self.check_type_visible(item, module, ty: summary, required: own)
+                None => {}
+            }
+        }
         else => self.check_value_types_visible(item, module, node, own)
     }
 } Checker.check_interface_names
@@ -1117,6 +1152,7 @@ fn declared_name(item: ast::Item, alloc: mem::Alloc) -> Option[ast::Name] {
         ast::ItemKind.Registry(declared) => declared.name
         ast::ItemKind.Contribute(declared) => declared.name
         ast::ItemKind.Test(declared) => declared.name
+        ast::ItemKind.Protocol(declared) => declared.name
         else => return None
     }
     return Some(ast::Name(text: text::String.of(name.text.as_str(), alloc), token: name.token))

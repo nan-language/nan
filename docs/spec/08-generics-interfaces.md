@@ -356,7 +356,7 @@ Each instantiation behaves exactly as its generic item with every parameter repl
 
 ## Method resolution
 
-**Method resolution** finds the function a call `x.f(...)` names. Let `R` be the type of `x`. When `R` is a type parameter, the candidates are the methods `f` of its bounds. When `R` is `Dyn[I]` or `mem::Box[Dyn[I]]`, they are the method `f` of `I` and the box members that [dynamic dispatch](#dynamic-dispatch) gives. Otherwise, with `T` the type `R` is or instantiates, they are exactly the function `T.f` declared in the module that declares `T` ([methods](02-items.md#methods)) and the methods `f` of the interfaces that `R` implements and that are declared in the package declaring `T` or in `core`. A std member that its owning chapter declares only for some instantiations is a candidate only when `R` is one of them.
+**Method resolution** finds the function a call `x.f(...)` names. Let `R` be the type of `x`. When `R` is a type parameter, the candidates are the methods `f` of its bounds. When `R` is `Dyn[I]` or `mem::Box[Dyn[I]]`, they are the method `f` of `I` and the box members that [dynamic dispatch](#dynamic-dispatch) gives. Otherwise, with `T` the type `R` is or instantiates, they are exactly the function `T.f` declared in the module that declares `T` ([methods](02-items.md#methods)) and the methods `f` of the interfaces that `R` implements and that are declared in the package declaring `T` or in `core`. A std member that its owning chapter declares only for some instantiations is a candidate only when `R` is one of them. When `R` is `sys::Outbox[P]` for a [protocol](26-components.md#operation-calls) P, the operations of P are candidates too.
 
 - A candidate that is an interface method stands for its implementing function for `R`, and for itself when `R` is a type parameter. The same candidates serve a member path `R.f(...)`, which also reaches functions without `self`.
 - Two candidates standing for different functions are an error (`interface.ambiguous-method`), with one exact fix per candidate interface `I` writing the qualified call `I.f(x, ...)`.
@@ -754,7 +754,7 @@ pub closed struct Reading derives Eq { // error: derive.constituent-missing
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `derive.constituent-missing` | error | [Derives](#derives), [Opacity](15-untrusted.md#opacity) |
+| `derive.constituent-missing` | error | [Derives](#derives), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `derive.duplicate` | error | [Derives](#derives) |
 | `derive.enum-default` | error | [Derives](#derives) |
 | `derive.unknown` | error | [Derives](#derives) |
@@ -763,21 +763,21 @@ pub closed struct Reading derives Eq { // error: derive.constituent-missing
 | `generic.const-type` | error | [Generic parameters](#generic-parameters) |
 | `generic.parameter-unused` | error | [Generic parameters](#generic-parameters) |
 | `generic.uninferred` | error | [Inference](#inference) |
-| `generic.unsatisfied-bound` | error | [Conformance](#conformance), [Instantiation](#instantiation), [Failure bounds](11-errors-domains.md#failure-bounds), [Templates](13-text-encode.md#templates), [Opacity](15-untrusted.md#opacity) |
+| `generic.unsatisfied-bound` | error | [Conformance](#conformance), [Instantiation](#instantiation), [Failure bounds](11-errors-domains.md#failure-bounds), [Templates](13-text-encode.md#templates), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `generic.where-misplaced` | error | [Generic parameters](#generic-parameters) |
 | `generic.where-unmet` | error | [Instantiation](#instantiation) |
 | `interface.ambiguous-method` | error | [Method resolution](#method-resolution) |
 | `interface.duplicate-impl` | error | [Coherence](#coherence) |
 | `interface.dyn-view-mode` | error | [Dynamic dispatch](#dynamic-dispatch) |
-| `interface.head-mismatch` | error | [Conformance](#conformance), [Projection results](07-ownership.md#projection-results), [Components](26-components.md#components) |
+| `interface.head-mismatch` | error | [Conformance](#conformance), [Projection results](07-ownership.md#projection-results), [Components](26-components.md#components), [Servers](26-components.md#servers) |
 | `interface.impl-misplaced` | error | [Impl lines](#impl-lines) |
 | `interface.impl-parameters` | error | [Impl lines](#impl-lines) |
 | `interface.impl-target` | error | [Impl lines](#impl-lines) |
-| `interface.impl-visibility` | error | [Conformance](#conformance) |
+| `interface.impl-visibility` | error | [Conformance](#conformance), [Servers](26-components.md#servers) |
 | `interface.method-clause` | error | [Interfaces](#interfaces) |
 | `interface.method-collision` | error | [Conformance](#conformance) |
-| `interface.missing-method` | error | [Conformance](#conformance) |
+| `interface.missing-method` | error | [Conformance](#conformance), [Servers](26-components.md#servers) |
 | `interface.not-dyn-usable` | error | [Dynamic dispatch](#dynamic-dispatch) |
-| `interface.not-implemented` | error | [Method resolution](#method-resolution), [Operator interfaces](#operator-interfaces), [Dynamic dispatch](#dynamic-dispatch), [Opacity](15-untrusted.md#opacity) |
+| `interface.not-implemented` | error | [Method resolution](#method-resolution), [Operator interfaces](#operator-interfaces), [Dynamic dispatch](#dynamic-dispatch), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `interface.not-interface` | error | [Impl lines](#impl-lines), [Generic parameters](#generic-parameters), [Dynamic dispatch](#dynamic-dispatch) |
 | `interface.unqualified-call` | error | [Method resolution](#method-resolution) |

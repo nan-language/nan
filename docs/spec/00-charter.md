@@ -288,6 +288,7 @@ Each term links to its home, whose definition governs.
 | [Copy](05-properties.md#copy) | Of a type whose values are copied, not moved: the types the property table makes Copy, and structs and enums deriving `Copy`. |
 | [core vocabulary](03-packages-modules.md#core-vocabulary) | Names usable everywhere without a path. |
 | [cown](16-concurrency.md#cowns) | `task::Cown[T]` holding shared state. |
+| [CPU signal](24-kernel.md#cross-cpu-operations) | Interrupt one CPU sends another on `hw::SIGNAL_VECTOR`. |
 | [cursor](07-ownership.md#iteration) | Value of a cursor type, whose `next` yields the elements of an iteration. |
 | [cursor type](07-ownership.md#iteration) | Type with a method `next(mut self) -> Option[T]` stating neither `fails` nor `uses wait`; `core::Cursor[T]` is its interface. |
 | [declassifying validator](15-untrusted.md#validator-classes) | Validator or decoder that is not parsing. |
@@ -309,7 +310,7 @@ Each term links to its home, whose definition governs.
 | [DMA buffer](23-low-level.md#dma) | `hw::Dma[T]` or `hw::DmaShared[T]`. |
 | [doc comment](32-docs.md#doc-comments) | `///` comment. |
 | [domain](11-errors-domains.md#domains) | Unit a trap abandons. |
-| [domain run](11-errors-domains.md#domains) | Call of `sys::Domain.run` or `run_sized`, running a body in a new domain. |
+| [domain run](11-errors-domains.md#domains) | Call of `run` or `run_sized` of `sys::Domain` or `sys::Abandoner`, running a body in a new domain. |
 | [droppable](05-properties.md#linear-types) | Of a type that is not linear. |
 | [Dyn-usable](08-generics-interfaces.md#dynamic-dispatch) | Usable through `Dyn[I]`. |
 | [elaboration](19-nir.md#elaboration) | Translating checked source into NIR. |
@@ -333,6 +334,7 @@ Each term links to its home, whose definition governs.
 | [final closure](27-program-model.md#final-builds) | Final-link root's dependency closure. |
 | [final-link root](27-program-model.md#final-builds) | Program built into an image. |
 | [first dead token](41-grammar.md#prefix-viability) | First token of a file or prefix that the grammar, outside rejected alternatives, does not accept at its position, or the token after a line holding a lexical diagnostic when that is earlier. |
+| [flexible struct](13-text-encode.md#flexible-structs) | Struct keeping the fields its `mem::wire` decoding skips. |
 | [foreign anchor](34-diagnostics.md#idiom-table) | First token of a foreign form that the grammar does not accept. |
 | [foreign fn](23-low-level.md#foreign-functions) | Function declaring an external symbol. |
 | [frame rule](20-prover.md#frame-rule) | Which places a call leaves unchanged. |
@@ -375,6 +377,7 @@ Each term links to its home, whose definition governs.
 | [item kind](02-items.md#item-kinds) | One of fourteen item forms. |
 | [join handle](16-concurrency.md#joins) | `task::Join[T, E]` a spawn returns. |
 | [judging root](25-registries.md#contributors) | Package against which registry admission and tables are judged. |
+| [kept fields](13-text-encode.md#flexible-structs) | Skipped fields a flexible struct holds as bytes. |
 | [key](13-text-encode.md#encode) | Encoded name of a field or variant. |
 | [key field](25-registries.md#registries) | Field of the entry type a registry is keyed by. |
 | [keyed task](26-components.md#keyed-tasks) | Task that `cx.spawn(key: k, ...)` starts, identified by its key and cancelling an earlier task with that key. |
@@ -405,6 +408,7 @@ Each term links to its home, whose definition governs.
 | [message](26-components.md#components) | Value delivered to a component. |
 | [method](02-items.md#methods) | `Type.name` function taking `self`. |
 | [method resolution](08-generics-interfaces.md#method-resolution) | Finding the function `x.f(...)` names. |
+| [migration](13-text-encode.md#migrations) | Conversion from or to an earlier shape of a type. |
 | [milestone](38-self-hosting.md#milestones) | One of M1 to M6, checks the bootstrap passes before language 1 freezes. |
 | [mode](07-ownership.md#modes) | Read, `mut` or `take`. |
 | [modifier](02-items.md#modifiers) | Word before the item kind. |
@@ -418,6 +422,7 @@ Each term links to its home, whose definition governs.
 | [NIR](19-nir.md#nir) | Specified checked intermediate representation. |
 | [obligation](18-contracts.md#obligations) | Condition required at a program point. |
 | [open type](04-types.md#closed-and-open-types) | `pub` type that may grow compatibly. |
+| [operation](26-components.md#protocols) | Typed message or request a protocol declares. |
 | [order-free member](33-toolchain.md#merge-driver) | Member whose order means nothing. |
 | [outbox](26-components.md#keyed-tasks) | `sys::Outbox[M]` posting to a component. |
 | [outcome](20-prover.md#outcomes) | Proved, refuted or unknown. |
@@ -437,6 +442,7 @@ Each term links to its home, whose definition governs.
 | [platform package](28-stdlib.md#platform-packages) | Std package minting a target's root grant and implementing its target-dependent operations. |
 | [platform registry](25-registries.md#platform-registries) | Registry binding stubs to handlers. |
 | [poisoning](11-errors-domains.md#poisoning) | State of a cown held by a domain that trapped. |
+| [policy](24-kernel.md#policies) | `hw::Policy` deciding where, in which order and how long a kernel's tasks run. |
 | [predicate](04-types.md#predicates) | `where` or `invariant` condition. |
 | [prefix viability](#guarantees) | Written text fixes all meaning: the first dead token is defined, and every prefix before it closes with typed holes and closers into a file the grammar derives. |
 | [premise](23-low-level.md#trusted-code) | What trusted code relies on. |
@@ -449,6 +455,7 @@ Each term links to its home, whose definition governs.
 | [projection](07-ownership.md#projections) | `proj` function, deriving its result from its receiver. |
 | [promise](05-properties.md#promises) | Fact consumers may rely on. |
 | [property test](22-testing.md#property-tests) | Test with generated inputs. |
+| [protocol](26-components.md#protocols) | Item declaring the operations of the components serving it. |
 | [prover](20-prover.md#procedure) | Specified procedure discharging obligations. |
 | [punning](06-statements-expressions.md#calls) | Omitting a label matching the binding. |
 | [pure](10-effects-digests.md#purity) | Of a function without effects or authority. |
@@ -461,17 +468,18 @@ Each term links to its home, whose definition governs.
 | [registry](25-registries.md#registries) | Table filled by contributions. |
 | [release](29-identity-versioning.md#releases) | Package state recorded in the local store. |
 | [release class](29-identity-versioning.md#releases) | Identical, additive or breaking. |
+| [release check](30-artefacts.md#releases) | Checking a release whole from its source tree. |
 | [release gate](31-trust.md#release-gate) | `nan verify`. |
 | [reliance test](22-testing.md#reliance-tests) | Test of a dependency's item. |
 | [render budget](13-text-encode.md#render) | `Render` call's output limit. |
 | [replay token](22-testing.md#replay) | Value reproducing a failure. |
+| [request](26-components.md#protocols) | Operation whose caller waits for its handler's result or failure. |
 | [requires-set](29-identity-versioning.md#requires-sets) | What a consumer relied on. |
 | [reservation](37-evolution.md#reservations) | Space reserved without meaning. |
 | [reserved word](01-lexical.md#keywords) | Word rejected where reserved. |
 | [resource](14-authority.md#resources) | Value opened through a capability. |
 | [result location](07-ownership.md#result-location) | Where a value is built. |
 | [retired form](37-evolution.md#successive-versions) | Form a later language version rejects with an exact rewrite. |
-| [reuse](30-artefacts.md#reuse) | Using a dependency's checked NIR as is. |
 | [reversibility class](10-effects-digests.md#reversibility) | Digest fact bounding what code does to state outside the program. |
 | [revocation](14-authority.md#revocation) | Ending every copy of a capability. |
 | [root grant](14-authority.md#root-grants) | Capability minted at entry. |
@@ -483,9 +491,12 @@ Each term links to its home, whose definition governs.
 | [scalar](04-types.md#scalars) | One of 14 built-in types. |
 | [schema hash](13-text-encode.md#schema-hashes) | Hash of an encoded structure. |
 | [seal](31-trust.md#seals) | Binding of a principal to item and closure hashes. |
+| [Secret](15-untrusted.md#secret-values) | Wrapper `core::Secret[T]` whose operations run in constant time. |
 | [secret key](31-trust.md#principals) | Seed a principal signs with, in the user directory. |
 | [Send](05-properties.md#send) | Of a type whose values may pass to another task. |
+| [serial executor](16-concurrency.md#executors) | Executor running one task at a time, passing its turn by its seed. |
 | [settlement](11-errors-domains.md#domains) | Settling a trapped domain's I/O before freeing. |
+| [shootdown](24-kernel.md#cross-cpu-operations) | Invalidation one x86_64 CPU posts to the others with the CPU signal. |
 | [shrinking](22-testing.md#property-tests) | Minimising a failing input. |
 | [signature](31-trust.md#signatures) | Ed25519 signature of a seal or an artefact. |
 | [signal](24-kernel.md#signals) | `hw::Signal[T]`, through which interrupt fns wake tasks. |
@@ -497,9 +508,11 @@ Each term links to its home, whose definition governs.
 | [state token](05-properties.md#state-tokens) | Zero-size view of machine state. |
 | [statement](06-statements-expressions.md#statements) | One logical line of a body. |
 | [status](18-contracts.md#statuses) | Proven, checked, assumed or open. |
+| [stepper](26-components.md#steppers) | `sys::Stepper[S, Env, M]`, running a component on the task holding it. |
 | [std](28-stdlib.md#std-layers) | Nine packages the reserved std aliases name, and the three platform packages. |
 | [store](12-memory.md#stores) | Manager of values in memory. |
 | [structural property](05-properties.md#structural-properties) | Property computed from structure. |
+| [summary](26-components.md#servers) | Value a component serving a protocol publishes at quiescence. |
 | [support routine](27-program-model.md#runtime-support) | Fixed runtime routine. |
 | [suspension point](17-suspension-io.md#stackful-tasks) | An `await`, where a task may suspend. |
 | [table](25-registries.md#tables) | Sequence of a registry's admitted contributions under a target. |
@@ -545,4 +558,4 @@ Each term links to its home, whose definition governs.
 
 ## Chapter map
 
-The chapters in reading order are [Charter and guarantees](00-charter.md), [Lexical structure](01-lexical.md), [Items](02-items.md), [Packages, modules and names](03-packages-modules.md), [Data types](04-types.md), [Structural properties](05-properties.md), [Statements and expressions](06-statements-expressions.md), [Ownership and access](07-ownership.md), [Generics and interfaces](08-generics-interfaces.md), [Numbers](09-numbers.md), [Effects, digests and limits](10-effects-digests.md), [Errors, traps and domains](11-errors-domains.md), [Memory and allocation](12-memory.md), [Text, rendering and Encode](13-text-encode.md), [Capabilities and authority](14-authority.md), [Untrusted data](15-untrusted.md), [Structured concurrency](16-concurrency.md), [Suspension, I/O and cleanup](17-suspension-io.md), [Contracts](18-contracts.md), [NIR](19-nir.md), [The normative prover](20-prover.md), [The reference interpreter](21-interpreter.md), [Testing and evidence](22-testing.md), [Low-level programming](23-low-level.md), [Kernel execution model](24-kernel.md), [Registries](25-registries.md), [Components](26-components.md), [Targets and program model](27-program-model.md), [Standard library 1.0](28-stdlib.md), [Identity and versioning](29-identity-versioning.md), [Artefacts](30-artefacts.md), [Trust and the release gate](31-trust.md), [Documentation](32-docs.md), [Toolchain](33-toolchain.md), [Diagnostics](34-diagnostics.md), [Canonical format and machine files](35-format.md), [Builds](36-builds.md), [Evolution and governance](37-evolution.md), [Self-hosting and milestones](38-self-hosting.md), [Primer and tool card](39-primer.md), [False friends](40-false-friends.md) and [Grammar](41-grammar.md).
+The chapters in reading order are [Charter and guarantees](00-charter.md), [Lexical structure](01-lexical.md), [Items](02-items.md), [Packages, modules and names](03-packages-modules.md), [Data types](04-types.md), [Structural properties](05-properties.md), [Statements and expressions](06-statements-expressions.md), [Ownership and access](07-ownership.md), [Generics and interfaces](08-generics-interfaces.md), [Numbers](09-numbers.md), [Effects, digests and limits](10-effects-digests.md), [Errors, traps and domains](11-errors-domains.md), [Memory and allocation](12-memory.md), [Text, rendering and Encode](13-text-encode.md), [Capabilities and authority](14-authority.md), [Untrusted and secret data](15-untrusted.md), [Structured concurrency](16-concurrency.md), [Suspension, I/O and cleanup](17-suspension-io.md), [Contracts](18-contracts.md), [NIR](19-nir.md), [The normative prover](20-prover.md), [The reference interpreter](21-interpreter.md), [Testing and evidence](22-testing.md), [Low-level programming](23-low-level.md), [Kernel execution model](24-kernel.md), [Registries](25-registries.md), [Components](26-components.md), [Targets and program model](27-program-model.md), [Standard library 1.0](28-stdlib.md), [Identity and versioning](29-identity-versioning.md), [Artefacts](30-artefacts.md), [Trust and the release gate](31-trust.md), [Documentation](32-docs.md), [Toolchain](33-toolchain.md), [Diagnostics](34-diagnostics.md), [Canonical format and machine files](35-format.md), [Builds](36-builds.md), [Evolution and governance](37-evolution.md), [Self-hosting and milestones](38-self-hosting.md), [Primer and tool card](39-primer.md), [False friends](40-false-friends.md) and [Grammar](41-grammar.md).

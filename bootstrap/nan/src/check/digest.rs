@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use super::Checker;
 use super::db::ItemId;
+use super::protocol::Served;
 use super::reversibility::{self, Class};
 use super::sig::SigKind;
 use super::tir::{
@@ -98,6 +99,19 @@ impl Digest {
             && self.class == Class::Traceless
     }
 
+    /// The digest of a function of a capability kind as code reaching it sees it: without the
+    /// device, priv and sync facts, with the kind as its one capability and no validators.
+    fn kind_view(&self, kind: ItemId) -> Digest {
+        Digest {
+            device: false,
+            privileged: false,
+            sync: false,
+            capabilities: Some(BTreeSet::from([kind])),
+            validators: Some(BTreeSet::new()),
+            ..self.clone()
+        }
+    }
+
     /// The code of the rule a limit demanding facts this digest lacks breaks.
     fn broken(&self, limits: &LimitSet) -> Option<Code> {
         if limits.pure && !self.pure() {
@@ -136,7 +150,7 @@ pub struct Site {
 /// What brings the facts of a site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Brought {
-    /// An operation of the code itself.
+    /// An operation of the code itself, or the float use a call of a std function brings.
     Operation,
     /// A call, or a function supplied as an argument: the function with a body it names, if any.
     Call(Option<ItemId>),
@@ -233,9 +247,20 @@ pub struct Cycles {
 }
 
 impl Checker<'_> {
-    /// The digest of a function item: computed from its body, supplied for a std function
-    /// without one, and otherwise declared; compensated when the function has an undo clause.
+    /// The digest of a function item: its code's, which a function of a capability kind gives
+    /// as the kind's view of it.
     pub fn digest(&self, item: ItemId) -> Rc<Digest> {
+        let digest = self.code_digest(item);
+        match self.kind_member(item) {
+            Some(kind) => Rc::new(digest.kind_view(kind)),
+            None => digest,
+        }
+    }
+
+    /// The digest a function item's code gives: computed from its body, supplied for a std
+    /// function without one, and otherwise declared; compensated when the function has an undo
+    /// clause.
+    pub fn code_digest(&self, item: ItemId) -> Rc<Digest> {
         let digest = self.uncompensated_digest(item);
         match self.compensates(item) {
             true => Rc::new(Digest {
@@ -724,6 +749,15 @@ impl Checker<'_> {
             limits.notrap = true;
             limits.terminates = true;
         }
+        match self.served(item) {
+            Some((_, protocol, Served::Handler(index))) => {
+                if let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind {
+                    demand(&mut limits, &operations[index].sig.limits);
+                }
+            }
+            Some((_, _, Served::Summary)) => limits.pure = true,
+            None => {}
+        }
         for line in self.implemented_lines(item) {
             if let SigKind::Impl {
                 interface: Some(bound),
@@ -955,6 +989,18 @@ impl Walk<'_, '_, '_> {
         match &expr.kind {
             TKind::Call(call) | TKind::Index(call) => self.call(call),
             TKind::Closure(_) => return,
+            TKind::Construct {
+                variant: Some(variant),
+                ..
+            } => {
+                if let Ty::Item(protocol, _) = &expr.ty
+                    && self.ck.is_protocol(*protocol)
+                {
+                    let mut facts = Digest::none();
+                    facts.class = self.ck.operation_class(*protocol, *variant);
+                    self.site(expr.token, facts, Brought::Operation);
+                }
+            }
             TKind::When { .. } => {
                 let mut facts = Digest::none();
                 facts.wait = true;
@@ -1094,7 +1140,23 @@ impl Walk<'_, '_, '_> {
                     facts.class = self.device_access();
                 }
                 let body_owned = self.ck.db.ast(*item).kind.is_fn_with_body();
+                if facts.float && self.ck.db.is_std(*item) {
+                    let mut float = Digest::none();
+                    float.float = true;
+                    self.site(token, float, Brought::Operation);
+                }
                 self.site(token, facts, Brought::Call(body_owned.then_some(*item)));
+            }
+            Callee::Method {
+                interface, method, ..
+            } if self.ck.is_protocol(interface.interface) => {
+                let mut facts = Digest::none();
+                if self.ck.is_operation(interface.interface, *method) {
+                    facts.wait = true;
+                    facts.terminates = false;
+                    facts.class = self.ck.operation_class(interface.interface, *method);
+                }
+                self.site(token, facts, Brought::Operation);
             }
             Callee::Method {
                 interface, method, ..

@@ -123,7 +123,11 @@ fn encode_kind(
             );
         }
         Kind::Unsigned(scalar) | Kind::Signed(scalar) => {
-            let loaded = fx.load(super::super::super::layout::scalar_type(*scalar), value, 0);
+            let loaded = fx.load(
+                super::super::super::layout::scalar_type(*scalar, lo.machine()),
+                value,
+                0,
+            );
             let signed = matches!(kind, Kind::Signed(_));
             let wide = match (signed, scalar.bits() < 64) {
                 (true, true) => fx.b.ins().sextend(types::I64, loaded),
@@ -148,9 +152,13 @@ fn encode_kind(
             );
         }
         Kind::Float(scalar) => {
-            let loaded = fx.load(super::super::super::layout::scalar_type(*scalar), value, 0);
+            let loaded = fx.load(
+                super::super::super::layout::scalar_type(*scalar, lo.machine()),
+                value,
+                0,
+            );
             let wide = match scalar {
-                Scalar::F32 => fx.b.ins().fpromote(types::F64, loaded),
+                Scalar::F32 => super::super::floats::promote(fx, loaded),
                 _ => loaded,
             };
             write(

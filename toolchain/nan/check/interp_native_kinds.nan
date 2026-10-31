@@ -1,0 +1,155 @@
+//! Capability kinds: minters, reaches and derivations. A minter holds its state and the entries it minted. An entry of a kind records, after whether it is live and its source, its minter's state and its record; an entry `sys::revocable` derives from one records neither, and a reach through it finds them at the nearest entry of its sources recording them.
+
+/// The positions of a kind entry's minter and record.
+const KIND_ENTRY_MINTER: usize = 2
+
+const KIND_ENTRY_RECORD: usize = 3
+
+/// The positions of a minter's state and of the list of the entries it minted.
+const MINTER_STATE: usize = 0
+
+const MINTER_MINTED: usize = 1
+
+/// The state of the minter a kind entry belongs to, and the entry's record.
+struct Pinned {
+    state: Val
+    record: Val
+} Pinned
+
+/// An operation of a minter, `sys::reach` or `sys::derive`; none for another.
+fn Interpreter.kind_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if owner == "sys::Minter" and member == "of" {
+        expect args.len() > 0
+        let state = mut self.memory.alloc(args[0].copy(alloc), writable: true, size: 0)
+        let minted = mut self.memory.alloc(Val.Array(mem::Shared.of(mem::List[Val].empty(alloc), alloc)), writable: true, size: 0)
+        var parts = Val.single(Val.extent_ref(state, alloc), alloc)
+        mut parts.push(Val.extent_ref(minted, alloc))
+        return Some(InterpFlow.Return(Val.Struct(item: self.ty_item("sys", name: "Minter"), fields: mem::Shared.of(take parts, alloc))))
+    }
+    if owner == "sys::Minter" and member == "mint" {
+        expect args.len() > 1
+        let minter = self.deref(args[0])
+        expect minter.fields().len() > MINTER_MINTED
+        let entry = mut self.kind_entry(source: Val.Absent, minter: minter.fields()[MINTER_STATE].copy(alloc), record: args[1].copy(alloc))
+        let minted = minter.fields()[MINTER_MINTED].place().copy(alloc)
+        var entries = Val.copies(self.memory.get(minted).fields(), alloc)
+        mut entries.push(entry.copy(alloc))
+        mut self.memory.set(minted, stored: Val.Array(mem::Shared.of(take entries, alloc)))
+        return Some(InterpFlow.Return(Val.Struct(item: self.kind_item(type_args), fields: mem::Shared.of(Val.single(take entry, alloc), alloc))))
+    }
+    if owner == "sys::Minter" and member == "revoke" {
+        expect args.len() > 1
+        let minter = self.deref(args[0])
+        expect minter.fields().len() > MINTER_STATE
+        let state = minter.fields()[MINTER_STATE].place().copy(alloc)
+        if not self.stale(args[1]) and self.pinned(args[1]).state.place() == state {
+            let capability = self.deref(args[1])
+            expect capability.fields().len() > CAPABILITY_ENTRY
+            let entry = capability.fields()[CAPABILITY_ENTRY].place().copy(alloc)
+            mut self.memory.set(entry.with(u32.fit(ENTRY_LIVE), alloc), stored: Val.Bool(false))
+        }
+        return Some(InterpFlow.Return(Val.Unit))
+    }
+    if owner == "sys::Minter" and member == "close" {
+        expect args.len() > 0
+        let minter = self.deref(args[0])
+        expect minter.fields().len() > MINTER_MINTED
+        let minted = minter.fields()[MINTER_MINTED].place().copy(alloc)
+        for entry in Val.copies(self.memory.get(minted).fields(), alloc) {
+            mut self.memory.set(entry.place().with(u32.fit(ENTRY_LIVE), alloc), stored: Val.Bool(false))
+        }
+        let state = self.deref(minter.fields()[MINTER_STATE])
+        mut self.native_release(state)
+        return Some(InterpFlow.Return(Val.Unit))
+    }
+    if owner == "sys::reach" and member.is_empty() {
+        expect args.len() > 1
+        let option_item = self.ty_item("core", name: "Option")
+        if self.stale(args[0]) {
+            return Some(InterpFlow.Return(Val.none(option_item, alloc)))
+        }
+        let pinned = self.pinned(args[0])
+        var given = Val.single(pinned.state.copy(alloc), alloc)
+        mut given.push(pinned.record.copy(alloc))
+        let flow = try mut self.call_value(args[1], args: take given, at, site)
+        let InterpFlow.Return(value) = flow else {
+            return Some(take flow)
+        }
+        return Some(InterpFlow.Return(Val.some(option_item, value: take value, alloc)))
+    }
+    if owner == "sys::derive" and member.is_empty() {
+        expect args.len() > 1
+        if self.stale(args[0]) {
+            return Some(InterpFlow.Fail(self.revoked()))
+        }
+        let pinned = self.pinned(args[0])
+        var given = Val.single(pinned.state.copy(alloc), alloc)
+        mut given.push(pinned.record.copy(alloc))
+        let flow = try mut self.call_value(args[1], args: take given, at, site)
+        let InterpFlow.Return(narrowed) = flow else {
+            return Some(take flow)
+        }
+        let capability = self.deref(args[0])
+        expect capability.fields().len() > CAPABILITY_ENTRY
+        let source = capability.fields()[CAPABILITY_ENTRY].copy(alloc)
+        let entry = mut self.kind_entry(source: take source, minter: pinned.state.copy(alloc), record: take narrowed)
+        return Some(InterpFlow.Return(Val.Struct(item: self.kind_item(type_args), fields: mem::Shared.of(Val.single(take entry, alloc), alloc))))
+    }
+    return None
+} Interpreter.kind_member
+
+/// The kind a minter's operation or a derivation fixes first.
+fn Interpreter.kind_item(self, type_args: Slice[ty::Arg]) -> ty::ItemId {
+    if type_args.len() > 0 {
+        match type_args[0].ty() {
+            Some(kind_ty) => {
+                match self.ck.types().kind(kind_ty) {
+                    ty::TyKind.Item(item: item, args: _) => return item
+                    else => {}
+                }
+            }
+            None => {}
+        }
+    }
+    expect false
+    return self.ty_item("sys", name: "Minter")
+} Interpreter.kind_item
+
+/// A new live entry of a kind deriving from `source`, belonging to the minter whose state is
+/// `minter` and recording `record`.
+fn Interpreter.kind_entry(mut self, take source: Val, take minter: Val, take record: Val) -> Val {
+    let alloc = self.alloc
+    var parts = Val.single(Val.Bool(true), alloc)
+    mut parts.push(take source)
+    mut parts.push(take minter)
+    mut parts.push(take record)
+    let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take parts, alloc)), writable: true, size: 0)
+    return Val.extent_ref(extent, alloc)
+} Interpreter.kind_entry
+
+/// The state of the minter a capability's entry belongs to, and the entry's record: those the
+/// nearest entry of its sources recording them records.
+fn Interpreter.pinned(self, capability: Val) -> Pinned {
+    let alloc = self.alloc
+    let held = self.deref(capability)
+    expect held.fields().len() > CAPABILITY_ENTRY
+    var entry = held.fields()[CAPABILITY_ENTRY].place().copy(alloc)
+    loop {
+        let parts = self.memory.get(entry).fields()
+        if parts.len() > KIND_ENTRY_RECORD {
+            return Pinned(state: parts[KIND_ENTRY_MINTER].copy(alloc), record: parts[KIND_ENTRY_RECORD].copy(alloc))
+        }
+        expect parts.len() > ENTRY_SOURCE
+        let next = parts[ENTRY_SOURCE].place().copy(alloc)
+        entry = next
+    }
+} Interpreter.pinned

@@ -1,4 +1,4 @@
-//! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns, validators and declassifying decoders, `device` and `priv` grants, waivers, `todo`, `dbg`, device premises and undo clauses, each with its line and parts.
+//! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns, validators and declassifying decoders, `device`, `priv`, `capability` and `confined` grants, waivers, `todo`, `dbg`, device premises and undo clauses, each with its line and parts.
 
 pkg enum Kind derives Copy, Eq, Ord, Hash {
     Trusted
@@ -13,6 +13,7 @@ pkg enum Kind derives Copy, Eq, Ord, Hash {
     Dbg
     Class
     Undo
+    Confined
 } Kind
 
 /// A ledger entry: its kind, the item holding it, its file and line, the texts of its parts and
@@ -40,6 +41,7 @@ pkg proj fn Kind.word(self) -> Str {
         Kind.Dbg => "dbg"
         Kind.Class => "class"
         Kind.Undo => "undo"
+        Kind.Confined => "confined"
     }
 } Kind.word
 
@@ -78,13 +80,37 @@ fn Checker.ledger(self, item: ty::ItemId) -> mem::List[Entry] {
         ast::ItemKind.Fn(function) => self.fn_ledger(item, function, at, mut entries)
         ast::ItemKind.Struct(structure) => self.decoder_ledger(item, derived: structure.derived.view(), derives_token: structure.derives_token, at, mut entries)
         ast::ItemKind.Enum(enumeration) => self.decoder_ledger(item, derived: enumeration.derived.view(), derives_token: enumeration.derives_token, at, mut entries)
+        ast::ItemKind.Protocol(protocol) => self.protocol_ledger(item, protocol, at, mut entries)
         else => {}
     }
     mut entries.sort_by(fn(left: Entry, right: Entry) => line_order(left, right))
     return entries
 } Checker.ledger
 
-/// The ledger entries of a package's `package` item: one per `device` or `priv` grant.
+/// The undo entries of a protocol's operations, each undoer named after the protocol.
+fn Checker.protocol_ledger(self, item: ty::ItemId, protocol: ast::ProtocolItem, at: LedgerAt, mut entries: mem::List[Entry]) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let path = db.canonical(item)
+    for operation in protocol.operations {
+        for clause in operation.method.clauses {
+            let ast::ClauseKind.Undo(target: target, member: _, premise: premise) = clause.kind else {
+                continue
+            }
+            var undoer = text::String.of(path.as_str(), alloc)
+            mut undoer.push('.')
+            let written = target.written(alloc)
+            mut undoer.append(written.as_str())
+            var texts = mem::List[text::String].empty(alloc)
+            mut texts.push(take undoer)
+            mut texts.push(text::String.of(premise.value.as_str(), alloc))
+            mut entries.push(at.entry(Kind.Undo, line: db.line(item, token: clause.token), texts: take texts, escape: true, alloc))
+        }
+    }
+} Checker.protocol_ledger
+
+/// The ledger entries of a package's `package` item: one per `device`, `priv`, `capability`
+/// or `confined` grant, the last no trust escape.
 fn Checker.grant_ledger(self, package_id: ty::PackageId) -> mem::List[Entry] {
     let db = self.db()
     let alloc = self.alloc()
@@ -96,16 +122,19 @@ fn Checker.grant_ledger(self, package_id: ty::PackageId) -> mem::List[Entry] {
     var path = text::String.of(source.dir.as_str(), alloc)
     mut path.append("/package.nan")
     for allow in manifest.allows {
-        match allow.authority {
-            workspace::Authority.Device or workspace::Authority.Priv => {}
+        var texts = mem::List[text::String].empty(alloc)
+        let kind = match allow.authority {
+            workspace::Authority.Device or workspace::Authority.Priv or workspace::Authority.Capability => Kind.Grant
+            workspace::Authority.Confined => Kind.Confined
             else => continue
         }
-        var texts = mem::List[text::String].empty(alloc)
-        mut texts.push(allow.authority.written(alloc))
+        if kind == Kind.Grant {
+            mut texts.push(allow.authority.written(alloc))
+        }
         for name in allow.names {
             mut texts.push(text::String.of(name.as_str(), alloc))
         }
-        mut entries.push(Entry(kind: Kind.Grant, item: text::String.of(db.package_data(package_id).name.as_str(), alloc), path: text::String.of(path.as_str(), alloc), line: allow.line, texts: take texts, escape: true))
+        mut entries.push(Entry(kind: kind, item: text::String.of(db.package_data(package_id).name.as_str(), alloc), path: text::String.of(path.as_str(), alloc), line: allow.line, texts: take texts, escape: kind == Kind.Grant))
     }
     return entries
 } Checker.grant_ledger

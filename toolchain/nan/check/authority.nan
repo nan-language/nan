@@ -1,9 +1,10 @@
-//! Authority: the manifest grants a module needs for the device, priv, trusted and validate operations it performs directly, the grants its dependencies need, the names grants and denials list, and denied dependencies.
+//! Authority: the manifest grants a module needs for the device, confined, priv, trusted and validate operations it performs directly and the capability kinds it declares, the grants its dependencies need, the names grants and denials list, and denied dependencies. A `device` grant also covers what `confined` does.
 
 /// The authorities a manifest grant names that a dependency's grant must be relayed for.
 fn relayed_authorities(alloc: mem::Alloc) -> mem::List[workspace::Authority] {
     var relayed = mem::List[workspace::Authority].empty(alloc)
     mut relayed.push(workspace::Authority.Device)
+    mut relayed.push(workspace::Authority.Confined)
     mut relayed.push(workspace::Authority.Priv)
     mut relayed.push(workspace::Authority.Trusted)
     mut relayed.push(workspace::Authority.Validate)
@@ -28,7 +29,7 @@ fn Checker.granted(self, module: ty::ModuleId, authority: workspace::Authority) 
         return false
     }
     for allow in manifest.allows {
-        if allow.authority != authority {
+        if not grant_covers(granted: allow.authority, authority) {
             continue
         }
         for name in allow.names {
@@ -103,8 +104,9 @@ fn Checker.unused_grants(self, package_id: ty::PackageId) -> mem::List[UnusedGra
     return unused
 } Checker.unused_grants
 
-/// The authority a call of a std function performs: the device operations of register
-/// windows and DMA, and the privileged intrinsics.
+/// The authority a call of a std function performs: the device operations, those reaching
+/// no memory but a device's own and its I/O domain's being confined ones, and the
+/// privileged intrinsics.
 fn Checker.call_authority(self, function: ty::ItemId) -> Option[workspace::Authority] {
     let db = self.db()
     if not db.is_std(function) {
@@ -128,11 +130,14 @@ fn Checker.call_authority(self, function: ty::ItemId) -> Option[workspace::Autho
         }
         member = after
     }
-    if owner == "hw::Mmio" or owner == "hw::Ports" or owner == "hw::Dma" or owner == "hw::DmaShared" or owner == "hw::dma_fence" {
+    let window = owner == "hw::Mmio" or owner == "hw::Ports"
+    let raw_install = owner == "hw::IrqShared" and (member == "install" or member == "install_on" or member == "install_msi")
+    if (window and member == "map") or (owner == "hw::IoSpace" and member == "physical") or (owner == "hw::PciFunction" and member == "attach_physical") or raw_install {
         return Some(workspace::Authority.Device)
     }
-    if owner == "hw::IrqShared" and (member == "install" or member == "uninstall") {
-        return Some(workspace::Authority.Device)
+    let confined = owner == "hw::Dma" or owner == "hw::DmaShared" or owner == "hw::Iommu" or owner == "hw::IoDomain" or owner == "hw::PciFunction" or owner == "hw::dma_fence"
+    if window or confined or (owner == "hw::IrqShared" and member == "uninstall") {
+        return Some(workspace::Authority.Confined)
     }
     if owner == "hw::Ring0" {
         return Some(workspace::Authority.Priv)
@@ -158,8 +163,12 @@ fn Checker.check_manifest(self, package_id: ty::PackageId) {
             workspace::Authority.Contribute(_) => continue
             else => {}
         }
+        let aliases = match allow.authority {
+            workspace::Authority.Capability => false
+            else => true
+        }
         for name in allow.names {
-            if db.module_named(package_id, name: name.as_str()).is_none() and not data.deps.contains(name) {
+            if db.module_named(package_id, name: name.as_str()).is_none() and not (aliases and data.deps.contains(name)) {
                 self.report_file(path, line: allow.line, code: diagnostic::Code.AuthorityUnknownName)
                 break
             }
@@ -258,7 +267,7 @@ fn Checker.check_capability_impl(self, item: ty::ItemId) {
 
 /// Whether a name a grant lists is used: a dependency contributing to the registry a
 /// `contribute` grant names, a module performing the authority or holding a failed construct,
-/// or a dependency granted it.
+/// a dependency granted it, or any dependency for an authority not relayed.
 fn Checker.grant_used(self, named_registry: Option[ty::ItemId], module: Option[ty::ModuleId], dep: Option[ty::PackageId], authority: workspace::Authority) -> bool {
     match named_registry {
         Some(registry_item) => {
@@ -270,17 +279,55 @@ fn Checker.grant_used(self, named_registry: Option[ty::ItemId], module: Option[t
         None => {}
     }
     match module {
-        Some(found) => {
-            let key = Performed(module: found, authority: copied_authority(authority, alloc: self.alloc()))
-            return self.state.contents().performed.get(key).is_some() or self.module_holds_failure(found)
-        }
+        Some(found) => return self.performs_under(found, authority) or self.module_holds_failure(found)
         None => {}
     }
     let Some(target) = dep else {
         return true
     }
-    return self.grants_any(target, authority)
+    var relayed = false
+    var granted = false
+    for covered in relayed_authorities(self.alloc()) {
+        relayed = relayed or covered == authority
+        granted = granted or (grant_covers(granted: authority, authority: covered) and self.grants_any(target, authority: covered))
+    }
+    return not relayed or granted
 } Checker.grant_used
+
+/// Whether a module performs an operation that a grant of an authority covers, a `device`
+/// grant covering confined operations only when no `confined` grant names the module.
+fn Checker.performs_under(self, module: ty::ModuleId, authority: workspace::Authority) -> bool {
+    let performed = self.state.contents().performed
+    let key = Performed(module: module, authority: copied_authority(authority, alloc: self.alloc()))
+    if performed.get(key).is_some() {
+        return true
+    }
+    if authority != workspace::Authority.Device {
+        return false
+    }
+    let confined = Performed(module: module, authority: workspace::Authority.Confined)
+    return performed.get(confined).is_some() and not self.names_confined(module)
+} Checker.performs_under
+
+/// Whether a `confined` grant of a module's package names the module.
+fn Checker.names_confined(self, module: ty::ModuleId) -> bool {
+    let db = self.db()
+    let package_id = db.module(module).package_id
+    let Some(manifest) = db.source(package_id).manifest else {
+        return false
+    }
+    for allow in manifest.allows {
+        if allow.authority != workspace::Authority.Confined {
+            continue
+        }
+        for name in allow.names {
+            if db.module_named(package_id, name: name.as_str()) == Some(module) {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.names_confined
 
 /// Reports a `dep` directive naming a package granted an authority the manifest does not grant
 /// the alias, with the fix granting each.
@@ -317,7 +364,7 @@ fn Checker.relayed(self, package_id: ty::PackageId, alias: Str, authority: works
         return false
     }
     for allow in manifest.allows {
-        if allow.authority != authority {
+        if not grant_covers(granted: allow.authority, authority) {
             continue
         }
         for name in allow.names {
@@ -329,12 +376,20 @@ fn Checker.relayed(self, package_id: ty::PackageId, alias: Str, authority: works
     return false
 } Checker.relayed
 
+/// Whether a grant of `granted` covers operations of `authority`: its own, and `device` covers
+/// `confined`.
+fn grant_covers(granted: workspace::Authority, authority: workspace::Authority) -> bool {
+    return granted == authority or (granted == workspace::Authority.Device and authority == workspace::Authority.Confined)
+} grant_covers
+
 fn copied_authority(authority: workspace::Authority, alloc: mem::Alloc) -> workspace::Authority {
     return match authority {
         workspace::Authority.Device => workspace::Authority.Device
+        workspace::Authority.Confined => workspace::Authority.Confined
         workspace::Authority.Priv => workspace::Authority.Priv
         workspace::Authority.Trusted => workspace::Authority.Trusted
         workspace::Authority.Validate => workspace::Authority.Validate
+        workspace::Authority.Capability => workspace::Authority.Capability
         workspace::Authority.Contribute(written) => workspace::Authority.Contribute(text::String.of(written.as_str(), alloc))
     }
 } copied_authority

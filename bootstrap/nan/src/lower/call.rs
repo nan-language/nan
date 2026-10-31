@@ -9,13 +9,13 @@ use super::abi::{Abi, Given, Repr, Returned};
 use super::body::{Body, Held};
 use super::fx::{Fx, PTR};
 use super::types::Wrap;
-use super::{Instance, Lowering, stack, supplied};
+use super::{Glue, Instance, Lowering, stack, supplied};
 use crate::check::db::ItemId;
 use crate::check::sig::{FnSig, SigKind};
 use crate::check::tir::Form;
 use crate::check::ty::{Arg, Args, FnTy, Subst, Ty};
 use crate::nir::{BlockId, Call, Callable, Callee, FnRef, NTy, Op, Operand, Role, Value};
-use crate::syntax::ast::Mode;
+use crate::syntax::ast::{FnKind, Mode};
 
 /// What a call calls.
 enum Target {
@@ -279,8 +279,13 @@ impl Body<'_, '_, '_, '_> {
                     .iter()
                     .zip(&abi.params)
                     .enumerate()
-                    .filter(|(_, (_, (nty, _)))| matches!(nty.ty(), Ty::Fn(_)))
-                    .map(|(position, (operand, _))| (position, self.binding(operand)))
+                    .filter_map(|(position, (operand, (nty, _)))| match nty.ty() {
+                        Ty::Fn(fn_ty) if fn_ty.kind == FnKind::Task => {
+                            Some((position, self.walk_binding(operand)))
+                        }
+                        Ty::Fn(_) => Some((position, self.binding(operand))),
+                        _ => None,
+                    })
                     .collect();
                 stack::Kind::Direct {
                     callee: *callee,
@@ -490,6 +495,29 @@ impl Body<'_, '_, '_, '_> {
         }
     }
 
+    /// What an operand passes for a `task fn` parameter of a direct call's callee: the walk
+    /// moving its captures, which a closure without captures that move and a named function
+    /// do not need.
+    fn walk_binding(&mut self, operand: &Operand) -> stack::Binding {
+        match self.fn_source(operand) {
+            FnSource::Closure(index) => {
+                let closure = Instance::Nir {
+                    item: self.item,
+                    role: Role::Closure,
+                    index,
+                    args: self.args.clone(),
+                };
+                match self.lo.glue(&Glue::Captures(closure)) {
+                    Some(walk) => stack::Binding::Walk(walk),
+                    None => stack::Binding::Bounded(Some(0)),
+                }
+            }
+            FnSource::Named(_) => stack::Binding::Bounded(Some(0)),
+            FnSource::Param(position) => stack::Binding::Param(position),
+            FnSource::Other(_) => stack::Binding::Bounded(None),
+        }
+    }
+
     /// Records the `stack N` demand a function type `wanted` makes of the function value an
     /// operand passes where it fits that type.
     pub fn fit(&mut self, operand: &Operand, wanted: &Ty) {
@@ -629,6 +657,12 @@ impl Lowering<'_, '_> {
                 method,
                 args: fn_ref.args.clone(),
             },
+            Callable::Method { interface, method } if self.ck.is_protocol(*interface) => {
+                Instance::Operation {
+                    protocol: *interface,
+                    method: *method,
+                }
+            }
             Callable::Method { interface, method } => {
                 let self_ty = fn_ref
                     .args
@@ -636,7 +670,7 @@ impl Lowering<'_, '_> {
                     .and_then(Arg::ty)
                     .cloned()
                     .expect("a Self type");
-                let name = self.method_name(*interface, *method);
+                let name = self.ck.method_name(*interface, *method as usize);
                 match self.ck.implementation(&self_ty, *interface, &name) {
                     Some(implementation)
                         if !matches!(implementation.callable, Callable::Method { .. }) =>
@@ -657,11 +691,20 @@ impl Lowering<'_, '_> {
         }
     }
 
-    pub fn method_name(&self, interface: ItemId, method: u32) -> String {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].name.clone(),
-            _ => panic!("a method of no interface"),
-        }
+    /// A function value naming a function, its arguments concrete: the code calling it through
+    /// the ABI of function values, without an environment.
+    pub fn function_value(&mut self, fx: &mut Fx, fn_ref: &FnRef) -> Held {
+        let instance = self.callable_instance(fn_ref, true);
+        let own_stack = self.instance_fn_ty(&instance).limits.stack;
+        let glue = self.instance(Instance::Value(Box::new(instance)));
+        self.entry_stack(glue, own_stack);
+        let reference = self.func_ref(fx, glue);
+        let code = fx.b.ins().func_addr(PTR, reference);
+        let slot = fx.slot(16, 8);
+        fx.store(code, slot, 0);
+        let none = fx.ptr(0);
+        fx.store(none, slot, 8);
+        Held::Address(slot)
     }
 
     /// How calls of a callable give their result, none unless it is a projection.
@@ -747,6 +790,13 @@ impl Lowering<'_, '_> {
                 args,
             } => self.derived_head(*owner, method, args),
             Instance::Conformance { ty, method, args } => self.conformance_head(ty, method, args),
+            Instance::Operation { protocol, method } => {
+                let outbox = self.std_ty("sys", "Outbox", vec![Ty::item(*protocol, Vec::new())]);
+                (self.ck)
+                    .outbox_head(*protocol, *method as usize, &outbox)
+                    .expect("an operation's head")
+                    .fn_ty()
+            }
             other => panic!("the head of {other:?}"),
         }
     }

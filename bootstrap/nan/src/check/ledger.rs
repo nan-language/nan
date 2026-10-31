@@ -1,6 +1,6 @@
 //! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns,
-//! validators and declassifying decoders, `device` and `priv` grants, waivers, `todo`, `dbg`,
-//! device premises and undo clauses, each with its line and parts.
+//! validators and declassifying decoders, `device`, `priv`, `capability` and `confined` grants,
+//! waivers, `todo`, `dbg`, device premises and undo clauses, each with its line and parts.
 
 use super::Checker;
 use super::db::{ItemId, PackageId};
@@ -25,6 +25,7 @@ pub enum Kind {
     Dbg,
     Class,
     Undo,
+    Confined,
 }
 
 impl Kind {
@@ -42,6 +43,7 @@ impl Kind {
             Kind::Dbg => "dbg",
             Kind::Class => "class",
             Kind::Undo => "undo",
+            Kind::Confined => "confined",
         }
     }
 
@@ -191,13 +193,34 @@ impl Checker<'_> {
                     add(Kind::Decoder, data.line(encode.token), Vec::new(), true);
                 }
             }
+            ItemKind::Protocol(protocol) => {
+                let path = self.db.canonical(item);
+                for operation in &protocol.operations {
+                    for clause in &operation.method.clauses {
+                        let ClauseKind::Undo {
+                            target, premise, ..
+                        } = &clause.kind
+                        else {
+                            continue;
+                        };
+                        let undoer = format!("{path}.{}", target.written());
+                        add(
+                            Kind::Undo,
+                            data.line(clause.token),
+                            vec![undoer, premise.value.clone()],
+                            true,
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         entries.sort_by_key(|entry| (entry.line, entry.kind));
         entries
     }
 
-    /// The ledger entries of a package's `package` item: one per `device` or `priv` grant.
+    /// The ledger entries of a package's `package` item: one per `device`, `priv`, `capability`
+    /// or `confined` grant, the last no trust escape.
     pub fn grant_ledger(&self, package: PackageId) -> Vec<Entry> {
         let data = self.db.package(package);
         let Some(manifest) = data.source.manifest.as_ref() else {
@@ -207,18 +230,23 @@ impl Checker<'_> {
         manifest
             .allows
             .iter()
-            .filter(|allow| matches!(allow.authority, Authority::Device | Authority::Priv))
-            .map(|allow| {
-                let mut texts = vec![allow.authority.written()];
+            .filter_map(|allow| {
+                let (kind, mut texts) = match allow.authority {
+                    Authority::Device | Authority::Priv | Authority::Capability => {
+                        (Kind::Grant, vec![allow.authority.written()])
+                    }
+                    Authority::Confined => (Kind::Confined, Vec::new()),
+                    _ => return None,
+                };
                 texts.extend(allow.names.iter().cloned());
-                Entry {
-                    kind: Kind::Grant,
+                Some(Entry {
+                    kind,
                     item: data.name.clone(),
                     path: path.clone(),
                     line: allow.line,
                     texts,
-                    escape: true,
-                }
+                    escape: kind == Kind::Grant,
+                })
             })
             .collect()
     }

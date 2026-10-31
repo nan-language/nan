@@ -1063,8 +1063,8 @@ pub closed struct Port derives Eq, Render, Encode {
     pub medium: Medium
 } Port
 
-pub fn load_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Result[Port, core::DecodeError] {
-    return attempt text::construction::Codec[Port].decode(raw, alloc)
+pub fn load_port(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Port fails core::DecodeError {
+    return try text::construction::Codec[Port].decode(raw, alloc)
 } load_port
 
 test port_reads_its_rendering for load_port {
@@ -1073,16 +1073,16 @@ test port_reads_its_rendering for load_port {
     var out = text::String.empty(world.alloc)
     mut out.write(text::fmt("{port}", port), budget: 128)
     expect out.as_str() == "Port(name: \"eth0\", mtu: 1500, medium: Medium.Fiber(lanes: 4))"
-    let loaded = load_port(Untrusted.of(out.as_bytes()), alloc: world.alloc)
+    let loaded = attempt load_port(Untrusted.of(out.as_bytes()), alloc: world.alloc)
     let expected: Result[Port, core::DecodeError] = Ok(take port)
     expect loaded == expected
 } port_reads_its_rendering
 
 test port_text_is_checked for load_port {
     let world = testing::world()
-    let spaced = load_port(Untrusted.of(b"Port( mtu: 9_000, name: \"lo\", medium: Copper )"), alloc: world.alloc)
-    let small = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 500, medium: Medium.Copper)"), alloc: world.alloc)
-    let unknown = load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 1500, medium: Medium.Radio)"), alloc: world.alloc)
+    let spaced = attempt load_port(Untrusted.of(b"Port( mtu: 9_000, name: \"lo\", medium: Copper )"), alloc: world.alloc)
+    let small = attempt load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 500, medium: Medium.Copper)"), alloc: world.alloc)
+    let unknown = attempt load_port(Untrusted.of(b"Port(name: \"lo\", mtu: 1500, medium: Medium.Radio)"), alloc: world.alloc)
     let expected: Result[Port, core::DecodeError] = Ok(Port(name: text::String.of("lo", alloc: world.alloc), mtu: 9_000, medium: Medium.Copper))
     expect spaced == expected
     expect small == Err(core::DecodeError.Invalid)

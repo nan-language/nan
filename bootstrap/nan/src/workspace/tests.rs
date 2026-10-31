@@ -414,3 +414,33 @@ fn two_sources_of_one_package_name_split_it() {
         .collect();
     assert_eq!(split, [7]);
 }
+
+#[test]
+fn a_change_shares_the_packages_it_leaves_unchanged() {
+    let units = "//! Units.\n\npackage units {\n    language 1\n    targets any\n} units\n";
+    let (_scratch, workspace) = load(&[
+        ("app/package.nan", MANIFEST),
+        ("app/app.nan", "//! App.\n"),
+        ("units/package.nan", units),
+    ]);
+    let changed = workspace.with_sources(&HashMap::from([(
+        "app/app.nan".to_owned(),
+        b"//! The app.\n".to_vec(),
+    )]));
+    let at = |dir: &str| {
+        workspace
+            .packages
+            .iter()
+            .position(|package| package.dir == dir)
+            .expect("a package")
+    };
+    assert!(!Arc::ptr_eq(
+        &workspace.packages[at("app")],
+        &changed.packages[at("app")]
+    ));
+    assert!(Arc::ptr_eq(
+        &workspace.packages[at("units")],
+        &changed.packages[at("units")]
+    ));
+    assert_eq!(changed.bytes("app/app.nan"), Some(&b"//! The app.\n"[..]));
+}

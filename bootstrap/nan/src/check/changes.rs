@@ -343,7 +343,7 @@ pub fn changes(old: &Workspace, new_workspace: &Workspace, file: Option<&str>) -
                 let package = new_workspace
                     .packages
                     .iter()
-                    .position(|package| std::ptr::eq(package, source));
+                    .position(|package| std::ptr::eq(&**package, source));
                 let weakened = Weakened {
                     ck: checker,
                     item,

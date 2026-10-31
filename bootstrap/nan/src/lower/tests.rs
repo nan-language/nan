@@ -33,7 +33,7 @@ fn distinct_instances_with_one_symbol_name_collide() {
     let std = crate::stdlib::packages();
     let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
     let item = item_named(&checker, "example::scale");
-    let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None);
+    let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
     lowering.instance(Instance::Nir {
         item,
         role: Role::Body,
@@ -66,7 +66,7 @@ fn secret_code_lowers_without_branches_or_divisions() {
     for target in [Target::X64Host, Target::Aarch64Host] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::step");
-        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None);
+        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
         let ((), texts) = dumping(|| {
             lowering.instance(Instance::Nir {
                 item,
@@ -86,6 +86,91 @@ fn secret_code_lowers_without_branches_or_divisions() {
             for op in ["brif", "br_table", "div", "rem"] {
                 assert!(!text.contains(op), "{name} holds no {op}:\n{text}");
             }
+        }
+    }
+}
+
+/// Each Secret member over a lane type, other than the shifts checking their amount, lowers to
+/// one block without a branch or a division, with vectors on a host target and without on a
+/// machine target.
+#[test]
+fn secret_lanes_lower_without_branches_or_divisions() {
+    let scratch = example(
+        "//! Lane steps.\n\n\
+         pub fn step(a: core::Secret[core::simd::U32x4], b: core::Secret[core::simd::U32x4], c: core::Secret[bool]) -> core::Secret[core::simd::U32x4] {\n\
+         \x20   let mixed = a.wrapping_add(b).bit_xor(a.wrapping_mul(b)).wrapping_sub(a.bit_or(b.bit_and(a)))\n\
+         \x20   return c.bit_and(a.eq(b).bit_or(a.ne(b))).select(mixed, if_false: a.bit_not())\n\
+         } step\n",
+    );
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let std = crate::stdlib::packages();
+    for target in [Target::X64Host, Target::X64Bare] {
+        let checker = checked(&workspace, &workspace.closures[0], std, target);
+        let item = item_named(&checker, "example::step");
+        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+        let ((), texts) = dumping(|| {
+            lowering.instance(Instance::Nir {
+                item,
+                role: Role::Body,
+                index: 0,
+                args: no_args(),
+            });
+            lowering.drain();
+        });
+        let members = texts.iter().filter(|(name, _)| name.contains("Secret"));
+        let mut vectors = false;
+        for (name, text) in members {
+            let blocks = text
+                .lines()
+                .filter(|line| line.trim_start().starts_with("block"))
+                .count();
+            assert_eq!(blocks, 1, "{name} has one block:\n{text}");
+            for op in ["brif", "br_table", "div", "rem"] {
+                assert!(!text.contains(op), "{name} holds no {op}:\n{text}");
+            }
+            let vector = ["i32x4", "i64x2"].iter().any(|ty| text.contains(ty));
+            assert!(target.is_host() || !vector, "{name}:\n{text}");
+            vectors |= vector;
+        }
+        assert_eq!(vectors, target.is_host());
+    }
+}
+
+/// On a host target each vectorized lane member lowers to one block computing on vector values;
+/// on a machine target, which uses no vector register, every lane member computes lane by lane.
+#[test]
+fn lanes_lower_to_vectors_on_hosts_alone() {
+    let scratch = example(
+        "//! Lanes.\n\n\
+         pub fn mixed(a: core::simd::I8x16, b: core::simd::I8x16, c: core::simd::I32x4) -> u16 {\n\
+         \x20   let sum = a.dot(b, acc: c)\n\
+         \x20   let lanes = core::simd::I32x4.select(sum.lanes_gt(c), if_true: sum.shl(3), if_false: sum.shr(2))\n\
+         \x20   return lanes.lanes_eq(core::simd::I32x4.splat(4)).bitmask()\n\
+         } mixed\n",
+    );
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let std = crate::stdlib::packages();
+    for target in [Target::X64Host, Target::X64Bare] {
+        let checker = checked(&workspace, &workspace.closures[0], std, target);
+        let item = item_named(&checker, "example::mixed");
+        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+        let ((), texts) = dumping(|| {
+            lowering.instance(Instance::Nir {
+                item,
+                role: Role::Body,
+                index: 0,
+                args: no_args(),
+            });
+            lowering.drain();
+        });
+        let members = texts
+            .iter()
+            .filter(|(name, _)| name.contains("simd") && !name.contains("requires"));
+        for (name, text) in members {
+            let vector = ["i8x16", "i16x8", "i32x4", "f32x4"]
+                .iter()
+                .any(|ty| text.contains(ty));
+            assert_eq!(vector, target.is_host(), "{name} on {target:?}:\n{text}");
         }
     }
 }

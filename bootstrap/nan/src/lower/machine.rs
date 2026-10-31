@@ -412,9 +412,11 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The start of a boot glue: records the two values the platform entered the image with,
-    /// then sets up the runtime, ending with status 71 when it cannot start.
+    /// The start of a boot glue: checks the image's codegen level, records the two values the
+    /// platform entered the image with, then sets up the runtime, ending with status 71 when the
+    /// level or the runtime cannot start.
     pub fn start_boot(&mut self, fx: &mut Fx, params: &[Value]) {
+        self.check_level(fx);
         let state_address = self.state(fx);
         fx.store(params[0], state_address, state::PLATFORM);
         fx.store(params[1], state_address, state::PLATFORM_TABLE);

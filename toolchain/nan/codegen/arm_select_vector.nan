@@ -1,0 +1,401 @@
+//! Instruction selection for AArch64 of the instructions on 128-bit vectors, in Advanced SIMD: 64-bit lane products and the reductions to general-purpose registers through each 64-bit half, float results canonicalized as Cranelift's pass does, and at `aarch64-dotprod` the tree of an i8 dot product added to an accumulator as one `sdot`.
+
+/// The log2 of the bytes of a vector type's lanes.
+fn arm_lane_size(ty: clif::Type) -> u32 {
+    return match ty.lane_type().bits() {
+        8 => 0
+        16 => 1
+        32 => 2
+        else => 3
+    }
+} arm_lane_size
+
+/// A new register holding a vector.
+fn ArmSelector.vector_temp(mut self) -> machinst::Reg {
+    return mut self.code.new_vector_vreg()
+} ArmSelector.vector_temp
+
+/// An operation of two vectors' lanes into a new register.
+fn ArmSelector.vec3(mut self, op: aarch64::VecOp, size: u32, lhs: machinst::Reg, rhs: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(aarch64::Inst.Vec3(op: op, size: size, dst: dst, lhs: lhs, rhs: rhs))
+    return dst
+} ArmSelector.vec3
+
+/// An operation of one vector's lanes into a new register.
+fn ArmSelector.vec2(mut self, op: aarch64::VecUnary, size: u32, src: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(aarch64::Inst.Vec2(op: op, size: size, dst: dst, src: src))
+    return dst
+} ArmSelector.vec2
+
+/// `bitselect`: each bit from `chosen` where `mask`'s is 1 and from `other` elsewhere, in a new
+/// register.
+fn ArmSelector.bitselect(mut self, mask: machinst::Reg, chosen: machinst::Reg, other: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.mov(dst, src: mask)
+    mut self.emit(aarch64::Inst.Bsl(dst: dst, lhs: chosen, rhs: other))
+    return dst
+} ArmSelector.bitselect
+
+/// A general-purpose register's low lane of `1 << size` bytes in every lane of a new register.
+fn ArmSelector.dup(mut self, size: u32, src: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(aarch64::Inst.Dup(size: size, dst: dst, src: src))
+    return dst
+} ArmSelector.dup
+
+/// A 64-bit half of a vector in a new general-purpose register.
+fn ArmSelector.half(mut self, src: machinst::Reg, lane: u32) -> machinst::Reg {
+    let dst = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Umov(dst: dst, src: src, lane: lane))
+    return dst
+} ArmSelector.half
+
+/// A float vector whose NaN lanes are made the canonical NaN.
+fn ArmSelector.canonical_lanes(mut self, value: machinst::Reg) -> machinst::Reg {
+    let ordered = mut self.vec3(aarch64::VecOp.Fcmeq, size: 2, lhs: value, rhs: value)
+    let bits = mut self.int_constant(0x7FC0_0000)
+    let canonical = mut self.dup(2, src: bits)
+    return mut self.bitselect(ordered, chosen: value, other: canonical)
+} ArmSelector.canonical_lanes
+
+/// Selects an instruction computing on vectors.
+fn ArmSelector.vector(mut self, func: clif::Function, inst: clif::Inst) {
+    match func.inst_data(inst) {
+        clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: offset) => {
+            let dst = mut self.dst_of(func, inst)
+            let mem = mut self.amode(arg, func, offset: i64.widen(offset), scale: 4)
+            mut self.emit(aarch64::Inst.VecLoad(dst: dst, src: mem))
+        }
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: offset) => {
+            let src = mut self.src(x, func)
+            let mem = mut self.amode(p, func, offset: i64.widen(offset), scale: 4)
+            mut self.emit(aarch64::Inst.VecStore(src: src, dst: mem))
+        }
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => {
+            if opcode == clif::Opcode.VanyTrue or opcode == clif::Opcode.VallTrue {
+                let outcome = mut self.lane_test(func, opcode, arg)
+                mut self.set_flag(func, inst, outcome)
+                return
+            }
+            let result = mut self.vector_unary(func, inst, opcode, arg)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => {
+            let result = mut self.vector_binary(func, opcode, x, y)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.Ternary(opcode: _, x: c, y: x, z: y) => {
+            let mask = mut self.src(c, func)
+            let chosen = mut self.src(x, func)
+            let other = mut self.src(y, func)
+            let result = mut self.bitselect(mask, chosen, other)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let size = arm_lane_size(func.value_type(x))
+            let a = mut self.src(x, func)
+            let b = mut self.src(y, func)
+            let result = match cond {
+                clif::IntCC.Equal => mut self.vec3(aarch64::VecOp.Cmeq, size, lhs: a, rhs: b)
+                clif::IntCC.SignedGreaterThan => mut self.vec3(aarch64::VecOp.Cmgt, size, lhs: a, rhs: b)
+                clif::IntCC.SignedLessThan => mut self.vec3(aarch64::VecOp.Cmgt, size, lhs: b, rhs: a)
+                clif::IntCC.UnsignedGreaterThan => mut self.vec3(aarch64::VecOp.Cmhi, size, lhs: a, rhs: b)
+                else => mut self.vec3(aarch64::VecOp.Cmhi, size, lhs: b, rhs: a)
+            }
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let a = mut self.src(x, func)
+            let b = mut self.src(y, func)
+            let result = match cond {
+                clif::FloatCC.Equal => mut self.vec3(aarch64::VecOp.Fcmeq, size: 2, lhs: a, rhs: b)
+                clif::FloatCC.LessThan => mut self.vec3(aarch64::VecOp.Fcmgt, size: 2, lhs: b, rhs: a)
+                else => mut self.vec3(aarch64::VecOp.Fcmgt, size: 2, lhs: a, rhs: b)
+            }
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        else => {
+            expect false
+        }
+    }
+} ArmSelector.vector
+
+/// `vany_true`, whether some lane is nonzero, or `vall_true`, whether every lane is, as flags
+/// on the two 64-bit halves of the vector, or for `vall_true` of its lanes compared with zero.
+fn ArmSelector.lane_test(mut self, func: clif::Function, opcode: clif::Opcode, arg: clif::Value) -> ArmTest {
+    let src = mut self.src(arg, func)
+    var tested = src
+    if opcode == clif::Opcode.VallTrue {
+        tested = mut self.vec2(aarch64::VecUnary.Cmeq0, size: arm_lane_size(func.value_type(arg)), src: src)
+    }
+    let low = mut self.half(tested, lane: 0)
+    let high = mut self.half(tested, lane: 1)
+    let either = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: aarch64::Width.Bits64, dst: either, lhs: low, rhs: high))
+    mut self.emit(aarch64::Inst.CmpImm(width: aarch64::Width.Bits64, lhs: either, imm: 0))
+    if opcode == clif::Opcode.VanyTrue {
+        return ArmTest.One(aarch64::Cond.Ne)
+    }
+    return ArmTest.One(aarch64::Cond.Eq)
+} ArmSelector.lane_test
+
+/// A unary vector instruction's result in a new register.
+fn ArmSelector.vector_unary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) -> machinst::Reg {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    if opcode == clif::Opcode.Splat {
+        let result_ty = func.value_type(result_of(func, inst, alloc: self.alloc))
+        if result_ty == clif::Type.Float32x4 {
+            let dst = mut self.vector_temp()
+            mut self.emit(aarch64::Inst.DupLane(dst: dst, src: src))
+            return dst
+        }
+        return mut self.dup(arm_lane_size(result_ty), src: src)
+    }
+    if opcode == clif::Opcode.Sqrt {
+        let root = mut self.vec2(aarch64::VecUnary.Fsqrt, size: 2, src: src)
+        return mut self.canonical_lanes(root)
+    }
+    if opcode == clif::Opcode.VhighBits {
+        return mut self.high_bits(ty, src)
+    }
+    return match opcode {
+        clif::Opcode.Bnot => mut self.vec2(aarch64::VecUnary.Not, size: 0, src: src)
+        clif::Opcode.FcvtFromSint => mut self.vec2(aarch64::VecUnary.Scvtf, size: 2, src: src)
+        clif::Opcode.FcvtToSintSat => mut self.vec2(aarch64::VecUnary.Fcvtzs, size: 2, src: src)
+        clif::Opcode.SwidenLow => mut self.vec2(aarch64::VecUnary.Sxtl, size: arm_lane_size(ty), src: src)
+        else => mut self.vec2(aarch64::VecUnary.Sxtl2, size: arm_lane_size(ty), src: src)
+    }
+} ArmSelector.vector_unary
+
+/// `vhigh_bits`: the top bit of each lane in a new general-purpose register, gathered from each
+/// 64-bit half.
+fn ArmSelector.high_bits(mut self, ty: clif::Type, src: machinst::Reg) -> machinst::Reg {
+    let size = arm_lane_size(ty)
+    let lanes = 8u32 >> size
+    let low = mut self.half_bits(size, half: mut self.half(src, lane: 0))
+    let high = mut self.half_bits(size, half: mut self.half(src, lane: 1))
+    let raised = mut self.temp(false)
+    mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsl, width: aarch64::Width.Bits64, dst: raised, src: high, amount: u8.truncate(lanes)))
+    let bits = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: aarch64::Width.Bits64, dst: bits, lhs: low, rhs: raised))
+    return bits
+} ArmSelector.high_bits
+
+/// The top bits of the lanes of `1 << size` bytes of a 64-bit half, lane 0's at bit 0: moved to
+/// their lanes' low bits and gathered into the top `64 - width` bits by a multiply whose terms
+/// place lane i's at bit `64 - width + i`, other terms landing in distinct lower bits or beyond.
+fn ArmSelector.half_bits(mut self, size: u32, half: machinst::Reg) -> machinst::Reg {
+    let width = 8u32 << size
+    let tops = mut self.temp(false)
+    mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: aarch64::Width.Bits64, dst: tops, src: half, amount: u8.truncate(width - 1)))
+    if size == 3 {
+        return tops
+    }
+    let ones = match size {
+        0 => 0x0101_0101_0101_0101u64
+        1 => 0x0001_0001_0001_0001
+        else => 0x0000_0001_0000_0001
+    }
+    let gather = match size {
+        0 => 0x0102_0408_1020_4080u64
+        1 => 0x0001_0002_0004_0008
+        else => 0x0000_0001_0000_0002
+    }
+    let spread = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: aarch64::Width.Bits64, dst: spread, src: tops, imm: ones))
+    let factor = mut self.int_constant(gather)
+    let product = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Madd(width: aarch64::Width.Bits64, dst: product, lhs: spread, rhs: factor, addend: aarch64::SP))
+    let lanes = 8u32 >> size
+    let placed = mut self.temp(false)
+    mut self.emit(aarch64::Inst.ShiftImm(kind: aarch64::ShiftKind.Lsr, width: aarch64::Width.Bits64, dst: placed, src: product, amount: u8.truncate(64 - width)))
+    let bits = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: aarch64::Width.Bits64, dst: bits, src: placed, imm: (1u64 << lanes) - 1))
+    return bits
+} ArmSelector.half_bits
+
+/// A binary vector instruction's result in a new register.
+fn ArmSelector.vector_binary(mut self, func: clif::Function, opcode: clif::Opcode, x: clif::Value, y: clif::Value) -> machinst::Reg {
+    let ty = func.value_type(x)
+    let size = arm_lane_size(ty)
+    if opcode == clif::Opcode.Iadd and self.isa.has(workspace::Level.Aarch64Dotprod) {
+        match mut self.dot(func, x, y) {
+            Some(acc) => return acc
+            None => {}
+        }
+    }
+    let a = mut self.src(x, func)
+    let b = mut self.src(y, func)
+    if opcode == clif::Opcode.Imul and size == 3 {
+        return mut self.wide_product(a, b)
+    }
+    if opcode == clif::Opcode.Ishl or opcode == clif::Opcode.Ushr or opcode == clif::Opcode.Sshr {
+        return mut self.lanes_shift(size, opcode, value: a, amount: b)
+    }
+    if opcode == clif::Opcode.Fadd or opcode == clif::Opcode.Fsub or opcode == clif::Opcode.Fmul or opcode == clif::Opcode.Fdiv or opcode == clif::Opcode.Fmin or opcode == clif::Opcode.Fmax {
+        let op = match opcode {
+            clif::Opcode.Fadd => aarch64::VecOp.Fadd
+            clif::Opcode.Fsub => aarch64::VecOp.Fsub
+            clif::Opcode.Fmul => aarch64::VecOp.Fmul
+            clif::Opcode.Fdiv => aarch64::VecOp.Fdiv
+            clif::Opcode.Fmin => aarch64::VecOp.Fmin
+            else => aarch64::VecOp.Fmax
+        }
+        let result = mut self.vec3(op, size: 2, lhs: a, rhs: b)
+        return mut self.canonical_lanes(result)
+    }
+    let op = match opcode {
+        clif::Opcode.Iadd => aarch64::VecOp.Add
+        clif::Opcode.Isub => aarch64::VecOp.Sub
+        clif::Opcode.Imul => aarch64::VecOp.Mul
+        clif::Opcode.Band => aarch64::VecOp.And
+        clif::Opcode.Bor => aarch64::VecOp.Orr
+        clif::Opcode.Bxor => aarch64::VecOp.Eor
+        clif::Opcode.SaddSat => aarch64::VecOp.Sqadd
+        clif::Opcode.UaddSat => aarch64::VecOp.Uqadd
+        clif::Opcode.SsubSat => aarch64::VecOp.Sqsub
+        clif::Opcode.UsubSat => aarch64::VecOp.Uqsub
+        else => aarch64::VecOp.Addp
+    }
+    return mut self.vec3(op, size, lhs: a, rhs: b)
+} ArmSelector.vector_binary
+
+/// `imul` of 64-bit lanes, each multiplied in general-purpose registers.
+fn ArmSelector.wide_product(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    for lane in 0u32..<2 {
+        let left = mut self.half(a, lane)
+        let right = mut self.half(b, lane)
+        let product = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Madd(width: aarch64::Width.Bits64, dst: product, lhs: left, rhs: right, addend: aarch64::SP))
+        if lane == 0 {
+            mut self.emit(aarch64::Inst.FloatFromInt(prec: aarch64::Precision.Double, dst: dst, src: product))
+        } else {
+            mut self.emit(aarch64::Inst.Ins(dst: dst, src: product, lane: 1))
+        }
+    }
+    return dst
+} ArmSelector.wide_product
+
+/// `ishl`, `ushr` or `sshr` of each lane by a scalar amount, cut to below the lane width: `ushl`
+/// or `sshl` by the amount, negated for a right shift, in every lane.
+fn ArmSelector.lanes_shift(mut self, size: u32, opcode: clif::Opcode, value: machinst::Reg, amount: machinst::Reg) -> machinst::Reg {
+    let cut = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: aarch64::Width.Bits32, dst: cut, src: amount, imm: u64.widen((8u32 << size) - 1)))
+    var count = cut
+    if opcode != clif::Opcode.Ishl {
+        count = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Neg(width: aarch64::Width.Bits32, dst: count, src: cut))
+    }
+    let counts = mut self.dup(size, src: count)
+    if opcode == clif::Opcode.Sshr {
+        return mut self.vec3(aarch64::VecOp.Sshl, size, lhs: value, rhs: counts)
+    }
+    return mut self.vec3(aarch64::VecOp.Ushl, size, lhs: value, rhs: counts)
+} ArmSelector.lanes_shift
+
+/// The instruction defining a value, when it has the opcode.
+fn ArmSelector.defined(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[clif::Inst] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.facts.defs.len()
+    let def = self.facts.defs[at]
+    if def == NONE or func.inst_data(clif::Inst(index: def)).opcode() != opcode {
+        return None
+    }
+    return Some(clif::Inst(index: def))
+} ArmSelector.defined
+
+/// The operand of a `swiden_low` or `swiden_high`.
+fn ArmSelector.widened_from(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[clif::Value] {
+    let Some(inst) = self.defined(func, value, opcode) else {
+        return None
+    }
+    let clif::InstructionData.Unary(opcode: _, arg: arg) = func.inst_data(inst) else {
+        return None
+    }
+    return Some(func.resolve_aliases(arg))
+} ArmSelector.widened_from
+
+/// The operands of a binary instruction of an opcode defining a value.
+fn ArmSelector.binary_operands(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[Operands] {
+    let Some(inst) = self.defined(func, value, opcode) else {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: _, x: x, y: y) = func.inst_data(inst) else {
+        return None
+    }
+    return Some(Operands(x: x, y: y))
+} ArmSelector.binary_operands
+
+/// The products whose sums of pairs `iadd_pairwise` of their widened halves gives: the `imul`
+/// giving them.
+fn ArmSelector.pair_sums_of(self, func: clif::Function, value: clif::Value) -> Option[clif::Value] {
+    let Some(sums) = self.binary_operands(func, value, opcode: clif::Opcode.IaddPairwise) else {
+        return None
+    }
+    let Some(low) = self.widened_from(func, value: sums.x, opcode: clif::Opcode.SwidenLow) else {
+        return None
+    }
+    let Some(high) = self.widened_from(func, value: sums.y, opcode: clif::Opcode.SwidenHigh) else {
+        return None
+    }
+    if low != high {
+        return None
+    }
+    return Some(low)
+} ArmSelector.pair_sums_of
+
+/// The vectors of bytes whose low or high widened halves a product multiplies.
+fn ArmSelector.halves_product(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[Operands] {
+    let Some(factors) = self.binary_operands(func, value, opcode: clif::Opcode.Imul) else {
+        return None
+    }
+    let Some(a) = self.widened_from(func, value: factors.x, opcode) else {
+        return None
+    }
+    let Some(b) = self.widened_from(func, value: factors.y, opcode) else {
+        return None
+    }
+    if func.value_type(a) != clif::Type.Int8x16 {
+        return None
+    }
+    return Some(Operands(x: a, y: b))
+} ArmSelector.halves_product
+
+/// At `aarch64-dotprod`, `acc` plus the i8 dot product tree of two vectors of bytes as one
+/// `sdot`, when `x` is that tree and `y` the accumulator.
+fn ArmSelector.dot(mut self, func: clif::Function, x: clif::Value, y: clif::Value) -> Option[machinst::Reg] {
+    let Some(sums) = self.binary_operands(func, value: x, opcode: clif::Opcode.IaddPairwise) else {
+        return None
+    }
+    let Some(low) = self.pair_sums_of(func, value: sums.x) else {
+        return None
+    }
+    let Some(high) = self.pair_sums_of(func, value: sums.y) else {
+        return None
+    }
+    let Some(low_operands) = self.halves_product(func, value: low, opcode: clif::Opcode.SwidenLow) else {
+        return None
+    }
+    let Some(high_operands) = self.halves_product(func, value: high, opcode: clif::Opcode.SwidenHigh) else {
+        return None
+    }
+    if low_operands != high_operands {
+        return None
+    }
+    let acc = mut self.src(y, func)
+    let a = mut self.src(low_operands.x, func)
+    let b = mut self.src(low_operands.y, func)
+    let dst = mut self.vector_temp()
+    mut self.mov(dst, src: acc)
+    mut self.emit(aarch64::Inst.Sdot(acc: dst, lhs: a, rhs: b))
+    return Some(dst)
+} ArmSelector.dot

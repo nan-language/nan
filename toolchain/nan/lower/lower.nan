@@ -179,11 +179,15 @@ pkg struct Program {
     pkg dump: bool
     /// The code an earlier lowering compiled, as its build cache entry holds it.
     pkg kept: mem::Bytes
+    /// The codegen level of the program's manifest for the target's architecture.
+    pkg level: Option[workspace::Level]
 } Program
 
 struct Lowering {
     ck: check::Checker
     module: object::Module
+    /// The codegen level the image's code is generated for, none for the base set.
+    level: Option[workspace::Level]
     layouts: Layouts
     prefixes: mem::HashMap[text::String, text::String]
     roots: mem::List[ty::PackageId]
@@ -288,7 +292,7 @@ fn Instance.sides_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
 /// artefacts of its `.nan` section.
 pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValue) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     entry_seam(mut lowering, program)
@@ -301,7 +305,7 @@ pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValu
 /// image.
 pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     let boot = mut lowering.boot_glue(program)
@@ -329,13 +333,15 @@ fn copied_roots(roots: Slice[ty::PackageId], alloc: mem::Alloc) -> mem::List[ty:
     return copied
 } copied_roots
 
-/// A lowering into a new object, of a test image when `test_runtime` is given.
-fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], take test_runtime: Option[Runtime]) -> Lowering {
+/// A lowering into a new object, for a codegen level when `level` is given, of a test image when
+/// `test_runtime` is given.
+fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], level: Option[workspace::Level], take test_runtime: Option[Runtime]) -> Lowering {
     let alloc = ck.alloc()
     let target = ck.db().target
     return Lowering(
         ck: take ck,
-        module: object::Module.new(target, alloc),
+        module: object::Module.new(target, level, alloc),
+        level: level,
         layouts: Layouts.new(alloc),
         prefixes: take prefixes,
         roots: take roots,
@@ -464,7 +470,13 @@ fn Lowering.define_instance(mut self, instance: Instance, id: object::FuncId) {
 
 fn Lowering.lower_instance(mut self, mut fx: Fx, instance: Instance, abi: Abi) {
     match instance {
-        Instance.Nir(item: item, role: role, index: index, args: args) => body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
+        Instance.Nir(item: item, role: role, index: index, args: args) => {
+            if role == nir::Role.Body and not self.machine() and self.ck.db().is_std(item) and simd_vectorized(self.ck.db().canonical(item).as_str()) {
+                simd_lower_vector(mut self, mut fx, abi, item, args)
+            } else {
+                body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
+            }
+        }
         Instance.Supplied(item: item, args: args) => supplied_lower(mut self, mut fx, abi, item, args)
         Instance.Derived(owner: owner, method: method, args: args) => conform_derived(mut self, mut fx, abi, owner, method: method.as_str(), args)
         Instance.Conformance(ty: ty, method: method, args: _) => supplied(mut self, mut fx, abi, ty, method: method.as_str())

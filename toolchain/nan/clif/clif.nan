@@ -9,6 +9,11 @@ pkg enum Type derives Copy, Eq, Ord, Hash {
     Int128
     Float32
     Float64
+    Int8x16
+    Int16x8
+    Int32x4
+    Int64x2
+    Float32x4
 } Type
 
 pkg fn Type.bits(self) -> u32
@@ -20,6 +25,7 @@ pkg fn Type.bits(self) -> u32
         Type.Int32 or Type.Float32 => 32
         Type.Int64 or Type.Float64 => 64
         Type.Int128 => 128
+        else => 128
     }
 } Type.bits
 
@@ -27,16 +33,59 @@ pkg fn Type.bytes(self) -> u32 {
     return self.bits() / 8
 } Type.bytes
 
+/// Whether the type is a scalar integer type.
 pkg fn Type.is_int(self) -> bool {
     return match self {
-        Type.Float32 or Type.Float64 => false
-        else => true
+        Type.Int8 or Type.Int16 or Type.Int32 or Type.Int64 or Type.Int128 => true
+        else => false
     }
 } Type.is_int
 
+/// Whether the type is a scalar float type.
 pkg fn Type.is_float(self) -> bool {
-    return not self.is_int()
+    return self == Type.Float32 or self == Type.Float64
 } Type.is_float
+
+/// Whether the type is a 128-bit vector of lanes.
+pkg fn Type.is_vector(self) -> bool {
+    return not self.is_int() and not self.is_float()
+} Type.is_vector
+
+/// Whether a value of the type lives in the float and vector registers.
+pkg fn Type.in_vector_registers(self) -> bool {
+    return not self.is_int()
+} Type.in_vector_registers
+
+/// The type of a vector's lanes, the type itself for a scalar.
+pkg fn Type.lane_type(self) -> Type {
+    return match self {
+        Type.Int8x16 => Type.Int8
+        Type.Int16x8 => Type.Int16
+        Type.Int32x4 => Type.Int32
+        Type.Int64x2 => Type.Int64
+        Type.Float32x4 => Type.Float32
+        else => self
+    }
+} Type.lane_type
+
+/// The integer type of a float type's shape: the type itself for an integer type.
+pkg fn Type.integer(self) -> Type {
+    return match self {
+        Type.Float32 => Type.Int32
+        Type.Float64 => Type.Int64
+        Type.Float32x4 => Type.Int32x4
+        else => self
+    }
+} Type.integer
+
+/// The vector of half as many lanes twice as wide.
+pkg fn Type.merge_lanes(self) -> Type {
+    return match self {
+        Type.Int8x16 => Type.Int16x8
+        Type.Int16x8 => Type.Int32x4
+        else => Type.Int64x2
+    }
+} Type.merge_lanes
 
 /// The integer type of a width in bits, none for a width no integer type has.
 pkg fn Type.int(bits: u32) -> Option[Type] {
@@ -60,6 +109,11 @@ pkg proj fn Type.name(self) -> Str {
         Type.Int128 => "i128"
         Type.Float32 => "f32"
         Type.Float64 => "f64"
+        Type.Int8x16 => "i8x16"
+        Type.Int16x8 => "i16x8"
+        Type.Int32x4 => "i32x4"
+        Type.Int64x2 => "i64x2"
+        Type.Float32x4 => "f32x4"
     }
 } Type.name
 
@@ -269,6 +323,10 @@ pkg enum Opcode derives Copy, Eq, Hash {
     Bswap
     Umin
     Umax
+    SaddSat
+    UaddSat
+    SsubSat
+    UsubSat
     Icmp
     Select
     Uextend
@@ -291,6 +349,8 @@ pkg enum Opcode derives Copy, Eq, Hash {
     Fabs
     Fneg
     Fcopysign
+    Fmin
+    Fmax
     Fcmp
     Fpromote
     Fdemote
@@ -298,6 +358,14 @@ pkg enum Opcode derives Copy, Eq, Hash {
     FcvtToUintSat
     FcvtFromSint
     FcvtFromUint
+    Splat
+    Bitselect
+    SwidenLow
+    SwidenHigh
+    IaddPairwise
+    VanyTrue
+    VallTrue
+    VhighBits
     Load
     Store
     AtomicLoad
@@ -347,6 +415,7 @@ fn Opcode.is_polymorphic(self) -> bool {
 fn Opcode.uses_typevar_operand(self) -> bool {
     return match self {
         Opcode.Iconst or Opcode.F32const or Opcode.F64const or Opcode.Uextend or Opcode.Sextend or Opcode.Ireduce or Opcode.Bitcast => false
+        Opcode.Splat or Opcode.VhighBits => false
         Opcode.Fpromote or Opcode.Fdemote or Opcode.FcvtToSintSat or Opcode.FcvtToUintSat or Opcode.FcvtFromSint or Opcode.FcvtFromUint => false
         Opcode.Load or Opcode.AtomicLoad or Opcode.AtomicRmw or Opcode.Fence or Opcode.StackAddr or Opcode.SymbolValue or Opcode.TlsValue => false
         Opcode.FuncAddr or Opcode.GetFramePointer or Opcode.Call or Opcode.Return or Opcode.Jump or Opcode.Trap => false
@@ -359,12 +428,15 @@ fn Opcode.uses_typevar_operand(self) -> bool {
 fn Opcode.requires_typevar_operand(self) -> bool {
     return match self {
         Opcode.Icmp or Opcode.Iconcat or Opcode.Isplit or Opcode.Fcmp or Opcode.Store or Opcode.AtomicStore or Opcode.CallIndirect or Opcode.Brif => true
+        Opcode.SwidenLow or Opcode.SwidenHigh or Opcode.VanyTrue or Opcode.VallTrue => true
         else => false
     }
 } Opcode.requires_typevar_operand
 
 /// The opcode's name in the text form.
-pkg proj fn Opcode.name(self) -> Str {
+pkg proj fn Opcode.name(self) -> Str
+    waive length "one arm per opcode"
+{
     return match self {
         Opcode.Iconst => "iconst"
         Opcode.F32const => "f32const"
@@ -393,6 +465,10 @@ pkg proj fn Opcode.name(self) -> Str {
         Opcode.Bswap => "bswap"
         Opcode.Umin => "umin"
         Opcode.Umax => "umax"
+        Opcode.SaddSat => "sadd_sat"
+        Opcode.UaddSat => "uadd_sat"
+        Opcode.SsubSat => "ssub_sat"
+        Opcode.UsubSat => "usub_sat"
         Opcode.Icmp => "icmp"
         Opcode.Select => "select"
         Opcode.Uextend => "uextend"
@@ -415,6 +491,8 @@ pkg proj fn Opcode.name(self) -> Str {
         Opcode.Fabs => "fabs"
         Opcode.Fneg => "fneg"
         Opcode.Fcopysign => "fcopysign"
+        Opcode.Fmin => "fmin"
+        Opcode.Fmax => "fmax"
         Opcode.Fcmp => "fcmp"
         Opcode.Fpromote => "fpromote"
         Opcode.Fdemote => "fdemote"
@@ -422,6 +500,14 @@ pkg proj fn Opcode.name(self) -> Str {
         Opcode.FcvtToUintSat => "fcvt_to_uint_sat"
         Opcode.FcvtFromSint => "fcvt_from_sint"
         Opcode.FcvtFromUint => "fcvt_from_uint"
+        Opcode.Splat => "splat"
+        Opcode.Bitselect => "bitselect"
+        Opcode.SwidenLow => "swiden_low"
+        Opcode.SwidenHigh => "swiden_high"
+        Opcode.IaddPairwise => "iadd_pairwise"
+        Opcode.VanyTrue => "vany_true"
+        Opcode.VallTrue => "vall_true"
+        Opcode.VhighBits => "vhigh_bits"
         Opcode.Load => "load"
         Opcode.Store => "store"
         Opcode.AtomicLoad => "atomic_load"

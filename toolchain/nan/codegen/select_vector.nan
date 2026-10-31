@@ -1,0 +1,569 @@
+//! Instruction selection for x86-64 of the instructions on 128-bit vectors: SSE2 sequences at the base level, SSE4.1 and SSE4.2 instructions at `x86_64-v2`, VEX encodings of three operands and AVX2 broadcasts at `x86_64-v3`, and AVX-512 operations on 64-bit lanes at `x86_64-v4`, float results canonicalized as Cranelift's pass does.
+
+/// Whether an instruction computes on vectors: it gives one, stores one, or reduces one.
+fn is_vector_inst(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    match func.inst_data(inst) {
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: _, offset: _) => return func.value_type(x).is_vector()
+        clif::InstructionData.Unary(opcode: opcode, arg: _) => {
+            if opcode == clif::Opcode.VanyTrue or opcode == clif::Opcode.VallTrue or opcode == clif::Opcode.VhighBits {
+                return true
+            }
+        }
+        else => {}
+    }
+    let results = func.inst_results(inst, alloc)
+    return results.len() > 0 and func.value_type(results[0]).is_vector()
+} is_vector_inst
+
+/// A new register holding a vector.
+fn Selector.vector_temp(mut self) -> machinst::Reg {
+    return mut self.code.new_vector_vreg()
+} Selector.vector_temp
+
+/// A new vector register holding a copy of `src`.
+fn Selector.vector_copy(mut self, src: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.mov(dst, src: src)
+    return dst
+} Selector.vector_copy
+
+/// A binary operation into a new register: three operands with VEX at `x86_64-v3`, a copy of
+/// `lhs` and two otherwise.
+fn Selector.packed(mut self, op: x64::Packed, lhs: machinst::Reg, rhs: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    if self.isa.has(workspace::Level.X64v3) {
+        mut self.emit(x64::Inst.PackedVex(op: op, dst: dst, lhs: lhs, rhs: rhs))
+        return dst
+    }
+    mut self.mov(dst, src: lhs)
+    mut self.emit(x64::Inst.Packed(op: op, dst: dst, src: rhs))
+    return dst
+} Selector.packed
+
+/// A unary operation into a new register.
+fn Selector.packed_unary(mut self, op: x64::Packed, src: machinst::Reg) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(x64::Inst.Packed(op: op, dst: dst, src: src))
+    return dst
+} Selector.packed_unary
+
+/// `pshufd` or `pshuflw` of `src` into a new register.
+fn Selector.shuffled(mut self, op: x64::PackedImm, src: machinst::Reg, order: u8) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(x64::Inst.PackedImm(op: op, dst: dst, src: src, imm: order))
+    return dst
+} Selector.shuffled
+
+/// `shufps` or `cmpps` of `lhs` and `rhs` into a new register.
+fn Selector.combined(mut self, op: x64::PackedImm, lhs: machinst::Reg, rhs: machinst::Reg, imm: u8) -> machinst::Reg {
+    let dst = mut self.vector_copy(lhs)
+    mut self.emit(x64::Inst.PackedImm(op: op, dst: dst, src: rhs, imm: imm))
+    return dst
+} Selector.combined
+
+/// A shift of each lane of a copy of `src` by an immediate.
+fn Selector.shifted(mut self, op: x64::PackedShift, src: machinst::Reg, amount: u8) -> machinst::Reg {
+    let dst = mut self.vector_copy(src)
+    mut self.emit(x64::Inst.PackedShift(op: op, reg: dst, imm: amount))
+    return dst
+} Selector.shifted
+
+/// A new register of zeros.
+fn Selector.zeros(mut self) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(x64::Inst.Packed(op: x64::Packed.Pxor, dst: dst, src: dst))
+    return dst
+} Selector.zeros
+
+/// A new register of ones.
+fn Selector.ones(mut self) -> machinst::Reg {
+    let dst = mut self.vector_temp()
+    mut self.emit(x64::Inst.Packed(op: x64::Packed.Pcmpeqd, dst: dst, src: dst))
+    return dst
+} Selector.ones
+
+/// The low lane of a size of a vector register broadcast to every lane of a new one.
+fn Selector.broadcast(mut self, size: x64::Size, src: machinst::Reg) -> machinst::Reg {
+    if self.isa.has(workspace::Level.X64v3) {
+        let dst = mut self.vector_temp()
+        mut self.emit(x64::Inst.Broadcast(size: size, dst: dst, src: src))
+        return dst
+    }
+    if size == x64::Size.Dword {
+        return mut self.shuffled(x64::PackedImm.Pshufd, src: src, order: 0)
+    }
+    if size == x64::Size.Qword {
+        return mut self.shuffled(x64::PackedImm.Pshufd, src: src, order: 0x44)
+    }
+    var words = src
+    if size == x64::Size.Byte {
+        words = mut self.vector_copy(src)
+        mut self.emit(x64::Inst.Packed(op: x64::Packed.Punpcklbw, dst: words, src: words))
+    }
+    let low = mut self.shuffled(x64::PackedImm.Pshuflw, src: words, order: 0)
+    return mut self.shuffled(x64::PackedImm.Pshufd, src: low, order: 0)
+} Selector.broadcast
+
+/// A new register holding a general-purpose one's low lane of a size in every lane.
+fn Selector.splat_gpr(mut self, size: x64::Size, src: machinst::Reg) -> machinst::Reg {
+    let low = mut self.vector_temp()
+    var moved = x64::Size.Dword
+    if size == x64::Size.Qword {
+        moved = x64::Size.Qword
+    }
+    mut self.emit(x64::Inst.MovToXmm(size: moved, dst: low, src: src))
+    return mut self.broadcast(size, src: low)
+} Selector.splat_gpr
+
+/// A new register holding a constant in every lane of a size.
+fn Selector.splat_bits(mut self, size: x64::Size, bits: u64) -> machinst::Reg {
+    let int = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: int, imm: bits))
+    return mut self.splat_gpr(size, src: int)
+} Selector.splat_bits
+
+/// The lane size of a vector type.
+fn lane_size(ty: clif::Type) -> x64::Size = x64::Size.of_bits(ty.lane_type().bits())
+
+/// Selects an instruction computing on vectors.
+fn Selector.vector(mut self, func: clif::Function, inst: clif::Inst) {
+    match func.inst_data(inst) {
+        clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: offset) => {
+            let dst = mut self.dst_of(func, inst)
+            let mem = mut self.amode(arg, func, offset, indexed: true)
+            mut self.emit(x64::Inst.VectorLoad(dst: dst, src: mem))
+        }
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: offset) => {
+            let src = mut self.src(x, func)
+            let mem = mut self.amode(p, func, offset, indexed: true)
+            mut self.emit(x64::Inst.VectorStore(src: src, dst: mem))
+        }
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => {
+            if opcode == clif::Opcode.VanyTrue or opcode == clif::Opcode.VallTrue {
+                let outcome = mut self.lane_test(func, opcode, arg)
+                mut self.set_flag(func, inst, outcome)
+                return
+            }
+            let result = mut self.vector_unary(func, inst, opcode, arg)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => {
+            let ty = func.value_type(x)
+            let a = mut self.src(x, func)
+            let b = mut self.src(y, func)
+            let result = mut self.vector_binary(ty, opcode, a, b)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.Ternary(opcode: _, x: c, y: x, z: y) => {
+            let mask = mut self.src(c, func)
+            let chosen = mut self.src(x, func)
+            let other = mut self.src(y, func)
+            let kept = mut self.packed(x64::Packed.Pand, lhs: chosen, rhs: mask)
+            let rest = mut self.packed(x64::Packed.Pandn, lhs: mask, rhs: other)
+            let result = mut self.packed(x64::Packed.Por, lhs: kept, rhs: rest)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let ty = func.value_type(x)
+            let a = mut self.src(x, func)
+            let b = mut self.src(y, func)
+            let result = mut self.lanes_compare(ty, cond, a, b)
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let a = mut self.src(x, func)
+            let b = mut self.src(y, func)
+            let result = match cond {
+                clif::FloatCC.Equal => mut self.combined(x64::PackedImm.Cmpps, lhs: a, rhs: b, imm: 0)
+                clif::FloatCC.LessThan => mut self.combined(x64::PackedImm.Cmpps, lhs: a, rhs: b, imm: 1)
+                else => mut self.combined(x64::PackedImm.Cmpps, lhs: b, rhs: a, imm: 1)
+            }
+            let dst = mut self.dst_of(func, inst)
+            mut self.mov(dst, src: result)
+        }
+        else => {
+            expect false
+        }
+    }
+} Selector.vector
+
+/// `vany_true`, whether some lane is nonzero, or `vall_true`, whether every lane is, as flags.
+fn Selector.lane_test(mut self, func: clif::Function, opcode: clif::Opcode, arg: clif::Value) -> FlagTest {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    var tested = src
+    if opcode == clif::Opcode.VallTrue {
+        let zeros = mut self.zeros()
+        tested = mut self.lanes_equal(ty, a: src, b: zeros)
+    }
+    if self.isa.has(workspace::Level.X64v2) {
+        mut self.emit(x64::Inst.Ptest(lhs: tested, rhs: tested))
+    } else {
+        if opcode == clif::Opcode.VanyTrue {
+            let zeros = mut self.zeros()
+            tested = mut self.packed(x64::Packed.Pcmpeqb, lhs: src, rhs: zeros)
+        }
+        let bits = mut self.temp(false)
+        mut self.emit(x64::Inst.MoveMask(op: x64::MaskMove.Bytes, dst: bits, src: tested))
+        if opcode == clif::Opcode.VanyTrue {
+            mut self.emit(x64::Inst.CmpImm(size: x64::Size.Dword, lhs: bits, imm: 0xFFFF))
+        } else {
+            mut self.emit(x64::Inst.Test(size: x64::Size.Dword, lhs: bits, rhs: bits))
+        }
+    }
+    if opcode == clif::Opcode.VanyTrue {
+        return FlagTest.One(x64::Cond.NotEqual)
+    }
+    return FlagTest.One(x64::Cond.Equal)
+} Selector.lane_test
+
+/// A unary vector instruction's result in a new register.
+fn Selector.vector_unary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) -> machinst::Reg {
+    let ty = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    if opcode == clif::Opcode.Splat {
+        let result_ty = func.value_type(result_of(func, inst, alloc: self.alloc))
+        if result_ty == clif::Type.Float32x4 {
+            return mut self.broadcast(x64::Size.Dword, src: src)
+        }
+        return mut self.splat_gpr(lane_size(result_ty), src: src)
+    }
+    if opcode == clif::Opcode.Bnot {
+        let ones = mut self.ones()
+        return mut self.packed(x64::Packed.Pxor, lhs: src, rhs: ones)
+    }
+    if opcode == clif::Opcode.Sqrt {
+        let root = mut self.packed_unary(x64::Packed.Sqrtps, src: src)
+        return mut self.canonical_lanes(root)
+    }
+    return match opcode {
+        clif::Opcode.FcvtFromSint => mut self.packed_unary(x64::Packed.Cvtdq2ps, src: src)
+        clif::Opcode.FcvtToSintSat => mut self.saturated_lanes(src)
+        clif::Opcode.SwidenLow or clif::Opcode.SwidenHigh => mut self.widened(ty, high: opcode == clif::Opcode.SwidenHigh, src: src)
+        else => mut self.high_bits(ty, src)
+    }
+} Selector.vector_unary
+
+/// `vhigh_bits`: the top bit of each lane in a new general-purpose register.
+fn Selector.high_bits(mut self, ty: clif::Type, src: machinst::Reg) -> machinst::Reg {
+    let bits = mut self.temp(false)
+    match ty {
+        clif::Type.Int8x16 => mut self.emit(x64::Inst.MoveMask(op: x64::MaskMove.Bytes, dst: bits, src: src))
+        clif::Type.Int16x8 => {
+            let bytes = mut self.packed(x64::Packed.Packsswb, lhs: src, rhs: src)
+            mut self.emit(x64::Inst.MoveMask(op: x64::MaskMove.Bytes, dst: bits, src: bytes))
+            mut self.emit(x64::Inst.Shift(op: x64::ShiftOp.Shr, size: x64::Size.Dword, dst: bits, amount: 8))
+        }
+        clif::Type.Int64x2 => mut self.emit(x64::Inst.MoveMask(op: x64::MaskMove.Qwords, dst: bits, src: src))
+        else => mut self.emit(x64::Inst.MoveMask(op: x64::MaskMove.Dwords, dst: bits, src: src))
+    }
+    return bits
+} Selector.high_bits
+
+/// `swiden_low` or `swiden_high` of 8- or 16-bit lanes: `pmovsx` at `x86_64-v2`, the lanes
+/// paired with themselves and shifted right arithmetically otherwise.
+fn Selector.widened(mut self, ty: clif::Type, high: bool, src: machinst::Reg) -> machinst::Reg {
+    let bytes = ty == clif::Type.Int8x16
+    if self.isa.has(workspace::Level.X64v2) {
+        var low = src
+        if high {
+            low = mut self.shuffled(x64::PackedImm.Pshufd, src: src, order: 0xEE)
+        }
+        if bytes {
+            return mut self.packed_unary(x64::Packed.Pmovsxbw, src: low)
+        }
+        return mut self.packed_unary(x64::Packed.Pmovsxwd, src: low)
+    }
+    if bytes {
+        var unpack = x64::Packed.Punpcklbw
+        if high {
+            unpack = x64::Packed.Punpckhbw
+        }
+        let pairs = mut self.packed(unpack, lhs: src, rhs: src)
+        return mut self.shifted(x64::PackedShift.Psraw, src: pairs, amount: 8)
+    }
+    var unpack = x64::Packed.Punpcklwd
+    if high {
+        unpack = x64::Packed.Punpckhwd
+    }
+    let pairs = mut self.packed(unpack, lhs: src, rhs: src)
+    return mut self.shifted(x64::PackedShift.Psrad, src: pairs, amount: 16)
+} Selector.widened
+
+/// `fcvt_to_sint_sat` of four floats: truncated, a NaN giving 0 and a lane beyond the range its
+/// bound, as Cranelift sequences it.
+fn Selector.saturated_lanes(mut self, src: machinst::Reg) -> machinst::Reg {
+    let ordered = mut self.combined(x64::PackedImm.Cmpps, lhs: src, rhs: src, imm: 0)
+    let kept = mut self.packed(x64::Packed.Pand, lhs: src, rhs: ordered)
+    let signs = mut self.packed(x64::Packed.Pxor, lhs: ordered, rhs: kept)
+    let converted = mut self.packed_unary(x64::Packed.Cvttps2dq, src: kept)
+    let overflowed = mut self.packed(x64::Packed.Pand, lhs: converted, rhs: signs)
+    let fill = mut self.shifted(x64::PackedShift.Psrad, src: overflowed, amount: 31)
+    return mut self.packed(x64::Packed.Pxor, lhs: fill, rhs: converted)
+} Selector.saturated_lanes
+
+/// A float vector whose NaN lanes are made the canonical NaN.
+fn Selector.canonical_lanes(mut self, value: machinst::Reg) -> machinst::Reg {
+    let nans = mut self.combined(x64::PackedImm.Cmpps, lhs: value, rhs: value, imm: 3)
+    let canonical = mut self.splat_bits(x64::Size.Dword, bits: 0x7FC0_0000)
+    let chosen = mut self.packed(x64::Packed.Pand, lhs: canonical, rhs: nans)
+    let kept = mut self.packed(x64::Packed.Pandn, lhs: nans, rhs: value)
+    return mut self.packed(x64::Packed.Por, lhs: chosen, rhs: kept)
+} Selector.canonical_lanes
+
+/// A binary vector instruction's result in a new register.
+fn Selector.vector_binary(mut self, ty: clif::Type, opcode: clif::Opcode, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let size = lane_size(ty)
+    return match opcode {
+        clif::Opcode.Iadd => mut self.packed(lane_op(size, byte: x64::Packed.Paddb, word: x64::Packed.Paddw, dword: x64::Packed.Paddd, qword: x64::Packed.Paddq), lhs: a, rhs: b)
+        clif::Opcode.Isub => mut self.packed(lane_op(size, byte: x64::Packed.Psubb, word: x64::Packed.Psubw, dword: x64::Packed.Psubd, qword: x64::Packed.Psubq), lhs: a, rhs: b)
+        clif::Opcode.Imul => mut self.lanes_product(size, a, b)
+        clif::Opcode.Band => mut self.packed(x64::Packed.Pand, lhs: a, rhs: b)
+        clif::Opcode.Bor => mut self.packed(x64::Packed.Por, lhs: a, rhs: b)
+        clif::Opcode.Bxor => mut self.packed(x64::Packed.Pxor, lhs: a, rhs: b)
+        clif::Opcode.UaddSat => mut self.packed(lane_op(size, byte: x64::Packed.Paddusb, word: x64::Packed.Paddusw, dword: x64::Packed.Paddusw, qword: x64::Packed.Paddusw), lhs: a, rhs: b)
+        clif::Opcode.SaddSat => mut self.packed(lane_op(size, byte: x64::Packed.Paddsb, word: x64::Packed.Paddsw, dword: x64::Packed.Paddsw, qword: x64::Packed.Paddsw), lhs: a, rhs: b)
+        clif::Opcode.UsubSat => mut self.packed(lane_op(size, byte: x64::Packed.Psubusb, word: x64::Packed.Psubusw, dword: x64::Packed.Psubusw, qword: x64::Packed.Psubusw), lhs: a, rhs: b)
+        clif::Opcode.SsubSat => mut self.packed(lane_op(size, byte: x64::Packed.Psubsb, word: x64::Packed.Psubsw, dword: x64::Packed.Psubsw, qword: x64::Packed.Psubsw), lhs: a, rhs: b)
+        clif::Opcode.Ishl or clif::Opcode.Ushr or clif::Opcode.Sshr => mut self.lanes_shift(size, opcode, value: a, amount: b)
+        clif::Opcode.Fadd => mut self.float_lanes(x64::Packed.Addps, a, b)
+        clif::Opcode.Fsub => mut self.float_lanes(x64::Packed.Subps, a, b)
+        clif::Opcode.Fmul => mut self.float_lanes(x64::Packed.Mulps, a, b)
+        clif::Opcode.Fdiv => mut self.float_lanes(x64::Packed.Divps, a, b)
+        clif::Opcode.Fmin => mut self.lanes_min(a, b)
+        clif::Opcode.Fmax => mut self.lanes_max(a, b)
+        else => mut self.pairwise(a, b)
+    }
+} Selector.vector_binary
+
+/// The operation of a lane size among four.
+fn lane_op(size: x64::Size, byte: x64::Packed, word: x64::Packed, dword: x64::Packed, qword: x64::Packed) -> x64::Packed {
+    return match size {
+        x64::Size.Byte => byte
+        x64::Size.Word => word
+        x64::Size.Dword => dword
+        x64::Size.Qword => qword
+    }
+} lane_op
+
+/// A float operation lane by lane, its NaN lanes made the canonical NaN.
+fn Selector.float_lanes(mut self, op: x64::Packed, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let result = mut self.packed(op, lhs: a, rhs: b)
+    return mut self.canonical_lanes(result)
+} Selector.float_lanes
+
+/// `fmin` of four floats as Cranelift sequences it, a NaN when either lane is one and `-0.0`
+/// below `0.0`, its NaN lanes made the canonical NaN.
+fn Selector.lanes_min(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let forward = mut self.packed(x64::Packed.Minps, lhs: a, rhs: b)
+    let backward = mut self.packed(x64::Packed.Minps, lhs: b, rhs: a)
+    let either = mut self.packed(x64::Packed.Orps, lhs: forward, rhs: backward)
+    let nans = mut self.combined(x64::PackedImm.Cmpps, lhs: either, rhs: backward, imm: 3)
+    let marked = mut self.packed(x64::Packed.Orps, lhs: either, rhs: nans)
+    let fraction = mut self.shifted(x64::PackedShift.Psrld, src: nans, amount: 10)
+    let least = mut self.packed(x64::Packed.Andnps, lhs: fraction, rhs: marked)
+    return mut self.canonical_lanes(least)
+} Selector.lanes_min
+
+/// `fmax` of four floats as Cranelift sequences it, a NaN when either lane is one and `0.0`
+/// above `-0.0`, its NaN lanes made the canonical NaN.
+fn Selector.lanes_max(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let forward = mut self.packed(x64::Packed.Maxps, lhs: a, rhs: b)
+    let backward = mut self.packed(x64::Packed.Maxps, lhs: b, rhs: a)
+    let differing = mut self.packed(x64::Packed.Xorps, lhs: forward, rhs: backward)
+    let blended = mut self.packed(x64::Packed.Orps, lhs: forward, rhs: differing)
+    let positive = mut self.packed(x64::Packed.Subps, lhs: blended, rhs: differing)
+    let nans = mut self.combined(x64::PackedImm.Cmpps, lhs: blended, rhs: blended, imm: 3)
+    let fraction = mut self.shifted(x64::PackedShift.Psrld, src: nans, amount: 10)
+    let greatest = mut self.packed(x64::Packed.Andnps, lhs: fraction, rhs: positive)
+    return mut self.canonical_lanes(greatest)
+} Selector.lanes_max
+
+/// `iadd_pairwise` of four 32-bit lanes each: `phaddd` at `x86_64-v2`, the even and odd lanes
+/// gathered with `shufps` and added otherwise.
+fn Selector.pairwise(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    if self.isa.has(workspace::Level.X64v2) {
+        return mut self.packed(x64::Packed.Phaddd, lhs: a, rhs: b)
+    }
+    let evens = mut self.combined(x64::PackedImm.Shufps, lhs: a, rhs: b, imm: 0x88)
+    let odds = mut self.combined(x64::PackedImm.Shufps, lhs: a, rhs: b, imm: 0xDD)
+    return mut self.packed(x64::Packed.Paddd, lhs: evens, rhs: odds)
+} Selector.pairwise
+
+/// `imul` lane by lane: `pmullw` for 16-bit lanes, `pmulld` at `x86_64-v2` for 32-bit ones,
+/// `vpmullq` at `x86_64-v4` for 64-bit ones, and Cranelift's `pmuludq` sequences otherwise.
+fn Selector.lanes_product(mut self, size: x64::Size, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    if size == x64::Size.Word {
+        return mut self.packed(x64::Packed.Pmullw, lhs: a, rhs: b)
+    }
+    if size == x64::Size.Dword {
+        if self.isa.has(workspace::Level.X64v2) {
+            return mut self.packed(x64::Packed.Pmulld, lhs: a, rhs: b)
+        }
+        let a_high = mut self.shuffled(x64::PackedImm.Pshufd, src: a, order: 0x31)
+        let b_high = mut self.shuffled(x64::PackedImm.Pshufd, src: b, order: 0x31)
+        let even = mut self.packed(x64::Packed.Pmuludq, lhs: a, rhs: b)
+        let low = mut self.shuffled(x64::PackedImm.Pshufd, src: even, order: 0x08)
+        let odd = mut self.packed(x64::Packed.Pmuludq, lhs: a_high, rhs: b_high)
+        let high = mut self.shuffled(x64::PackedImm.Pshufd, src: odd, order: 0x08)
+        return mut self.packed(x64::Packed.Punpckldq, lhs: low, rhs: high)
+    }
+    if self.isa.has(workspace::Level.X64v4) {
+        let dst = mut self.vector_temp()
+        mut self.emit(x64::Inst.PackedWide(op: x64::PackedWide.Vpmullq, dst: dst, lhs: a, rhs: b))
+        return dst
+    }
+    let a_high = mut self.shifted(x64::PackedShift.Psrlq, src: a, amount: 32)
+    let high_low = mut self.packed(x64::Packed.Pmuludq, lhs: a_high, rhs: b)
+    let b_high = mut self.shifted(x64::PackedShift.Psrlq, src: b, amount: 32)
+    let low_high = mut self.packed(x64::Packed.Pmuludq, lhs: a, rhs: b_high)
+    let cross = mut self.packed(x64::Packed.Paddq, lhs: high_low, rhs: low_high)
+    let raised = mut self.shifted(x64::PackedShift.Psllq, src: cross, amount: 32)
+    let low = mut self.packed(x64::Packed.Pmuludq, lhs: a, rhs: b)
+    return mut self.packed(x64::Packed.Paddq, lhs: low, rhs: raised)
+} Selector.lanes_product
+
+/// The shift count of a lane size: the amount, cut to below the lane width as `ishl`, `ushr` and
+/// `sshr` read it, plus `extra`, in a new vector register.
+fn Selector.shift_count(mut self, size: x64::Size, amount: machinst::Reg, extra: i32) -> machinst::Reg {
+    let cut = mut self.temp(false)
+    mut self.mov(cut, src: amount)
+    let width = match size {
+        x64::Size.Byte => 8i32
+        x64::Size.Word => 16
+        x64::Size.Dword => 32
+        x64::Size.Qword => 64
+    }
+    mut self.emit(x64::Inst.AluImm(op: x64::AluOp.And, size: x64::Size.Dword, dst: cut, imm: width - 1))
+    if extra != 0 {
+        mut self.emit(x64::Inst.AluImm(op: x64::AluOp.Add, size: x64::Size.Dword, dst: cut, imm: extra))
+    }
+    let count = mut self.vector_temp()
+    mut self.emit(x64::Inst.MovToXmm(size: x64::Size.Dword, dst: count, src: cut))
+    return count
+} Selector.shift_count
+
+/// `ishl`, `ushr` or `sshr` of each lane by a scalar amount: through 16-bit lanes for bytes,
+/// `vpsraq` at `x86_64-v4` and a sign fix after a logical shift otherwise for 64-bit `sshr`.
+fn Selector.lanes_shift(mut self, size: x64::Size, opcode: clif::Opcode, value: machinst::Reg, amount: machinst::Reg) -> machinst::Reg {
+    if size == x64::Size.Byte {
+        return mut self.byte_shift(opcode, value, amount)
+    }
+    let count = mut self.shift_count(size, amount, extra: 0)
+    if opcode == clif::Opcode.Ishl {
+        return mut self.packed(lane_op(size, byte: x64::Packed.Psllw, word: x64::Packed.Psllw, dword: x64::Packed.Pslld, qword: x64::Packed.Psllq), lhs: value, rhs: count)
+    }
+    if opcode == clif::Opcode.Ushr {
+        return mut self.packed(lane_op(size, byte: x64::Packed.Psrlw, word: x64::Packed.Psrlw, dword: x64::Packed.Psrld, qword: x64::Packed.Psrlq), lhs: value, rhs: count)
+    }
+    if size != x64::Size.Qword {
+        return mut self.packed(lane_op(size, byte: x64::Packed.Psraw, word: x64::Packed.Psraw, dword: x64::Packed.Psrad, qword: x64::Packed.Psrad), lhs: value, rhs: count)
+    }
+    if self.isa.has(workspace::Level.X64v4) {
+        let dst = mut self.vector_temp()
+        mut self.emit(x64::Inst.PackedWide(op: x64::PackedWide.Vpsraq, dst: dst, lhs: value, rhs: count))
+        return dst
+    }
+    let shifted = mut self.packed(x64::Packed.Psrlq, lhs: value, rhs: count)
+    let signs = mut self.splat_bits(x64::Size.Qword, bits: 0x8000_0000_0000_0000)
+    let moved = mut self.packed(x64::Packed.Psrlq, lhs: signs, rhs: count)
+    let flipped = mut self.packed(x64::Packed.Pxor, lhs: shifted, rhs: moved)
+    return mut self.packed(x64::Packed.Psubq, lhs: flipped, rhs: moved)
+} Selector.lanes_shift
+
+/// A shift of bytes through 16-bit lanes: each byte widened with zeros, or for `sshr` with
+/// itself and shifted 8 bits further, shifted, cut back to its byte and packed.
+fn Selector.byte_shift(mut self, opcode: clif::Opcode, value: machinst::Reg, amount: machinst::Reg) -> machinst::Reg {
+    if opcode == clif::Opcode.Sshr {
+        let count = mut self.shift_count(x64::Size.Byte, amount, extra: 8)
+        let low = mut self.packed(x64::Packed.Punpcklbw, lhs: value, rhs: value)
+        let high = mut self.packed(x64::Packed.Punpckhbw, lhs: value, rhs: value)
+        let low_shifted = mut self.packed(x64::Packed.Psraw, lhs: low, rhs: count)
+        let high_shifted = mut self.packed(x64::Packed.Psraw, lhs: high, rhs: count)
+        return mut self.packed(x64::Packed.Packsswb, lhs: low_shifted, rhs: high_shifted)
+    }
+    let count = mut self.shift_count(x64::Size.Byte, amount, extra: 0)
+    let zeros = mut self.zeros()
+    let low = mut self.packed(x64::Packed.Punpcklbw, lhs: value, rhs: zeros)
+    let high = mut self.packed(x64::Packed.Punpckhbw, lhs: value, rhs: zeros)
+    var op = x64::Packed.Psrlw
+    if opcode == clif::Opcode.Ishl {
+        op = x64::Packed.Psllw
+    }
+    var low_shifted = mut self.packed(op, lhs: low, rhs: count)
+    var high_shifted = mut self.packed(op, lhs: high, rhs: count)
+    if opcode == clif::Opcode.Ishl {
+        let ones = mut self.ones()
+        let bytes = mut self.shifted(x64::PackedShift.Psrlw, src: ones, amount: 8)
+        low_shifted = mut self.packed(x64::Packed.Pand, lhs: low_shifted, rhs: bytes)
+        high_shifted = mut self.packed(x64::Packed.Pand, lhs: high_shifted, rhs: bytes)
+    }
+    return mut self.packed(x64::Packed.Packuswb, lhs: low_shifted, rhs: high_shifted)
+} Selector.byte_shift
+
+/// Each lane all ones where the lanes are equal: `pcmpeqq` at `x86_64-v2` for 64-bit lanes, both
+/// halves' doubleword equalities otherwise.
+fn Selector.lanes_equal(mut self, ty: clif::Type, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let size = lane_size(ty)
+    if size != x64::Size.Qword {
+        return mut self.packed(lane_op(size, byte: x64::Packed.Pcmpeqb, word: x64::Packed.Pcmpeqw, dword: x64::Packed.Pcmpeqd, qword: x64::Packed.Pcmpeqd), lhs: a, rhs: b)
+    }
+    if self.isa.has(workspace::Level.X64v2) {
+        return mut self.packed(x64::Packed.Pcmpeqq, lhs: a, rhs: b)
+    }
+    let halves = mut self.packed(x64::Packed.Pcmpeqd, lhs: a, rhs: b)
+    let crossed = mut self.shuffled(x64::PackedImm.Pshufd, src: halves, order: 0xB1)
+    return mut self.packed(x64::Packed.Pand, lhs: halves, rhs: crossed)
+} Selector.lanes_equal
+
+/// Each lane all ones where `a`'s is greater as signed: `pcmpgtq` at `x86_64-v2` for 64-bit lanes,
+/// Cranelift's doubleword sequence otherwise.
+fn Selector.lanes_greater(mut self, size: x64::Size, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    if size != x64::Size.Qword {
+        return mut self.packed(lane_op(size, byte: x64::Packed.Pcmpgtb, word: x64::Packed.Pcmpgtw, dword: x64::Packed.Pcmpgtd, qword: x64::Packed.Pcmpgtd), lhs: a, rhs: b)
+    }
+    if self.isa.has(workspace::Level.X64v2) {
+        return mut self.packed(x64::Packed.Pcmpgtq, lhs: a, rhs: b)
+    }
+    let flip = mut self.splat_bits(x64::Size.Qword, bits: 0x8000_0000)
+    let a_flipped = mut self.packed(x64::Packed.Pxor, lhs: flip, rhs: a)
+    let b_flipped = mut self.packed(x64::Packed.Pxor, lhs: flip, rhs: b)
+    let greater = mut self.packed(x64::Packed.Pcmpgtd, lhs: a_flipped, rhs: b_flipped)
+    let low_greater = mut self.shuffled(x64::PackedImm.Pshufd, src: greater, order: 0xA0)
+    let high_greater = mut self.shuffled(x64::PackedImm.Pshufd, src: greater, order: 0xF5)
+    let equal = mut self.packed(x64::Packed.Pcmpeqd, lhs: a_flipped, rhs: b_flipped)
+    let high_equal = mut self.shuffled(x64::PackedImm.Pshufd, src: equal, order: 0xF5)
+    let low_decides = mut self.packed(x64::Packed.Pand, lhs: low_greater, rhs: high_equal)
+    return mut self.packed(x64::Packed.Por, lhs: low_decides, rhs: high_greater)
+} Selector.lanes_greater
+
+/// `icmp` of vectors: equality, and the signed and unsigned orders, the unsigned ones comparing
+/// the lanes with their top bits flipped.
+fn Selector.lanes_compare(mut self, ty: clif::Type, cond: clif::IntCC, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+    let size = lane_size(ty)
+    if cond == clif::IntCC.Equal {
+        return mut self.lanes_equal(ty, a, b)
+    }
+    var left = a
+    var right = b
+    if cond == clif::IntCC.SignedLessThan or cond == clif::IntCC.UnsignedLessThan {
+        left = b
+        right = a
+    }
+    if cond == clif::IntCC.UnsignedLessThan or cond == clif::IntCC.UnsignedGreaterThan {
+        let top = match size {
+            x64::Size.Byte => 0x80u64
+            x64::Size.Word => 0x8000
+            x64::Size.Dword => 0x8000_0000
+            x64::Size.Qword => 0x8000_0000_0000_0000
+        }
+        let flip = mut self.splat_bits(size, bits: top)
+        left = mut self.packed(x64::Packed.Pxor, lhs: left, rhs: flip)
+        right = mut self.packed(x64::Packed.Pxor, lhs: right, rhs: flip)
+    }
+    return mut self.lanes_greater(size, a: left, b: right)
+} Selector.lanes_compare

@@ -1170,7 +1170,7 @@ pub fn Module.into_region(take self) -> hw::Region
 
 ## Floating point
 
-A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
+A function, closure or const whose own operations or calls of std functions have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation or call.
 
 Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no thread switch saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The entry function starts with the extended state enabled ([anchor](#anchor)).
 
@@ -1189,6 +1189,23 @@ package kernel {
 pub fn doubled(level: f64) -> f64 {
     return level * 2.0 // error: kernel.float-use
 } doubled
+```
+
+```nan
+// file: kernel/package.nan
+//! Load totals for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+} kernel
+
+// file: kernel/kernel.nan
+//! Totals load figures.
+
+pub fn total(levels: core::simd::F32x4) -> f32 {
+    return levels.sum() // error: kernel.float-use
+} total
 ```
 
 ## Kernel halts

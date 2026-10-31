@@ -110,7 +110,13 @@ pub fn unavailable_if(fx: &mut Fx, condition: Value) {
 
 /// Writes that the runtime is unavailable and ends with status 71.
 pub fn unavailable(lo: &mut Lowering, fx: &mut Fx) {
-    let text = lo.view_literal(fx, UNAVAILABLE.as_bytes()).address();
+    refuse(lo, fx, UNAVAILABLE);
+}
+
+/// Writes why the image cannot run to standard error, the serial port on a machine target, and
+/// ends with status 71.
+pub fn refuse(lo: &mut Lowering, fx: &mut Fx, why: &str) {
+    let text = lo.view_literal(fx, why.as_bytes()).address();
     let start = fx.load(PTR, text, 0);
     let len = fx.load(PTR, text, 8);
     lo.call_routine(fx, Routine::WriteErr, &[start, len]);

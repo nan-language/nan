@@ -60,6 +60,21 @@ impl Candidate {
 }
 
 /// The interfaces derives may name, beside `Copy` and the promises.
+/// The integer lane types of `core::simd`, which implement `core::SecretBits`.
+pub const INTEGER_LANES: [&str; 8] = [
+    "core::simd::U8x16",
+    "core::simd::I8x16",
+    "core::simd::U16x8",
+    "core::simd::I16x8",
+    "core::simd::U32x4",
+    "core::simd::I32x4",
+    "core::simd::U64x2",
+    "core::simd::I64x2",
+];
+
+/// Those of 8-bit lanes, which have no product.
+const BYTE_LANES: [&str; 2] = ["core::simd::U8x16", "core::simd::I8x16"];
+
 const DERIVABLE: [&str; 7] = [
     "Eq", "Ord", "Hash", "Default", "Render", "Encode", "Generate",
 ];
@@ -357,6 +372,7 @@ impl Checker<'_> {
                             && all_args(interface)
                     }
                     ("core::Untrusted", "Render") => true,
+                    (lanes, "SecretBits") => INTEGER_LANES.contains(&lanes),
                     ("core::Untrusted", "Encode") => all_args(interface),
                     ("core::Untrusted", "Generate") => ty.type_arg(0).is_some_and(|inner| {
                         self.implements(inner, interface) && self.has(inner, Property::Inert)
@@ -705,6 +721,11 @@ impl Checker<'_> {
                     .is_some_and(|scalar| scalar.is_integer() || scalar == Scalar::Char)
             }),
             Receivers::Integer => element.and_then(Ty::scalar).is_some_and(Scalar::is_integer),
+            Receivers::Lanes | Receivers::Multiplied => {
+                let lanes = named(&INTEGER_LANES, false)
+                    && (receivers == Receivers::Lanes || !named(&BYTE_LANES, false));
+                lanes || element.and_then(Ty::scalar).is_some_and(Scalar::is_integer)
+            }
             Receivers::Wide => matches!(element, Some(Ty::Scalar(Scalar::U64 | Scalar::I64))),
             Receivers::Bool => element == Some(&Ty::Scalar(Scalar::Bool)),
         }
@@ -731,10 +752,11 @@ impl Checker<'_> {
             ("core::Untrusted", "append" | "try_append") => Receivers::OwnedBytes,
             ("core::Untrusted", "into_cleared") => Receivers::Clearable,
             ("core::Range", "next") => Receivers::Stepped,
+            ("core::Secret", "wrapping_add" | "wrapping_sub" | "shl" | "shr") => Receivers::Lanes,
+            ("core::Secret", "wrapping_mul") => Receivers::Multiplied,
             (
                 "core::Secret",
-                "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "shl" | "shr" | "rotate_left"
-                | "rotate_right" | "lt" | "le" | "gt" | "ge" | "widen" | "truncate",
+                "rotate_left" | "rotate_right" | "lt" | "le" | "gt" | "ge" | "widen" | "truncate",
             ) => Receivers::Integer,
             ("core::Secret", "mul_high") => Receivers::Wide,
             ("core::Secret", "select") => Receivers::Bool,
@@ -1157,6 +1179,10 @@ enum Receivers {
     Stepped,
     /// The integer types.
     Integer,
+    /// The integer types and the integer lane types.
+    Lanes,
+    /// The integer types and the integer lane types of 16-bit lanes or wider.
+    Multiplied,
     /// `u64` and `i64`.
     Wide,
     Bool,
@@ -1172,6 +1198,8 @@ impl Receivers {
                     Receivers::ByteContents,
                     Receivers::WritableByteContents | Receivers::OwnedBytes
                 ) | (Receivers::WritableByteContents, Receivers::OwnedBytes)
+                    | (Receivers::Lanes, Receivers::Multiplied | Receivers::Integer)
+                    | (Receivers::Multiplied, Receivers::Integer)
             )
     }
 }

@@ -8,7 +8,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 | Package | Holds | Modules below the root |
 | --- | --- | --- |
-| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures | `core::atomic`, `core::crypto` |
+| `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures, lane types | `core::atomic`, `core::crypto`, `core::simd` |
 | `mem` | allocators, budgets, stores, ids, handles, boxes, shared values, collections, once maps | `mem::wire` |
 | `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
@@ -62,6 +62,7 @@ The table names every pub std type, interface, free function and registry with t
 | `core` | `Generate`, `core::Choices` | [Generation](22-testing.md#generation) |
 | `core` | `core::atomic::AtomicU8`, `core::atomic::AtomicU16`, `core::atomic::AtomicU32`, `core::atomic::AtomicU64`, `core::atomic::AtomicUsize`, `core::atomic::AtomicBool` | [Atomics](16-concurrency.md#atomics) |
 | `core` | `core::crypto::PublicKey`, `core::crypto::Signature`, `core::crypto::SecretKey` | [Signatures](31-trust.md#signatures) |
+| `core` | `core::simd::U8x16`, `core::simd::I8x16`, `core::simd::U16x8`, `core::simd::I16x8`, `core::simd::U32x4`, `core::simd::I32x4`, `core::simd::U64x2`, `core::simd::I64x2`, `core::simd::F32x4`, `core::simd::F16x8`, `core::simd::Mask8x16`, `core::simd::Mask16x8`, `core::simd::Mask32x4`, `core::simd::Mask64x2` | [Lanes](09-numbers.md#lanes) |
 | `mem` | `mem::Alloc`, `mem::Budget`, `mem::OutOfMemory` | [Allocators](12-memory.md#allocators), [Budgets](12-memory.md#budgets), [Growth](12-memory.md#growth) |
 | `mem` | `mem::Heap`, `mem::Arena`, `mem::Id`, `mem::Pool`, `mem::Handle` | [Stores](12-memory.md#stores) |
 | `mem` | `mem::Box` | [Box](07-ownership.md#box); `from_box` in [Dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch) |
@@ -469,10 +470,10 @@ pub fn record_all(mut history: mem::List[u32], values: Slice[u32]) fails mem::Ou
 
 ## Reserved std names
 
-The paths `sys::infer`, `sys::load` and `core::simd` are reserved: no std module or item has them, and a path whose first two segments are one of them is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
+The paths `sys::infer` and `sys::load` are reserved: no std module or item has them, and a path whose first two segments are one of them is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
 
 ```nan
-pub fn lane_count(data: Slice[u32]) -> usize {
-    return core::simd::lanes(data) // error: name.reserved
-} lane_count
+pub fn model_size(model: Str) -> usize {
+    return sys::infer::size(model) // error: name.reserved
+} model_size
 ```

@@ -10,7 +10,7 @@ use crate::workspace::Arch;
 
 /// The compiler stubs. Each takes its integer arguments and gives its integer result in the
 /// registers its architecture's convention names, and returns, but `Halt`, which stops the
-/// processor with maskable interrupts disabled. A port stub, on x86_64 alone, takes the port
+/// processor with maskable interrupts disabled, and `EnterImage`. A port stub, on x86_64 alone, takes the port
 /// and, for `Out`, the value; a memory-mapped stub takes the address and, for a write, the
 /// value; `Copy` and `Fill` take the target, the source or byte, and the length, a copy between
 /// overlapping ranges running backwards when its target lies above its source. `Thread` reads
@@ -59,7 +59,9 @@ use crate::workspace::Arch;
 /// address and the value seen there and waits for an event unless the word differs;
 /// `SendSignal`, which sends software-generated interrupt 1 to the CPU of an affinity;
 /// `EnterRoot`, which installs the entry root with the
-/// memory attributes and translation control the entry seams program; `InterruptStack`, which
+/// memory attributes and translation control the entry seams program; `EnterImage`, which masks
+/// every exception, turns the MMU and caches off, drops the instruction cache and translations
+/// and branches to its third argument, keeping its first two in `x0` and `x1`; `InterruptStack`, which
 /// makes a stack top the one exceptions switch to and leaves the caller on its stack through
 /// `SP_EL0`; `Switch`, the task-stack switch, and `MachineSwitch`, which keeps the general
 /// registers alone, the floating-point ones holding nothing on a machine target; `SemiExit`,
@@ -140,6 +142,7 @@ pub enum Stub {
     WaitEvent,
     SendSignal,
     EnterRoot,
+    EnterImage,
     InterruptStack,
     Switch,
     MachineSwitch,
@@ -484,6 +487,7 @@ impl Stub {
             | Stub::WaitEvent
             | Stub::SendSignal
             | Stub::EnterRoot
+            | Stub::EnterImage
             | Stub::InterruptStack
             | Stub::Switch
             | Stub::MachineSwitch
@@ -681,6 +685,16 @@ impl Stub {
                     0xdc, 0x4c, 0xd3, 0x69, 0x83, 0x08, 0xd5, 0x02, 0x00, 0x00, 0x14, 0x1f, 0x83,
                     0x08, 0xd5, 0x9f, 0x3b, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0xc0, 0x03, 0x5f,
                     0xd6,
+                ],
+            ),
+            Stub::EnterImage => (
+                3,
+                0,
+                &[
+                    0xdf, 0x4f, 0x03, 0xd5, 0x9f, 0x3f, 0x03, 0xd5, 0x09, 0x10, 0x38, 0xd5, 0xaa,
+                    0x00, 0x82, 0xd2, 0x29, 0x01, 0x2a, 0x8a, 0x09, 0x10, 0x18, 0xd5, 0xdf, 0x3f,
+                    0x03, 0xd5, 0x1f, 0x75, 0x08, 0xd5, 0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x37, 0x03,
+                    0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x40, 0x00, 0x1f, 0xd6,
                 ],
             ),
             Stub::CleanCache => (

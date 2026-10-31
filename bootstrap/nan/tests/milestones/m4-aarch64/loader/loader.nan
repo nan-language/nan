@@ -1,50 +1,47 @@
-//! Entry of the loader and its reports on the serial port.
+//! Entry of the loader: it places the kernel, records, counts and measures the boot, then enters the kernel.
 
-/// The polls of the flags before a byte is written whatever they say.
-const TRANSMIT_POLLS: u32 = 100_000
+/// The loader's variables' vendor, and its variable counting boots.
+const VENDOR: boot::Guid = boot::Guid(data1: 0x6E61_6E00, data2: 0x6C6F, data3: 0x6164, data4: 0x6572_0000_0000_0001)
 
-/// The base of the virt board's first PL011.
-const PL011_BASE: u64 = 0x0900_0000
+const BOOT_COUNT: Str = "NanBootCount"
 
-layout Flags: u32 le {
-    reserved_low: bit 0..=3
-    receive_empty: bit 4
-    transmit_full: bit 5
-    reserved: rest
-} Flags
+/// The PCR the kernel is measured into, and the event type of a loaded image.
+const KERNEL_PCR: u32 = 8
 
-registers Pl011 {
-    data: u8 at 0x0 write
-    flags: Flags at 0x18 read
-} Pl011
+const EV_IPL: u32 = 0x0D
+
+/// How long the loader waits for a key choosing recovery.
+const KEY_WAIT_MS: u64 = 10
+
+/// What keeps the loader from entering the kernel: a firmware service's failure, or the image.
+enum LoaderError {
+    Service(service: Service, error: boot::ServiceError)
+    Image(ImageError) from
+} LoaderError
+
+/// The firmware services the loader calls.
+enum Service derives Copy {
+    Files
+    Variables
+    Tpm
+    Entropy
+    Keys
+    Console
+} Service
 
 fn main(take m: boot::Machine) -> Never limits stack 16_384 {
     let alloc = m.alloc()
-    let read = attempt mut m.with_services(fn(services: boot::Services) -> Untrusted[mem::Bytes] fails boot::ServiceError {
-        return try services.read_file("kernel.elf", alloc)
+    let loaded = attempt mut m.with_services(fn(services: boot::Services) -> boot::Image fails LoaderError {
+        return try load(services, alloc)
     })
-    var k = take m.exit_services()
-    let usable = mut k.regions()
-    var uart = trusted "the virt board maps its first PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(PL011_BASE) }
-    match read {
+    match loaded {
         Ok(image) => {
-            let outcome = attempt place_all(image.view(), usable: usable.view())
-            match outcome {
-                Ok(count) => {
-                    say(mut uart, text: "loader: copied ")
-                    say_number(mut uart, value: u64.widen(count))
-                    say(mut uart, text: " loadable segments of kernel.elf to their physical addresses\n")
-                }
-                Err(error) => {
-                    say(mut uart, text: "loader: kernel.elf is not a loadable image: ")
-                    say_reason(mut uart, error)
-                    say(mut uart, text: "\n")
-                }
-            }
+            trusted "kernel.elf's segments lie in their regions, an aarch64-bare image entered at its entry" { take m.enter(take image) }
         }
         Err(error) => {
-            say(mut uart, text: "loader: kernel.elf unreadable\n")
-            discard error
+            discard attempt mut m.with_services(fn(services: boot::Services) fails boot::ServiceError {
+                try report(services, error)
+            })
         }
     }
     var spins: u64 = 0
@@ -53,53 +50,124 @@ fn main(take m: boot::Machine) -> Never limits stack 16_384 {
     }
 } main
 
-/// Writes why an image cannot be placed.
-fn say_reason(mut uart: hw::Mmio[Pl011], error: ImageError) {
-    match error {
-        ImageError.NotElf => say(mut uart, text: "not an aarch64 ELF executable")
-        ImageError.Truncated => say(mut uart, text: "truncated")
-        ImageError.Inverted => say(mut uart, text: "a segment holds more bytes than its memory")
-        ImageError.Unmapped => say(mut uart, text: "a segment lies outside the mapped memory")
-        ImageError.Unusable => say(mut uart, text: "a segment lies outside the usable memory")
-        ImageError.Misplaced => say(mut uart, text: "a segment's memory differs from its bytes")
+/// Reads and places the kernel, counts, records and measures the boot, draws the kernel's
+/// entropy seed and waits briefly for a key: the image to enter, with the seed as its module.
+fn load(services: boot::Services, alloc: mem::Alloc) -> boot::Image fails LoaderError {
+    let raw = try served(Service.Files, outcome: attempt services.read_file("kernel.elf", alloc))
+    let segments = try loadable(raw.view(), alloc)
+    let entry_point = try entry_address(raw.view())
+    let count = try served(Service.Variables, outcome: attempt counted_boot(services, alloc))
+    if try served(Service.Files, outcome: attempt recorded(services, count, alloc)) {
+        try say(services, text: "loader: recorded the boot in boot.rec\n")
     }
-} say_reason
+    try served(Service.Tpm, outcome: attempt measure_kernel(services, raw: raw.view()))
+    try say(services, text: "loader: measured kernel.elf into PCR 8\n")
+    var seed = mem::Bytes.zeroed(16, alloc)
+    try served(Service.Entropy, outcome: attempt services.random(mut seed.view_mut()))
+    try say(services, text: "loader: drew 16 bytes of entropy\n")
+    let key = try served(Service.Keys, outcome: attempt services.read_key(KEY_WAIT_MS))
+    if key == None {
+        try say(services, text: "loader: no key within 10 ms\n")
+    }
+    var modules = mem::List[boot::ModuleSource].empty(alloc)
+    var name = mem::Bytes.empty(alloc)
+    mut name.append(b"seed")
+    mut modules.push(boot::ModuleSource(name: take name, contents: Untrusted.of(take seed)))
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"console=serial")
+    try say(services, text: "loader: entering kernel.elf with 1 module\n")
+    let regions = try place_all(services, raw: raw.view(), segments: segments.view(), alloc)
+    return boot::Image(entry: entry_point, segments: take regions, modules: take modules, command_line: take line)
+} load
 
-/// Writes text to the serial port.
-fn say(mut uart: hw::Mmio[Pl011], text: Str) {
-    for byte in text.as_bytes() {
-        put(mut uart, byte)
+/// What a call of a firmware service returned, failing with the service and its error.
+fn served[T: Any](service: Service, take outcome: Result[T, boot::ServiceError]) -> T fails LoaderError {
+    match outcome {
+        Ok(value) => return value
+        Err(error) => fail LoaderError.Service(service: service, error: take error)
     }
+} served
+
+/// Writes `text` to the firmware's console.
+fn say(services: boot::Services, text: Str) fails LoaderError {
+    try served(Service.Console, outcome: attempt services.write_console(text))
 } say
 
-/// Writes a byte once the transmitter has room, or after `TRANSMIT_POLLS` polls.
-fn put(mut uart: hw::Mmio[Pl011], byte: u8) {
-    for _ in 0..<TRANSMIT_POLLS {
-        let flags = mut uart.read(Pl011.flags)
-        if not flags.transmit_full {
-            break
+/// The boot this is, counted in a non-volatile variable that only boot services reach.
+fn counted_boot(services: boot::Services, alloc: mem::Alloc) -> u32 fails boot::ServiceError {
+    var count: u32 = 1
+    match first attempt services.get_variable(BOOT_COUNT, vendor: VENDOR, alloc) {
+        Ok(variable) => {
+            count = previous(variable.data.view()).saturating_add(1)
         }
+        Err(boot::ServiceError.NotFound) => {}
+        Err(error) => fail error
     }
-    mut uart.write(Pl011.data, value: byte)
-} put
+    var bytes = Array[u8, 4].filled(0)
+    mut bytes.view_mut().write_u32_le(0, value: count)
+    let attributes = boot::VariableAttributes(non_volatile: true, boot_service_access: true, runtime_access: false, reserved: 0)
+    try services.set_variable(BOOT_COUNT, vendor: VENDOR, attributes, data: bytes.view())
+    return count
+} counted_boot
 
-/// Writes a number in decimal to the serial port.
-fn say_number(mut uart: hw::Mmio[Pl011], value: u64) {
-    var digits = Array[u8, 20].filled(b'0')
-    var rest = value
-    var leading: usize = 19
-    for position in 0usize..<20 {
-        let at = 19 - position
-        digits[at] = b'0' + u8.fit(rest % 10)
-        rest = rest / 10
-        if digits[at] != b'0' {
-            leading = at
+/// The count a boot count variable holds, zero when it holds no count.
+validator fn previous(data: Untrusted[Slice[u8]]) -> u32 {
+    let bytes = data.inspect()
+    if bytes.len() != 4 {
+        return 0
+    }
+    return bytes.u32_le(0)
+} previous
+
+/// Writes the boot's count to `boot.rec` on the boot volume and reads it back: whether the file
+/// holds the count.
+fn recorded(services: boot::Services, count: u32, alloc: mem::Alloc) -> bool fails boot::ServiceError {
+    var bytes = Array[u8, 4].filled(0)
+    mut bytes.view_mut().write_u32_le(0, value: count)
+    try services.write_file("boot.rec", data: bytes.view())
+    let back = try services.read_file("boot.rec", alloc)
+    return previous(back.view()) == count
+} recorded
+
+/// Measures the kernel's image into its PCR.
+validator fn measure_kernel(services: boot::Services, raw: Untrusted[Slice[u8]]) fails boot::ServiceError {
+    try services.measure(KERNEL_PCR, event_type: EV_IPL, data: raw.inspect(), event: b"kernel.elf")
+} measure_kernel
+
+/// Says on the console why the loader cannot enter the kernel.
+fn report(services: boot::Services, error: LoaderError) fails boot::ServiceError {
+    match error {
+        LoaderError.Service(service: service, error: failure) => {
+            let name = match service {
+                Service.Files => "loader: the firmware's file service"
+                Service.Variables => "loader: the firmware's variable service"
+                Service.Tpm => "loader: the firmware's TPM service"
+                Service.Entropy => "loader: the firmware's entropy service"
+                Service.Keys => "loader: the firmware's key service"
+                Service.Console => "loader: the firmware's console service"
+            }
+            let outcome = match failure {
+                boot::ServiceError.NotFound => " found nothing\n"
+                boot::ServiceError.OutOfMemory => " ran out of memory\n"
+                boot::ServiceError.Denied => " was denied\n"
+                boot::ServiceError.Unsupported => " is unsupported\n"
+                boot::ServiceError.Invalid => " was invalid\n"
+                else => " failed\n"
+            }
+            try services.write_console(name)
+            try services.write_console(outcome)
+        }
+        LoaderError.Image(failure) => {
+            let text = match failure {
+                ImageError.NotElf => "loader: kernel.elf is not an aarch64 ELF executable\n"
+                ImageError.Truncated => "loader: kernel.elf is truncated\n"
+                ImageError.Inverted => "loader: a segment of kernel.elf holds more bytes than its memory\n"
+                ImageError.Unmapped => "loader: a segment of kernel.elf lies outside the mapped memory\n"
+                ImageError.Unusable => "loader: a segment of kernel.elf lies outside free memory\n"
+                ImageError.Misplaced => "loader: a segment's memory differs from its bytes\n"
+                ImageError.NoEntry => "loader: kernel.elf names no entry\n"
+            }
+            try services.write_console(text)
         }
     }
-    let Some(parts) = digits.view().split_at(leading) else {
-        return
-    }
-    for byte in parts.tail {
-        put(mut uart, byte)
-    }
-} say_number
+} report

@@ -1,0 +1,54 @@
+//! The jump from a UEFI loader into a loaded bare image by its target's boot protocol, once the loader has ended boot services: on x86_64 the PVH protocol, through a trampoline copied below 4 GiB, and on AArch64 the image entry with the MMU and caches off.
+
+/// The x86_64 hand-off trampoline, position-independent, entered in long mode with the start
+/// information in `rdi` and the image's 32-bit entry in `rsi`: with maskable interrupts disabled
+/// and PCIDs off, it loads its own descriptor table, whose address it writes into its
+/// pseudo-descriptor, and far-returns to its 32-bit code segment; there it turns paging off,
+/// which leaves long mode, clears `EFER`, sets `CR0` to protection alone and clears `CR4`,
+/// loads its flat data segment, and jumps to the entry with the start information in `ebx`.
+const PVH_TRAMPOLINE: Slice[u8] = b"\xfa\x0f\x20\xe0\x48\x25\xff\xff\xfd\xff\x0f\x22\xe0\x48\x8d\x05\x54\x00\x00\x00\x48\x89\x05\x67\x00\x00\x00\x0f\x01\x15\x5e\x00\x00\x00\x48\x8d\x05\x05\x00\x00\x00\x6a\x08\x50\x48\xcb\x0f\x20\xc0\x25\xff\xff\xff\x7f\x0f\x22\xc0\xb9\x80\x00\x00\xc0\x31\xc0\x31\xd2\x0f\x30\xb8\x11\x00\x00\x00\x0f\x22\xc0\x31\xc0\x0f\x22\xe0\x66\xb8\x10\x00\x8e\xd8\x8e\xc0\x8e\xd0\x8e\xe0\x8e\xe8\x89\xfb\xff\xe6\x0f\x1f\x44\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x9a\xcf\x00\xff\xff\x00\x00\x00\x92\xcf\x00\x17\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+/// Enters a loaded bare image at `entry` with the start information at `info` and the device
+/// tree at `tree`: on x86_64 by copying the trampoline to the page at `page` and running it
+/// there, on AArch64 through the `EnterImage` stub, with the device tree in `x0` and the start
+/// information in `x1`. Neither returns.
+fn Lowering.enter_image(mut self, mut fx: Fx, entry: clif::Value, info: clif::Value, tree: clif::Value, page: clif::Value) {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        var args = mem::List[clif::Value].empty(fx.alloc)
+        mut args.push(tree)
+        mut args.push(info)
+        mut args.push(entry)
+        discard mut self.call_stub(mut fx, stub: Stub.EnterImage, args: args.view())
+    } else {
+        let code_data = mut self.pvh_trampoline()
+        let code = mut self.data_address(mut fx, id: code_data)
+        let len = mut fx.ptr(u64.widen(PVH_TRAMPOLINE.len()))
+        var copy_args = mem::List[clif::Value].empty(fx.alloc)
+        mut copy_args.push(page)
+        mut copy_args.push(code)
+        mut copy_args.push(len)
+        discard mut self.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+        var signature = clif::Signature.new(clif::CallConv.SystemV, alloc: fx.alloc)
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+        let sig_ref = mut fx.b.import_signature(take signature)
+        var call_args = mem::List[clif::Value].empty(fx.alloc)
+        mut call_args.push(info)
+        mut call_args.push(entry)
+        let call = mut fx.b.call_indirect(sig_ref, callee: page, args: call_args.view())
+        mut fx.sites.push(CallSite(inst: call, site: Site(kind: StackKind.Stub, at: None)))
+    }
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} Lowering.enter_image
+
+/// The x86_64 hand-off trampoline's code, a read-only data object the loader copies.
+fn Lowering.pvh_trampoline(mut self) -> object::DataId {
+    let id = mut self.module.declare_data("_NSpvh_trampoline", linkage: object::Linkage.Local, writable: false, tls: false)
+    var code = mem::Bytes.empty(self.alloc)
+    mut code.append(PVH_TRAMPOLINE)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take code)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+    return id
+} Lowering.pvh_trampoline

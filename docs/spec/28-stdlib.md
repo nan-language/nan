@@ -284,7 +284,7 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext`, `hw::TrapFrame[V]`, `hw::SpinGuard[T]` and `hw::SavedContext`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext`, `hw::TrapFrame[V]`, `hw::SpinGuard[T]` and `hw::SavedContext`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
@@ -321,11 +321,11 @@ Apart from [device accesses](10-effects-digests.md#reversibility), the std opera
 
 | Operations | Class |
 | --- | --- |
-| `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console` | `recorded` |
+| `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console`, `boot::Services.measure` | `recorded` |
 | `sys::fs::File.write`, `sys::Net.listen` | `restorable` |
-| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove` | `irreversible(erase)` |
+| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove`, `boot::Services.write_file`, `boot::Services.delete_file`, `boot::Services.set_variable`, `boot::Services.submit_tpm` | `irreversible(erase)` |
 | `sys::Net.connect`, `sys::net::Conn.write`, `sys::net::Conn.close`, `sys::net::Conn.abandon` | `irreversible(emit)` |
-| `hw::Ring0.firmware_call` | `irreversible(emit, actuate, erase, spend)` |
+| `hw::Ring0.firmware_call`, `boot::Machine.enter` | `irreversible(emit, actuate, erase, spend)` |
 
 The classes of the operations of the sys capabilities and of the resources they open hold on the host targets and under `any`. On the machine targets, where those capabilities have values only as [sims](22-testing.md#simulated-capabilities), they are `traceless`.
 
@@ -336,8 +336,8 @@ A **platform package** is the package that mints a target's [root grant](14-auth
 | Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
 | `host_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
-| `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services`, through the firmware's boot services |
-| `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the start information, the PVH start information on `x86_64-bare` and the device tree on `aarch64-bare` |
+| `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services` and `boot::Machine.enter`, through the firmware's boot services |
+| `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the [start information](24-kernel.md#start-information) and, on `aarch64-bare`, the device tree |
 
 - A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI, PVH or device trees; no other std item has one.
 - No alias and no `dep` directive names a platform package, so no path outside it reaches its items. The [final closure](27-program-model.md#final-builds) of a program also holds the platform package its descriptor names, and no other.

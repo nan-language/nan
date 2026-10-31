@@ -1,45 +1,37 @@
-//! Entry of the loader and its reports on the serial port.
+//! Entry of the loader: it places the kernel, records, counts and measures the boot, then enters the kernel.
 
-/// The polls of the line status before a byte is written whatever it says.
-const TRANSMIT_POLLS: u32 = 100_000
+/// The loader's variables' vendor, and its variable counting boots.
+const VENDOR: boot::Guid = boot::Guid(data1: 0x6E61_6E00, data2: 0x6C6F, data3: 0x6164, data4: 0x6572_0000_0000_0001)
 
-layout LineStatus: u8 {
-    transmit_empty: bit 5
-    reserved: rest
-} LineStatus
+const BOOT_COUNT: Str = "NanBootCount"
 
-registers Uart {
-    data: u8 at 0x0 write
-    line_status: LineStatus at 0x5 read
-} Uart
+/// The PCR the kernel is measured into, and the event type of a loaded image.
+const KERNEL_PCR: u32 = 8
+
+const EV_IPL: u32 = 0x0D
+
+/// How long the loader waits for a key choosing recovery.
+const KEY_WAIT_MS: u64 = 10
+
+/// What keeps the loader from entering the kernel.
+enum LoaderError {
+    Service(boot::ServiceError) from
+    Image(ImageError) from
+} LoaderError
 
 fn main(take m: boot::Machine) -> Never limits stack 16_384 {
     let alloc = m.alloc()
-    let read = attempt mut m.with_services(fn(services: boot::Services) -> Untrusted[mem::Bytes] fails boot::ServiceError {
-        return try services.read_file("kernel.elf", alloc)
+    let loaded = attempt mut m.with_services(fn(services: boot::Services) -> boot::Image fails LoaderError {
+        return try load(services, alloc)
     })
-    var k = take m.exit_services()
-    let usable = mut k.regions()
-    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
-    match read {
+    match loaded {
         Ok(image) => {
-            let outcome = attempt place_all(image.view(), usable: usable.view())
-            match outcome {
-                Ok(count) => {
-                    say(mut uart, text: "loader: copied ")
-                    say_number(mut uart, value: u64.widen(count))
-                    say(mut uart, text: " loadable segments of kernel.elf to their physical addresses\n")
-                }
-                Err(error) => {
-                    say(mut uart, text: "loader: kernel.elf is not a loadable image: ")
-                    say_reason(mut uart, error)
-                    say(mut uart, text: "\n")
-                }
-            }
+            trusted "kernel.elf's segments lie in their regions, an x86_64-bare image entered at its PVH entry" { take m.enter(take image) }
         }
         Err(error) => {
-            say(mut uart, text: "loader: kernel.elf unreadable\n")
-            discard error
+            discard attempt mut m.with_services(fn(services: boot::Services) fails boot::ServiceError {
+                try report(services, error)
+            })
         }
     }
     var spins: u64 = 0
@@ -48,54 +40,92 @@ fn main(take m: boot::Machine) -> Never limits stack 16_384 {
     }
 } main
 
-/// Writes why an image cannot be placed.
-fn say_reason(mut uart: hw::Ports[Uart], error: ImageError) {
-    match error {
-        ImageError.NotElf => say(mut uart, text: "not an x86-64 ELF executable")
-        ImageError.Truncated => say(mut uart, text: "truncated")
-        ImageError.Inverted => say(mut uart, text: "a segment holds more bytes than its memory")
-        ImageError.Unmapped => say(mut uart, text: "a segment lies outside the mapped memory")
-        ImageError.Unusable => say(mut uart, text: "a segment lies outside the usable memory")
-        ImageError.Misplaced => say(mut uart, text: "a segment's memory differs from its bytes")
+/// Reads and places the kernel, counts, records and measures the boot, draws the kernel's
+/// entropy seed and waits briefly for a key: the image to enter, with the seed as its module.
+fn load(services: boot::Services, alloc: mem::Alloc) -> boot::Image fails LoaderError {
+    let raw = try services.read_file("kernel.elf", alloc)
+    let segments = try loadable(raw.view(), alloc)
+    let entry_point = try pvh_entry(raw.view())
+    let count = try counted_boot(services, alloc)
+    try record(services, count, alloc)
+    try measure_kernel(services, raw: raw.view())
+    try services.write_console("loader: measured kernel.elf into PCR 8\n")
+    var seed = mem::Bytes.zeroed(16, alloc)
+    try services.random(mut seed.view_mut())
+    try services.write_console("loader: drew 16 bytes of entropy\n")
+    let key = try services.read_key(KEY_WAIT_MS)
+    if key == None {
+        try services.write_console("loader: no key within 10 ms\n")
     }
-} say_reason
+    var modules = mem::List[boot::ModuleSource].empty(alloc)
+    var name = mem::Bytes.empty(alloc)
+    mut name.append(b"seed")
+    mut modules.push(boot::ModuleSource(name: take name, contents: Untrusted.of(take seed)))
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"console=serial")
+    try services.write_console("loader: entering kernel.elf with 1 module\n")
+    let regions = try place_all(services, raw: raw.view(), segments: segments.view(), alloc)
+    return boot::Image(entry: entry_point, segments: take regions, modules: take modules, command_line: take line)
+} load
 
-/// Writes text to the serial port.
-fn say(mut uart: hw::Ports[Uart], text: Str) {
-    for byte in text.as_bytes() {
-        put(mut uart, byte)
-    }
-} say
-
-/// Writes a byte to the serial port once its transmitter is empty, or after `TRANSMIT_POLLS`
-/// polls.
-fn put(mut uart: hw::Ports[Uart], byte: u8) {
-    for _ in 0..<TRANSMIT_POLLS {
-        let status = mut uart.read(Uart.line_status)
-        if status.transmit_empty {
-            break
+/// The boot this is, counted in a non-volatile variable that only boot services reach.
+fn counted_boot(services: boot::Services, alloc: mem::Alloc) -> u32 fails boot::ServiceError {
+    var count: u32 = 1
+    match first attempt services.get_variable(BOOT_COUNT, vendor: VENDOR, alloc) {
+        Ok(variable) => {
+            count = previous(variable.data.view()).saturating_add(1)
         }
+        Err(boot::ServiceError.NotFound) => {}
+        Err(error) => fail error
     }
-    mut uart.write(Uart.data, value: byte)
-} put
+    var bytes = Array[u8, 4].filled(0)
+    mut bytes.view_mut().write_u32_le(0, value: count)
+    let attributes = boot::VariableAttributes(non_volatile: true, boot_service_access: true, runtime_access: false, reserved: 0)
+    try services.set_variable(BOOT_COUNT, vendor: VENDOR, attributes, data: bytes.view())
+    return count
+} counted_boot
 
-/// Writes a number in decimal to the serial port.
-fn say_number(mut uart: hw::Ports[Uart], value: u64) {
-    var digits = Array[u8, 20].filled(b'0')
-    var rest = value
-    var leading: usize = 19
-    for position in 0usize..<20 {
-        let at = 19 - position
-        digits[at] = b'0' + u8.fit(rest % 10)
-        rest = rest / 10
-        if digits[at] != b'0' {
-            leading = at
-        }
+/// The count a boot count variable holds, zero when it holds no count.
+validator fn previous(data: Untrusted[Slice[u8]]) -> u32 {
+    let bytes = data.inspect()
+    if bytes.len() != 4 {
+        return 0
     }
-    let Some(parts) = digits.view().split_at(leading) else {
-        return
+    return bytes.u32_le(0)
+} previous
+
+/// Writes the boot's count to `boot.rec` on the boot volume and reads it back.
+fn record(services: boot::Services, count: u32, alloc: mem::Alloc) fails boot::ServiceError {
+    var bytes = Array[u8, 4].filled(0)
+    mut bytes.view_mut().write_u32_le(0, value: count)
+    try services.write_file("boot.rec", data: bytes.view())
+    let back = try services.read_file("boot.rec", alloc)
+    if previous(back.view()) == count {
+        try services.write_console("loader: recorded the boot in boot.rec\n")
     }
-    for byte in parts.tail {
-        put(mut uart, byte)
+} record
+
+/// Measures the kernel's image into its PCR.
+validator fn measure_kernel(services: boot::Services, raw: Untrusted[Slice[u8]]) fails boot::ServiceError {
+    try services.measure(KERNEL_PCR, event_type: EV_IPL, data: raw.inspect(), event: b"kernel.elf")
+} measure_kernel
+
+/// Says on the console why the loader cannot enter the kernel.
+fn report(services: boot::Services, error: LoaderError) fails boot::ServiceError {
+    let text = match error {
+        LoaderError.Service(boot::ServiceError.NotFound) => "loader: a firmware service found nothing\n"
+        LoaderError.Service(boot::ServiceError.OutOfMemory) => "loader: a firmware service ran out of memory\n"
+        LoaderError.Service(boot::ServiceError.Denied) => "loader: a firmware service was denied\n"
+        LoaderError.Service(boot::ServiceError.Unsupported) => "loader: a firmware service is unsupported\n"
+        LoaderError.Service(boot::ServiceError.Invalid) => "loader: a firmware service was invalid\n"
+        else => "loader: a firmware service failed\n"
+        LoaderError.Image(ImageError.NotElf) => "loader: kernel.elf is not an x86-64 ELF executable\n"
+        LoaderError.Image(ImageError.Truncated) => "loader: kernel.elf is truncated\n"
+        LoaderError.Image(ImageError.Inverted) => "loader: a segment of kernel.elf holds more bytes than its memory\n"
+        LoaderError.Image(ImageError.Unmapped) => "loader: a segment of kernel.elf lies outside the mapped memory\n"
+        LoaderError.Image(ImageError.Unusable) => "loader: a segment of kernel.elf lies outside free memory\n"
+        LoaderError.Image(ImageError.Misplaced) => "loader: a segment's memory differs from its bytes\n"
+        LoaderError.Image(ImageError.NoEntry) => "loader: kernel.elf names no PVH entry\n"
     }
-} say_number
+    try services.write_console(text)
+} report

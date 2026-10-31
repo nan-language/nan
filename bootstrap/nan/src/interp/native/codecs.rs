@@ -1,5 +1,5 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and
-//! `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
+//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas and erased
+//! decoders, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
 //! type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then
 //! writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through
 //! the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
@@ -9,15 +9,15 @@ mod construction;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use super::super::value::{Loc, Val, View};
+use super::super::value::{FnVal, Loc, Val, View};
 use super::super::{End, Exec, Flow, Interpreter, Site};
 use super::collections::{conformance, ordering};
 use super::render::float_text;
 use super::stores::{boxed, cell_of, counted, entries, exhausted, holding, place};
-use crate::check::db::ItemId;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
-use crate::nir::{Callable, FnRef, Span};
+use crate::nir::{Callable, FnRef, Role, Span};
 use crate::syntax::ast::TypeModifier;
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
@@ -65,30 +65,111 @@ pub fn member(
             }
         }
         "decode" => {
-            let raw = interp.deref(&args[0]).fields()[0].clone();
-            let input = interp.bytes(&raw);
-            let cell = cell_of(interp, &args[1]);
-            let mut reader: Box<dyn Reader> = match format {
-                Format::Wire => Box::new(WireReader::new(input)),
-                Format::Json => Box::new(JsonReader::new(input)),
-                Format::Construction => Box::new(construction::ConstructionReader::new(input)),
-            };
+            let decoded = read(interp, format, &ty, args, at, site);
+            outcome(interp, decoded)
+        }
+        "canonical" => {
+            let canonical = read(interp, format, &ty, args, at, site).and_then(|value| {
+                let mut out = Vec::new();
+                write_wire(&encoded(interp, &value, &ty), &mut out);
+                super::stores::release(interp, &value);
+                let bytes = out
+                    .into_iter()
+                    .map(|byte| Val::Int(i128::from(byte)))
+                    .collect();
+                let cell = cell_of(interp, &args[1]);
+                let Some(bytes) =
+                    holding(interp, "mem::Bytes", bytes, cell, &Ty::Scalar(Scalar::U8))
+                else {
+                    return fail("OutOfMemory");
+                };
+                let untrusted = interp.ty_item("core", "Untrusted");
+                Ok(Val::Struct(untrusted, Rc::new(vec![bytes])))
+            });
+            outcome(interp, canonical)
+        }
+        "schema_hash" => Ok(Flow::Return(schema_hash(interp, &ty))),
+        "schema" => {
+            let schema = Ty::item(interp.ty_item("mem::wire", "Schema"), Vec::new());
+            let mut reader = WireReader::new(interp.ck.schema(&ty).wire());
+            let cell = cell_of(interp, &args[0]);
             let mut decoding = Decoding {
                 interp,
-                reader: reader.as_mut(),
+                reader: &mut reader,
                 cell,
                 depth: 0,
                 at,
                 site,
             };
-            let decoded = decoding.value(&ty).and_then(|value| {
-                decoding.reader.finish(decoding.interp)?;
-                Ok(value)
+            match decoding.value(&schema) {
+                Ok(tree) => Ok(Flow::Return(tree)),
+                Err(Failure::Run(end)) => Err(end),
+                Err(_) => exhausted(interp, false, at),
+            }
+        }
+        "erased" => {
+            let codec = interp.ty_item("mem::wire", "Codec");
+            let canonical = interp.ck.db.members(TypeKey::Item(codec), "canonical")[0];
+            let function = FnVal::Function(FnRef {
+                callable: Callable::Item {
+                    item: canonical,
+                    role: Role::Body,
+                    index: 0,
+                },
+                args: Rc::from(type_args.to_vec()),
             });
-            outcome(interp, decoded)
+            let erased = interp.ty_item("mem::wire", "Erased");
+            let fields = vec![schema_hash(interp, &ty), Val::Fn(Rc::new(function))];
+            Ok(Flow::Return(Val::Struct(erased, Rc::new(fields))))
         }
         _ => return None,
     })
+}
+
+/// One value of a type read from a format's bytes, the Untrusted slice `args[0]`, drawing on
+/// the allocator `args[1]`, and nothing left after it.
+fn read(
+    interp: &mut Interpreter,
+    format: Format,
+    ty: &Ty,
+    args: &[Val],
+    at: (ItemId, Span),
+    site: Site,
+) -> Decoded<Val> {
+    let raw = interp.deref(&args[0]).fields()[0].clone();
+    let input = interp.bytes(&raw);
+    let cell = cell_of(interp, &args[1]);
+    let mut reader: Box<dyn Reader> = match format {
+        Format::Wire => Box::new(WireReader::new(input)),
+        Format::Json => Box::new(JsonReader::new(input)),
+        Format::Construction => Box::new(construction::ConstructionReader::new(input)),
+    };
+    let mut decoding = Decoding {
+        interp,
+        reader: reader.as_mut(),
+        cell,
+        depth: 0,
+        at,
+        site,
+    };
+    decoding.value(ty).and_then(|value| {
+        decoding.reader.finish(decoding.interp)?;
+        Ok(value)
+    })
+}
+
+/// The `mem::wire::SchemaHash` of a type implementing `Encode`.
+fn schema_hash(interp: &Interpreter, ty: &Ty) -> Val {
+    let bytes = interp
+        .ck
+        .schema(ty)
+        .hash()
+        .0
+        .iter()
+        .map(|byte| Val::Int(i128::from(*byte)))
+        .collect();
+    let item = interp.ty_item("mem::wire", "SchemaHash");
+    Val::Struct(item, Rc::new(vec![Val::Array(Rc::new(bytes))]))
 }
 
 /// `T.encode(self, mut e)` or `T.decode(mut d, alloc)` of a type whose `Encode` a derive writes

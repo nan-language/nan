@@ -657,6 +657,22 @@ impl Lowering<'_, '_> {
         }
     }
 
+    /// A function value naming a function, its arguments concrete: the code calling it through
+    /// the ABI of function values, without an environment.
+    pub fn function_value(&mut self, fx: &mut Fx, fn_ref: &FnRef) -> Held {
+        let instance = self.callable_instance(fn_ref, true);
+        let own_stack = self.instance_fn_ty(&instance).limits.stack;
+        let glue = self.instance(Instance::Value(Box::new(instance)));
+        self.entry_stack(glue, own_stack);
+        let reference = self.func_ref(fx, glue);
+        let code = fx.b.ins().func_addr(PTR, reference);
+        let slot = fx.slot(16, 8);
+        fx.store(code, slot, 0);
+        let none = fx.ptr(0);
+        fx.store(none, slot, 8);
+        Held::Address(slot)
+    }
+
     pub fn method_name(&self, interface: ItemId, method: u32) -> String {
         match &self.ck.sig(interface).kind {
             SigKind::Interface { methods } => methods[method as usize].name.clone(),

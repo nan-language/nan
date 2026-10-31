@@ -1,4 +1,4 @@
-//! The codecs `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`: per format and type, an encoding function writes a value through a writer and a decoding function reads one through a reader, laid out as the kinds of `core::Encoder` and `core::Decoder` are (a struct as a record of its fields in ascending byte order of their keys, an enum value as a variant, and each std type as its encoding states), the calls of a decoder being a format too; a decoding function gives zero, or one plus the index of the `core::DecodeError` variant it fails with, having released what it read.
+//! The codecs `mem::wire::Codec`, with its schemas and erased decoders, `text::json::Codec` and `text::construction::Codec`: per format and type, an encoding function writes a value through a writer and a decoding function reads one through a reader, laid out as the kinds of `core::Encoder` and `core::Decoder` are (a struct as a record of its fields in ascending byte order of their keys, an enum value as a variant, and each std type as its encoding states), the calls of a decoder being a format too; a decoding function gives zero, or one plus the index of the `core::DecodeError` variant it fails with, having released what it read.
 
 /// A format values encode in.
 enum Format derives Copy, Eq, Hash {
@@ -190,6 +190,24 @@ fn codecs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         decode(mut lo, mut fx, supply, format: decoding)
         return true
     }
+    if member == "canonical" {
+        codecs_canonical(mut lo, mut fx, supply)
+        return true
+    }
+    if member == "schema_hash" {
+        let hash = schema_hash_address(mut lo, mut fx, ty: supply.type_arg(lo, index: 0))
+        let held = mut lo.held_at(mut fx, ty: supply.abi.result, address: hash)
+        supply.ret(mut lo, mut fx, held)
+        return true
+    }
+    if member == "schema" {
+        codecs_schema(mut lo, mut fx, supply)
+        return true
+    }
+    if member == "erased" {
+        codecs_erased(mut lo, mut fx, supply)
+        return true
+    }
     let Some(format) = encoding else {
         expect false
         return true
@@ -259,6 +277,24 @@ fn codecs_call(mut lo: Lowering, mut fx: Fx, function: object::FuncId, args: Sli
 /// `Codec.decode(raw, alloc)`: one value read, failing with `Trailing` on what is left.
 fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: DecodeFormat) {
     let ty = supply.type_arg(lo, index: 0)
+    let target = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty)
+    let code = codecs_read(mut lo, mut fx, supply, format, ty, target)
+    codecs_returned(mut lo, mut fx, supply, ty, target, code)
+} decode
+
+/// The address a result of a type is built at: the operation's result address, or a slot.
+fn codecs_result_at(mut lo: Lowering, mut fx: Fx, sret: Option[clif::Value], ty: ty::Ty) -> clif::Value {
+    let laid = mut lo.layout_of(ty)
+    return match sret {
+        Some(held) => held
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+} codecs_result_at
+
+/// Reads one value of `ty` at `target` from the bytes of the operation's Untrusted slice,
+/// drawing through its allocator: the code of a decoding function, `Trailing` on what is left
+/// after the value, which is then released.
+fn codecs_read(mut lo: Lowering, mut fx: Fx, supply: Supply, format: DecodeFormat, ty: ty::Ty, target: clif::Value) -> clif::Value {
     let raw = supply.param(0).address_value()
     let start = mut fx.load(PTR, addr: raw, offset: 0)
     let len = mut fx.load(PTR, addr: raw, offset: 8)
@@ -269,16 +305,6 @@ fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: DecodeFormat) {
     mut fx.store(end, addr: state, offset: READER_END)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: state, offset: READER_DEPTH)
-    let laid = mut lo.layout_of(ty)
-    var target = zero
-    match supply.sret {
-        Some(sret) => {
-            target = sret
-        }
-        None => {
-            target = mut fx.slot(laid.contents().size, align: laid.contents().align)
-        }
-    }
     let function = decoder(mut lo, format, ty)
     let call_args = fx.list3(state, b: alloc, c: target)
     let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
@@ -303,8 +329,111 @@ fn decode(mut lo: Lowering, mut fx: Fx, supply: Supply, format: DecodeFormat) {
         return fx1.list1(code)
     })
     expect checked.len() == 1
-    codecs_returned(mut lo, mut fx, supply, ty, target, code: checked[0])
-} decode
+    return checked[0]
+} codecs_read
+
+/// `Codec.canonical(raw, alloc)`: one value read as `decode` reads it, then released once its
+/// encoding is written to new bytes, failing with `OutOfMemory` when they cannot be drawn.
+fn codecs_canonical(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let ty = supply.type_arg(lo, index: 0)
+    let laid = mut lo.layout_of(ty)
+    let value = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let code = codecs_read(mut lo, mut fx, supply, format: DecodeFormat.Wire, ty, target: value)
+    let result = supply.abi.result
+    let bytes = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
+    let read = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: 0)
+    let results = fx.types1(clif::Type.Int32)
+    let checked = mut fx.choose(read, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let function = encoder(mut lo, format: Format.Wire, ty)
+        let size = codecs_measure(mut lo, fx: mut fx1, function, value)
+        let alloc = mut fx1.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+        vector_empty(mut fx1, address: bytes, alloc, element: CODECS_BYTE)
+        let drawn = vector_resize(mut lo, fx: mut fx1, address: bytes, capacity: size, element: CODECS_BYTE)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.release(mut fx2, ty, address: value)
+        })
+        let written_types = fx1.types1(clif::Type.Int32)
+        return mut fx1.choose(failed, results: written_types.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let exhausted = mut fx2.int(clif::Type.Int32, value: FAILURE_OUT_OF_MEMORY)
+            return fx2.list1(exhausted)
+        }, otherwise: fn[mut lo](mut fx2: Fx) -> mem::List[clif::Value] {
+            let state = mut fx2.slot(WRITER_SIZE, align: 8)
+            let data = mut fx2.load(PTR, addr: bytes, offset: VECTOR_DATA)
+            mut fx2.store(data, addr: state, offset: WRITER_BUFFER)
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: state, offset: WRITER_LEN)
+            let call_args = fx2.list2(value, b: state)
+            discard codecs_call(mut lo, fx: mut fx2, function, args: call_args.view())
+            mut fx2.store(size, addr: bytes, offset: VECTOR_LEN)
+            mut lo.release(mut fx2, ty, address: value)
+            let none = mut fx2.int(clif::Type.Int32, value: 0)
+            return fx2.list1(none)
+        })
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(code)
+    })
+    expect checked.len() == 1
+    codecs_returned(mut lo, mut fx, supply, ty: result, target: bytes, code: checked[0])
+} codecs_canonical
+
+/// The address of the schema hash of a type, as read-only data.
+fn schema_hash_address(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) -> clif::Value {
+    let hash = check::schema_hash(lo.ck.schema(ty), alloc: lo.alloc)
+    let data = mut lo.bytes_data(hash.bytes.view())
+    return mut lo.data_address(mut fx, id: data)
+} schema_hash_address
+
+/// `Codec.schema(alloc)`: the type's schema tree, decoded from its `mem::wire` encoding.
+fn codecs_schema(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let tree = check::schema_wire(lo.ck.schema(supply.type_arg(lo, index: 0)), alloc: lo.alloc)
+    let data = mut lo.bytes_data(tree.view())
+    let start = mut lo.data_address(mut fx, id: data)
+    let alloc = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let state = mut fx.slot(READER_SIZE, align: 8)
+    mut fx.store(start, addr: state, offset: READER_POS)
+    let end = mut fx.b.iadd_imm_s(start, y: i64.fit(tree.len()))
+    mut fx.store(end, addr: state, offset: READER_END)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: state, offset: READER_DEPTH)
+    let result = supply.abi.result
+    let target = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
+    let function = decoder(mut lo, format: DecodeFormat.Wire, ty: result)
+    let call_args = fx.list3(state, b: alloc, c: target)
+    let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
+    expect codes.len() == 1
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: codes[0], y: 0)
+    let no_taken = mem::List[Taken].empty(lo.alloc)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        supply.exhausted(mut lo, fx: mut fx1, taken: no_taken.view())
+    })
+    let held = mut lo.held_at(mut fx, ty: result, address: target)
+    supply.ret(mut lo, mut fx, held)
+} codecs_schema
+
+/// `Codec.erased()`: the type's schema hash and `Codec.canonical` of it as a function value.
+fn codecs_erased(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result = supply.abi.result
+    let target = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
+    let hash = schema_hash_address(mut lo, mut fx, ty: supply.type_arg(lo, index: 0))
+    let schema_field = mut lo.layouts.field(lo.ck, ty: result, variant: None, label: "schema")
+    let schema_at = mut fx.b.iadd_imm_s(target, y: i64.fit(schema_field.offset))
+    mut lo.copy(mut fx, dst: schema_at, src: hash, size: 33, align: 1)
+    let Some(codec) = lo.ck.db().std_item("mem::wire", name: "Codec") else {
+        expect false
+        return
+    }
+    let canonical_items = lo.ck.db().members(check::TypeKey.Item(codec), name: "canonical")
+    expect canonical_items.len() > 0
+    let function = nir::FnRef(callable: nir::Callable.Item(item: canonical_items[0], role: nir::Role.Body, index: 0), args: supply.args)
+    let function_held = mut lo.function_value(mut fx, fn_ref: function)
+    let value = function_held.address_value()
+    let canonical_field = mut lo.layouts.field(lo.ck, ty: result, variant: None, label: "canonical")
+    let field_at = mut fx.b.iadd_imm_s(target, y: i64.fit(canonical_field.offset))
+    mut lo.copy(mut fx, dst: field_at, src: value, size: 16, align: 8)
+    let held = mut lo.held_at(mut fx, ty: result, address: target)
+    supply.ret(mut lo, mut fx, held)
+} codecs_erased
 
 /// Returns the value a decoding function read at `target`, or fails with the
 /// `core::DecodeError` its code names.

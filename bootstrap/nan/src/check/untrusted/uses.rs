@@ -65,8 +65,8 @@ impl Checker<'_> {
     }
 
     /// The codec uses of a function: of its body, or for a supplied `Codec` member of
-    /// `mem::wire`, `text::json` or `text::construction`, the decoder of `T` for `decode` and its
-    /// encoder otherwise.
+    /// `mem::wire`, `text::json` or `text::construction`, the decoder of `T` for `decode`,
+    /// `canonical` and `erased` and its encoder for `encode` and `try_encode`.
     pub fn codec_uses(&self, function: ItemId) -> Vec<(Param, Codec)> {
         let Some(head) = self.fn_sig(function) else {
             return Vec::new();
@@ -87,6 +87,8 @@ impl Checker<'_> {
         }
         let codec = match self.db.canonical(function).as_str() {
             "mem::wire::Codec.decode"
+            | "mem::wire::Codec.canonical"
+            | "mem::wire::Codec.erased"
             | "text::json::Codec.decode"
             | "text::construction::Codec.decode" => Codec::Decode,
             "mem::wire::Codec.encode"

@@ -373,6 +373,32 @@ The **encode class** of a release is the worst class of the exported types imple
 - in a `Variant` node, each variant of O is matched by a variant of N whose key or aliases include its key, without a payload when O's has none and with a payload accepting O's otherwise;
 - nodes of the other kinds always.
 
+`mem::wire::Schema.accepts` decides it, so code holding two trees, such as those of [code roots](30-artefacts.md#code-roots), compares them without the toolchain.
+
+```nan-api
+// module: mem::wire
+
+pub fn Schema.accepts(self, old: Schema) -> bool
+```
+
+```nan
+pub closed struct Settings derives Encode {
+    pub retries: u8
+} Settings
+
+pub open struct Config derives Encode {
+    pub retries: u8
+    pub verbose: bool
+} Config
+
+pub fn reads_settings(alloc: mem::Alloc) -> bool
+    example reads_settings(testing::world().alloc)
+{
+    let config = mem::wire::Codec[Config].schema(alloc)
+    return config.accepts(mem::wire::Codec[Settings].schema(alloc))
+} reads_settings
+```
+
 ### Publish summaries
 
 The **publish summary** of a release lists its release class and encode class; each exported item with its class and behaviour epoch; each epoch bump with its reason; the entries its [authority summary](14-authority.md#authority-summaries) gains and loses against the parent; and, for each exported function and each target, the methods of primitive capabilities it reaches and its trap sites, each with its [trap kind](11-errors-domains.md#traps), file path and line.
@@ -411,9 +437,10 @@ The **requires-set** of a package records what its acceptance relies on in other
 4. each digest fact, and each capability or validator of a digest set, whose absence the package relied on, the bound it relied on the class staying within, and terminates when it relied on its presence, through a limit, a fit or purity ([digests](10-effects-digests.md#digests));
 5. for each method name resolved on the item as a type, the canonical path of the function [method resolution](08-generics-interfaces.md#method-resolution) found;
 6. the item hash, when the package instantiates the item or unfolds its transparent body;
-7. for an interface the package implements by an impl line, the names of the functions named after that line's impl target in the line's module that are not methods of the interface.
+7. for an interface the package implements by an impl line, the names of the functions named after that line's impl target in the line's module that are not methods of the interface;
+8. for a struct or enum, the schema hashes of its instantiations that the schema trees of the package's [code root](30-artefacts.md#code-roots) make nodes for outside the nodes made for any other instantiation of an item of another package.
 
-A requires-set **is satisfied by** a set of releases, one per package, when for each entry the item of that package's release is compatible for each recorded role, each recorded reliance still holds with digests re-derived across the set, each recorded method name resolves to the same function, no name recorded for an implemented interface is a method of that interface, and each recorded item hash is equal. A release whose requires-set its closure does not satisfy is checked again from its NIR ([reuse](30-artefacts.md#reuse)).
+A requires-set **is satisfied by** a set of releases, one per package, when for each entry the item of that package's release is compatible for each recorded role, each recorded reliance still holds with digests re-derived across the set, each recorded method name resolves to the same function, no name recorded for an implemented interface is a method of that interface, and each recorded item hash and schema hash is equal. A release whose requires-set its closure does not satisfy is checked again from its NIR ([reuse](30-artefacts.md#reuse)).
 
 An artefact of an earlier [language version](37-evolution.md#language-versions) holds no value for a fact kind a later version introduces; a toolchain reading it takes that fact at its worst value ([digests](10-effects-digests.md#digests)).
 

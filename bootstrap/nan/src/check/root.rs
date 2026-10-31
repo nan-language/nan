@@ -1,11 +1,10 @@
 //! Code roots: the artefact of a package's current state in a closure, from its checkers under
 //! each target it declares, with the files its attestation hashes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use super::db::{ItemId, PackageId};
+use super::db::PackageId;
 use super::requires::Entry as Required;
-use super::sig::SigKind;
 use super::snapshot::Items;
 use super::{Checker, check_targets, unchecked};
 use crate::artefact::{self, AttestedSeal, Parts};
@@ -189,6 +188,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
                     known.relied.extend(entry.relied);
                     known.methods.extend(entry.methods);
                     known.implementers.extend(entry.implementers);
+                    known.schemas.extend(entry.schemas);
                     known.item_hash = known.item_hash.or(entry.item_hash);
                 }
                 None => {
@@ -261,7 +261,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
         history_tombstones,
         ledger,
         lines,
-        schemas: first.state_schemas(id),
+        schemas: first.schema_trees(id),
     };
     let code_root = artefact::code_root(&parts);
     let seals: Vec<AttestedSeal> = computed
@@ -364,31 +364,12 @@ impl Checker<'_> {
             .collect()
     }
 
-    /// Each component state a package declares, the target of an impl line naming
-    /// `sys::Component`, with its canonical path and schema hash.
-    fn state_schemas(&self, package: PackageId) -> Vec<(String, Hash)> {
-        let mut found: BTreeSet<(String, ItemId)> = BTreeSet::new();
-        for module in &self.db.package(package).modules {
-            for item in &self.db.module(*module).items {
-                if let SigKind::Impl {
-                    target: Some(super::db::TypeKey::Item(target)),
-                    interface: Some(bound),
-                    ..
-                } = &self.sig(*item).kind
-                    && self.db.canonical(bound.interface) == "sys::Component"
-                {
-                    found.insert((self.db.canonical(*target), *target));
-                }
-            }
-        }
-        found
+    /// The schema tree of each type a package's code root records, by canonical path, as its
+    /// `mem::wire` encoding.
+    fn schema_trees(&self, package: PackageId) -> Vec<(String, Vec<u8>)> {
+        self.recorded_schemas(package)
             .into_iter()
-            .map(|(path, target)| {
-                (
-                    path,
-                    self.schema(&super::ty::Ty::item(target, Vec::new())).hash(),
-                )
-            })
+            .map(|(path, ty)| (path, self.schema(&ty).wire()))
             .collect()
     }
 }

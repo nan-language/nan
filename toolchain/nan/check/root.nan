@@ -204,7 +204,7 @@ fn Session.coded(self, closure: workspace::Closure, member: workspace::Member, t
     let ledger = ledger_records(source, package_name, entries: leading.checker.package_ledger(id).view(), alloc)
     let lines = span_lines(source, lines: stream.lines, alloc)
     let NirStream(bytes: nir, lines: _) = stream
-    let parts = artefact::Parts(language: 1, manifest: take manifest, snapshots: take snapshots, nir: take nir, required: take required, source_tombstones: take source_tombstones, history_tombstones: take history_tombstones, ledger: take ledger, lines: take lines, schemas: leading.checker.state_schemas(id))
+    let parts = artefact::Parts(language: 1, manifest: take manifest, snapshots: take snapshots, nir: take nir, required: take required, source_tombstones: take source_tombstones, history_tombstones: take history_tombstones, ledger: take ledger, lines: take lines, schemas: leading.checker.schema_trees(id))
     let code_root = artefact::code_root(parts, alloc)
     return Coded(code_root: take code_root, seals: artefact::seal_list(attested_seals(computed, principals: items.principals, alloc).view(), alloc))
 } Session.coded
@@ -260,7 +260,7 @@ fn add_interface_lines(mut written: text::String, entry: machine::ApiEntry, gram
 } add_interface_lines
 
 /// The encoded requires-set of a package across the checkers of its targets, each entry's
-/// roles, relied facts, methods and implementers joined, by path.
+/// roles, relied facts, methods, implementers and schema hashes joined, by path.
 fn Session.required(self, closure: workspace::Closure, checkers: Slice[TargetChecker], package_name: Str) -> mem::List[mem::Bytes] {
     let alloc = self.alloc
     var joined = mem::Map[text::String, RequiresEntry].empty(alloc)
@@ -289,7 +289,7 @@ fn join_required(mut joined: mem::Map[text::String, RequiresEntry], take entry: 
         return
     }
     var known = mut joined.at_mut(entry.path)
-    let RequiresEntry(path: _, roles: roles, interface_hash: _, epoch: _, relied: relied, methods: methods, item_hash: item_hash, implementers: implementers) = entry
+    let RequiresEntry(path: _, roles: roles, interface_hash: _, epoch: _, relied: relied, methods: methods, item_hash: item_hash, implementers: implementers, schemas: schemas) = entry
     for role in take roles {
         discard mut known.roles.insert(role)
     }
@@ -302,6 +302,9 @@ fn join_required(mut joined: mem::Map[text::String, RequiresEntry], take entry: 
     }
     for name in take implementers {
         discard mut known.implementers.insert(take name)
+    }
+    for hash in take schemas {
+        discard mut known.schemas.insert(hash)
     }
     if known.item_hash.is_none() {
         known.item_hash = item_hash
@@ -472,44 +475,16 @@ fn Checker.tombstone_forms(self, package_id: ty::PackageId, history: bool) -> me
     return forms
 } Checker.tombstone_forms
 
-/// Each component state a package declares, the target of an impl line naming
-/// `sys::Component`, with its canonical path and schema hash.
-fn Checker.state_schemas(self, package_id: ty::PackageId) -> mem::List[artefact::Schema] {
+/// The schema tree of each type a package's code root records, by canonical path, as its
+/// `mem::wire` encoding.
+fn Checker.schema_trees(self, package_id: ty::PackageId) -> mem::List[artefact::Schema] {
     let alloc = self.alloc()
-    let db = self.db()
-    var states = mem::List[ty::ItemId].empty(alloc)
-    for module in db.package_data(package_id).modules {
-        for item in db.module(module).items {
-            let sig = self.sig(item)
-            let SigKind.Impl(target: Some(TypeKey.Item(target)), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
-                continue
-            }
-            if db.canonical_text(bound.item) == "sys::Component" {
-                mut states.push(target)
-            }
-        }
-    }
-    mut states.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => state_order(db, left, right))
     var found = mem::List[artefact::Schema].empty(alloc)
-    for index in 0..<states.len() {
-        if index > 0 and states[index - 1] == states[index] {
-            continue
-        }
-        let target = states[index]
-        let ty = self.types().item(target, args: mem::List[ty::Arg].empty(alloc))
-        mut found.push(artefact::Schema(path: db.canonical(target), hash: self.schema(ty).hash(alloc)))
+    for entry in self.recorded_schemas(package_id) {
+        mut found.push(artefact::Schema(path: text::String.of(entry.key().as_str(), alloc), tree: schema_wire(self.schema(entry.value()), alloc)))
     }
     return found
-} Checker.state_schemas
-
-/// The order of component states by canonical path, then item.
-fn state_order(db: Db, left: ty::ItemId, right: ty::ItemId) -> core::Ordering {
-    let by_path = db.canonical_text(left).cmp(db.canonical_text(right))
-    if by_path != core::Ordering.Equal {
-        return by_path
-    }
-    return left.cmp(right)
-} state_order
+} Checker.schema_trees
 
 /// A package's source and machine files, by path within the package.
 pkg fn package_files(source: workspace::Package, alloc: mem::Alloc) -> mem::List[artefact::SourceFile] {

@@ -23,7 +23,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
-- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -69,7 +69,9 @@ The table names every pub std type, interface, free function and registry with t
 | `mem` | `mem::Entry`, `mem::KeyValue`, `mem::List`, `mem::Bytes`, `mem::Map`, `mem::HashMap`, `mem::Set`, `mem::Bounded` | [Collections](12-memory.md#collections); `get_by`, `get_by_mut` and `contains_by` in [Ordered lookup](#ordered-lookup); `mem::Map.at`, `mem::Map.at_mut`, `mem::HashMap.at` and `mem::HashMap.at_mut` in [Maps and sets](12-memory.md#maps-and-sets) |
 | `mem` | `mem::ArenaCursor`, `mem::PoolCursor`, `mem::ListCursor`, `mem::BoundedCursor`, `mem::MapCursor`, `mem::MapCursorMut`, `mem::MapIntoCursor`, `mem::HashMapCursor`, `mem::HashMapCursorMut`, `mem::HashMapIntoCursor`, `mem::SetCursor`, `mem::SetIntoCursor` | [Memory types](12-memory.md#memory-types) |
 | `mem` | `mem::OnceMap` | [Once maps](12-memory.md#once-maps) |
-| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format) |
+| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format); `schema_hash` and `schema` in [Schema hashes](13-text-encode.md#schema-hashes), `canonical` and `erased` in [Erased decoders](13-text-encode.md#erased-decoders) |
+| `mem` | `mem::wire::SchemaHash`, `mem::wire::Schema`, `mem::wire::SchemaField`, `mem::wire::SchemaVariant` | [Schema hashes](13-text-encode.md#schema-hashes); `mem::wire::Schema.accepts` in [Encode class](29-identity-versioning.md#encode-class) |
+| `mem` | `mem::wire::Erased` | [Erased decoders](13-text-encode.md#erased-decoders) |
 | `text` | `text::String`, `text::Fixed` | [Text types](13-text-encode.md#text-types) |
 | `text` | `text::utf8::Utf8Error`, `text::utf8::valid_prefix`, `text::utf8::is_valid`, `text::utf8::char_at`, `text::utf8::write_char` | [UTF-8](13-text-encode.md#utf-8) |
 | `text` | `text::Symbol`, `text::Interner` | [Interning](13-text-encode.md#interning) |

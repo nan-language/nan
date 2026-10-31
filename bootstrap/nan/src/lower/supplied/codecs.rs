@@ -1,9 +1,9 @@
-//! The codecs `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`. Per
-//! format and type, an encoding function writes a value through a writer and a decoding
-//! function reads one through a reader, laid out as the kinds of `core::Encoder` and
-//! `core::Decoder` are: a struct as a record of its fields in ascending byte order of their
-//! keys, an enum value as a variant, and each std type as its encoding states. The calls of a
-//! decoder are a format too.
+//! The codecs `mem::wire::Codec`, with its schemas and erased decoders, `text::json::Codec` and
+//! `text::construction::Codec`. Per format and type, an encoding function writes a value through
+//! a writer and a decoding function reads one through a reader, laid out as the kinds of
+//! `core::Encoder` and `core::Decoder` are: a struct as a record of its fields in ascending byte
+//! order of their keys, an enum value as a variant, and each std type as its encoding states.
+//! The calls of a decoder are a format too.
 //!
 //! A writer is the buffer bytes go to, zero while measuring, and the count of bytes written. A
 //! reader is the address of the next byte, or the decoder's address, the end of the input and
@@ -25,9 +25,10 @@ use super::super::{CALL_CONV, Glue, Instance, Lowering};
 use super::Supply;
 use super::mem::maps::Entries;
 use super::mem::vector::{self, Element};
+use crate::check::db::TypeKey;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Scalar, Subst, Ty};
-use crate::nir::Role;
+use crate::nir::{Callable, FnRef, Role};
 use crate::syntax::ast::TypeModifier;
 
 /// A format values encode in.
@@ -107,6 +108,14 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     match (supply.member(), encoding) {
         ("encode" | "try_encode", Some(format)) => encode(lo, fx, supply, format),
         ("decode", _) => decode(lo, fx, supply, &decoding),
+        ("canonical", _) => canonical(lo, fx, supply),
+        ("schema_hash", _) => {
+            let hash = schema_hash(lo, fx, &supply.type_arg(0));
+            let held = lo.held_at(fx, &supply.abi.result, hash);
+            supply.ret(lo, fx, held);
+        }
+        ("schema", _) => schema(lo, fx, supply),
+        ("erased", _) => erased(lo, fx, supply),
         (member, _) => panic!("no lowering of {owner}.{member}"),
     }
     true
@@ -161,6 +170,25 @@ fn call(lo: &mut Lowering, fx: &mut Fx, function: FuncId, args: &[Value]) -> Vec
 /// `Codec.decode(raw, alloc)`: one value read, failing with `Trailing` on what is left.
 fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: &DecodeFormat) {
     let ty = supply.type_arg(0);
+    let layout = lo.layout(&ty);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let code = read(lo, fx, supply, format, &ty, target);
+    returned(lo, fx, supply, &ty, target, code);
+}
+
+/// Reads one value of `ty` at `target` from the bytes of the operation's Untrusted slice,
+/// drawing through its allocator: the code of a decoding function, `Trailing` on what is left
+/// after the value, which is then released.
+fn read(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    format: &DecodeFormat,
+    ty: &Ty,
+    target: Value,
+) -> Value {
     let raw = supply.param(0).address();
     let start = fx.load(PTR, raw, 0);
     let len = fx.load(PTR, raw, 8);
@@ -171,14 +199,10 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: &DecodeFormat
     fx.store(end, state, reader::END);
     let zero = fx.ptr(0);
     fx.store(zero, state, reader::DEPTH);
-    let layout = lo.layout(&ty);
-    let target = supply
-        .sret
-        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let function = decoder(lo, format, &ty);
+    let function = decoder(lo, format, ty);
     let code = call(lo, fx, function, &[state, alloc, target])[0];
     let read = fx.b.ins().icmp_imm_s(IntCC::Equal, code, 0);
-    let code = fx.choose_in(
+    fx.choose_in(
         lo,
         read,
         &[types::I32],
@@ -188,14 +212,126 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: &DecodeFormat
             }
             let pos = fx.load(PTR, state, reader::POS);
             let left = fx.b.ins().icmp(IntCC::NotEqual, pos, end);
-            fx.when(left, |fx| lo.release(fx, &ty, target));
+            fx.when(left, |fx| lo.release(fx, ty, target));
             let trailing = fx.int(types::I32, failure::TRAILING);
             let none = fx.int(types::I32, 0);
             vec![fx.b.ins().select(left, trailing, none)]
         },
         |_, _| vec![code],
+    )[0]
+}
+
+/// `Codec.canonical(raw, alloc)`: one value read as `decode` reads it, then released once its
+/// encoding is written to new bytes, failing with `OutOfMemory` when they cannot be drawn.
+fn canonical(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let ty = supply.type_arg(0);
+    let layout = lo.layout(&ty);
+    let value = fx.slot(layout.size, layout.align);
+    let code = read(lo, fx, supply, &DecodeFormat::Wire, &ty, value);
+    let result = supply.abi.result.clone();
+    let bytes = supply.sret.unwrap_or_else(|| {
+        let layout = lo.layout(&result);
+        fx.slot(layout.size, layout.align)
+    });
+    let read = fx.b.ins().icmp_imm_s(IntCC::Equal, code, 0);
+    let code = fx.choose_in(
+        lo,
+        read,
+        &[types::I32],
+        |lo, fx| {
+            let function = encoder(lo, Format::Wire, &ty);
+            let size = measure(lo, fx, function, value);
+            let alloc = fx.load(PTR, supply.param(1).address(), 0);
+            vector::empty(fx, bytes, alloc, BYTE);
+            let drawn = vector::resize(lo, fx, bytes, size, BYTE);
+            let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
+            fx.when(failed, |fx| lo.release(fx, &ty, value));
+            fx.choose_in(
+                lo,
+                failed,
+                &[types::I32],
+                |_, fx| vec![fx.int(types::I32, failure::OUT_OF_MEMORY)],
+                |lo, fx| {
+                    let state = fx.slot(writer::SIZE, 8);
+                    let data = fx.load(PTR, bytes, vector::DATA);
+                    fx.store(data, state, writer::BUFFER);
+                    let zero = fx.ptr(0);
+                    fx.store(zero, state, writer::LEN);
+                    call(lo, fx, function, &[value, state]);
+                    fx.store(size, bytes, vector::LEN);
+                    lo.release(fx, &ty, value);
+                    vec![fx.int(types::I32, 0)]
+                },
+            )
+        },
+        |_, _| vec![code],
     )[0];
-    returned(lo, fx, supply, &ty, target, code);
+    returned(lo, fx, supply, &result, bytes, code);
+}
+
+/// The address of the schema hash of a type, as read-only data.
+fn schema_hash(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) -> Value {
+    let hash = lo.ck.schema(ty).hash();
+    let data = lo.bytes_data(&hash.0);
+    lo.data_address(fx, data)
+}
+
+/// `Codec.schema(alloc)`: the type's schema tree, decoded from its `mem::wire` encoding.
+fn schema(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let tree = lo.ck.schema(&supply.type_arg(0)).wire();
+    let data = lo.bytes_data(&tree);
+    let start = lo.data_address(fx, data);
+    let alloc = fx.load(PTR, supply.param(0).address(), 0);
+    let state = fx.slot(reader::SIZE, 8);
+    fx.store(start, state, reader::POS);
+    let end = fx.b.ins().iadd_imm_s(start, tree.len() as i64);
+    fx.store(end, state, reader::END);
+    let zero = fx.ptr(0);
+    fx.store(zero, state, reader::DEPTH);
+    let result = supply.abi.result.clone();
+    let layout = lo.layout(&result);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let function = decoder(lo, &DecodeFormat::Wire, &result);
+    let code = call(lo, fx, function, &[state, alloc, target])[0];
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
+    fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
+    let held = lo.held_at(fx, &result, target);
+    supply.ret(lo, fx, held);
+}
+
+/// `Codec.erased()`: the type's schema hash and `Codec.canonical` of it as a function value.
+fn erased(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let result = supply.abi.result.clone();
+    let layout = lo.layout(&result);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let hash = schema_hash(lo, fx, &supply.type_arg(0));
+    let at = lo.layouts.field(lo.ck, &result, None, "schema").offset;
+    let schema = fx.b.ins().iadd_imm_s(target, at as i64);
+    lo.copy(fx, schema, hash, 33, 1);
+    let codec = lo
+        .ck
+        .db
+        .std_item("mem::wire", "Codec")
+        .expect("mem::wire::Codec");
+    let canonical = lo.ck.db.members(TypeKey::Item(codec), "canonical")[0];
+    let function = FnRef {
+        callable: Callable::Item {
+            item: canonical,
+            role: Role::Body,
+            index: 0,
+        },
+        args: supply.args.clone(),
+    };
+    let value = lo.function_value(fx, &function).address();
+    let at = lo.layouts.field(lo.ck, &result, None, "canonical").offset;
+    let field = fx.b.ins().iadd_imm_s(target, at as i64);
+    lo.copy(fx, field, value, 16, 8);
+    let held = lo.held_at(fx, &result, target);
+    supply.ret(lo, fx, held);
 }
 
 /// Returns the value a decoding function read at `target`, or fails with the

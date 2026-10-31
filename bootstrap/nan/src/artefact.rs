@@ -31,8 +31,9 @@ pub struct Parts {
     /// Each file holding the first line of a span, by path as spans write it, with each such
     /// line's number and text, in line order.
     pub lines: Vec<(String, Vec<(u32, String)>)>,
-    /// Each component state's canonical path and schema hash.
-    pub schemas: Vec<(String, Hash)>,
+    /// The canonical path of each type whose schema tree the code root records, with the
+    /// tree's `mem::wire` encoding.
+    pub schemas: Vec<(String, Vec<u8>)>,
 }
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -117,9 +118,9 @@ pub fn code_root(parts: &Parts) -> Vec<u8> {
             parts
                 .schemas
                 .iter()
-                .map(|(path, hash)| {
+                .map(|(path, tree)| {
                     let mut out = text(path);
-                    bytes(&mut out, &hash.0);
+                    bytes(&mut out, tree);
                     out
                 })
                 .collect(),

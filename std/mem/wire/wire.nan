@@ -13,6 +13,241 @@ pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails cor
     example attempt Codec[u16].decode(Untrusted.of(b"\xAC\x02"), alloc: testing::world().alloc) == Ok(300)
     example attempt Codec[u8].decode(Untrusted.of(b"\x05\x00"), alloc: testing::world().alloc) == Err(core::DecodeError.Trailing)
 
+pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
+    example (attempt Codec[u8].canonical(Untrusted.of(b"\x05\x00"), alloc: testing::world().alloc)).is_err()
+
+pub fn Codec.erased() -> Erased limits pure, notrap, terminates
+    example Codec[u8].erased().schema == Codec[u8].schema_hash()
+
+pub fn Codec.schema_hash() -> SchemaHash limits pure, notrap, terminates
+    example Codec[u8].schema_hash() != Codec[u16].schema_hash()
+
+pub fn Codec.schema(alloc: mem::Alloc) -> Schema
+    example Codec[i32].schema(testing::world().alloc).accepts(Schema.Signed(width: 32))
+
+pub closed struct SchemaHash derives Copy, Eq, Ord, Hash, Encode {
+    pub bytes: Array[u8, 33]
+} SchemaHash
+
+pub closed enum Schema derives Encode {
+    Bool
+    Char
+    Text
+    Bytes
+    Unsigned(width: u8)
+    Signed(width: u8)
+    Float(width: u8)
+    BoundedText(capacity: u64)
+    Sequence(element: mem::Box[Schema], length: Option[u64], capacity: Option[u64], unique: bool)
+    Map(key: mem::Box[Schema], value: mem::Box[Schema])
+    Record(open: bool, fields: mem::List[SchemaField])
+    Variant(open: bool, variants: mem::List[SchemaVariant])
+    Back(depth: u64)
+} Schema
+
+pub closed struct SchemaField derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub defaulted: bool
+    pub value: Schema
+} SchemaField
+
+pub closed struct SchemaVariant derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub payload: Option[Schema]
+} SchemaVariant
+
+pub open struct Erased derives Copy {
+    pub schema: SchemaHash
+    pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
+} Erased
+
+pub fn Schema.accepts(self, old: Schema) -> bool
+    example Schema.BoundedText(capacity: 16).accepts(Schema.BoundedText(capacity: 8))
+    example not Schema.Unsigned(width: 16).accepts(Schema.Unsigned(width: 8))
+{
+    match self {
+        Schema.Unsigned(width: new) => {
+            let Schema.Unsigned(width: held) = old else {
+                return false
+            }
+            return new == held
+        }
+        Schema.Signed(width: new) => {
+            let Schema.Signed(width: held) = old else {
+                return false
+            }
+            return new == held
+        }
+        Schema.Float(width: new) => {
+            let Schema.Float(width: held) = old else {
+                return false
+            }
+            return new == held
+        }
+        Schema.Back(depth: new) => {
+            let Schema.Back(depth: held) = old else {
+                return false
+            }
+            return new == held
+        }
+        Schema.BoundedText(capacity: new) => {
+            let Schema.BoundedText(capacity: held) = old else {
+                return false
+            }
+            return new >= held
+        }
+        Schema.Sequence(element: element, length: length, capacity: capacity, unique: unique) => {
+            let Schema.Sequence(element: old_element, length: old_length, capacity: old_capacity, unique: old_unique) = old else {
+                return false
+            }
+            let fits = match capacity {
+                None => true
+                Some(room) => match old_capacity {
+                    Some(held) => room >= held
+                    None => false
+                }
+            }
+            return element.contents().accepts(old_element.contents()) and length == old_length and fits and (not unique or old_unique)
+        }
+        Schema.Map(key: key, value: value) => {
+            let Schema.Map(key: old_key, value: old_value) = old else {
+                return false
+            }
+            return key.contents().accepts(old_key.contents()) and value.contents().accepts(old_value.contents())
+        }
+        Schema.Record(open: open, fields: fields) => {
+            let Schema.Record(open: _, fields: old_fields) = old else {
+                return false
+            }
+            return record_accepts(open, fields: fields.view(), old_fields: old_fields.view())
+        }
+        Schema.Variant(open: _, variants: variants) => {
+            let Schema.Variant(open: _, variants: old_variants) = old else {
+                return false
+            }
+            return variants_accept(variants.view(), old_variants: old_variants.view())
+        }
+        else => return self.kind() == old.kind()
+    }
+} Schema.accepts
+
+test records_accept_defaulted_and_dropped_fields for Schema.accepts {
+    let alloc = testing::world().alloc
+    var old_fields = mem::List[SchemaField].empty(alloc)
+    mut old_fields.push(plain_field("level", value: Schema.Unsigned(width: 8), alloc))
+    mut old_fields.push(plain_field("mode", value: Schema.Text, alloc))
+    var renamed = plain_field("lvl", value: Schema.Unsigned(width: 8), alloc)
+    mut renamed.aliases.push(text::String.of("level", alloc))
+    var added = plain_field("verbose", value: Schema.Bool, alloc)
+    added.defaulted = true
+    var new_fields = mem::List[SchemaField].empty(alloc)
+    mut new_fields.push(take renamed)
+    mut new_fields.push(take added)
+    let old = Schema.Record(open: false, fields: take old_fields)
+    let open = Schema.Record(open: true, fields: take new_fields)
+    expect open.accepts(old)
+    expect not old.accepts(open)
+} records_accept_defaulted_and_dropped_fields
+
+fn plain_field(key: Str, take value: Schema, alloc: mem::Alloc) -> SchemaField {
+    return SchemaField(key: text::String.of(key, alloc), aliases: mem::List[text::String].empty(alloc), defaulted: false, value: take value)
+} plain_field
+
+/// The position of a node's kind among the kinds of nodes.
+fn Schema.kind(self) -> u32 {
+    return match self {
+        Schema.Bool => 0
+        Schema.Char => 1
+        Schema.Text => 2
+        Schema.Bytes => 3
+        Schema.Unsigned(width: _) => 4
+        Schema.Signed(width: _) => 5
+        Schema.Float(width: _) => 6
+        Schema.BoundedText(capacity: _) => 7
+        Schema.Sequence(element: _, length: _, capacity: _, unique: _) => 8
+        Schema.Map(key: _, value: _) => 9
+        Schema.Record(open: _, fields: _) => 10
+        Schema.Variant(open: _, variants: _) => 11
+        Schema.Back(depth: _) => 12
+    }
+} Schema.kind
+
+/// Whether a field's key or one of its aliases is `key`.
+fn field_matches(field: SchemaField, key: Str) -> bool {
+    if field.key.as_str() == key {
+        return true
+    }
+    return field.aliases.position(fn(alias: text::String) => alias.as_str() == key).is_some()
+} field_matches
+
+/// Whether a record's fields accept old ones: each old field kept by a matching field accepting
+/// it, or dropped from an open record, and each field matching an old one or defaulted.
+fn record_accepts(open: bool, fields: Slice[SchemaField], old_fields: Slice[SchemaField]) -> bool {
+    for held in old_fields {
+        var matched: Option[usize] = None
+        for at in 0..<fields.len() {
+            if field_matches(fields[at], key: held.key.as_str()) {
+                matched = Some(at)
+                break
+            }
+        }
+        let kept = match matched {
+            Some(at) => fields[at].value.accepts(held.value)
+            None => open
+        }
+        if not kept {
+            return false
+        }
+    }
+    for field in fields {
+        if field.defaulted {
+            continue
+        }
+        var known = false
+        for held in old_fields {
+            if field_matches(field, key: held.key.as_str()) {
+                known = true
+                break
+            }
+        }
+        if not known {
+            return false
+        }
+    }
+    return true
+} record_accepts
+
+/// Whether variants accept old ones: each old variant matched by key or alias with a payload
+/// accepting its own.
+fn variants_accept(variants: Slice[SchemaVariant], old_variants: Slice[SchemaVariant]) -> bool {
+    for held in old_variants {
+        var found = false
+        for variant in variants {
+            let matched = variant.key == held.key or variant.aliases.position(fn(alias: text::String) => alias == held.key).is_some()
+            if not matched {
+                continue
+            }
+            let accepted = match variant.payload {
+                None => held.payload.is_none()
+                Some(payload) => match held.payload {
+                    Some(old_payload) => payload.accepts(old_payload)
+                    None => false
+                }
+            }
+            if accepted {
+                found = true
+                break
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    return true
+} variants_accept
+
 test encode_appends_a_uvar for Codec.encode {
     var out = mem::Bytes.zeroed(1, alloc: testing::world().alloc)
     Codec[u16].encode(300, mut out)

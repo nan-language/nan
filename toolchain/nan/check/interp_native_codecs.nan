@@ -1,4 +1,4 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec`, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas and erased decoders, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const DECODE_DEPTH_LIMIT: usize = 128
@@ -199,8 +199,35 @@ fn Interpreter.codec_member(
         }
         else => return None
     }
-    expect args.len() > 1
     let ty = type_arg_or_unit(type_args, index: 0)
+    if member == "schema_hash" {
+        return Some(InterpFlow.Return(self.schema_hash_value(ty)))
+    }
+    if member == "schema" {
+        expect args.len() > 0
+        let schema = self.ck.types().item(self.ty_item("mem::wire", name: "Schema"), args: mem::List[ty::Arg].empty(alloc))
+        let tree = schema_wire(self.ck.schema(ty), alloc)
+        let cell = self.cell_of(args[0])
+        match attempt mut self.decode_value(CodecFormat.Wire, input: take tree, cell, ty: schema, at, site) {
+            Ok(value) => return Some(InterpFlow.Return(take value))
+            Err(Failure.Run(end)) => fail end
+            else => return Some(try self.exhausted(fallible: false, at))
+        }
+    }
+    if member == "erased" {
+        let codec = self.ty_item("mem::wire", name: "Codec")
+        let canonical = self.ck.db().members(TypeKey.Item(codec), name: "canonical")
+        expect canonical.len() > 0
+        var held_args = mem::List[ty::Arg].empty(alloc)
+        for arg in type_args {
+            mut held_args.push(arg)
+        }
+        let function = FnVal.Function(nir::FnRef(callable: nir::Callable.Item(item: canonical[0], role: nir::Role.Body, index: 0), args: self.ck.types().args(take held_args)))
+        var fields = Val.single(self.schema_hash_value(ty), alloc)
+        mut fields.push(Val.Fn(mem::Shared.of(take function, alloc)))
+        return Some(InterpFlow.Return(Val.Struct(item: self.ty_item("mem::wire", name: "Erased"), fields: mem::Shared.of(take fields, alloc))))
+    }
+    expect args.len() > 1
     if member == "encode" or member == "try_encode" {
         if format == CodecFormat.Construction {
             return None
@@ -218,17 +245,52 @@ fn Interpreter.codec_member(
         }
         return Some(try self.exhausted(fallible: member == "try_encode", at))
     }
-    if member != "decode" {
+    if member == "decode" {
+        let decoded = attempt mut self.read_value(format, args, ty, at, site)
+        return Some(try self.decode_outcome(take decoded))
+    }
+    if member != "canonical" {
         return None
     }
+    let canonical = match attempt mut self.read_value(format, args, ty, at, site) {
+        Ok(value) => attempt mut self.canonical_bytes(take value, ty, cell: self.cell_of(args[1]))
+        Err(failure) => Err(take failure)
+    }
+    return Some(try self.decode_outcome(take canonical))
+} Interpreter.codec_member
+
+/// One value of a type read from a format's bytes, the Untrusted slice `args[0]`, drawing on
+/// the allocator `args[1]`, and nothing left after it.
+fn Interpreter.read_value(mut self, format: CodecFormat, args: Slice[Val], ty: ty::Ty, at: ItemSpan, site: RunSite) -> Val fails Failure {
     let wrapped = self.deref(args[0])
     expect wrapped.fields().len() > 0
-    let raw = wrapped.fields()[0].copy(alloc)
+    let raw = wrapped.fields()[0].copy(self.alloc)
     let input = mut self.bytes(raw)
     let cell = self.cell_of(args[1])
-    let decoded = attempt mut self.decode_value(format, take input, cell, ty, at, site)
-    return Some(try self.decode_outcome(take decoded))
-} Interpreter.codec_member
+    return try mut self.decode_value(format, take input, cell, ty, at, site)
+} Interpreter.read_value
+
+/// The `mem::wire` encoding of a value as new Untrusted bytes drawn on `cell`, the value
+/// released.
+fn Interpreter.canonical_bytes(mut self, take value: Val, ty: ty::Ty, cell: u32) -> Val fails Failure {
+    let alloc = self.alloc
+    var out = mem::Bytes.empty(alloc)
+    self.encoded(value, ty).write_wire(mut out, alloc)
+    mut self.release_value(value)
+    let Some(bytes) = mut self.holding(path: "mem::Bytes", elements: byte_values(out.view(), alloc), cell, element: ty::Ty.scalar(ty::Scalar.Unsigned8)) else {
+        fail Failure.Decode(DecodeKind.OutOfMemory)
+    }
+    return Val.Struct(item: self.ty_item("core", name: "Untrusted"), fields: mem::Shared.of(Val.single(take bytes, alloc), alloc))
+} Interpreter.canonical_bytes
+
+/// The `mem::wire::SchemaHash` of a type implementing `Encode`.
+fn Interpreter.schema_hash_value(self, ty: ty::Ty) -> Val {
+    let alloc = self.alloc
+    let hash = schema_hash(self.ck.schema(ty), alloc)
+    let bytes = byte_values(hash.bytes.view(), alloc)
+    let fields = Val.single(Val.Array(mem::Shared.of(take bytes, alloc)), alloc)
+    return Val.Struct(item: self.ty_item("mem::wire", name: "SchemaHash"), fields: mem::Shared.of(take fields, alloc))
+} Interpreter.schema_hash_value
 
 /// `T.encode(self, mut e)` or `T.decode(mut d, alloc)` of a type whose `Encode` a derive writes
 /// or the toolchain supplies, through the calls of an encoder or decoder of type `through`: the

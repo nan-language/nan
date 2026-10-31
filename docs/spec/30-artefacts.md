@@ -56,7 +56,7 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 7 | history tombstones | a list of the normalised forms of the tombstones its [history](29-identity-versioning.md#history) holds |
 | 8 | ledger | the package's [ledger](31-trust.md#ledger), a list of records keyed as the ledger table states |
 | 9 | line tables | a list of pairs, one per source file of the package holding the first line of a [span](19-nir.md#spans) in part 4: the file's path as spans write it, and a list of pairs, in line order, of each such line's number and its text without its line end |
-| 10 | state schemas | a list of pairs, one per [component state](26-components.md#component-state) the package declares: its canonical path and its [schema hash](13-text-encode.md#schema-hashes) |
+| 10 | schema trees | a list of pairs, one per exported type implementing `Encode` ([encode class](29-identity-versioning.md#encode-class)) and per [component state](26-components.md#component-state) the package declares: its canonical path and the `mem::wire` encoding, as bytes, of its [schema tree](13-text-encode.md#schema-hashes) |
 
 | Entry key | Content |
 | --- | --- |
@@ -69,6 +69,7 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 7 | the method resolutions, each a pair of the method name and the function reference found, as the NIR encoding writes one |
 | 8 | the item hash, when the entry records one; absent otherwise |
 | 9 | the implementer names, each a text, in byte order |
+| 10 | the schema hashes, each as bytes, in byte order |
 
 | Ledger key | Content |
 | --- | --- |
@@ -109,7 +110,7 @@ For each package whose units come from an artefact, after every package it depen
 
 1. decides anew, under the package's language version, each obligation site whose proven or assumed [status](18-contracts.md#statuses) an [advisory](37-evolution.md#prover-monotonicity) the toolchain carries retracts;
 2. when the closure [satisfies](29-identity-versioning.md#requires-sets) the package's requires-set, reuses its units: their well-formedness and other statuses stand;
-3. otherwise checks the package again from its NIR: each unit must name only items of the closure that the package may name ([visibility](03-packages-modules.md#visibility)) and be [well formed](19-nir.md#well-formedness), the prover decides each obligation site anew under the package's language version, and the interpreter runs each [example](21-interpreter.md#example-runs);
+3. otherwise checks the package again from its NIR: each unit must name only items of the closure that the package may name ([visibility](03-packages-modules.md#visibility)) and be [well formed](19-nir.md#well-formedness), the prover decides each obligation site anew under the package's language version, the interpreter runs each [example](21-interpreter.md#example-runs), and each schema tree of the code root must be the tree its type has in the closure;
 4. re-derives the digest of each function of each unit, for each target, by [propagation](10-effects-digests.md#propagation) from its NIR, its statuses and the digests of the closure, and checks each [limit](10-effects-digests.md#limits) of the unit other than `stack N` against them.
 
 - Reuse changes a unit only in its digests and statuses.

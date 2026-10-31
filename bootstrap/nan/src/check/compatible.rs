@@ -10,11 +10,9 @@ use super::reversibility;
 use super::schema::Node;
 use super::sig::SigKind;
 use super::synthetic::{self, Synthetic};
-use super::ty::Ty;
 use super::{Checker, check_targets, checked};
 use crate::machine::api::{Accepted, Entry};
 use crate::store::{self, Class};
-use crate::syntax::ast::{ItemKind, Visibility};
 use crate::workspace::Workspace;
 
 /// What comparing an item's interface texts leaves to judge: nothing for a breaking change, or
@@ -303,29 +301,12 @@ fn encoded(workspace: &Workspace, index: usize) -> BTreeMap<String, Node> {
         return BTreeMap::new();
     };
     let checker = checked(workspace, closure, crate::stdlib::packages(), target);
-    let Some((id, encode)) = package
-        .name()
-        .and_then(|name| checker.package_named(name))
-        .zip(checker.db.core_item("Encode"))
-    else {
+    let Some(id) = package.name().and_then(|name| checker.package_named(name)) else {
         return BTreeMap::new();
     };
-    let mut trees = BTreeMap::new();
-    for &module in &checker.db.package(id).modules {
-        for &item in &checker.db.module(module).items {
-            let ast = checker.db.ast(item);
-            let typed = matches!(ast.kind, ItemKind::Struct(_) | ItemKind::Enum(_));
-            if !typed || ast.visibility != Visibility::Pub || !checker.sig(item).generics.is_empty()
-            {
-                continue;
-            }
-            let ty = Ty::item(item, Vec::new());
-            if checker.implements(&ty, encode)
-                && let Some(path) = checker.canonical_path(item)
-            {
-                trees.insert(path, checker.schema(&ty));
-            }
-        }
-    }
-    trees
+    checker
+        .exported_encoded(id)
+        .into_iter()
+        .map(|(path, ty)| (path, checker.schema(&ty)))
+        .collect()
 }

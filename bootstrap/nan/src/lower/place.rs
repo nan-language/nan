@@ -572,17 +572,7 @@ impl Body<'_, '_, '_, '_> {
             callable: fn_ref.callable.clone(),
             args: self.subst.args(&fn_ref.args),
         };
-        let instance = self.lo.callable_instance(&fn_ref, true);
-        let own_stack = self.lo.instance_fn_ty(&instance).limits.stack;
-        let glue = self.lo.instance(Instance::Value(Box::new(instance)));
-        self.lo.entry_stack(glue, own_stack);
-        let reference = self.lo.func_ref(self.fx, glue);
-        let code = self.fx.b.ins().func_addr(PTR, reference);
-        let slot = self.fx.slot(16, 8);
-        self.fx.store(code, slot, 0);
-        let none = self.fx.ptr(0);
-        self.fx.store(none, slot, 8);
-        Held::Address(slot)
+        self.lo.function_value(self.fx, &fn_ref)
     }
 
     /// A closure value: its code and an environment holding its captures, in this frame for a

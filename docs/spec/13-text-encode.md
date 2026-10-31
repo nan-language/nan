@@ -1,6 +1,6 @@
 # Text, rendering and Encode
 
-This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema hashes, the formats `mem::wire` and `text::json`, and the construction text that `text::construction` decodes.
+This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema trees and hashes, the formats `mem::wire` and `text::json`, erased decoders, and the construction text that `text::construction` decodes.
 
 ## Text types
 
@@ -746,21 +746,86 @@ test config_tolerates_new_fields for load_config {
 
 ## Schema hashes
 
-The **schema hash** of a type implementing `Encode` is the [hash](29-identity-versioning.md#hash-values) of the `mem::wire` encoding of the root node of its schema tree, the description of its encoded structure. A node encodes as a variant keyed by its name, with a record of its fields as payload when it has fields:
+The **schema tree** of a type implementing `Encode` is the `mem::wire::Schema` describing its encoded structure, and its **schema hash** is the [hash](29-identity-versioning.md#hash-values) of the tree's `mem::wire` encoding.
 
-| Node | Fields | Made for |
-| --- | --- | --- |
-| `Bool`, `Char`, `Text`, `Bytes` | none | `bool`, `char`, `text::String`, `mem::Bytes` |
-| `Unsigned`, `Signed`, `Float` | `width: u8`, in bits, 64 for `usize` and `isize` | integers and floats |
-| `BoundedText` | `capacity: u64` | `text::Fixed[N]` |
-| `Sequence` | `element`, a node; `length: Option[u64]`; `capacity: Option[u64]`; `unique: bool` | `Array` (length), `mem::Bounded` (capacity), `mem::Set` (unique), `mem::List` |
-| `Map` | `key`, `value`: nodes | `mem::Map` |
-| `Record` | `open: bool`; `fields`, a sequence of records with `key: Str`, `aliases`, a sequence of texts in byte order, `defaulted: bool` and `value`, a node | structs, labelled payloads, `Unit` |
-| `Variant` | `open: bool`; `variants`, a sequence of records with `key: Str`, `aliases` and `payload: Option` of a node | enums, `Option`, `Result` |
-| `Back` | `depth: u64` | recursion |
+```nan-api
+// module: mem::wire
 
-- `Record` fields and `Variant` variants appear in ascending byte order of keys. `defaulted` is true when the field takes a default when missing. `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
+pub closed struct SchemaHash derives Copy, Eq, Ord, Hash, Encode {
+    pub bytes: Array[u8, 33]
+} SchemaHash
+
+pub closed enum Schema derives Encode {
+    Bool
+    Char
+    Text
+    Bytes
+    Unsigned(width: u8)
+    Signed(width: u8)
+    Float(width: u8)
+    BoundedText(capacity: u64)
+    Sequence(element: mem::Box[Schema], length: Option[u64], capacity: Option[u64], unique: bool)
+    Map(key: mem::Box[Schema], value: mem::Box[Schema])
+    Record(open: bool, fields: mem::List[SchemaField])
+    Variant(open: bool, variants: mem::List[SchemaVariant])
+    Back(depth: u64)
+} Schema
+
+pub closed struct SchemaField derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub defaulted: bool
+    pub value: Schema
+} SchemaField
+
+pub closed struct SchemaVariant derives Encode {
+    pub key: text::String
+    pub aliases: mem::List[text::String]
+    pub payload: Option[Schema]
+} SchemaVariant
+
+pub fn Codec.schema_hash() -> SchemaHash limits pure, notrap, terminates
+
+pub fn Codec.schema(alloc: mem::Alloc) -> Schema
+```
+
+| Node | Made for |
+| --- | --- |
+| `Bool`, `Char`, `Text`, `Bytes` | `bool`, `char`, `text::String`, `mem::Bytes` |
+| `Unsigned`, `Signed`, `Float` | integers and floats, `width` in bits, 64 for `usize` and `isize` |
+| `BoundedText` | `text::Fixed[N]`, of `capacity` N |
+| `Sequence` | `Array` with its `length`, `mem::Bounded` with its `capacity`, `mem::Set`, which is `unique`, and `mem::List` |
+| `Map` | `mem::Map` |
+| `Record` | structs, labelled payloads, `Unit` |
+| `Variant` | enums, `Option`, `Result` |
+| `Back` | recursion |
+
+- A `Record` or `Variant` node is `open` when its type is declared `open`. Its fields, one per field of the struct or label of the payload, and its variants, one per variant of the enum, appear in ascending byte order of keys, each with the aliases of its key in byte order. A field is `defaulted` when it takes a default when missing; a variant's `payload` is the node of its payload.
+- `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
 - Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
+- `schema_hash` gives the schema hash of `T`, and `schema` its schema tree drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`).
+
+```nan
+pub closed struct Probe derives Encode {
+    pub seq: u32
+    pub hops: u8
+} Probe
+
+pub const PROBE_SCHEMA: mem::wire::SchemaHash = mem::wire::Codec[Probe].schema_hash()
+
+pub fn hop_width(alloc: mem::Alloc) -> u8
+    example hop_width(testing::world().alloc) == 8
+    example PROBE_SCHEMA != mem::wire::Codec[u32].schema_hash()
+{
+    let mem::wire::Schema.Record(open: _, fields: fields) = mem::wire::Codec[Probe].schema(alloc) else {
+        return 0
+    }
+    let mem::wire::Schema.Unsigned(width: width) = fields[0].value else {
+        return 0
+    }
+    return width
+} hop_width
+```
 
 ## Wire format
 
@@ -818,6 +883,64 @@ test signal_bytes for load_signal {
     expect level == Ok(Signal.Level(300))
     expect trailing == Err(core::DecodeError.Trailing)
 } signal_bytes
+```
+
+## Erased decoders
+
+An **erased decoder** is a `mem::wire::Erased`: the schema hash of a type and a function checking `mem::wire` bytes against the type, whose caller need not name it.
+
+```nan-api
+// module: mem::wire
+
+pub open struct Erased derives Copy {
+    pub schema: SchemaHash
+    pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
+} Erased
+
+pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
+
+pub fn Codec.erased() -> Erased limits pure, notrap, terminates
+```
+
+- `canonical` reads one value as `decode` does, then gives the bytes `encode` writes for it, drawn through `alloc`, failing with `OutOfMemory` when it cannot draw them. Its result stays Untrusted, so it reads no contents for its caller.
+- `erased` gives the schema hash of `T` and `Codec[T].canonical`.
+- A package exports the erased decoders of its types by contributing them to a [registry](25-registries.md#registries), through which code checks records by their schema hashes without naming their types.
+
+```nan
+pub closed struct Probe derives Encode {
+    pub seq: u32
+    pub hops: u8 where hops < 16
+} Probe
+
+retired Probe.ttl => Probe.hops preserves
+
+pub registry decoders: mem::wire::Erased keyed by schema
+
+contribute decoders probe_decoder = mem::wire::Codec[Probe].erased()
+
+pub fn checked(schema: mem::wire::SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError {
+    for decoder in decoders {
+        if decoder.schema == schema {
+            return try (decoder.canonical)(raw, alloc)
+        }
+    }
+    fail core::DecodeError.Invalid
+} checked
+
+test probes_are_checked for checked {
+    let world = testing::world()
+    let schema = mem::wire::Codec[Probe].schema_hash()
+    let legacy = attempt checked(schema, raw: Untrusted.of(b"\x02\x03seq\x01\x05\x03ttl\x01\x03"), alloc: world.alloc)
+    let far = attempt checked(schema, raw: Untrusted.of(b"\x02\x04hops\x01\x13\x03seq\x01\x05"), alloc: world.alloc)
+    let Ok(canonical) = legacy else {
+        expect false
+        return
+    }
+    let current = attempt mem::wire::Codec[Probe].decode(canonical.view(), alloc: world.alloc)
+    expect canonical.byte_len() == 14
+    expect current.is_ok()
+    expect far.is_err()
+} probes_are_checked
 ```
 
 ## JSON

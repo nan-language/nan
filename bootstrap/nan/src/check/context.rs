@@ -7,7 +7,7 @@ use std::ops::RangeInclusive;
 
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::reading::{Api, digest_lines};
-use super::{Checker, check_targets, checkers, ty};
+use super::{Checker, check_targets, checkers, scope_checkers, ty};
 use crate::scope::Scope;
 use crate::syntax::ast::{ItemKind, Tok};
 use crate::syntax::grammar::Rule;
@@ -318,11 +318,11 @@ pub struct Green {
     pub api: Vec<String>,
 }
 
-/// The last-green entries of the workspace's items: of those whose heads lie in a scope, if any,
-/// and of those in the closure sets of `lines`, each once, by path.
-pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u32)]) -> Vec<Green> {
+/// The last-green entries of the items a check of a scope reads: of those whose heads lie in the
+/// scope without `lines`, otherwise of those in the closure sets of `lines`, each once, by path.
+pub fn greens(workspace: &Workspace, scope: &Scope, lines: &[(String, u32)]) -> Vec<Green> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, std);
+    let checkers = scope_checkers(workspace, std, scope);
     let mut found: Vec<Green> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for (_, checker) in &checkers {
@@ -337,9 +337,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
             if !db.is_reported(item) {
                 continue;
             }
-            if scope.is_some_and(|scope| {
-                scope.holds(workspace, &data.file.path, Some(data.head_line()))
-            }) {
+            if lines.is_empty() && scope.holds(workspace, &data.file.path, Some(data.head_line())) {
                 items.push(item);
             }
             let held = lines.iter().filter(|(path, line)| {

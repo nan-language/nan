@@ -86,7 +86,7 @@ fn green(
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
     let writer = scope.package(workspace).and_then(|package| package.name());
-    let greens = check::greens(workspace, Some(&scope), &[]);
+    let greens = check::greens(workspace, &scope, &[]);
     let records = changed(&green_entries(workspace, agent), &greens, writer);
     Ok(Output {
         command: invocation.command(&written, true),

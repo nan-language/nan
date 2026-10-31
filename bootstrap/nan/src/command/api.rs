@@ -53,7 +53,7 @@ pub fn update(
             Scope::Module(held, held_module) => *held == index && *held_module == module,
             Scope::File(path) | Scope::Lines(path, _) => {
                 workspace.file(path).is_some_and(|(holder, file)| {
-                    std::ptr::eq(holder, package) && file.module == Some(module)
+                    std::ptr::eq(holder, &**package) && file.module == Some(module)
                 })
             }
         };

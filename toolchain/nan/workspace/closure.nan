@@ -21,6 +21,67 @@ pkg struct Closure {
     pkg aliases: mem::Map[AliasKey, Member]
 } Closure
 
+/// A closure without members.
+pkg fn Closure.empty(alloc: mem::Alloc) -> Closure {
+    return Closure(members: mem::Map[text::String, Member].empty(alloc), checked: mem::List[usize].empty(alloc), aliases: mem::Map[AliasKey, Member].empty(alloc))
+} Closure.empty
+
+/// The part of the closure that checking one workspace package it checks reads: that package,
+/// the members named like std packages, and each member their `dep` aliases reach.
+pkg fn Closure.reached_from(self, held: Workspace, package_index: usize, alloc: mem::Alloc) -> Closure {
+    var reached = mem::List[Member].empty(alloc)
+    for entry in self.members {
+        if stdlib::is_std(entry.key().as_str()) {
+            mut reached.push(entry.value())
+        }
+    }
+    mut reached.push(Member.Source(package_index))
+    var at: usize = 0
+    while at < reached.len() {
+        let member = reached[at]
+        at += 1
+        let Some(manifest) = held.member(member).manifest else {
+            continue
+        }
+        for dep in manifest.deps {
+            let Some(next) = self.alias(member, alias: dep.alias.as_str()) else {
+                continue
+            }
+            if not holds_member(reached.view(), wanted: next) {
+                mut reached.push(next)
+            }
+        }
+    }
+    var members = mem::Map[text::String, Member].empty(alloc)
+    for entry in self.members {
+        if holds_member(reached.view(), wanted: entry.value()) {
+            discard mut members.insert(text::String.of(entry.key().as_str(), alloc), value: entry.value())
+        }
+    }
+    var checked = mem::List[usize].empty(alloc)
+    for index in self.checked {
+        if holds_member(reached.view(), wanted: Member.Source(index)) {
+            mut checked.push(index)
+        }
+    }
+    var aliases = mem::Map[AliasKey, Member].empty(alloc)
+    for entry in self.aliases {
+        if holds_member(reached.view(), wanted: entry.key().member) {
+            discard mut aliases.insert(AliasKey(member: entry.key().member, alias: text::String.of(entry.key().alias.as_str(), alloc)), value: entry.value())
+        }
+    }
+    return Closure(members: take members, checked: take checked, aliases: take aliases)
+} Closure.reached_from
+
+fn holds_member(members: Slice[Member], wanted: Member) -> bool {
+    for member in members {
+        if member == wanted {
+            return true
+        }
+    }
+    return false
+} holds_member
+
 /// The member of a package name.
 pkg fn Closure.member(self, name: Str) -> Option[Member] {
     return members_get(self.members, name)
@@ -58,7 +119,7 @@ fn AliasKey.order(self, member: Member, alias: Str) -> core::Ordering {
 pkg struct Release {
     pkg root: hashing::HashValue
     pkg entry: mem::Shared[store::Entry]
-    pkg pack: Package
+    pkg pack: mem::Shared[Package]
 } Release
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
@@ -72,21 +133,23 @@ struct Read {
 } Read
 
 /// The closures of the workspace packages, reading releases through `store_entry`: the store
-/// entry holding a release, by its code root.
+/// entry holding a release, by its code root, unless `loaded_release` holds it loaded into its
+/// directory.
 fn read_closures(
-    packages: Slice[Package],
+    packages: Slice[mem::Shared[Package]],
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]],
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Read fails platform::IoError {
     var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
     var closures = mem::List[Closure].empty(alloc)
     var index: usize = 0
-    for pack in packages {
+    for held in packages {
         invariant index < packages.len()
         let at = index
         index += 1
-        let Some(own) = try mut reader.own(packages, pack, index: at, store_entry, grammar) else {
+        let Some(own) = try mut reader.own(packages, pack: held.contents(), index: at, store_entry, loaded_release, grammar) else {
             continue
         }
         var fitting: Option[usize] = None
@@ -117,7 +180,7 @@ fn read_closures(
 
 /// Whether a package's own closure agrees with a closure: on the members of their package names,
 /// on the members of their aliases, and on the packages the closure checks.
-fn fits(own: Own, closure: Closure, packages: Slice[Package]) -> bool {
+fn fits(own: Own, closure: Closure, packages: Slice[mem::Shared[Package]]) -> bool {
     for entry in own.members {
         match members_get(closure.members, name: entry.key().as_str()) {
             Some(known) => {
@@ -140,7 +203,7 @@ fn fits(own: Own, closure: Closure, packages: Slice[Package]) -> bool {
         }
     }
     for checked in closure.checked {
-        let name = match packages[checked].name() {
+        let name = match packages[checked].contents().name() {
             Some(named) => named
             None => ""
         }
@@ -184,11 +247,11 @@ fn ClosureReader.report(mut self, code: diagnostic::Code, pack: Package, line: u
 } ClosureReader.report
 
 /// The workspace package at a directory, by index.
-fn package_at_dir(packages: Slice[Package], dir: Str) -> Option[usize] {
+fn package_at_dir(packages: Slice[mem::Shared[Package]], dir: Str) -> Option[usize] {
     var index: usize = 0
-    for pack in packages {
+    for held in packages {
         invariant index < packages.len()
-        if pack.is_at(dir) {
+        if held.contents().is_at(dir) {
             return Some(index)
         }
         index += 1
@@ -200,17 +263,20 @@ fn package_at_dir(packages: Slice[Package], dir: Str) -> Option[usize] {
 fn Package.is_at(self, dir: Str) -> bool = self.dir.as_str() == dir and self.manifest.is_some()
 
 /// The release of a store entry, loaded once into a directory.
-fn ClosureReader.release(mut self, take entry: mem::Shared[store::Entry], dir: Str, grammar: syntax::Grammar) -> usize fails platform::IoError {
+fn ClosureReader.release(mut self, take entry: mem::Shared[store::Entry], dir: Str, loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]], grammar: syntax::Grammar) -> usize fails platform::IoError {
     let root = entry.contents().root(self.alloc)
     var index: usize = 0
     for release in self.releases {
         invariant index < self.releases.len()
-        if release.root == root and release.pack.dir.as_str() == dir {
+        if release.root == root and release.pack.contents().dir.as_str() == dir {
             return index
         }
         index += 1
     }
-    let loaded = try Package.from_entry(entry.contents(), dir, grammar, alloc: self.alloc)
+    let loaded = match loaded_release(root, dir) {
+        Some(held) => held
+        None => mem::Shared.of(try Package.from_entry(entry.contents(), dir, grammar, alloc: self.alloc), alloc: self.alloc)
+    }
     mut self.releases.push(Release(root: root, entry: take entry, pack: take loaded))
     return index
 } ClosureReader.release
@@ -222,10 +288,10 @@ struct MemberDeps {
     deps: mem::List[DepSource]
 } MemberDeps
 
-fn ClosureReader.member_deps(self, packages: Slice[Package], member: Member) -> MemberDeps {
+fn ClosureReader.member_deps(self, packages: Slice[mem::Shared[Package]], member: Member) -> MemberDeps {
     return match member {
-        Member.Source(index) => deps_of(packages[index], alloc: self.alloc)
-        Member.Release(index) => deps_of(self.releases[index].pack, alloc: self.alloc)
+        Member.Source(index) => deps_of(packages[index].contents(), alloc: self.alloc)
+        Member.Release(index) => deps_of(self.releases[index].pack.contents(), alloc: self.alloc)
     }
 } ClosureReader.member_deps
 
@@ -247,10 +313,11 @@ fn deps_of(pack: Package, alloc: mem::Alloc) -> MemberDeps {
 /// manifest.
 fn ClosureReader.own(
     mut self,
-    packages: Slice[Package],
+    packages: Slice[mem::Shared[Package]],
     pack: Package,
     index: usize,
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]],
     grammar: syntax::Grammar,
     ) -> Option[Own] fails platform::IoError {
     let alloc = self.alloc
@@ -274,7 +341,7 @@ fn ClosureReader.own(
     }
     var lines = mem::Map[text::String, Member].empty(alloc)
     for line in lock.deps {
-        let member = try mut self.locked_member(packages, pack, line, store_entry, grammar)
+        let member = try mut self.locked_member(packages, pack, line, store_entry, loaded_release, grammar)
         let Some(found) = member else {
             continue
         }
@@ -315,10 +382,11 @@ fn ClosureReader.own(
 /// The member a line of a workspace package's lock reaches, reporting why it reaches none.
 fn ClosureReader.locked_member(
     mut self,
-    packages: Slice[Package],
+    packages: Slice[mem::Shared[Package]],
     pack: Package,
     line: machine::Locked,
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]],
     grammar: syntax::Grammar,
     ) -> Option[Member] fails platform::IoError {
     let alloc = self.alloc
@@ -350,13 +418,13 @@ fn ClosureReader.locked_member(
             }
             return None
         }
-        return Some(Member.Release(try mut self.release(take stored, dir: line.package_name.as_str(), grammar)))
+        return Some(Member.Release(try mut self.release(take stored, dir: line.package_name.as_str(), loaded_release, grammar)))
     }
     let dir = resolve_source(pack.dir.as_str(), source: line.source.as_str(), alloc)
     var source: Option[usize] = None
     match package_at_dir(packages, dir: dir.as_str()) {
         Some(at) => {
-            let located = packages[at]
+            let located = packages[at].contents()
             if located.name() == Some(line.package_name.as_str()) and entry_holds(entry, pack: located, alloc) {
                 source = Some(at)
             }
@@ -382,7 +450,7 @@ fn ClosureReader.locked_member(
         }
         return Some(Member.Source(at))
     }
-    return Some(Member.Release(try mut self.release(take stored, dir: dir.as_str(), grammar)))
+    return Some(Member.Release(try mut self.release(take stored, dir: dir.as_str(), loaded_release, grammar)))
 } ClosureReader.locked_member
 
 /// Whether the store holds an entry for a root whose release has another code root.
@@ -441,7 +509,7 @@ fn entry_holds(entry: Option[mem::Shared[store::Entry]], pack: Package, alloc: m
 /// reaches.
 fn ClosureReader.reach(
     mut self,
-    packages: Slice[Package],
+    packages: Slice[mem::Shared[Package]],
     pack: Package,
     index: usize,
     lines: mem::Map[text::String, Member],
@@ -523,7 +591,7 @@ fn first_dep_line(manifest: Manifest) -> u32 {
 /// Reports each `dep` directive of a workspace package reaching the package name an earlier
 /// directive in alias order reaches through another source: a path source the package at its
 /// directory, a store name the package its lock line names.
-fn ClosureReader.split(mut self, packages: Slice[Package], pack: Package) {
+fn ClosureReader.split(mut self, packages: Slice[mem::Shared[Package]], pack: Package) {
     let alloc = self.alloc
     let Some(manifest) = pack.manifest else {
         return
@@ -568,9 +636,10 @@ fn ClosureReader.split(mut self, packages: Slice[Package], pack: Package) {
 
 /// The package name a `dep` directive of a workspace package reaches from its source: for a path,
 /// the name of the package at its directory; for a store name, the package its lock line names.
-fn reached_name(packages: Slice[Package], pack: Package, dep: Dep, source: Str, alloc: mem::Alloc) -> Option[text::String] {
+fn reached_name(packages: Slice[mem::Shared[Package]], pack: Package, dep: Dep, source: Str, alloc: mem::Alloc) -> Option[text::String] {
     if dep.path {
-        for candidate in packages {
+        for held in packages {
+            let candidate = held.contents()
             if candidate.is_at(source) {
                 let Some(name) = candidate.name() else {
                     return None
@@ -591,7 +660,7 @@ fn reached_name(packages: Slice[Package], pack: Package, dep: Dep, source: Str, 
 
 /// The closure of a package without a valid lock: its path dependencies from source, through
 /// their own path dependencies.
-fn ClosureReader.unlocked(self, packages: Slice[Package], index: usize, mut own: Own) {
+fn ClosureReader.unlocked(self, packages: Slice[mem::Shared[Package]], index: usize, mut own: Own) {
     let alloc = self.alloc
     var pending = mem::List[usize].empty(alloc)
     mut pending.push(index)
@@ -601,7 +670,7 @@ fn ClosureReader.unlocked(self, packages: Slice[Package], index: usize, mut own:
         let Some(current) = mut pending.pop() else {
             return
         }
-        let Some(manifest) = packages[current].manifest else {
+        let Some(manifest) = packages[current].contents().manifest else {
             continue
         }
         for dep in manifest.deps {
@@ -614,7 +683,7 @@ fn ClosureReader.unlocked(self, packages: Slice[Package], index: usize, mut own:
             let Some(target) = package_at_dir(packages, dir: dir.as_str()) else {
                 continue
             }
-            let name = match packages[target].name() {
+            let name = match packages[target].contents().name() {
                 Some(named) => named
                 None => ""
             }

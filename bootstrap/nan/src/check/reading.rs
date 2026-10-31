@@ -461,7 +461,7 @@ pub fn ledgered(workspace: &Workspace, scope: &Scope) -> Vec<super::ledger::Entr
             let id = db
                 .packages
                 .iter()
-                .position(|data| std::ptr::eq(data.source, package) && !data.quiet);
+                .position(|data| std::ptr::eq(data.source, &**package) && !data.quiet);
             if let Some(id) = id {
                 return checker.package_ledger(PackageId(id as u32));
             }

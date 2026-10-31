@@ -72,10 +72,10 @@ impl Scope {
         match self {
             Scope::Workspace => true,
             Scope::Package(index) => {
-                file.is_some_and(|(package, _)| std::ptr::eq(package, &workspace.packages[*index]))
+                file.is_some_and(|(package, _)| std::ptr::eq(package, &*workspace.packages[*index]))
             }
             Scope::Module(index, module) => file.is_some_and(|(package, file)| {
-                std::ptr::eq(package, &workspace.packages[*index]) && file.module == Some(*module)
+                std::ptr::eq(package, &*workspace.packages[*index]) && file.module == Some(*module)
             }),
             Scope::File(scope) => scope == path,
             Scope::Lines(scope, lines) => {
@@ -86,15 +86,16 @@ impl Scope {
 
     /// The one package the scope lies in, if it holds no other.
     pub fn package<'a>(&self, workspace: &'a Workspace) -> Option<&'a Package> {
+        self.package_index(workspace)
+            .map(|index| &*workspace.packages[index])
+    }
+
+    /// The index of the one package the scope lies in, if it holds no other.
+    pub fn package_index(&self, workspace: &Workspace) -> Option<usize> {
         match self {
-            Scope::Workspace => match &workspace.packages[..] {
-                [package] => Some(package),
-                _ => None,
-            },
-            Scope::Package(index) | Scope::Module(index, _) => Some(&workspace.packages[*index]),
-            Scope::File(path) | Scope::Lines(path, _) => {
-                workspace.file(path).map(|(package, _)| package)
-            }
+            Scope::Workspace => (workspace.packages.len() == 1).then_some(0),
+            Scope::Package(index) | Scope::Module(index, _) => Some(*index),
+            Scope::File(path) | Scope::Lines(path, _) => workspace.file_package(path),
         }
     }
 }

@@ -170,7 +170,7 @@ fn scope_targets(workspace: &Workspace, closure: &Closure, scope: &Scope) -> Vec
     let mut targets: Vec<Target> = closure
         .checked
         .iter()
-        .map(|index| &workspace.packages[*index])
+        .map(|index| &*workspace.packages[*index])
         .filter(selects)
         .flat_map(run_targets)
         .collect();

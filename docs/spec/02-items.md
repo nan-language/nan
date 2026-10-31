@@ -58,7 +58,7 @@ pub fn Mode.is_busy(self) -> bool = match self { // error: item.multiple-lines
 
 ## Item kinds
 
-The **item kinds** are exactly `fn`, `struct`, `enum`, `interface`, `impl`, `layout`, `registers`, `const`, `const assert`, `registry`, `contribute`, `test`, `retired` and `package`.
+The **item kinds** are exactly `fn`, `struct`, `enum`, `interface`, `impl`, `layout`, `registers`, `const`, `const assert`, `registry`, `contribute`, `test`, `retired`, `package` and `protocol`.
 
 | Kind | Shape | Visibility | Modifiers | Defined in |
 | --- | --- | --- | --- | --- |
@@ -76,6 +76,7 @@ The **item kinds** are exactly `fn`, `struct`, `enum`, `interface`, `impl`, `lay
 | `test` | braced | no | none | [Testing and evidence](22-testing.md) |
 | `retired` | single-line | no | none | [Identity and versioning](29-identity-versioning.md) |
 | `package` | braced | no | none | [Packages, modules and names](03-packages-modules.md) |
+| `protocol` | braced | yes | none | [Components](26-components.md#protocols) |
 
 ```ebnf
 source_file = ( COL0 ( FILE_DOC NL | item_start ) item* )? EOF ;
@@ -92,6 +93,7 @@ item_kind = fn_item
     | "const" ( const_item | const_assert_item )
     | registry_item
     | contribute_item
+    | protocol_item
     | test_item
     | retired_item
     | package_item ;
@@ -566,11 +568,11 @@ Language 1 reserves two forms of item heads.
 
 ```ebnf
 self_field_set = "." "{" IDENT ( "," IDENT )* "}" {!item.self-field-set} ;
-reserved_head_word = ( 'stable' | 'machine' | 'protocol' | 'ipc' ) {!item.reserved-word} ;
+reserved_head_word = ( 'stable' | 'machine' | 'ipc' ) {!item.reserved-word} ;
 ```
 
 - A `self` parameter followed by a field set, such as `mut self.{level, peak}`, is an error (`item.self-field-set`); the exact fix replaces it with `self` in the same mode.
-- The words `stable`, `machine`, `protocol` and `ipc` are reserved in modifier and kind position of an item; there they are an error (`item.reserved-word`). Everywhere else they are identifiers.
+- The words `stable`, `machine` and `ipc` are reserved in modifier and kind position of an item; there they are an error (`item.reserved-word`). Everywhere else they are identifiers.
 
 ```nan
 pub closed struct Reading {
@@ -606,7 +608,7 @@ pub stable struct Reading { // error: item.reserved-word
 | `item.const-cycle` | error | [Constants](#constants) |
 | `item.const-type` | error | [Constants](#constants) |
 | `item.const-untyped` | error | [Constants](#constants) |
-| `item.duplicate` | error | [Order and names](#order-and-names), [Interfaces](08-generics-interfaces.md#interfaces) |
+| `item.duplicate` | error | [Order and names](#order-and-names), [Interfaces](08-generics-interfaces.md#interfaces), [Protocols](26-components.md#protocols) |
 | `item.fails-missing` | error | [Heads](#heads) |
 | `item.fails-unneeded` | error | [Heads](#heads) |
 | `item.foreign-form` | error | [Heads](#heads), [Transparent functions](#transparent-functions) |

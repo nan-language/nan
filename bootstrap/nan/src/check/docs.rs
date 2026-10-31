@@ -67,10 +67,11 @@ const CLAIM_TERMS: [&str; 11] = [
 ];
 
 /// The members a doc comment may document beside items.
-const MEMBERS: [Rule; 6] = [
+const MEMBERS: [Rule; 7] = [
     Rule::StructMember,
     Rule::EnumMember,
     Rule::InterfaceMember,
+    Rule::ProtocolOperation,
     Rule::TagLine,
     Rule::LayoutMember,
     Rule::RegisterMember,
@@ -117,7 +118,7 @@ fn doc_comments(syntax: &SourceFile, tree: &Tree, visibility: Visibility) -> Vec
 }
 
 /// What the doc comment of a member documents: the member's name, or an invariant line's text,
-/// and its visibility, a field's being the narrower of its own and its item's.
+/// and its visibility, a field's or operation's being the narrower of its own and its item's.
 fn documented(
     syntax: &SourceFile,
     tree: &Tree,
@@ -147,7 +148,7 @@ fn documented(
         .find(|token| syntax.tokens[*token as usize].kind == TokenKind::Ident)
         .map_or("", |token| syntax.text(token as usize));
     let visibility = match tree.rule(content) {
-        Rule::Field => {
+        Rule::Field | Rule::ProtocolOperation => {
             let own = match tree
                 .find(content, Rule::Visibility)
                 .and_then(|node| tree.span(node))

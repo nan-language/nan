@@ -15,6 +15,7 @@ fn parts() -> Parts {
             vec![(3, "pub fn f() = 1".to_owned())],
         )],
         schemas: Vec::new(),
+        protocols: Vec::new(),
     }
 }
 

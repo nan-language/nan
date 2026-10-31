@@ -836,8 +836,8 @@ pub fn is_heavy(byte: u8) -> bool = weight(byte) > 300
 | `effect.fit-kind` | error | [Fit](#fit) |
 | `effect.fit-wait` | error | [Fit](#fit) |
 | `effect.foreign-wait` | error | [Foreign functions and trusted code](#foreign-functions-and-trusted-code) |
-| `effect.undo-irreversible` | error | [Compensation](#compensation) |
-| `effect.undo-target` | error | [Compensation](#compensation) |
+| `effect.undo-irreversible` | error | [Compensation](#compensation), [Servers](26-components.md#servers) |
+| `effect.undo-target` | error | [Compensation](#compensation), [Servers](26-components.md#servers) |
 | `effect.uses-unknown` | error | [Waiting](#waiting) |
 | `limit.allocates` | error | [Limits](#limits) |
 | `limit.duplicate` | error | [Limits](#limits) |

@@ -116,10 +116,12 @@ impl Body<'_, '_, '_, '_> {
             return false;
         };
         match &self.lo.ck.sig(*item).kind {
-            SigKind::Enum { variants } => variants.iter().any(|candidate| {
-                candidate.name == variant
-                    && matches!(candidate.payload, crate::check::sig::Payload::Labelled(_))
-            }),
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
+                variants.iter().any(|candidate| {
+                    candidate.name == variant
+                        && matches!(candidate.payload, crate::check::sig::Payload::Labelled(_))
+                })
+            }
             _ => false,
         }
     }

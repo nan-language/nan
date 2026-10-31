@@ -283,7 +283,7 @@ impl SourceFile {
             TokenKind::Keyword(
                 Keyword::Fn | Keyword::Struct | Keyword::Enum | Keyword::Interface | Keyword::Test
             ) | TokenKind::Eof
-        ) && !matches!(self.text(at), "layout" | "registers")
+        ) && !matches!(self.text(at), "layout" | "registers" | "protocol")
         {
             at = self.next(at + 1);
         }

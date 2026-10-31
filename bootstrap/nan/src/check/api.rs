@@ -61,8 +61,8 @@ impl Checker<'_> {
 
     /// The lines of an item's `api` record before its digest: its doc comments when `docs`
     /// holds, its interface text as consumers or code in the module `viewer` see it, each ensures
-    /// clause followed by its status, the impl lines naming it that consumers or that code see
-    /// and, for a struct or enum, its properties.
+    /// clause followed by its status, the impl lines naming it that consumers or that code see,
+    /// for a struct, enum or protocol, its properties, and for a protocol, its protocol hash.
     pub fn api_lines(&self, item: ItemId, docs: bool, viewer: Option<ModuleId>) -> Vec<String> {
         let data = self.db.item(item);
         let syntax = data.syntax();
@@ -105,7 +105,10 @@ impl Checker<'_> {
         for other in impls {
             lines.extend(self.interface_text(other, None));
         }
-        if matches!(data.ast.kind, ItemKind::Struct(_) | ItemKind::Enum(_)) {
+        if matches!(
+            data.ast.kind,
+            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Protocol(_)
+        ) {
             let props = self.consumer_props(item);
             let seen: Vec<&str> = [
                 (Property::Linear, "linear"),
@@ -120,6 +123,10 @@ impl Checker<'_> {
             .map(|(_, name)| name)
             .collect();
             lines.push(format!("properties: {}", or_none(&seen, ", ")));
+        }
+        if let ItemKind::Protocol(_) = data.ast.kind {
+            let (hash, _) = self.protocol_hashes(item);
+            lines.push(format!("protocol: {}", hash.short()));
         }
         lines
     }

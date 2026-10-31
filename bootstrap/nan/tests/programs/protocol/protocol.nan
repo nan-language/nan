@@ -1,0 +1,119 @@
+//! A counter served through a protocol, its client logging what each operation gives back.
+
+pub closed enum Refusal derives Render, Encode {
+    TooLarge(u32)
+} Refusal
+
+pub closed struct Tally derives Copy, Encode {
+    pub adds: u64
+    pub ticks: u64
+} Tally
+
+pub flexible struct Note derives Encode {
+    pub weight: u64
+} Note
+
+pub protocol Counter summary Tally {
+    pub fn weigh(note: Note) -> u64 limits traceless
+    pub fn add(amount: u32) -> u64 fails Refusal limits traceless
+        requires amount > 0
+    pub fn reset() limits pure
+    pub fn report(log: sys::Log) limits recorded
+    pub fn history() -> mem::List[u64] limits traceless
+    fn tick() limits pure
+} Counter
+
+pub closed struct Env {
+    pub alloc: mem::Alloc
+} Env
+
+pub closed struct Count derives Encode {
+    pub total: u64
+    pub adds: u64
+    pub ticks: u64
+    pub totals: mem::List[u64]
+} Count
+
+impl Count: sys::Component[Env, Counter]
+
+pub fn Count.start(mut env: Env) -> Count = Count(total: 0, adds: 0, ticks: 0, totals: mem::List[u64].empty(env.alloc))
+
+pub fn Count.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 fails Refusal {
+    if amount > 100 {
+        fail Refusal.TooLarge(amount)
+    }
+    self.total = self.total.wrapping_add(u64.widen(amount))
+    self.adds = self.adds.wrapping_add(1)
+    mut self.totals.push(self.total)
+    mut cx.after(ms: 1, send: Counter.tick())
+    return self.total
+} Count.add
+
+pub fn Count.weigh(mut self, take note: Note, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 {
+    self.total = self.total.wrapping_add(note.weight)
+    return self.total
+} Count.weigh
+
+pub fn Count.reset(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.total = 0
+} Count.reset
+
+pub fn Count.report(mut self, take log: sys::Log, mut env: Env, mut cx: sys::Cx[Counter]) {
+    log.info("reported total", value: self.total)
+} Count.report
+
+pub fn Count.history(mut self, mut env: Env, mut cx: sys::Cx[Counter]) -> mem::List[u64] {
+    var copy = mem::List[u64].empty(env.alloc)
+    for total in self.totals {
+        mut copy.push(total)
+    }
+    return copy
+} Count.history
+
+fn Count.tick(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.ticks = self.ticks.wrapping_add(1)
+} Count.tick
+
+pub fn Count.summary(self) -> Tally = Tally(adds: self.adds, ticks: self.ticks)
+
+fn sum(values: mem::List[u64]) -> u64 {
+    var total: u64 = 0
+    for value in values {
+        total = total.wrapping_add(value)
+    }
+    return total
+} sum
+
+fn exchange(world: host::World) fails sys::CallError[Refusal] uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let log = world.log
+    let pause = world.clock
+    let count = try await host::Runner[Count].run(Env(alloc: alloc), exec, alloc, body: fn(inbox: sys::Outbox[Counter]) fails sys::CallError[Refusal] uses wait {
+        let opening = try await inbox.add(amount: 5)
+        log.info("first total", value: opening)
+        log.info("second total", value: try await inbox.add(amount: 7))
+        let refused = match attempt await inbox.add(amount: 500) {
+            Err(sys::CallError.Failed(Refusal.TooLarge(amount))) => amount
+            else => 0
+        }
+        log.info("refused amount", value: refused)
+        log.info("weighed total", value: try await inbox.weigh(note: Note(weight: 30)))
+        try await inbox.report(log: log)
+        try await inbox.reset()
+        discard try await sys::Domain.run(fn() fails sys::CallError[Refusal] uses wait {
+            let totals = try await inbox.history()
+            log.info("history sum", value: sum(totals))
+        }, exec, alloc)
+        try await pause.sleep(50)
+        let tally = try inbox.summary()
+        log.info("adds", value: tally.adds)
+        log.info("ticks", value: tally.ticks)
+    })
+    log.info("final total", value: count.total)
+} exchange
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let exchanged = attempt await exchange(world)
+    world.log.info("exchanged", value: exchanged.is_ok())
+} main

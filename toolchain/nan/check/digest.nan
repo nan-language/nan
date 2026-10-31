@@ -1078,6 +1078,23 @@ fn Checker.check_limits(self, item: ty::ItemId, body: mem::Shared[TBody]) {
         }
         else => {}
     }
+    match self.served(item) {
+        Some(by) => {
+            match by.served {
+                Served.Handler(index) => {
+                    let protocol_sig = self.sig(by.protocol)
+                    match protocol_sig.contents().kind {
+                        SigKind.Protocol(operations: operations, variants: _, summary: _) => demand(mut limit_set, demanded: operations[index].sig.limit_set)
+                        else => {}
+                    }
+                }
+                Served.Summary => {
+                    limit_set.pure = true
+                }
+            }
+        }
+        None => {}
+    }
     for line in self.implemented_lines(item) {
         let sig = self.sig(line)
         let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
@@ -1336,6 +1353,18 @@ fn DigestWalk.expr(mut self, expr: TExpr) {
     match expr.kind {
         TKind.Call(call) or TKind.Index(call) => mut self.call(call.contents())
         TKind.Closure(_) => return
+        TKind.Construct(variant: Some(variant), values: _, wrapped: _) => {
+            match self.ck.types().kind(expr.ty) {
+                ty::TyKind.Item(item: protocol, args: _) => {
+                    if self.ck.is_protocol(protocol) {
+                        var facts = Digest.none(self.ck.alloc())
+                        facts.class = self.ck.operation_class(protocol, index: variant)
+                        mut self.site(expr.token, digest: take facts, brought: Brought.Operation)
+                    }
+                }
+                else => {}
+            }
+        }
         TKind.When(attempted: _, accesses: _, body: _) => {
             var facts = Digest.none(self.ck.alloc())
             facts.wait = true
@@ -1461,23 +1490,36 @@ fn DigestWalk.float(mut self, token: u32, ty: ty::Ty) {
     }
 } DigestWalk.float
 
+/// The site of a call of an interface method, with its declared digest, or of a method an
+/// outbox of a protocol calls: waiting and the class of an operation, nothing for `summary`.
+fn DigestWalk.method_site(mut self, token: u32, bound: ty::Bound, method: usize) {
+    let alloc = self.ck.alloc()
+    if self.ck.is_protocol(bound.item) {
+        var facts = Digest.none(alloc)
+        if self.ck.is_operation(bound.item, method) {
+            facts.wait = true
+            facts.terminates = false
+            facts.class = self.ck.operation_class(bound.item, index: method)
+        }
+        mut self.site(token, digest: take facts, brought: Brought.Operation)
+        return
+    }
+    let sig = self.ck.sig(bound.item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return
+    }
+    expect method < methods.len()
+    let head = methods[method].sig
+    mut self.site(token, digest: Digest.declared(head.wait, limit_set: head.limit_set, alloc), brought: Brought.Call(None))
+} DigestWalk.method_site
+
 /// A call: the facts of what it calls, and of each function argument it supplies.
 fn DigestWalk.call(mut self, call: Call) {
     let token = call.token
     let alloc = self.ck.alloc()
     match call.callee {
         Callee.Function(item: function) => mut self.function_site(token, function)
-        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
-            let sig = self.ck.sig(bound.item)
-            match sig.contents().kind {
-                SigKind.Interface(methods: methods) => {
-                    expect method < methods.len()
-                    let head = methods[method].sig
-                    mut self.site(token, digest: Digest.declared(head.wait, limit_set: head.limit_set, alloc), brought: Brought.Call(None))
-                }
-                else => {}
-            }
-        }
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => mut self.method_site(token, bound, method)
         Callee.Value(value) => {
             let callee = value.contents()
             if not self.own_parameter(callee) {

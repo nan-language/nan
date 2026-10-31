@@ -191,6 +191,26 @@ impl Checker<'_> {
                     add(Kind::Decoder, data.line(encode.token), Vec::new(), true);
                 }
             }
+            ItemKind::Protocol(protocol) => {
+                let path = self.db.canonical(item);
+                for operation in &protocol.operations {
+                    for clause in &operation.method.clauses {
+                        let ClauseKind::Undo {
+                            target, premise, ..
+                        } = &clause.kind
+                        else {
+                            continue;
+                        };
+                        let undoer = format!("{path}.{}", target.written());
+                        add(
+                            Kind::Undo,
+                            data.line(clause.token),
+                            vec![undoer, premise.value.clone()],
+                            true,
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         entries.sort_by_key(|entry| (entry.line, entry.kind));

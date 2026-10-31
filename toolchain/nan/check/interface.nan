@@ -88,9 +88,8 @@ fn Checker.check_impl(self, item: ty::ItemId) -> bool {
     let SigKind.Interface(methods: methods) = interface_sig.contents().kind else {
         return false
     }
-    for method in methods {
-        let implemented = self.implementing_function(item, name: method.name.as_str()).is_some() or method.default
-        if not implemented {
+    for name in self.required_methods(item, methods: methods.view()) {
+        if self.implementing_function(item, name: name.as_str()).is_none() {
             self.report(item, token, code: diagnostic::Code.InterfaceMissingMethod)
             return true
         }
@@ -100,6 +99,23 @@ fn Checker.check_impl(self, item: ty::ItemId) -> bool {
     }
     return true
 } Checker.check_impl
+
+/// The names an impl line must implement: the handlers of the protocol it serves, or else the
+/// interface's methods without a default.
+fn Checker.required_methods(self, item: ty::ItemId, methods: Slice[MethodSig]) -> mem::List[text::String] {
+    match self.line_protocol(item) {
+        Some(protocol) => return self.served_names(protocol)
+        None => {}
+    }
+    let alloc = self.alloc()
+    var required = mem::List[text::String].empty(alloc)
+    for method in methods {
+        if not method.default {
+            mut required.push(text::String.of(method.name.as_str(), alloc))
+        }
+    }
+    return required
+} Checker.required_methods
 
 /// The rule an impl line breaks by the interface it names alone: a property interface, `Encode`
 /// outside std, or `core::SecretBits`.
@@ -213,6 +229,26 @@ fn Checker.check_implementing(self, function: ty::ItemId, sig: FnSig) {
     let ast::ItemKind.Fn(written) = db.ast(function).kind else {
         return
     }
+    match self.served(function) {
+        Some(by) => {
+            let line_sig = self.sig(by.line)
+            let SigKind.Impl(target: _, target_ty: target_ty, bound: _) = line_sig.contents().kind else {
+                return
+            }
+            let wanted = self.served_head(by, state: target_ty)
+            if not self.head_matches(written: sig, wanted) {
+                self.report(function, token, code: diagnostic::Code.InterfaceHeadMismatch)
+                return
+            }
+            let state = match db.owners.get(function) {
+                Some(TypeKey.Item(target)) => db.ast(target).visibility
+                else => ast::Visibility.Pub
+            }
+            discard self.check_implementing_visibility(function, expected: openness(self.served_visibility(by.protocol, served: by.served, state)))
+            return
+        }
+        None => {}
+    }
     for line in self.implemented_lines(function) {
         let line_sig = self.sig(line)
         let SigKind.Impl(target: _, target_ty: target_ty, bound: Some(bound)) = line_sig.contents().kind else {
@@ -237,28 +273,39 @@ fn Checker.check_implementing(self, function: ty::ItemId, sig: FnSig) {
         if openness(interface_visibility) < expected {
             expected = openness(interface_visibility)
         }
-        let written_visibility = db.ast(function).visibility
-        if openness(written_visibility) != expected {
-            let word = match expected {
-                0 => ""
-                1 => "pkg"
-                else => "pub"
-            }
-            var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
-            if written_visibility == ast::Visibility.Private {
-                var inserted = text::String.of(word, alloc: self.alloc())
-                mut inserted.push(' ')
-                mut fixes.push(self.fix_inserting(function, before: token, text: inserted.as_str()))
-            } else if expected == 0 {
-                mut fixes.push(self.fix_deleting_forward(function, head: token, last: token))
-            } else {
-                mut fixes.push(self.fix_replacing(function, head: token, last: token, text: word))
-            }
-            self.report_fixed(function, construct: nir::Span.at(token), code: diagnostic::Code.InterfaceImplVisibility, take fixes, offer: diagnostic::Offer.Each)
+        if not self.check_implementing_visibility(function, expected) {
             return
         }
     }
 } Checker.check_implementing
+
+/// Whether an implementing function has the visibility `expected`, as its openness; any other is
+/// reported with the fix writing that one.
+fn Checker.check_implementing_visibility(self, function: ty::ItemId, expected: u8) -> bool {
+    let db = self.db()
+    let token = db.ast(function).token
+    let written_visibility = db.ast(function).visibility
+    if openness(written_visibility) == expected {
+        return true
+    }
+    let word = match expected {
+        0 => ""
+        1 => "pkg"
+        else => "pub"
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    if written_visibility == ast::Visibility.Private {
+        var inserted = text::String.of(word, alloc: self.alloc())
+        mut inserted.push(' ')
+        mut fixes.push(self.fix_inserting(function, before: token, text: inserted.as_str()))
+    } else if expected == 0 {
+        mut fixes.push(self.fix_deleting_forward(function, head: token, last: token))
+    } else {
+        mut fixes.push(self.fix_replacing(function, head: token, last: token, text: word))
+    }
+    self.report_fixed(function, construct: nir::Span.at(token), code: diagnostic::Code.InterfaceImplVisibility, take fixes, offer: diagnostic::Offer.Each)
+    return false
+} Checker.check_implementing_visibility
 
 /// Whether an implementing function's head matches its method's, `Self` and the interface's
 /// parameters substituted: its modifier, own generic parameters, parameters, result, failure

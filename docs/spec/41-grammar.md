@@ -90,6 +90,7 @@ item_kind = fn_item
     | "const" ( const_item | const_assert_item )
     | registry_item
     | contribute_item
+    | protocol_item
     | test_item
     | retired_item
     | package_item ;
@@ -116,7 +117,7 @@ clause_line = requires_clause
 const_item = IDENT ( ":" type_expr "=" expr NL | "=" expr NL {!item.const-untyped} ) ;
 const_assert_item = "assert" expr NL ;
 self_field_set = "." "{" IDENT ( "," IDENT )* "}" {!item.self-field-set} ;
-reserved_head_word = ( 'stable' | 'machine' | 'protocol' | 'ipc' ) {!item.reserved-word} ;
+reserved_head_word = ( 'stable' | 'machine' | 'ipc' ) {!item.reserved-word} ;
 ```
 
 ### Packages and names
@@ -390,6 +391,17 @@ unique_list = 'unique' IDENT ( "," IDENT )* ;
 contribute_item = "contribute" path IDENT "=" expr NL ;
 ```
 
+### Components
+
+From [Components](26-components.md).
+
+```ebnf
+protocol_item = 'protocol' IDENT ( 'summary' type_expr )? "{" protocol_operation+ COL0 "}" item_label NL ;
+protocol_operation = ( DOC NL )* visibility? "fn" IDENT "(" operation_params? ")" fn_result? fails_clause? limits_clause? NL clause_region? ;
+operation_params = operation_param ( "," operation_params? )? ;
+operation_param = IDENT ":" type_expr ;
+```
+
 ### Tombstones
 
 From [Identity and versioning](29-identity-versioning.md).
@@ -479,8 +491,8 @@ Generated as [Keywords](01-lexical.md#keywords) states:
 | Class | Words |
 | --- | --- |
 | hard keywords | the 67 words of `HARD_KEYWORD` |
-| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `capability`, `changes`, `closed`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `flexible`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `manual`, `migrate`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
-| reserved words | `bank`, `ipc`, `machine`, `protocol`, `stable` |
+| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `capability`, `changes`, `closed`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `flexible`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `manual`, `migrate`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `protocol`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `summary`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
+| reserved words | `bank`, `ipc`, `machine`, `stable` |
 
 ## One-token lookahead
 

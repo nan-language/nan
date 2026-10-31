@@ -1,6 +1,6 @@
 # Components
 
-This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, and the runner `host::Runner`.
+This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, and protocols with their servers, operation calls and hashes.
 
 ## Components
 
@@ -604,13 +604,381 @@ pub fn tally_readings(exec: task::Executor, alloc: mem::Alloc) -> Tally fails ta
 } tally_readings
 ```
 
+## Protocols
+
+A **protocol** item declares the typed **operations** of the components serving it. Its name is a type, the message type of those components.
+
+```ebnf
+protocol_item = 'protocol' IDENT ( 'summary' type_expr )? "{" protocol_operation+ COL0 "}" item_label NL ;
+protocol_operation = ( DOC NL )* visibility? "fn" IDENT "(" operation_params? ")" fn_result? fails_clause? limits_clause? NL clause_region? ;
+operation_params = operation_param ( "," operation_params? )? ;
+operation_param = IDENT ":" type_expr ;
+```
+
+- An operation with a result or a `fails` clause is a **request**; any other is a **one-way** operation. Its parameter types, result and failure type are its **types**.
+- Operation names are distinct within their protocol (`item.duplicate`). An operation named `post`, `start` or `summary` is an error (`component.operation-name`).
+- An operation is visible where both it and its protocol are.
+- Each operation's `limits` clause holds `pure` or a [class](10-effects-digests.md#reversibility), the **class** of the operation, `traceless` for `pure`. An operation without one is an error (`component.operation-class`).
+- Each type of an operation is Send and not linear, and each type of a `pub` operation implements [Encode](13-text-encode.md#encode) or is a **handle type**: a [primitive capability](05-properties.md#capability-types) that is Send and not linear, capability kinds included, or `sys::Outbox[Q]`. Any other type is an error (`component.operation-type`), reported on the operation's line.
+- The clause region of an operation holds `requires`, `ensures`, `undo` and `todo` clauses, over the operation's parameters and, in `ensures`, `result`. Any other clause, or a `todo` clause holding an example clause, is an error (`component.operation-clause`).
+- The **summary type**, written after `summary`, implements Encode and is Copy; any other is an error (`component.summary-type`).
+
+A protocol P is a type with no generic parameters. It is Send, never linear, Copy, a view or AnyBits, and Inert when the parameter types of its operations are. A value of P is a message of one of its one-way operations: `P.op(p: v, ...)` builds the message of the one-way operation `op` holding its arguments, labelled by the operation's parameter names and marked as construction values are ([construction](04-types.md#construction)), where the operation is visible. Naming a request so is an error (`component.request-value`). No pattern matches a value of P.
+
+```nan
+pub closed enum Missing derives Render, Encode {
+    Empty
+} Missing
+
+pub closed struct Usage derives Copy, Encode {
+    pub writes: u64
+} Usage
+
+pub protocol Cell summary Usage {
+    /// The value held, failing when none is.
+    pub fn read() -> u32 fails Missing limits pure
+    /// Holds `value` from now on.
+    pub fn write(value: u32) limits pure
+        requires value > 0
+    fn expire() limits pure
+} Cell
+
+pub fn expiry() -> Cell = Cell.expire()
+```
+
+The API view of `Cell` leaves out `expire`, which consumers do not see, and ends with its [protocol hash](#protocol-hashes):
+
+```text
+$ nan show example::Cell --api
+ok show example::Cell --api: records 1
+api example::Cell example/example.nan:10
+    pub protocol Cell summary Usage {
+        pub fn read() -> u32 fails Missing limits pure
+        pub fn write(value: u32) limits pure
+            requires value > 0
+    } Cell
+    properties: Send, Inert
+    protocol: afshkplsj36ab4xop7
+ok show example::Cell --api: records 1
+```
+
+```nan
+pub protocol Gate {
+    pub fn open(at: u64) // error: component.operation-class
+} Gate
+```
+
+```nan
+pub protocol Relay {
+    pub fn forward(frame: mem::Bytes) limits recorded
+    pub fn adopt(conn: sys::net::Conn) limits irreversible(emit) // error: component.operation-type
+} Relay
+```
+
+A [capability kind](14-authority.md#capability-kinds) is a handle type:
+
+```nan
+// file: ports/package.nan
+//! Ports a router hands to the components it serves.
+
+package ports {
+    language 1
+    targets any
+    allow capability in ports
+} ports
+
+// file: ports/ports.nan
+//! Ports handed on through the Router protocol.
+
+pub open struct Port {
+} Port
+
+impl Port: sys::Kind[u32, u64]
+
+pub protocol Router {
+    pub fn attach(port: Port, slot: u32) limits recorded
+} Router
+```
+
+```nan
+pub closed enum Missing derives Render, Encode {
+    Empty
+} Missing
+
+pub protocol Cell {
+    pub fn read() -> u32 fails Missing limits pure
+} Cell
+
+pub fn reading() -> Cell = Cell.read() // error: component.request-value
+```
+
+### Servers
+
+An impl line `impl S: sys::Component[Env, P]`, P a protocol, declares a component **serving** P. In place of `S.on`, its [conformance](08-generics-interfaces.md#conformance) requires the **handler** of each operation `op` of P, read as an interface method with this head, and, when P declares a summary type Y, the **summary function**, read as an interface method `fn summary(self) -> Y`:
+
+```text
+fn op(mut self, take p: T, ..., mut env: Env, mut cx: sys::Cx[P]) -> R fails E
+```
+
+The parameters `p: T` are the operation's in order, R is its result and E its failure type, `-> R` and `fails E` being left out where the operation has none.
+
+- A missing handler or summary function is an error (`interface.missing-method`) and a mismatched head one (`interface.head-mismatch`), as conformance states. The visibility of a handler is the less visible of S and the operation, and that of the summary function the less visible of S and P (`interface.impl-visibility`).
+- The operation's limits apply to its handler as an interface method's apply to its implementing function, and the code of the summary function meets `limits pure`.
+- The operation's `requires` and `ensures` clauses bind its handler as an interface method's bind its implementing function ([interface contracts](18-contracts.md#interface-contracts)), over the parameters they share.
+- An operation's `undo` clause names another operation of P by its name; anything else is an error (`effect.undo-target`), and so is an undoer whose class is not at most `restorable` (`effect.undo-irreversible`). The handler's digest is compensated as if the handler had the clause ([compensation](10-effects-digests.md#compensation)), and the ledger records an `undo` entry on P.
+- The runner of a component serving P passes each message it removes from the intake to its operation's handler with the message's arguments, in place of `on`. When a request's handler returns or fails, its result or failure goes to the task that posted the request ([operation calls](#operation-calls)).
+- When P declares a summary type, the runner **publishes** the component's summary: after `start` returns and after each handler returns or fails, it calls the summary function on the state and keeps the value it gives, in place of the one kept before.
+
+```nan
+pub closed enum Missing derives Render, Encode {
+    Empty
+} Missing
+
+pub closed struct Usage derives Copy, Encode {
+    pub writes: u64
+} Usage
+
+pub protocol Cell summary Usage {
+    pub fn read() -> u32 fails Missing limits pure
+    pub fn write(value: u32) limits pure
+} Cell
+
+pub closed struct Env {
+} Env
+
+pub closed struct Slot derives Encode {
+    pub value: u32
+    pub writes: u64
+} Slot
+
+impl Slot: sys::Component[Env, Cell]
+
+pub fn Slot.start(mut env: Env) -> Slot = Slot(value: 0, writes: 0)
+
+pub fn Slot.read(mut self, mut env: Env, mut cx: sys::Cx[Cell]) -> u32 fails Missing {
+    if self.value == 0 {
+        fail Missing.Empty
+    }
+    return self.value
+} Slot.read
+
+pub fn Slot.write(mut self, take value: u32, mut env: Env, mut cx: sys::Cx[Cell]) {
+    self.value = value
+    self.writes = self.writes.wrapping_add(1)
+} Slot.write
+
+pub fn Slot.summary(self) -> Usage = Usage(writes: self.writes)
+```
+
+```nan
+pub protocol Cell {
+    pub fn write(value: u32) limits pure
+} Cell
+
+pub closed struct Env {
+} Env
+
+pub closed struct Slot derives Encode {
+    pub value: u32
+} Slot
+
+impl Slot: sys::Component[Env, Cell] // error: interface.missing-method
+
+pub fn Slot.start(mut env: Env) -> Slot = Slot(value: 0)
+
+pub fn Slot.on(mut self, take message: Cell, mut env: Env, mut cx: sys::Cx[Cell]) {
+} Slot.on
+```
+
+The handler of `split` meets its operation's `notrap` through the operation's `requires`:
+
+```nan
+pub protocol Share {
+    pub fn split(parts: u32) -> u32 limits pure, notrap
+        requires parts > 0
+} Share
+
+pub closed struct Env {
+} Env
+
+pub closed struct Pie derives Encode {
+    pub size: u32
+} Pie
+
+impl Pie: sys::Component[Env, Share]
+
+pub fn Pie.start(mut env: Env) -> Pie = Pie(size: 100)
+
+pub fn Pie.split(mut self, take parts: u32, mut env: Env, mut cx: sys::Cx[Share]) -> u32 {
+    return self.size / parts
+} Pie.split
+```
+
+```nan
+pub protocol Lamp {
+    pub fn light() limits restorable
+        undo dim "dim turns off the lamp light turned on"
+    pub fn dim() limits restorable
+        undo light "light turns on the lamp dim turned off"
+} Lamp
+```
+
+```nan
+pub protocol Lamp {
+    pub fn light() limits restorable
+        undo smash "smash puts the room dark again" // error: effect.undo-irreversible
+    pub fn smash() limits irreversible(actuate)
+} Lamp
+```
+
+```nan
+pub protocol Journal {
+    pub fn note(entry: u64) limits traceless
+} Journal
+
+pub closed struct Env {
+    pub log: sys::Log
+} Env
+
+pub closed struct Notes derives Encode {
+    pub count: u64
+} Notes
+
+impl Notes: sys::Component[Env, Journal]
+
+pub fn Notes.start(mut env: Env) -> Notes = Notes(count: 0)
+
+pub fn Notes.note(mut self, take entry: u64, mut env: Env, mut cx: sys::Cx[Journal]) {
+    env.log.info("entry", value: entry) // error: limit.reversibility-exceeded
+} Notes.note
+```
+
+### Operation calls
+
+On a value of `sys::Outbox[P]`, P a protocol, the candidates of [method resolution](08-generics-interfaces.md#method-resolution) for a name also hold P's operation of that name where it is visible, and `summary` when P declares a summary type Y. As methods of the outbox, they have these heads:
+
+| Candidate | Head |
+| --- | --- |
+| an operation without a `fails` clause | `fn op(self, take p: T, ...) -> R fails task::SendError uses wait`, without `-> R` for a one-way operation |
+| an operation with `fails E` | `fn op(self, take p: T, ...) -> R fails sys::CallError[E] uses wait` |
+| `summary` | `fn summary(self) -> Y fails task::SendError` |
+
+```nan-api
+// module: sys
+
+pub closed enum CallError[E: Send] derives Render {
+    Failed(E)
+    Closed(task::SendError) from
+    Cancelled(task::Cancelled) from
+} CallError
+```
+
+- A one-way call `out.op(...)` posts the message `P.op(...)` as [`out.post`](#keyed-tasks) does.
+- A request call `out.op(...)` runs the steps of a post of its message. Once the component task removes the message, the call waits, whatever cancellation reaches it, until the handler returns or fails, then returns the handler's result or fails with `CallError.Failed` holding its failure; it fails as closed when the component task stops first. When the posting task has stopped by then, the result or failure is released.
+- A request call fails as closed with `task::SendError.Closed`, or `CallError.Closed` holding it when its operation has a `fails` clause.
+- `out.summary()` gives the summary the component published last, and fails with `task::SendError.Closed` when `out` is stale. It never waits.
+- At an operation call, the operation's `requires`, over the arguments after the outbox, is an obligation, and its `ensures` a fact once the call returns.
+- The digest of an operation call states waiting and the operation's class, compensated when the operation has an `undo` clause; that of building a message states the operation's class alone, and that of `summary` nothing. The handler's digest never enters the caller's.
+
+```nan
+// file: cell/package.nan
+//! A cell on the host.
+
+package cell {
+    language 1
+    targets x86_64-host
+} cell
+
+// file: cell/cell.nan
+//! A cell holding one value, served through the Cell protocol.
+
+pub closed enum Missing derives Render, Encode {
+    Empty
+} Missing
+
+pub closed struct Usage derives Copy, Encode {
+    pub writes: u64
+} Usage
+
+pub protocol Cell summary Usage {
+    pub fn read() -> u32 fails Missing limits pure
+    pub fn write(value: u32) limits pure
+} Cell
+
+pub closed struct Env {
+} Env
+
+pub closed struct Slot derives Encode {
+    pub value: u32
+    pub writes: u64
+} Slot
+
+impl Slot: sys::Component[Env, Cell]
+
+pub fn Slot.start(mut env: Env) -> Slot = Slot(value: 0, writes: 0)
+
+pub fn Slot.read(mut self, mut env: Env, mut cx: sys::Cx[Cell]) -> u32 fails Missing {
+    if self.value == 0 {
+        fail Missing.Empty
+    }
+    return self.value
+} Slot.read
+
+pub fn Slot.write(mut self, take value: u32, mut env: Env, mut cx: sys::Cx[Cell]) {
+    self.value = value
+    self.writes = self.writes.wrapping_add(1)
+} Slot.write
+
+pub fn Slot.summary(self) -> Usage = Usage(writes: self.writes)
+
+pub fn exchange(world: host::World, value: u32) -> Slot fails sys::CallError[Missing] uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    return try await host::Runner[Slot].run(Env(), exec, alloc, body: fn(inbox: sys::Outbox[Cell]) fails sys::CallError[Missing] uses wait {
+        try await inbox.write(value: value)
+        discard try await inbox.read()
+        discard try inbox.summary()
+    })
+} exchange
+
+test exchange_writes_once for exchange {
+    let world = testing::world()
+    let slot = try await exchange(world, value: 7)
+    expect slot.value == 7
+    expect slot.writes == 1
+} exchange_writes_once
+```
+
+```nan
+pub protocol Mailer {
+    pub fn send(to: u64) limits irreversible(emit)
+} Mailer
+
+pub fn notify(outbox: sys::Outbox[Mailer]) fails task::SendError uses wait limits restorable {
+    try await outbox.send(to: 1) // error: limit.reversibility-exceeded
+} notify
+```
+
+### Protocol hashes
+
+The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), or `handle ` and the type's normalised text for a handle type, followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
+
+- The code root of a package records the hashes of each `pub` protocol it declares ([code roots](30-artefacts.md#code-roots)), and `nan show --api` prints a protocol's ([commands](33-toolchain.md#commands)).
+- Operations reach the components of their own closure only: the wire encoding of messages, and of the handle types they hold, between closures is [reserved](37-evolution.md#reservations).
+
 ## Diagnostics
 
 | Code | Class | Rule |
 | --- | --- | --- |
 | `component.env-not-abandonable` | error | [Component state](#component-state) |
 | `component.not-component` | error | [Runner](#runner) |
+| `component.operation-class` | error | [Protocols](#protocols) |
+| `component.operation-clause` | error | [Protocols](#protocols) |
+| `component.operation-name` | error | [Protocols](#protocols) |
+| `component.operation-type` | error | [Protocols](#protocols) |
+| `component.request-value` | error | [Protocols](#protocols) |
 | `component.state-generic` | error | [Component state](#component-state) |
 | `component.state-not-encode` | error | [Component state](#component-state) |
 | `component.state-not-inert` | error | [Component state](#component-state) |
+| `component.summary-type` | error | [Protocols](#protocols) |
 | `component.unavailable` | error | [Runner](#runner) |

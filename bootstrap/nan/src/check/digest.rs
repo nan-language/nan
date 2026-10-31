@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use super::Checker;
 use super::db::ItemId;
+use super::protocol::Served;
 use super::reversibility::{self, Class};
 use super::sig::SigKind;
 use super::tir::{
@@ -748,6 +749,15 @@ impl Checker<'_> {
             limits.notrap = true;
             limits.terminates = true;
         }
+        match self.served(item) {
+            Some((_, protocol, Served::Handler(index))) => {
+                if let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind {
+                    demand(&mut limits, &operations[index].sig.limits);
+                }
+            }
+            Some((_, _, Served::Summary)) => limits.pure = true,
+            None => {}
+        }
         for line in self.implemented_lines(item) {
             if let SigKind::Impl {
                 interface: Some(bound),
@@ -979,6 +989,18 @@ impl Walk<'_, '_, '_> {
         match &expr.kind {
             TKind::Call(call) | TKind::Index(call) => self.call(call),
             TKind::Closure(_) => return,
+            TKind::Construct {
+                variant: Some(variant),
+                ..
+            } => {
+                if let Ty::Item(protocol, _) = &expr.ty
+                    && self.ck.is_protocol(*protocol)
+                {
+                    let mut facts = Digest::none();
+                    facts.class = self.ck.operation_class(*protocol, *variant);
+                    self.site(expr.token, facts, Brought::Operation);
+                }
+            }
             TKind::When { .. } => {
                 let mut facts = Digest::none();
                 facts.wait = true;
@@ -1119,6 +1141,17 @@ impl Walk<'_, '_, '_> {
                 }
                 let body_owned = self.ck.db.ast(*item).kind.is_fn_with_body();
                 self.site(token, facts, Brought::Call(body_owned.then_some(*item)));
+            }
+            Callee::Method {
+                interface, method, ..
+            } if self.ck.is_protocol(interface.interface) => {
+                let mut facts = Digest::none();
+                if self.ck.is_operation(interface.interface, *method) {
+                    facts.wait = true;
+                    facts.terminates = false;
+                    facts.class = self.ck.operation_class(interface.interface, *method);
+                }
+                self.site(token, facts, Brought::Operation);
             }
             Callee::Method {
                 interface, method, ..

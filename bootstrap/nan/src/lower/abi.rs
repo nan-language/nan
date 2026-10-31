@@ -222,6 +222,10 @@ impl Lowering<'_, '_> {
                 let fn_ty = self.conformance_head(ty, method, args);
                 self.head_abi(&fn_ty, &Subst::default(), None)
             }
+            Instance::Operation { .. } => {
+                let fn_ty = self.instance_fn_ty(instance);
+                self.head_abi(&fn_ty, &Subst::default(), None)
+            }
             Instance::Release(ty) => Abi {
                 env: false,
                 params: vec![(NTy::RefMut(ty.clone()), Repr::Address)],

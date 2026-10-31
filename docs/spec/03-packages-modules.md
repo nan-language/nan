@@ -742,7 +742,7 @@ pub fn record_twice(mut counter: Counter) {
 | `name.moved` | error | [Unknown names](#unknown-names) |
 | `name.newer-release` | error | [Unknown names](#unknown-names) |
 | `name.prefix-mismatch` | error | [Name prefixes](#name-prefixes) |
-| `name.private` | error | [Visibility](#visibility), [Registries](25-registries.md#registries), [Contributions](25-registries.md#contributions) |
+| `name.private` | error | [Visibility](#visibility), [Registries](25-registries.md#registries), [Contributions](25-registries.md#contributions), [Protocols](26-components.md#protocols), [Operation calls](26-components.md#operation-calls) |
 | `name.private-in-interface` | error | [Visibility](#visibility) |
 | `name.redundant-path` | error | [Paths](#paths) |
 | `name.reserved` | error | [Aliases](#aliases), [Reserved std names](28-stdlib.md#reserved-std-names) |

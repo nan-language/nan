@@ -150,7 +150,7 @@ pub struct Site {
 /// What brings the facts of a site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Brought {
-    /// An operation of the code itself.
+    /// An operation of the code itself, or the float use a call of a std function brings.
     Operation,
     /// A call, or a function supplied as an argument: the function with a body it names, if any.
     Call(Option<ItemId>),
@@ -1140,6 +1140,11 @@ impl Walk<'_, '_, '_> {
                     facts.class = self.device_access();
                 }
                 let body_owned = self.ck.db.ast(*item).kind.is_fn_with_body();
+                if facts.float && self.ck.db.is_std(*item) {
+                    let mut float = Digest::none();
+                    float.float = true;
+                    self.site(token, float, Brought::Operation);
+                }
                 self.site(token, facts, Brought::Call(body_owned.then_some(*item)));
             }
             Callee::Method {

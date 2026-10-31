@@ -461,7 +461,7 @@ pub fn keep_count(count: u32, mut out: mem::Bytes) {
 
 ## Secret values
 
-**Secret** is the core type `core::Secret[T: core::SecretBits]`: a value of `T`, such as a key, whose operations take the same steps and the same time whatever value it holds. `core::SecretBits` is the core interface that exactly the integer types and `bool` implement; an impl line naming it is an error (`secret.bits-impl`).
+**Secret** is the core type `core::Secret[T: core::SecretBits]`: a value of `T`, such as a key, whose operations take the same steps and the same time whatever value it holds. `core::SecretBits` is the core interface that exactly the integer types, `bool` and the integer [lane types](09-numbers.md#lanes) implement; an impl line naming it is an error (`secret.bits-impl`).
 
 ```nan-api
 // module: core
@@ -484,11 +484,12 @@ pub fn Secret.reveal(self) -> T limits pure, notrap, terminates
 
 | Head | Receivers `Secret[T]` |
 | --- | --- |
-| `fn wrapping_add(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates`, and `wrapping_sub` and `wrapping_mul` alike | integer `T` |
+| `fn wrapping_add(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates`, and `wrapping_sub` alike | integer `T`, integer lane type `T` |
+| `fn wrapping_mul(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates` | integer `T`, integer lane type `T` of 16-bit lanes or wider |
 | `fn mul_high(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates` | `u64`, `i64` |
 | `fn bit_and(self, other: Secret[T]) -> Secret[T] limits pure, notrap, terminates`, and `bit_or` and `bit_xor` alike | every `T` |
 | `fn bit_not(self) -> Secret[T] limits pure, notrap, terminates` | every `T` |
-| `fn shl(self, amount: u32) -> Secret[T] limits pure, terminates`, and `shr` alike | integer `T` |
+| `fn shl(self, amount: u32) -> Secret[T] limits pure, terminates`, and `shr` alike | integer `T`, integer lane type `T` |
 | `fn rotate_left(self, amount: u32) -> Secret[T] limits pure, notrap, terminates`, and `rotate_right` alike | integer `T` |
 | `fn eq(self, other: Secret[T]) -> Secret[bool] limits pure, notrap, terminates`, and `ne` alike | every `T` |
 | `fn lt(self, other: Secret[T]) -> Secret[bool] limits pure, notrap, terminates`, and `le`, `gt` and `ge` alike | integer `T` |
@@ -503,11 +504,18 @@ Each member computes on the values its Secret operands hold and wraps its result
 - `bit_and`, `bit_or`, `bit_xor` and `bit_not` compute as `&`, `|`, `^` and `~`; on `bool` they are and, or, exclusive or and negation.
 - `shl` and `shr` trap when the amount n is at least w (`trap.shift`). Otherwise `shl` is the value congruent to a × 2^n modulo 2^w, and `shr` is a ÷ 2^n rounded toward negative infinity. `rotate_left` and `rotate_right` rotate the w bits by n modulo w.
 - `eq`, `ne`, `lt`, `le`, `gt` and `ge` compare as `==`, `!=`, `<`, `<=`, `>` and `>=` on `T`.
+- On an integer lane type, `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shl` and `shr` compute lane by lane as the lane type's members of those names, `shl` and `shr` trapping when n is at least the lane width, and `eq` holds when every lane is equal.
 - `c.select(a, if_false: b)` is `a` when `c` holds `true`, and `b` otherwise.
 - `Secret[T].widen(x)` and `Secret[T].truncate(x)`, for `x` of `Secret[S]`, convert as `T.widen` and `T.truncate` of [conversions](09-numbers.md#conversions). A source `S` that is no integer type is an error (`num.conversion-undefined`), as are `S` equal to `T` (`num.same-type-conversion`), `widen` on a pair that is not a widening pair (`num.widen-lossy`) and `truncate` on a widening pair (`num.widen-applies`).
 - `equal` requires `a.len() == b.len()` and holds `true` exactly when every element of `a` equals the element of `b` at its position. `copy_if` requires `target.len() == source.len()` and, when `choice` holds `true`, copies every element of `source` into `target`; otherwise it leaves `target` unchanged.
 
 ```nan
+pub fn mixed_lanes(swap: core::Secret[bool], a: core::Secret[core::simd::U32x4], b: core::Secret[core::simd::U32x4]) -> core::Secret[core::simd::U32x4]
+    example mixed_lanes(core::Secret.of(true), a: core::Secret.of(core::simd::U32x4.splat(1)), b: core::Secret.of(core::simd::U32x4.splat(2))).reveal().lane(0) == 3
+{
+    return swap.select(a.wrapping_add(b), if_false: a.bit_xor(b).shl(4))
+} mixed_lanes
+
 pub fn conditional_swap(swap: core::Secret[bool], mut a: core::Secret[u64], mut b: core::Secret[u64]) {
     let mask = swap.select(core::Secret.of(~0u64), if_false: core::Secret.of(0))
     let flip = a.bit_xor(b).bit_and(mask)
@@ -553,7 +561,7 @@ impl Limb: core::SecretBits // error: secret.bits-impl
 
 ### Constant-time lowering
 
-[Lowering](30-artefacts.md#lowering) gives each member of Secret other than `equal` and `copy_if` a fixed sequence of integer additions, subtractions, multiplications, bitwise operations, shifts, rotations, comparisons giving a flag, conditional moves (`cmov` on x86_64, `csel` on AArch64), extensions and truncations. That sequence holds no branch, no division and no memory access whose address depends on an operand; its only branch is the check of the amount of `shl` and `shr`, which depends on the amount alone. `equal` and `copy_if` branch and index only on the lengths of their slices and the positions within them. A function computing on Secret values through these members thus branches, divides and addresses memory independently of the values they hold.
+[Lowering](30-artefacts.md#lowering) gives each member of Secret other than `equal` and `copy_if` a fixed sequence of integer additions, subtractions, multiplications, bitwise operations, shifts, rotations, comparisons giving a flag, conditional moves (`cmov` on x86_64, `csel` on AArch64), extensions and truncations; over a lane type, those operations lane by lane, in vector registers on a host target with broadcasts and bitwise selects, and the loads and stores of its lanes at its operands' addresses. That sequence holds no branch, no division and no memory access whose address depends on an operand; its only branch is the check of the amount of `shl` and `shr`, which depends on the amount alone. `equal` and `copy_if` branch and index only on the lengths of their slices and the positions within them. A function computing on Secret values through these members thus branches, divides and addresses memory independently of the values they hold.
 
 The time each of these instructions takes is independent of its operands on a processor whose data-independent timing mode is on and that lists the instruction under that mode; the [runtime](27-program-model.md#runtime-support) turns that mode on where the program can. The guarantee covers the instructions lowering emits, not speculative execution, power or frequency variation, nor the clearing of Secret values from registers and memory.
 

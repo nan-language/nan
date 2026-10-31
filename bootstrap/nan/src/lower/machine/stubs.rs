@@ -42,7 +42,8 @@ use crate::workspace::Arch;
 /// translation instead where the CPU lacks the instruction or has PCIDs disabled; `Shootdown`
 /// drops a page's cached translations, or every one for a scope of 1 or with PCIDs enabled;
 /// `Cr3Tag` gives the bits a PCID and the no-flush flag add to a root, none with PCIDs
-/// disabled; `ReadXcr0` gives `XCR0`, 0 without XSAVE enabled; `WriteXcr0` writes it and gives
+/// disabled; `ReadXcr0` gives `XCR0`, 0 without XSAVE enabled, and `Xgetbv` gives it at any
+/// privilege, 0 where CPUID reports XSAVE disabled; `WriteXcr0` writes it and gives
 /// 1, or gives 0 for a value `xsetbv` would fault on; `EnableProtection` sets the
 /// control-register bit of the `hw::Protection` variant at an index and gives 1, or
 /// gives 0 where the CPU lacks it; `ClearBuffers` runs `verw`; and `UserOpen` and `UserClose`
@@ -120,6 +121,7 @@ pub enum Stub {
     Shootdown,
     Cr3Tag,
     ReadXcr0,
+    Xgetbv,
     WriteXcr0,
     EnableProtection,
     ClearBuffers,
@@ -408,6 +410,15 @@ impl Stub {
                 &[
                     0x0f, 0x20, 0xe0, 0x0f, 0xba, 0xe0, 0x12, 0x73, 0x0d, 0x31, 0xc9, 0x0f, 0x01,
                     0xd0, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3, 0x31, 0xc0, 0xc3,
+                ],
+            ),
+            Stub::Xgetbv => (
+                0,
+                1,
+                &[
+                    0x53, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x0f, 0xa2, 0x5b, 0x0f, 0xba,
+                    0xe1, 0x1b, 0x73, 0x0d, 0x31, 0xc9, 0x0f, 0x01, 0xd0, 0x48, 0xc1, 0xe2, 0x20,
+                    0x48, 0x09, 0xd0, 0xc3, 0x31, 0xc0, 0xc3,
                 ],
             ),
             Stub::WriteXcr0 => (
@@ -881,6 +892,7 @@ impl Stub {
             | Stub::Shootdown
             | Stub::Cr3Tag
             | Stub::ReadXcr0
+            | Stub::Xgetbv
             | Stub::WriteXcr0
             | Stub::EnableProtection
             | Stub::ClearBuffers

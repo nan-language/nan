@@ -46,11 +46,11 @@ fn call_result(b: clif::Builder, call: clif::Inst, alloc: mem::Alloc) -> clif::V
 
 fn no_values(alloc: mem::Alloc) -> mem::List[clif::Value] = mem::List[clif::Value].empty(alloc)
 
-fn host_isa() -> Isa = Isa(arch: workspace::Arch.Amd64, pic: true, probes: true)
+fn host_isa() -> Isa = Isa(arch: workspace::Arch.Amd64, pic: true, probes: true, level: None)
 
-fn arm_isa() -> Isa = Isa(arch: workspace::Arch.Aarch64, pic: true, probes: true)
+fn arm_isa() -> Isa = Isa(arch: workspace::Arch.Aarch64, pic: true, probes: true, level: None)
 
-fn arm_machine_isa() -> Isa = Isa(arch: workspace::Arch.Aarch64, pic: false, probes: false)
+fn arm_machine_isa() -> Isa = Isa(arch: workspace::Arch.Aarch64, pic: false, probes: false, level: None)
 
 test compiles_an_addition_without_moves_for_aarch64 for compile {
     let alloc = testing::world().alloc
@@ -170,7 +170,7 @@ test locates_traps_at_their_instructions_for_aarch64 for compile {
     expect code.locations[0] == Located(offset: 12, loc: clif::SourceLoc(bits: 5))
 } locates_traps_at_their_instructions_for_aarch64
 
-fn machine_isa() -> Isa = Isa(arch: workspace::Arch.Amd64, pic: false, probes: false)
+fn machine_isa() -> Isa = Isa(arch: workspace::Arch.Amd64, pic: false, probes: false, level: None)
 
 test compiles_an_addition_without_moves for compile {
     let alloc = testing::world().alloc
@@ -766,3 +766,97 @@ test selects_secret_operations_without_branches_or_divisions for select {
     expect arm_selected.blocks.len() == 1
     expect not arm_branches_or_divides(arm_selected)
 } selects_secret_operations_without_branches_or_divisions
+
+/// A function storing at its third parameter the product of the vectors of two 64-bit lanes
+/// its first two address.
+fn lanes_product(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(3, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 3
+    let a = mut b.load(clif::Type.Int64x2, flags: clif::MemFlags.unaligned(), p: params[0], offset: 0)
+    let c = mut b.load(clif::Type.Int64x2, flags: clif::MemFlags.unaligned(), p: params[1], offset: 0)
+    let product = mut b.imul(a, y: c)
+    mut b.store(clif::MemFlags.unaligned(), x: product, p: params[2], offset: 0)
+    mut b.ret(one(params[2], alloc).view())
+    return take b.finalize()
+} lanes_product
+
+test selects_vector_instructions_of_each_level for compile {
+    let alloc = testing::world().alloc
+    let base = compile(lanes_product(alloc), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    let vex = compile(lanes_product(alloc), isa: Isa(arch: workspace::Arch.Amd64, pic: true, probes: true, level: Some(workspace::Level.X64v3)), leaves: Leaves.empty(alloc), alloc)
+    let evex = compile(lanes_product(alloc), isa: Isa(arch: workspace::Arch.Amd64, pic: true, probes: true, level: Some(workspace::Level.X64v4)), leaves: Leaves.empty(alloc), alloc)
+    expect holds_vex(base.bytes.view(), opcode: 0xF4) == false and holds_vex(vex.bytes.view(), opcode: 0xF4)
+    expect holds_vpmullq(base.bytes.view()) == false and holds_vpmullq(vex.bytes.view()) == false and holds_vpmullq(evex.bytes.view())
+    expect evex.bytes.len() < vex.bytes.len()
+} selects_vector_instructions_of_each_level
+
+/// Whether code holds a VEX-encoded instruction of the `0F` map with an opcode and the `66`
+/// prefix, as `vpmuludq` is.
+fn holds_vex(code: Slice[u8], opcode: u8) -> bool {
+    for at in 0..<code.len() {
+        if at + 3 < code.len() and code[at] == 0xC4 and (code[at + 1] & 0x1F) == 1 and (code[at + 2] & 3) == 1 and code[at + 3] == opcode {
+            return true
+        }
+    }
+    return false
+} holds_vex
+
+/// Whether code holds `vpmullq` of 128-bit registers below 16, EVEX-encoded.
+fn holds_vpmullq(code: Slice[u8]) -> bool {
+    for at in 0..<code.len() {
+        if at + 4 < code.len() and code[at] == 0x62 and (code[at + 1] & 0x13) == 0x12 and (code[at + 2] & 0x87) == 0x85 and code[at + 3] == 0x08 and code[at + 4] == 0x40 {
+            return true
+        }
+    }
+    return false
+} holds_vpmullq
+
+/// A function adding to the vector of four 32-bit lanes its third parameter addresses the dot
+/// product of the vectors of bytes its first two address, in the form lowering builds it.
+fn bytes_dot(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(3, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 3
+    let a = mut b.load(clif::Type.Int8x16, flags: clif::MemFlags.unaligned(), p: params[0], offset: 0)
+    let c = mut b.load(clif::Type.Int8x16, flags: clif::MemFlags.unaligned(), p: params[1], offset: 0)
+    let acc = mut b.load(clif::Type.Int32x4, flags: clif::MemFlags.unaligned(), p: params[2], offset: 0)
+    let low_a = mut b.swiden_low(a)
+    let low_c = mut b.swiden_low(c)
+    let low = mut b.imul(low_a, y: low_c)
+    let high_a = mut b.swiden_high(a)
+    let high_c = mut b.swiden_high(c)
+    let high = mut b.imul(high_a, y: high_c)
+    let low_first = mut b.swiden_low(low)
+    let low_second = mut b.swiden_high(low)
+    let low_pairs = mut b.iadd_pairwise(low_first, y: low_second)
+    let high_first = mut b.swiden_low(high)
+    let high_second = mut b.swiden_high(high)
+    let high_pairs = mut b.iadd_pairwise(high_first, y: high_second)
+    let pairs = mut b.iadd_pairwise(low_pairs, y: high_pairs)
+    let sum = mut b.iadd(pairs, y: acc)
+    mut b.store(clif::MemFlags.unaligned(), x: sum, p: params[2], offset: 0)
+    mut b.ret(one(params[2], alloc).view())
+    return take b.finalize()
+} bytes_dot
+
+test selects_sdot_for_a_dot_product_at_aarch64_dotprod for compile {
+    let alloc = testing::world().alloc
+    let base = compile(bytes_dot(alloc), isa: arm_isa(), leaves: Leaves.empty(alloc), alloc)
+    let dotprod = compile(bytes_dot(alloc), isa: Isa(arch: workspace::Arch.Aarch64, pic: true, probes: true, level: Some(workspace::Level.Aarch64Dotprod)), leaves: Leaves.empty(alloc), alloc)
+    expect holds_sdot(base.bytes.view()) == false and holds_sdot(dotprod.bytes.view())
+    expect dotprod.bytes.len() < base.bytes.len()
+} selects_sdot_for_a_dot_product_at_aarch64_dotprod
+
+/// Whether AArch64 code holds `sdot` of vector registers.
+fn holds_sdot(code: Slice[u8]) -> bool {
+    var at: usize = 0
+    while at + 3 < code.len() {
+        let word = u32.widen(code[at]) | (u32.widen(code[at + 1]) << 8) | (u32.widen(code[at + 2]) << 16) | (u32.widen(code[at + 3]) << 24)
+        if (word & 0xFFE0_FC00) == 0x4E80_9400 {
+            return true
+        }
+        at += 4
+    }
+    return false
+} holds_sdot

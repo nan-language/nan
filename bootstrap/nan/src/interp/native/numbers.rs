@@ -27,7 +27,7 @@ pub fn scalar_member(
     let value = match member {
         "wrapping_add" => Val::Int(wrap(a + b(), scalar)),
         "wrapping_sub" => Val::Int(wrap(a - b(), scalar)),
-        "wrapping_mul" => Val::Int(wrap(a * b(), scalar)),
+        "wrapping_mul" => Val::Int(wrap(a.wrapping_mul(b()), scalar)),
         "wrapping_shl" | "checked_shl" | "shr_arith" => {
             let amount = b();
             let fits_width = amount < i128::from(scalar.bits());

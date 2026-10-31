@@ -127,12 +127,13 @@ From [Packages, modules and names](03-packages-modules.md).
 ```ebnf
 package_item = "package" IDENT "{" directive* COL0 "}" item_label NL ;
 directive = language_directive | targets_directive | entry_directive
-    | dep_directive | allow_directive | deny_directive ;
+    | codegen_directive | dep_directive | allow_directive | deny_directive ;
 language_directive = 'language' INT NL ;
 targets_directive = 'targets' target_list NL ;
 target_list = target ( "," target )* ;
 target = IDENT ( "-" IDENT )? ;
 entry_directive = 'entry' IDENT NL ;
+codegen_directive = 'codegen' target_list NL ;
 dep_directive = 'dep' IDENT TEXT NL ;
 allow_directive = 'allow' authority "in" name_list NL ;
 authority = 'device' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;

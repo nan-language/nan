@@ -131,6 +131,7 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
         ck,
         tests.prefixes.clone(),
         tests.roots.clone(),
+        None,
         Some(runtime),
     );
     let entry = entry_glue(&mut lowering, tests);

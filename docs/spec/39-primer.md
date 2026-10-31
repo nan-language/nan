@@ -253,6 +253,7 @@ pub fn Square.area(self) -> u64 {
 - `>>` shifts unsigned integers and `shr_arith` signed ones. A shift by the width or more traps (`trap.shift`); otherwise a signed `<<` that is not exact traps (`trap.overflow`).
 - [Named conversions](09-numbers.md#conversions) are functions of the target type: `u64.widen(x)` is lossless, `u8.fit(x)` traps when the value does not fit (`trap.conversion`), `u8.checked_fit(x)` returns an `Option`, `u8.truncate(x)` keeps low bits, `u8.saturate(x)` clamps, and `nearest` rounds to the nearest value. `x.to_bits()`, `T.from_bits(b)` (into AnyBits types) and `T.checked_from_bits(b)` (an `Option`) reinterpret bits.
 - Floats are strict IEEE 754 with explicit `fused_mul_add`. They have no `Eq`, `Ord` or `Hash`; `core::TotalF64` and `core::TotalF32` order them totally.
+- [`core::simd`](09-numbers.md#lanes) holds 128-bit lane types such as `U32x4` and `F32x4`, computing lane by lane alike on every target.
 
 ```nan
 pub fn checksum(data: Slice[u8]) -> u8 {
@@ -528,7 +529,7 @@ pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::Page
 
 ### Secret values
 
-- Keys and other secrets go in [`core::Secret[T]`](15-untrusted.md#secret-values), over the integer types and `bool`. Its members, such as `wrapping_add`, `bit_xor`, `rotate_left`, `eq`, `lt` and `select`, lower without branches, and a `Secret[bool]` decides nothing until `reveal` (`secret.public-use`).
+- Keys and other secrets go in [`core::Secret[T]`](15-untrusted.md#secret-values), over the integer types, `bool` and the integer lane types. Its members, such as `wrapping_add`, `bit_xor`, `rotate_left`, `eq`, `lt` and `select`, lower without branches, and a `Secret[bool]` decides nothing until `reveal` (`secret.public-use`).
 
 ## Concurrency topic
 
@@ -712,7 +713,7 @@ interrupt fn Serial.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit li
 
 ### Manifests
 
-- The [manifest](03-packages-modules.md#manifest) `package.nan` holds `package name { ... } name` with one directive per line, in this order: `language 1`; `targets` naming `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, their `aarch64-` counterparts or `any`; `entry main`; `dep alias "source"` lines by alias; `allow <authority> in <modules or aliases>` lines by authority; `deny a -> b` lines, each forbidding `a` from depending on `b`. It holds no versions or hashes.
+- The [manifest](03-packages-modules.md#manifest) `package.nan` holds `package name { ... } name` with one directive per line, in this order: `language 1`; `targets` naming `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, their `aarch64-` counterparts or `any`; `entry main`; `codegen x86_64-v3` or another [level](27-program-model.md#codegen-levels) a program's builds may use, its image refusing a processor without it; `dep alias "source"` lines by alias; `allow <authority> in <modules or aliases>` lines by authority; `deny a -> b` lines, each forbidding `a` from depending on `b`. It holds no versions or hashes.
 - A package with `entry main` is a program and its entry is `fn main(take world: host::World) fails E uses wait`, or `-> u8` for an exit status, on the host; a package without one is a library. A trap in `main` exits with status 70 after the trap report. A termination request from the host cancels `main`, and the process exits with status 128 plus the signal number. Every declared [target](27-program-model.md#targets) is checked.
 - A module's last path segment is unique in its package and the module graph is acyclic. A directory `name@target` holds one target's [variant](03-packages-modules.md#target-variants) of module `name` and exports identical items.
 - A manifest granting `device` or `priv` needs a seal.

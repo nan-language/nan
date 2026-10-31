@@ -154,6 +154,41 @@ pkg proj fn Target.image_suffix(self) -> Str {
     }
 } Target.image_suffix
 
+/// A codegen level: the extensions beyond its architecture's base instruction set that a
+/// program's final builds for that architecture use.
+pkg enum Level derives Copy, Eq, Hash {
+    X64v2
+    X64v3
+    X64v4
+    Aarch64Dotprod
+} Level
+
+pkg proj fn Level.name(self) -> Str {
+    return match self {
+        Level.X64v2 => "x86_64-v2"
+        Level.X64v3 => "x86_64-v3"
+        Level.X64v4 => "x86_64-v4"
+        Level.Aarch64Dotprod => "aarch64-dotprod"
+    }
+} Level.name
+
+pkg fn Level.from_name(name: Str) -> Option[Level] {
+    return match name {
+        "x86_64-v2" => Some(Level.X64v2)
+        "x86_64-v3" => Some(Level.X64v3)
+        "x86_64-v4" => Some(Level.X64v4)
+        "aarch64-dotprod" => Some(Level.Aarch64Dotprod)
+        else => None
+    }
+} Level.from_name
+
+pkg fn Level.arch(self) -> Arch {
+    return match self {
+        Level.Aarch64Dotprod => Arch.Aarch64
+        else => Arch.Amd64
+    }
+} Level.arch
+
 pkg struct Manifest {
     pkg name: text::String
     /// The line of the `package` keyword.
@@ -169,6 +204,8 @@ pkg struct Manifest {
     pkg language: Option[Language]
     /// The name the `entry` directive gives, and its line.
     pkg entry: Option[ProgramEntry]
+    /// The codegen levels the `codegen` directive lists that this implementation knows.
+    pkg levels: mem::List[Level]
     pkg deps: mem::List[Dep]
     pkg allows: mem::List[Allow]
     /// The module pairs of `deny a -> b` directives, and their lines.
@@ -248,6 +285,8 @@ struct ManifestReader {
 struct Declared {
     language: bool
     entry: bool
+    /// The line of the `codegen` directive, once read.
+    codegen: Option[u32]
     dep_aliases: mem::List[text::String]
     dep_sources: mem::List[text::String]
     authorities: mem::List[text::String]
@@ -376,8 +415,8 @@ fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, i
             expect false
         }
     }
-    var manifest = Manifest(name: take name, line: keyword_line, targets: mem::List[Target].empty(alloc), targets_line: None, targets_failed: false, supported: true, language: None, entry: None, deps: mem::List[Dep].empty(alloc), allows: mem::List[Allow].empty(alloc), denies: mem::List[Deny].empty(alloc))
-    var declared = Declared(language: false, entry: false, dep_aliases: mem::List[text::String].empty(alloc), dep_sources: mem::List[text::String].empty(alloc), authorities: mem::List[text::String].empty(alloc), denials: mem::List[Deny].empty(alloc))
+    var manifest = Manifest(name: take name, line: keyword_line, targets: mem::List[Target].empty(alloc), targets_line: None, targets_failed: false, supported: true, language: None, entry: None, levels: mem::List[Level].empty(alloc), deps: mem::List[Dep].empty(alloc), allows: mem::List[Allow].empty(alloc), denies: mem::List[Deny].empty(alloc))
+    var declared = Declared(language: false, entry: false, codegen: None, dep_aliases: mem::List[text::String].empty(alloc), dep_sources: mem::List[text::String].empty(alloc), authorities: mem::List[text::String].empty(alloc), denials: mem::List[Deny].empty(alloc))
     for directive in tree.child_nodes(item_node) {
         if tree.rule(directive) != syntax::Rule.Directive {
             continue
@@ -400,6 +439,7 @@ fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, i
                 var words = idents(file, tree, node, alloc)
                 manifest.entry = Some(ProgramEntry(name: mut words.remove(1), line: line))
             }
+            syntax::Rule.CodegenDirective => mut self.read_codegen(file, tree, node, line, manifest: mut manifest, declared: mut declared)
             syntax::Rule.DepDirective => mut self.read_dep(file, tree, node, line, manifest: mut manifest, declared: mut declared)
             syntax::Rule.AllowDirective => mut self.read_allow(file, tree, node, line, manifest: mut manifest, declared: mut declared)
             syntax::Rule.DenyDirective => mut self.read_deny(file, tree, node, line, manifest: mut manifest, declared: mut declared)
@@ -411,8 +451,33 @@ fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, i
     if not declared.language or manifest.targets_line.is_none() {
         mut self.report(manifest.line, code: diagnostic::Code.ManifestMissingDirective)
     }
+    match declared.codegen {
+        Some(line) => mut self.check_codegen(manifest, line)
+        None => {}
+    }
     return manifest
 } ManifestReader.read
+
+/// Reports a `codegen` directive in a library, and one listing a level of an architecture none of
+/// the package's targets has.
+fn ManifestReader.check_codegen(mut self, manifest: Manifest, line: u32) {
+    if manifest.entry.is_none() {
+        mut self.report(line, code: diagnostic::Code.ManifestCodegenLibrary)
+    }
+    var unbuilt = false
+    for level in manifest.levels {
+        var built = false
+        for target in manifest.targets {
+            if target.arch() == Some(level.arch()) {
+                built = true
+            }
+        }
+        unbuilt = unbuilt or not built
+    }
+    if unbuilt {
+        mut self.report(line, code: diagnostic::Code.ManifestCodegenTarget)
+    }
+} ManifestReader.check_codegen
 
 fn ManifestReader.read_language(
     mut self,
@@ -508,6 +573,46 @@ fn ManifestReader.read_targets(
     }
     manifest.targets_failed = manifest.targets.len() < names.len() or any_not_alone or repeated
 } ManifestReader.read_targets
+
+fn ManifestReader.read_codegen(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    mut declared: Declared,
+    ) {
+    let alloc = self.alloc
+    if declared.codegen.is_some() {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+        return
+    }
+    declared.codegen = Some(line)
+    let Some(list) = tree.find(node, rule: syntax::Rule.TargetList) else {
+        expect false
+        return
+    }
+    var names = mem::List[text::String].empty(alloc)
+    for level in tree.child_nodes(list) {
+        mut names.push(joined(file, tree, node: level, alloc))
+    }
+    for name in names {
+        match Level.from_name(name.as_str()) {
+            Some(level) => mut manifest.levels.push(level)
+            None => mut self.report(line, code: diagnostic::Code.ManifestUnknownCodegen)
+        }
+    }
+    var shared = false
+    for index in 0..<manifest.levels.len() {
+        for earlier in 0..<index {
+            shared = shared or manifest.levels[earlier].arch() == manifest.levels[index].arch()
+        }
+    }
+    if has_repeat(names.view()) or shared {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+    }
+} ManifestReader.read_codegen
 
 fn ManifestReader.read_dep(
     mut self,

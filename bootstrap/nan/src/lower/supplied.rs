@@ -15,6 +15,7 @@ pub mod render;
 pub mod same;
 pub mod secret;
 pub mod sequences;
+pub mod simd;
 pub mod sims;
 pub mod sys;
 pub mod tasks;
@@ -221,6 +222,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
     };
     let lowered = numbers::lower(lo, fx, &supply)
         || secret::lower(lo, fx, &supply)
+        || simd::lower(lo, fx, &supply)
         || generate::lower(lo, fx, &supply)
         || sequences::lower(lo, fx, &supply)
         || pointers::lower(lo, fx, &supply)

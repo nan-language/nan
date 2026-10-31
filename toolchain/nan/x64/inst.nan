@@ -183,6 +183,28 @@ pkg enum Inst derives Copy, Eq {
     CanonNan(size: Size, reg: machinst::Reg, temp: machinst::Reg)
     /// `movaps dst, src` when the condition holds.
     XmmCmov(cond: Cond, dst: machinst::Reg, src: machinst::Reg)
+    /// `movdqu` of a vector from memory.
+    VectorLoad(dst: machinst::Reg, src: Amode)
+    /// `movdqu` of a vector to memory.
+    VectorStore(src: machinst::Reg, dst: Amode)
+    /// An SSE operation in its legacy encoding: `dst = dst op src`, or `dst = op src` for a unary
+    /// one.
+    Packed(op: Packed, dst: machinst::Reg, src: machinst::Reg)
+    /// A binary SSE operation in its VEX encoding: `dst = lhs op rhs`.
+    PackedVex(op: Packed, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// An SSE operation with an immediate: `dst = op src` for a unary one, `dst = dst op src`
+    /// otherwise.
+    PackedImm(op: PackedImm, dst: machinst::Reg, src: machinst::Reg, imm: u8)
+    /// A shift of each lane of a vector register by an immediate.
+    PackedShift(op: PackedShift, reg: machinst::Reg, imm: u8)
+    /// The broadcast of the low lane of a size of `src` to every lane of `dst`.
+    Broadcast(size: Size, dst: machinst::Reg, src: machinst::Reg)
+    /// An AVX-512 operation on 64-bit lanes: `dst = lhs op rhs`.
+    PackedWide(op: PackedWide, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// The top bits of the lanes of a vector register into a general-purpose one.
+    MoveMask(op: MaskMove, dst: machinst::Reg, src: machinst::Reg)
+    /// `ptest`: the zero flag set when `lhs & rhs` is zero.
+    Ptest(lhs: machinst::Reg, rhs: machinst::Reg)
 } Inst
 
 /// The memory operand with its registers replaced by what `visit` gives for them.
@@ -332,6 +354,26 @@ pkg fn Inst.map_regs(self, visit: fn(reg: machinst::Reg, role: machinst::Role) -
         Inst.UintToFloat(size: size, dst: dst, src: src, temp: temp) => return Inst.UintToFloat(size: size, dst: visit(dst, role: machinst::Role.Def), src: visit(src, role: machinst::Role.Use), temp: visit(temp, role: machinst::Role.Temp))
         Inst.CanonNan(size: size, reg: reg, temp: temp) => return Inst.CanonNan(size: size, reg: visit(reg, role: machinst::Role.Mod), temp: visit(temp, role: machinst::Role.Temp))
         Inst.XmmCmov(cond: cond, dst: dst, src: src) => return Inst.XmmCmov(cond: cond, dst: visit(dst, role: machinst::Role.Mod), src: visit(src, role: machinst::Role.Use))
+        Inst.VectorLoad(dst: dst, src: src) => return Inst.VectorLoad(dst: visit(dst, role: machinst::Role.Def), src: mapped(src, visit))
+        Inst.VectorStore(src: src, dst: dst) => return Inst.VectorStore(src: visit(src, role: machinst::Role.Use), dst: mapped(dst, visit))
+        Inst.Packed(op: op, dst: dst, src: src) => {
+            if op.is_unary() {
+                return Inst.Packed(op: op, dst: visit(dst, role: machinst::Role.Def), src: visit(src, role: machinst::Role.Use))
+            }
+            return Inst.Packed(op: op, dst: visit(dst, role: machinst::Role.Mod), src: visit(src, role: machinst::Role.Use))
+        }
+        Inst.PackedVex(op: op, dst: dst, lhs: lhs, rhs: rhs) => return Inst.PackedVex(op: op, dst: visit(dst, role: machinst::Role.Def), lhs: visit(lhs, role: machinst::Role.Use), rhs: visit(rhs, role: machinst::Role.Use))
+        Inst.PackedImm(op: op, dst: dst, src: src, imm: imm) => {
+            if op.is_unary() {
+                return Inst.PackedImm(op: op, dst: visit(dst, role: machinst::Role.Def), src: visit(src, role: machinst::Role.Use), imm: imm)
+            }
+            return Inst.PackedImm(op: op, dst: visit(dst, role: machinst::Role.Mod), src: visit(src, role: machinst::Role.Use), imm: imm)
+        }
+        Inst.PackedShift(op: op, reg: reg, imm: imm) => return Inst.PackedShift(op: op, reg: visit(reg, role: machinst::Role.Mod), imm: imm)
+        Inst.Broadcast(size: size, dst: dst, src: src) => return Inst.Broadcast(size: size, dst: visit(dst, role: machinst::Role.Def), src: visit(src, role: machinst::Role.Use))
+        Inst.PackedWide(op: op, dst: dst, lhs: lhs, rhs: rhs) => return Inst.PackedWide(op: op, dst: visit(dst, role: machinst::Role.Def), lhs: visit(lhs, role: machinst::Role.Use), rhs: visit(rhs, role: machinst::Role.Use))
+        Inst.MoveMask(op: op, dst: dst, src: src) => return Inst.MoveMask(op: op, dst: visit(dst, role: machinst::Role.Def), src: visit(src, role: machinst::Role.Use))
+        Inst.Ptest(lhs: lhs, rhs: rhs) => return Inst.Ptest(lhs: visit(lhs, role: machinst::Role.Use), rhs: visit(rhs, role: machinst::Role.Use))
         Inst.JumpTable(index: index, base: base, temp: temp, table: table) => return Inst.JumpTable(index: visit(index, role: machinst::Role.Use), base: visit(base, role: machinst::Role.Temp), temp: visit(temp, role: machinst::Role.Temp), table: table)
         Inst.Mfence or Inst.Ud2 or Inst.Jmp(label: _) or Inst.Jcc(cond: _, label: _) or Inst.Push(reg: _) or Inst.Pop(reg: _) => return self
     }
@@ -376,6 +418,8 @@ pkg fn Inst.is_pure(self) -> bool {
         Inst.FloatArith(op: _, size: _, dst: _, src: _) or Inst.FloatSqrt(size: _, dst: _, src: _) or Inst.FloatConvert(source: _, dst: _, src: _) or Inst.FloatBits(op: _, dst: _, src: _) or Inst.Ucomis(size: _, lhs: _, rhs: _) => true
         Inst.CvtIntToFloat(int_size: _, size: _, dst: _, src: _) or Inst.CvtFloatToInt(size: _, int_size: _, dst: _, src: _) or Inst.MovToXmm(size: _, dst: _, src: _) or Inst.MovFromXmm(size: _, dst: _, src: _) => true
         Inst.FloatToIntSat(signed: _, size: _, dst: _, src: _, temp: _) or Inst.UintToFloat(size: _, dst: _, src: _, temp: _) or Inst.CanonNan(size: _, reg: _, temp: _) or Inst.XmmCmov(cond: _, dst: _, src: _) => true
+        Inst.Packed(op: _, dst: _, src: _) or Inst.PackedVex(op: _, dst: _, lhs: _, rhs: _) or Inst.PackedImm(op: _, dst: _, src: _, imm: _) or Inst.PackedShift(op: _, reg: _, imm: _) => true
+        Inst.Broadcast(size: _, dst: _, src: _) or Inst.PackedWide(op: _, dst: _, lhs: _, rhs: _) or Inst.MoveMask(op: _, dst: _, src: _) or Inst.Ptest(lhs: _, rhs: _) => true
         else => false
     }
 } Inst.is_pure
@@ -397,6 +441,8 @@ pkg fn Inst.writes_flags(self) -> bool {
         Inst.Bswap(size: _, reg: _) or Inst.Jmp(label: _) or Inst.Jcc(cond: _, label: _) or Inst.Args(params: _) or Inst.SignExtendData(size: _) or Inst.Xchg(size: _, reg: _, mem: _) => false
         Inst.FloatArith(op: _, size: _, dst: _, src: _) or Inst.FloatSqrt(size: _, dst: _, src: _) or Inst.FloatConvert(source: _, dst: _, src: _) or Inst.FloatBits(op: _, dst: _, src: _) => false
         Inst.CvtIntToFloat(int_size: _, size: _, dst: _, src: _) or Inst.CvtFloatToInt(size: _, int_size: _, dst: _, src: _) or Inst.MovToXmm(size: _, dst: _, src: _) or Inst.MovFromXmm(size: _, dst: _, src: _) or Inst.XmmCmov(cond: _, dst: _, src: _) => false
+        Inst.VectorLoad(dst: _, src: _) or Inst.VectorStore(src: _, dst: _) or Inst.Packed(op: _, dst: _, src: _) or Inst.PackedVex(op: _, dst: _, lhs: _, rhs: _) or Inst.PackedImm(op: _, dst: _, src: _, imm: _) => false
+        Inst.PackedShift(op: _, reg: _, imm: _) or Inst.Broadcast(size: _, dst: _, src: _) or Inst.PackedWide(op: _, dst: _, lhs: _, rhs: _) or Inst.MoveMask(op: _, dst: _, src: _) => false
         Inst.Unary(op: op, size: _, reg: _) => op == UnaryOp.Neg
         else => true
     }

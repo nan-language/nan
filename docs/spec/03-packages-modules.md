@@ -34,12 +34,13 @@ The **manifest** is the `package` item of `package.nan`. That file holds its `//
 ```ebnf
 package_item = "package" IDENT "{" directive* COL0 "}" item_label NL ;
 directive = language_directive | targets_directive | entry_directive
-    | dep_directive | allow_directive | deny_directive ;
+    | codegen_directive | dep_directive | allow_directive | deny_directive ;
 language_directive = 'language' INT NL ;
 targets_directive = 'targets' target_list NL ;
 target_list = target ( "," target )* ;
 target = IDENT ( "-" IDENT )? ;
 entry_directive = 'entry' IDENT NL ;
+codegen_directive = 'codegen' target_list NL ;
 dep_directive = 'dep' IDENT TEXT NL ;
 allow_directive = 'allow' authority "in" name_list NL ;
 authority = 'device' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;
@@ -52,20 +53,21 @@ A **directive** is one manifest line:
 - `language` states the [language version](37-evolution.md#language-versions) of the package.
 - `targets` lists the [targets](27-program-model.md#targets) the package is checked and built for, among `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare` and `any`. `x86_64-nanos` and `aarch64-nanos` are reserved: listing either is an error (`manifest.reserved-target`). Any other name is an error (`manifest.unknown-target`). `any` listed with another target is an error (`manifest.any-not-alone`).
 - `entry` names the [entry function](27-program-model.md#entry).
+- `codegen` lists the [codegen levels](27-program-model.md#codegen-levels) of the program's final builds, among `x86_64-v2`, `x86_64-v3`, `x86_64-v4` and `aarch64-dotprod`. Any other name is an error (`manifest.unknown-codegen`). A `codegen` directive in a package without an `entry` directive is an error (`manifest.codegen-library`), and so is a level of an architecture that none of the package's targets has (`manifest.codegen-target`).
 - `dep` declares an [alias](#aliases).
 - `allow` is a [manifest grant](14-authority.md#manifest-grants) of its authority to the names listed; `contribute` takes the path of a registry.
 - `deny a -> b` is a [denied dependency](14-authority.md#denied-dependencies) of module `a` on `b`; `a` and `b` differ (`manifest.deny-self`).
 - [Manifest grants](14-authority.md#manifest-grants) fixes which names `allow` and `deny` directives may list.
 
-`language` and `targets` appear exactly once and `entry` at most once; a missing `language` or `targets` directive is an error (`manifest.missing-directive`), reported on the `package` line. These are errors (`manifest.duplicate`), reported on the later occurrence:
+`language` and `targets` appear exactly once and `entry` and `codegen` at most once; a missing `language` or `targets` directive is an error (`manifest.missing-directive`), reported on the `package` line. These are errors (`manifest.duplicate`), reported on the later occurrence:
 
-- a second `language`, `targets` or `entry` directive;
+- a second `language`, `targets`, `entry` or `codegen` directive;
 - two `dep` directives with the same alias, or with sources naming the same store name or the same directory once `.` and `..` segments are resolved;
 - two `allow` directives with the same authority, `contribute` with one registry path counting as one authority;
 - two `deny` directives with the same `a` and `b`;
-- a name listed twice in one `targets` or `allow` directive.
+- a name listed twice in one `targets`, `codegen` or `allow` directive, and two levels of one architecture in a `codegen` directive.
 
-`nan fmt` writes directives in this order: `language`, `targets`, `entry`, then `dep` directives by alias, `allow` directives by authority as written and `deny` directives by `a` and then `b`, with the names of each list sorted; every ordering it applies is byte order.
+`nan fmt` writes directives in this order: `language`, `targets`, `entry`, `codegen`, then `dep` directives by alias, `allow` directives by authority as written and `deny` directives by `a` and then `b`, with the names of each list sorted; every ordering it applies is byte order.
 
 ```nan
 // file: wire/package.nan
@@ -109,6 +111,60 @@ package wire {
 //! The largest link payload.
 
 pub const MAX_PAYLOAD: u16 = 1_400
+```
+
+```nan
+// file: wire/package.nan
+//! Link header limits.
+
+package wire {
+    language 1
+    targets x86_64-host
+    codegen x86_64-v3 // error: manifest.codegen-library
+} wire
+
+// file: wire/wire.nan
+//! The largest link payload.
+
+pub const MAX_PAYLOAD: u16 = 1_400
+```
+
+```nan
+// file: relay/package.nan
+//! A link relay for x86_64 hosts.
+
+package relay {
+    language 1
+    targets x86_64-host
+    entry main
+    codegen aarch64-dotprod // error: manifest.codegen-target
+} relay
+
+// file: relay/relay.nan
+//! Relays nothing yet.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("relay", value: 0u8)
+} main
+```
+
+```nan
+// file: relay/package.nan
+//! A link relay for x86_64 hosts.
+
+package relay {
+    language 1
+    targets x86_64-host
+    entry main
+    codegen x86_64-v5 // error: manifest.unknown-codegen
+} relay
+
+// file: relay/relay.nan
+//! Relays nothing yet.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("relay", value: 0u8)
+} main
 ```
 
 ## Aliases
@@ -721,12 +777,15 @@ pub fn record_twice(mut counter: Counter) {
 | --- | --- | --- |
 | `manifest.any-not-alone` | error | [Manifest](#manifest) |
 | `manifest.bad-source` | error | [Aliases](#aliases) |
+| `manifest.codegen-library` | error | [Manifest](#manifest) |
+| `manifest.codegen-target` | error | [Manifest](#manifest) |
 | `manifest.deny-self` | error | [Manifest](#manifest) |
 | `manifest.duplicate` | error | [Manifest](#manifest) |
 | `manifest.misplaced` | error | [Manifest](#manifest) |
 | `manifest.missing` | error | [Packages](#packages) |
 | `manifest.missing-directive` | error | [Manifest](#manifest) |
 | `manifest.reserved-target` | error | [Manifest](#manifest) |
+| `manifest.unknown-codegen` | error | [Manifest](#manifest) |
 | `manifest.unknown-target` | error | [Manifest](#manifest) |
 | `module.cycle` | error | [Modules](#modules) |
 | `module.variant-mismatch` | error | [Target variants](#target-variants) |

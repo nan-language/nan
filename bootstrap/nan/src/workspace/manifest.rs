@@ -157,6 +157,91 @@ impl Target {
     }
 }
 
+/// A codegen level: the extensions beyond its architecture's base instruction set that a
+/// program's final builds for that architecture use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Level {
+    X64V2,
+    X64V3,
+    X64V4,
+    Aarch64Dotprod,
+}
+
+impl Level {
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::X64V2 => "x86_64-v2",
+            Level::X64V3 => "x86_64-v3",
+            Level::X64V4 => "x86_64-v4",
+            Level::Aarch64Dotprod => "aarch64-dotprod",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Level> {
+        [
+            Level::X64V2,
+            Level::X64V3,
+            Level::X64V4,
+            Level::Aarch64Dotprod,
+        ]
+        .into_iter()
+        .find(|level| level.name() == name)
+    }
+
+    pub fn arch(self) -> Arch {
+        match self {
+            Level::Aarch64Dotprod => Arch::Aarch64,
+            _ => Arch::Amd64,
+        }
+    }
+
+    /// The Cranelift settings of the level's extensions.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Level::X64V2 => &[
+                "has_cmpxchg16b",
+                "has_popcnt",
+                "has_sse3",
+                "has_ssse3",
+                "has_sse41",
+                "has_sse42",
+            ],
+            Level::X64V3 => &[
+                "has_cmpxchg16b",
+                "has_popcnt",
+                "has_sse3",
+                "has_ssse3",
+                "has_sse41",
+                "has_sse42",
+                "has_avx",
+                "has_avx2",
+                "has_bmi1",
+                "has_bmi2",
+                "has_fma",
+                "has_lzcnt",
+            ],
+            Level::X64V4 => &[
+                "has_cmpxchg16b",
+                "has_popcnt",
+                "has_sse3",
+                "has_ssse3",
+                "has_sse41",
+                "has_sse42",
+                "has_avx",
+                "has_avx2",
+                "has_bmi1",
+                "has_bmi2",
+                "has_fma",
+                "has_lzcnt",
+                "has_avx512f",
+                "has_avx512dq",
+                "has_avx512vl",
+            ],
+            Level::Aarch64Dotprod => &["has_lse", "has_dotprod"],
+        }
+    }
+}
+
 pub struct Manifest {
     pub name: String,
     /// The line of the `package` keyword.
@@ -172,6 +257,8 @@ pub struct Manifest {
     pub language: Option<(u128, u32)>,
     /// The name the `entry` directive gives, and its line.
     pub entry: Option<(String, u32)>,
+    /// The codegen levels the `codegen` directive lists that this implementation knows.
+    pub levels: Vec<Level>,
     pub deps: Vec<Dep>,
     pub allows: Vec<Allow>,
     /// The module pairs of `deny a -> b` directives, and their lines.
@@ -322,11 +409,13 @@ impl Reader<'_> {
             supported: true,
             language: None,
             entry: None,
+            levels: Vec::new(),
             deps: Vec::new(),
             allows: Vec::new(),
             denies: Vec::new(),
         };
         let (mut language, mut entry) = (false, false);
+        let mut codegen: Option<u32> = None;
         let mut dep_aliases: Vec<String> = Vec::new();
         let mut dep_sources: Vec<String> = Vec::new();
         let mut authorities: Vec<String> = Vec::new();
@@ -401,6 +490,35 @@ impl Reader<'_> {
                     }
                     manifest.entry = Some((self.idents(node).swap_remove(1), line));
                 }
+                Rule::CodegenDirective => {
+                    if codegen.replace(line).is_some() {
+                        self.report(line, Code::ManifestDuplicate);
+                        continue;
+                    }
+                    let list = self
+                        .tree
+                        .find(node, Rule::TargetList)
+                        .expect("a level list");
+                    let names: Vec<String> = self
+                        .tree
+                        .child_nodes(list)
+                        .map(|level| self.joined(level))
+                        .collect();
+                    for name in &names {
+                        match Level::from_name(name) {
+                            Some(level) => manifest.levels.push(level),
+                            None => self.report(line, Code::ManifestUnknownCodegen),
+                        }
+                    }
+                    let shared = manifest.levels.iter().enumerate().any(|(index, level)| {
+                        manifest.levels[..index]
+                            .iter()
+                            .any(|earlier| earlier.arch() == level.arch())
+                    });
+                    if has_repeat(&names) || shared {
+                        self.report(line, Code::ManifestDuplicate);
+                    }
+                }
                 Rule::DepDirective => {
                     let alias = self.idents(node).swap_remove(1);
                     let text = self
@@ -473,6 +591,20 @@ impl Reader<'_> {
         }
         if !language || manifest.targets_line.is_none() {
             self.report(manifest.line, Code::ManifestMissingDirective);
+        }
+        if let Some(line) = codegen {
+            if manifest.entry.is_none() {
+                self.report(line, Code::ManifestCodegenLibrary);
+            }
+            let unbuilt = manifest.levels.iter().any(|level| {
+                !manifest
+                    .targets
+                    .iter()
+                    .any(|target| target.arch() == Some(level.arch()))
+            });
+            if unbuilt {
+                self.report(line, Code::ManifestCodegenTarget);
+            }
         }
         manifest
     }

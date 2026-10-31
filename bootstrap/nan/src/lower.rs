@@ -16,6 +16,7 @@ mod fx;
 mod held;
 pub(crate) mod host;
 mod layout;
+mod levels;
 mod lines;
 pub mod machine;
 mod place;
@@ -45,7 +46,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId, TypeKey};
 use crate::check::ty::{self as ty, Args, Ty};
 use crate::nir::{Role, Span};
-use crate::workspace::{Arch, Target};
+use crate::workspace::{Arch, Level, Target};
 pub use abi::Abi;
 use fx::Fx;
 use layout::Layouts;
@@ -253,6 +254,8 @@ pub struct Program {
     pub prefixes: HashMap<String, String>,
     /// The content of the image's `.nan` section.
     pub section: Vec<u8>,
+    /// The codegen level of the program's manifest for the target's architecture.
+    pub level: Option<Level>,
 }
 
 pub struct Lowering<'c, 'a> {
@@ -260,6 +263,8 @@ pub struct Lowering<'c, 'a> {
     pub module: ObjectModule,
     pub layouts: Layouts,
     isa: OwnedTargetIsa,
+    /// The codegen level the image's code is generated for, none for the base set.
+    level: Option<Level>,
     prefixes: HashMap<String, String>,
     roots: Vec<PackageId>,
     instances: HashMap<Instance, FuncId>,
@@ -304,13 +309,13 @@ enum Pending {
 }
 
 /// The settings an image's code is generated with: the base set of its architecture, the x86-64
-/// one with SSE2 or the A64 one of Armv8.0-A, frame pointers in every function, Cranelift's stack
-/// switching where it has it, and the canonical NaN as the NaN every float operation returns. A
-/// host image is position-independent and links against glibc with inline stack probes for its
-/// guard pages; a machine image loads at a fixed address and is not position-independent, so its
-/// code reaches its own functions and data directly, with no global offset table and no stack
-/// probes.
-fn isa(target: Target) -> OwnedTargetIsa {
+/// one with SSE2 or the A64 one of Armv8.0-A, with the extensions of its codegen level, frame
+/// pointers in every function, Cranelift's stack switching where it has it, and the canonical NaN
+/// as the NaN every float operation returns. A host image is position-independent and links
+/// against glibc with inline stack probes for its guard pages; a machine image loads at a fixed
+/// address and is not position-independent, so its code reaches its own functions and data
+/// directly, with no global offset table and no stack probes.
+fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
     let mut flags = settings::builder();
     let host = target.is_host();
     let triple = match (target.arch(), host) {
@@ -333,15 +338,24 @@ fn isa(target: Target) -> OwnedTargetIsa {
     ] {
         flags.set(name, value).expect("a Cranelift setting");
     }
-    cranelift_codegen::isa::lookup_by_name(triple)
-        .expect("the target's backend")
+    let mut builder = cranelift_codegen::isa::lookup_by_name(triple).expect("the target's backend");
+    for extension in level.map_or(&[][..], Level::extensions) {
+        builder.enable(extension).expect("a Cranelift ISA setting");
+    }
+    builder
         .finish(settings::Flags::new(flags))
         .expect("the target's settings")
 }
 
 /// Lowers the reach of a program's final build.
 pub fn lower(ck: &Checker, program: &Program) -> Lowered {
-    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
+    let mut lowering = Lowering::new(
+        ck,
+        program.prefixes.clone(),
+        program.roots.clone(),
+        program.level,
+        None,
+    );
     host::entry_seam(&mut lowering, program);
     lowering.drain();
     lowering.finish(Some(&program.section))
@@ -351,7 +365,13 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
 /// entry landing fn behind the machine entry seam, into an object the image writer turns into an
 /// image.
 pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
-    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
+    let mut lowering = Lowering::new(
+        ck,
+        program.prefixes.clone(),
+        program.roots.clone(),
+        program.level,
+        None,
+    );
     let boot = lowering.boot_glue(program);
     let stack = lowering.boot_stack(program);
     lowering.entry_seam(boot, stack);
@@ -360,14 +380,16 @@ pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
-    /// A lowering into a new object, of a test image when `test` is given.
+    /// A lowering into a new object, for a codegen level when `level` is given, of a test image
+    /// when `test` is given.
     fn new(
         ck: &'c Checker<'a>,
         prefixes: HashMap<String, String>,
         roots: Vec<PackageId>,
+        level: Option<Level>,
         test: Option<test_image::Runtime>,
     ) -> Self {
-        let isa = isa(ck.db.target);
+        let isa = isa(ck.db.target, level);
         let builder = ObjectBuilder::new(
             isa.clone(),
             "nan",
@@ -379,6 +401,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             module: ObjectModule::new(builder),
             layouts: Layouts::new(),
             isa,
+            level,
             prefixes,
             roots,
             instances: HashMap::new(),
@@ -477,6 +500,17 @@ impl<'c, 'a> Lowering<'c, 'a> {
 
     fn lower_instance(&mut self, fx: &mut Fx, instance: &Instance, abi: &Abi) {
         match instance {
+            Instance::Nir {
+                item,
+                role: Role::Body,
+                args,
+                ..
+            } if !self.machine()
+                && self.ck.db.is_std(*item)
+                && supplied::simd::vectorized(&self.ck.db.canonical(*item)) =>
+            {
+                supplied::simd::lower_vector(self, fx, abi, *item, args)
+            }
             Instance::Nir {
                 item,
                 role,

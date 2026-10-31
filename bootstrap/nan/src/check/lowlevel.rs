@@ -11,7 +11,7 @@ use crate::syntax::ast::{self, Access, ItemKind, LayoutFieldKind, LayoutRepr, Mo
 use crate::workspace::Target;
 
 /// The trusted primitives: std functions callable only inside trusted code.
-const PRIMITIVES: [&str; 9] = [
+const PRIMITIVES: [&str; 10] = [
     "hw::Ptr.read",
     "hw::Ptr.write",
     "hw::Ptr.offset",
@@ -21,6 +21,7 @@ const PRIMITIVES: [&str; 9] = [
     "hw::Mmio.map",
     "hw::Ports.map",
     "hw::TrapFrame.set_ip",
+    "boot::Machine.enter",
 ];
 
 /// The privileged intrinsics that are trusted primitives too.

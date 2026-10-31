@@ -1,0 +1,76 @@
+//! The firmware's console: text output and key input with a timeout.
+
+/// The offset in the text output protocol of `OutputString`, and in the text input protocol of
+/// `ReadKeyStroke` and of its key event.
+const STRING_OUTPUT: u64 = 8
+
+const READ_KEY_STROKE: u64 = 8
+
+const WAIT_FOR_KEY: u64 = 16
+
+/// The type of a timer event, a timer's relative mode, and the 100 ns units of a millisecond.
+const TIMER_EVENT: u64 = 0x8000_0000
+
+const RELATIVE: u64 = 2
+
+const UNITS_PER_MS: u64 = 10_000
+
+pkg fn write_console(text: Str) fails boot::ServiceError {
+    let output = word(system_table() + CONSOLE_OUT)
+    let output_string = word(output + STRING_OUTPUT)
+    var units = Array[u16, 256].filled(0)
+    var at: usize = 0
+    for c in text {
+        if at + 3 > NAME_LIMIT {
+            units[at] = 0
+            try success(call(output_string, a: output, b: src_units(units.view()), c: 0, d: 0, e: 0))
+            at = 0
+        }
+        let point = c.to_bits()
+        if point == 0x0A {
+            units[at] = 0x0D
+            at += 1
+        }
+        if point >= 0x1_0000 {
+            let offset = point - 0x1_0000
+            units[at] = u16.fit(0xD800 + (offset >> 10))
+            units[at + 1] = u16.fit(0xDC00 + (offset & 0x3FF))
+            at += 2
+        } else {
+            units[at] = u16.fit(point)
+            at += 1
+        }
+    }
+    units[at] = 0
+    try success(call(output_string, a: output, b: src_units(units.view()), c: 0, d: 0, e: 0))
+} write_console
+
+pkg fn read_key(timeout_ms: u64) -> Option[boot::Key] fails boot::ServiceError {
+    let input = word(system_table() + CONSOLE_IN)
+    var timer = Array[u64, 1].filled(0)
+    try success(call(boot_service(CREATE_EVENT), a: TIMER_EVENT, b: 0, c: 0, d: 0, e: dst_words(mut timer.view_mut())))
+    let ticks = timeout_ms.saturating_mul(UNITS_PER_MS)
+    var events = Array[u64, 2].filled(word(input + WAIT_FOR_KEY))
+    events[1] = timer[0]
+    var waited = call(boot_service(SET_TIMER), a: timer[0], b: RELATIVE, c: ticks, d: 0, e: 0)
+    var index = Array[u64, 1].filled(1)
+    if (waited & ERROR) == 0 {
+        waited = call(boot_service(WAIT_FOR_EVENT), a: 2, b: dst_words(mut events.view_mut()), c: dst_words(mut index.view_mut()), d: 0, e: 0)
+    }
+    discard call(boot_service(CLOSE_EVENT), a: timer[0], b: 0, c: 0, d: 0, e: 0)
+    try success(waited)
+    if index[0] != 0 {
+        return None
+    }
+    var key = Array[u16, 2].filled(0)
+    let status = call(word(input + READ_KEY_STROKE), a: input, b: dst_units(mut key.view_mut()), c: 0, d: 0, e: 0)
+    if status == NOT_READY {
+        return None
+    }
+    try success(status)
+    var text: Option[char] = None
+    if key[1] != 0 {
+        text = char.checked_from_bits(u32.widen(key[1]))
+    }
+    return Some(boot::Key(text: text, scan: key[0]))
+} read_key

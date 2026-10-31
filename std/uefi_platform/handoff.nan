@@ -1,0 +1,232 @@
+//! The hand-off to a loaded bare image: its start information, the end of boot services, the jump.
+
+/// The start information's magic number and version, its size, and the offsets of its module
+/// count, module list, command line, RSDP, memory map and memory map entry count.
+const START_MAGIC: u32 = 0x336E_C578
+
+const START_VERSION: u32 = 1
+
+const INFO_BYTES: u64 = 64
+
+const INFO_MODULES: u64 = 12
+
+const INFO_MODULE_LIST: u64 = 16
+
+const INFO_COMMAND_LINE: u64 = 24
+
+const INFO_RSDP: u64 = 32
+
+const INFO_MAP: u64 = 40
+
+const INFO_MAP_ENTRIES: u64 = 48
+
+/// The bytes of a module list entry and of a memory map entry, and the entries of slack the map
+/// holds for those the firmware's map gains before boot services end.
+const MODULE_BYTES: u64 = 32
+
+const ENTRY_BYTES: u64 = 24
+
+const MAP_SLACK: u64 = 64
+
+/// The allocation type of pages below a highest address, the highest address of the hand-off
+/// pages, and their memory type.
+const ALLOCATE_MAX_ADDRESS: u64 = 1
+
+const HIGHEST: u64 = 0xFFFF_FFFF
+
+const HANDOFF_DATA: u64 = 2
+
+/// The start information's memory types: usable, reserved, ACPI reclaimable, ACPI NVS and
+/// unusable.
+const USABLE: u32 = 1
+
+const RESERVED: u32 = 2
+
+const ACPI_RECLAIMABLE: u32 = 3
+
+const ACPI_NVS: u32 = 4
+
+const UNUSABLE: u32 = 5
+
+const ACPI_20: boot::Guid = boot::Guid(data1: 0x8868_E871, data2: 0xE4F1, data3: 0x11D3, data4: 0xBC22_0080_C73C_8881)
+
+const ACPI_10: boot::Guid = boot::Guid(data1: 0xEB9D_2D30, data2: 0x2D88, data3: 0x11D3, data4: 0x9A16_0090_273F_C14D)
+
+const DEVICE_TREE: boot::Guid = boot::Guid(data1: 0xB1B6_21D5, data2: 0xF19C, data3: 0x41A5, data4: 0x830B_D915_2C69_AAE0)
+
+/// Copies the Untrusted bytes to a physical address, without reading them otherwise.
+pkg fn place(contents: Untrusted[Slice[u8]], at: u64)
+
+/// Makes the data caches hold no line of a range that memory does not, on AArch64; nothing on
+/// x86_64, whose caches memory sees.
+pkg fn clean(base: u64, byte_len: u64)
+
+/// Enters a loaded bare image at `entry` by its target's boot protocol, the start information
+/// at `info` and the device tree at `tree`, zero for none, using the page at `trampoline`
+/// below 4 GiB on x86_64.
+pkg fn jump(entry: u64, info: u64, tree: u64, trampoline: u64) -> Never
+
+/// Traps with `trap.exhausted`.
+pkg fn exhausted() -> Never
+
+/// The address of the table the configuration table lists under a GUID, zero when none.
+fn configured(guid: boot::Guid) -> u64 {
+    let table = system_table()
+    let count = word(table + 104)
+    let entries = word(table + 112)
+    let wanted = guid_bits(guid)
+    for index in 0..<count {
+        let entry = entries + index * 24
+        if word(entry) == u64_le(wanted.view(), at: 0) and word(entry + 8) == u64_le(wanted.view(), at: 8) {
+            return word(entry + 16)
+        }
+    }
+    return 0
+} configured
+
+fn u64_le(bytes: Slice[u8], at: usize) -> u64 {
+    if at > bytes.len() or bytes.len() - at < 8 {
+        return 0
+    }
+    return bytes.u64_le(at)
+} u64_le
+
+/// A 32-bit number read little-endian, as its big-endian bytes give it.
+fn big_endian(raw: u64) -> u64 {
+    var value: u64 = 0
+    for index in 0u64..<4 {
+        value = (value << 8) | ((raw >> u32.fit(index * 8)) & 0xFF)
+    }
+    return value
+} big_endian
+
+/// The bytes of whole pages holding `bytes`.
+fn whole_pages(bytes: u64) -> u64 {
+    return (bytes + PAGE - 1) / PAGE * PAGE
+} whole_pages
+
+/// Writes a value at an address of the hand-off pages.
+fn put32(at: u64, value: u32) {
+    trusted "the hand-off pages are the image's, mapped and aligned for the value" { hw::Ptr[u32].of_addr(usize.widen(at)).write(value) }
+} put32
+
+fn put64(at: u64, value: u64) {
+    trusted "the hand-off pages are the image's, mapped and aligned for the value" { hw::Ptr[u64].of_addr(usize.widen(at)).write(value) }
+} put64
+
+/// Writes bytes and a NUL at an address of the hand-off pages, giving the address past them.
+fn put_text(at: u64, bytes: Slice[u8]) -> u64 {
+    let len = bytes.len()
+    trusted "the hand-off pages are the image's and hold the bytes and their NUL" {
+        hw::Ptr.of_view(bytes).copy(hw::Ptr[u8].of_addr(usize.widen(at)), count: len)
+        hw::Ptr[u8].of_addr(usize.widen(at)).offset(isize.fit(len)).write(0)
+    }
+    return at + u64.widen(len) + 1
+} put_text
+
+/// The start information's type of a firmware memory type: usable for conventional memory,
+/// boot services' code and data and the loader's, the ACPI types and unusable memory as
+/// themselves, reserved for any other.
+fn start_type(kind: u32) -> u32 {
+    return match kind {
+        1 or 2 or 3 or 4 or 7 => USABLE
+        8 => UNUSABLE
+        9 => ACPI_RECLAIMABLE
+        10 => ACPI_NVS
+        else => RESERVED
+    }
+} start_type
+
+pkg fn hand_off(alloc: mem::Alloc, take image: boot::Image) -> Never
+    waive length "the hand-off lays out, fills and enters in one sequence, which ends boot services in its middle"
+{
+    let boot::Image(entry: entry, segments: segments, modules: modules, command_line: command_line) = image
+    var rsdp = configured(ACPI_20)
+    if rsdp == 0 {
+        rsdp = configured(ACPI_10)
+    }
+    let tree = configured(DEVICE_TREE)
+    var tree_len: u64 = 0
+    if tree != 0 {
+        tree_len = big_endian(bytes_at(tree + 4, count: 4))
+    }
+    var map = Map(bytes: mem::Bytes.empty(alloc), size: 0, stride: 0, key: 0)
+    let Ok(_) = attempt read_map(mut map, alloc) else {
+        exhausted()
+    }
+    let capacity = map.size / map.stride + MAP_SLACK
+    let count = u64.widen(modules.len())
+    let list_at = PAGE + INFO_BYTES
+    let map_at = list_at + count * MODULE_BYTES
+    let text_at = map_at + capacity * ENTRY_BYTES
+    var names = u64.widen(command_line.len()) + 1
+    var contents: u64 = 0
+    for module in modules {
+        names += u64.widen(module.name.len()) + 1
+        contents += whole_pages(u64.widen(module.contents.byte_len()))
+    }
+    let contents_at = whole_pages(text_at + names)
+    let tree_at = contents_at + contents
+    let total = tree_at + whole_pages(tree_len)
+    var found = Array[u64, 1].filled(HIGHEST)
+    let allocated = call(boot_service(ALLOCATE_PAGES), a: ALLOCATE_MAX_ADDRESS, b: HANDOFF_DATA, c: total / PAGE, d: dst_words(mut found.view_mut()), e: 0)
+    if allocated != 0 {
+        exhausted()
+    }
+    let base = found[0]
+    let info = base + PAGE
+    put32(info, value: START_MAGIC)
+    put32(info + 4, value: START_VERSION)
+    put32(info + INFO_MODULES, value: u32.fit(count))
+    put64(info + INFO_MODULE_LIST, value: base + list_at)
+    put64(info + INFO_COMMAND_LINE, value: base + text_at)
+    put64(info + INFO_RSDP, value: rsdp)
+    put64(info + INFO_MAP, value: base + map_at)
+    var name_at = put_text(base + text_at, bytes: command_line.view())
+    var content_at = base + contents_at
+    var listed = base + list_at
+    for module in modules {
+        let len = u64.widen(module.contents.byte_len())
+        put64(listed, value: content_at)
+        put64(listed + 8, value: len)
+        put64(listed + 16, value: name_at)
+        put64(listed + 24, value: 0)
+        name_at = put_text(name_at, bytes: module.name.view())
+        place(module.contents.view(), at: content_at)
+        content_at += whole_pages(len)
+        listed += MODULE_BYTES
+    }
+    var tree_copy: u64 = 0
+    if tree != 0 {
+        tree_copy = base + tree_at
+        trusted "the firmware's device tree holds `tree_len` bytes, and the hand-off pages as many from `tree_copy`" {
+            hw::Ptr[u8].of_addr(usize.widen(tree)).copy(hw::Ptr[u8].of_addr(usize.widen(tree_copy)), count: usize.widen(tree_len))
+        }
+    }
+    loop {
+        let Ok(_) = attempt read_map(mut map, alloc) else {
+            exhausted()
+        }
+        if call(boot_service(EXIT_BOOT_SERVICES), a: image_handle(), b: map.key, c: 0, d: 0, e: 0) == 0 {
+            break
+        }
+    }
+    var entries: u64 = 0
+    for index in 0..<(map.size / map.stride) {
+        if entries < capacity {
+            let described = range(map, index)
+            let at = base + map_at + entries * ENTRY_BYTES
+            put64(at, value: described.base)
+            put64(at + 8, value: described.byte_len)
+            put32(at + 16, value: start_type(described.kind))
+            put32(at + 20, value: 0)
+            entries += 1
+        }
+    }
+    put32(info + INFO_MAP_ENTRIES, value: u32.fit(entries))
+    clean(base, byte_len: total)
+    for segment in segments {
+        clean(segment.base(), byte_len: segment.byte_len())
+    }
+    jump(entry, info, tree: tree_copy, trampoline: base)
+} hand_off

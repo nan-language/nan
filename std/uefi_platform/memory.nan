@@ -1,0 +1,90 @@
+//! The firmware's memory map and its page allocations.
+
+/// The offsets in a memory descriptor of its type, its physical start, its page count and its
+/// attributes, and the least size of one.
+const DESCRIPTOR_TYPE: usize = 0
+
+const DESCRIPTOR_START: usize = 8
+
+const DESCRIPTOR_PAGES: usize = 24
+
+const DESCRIPTOR_ATTRIBUTES: usize = 32
+
+const DESCRIPTOR_BYTES: u64 = 40
+
+/// The bytes of a page, the descriptors of slack a map buffer holds for those the firmware adds
+/// before the map is read into it, and the allocation type and memory type of `allocate`.
+const PAGE: u64 = 4_096
+
+const DESCRIPTOR_SLACK: u64 = 8
+
+const ALLOCATE_ADDRESS: u64 = 2
+
+const LOADER_DATA: u64 = 2
+
+/// A memory map the firmware gave: its descriptors, their bytes and stride, and the key ending
+/// boot services with it.
+struct Map {
+    bytes: mem::Bytes
+    size: u64
+    stride: u64
+    key: u64
+} Map
+
+/// The region from `base` of `byte_len` bytes.
+pkg fn region(base: u64, byte_len: u64) -> hw::Region
+
+/// Reads the firmware's memory map into `map`, growing its buffer while the map does not fit.
+fn read_map(mut map: Map, alloc: mem::Alloc) fails boot::ServiceError {
+    loop {
+        var words = Array[u64, 4].filled(0)
+        words[0] = u64.widen(map.bytes.len())
+        let at = dst_words(mut words.view_mut())
+        let status = call(boot_service(GET_MEMORY_MAP), a: at, b: dst(mut map.bytes.view_mut()), c: at + 8, d: at + 16, e: at + 24)
+        if status != BUFFER_TOO_SMALL {
+            try success(status)
+            if words[2] < DESCRIPTOR_BYTES {
+                fail boot::ServiceError.DeviceError
+            }
+            map.size = words[0]
+            map.key = words[1]
+            map.stride = words[2]
+            return
+        }
+        map.bytes = try zeroed(words[0] + DESCRIPTOR_SLACK * words[2], alloc)
+    }
+} read_map
+
+/// The descriptor at `index` of a memory map, as a range.
+fn range(map: Map, index: u64) -> boot::MemoryRange {
+    let at = usize.widen(index * map.stride)
+    let entry = map.bytes.view()
+    let pages = entry.u64_le(at + DESCRIPTOR_PAGES)
+    return boot::MemoryRange(base: entry.u64_le(at + DESCRIPTOR_START), byte_len: pages.saturating_mul(PAGE), kind: entry.u32_le(at + DESCRIPTOR_TYPE), attributes: entry.u64_le(at + DESCRIPTOR_ATTRIBUTES))
+} range
+
+pkg fn memory_map(alloc: mem::Alloc) -> mem::List[boot::MemoryRange] fails boot::ServiceError {
+    var map = Map(bytes: mem::Bytes.empty(alloc), size: 0, stride: 0, key: 0)
+    try read_map(mut map, alloc)
+    var ranges = mem::List[boot::MemoryRange].empty(alloc)
+    for index in 0..<(map.size / map.stride) {
+        let Ok(_) = attempt mut ranges.try_push(range(map, index)) else {
+            fail boot::ServiceError.OutOfMemory
+        }
+    }
+    return ranges
+} memory_map
+
+pkg fn free(base: u64, byte_len: u64) fails boot::ServiceError {
+    try success(call(boot_service(FREE_PAGES), a: base, b: (byte_len + PAGE - 1) / PAGE, c: 0, d: 0, e: 0))
+} free
+
+pkg fn allocate(base: u64, byte_len: u64) -> hw::Region fails boot::ServiceError {
+    if base % PAGE != 0 or byte_len == 0 or byte_len > ~0u64 - PAGE {
+        fail boot::ServiceError.Invalid
+    }
+    let pages = (byte_len + PAGE - 1) / PAGE
+    var at = Array[u64, 1].filled(base)
+    try success(call(boot_service(ALLOCATE_PAGES), a: ALLOCATE_ADDRESS, b: LOADER_DATA, c: pages, d: dst_words(mut at.view_mut()), e: 0))
+    return region(at[0], byte_len: pages * PAGE)
+} allocate

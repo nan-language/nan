@@ -1,0 +1,125 @@
+//! The TPM through the firmware's TCG2_PROTOCOL protocol, and its entropy through the RNG_PROTOCOL protocol.
+
+/// The offsets in the TCG2_PROTOCOL protocol of `GetEventLog`, `HashLogExtendEvent` and `SubmitCommand`,
+/// and in the RNG_PROTOCOL protocol of `GetRNG`.
+const GET_CAPABILITY: u64 = 0
+
+const GET_EVENT_LOG: u64 = 8
+
+const HASH_LOG_EXTEND_EVENT: u64 = 16
+
+const SUBMIT_COMMAND: u64 = 24
+
+const GET_RNG: u64 = 8
+
+/// The event log format of crypto-agile logs.
+const CRYPTO_AGILE: u64 = 2
+
+/// The most bytes of an event `measure` records, and the bytes heading it: the event's size,
+/// then its header's size, version, PCR and type.
+const EVENT_LIMIT: usize = 1_024
+
+const EVENT_HEAD: usize = 18
+
+/// The size of the TCG2 protocol's capability record, and the offset in it of the most bytes of
+/// a TPM response.
+const CAPABILITY_BYTES: u8 = 36
+
+const MAX_RESPONSE: u64 = 20
+
+/// The bytes of the first entry of a crypto-agile log before its event data, and of a later
+/// entry before its digests.
+const FIRST_HEAD: u64 = 32
+
+const ENTRY_HEAD: u64 = 12
+
+const TCG2_PROTOCOL: boot::Guid = boot::Guid(data1: 0x607F_766C, data2: 0x7455, data3: 0x42BE, data4: 0x930B_E4D7_6DB2_720F)
+
+const RNG_PROTOCOL: boot::Guid = boot::Guid(data1: 0x3152_BCA5, data2: 0xEADE, data3: 0x433D, data4: 0x862E_C01C_DC29_1F44)
+
+pkg fn measure(pcr: u32, event_type: u32, data: Slice[u8], event: Slice[u8]) fails boot::ServiceError {
+    if event.len() > EVENT_LIMIT {
+        fail boot::ServiceError.Invalid
+    }
+    let tcg = try protocol(TCG2_PROTOCOL)
+    var record = Array[u8, 1_042].filled(0)
+    var head = mut record.view_mut()
+    mut head.write_u32_le(0, value: u32.fit(EVENT_HEAD + event.len()))
+    mut head.write_u32_le(4, value: 14)
+    mut head.write_u16_le(8, value: 1)
+    mut head.write_u32_le(10, value: pcr)
+    mut head.write_u32_le(14, value: event_type)
+    for index in 0..<event.len() {
+        head[EVENT_HEAD + index] = event[index]
+    }
+    try success(call(word(tcg + HASH_LOG_EXTEND_EVENT), a: tcg, b: 0, c: src(data), d: u64.widen(data.len()), e: src(record.view())))
+} measure
+
+pkg fn event_log(alloc: mem::Alloc) -> boot::EventLog fails boot::ServiceError {
+    let tcg = try protocol(TCG2_PROTOCOL)
+    var found = Array[u64, 3].filled(0)
+    let location = dst_words(mut found.view_mut())
+    try success(call(word(tcg + GET_EVENT_LOG), a: tcg, b: CRYPTO_AGILE, c: location, d: location + 8, e: location + 16))
+    let start = found[0]
+    let last = found[1]
+    let truncated = (found[2] & 0xFF) != 0
+    if start == 0 {
+        return boot::EventLog(bytes: Untrusted.of(mem::Bytes.empty(alloc)), truncated: truncated)
+    }
+    var end = start + FIRST_HEAD + bytes_at(start + FIRST_HEAD - 4, count: 4)
+    if last > start {
+        end = try past_entry(last)
+    }
+    let bytes = try drawn(start, len: end - start, alloc)
+    return boot::EventLog(bytes: Untrusted.of(take bytes), truncated: truncated)
+} event_log
+
+/// The address past a crypto-agile entry, whose digests' sizes their algorithms fix: SHA-1,
+/// SHA-256, SHA-384, SHA-512 and SM3-256. Fails with `Unsupported` for another algorithm.
+fn past_entry(entry: u64) -> u64 fails boot::ServiceError {
+    let count = bytes_at(entry + 8, count: 4)
+    var at = entry + ENTRY_HEAD
+    for _ in 0..<count {
+        let size = match bytes_at(at, count: 2) {
+            0x4 => 20u64
+            0xB or 0x12 => 32u64
+            0xC => 48u64
+            0xD => 64u64
+            else => 0u64
+        }
+        if size == 0 {
+            fail boot::ServiceError.Unsupported
+        }
+        at += 2 + size
+    }
+    return at + 4 + bytes_at(at, count: 4)
+} past_entry
+
+pkg fn submit_tpm(command: Slice[u8], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails boot::ServiceError {
+    let tcg = try protocol(TCG2_PROTOCOL)
+    var capability = Array[u8, 36].filled(0)
+    capability[0] = CAPABILITY_BYTES
+    let record = dst(mut capability.view_mut())
+    try success(call(word(tcg + GET_CAPABILITY), a: tcg, b: record, c: 0, d: 0, e: 0))
+    let limit = bytes_at(record + MAX_RESPONSE, count: 2)
+    var response = try zeroed(limit, alloc)
+    try success(call(word(tcg + SUBMIT_COMMAND), a: tcg, b: u64.widen(command.len()), c: src(command), d: limit, e: dst(mut response.view_mut())))
+    var stated: u64 = 0
+    if response.len() >= 6 {
+        stated = u64.widen(response.view().u32_be(2))
+    }
+    if stated > limit {
+        stated = limit
+    }
+    mut response.truncate(usize.widen(stated))
+    return Untrusted.of(take response)
+} submit_tpm
+
+pkg fn random(mut buf: SliceMut[u8]) fails boot::ServiceError {
+    if buf.is_empty() {
+        return
+    }
+    let rng = try protocol(RNG_PROTOCOL)
+    let len = u64.widen(buf.len())
+    try success(call(word(rng + GET_RNG), a: rng, b: 0, c: len, d: dst(mut buf), e: 0))
+} random

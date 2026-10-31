@@ -14,6 +14,7 @@ use super::super::runtime::memory::CHUNK;
 use super::super::runtime::system::{self, unavailable_unless};
 use super::super::runtime::tasks::thread;
 use super::super::runtime::{Routine, report, state};
+use super::start::info;
 use super::stubs::Stub;
 use crate::workspace::{Arch, Kind, Target};
 
@@ -344,23 +345,30 @@ impl Lowering<'_, '_> {
     }
 
     /// The address of the ACPI root system description pointer, zero when the platform gives
-    /// none: on `x86_64-bare` the one the start information names, or else the one found in the
-    /// BIOS area; on `x86_64-uefi` the one the firmware's configuration table names.
-    fn rsdp(&mut self, fx: &mut Fx) -> Value {
+    /// none: on a bare target the one the start information names, or else on `x86_64-bare` the
+    /// one found in the BIOS area; on a UEFI target the one the firmware's configuration table
+    /// names.
+    pub fn rsdp(&mut self, fx: &mut Fx) -> Value {
         let state_address = self.state(fx);
-        if self.ck.db.target.kind() == Some(Kind::Uefi) {
-            let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
-            return self.configured_rsdp(fx, table);
+        match self.ck.db.target.kind() {
+            Some(Kind::Uefi) => {
+                let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
+                return self.configured_rsdp(fx, table);
+            }
+            Some(Kind::Bare) => {}
+            _ => return fx.ptr(0),
         }
-        let info = fx.load(PTR, state_address, state::PLATFORM);
-        let magic = load_u32(fx, info, 0);
-        let valid = fx.b.ins().icmp_imm_s(IntCC::Equal, magic, START_INFO_MAGIC);
+        let info = self.start_info(fx);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
         let given = fx.choose(
-            valid,
+            present,
             &[PTR],
-            |fx| vec![fx.load(PTR, info, START_INFO_RSDP)],
+            |fx| vec![fx.load(PTR, info, info::RSDP)],
             |fx| vec![fx.ptr(0)],
         )[0];
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            return given;
+        }
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, given, 0);
         fx.choose(missing, &[PTR], |fx| vec![scan_rsdp(fx)], |_| vec![given])[0]
     }
@@ -442,10 +450,6 @@ impl Lowering<'_, '_> {
         )[0]
     }
 }
-
-/// The magic number of a PVH start information structure and the offset of its RSDP address.
-const START_INFO_MAGIC: i64 = 0x336E_C578;
-const START_INFO_RSDP: u64 = 32;
 
 /// The offsets in a UEFI system table of its configuration table's entry count and address, the
 /// size of an entry, a GUID then the table's address, and the GUIDs of the ACPI tables, each as

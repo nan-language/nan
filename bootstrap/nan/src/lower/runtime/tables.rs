@@ -27,6 +27,7 @@ use super::super::fx::{Fx, PTR};
 use super::super::supplied::tasks::components;
 use super::super::{Instance, Lowering};
 use super::{Routine, memory, state, tasks};
+use crate::workspace::Kind;
 
 /// The capability table's capacity.
 pub const ENTRIES: u64 = 65_536;
@@ -715,7 +716,7 @@ fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
         fx.store(value, grant, at);
     }
     let untaken = fx.int(types::I8, 0);
-    for field in ["regions", "ring0"] {
+    for field in ["regions", "ring0", "modules"] {
         let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
         fx.store(untaken, grant, at);
     }
@@ -760,7 +761,7 @@ pub fn mint(lo: &mut Lowering, fx: &mut Fx, kind: Value) -> Value {
 }
 
 impl Lowering<'_, '_> {
-    /// Calls the function of the host platform package named `name` with values held as it
+    /// Calls the function of the target's platform package named `name` with values held as it
     /// takes them.
     pub fn platform_call(&mut self, fx: &mut Fx, name: &str, args: &[Held]) -> Called {
         let instance = self.platform_instance(name);
@@ -769,25 +770,25 @@ impl Lowering<'_, '_> {
         self.invoke(fx, Invoked::Direct(id), &abi, args)
     }
 
-    /// The instance of the function of the host platform package named `name`, which only a host
-    /// image holds.
+    /// The instance of the function of the target's platform package named `name`.
     fn platform_instance(&mut self, name: &str) -> Instance {
-        assert!(
-            !self.machine(),
-            "the host platform function {name} in a machine image"
-        );
+        let platform = match self.ck.db.target.kind() {
+            Some(Kind::Uefi) => "uefi_platform",
+            Some(Kind::Bare) => "bare_platform",
+            _ => "host_platform",
+        };
         let item = self
             .ck
             .db
             .packages
             .iter()
-            .position(|package| package.name == "host_platform")
+            .position(|package| package.name == platform)
             .and_then(|index| {
                 let package = &self.ck.db.packages[index];
                 let root = package.root?;
                 self.ck.db.lookup(root, name)
             })
-            .unwrap_or_else(|| panic!("the platform function host_platform::{name}"));
+            .unwrap_or_else(|| panic!("the platform function {platform}::{name}"));
         Instance::Nir {
             item,
             role: crate::nir::Role::Body,

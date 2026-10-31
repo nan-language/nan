@@ -170,6 +170,7 @@ The **ledger** of an item is the list of its entries of the kinds this table giv
 | `dbg` | a `dbg` | none | the item containing it | no |
 | `class` | a [device premise](10-effects-digests.md#reversibility) | its class | the item containing its function or closure | yes |
 | `undo` | an [undo clause](10-effects-digests.md#compensation) | its undoer and premise | the function | yes |
+| `confined` | a `confined` [grant](14-authority.md#device-and-priv-grants) | the names it lists | the `package` item | no |
 
 ```nan
 // file: procinfo/package.nan

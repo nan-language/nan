@@ -185,6 +185,8 @@ pub enum Routine {
     ClockNow,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
+    /// `()`: under the IOMMU's lock, invalidates everything it caches and waits until it has.
+    IommuFlush,
 }
 
 impl Routine {
@@ -256,6 +258,7 @@ impl Routine {
             Routine::Stream => "_NSreplay_stream",
             Routine::ClockNow => "_NSstack_switch_clock_now",
             Routine::Draw => "_NSreplay_draw",
+            Routine::IommuFlush => "_NSiommu_flush",
         }
     }
 
@@ -315,7 +318,7 @@ impl Routine {
             Routine::ReportScalar => (&[P, P, P], &[]),
             Routine::WriteErr => (&[P, P], &[]),
             Routine::Spawn => (&[P, P, P, P, P, P, P, P], &[P]),
-            Routine::Park | Routine::Schedule | Routine::Yield => (&[], &[]),
+            Routine::Park | Routine::Schedule | Routine::Yield | Routine::IommuFlush => (&[], &[]),
             Routine::Stream => (&[P, P, P], &[P]),
             Routine::Draw => (&[P, P, P, P], &[P]),
             Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
@@ -443,7 +446,11 @@ pub mod state {
     /// default one, and the last key the default policy gave.
     pub const POLICY: u64 = 464;
     pub const TICKET: u64 = 472;
-    pub const SIZE: u64 = 480;
+    /// On a kernel, the unit record of the IOMMU `boot::Kernel.iommu` enabled, zero before; on
+    /// an x86_64 kernel, the lock of the PCI configuration ports.
+    pub const IOMMU: u64 = 480;
+    pub const PCI_LOCK: u64 = 488;
+    pub const SIZE: u64 = 496;
 }
 
 impl Lowering<'_, '_> {
@@ -683,6 +690,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
+        Routine::IommuFlush => lo.define_iommu_flush(fx),
         Routine::Init
         | Routine::Exit
         | Routine::RecordAlloc

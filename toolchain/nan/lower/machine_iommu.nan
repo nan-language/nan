@@ -1,0 +1,309 @@
+//! The machine's IOMMU as the runtime drives it once std's `hw` has enabled it: the unit record `hw` builds and the runtime state names, its lock, the invalidation of everything the unit caches through its command queue, and on VT-d the remapping table entries of the message-signalled interrupts `install_msi` gives, one per CPU and vector.
+
+/// The offsets of the unit record's words the runtime reads: its kind, its register base, its
+/// command queue and the queue's next entry, the remapping table, its flags, its lock and the
+/// word a VT-d invalidation wait writes.
+const IOMMU_KIND: u64 = 0
+
+const IOMMU_REGISTERS: u64 = 8
+
+const IOMMU_QUEUE: u64 = 16
+
+const IOMMU_TAIL: u64 = 24
+
+const IOMMU_REMAPPING: u64 = 32
+
+const IOMMU_FLAGS: u64 = 40
+
+const IOMMU_LOCK: u64 = 48
+
+const IOMMU_WAIT: u64 = 56
+
+/// The unit's kinds and the flags the runtime reads: interrupt remapping in extended mode,
+/// reads and writes an invalidation drains, and table walks that miss the caches.
+const IOMMU_VTD: i64 = 1
+
+const IOMMU_EXTENDED: i64 = 1
+
+const IOMMU_DRAIN_READS: i64 = 2
+
+const IOMMU_DRAIN_WRITES: i64 = 4
+
+const IOMMU_UNCOHERENT: i64 = 8
+
+/// The entries of the command queue and the bytes of one.
+const IOMMU_QUEUE_ENTRIES: i64 = 256
+
+const IOMMU_QUEUE_ENTRY: i64 = 16
+
+/// The VT-d invalidation descriptors: of every context, of every translation with its read
+/// and write drains, of every interrupt entry, and a wait writing 1 to an address; and the
+/// queue tail register.
+const VTD_CONTEXTS: i64 = 0x11
+
+const VTD_TRANSLATIONS: i64 = 0x12
+
+const VTD_DRAIN_READ: i64 = 0x80
+
+const VTD_DRAIN_WRITE: i64 = 0x40
+
+const VTD_INTERRUPT_ENTRIES: i64 = 0x4
+
+const VTD_WAIT: i64 = 0x1_0000_0025
+
+const VTD_QUEUE_TAIL: u64 = 0x88
+
+/// The SMMUv3 commands: invalidating every configuration, every non-secure translation, and a
+/// synchronisation; its queue's produce and consume registers, and the index bits with the
+/// wrap bit of a queue of `IOMMU_QUEUE_ENTRIES`.
+const SMMU_CONFIGURATIONS: i64 = 0x04
+
+const SMMU_EVERY_CONFIGURATION: i64 = 31
+
+const SMMU_NON_SECURE: i64 = 0x30
+
+const SMMU_SYNC: i64 = 0x46
+
+const SMMU_PRODUCE: u64 = 0x98
+
+const SMMU_CONSUME: u64 = 0x9C
+
+const SMMU_WRAPPED: i64 = 2 * IOMMU_QUEUE_ENTRIES - 1
+
+/// A remapping table entry's first word: present, its vector and destination; its second, the
+/// requester id it accepts and the bit validating it. The message naming entry `i` has address
+/// `0xFEE0_0000 | (i & 0x7FFF) << 5 | REMAPPED_FORMAT | (i >> 15) << 2`, which the format bit
+/// marks, and data 0.
+const REMAPPING_PRESENT: i64 = 1
+
+const REMAPPING_VALIDATED: i64 = 1i64 << 18
+
+const REMAPPED_FORMAT: i64 = 0x10
+
+const REMAPPED_BASE: i64 = 0xFEE0_0000
+
+/// The unit record, zero while no IOMMU is enabled.
+fn Lowering.iommu_unit(mut self, mut fx: Fx) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    return mut fx.load(PTR, addr: state_address, offset: STATE_IOMMU)
+} Lowering.iommu_unit
+
+/// Takes a unit's lock with maskable interrupts disabled, giving the state to restore.
+fn Lowering.iommu_lock(mut self, mut fx: Fx, unit: clif::Value) -> clif::Value {
+    let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0
+    let lock = mut fx.offset(unit, offset: IOMMU_LOCK)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.ptr(0)
+        let held = mut fx1.ptr(1)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock, e: free, x: held)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    return saved[0]
+} Lowering.iommu_lock
+
+fn Lowering.iommu_unlock(mut self, mut fx: Fx, unit: clif::Value, flags: clif::Value) {
+    let lock = mut fx.offset(unit, offset: IOMMU_LOCK)
+    let free = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: free, p: lock)
+    discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(flags).view())
+} Lowering.iommu_unlock
+
+/// `IommuFlush()`: under the unit's lock, invalidates every context, translation and interrupt
+/// entry the unit caches, draining the requests in flight where it can, and waits until the
+/// unit has.
+fn Lowering.define_iommu_flush(mut self, mut fx: Fx) {
+    discard mut fx.entry()
+    let unit = mut self.iommu_unit(mut fx)
+    let kind = mut fx.load(PTR, addr: unit, offset: IOMMU_KIND)
+    let vtd = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: IOMMU_VTD)
+    discard mut fx.choose_in(mut self, condition: vtd, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.vtd_flush(mut fx1, unit)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.smmu_flush(mut fx1, unit)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} Lowering.define_iommu_flush
+
+/// Queues VT-d's global invalidations and a wait writing the unit's wait word, then polls that
+/// word.
+fn Lowering.vtd_flush(mut self, mut fx: Fx, unit: clif::Value) {
+    let flags = mut fx.load(PTR, addr: unit, offset: IOMMU_FLAGS)
+    let read_flag = mut fx.b.band_imm_s(flags, y: IOMMU_DRAIN_READS)
+    let reads = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: read_flag, y: 0)
+    let write_flag = mut fx.b.band_imm_s(flags, y: IOMMU_DRAIN_WRITES)
+    let writes = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: write_flag, y: 0)
+    let none = mut fx.ptr(0)
+    let read_drain = mut fx.ptr(u64.fit(VTD_DRAIN_READ))
+    let write_drain = mut fx.ptr(u64.fit(VTD_DRAIN_WRITE))
+    let read_bit = mut fx.b.select(reads, x: read_drain, y: none)
+    let write_bit = mut fx.b.select(writes, x: write_drain, y: none)
+    let drains = mut fx.b.bor(read_bit, y: write_bit)
+    let translations = mut fx.b.bor_imm_s(drains, y: VTD_TRANSLATIONS)
+    let wait = mut fx.offset(unit, offset: IOMMU_WAIT)
+    mut fx.store(none, addr: wait, offset: 0)
+    let contexts = mut fx.ptr(u64.fit(VTD_CONTEXTS))
+    let entries = mut fx.ptr(u64.fit(VTD_INTERRUPT_ENTRIES))
+    let waiting = mut fx.ptr(u64.fit(VTD_WAIT))
+    mut self.queue_command(mut fx, unit, low: contexts, high: none)
+    mut self.queue_command(mut fx, unit, low: translations, high: none)
+    mut self.queue_command(mut fx, unit, low: entries, high: none)
+    mut self.queue_command(mut fx, unit, low: waiting, high: wait)
+    discard mut self.call_stub(mut fx, stub: Stub.Mfence, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let tail_index = mut fx.load(PTR, addr: unit, offset: IOMMU_TAIL)
+    let tail = mut fx.b.imul_imm_s(tail_index, y: IOMMU_QUEUE_ENTRY)
+    let base = mut fx.load(PTR, addr: unit, offset: IOMMU_REGISTERS)
+    let at = mut fx.b.iadd_imm_s(base, y: i64.fit(VTD_QUEUE_TAIL))
+    mut self.mmio_write(mut fx, width: 8, address: at, value: tail)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let written = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: wait)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: written, y: 0)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.vtd_flush
+
+/// Queues SMMUv3's invalidation of every configuration and non-secure translation and a
+/// synchronisation, then polls until the unit has consumed them.
+fn Lowering.smmu_flush(mut self, mut fx: Fx, unit: clif::Value) {
+    let none = mut fx.ptr(0)
+    let configurations = mut fx.ptr(u64.fit(SMMU_CONFIGURATIONS))
+    let every = mut fx.ptr(u64.fit(SMMU_EVERY_CONFIGURATION))
+    let translations = mut fx.ptr(u64.fit(SMMU_NON_SECURE))
+    let sync = mut fx.ptr(u64.fit(SMMU_SYNC))
+    mut self.queue_command(mut fx, unit, low: configurations, high: every)
+    mut self.queue_command(mut fx, unit, low: translations, high: none)
+    mut self.queue_command(mut fx, unit, low: sync, high: none)
+    discard mut self.call_stub(mut fx, stub: Stub.Mfence, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let produced = mut fx.load(PTR, addr: unit, offset: IOMMU_TAIL)
+    let base = mut fx.load(PTR, addr: unit, offset: IOMMU_REGISTERS)
+    let produce = mut fx.b.iadd_imm_s(base, y: i64.fit(SMMU_PRODUCE))
+    mut self.mmio_write(mut fx, width: 4, address: produce, value: produced)
+    let consume = mut fx.b.iadd_imm_s(base, y: i64.fit(SMMU_CONSUME))
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let read = mut self.mmio_read(mut fx1, width: 4, address: consume)
+        let consumed = mut fx1.b.band_imm_s(read, y: SMMU_WRAPPED)
+        let busy = mut fx1.b.icmp(clif::IntCC.NotEqual, x: consumed, y: produced)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.smmu_flush
+
+/// Writes a command of two words at the queue's next entry and advances it: a VT-d tail counts
+/// entries modulo the queue's, an SMMUv3 index carries its wrap bit.
+fn Lowering.queue_command(mut self, mut fx: Fx, unit: clif::Value, low: clif::Value, high: clif::Value) {
+    let queue = mut fx.load(PTR, addr: unit, offset: IOMMU_QUEUE)
+    let tail = mut fx.load(PTR, addr: unit, offset: IOMMU_TAIL)
+    let index = mut fx.b.band_imm_s(tail, y: IOMMU_QUEUE_ENTRIES - 1)
+    let offset = mut fx.b.imul_imm_s(index, y: IOMMU_QUEUE_ENTRY)
+    let at = mut fx.b.iadd(queue, y: offset)
+    mut fx.store(low, addr: at, offset: 0)
+    mut fx.store(high, addr: at, offset: 8)
+    let advanced = mut fx.b.iadd_imm_s(tail, y: 1)
+    let kind = mut fx.load(PTR, addr: unit, offset: IOMMU_KIND)
+    let vtd = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: IOMMU_VTD)
+    let entries_mask = mut fx.ptr(u64.fit(IOMMU_QUEUE_ENTRIES) - 1)
+    let wrapped = mut fx.ptr(u64.fit(SMMU_WRAPPED))
+    let mask = mut fx.b.select(vtd, x: entries_mask, y: wrapped)
+    let next = mut fx.b.band(advanced, y: mask)
+    mut fx.store(next, addr: unit, offset: IOMMU_TAIL)
+} Lowering.queue_command
+
+/// Writes the remapping table entry of CPU `cpu`'s vector `vector`, whose local APIC has id
+/// `id`, accepting only requester `source` when `validated` holds, and invalidates the unit's
+/// caches; gives the message naming it, or zero when the entry cannot name an id past 255.
+fn Lowering.remap(mut self, mut fx: Fx, unit: clif::Value, cpu: clif::Value, vector: clif::Value, id: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
+    let flags = mut fx.load(PTR, addr: unit, offset: IOMMU_FLAGS)
+    let mode = mut fx.b.band_imm_s(flags, y: IOMMU_EXTENDED)
+    let extended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mode, y: 0)
+    let narrow = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: id, y: 0xFF)
+    let representable = mut fx.b.bor(extended, y: narrow)
+    let unreached = mut fx.ptr(0)
+    let address = mut fx.variable(PTR, initial: unreached)
+    mut fx.if_true(representable, then: fn[mut self](mut fx1: Fx) {
+        let row = mut fx1.b.ishl_imm_s(cpu, y: 8)
+        let index = mut fx1.b.iadd(row, y: vector)
+        let entry = mut self.remapping_entry(mut fx1, unit, index)
+        let shifted = mut fx1.b.ishl_imm_s(id, y: 8)
+        let chosen = mut fx1.b.select(extended, x: id, y: shifted)
+        let destination = mut fx1.b.ishl_imm_s(chosen, y: 32)
+        let vector_bits = mut fx1.b.ishl_imm_s(vector, y: 16)
+        let routed = mut fx1.b.bor(vector_bits, y: destination)
+        let low = mut fx1.b.bor_imm_s(routed, y: REMAPPING_PRESENT)
+        let high = remapping_requester(mut fx1, source, validated)
+        mut fx1.store(high, addr: entry, offset: 8)
+        discard mut self.call_stub(mut fx1, stub: Stub.Mfence, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        mut fx1.store(low, addr: entry, offset: 0)
+        mut self.publish_entry(mut fx1, unit, entry)
+        let handle_bits = mut fx1.b.band_imm_s(index, y: 0x7FFF)
+        let handle = mut fx1.b.ishl_imm_s(handle_bits, y: 5)
+        let upper_bit = mut fx1.b.ushr_imm_s(index, y: 15)
+        let upper = mut fx1.b.ishl_imm_s(upper_bit, y: 2)
+        let combined = mut fx1.b.bor(handle, y: upper)
+        let message = mut fx1.b.bor_imm_s(combined, y: REMAPPED_BASE | REMAPPED_FORMAT)
+        mut fx1.b.def_var(address, val: message)
+    })
+    return mut fx.b.use_var(address)
+} Lowering.remap
+
+/// A remapping table entry's second word: the requester id `source` validated when `validated`
+/// holds, and nothing otherwise.
+fn remapping_requester(mut fx: Fx, source: clif::Value, validated: bool) -> clif::Value {
+    if validated {
+        let requester = mut fx.b.band_imm_s(source, y: 0xFFFF)
+        return mut fx.b.bor_imm_s(requester, y: REMAPPING_VALIDATED)
+    }
+    return mut fx.ptr(0)
+} remapping_requester
+
+/// Clears the remapping table entry a remapped message names, and invalidates the unit's
+/// caches.
+fn Lowering.unremap(mut self, mut fx: Fx, unit: clif::Value, message: clif::Value) {
+    let low_shifted = mut fx.b.ushr_imm_s(message, y: 5)
+    let low = mut fx.b.band_imm_s(low_shifted, y: 0x7FFF)
+    let high_shifted = mut fx.b.ushr_imm_s(message, y: 2)
+    let high_bit = mut fx.b.band_imm_s(high_shifted, y: 1)
+    let high = mut fx.b.ishl_imm_s(high_bit, y: 15)
+    let index = mut fx.b.bor(low, y: high)
+    let entry = mut self.remapping_entry(mut fx, unit, index)
+    let none = mut fx.ptr(0)
+    mut fx.store(none, addr: entry, offset: 0)
+    mut self.publish_entry(mut fx, unit, entry)
+} Lowering.unremap
+
+/// Whether a message is in the remapped format.
+fn Lowering.remapped_format(mut self, mut fx: Fx, message: clif::Value) -> clif::Value {
+    let format = mut fx.b.band_imm_s(message, y: REMAPPED_FORMAT)
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: format, y: 0)
+} Lowering.remapped_format
+
+/// The address of a remapping table entry.
+fn Lowering.remapping_entry(mut self, mut fx: Fx, unit: clif::Value, index: clif::Value) -> clif::Value {
+    let table = mut fx.load(PTR, addr: unit, offset: IOMMU_REMAPPING)
+    let at = mut fx.b.imul_imm_s(index, y: 16)
+    return mut fx.b.iadd(table, y: at)
+} Lowering.remapping_entry
+
+/// Writes a remapping table entry back to memory when the unit's walks miss the caches, then
+/// invalidates the unit's caches under its lock.
+fn Lowering.publish_entry(mut self, mut fx: Fx, unit: clif::Value, entry: clif::Value) {
+    let flags = mut fx.load(PTR, addr: unit, offset: IOMMU_FLAGS)
+    let flag = mut fx.b.band_imm_s(flags, y: IOMMU_UNCOHERENT)
+    let uncoherent = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+    mut fx.if_true(uncoherent, then: fn[mut self](mut fx1: Fx) {
+        discard mut self.call_stub(mut fx1, stub: Stub.FlushLine, args: Array[clif::Value, 1].filled(entry).view())
+    })
+    let held = mut self.iommu_lock(mut fx, unit)
+    discard mut self.call_routine(mut fx, routine: Routine.IommuFlush, args: mem::List[clif::Value].empty(fx.alloc).view())
+    mut self.iommu_unlock(mut fx, unit, flags: held)
+} Lowering.publish_entry

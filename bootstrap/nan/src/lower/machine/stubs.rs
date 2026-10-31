@@ -18,6 +18,7 @@ use crate::workspace::Arch;
 /// `TPIDR_EL1` on AArch64; `SetCpu` points that register at a record. `Cli` and `Sti` disable
 /// and enable maskable interrupts; `IrqSave` gives their state and disables them, `IrqRestore`
 /// restores it. `IdleWait` halts until an interrupt with maskable interrupts enabled.
+/// `FlushLine` writes the data cache line holding an address back to memory.
 /// `DisableFloats` makes every floating-point, SSE and SIMD instruction of the running CPU
 /// fault, setting `CR0.TS` on x86_64 and clearing `CPACR_EL1.FPEN` on AArch64.
 ///
@@ -89,6 +90,7 @@ pub enum Stub {
     Copy,
     Pause,
     Mfence,
+    FlushLine,
     IdleWait,
     Sti,
     Cli,
@@ -216,6 +218,7 @@ impl Stub {
             ),
             Stub::Pause => (0, 0, &[0xf3, 0x90, 0xc3]),
             Stub::Mfence => (0, 0, &[0x0f, 0xae, 0xf0, 0xc3]),
+            Stub::FlushLine => (1, 0, &[0x0f, 0xae, 0x3f, 0xc3]),
             Stub::IdleWait => (0, 0, &[0xfb, 0xf4, 0xfa, 0xc3]),
             Stub::Lidt => (1, 0, &[0x0f, 0x01, 0x1f, 0xc3]),
             Stub::Sti => (0, 0, &[0xfb, 0xc3]),
@@ -602,6 +605,7 @@ impl Stub {
             ),
             Stub::Pause => (0, 0, &[0x3f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::Mfence => (0, 0, &[0xbf, 0x3b, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::FlushLine => (1, 0, &[0x20, 0x7a, 0x0b, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::IdleWait => (
                 0,
                 0,

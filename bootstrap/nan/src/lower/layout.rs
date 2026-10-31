@@ -501,7 +501,8 @@ impl Layouts {
                 empty()
             }
             // A machine root grant: the handles of its root allocator, executor, clock and wall
-            // clock, and whether its regions, its `hw::Ring0` and its modules were taken;
+            // clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU and its PCI
+            // functions were taken;
             // `boot::Machine` carries them into the `boot::Kernel` its `exit_services` returns.
             "boot::Kernel" | "boot::Machine" => self.record(
                 ck,
@@ -513,6 +514,8 @@ impl Layouts {
                     ("regions".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("ring0".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("modules".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("iommu".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("functions".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],
             ),
             // A physical frame, a page-table root owning one, and a user address are one
@@ -553,8 +556,9 @@ impl Layouts {
             // A register window and a simulated register block each hold one pointer: the sim
             // block its window reaches, or on a machine target the mapped address or port.
             "hw::Mmio" | "hw::Ports" | "hw::sim::Registers" => pointers(1, None),
-            // A DMA buffer holds its box, whose contents never move.
-            "hw::Dma" | "hw::DmaShared" => pointers(1, Some(0)),
+            // A DMA buffer holds its box, whose contents never move, and the record of its mapping
+            // in an I/O domain, zero in the physical space.
+            "hw::Dma" | "hw::DmaShared" => pointers(2, Some(0)),
             // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
             // that of its storage.
             "hw::IrqShared" | "hw::PerCpu" => pointers(1, None),

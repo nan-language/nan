@@ -1,6 +1,6 @@
 # Low-level programming
 
-This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and `UserAddr.copy_in`, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
+This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and `UserAddr.copy_in`, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, I/O domains, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
 
 ## Trusted code
 
@@ -78,7 +78,7 @@ An execution has undefined behaviour exactly from the first point where one of t
 - trusted code breaks a [Ptr rule](#ptr-rules) or the soundness condition of a trusted primitive it calls;
 - the condition of an `assume`, or the premise of trusted code, is false;
 - a [foreign fn](#foreign-functions), or a function reached through a foreign function type, behaves otherwise than its head states;
-- code performing `device` or `priv` operations programs the hardware against what its types state, such as a device accessing memory other than its DMA buffers, or a DMA buffer after the operation that handed it to the device has returned it.
+- code performing `device` or `priv` operations programs the hardware against what its types state, such as a device that no [I/O domain](#io-domains) confines accessing memory other than its DMA buffers, or a DMA buffer after the operation that handed it to the device has returned it.
 
 No rule of this specification constrains an execution from that point on. In every other execution, each operation has the behaviour its owning rule defines. The [interpreter](21-interpreter.md#ptr-checks) checks the Ptr rules and every `assume` in the runs it makes.
 
@@ -348,7 +348,7 @@ pub fn Ports.write_at[E: AnyBits, N: usize](mut self, register: Register[R, Arra
 - An index not below the array's length traps (`trap.bounds`).
 - Each volatile call performs exactly one access of the register's or element's width: through `Mmio` at the virtual address `phys` plus the offset modulo 2^64, through `Ports` at the port `port` plus the offset modulo 65_536. A value travels as its memory representation.
 - Volatile accesses of a task take effect in program order. The implementation never merges, splits, duplicates, removes or reorders them, nor moves them across [DMA access calls](#dma) and `hw::dma_fence`.
-- `map`, `unmap` and volatile calls are device operations, legal only in modules that `allow device` names (`authority.ungranted`). Each has the device fact, terminates and allocates nothing; only an index traps. `hw::sim` constructors make simulated windows ([sim constructors](22-testing.md#sim-constructors)).
+- `map` is a device operation, legal only in modules that `allow device` names, and `unmap` and volatile calls are confined operations, legal only in modules that `allow confined` or `allow device` names (`authority.ungranted`). Each has the device fact, terminates and allocates nothing; only an index traps. `hw::sim` constructors make simulated windows ([sim constructors](22-testing.md#sim-constructors)), and `hw::Mmio.of_bar` windows over a PCI function's BAR ([PCI functions](24-kernel.md#pci-functions)).
 
 ```nan
 // file: kernel/package.nan
@@ -475,20 +475,20 @@ A **DMA buffer** is an `hw::Dma[T]` or an `hw::DmaShared[T]`: memory a device ac
 pub open linear struct Dma[T: AnyBits] {
 } Dma
 
-pub fn Dma.of(take contents: mem::Box[T]) -> Dma[T]
+pub fn Dma.of(take contents: mem::Box[T], space: IoSpace) -> Dma[T]
 
 pub fn Dma.bus_addr(self) -> BusAddr limits notrap, terminates, noalloc
 
-pub proj fn Dma.contents(self) -> T
+pub fn Dma.contents(self) -> T
 
-pub proj fn Dma.contents_mut(mut self) -> T
+pub fn Dma.write(mut self, take contents: T)
 
 pub fn Dma.into_box(take self) -> mem::Box[T]
 
 pub open linear struct DmaShared[T: AnyBits] {
 } DmaShared
 
-pub fn DmaShared.of(take contents: mem::Box[T]) -> DmaShared[T]
+pub fn DmaShared.of(take contents: mem::Box[T], space: IoSpace) -> DmaShared[T]
 
 pub fn DmaShared.bus_addr(self) -> BusAddr limits notrap, terminates, noalloc
 
@@ -497,8 +497,10 @@ pub fn DmaShared.into_box(take self) -> mem::Box[T]
 pub fn dma_fence()
 ```
 
-- Every operation of this section is a device operation (`authority.ungranted`), has the device fact, terminates and allocates nothing.
-- A buffer's memory is its box's contents, which never move. On the machine targets its bus address is the physical address that the address of the contents translates to when `of` runs, and a device reaches the size of `T` bytes from it, which are contiguous in physical memory ([physical memory](24-kernel.md#physical-memory)). On the host targets its bus address is the address of the contents, and only [simulated devices](22-testing.md#simulated-capabilities) reach it.
+- Every operation of this section is a confined operation (`authority.ungranted`), has the device fact and terminates; only `of` allocates.
+- A buffer's memory is its box's contents, which never move once `of` returns. On the machine targets its bus address is the physical address that the address of the contents translates to, and a device reaches the size of `T` bytes from it, which are contiguous in physical memory ([physical memory](24-kernel.md#physical-memory)). On the host targets its bus address is the address of the contents, and only [simulated devices](22-testing.md#simulated-capabilities) reach it.
+- `of(take contents, space: s)` in the physical space keeps the box's contents where they are. In the space of an [I/O domain](#io-domains) on a machine target, it moves them into whole pages of their own drawn through the box's allocator, the rest of the pages zeroed, and maps those pages at their own addresses in the domain, unless the domain is closed; it traps when the allocator or the IOMMU's tables are exhausted (`trap.exhausted`). `take buffer.into_box()` of such a buffer unmaps its pages and returns once the IOMMU no longer translates them.
+- `buffer.contents()` gives a copy of the buffer's contents, read once, and `mut buffer.write(take v)` replaces them. A device may write the buffer between two calls, so two copies may differ; the [prover](20-prover.md) never takes them as equal.
 - The T of `hw::Dma[T]` and `hw::DmaShared[T]` has a [fixed layout](21-interpreter.md#interpreter-memory); another T is an error (`hw.layout-unfixed`), reported where the type is written.
 - The contents of an `hw::DmaShared[T]` are reached only through its **DMA access calls**, whose field operand is the member path `T.f` of a field f of T, written directly, where T is a bytes layout. Another operand, or a call not matching its field's row, is an error (`hw.dma-operand`).
 
@@ -553,7 +555,7 @@ pub fn next_used(mut ring: hw::DmaShared[UsedRing], seen: u16) -> Option[UsedEnt
 
 pub fn sector_buffer(heap: mem::Heap) -> hw::Dma[Sector] {
     let contents = heap.boxed(Sector(data: Array[u8, 512].filled(0)))
-    return hw::Dma.of(take contents)
+    return hw::Dma.of(take contents, space: hw::IoSpace.physical())
 } sector_buffer
 ```
 
@@ -644,6 +646,116 @@ pub closed struct Reading {
 pub fn reading_box(take buffer: hw::Dma[Reading]) -> mem::Box[Reading] { // error: hw.layout-unfixed
     return take buffer.into_box()
 } reading_box
+```
+
+```nan
+// file: kernel/package.nan
+//! A device's slot index read twice.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow confined in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Picks a table entry by the index a device wrote.
+
+pub layout Slot: bytes 8 le {
+    index: u64 at 0
+} Slot
+
+pub fn pick(buffer: hw::Dma[Slot], table: Array[u8, 4]) -> u8 limits notrap {
+    if buffer.contents().index < 4 {
+        return table[usize.widen(buffer.contents().index)] // error: proof.unknown
+    }
+    return 0
+} pick
+```
+
+## I/O domains
+
+An **I/O domain** is a set of pages that the PCI functions attached to it reach at their own physical addresses, through the machine's IOMMU ([PCI functions](24-kernel.md#pci-functions)); `boot::Kernel.iommu` gives the `hw::Iommu` making them ([anchor](24-kernel.md#anchor)). A **space** is where a [DMA buffer](#dma) is made: a domain's, or the physical space, which holds every physical address.
+
+```nan-api
+// module: hw
+
+pub open linear struct Iommu {
+} Iommu
+
+pub fn Iommu.domain(self) -> IoDomain fails IommuError
+
+pub open linear struct IoDomain {
+} IoDomain
+
+pub fn IoDomain.space(self) -> IoSpace
+
+pub fn IoDomain.close(take self)
+
+pub open struct IoSpace derives Copy, Send {
+} IoSpace
+
+pub fn IoSpace.physical() -> IoSpace
+
+pub closed enum IommuError derives Copy, Eq, Render {
+    Exhausted
+    Physical
+    Closed
+    Unsupported
+} IommuError
+```
+
+- `iommu.domain()` makes a new domain mapping no page. It fails with `Exhausted` when the IOMMU has 256 domains or no memory for their tables is left; a domain's tables are memory of the [support routines](27-program-model.md#runtime-support), drawn through no allocator.
+- `domain.space()` gives the domain's space, and `hw::IoSpace.physical()` the physical space. The space of a closed domain is **stale**: a buffer made in it maps nothing.
+- `take domain.close()` ends the domain: each function attached to it reaches no memory from then on, and its tables are freed once the IOMMU no longer caches them. The buffers made in its space stay the CPU's; their `into_box` unmaps nothing.
+- An `hw::IoDomain`, and a buffer made in a domain's space, are resources of the domain run holding them, which its [settlement](11-errors-domains.md#settlement) closes and unmaps.
+- A **confined operation** reaches, through a device, no memory but what the device's own I/O domain maps. The confined operations are those of this section but `hw::IoSpace.physical`, which is a device operation, and those that [register windows](#register-windows), [DMA](#dma), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions) name. They are legal only in modules that `allow confined` or `allow device` names (`authority.ungranted`).
+- Each operation of this section has the device fact; `domain` traps when no memory is left for the record of its domain (`trap.exhausted`).
+
+```nan
+// file: driver/package.nan
+//! A block driver confined to an I/O domain.
+
+package driver {
+    language 1
+    targets x86_64-bare
+    allow confined in driver
+} driver
+
+// file: driver/driver.nan
+//! Attaches a disk to the driver's domain and makes a sector buffer in it.
+
+pub layout Sector: bytes 512 le {
+    data: Array[u8, 512] at 0
+} Sector
+
+pub fn sector_buffer(mut disk: hw::PciFunction, domain: hw::IoDomain, heap: mem::Heap) -> hw::Dma[Sector] fails hw::IommuError {
+    let space = domain.space()
+    try mut disk.attach(space)
+    return hw::Dma.of(heap.boxed(Sector(data: Array[u8, 512].filled(0))), space)
+} sector_buffer
+```
+
+```nan
+// file: driver/package.nan
+//! A block driver confined to an I/O domain.
+
+package driver {
+    language 1
+    targets x86_64-bare
+    allow confined in driver
+} driver
+
+// file: driver/driver.nan
+//! Makes a sector buffer in physical memory.
+
+pub layout Sector: bytes 512 le {
+    data: Array[u8, 512] at 0
+} Sector
+
+pub fn sector_buffer(heap: mem::Heap) -> hw::Dma[Sector] {
+    return hw::Dma.of(heap.boxed(Sector(data: Array[u8, 512].filled(0))), space: hw::IoSpace.physical()) // error: authority.ungranted
+} sector_buffer
 ```
 
 ## Privileged intrinsics
@@ -746,7 +858,7 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 
 - `hw::Idt` is an interrupt descriptor table whose gate n is an interrupt gate of privilege level 0 entering the [machine seam](#machine-seams) of vector n with the `ist` of n's `hw::vectors` entry, or 0 without one. `Idt.of_vectors()` builds it.
 - `load_idt` loads the table into the running CPU's interrupt descriptor table register.
-- `write_cr3` makes `root` the running CPU's page-table root and returns `Some` of a `hw::PageTableRoot` owning the frame of the root it replaces, or `None` when it replaces the [entry root](24-kernel.md#physical-memory). It is a trusted primitive whose soundness condition is that `root` maps the running code, its stack and every live value at their current addresses, and keeps the image, the memory it reserves and every live frame and region mapped at their physical addresses; that no other `hw::PageTableRoot` owns the frame of the replaced root; and that until a later `write_cr3` on that CPU returns `root`, no value that safe code reaches owns or views memory of a page table that `root` reaches, other than `root` itself.
+- `write_cr3` makes `root` the running CPU's page-table root and returns `Some` of a `hw::PageTableRoot` owning the frame of the root it replaces, or `None` when it replaces the [entry root](24-kernel.md#physical-memory). It is a trusted primitive whose soundness condition is that `root` maps the running code, its stack and every live value at their current addresses, and keeps the image, the memory it reserves and every live frame and region mapped at their physical addresses and every live window `hw::Mmio.of_bar` gave mapped uncached at its address; that no other `hw::PageTableRoot` owns the frame of the replaced root; and that until a later `write_cr3` on that CPU returns `root`, no value that safe code reaches owns or views memory of a page table that `root` reaches, other than `root` itself.
 - `write_cr3_tagged` installs `root` as `write_cr3` does, as a later `write_cr3` or `write_cr3_tagged` returns it, but tags the translations the CPU caches from it with PCID `pcid`. It keeps the translations cached under other PCIDs, and those under `pcid` too when `keep` is true. While the CPU has PCIDs disabled it ignores `pcid` and `keep`. It is a trusted primitive whose soundness condition is that of `write_cr3`, and that each translation cached under `pcid` that it keeps maps as `root` does.
 - `invalidate_pcid_page` removes the running CPU's cached translations of the page holding `page` under `pcid`, and `invalidate_pcid` every one under `pcid`; while the CPU has PCIDs disabled, PCID 0 tags every translation.
 - `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact. The indirect branch prediction barrier is `write_msr(0x49, value: 1)`.

@@ -1,0 +1,211 @@
+//! The operations std's `hw` supplies to its IOMMU and PCI code: the unit record the runtime state names, its lock and invalidation, chunks, runtime records and holdings, cache line write-backs, the platform's tables, PCI configuration accesses, and the calls of that code the runtime makes for the kernel's accessors, DMA buffers and settlement.
+
+/// The configuration ports of PCI configuration mechanism #1: the address, whose high bit
+/// enables it, and the data.
+const CONFIG_ADDRESS: u64 = 0xCF8
+
+const CONFIG_DATA: u64 = 0xCFC
+
+const CONFIG_ENABLE: i64 = 0x8000_0000
+
+fn iommu_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let written = supply.path.as_str()
+    if not written.starts_with("hw::") {
+        return false
+    }
+    let Some(name) = written.slice_bytes(4, end: written.as_bytes().len()) else {
+        return false
+    }
+    if unit_lower(mut lo, mut fx, supply, name) {
+        return true
+    }
+    match name {
+        "chunks" => {
+            let drawn = system_map_chunks(mut lo, mut fx, count: supply.param(0).scalar_value())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(drawn))
+        }
+        "runtime_record" => {
+            let record = mut lo.record_alloc(mut fx, size: supply.param(0).scalar_value())
+            let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            supply.ret(mut lo, mut fx, held: Held.Scalar(record))
+        }
+        "free_record" => {
+            mut lo.record_free(mut fx, address: supply.param(0).scalar_value())
+            supply.done(mut lo, mut fx)
+        }
+        "hold" => {
+            let held = mut lo.call_routine(mut fx, routine: Routine.Hold, args: fx.list2(supply.param(0).scalar_value(), b: supply.param(1).scalar_value()).view())
+            expect held.len() > 0
+            supply.ret(mut lo, mut fx, held: Held.Scalar(held[0]))
+        }
+        "unhold" => {
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(supply.param(0).scalar_value()).view())
+            supply.done(mut lo, mut fx)
+        }
+        "flush_line" => {
+            discard mut lo.call_stub(mut fx, stub: Stub.FlushLine, args: fx.list1(supply.param(0).scalar_value()).view())
+            supply.done(mut lo, mut fx)
+        }
+        "exhausted" => raise_kind(mut lo, mut fx, kind: "trap.exhausted")
+        "x2apic" => {
+            let state_address = mut lo.state(mut fx)
+            let mode = mut fx.load(PTR, addr: state_address, offset: STATE_X2APIC)
+            let on = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mode, y: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(on))
+        }
+        "rsdp_address" => {
+            let rsdp = mut lo.rsdp(mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(rsdp))
+        }
+        "tree_address" => {
+            let tree = boot_tree_address(mut lo, mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(tree))
+        }
+        "on_aarch64" => {
+            var aarch64: i64 = 0
+            if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                aarch64 = 1
+            }
+            let flag = mut fx.int(clif::Type.Int8, value: aarch64)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(flag))
+        }
+        "config_read" => {
+            let value = pci_config(mut lo, mut fx, supply, write: None)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "config_write" => {
+            discard pci_config(mut lo, mut fx, supply, write: Some(supply.param(3).scalar_value()))
+            supply.done(mut lo, mut fx)
+        }
+        else => return false
+    }
+    return true
+} iommu_lower
+
+/// The unit's operations: its record, its lock and its invalidation.
+fn unit_lower(mut lo: Lowering, mut fx: Fx, supply: Supply, name: Str) -> bool {
+    match name {
+        "iommu_unit" => {
+            let unit = mut lo.iommu_unit(mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(unit))
+        }
+        "iommu_ready" => {
+            let state_address = mut lo.state(mut fx)
+            mut fx.store(supply.param(0).scalar_value(), addr: state_address, offset: STATE_IOMMU)
+            supply.done(mut lo, mut fx)
+        }
+        "iommu_lock" => {
+            let unit = mut lo.iommu_unit(mut fx)
+            let flags = mut lo.iommu_lock(mut fx, unit)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(flags))
+        }
+        "iommu_unlock" => {
+            let unit = mut lo.iommu_unit(mut fx)
+            mut lo.iommu_unlock(mut fx, unit, flags: supply.param(0).scalar_value())
+            supply.done(mut lo, mut fx)
+        }
+        "iommu_flush" => {
+            discard mut lo.call_routine(mut fx, routine: Routine.IommuFlush, args: mem::List[clif::Value].empty(fx.alloc).view())
+            supply.done(mut lo, mut fx)
+        }
+        else => return false
+    }
+    return true
+} unit_lower
+
+/// A PCI configuration access of a double word: through the ECAM a nonzero first parameter
+/// names, or on x86_64 through the configuration ports, which a lock keeps to one CPU at a time.
+/// Reads give the double word.
+fn pci_config(mut lo: Lowering, mut fx: Fx, supply: Supply, write: Option[clif::Value]) -> clif::Value {
+    let ecam = supply.param(0).scalar_value()
+    let requester = mut fx.b.uextend(PTR, x: supply.param(1).scalar_value())
+    let offset = mut fx.b.uextend(PTR, x: supply.param(2).scalar_value())
+    let value = match write {
+        Some(written) => Some(mut fx.b.uextend(PTR, x: written))
+        None => None
+    }
+    var read = clif::Value(index: 0)
+    if lo.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
+        let ported = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ecam, y: 0)
+        let chosen = mut fx.choose_in(mut lo, condition: ported, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            return config_ports(mut lo1, fx: mut fx1, requester, offset, value)
+        }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            return config_mapped(mut lo1, fx: mut fx1, ecam, requester, offset, value)
+        })
+        expect chosen.len() > 0
+        read = chosen[0]
+    } else {
+        let mapped = config_mapped(mut lo, mut fx, ecam, requester, offset, value)
+        expect mapped.len() > 0
+        read = mapped[0]
+    }
+    return mut fx.b.ireduce(clif::Type.Int32, x: read)
+} pci_config
+
+/// A configuration access through the ECAM at `ecam`.
+fn config_mapped(mut lo: Lowering, mut fx: Fx, ecam: clif::Value, requester: clif::Value, offset: clif::Value, value: Option[clif::Value]) -> mem::List[clif::Value] {
+    let function = mut fx.b.ishl_imm_s(requester, y: 12)
+    let base = mut fx.b.iadd(ecam, y: function)
+    let at = mut fx.b.iadd(base, y: offset)
+    match value {
+        Some(written) => {
+            mut lo.mmio_write(mut fx, width: 4, address: at, value: written)
+            return fx.list1(mut fx.ptr(0))
+        }
+        None => return fx.list1(mut lo.mmio_read(mut fx, width: 4, address: at))
+    }
+} config_mapped
+
+/// A configuration access through the configuration ports, under their lock with maskable
+/// interrupts disabled.
+fn config_ports(mut lo: Lowering, mut fx: Fx, requester: clif::Value, offset: clif::Value, value: Option[clif::Value]) -> mem::List[clif::Value] {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_PCI_LOCK)
+    let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.ptr(0)
+        let held = mut fx1.ptr(1)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock, e: free, x: held)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let function = mut fx.b.ishl_imm_s(requester, y: 8)
+    let low = mut fx.b.band_imm_s(offset, y: 0xFC)
+    let combined = mut fx.b.bor(function, y: low)
+    let address = mut fx.b.bor_imm_s(combined, y: CONFIG_ENABLE)
+    let address_port = mut fx.ptr(CONFIG_ADDRESS)
+    mut lo.port_out(mut fx, width: 4, port: address_port, value: address)
+    let data_port = mut fx.ptr(CONFIG_DATA)
+    var read = clif::Value(index: 0)
+    match value {
+        Some(written) => {
+            mut lo.port_out(mut fx, width: 4, port: data_port, value: written)
+            read = mut fx.ptr(0)
+        }
+        None => {
+            read = mut lo.port_in(mut fx, width: 4, port: data_port)
+        }
+    }
+    let free = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: free, p: lock)
+    discard mut lo.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved[0]).view())
+    return fx.list1(read)
+} config_ports
+
+/// Calls a function std's `hw` declares, of no type parameters, with values held as its
+/// parameters take them, giving its result.
+fn call_hw(mut lo: Lowering, mut fx: Fx, name: Str, args: Slice[Held]) -> Held {
+    let Some(item) = lo.ck.db().std_item("hw", name) else {
+        expect false
+        return Held.Empty
+    }
+    let instance = mut lo.callable_instance(nir::FnRef.item(item, args: ty::Args.none()), as_value: false)
+    let abi = mut lo.abi(instance)
+    let id = mut lo.instance(take instance)
+    let called = mut lo.invoke(mut fx, invoked: Invoked.Direct(id), abi, args)
+    return called.result
+} call_hw

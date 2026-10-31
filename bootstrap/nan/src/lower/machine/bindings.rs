@@ -1,8 +1,9 @@
 //! The devices `hw::IrqShared` installs: the binding table, whose first row of vectors serves
 //! every CPU and whose other rows serve one CPU each; the chains of devices sharing a binding,
 //! which the dispatcher runs and installs and uninstalls change under the bindings lock; and the
-//! vectors of x86_64 message-signalled interrupts. On AArch64 a vector from 32 up is a shared
-//! peripheral interrupt, routed to the CPU of its devices.
+//! vectors of x86_64 message-signalled interrupts, with their remapping entries once the IOMMU
+//! remaps interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to
+//! the CPU of its devices.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -252,11 +253,19 @@ impl Lowering<'_, '_> {
     }
 
     /// Installs a device record on a new message-signalled interrupt of CPU `cpu`, from the
-    /// device `source` on AArch64, giving one of the `msi` outcomes.
-    pub fn install_msi(&mut self, fx: &mut Fx, record: Value, cpu: Value, source: Value) -> Value {
+    /// device `source`, giving one of the `msi` outcomes; with interrupt remapping on x86_64, the
+    /// remapping entry accepts that device alone when `validated` holds.
+    pub fn install_msi(
+        &mut self,
+        fx: &mut Fx,
+        record: Value,
+        cpu: Value,
+        source: Value,
+        validated: bool,
+    ) -> Value {
         let flags = self.lock_bindings(fx);
         let outcome = match self.machine_arch() {
-            Arch::Amd64 => self.x64_install_msi(fx, record, cpu),
+            Arch::Amd64 => self.x64_install_msi(fx, record, cpu, source, validated),
             Arch::Aarch64 => self.its_install(fx, record, cpu, source),
         };
         self.unlock_bindings(fx, flags);
@@ -264,9 +273,17 @@ impl Lowering<'_, '_> {
     }
 
     /// The x86_64 part of `install_msi`: the lowest vector of `MSI_VECTORS` the final build does
-    /// not bind and no device is installed on for the CPU, with a message naming the CPU's local
-    /// APIC id, which no message reaches past `MSI_ID_MAX`.
-    fn x64_install_msi(&mut self, fx: &mut Fx, record: Value, cpu: Value) -> Value {
+    /// not bind and no device is installed on for the CPU. Its message names the CPU's local
+    /// APIC id, which no message reaches past `MSI_ID_MAX`, or once the IOMMU remaps
+    /// interrupts, the remapping entry of the CPU and vector.
+    fn x64_install_msi(
+        &mut self,
+        fx: &mut Fx,
+        record: Value,
+        cpu: Value,
+        source: Value,
+        validated: bool,
+    ) -> Value {
         let row = fx.b.ins().iadd_imm_s(cpu, 1);
         let bound = self.statically_bound();
         let first = fx.ptr(MSI_VECTORS.0 as u64);
@@ -293,26 +310,44 @@ impl Lowering<'_, '_> {
         let found =
             fx.b.ins()
                 .icmp_imm_s(IntCC::UnsignedLessThan, vector, MSI_VECTORS.1);
-        let id = self.hardware_id(fx, cpu);
-        let far =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedGreaterThan, id, MSI_ID_MAX);
-        let installed = fx.ptr(msi::INSTALLED as u64);
         let exhausted = fx.ptr(msi::EXHAUSTED as u64);
-        let unreachable = fx.ptr(msi::UNREACHABLE as u64);
-        let outcome = fx.b.ins().select(found, installed, exhausted);
-        let outcome = fx.b.ins().select(far, unreachable, outcome);
-        let done = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, msi::INSTALLED);
-        fx.when(done, |fx| {
-            fx.store(vector, record, device::VECTOR);
-            let address = fx.b.ins().ishl_imm_s(id, 12);
-            let address = fx.b.ins().bor_imm_s(address, MSI_ADDRESS);
-            fx.store(address, record, device::MESSAGE);
-            fx.store(vector, record, device::DATA);
-            let slot = self.irq_binding(fx, row, vector);
-            self.chain(fx, record, slot);
+        let outcome = fx.var(PTR, exhausted);
+        fx.when(found, |fx| {
+            let id = self.hardware_id(fx, cpu);
+            let unit = self.iommu_unit(fx);
+            let remapping = fx.b.ins().icmp_imm_s(IntCC::NotEqual, unit, 0);
+            let message = fx.choose_in(
+                self,
+                remapping,
+                &[PTR, PTR],
+                |lo, fx| {
+                    let address = lo.remap(fx, unit, cpu, vector, id, source, validated);
+                    vec![address, fx.ptr(0)]
+                },
+                |_, fx| {
+                    let address = fx.b.ins().ishl_imm_s(id, 12);
+                    let address = fx.b.ins().bor_imm_s(address, MSI_ADDRESS);
+                    let far =
+                        fx.b.ins()
+                            .icmp_imm_s(IntCC::UnsignedGreaterThan, id, MSI_ID_MAX);
+                    let none = fx.ptr(0);
+                    vec![fx.b.ins().select(far, none, address), vector]
+                },
+            );
+            let reached = fx.b.ins().icmp_imm_s(IntCC::NotEqual, message[0], 0);
+            let installed = fx.ptr(msi::INSTALLED as u64);
+            let unreachable = fx.ptr(msi::UNREACHABLE as u64);
+            let chosen = fx.b.ins().select(reached, installed, unreachable);
+            fx.b.def_var(outcome, chosen);
+            fx.when(reached, |fx| {
+                fx.store(vector, record, device::VECTOR);
+                fx.store(message[0], record, device::MESSAGE);
+                fx.store(message[1], record, device::DATA);
+                let slot = self.irq_binding(fx, row, vector);
+                self.chain(fx, record, slot);
+            });
         });
-        outcome
+        fx.b.use_var(outcome)
     }
 
     /// Removes a device record from its binding's chain, and on AArch64 disables a shared
@@ -329,6 +364,14 @@ impl Lowering<'_, '_> {
         })[0];
         let next = fx.load(PTR, record, device::NEXT);
         fx.b.ins().atomic_store(MemFlagsData::trusted(), next, link);
+        if self.machine_arch() == Arch::Amd64 {
+            let message = fx.load(PTR, record, device::MESSAGE);
+            let remapped = self.is_remapped(fx, message);
+            fx.when(remapped, |fx| {
+                let unit = self.iommu_unit(fx);
+                self.unremap(fx, unit, message);
+            });
+        }
         if self.machine_arch() == Arch::Aarch64 {
             let vector = fx.load(PTR, record, device::VECTOR);
             let lpi = fx.b.ins().icmp_imm_s(

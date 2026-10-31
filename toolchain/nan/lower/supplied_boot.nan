@@ -1,4 +1,4 @@
-//! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start information, the firmware services of the UEFI targets, the anchor a kernel installs before its executor starts, and what the start information and the firmware's tables give std. The installed anchor lies in storage the image reserves, whose address and the location of the `anchor` call the runtime state records.
+//! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start information, the IOMMU and PCI functions std's `hw` enables and lists, the firmware services of the UEFI targets, the anchor a kernel installs before its executor starts, and what the start information and the firmware's tables give std. The installed anchor lies in storage the image reserves, whose address and the location of the `anchor` call the runtime state records.
 
 fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
@@ -18,6 +18,8 @@ fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "boot::Kernel.ring0" or "boot::Machine.ring0" => boot_ring0(mut lo, mut fx, supply)
         "boot::Kernel.regions" => regions(mut lo, mut fx, supply)
         "boot::Kernel.modules" => boot_modules(mut lo, mut fx, supply)
+        "boot::Kernel.iommu" => boot_iommu(mut lo, mut fx, supply)
+        "boot::Kernel.pci_functions" => boot_pci_functions(mut lo, mut fx, supply)
         "boot::Kernel.anchor" => boot_anchor(mut lo, mut fx, supply)
         "boot::Kernel.policy" => mut lo.install_policy(mut fx, supply)
         "boot::Module.contents" => module_contents(mut lo, mut fx, supply)
@@ -26,14 +28,8 @@ fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             supply.ret(mut lo, mut fx, held: Held.Scalar(info))
         }
         "boot::tree_address" => {
-            if lo.ck.db().target == workspace::Target.Aarch64Bare {
-                let state_address = mut lo.state(mut fx)
-                let tree = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
-                supply.ret(mut lo, mut fx, held: Held.Scalar(tree))
-            } else {
-                let none = mut fx.ptr(0)
-                supply.ret(mut lo, mut fx, held: Held.Scalar(none))
-            }
+            let tree = boot_tree_address(mut lo, mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(tree))
         }
         "boot::rsdp_address" => {
             let rsdp = mut lo.rsdp(mut fx)
@@ -97,6 +93,67 @@ fn boot_wall_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let none = mut lo.none_value(mut fx, option)
     supply.ret(mut lo, mut fx, held: none)
 } boot_wall_clock
+
+/// The address of the flattened device tree the image started with, zero without one.
+fn boot_tree_address(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    if lo.ck.db().target == workspace::Target.Aarch64Bare {
+        let state_address = mut lo.state(mut fx)
+        return mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+    }
+    return mut fx.ptr(0)
+} boot_tree_address
+
+/// Whether a flag of the root grant was set, setting it.
+fn first_take(mut lo: Lowering, mut fx: Fx, supply: Supply, field_name: Str) -> clif::Value {
+    let grant = supply.param(0).address_value()
+    let at = boot_field(mut lo, supply, field_name)
+    let taken = mut fx.load(clif::Type.Int8, addr: grant, offset: at)
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(yes, addr: grant, offset: at)
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+} first_take
+
+/// `k.iommu()`: the first time, what std's `hw` gives on enabling the machine's IOMMU on a
+/// kernel; `None` after, and on a test image.
+fn boot_iommu(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let option = supply.abi.result
+    if lo.kernel() {
+        let unclaimed = first_take(mut lo, mut fx, supply, field_name: "iommu")
+        mut fx.if_true(unclaimed, then: fn[mut lo](mut fx1: Fx) {
+            let started = call_hw(mut lo, fx: mut fx1, name: "started", args: mem::List[Held].empty(fx1.alloc).view())
+            supply.ret(mut lo, fx: mut fx1, held: started)
+        })
+    }
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} boot_iommu
+
+/// `k.pci_functions()`: the first time, the functions std's `hw` enumerates on a kernel, drawn
+/// through the root allocator; an empty list after, and on a test image.
+fn boot_pci_functions(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let grant = supply.param(0).address_value()
+    let alloc_at = boot_field(mut lo, supply, field_name: "alloc")
+    let alloc = mut fx.offset(grant, offset: alloc_at)
+    if lo.kernel() {
+        let unclaimed = first_take(mut lo, mut fx, supply, field_name: "functions")
+        mut fx.if_true(unclaimed, then: fn[mut lo](mut fx1: Fx) {
+            let functions = call_hw(mut lo, fx: mut fx1, name: "enumerated", args: Array[Held, 1].filled(Held.Address(alloc)).view())
+            supply.ret(mut lo, fx: mut fx1, held: functions)
+        })
+    }
+    let Some(list) = supply.sret else {
+        expect false
+        return
+    }
+    let Some(function_ty) = lo.ck.types().type_arg(supply.abi.result, index: 0) else {
+        expect false
+        return
+    }
+    let element = Element.of(mut lo, ty: function_ty)
+    let cell = mut fx.load(PTR, addr: alloc, offset: 0)
+    vector_empty(mut fx, address: list, alloc: cell, element)
+    supply.ret(mut lo, mut fx, held: Held.Address(list))
+} boot_pci_functions
 
 /// `k.ring0()`: `Some` of the machine's one `hw::Ring0` the first time, `None` after.
 fn boot_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {

@@ -1,4 +1,4 @@
-//! The devices `hw::IrqShared` installs: the binding table, whose first row of vectors serves every CPU and whose other rows serve one CPU each; the chains of devices sharing a binding, which the dispatcher runs and installs and uninstalls change under the bindings lock; and the vectors of x86_64 message-signalled interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to the CPU of its devices.
+//! The devices `hw::IrqShared` installs: the binding table, whose first row of vectors serves every CPU and whose other rows serve one CPU each; the chains of devices sharing a binding, which the dispatcher runs and installs and uninstalls change under the bindings lock; and the vectors of x86_64 message-signalled interrupts, with their remapping entries once the IOMMU remaps interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to the CPU of its devices.
 
 /// A binding: the record of its first device, zero while none is installed, then the number of
 /// CPUs running its devices.
@@ -257,11 +257,12 @@ fn Lowering.chain(mut self, mut fx: Fx, record: clif::Value, slot: clif::Value) 
 } Lowering.chain
 
 /// Installs a device record on a new message-signalled interrupt of CPU `cpu`, from the device
-/// `source` on AArch64, giving one of the `MSI_` outcomes.
-fn Lowering.install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value) -> clif::Value {
+/// `source`, giving one of the `MSI_` outcomes; with interrupt remapping on x86_64, the remapping
+/// entry accepts that device alone when `validated` holds.
+fn Lowering.install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
     let flags = mut self.lock_bindings(mut fx)
     let outcome = match self.machine_arch() {
-        workspace::Arch.Amd64 => mut self.x64_install_msi(mut fx, record, cpu)
+        workspace::Arch.Amd64 => mut self.x64_install_msi(mut fx, record, cpu, source, validated)
         workspace::Arch.Aarch64 => mut self.its_install(mut fx, record, cpu, source)
     }
     mut self.unlock_bindings(mut fx, flags)
@@ -269,9 +270,10 @@ fn Lowering.install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Va
 } Lowering.install_msi
 
 /// The x86_64 part of `install_msi`: the lowest vector from `MSI_FIRST_VECTOR` short of
-/// `MSI_VECTORS_END` the final build does not bind and no device is installed on for the CPU,
-/// with a message naming the CPU's local APIC id, which no message reaches past `MSI_ID_MAX`.
-fn Lowering.x64_install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value) -> clif::Value {
+/// `MSI_VECTORS_END` the final build does not bind and no device is installed on for the CPU.
+/// Its message names the CPU's local APIC id, which no message reaches past `MSI_ID_MAX`, or
+/// once the IOMMU remaps interrupts, the remapping entry of the CPU and vector.
+fn Lowering.x64_install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
     let row = mut fx.b.iadd_imm_s(cpu, y: 1)
     let statically = mut self.statically_bound()
     let start = mut fx.ptr(u64.fit(MSI_FIRST_VECTOR))
@@ -297,24 +299,39 @@ fn Lowering.x64_install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif
     expect searched.len() > 0
     let vector = searched[0]
     let found = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: MSI_VECTORS_END)
-    let id = mut self.hardware_id(mut fx, index: cpu)
-    let far = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: id, y: MSI_ID_MAX)
-    let installed = mut fx.ptr(u64.fit(MSI_INSTALLED))
     let exhausted = mut fx.ptr(u64.fit(MSI_EXHAUSTED))
-    let unreachable = mut fx.ptr(u64.fit(MSI_UNREACHABLE))
-    let available = mut fx.b.select(found, x: installed, y: exhausted)
-    let outcome = mut fx.b.select(far, x: unreachable, y: available)
-    let done = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_INSTALLED)
-    mut fx.if_true(done, then: fn[mut self](mut fx1: Fx) {
-        mut fx1.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
-        let shifted = mut fx1.b.ishl_imm_s(id, y: 12)
-        let address = mut fx1.b.bor_imm_s(shifted, y: MSI_ADDRESS)
-        mut fx1.store(address, addr: record, offset: DEVICE_RECORD_MESSAGE)
-        mut fx1.store(vector, addr: record, offset: DEVICE_RECORD_DATA)
-        let slot = mut self.irq_binding(mut fx1, row, vector)
-        mut self.chain(mut fx1, record, slot)
+    let outcome = mut fx.variable(PTR, initial: exhausted)
+    mut fx.if_true(found, then: fn[mut self](mut fx1: Fx) {
+        let id = mut self.hardware_id(mut fx1, index: cpu)
+        let unit = mut self.iommu_unit(mut fx1)
+        let remapping = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: unit, y: 0)
+        let message = mut fx1.choose_in(mut self, condition: remapping, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let address = mut lo2.remap(mut fx2, unit, cpu, vector, id, source, validated)
+            let data = mut fx2.ptr(0)
+            return fx2.list2(address, b: data)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let shifted = mut fx2.b.ishl_imm_s(id, y: 12)
+            let address = mut fx2.b.bor_imm_s(shifted, y: MSI_ADDRESS)
+            let far = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: id, y: MSI_ID_MAX)
+            let none = mut fx2.ptr(0)
+            let reached = mut fx2.b.select(far, x: none, y: address)
+            return fx2.list2(reached, b: vector)
+        })
+        expect message.len() > 1
+        let reached = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: message[0], y: 0)
+        let installed = mut fx1.ptr(u64.fit(MSI_INSTALLED))
+        let unreachable = mut fx1.ptr(u64.fit(MSI_UNREACHABLE))
+        let chosen = mut fx1.b.select(reached, x: installed, y: unreachable)
+        mut fx1.b.def_var(outcome, val: chosen)
+        mut fx1.if_true(reached, then: fn[mut self](mut fx2: Fx) {
+            mut fx2.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
+            mut fx2.store(message[0], addr: record, offset: DEVICE_RECORD_MESSAGE)
+            mut fx2.store(message[1], addr: record, offset: DEVICE_RECORD_DATA)
+            let slot = mut self.irq_binding(mut fx2, row, vector)
+            mut self.chain(mut fx2, record, slot)
+        })
     })
-    return outcome
+    return mut fx.b.use_var(outcome)
 } Lowering.x64_install_msi
 
 /// Removes a device record from its binding's chain, and on AArch64 disables a shared peripheral
@@ -333,6 +350,14 @@ fn Lowering.uninstall_device(mut self, mut fx: Fx, record: clif::Value) {
     expect link.len() > 0
     let next = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_NEXT)
     mut fx.b.atomic_store(clif::MemFlags.owned(), x: next, p: link[0])
+    if self.machine_arch() == workspace::Arch.Amd64 {
+        let message = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MESSAGE)
+        let remapped = mut self.remapped_format(mut fx, message)
+        mut fx.if_true(remapped, then: fn[mut self](mut fx1: Fx) {
+            let unit = mut self.iommu_unit(mut fx1)
+            mut self.unremap(mut fx1, unit, message)
+        })
+    }
     if self.machine_arch() == workspace::Arch.Aarch64 {
         let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
         let lpi = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: LPI_BASE)

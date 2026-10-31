@@ -278,6 +278,7 @@ pub struct Dep {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Authority {
     Device,
+    Confined,
     Priv,
     Trusted,
     Validate,
@@ -291,6 +292,7 @@ impl Authority {
     pub fn written(&self) -> String {
         match self {
             Authority::Device => "device".to_owned(),
+            Authority::Confined => "confined".to_owned(),
             Authority::Priv => "priv".to_owned(),
             Authority::Trusted => "trusted".to_owned(),
             Authority::Validate => "validate".to_owned(),
@@ -561,6 +563,7 @@ impl Reader<'_> {
                     }
                     let granted = match authority.as_str() {
                         "device" => Authority::Device,
+                        "confined" => Authority::Confined,
                         "priv" => Authority::Priv,
                         "trusted" => Authority::Trusted,
                         "validate" => Authority::Validate,

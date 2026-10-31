@@ -3,19 +3,21 @@
 //! connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker,
 //! whose cell closes; a channel's sender or receiver, which counts as released; a minter of a
 //! capability kind, which revokes its entries and keeps its state; a device installed behind an
-//! IRQ-safe lock, which is uninstalled and whose record is freed, the device left as it is; and a
-//! stepper, whose record is settled.
+//! IRQ-safe lock, which is uninstalled and whose record is freed, the device left as it is; a
+//! stepper, whose record is settled; and on a machine target a DMA buffer's mapping in an I/O
+//! domain, an I/O domain or a PCI function, which std's `hw` unmaps, closes or cuts off.
 //!
 //! A holding's record is its links, its owner, zero while no domain owns it, its kind and what
 //! it holds: a descriptor, a capability or cell handle, a channel's record, a minter's state
-//! record, a device's record or a stepper's record. The lock of the cell and capability tables
-//! guards the lists.
+//! record, a device's record, a stepper's record or the record `hw` keeps. The lock of the cell
+//! and capability tables guards the lists.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
+use super::super::supplied::hw::iommu;
 use super::super::supplied::sims;
 use super::super::supplied::tasks::{channels, components};
 use super::super::transfer;
@@ -40,6 +42,8 @@ pub mod kind {
     pub const MINTER: i64 = 6;
     pub const UNINSTALL: i64 = 7;
     pub const STEPPER: i64 = 8;
+    pub const UNMAP: i64 = 9;
+    pub const DETACH: i64 = 10;
 }
 
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
@@ -215,6 +219,15 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
         });
         let stepper = is(fx, kind::STEPPER);
         fx.when(stepper, |fx| components::withdraw(lo, fx, payload));
+        if lo.machine() {
+            let unmap = is(fx, kind::UNMAP);
+            let detach = is(fx, kind::DETACH);
+            let cut = fx.b.ins().bor(unmap, detach);
+            fx.when(cut, |fx| {
+                let args = [Held::Scalar(kind), Held::Scalar(payload)];
+                iommu::call_hw(lo, fx, "settled", &args);
+            });
+        }
         lo.record_free(fx, record);
     });
 }

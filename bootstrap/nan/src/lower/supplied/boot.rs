@@ -1,6 +1,6 @@
 //! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root
 //! allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start
-//! information, the firmware services of the UEFI targets, the anchor a kernel installs before
+//! information, the IOMMU and PCI functions std's `hw` enables and lists, the firmware services of the UEFI targets, the anchor a kernel installs before
 //! its executor starts, and what the start information and the firmware's tables give std. The
 //! installed anchor lies in storage the image reserves, whose address and the location of the
 //! `anchor` call the runtime state records.
@@ -40,6 +40,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.ring0" | "boot::Machine.ring0" => ring0(lo, fx, supply),
         "boot::Kernel.regions" => regions(lo, fx, supply),
         "boot::Kernel.modules" => modules(lo, fx, supply),
+        "boot::Kernel.iommu" => iommu(lo, fx, supply),
+        "boot::Kernel.pci_functions" => pci_functions(lo, fx, supply),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
         "boot::Kernel.policy" => lo.install_policy(fx, supply),
         "boot::Module.contents" => module_contents(lo, fx, supply),
@@ -48,13 +50,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             supply.ret(lo, fx, Held::Scalar(info));
         }
         "boot::tree_address" => {
-            let tree = match lo.ck.db.target {
-                Target::Aarch64Bare => {
-                    let state_address = lo.state(fx);
-                    fx.load(PTR, state_address, state::PLATFORM)
-                }
-                _ => fx.ptr(0),
-            };
+            let tree = tree_address(lo, fx);
             supply.ret(lo, fx, Held::Scalar(tree));
         }
         "boot::rsdp_address" => {
@@ -84,6 +80,68 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         _ => return false,
     }
     true
+}
+
+/// The address of the flattened device tree the image started with, zero without one.
+pub fn tree_address(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    match lo.ck.db.target {
+        Target::Aarch64Bare => {
+            let state_address = lo.state(fx);
+            fx.load(PTR, state_address, state::PLATFORM)
+        }
+        _ => fx.ptr(0),
+    }
+}
+
+/// Whether a flag of the root grant was set, setting it.
+fn first_take(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, name: &str) -> Value {
+    let grant = supply.param(0).address();
+    let at = field(lo, supply, name);
+    let taken = fx.load(types::I8, grant, at);
+    let yes = fx.int(types::I8, 1);
+    fx.store(yes, grant, at);
+    fx.b.ins().icmp_imm_s(IntCC::Equal, taken, 0)
+}
+
+/// `k.iommu()`: the first time, what std's `hw` gives on enabling the machine's IOMMU on a
+/// kernel; `None` after, and on a test image.
+fn iommu(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let option = supply.abi.result.clone();
+    if lo.kernel() {
+        let first = first_take(lo, fx, supply, "iommu");
+        fx.when(first, |fx| {
+            let started = super::hw::iommu::call_hw(lo, fx, "started", &[]);
+            supply.ret(lo, fx, started);
+        });
+    }
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
+}
+
+/// `k.pci_functions()`: the first time, the functions std's `hw` enumerates on a kernel, drawn
+/// through the root allocator; an empty list after, and on a test image.
+fn pci_functions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let grant = supply.param(0).address();
+    let alloc = fx.offset(grant, field(lo, supply, "alloc"));
+    if lo.kernel() {
+        let first = first_take(lo, fx, supply, "functions");
+        fx.when(first, |fx| {
+            let functions =
+                super::hw::iommu::call_hw(lo, fx, "enumerated", &[Held::Address(alloc)]);
+            supply.ret(lo, fx, functions);
+        });
+    }
+    let list = supply.sret.expect("the functions' address");
+    let function_ty = supply
+        .abi
+        .result
+        .type_arg(0)
+        .cloned()
+        .expect("the function type");
+    let element = Element::of(lo, &function_ty);
+    let cell = fx.load(PTR, alloc, 0);
+    vector::empty(fx, list, cell, element);
+    supply.ret(lo, fx, Held::Address(list));
 }
 
 /// The offset of a field of the root grant the operation is named after.

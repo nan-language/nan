@@ -1,12 +1,14 @@
 //! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA
-//! buffers, the CPU-facing operations, and physical memory.
+//! buffers, the CPU-facing operations, physical memory, and what the IOMMU and PCI code of std
+//! needs.
 
 mod cpu;
+pub mod iommu;
 mod physical;
 mod sync;
 mod windows;
 
-use cranelift_codegen::ir::Value;
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
@@ -18,6 +20,9 @@ pub use physical::{region, region_cell};
 pub use windows::dma_access;
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
+    if iommu::lower(lo, fx, supply) {
+        return true;
+    }
     let owner = supply
         .path
         .rsplit_once('.')
@@ -71,7 +76,8 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
             let value = ty.type_arg(0).cloned().expect("a wrapped type");
             lo.transfers(&value)
         }
-        "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => true,
+        "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
+        | "hw::IoDomain" | "hw::PciFunction" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
         | "hw::PageTableRoot" => false,
         _ => return None,
@@ -106,9 +112,22 @@ pub fn transfer(
             lo.transfer(fx, &wrapped(), value, lift, owner);
         }
         "hw::PerCpu" => sync::transfer_per_cpu(lo, fx, &wrapped(), address, lift, owner),
-        "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => {
+        "hw::Dma" | "hw::DmaShared" => {
             let contents = fx.load(PTR, address, 0);
             super::super::transfer::lift(lo, fx, contents, lift);
+            let mapping = fx.load(PTR, address, 8);
+            let mapped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mapping, 0);
+            fx.when(mapped, |fx| {
+                super::super::transfer::rehome(lo, fx, mapping, owner)
+            });
+        }
+        "hw::IdtInstalled" => {
+            let contents = fx.load(PTR, address, 0);
+            super::super::transfer::lift(lo, fx, contents, lift);
+        }
+        "hw::IoDomain" | "hw::PciFunction" => {
+            let record = fx.load(PTR, address, 0);
+            super::super::transfer::rehome(lo, fx, record, owner);
         }
         _ => return false,
     }

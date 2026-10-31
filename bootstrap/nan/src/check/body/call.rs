@@ -2987,7 +2987,7 @@ impl Body<'_, '_> {
         args: &[ast::Arg],
         markers: Markers,
     ) -> TExpr {
-        self.ck.require(self.item, token, Authority::Device);
+        self.ck.require(self.item, token, Authority::Confined);
         let layout = receiver.ty.type_arg(0).cloned().unwrap_or(Ty::Error);
         let Some(first) = args.first() else {
             self.report(token, Code::HwDmaOperand);

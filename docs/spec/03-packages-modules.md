@@ -43,7 +43,7 @@ entry_directive = 'entry' IDENT NL ;
 codegen_directive = 'codegen' target_list NL ;
 dep_directive = 'dep' IDENT TEXT NL ;
 allow_directive = 'allow' authority "in" name_list NL ;
-authority = 'device' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;
+authority = 'device' | 'confined' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;
 name_list = IDENT ( "," IDENT )* ;
 deny_directive = 'deny' IDENT "->" IDENT NL ;
 ```

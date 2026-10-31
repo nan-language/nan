@@ -246,3 +246,10 @@ fn x64_stubs_run_their_instructions() {
     }
     assert!(contains(&bytes(Stub::UserClose), &[0x0f, 0x01, 0xca]));
 }
+
+#[test]
+fn aarch64_psci_stubs_call_through_their_conduit() {
+    let exception = |opc: u32, ll: u32| 0xD400_0000 | opc << 21 | ll;
+    assert_eq!(words(Stub::Hvc), [exception(0, 0b10), RET], "hvc #0");
+    assert_eq!(words(Stub::Smc), [exception(0, 0b11), RET], "smc #0");
+}

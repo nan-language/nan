@@ -15,17 +15,19 @@ use super::super::runtime::{report, state, system};
 use super::heap::{self, BOOT_HEAP};
 use super::start::{self, info, map_entry, module};
 use super::{
-    A64_ACCESS, A64_ATTR_NORMAL, A64_INNER, A64_TABLE, A64_VALID, LARGE, MAPPED, PRESENT, Stub,
-    WRITABLE,
+    A64_DEVICE_BLOCK, A64_NORMAL_BLOCK, A64_TABLE, A64_VALID, LARGE, MAPPED, PRESENT, Stub,
+    TABLE_ENTRIES, WRITABLE,
 };
 use crate::workspace::{Arch, Kind, Target};
 
 /// The bytes of the boot area: the boot heap, then the runtime tables, to a whole page.
 pub const BOOT_AREA: u64 = (BOOT_HEAP + system::TABLE_BYTES).next_multiple_of(TABLE);
 
-/// The bytes of a page table, and the bytes an entry of its upper tables maps: a gigabyte.
+/// The bytes of a page table, the bytes an entry of its upper tables maps, a gigabyte, and the
+/// bytes an AArch64 level-2 block maps.
 const TABLE: u64 = 4_096;
 const GIGABYTE: u64 = 1 << 30;
+const BLOCK: u64 = 2 << 20;
 
 /// The memory the entry root can map at its physical addresses: the lower half of the 48-bit
 /// address space, below 128 TiB.
@@ -34,14 +36,17 @@ const REACHABLE: u64 = 1 << 47;
 /// The first mebibyte, which usable memory leaves out on x86_64.
 const LOW_MEMORY: i64 = 0x10_0000;
 
-/// The usable entries of a UEFI memory map: in a descriptor the offsets of its type, physical
-/// start and page count, and the types of conventional memory and of boot services' code and
-/// data, which `exit_services` frees.
+/// The entries of a UEFI memory map: in a descriptor the offsets of its type, physical start and
+/// page count; the types of conventional memory and of boot services' code and data, which
+/// `exit_services` frees; and the types of memory the AArch64 entry root maps as normal memory:
+/// the loader's code and data, boot and runtime services' code and data, conventional memory,
+/// ACPI reclaimable memory, ACPI NVS and persistent memory.
 mod firmware_map {
     pub const KIND: u64 = 0;
     pub const BASE: u64 = 8;
     pub const PAGES: u64 = 24;
     pub const USABLE: [i64; 3] = [3, 4, 7];
+    pub const MAPPED: [i64; 10] = [1, 2, 3, 4, 5, 6, 7, 9, 10, 14];
 }
 
 /// The flattened device tree `aarch64-bare` enters with, whose words are big-endian: the offsets
@@ -50,7 +55,7 @@ mod firmware_map {
 /// ending the block, any other being one word; in a property the offsets of its value's length,
 /// of its name's offset in the strings block and of its value; a reservation's size and the
 /// offset of its length; and the root's cells of an address and of a size when it states none.
-mod device_tree {
+pub(super) mod device_tree {
     pub const SIZE: u64 = 4;
     pub const STRUCTURE: u64 = 8;
     pub const STRINGS: u64 = 12;
@@ -111,10 +116,11 @@ impl Lowering<'_, '_> {
         (tables, end)
     }
 
-    /// The boot area with the tables extending the entry root at its end, carved outside the
-    /// image, its runtime tables zero-filled; `Init` returns 1 when no usable memory holds it.
-    /// Extends the entry root, which the entry seam installed, and on AArch64 installs it again so
-    /// that its walks see the tables written.
+    /// The boot area with the entry root's tables at its end, carved outside the image, its
+    /// runtime tables zero-filled; `Init` returns 1 when no usable memory holds it. On x86_64 it
+    /// extends the entry root, which the entry seam installed; on AArch64 it fills the entry root,
+    /// drops any cache line holding the tables it wrote through the boot root's device mapping,
+    /// and installs it in place of the boot root before filling the runtime tables.
     fn carve_boot_area(&mut self, fx: &mut Fx) -> Value {
         let extension = self.root_extension(fx);
         let image = self.image_extent(fx);
@@ -124,13 +130,19 @@ impl Lowering<'_, '_> {
         system::unavailable_if(fx, missing);
         let tables = fx.offset(area, BOOT_HEAP);
         let len = fx.ptr(system::TABLE_BYTES);
-        heap::clear(self, fx, tables, len);
-        let root_tables = fx.offset(area, BOOT_AREA);
-        self.write_root_extension(fx, extension, root_tables);
         if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            let root_tables = fx.offset(area, BOOT_AREA);
+            self.write_root_extension(fx, extension, root_tables);
+            let bytes = extension.bytes;
+            self.call_stub(fx, Stub::InvalidateCache, &[root_tables, bytes]);
             let root = self.entry_root();
             let root = self.data_address(fx, root);
             self.call_stub(fx, Stub::WriteTtbr0, &[root]);
+            heap::clear(self, fx, tables, len);
+        } else {
+            heap::clear(self, fx, tables, len);
+            let root_tables = fx.offset(area, BOOT_AREA);
+            self.write_root_extension(fx, extension, root_tables);
         }
         area
     }
@@ -147,12 +159,16 @@ impl Lowering<'_, '_> {
     }
 
     /// The lowest chunk-aligned address of usable memory outside the `held` ranges from which
-    /// `bytes` lie wholly in that usable memory below 4 GiB, where the entry root's own tables
-    /// map them; all ones when there is none.
+    /// `bytes` lie wholly in that usable memory below 4 GiB on x86_64, where the entry root's
+    /// own tables map them, and below 512 GiB on AArch64, where the boot root does; all ones
+    /// when there is none.
     fn carve(&mut self, fx: &mut Fx, bytes: Value, held: &[(Value, Value)]) -> Value {
         let none = fx.ptr(u64::MAX);
         let lowest = fx.var(PTR, none);
-        let mapped = fx.ptr(MAPPED);
+        let mapped = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => fx.ptr(TABLE_ENTRIES * GIGABYTE),
+            _ => fx.ptr(MAPPED),
+        };
         self.usable_memory(fx, held, &mut |_, fx, base, end| {
             let bumped = fx.b.ins().iadd_imm_s(base, CHUNK as i64 - 1);
             let aligned = fx.b.ins().band_imm_s(bumped, -(CHUNK as i64));
@@ -168,28 +184,35 @@ impl Lowering<'_, '_> {
         fx.b.use_var(lowest)
     }
 
-    /// The extension of the entry root over the usable memory the platform lists above 4 GiB, up
-    /// to its end rounded up to a gigabyte: its upper tables, one per 512 GiB past the root's own,
-    /// and on x86_64, when the CPU maps no 1 GiB pages, a page directory per gigabyte past 4 GiB.
+    /// The extension of the entry root up to the end of the memory it maps rounded up to a
+    /// gigabyte: its upper tables, one per 512 GiB past the root's own, and the tables of 2 MiB
+    /// entries it adds. On x86_64 it maps the usable memory the platform lists above 4 GiB, and,
+    /// when the CPU maps no 1 GiB pages, adds a page directory per gigabyte past 4 GiB; on AArch64
+    /// it maps the memory `mapped_memory` visits and adds a level-2 table per gigabyte.
     fn root_extension(&mut self, fx: &mut Fx) -> Extension {
-        let floor = fx.ptr(MAPPED);
+        let aarch64 = self.ck.db.target.arch() == Some(Arch::Aarch64);
+        let floor = fx.ptr(if aarch64 { 0 } else { MAPPED });
         let top = fx.var(PTR, floor);
-        self.usable_memory(fx, &[], &mut |_, fx, base, end| {
+        let mut raise = |_: &mut Lowering, fx: &mut Fx, base: Value, end: Value| {
             let held = fx.b.use_var(top);
             let present = fx.b.ins().icmp(IntCC::UnsignedLessThan, base, end);
             let higher = fx.b.ins().umax(held, end);
             let next = fx.b.ins().select(present, higher, held);
             fx.b.def_var(top, next);
-        });
+        };
+        match aarch64 {
+            true => self.mapped_memory(fx, &mut raise),
+            false => self.usable_memory(fx, &[], &mut raise),
+        }
         let top = fx.b.use_var(top);
         let bumped = fx.b.ins().iadd_imm_s(top, GIGABYTE as i64 - 1);
         let gigabytes = fx.b.ins().ushr_imm_s(bumped, 30);
         let bumped = fx.b.ins().iadd_imm_s(gigabytes, 511);
         let spanned = fx.b.ins().ushr_imm_s(bumped, 9);
         let uppers = fx.b.ins().iadd_imm_s(spanned, -1);
-        let (pages, tables) = match self.ck.db.target.arch() {
-            Some(Arch::Aarch64) => (None, uppers),
-            _ => {
+        let (pages, tables) = match aarch64 {
+            true => (None, fx.b.ins().iadd(uppers, gigabytes)),
+            false => {
                 let pages = self.call_stub(fx, Stub::GigabytePages, &[])[0];
                 let zero = fx.ptr(0);
                 let past =
@@ -208,11 +231,12 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// Extends the entry root in place over the gigabytes past the first 4 that `extension` maps,
-    /// with its tables at `tables`, zero-filled first, whose extent it records in the runtime
-    /// state. Each gigabyte gets an entry in its upper table, the root's own for the first
-    /// 512 GiB: on AArch64 a 1 GiB block, on x86_64 a 1 GiB page or, when the CPU maps none, a
-    /// page directory of 2 MiB pages, the directories following the upper tables.
+    /// Writes the entry root's tables at `tables`, zero-filled first, whose extent it records in
+    /// the runtime state. On x86_64 it extends the root in place over the gigabytes past the first
+    /// 4 that `extension` maps: each gets an entry in its upper table, the root's own for the
+    /// first 512 GiB, a 1 GiB page or, when the CPU maps none, a page directory of 2 MiB pages,
+    /// the directories following the upper tables. On AArch64 it fills the root, its level-2
+    /// tables following the upper tables.
     fn write_root_extension(&mut self, fx: &mut Fx, extension: Extension, tables: Value) {
         let state_address = self.state(fx);
         fx.store(tables, state_address, state::ENTRY_TABLES);
@@ -224,13 +248,11 @@ impl Lowering<'_, '_> {
         let own = fx.offset(root, TABLE);
         let skipped = fx.b.ins().ishl_imm_s(extension.uppers, 12);
         let directories = fx.b.ins().iadd(tables, skipped);
-        let (link, block) = match self.ck.db.target.arch() {
-            Some(Arch::Aarch64) => (
-                A64_VALID | A64_TABLE,
-                A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL,
-            ),
-            _ => (WRITABLE | PRESENT, LARGE | WRITABLE | PRESENT),
-        };
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            self.write_aarch64_root(fx, extension, (root, own), tables, directories);
+            return;
+        }
+        let (link, block) = (WRITABLE | PRESENT, LARGE | WRITABLE | PRESENT);
         let first = fx.ptr(MAPPED / GIGABYTE);
         fx.each(first, extension.gigabytes, |fx, gigabyte| {
             let index = fx.b.ins().ushr_imm_s(gigabyte, 9);
@@ -274,6 +296,75 @@ impl Lowering<'_, '_> {
         });
     }
 
+    /// Fills the AArch64 entry root, its level-0 table at `root.0` and level-1 table at `root.1`,
+    /// with the upper tables of `extension` at `tables` and its level-2 tables at `leaves`, a
+    /// table per gigabyte below the top of the memory it maps: each 2 MiB block of that memory as
+    /// normal memory and every other block of the gigabytes the level-1 tables span as device
+    /// memory.
+    fn write_aarch64_root(
+        &mut self,
+        fx: &mut Fx,
+        extension: Extension,
+        root: (Value, Value),
+        tables: Value,
+        leaves: Value,
+    ) {
+        let spanned = fx.b.ins().iadd_imm_s(extension.uppers, 1);
+        let count = fx.b.ins().ishl_imm_s(spanned, 9);
+        let zero = fx.ptr(0);
+        fx.each(zero, count, |fx, gigabyte| {
+            let index = fx.b.ins().ushr_imm_s(gigabyte, 9);
+            let offset = fx.b.ins().ishl_imm_s(index, 12);
+            let added = fx.b.ins().iadd(tables, offset);
+            let added = fx.b.ins().iadd_imm_s(added, -(TABLE as i64));
+            let first_upper = fx.b.ins().icmp_imm_s(IntCC::Equal, index, 0);
+            let upper = fx.b.ins().select(first_upper, root.1, added);
+            let linked = fx.b.ins().bor_imm_s(upper, (A64_VALID | A64_TABLE) as i64);
+            let slot = fx.b.ins().ishl_imm_s(index, 3);
+            let slot = fx.b.ins().iadd(root.0, slot);
+            fx.store(linked, slot, 0);
+            let address = fx.b.ins().ishl_imm_s(gigabyte, 30);
+            let leaf = fx.b.ins().ishl_imm_s(gigabyte, 12);
+            let leaf = fx.b.ins().iadd(leaves, leaf);
+            let below =
+                fx.b.ins()
+                    .icmp(IntCC::UnsignedLessThan, gigabyte, extension.gigabytes);
+            fx.when(below, |fx| {
+                let zero = fx.ptr(0);
+                let entries = fx.ptr(TABLE_ENTRIES);
+                fx.each(zero, entries, |fx, block| {
+                    let at = fx.b.ins().ishl_imm_s(block, 21);
+                    let at = fx.b.ins().bor(address, at);
+                    let entry = fx.b.ins().bor_imm_s(at, A64_DEVICE_BLOCK as i64);
+                    let slot = fx.b.ins().ishl_imm_s(block, 3);
+                    let slot = fx.b.ins().iadd(leaf, slot);
+                    fx.store(entry, slot, 0);
+                });
+            });
+            let linked = fx.b.ins().bor_imm_s(leaf, (A64_VALID | A64_TABLE) as i64);
+            let block = fx.b.ins().bor_imm_s(address, A64_DEVICE_BLOCK as i64);
+            let entry = fx.b.ins().select(below, linked, block);
+            let within = fx.b.ins().band_imm_s(gigabyte, 511);
+            let within = fx.b.ins().ishl_imm_s(within, 3);
+            let slot = fx.b.ins().iadd(upper, within);
+            fx.store(entry, slot, 0);
+        });
+        let blocks = fx.b.ins().ishl_imm_s(extension.gigabytes, 9);
+        self.mapped_memory(fx, &mut |_, fx, base, end| {
+            let first = fx.b.ins().ushr_imm_s(base, 21);
+            let last = fx.b.ins().iadd_imm_s(end, BLOCK as i64 - 1);
+            let last = fx.b.ins().ushr_imm_s(last, 21);
+            let last = fx.b.ins().umin(last, blocks);
+            fx.each(first, last, |fx, block| {
+                let at = fx.b.ins().ishl_imm_s(block, 21);
+                let entry = fx.b.ins().bor_imm_s(at, A64_NORMAL_BLOCK as i64);
+                let slot = fx.b.ins().ishl_imm_s(block, 3);
+                let slot = fx.b.ins().iadd(leaves, slot);
+                fx.store(entry, slot, 0);
+            });
+        });
+    }
+
     /// The boot area in the zeroed data the image reserves for it with one chunk more, so that it
     /// aligns to a chunk wherever the image is loaded.
     fn reserve_boot_area(&mut self, fx: &mut Fx) -> Value {
@@ -297,6 +388,27 @@ impl Lowering<'_, '_> {
     /// without one, the ranges of the device tree's memory nodes and, on a UEFI target, the
     /// usable entries of the firmware's final memory map.
     pub fn usable_memory(&mut self, fx: &mut Fx, held: &[(Value, Value)], visit: Visit) {
+        self.listed_memory(fx, Listed::Usable, held, visit);
+    }
+
+    /// Visits the memory the AArch64 entry root maps as normal memory, whole: the ranges of the
+    /// device tree's memory nodes, or the usable, ACPI reclaimable and ACPI NVS entries of the
+    /// start information's memory map, or the entries of the firmware's final memory map that are
+    /// neither reserved, unusable nor memory-mapped I/O; and the image.
+    fn mapped_memory(&mut self, fx: &mut Fx, visit: Visit) {
+        self.listed_memory(fx, Listed::Mapped, &[], visit);
+        let (start, end) = self.image_extent(fx);
+        visit(self, fx, start, end);
+    }
+
+    /// Visits the usable or mapped memory the platform lists.
+    fn listed_memory(
+        &mut self,
+        fx: &mut Fx,
+        listed: Listed,
+        held: &[(Value, Value)],
+        visit: Visit,
+    ) {
         let state_address = self.state(fx);
         match self.ck.db.target {
             Target::X64Uefi | Target::Aarch64Uefi => {
@@ -305,13 +417,17 @@ impl Lowering<'_, '_> {
                 let stride = fx.load(PTR, state_address, state::MAP_STRIDE);
                 let count = fx.b.ins().udiv(size, stride);
                 let zero = fx.ptr(0);
+                let kinds: &[i64] = match listed {
+                    Listed::Usable => &firmware_map::USABLE,
+                    Listed::Mapped => &firmware_map::MAPPED,
+                };
                 fx.each(zero, count, |fx, index| {
                     let offset = fx.b.ins().imul(index, stride);
                     let entry = fx.b.ins().iadd(map, offset);
                     let kind = fx.load(types::I32, entry, firmware_map::KIND);
                     let mut free = fx.int(types::I8, 0);
-                    for usable_kind in firmware_map::USABLE {
-                        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, usable_kind);
+                    for usable_kind in kinds {
+                        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, *usable_kind);
                         free = fx.b.ins().bor(free, same);
                     }
                     fx.when(free, |fx| {
@@ -319,7 +435,8 @@ impl Lowering<'_, '_> {
                         let pages = fx.load(PTR, entry, firmware_map::PAGES);
                         let bytes = fx.b.ins().ishl_imm_s(pages, 12);
                         let end = fx.b.ins().iadd(base, bytes);
-                        visit_unheld(self, fx, held, Holds::default(), (base, end), visit);
+                        let range = (base, end);
+                        reach(self, fx, listed, held, Holds::default(), range, visit);
                     });
                 });
             }
@@ -336,25 +453,53 @@ impl Lowering<'_, '_> {
                         |fx| vec![fx.ptr(0)],
                     )[0];
                     let held = [&[(tree, tree_end)], held].concat();
-                    start_memory(self, fx, info, &held, visit);
+                    start_memory(self, fx, info, listed, &held, visit);
                 });
                 let absent = fx.b.ins().bxor_imm_s(given, 1);
-                fx.when(absent, |fx| tree_memory(self, fx, tree, held, visit));
+                fx.when(absent, |fx| {
+                    tree_memory(self, fx, tree, listed, held, visit)
+                });
             }
             _ => {
                 let info = self.start_info(fx);
-                start_memory(self, fx, info, held, visit);
+                start_memory(self, fx, info, listed, held, visit);
             }
         }
     }
 }
 
-/// The usable entries of a start information's memory map, which version 1 of it has, visited
-/// outside the `held` ranges and those the start information holds.
+/// Which memory a walk of the platform's memory visits: the usable memory outside the ranges it
+/// holds, or the memory the AArch64 entry root maps as normal memory.
+#[derive(Clone, Copy)]
+enum Listed {
+    Usable,
+    Mapped,
+}
+
+/// Visits a range a walk of the platform's memory found: its parts outside the `held` ranges and
+/// the `holds` for usable memory, all of it for mapped memory.
+fn reach(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    listed: Listed,
+    held: &[(Value, Value)],
+    holds: Holds,
+    range: (Value, Value),
+    visit: Visit,
+) {
+    match listed {
+        Listed::Usable => visit_unheld(lo, fx, held, holds, range, visit),
+        Listed::Mapped => visit(lo, fx, range.0, range.1),
+    }
+}
+
+/// The usable or mapped entries of a start information's memory map, which version 1 of it has,
+/// usable ones visited outside the `held` ranges and those the start information holds.
 fn start_memory(
     lo: &mut Lowering,
     fx: &mut Fx,
     start: Value,
+    listed: Listed,
     held: &[(Value, Value)],
     visit: Visit,
 ) {
@@ -372,7 +517,17 @@ fn start_memory(
                 let offset = fx.b.ins().imul_imm_s(index, map_entry::BYTES);
                 let entry = fx.b.ins().iadd(map, offset);
                 let kind = fx.load(types::I32, entry, map_entry::KIND);
-                let free = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, map_entry::USABLE);
+                let free = match listed {
+                    Listed::Usable => fx.b.ins().icmp_imm_s(IntCC::Equal, kind, map_entry::USABLE),
+                    Listed::Mapped => {
+                        let mut free = fx.int(types::I8, 0);
+                        for mapped in map_entry::MAPPED {
+                            let same = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, mapped);
+                            free = fx.b.ins().bor(free, same);
+                        }
+                        free
+                    }
+                };
                 fx.when(free, |fx| {
                     let base = fx.load(PTR, entry, map_entry::BASE);
                     let size = fx.load(PTR, entry, map_entry::SIZE);
@@ -381,7 +536,7 @@ fn start_memory(
                         reserved: None,
                         start: Some(start),
                     };
-                    visit_unheld(lo, fx, held, holds, (base, end), visit);
+                    reach(lo, fx, listed, held, holds, (base, end), visit);
                 });
             });
         });
@@ -516,11 +671,13 @@ fn lowest_overlap(
     (start, stop)
 }
 
-/// A walk of the device tree's structure block: the strings block naming its properties, the
-/// memory reservation block, and the variables holding the depth of the node it is in, whether
-/// that node is a memory node, and the root's cells of an address and of a size.
+/// A walk of the device tree's structure block: the memory it visits, the strings block naming
+/// its properties, the memory reservation block, and the variables holding the depth of the node
+/// it is in, whether that node is a memory node, and the root's cells of an address and of a
+/// size.
 #[derive(Clone, Copy)]
 struct TreeWalk {
+    listed: Listed,
     strings: Value,
     reserved: Value,
     depth: Variable,
@@ -529,10 +686,18 @@ struct TreeWalk {
     size_cells: Variable,
 }
 
-/// The usable memory of `aarch64-bare` without a start information: the ranges in the `reg` property of each memory node of
-/// the device tree, a child of its root named `memory` or `memory@` and a unit address, read in
-/// the root's cells, visited outside the device tree and the `held` ranges.
-fn tree_memory(lo: &mut Lowering, fx: &mut Fx, tree: Value, held: &[(Value, Value)], visit: Visit) {
+/// The usable or mapped memory of `aarch64-bare` without a start information: the ranges in the
+/// `reg` property of each memory node of the device tree, a child of its root named `memory` or
+/// `memory@` and a unit address, read in the root's cells, usable memory visited outside the
+/// device tree, the ranges it reserves and the `held` ranges.
+fn tree_memory(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    tree: Value,
+    listed: Listed,
+    held: &[(Value, Value)],
+    visit: Visit,
+) {
     let structure = tree_address(fx, tree, device_tree::STRUCTURE);
     let strings = tree_address(fx, tree, device_tree::STRINGS);
     let reserved = tree_address(fx, tree, device_tree::RESERVED);
@@ -547,6 +712,7 @@ fn tree_memory(lo: &mut Lowering, fx: &mut Fx, tree: Value, held: &[(Value, Valu
     let size_cells = fx.ptr(device_tree::SIZE_CELLS);
     let size_cells = fx.var(PTR, size_cells);
     let walk = TreeWalk {
+        listed,
         strings,
         reserved,
         depth,
@@ -644,7 +810,7 @@ fn tree_property(
                 reserved: Some(walk.reserved),
                 start: None,
             };
-            visit_unheld(lo, fx, held, holds, (base, end), visit);
+            reach(lo, fx, walk.listed, held, holds, (base, end), visit);
         });
     });
     let padded = fx.b.ins().iadd_imm_s(len, 3);
@@ -654,19 +820,19 @@ fn tree_property(
 
 /// The address `tree` plus the device tree's header word at `field`: that of one of its blocks,
 /// or its end.
-fn tree_address(fx: &mut Fx, tree: Value, field: u64) -> Value {
+pub(super) fn tree_address(fx: &mut Fx, tree: Value, field: u64) -> Value {
     let offset = tree_cell(fx, tree, field);
     fx.b.ins().iadd(tree, offset)
 }
 
 /// The big-endian cell at `offset` past `at`, widened to an address.
-fn tree_cell(fx: &mut Fx, at: Value, offset: u64) -> Value {
+pub(super) fn tree_cell(fx: &mut Fx, at: Value, offset: u64) -> Value {
     let cell = fx.load_ordered(types::I32, at, offset, false, true);
     fx.b.ins().uextend(PTR, cell)
 }
 
 /// The number the `count` cells at `at` hold, the most significant first, to 64 bits.
-fn tree_number(fx: &mut Fx, at: Value, count: Value) -> Value {
+pub(super) fn tree_number(fx: &mut Fx, at: Value, count: Value) -> Value {
     let zero = fx.ptr(0);
     let number = fx.var(PTR, zero);
     fx.each(zero, count, |fx, index| {
@@ -693,7 +859,7 @@ fn memory_node(fx: &mut Fx, name: Value) -> Value {
 
 /// The address after the node name at `name`, which a zero byte ends and zeros pad to whole
 /// words: past the first word whose last byte is zero.
-fn name_end(fx: &mut Fx, name: Value) -> Value {
+pub(super) fn name_end(fx: &mut Fx, name: Value) -> Value {
     fx.repeat(&[name], |fx, state| {
         let last = fx.load(types::I8, state[0], 3);
         let next = fx.b.ins().iadd_imm_s(state[0], 4);
@@ -703,7 +869,7 @@ fn name_end(fx: &mut Fx, name: Value) -> Value {
 }
 
 /// Whether the bytes at `at` start with `text`.
-fn starts_with(fx: &mut Fx, at: Value, text: &[u8]) -> Value {
+pub(super) fn starts_with(fx: &mut Fx, at: Value, text: &[u8]) -> Value {
     let mut same = fx.int(types::I8, 1);
     for (offset, byte) in text.iter().enumerate() {
         let found = fx.load(types::I8, at, offset as u64);

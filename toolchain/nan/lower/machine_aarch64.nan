@@ -1,4 +1,4 @@
-//! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the descriptor names, its ITS set up by `machine_its.nan`, the virtual timer of each CPU, and the vectors the dispatcher of `machine_interrupts.nan` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every exception switches to `SP_EL1`, the CPU's interrupt stack.
+//! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the machine's discovery finds, its ITS set up by `machine_its.nan`, the virtual timer of each CPU, and the vectors the dispatcher of `machine_interrupts.nan` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every exception switches to `SP_EL1`, the CPU's interrupt stack.
 
 /// The EL1 exception vector table and the common seam that follows it. An exception taken from
 /// kernel code enters one of the first four entries on the CPU's interrupt stack, one taken
@@ -84,15 +84,8 @@ const AARCH64_SPURIOUS: i64 = 1020
 
 const AARCH64_SPECIAL: i64 = 4
 
-/// The GICv3 the descriptor names: its distributor, and the first CPU's redistributor, each
-/// CPU's a stride after the previous one with its frame of software-generated and private
-/// interrupts a page after its control frame.
-const GICD: u64 = 0x0800_0000
-
-const GICR: u64 = 0x080A_0000
-
-const GICR_STRIDE: u64 = 0x2_0000
-
+/// The offset in a CPU's redistributor of its frame of software-generated and private
+/// interrupts, a page after its control frame.
 const GICR_SGI: u64 = 0x1_0000
 
 /// The distributor's registers the kernel programs: its control register, set to affinity
@@ -184,6 +177,12 @@ fn aarch64_exception_vector(mut fx: Fx, syndrome: clif::Value) -> clif::Value {
     return mut fx.b.select(abort, x: aborted, y: other)
 } aarch64_exception_vector
 
+/// The distributor's base.
+fn Lowering.distributor(mut self, mut fx: Fx) -> clif::Value {
+    let record = mut self.machine_record(mut fx)
+    return mut fx.load(PTR, addr: record, offset: MACHINE_GICD)
+} Lowering.distributor
+
 /// Reads a GIC CPU-interface, vector-base, timer or counter system register through the
 /// `ReadSysReg` stub.
 fn Lowering.read_sysreg(mut self, mut fx: Fx, register: u16) -> clif::Value {
@@ -202,13 +201,14 @@ fn Lowering.write_sysreg(mut self, mut fx: Fx, register: u16, value: clif::Value
 /// group 1 and enables each that a contribution binds, routed to the boot CPU, and the ITS is
 /// set up; the glue enables the private interrupts on each CPU.
 fn Lowering.aarch64_interrupt_setup(mut self, mut fx: Fx) -> object::FuncId {
-    let ctlr = mut fx.ptr(GICD + GICD_CTLR)
+    let gicd = mut self.distributor(mut fx)
+    let ctlr = mut fx.b.iadd_imm_s(gicd, y: i64.fit(GICD_CTLR))
     let groups = mut fx.ptr(GICD_ARE_GROUPS)
     mut self.mmio_write(mut fx, width: 4, address: ctlr, value: groups)
     let ones = mut fx.ptr(0xFFFF_FFFF)
     var word: u64 = 1
     while word < GICD_SPI_WORDS {
-        let group = mut fx.ptr(GICD + GICD_IGROUPR + 4 * word)
+        let group = mut fx.b.iadd_imm_s(gicd, y: i64.fit(GICD_IGROUPR + 4 * word))
         mut self.mmio_write(mut fx, width: 4, address: group, value: ones)
         word = word + 1
     }
@@ -234,8 +234,10 @@ fn Lowering.aarch64_interrupt_setup(mut self, mut fx: Fx) -> object::FuncId {
 /// installed device.
 fn Lowering.aarch64_route(mut self, mut fx: Fx, vector: clif::Value, cpu: clif::Value) {
     let affinity = mut self.hardware_id(mut fx, index: cpu)
+    let gicd = mut self.distributor(mut fx)
     let shifted = mut fx.b.ishl_imm_s(vector, y: 3)
-    let route = mut fx.b.iadd_imm_s(shifted, y: i64.fit(GICD + GICD_IROUTER))
+    let routed = mut fx.b.iadd(shifted, y: gicd)
+    let route = mut fx.b.iadd_imm_s(routed, y: i64.fit(GICD_IROUTER))
     mut self.mmio_write(mut fx, width: 8, address: route, value: affinity)
     mut self.gic_spi_bit(mut fx, register: GICD_ISENABLER, vector)
 } Lowering.aarch64_route
@@ -250,9 +252,11 @@ fn Lowering.aarch64_disable(mut self, mut fx: Fx, vector: clif::Value) {
 fn Lowering.gic_spi_bit(mut self, mut fx: Fx, register: u64, vector: clif::Value)
     requires register < 0x1000
 {
+    let gicd = mut self.distributor(mut fx)
     let shifted = mut fx.b.ushr_imm_s(vector, y: 5)
     let word = mut fx.b.ishl_imm_s(shifted, y: 2)
-    let at = mut fx.b.iadd_imm_s(word, y: i64.fit(GICD + register))
+    let in_distributor = mut fx.b.iadd(word, y: gicd)
+    let at = mut fx.b.iadd_imm_s(in_distributor, y: i64.fit(register))
     let position = mut fx.b.band_imm_s(vector, y: 31)
     let one = mut fx.ptr(1)
     let bit = mut fx.b.ishl(one, y: position)
@@ -293,9 +297,8 @@ fn Lowering.aarch64_cpu_prepare(mut self, vbar: object::FuncId, private: u64) ->
         let table_ref = mut lo1.func_ref(mut fx1, id: vbar)
         let table = mut fx1.b.func_addr(PTR, func_ref: table_ref)
         mut lo1.write_sysreg(mut fx1, register: VBAR_EL1, value: table)
-        let index = mut lo1.running_index(mut fx1)
-        let stride = mut fx1.b.imul_imm_s(index, y: i64.fit(GICR_STRIDE))
-        let base = mut fx1.b.iadd_imm_s(stride, y: i64.fit(GICR))
+        let record = mut lo1.running_cpu(mut fx1)
+        let base = mut fx1.load(PTR, addr: record, offset: CPU_REDISTRIBUTOR)
         let sgi = mut fx1.b.iadd_imm_s(base, y: i64.fit(GICR_SGI))
         let waker = mut fx1.b.iadd_imm_s(base, y: i64.fit(GICR_WAKER))
         let state = mut lo1.mmio_read(mut fx1, width: 4, address: waker)

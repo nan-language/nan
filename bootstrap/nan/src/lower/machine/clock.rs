@@ -8,8 +8,8 @@
 //! On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel
 //! 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the
 //! clock as it starts taking interrupts. The wall clock source is the CMOS clock on
-//! `x86_64-bare`, the PL031 at `0x0901_0000` on `aarch64-bare` and the firmware's `GetTime` on the
-//! UEFI targets, its time read as UTC.
+//! `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's
+//! `GetTime` on the UEFI targets, its time read as UTC.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -19,6 +19,7 @@ use super::super::runtime::tasks::{self, CANCELED, EXPIRED, operation};
 use super::super::runtime::{Routine, state, timers};
 use super::super::supplied::boot::firmware;
 use super::cpus::cpu;
+use super::discovery::machine;
 use super::stubs::Stub;
 use crate::workspace::{Arch, Target};
 
@@ -59,10 +60,6 @@ const CMOS_UPDATING: i64 = 0x80;
 const CMOS_24_HOUR: i64 = 0x02;
 const CMOS_BINARY: i64 = 0x04;
 const CMOS_AFTERNOON: i64 = 0x80;
-
-/// The PL031 of `aarch64-bare`, whose data register at its base counts the seconds since the
-/// Unix epoch.
-const PL031: u64 = 0x0901_0000;
 
 /// The nanoseconds of a second.
 const NS_PER_SECOND: u64 = 1_000_000_000;
@@ -335,7 +332,8 @@ impl Lowering<'_, '_> {
     }
 
     /// Reads the target's wall clock source: whether it gave a time, and that time in
-    /// nanoseconds since the Unix epoch.
+    /// nanoseconds since the Unix epoch. The PL031's data register, at its base, counts the
+    /// seconds since the epoch; an `aarch64-bare` machine without one gives no time.
     pub fn wall_source(&mut self, fx: &mut Fx) -> (Value, Value) {
         match self.ck.db.target {
             Target::X64Bare => {
@@ -343,9 +341,16 @@ impl Lowering<'_, '_> {
                 (valid, self.cmos_time(fx))
             }
             Target::Aarch64Bare => {
-                let address = fx.ptr(PL031);
-                let seconds = self.mmio_read(fx, 4, address);
-                let valid = fx.int(types::I8, 1);
+                let record = self.machine_record(fx);
+                let rtc = fx.load(PTR, record, machine::RTC);
+                let valid = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rtc, 0);
+                let seconds = fx.choose_in(
+                    self,
+                    valid,
+                    &[PTR],
+                    |lo, fx| vec![lo.mmio_read(fx, 4, rtc)],
+                    |_, fx| vec![fx.ptr(0)],
+                )[0];
                 (valid, fx.b.ins().imul_imm_s(seconds, NS_PER_SECOND as i64))
             }
             _ => {

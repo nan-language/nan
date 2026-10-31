@@ -1,6 +1,6 @@
 # 0066. The AArch64 targets
 
-Status: accepted
+Status: accepted; fixed `virt` layout superseded by 0110
 
 ## Context
 

@@ -1,4 +1,4 @@
-//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 at `0x0901_0000` on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
+//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
 
 /// The nanoseconds between a CPU's pacing ticks.
 const PACING_PERIOD: u64 = 10_000_000
@@ -55,10 +55,6 @@ const CMOS_24_HOUR: i64 = 0x02
 const CMOS_BINARY: i64 = 0x04
 
 const CMOS_AFTERNOON: i64 = 0x80
-
-/// The PL031 of `aarch64-bare`, whose data register at its base counts the seconds since the
-/// Unix epoch.
-const PL031: u64 = 0x0901_0000
 
 /// The nanoseconds of a second.
 const NS_PER_SECOND: u64 = 1_000_000_000
@@ -371,7 +367,8 @@ fn Lowering.kernel_cancelled(mut self, mut fx: Fx, op: clif::Value) {
     deliver(mut self, mut fx, op, result: cancelled)
 } Lowering.kernel_cancelled
 
-/// Reads the target's wall clock source.
+/// Reads the target's wall clock source. The PL031's data register, at its base, counts the
+/// seconds since the Unix epoch; an `aarch64-bare` machine without one gives no time.
 fn Lowering.wall_source(mut self, mut fx: Fx) -> WallSource {
     match self.ck.db().target {
         workspace::Target.X64Bare => {
@@ -380,10 +377,15 @@ fn Lowering.wall_source(mut self, mut fx: Fx) -> WallSource {
             return WallSource(valid: valid, now: now)
         }
         workspace::Target.Aarch64Bare => {
-            let address = mut fx.ptr(PL031)
-            let seconds = mut self.mmio_read(mut fx, width: 4, address)
-            let valid = mut fx.int(clif::Type.Int8, value: 1)
-            let now = mut fx.b.imul_imm_s(seconds, y: i64.fit(NS_PER_SECOND))
+            let record = mut self.machine_record(mut fx)
+            let rtc = mut fx.load(PTR, addr: record, offset: MACHINE_RTC)
+            let valid = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rtc, y: 0)
+            let read = mut fx.choose_in(mut self, condition: valid, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                return fx1.list1(mut lo1.mmio_read(mut fx1, width: 4, address: rtc))
+            }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                return fx1.list1(mut fx1.ptr(0))
+            })
+            let now = mut fx.b.imul_imm_s(read[0], y: i64.fit(NS_PER_SECOND))
             return WallSource(valid: valid, now: now)
         }
         else => {

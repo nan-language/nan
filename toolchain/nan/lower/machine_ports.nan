@@ -1,21 +1,15 @@
-//! The ports the machine descriptors name: the serial port reports and test frames are written to, the 16550 on x86_64 and the PL011 on AArch64; the exit port that ends the emulator; and the emulator's configuration device, from which a test image reads the texts naming its run.
+//! The ports the machine descriptors name: the serial port reports and test frames are written to, the 16550 on x86_64 and the UART the AArch64 machine's discovery finds; the exit port that ends the emulator; and the emulator's configuration device, from which a test image reads the texts naming its run.
 
 /// The serial and exit ports the x86_64 descriptors name.
 const SERIAL_PORT: u64 = 0x3F8
 
 const EXIT_PORT: u64 = 0xF4
 
-/// The PL011 UART the AArch64 descriptors name, and its registers: the data register, the flag
-/// register and its transmit-full bit, the integer and fractional baud divisors, the line control
-/// register with eight data bits and its FIFOs enabled, and the control register enabling the UART,
-/// its transmitter and its receiver.
-const PL011: u64 = 0x0900_0000
-
-const PL011_DATA: u64 = 0x00
-
+/// The PL011's registers: the data register, the flag register, whose transmit-full bit is the bit
+/// `TRANSMIT` a 16550's line status register sets while its transmitter is empty, the integer and
+/// fractional baud divisors, the line control register with eight data bits and its FIFOs
+/// enabled, and the control register enabling the UART, its transmitter and its receiver.
 const PL011_FLAG: u64 = 0x18
-
-const PL011_TRANSMIT_FULL: i64 = 1 << 5
 
 const PL011_IBRD: u64 = 0x24
 
@@ -29,23 +23,22 @@ const PL011_CONTROL: u64 = 0x30
 
 const PL011_ENABLE: u64 = 0x301
 
-/// The writes programming the PL011, each a register's offset and its value: the UART off, the
-/// divisors giving 115200 baud from the `virt` board's 24 MHz UART clock, 8N1 with the FIFOs on,
-/// then the UART on.
-const PL011_SETUP: Array[RegisterWrite, 5] = listed_pl011_setup()
+const TRANSMIT: i64 = 0x20
 
-fn listed_pl011_setup() -> Array[RegisterWrite, 5] {
-    var listed = Array[RegisterWrite, 5].filled(RegisterWrite(register: PL011_CONTROL, value: 0))
-    listed[1] = RegisterWrite(register: PL011_IBRD, value: 13)
-    listed[2] = RegisterWrite(register: PL011_FBRD, value: 1)
-    listed[3] = RegisterWrite(register: PL011_LINE_CONTROL, value: PL011_EIGHT_BITS)
-    listed[4] = RegisterWrite(register: PL011_CONTROL, value: PL011_ENABLE)
+/// The divisors giving 115200 baud from a 24 MHz UART clock, which a PL011 the firmware left
+/// without a divisor gets.
+const PL011_DIVISORS: Array[RegisterWrite, 2] = listed_pl011_divisors()
+
+fn listed_pl011_divisors() -> Array[RegisterWrite, 2] {
+    var listed = Array[RegisterWrite, 2].filled(RegisterWrite(register: PL011_IBRD, value: 13))
+    listed[1] = RegisterWrite(register: PL011_FBRD, value: 1)
     return listed
-} listed_pl011_setup
+} listed_pl011_divisors
 
-/// The writes programming the 16550, each a register's offset and its value: no
+/// The writes programming the 16550, each a register's index and its value: no
 /// interrupts, the divisor latch open, divisor 1, then 8N1 with the latch closed, the FIFOs on
-/// and cleared, and the modem lines raised with loopback off.
+/// and cleared, and the modem lines raised with loopback off. A memory-mapped 16550 keeps its
+/// divisor and gets the writes after the divisor's.
 const SERIAL_SETUP: Array[RegisterWrite, 7] = listed_serial_setup()
 
 fn listed_serial_setup() -> Array[RegisterWrite, 7] {
@@ -59,85 +52,152 @@ fn listed_serial_setup() -> Array[RegisterWrite, 7] {
     return listed
 } listed_serial_setup
 
+const MAPPED_SETUP: usize = 3
+
 /// A value written to a register at an offset.
 struct RegisterWrite derives Copy {
     register: u64
     value: u64
 } RegisterWrite
 
-/// The UART's line status register and its bit set while the transmitter holds no byte.
+/// The UART's line status register.
 const LINE_STATUS: u64 = 5
 
-const TRANSMITTER_EMPTY: i64 = 0x20
-
-/// Programs the serial port's UART to 115200 baud, 8 data bits, no parity and one stop bit, its
-/// FIFOs on: the 16550 at an x86_64 port, or the PL011 at the AArch64 descriptor's memory-mapped
-/// address.
+/// Programs the serial port's UART to 8 data bits, no parity and one stop bit, its FIFOs on: the
+/// 16550 at an x86_64 port to 115200 baud; on AArch64 the UART the machine record names, keeping
+/// its baud rate, a PL011 without a divisor getting 115200 baud from a 24 MHz clock and an SBSA
+/// generic UART nothing.
 fn Lowering.serial_init(mut self, mut fx: Fx) {
-    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
-        for setup in PL011_SETUP {
-            let at = mut fx.ptr(PL011 + setup.register)
+    if self.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        for setup in SERIAL_SETUP {
+            expect setup.register < 8
+            let port = mut fx.ptr(SERIAL_PORT + setup.register)
             let value = mut fx.ptr(setup.value)
-            mut self.mmio_write(mut fx, width: 4, address: at, value)
+            mut self.port_out(mut fx, width: 1, port, value)
         }
         return
     }
-    for setup in SERIAL_SETUP {
-        expect setup.register < 8
-        let port = mut fx.ptr(SERIAL_PORT + setup.register)
-        let value = mut fx.ptr(setup.value)
-        mut self.port_out(mut fx, width: 1, port, value)
-    }
+    let record = mut self.machine_record(mut fx)
+    let base = mut fx.load(PTR, addr: record, offset: MACHINE_UART)
+    let kind = mut fx.load(PTR, addr: record, offset: MACHINE_UART_KIND)
+    let pl011 = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: UART_PL011)
+    mut fx.if_true(pl011, then: fn[mut self](mut fx1: Fx) {
+        pl011_write(mut self, fx: mut fx1, base, register: PL011_CONTROL, value: 0)
+        let divisor_at = mut fx1.b.iadd_imm_s(base, y: i64.fit(PL011_IBRD))
+        let divisor = mut self.mmio_read(mut fx1, width: 4, address: divisor_at)
+        let unset = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: divisor, y: 0)
+        mut fx1.if_true(unset, then: fn[mut self](mut fx2: Fx) {
+            for setup in PL011_DIVISORS {
+                pl011_write(mut self, fx: mut fx2, base, register: setup.register, value: setup.value)
+            }
+        })
+        pl011_write(mut self, fx: mut fx1, base, register: PL011_LINE_CONTROL, value: PL011_EIGHT_BITS)
+        pl011_write(mut self, fx: mut fx1, base, register: PL011_CONTROL, value: PL011_ENABLE)
+    })
+    let ns16550 = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: UART_NS16550)
+    mut fx.if_true(ns16550, then: fn[mut self](mut fx1: Fx) {
+        for index in MAPPED_SETUP..<SERIAL_SETUP.len() {
+            let setup = SERIAL_SETUP[index]
+            let at = mut self.uart_register(mut fx1, record, index: setup.register)
+            let value = mut fx1.ptr(setup.value)
+            mut self.uart_write(mut fx1, record, at, value)
+        }
+    })
 } Lowering.serial_init
 
-/// Writes a byte range to the serial port, each byte once its transmitter can take one.
+/// Writes `value` to a PL011 register at an offset from its base.
+fn pl011_write(mut lo: Lowering, mut fx: Fx, base: clif::Value, register: u64, value: u64) {
+    let at = mut fx.b.iadd_imm_s(base, y: i64.fit(register))
+    let written = mut fx.ptr(value)
+    mut lo.mmio_write(mut fx, width: 4, address: at, value: written)
+} pl011_write
+
+/// Writes a byte range to the serial port, each byte once its transmitter can take one; on
+/// AArch64 nothing is written when the machine has no UART.
 fn Lowering.serial_write(mut self, mut fx: Fx, text: clif::Value, len: clif::Value) {
-    let aarch64 = self.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
-    let data_address = if aarch64 {
-        PL011 + PL011_DATA
-    } else {
-        SERIAL_PORT
+    if self.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        let data = mut fx.ptr(SERIAL_PORT)
+        let status = mut fx.ptr(SERIAL_PORT + LINE_STATUS)
+        mut self.write_bytes(mut fx, text, len, busy: fn(mut lo1: Lowering, mut fx1: Fx) -> clif::Value {
+            let line = mut lo1.port_in(mut fx1, width: 1, port: status)
+            let flag = mut fx1.b.band_imm_s(line, y: TRANSMIT)
+            return mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: flag, y: 0)
+        }, put: fn(mut lo1: Lowering, mut fx1: Fx, byte: clif::Value) {
+            mut lo1.port_out(mut fx1, width: 1, port: data, value: byte)
+        })
+        return
     }
-    let status_address = if aarch64 {
-        PL011 + PL011_FLAG
-    } else {
-        SERIAL_PORT + LINE_STATUS
-    }
-    let ready = if aarch64 {
-        PL011_TRANSMIT_FULL
-    } else {
-        TRANSMITTER_EMPTY
-    }
-    let data = mut fx.ptr(data_address)
-    let status = mut fx.ptr(status_address)
+    let record = mut self.machine_record(mut fx)
+    let base = mut fx.load(PTR, addr: record, offset: MACHINE_UART)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+    mut fx.if_true(present, then: fn[mut self](mut fx1: Fx) {
+        let kind = mut fx1.load(PTR, addr: record, offset: MACHINE_UART_KIND)
+        let ns16550 = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: UART_NS16550)
+        let status_register = mut self.uart_register(mut fx1, record, index: LINE_STATUS)
+        let flag_at = mut fx1.b.iadd_imm_s(base, y: i64.fit(PL011_FLAG))
+        let status = mut fx1.b.select(ns16550, x: status_register, y: flag_at)
+        let empty = mut fx1.ptr(0)
+        let full = mut fx1.ptr(u64.fit(TRANSMIT))
+        let busy_value = mut fx1.b.select(ns16550, x: empty, y: full)
+        mut self.write_bytes(mut fx1, text, len, busy: fn(mut lo2: Lowering, mut fx2: Fx) -> clif::Value {
+            let line = mut lo2.uart_read(mut fx2, record, at: status)
+            let flag = mut fx2.b.band_imm_s(line, y: TRANSMIT)
+            return mut fx2.b.icmp(clif::IntCC.Equal, x: flag, y: busy_value)
+        }, put: fn(mut lo2: Lowering, mut fx2: Fx, byte: clif::Value) {
+            mut lo2.uart_write(mut fx2, record, at: base, value: byte)
+        })
+    })
+} Lowering.serial_write
+
+/// Writes each byte of a range through `put` once `busy` gives zero.
+fn Lowering.write_bytes(mut self, mut fx: Fx, text: clif::Value, len: clif::Value, busy: fn(mut lo: Lowering, mut fx: Fx) -> clif::Value, put: fn(mut lo: Lowering, mut fx: Fx, byte: clif::Value)) {
     let start = mut fx.ptr(0)
     mut fx.each(start, end: len, body: fn[mut self](mut fx1: Fx, index: clif::Value) {
         discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
-            let line = if aarch64 {
-                mut self.mmio_read(mut fx2, width: 4, address: status)
-            } else {
-                mut self.port_in(mut fx2, width: 1, port: status)
-            }
-            let flag = mut fx2.b.band_imm_s(line, y: ready)
-            // The x86_64 flag is set when the transmitter is free; the PL011 flag when it is full,
-            // so each architecture waits while its own condition on the flag holds.
-            let busy = if aarch64 {
-                mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
-            } else {
-                mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: flag, y: 0)
-            }
-            return Pass(again: busy, next: mem::List[clif::Value].empty(fx2.alloc))
+            let again = busy(mut self, fx: mut fx2)
+            return Pass(again: again, next: mem::List[clif::Value].empty(fx2.alloc))
         })
         let at = mut fx1.b.iadd(text, y: index)
         let loaded = mut fx1.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 0)
         let byte = mut fx1.b.uextend(PTR, x: loaded)
-        if aarch64 {
-            mut self.mmio_write(mut fx1, width: 1, address: data, value: byte)
-        } else {
-            mut self.port_out(mut fx1, width: 1, port: data, value: byte)
-        }
+        put(mut self, fx: mut fx1, byte)
     })
-} Lowering.serial_write
+} Lowering.write_bytes
+
+/// The address of the AArch64 UART's register of an index, its registers lying `1 << shift` bytes
+/// apart.
+fn Lowering.uart_register(mut self, mut fx: Fx, record: clif::Value, index: u64) -> clif::Value {
+    let base = mut fx.load(PTR, addr: record, offset: MACHINE_UART)
+    let shift = mut fx.load(PTR, addr: record, offset: MACHINE_UART_SHIFT)
+    let index_value = mut fx.ptr(index)
+    let offset = mut fx.b.ishl(index_value, y: shift)
+    return mut fx.b.iadd(base, y: offset)
+} Lowering.uart_register
+
+/// Reads an AArch64 UART register at the UART's access width.
+fn Lowering.uart_read(mut self, mut fx: Fx, record: clif::Value, at: clif::Value) -> clif::Value {
+    let width = mut fx.load(PTR, addr: record, offset: MACHINE_UART_WIDTH)
+    let bytes = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: width, y: 1)
+    let read = mut fx.choose_in(mut self, condition: bytes, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut lo1.mmio_read(mut fx1, width: 1, address: at))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut lo1.mmio_read(mut fx1, width: 4, address: at))
+    })
+    return read[0]
+} Lowering.uart_read
+
+/// Writes an AArch64 UART register at the UART's access width.
+fn Lowering.uart_write(mut self, mut fx: Fx, record: clif::Value, at: clif::Value, value: clif::Value) {
+    let width = mut fx.load(PTR, addr: record, offset: MACHINE_UART_WIDTH)
+    let bytes = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: width, y: 1)
+    discard mut fx.choose_in(mut self, condition: bytes, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.mmio_write(mut fx1, width: 1, address: at, value)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.mmio_write(mut fx1, width: 4, address: at, value)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} Lowering.uart_write
 
 /// Ends the machine through the exit port the emulator reads, writing the status byte and then
 /// stopping the processor with maskable interrupts disabled. On AArch64 the exit is a semihosting

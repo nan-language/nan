@@ -146,6 +146,62 @@ fn link_patches_aarch64_branches_pages_and_page_offsets() {
 }
 
 #[test]
+fn link_lists_a_relocated_images_absolute_addresses_after_its_segments() {
+    let mut module = module("aarch64-unknown-none-elf");
+    let signature = module.make_signature();
+    let entry = module
+        .declare_function("entry", Linkage::Local, &signature)
+        .expect("a function");
+    module
+        .define_function_bytes(entry, 16, &code(&[RET]), &[])
+        .expect("the entry");
+    for (name, writable, size) in [
+        (RELOCATION_HEADER, false, RELOCATION_HEADER_BYTES),
+        (IMAGE_EXTENT, true, 16),
+    ] {
+        let id = module
+            .declare_data(name, Linkage::Local, writable, false)
+            .expect("a data object");
+        let mut description = DataDescription::new();
+        description.define(vec![0; size].into_boxed_slice());
+        module.define_data(id, &description).expect("a data object");
+    }
+    let table = module
+        .declare_data("table", Linkage::Local, true, false)
+        .expect("a data object");
+    let mut description = DataDescription::new();
+    description.define(vec![0; 8].into_boxed_slice());
+    let address = module.declare_func_in_data(entry, &mut description);
+    description.write_function_addr(0, address);
+    module
+        .define_data(table, &description)
+        .expect("a data object");
+    let base = elf::base(workspace::Arch::Aarch64);
+    let linked = link(&module.finish().emit().expect("an object"), base, false);
+    let [_, header, data, listed] = &linked.segments[..] else {
+        panic!("{} segments", linked.segments.len());
+    };
+    let words = |bytes: &[u8]| -> Vec<u64> {
+        bytes
+            .chunks(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .collect()
+    };
+    let places: Vec<u64> = linked.absolute.iter().map(|(place, _)| *place).collect();
+    assert_eq!(places.len(), 3, "the table's word and the extent's two");
+    assert_eq!(
+        (listed.address, listed.access),
+        (data.address + 0x1000, Access::Read)
+    );
+    assert_eq!(words(&listed.bytes), places);
+    let end = listed.address + 24;
+    assert_eq!(
+        words(&header.bytes[..RELOCATION_HEADER_BYTES]),
+        [header.address, base, end, listed.address, 3]
+    );
+}
+
+#[test]
 fn base_relocations_group_addresses_by_page_and_pad_odd_blocks() {
     let first: [u8; 16] = [
         0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0xa0, 0x10, 0xa0, 0xf8, 0xaf, 0x00,

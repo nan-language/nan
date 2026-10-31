@@ -39,46 +39,59 @@ const LARGE_PAGE: u64 = 2u64 * 1024 * 1024
 
 const DEVICES: u64 = 3 << 30
 
-/// The bytes a 1 GiB block descriptor maps, the first of which holds the `virt` board's devices.
+/// The bytes a 1 GiB block descriptor maps, and the entries of an AArch64 translation table.
 const AARCH64_BLOCK: u64 = 1 << 30
 
-/// The bits of an AArch64 descriptor: a valid descriptor, a table rather than a block, the access
-/// flag, inner-shareable, and the memory-attribute indices into `MAIR_EL1` of device memory and of
-/// normal write-back memory, as the entry seam programs them.
+const TABLE_ENTRIES: u64 = 512
+
+/// The bits of an AArch64 descriptor: a valid descriptor, a table rather than a block, and the
+/// access flag; a block of normal write-back inner-shareable memory, and one of device memory
+/// that neither EL1 nor EL0 runs code from, of the memory-attribute indices the entry seams
+/// program into `MAIR_EL1`.
 const A64_VALID: u64 = 0x1
 
 const A64_TABLE: u64 = 0x2
 
 const A64_ACCESS: u64 = 0x400
 
-const A64_INNER: u64 = 0x300
+const A64_NORMAL_BLOCK: u64 = A64_VALID | A64_ACCESS | 0x300 | (2 << 2)
 
-const A64_ATTR_DEVICE: u64 = 0 << 2
-
-const A64_ATTR_NORMAL: u64 = 2 << 2
+const A64_DEVICE_BLOCK: u64 = A64_VALID | A64_ACCESS | (3 << 53)
 
 /// The `x86_64-uefi` entry seam's machine code: already in long mode, it sets the boot stack and
 /// calls the boot glue with the image handle and system table the firmware passed.
 const UEFI_SEAM: Slice[u8] = b"\x48\xbc\x00\x00\x00\x00\x00\x00\x00\x00\x48\x89\xcf\x48\x89\xd6\xe8\x00\x00\x00\x00\xf4\xeb\xfd"
 
-/// The `aarch64-bare` entry seam's machine code, entered at EL1 with the MMU off: it enables
-/// floating point and Advanced SIMD, loads the entry root, the memory attributes and the
-/// translation control, which walks the entry root for the low addresses and no table for the
-/// high ones, its physical address size the processor's up to 48 bits, turns the MMU and caches
-/// on, sets the boot stack, and calls the boot glue with the `x0` and `x1` it entered with, `x0`
-/// becoming `0x4000_0000` when both are zero. Its literal pool, after the code, holds the entry
-/// root's address, the memory attributes, the translation control without its physical address
-/// size, the boot stack's top and the boot glue's address; the image writer patches the first,
-/// fourth and fifth.
-const AARCH64_BARE_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x03\x00\x58\x09\x20\x18\xd5\xc9\x03\x00\x58\x09\xa2\x18\xd5\xc9\x03\x00\x58\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x02\x00\x58\x3f\x01\x00\x91\x60\x00\x00\xb5\x41\x00\x00\xb5\x00\x00\xa8\xd2\xa9\x01\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x1f\x20\x03\xd5\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\xff\x00\x00\x00\x00\x00\x10\x35\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+/// The `aarch64-bare` entry seam's machine code, entered at EL1 or EL2 with the MMU off. Entered
+/// at EL2, its first 29 instructions, which the secondary seam begins with too, make EL1 run in
+/// AArch64 with the counters, the GIC CPU interface's system registers and the floating-point
+/// registers untrapped and no virtual counter offset, its `MIDR_EL1` and `MPIDR_EL1` the
+/// processor's and its `SCTLR_EL1` with the MMU, caches and alignment checks off, and return to
+/// the code after them at EL1 with every exception masked. It enables floating point and
+/// Advanced SIMD and makes `x0` `0x4000_0000` when `x0` and `x1` are both zero. From the
+/// relocation header, whose address an `adrp` and `add` form, it takes the distance the image was
+/// loaded from its linked address. It maps each gigabyte the image spans as normal memory in the
+/// boot root, also formed by an `adrp` and `add`, invalidating the cache lines it writes, and
+/// points the boot root's level-0 entry at its level-1 table. It loads the boot root, the memory
+/// attributes and the translation control, which walks the boot root for the low addresses and
+/// no table for the high ones, its physical address size the processor's up to 48 bits, and
+/// turns the MMU and caches on. It then adds that distance to each absolute address the header's
+/// table lists, sets the boot stack, and calls the boot glue with `x0` and `x1`. Its literal pool,
+/// after the code, holds the memory attributes, the translation control without its physical
+/// address size, the bits of a normal 1 GiB block, the boot stack's top and the boot glue's
+/// address; the image writer patches the last two.
+const AARCH64_BARE_SEAM: Slice[u8] = b"\x49\x42\x38\xd5\x3f\x21\x00\xf1\x61\x03\x00\x54\x09\x00\xb0\xd2\x09\x11\x1c\xd5\x09\xe1\x3c\xd5\x29\x05\x40\xb2\x09\xe1\x1c\xd5\x7f\xe0\x1c\xd5\xa9\xc9\x3c\xd5\x2a\x01\x80\xd2\x29\x01\x0a\xaa\xa9\xc9\x1c\xd5\xe9\x7f\x86\xd2\x49\x11\x1c\xd5\x7f\x11\x1c\xd5\x09\x00\x38\xd5\x09\x00\x1c\xd5\xa9\x00\x38\xd5\xa9\x00\x1c\xd5\x09\x00\x81\xd2\x09\x1a\xa6\xf2\x09\x10\x18\xd5\xa9\x78\x80\xd2\x09\x40\x1c\xd5\x89\x00\x00\x10\x29\x40\x1c\xd5\xdf\x3f\x03\xd5\xe0\x03\x9f\xd6\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\x60\x00\x00\xb5\x41\x00\x00\xb5\x00\x00\xa8\xd2\x02\x00\x00\x90\x42\x00\x00\x91\x43\x00\x40\xf9\x43\x00\x03\xcb\x4b\x04\x40\xf9\x6b\x01\x03\x8b\x4c\x08\x40\xf9\x8c\x01\x03\x8b\x8c\x05\x00\xd1\x6b\xfd\x5e\xd3\x8c\xfd\x5e\xd3\x0d\x00\x00\x90\xad\x01\x00\x91\xae\x05\x40\x91\xcf\x05\x40\xb2\xaf\x01\x00\xf9\x2d\x76\x08\xd5\xaf\x06\x00\x58\x7f\x01\x08\xf1\x22\x01\x00\x54\x70\x85\x62\xd3\x10\x02\x0f\xaa\xd1\x0d\x0b\x8b\x30\x02\x00\xf9\x31\x76\x08\xd5\x6b\x05\x00\x91\x7f\x01\x0c\xeb\xe9\xfe\xff\x54\x9f\x3f\x03\xd5\x0d\x20\x18\xd5\x89\x04\x00\x58\x09\xa2\x18\xd5\x89\x04\x00\x58\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x83\x01\x00\xb4\x44\x0c\x40\xf9\x84\x00\x03\x8b\x45\x10\x40\xf9\x05\x01\x00\xb4\x86\x84\x40\xf8\xc6\x00\x03\x8b\xc7\x00\x40\xf9\xe7\x00\x03\x8b\xc7\x00\x00\xf9\xa5\x04\x00\xd1\xf9\xff\xff\x17\x89\x01\x00\x58\x3f\x01\x00\x91\x89\x01\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x00\x44\xff\x00\x00\x00\x00\x00\x10\x35\x80\x00\x00\x00\x00\x00\x09\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 
-/// The offsets within `AARCH64_BARE_SEAM` of the literal-pool entries the image writer patches:
-/// the entry root's address, the boot stack's top and the boot glue's address.
-const AARCH64_SEAM_ROOT: u32 = 0x88
+/// The offsets within `AARCH64_BARE_SEAM` of the `adrp` and `add` forming the relocation header's
+/// address and the boot root's, and of the literal-pool entries the image writer patches: the
+/// boot stack's top and the boot glue's address.
+const AARCH64_SEAM_RELOCATIONS: u32 = 0x90
 
-const AARCH64_SEAM_STACK: u32 = 0xa0
+const AARCH64_SEAM_ROOT: u32 = 0xbc
 
-const AARCH64_SEAM_BOOT: u32 = 0xa8
+const AARCH64_SEAM_STACK: u32 = 0x1b0
+
+const AARCH64_SEAM_BOOT: u32 = 0x1b8
 
 /// The `aarch64-uefi` entry seam's machine code: the firmware calls it in the Procedure Call
 /// Standard with the image handle in `x0` and the system table in `x1`, under the MMU it set up; it
@@ -91,13 +104,14 @@ const AARCH64_UEFI_STACK: u32 = 0x28
 
 const AARCH64_UEFI_BOOT: u32 = 0x30
 
-/// The AArch64 secondary entry seam's machine code, which `PSCI CPU_ON` enters at EL1 with the
-/// MMU off, the start record's address in `x0`. It enables floating point and Advanced SIMD,
-/// installs the entry root and turns the MMU and caches on as the boot seam does, sets the stack the
-/// record names, and calls the record's glue with the record's CPU record. The record holds the
-/// entry root, the stack's top, the glue's address and the CPU record, which it reads before the
-/// MMU is on, from identity-mapped memory.
-const AARCH64_SECONDARY_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x00\x40\xf9\x09\x20\x18\xd5\x09\x80\x88\xd2\xe9\x1f\xa0\xf2\x09\xa2\x18\xd5\x09\xa2\x86\xd2\x09\x10\xa0\xf2\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x04\x40\xf9\x3f\x01\x00\x91\x0a\x08\x40\xf9\x00\x0c\x40\xf9\x40\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17"
+/// The AArch64 secondary entry seam's machine code, which `PSCI CPU_ON` enters at EL1 or EL2 with
+/// the MMU off, the start record's address in `x0`. Entered at EL2, it drops to EL1 as the boot
+/// seam does, by the same instructions. It enables floating point and Advanced SIMD, installs the
+/// entry root and turns the MMU and caches on as the boot seam does, sets the stack the record
+/// names, and calls the record's glue with the record's CPU record. The record holds the entry
+/// root, the stack's top, the glue's address and the CPU record, which it reads before the MMU is
+/// on, from identity-mapped memory.
+const AARCH64_SECONDARY_SEAM: Slice[u8] = b"\x49\x42\x38\xd5\x3f\x21\x00\xf1\x61\x03\x00\x54\x09\x00\xb0\xd2\x09\x11\x1c\xd5\x09\xe1\x3c\xd5\x29\x05\x40\xb2\x09\xe1\x1c\xd5\x7f\xe0\x1c\xd5\xa9\xc9\x3c\xd5\x2a\x01\x80\xd2\x29\x01\x0a\xaa\xa9\xc9\x1c\xd5\xe9\x7f\x86\xd2\x49\x11\x1c\xd5\x7f\x11\x1c\xd5\x09\x00\x38\xd5\x09\x00\x1c\xd5\xa9\x00\x38\xd5\xa9\x00\x1c\xd5\x09\x00\x81\xd2\x09\x1a\xa6\xf2\x09\x10\x18\xd5\xa9\x78\x80\xd2\x09\x40\x1c\xd5\x89\x00\x00\x10\x29\x40\x1c\xd5\xdf\x3f\x03\xd5\xe0\x03\x9f\xd6\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x00\x40\xf9\x09\x20\x18\xd5\x09\x80\x88\xd2\xe9\x1f\xa0\xf2\x09\xa2\x18\xd5\x09\xa2\x86\xd2\x09\x10\xa0\xf2\x0a\x07\x38\xd5\x4a\x0d\x40\x92\x5f\x15\x00\xf1\xab\x00\x80\xd2\x4a\x91\x8b\x9a\x29\x81\x0a\xaa\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x04\x40\xf9\x3f\x01\x00\x91\x0a\x08\x40\xf9\x00\x0c\x40\xf9\x40\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17"
 
 /// The offsets of a secondary start record's fields: the entry root, the stack's top, the glue's
 /// address and the CPU record, as `AARCH64_SECONDARY_SEAM` reads them.
@@ -200,19 +214,44 @@ fn Lowering.uefi_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
     mut self.module.define_function_bytes(seam, align: 16, bytes: UEFI_SEAM, relocs: relocs.view())
 } Lowering.uefi_entry_seam
 
-/// Reserves an `aarch64-bare` image's boot stack and emits the program entry seam, which the
-/// platform enters with the MMU off and which calls `boot` with the device tree's address and
-/// zero.
+/// Reserves an `aarch64-bare` image's boot root, relocation header and boot stack and emits the
+/// program entry seam, which the platform enters with the MMU off and which calls `boot` with the
+/// device tree's address and the start information's.
 fn Lowering.aarch64_bare_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
-    let root = mut self.aarch64_entry_root()
+    let root = mut self.aarch64_boot_root()
+    let relocations = mut self.module.declare_data(image::RELOCATION_HEADER, linkage: object::Linkage.Local, writable: false, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(mem::Bytes.zeroed(image::RELOCATION_HEADER_BYTES, alloc: self.alloc))
+    mut description.set_align(8)
+    mut self.module.define_data(relocations, take description)
     let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
     let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
     var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
-    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_ROOT, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(root), addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_RELOCATIONS, kind: machinst::RelocKind.Arm64AdrPrel, target: object::RelocTarget.Data(relocations), addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_RELOCATIONS + 4, kind: machinst::RelocKind.Arm64AddLo12, target: object::RelocTarget.Data(relocations), addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_ROOT, kind: machinst::RelocKind.Arm64AdrPrel, target: object::RelocTarget.Data(root), addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_ROOT + 4, kind: machinst::RelocKind.Arm64AddLo12, target: object::RelocTarget.Data(root), addend: 0))
     mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_STACK, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
     mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_BOOT, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Function(boot), addend: 0))
     mut self.module.define_function_bytes(seam, align: 16, bytes: AARCH64_BARE_SEAM, relocs: relocs.view())
 } Lowering.aarch64_bare_entry_seam
+
+/// The boot root the `aarch64-bare` entry seam installs, a 4 KiB-granule level-0 table and a
+/// level-1 table mapping the first 512 GiB in 1 GiB blocks of device memory that no code runs
+/// from. The seam points the level-0 table's first entry at the level-1 table and maps the
+/// gigabytes the image spans as normal memory, so that the table holds no absolute address.
+fn Lowering.aarch64_boot_root(mut self) -> object::DataId {
+    let id = mut self.module.declare_data("_NSboot_root", linkage: object::Linkage.Local, writable: true, tls: false)
+    var table_bytes = mem::Bytes.zeroed(4_096, alloc: self.alloc)
+    for gigabyte in 0..<TABLE_ENTRIES {
+        object::append_u64(mut table_bytes, value: (gigabyte * AARCH64_BLOCK) | A64_DEVICE_BLOCK)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take table_bytes)
+    mut description.set_align(4_096)
+    mut self.module.define_data(id, take description)
+    return id
+} Lowering.aarch64_boot_root
 
 /// Reserves an `aarch64-uefi` image's boot stack and emits the program entry seam, which the
 /// firmware calls with the image handle and system table and which calls `boot`.
@@ -272,9 +311,10 @@ fn Lowering.boot_glue(mut self, program: Program) -> object::FuncId {
     return id
 } Lowering.boot_glue
 
-/// The entry root, whose page tables the image holds mapping the first 4 GiB writable at their
-/// physical addresses, which the entry seam or `exit_services` installs, in the format of the
-/// target's architecture.
+/// The entry root, in the format of the target's architecture: on x86_64 the image's page tables
+/// mapping the first 4 GiB writable at their physical addresses, which the entry seam or
+/// `exit_services` installs; on AArch64 tables that `Init` on a bare target and `exit_services` on
+/// a UEFI target fill and install.
 fn Lowering.entry_root(mut self) -> object::DataId {
     if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
         return mut self.aarch64_entry_root()
@@ -326,11 +366,8 @@ fn Lowering.x64_entry_root(mut self) -> object::DataId {
     return id
 } Lowering.x64_entry_root
 
-/// The AArch64 entry root, a 4 KiB-granule level-0 table pointing at a level-1 table of four
-/// 1 GiB block descriptors mapping the first 4 GiB: the first gigabyte, which holds the `virt`
-/// board's devices, as device memory, and the rest as normal write-back inner-shareable memory,
-/// at their physical addresses. Its attribute indices are those the `aarch64-bare` entry seam
-/// programs into `MAIR_EL1`.
+/// The AArch64 entry root, a 4 KiB-granule level-0 table pointing at a level-1 table, which `Init`
+/// on a bare target and `exit_services` on a UEFI target fill.
 fn Lowering.aarch64_entry_root(mut self) -> object::DataId {
     let root_name = "_NSentry_root"
     match self.reservations.get(text::String.of(root_name, alloc: self.alloc)) {
@@ -338,22 +375,8 @@ fn Lowering.aarch64_entry_root(mut self) -> object::DataId {
         None => {}
     }
     let id = mut self.module.declare_data(root_name, linkage: object::Linkage.Local, writable: true, tls: false)
-    // The level-0 table is zeroed; the level-1 table follows it a page later.
-    var table_bytes = mem::Bytes.zeroed(2 * 4_096, alloc: self.alloc)
-    for gigabyte in 0..<(MACHINE_MAPPED / AARCH64_BLOCK) {
-        let address = gigabyte * AARCH64_BLOCK
-        let memory = if address < AARCH64_BLOCK {
-            A64_VALID | A64_ACCESS | A64_ATTR_DEVICE
-        } else {
-            A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL
-        }
-        let block_entry = address | memory
-        let at = usize.widen(4_096 + 8 * gigabyte)
-        var writable = mut table_bytes.view_mut()
-        mut writable.write_u64_le(at, value: block_entry)
-    }
     var description = object::DataDescription.new(self.alloc)
-    mut description.define(take table_bytes)
+    mut description.define(mem::Bytes.zeroed(2 * 4_096, alloc: self.alloc))
     mut description.set_align(4_096)
     let own = mut description.import_data(id)
     mut description.write_data_addr(0, data: own, addend: i64.fit(4_096 + A64_VALID + A64_TABLE))

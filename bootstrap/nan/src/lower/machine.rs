@@ -7,9 +7,11 @@
 //! addresses.
 
 mod aarch64;
+mod acpi;
 mod bindings;
 mod clock;
 mod cpus;
+mod discovery;
 mod handoff;
 pub mod heap;
 mod interrupts;
@@ -82,18 +84,19 @@ const UNCACHED: u64 = 0x18;
 const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 const DEVICES: u64 = 3 << 30;
 
-/// The bytes a 1 GiB block descriptor maps, the first of which holds the `virt` board's devices.
+/// The bytes a 1 GiB block descriptor maps, and the entries of an AArch64 translation table.
 const AARCH64_BLOCK: u64 = 1 << 30;
+pub const TABLE_ENTRIES: u64 = 512;
 
-/// The bits of an AArch64 descriptor: a valid descriptor, a table rather than a block, the access
-/// flag, inner-shareable, and the memory-attribute indices into `MAIR_EL1` of device memory and
-/// of normal write-back memory, as the entry seam programs them.
+/// The bits of an AArch64 descriptor: a valid descriptor, a table rather than a block, and the
+/// access flag; a block of normal write-back inner-shareable memory, and one of device memory
+/// that neither EL1 nor EL0 runs code from, of the memory-attribute indices the entry seams
+/// program into `MAIR_EL1`.
 pub const A64_VALID: u64 = 0x1;
 pub const A64_TABLE: u64 = 0x2;
 pub const A64_ACCESS: u64 = 0x400;
-const A64_INNER: u64 = 0x300;
-const A64_ATTR_DEVICE: u64 = 0 << 2;
-const A64_ATTR_NORMAL: u64 = 2 << 2;
+pub const A64_NORMAL_BLOCK: u64 = A64_VALID | A64_ACCESS | 0x300 | (2 << 2);
+pub const A64_DEVICE_BLOCK: u64 = A64_VALID | A64_ACCESS | (3 << 53);
 
 /// The `x86_64-uefi` entry seam's machine code: already in long mode, it sets the boot stack and
 /// calls the boot glue with the image handle and system table the firmware passed.
@@ -102,34 +105,62 @@ const UEFI_SEAM: &[u8] = &[
     0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4, 0xeb, 0xfd,
 ];
 
-/// The `aarch64-bare` entry seam's machine code, entered at EL1 with the MMU off: it enables
-/// floating point and Advanced SIMD, loads the entry root, the memory attributes and the
-/// translation control, which walks the entry root for the low addresses and no table for the
-/// high ones, its physical address size the processor's up to 48 bits, turns the MMU and caches
-/// on, sets the boot stack, and calls the boot glue with the `x0` and `x1` it entered with, `x0`
-/// becoming `0x4000_0000` when both are zero. Its literal pool, after the code, holds the entry
-/// root's address, the memory attributes, the translation control without its physical address
-/// size, the boot stack's top and the boot glue's address; the image writer patches the first,
-/// fourth and fifth.
+/// The `aarch64-bare` entry seam's machine code, entered at EL1 or EL2 with the MMU off.
+/// Entered at EL2, its first 29 instructions, which the secondary seam begins with too, make
+/// EL1 run in AArch64 with the counters, the GIC CPU interface's system registers and the
+/// floating-point registers untrapped and no virtual counter offset, its `MIDR_EL1` and
+/// `MPIDR_EL1` the processor's and its `SCTLR_EL1` with the MMU, caches and alignment checks
+/// off, and return to the code after them at EL1 with every exception masked. It enables
+/// floating point and Advanced SIMD and makes `x0` `0x4000_0000` when `x0` and `x1` are both
+/// zero. From the relocation header, whose address an `adrp` and `add` form, it takes the
+/// distance the image was loaded from its linked address. It maps each gigabyte the image spans
+/// as normal memory in the boot root, also formed by an `adrp` and `add`, invalidating the
+/// cache lines it writes, and points the boot root's level-0 entry at its level-1 table. It
+/// loads the boot root, the memory attributes and the translation control, which walks the boot
+/// root for the low addresses and no table for the high ones, its physical address size the
+/// processor's up to 48 bits, and turns the MMU and caches on. It then adds that distance to
+/// each absolute address the header's table lists, sets the boot stack, and calls the boot glue
+/// with `x0` and `x1`. Its literal pool, after the code, holds the memory attributes, the
+/// translation control without its physical address size, the bits of a normal 1 GiB block, the
+/// boot stack's top and the boot glue's address; the image writer patches the last two.
 const AARCH64_BARE_SEAM: &[u8] = &[
-    0x49, 0x10, 0x38, 0xd5, 0x29, 0x05, 0x6c, 0xb2, 0x49, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
-    0xc9, 0x03, 0x00, 0x58, 0x09, 0x20, 0x18, 0xd5, 0xc9, 0x03, 0x00, 0x58, 0x09, 0xa2, 0x18, 0xd5,
-    0xc9, 0x03, 0x00, 0x58, 0x0a, 0x07, 0x38, 0xd5, 0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1,
+    0x49, 0x42, 0x38, 0xd5, 0x3f, 0x21, 0x00, 0xf1, 0x61, 0x03, 0x00, 0x54, 0x09, 0x00, 0xb0, 0xd2,
+    0x09, 0x11, 0x1c, 0xd5, 0x09, 0xe1, 0x3c, 0xd5, 0x29, 0x05, 0x40, 0xb2, 0x09, 0xe1, 0x1c, 0xd5,
+    0x7f, 0xe0, 0x1c, 0xd5, 0xa9, 0xc9, 0x3c, 0xd5, 0x2a, 0x01, 0x80, 0xd2, 0x29, 0x01, 0x0a, 0xaa,
+    0xa9, 0xc9, 0x1c, 0xd5, 0xe9, 0x7f, 0x86, 0xd2, 0x49, 0x11, 0x1c, 0xd5, 0x7f, 0x11, 0x1c, 0xd5,
+    0x09, 0x00, 0x38, 0xd5, 0x09, 0x00, 0x1c, 0xd5, 0xa9, 0x00, 0x38, 0xd5, 0xa9, 0x00, 0x1c, 0xd5,
+    0x09, 0x00, 0x81, 0xd2, 0x09, 0x1a, 0xa6, 0xf2, 0x09, 0x10, 0x18, 0xd5, 0xa9, 0x78, 0x80, 0xd2,
+    0x09, 0x40, 0x1c, 0xd5, 0x89, 0x00, 0x00, 0x10, 0x29, 0x40, 0x1c, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
+    0xe0, 0x03, 0x9f, 0xd6, 0x49, 0x10, 0x38, 0xd5, 0x29, 0x05, 0x6c, 0xb2, 0x49, 0x10, 0x18, 0xd5,
+    0xdf, 0x3f, 0x03, 0xd5, 0x60, 0x00, 0x00, 0xb5, 0x41, 0x00, 0x00, 0xb5, 0x00, 0x00, 0xa8, 0xd2,
+    0x02, 0x00, 0x00, 0x90, 0x42, 0x00, 0x00, 0x91, 0x43, 0x00, 0x40, 0xf9, 0x43, 0x00, 0x03, 0xcb,
+    0x4b, 0x04, 0x40, 0xf9, 0x6b, 0x01, 0x03, 0x8b, 0x4c, 0x08, 0x40, 0xf9, 0x8c, 0x01, 0x03, 0x8b,
+    0x8c, 0x05, 0x00, 0xd1, 0x6b, 0xfd, 0x5e, 0xd3, 0x8c, 0xfd, 0x5e, 0xd3, 0x0d, 0x00, 0x00, 0x90,
+    0xad, 0x01, 0x00, 0x91, 0xae, 0x05, 0x40, 0x91, 0xcf, 0x05, 0x40, 0xb2, 0xaf, 0x01, 0x00, 0xf9,
+    0x2d, 0x76, 0x08, 0xd5, 0xaf, 0x06, 0x00, 0x58, 0x7f, 0x01, 0x08, 0xf1, 0x22, 0x01, 0x00, 0x54,
+    0x70, 0x85, 0x62, 0xd3, 0x10, 0x02, 0x0f, 0xaa, 0xd1, 0x0d, 0x0b, 0x8b, 0x30, 0x02, 0x00, 0xf9,
+    0x31, 0x76, 0x08, 0xd5, 0x6b, 0x05, 0x00, 0x91, 0x7f, 0x01, 0x0c, 0xeb, 0xe9, 0xfe, 0xff, 0x54,
+    0x9f, 0x3f, 0x03, 0xd5, 0x0d, 0x20, 0x18, 0xd5, 0x89, 0x04, 0x00, 0x58, 0x09, 0xa2, 0x18, 0xd5,
+    0x89, 0x04, 0x00, 0x58, 0x0a, 0x07, 0x38, 0xd5, 0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1,
     0xab, 0x00, 0x80, 0xd2, 0x4a, 0x91, 0x8b, 0x9a, 0x29, 0x81, 0x0a, 0xaa, 0x49, 0x20, 0x18, 0xd5,
     0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x37, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x10, 0x38, 0xd5,
     0xaa, 0x00, 0x82, 0xd2, 0x29, 0x01, 0x0a, 0xaa, 0x09, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
-    0x09, 0x02, 0x00, 0x58, 0x3f, 0x01, 0x00, 0x91, 0x60, 0x00, 0x00, 0xb5, 0x41, 0x00, 0x00, 0xb5,
-    0x00, 0x00, 0xa8, 0xd2, 0xa9, 0x01, 0x00, 0x58, 0x20, 0x01, 0x3f, 0xd6, 0x7f, 0x20, 0x03, 0xd5,
-    0xff, 0xff, 0xff, 0x17, 0x1f, 0x20, 0x03, 0xd5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x44, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x83, 0x01, 0x00, 0xb4, 0x44, 0x0c, 0x40, 0xf9, 0x84, 0x00, 0x03, 0x8b, 0x45, 0x10, 0x40, 0xf9,
+    0x05, 0x01, 0x00, 0xb4, 0x86, 0x84, 0x40, 0xf8, 0xc6, 0x00, 0x03, 0x8b, 0xc7, 0x00, 0x40, 0xf9,
+    0xe7, 0x00, 0x03, 0x8b, 0xc7, 0x00, 0x00, 0xf9, 0xa5, 0x04, 0x00, 0xd1, 0xf9, 0xff, 0xff, 0x17,
+    0x89, 0x01, 0x00, 0x58, 0x3f, 0x01, 0x00, 0x91, 0x89, 0x01, 0x00, 0x58, 0x20, 0x01, 0x3f, 0xd6,
+    0x7f, 0x20, 0x03, 0xd5, 0xff, 0xff, 0xff, 0x17, 0x00, 0x44, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x10, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// The offsets within `AARCH64_BARE_SEAM` of the literal-pool entries the image writer patches:
-/// the entry root's address, the boot stack's top and the boot glue's address.
-const AARCH64_SEAM_ROOT: u32 = 0x88;
-const AARCH64_SEAM_STACK: u32 = 0xa0;
-const AARCH64_SEAM_BOOT: u32 = 0xa8;
+/// The offsets within `AARCH64_BARE_SEAM` of the `adrp` and `add` forming the relocation
+/// header's address and the boot root's, and of the literal-pool entries the image writer
+/// patches: the boot stack's top and the boot glue's address.
+const AARCH64_SEAM_RELOCATIONS: u32 = 0x90;
+const AARCH64_SEAM_ROOT: u32 = 0xbc;
+const AARCH64_SEAM_STACK: u32 = 0x1b0;
+const AARCH64_SEAM_BOOT: u32 = 0x1b8;
 
 /// The `aarch64-uefi` entry seam's machine code: the firmware calls it in the Procedure Call
 /// Standard with the image handle in `x0` and the system table in `x1`, under the MMU it set up;
@@ -146,22 +177,30 @@ const AARCH64_UEFI_SEAM: &[u8] = &[
 const AARCH64_UEFI_STACK: u32 = 0x28;
 const AARCH64_UEFI_BOOT: u32 = 0x30;
 
-/// The AArch64 secondary entry seam's machine code, which `PSCI CPU_ON` enters at EL1 with the
-/// MMU off, the start record's address in `x0`. It enables floating point and Advanced SIMD,
-/// installs the entry root and turns the MMU and caches on as the boot seam does, sets the stack
-/// the record names, and calls the record's glue with the record's CPU record. The record holds
-/// the entry root, the stack's top, the glue's address and the CPU record, which it reads before
-/// the MMU is on, from identity-mapped memory.
+/// The AArch64 secondary entry seam's machine code, which `PSCI CPU_ON` enters at EL1 or EL2
+/// with the MMU off, the start record's address in `x0`. Entered at EL2, it drops to EL1 as the
+/// boot seam does, by the same instructions. It enables floating point and Advanced SIMD,
+/// installs the entry root and turns the MMU and caches on as the boot seam does, sets the
+/// stack the record names, and calls the record's glue with the record's CPU record. The record
+/// holds the entry root, the stack's top, the glue's address and the CPU record, which it reads
+/// before the MMU is on, from identity-mapped memory.
 const AARCH64_SECONDARY_SEAM: &[u8] = &[
-    0x49, 0x10, 0x38, 0xd5, 0x29, 0x05, 0x6c, 0xb2, 0x49, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
-    0x09, 0x00, 0x40, 0xf9, 0x09, 0x20, 0x18, 0xd5, 0x09, 0x80, 0x88, 0xd2, 0xe9, 0x1f, 0xa0, 0xf2,
-    0x09, 0xa2, 0x18, 0xd5, 0x09, 0xa2, 0x86, 0xd2, 0x09, 0x10, 0xa0, 0xf2, 0x0a, 0x07, 0x38, 0xd5,
-    0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1, 0xab, 0x00, 0x80, 0xd2, 0x4a, 0x91, 0x8b, 0x9a,
-    0x29, 0x81, 0x0a, 0xaa, 0x49, 0x20, 0x18, 0xd5, 0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x37, 0x03, 0xd5,
-    0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x10, 0x38, 0xd5, 0xaa, 0x00, 0x82, 0xd2, 0x29, 0x01, 0x0a, 0xaa,
-    0x09, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x04, 0x40, 0xf9, 0x3f, 0x01, 0x00, 0x91,
-    0x0a, 0x08, 0x40, 0xf9, 0x00, 0x0c, 0x40, 0xf9, 0x40, 0x01, 0x3f, 0xd6, 0x7f, 0x20, 0x03, 0xd5,
-    0xff, 0xff, 0xff, 0x17,
+    0x49, 0x42, 0x38, 0xd5, 0x3f, 0x21, 0x00, 0xf1, 0x61, 0x03, 0x00, 0x54, 0x09, 0x00, 0xb0, 0xd2,
+    0x09, 0x11, 0x1c, 0xd5, 0x09, 0xe1, 0x3c, 0xd5, 0x29, 0x05, 0x40, 0xb2, 0x09, 0xe1, 0x1c, 0xd5,
+    0x7f, 0xe0, 0x1c, 0xd5, 0xa9, 0xc9, 0x3c, 0xd5, 0x2a, 0x01, 0x80, 0xd2, 0x29, 0x01, 0x0a, 0xaa,
+    0xa9, 0xc9, 0x1c, 0xd5, 0xe9, 0x7f, 0x86, 0xd2, 0x49, 0x11, 0x1c, 0xd5, 0x7f, 0x11, 0x1c, 0xd5,
+    0x09, 0x00, 0x38, 0xd5, 0x09, 0x00, 0x1c, 0xd5, 0xa9, 0x00, 0x38, 0xd5, 0xa9, 0x00, 0x1c, 0xd5,
+    0x09, 0x00, 0x81, 0xd2, 0x09, 0x1a, 0xa6, 0xf2, 0x09, 0x10, 0x18, 0xd5, 0xa9, 0x78, 0x80, 0xd2,
+    0x09, 0x40, 0x1c, 0xd5, 0x89, 0x00, 0x00, 0x10, 0x29, 0x40, 0x1c, 0xd5, 0xdf, 0x3f, 0x03, 0xd5,
+    0xe0, 0x03, 0x9f, 0xd6, 0x49, 0x10, 0x38, 0xd5, 0x29, 0x05, 0x6c, 0xb2, 0x49, 0x10, 0x18, 0xd5,
+    0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x00, 0x40, 0xf9, 0x09, 0x20, 0x18, 0xd5, 0x09, 0x80, 0x88, 0xd2,
+    0xe9, 0x1f, 0xa0, 0xf2, 0x09, 0xa2, 0x18, 0xd5, 0x09, 0xa2, 0x86, 0xd2, 0x09, 0x10, 0xa0, 0xf2,
+    0x0a, 0x07, 0x38, 0xd5, 0x4a, 0x0d, 0x40, 0x92, 0x5f, 0x15, 0x00, 0xf1, 0xab, 0x00, 0x80, 0xd2,
+    0x4a, 0x91, 0x8b, 0x9a, 0x29, 0x81, 0x0a, 0xaa, 0x49, 0x20, 0x18, 0xd5, 0x1f, 0x87, 0x08, 0xd5,
+    0x9f, 0x37, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x10, 0x38, 0xd5, 0xaa, 0x00, 0x82, 0xd2,
+    0x29, 0x01, 0x0a, 0xaa, 0x09, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x09, 0x04, 0x40, 0xf9,
+    0x3f, 0x01, 0x00, 0x91, 0x0a, 0x08, 0x40, 0xf9, 0x00, 0x0c, 0x40, 0xf9, 0x40, 0x01, 0x3f, 0xd6,
+    0x7f, 0x20, 0x03, 0xd5, 0xff, 0xff, 0xff, 0x17,
 ];
 
 /// The offsets of a secondary start record's fields: the entry root, the stack's top, the glue's
@@ -195,7 +234,7 @@ pub fn shared_data(arch: Arch) -> Vec<Reserved> {
     let mut shared = vec![cpus::CPUS, bindings::IRQ_BINDINGS, heap::HEAP_STATE];
     match arch {
         Arch::Amd64 => shared.push(interrupts::IDT),
-        Arch::Aarch64 => shared.extend([its::IRQ_LPIS, its::ITS_DEVICES]),
+        Arch::Aarch64 => shared.extend([its::IRQ_LPIS, its::ITS_DEVICES, discovery::MACHINE]),
     }
     shared
 }
@@ -270,25 +309,53 @@ impl Lowering<'_, '_> {
             .expect("the aarch64 uefi entry seam");
     }
 
-    /// Reserves an `aarch64-bare` image's boot stack and emits the program entry seam, which the
-    /// platform enters with the MMU off and which calls `boot` with the device tree's address and
-    /// zero.
+    /// Reserves an `aarch64-bare` image's boot root, relocation header and boot stack and emits
+    /// the program entry seam, which the platform enters with the MMU off and which calls `boot`
+    /// with the device tree's address and the start information's.
     fn aarch64_bare_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
-        let root = self.aarch64_entry_root();
+        let root = self.aarch64_boot_root();
+        let relocations = self
+            .module
+            .declare_data(
+                crate::image::RELOCATION_HEADER,
+                Linkage::Local,
+                false,
+                false,
+            )
+            .expect("the relocation header");
+        let mut description = DataDescription::new();
+        description.define(vec![0; crate::image::RELOCATION_HEADER_BYTES].into_boxed_slice());
+        description.set_align(8);
+        self.module
+            .define_data(relocations, &description)
+            .expect("the relocation header");
         let stack = self.reserved_data(boot_stack_data(boot_stack));
         let seam = self
             .module
             .declare_function(ENTRY, Linkage::Export, &Signature::new(super::CALL_CONV))
             .expect("the program entry seam");
-        let abs8 = |offset: u32, data: DataId, addend: i64| ModuleReloc {
+        let data = |offset: u32, kind: Reloc, data: DataId, addend: i64| ModuleReloc {
             offset,
-            kind: Reloc::Abs8,
+            kind,
             name: data.into(),
             addend,
         };
         let relocs = vec![
-            abs8(AARCH64_SEAM_ROOT, root, 0),
-            abs8(AARCH64_SEAM_STACK, stack, boot_stack as i64),
+            data(
+                AARCH64_SEAM_RELOCATIONS,
+                Reloc::Aarch64AdrPrelPgHi21,
+                relocations,
+                0,
+            ),
+            data(
+                AARCH64_SEAM_RELOCATIONS + 4,
+                Reloc::Aarch64AddAbsLo12Nc,
+                relocations,
+                0,
+            ),
+            data(AARCH64_SEAM_ROOT, Reloc::Aarch64AdrPrelPgHi21, root, 0),
+            data(AARCH64_SEAM_ROOT + 4, Reloc::Aarch64AddAbsLo12Nc, root, 0),
+            data(AARCH64_SEAM_STACK, Reloc::Abs8, stack, boot_stack as i64),
             ModuleReloc {
                 offset: AARCH64_SEAM_BOOT,
                 kind: Reloc::Abs8,
@@ -299,6 +366,29 @@ impl Lowering<'_, '_> {
         self.module
             .define_function_bytes(seam, 16, AARCH64_BARE_SEAM, &relocs)
             .expect("the aarch64 bare entry seam");
+    }
+
+    /// The boot root the `aarch64-bare` entry seam installs, a 4 KiB-granule level-0 table and a
+    /// level-1 table mapping the first 512 GiB in 1 GiB blocks of device memory that no code runs
+    /// from. The seam points the level-0 table's first entry at the level-1 table and maps the
+    /// gigabytes the image spans as normal memory, so that the table holds no absolute address.
+    fn aarch64_boot_root(&mut self) -> DataId {
+        let id = self
+            .module
+            .declare_data("_NSboot_root", Linkage::Local, true, false)
+            .expect("the boot root");
+        let mut bytes = vec![0u8; 4_096];
+        for gigabyte in 0..TABLE_ENTRIES {
+            let entry = (gigabyte * AARCH64_BLOCK) | A64_DEVICE_BLOCK;
+            bytes.extend_from_slice(&entry.to_le_bytes());
+        }
+        let mut description = DataDescription::new();
+        description.define(bytes.into_boxed_slice());
+        description.set_align(4_096);
+        self.module
+            .define_data(id, &description)
+            .expect("the boot root");
+        id
     }
 
     /// Emits the AArch64 secondary entry seam, which `PSCI CPU_ON` enters, and gives its
@@ -452,9 +542,10 @@ impl Lowering<'_, '_> {
         system::start(self, fx);
     }
 
-    /// The entry root, whose page tables the image holds mapping the first 4 GiB writable at
-    /// their physical addresses, which the entry seam or `exit_services` installs, in the format
-    /// of the target's architecture.
+    /// The entry root, in the format of the target's architecture: on x86_64 the image's page
+    /// tables mapping the first 4 GiB writable at their physical addresses, which the entry seam
+    /// or `exit_services` installs; on AArch64 tables that `Init` on a bare target and
+    /// `exit_services` on a UEFI target fill and install.
     pub fn entry_root(&mut self) -> DataId {
         match self.ck.db.target.arch() {
             Some(Arch::Aarch64) => self.aarch64_entry_root(),
@@ -505,11 +596,8 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The AArch64 entry root, a 4 KiB-granule level-0 table pointing at a level-1 table of four
-    /// 1 GiB block descriptors mapping the first 4 GiB: the first gigabyte, which holds the `virt`
-    /// board's devices, as device memory, and the rest as normal write-back inner-shareable
-    /// memory, at their physical addresses. Its attribute indices are those the `aarch64-bare`
-    /// entry seam programs into `MAIR_EL1`.
+    /// The AArch64 entry root, a 4 KiB-granule level-0 table pointing at a level-1 table, which
+    /// `Init` on a bare target and `exit_services` on a UEFI target fill.
     fn aarch64_entry_root(&mut self) -> DataId {
         const NAME: &str = "_NSentry_root";
         if let Some(id) = self.reserved.get(NAME) {
@@ -519,21 +607,8 @@ impl Lowering<'_, '_> {
             .module
             .declare_data(NAME, Linkage::Local, true, false)
             .expect("the entry root");
-        // The level-0 table is zeroed; the level-1 table follows it a page later.
-        let mut bytes = vec![0u8; 2 * 4_096];
-        for gigabyte in 0..MAPPED / AARCH64_BLOCK {
-            let address = gigabyte * AARCH64_BLOCK;
-            let memory = if address < AARCH64_BLOCK {
-                A64_VALID | A64_ACCESS | A64_ATTR_DEVICE
-            } else {
-                A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL
-            };
-            let entry = address | memory;
-            let at = 4_096 + 8 * gigabyte as usize;
-            bytes[at..at + 8].copy_from_slice(&entry.to_le_bytes());
-        }
         let mut description = DataDescription::new();
-        description.define(bytes.into_boxed_slice());
+        description.define(vec![0u8; 2 * 4_096].into_boxed_slice());
         description.set_align(4_096);
         let own = self.module.declare_data_in_data(id, &mut description);
         description.write_data_addr(0, own, (4_096 + A64_VALID + A64_TABLE) as i64);

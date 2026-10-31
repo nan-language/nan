@@ -408,7 +408,7 @@ fn aarch64_maintenance(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let function = supply.param(1).scalar();
             let function = fx.b.ins().uextend(PTR, function);
             let args = [2, 3, 4].map(|index| supply.param(index).scalar());
-            let result = lo.call_stub(fx, Stub::Hvc, &[function, args[0], args[1], args[2]])[0];
+            let result = lo.psci_call(fx, function, args);
             supply.ret(lo, fx, Held::Scalar(result));
         }
         member => panic!("no AArch64 lowering of hw::Ring0.{member}"),

@@ -1,0 +1,143 @@
+//! The CPU signal, the interrupt one CPU sends another on the vector the runtime keeps for it: `hw::Ring0.signal_cpu`, the shootdowns of `hw::Ring0.invalidate_everywhere`, which x86_64 CPUs serve on the signal and AArch64 CPUs leave to the broadcast invalidation of their interconnect, and `hw::Ring0.wait_for_interrupt`, whose wait no preemption interrupts.
+
+/// The vector of the CPU signal, and the interrupt command sending it to one CPU: a fixed
+/// interrupt on that vector, asserted.
+const SIGNAL_VECTOR: i64 = 0xFE
+
+const IPI_SIGNAL: u64 = 0x4000 | u64.fit(SIGNAL_VECTOR)
+
+/// Sends the CPU signal to CPU `index` when it is a started CPU.
+fn Lowering.signal_cpu(mut self, mut fx: Fx, index: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let inside = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+    mut fx.if_true(inside, then: fn[mut self](mut fx1: Fx) {
+        let record = mut self.cpu_record(mut fx1, index)
+        let started_at = mut fx1.offset(record, offset: CPU_STARTED)
+        let started_word = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: started_at)
+        let started = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: started_word, y: 0)
+        mut fx1.if_true(started, then: fn[mut self](mut fx2: Fx) {
+            mut self.send_signal(mut fx2, record)
+        })
+    })
+} Lowering.signal_cpu
+
+/// Sends the CPU signal to the CPU of a record: through its local APIC on x86_64, with maskable
+/// interrupts disabled so that no interrupt fn's own signal splits the command, and as
+/// software-generated interrupt 1 on AArch64.
+fn Lowering.send_signal(mut self, mut fx: Fx, record: clif::Value) {
+    let id = mut fx.load(PTR, addr: record, offset: CPU_HARDWARE_ID)
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => {
+            let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+            expect saved.len() > 0
+            mut self.send_ipi(mut fx, destination: id, command: IPI_SIGNAL)
+            discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved[0]).view())
+        }
+        workspace::Arch.Aarch64 => {
+            discard mut self.call_stub(mut fx, stub: Stub.SendSignal, args: Array[clif::Value, 1].filled(id).view())
+        }
+    }
+} Lowering.send_signal
+
+/// Invalidates a scope's translations on every started CPU, the scope being a page's address or
+/// 1 for every translation. On AArch64 one broadcast invalidation reaches them all. On x86_64
+/// the caller takes the shootdown lock, spinning with maskable interrupts enabled so that it
+/// serves other shootdowns meanwhile; then, with them disabled so that it stays on its CPU, it
+/// posts the scope to every other started CPU, counting each, sends it the signal and
+/// invalidates its own translations; it then waits, with them enabled, until each has served the
+/// shootdown, and releases the lock.
+fn Lowering.invalidate_everywhere(mut self, mut fx: Fx, scope: clif::Value) {
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        discard mut self.call_stub(mut fx, stub: Stub.TlbiBroadcast, args: Array[clif::Value, 1].filled(scope).view())
+        return
+    }
+    let state_address = mut self.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_SHOOTDOWN_LOCK)
+    let left = mut fx.offset(state_address, offset: STATE_SHOOTDOWN_LEFT)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.ptr(0)
+        let held = mut fx1.ptr(1)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock, e: free, x: held)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx1.if_true(busy, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0
+    let posted = mut fx.offset(state_address, offset: STATE_SHOOTDOWN_SCOPE)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: scope, p: posted)
+    let own = mut self.running_index(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: count, body: fn[mut self](mut fx1: Fx, index: clif::Value) {
+        let other = mut fx1.b.icmp(clif::IntCC.NotEqual, x: index, y: own)
+        let record = mut self.cpu_record(mut fx1, index)
+        let started_at = mut fx1.offset(record, offset: CPU_STARTED)
+        let started_word = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: started_at)
+        let started = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: started_word, y: 0)
+        let target = mut fx1.b.band(other, y: started)
+        mut fx1.if_true(target, then: fn[mut self](mut fx2: Fx) {
+            let one = mut fx2.ptr(1)
+            discard fetch_add(mut fx2, address: left, amount: one)
+            let pending = mut fx2.offset(record, offset: CPU_SHOOTDOWN)
+            mut fx2.b.atomic_store(clif::MemFlags.owned(), x: one, p: pending)
+            let id = mut fx2.load(PTR, addr: record, offset: CPU_HARDWARE_ID)
+            mut self.send_ipi(mut fx2, destination: id, command: IPI_SIGNAL)
+        })
+    })
+    discard mut self.call_stub(mut fx, stub: Stub.Shootdown, args: Array[clif::Value, 1].filled(scope).view())
+    discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved[0]).view())
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let remaining = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: left)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: remaining, y: 0)
+        mut fx1.if_true(waiting, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let unlocked = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: unlocked, p: lock)
+} Lowering.invalidate_everywhere
+
+/// Serves the shootdown posted to the running CPU, if any, when the CPU signal arrives on
+/// x86_64: invalidates the posted scope's translations and counts the CPU as done.
+fn Lowering.serve_shootdown(mut self, mut fx: Fx) {
+    let record = mut self.running_cpu(mut fx)
+    let pending = mut fx.offset(record, offset: CPU_SHOOTDOWN)
+    let posted = mut fx.ptr(1)
+    let served = mut fx.ptr(0)
+    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: pending, e: posted, x: served)
+    let due = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+    mut fx.if_true(due, then: fn[mut self](mut fx1: Fx) {
+        let state_address = mut self.state(mut fx1)
+        let scope_at = mut fx1.offset(state_address, offset: STATE_SHOOTDOWN_SCOPE)
+        let scope = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: scope_at)
+        discard mut self.call_stub(mut fx1, stub: Stub.Shootdown, args: Array[clif::Value, 1].filled(scope).view())
+        let left = mut fx1.offset(state_address, offset: STATE_SHOOTDOWN_LEFT)
+        let done = mut fx1.int(PTR, value: -1)
+        discard fetch_add(mut fx1, address: left, amount: done)
+    })
+} Lowering.serve_shootdown
+
+/// Halts the running CPU until an interrupt arrives, with maskable interrupts enabled while it
+/// waits and its record saying so, which keeps the seam from preempting the caller. Returns at
+/// once inside an interrupt fn and before the anchor is installed.
+fn Lowering.wait_for_interrupt(mut self, mut fx: Fx) {
+    let state_address = mut self.state(mut fx)
+    let anchor = mut fx.load(PTR, addr: state_address, offset: STATE_ANCHOR)
+    let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: anchor, y: 0)
+    let record = mut self.running_cpu(mut fx)
+    let serving = mut fx.load(PTR, addr: record, offset: CPU_FRAME)
+    let outside = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: serving, y: 0)
+    let waits = mut fx.b.band(installed, y: outside)
+    mut fx.if_true(waits, then: fn[mut self](mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: CPU_WAITING)
+        discard mut self.call_stub(mut fx1, stub: Stub.IdleWait, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        let zero_value = mut fx1.ptr(0)
+        mut fx1.store(zero_value, addr: record, offset: CPU_WAITING)
+    })
+} Lowering.wait_for_interrupt

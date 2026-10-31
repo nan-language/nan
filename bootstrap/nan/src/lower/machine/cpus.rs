@@ -35,9 +35,11 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
 /// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
 /// whether it has AVX enabled, which the vector seam reads to save the extended state; the
-/// frame the vector seam saved for the interrupt it serves, zero outside one; and, on a kernel,
-/// the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
-/// millisecond.
+/// frame the vector seam saved for the interrupt it serves, zero outside one; on x86_64, the
+/// features the `CpuFeatures` stub records; on a kernel, the nanosecond of its timer's next
+/// pacing tick and the ticks its timer counts in a millisecond; whether it waits in
+/// `hw::Ring0.wait_for_interrupt`, which no preemption interrupts; and whether a shootdown
+/// another CPU posted awaits it.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -51,8 +53,11 @@ pub mod cpu {
     pub const ROOT: u64 = 224;
     pub const AVX: u64 = 232;
     pub const FRAME: u64 = 240;
+    pub const FEATURES: u64 = 248;
     pub const NEXT_PACE: u64 = 256;
     pub const TIMER_RATE: u64 = 264;
+    pub const WAITING: u64 = 272;
+    pub const SHOOTDOWN: u64 = 280;
     pub const SIZE: u64 = 320;
 }
 
@@ -104,8 +109,8 @@ impl Lowering<'_, '_> {
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
     /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
     /// its clock started and a CPU for each processor the platform reports; an executor thread
-    /// record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor tables loaded and AVX
-    /// enabled when it has it.
+    /// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
+    /// the boot CPU's descriptor tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
@@ -136,6 +141,9 @@ impl Lowering<'_, '_> {
             let cpu = self.cpu_record(fx, index);
             fx.store(record, cpu, cpu::THREAD);
         });
+        if self.ck.db.target.arch() == Some(Arch::Amd64) {
+            self.call_stub(fx, Stub::CpuFeatures, &[zero]);
+        }
         if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
             self.enable_avx(fx, boot);
@@ -182,17 +190,20 @@ impl Lowering<'_, '_> {
 
     /// Installs `root` as the running CPU's page-table root, with maskable interrupts disabled so
     /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
-    /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub.
-    pub fn swap_root(&mut self, fx: &mut Fx, root: Value) -> Value {
+    /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub, which
+    /// receives `tagged` instead when given: the root with a PCID or ASID, whose translations
+    /// stay cached.
+    pub fn swap_root(&mut self, fx: &mut Fx, root: Value, tagged: Option<Value>) -> Value {
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let record = self.running_cpu(fx);
         let replaced = fx.load(PTR, record, cpu::ROOT);
         fx.store(root, record, cpu::ROOT);
-        let install = match self.ck.db.target.arch() {
-            Some(Arch::Aarch64) => Stub::WriteTtbr0,
+        let install = match (self.ck.db.target.arch(), tagged) {
+            (Some(Arch::Aarch64), Some(_)) => Stub::WriteTtbr0Tagged,
+            (Some(Arch::Aarch64), None) => Stub::WriteTtbr0,
             _ => Stub::WriteCr3,
         };
-        self.call_stub(fx, install, &[root]);
+        self.call_stub(fx, install, &[tagged.unwrap_or(root)]);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);
         replaced
     }
@@ -663,9 +674,9 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a started CPU calls with its record: it points its base register at the record,
-    /// sets its data-independent timing mode, on x86_64 loads its descriptor tables and enables
-    /// AVX when it has it, prepares its interrupt delivery through `prepare`, records that it
-    /// started and runs the executor's scheduler.
+    /// sets its data-independent timing mode, on x86_64 records its features, loads its
+    /// descriptor tables and enables AVX when it has it, prepares its interrupt delivery through
+    /// `prepare`, records that it started and runs the executor's scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
         signature.params.push(AbiParam::new(PTR));
@@ -682,6 +693,8 @@ impl Lowering<'_, '_> {
                 lo.set_cpu_base(fx, record);
                 lo.call_stub(fx, Stub::ConstantTime, &[]);
                 if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
+                    let index = lo.running_index(fx);
+                    lo.call_stub(fx, Stub::CpuFeatures, &[index]);
                     lo.load_cpu_tables(fx, record);
                     lo.enable_avx(fx, record);
                 }

@@ -19,6 +19,7 @@ use super::super::{Instance, Lowering};
 use super::SEAM_FRAME;
 use super::aarch64;
 use super::cpus::cpu;
+use super::signal::SIGNAL_VECTOR;
 use super::stubs::Stub;
 use crate::check::ty::Ty;
 use crate::interp::{FnVal, Val};
@@ -632,7 +633,8 @@ impl Lowering<'_, '_> {
     /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
     /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
     /// binds. A timer interrupt first serves the kernel's clock, and reaches an interrupt fn on a
-    /// pacing tick alone. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
+    /// pacing tick alone. The CPU signal first serves a shootdown on x86_64, and only ends
+    /// unless bound. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
     /// maskable interrupts enabled and the anchor is installed, the task is preempted. An unbound
     /// timer interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
     /// unbound vector, the kernel halts at the interrupted instruction.
@@ -651,6 +653,7 @@ impl Lowering<'_, '_> {
                 fx.when(stopping, |fx| lo.stop_if_halting(fx));
             }
             let zero = fx.ptr(0);
+            lo.dispatch_signal(fx, bound, vector, zero);
             let timer = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, vectors.timer);
             fx.when(timer, |fx| {
                 let pacing = lo.timer_interrupt(fx);
@@ -704,6 +707,26 @@ impl Lowering<'_, '_> {
             report::halt(lo, fx, "unbound-vector", location, Some(("vector", vector)));
         });
         id
+    }
+
+    /// Serves the CPU signal when `vector` is its: a shootdown first on x86_64, then, unless a
+    /// contribution binds the vector, the end of the interrupt, returning `zero`.
+    fn dispatch_signal(&mut self, fx: &mut Fx, bound: &[Bound], vector: Value, zero: Value) {
+        let shooting = self.machine_arch() == Arch::Amd64;
+        let signal_bound = bound.iter().any(|entry| entry.vector == SIGNAL_VECTOR);
+        if !shooting && signal_bound {
+            return;
+        }
+        let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, SIGNAL_VECTOR);
+        fx.when(signal, |fx| {
+            if shooting {
+                self.serve_shootdown(fx);
+            }
+            if !signal_bound {
+                self.end_of_interrupt(fx);
+                fx.b.ins().return_(&[zero]);
+            }
+        });
     }
 
     /// Calls the interrupt fn a contribution binds to the fired vector: an `Irq` handler with a
@@ -790,7 +813,8 @@ impl Lowering<'_, '_> {
 
     /// Whether the seam preempts the interrupted code: its interrupt fn rescheduled, the final
     /// build has a `hw::preempt` entry, the code is a kernel task that ran with maskable
-    /// interrupts enabled on its own stack, and the anchor is installed. Gives a word.
+    /// interrupts enabled on its own stack outside `hw::Ring0.wait_for_interrupt`, and the
+    /// anchor is installed. Gives a word.
     fn preempts(
         &mut self,
         fx: &mut Fx,
@@ -822,7 +846,11 @@ impl Lowering<'_, '_> {
             },
             |fx| vec![fx.int(types::I8, 0)],
         )[0];
+        let cpu_record = self.running_cpu(fx);
+        let waiting = fx.load(PTR, cpu_record, cpu::WAITING);
+        let free = fx.b.ins().icmp_imm_s(IntCC::Equal, waiting, 0);
         let preempting = fx.b.ins().band(enabled, installed);
+        let preempting = fx.b.ins().band(preempting, free);
         let preempting = fx.b.ins().band(preempting, on_stack);
         let preempting = fx.b.ins().band(preempting, reschedule);
         fx.b.ins().uextend(PTR, preempting)
@@ -835,12 +863,18 @@ impl Lowering<'_, '_> {
         fx.b.ins().iadd(table, offset)
     }
 
-    /// The vectors the final build binds by contribution.
+    /// The vectors the final build binds by contribution, then the CPU signal's unless one binds
+    /// it, which the runtime keeps.
     pub fn statically_bound(&mut self) -> Vec<i64> {
-        self.bound_vectors()
+        let mut vectors: Vec<i64> = self
+            .bound_vectors()
             .iter()
             .map(|entry| entry.vector)
-            .collect()
+            .collect();
+        if !vectors.contains(&SIGNAL_VECTOR) {
+            vectors.push(SIGNAL_VECTOR);
+        }
+        vectors
     }
 
     /// The vector the running CPU's interrupt fn serves.

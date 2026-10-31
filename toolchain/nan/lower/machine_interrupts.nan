@@ -627,7 +627,8 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
 /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
 /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
 /// binds. A timer interrupt first serves the kernel's clock, and reaches an interrupt fn on a
-/// pacing tick alone. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
+/// pacing tick alone. The CPU signal first serves a shootdown on x86_64, and only ends unless
+/// bound. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with
 /// maskable interrupts enabled and the anchor is installed, the task is preempted. An unbound
 /// timer interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
 /// unbound vector, the kernel halts at the interrupted instruction.
@@ -651,6 +652,7 @@ fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif:
             None => {}
         }
         let zero_value = mut fx1.ptr(0)
+        mut lo1.dispatch_signal(mut fx1, bound, vector, zero_value)
         let clocked = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: known.timer)
         mut fx1.if_true(clocked, then: fn[mut lo1](mut fx2: Fx) {
             let pacing = mut lo1.timer_interrupt(mut fx2)
@@ -709,6 +711,31 @@ fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif:
     })
     return id
 } Lowering.dispatch_vector
+
+/// Serves the CPU signal when `vector` is its: a shootdown first on x86_64, then, unless a
+/// contribution binds the vector, the end of the interrupt, returning `zero_value`.
+fn Lowering.dispatch_signal(mut self, mut fx: Fx, bound: Slice[Bound], vector: clif::Value, zero_value: clif::Value) {
+    let shooting = self.machine_arch() == workspace::Arch.Amd64
+    var signal_bound = false
+    for bound_entry in bound {
+        if bound_entry.vector == SIGNAL_VECTOR {
+            signal_bound = true
+        }
+    }
+    if not shooting and signal_bound {
+        return
+    }
+    let signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: SIGNAL_VECTOR)
+    mut fx.if_true(signal, then: fn[mut self](mut fx1: Fx) {
+        if shooting {
+            mut self.serve_shootdown(mut fx1)
+        }
+        if not signal_bound {
+            mut self.end_of_interrupt(mut fx1)
+            mut fx1.b.ret(Array[clif::Value, 1].filled(zero_value).view())
+        }
+    })
+} Lowering.dispatch_signal
 
 /// Calls the interrupt fn a contribution binds to the fired vector: an `Irq` handler with a
 /// new `hw::IrqContext`, an exception handler with an `hw::TrapFrame` naming the saved frame
@@ -792,7 +819,8 @@ fn Lowering.reschedules(mut self, mut fx: Fx, exit_ty: ty::Ty, exit: Held) -> cl
 
 /// Whether the seam preempts the interrupted code: its interrupt fn rescheduled, the final
 /// build has a `hw::preempt` entry, the code is a kernel task that ran with maskable
-/// interrupts enabled on its own stack, and the anchor is installed. Gives a word.
+/// interrupts enabled on its own stack outside `hw::Ring0.wait_for_interrupt`, and the anchor
+/// is installed. Gives a word.
 fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif::Value, preempting: bool) -> clif::Value {
     if not preempting {
         return mut fx.ptr(0)
@@ -819,7 +847,11 @@ fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif:
         mut produced.push(mut fx1.int(clif::Type.Int8, value: 0))
         return produced
     })
-    let allowed = mut fx.b.band(enabled, y: installed)
+    let cpu_record = mut self.running_cpu(mut fx)
+    let waiting = mut fx.load(PTR, addr: cpu_record, offset: CPU_WAITING)
+    let free = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: waiting, y: 0)
+    let enabled_installed = mut fx.b.band(enabled, y: installed)
+    let allowed = mut fx.b.band(enabled_installed, y: free)
     let allowed_here = mut fx.b.band(allowed, y: on_stack_values[0])
     let decided = mut fx.b.band(allowed_here, y: reschedule)
     return mut fx.b.uextend(PTR, x: decided)
@@ -832,12 +864,20 @@ fn Lowering.irq_binding(mut self, mut fx: Fx, vector: clif::Value) -> clif::Valu
     return mut fx.b.iadd(table, y: offset)
 } Lowering.irq_binding
 
-/// The vectors the final build binds by contribution.
+/// The vectors the final build binds by contribution, then the CPU signal's unless one binds
+/// it, which the runtime keeps.
 fn Lowering.statically_bound(mut self) -> mem::List[i64] {
     let bound = mut self.bound_vectors()
     var numbers = mem::List[i64].empty(self.alloc)
+    var signal_bound = false
     for bound_entry in bound {
         mut numbers.push(bound_entry.vector)
+        if bound_entry.vector == SIGNAL_VECTOR {
+            signal_bound = true
+        }
+    }
+    if not signal_bound {
+        mut numbers.push(SIGNAL_VECTOR)
     }
     return numbers
 } Lowering.statically_bound

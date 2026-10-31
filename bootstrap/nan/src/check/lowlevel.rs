@@ -24,12 +24,16 @@ const PRIMITIVES: [&str; 9] = [
 ];
 
 /// The privileged intrinsics that are trusted primitives too.
-const PRIVILEGED_PRIMITIVES: [&str; 5] = [
+const PRIVILEGED_PRIMITIVES: [&str; 9] = [
     "write_cr3",
     "read_msr",
     "write_msr",
+    "write_cr3_tagged",
     "write_ttbr0",
     "write_sysreg",
+    "write_ttbr0_tagged",
+    "invalidate_data_cache",
+    "firmware_call",
 ];
 
 /// The calling conventions and the targets each serves.

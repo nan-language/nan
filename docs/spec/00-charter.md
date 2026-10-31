@@ -288,6 +288,7 @@ Each term links to its home, whose definition governs.
 | [Copy](05-properties.md#copy) | Of a type whose values are copied, not moved: the types the property table makes Copy, and structs and enums deriving `Copy`. |
 | [core vocabulary](03-packages-modules.md#core-vocabulary) | Names usable everywhere without a path. |
 | [cown](16-concurrency.md#cowns) | `task::Cown[T]` holding shared state. |
+| [CPU signal](24-kernel.md#cross-cpu-operations) | Interrupt one CPU sends another on `hw::SIGNAL_VECTOR`. |
 | [cursor](07-ownership.md#iteration) | Value of a cursor type, whose `next` yields the elements of an iteration. |
 | [cursor type](07-ownership.md#iteration) | Type with a method `next(mut self) -> Option[T]` stating neither `fails` nor `uses wait`; `core::Cursor[T]` is its interface. |
 | [declassifying validator](15-untrusted.md#validator-classes) | Validator or decoder that is not parsing. |
@@ -487,6 +488,7 @@ Each term links to its home, whose definition governs.
 | [secret key](31-trust.md#principals) | Seed a principal signs with, in the user directory. |
 | [Send](05-properties.md#send) | Of a type whose values may pass to another task. |
 | [settlement](11-errors-domains.md#domains) | Settling a trapped domain's I/O before freeing. |
+| [shootdown](24-kernel.md#cross-cpu-operations) | Invalidation one x86_64 CPU posts to the others with the CPU signal. |
 | [shrinking](22-testing.md#property-tests) | Minimising a failing input. |
 | [signature](31-trust.md#signatures) | Ed25519 signature of a seal or an artefact. |
 | [signal](24-kernel.md#signals) | `hw::Signal[T]`, through which interrupt fns wake tasks. |

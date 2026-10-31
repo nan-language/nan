@@ -431,8 +431,11 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
 }
 
 /// What the M4 kernel and loader of either architecture write once they show their behaviour.
-const KERNEL_SHOWS: [&str; 7] = [
+const KERNEL_SHOWS: [&str; 10] = [
     "kernel: running on 4 cpus",
+    "idle: an interrupt ended a wait",
+    "signal: each of 4 cpus took the cpu signal",
+    "shootdown: every cpu invalidated its translations",
     "smp: tasks ran on every one of 4 cpus",
     "preempt: 5 tasks that never await all ran",
     "uart: reader woke on byte 78",
@@ -443,14 +446,21 @@ const KERNEL_SHOWS: [&str; 7] = [
 const LOADER_SHOWS: [&str; 1] =
     ["loader: copied 3 loadable segments of kernel.elf to their physical addresses"];
 
+/// What the x86_64 M4 kernel also writes once it identifies its CPU and reads its counter.
+const X64_KERNEL_SHOWS: [&str; 2] = [
+    "cpuid: the vendor string is 12 printable bytes",
+    "tsc: the counter advanced over a tick",
+];
+
 /// Builds a copy of an M4 scenario outside every git working tree, runs each program under its
-/// emulator until it shows its behaviour, then verifies the scenario.
-fn m4_scenario(milestone: &str) {
+/// emulator until it shows its behaviour, the kernel also `kernel_shows`, then verifies the
+/// scenario.
+fn m4_scenario(milestone: &str, kernel_shows: &[&str]) {
     let outside =
         std::env::temp_dir().join(format!("nan-milestones-{milestone}-{}", std::process::id()));
     let root = copied_into(milestone, &outside);
     ok(&root, &["build"]);
-    shows(&root, "kernel", &KERNEL_SHOWS);
+    shows(&root, "kernel", &[&KERNEL_SHOWS[..], kernel_shows].concat());
     shows(&root, "loader", &LOADER_SHOWS);
     verified(&root);
     fs::remove_dir(outside).expect("the scenario's directory removed");
@@ -458,10 +468,10 @@ fn m4_scenario(milestone: &str) {
 
 #[test]
 fn m4() {
-    m4_scenario("m4");
+    m4_scenario("m4", &X64_KERNEL_SHOWS);
 }
 
 #[test]
 fn m4_aarch64() {
-    m4_scenario("m4-aarch64");
+    m4_scenario("m4-aarch64", &[]);
 }

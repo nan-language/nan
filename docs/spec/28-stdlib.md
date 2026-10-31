@@ -13,7 +13,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 | `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
 | `sys` | the sys capabilities, revocation, domains, components | `sys::fs`, `sys::net`, `sys::sim` |
-| `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, scheduling, physical memory, platform registries | `hw::sim` |
+| `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, cross-CPU operations, scheduling, physical memory, platform registries | `hw::sim` |
 | `boot` | the uefi and bare root grants, firmware services | none |
 | `host` | the host root grant, the component runner | none |
 | `testing` | the simulated world, structural comparison | none |
@@ -99,13 +99,14 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::Register` | [Registers](23-low-level.md#registers) |
 | `hw` | `hw::Mmio`, `hw::Ports` | [Register windows](23-low-level.md#register-windows) |
 | `hw` | `hw::Dma`, `hw::DmaShared`, `hw::dma_fence` | [DMA](23-low-level.md#dma) |
-| `hw` | `hw::Ring0`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
+| `hw` | `hw::Ring0`, `hw::TlbScope`, `hw::CpuidRegs`, `hw::TscRead`, `hw::Protection`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
 | `hw` | `hw::mint_root` | [Landing functions](23-low-level.md#landing-functions) |
 | `hw` | `hw::Anchor`, `hw::cpu_count` | [Anchor](24-kernel.md#anchor) |
 | `hw` | `hw::IrqContext`, `hw::TrapFrame`, `hw::NoCode`, `hw::ErrorCode`, `hw::PageFault`, `hw::IrqExit` | [Interrupt functions](24-kernel.md#interrupt-functions) |
 | `hw` | `hw::IrqsDisabled`, `hw::without_irqs` | [Interrupt state](24-kernel.md#interrupt-state) |
 | `hw` | `hw::Signal` | [Signals](24-kernel.md#signals) |
 | `hw` | `hw::SpinLock`, `hw::SpinGuard`, `hw::IrqShared` | [Locks](24-kernel.md#locks) |
+| `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |
 | `hw` | `hw::RunQueue`, `hw::SavedContext`, `hw::Resumable`, `hw::switch_to`, `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |
 | `hw` | `hw::vectors`, `hw::Vector`, `hw::VectorHandler`, `hw::syscall_entry`, `hw::SyscallEntry`, `hw::preempt`, `hw::PreemptEntry` | [Platform registries](25-registries.md#platform-registries) |
@@ -322,6 +323,7 @@ Apart from [device accesses](10-effects-digests.md#reversibility), the std opera
 | `sys::fs::File.write`, `sys::Net.listen` | `restorable` |
 | `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove` | `irreversible(erase)` |
 | `sys::Net.connect`, `sys::net::Conn.write`, `sys::net::Conn.close`, `sys::net::Conn.abandon` | `irreversible(emit)` |
+| `hw::Ring0.firmware_call` | `irreversible(emit, actuate, erase, spend)` |
 
 The classes of the operations of the sys capabilities and of the resources they open hold on the host targets and under `any`. On the machine targets, where those capabilities have values only as [sims](22-testing.md#simulated-capabilities), they are `traceless`.
 

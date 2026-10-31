@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -193,7 +193,7 @@ When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 
 
 1. The seam saves the interrupted code's registers and [extended state](#floating-point) on its interrupt stack.
 2. For a vector bound to an `hw::IrqShared`, it acquires that lock, calls the device's interrupt fn with the device and a new `hw::IrqContext`, and releases the lock. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
-3. On `hw::IrqExit.Reschedule`, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
+3. On `hw::IrqExit.Reschedule`, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
 4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
 
 Each CPU has an interrupt stack, reserved by the image, for each `ist` value that its bindings use, those of `hw::IrqShared.install` using 0 ([platform registries](25-registries.md#platform-registries)). A seam entered while its stack is in use on its CPU continues on it below the frames in use.
@@ -294,7 +294,7 @@ The kernel stack of a thread that runs user code holds at least the largest stac
 
 ## Interrupt state
 
-`hw::IrqsDisabled` is the [state token](05-properties.md#state-tokens) standing for maskable interrupts being disabled on the CPU running its holder, which therefore never changes CPU.
+`hw::IrqsDisabled` is the [state token](05-properties.md#state-tokens) standing for maskable interrupts being disabled on the CPU running its holder, which therefore never changes CPU. `hw::Ring0.wait_for_interrupt` enables them while its CPU halts, so interrupt fns may run there meanwhile, but no preemption moves the holder.
 
 ```nan-api
 // module: hw
@@ -412,7 +412,7 @@ pub fn IrqShared.uninstall(take self) -> T
 
 `hw::IrqShared[T]` keeps a device of type T behind an IRQ-safe lock that the interrupt path also takes:
 
-- `install(take dev, vector: v, on_irq: f)` keeps `dev`, binds interrupt vector v to f on every CPU and returns the linear `hw::IrqShared[T]`. Installing on a vector already bound traps (`trap.duplicate-access`).
+- `install(take dev, vector: v, on_irq: f)` keeps `dev`, binds interrupt vector v to f on every CPU and returns the linear `hw::IrqShared[T]`. Installing on a vector already bound, or on `hw::SIGNAL_VECTOR`, traps (`trap.duplicate-access`).
 - `with` reaches the device from other code, as `SpinLock.with` does.
 - `take shared.uninstall()` unbinds the vector, spins until no CPU runs f for it, and returns the device.
 - `install` and `uninstall` are the device operations that `allow device` covers ([manifest grants](14-authority.md#manifest-grants)).
@@ -470,6 +470,47 @@ interrupt fn Serial.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit li
     take irq.complete()
     return hw::IrqExit.Resume
 } Serial.on_irq
+```
+
+## Cross-CPU operations
+
+The **CPU signal** is the interrupt one CPU sends another on `hw::SIGNAL_VECTOR`, which the runtime keeps on every machine target ([descriptors](27-program-model.md#descriptors)).
+
+```nan-api
+// module: hw
+
+pub const SIGNAL_VECTOR: u8 = 0xFE
+```
+
+- `cpu.signal_cpu(n)` sends the CPU signal to CPU n when it is a started CPU, the calling one included, and does nothing otherwise. A CPU takes the signal once it has maskable interrupts enabled; signals sent to it meanwhile may arrive as one.
+- When the signal arrives, the CPU serves the shootdowns posted to it, then calls the interrupt fn that an `hw::vectors` contribution binds to `hw::SIGNAL_VECTOR`, or only ends the interrupt without one.
+- `cpu.invalidate_everywhere(scope)` removes, on every started CPU, the cached translations of the page that `Page` holds under every PCID or ASID, or every cached translation for `All`, and returns once each CPU has. On x86_64 the calling CPU removes its own, posts a **shootdown** of the scope to each other started CPU, sends it the CPU signal and waits, with maskable interrupts enabled, until each has served it; one shootdown runs at a time, and a CPU waiting to start one serves the others meanwhile. On AArch64 one broadcast invalidation reaches every CPU.
+- `invalidate_everywhere` is a cancellation point ([acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation)) whose invalidations acknowledge a cancellation only once done: called cancelled, it fails at once and removes nothing; once started, it completes.
+- Interrupt fns and bodies with maskable interrupts disabled cannot wait, so no CPU waits for a shootdown that waits for it. A CPU that keeps maskable interrupts disabled delays every signal to it and every shootdown waiting for it.
+
+```nan
+// file: kernel/package.nan
+//! Address spaces shared by every CPU of a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow priv in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Ends each CPU signal and drops a page's translations on every CPU.
+
+pub interrupt fn on_signal(take irq: hw::IrqContext) -> hw::IrqExit limits stack 512 {
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_signal
+
+contribute hw::vectors signal = hw::Vector(vector: hw::SIGNAL_VECTOR, ist: 0, handler: hw::VectorHandler.Irq(on_signal), user: None)
+
+pub fn unmap_everywhere(cpu: hw::Ring0, page: hw::VirtAddr) fails task::Cancelled uses wait {
+    try await cpu.invalidate_everywhere(hw::TlbScope.Page(page))
+} unmap_everywhere
 ```
 
 ## Scheduling

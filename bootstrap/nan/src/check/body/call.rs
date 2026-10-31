@@ -24,16 +24,39 @@ use crate::syntax::ast::{
 use crate::workspace::{Arch, Authority};
 
 /// The std functions that belong to one architecture's machine targets: its privileged
-/// intrinsics other than `invalidate_page`, and the x86_64 interrupt descriptor table.
-const INTRINSIC_ARCHS: [(&str, Arch); 8] = [
+/// intrinsics other than those both architectures share, and the x86_64 interrupt descriptor
+/// table.
+const INTRINSIC_ARCHS: [(&str, Arch); 30] = [
     ("hw::Ring0.load_idt", Arch::Amd64),
     ("hw::Ring0.write_cr3", Arch::Amd64),
     ("hw::Ring0.read_msr", Arch::Amd64),
     ("hw::Ring0.write_msr", Arch::Amd64),
+    ("hw::Ring0.cpuid", Arch::Amd64),
+    ("hw::Ring0.read_tsc", Arch::Amd64),
+    ("hw::Ring0.read_tscp", Arch::Amd64),
+    ("hw::Ring0.monitor_wait", Arch::Amd64),
+    ("hw::Ring0.invalidate_pcid", Arch::Amd64),
+    ("hw::Ring0.invalidate_pcid_page", Arch::Amd64),
+    ("hw::Ring0.write_cr3_tagged", Arch::Amd64),
+    ("hw::Ring0.read_xcr0", Arch::Amd64),
+    ("hw::Ring0.write_xcr0", Arch::Amd64),
+    ("hw::Ring0.hardware_random", Arch::Amd64),
+    ("hw::Ring0.hardware_seed", Arch::Amd64),
+    ("hw::Ring0.enable_protection", Arch::Amd64),
+    ("hw::Ring0.clear_cpu_buffers", Arch::Amd64),
     ("hw::Idt.of_vectors", Arch::Amd64),
     ("hw::Ring0.write_ttbr0", Arch::Aarch64),
     ("hw::Ring0.read_sysreg", Arch::Aarch64),
     ("hw::Ring0.write_sysreg", Arch::Aarch64),
+    ("hw::Ring0.wait_for_event", Arch::Aarch64),
+    ("hw::Ring0.write_ttbr0_tagged", Arch::Aarch64),
+    ("hw::Ring0.invalidate_asid", Arch::Aarch64),
+    ("hw::Ring0.invalidate_asid_page", Arch::Aarch64),
+    ("hw::Ring0.clean_data_cache", Arch::Aarch64),
+    ("hw::Ring0.clean_invalidate_data_cache", Arch::Aarch64),
+    ("hw::Ring0.invalidate_data_cache", Arch::Aarch64),
+    ("hw::Ring0.sync_instruction_cache", Arch::Aarch64),
+    ("hw::Ring0.firmware_call", Arch::Aarch64),
 ];
 
 /// The named conversions.

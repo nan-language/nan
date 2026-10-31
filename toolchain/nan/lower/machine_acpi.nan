@@ -1,0 +1,239 @@
+//! The firmware tables a machine image reads: the UEFI configuration table, and the ACPI tables the root system description pointer reaches.
+
+/// The offsets in a UEFI system table of its configuration table's entry count and address, the
+/// size of an entry, a GUID then the table's address, and the GUIDs of the ACPI tables and of
+/// the flattened device tree, each as its two little-endian words.
+const SYSTEM_TABLE_ENTRIES: u64 = 104
+
+const SYSTEM_TABLE_CONFIGURATION: u64 = 112
+
+const CONFIGURATION_ENTRY: u64 = 24
+
+const ACPI_10_TABLE: GuidWords = GuidWords(low: 0x11D3_2D88_EB9D_2D30, high: 0x4DC1_3F27_9000_169A)
+
+const ACPI_20_TABLE: GuidWords = GuidWords(low: 0x11D3_E4F1_8868_E871, high: 0x8188_3CC7_8000_22BC)
+
+const DEVICE_TREE_TABLE: GuidWords = GuidWords(low: 0x41A5_F19C_B1B6_21D5, high: 0xE0AA_692C_15D9_0B83)
+
+/// A GUID as its two little-endian words.
+struct GuidWords derives Copy {
+    low: u64
+    high: u64
+} GuidWords
+
+/// The size of an ACPI table's header, the MADT's signature, and the offset of its first entry.
+const SDT_HEADER: u64 = 36
+
+const MADT_SIGNATURE: i64 = 0x4349_5041
+
+const MADT_ENTRIES: u64 = 44
+
+/// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.
+const BIOS_AREA: AddressRange = AddressRange(start: 0xE_0000, end: 0x10_0000)
+
+const RSDP_SIGNATURE: u64 = 0x2052_5450_2044_5352
+
+/// The addresses from `start` up to `end`.
+struct AddressRange derives Copy {
+    start: u64
+    end: u64
+} AddressRange
+
+/// The RSDP found in the BIOS area, zero when none.
+fn scan_rsdp(mut fx: Fx) -> clif::Value {
+    let start = mut fx.ptr(BIOS_AREA.start)
+    let zero_value = mut fx.ptr(0)
+    var initial = Array[clif::Value, 2].filled(start)
+    initial[1] = zero_value
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let at = current[0]
+        let word = mut fx1.load(PTR, addr: at, offset: 0)
+        let signature = mut fx1.ptr(RSDP_SIGNATURE)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: word, y: signature)
+        let zero_word = mut fx1.ptr(0)
+        let matched = mut fx1.b.select(same, x: at, y: zero_word)
+        let next = mut fx1.b.iadd_imm_s(at, y: 16)
+        let inside = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: i64.fit(BIOS_AREA.end))
+        let missing = mut fx1.b.bxor_imm_s(same, y: 1)
+        let more = mut fx1.b.band(inside, y: missing)
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(next)
+        mut state.push(matched)
+        return Pass(again: more, next: take state)
+    })
+    return found[1]
+} scan_rsdp
+
+/// The address of the ACPI root system description pointer, zero when the platform gives
+/// none: on a bare target the one the start information names, or else on `x86_64-bare` the
+/// one found in the BIOS area; on a UEFI target the one the firmware's configuration table
+/// names, preferring the ACPI 2.0 entry.
+fn Lowering.rsdp(mut self, mut fx: Fx) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    match self.ck.db().target.kind() {
+        Some(workspace::Kind.Uefi) => {
+            let table = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM_TABLE)
+            var guids = Array[GuidWords, 2].filled(ACPI_10_TABLE)
+            guids[1] = ACPI_20_TABLE
+            return mut self.configured(mut fx, table, guids: guids.view())
+        }
+        Some(workspace::Kind.Bare) => {}
+        else => {
+            return mut fx.ptr(0)
+        }
+    }
+    let info = mut self.start_info(mut fx)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: info, y: 0)
+    let given_values = mut fx.choose(present, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.load(PTR, addr: info, offset: START_INFO_RSDP))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.ptr(0))
+    })
+    let given = given_values[0]
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        return given
+    }
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: given, y: 0)
+    let found = mut fx.choose(missing, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(scan_rsdp(mut fx1))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(given)
+    })
+    return found[0]
+} Lowering.rsdp
+
+/// The address a UEFI system table's configuration table gives for the last of `guids` it lists,
+/// zero when it lists none.
+fn Lowering.configured(mut self, mut fx: Fx, table: clif::Value, guids: Slice[GuidWords]) -> clif::Value {
+    let count = mut fx.load(PTR, addr: table, offset: SYSTEM_TABLE_ENTRIES)
+    let entries = mut fx.load(PTR, addr: table, offset: SYSTEM_TABLE_CONFIGURATION)
+    let zero_value = mut fx.ptr(0)
+    let found = mut fx.variable(PTR, initial: zero_value)
+    for wanted in guids {
+        mut fx.each(zero_value, end: count, body: fn(mut fx1: Fx, index: clif::Value) {
+            let entry_offset = mut fx1.b.imul_imm_s(index, y: i64.fit(CONFIGURATION_ENTRY))
+            let entry = mut fx1.b.iadd(entries, y: entry_offset)
+            let low_word = mut fx1.load(PTR, addr: entry, offset: 0)
+            let high_word = mut fx1.load(PTR, addr: entry, offset: 8)
+            let low = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: low_word, y: i64.from_bits(wanted.low))
+            let high = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: high_word, y: i64.from_bits(wanted.high))
+            let same = mut fx1.b.band(low, y: high)
+            mut fx1.if_true(same, then: fn(mut fx2: Fx) {
+                let pointer = mut fx2.load(PTR, addr: entry, offset: 16)
+                mut fx2.b.def_var(found, val: pointer)
+            })
+        })
+    }
+    return mut fx.b.use_var(found)
+} Lowering.configured
+
+/// The ACPI table of a signature the RSDP's XSDT or RSDT lists, zero when none.
+fn Lowering.acpi_table(mut self, mut fx: Fx, rsdp: clif::Value, signature: i64) -> clif::Value {
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rsdp, y: 0)
+    let chosen = mut fx.choose(present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let revision = mut fx1.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: rsdp, offset: 15)
+        let extended = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: revision, y: 2)
+        let xsdt_values = mut fx1.choose(extended, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let loaded = mut fx2.b.load(PTR, flags: clif::MemFlags.unaligned(), p: rsdp, offset: 24)
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(loaded)
+            return produced
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(mut fx2.ptr(0))
+            return produced
+        })
+        let xsdt = xsdt_values[0]
+        let wide = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: xsdt, y: 0)
+        let rsdt = load_u32(mut fx1, address: rsdp, offset: 16)
+        let table = mut fx1.b.select(wide, x: xsdt, y: rsdt)
+        let eight = mut fx1.ptr(8)
+        let four = mut fx1.ptr(4)
+        let width = mut fx1.b.select(wide, x: eight, y: four)
+        let length = load_u32(mut fx1, address: table, offset: 4)
+        let listed = mut fx1.b.iadd_imm_s(length, y: -i64.fit(SDT_HEADER))
+        let count = mut fx1.b.udiv(listed, y: width)
+        let zero_value = mut fx1.ptr(0)
+        let found = mut fx1.variable(PTR, initial: zero_value)
+        mut fx1.each(zero_value, end: count, body: fn(mut fx2: Fx, index: clif::Value) {
+            let offset = mut fx2.b.imul(index, y: width)
+            let listed_at = mut fx2.b.iadd(table, y: offset)
+            let at = mut fx2.b.iadd_imm_s(listed_at, y: i64.fit(SDT_HEADER))
+            let entries = mut fx2.choose(wide, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(mut fx3.b.load(PTR, flags: clif::MemFlags.unaligned(), p: at, offset: 0))
+                return produced
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(load_u32(mut fx3, address: at, offset: 0))
+                return produced
+            })
+            let entry = entries[0]
+            let table_signature = load_u32(mut fx2, address: entry, offset: 0)
+            let same = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: table_signature, y: signature)
+            mut fx2.if_true(same, then: fn(mut fx3: Fx) {
+                mut fx3.b.def_var(found, val: entry)
+            })
+        })
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.b.use_var(found))
+        return produced
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.ptr(0))
+        return produced
+    })
+    return chosen[0]
+} Lowering.acpi_table
+
+/// Visits each entry of the MADT the RSDP lists, given its address and its type, while the
+/// entry's header lies in the table and its length is nonzero.
+fn Lowering.madt_entries(mut self, mut fx: Fx, rsdp: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, at: clif::Value, kind: clif::Value)) {
+    let madt = mut self.acpi_table(mut fx, rsdp, signature: MADT_SIGNATURE)
+    let found = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: madt, y: 0)
+    mut fx.if_true(found, then: fn[mut self](mut fx1: Fx) {
+        let length = load_u32(mut fx1, address: madt, offset: 4)
+        let end = mut fx1.b.iadd(madt, y: length)
+        let head = mut fx1.b.iadd_imm_s(madt, y: i64.fit(MADT_ENTRIES))
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(head).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 0
+            let at = current[0]
+            let header = mut fx2.b.iadd_imm_s(at, y: 2)
+            let inside = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: header, y: end)
+            var results = Array[clif::Type, 2].filled(PTR)
+            results[1] = clif::Type.Int8
+            let next = mut fx2.choose_in(mut self, condition: inside, results: results.view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let kind = mut fx3.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 0)
+                let len_byte = mut fx3.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 1)
+                let len = mut fx3.b.uextend(PTR, x: len_byte)
+                visit(mut lo3, fx: mut fx3, at, kind)
+                let next_at = mut fx3.b.iadd(at, y: len)
+                let more = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(next_at)
+                mut produced.push(more)
+                return produced
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(at)
+                mut produced.push(mut fx3.int(clif::Type.Int8, value: 0))
+                return produced
+            })
+            var state = mem::List[clif::Value].empty(fx2.alloc)
+            mut state.push(next[0])
+            return Pass(again: next[1], next: take state)
+        })
+    })
+} Lowering.madt_entries
+
+/// A 32-bit value of a firmware table at an address, zero-extended.
+fn load_u32(mut fx: Fx, address: clif::Value, offset: u64) -> clif::Value {
+    let value = mut fx.b.load(clif::Type.Int32, flags: clif::MemFlags.unaligned(), p: address, offset: i32.fit(offset))
+    return mut fx.b.uextend(PTR, x: value)
+} load_u32
+
+/// A 64-bit value of a firmware table at an address.
+fn load_u64(mut fx: Fx, address: clif::Value, offset: u64) -> clif::Value {
+    return mut fx.b.load(PTR, flags: clif::MemFlags.unaligned(), p: address, offset: i32.fit(offset))
+} load_u64

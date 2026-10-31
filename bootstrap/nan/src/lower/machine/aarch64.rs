@@ -1,6 +1,6 @@
 //! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the
-//! descriptor names, its ITS set up by `its.rs`, the virtual timer of each CPU, and the vectors
-//! the dispatcher of `interrupts.rs` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every
+//! machine's discovery finds, its ITS set up by `its.rs`, the virtual timer of each CPU, and the
+//! vectors the dispatcher of `interrupts.rs` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every
 //! exception switches to `SP_EL1`, the CPU's interrupt stack.
 
 use cranelift_codegen::binemit::Reloc;
@@ -10,6 +10,7 @@ use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 use super::super::fx::{Fx, PTR};
 use super::Lowering;
 use super::cpus::cpu;
+use super::discovery::machine;
 use super::interrupts::{SavedFrame, Vectors};
 use super::signal::SIGNAL_VECTOR;
 use super::stubs::Stub;
@@ -259,12 +260,8 @@ pub(super) const VECTORS: Vectors = Vectors {
     exceptions: ABORT_VECTOR + 1,
 };
 
-/// The GICv3 the descriptor names: its distributor, and the first CPU's redistributor, each
-/// CPU's a stride after the previous one with its frame of software-generated and private
-/// interrupts a page after its control frame.
-pub(super) const GICD: u64 = 0x0800_0000;
-pub(super) const GICR: u64 = 0x080A_0000;
-pub(super) const GICR_STRIDE: u64 = 0x2_0000;
+/// The offset in a CPU's redistributor of its frame of software-generated and private
+/// interrupts, a page after its control frame.
 const GICR_SGI: u64 = 0x1_0000;
 
 /// The distributor's registers the kernel programs: its control register, set to affinity
@@ -327,6 +324,12 @@ pub(super) fn exception_vector(fx: &mut Fx, syndrome: Value) -> Value {
 }
 
 impl Lowering<'_, '_> {
+    /// The distributor's base.
+    pub(super) fn distributor(&mut self, fx: &mut Fx) -> Value {
+        let record = self.machine_record(fx);
+        fx.load(PTR, record, machine::GICD)
+    }
+
     /// Reads a GIC CPU-interface, vector-base, timer or counter system register through the
     /// `ReadSysReg` stub.
     pub(super) fn read_sysreg(&mut self, fx: &mut Fx, register: u16) -> Value {
@@ -343,12 +346,14 @@ impl Lowering<'_, '_> {
     /// in group 1 and enables each that a contribution binds, routed to the boot CPU, and the
     /// ITS is set up; the glue enables the private interrupts on each CPU.
     pub fn aarch64_interrupt_setup(&mut self, fx: &mut Fx) -> FuncId {
-        let ctlr = fx.ptr(GICD + GICD_CTLR);
+        let gicd = self.distributor(fx);
+        let ctlr = fx.b.ins().iadd_imm_s(gicd, GICD_CTLR as i64);
         let groups = fx.ptr(GICD_ARE_GROUPS);
         self.mmio_write(fx, 4, ctlr, groups);
         let ones = fx.ptr(0xFFFF_FFFF);
         for word in 1..GICD_SPI_WORDS {
-            let group = fx.ptr(GICD + GICD_IGROUPR + 4 * word);
+            let offset = GICD_IGROUPR + 4 * word;
+            let group = fx.b.ins().iadd_imm_s(gicd, offset as i64);
             self.mmio_write(fx, 4, group, ones);
         }
         let bound = self.bound_vectors();
@@ -376,8 +381,10 @@ impl Lowering<'_, '_> {
     /// an installed device.
     pub fn aarch64_route(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
         let affinity = self.hardware_id(fx, cpu);
+        let gicd = self.distributor(fx);
         let route = fx.b.ins().ishl_imm_s(vector, 3);
-        let route = fx.b.ins().iadd_imm_s(route, (GICD + GICD_IROUTER) as i64);
+        let route = fx.b.ins().iadd(route, gicd);
+        let route = fx.b.ins().iadd_imm_s(route, GICD_IROUTER as i64);
         self.mmio_write(fx, 8, route, affinity);
         self.gic_spi_bit(fx, GICD_ISENABLER, vector);
     }
@@ -390,9 +397,11 @@ impl Lowering<'_, '_> {
     /// Writes the bit of a shared peripheral interrupt alone to its word of one of the
     /// distributor's set-enable or clear-enable registers, which leave the other bits as they are.
     fn gic_spi_bit(&mut self, fx: &mut Fx, register: u64, vector: Value) {
+        let gicd = self.distributor(fx);
         let word = fx.b.ins().ushr_imm_s(vector, 5);
         let word = fx.b.ins().ishl_imm_s(word, 2);
-        let at = fx.b.ins().iadd_imm_s(word, (GICD + register) as i64);
+        let at = fx.b.ins().iadd(word, gicd);
+        let at = fx.b.ins().iadd_imm_s(at, register as i64);
         let position = fx.b.ins().band_imm_s(vector, 31);
         let one = fx.ptr(1);
         let bit = fx.b.ins().ishl(one, position);
@@ -449,9 +458,8 @@ impl Lowering<'_, '_> {
             let table = lo.func_ref(fx, vbar);
             let table = fx.b.ins().func_addr(PTR, table);
             lo.write_sysreg(fx, VBAR_EL1, table);
-            let index = lo.running_index(fx);
-            let stride = fx.b.ins().imul_imm_s(index, GICR_STRIDE as i64);
-            let base = fx.b.ins().iadd_imm_s(stride, GICR as i64);
+            let record = lo.running_cpu(fx);
+            let base = fx.load(PTR, record, cpu::REDISTRIBUTOR);
             let sgi = fx.b.ins().iadd_imm_s(base, GICR_SGI as i64);
             let waker = fx.b.ins().iadd_imm_s(base, GICR_WAKER as i64);
             let state = lo.mmio_read(fx, 4, waker);

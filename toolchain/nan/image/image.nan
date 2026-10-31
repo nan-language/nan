@@ -7,6 +7,15 @@ const PAGE: u64 = 4_096
 /// address plus one.
 pkg const IMAGE_EXTENT: Str = "_NSimage"
 
+/// The relocation header, a data object of `RELOCATION_HEADER_BYTES` bytes into which the image
+/// writer of a bare image writes five words as linked: the header's address, the image's first
+/// and last address plus one, the address of a table listing the address of each absolute address
+/// its relocations wrote, and that table's entry count. The table lies in a read-only segment
+/// after the others; none of the header's words is itself relocated.
+pkg const RELOCATION_HEADER: Str = "_NSrelocs"
+
+pkg const RELOCATION_HEADER_BYTES: usize = 40
+
 /// The image of a machine target linking an object lowering wrote, entered at the symbol `entry`.
 pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: mem::Alloc) -> mem::Bytes {
     let Some(arch) = target.arch() else {
@@ -94,13 +103,44 @@ fn Linked.end(self) -> u64 {
     return end
 } Linked.end
 
-/// Writes the image's extent, from `base` to the end of its segments, into the data object
-/// `IMAGE_EXTENT` when the object defines one, as two absolute addresses.
-fn Linked.record_extent(mut self, base: u64) {
-    let Some(at) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(IMAGE_EXTENT)) else {
+/// Writes the relocation header and appends its table when the object defines the header, the
+/// table listing the image extent's words too.
+fn Linked.record_relocations(mut self, base: u64, alloc: mem::Alloc) {
+    let Some(header) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(RELOCATION_HEADER)) else {
         return
     }
-    let end = self.end()
+    var places = mem::List[u64].empty(alloc)
+    for absolute in self.absolute {
+        expect absolute.width == 8
+        mut places.push(absolute.address)
+    }
+    match self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(IMAGE_EXTENT)) {
+        Some(extent) => {
+            mut places.push(extent)
+            mut places.push(extent + 8)
+        }
+        None => {}
+    }
+    mut places.sort_by(fn(left: u64, right: u64) => left.cmp(right))
+    let table = next_multiple_of(self.end(), multiple: PAGE)
+    if places.len() > 0 {
+        var bytes = mem::Bytes.empty(alloc)
+        for place in places {
+            object::append_u64(mut bytes, value: place)
+        }
+        mut self.segments.push(Segment(address: table, access: Access.Read, bytes: take bytes, size: 8 * u64.widen(places.len())))
+    }
+    var words = mem::List[u64].empty(alloc)
+    mut words.push(header)
+    mut words.push(base)
+    mut words.push(self.end())
+    mut words.push(table)
+    mut words.push(u64.widen(places.len()))
+    mut self.write_words(at: header, words: words.view())
+} Linked.record_relocations
+
+/// Writes words at an address of a segment's bytes.
+fn Linked.write_words(mut self, at: u64, words: Slice[u64]) {
     let Some(index) = self.segments.position(fn(segment: Segment) => segment.contains(at)) else {
         expect false
         return
@@ -108,8 +148,21 @@ fn Linked.record_extent(mut self, base: u64) {
     expect self.segments[index].contains(at)
     let offset = usize.widen(at - self.segments[index].address)
     var bytes = mut self.segments[index].bytes.view_mut()
-    mut bytes.write_u64_le(offset, value: base)
-    mut bytes.write_u64_le(offset + 8, value: end)
+    for slot in 0..<words.len() {
+        mut bytes.write_u64_le(offset + 8 * slot, value: words[slot])
+    }
+} Linked.write_words
+
+/// Writes the image's extent, from `base` to the end of its segments, into the data object
+/// `IMAGE_EXTENT` when the object defines one, as two absolute addresses.
+fn Linked.record_extent(mut self, base: u64) {
+    let Some(at) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(IMAGE_EXTENT)) else {
+        return
+    }
+    let end = self.end()
+    var words = Array[u64, 2].filled(base)
+    words[1] = end
+    mut self.write_words(at, words: words.view())
     mut self.absolute.push(Absolute(address: at, width: 8))
     mut self.absolute.push(Absolute(address: at + 8, width: 8))
 } Linked.record_extent
@@ -221,6 +274,7 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
     }
     mut imports.sort_by(import_order)
     var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute, imports: take imports)
+    mut linked.record_relocations(base, alloc)
     mut linked.record_extent(base)
     mut linked.absolute.sort_by(absolute_order)
     return linked

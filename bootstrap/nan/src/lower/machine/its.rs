@@ -11,9 +11,9 @@ use super::super::fx::{Fx, PTR};
 use super::super::runtime::system::map_chunks;
 use super::super::runtime::{report, state};
 use super::Lowering;
-use super::aarch64::{GICD, GICR, GICR_STRIDE};
 use super::bindings::{binding, device, msi};
-use super::cpus::MAX_CPUS;
+use super::cpus::{MAX_CPUS, cpu};
+use super::discovery::machine;
 use super::stubs::Stub;
 
 /// The first LPI's identifier, and the LPIs the runtime installs devices on: those that
@@ -28,10 +28,9 @@ const EVENT_BITS: u64 = 13;
 const GICD_TYPER: u64 = 0x4;
 const GICD_LPIS: i64 = 1 << 17;
 
-/// The ITS the descriptor names and its registers: its control register with its enable bit,
-/// its type register, the command queue's base, write and read registers, its first table base
-/// register, a doubleword per table, and the translation register devices write.
-const GITS: u64 = 0x0808_0000;
+/// The ITS's registers: its control register with its enable bit, its type register, the
+/// command queue's base, write and read registers, its first table base register, a doubleword
+/// per table, and the translation register devices write.
 const GITS_CTLR: u64 = 0x0;
 const GITS_ENABLED: u64 = 1;
 const GITS_TYPER: u64 = 0x8;
@@ -40,7 +39,7 @@ const GITS_CWRITER: u64 = 0x88;
 const GITS_CREADR: u64 = 0x90;
 const GITS_BASER: u64 = 0x100;
 const GITS_TABLES: u64 = 8;
-const GITS_TRANSLATER: u64 = GITS + 0x1_0040;
+const GITS_TRANSLATER: u64 = 0x1_0040;
 
 /// The fields of the ITS type register: the bytes of an interrupt table entry less one, the
 /// event id bits less one, the device id bits less one, each at its position under its mask,
@@ -81,7 +80,7 @@ const CHUNK_SHIFT: i64 = 16;
 /// table zeroed.
 const GICR_CTLR: u64 = 0x0;
 const GICR_LPIS: i64 = 1;
-const GICR_TYPER: u64 = 0x8;
+pub(super) const GICR_TYPER: u64 = 0x8;
 const GICR_PROCESSOR: (i64, i64) = (8, 0xFFFF);
 const GICR_PROPBASER: u64 = 0x70;
 const GICR_PENDBASER: u64 = 0x78;
@@ -124,95 +123,113 @@ impl Lowering<'_, '_> {
         fx.b.ins().iadd(table, at)
     }
 
-    /// On the boot CPU, when the distributor reports LPIs and the ITS takes the event ids of
-    /// every LPI: gives the ITS its device and collection tables, the device table covering at
-    /// most `DEVICE_BITS` id bits, and its command queue, enables it, draws the LPI property
-    /// table and maps a collection to each CPU's redistributor, numbered as the CPU.
+    /// On the boot CPU, sets the ITS up when the machine has one and the distributor reports
+    /// LPIs.
     pub(super) fn its_setup(&mut self, fx: &mut Fx) {
-        let at = fx.ptr(GICD + GICD_TYPER);
-        let gicd = self.mmio_read(fx, 4, at);
-        let lpis = fx.b.ins().band_imm_s(gicd, GICD_LPIS);
-        let lpis = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lpis, 0);
-        fx.when(lpis, |fx| {
-            let typer = self.its_typer(fx);
-            let events = field(fx, typer, TYPER_EVENTS);
-            let events = fx.b.ins().iadd_imm_s(events, 1);
-            let enough =
-                fx.b.ins()
-                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, events, EVENT_BITS as i64);
-            fx.when(enough, |fx| {
-                let bits = field(fx, typer, TYPER_DEVICES);
-                let bits = fx.b.ins().iadd_imm_s(bits, 1);
-                let wide =
-                    fx.b.ins()
-                        .icmp_imm_s(IntCC::UnsignedGreaterThan, bits, DEVICE_BITS);
-                let most = fx.ptr(DEVICE_BITS as u64);
-                let bits = fx.b.ins().select(wide, most, bits);
-                let one = fx.ptr(1);
-                let devices = fx.b.ins().ishl(one, bits);
-                let state_address = self.state(fx);
-                fx.store(devices, state_address, state::ITS_DEVICES);
-                let zero = fx.ptr(0);
-                let tables = fx.ptr(GITS_TABLES);
-                fx.each(zero, tables, |fx, index| {
-                    let at = fx.b.ins().imul_imm_s(index, 8);
-                    let at = fx.b.ins().iadd_imm_s(at, (GITS + GITS_BASER) as i64);
-                    let baser = self.mmio_read(fx, 8, at);
-                    let kind = field(fx, baser, BASER_TYPE);
-                    let device_table = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, BASER_DEVICES);
-                    let collections = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, BASER_COLLECTIONS);
-                    let used = fx.b.ins().bor(device_table, collections);
-                    fx.when(used, |fx| {
-                        let size = field(fx, baser, BASER_ENTRY);
-                        let size = fx.b.ins().iadd_imm_s(size, 1);
-                        let cpus = fx.ptr(MAX_CPUS);
-                        let entries = fx.b.ins().select(device_table, devices, cpus);
-                        let bytes = fx.b.ins().imul(entries, size);
-                        let table = self.its_chunks(fx, bytes);
-                        let last = fx.b.ins().iadd_imm_s(bytes, -1);
-                        let pages = fx.b.ins().ushr_imm_s(last, CHUNK_SHIFT);
-                        let kept = fx.b.ins().band_imm_s(baser, BASER_KEPT);
-                        let value = fx.b.ins().bor(kept, table);
-                        let value = fx.b.ins().bor(value, pages);
-                        let value =
-                            fx.b.ins()
-                                .bor_imm_s(value, VALID | ITS_CACHED | SHAREABLE | PAGES_64K);
-                        self.mmio_write(fx, 8, at, value);
-                    });
-                });
-                let bytes = fx.ptr(QUEUE_BYTES);
-                let queue = self.its_chunks(fx, bytes);
-                let base =
-                    fx.b.ins()
-                        .bor_imm_s(queue, VALID | ITS_CACHED | SHAREABLE | QUEUE_PAGES);
-                let at = fx.ptr(GITS + GITS_CBASER);
-                self.mmio_write(fx, 8, at, base);
-                let at = fx.ptr(GITS + GITS_CWRITER);
-                self.mmio_write(fx, 8, at, zero);
-                let at = fx.ptr(GITS + GITS_CTLR);
-                let enabled = fx.ptr(GITS_ENABLED);
-                self.mmio_write(fx, 4, at, enabled);
-                fx.store(queue, state_address, state::ITS_QUEUE);
-                let bytes = fx.ptr(LPIS);
-                let properties = self.its_chunks(fx, bytes);
-                fx.store(properties, state_address, state::ITS_PROPERTIES);
-                let count = fx.load(PTR, state_address, state::THREAD_COUNT);
-                fx.each(zero, count, |fx, cpu| {
-                    let target = self.its_target(fx, typer, cpu);
-                    let mapped = fx.b.ins().bor(target, cpu);
-                    let mapped = fx.b.ins().bor_imm_s(mapped, VALID);
-                    let none = fx.ptr(0);
-                    let command = fx.ptr(MAPC as u64);
-                    self.its_command(fx, [command, none, mapped, none]);
-                });
-                self.its_flush(fx);
-            });
+        let its = self.its(fx);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, its, 0);
+        fx.when(present, |fx| {
+            let gicd = self.distributor(fx);
+            let at = fx.b.ins().iadd_imm_s(gicd, GICD_TYPER as i64);
+            let gicd = self.mmio_read(fx, 4, at);
+            let lpis = fx.b.ins().band_imm_s(gicd, GICD_LPIS);
+            let lpis = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lpis, 0);
+            fx.when(lpis, |fx| self.its_tables(fx));
         });
+    }
+
+    /// When the ITS takes the event ids of every LPI: gives it its device and collection tables,
+    /// the device table covering at most `DEVICE_BITS` id bits, and its command queue, enables
+    /// it, draws the LPI property table and maps a collection to each CPU's redistributor,
+    /// numbered as the CPU.
+    fn its_tables(&mut self, fx: &mut Fx) {
+        let its = self.its(fx);
+        let typer = self.its_typer(fx);
+        let events = field(fx, typer, TYPER_EVENTS);
+        let events = fx.b.ins().iadd_imm_s(events, 1);
+        let enough =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, events, EVENT_BITS as i64);
+        fx.when(enough, |fx| {
+            let bits = field(fx, typer, TYPER_DEVICES);
+            let bits = fx.b.ins().iadd_imm_s(bits, 1);
+            let wide =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThan, bits, DEVICE_BITS);
+            let most = fx.ptr(DEVICE_BITS as u64);
+            let bits = fx.b.ins().select(wide, most, bits);
+            let one = fx.ptr(1);
+            let devices = fx.b.ins().ishl(one, bits);
+            let state_address = self.state(fx);
+            fx.store(devices, state_address, state::ITS_DEVICES);
+            let zero = fx.ptr(0);
+            let tables = fx.ptr(GITS_TABLES);
+            fx.each(zero, tables, |fx, index| {
+                let at = fx.b.ins().imul_imm_s(index, 8);
+                let at = fx.b.ins().iadd(at, its);
+                let at = fx.b.ins().iadd_imm_s(at, GITS_BASER as i64);
+                let baser = self.mmio_read(fx, 8, at);
+                let kind = field(fx, baser, BASER_TYPE);
+                let device_table = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, BASER_DEVICES);
+                let collections = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, BASER_COLLECTIONS);
+                let used = fx.b.ins().bor(device_table, collections);
+                fx.when(used, |fx| {
+                    let size = field(fx, baser, BASER_ENTRY);
+                    let size = fx.b.ins().iadd_imm_s(size, 1);
+                    let cpus = fx.ptr(MAX_CPUS);
+                    let entries = fx.b.ins().select(device_table, devices, cpus);
+                    let bytes = fx.b.ins().imul(entries, size);
+                    let table = self.its_chunks(fx, bytes);
+                    let last = fx.b.ins().iadd_imm_s(bytes, -1);
+                    let pages = fx.b.ins().ushr_imm_s(last, CHUNK_SHIFT);
+                    let kept = fx.b.ins().band_imm_s(baser, BASER_KEPT);
+                    let value = fx.b.ins().bor(kept, table);
+                    let value = fx.b.ins().bor(value, pages);
+                    let value =
+                        fx.b.ins()
+                            .bor_imm_s(value, VALID | ITS_CACHED | SHAREABLE | PAGES_64K);
+                    self.mmio_write(fx, 8, at, value);
+                });
+            });
+            let bytes = fx.ptr(QUEUE_BYTES);
+            let queue = self.its_chunks(fx, bytes);
+            let base =
+                fx.b.ins()
+                    .bor_imm_s(queue, VALID | ITS_CACHED | SHAREABLE | QUEUE_PAGES);
+            let at = fx.b.ins().iadd_imm_s(its, GITS_CBASER as i64);
+            self.mmio_write(fx, 8, at, base);
+            let at = fx.b.ins().iadd_imm_s(its, GITS_CWRITER as i64);
+            self.mmio_write(fx, 8, at, zero);
+            let at = fx.b.ins().iadd_imm_s(its, GITS_CTLR as i64);
+            let enabled = fx.ptr(GITS_ENABLED);
+            self.mmio_write(fx, 4, at, enabled);
+            fx.store(queue, state_address, state::ITS_QUEUE);
+            let bytes = fx.ptr(LPIS);
+            let properties = self.its_chunks(fx, bytes);
+            fx.store(properties, state_address, state::ITS_PROPERTIES);
+            let count = fx.load(PTR, state_address, state::THREAD_COUNT);
+            fx.each(zero, count, |fx, cpu| {
+                let target = self.its_target(fx, typer, cpu);
+                let mapped = fx.b.ins().bor(target, cpu);
+                let mapped = fx.b.ins().bor_imm_s(mapped, VALID);
+                let none = fx.ptr(0);
+                let command = fx.ptr(MAPC as u64);
+                self.its_command(fx, [command, none, mapped, none]);
+            });
+            self.its_flush(fx);
+        });
+    }
+
+    /// The ITS's base.
+    fn its(&mut self, fx: &mut Fx) -> Value {
+        let record = self.machine_record(fx);
+        fx.load(PTR, record, machine::ITS)
     }
 
     /// The ITS's type register.
     fn its_typer(&mut self, fx: &mut Fx) -> Value {
-        let at = fx.ptr(GITS + GITS_TYPER);
+        let its = self.its(fx);
+        let at = fx.b.ins().iadd_imm_s(its, GITS_TYPER as i64);
         self.mmio_read(fx, 8, at)
     }
 
@@ -229,8 +246,8 @@ impl Lowering<'_, '_> {
     /// The redistributor of CPU `cpu` as ITS commands name it, at the place of their target
     /// field: by its address, or by its processor number.
     fn its_target(&mut self, fx: &mut Fx, typer: Value, cpu: Value) -> Value {
-        let base = fx.b.ins().imul_imm_s(cpu, GICR_STRIDE as i64);
-        let base = fx.b.ins().iadd_imm_s(base, GICR as i64);
+        let record = self.cpu_record(fx, cpu);
+        let base = fx.load(PTR, record, cpu::REDISTRIBUTOR);
         let at = fx.b.ins().iadd_imm_s(base, GICR_TYPER as i64);
         let rd_typer = self.mmio_read(fx, 8, at);
         let processor = field(fx, rd_typer, GICR_PROCESSOR);
@@ -256,11 +273,12 @@ impl Lowering<'_, '_> {
 
     /// Hands the ITS the commands written and waits until it has processed them.
     fn its_flush(&mut self, fx: &mut Fx) {
+        let its = self.its(fx);
         let state_address = self.state(fx);
         let written = fx.load(PTR, state_address, state::ITS_WRITE);
-        let at = fx.ptr(GITS + GITS_CWRITER);
+        let at = fx.b.ins().iadd_imm_s(its, GITS_CWRITER as i64);
         self.mmio_write(fx, 8, at, written);
-        let at = fx.ptr(GITS + GITS_CREADR);
+        let at = fx.b.ins().iadd_imm_s(its, GITS_CREADR as i64);
         fx.repeat(&[], |fx, _| {
             let read = self.mmio_read(fx, 8, at);
             let read =
@@ -348,7 +366,8 @@ impl Lowering<'_, '_> {
                 fx.store(enabled, property, 0);
                 let intid = fx.b.ins().iadd_imm_s(index, LPI_BASE);
                 fx.store(intid, record, device::VECTOR);
-                let address = fx.ptr(GITS_TRANSLATER);
+                let its = self.its(fx);
+                let address = fx.b.ins().iadd_imm_s(its, GITS_TRANSLATER as i64);
                 fx.store(address, record, device::MESSAGE);
                 fx.store(index, record, device::DATA);
                 fx.store(source, record, device::SOURCE);

@@ -1,0 +1,82 @@
+//! Entered at EL2, reaches PSCI through the conduit its device tree names and has every CPU take the CPU signal, which the boot CPU's first timer interrupt sends.
+
+/// The PSCI function giving the interface's version, which no PSCI implementation gives as a
+/// negative status.
+const PSCI_VERSION: u32 = 0x8400_0000
+
+/// The polls of the signals taken before the first task stops waiting for them.
+const POLLS: u64 = 100_000_000
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// What interrupt fns reach: the CPU's operations, the timer interrupts taken and the CPU
+/// signals taken.
+linear struct State {
+    cpu: hw::Ring0
+    ticks: core::atomic::AtomicU64
+    signals: mem::Shared[core::atomic::AtomicU64]
+} State
+
+/// Writes a text to the PL011 the emulator connects to the serial port.
+fn say(text: Str) {
+    var port = trusted "the virt board maps its first PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+/// Sends every CPU the CPU signal at the first timer interrupt.
+pub interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    discard hw::Anchor[State].with(fn(state: State) {
+        if state.ticks.fetch_add(1) == Some(0) {
+            for index in 0..<hw::cpu_count() {
+                state.cpu.signal_cpu(index)
+            }
+        }
+    })
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_timer
+
+/// Counts each CPU signal a CPU takes.
+pub interrupt fn on_signal(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    discard hw::Anchor[State].with(fn(state: State) {
+        discard state.signals.contents().fetch_add(1)
+    })
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_signal
+
+contribute hw::vectors timer = hw::Vector(vector: 27, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None)
+
+contribute hw::vectors signal = hw::Vector(vector: hw::SIGNAL_VECTOR, ist: 0, handler: hw::VectorHandler.Irq(on_signal), user: None)
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let Some(cpu) = mut k.ring0() else {
+        loop {
+        }
+    }
+    let version = trusted "PSCI_VERSION only reads the interface's version" { cpu.firmware_call(PSCI_VERSION, a: 0, b: 0, c: 0) }
+    if version > 0 and version < 0x8000_0000 {
+        say(text: "psci answers\n")
+    }
+    if hw::cpu_count() == 4 {
+        say(text: "4 cpus\n")
+    }
+    let signals = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    let counted = signals.share()
+    let state = State(cpu: take cpu, ticks: core::atomic::AtomicU64.of(0), signals: take signals)
+    take k.anchor(take state, run: fn[take counted](exec: task::Executor) limits stack 16_384 {
+        var waited: u64 = 0
+        while counted.contents().load() < u64.widen(hw::cpu_count()) and waited < POLLS {
+            waited += 1
+        }
+        if waited < POLLS {
+            say(text: "every cpu took the signal\n")
+        }
+    })
+} main

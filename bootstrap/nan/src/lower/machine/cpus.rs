@@ -1,7 +1,7 @@
 //! The processors of a machine image: their records, which the GS base addresses on x86_64 and
-//! `TPIDR_EL1` on AArch64; the CPUs the platform reports, through the ACPI MADT or PSCI, the boot
-//! CPU first; and the starting of the others, through a trampoline the anchor copies below 1 MiB
-//! or through PSCI.
+//! `TPIDR_EL1` on AArch64; the CPUs the platform reports, through the ACPI MADT on x86_64 and as
+//! the AArch64 machine's discovery finds them, the boot CPU first; and the starting of the
+//! others, through a trampoline the anchor copies below 1 MiB or through PSCI.
 
 use super::super::data::Reserved;
 use cranelift_codegen::ir::{
@@ -15,20 +15,15 @@ use super::super::runtime::memory::CHUNK;
 use super::super::runtime::system::{self, unavailable_unless};
 use super::super::runtime::tasks::thread;
 use super::super::runtime::{Routine, report, state};
-use super::start::info;
+use super::acpi::load_u32;
 use super::stubs::Stub;
-use crate::workspace::{Arch, Kind, Target};
+use crate::workspace::{Arch, Target};
 
 /// The most CPUs a machine image runs; the platform's others stay stopped.
 pub const MAX_CPUS: u64 = 64;
 
-/// The PSCI functions the AArch64 machine layer calls through the hypervisor conduit: the power
-/// state of a processor, which discovers the CPUs, and powering one on; and the largest status a
-/// query gives for a processor that exists — on, off or on-pending — an affinity no processor
-/// answers for giving a negative status instead.
-const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+/// The PSCI function powering a processor on.
 const PSCI_CPU_ON: u64 = 0xC400_0003;
-const PSCI_PRESENT_MAX: i64 = 2;
 
 /// The offsets of a CPU record's fields: its executor thread's record, which the `thread` stub
 /// reads; the vector its running interrupt fn serves; the top and lowest address of its
@@ -43,8 +38,8 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// interrupts; whether the dispatcher running installed devices defers the end of the
 /// interrupt their `hw::IrqContext.complete` would make; its queue of ready tasks, the lock of
 /// that queue and the key of its first task; the key of the task it runs, zero for none, and the
-/// nanosecond that task's slice ends, zero for none; whether it idles; and whether it runs a hook
-/// of the kernel's policy.
+/// nanosecond that task's slice ends, zero for none; whether it idles; whether it runs a hook
+/// of the kernel's policy; and on AArch64, the base of its GICv3 redistributor's frames.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -70,6 +65,7 @@ pub mod cpu {
     pub const SLICE_END: u64 = 320;
     pub const IDLE: u64 = 328;
     pub const HOOK: u64 = 336;
+    pub const REDISTRIBUTOR: u64 = 344;
     pub const SIZE: u64 = 384;
 }
 
@@ -132,15 +128,18 @@ impl Lowering<'_, '_> {
     }
 
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
-    /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
-    /// its clock started, on x86_64 the local APICs' mode chosen, and a CPU for each processor
-    /// the platform reports; an executor thread
-    /// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
+    /// register addresses from now on; the boot CPU's data-independent timing mode; on AArch64,
+    /// the machine discovered; on a kernel, its clock started, on x86_64 the local APICs' mode
+    /// chosen, and a CPU for each processor the platform reports; an executor thread record for
+    /// each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
     /// the boot CPU's descriptor tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
         self.call_stub(fx, Stub::ConstantTime, &[]);
+        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
+            self.discover_machine(fx);
+        }
         if self.kernel() {
             self.start_clock(fx);
         }
@@ -149,7 +148,7 @@ impl Lowering<'_, '_> {
                 self.choose_apic_mode(fx);
                 self.discover(fx, boot)
             }
-            (true, Some(Arch::Aarch64)) => self.aarch64_discover(fx, boot),
+            (true, Some(Arch::Aarch64)) => self.discovered_cpus(fx),
             _ => fx.ptr(1),
         };
         let state_address = self.state(fx);
@@ -249,51 +248,6 @@ impl Lowering<'_, '_> {
         fx.b.ins().store(unaligned(), top, record, at as i32);
     }
 
-    /// The number of CPUs the board provides, at least 1 and at most `MAX_CPUS`, recording each
-    /// one's affinity in its record: the boot CPU, affinity zero, first, then every consecutive
-    /// affinity a processor answers a power-state query for. The board numbers its processors from
-    /// zero without gaps, so each affinity is its CPU's index.
-    fn aarch64_discover(&mut self, fx: &mut Fx, boot: Value) -> Value {
-        let zero = fx.ptr(0);
-        fx.store(zero, boot, cpu::HARDWARE_ID);
-        let one = fx.ptr(1);
-        let count = fx.var(PTR, one);
-        fx.repeat(&[one], |fx, at| {
-            let affinity = at[0];
-            let room =
-                fx.b.ins()
-                    .icmp_imm_s(IntCC::UnsignedLessThan, affinity, MAX_CPUS as i64);
-            let present = fx.choose_in(
-                self,
-                room,
-                &[types::I8],
-                |lo, fx| {
-                    let function = fx.ptr(PSCI_AFFINITY_INFO);
-                    let level = fx.ptr(0);
-                    let pad = fx.ptr(0);
-                    let status = lo.call_stub(fx, Stub::Hvc, &[function, affinity, level, pad])[0];
-                    let present = fx.b.ins().icmp_imm_s(
-                        IntCC::UnsignedLessThanOrEqual,
-                        status,
-                        PSCI_PRESENT_MAX,
-                    );
-                    fx.when(present, |fx| {
-                        let counted = fx.b.use_var(count);
-                        let record = lo.cpu_record(fx, counted);
-                        fx.store(affinity, record, cpu::HARDWARE_ID);
-                        let counted = fx.b.ins().iadd_imm_s(counted, 1);
-                        fx.b.def_var(count, counted);
-                    });
-                    vec![present]
-                },
-                |_, fx| vec![fx.int(types::I8, 0)],
-            )[0];
-            let next = fx.b.ins().iadd_imm_s(affinity, 1);
-            (present, vec![next])
-        });
-        fx.b.use_var(count)
-    }
-
     /// The number of CPUs the platform reports as usable, at least 1 and at most `MAX_CPUS`,
     /// recording each one's local APIC id in its record: the boot CPU's first, then the others
     /// in the order of the MADT's local APIC and local x2APIC entries.
@@ -303,218 +257,45 @@ impl Lowering<'_, '_> {
         let one = fx.ptr(1);
         let count = fx.var(PTR, one);
         let rsdp = self.rsdp(fx);
-        let madt = self.madt(fx, rsdp);
-        let found = fx.b.ins().icmp_imm_s(IntCC::NotEqual, madt, 0);
-        fx.when(found, |fx| {
-            let length = load_u32(fx, madt, 4);
-            let end = fx.b.ins().iadd(madt, length);
-            let first = fx.b.ins().iadd_imm_s(madt, MADT_ENTRIES as i64);
-            fx.repeat(&[first], |fx, at| {
-                let at = at[0];
-                let header = fx.b.ins().iadd_imm_s(at, 2);
-                let inside = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, header, end);
-                let next = fx.choose_in(
-                    self,
-                    inside,
-                    &[PTR, types::I8],
-                    |lo, fx| {
-                        let kind = fx.b.ins().load(types::I8, unaligned(), at, 0);
-                        let len = fx.b.ins().load(types::I8, unaligned(), at, 1);
-                        let len = fx.b.ins().uextend(PTR, len);
-                        let apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
-                        let x2apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, MADT_X2APIC);
-                        let processor = fx.b.ins().bor(apic, x2apic);
-                        fx.when(processor, |fx| {
-                            let short_flags = load_u32(fx, at, 4);
-                            let wide_flags = load_u32(fx, at, 8);
-                            let flags = fx.b.ins().select(x2apic, wide_flags, short_flags);
-                            let usable = fx.b.ins().band_imm_s(flags, PROCESSOR_ENABLED);
-                            let usable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, usable, 0);
-                            let short_id = fx.b.ins().load(types::I8, unaligned(), at, 3);
-                            let short_id = fx.b.ins().uextend(PTR, short_id);
-                            let wide_id = load_u32(fx, at, 4);
-                            let id = fx.b.ins().select(x2apic, wide_id, short_id);
-                            let other = fx.b.ins().icmp(IntCC::NotEqual, id, own);
-                            let counted = fx.b.use_var(count);
-                            let room = fx.b.ins().icmp_imm_s(
-                                IntCC::UnsignedLessThan,
-                                counted,
-                                MAX_CPUS as i64,
-                            );
-                            let taken = fx.b.ins().band(usable, other);
-                            let taken = fx.b.ins().band(taken, room);
-                            fx.when(taken, |fx| {
-                                let counted = fx.b.use_var(count);
-                                let record = lo.cpu_record(fx, counted);
-                                fx.store(id, record, cpu::HARDWARE_ID);
-                                let counted = fx.b.ins().iadd_imm_s(counted, 1);
-                                fx.b.def_var(count, counted);
-                            });
-                        });
-                        let next = fx.b.ins().iadd(at, len);
-                        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, len, 0);
-                        vec![next, more]
-                    },
-                    |_, fx| vec![at, fx.int(types::I8, 0)],
-                );
-                (next[1], vec![next[0]])
+        self.madt_entries(fx, rsdp, &mut |lo, fx, at, kind| {
+            let apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+            let x2apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, MADT_X2APIC);
+            let processor = fx.b.ins().bor(apic, x2apic);
+            fx.when(processor, |fx| {
+                let short_flags = load_u32(fx, at, 4);
+                let wide_flags = load_u32(fx, at, 8);
+                let flags = fx.b.ins().select(x2apic, wide_flags, short_flags);
+                let usable = fx.b.ins().band_imm_s(flags, PROCESSOR_ENABLED);
+                let usable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, usable, 0);
+                let short_id = fx.b.ins().load(types::I8, unaligned(), at, 3);
+                let short_id = fx.b.ins().uextend(PTR, short_id);
+                let wide_id = load_u32(fx, at, 4);
+                let id = fx.b.ins().select(x2apic, wide_id, short_id);
+                let other = fx.b.ins().icmp(IntCC::NotEqual, id, own);
+                let counted = fx.b.use_var(count);
+                let room =
+                    fx.b.ins()
+                        .icmp_imm_s(IntCC::UnsignedLessThan, counted, MAX_CPUS as i64);
+                let taken = fx.b.ins().band(usable, other);
+                let taken = fx.b.ins().band(taken, room);
+                fx.when(taken, |fx| {
+                    let counted = fx.b.use_var(count);
+                    let record = lo.cpu_record(fx, counted);
+                    fx.store(id, record, cpu::HARDWARE_ID);
+                    let counted = fx.b.ins().iadd_imm_s(counted, 1);
+                    fx.b.def_var(count, counted);
+                });
             });
         });
         fx.b.use_var(count)
     }
-
-    /// The address of the ACPI root system description pointer, zero when the platform gives
-    /// none: on a bare target the one the start information names, or else on `x86_64-bare` the
-    /// one found in the BIOS area; on a UEFI target the one the firmware's configuration table
-    /// names.
-    pub fn rsdp(&mut self, fx: &mut Fx) -> Value {
-        let state_address = self.state(fx);
-        match self.ck.db.target.kind() {
-            Some(Kind::Uefi) => {
-                let table = fx.load(PTR, state_address, state::PLATFORM_TABLE);
-                return self.configured_rsdp(fx, table);
-            }
-            Some(Kind::Bare) => {}
-            _ => return fx.ptr(0),
-        }
-        let info = self.start_info(fx);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
-        let given = fx.choose(
-            present,
-            &[PTR],
-            |fx| vec![fx.load(PTR, info, info::RSDP)],
-            |fx| vec![fx.ptr(0)],
-        )[0];
-        if self.ck.db.target.arch() == Some(Arch::Aarch64) {
-            return given;
-        }
-        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, given, 0);
-        fx.choose(missing, &[PTR], |fx| vec![scan_rsdp(fx)], |_| vec![given])[0]
-    }
-
-    /// The RSDP a UEFI system table's configuration table names, preferring the ACPI 2.0 entry.
-    fn configured_rsdp(&mut self, fx: &mut Fx, table: Value) -> Value {
-        let count = fx.load(PTR, table, SYSTEM_TABLE_ENTRIES);
-        let entries = fx.load(PTR, table, SYSTEM_TABLE_CONFIGURATION);
-        let zero = fx.ptr(0);
-        let found = fx.var(PTR, zero);
-        for guid in [ACPI_10_TABLE, ACPI_20_TABLE] {
-            fx.each(zero, count, |fx, index| {
-                let entry = fx.b.ins().imul_imm_s(index, CONFIGURATION_ENTRY as i64);
-                let entry = fx.b.ins().iadd(entries, entry);
-                let low = fx.load(PTR, entry, 0);
-                let high = fx.load(PTR, entry, 8);
-                let low = fx.b.ins().icmp_imm_s(IntCC::Equal, low, guid.0 as i64);
-                let high = fx.b.ins().icmp_imm_s(IntCC::Equal, high, guid.1 as i64);
-                let same = fx.b.ins().band(low, high);
-                fx.when(same, |fx| {
-                    let pointer = fx.load(PTR, entry, 16);
-                    fx.b.def_var(found, pointer);
-                });
-            });
-        }
-        fx.b.use_var(found)
-    }
-
-    /// The MADT the RSDP's XSDT or RSDT lists, zero when none.
-    fn madt(&mut self, fx: &mut Fx, rsdp: Value) -> Value {
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rsdp, 0);
-        fx.choose(
-            present,
-            &[PTR],
-            |fx| {
-                let revision = fx.b.ins().load(types::I8, unaligned(), rsdp, 15);
-                let extended =
-                    fx.b.ins()
-                        .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, revision, 2);
-                let xsdt = fx.choose(
-                    extended,
-                    &[PTR],
-                    |fx| {
-                        let xsdt = fx.b.ins().load(PTR, unaligned(), rsdp, 24);
-                        vec![xsdt]
-                    },
-                    |fx| vec![fx.ptr(0)],
-                )[0];
-                let wide = fx.b.ins().icmp_imm_s(IntCC::NotEqual, xsdt, 0);
-                let rsdt = load_u32(fx, rsdp, 16);
-                let table = fx.b.ins().select(wide, xsdt, rsdt);
-                let eight = fx.ptr(8);
-                let four = fx.ptr(4);
-                let width = fx.b.ins().select(wide, eight, four);
-                let length = load_u32(fx, table, 4);
-                let listed = fx.b.ins().iadd_imm_s(length, -(SDT_HEADER as i64));
-                let count = fx.b.ins().udiv(listed, width);
-                let zero = fx.ptr(0);
-                let found = fx.var(PTR, zero);
-                fx.each(zero, count, |fx, index| {
-                    let offset = fx.b.ins().imul(index, width);
-                    let at = fx.b.ins().iadd(table, offset);
-                    let at = fx.b.ins().iadd_imm_s(at, SDT_HEADER as i64);
-                    let entry = fx.choose(
-                        wide,
-                        &[PTR],
-                        |fx| vec![fx.b.ins().load(PTR, unaligned(), at, 0)],
-                        |fx| vec![load_u32(fx, at, 0)],
-                    )[0];
-                    let signature = load_u32(fx, entry, 0);
-                    let apic =
-                        fx.b.ins()
-                            .icmp_imm_s(IntCC::Equal, signature, MADT_SIGNATURE);
-                    fx.when(apic, |fx| fx.b.def_var(found, entry));
-                });
-                vec![fx.b.use_var(found)]
-            },
-            |fx| vec![fx.ptr(0)],
-        )[0]
-    }
 }
-
-/// The offsets in a UEFI system table of its configuration table's entry count and address, the
-/// size of an entry, a GUID then the table's address, and the GUIDs of the ACPI tables, each as
-/// its two little-endian words.
-const SYSTEM_TABLE_ENTRIES: u64 = 104;
-const SYSTEM_TABLE_CONFIGURATION: u64 = 112;
-const CONFIGURATION_ENTRY: u64 = 24;
-const ACPI_10_TABLE: (u64, u64) = (0x11D3_2D88_EB9D_2D30, 0x4DC1_3F27_9000_169A);
-const ACPI_20_TABLE: (u64, u64) = (0x11D3_E4F1_8868_E871, 0x8188_3CC7_8000_22BC);
-
-/// The size of an ACPI table's header, the MADT's signature, and the offset of its first entry.
-const SDT_HEADER: u64 = 36;
-const MADT_SIGNATURE: i64 = 0x4349_5041;
-const MADT_ENTRIES: u64 = 44;
 
 /// The kind of a MADT local x2APIC entry, whose id and flags are words at offsets 4 and 8
 /// where a local APIC entry has a byte id at 3 and its flags at 4, and the flag of either saying
 /// its processor is enabled and ready for use.
 const MADT_X2APIC: i64 = 9;
 const PROCESSOR_ENABLED: i64 = 1;
-
-/// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.
-const BIOS_AREA: (u64, u64) = (0xE_0000, 0x10_0000);
-const RSDP_SIGNATURE: u64 = 0x2052_5450_2044_5352;
-
-/// The RSDP found in the BIOS area, zero when none.
-fn scan_rsdp(fx: &mut Fx) -> Value {
-    let start = fx.ptr(BIOS_AREA.0);
-    let zero = fx.ptr(0);
-    let found = fx.repeat(&[start, zero], |fx, state| {
-        let (at, _) = (state[0], state[1]);
-        let word = fx.load(PTR, at, 0);
-        let signature = fx.ptr(RSDP_SIGNATURE);
-        let same = fx.b.ins().icmp(IntCC::Equal, word, signature);
-        let zero = fx.ptr(0);
-        let found = fx.b.ins().select(same, at, zero);
-        let next = fx.b.ins().iadd_imm_s(at, 16);
-        let inside =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedLessThan, next, BIOS_AREA.1 as i64);
-        let missing = fx.b.ins().bxor_imm_s(same, 1);
-        let more = fx.b.ins().band(inside, missing);
-        (more, vec![next, found])
-    });
-    found[1]
-}
 
 /// The physical page the trampoline starting the other CPUs is copied to, whose page number the
 /// startup IPI carries; each started CPU's executor runs on a stack of one chunk.
@@ -619,8 +400,8 @@ impl Lowering<'_, '_> {
     /// entry seam: it reads the start record the boot CPU fills with the entry root, the CPU's
     /// executor stack, the start glue and the CPU's record, turns its MMU on and runs the glue,
     /// which prepares its interrupt delivery and starts its executor. The boot CPU starts the CPUs
-    /// one at a time, filling the record anew for each, and a CPU that does not start ends the
-    /// sequence, leaving the CPUs after it stopped.
+    /// one at a time through the PSCI conduit, filling the record anew for each, and a CPU that
+    /// PSCI refuses or that does not start ends the sequence, leaving the CPUs after it stopped.
     fn aarch64_start_cpus(&mut self, fx: &mut Fx, prepare: FuncId) {
         let state_address = self.state(fx);
         let count = fx.load(PTR, state_address, state::THREAD_COUNT);
@@ -650,8 +431,15 @@ impl Lowering<'_, '_> {
                 fx.store(cpu, record, super::secondary::CPU);
                 let affinity = fx.load(PTR, cpu, cpu::HARDWARE_ID);
                 let function = fx.ptr(PSCI_CPU_ON);
-                self.call_stub(fx, Stub::Hvc, &[function, affinity, seam, record]);
-                let started = self.wait_started(fx, cpu);
+                let status = self.psci_call(fx, function, [affinity, seam, record]);
+                let accepted = fx.b.ins().icmp_imm_s(IntCC::Equal, status, 0);
+                let started = fx.choose_in(
+                    self,
+                    accepted,
+                    &[types::I8],
+                    |lo, fx| vec![lo.wait_started(fx, cpu)],
+                    |_, fx| vec![fx.int(types::I8, 0)],
+                )[0];
                 let next = fx.b.ins().iadd_imm_s(index, 1);
                 let remaining = fx.b.ins().icmp(IntCC::UnsignedLessThan, next, count);
                 (fx.b.ins().band(started, remaining), vec![next])
@@ -746,12 +534,4 @@ impl Lowering<'_, '_> {
         );
         id
     }
-}
-
-/// A 32-bit value of a firmware table at an address, zero-extended.
-fn load_u32(fx: &mut Fx, address: Value, offset: u64) -> Value {
-    let value =
-        fx.b.ins()
-            .load(types::I32, unaligned(), address, offset as i32);
-    fx.b.ins().uextend(PTR, value)
 }

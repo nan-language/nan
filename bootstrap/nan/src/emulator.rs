@@ -118,7 +118,7 @@ pub enum Boots {
 }
 
 /// The emulator arguments common to every machine run of an architecture: the machine with its
-/// IOMMU first, on x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy
+/// IOMMU first, the AArch64 one without ACPI, on x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy
 /// device, exit port, TPM, watchdog, disk and network device, each virtio PCI device modern and
 /// behind the IOMMU, no display, the serial port on the standard streams then the console port,
 /// and an end with the process that starts it. `kept` holds whether a run's boots keep resets,
@@ -147,7 +147,7 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
         ],
         (Arch::Aarch64, _) => &[
             "-machine",
-            "virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off",
+            "virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off",
             "-accel",
             "tcg",
             "-cpu",

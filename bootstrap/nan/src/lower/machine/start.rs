@@ -33,14 +33,16 @@ pub mod module {
     pub const BYTES: i64 = 32;
 }
 
-/// The offsets in a memory map entry of its address, size and type, an entry's size, and the
-/// type of usable memory.
+/// The offsets in a memory map entry of its address, size and type, an entry's size, the type
+/// of usable memory, and the types of memory the AArch64 entry root maps as normal memory:
+/// usable, ACPI reclaimable and ACPI NVS memory.
 pub mod map_entry {
     pub const BASE: u64 = 0;
     pub const SIZE: u64 = 8;
     pub const KIND: u64 = 16;
     pub const BYTES: i64 = 24;
     pub const USABLE: i64 = 1;
+    pub const MAPPED: [i64; 3] = [1, 3, 4];
 }
 
 impl Lowering<'_, '_> {

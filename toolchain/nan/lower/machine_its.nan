@@ -16,11 +16,9 @@ const GICD_TYPER: u64 = 0x4
 
 const GICD_LPIS: i64 = 1i64 << 17
 
-/// The ITS the descriptor names and its registers: its control register with its enable bit,
-/// its type register, the command queue's base, write and read registers, its first table base
-/// register, a doubleword per table, and the translation register devices write.
-const GITS: u64 = 0x0808_0000
-
+/// The ITS's registers: its control register with its enable bit, its type register, the command
+/// queue's base, write and read registers, its first table base register, a doubleword per table,
+/// and the translation register devices write.
 const GITS_CTLR: u64 = 0x0
 
 const GITS_ENABLED: u64 = 1
@@ -37,7 +35,7 @@ const GITS_BASER: u64 = 0x100
 
 const GITS_TABLES: u64 = 8
 
-const GITS_TRANSLATER: u64 = GITS + 0x1_0040
+const GITS_TRANSLATER: u64 = 0x1_0040
 
 /// The fields of the ITS type register, each at its position under its mask: the bytes of an
 /// interrupt table entry less one, the event id bits less one and the device id bits less one;
@@ -142,87 +140,105 @@ fn Lowering.lpi_binding(mut self, mut fx: Fx, intid: clif::Value) -> clif::Value
     return mut fx.b.iadd(table, y: at)
 } Lowering.lpi_binding
 
-/// On the boot CPU, when the distributor reports LPIs and the ITS takes the event ids of every
-/// LPI: gives the ITS its device and collection tables, the device table covering at most
-/// `DEVICE_BITS` id bits, and its command queue, enables it, draws the LPI property table and
-/// maps a collection to each CPU's redistributor, numbered as the CPU.
+/// On the boot CPU, sets the ITS up when the machine has one and the distributor reports LPIs.
 fn Lowering.its_setup(mut self, mut fx: Fx) {
-    let at = mut fx.ptr(GICD + GICD_TYPER)
-    let distributor_type = mut self.mmio_read(mut fx, width: 4, address: at)
-    let lpi_bit = mut fx.b.band_imm_s(distributor_type, y: GICD_LPIS)
-    let has_lpis = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lpi_bit, y: 0)
-    mut fx.if_true(has_lpis, then: fn[mut self](mut fx1: Fx) {
-        let typer = mut self.its_typer(mut fx1)
-        let event_field = its_field(mut fx1, register: typer, field: TYPER_EVENTS)
-        let events = mut fx1.b.iadd_imm_s(event_field, y: 1)
-        let enough = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: events, y: i64.fit(EVENT_BITS))
-        mut fx1.if_true(enough, then: fn[mut self](mut fx2: Fx) {
-            let device_field = its_field(mut fx2, register: typer, field: TYPER_DEVICES)
-            let bits = mut fx2.b.iadd_imm_s(device_field, y: 1)
-            let wide = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: bits, y: DEVICE_BITS)
-            let most = mut fx2.ptr(u64.fit(DEVICE_BITS))
-            let kept_bits = mut fx2.b.select(wide, x: most, y: bits)
-            let one = mut fx2.ptr(1)
-            let device_limit = mut fx2.b.ishl(one, y: kept_bits)
-            let state_address = mut self.state(mut fx2)
-            mut fx2.store(device_limit, addr: state_address, offset: STATE_ITS_DEVICES)
-            let zero_value = mut fx2.ptr(0)
-            let tables = mut fx2.ptr(GITS_TABLES)
-            mut fx2.each(zero_value, end: tables, body: fn[mut self](mut fx3: Fx, index: clif::Value) {
-                let scaled = mut fx3.b.imul_imm_s(index, y: 8)
-                let register = mut fx3.b.iadd_imm_s(scaled, y: i64.fit(GITS + GITS_BASER))
-                let baser = mut self.mmio_read(mut fx3, width: 8, address: register)
-                let kind = its_field(mut fx3, register: baser, field: BASER_TYPE)
-                let device_table = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_DEVICES)
-                let collections = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_COLLECTIONS)
-                let used = mut fx3.b.bor(device_table, y: collections)
-                mut fx3.if_true(used, then: fn[mut self](mut fx4: Fx) {
-                    let entry_field = its_field(mut fx4, register: baser, field: BASER_ENTRY)
-                    let size = mut fx4.b.iadd_imm_s(entry_field, y: 1)
-                    let cpus = mut fx4.ptr(MAX_CPUS)
-                    let entries = mut fx4.b.select(device_table, x: device_limit, y: cpus)
-                    let bytes = mut fx4.b.imul(entries, y: size)
-                    let table = mut self.its_chunks(mut fx4, bytes)
-                    let last = mut fx4.b.iadd_imm_s(bytes, y: -1)
-                    let pages = mut fx4.b.ushr_imm_s(last, y: CHUNK_SHIFT)
-                    let kept = mut fx4.b.band_imm_s(baser, y: BASER_KEPT)
-                    let placed = mut fx4.b.bor(kept, y: table)
-                    let sized = mut fx4.b.bor(placed, y: pages)
-                    let value = mut fx4.b.bor_imm_s(sized, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | PAGES_64K)
-                    mut self.mmio_write(mut fx4, width: 8, address: register, value)
-                })
-            })
-            let queue_size = mut fx2.ptr(QUEUE_BYTES)
-            let queue = mut self.its_chunks(mut fx2, bytes: queue_size)
-            let base = mut fx2.b.bor_imm_s(queue, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | QUEUE_PAGES)
-            let cbaser = mut fx2.ptr(GITS + GITS_CBASER)
-            mut self.mmio_write(mut fx2, width: 8, address: cbaser, value: base)
-            let cwriter = mut fx2.ptr(GITS + GITS_CWRITER)
-            mut self.mmio_write(mut fx2, width: 8, address: cwriter, value: zero_value)
-            let ctlr = mut fx2.ptr(GITS + GITS_CTLR)
-            let enabled = mut fx2.ptr(GITS_ENABLED)
-            mut self.mmio_write(mut fx2, width: 4, address: ctlr, value: enabled)
-            mut fx2.store(queue, addr: state_address, offset: STATE_ITS_QUEUE)
-            let property_bytes = mut fx2.ptr(LPIS)
-            let properties = mut self.its_chunks(mut fx2, bytes: property_bytes)
-            mut fx2.store(properties, addr: state_address, offset: STATE_ITS_PROPERTIES)
-            let count = mut fx2.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
-            mut fx2.each(zero_value, end: count, body: fn[mut self](mut fx3: Fx, cpu: clif::Value) {
-                let target = mut self.its_target(mut fx3, typer, cpu)
-                let collected = mut fx3.b.bor(target, y: cpu)
-                let mapped = mut fx3.b.bor_imm_s(collected, y: ITS_VALID)
-                let none = mut fx3.ptr(0)
-                let command = mut fx3.ptr(u64.fit(ITS_MAPC))
-                mut self.its_command(mut fx3, words: fx3.list4(command, b: none, c: mapped, d: none).view())
-            })
-            mut self.its_flush(mut fx2)
+    let its = mut self.its(mut fx)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: its, y: 0)
+    mut fx.if_true(present, then: fn[mut self](mut fx1: Fx) {
+        let gicd = mut self.distributor(mut fx1)
+        let at = mut fx1.b.iadd_imm_s(gicd, y: i64.fit(GICD_TYPER))
+        let distributor_type = mut self.mmio_read(mut fx1, width: 4, address: at)
+        let lpi_bit = mut fx1.b.band_imm_s(distributor_type, y: GICD_LPIS)
+        let has_lpis = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: lpi_bit, y: 0)
+        mut fx1.if_true(has_lpis, then: fn[mut self](mut fx2: Fx) {
+            mut self.its_tables(mut fx2)
         })
     })
 } Lowering.its_setup
 
+/// When the ITS takes the event ids of every LPI: gives it its device and collection tables, the
+/// device table covering at most `DEVICE_BITS` id bits, and its command queue, enables it, draws
+/// the LPI property table and maps a collection to each CPU's redistributor, numbered as the CPU.
+fn Lowering.its_tables(mut self, mut fx: Fx) {
+    let its = mut self.its(mut fx)
+    let typer = mut self.its_typer(mut fx)
+    let event_field = its_field(mut fx, register: typer, field: TYPER_EVENTS)
+    let events = mut fx.b.iadd_imm_s(event_field, y: 1)
+    let enough = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: events, y: i64.fit(EVENT_BITS))
+    mut fx.if_true(enough, then: fn[mut self](mut fx1: Fx) {
+        let device_field = its_field(mut fx1, register: typer, field: TYPER_DEVICES)
+        let bits = mut fx1.b.iadd_imm_s(device_field, y: 1)
+        let wide = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: bits, y: DEVICE_BITS)
+        let most = mut fx1.ptr(u64.fit(DEVICE_BITS))
+        let kept_bits = mut fx1.b.select(wide, x: most, y: bits)
+        let one = mut fx1.ptr(1)
+        let device_limit = mut fx1.b.ishl(one, y: kept_bits)
+        let state_address = mut self.state(mut fx1)
+        mut fx1.store(device_limit, addr: state_address, offset: STATE_ITS_DEVICES)
+        let zero_value = mut fx1.ptr(0)
+        let tables = mut fx1.ptr(GITS_TABLES)
+        mut fx1.each(zero_value, end: tables, body: fn[mut self](mut fx2: Fx, index: clif::Value) {
+            let scaled = mut fx2.b.imul_imm_s(index, y: 8)
+            let in_its = mut fx2.b.iadd(scaled, y: its)
+            let register = mut fx2.b.iadd_imm_s(in_its, y: i64.fit(GITS_BASER))
+            let baser = mut self.mmio_read(mut fx2, width: 8, address: register)
+            let kind = its_field(mut fx2, register: baser, field: BASER_TYPE)
+            let device_table = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_DEVICES)
+            let collections = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_COLLECTIONS)
+            let used = mut fx2.b.bor(device_table, y: collections)
+            mut fx2.if_true(used, then: fn[mut self](mut fx3: Fx) {
+                let entry_field = its_field(mut fx3, register: baser, field: BASER_ENTRY)
+                let size = mut fx3.b.iadd_imm_s(entry_field, y: 1)
+                let cpus = mut fx3.ptr(MAX_CPUS)
+                let entries = mut fx3.b.select(device_table, x: device_limit, y: cpus)
+                let bytes = mut fx3.b.imul(entries, y: size)
+                let table = mut self.its_chunks(mut fx3, bytes)
+                let last = mut fx3.b.iadd_imm_s(bytes, y: -1)
+                let pages = mut fx3.b.ushr_imm_s(last, y: CHUNK_SHIFT)
+                let kept = mut fx3.b.band_imm_s(baser, y: BASER_KEPT)
+                let placed = mut fx3.b.bor(kept, y: table)
+                let sized = mut fx3.b.bor(placed, y: pages)
+                let value = mut fx3.b.bor_imm_s(sized, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | PAGES_64K)
+                mut self.mmio_write(mut fx3, width: 8, address: register, value)
+            })
+        })
+        let queue_size = mut fx1.ptr(QUEUE_BYTES)
+        let queue = mut self.its_chunks(mut fx1, bytes: queue_size)
+        let base = mut fx1.b.bor_imm_s(queue, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | QUEUE_PAGES)
+        let cbaser = mut fx1.b.iadd_imm_s(its, y: i64.fit(GITS_CBASER))
+        mut self.mmio_write(mut fx1, width: 8, address: cbaser, value: base)
+        let cwriter = mut fx1.b.iadd_imm_s(its, y: i64.fit(GITS_CWRITER))
+        mut self.mmio_write(mut fx1, width: 8, address: cwriter, value: zero_value)
+        let ctlr = mut fx1.b.iadd_imm_s(its, y: i64.fit(GITS_CTLR))
+        let enabled = mut fx1.ptr(GITS_ENABLED)
+        mut self.mmio_write(mut fx1, width: 4, address: ctlr, value: enabled)
+        mut fx1.store(queue, addr: state_address, offset: STATE_ITS_QUEUE)
+        let property_bytes = mut fx1.ptr(LPIS)
+        let properties = mut self.its_chunks(mut fx1, bytes: property_bytes)
+        mut fx1.store(properties, addr: state_address, offset: STATE_ITS_PROPERTIES)
+        let count = mut fx1.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+        mut fx1.each(zero_value, end: count, body: fn[mut self](mut fx2: Fx, cpu: clif::Value) {
+            let target = mut self.its_target(mut fx2, typer, cpu)
+            let collected = mut fx2.b.bor(target, y: cpu)
+            let mapped = mut fx2.b.bor_imm_s(collected, y: ITS_VALID)
+            let none = mut fx2.ptr(0)
+            let command = mut fx2.ptr(u64.fit(ITS_MAPC))
+            mut self.its_command(mut fx2, words: fx2.list4(command, b: none, c: mapped, d: none).view())
+        })
+        mut self.its_flush(mut fx1)
+    })
+} Lowering.its_tables
+
+/// The ITS's base.
+fn Lowering.its(mut self, mut fx: Fx) -> clif::Value {
+    let record = mut self.machine_record(mut fx)
+    return mut fx.load(PTR, addr: record, offset: MACHINE_ITS)
+} Lowering.its
+
 /// The ITS's type register.
 fn Lowering.its_typer(mut self, mut fx: Fx) -> clif::Value {
-    let at = mut fx.ptr(GITS + GITS_TYPER)
+    let its = mut self.its(mut fx)
+    let at = mut fx.b.iadd_imm_s(its, y: i64.fit(GITS_TYPER))
     return mut self.mmio_read(mut fx, width: 8, address: at)
 } Lowering.its_typer
 
@@ -241,8 +257,8 @@ fn Lowering.its_chunks(mut self, mut fx: Fx, bytes: clif::Value) -> clif::Value 
 /// The redistributor of CPU `cpu` as ITS commands name it, at the place of their target field:
 /// by its address, or by its processor number.
 fn Lowering.its_target(mut self, mut fx: Fx, typer: clif::Value, cpu: clif::Value) -> clif::Value {
-    let offset = mut fx.b.imul_imm_s(cpu, y: i64.fit(GICR_STRIDE))
-    let base = mut fx.b.iadd_imm_s(offset, y: i64.fit(GICR))
+    let record = mut self.cpu_record(mut fx, index: cpu)
+    let base = mut fx.load(PTR, addr: record, offset: CPU_REDISTRIBUTOR)
     let at = mut fx.b.iadd_imm_s(base, y: i64.fit(GICR_TYPER))
     let rd_typer = mut self.mmio_read(mut fx, width: 8, address: at)
     let number = its_field(mut fx, register: rd_typer, field: GICR_PROCESSOR)
@@ -268,11 +284,12 @@ fn Lowering.its_command(mut self, mut fx: Fx, words: Slice[clif::Value]) {
 
 /// Hands the ITS the commands written and waits until it has processed them.
 fn Lowering.its_flush(mut self, mut fx: Fx) {
+    let its = mut self.its(mut fx)
     let state_address = mut self.state(mut fx)
     let written = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_WRITE)
-    let cwriter = mut fx.ptr(GITS + GITS_CWRITER)
+    let cwriter = mut fx.b.iadd_imm_s(its, y: i64.fit(GITS_CWRITER))
     mut self.mmio_write(mut fx, width: 8, address: cwriter, value: written)
-    let creadr = mut fx.ptr(GITS + GITS_CREADR)
+    let creadr = mut fx.b.iadd_imm_s(its, y: i64.fit(GITS_CREADR))
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
         let raw = mut self.mmio_read(mut fx1, width: 8, address: creadr)
         let read = mut fx1.b.band_imm_s(raw, y: i64.fit(QUEUE_BYTES) - i64.fit(COMMAND_BYTES))
@@ -347,7 +364,8 @@ fn Lowering.its_install(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Va
             mut fx2.store(enabled, addr: property, offset: 0)
             let intid = mut fx2.b.iadd_imm_s(index, y: LPI_BASE)
             mut fx2.store(intid, addr: record, offset: DEVICE_RECORD_VECTOR)
-            let address = mut fx2.ptr(GITS_TRANSLATER)
+            let its = mut self.its(mut fx2)
+            let address = mut fx2.b.iadd_imm_s(its, y: i64.fit(GITS_TRANSLATER))
             mut fx2.store(address, addr: record, offset: DEVICE_RECORD_MESSAGE)
             mut fx2.store(index, addr: record, offset: DEVICE_RECORD_DATA)
             mut fx2.store(source, addr: record, offset: DEVICE_RECORD_SOURCE)

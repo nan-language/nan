@@ -69,8 +69,9 @@ use crate::workspace::Arch;
 /// makes a stack top the one exceptions switch to and leaves the caller on its stack through
 /// `SP_EL0`; `Switch`, the task-stack switch, and `MachineSwitch`, which keeps the general
 /// registers alone, the floating-point ones holding nothing on a machine target; `SemiExit`,
-/// the exit port; `Hvc`, which makes a PSCI call through the hypervisor conduit, taking the
-/// function identifier and three arguments and giving the result; and `FiqOn` and `FiqOff`, which unmask and mask fast interrupts,
+/// the exit port; `Hvc` and `Smc`, which make a PSCI call through the hypervisor or secure
+/// monitor conduit, taking the function identifier and three arguments and giving the result;
+/// and `FiqOn` and `FiqOff`, which unmask and mask fast interrupts,
 /// through which a halting CPU stops the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stub {
@@ -155,6 +156,7 @@ pub enum Stub {
     MachineSwitch,
     SemiExit,
     Hvc,
+    Smc,
     FiqOn,
     FiqOff,
 }
@@ -519,6 +521,7 @@ impl Stub {
             | Stub::MachineSwitch
             | Stub::SemiExit
             | Stub::Hvc
+            | Stub::Smc
             | Stub::FiqOn
             | Stub::FiqOff => panic!("no x86_64 code for the AArch64 stub {self:?}"),
         }
@@ -870,6 +873,7 @@ impl Stub {
                 ],
             ),
             Stub::Hvc => (4, 1, &[0x02, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Smc => (4, 1, &[0x03, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::ConstantTime => (
                 0,
                 0,

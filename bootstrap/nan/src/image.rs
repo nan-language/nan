@@ -20,6 +20,14 @@ const PAGE: u64 = 4_096;
 /// address plus one.
 pub const IMAGE_EXTENT: &str = "_NSimage";
 
+/// The relocation header, a data object of `RELOCATION_HEADER_BYTES` bytes into which the image
+/// writer of a bare image writes five words as linked: the header's address, the image's first
+/// and last address plus one, the address of a table listing the address of each absolute address
+/// its relocations wrote, and that table's entry count. The table lies in a read-only segment
+/// after the others; none of the header's words is itself relocated.
+pub const RELOCATION_HEADER: &str = "_NSrelocs";
+pub const RELOCATION_HEADER_BYTES: usize = 40;
+
 /// The image of a machine target linking an object lowering wrote, entered at the symbol `entry`.
 pub fn write(target: Target, object: &[u8], entry: &str) -> Vec<u8> {
     let arch = target.arch().expect("a machine target's architecture");
@@ -80,6 +88,55 @@ impl Linked {
             .unwrap_or(0)
     }
 
+    /// Writes the relocation header and appends its table when the object defines the header,
+    /// the table listing the image extent's words too.
+    fn record_relocations(&mut self, base: u64) {
+        let Some(header) = self.symbols.get(RELOCATION_HEADER).copied() else {
+            return;
+        };
+        let mut places: Vec<u64> = self
+            .absolute
+            .iter()
+            .map(|(place, width)| {
+                assert_eq!(
+                    *width, 8,
+                    "a relocated image's absolute addresses are 8 bytes"
+                );
+                *place
+            })
+            .collect();
+        if let Some(extent) = self.symbols.get(IMAGE_EXTENT) {
+            places.extend([*extent, *extent + 8]);
+        }
+        places.sort();
+        let table = self.end().next_multiple_of(PAGE);
+        if !places.is_empty() {
+            self.segments.push(Segment {
+                address: table,
+                access: Access::Read,
+                bytes: places
+                    .iter()
+                    .flat_map(|place| place.to_le_bytes())
+                    .collect(),
+                size: 8 * places.len() as u64,
+            });
+        }
+        let words = [header, base, self.end(), table, places.len() as u64];
+        self.write_words(header, &words);
+    }
+
+    /// Writes words at an address of a segment's bytes.
+    fn write_words(&mut self, at: u64, words: &[u64]) {
+        let segment = self
+            .segments
+            .iter_mut()
+            .find(|segment| (segment.address..segment.address + segment.size).contains(&at))
+            .expect("the segment of a recorded object");
+        let offset = (at - segment.address) as usize;
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        segment.bytes[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+
     /// Writes the image's extent, from `base` to the end of its segments, into the data object
     /// `IMAGE_EXTENT` when the object defines one, as two absolute addresses.
     fn record_extent(&mut self, base: u64) {
@@ -87,14 +144,7 @@ impl Linked {
             return;
         };
         let end = self.end();
-        let segment = self
-            .segments
-            .iter_mut()
-            .find(|segment| (segment.address..segment.address + segment.size).contains(&at))
-            .expect("the segment of the image extent");
-        let offset = (at - segment.address) as usize;
-        segment.bytes[offset..offset + 8].copy_from_slice(&base.to_le_bytes());
-        segment.bytes[offset + 8..offset + 16].copy_from_slice(&end.to_le_bytes());
+        self.write_words(at, &[base, end]);
         self.absolute.extend([(at, 8), (at + 8, 8)]);
     }
 }
@@ -297,6 +347,7 @@ fn link(object: &[u8], base: u64, importing: bool) -> Linked {
         absolute,
         imports,
     };
+    linked.record_relocations(base);
     linked.record_extent(base);
     linked.absolute.sort();
     linked

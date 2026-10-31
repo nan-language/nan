@@ -260,11 +260,18 @@ fn stop_tasks(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
 } stop_tasks
 
 /// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to
-/// stop.
+/// stop. A running task's thread receives the stop signal; on a kernel, its CPU receives the
+/// CPU signal when the task is first asked, and the CPU's timer interrupts ask again.
 fn settle_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
     let one = mut fx.ptr(1)
     let asked = mut fx.offset(record, offset: TASK_STOP)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: one, p: asked)
+    var first_ask: Option[clif::Value] = None
+    if lo.kernel() {
+        let before = mut fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Xchg, p: asked, x: one)
+        first_ask = Some(mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 0))
+    } else {
+        mut fx.b.atomic_store(clif::MemFlags.owned(), x: one, p: asked)
+    }
     let word = mut fx.offset(record, offset: TASK_STATE)
     let current = mut fx.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: word)
     let stopped = mut fx.int(clif::Type.Int32, value: RUN_STOPPED)
@@ -287,7 +294,21 @@ fn settle_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value
             return fx2.list1(remains)
         }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             let running = mut fx2.b.bxor_imm_s(is_stopped, y: 1)
+            match first_ask {
+                Some(asked_first) => {
+                    let signalled = mut fx2.b.band(running, y: asked_first)
+                    mut fx2.if_true(signalled, then: fn[mut lo2](mut fx3: Fx) {
+                        let thread = mut fx3.load(PTR, addr: record, offset: TASK_THREAD)
+                        let index = mut fx3.load(PTR, addr: thread, offset: THREAD_INDEX)
+                        mut lo2.signal_cpu(mut fx3, index)
+                    })
+                    return fx2.list1(running)
+                }
+                None => {}
+            }
             mut fx2.if_true(running, then: fn[mut lo2](mut fx3: Fx) {
+                // A machine test image settles domains on its one executor, which runs the
+                // settling task.
                 if lo2.machine() {
                     mut fx3.b.trap(clif::TrapCode(user: 1))
                     return

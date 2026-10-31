@@ -777,7 +777,7 @@ pub fn drop_quiet(mut levels: mem::List[u32], floor: u32) {
 
 ## Interior mutability
 
-**Interior mutability** is mutation of a value's contents through a read access. Exactly these base types have it: `task::Cown[T]` ([cowns](16-concurrency.md#cowns)), the [atomic](16-concurrency.md#atomics) types of `core::atomic`, `mem::Arena[T]`, `mem::OnceMap[K, V]`, `text::Interner` ([interning](13-text-encode.md#interning)), `hw::SpinLock[T]` and `hw::IrqShared[T]` ([locks](24-kernel.md#locks)), `hw::PerCpu[T]` ([scheduling](24-kernel.md#scheduling)) and `hw::Signal[T]` ([signals](24-kernel.md#signals)). A type containing one of them has interior mutability through it; no other type has it.
+**Interior mutability** is mutation of a value's contents through a read access. Exactly these base types have it: `task::Cown[T]` ([cowns](16-concurrency.md#cowns)), the [atomic](16-concurrency.md#atomics) types of `core::atomic`, `mem::Arena[T]`, `mem::OnceMap[K, V]`, `text::Interner` ([interning](13-text-encode.md#interning)), `hw::SpinLock[T]` and `hw::IrqShared[T]` ([locks](24-kernel.md#locks)), `hw::PerCpu[T]` ([scheduling](24-kernel.md#scheduling)), `hw::Signal[T]` ([signals](24-kernel.md#signals)) and `sys::Abandoner` ([domain run](11-errors-domains.md#domain-run)). A type containing one of them has interior mutability through it; no other type has it.
 
 - Each of these types is implemented by trusted code in std, and never moves or frees a value it holds while a view of that value may be live.
 - Each operation on one of them is atomic with respect to every other task.

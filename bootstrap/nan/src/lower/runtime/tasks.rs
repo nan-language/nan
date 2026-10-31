@@ -141,7 +141,8 @@ pub mod domain {
     pub const PARENT: u64 = 0;
     pub const POOLS: u64 = 8;
     pub const CHUNKS: u64 = 16;
-    /// Nonzero once a trap abandons it.
+    /// Zero while it runs, 1 once abandoned, and `CLOSED` once its first task's entry has ended
+    /// first.
     pub const ABANDONED: u64 = 24;
     /// The task waiting for the domain's first task to end, and the lock of that wait.
     pub const WAITER: u64 = 32;
@@ -157,6 +158,7 @@ pub mod domain {
     /// The handle of its cell, which the chunks passing to it are charged to.
     pub const CELL: u64 = 80;
     pub const SIZE: u64 = 88;
+    pub const CLOSED: i64 = 2;
 }
 
 /// The offsets of an operation record's fields: what a task waits on at a cancellation point,

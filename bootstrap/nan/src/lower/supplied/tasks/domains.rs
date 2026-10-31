@@ -1,16 +1,20 @@
 //! Domains: `sys::Domain.run` and `run_sized`, which run a body as the first task of a new domain,
-//! and the trap that abandons one. The body's captures pass to the domain; when the body returns or
+//! the same runs through a `sys::Abandoner`, which abandons the domain it runs on `trigger`, and
+//! the trap that abandons one. The body's captures pass to the domain; when the body returns or
 //! fails, its result or failure passes to the caller's domain with every holding the domain still
 //! owns, and the domain's other chunks are freed.
+//!
+//! An abandoner is its lock word, whether it was triggered, and the domain it runs: zero when it
+//! runs none, `PENDING` while a run prepares its domain, and the domain's record otherwise.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC};
 use cranelift_module::FuncId;
 
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::tasks::{self, domain, flag, task, trap_record};
 use super::super::super::runtime::{Routine, holdings, memory, report};
-use super::super::super::{Glue, Lowering};
+use super::super::super::{Glue, Lowering, transfer};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
 use crate::check::ty::Ty;
@@ -27,10 +31,29 @@ pub fn sized_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value) -> Value {
     stack
 }
 
+/// The domain word of an abandoner whose run prepares its domain.
+const PENDING: i64 = 1;
+
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
-        "sys::Domain.run" => run(lo, fx, supply, false),
-        "sys::Domain.run_sized" => run(lo, fx, supply, true),
+        "sys::Domain.run" => run(lo, fx, supply, false, false),
+        "sys::Domain.run_sized" => run(lo, fx, supply, true, false),
+        "sys::Abandoner.run" => run(lo, fx, supply, false, true),
+        "sys::Abandoner.run_sized" => run(lo, fx, supply, true, true),
+        "sys::Abandoner.new" => {
+            let sret = supply.sret.expect("an abandoner's slot");
+            let fields = Abandoner::at(lo, fx, supply, sret);
+            let zero = fx.ptr(0);
+            for field in [fields.lock, fields.triggered, fields.domain] {
+                fx.store(zero, field, 0);
+            }
+            supply.ret(lo, fx, Held::Address(sret));
+        }
+        "sys::Abandoner.trigger" => {
+            let fields = Abandoner::at(lo, fx, supply, supply.param(0).address());
+            trigger(lo, fx, &fields);
+            supply.done(lo, fx);
+        }
         "sys::Trap.kind" => {
             let record = trap_record(fx, supply.param(0));
             let kind = fx.load(PTR, record, trap_record::KIND);
@@ -78,15 +101,73 @@ fn trap_kind_item(ty: &Ty) -> crate::check::db::ItemId {
     *item
 }
 
+/// The addresses of an abandoner's fields.
+pub struct Abandoner {
+    lock: Value,
+    triggered: Value,
+    domain: Value,
+}
+
+impl Abandoner {
+    /// The fields of the abandoner at an address, of the type that owns the operation.
+    fn at(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, address: Value) -> Abandoner {
+        let ty = supply.owner.clone().expect("the abandoner type");
+        let mut field = |name: &str| {
+            let offset = lo.layouts.field(lo.ck, &ty, None, name).offset;
+            fx.offset(address, offset)
+        };
+        Abandoner {
+            lock: field("lock"),
+            triggered: field("triggered"),
+            domain: field("domain"),
+        }
+    }
+}
+
+/// `abandoner.trigger()`: marks the abandoner triggered and abandons the domain it runs, unless
+/// its first task has ended: the domain's trap report, of `trap.abandoned`, locates the call,
+/// and the task waiting for the domain wakes to settle it.
+fn trigger(lo: &mut Lowering, fx: &mut Fx, fields: &Abandoner) {
+    lo.call_routine(fx, Routine::Lock, &[fields.lock]);
+    let one = fx.ptr(1);
+    fx.store(one, fields.triggered, 0);
+    let record = fx.load(PTR, fields.domain, 0);
+    let running =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, record, PENDING);
+    fx.when(running, |fx| {
+        let flag = fx.offset(record, domain::ABANDONED);
+        let live = fx.ptr(0);
+        let seen =
+            fx.b.ins()
+                .atomic_cas(MemFlagsData::trusted(), flag, live, one);
+        let first = fx.b.ins().icmp_imm_s(IntCC::Equal, seen, 0);
+        fx.when(first, |fx| {
+            let trap = fx.load(PTR, record, domain::TRAP);
+            let kind = fx.ptr(super::super::super::trap::kind_number("trap.abandoned") as u64);
+            lo.call_routine(fx, Routine::TrapReport, &[kind, trap]);
+            let lock = fx.offset(record, domain::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let waiter = fx.load(PTR, record, domain::WAITER);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            lo.call_routine(fx, Routine::Wake, &[waiter]);
+        });
+    });
+    lo.call_routine(fx, Routine::Unlock, &[fields.lock]);
+}
+
 /// `sys::Domain.run(body, exec, alloc)`: runs `body` as the first task of a new domain nested in
 /// the caller's and waits for it to end, or once a trap abandons it, for its settlement; when
 /// `sized`, as `sys::Domain.run_sized(body, stack, exec, alloc)`, on a stack of `stack` usable
-/// bytes, trapping exhausted when no address space holds one.
-fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
+/// bytes, trapping exhausted when no address space holds one. Through an abandoner, the
+/// operation's receiver, as `sys::Abandoner.run` and `run_sized`: a second run at once traps
+/// with `trap.duplicate-access`, and the abandoner's `trigger` abandons the domain.
+fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bool) {
     let result_ty = supply.type_arg(0);
     let fails = supply.type_arg(1);
-    let body_ty = fn_param(supply, 0);
-    let given = usize::from(sized);
+    let body = usize::from(through);
+    let body_ty = fn_param(supply, body);
+    let given = body + usize::from(sized);
     let (live, _) = super::executor(lo, fx, supply.param(1 + given).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
@@ -95,7 +176,12 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
     });
     let cell = fx.load(PTR, supply.param(2 + given).address(), 0);
     let caller_domain = tasks::current_domain(lo, fx);
-    let stack = sized.then(|| sized_stack(lo, fx, supply.param(1).scalar()));
+    let stack = sized.then(|| sized_stack(lo, fx, supply.param(body + 1).scalar()));
+    let abandoner = through.then(|| {
+        let fields = Abandoner::at(lo, fx, supply, supply.param(0).address());
+        claim(lo, fx, &fields);
+        fields
+    });
     let Nested {
         record,
         first,
@@ -104,10 +190,11 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
         lo,
         fx,
         &body_ty,
-        supply.param(0).address(),
+        supply.param(body).address(),
         cell,
         stack,
         true,
+        abandoner.as_ref(),
     );
     let option = supply.abi.result.clone();
     let layout = lo.layout(&option);
@@ -115,7 +202,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
     let abandoned = fx.load(PTR, record, domain::ABANDONED);
-    let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
+    let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
     fx.when(abandoned, |fx| {
         lo.call_routine(fx, Routine::Settle, &[record]);
         lo.record_free(fx, record);
@@ -158,6 +245,20 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
     supply.ret(lo, fx, held);
 }
 
+/// Claims an abandoner for a run, trapping with `trap.duplicate-access` when it runs another.
+fn claim(lo: &mut Lowering, fx: &mut Fx, fields: &Abandoner) {
+    lo.call_routine(fx, Routine::Lock, &[fields.lock]);
+    let current = fx.load(PTR, fields.domain, 0);
+    let busy = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+    fx.when(busy, |fx| {
+        lo.call_routine(fx, Routine::Unlock, &[fields.lock]);
+        report::raise_kind(lo, fx, "trap.duplicate-access");
+    });
+    let pending = fx.ptr(PENDING as u64);
+    fx.store(pending, fields.domain, 0);
+    lo.call_routine(fx, Routine::Unlock, &[fields.lock]);
+}
+
 /// A domain `run_nested` ran: its record, its first task and its trap record.
 pub struct Nested {
     pub record: Value,
@@ -169,6 +270,10 @@ pub struct Nested {
 /// nested in the running task's, its stack, of `stack` usable bytes or else of the size its type
 /// gives, and its trap record drawn through a cell, the domain's cell, and waits until that task
 /// ends or a trap abandons the domain; the spawn is a scheduling point when `point` holds.
+/// Through a claimed abandoner, the domain is the one it runs until the wait ends, and an
+/// abandoner triggered already abandons it before its first task starts, which then never does,
+/// its trap report locating the run's call.
+#[allow(clippy::too_many_arguments)]
 pub fn run_nested(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -177,6 +282,7 @@ pub fn run_nested(
     cell: Value,
     stack: Option<Value>,
     point: bool,
+    abandoner: Option<&Abandoner>,
 ) -> Nested {
     let caller_domain = tasks::current_domain(lo, fx);
     let size = fx.ptr(trap_record::BYTES + report::REPORT);
@@ -203,33 +309,83 @@ pub fn run_nested(
     lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
     let region = fx.load(PTR, current, task::REGION);
     let none = fx.ptr(0);
-    lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record);
-    let done = domain_done(lo);
-    let first = super::scopes::start_task(
-        lo, fx, body_ty, function, cell, record, region, record, stack, None, done,
-    );
-    match point {
-        true => tasks::spawned(lo, fx, first),
-        false => {
-            lo.call_routine(fx, Routine::Wake, &[first]);
-        }
+    match fx.fn_params.get(&function).copied() {
+        Some(position) => transfer::move_captures(fx, function, none, record, Some(position)),
+        None => lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record),
     }
+    let end = domain_end(lo);
+    let done = domain_done(lo);
+    let start = |lo: &mut Lowering, fx: &mut Fx| {
+        let first = super::scopes::start_task(
+            lo,
+            fx,
+            body_ty,
+            function,
+            cell,
+            record,
+            region,
+            record,
+            stack,
+            Some(end),
+            done,
+        );
+        match point {
+            true => tasks::spawned(lo, fx, first),
+            false => {
+                lo.call_routine(fx, Routine::Wake, &[first]);
+            }
+        }
+        first
+    };
+    let first = match abandoner {
+        None => start(lo, fx),
+        Some(fields) => {
+            lo.call_routine(fx, Routine::Lock, &[fields.lock]);
+            fx.store(record, fields.domain, 0);
+            let latched = fx.load(PTR, fields.triggered, 0);
+            lo.call_routine(fx, Routine::Unlock, &[fields.lock]);
+            let latched = fx.b.ins().icmp_imm_s(IntCC::NotEqual, latched, 0);
+            fx.choose_in(
+                lo,
+                latched,
+                &[PTR],
+                |lo, fx| {
+                    let one = fx.ptr(1);
+                    fx.store(one, record, domain::ABANDONED);
+                    let kind =
+                        fx.ptr(super::super::super::trap::kind_number("trap.abandoned") as u64);
+                    lo.call_routine(fx, Routine::TrapReport, &[kind, trap]);
+                    vec![fx.ptr(0)]
+                },
+                |lo, fx| vec![start(lo, fx)],
+            )[0]
+        }
+    };
     let lock = fx.offset(record, domain::LOCK);
-    fx.repeat(&[], |fx, _| {
-        lo.call_routine(fx, Routine::Lock, &[lock]);
-        let flags = fx.load(PTR, first, task::FLAGS);
-        let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
-        let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
-        let abandoned = fx.load(PTR, record, domain::ABANDONED);
-        let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
-        let over = fx.b.ins().bor(ended, abandoned);
-        let waiting = fx.b.ins().bxor_imm_s(over, 1);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
-        fx.when(waiting, |fx| {
-            lo.call_routine(fx, Routine::Park, &[]);
+    let started = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
+    fx.when(started, |fx| {
+        fx.repeat(&[], |fx, _| {
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let flags = fx.load(PTR, first, task::FLAGS);
+            let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
+            let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
+            let abandoned = fx.load(PTR, record, domain::ABANDONED);
+            let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
+            let over = fx.b.ins().bor(ended, abandoned);
+            let waiting = fx.b.ins().bxor_imm_s(over, 1);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.when(waiting, |fx| {
+                lo.call_routine(fx, Routine::Park, &[]);
+            });
+            (waiting, Vec::new())
         });
-        (waiting, Vec::new())
     });
+    if let Some(fields) = abandoner {
+        lo.call_routine(fx, Routine::Lock, &[fields.lock]);
+        let zero = fx.ptr(0);
+        fx.store(zero, fields.domain, 0);
+        lo.call_routine(fx, Routine::Unlock, &[fields.lock]);
+    }
     lo.call_routine(fx, Routine::Lock, &[parent_lock]);
     unlink_child(fx, caller_domain, record);
     lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
@@ -274,6 +430,26 @@ fn unlink_child(fx: &mut Fx, parent: Value, child: Value) {
             Vec::new()
         },
     );
+}
+
+/// What a domain's first task does once its entry has ended: it closes the domain, so that no
+/// abandoning begins after it, or stops when one began first.
+fn domain_end(lo: &mut Lowering) -> FuncId {
+    lo.glue_function(Glue::DomainEnd, super::record_signature(), |lo, fx| {
+        let first = fx.entry()[0];
+        let record = fx.load(PTR, first, task::OWNER);
+        let flag = fx.offset(record, domain::ABANDONED);
+        let live = fx.ptr(0);
+        let closed = fx.ptr(domain::CLOSED as u64);
+        let seen =
+            fx.b.ins()
+                .atomic_cas(MemFlagsData::trusted(), flag, live, closed);
+        let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
+        fx.when(abandoned, |fx| {
+            lo.call_routine(fx, Routine::Stop, &[first]);
+        });
+        fx.b.ins().return_(&[]);
+    })
 }
 
 /// What the executor thread does once a domain's first task has ended: the caller of

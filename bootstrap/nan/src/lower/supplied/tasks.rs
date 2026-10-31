@@ -30,7 +30,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::Cown" => cowns::lower(lo, fx, supply),
         "task::Executor" => super::sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
-        "sys::Domain" | "sys::Trap" => domains::lower(lo, fx, supply),
+        "sys::Domain" | "sys::Abandoner" | "sys::Trap" => domains::lower(lo, fx, supply),
         "host::Runner" | "sys::Cx" | "sys::Outbox" => components::lower(lo, fx, supply),
         _ => return false,
     }
@@ -75,7 +75,7 @@ pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "task::Join" | "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
         "task::Scope" | "task::Executor" | "task::Cancelled" | "task::Poisoned" | "sys::Cx"
-        | "sys::Outbox" => Some(false),
+        | "sys::Outbox" | "sys::Abandoner" => Some(false),
         _ => None,
     }
 }
@@ -85,7 +85,7 @@ pub fn needs_release(path: &str) -> Option<bool> {
 pub fn transfers(path: &str) -> Option<bool> {
     match path {
         "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Cancelled" | "task::Poisoned" => Some(false),
+        "task::Cancelled" | "task::Poisoned" | "sys::Abandoner" => Some(false),
         _ => None,
     }
 }

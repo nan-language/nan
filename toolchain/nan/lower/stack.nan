@@ -20,7 +20,8 @@ enum StackKind {
     /// A direct call, with what it passes for the callee's function-typed parameters, by
     /// position.
     Direct(callee: object::FuncId, bindings: mem::List[ParamBinding])
-    /// A call through the function's own function-typed parameter at a position.
+    /// A call through the function's own function-typed parameter at a position, or, for a
+    /// `task fn` parameter, the walk moving its captures.
     Param(usize)
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option[u64])
@@ -38,6 +39,8 @@ struct ParamBinding derives Copy {
 enum Binding derives Copy {
     /// A closure or a named function, by the lowered function its value calls.
     Function(object::FuncId)
+    /// For a `task fn` parameter, the walk moving a closure's captures, by the glue it calls.
+    Walk(object::FuncId)
     /// The calling function's own parameter at a position.
     Param(usize)
     /// Another function value, bounded by the `stack N` its type demands.
@@ -45,10 +48,11 @@ enum Binding derives Copy {
 } Binding
 
 /// A lowered function: its frame size, the `stack N` the type of each of its function-typed
-/// parameters demands, by position, and its call sites.
+/// parameters demands, by position, none for a `task fn` one, and its call sites.
 pkg struct Frame {
     function: object::FuncId
-    /// The canonical path naming it in reasons; empty for code lowering writes itself.
+    /// The canonical path naming it in reasons, or the type a move walks; empty for other code
+    /// lowering writes itself.
     name: text::String
     size: u64
     params: mem::List[ParamStack]
@@ -85,7 +89,7 @@ enum StackReport derives Copy {
 } StackReport
 
 /// A call of a call path: the function making it and the index of its site.
-struct CallStep derives Copy {
+struct CallStep derives Copy, Eq, Hash {
     function: object::FuncId
     index: usize
 } CallStep
@@ -120,12 +124,36 @@ fn bounded_use(stack_bound: Option[u64], alloc: mem::Alloc) -> Use {
     }
 } bounded_use
 
-/// The bound of a function's parameter at a position, none past its bounds.
-fn param_bound(bounds: Slice[Option[u64]], position: usize) -> Option[u64] {
-    if position < bounds.len() {
-        return bounds[position]
+/// The stack bound of a function-typed parameter: its bytes, or none with the path of calls
+/// down to the unbounded call site that leaves it so, empty when nothing does.
+struct ParamBound derives Eq, Hash {
+    bytes: Option[u64]
+    path: mem::List[CallStep]
+} ParamBound
+
+fn ParamBound.copy(self, alloc: mem::Alloc) -> ParamBound {
+    return ParamBound(bytes: self.bytes, path: copied_steps(self.path.view(), alloc))
+} ParamBound.copy
+
+/// A bound of bytes, none without a path for none.
+fn param_bytes(bytes: Option[u64], alloc: mem::Alloc) -> ParamBound {
+    return ParamBound(bytes: bytes, path: mem::List[CallStep].empty(alloc))
+} param_bytes
+
+/// The use of a call bounded by a parameter's bound, unbounded along its path for none.
+fn bound_use(bound: ParamBound, alloc: mem::Alloc) -> Use {
+    return match bound.bytes {
+        Some(used_bytes) => Use.Bounded(bytes: used_bytes, path: mem::List[CallStep].empty(alloc))
+        None => Use.Unbounded(copied_steps(bound.path.view(), alloc))
     }
-    return None
+} bound_use
+
+/// The bound of a function's parameter at a position, none past its bounds.
+fn param_bound(bounds: Slice[ParamBound], position: usize, alloc: mem::Alloc) -> ParamBound {
+    if position < bounds.len() {
+        return bounds[position].copy(alloc)
+    }
+    return param_bytes(None, alloc)
 } param_bound
 
 /// An unbounded call site of a frame: its index and the path of calls below it.
@@ -156,7 +184,7 @@ struct Judge {
 /// A function and the bounds of its function-typed parameters, by position.
 struct UseKey derives Eq, Hash {
     function: object::FuncId
-    bounds: mem::List[Option[u64]]
+    bounds: mem::List[ParamBound]
 } UseKey
 
 /// A judge of frames, each found by its function.
@@ -170,9 +198,9 @@ fn Judge.of(all_frames: Slice[Frame], alloc: mem::Alloc) -> Judge {
 
 /// The bounds a function's parameters have when it is judged on its own, none for a function
 /// without a frame.
-fn Judge.own_of(self, all_frames: Slice[Frame], function: object::FuncId) -> mem::List[Option[u64]] {
+fn Judge.own_of(self, all_frames: Slice[Frame], function: object::FuncId) -> mem::List[ParamBound] {
     let Some(position) = self.positions.get(function) else {
-        return mem::List[Option[u64]].empty(self.alloc)
+        return mem::List[ParamBound].empty(self.alloc)
     }
     expect position < all_frames.len()
     return own_bounds(all_frames[position], alloc: self.alloc)
@@ -264,13 +292,13 @@ fn extend_found(mut found: mem::List[diagnostic::Diagnostic], take reported: Opt
 } extend_found
 
 /// The stack use of a function whose function-typed parameters have bounds, by position.
-fn Judge.function(mut self, all_frames: Slice[Frame], function: object::FuncId, bounds: Slice[Option[u64]]) -> Use {
+fn Judge.function(mut self, all_frames: Slice[Frame], function: object::FuncId, bounds: Slice[ParamBound]) -> Use {
     if self.active.position(fn(value: object::FuncId) => value == function).is_some() {
         return Use.Unbounded(mem::List[CallStep].empty(self.alloc))
     }
-    var key_bounds = mem::List[Option[u64]].empty(self.alloc)
+    var key_bounds = mem::List[ParamBound].empty(self.alloc)
     for bound in bounds {
-        mut key_bounds.push(bound)
+        mut key_bounds.push(bound.copy(self.alloc))
     }
     let key = UseKey(function: function, bounds: take key_bounds)
     match self.known.get(key) {
@@ -316,17 +344,17 @@ fn settled_use(take unbounded: Option[mem::List[CallStep]], own_size: u64, deepe
 } settled_use
 
 /// The stack use of a call site under the bounds of its function's parameters.
-fn Judge.site(mut self, all_frames: Slice[Frame], site: Site, bounds: Slice[Option[u64]]) -> Use {
+fn Judge.site(mut self, all_frames: Slice[Frame], site: Site, bounds: Slice[ParamBound]) -> Use {
     match site.kind {
         StackKind.Stub => return Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
         StackKind.Bounded(stack_bound) => return bounded_use(stack_bound, alloc: self.alloc)
-        StackKind.Param(position) => return bounded_use(param_bound(bounds, position), alloc: self.alloc)
+        StackKind.Param(position) => return bound_use(param_bound(bounds, position, alloc: self.alloc), alloc: self.alloc)
         StackKind.Direct(callee: callee, bindings: bindings) => {
             var callee_bounds = self.own_of(all_frames, function: callee)
             for passing in bindings {
                 let passed = mut self.passed_bound(all_frames, binding: passing.binding, bounds)
                 while callee_bounds.len() <= passing.position {
-                    mut callee_bounds.push(None)
+                    mut callee_bounds.push(param_bytes(None, alloc: self.alloc))
                 }
                 callee_bounds[passing.position] = passed
             }
@@ -336,20 +364,32 @@ fn Judge.site(mut self, all_frames: Slice[Frame], site: Site, bounds: Slice[Opti
 } Judge.site
 
 /// What a direct call passes for a function-typed parameter, as a bound under the bounds of the
-/// calling function's parameters: a function's stack use, none for an unbounded one.
-fn Judge.passed_bound(mut self, all_frames: Slice[Frame], binding: Binding, bounds: Slice[Option[u64]]) -> Option[u64] {
+/// calling function's parameters: a function's stack use, none for an unbounded one, along
+/// the path that leaves a walk unbounded.
+fn Judge.passed_bound(mut self, all_frames: Slice[Frame], binding: Binding, bounds: Slice[ParamBound]) -> ParamBound {
     match binding {
         Binding.Function(passed_function) => {
-            let own = self.own_of(all_frames, function: passed_function)
-            return match mut self.function(all_frames, function: passed_function, bounds: own.view()) {
-                Use.Bounded(bytes: used_bytes, path: _) => Some(used_bytes)
-                Use.Unbounded(_) => None
+            return match mut self.own_use(all_frames, function: passed_function) {
+                Use.Bounded(bytes: used_bytes, path: _) => param_bytes(Some(used_bytes), alloc: self.alloc)
+                Use.Unbounded(_) => param_bytes(None, alloc: self.alloc)
             }
         }
-        Binding.Param(own_position) => return param_bound(bounds, position: own_position)
-        Binding.Bounded(stack_bound) => return stack_bound
+        Binding.Walk(glue) => {
+            return match mut self.own_use(all_frames, function: glue) {
+                Use.Bounded(bytes: used_bytes, path: _) => param_bytes(Some(used_bytes), alloc: self.alloc)
+                Use.Unbounded(calls) => ParamBound(bytes: None, path: take calls)
+            }
+        }
+        Binding.Param(own_position) => return param_bound(bounds, position: own_position, alloc: self.alloc)
+        Binding.Bounded(stack_bound) => return param_bytes(stack_bound, alloc: self.alloc)
     }
 } Judge.passed_bound
+
+/// The stack use of a function under the bounds of its own parameters.
+fn Judge.own_use(mut self, all_frames: Slice[Frame], function: object::FuncId) -> Use {
+    let own = self.own_of(all_frames, function)
+    return mut self.function(all_frames, function, bounds: own.view())
+} Judge.own_use
 
 /// The because-chain of a call path: a `called` reason per call, and for an unbounded path
 /// a `raised` reason for its last call site, the unbounded one. Calls of code lowering
@@ -395,20 +435,20 @@ fn Judge.name(self, all_frames: Slice[Frame], function: object::FuncId) -> text:
 } Judge.name
 
 /// The bounds a function's parameters have when it is judged on its own.
-fn own_bounds(frame: Frame, alloc: mem::Alloc) -> mem::List[Option[u64]] {
+fn own_bounds(frame: Frame, alloc: mem::Alloc) -> mem::List[ParamBound] {
     var len: usize = 0
     for param in frame.params {
         if param.position + 1 > len {
             len = param.position + 1
         }
     }
-    var bounds = mem::List[Option[u64]].empty(alloc)
+    var bounds = mem::List[ParamBound].empty(alloc)
     while bounds.len() < len {
-        mut bounds.push(None)
+        mut bounds.push(param_bytes(None, alloc))
     }
     for param in frame.params {
         expect param.position < bounds.len()
-        bounds[param.position] = param.stack
+        bounds[param.position] = param_bytes(param.stack, alloc)
     }
     return bounds
 } own_bounds

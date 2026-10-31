@@ -42,6 +42,8 @@ enum Glue derives Eq, Hash {
     RaceEnd
     /// What the executor thread does once a race's task has ended.
     RaceDone
+    /// What a domain's first task does once its entry ends: closes the domain.
+    DomainEnd
     /// What the executor thread does once a domain's first task has ended.
     DomainDone
     /// What the executor thread does once a kernel anchor's first task has ended.
@@ -120,14 +122,14 @@ enum Glue derives Eq, Hash {
 /// task or of a construct.
 fn Glue.critical(self) -> bool {
     return match self {
-        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
+        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainEnd or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
         else => false
     }
 } Glue.critical
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: Str = "sys::Domain task::Sender task::Receiver task::Scope sys::Cx sys::Outbox mem::Shared task::Cown"
+const CRITICAL_OWNERS: Str = "sys::Domain task::Sender task::Receiver task::Scope sys::Cx sys::Outbox mem::Shared task::Cown hw::Ring0"
 
 /// The outcome of lowering a final closure.
 pkg struct Lowered {
@@ -489,7 +491,12 @@ fn Lowering.describe_frame(mut self, instance: Instance, abi: Abi, id: object::F
     for position in 0..<abi.params.len() {
         match types.kind(abi.params[position].nty.ty()) {
             ty::TyKind.Fn(fn_ty) => {
-                mut params.push(ParamStack(position: position, stack: types.fn_of(fn_ty).limit_set.stack))
+                let param_fn = types.fn_of(fn_ty)
+                var stack = param_fn.limit_set.stack
+                if param_fn.kind == ast::FnKind.Task {
+                    stack = None
+                }
+                mut params.push(ParamStack(position: position, stack: stack))
             }
             else => {}
         }
@@ -564,8 +571,8 @@ fn push_stack(mut demanded: mem::List[u64], stack: Option[u64]) {
 /// The line table flags of an instance's function: trap reports leave out the frames of
 /// std items and of the code lowering writes itself, and a stopping task does not stop
 /// inside a std function of a type with interior mutability or of `task::Sender`,
-/// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared` or
-/// `task::Cown`.
+/// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared`, `task::Cown`
+/// or `hw::Ring0`.
 fn Lowering.frame_flags(self, instance: Instance) -> u32 {
     var hidden = true
     var critical = false
@@ -726,10 +733,33 @@ fn Lowering.glue_function(mut self, take glue: Glue, take signature: clif::Signa
     if glue.critical() {
         flags = LINES_HIDDEN | LINES_CRITICAL
     }
+    var walked: Option[text::String] = None
+    match glue {
+        Glue.Transfer(moved) => {
+            match self.ck.types().kind(moved) {
+                ty::TyKind.Item(item: item, args: _) => {
+                    walked = Some(self.ck.show(moved, from: self.ck.db().module_of(item)))
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
     discard mut self.glues.insert(take glue, value: id)
     mut self.define(id, take signature, flags, build)
+    match walked {
+        Some(walked_name) => {
+            expect self.frames.len() > 0
+            let last = self.frames.len() - 1
+            self.frames[last].name = walked_name
+        }
+        None => {}
+    }
     return id
 } Lowering.glue_function
+
+/// The function of a glue already asked for.
+fn Lowering.known_glue(self, glue: Glue) -> Option[object::FuncId] = self.glues.get(glue)
 
 /// Marks the code `fx` emits next as coming from a span of an item's file.
 fn Lowering.locate(mut self, mut fx: Fx, item: ty::ItemId, span: nir::Span) {

@@ -488,7 +488,7 @@ fn entry_glue(lo: &mut Lowering, tests: &Tests) -> FuncId {
         let alloc = lo.layouts.field(lo.ck, &world_ty, None, "alloc").offset;
         let cell = fx.load(PTR, world, alloc);
         let domains::Nested { record, trap, .. } =
-            domains::run_nested(lo, fx, &run_type(), function, cell, None, false);
+            domains::run_nested(lo, fx, &run_type(), function, cell, None, false, None);
         let target = fx.load(PTR, slot, 0);
         let id = lo.ran_data();
         let global = lo.data_ref(fx, id);
@@ -496,7 +496,7 @@ fn entry_glue(lo: &mut Lowering, tests: &Tests) -> FuncId {
         let ran = fx.b.ins().iadd(ran, target);
         let ran = fx.load(types::I8, ran, 0);
         let abandoned = fx.load(PTR, record, domain::ABANDONED);
-        let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
+        let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
         fx.when(abandoned, |fx| {
             lo.call_routine(fx, Routine::Settle, &[record]);
             let len = fx.load(PTR, trap, trap_record::LEN);

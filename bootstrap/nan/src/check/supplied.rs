@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 30] = [
+const DRAWING: [&str; 32] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -26,6 +26,8 @@ const DRAWING: [&str; 30] = [
     "sys::Fs.read_all",
     "sys::Domain.run",
     "sys::Domain.run_sized",
+    "sys::Abandoner.run",
+    "sys::Abandoner.run_sized",
     "sys::Minter.of",
     "sys::Cx.send",
     "sys::Cx.after",
@@ -61,7 +63,7 @@ const FAILING_DRAWS: [&str; 8] = [
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
 /// exhausted capability tables and cells.
-const TRAPPING: [&str; 25] = [
+const TRAPPING: [&str; 27] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -73,6 +75,8 @@ const TRAPPING: [&str; 25] = [
     "sys::revocable",
     "sys::Minter.mint",
     "sys::derive",
+    "sys::Abandoner.run",
+    "sys::Abandoner.run_sized",
     "sys::Fs.subdir",
     "sys::Fs.read_only",
     "sys::Net.only_host",

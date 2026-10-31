@@ -430,7 +430,7 @@ fn shows(root: &Path, program: &str, behaviour: &[&str]) {
     );
 }
 
-/// What the M4 kernel and loader of either architecture write once they show their behaviour.
+/// What the M4 kernel of either architecture writes once it shows its behaviour.
 const KERNEL_SHOWS: [&str; 10] = [
     "kernel: running on 4 cpus",
     "idle: an interrupt ended a wait",
@@ -443,8 +443,18 @@ const KERNEL_SHOWS: [&str; 10] = [
     "clock: slept 2 ms and a deadline ended a wait",
     "clock: the wall clock reads a time after 2020",
 ];
-const LOADER_SHOWS: [&str; 1] =
-    ["loader: copied 3 loadable segments of kernel.elf to their physical addresses"];
+
+/// What the M4 loader of either architecture writes before it enters the kernel, and what the
+/// kernel it entered writes of the module and command line it passed.
+const LOADER_SHOWS: [&str; 7] = [
+    "loader: recorded the boot in boot.rec",
+    "loader: measured kernel.elf into PCR 8",
+    "loader: drew 16 bytes of entropy",
+    "loader: no key within 10 ms",
+    "loader: entering kernel.elf with 1 module",
+    "kernel: command line console=serial",
+    "kernel: module seed of 16 bytes",
+];
 
 /// What the x86_64 M4 kernel also writes once it identifies its CPU and reads its counter.
 const X64_KERNEL_SHOWS: [&str; 2] = [
@@ -452,16 +462,17 @@ const X64_KERNEL_SHOWS: [&str; 2] = [
     "tsc: the counter advanced over a tick",
 ];
 
-/// Builds a copy of an M4 scenario outside every git working tree, runs each program under its
-/// emulator until it shows its behaviour, the kernel also `kernel_shows`, then verifies the
-/// scenario.
+/// Builds a copy of an M4 scenario outside every git working tree, runs the kernel under its
+/// emulator until it shows its behaviour, also `kernel_shows`, then the loader until it and the
+/// kernel it enters show theirs, then verifies the scenario.
 fn m4_scenario(milestone: &str, kernel_shows: &[&str]) {
     let outside =
         std::env::temp_dir().join(format!("nan-milestones-{milestone}-{}", std::process::id()));
     let root = copied_into(milestone, &outside);
     ok(&root, &["build"]);
-    shows(&root, "kernel", &[&KERNEL_SHOWS[..], kernel_shows].concat());
-    shows(&root, "loader", &LOADER_SHOWS);
+    let kernel = [&KERNEL_SHOWS[..], kernel_shows].concat();
+    shows(&root, "kernel", &kernel);
+    shows(&root, "loader", &[&LOADER_SHOWS[..], &kernel].concat());
     verified(&root);
     fs::remove_dir(outside).expect("the scenario's directory removed");
 }

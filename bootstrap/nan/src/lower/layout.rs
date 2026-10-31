@@ -499,8 +499,8 @@ impl Layouts {
                 empty()
             }
             // A machine root grant: the handles of its root allocator, executor, clock and wall
-            // clock, and whether its regions and its `hw::Ring0` were taken; `boot::Machine`
-            // carries them into the `boot::Kernel` its `exit_services` returns.
+            // clock, and whether its regions, its `hw::Ring0` and its modules were taken;
+            // `boot::Machine` carries them into the `boot::Kernel` its `exit_services` returns.
             "boot::Kernel" | "boot::Machine" => self.record(
                 ck,
                 &[
@@ -510,6 +510,7 @@ impl Layouts {
                     ("wall".to_owned(), Ty::Scalar(Scalar::U64)),
                     ("regions".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("ring0".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("modules".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],
             ),
             // A physical frame, a page-table root owning one, and a user address are one

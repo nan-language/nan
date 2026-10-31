@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 28] = [
+const DRAWING: [&str; 30] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -38,14 +38,25 @@ const DRAWING: [&str; 28] = [
     "hw::sim::Registers.queue",
     "hw::sim::Registers.queue_at",
     "boot::Kernel.regions",
+    "boot::Kernel.modules",
     "boot::Kernel.anchor",
+    "boot::Machine.enter",
     "host::Runner.run",
     "testing::world",
 ];
 
 /// The supplied operations without a `try_` name that draw memory and fail, rather than trap,
 /// when it is exhausted.
-const FAILING_DRAWS: [&str; 2] = ["mem::wire::Codec.canonical", "boot::Services.read_file"];
+const FAILING_DRAWS: [&str; 8] = [
+    "mem::wire::Codec.canonical",
+    "boot::Services.read_file",
+    "boot::Services.list_directory",
+    "boot::Services.boot_device",
+    "boot::Services.get_variable",
+    "boot::Services.event_log",
+    "boot::Services.submit_tpm",
+    "boot::Services.memory_map",
+];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and

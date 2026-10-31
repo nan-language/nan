@@ -1,0 +1,167 @@
+//! Calls each firmware service and writes what it gave to the serial port once boot services end.
+
+/// The vendor of the variable the program writes, and the PCR it extends.
+const VENDOR: boot::Guid = boot::Guid(data1: 0x6E61_6E00, data2: 0x7072, data3: 0x6F62, data4: 0x6500_0000_0000_0001)
+
+const PCR: u32 = 16
+
+/// A TPM 2.0 command asking the TPM for 8 random bytes.
+const GET_RANDOM: Slice[u8] = b"\x80\x01\x00\x00\x00\x0c\x00\x00\x01\x7b\x00\x08"
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take m: boot::Machine) -> Never limits stack 32_768 {
+    let alloc = m.alloc()
+    var report = mem::Bytes.empty(alloc)
+    mut m.with_services(fn[mut report](services: boot::Services) {
+        failed(attempt files(services, mut report, alloc), group: b"files", mut report)
+        failed(attempt variables(services, mut report, alloc), group: b"variables", mut report)
+        failed(attempt memory(services, mut report, alloc), group: b"memory", mut report)
+        failed(attempt tables(services, mut report, alloc), group: b"tables", mut report)
+        failed(attempt devices(services, mut report, alloc), group: b"devices", mut report)
+    })
+    let k = take m.exit_services()
+    say(report.view())
+    take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 16_384 {
+        say(b"anchored\n")
+    })
+} main
+
+/// Reports a group of services that failed, and the error it failed with.
+fn failed(outcome: Result[Unit, boot::ServiceError], group: Slice[u8], mut report: mem::Bytes) {
+    let Err(error) = outcome else {
+        return
+    }
+    mut report.append(group)
+    let reason = match error {
+        boot::ServiceError.NotFound => b" failed: not found\n"
+        boot::ServiceError.OutOfMemory => b" failed: out of memory\n"
+        boot::ServiceError.Denied => b" failed: denied\n"
+        boot::ServiceError.Unsupported => b" failed: unsupported\n"
+        boot::ServiceError.Invalid => b" failed: invalid\n"
+        else => b" failed: device error\n"
+    }
+    mut report.append(reason)
+} failed
+
+/// Writes, reads back, lists and deletes a file of the boot volume, and names the image's own.
+fn files(services: boot::Services, mut report: mem::Bytes, alloc: mem::Alloc) fails boot::ServiceError {
+    try services.write_file("probe.txt", data: b"probe")
+    let back = try services.read_file("probe.txt", alloc)
+    if same(back.view(), expected: b"probe") {
+        mut report.append(b"file: written and read back\n")
+    }
+    let entries = try services.list_directory("", alloc)
+    for entry in entries {
+        if same(entry.name.view(), expected: b"probe.txt") and entry.byte_len == 5 and not entry.directory {
+            mut report.append(b"directory: lists probe.txt of 5 bytes\n")
+        }
+    }
+    try services.delete_file("probe.txt")
+    match first attempt services.read_file("probe.txt", alloc) {
+        Err(boot::ServiceError.NotFound) => mut report.append(b"file: deleted\n")
+        else => {}
+    }
+    let device = try services.boot_device(alloc)
+    if same(device.file.view(), expected: b"EFI/BOOT/BOOTX64.EFI") {
+        mut report.append(b"boot device: EFI/BOOT/BOOTX64.EFI\n")
+    }
+} files
+
+/// Writes, reads back and deletes a non-volatile variable only boot services reach.
+fn variables(services: boot::Services, mut report: mem::Bytes, alloc: mem::Alloc) fails boot::ServiceError {
+    let attributes = boot::VariableAttributes(non_volatile: true, boot_service_access: true, runtime_access: false, reserved: 0)
+    try services.set_variable("NanProbe", vendor: VENDOR, attributes, data: b"\x01\x02\x03")
+    let variable = try services.get_variable("NanProbe", vendor: VENDOR, alloc)
+    if variable.attributes == attributes and same(variable.data.view(), expected: b"\x01\x02\x03") {
+        mut report.append(b"variable: written and read back\n")
+    }
+    try services.set_variable("NanProbe", vendor: VENDOR, attributes, data: b"")
+    let gone = attempt services.get_variable("NanProbe", vendor: VENDOR, alloc)
+    if gone.is_err() {
+        mut report.append(b"variable: deleted\n")
+    }
+} variables
+
+/// Finds conventional memory above 1 MiB in the memory map, allocates a page of it and frees it.
+fn memory(services: boot::Services, mut report: mem::Bytes, alloc: mem::Alloc) fails boot::ServiceError {
+    let ranges = try services.memory_map(alloc)
+    for range in ranges {
+        if range.kind == 7 and range.base >= 0x10_0000 and range.byte_len >= 8_192 {
+            let region = try services.allocate(range.base, byte_len: 100)
+            if region.base() == range.base and region.byte_len() == 4_096 {
+                mut report.append(b"memory: a page of conventional memory allocated\n")
+            }
+            try services.free(take region)
+            return
+        }
+    }
+} memory
+
+/// Reads the RSDP and two ACPI tables.
+fn tables(services: boot::Services, mut report: mem::Bytes, alloc: mem::Alloc) fails boot::ServiceError {
+    let rsdp = try services.config_table(boot::ConfigTable.Acpi, alloc)
+    if starts(rsdp.view(), prefix: b"RSD PTR ") {
+        mut report.append(b"acpi: the RSDP\n")
+    }
+    let madt = try services.acpi_table(signature(b"APIC"), alloc)
+    let dsdt = try services.acpi_table(signature(b"DSDT"), alloc)
+    if starts(madt.view(), prefix: b"APIC") and starts(dsdt.view(), prefix: b"DSDT") {
+        mut report.append(b"acpi: the MADT and the DSDT\n")
+    }
+} tables
+
+/// Draws entropy, waits for no key, and measures into, reads the log of and sends a command to
+/// the TPM.
+fn devices(services: boot::Services, mut report: mem::Bytes, alloc: mem::Alloc) fails boot::ServiceError {
+    var drawn = Array[u8, 32].filled(0)
+    try services.random(mut drawn.view_mut())
+    if drawn != Array[u8, 32].filled(0) {
+        mut report.append(b"random: 32 bytes\n")
+    }
+    if try services.read_key(0) == None {
+        mut report.append(b"console: no key\n")
+    }
+    try services.measure(PCR, event_type: 0x0D, data: b"probe", event: b"probe")
+    mut report.append(b"tpm: measured into PCR 16\n")
+    let log = try services.event_log(alloc)
+    if starts(log.bytes.view(), prefix: b"\x00\x00\x00\x00\x03\x00\x00\x00") {
+        mut report.append(b"tpm: the log opens with the spec event\n")
+    }
+    let response = try services.submit_tpm(GET_RANDOM, alloc)
+    if starts(response.view(), prefix: b"\x80\x01\x00\x00\x00\x14\x00\x00\x00\x00\x00\x08") {
+        mut report.append(b"tpm: 8 random bytes from the TPM\n")
+    }
+} devices
+
+/// The four bytes of an ACPI table's signature.
+fn signature(text: Slice[u8]) -> Array[u8, 4] {
+    var bytes = Array[u8, 4].filled(0)
+    for index in 0usize..<4 {
+        bytes[index] = text[index]
+    }
+    return bytes
+} signature
+
+/// Whether Untrusted bytes are `expected`.
+validator fn same(bytes: Untrusted[Slice[u8]], expected: Slice[u8]) -> bool {
+    return bytes.inspect() == expected
+} same
+
+/// Whether Untrusted bytes start with `prefix`.
+validator fn starts(bytes: Untrusted[Slice[u8]], prefix: Slice[u8]) -> bool {
+    let Some(head) = bytes.inspect().prefix(prefix.len()) else {
+        return false
+    }
+    return head == prefix
+} starts

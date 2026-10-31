@@ -1,4 +1,4 @@
-//! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root allocator, clocks, `hw::Ring0` and the usable memory of the machine, the firmware services of the UEFI targets, and the anchor a kernel installs before its executor starts. The installed anchor lies in storage the image reserves, whose address and the location of the `anchor` call the runtime state records.
+//! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start information, the firmware services of the UEFI targets, the anchor a kernel installs before its executor starts, and what the start information and the firmware's tables give std. The installed anchor lies in storage the image reserves, whose address and the location of the `anchor` call the runtime state records.
 
 fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
@@ -15,18 +15,56 @@ fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             supply.ret(mut lo, mut fx, held: Held.Address(clock))
         }
         "boot::Kernel.wall_clock" => boot_wall_clock(mut lo, mut fx, supply)
-        "boot::Kernel.ring0" => boot_ring0(mut lo, mut fx, supply)
+        "boot::Kernel.ring0" or "boot::Machine.ring0" => boot_ring0(mut lo, mut fx, supply)
         "boot::Kernel.regions" => regions(mut lo, mut fx, supply)
+        "boot::Kernel.modules" => boot_modules(mut lo, mut fx, supply)
         "boot::Kernel.anchor" => boot_anchor(mut lo, mut fx, supply)
+        "boot::Module.contents" => module_contents(mut lo, mut fx, supply)
+        "boot::start_info" => {
+            let info = mut lo.start_info(mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(info))
+        }
+        "boot::tree_address" => {
+            if lo.ck.db().target == workspace::Target.Aarch64Bare {
+                let state_address = mut lo.state(mut fx)
+                let tree = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+                supply.ret(mut lo, mut fx, held: Held.Scalar(tree))
+            } else {
+                let none = mut fx.ptr(0)
+                supply.ret(mut lo, mut fx, held: Held.Scalar(none))
+            }
+        }
+        "boot::rsdp_address" => {
+            let rsdp = mut lo.rsdp(mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(rsdp))
+        }
+        "boot::system_table_address" => {
+            if lo.ck.db().target.kind() == Some(workspace::Kind.Uefi) {
+                let state_address = mut lo.state(mut fx)
+                let table = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM_TABLE)
+                supply.ret(mut lo, mut fx, held: Held.Scalar(table))
+            } else {
+                let none = mut fx.ptr(0)
+                supply.ret(mut lo, mut fx, held: Held.Scalar(none))
+            }
+        }
         "boot::Machine.with_services" => firmware_with_services(mut lo, mut fx, supply)
         "boot::Machine.exit_services" => exit_services(mut lo, mut fx, supply)
-        "boot::Services.write_console" => write_console(mut lo, mut fx, supply)
-        "boot::Services.read_file" => read_file(mut lo, mut fx, supply)
+        "boot::Machine.enter" => firmware_enter(mut lo, mut fx, supply)
+        "boot::Services.free" => firmware_free(mut lo, mut fx, supply)
         "bare_platform::yield_task" or "uefi_platform::yield_task" => {
             yield_preempted(mut lo, mut fx)
             supply.done(mut lo, mut fx)
         }
-        else => return false
+        else => {
+            if supply.path.as_str().starts_with("boot::Services.") {
+                firmware_service(mut lo, mut fx, supply)
+            } else if supply.path.as_str().starts_with("uefi_platform::") {
+                firmware_platform(mut lo, mut fx, supply)
+            } else {
+                return false
+            }
+        }
     }
     return true
 } boot_lower
@@ -108,6 +146,81 @@ fn regions(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     })
     supply.ret(mut lo, mut fx, held: Held.Address(list))
 } regions
+
+/// `k.modules()`: the first time, the modules the start information lists, in its order, drawn
+/// through the root allocator; an empty list after, and on a target without a start information.
+fn boot_modules(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let grant = supply.param(0).address_value()
+    let at = boot_field(mut lo, supply, field_name: "modules")
+    let taken = mut fx.load(clif::Type.Int8, addr: grant, offset: at)
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(yes, addr: grant, offset: at)
+    let Some(list) = supply.sret else {
+        expect false
+        return
+    }
+    let Some(module_ty) = lo.ck.types().type_arg(supply.abi.result, index: 0) else {
+        expect false
+        return
+    }
+    let element = Element.of(mut lo, ty: module_ty)
+    let alloc_at = boot_field(mut lo, supply, field_name: "alloc")
+    let cell = mut fx.load(PTR, addr: grant, offset: alloc_at)
+    vector_empty(mut fx, address: list, alloc: cell, element)
+    let info = mut lo.start_info(mut fx)
+    let untaken = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+    let given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: info, y: 0)
+    let claimed = mut fx.b.band(untaken, y: given)
+    mut fx.if_true(claimed, then: fn[mut lo](mut fx1: Fx) {
+        let count = start_count(mut fx1, info, offset: START_INFO_MODULE_COUNT)
+        let entries = mut fx1.load(PTR, addr: info, offset: START_INFO_MODULES)
+        let room = vector_reserve(mut lo, fx: mut fx1, address: list, needed: count, element)
+        let short = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+        mut fx1.if_true(short, then: fn[mut lo](mut fx2: Fx) {
+            raise_kind(mut lo, fx: mut fx2, kind: "trap.exhausted")
+        })
+        let data = mut fx1.load(PTR, addr: list, offset: VECTOR_DATA)
+        let region_field = mut lo.layouts.field(lo.ck, ty: module_ty, variant: None, label: "region")
+        let region_at = region_field.offset
+        let name_field = mut lo.layouts.field(lo.ck, ty: module_ty, variant: None, label: "name_at")
+        let name_at = name_field.offset
+        let zero_value = mut fx1.ptr(0)
+        mut fx1.each(zero_value, end: count, body: fn(mut fx2: Fx, index: clif::Value) {
+            let offset = mut fx2.b.imul_imm_s(index, y: START_MODULE_BYTES)
+            let entry = mut fx2.b.iadd(entries, y: offset)
+            let slot = element.at(mut fx2, data, index)
+            let region = mut fx2.offset(slot, offset: region_at)
+            let address = mut fx2.load(PTR, addr: entry, offset: START_MODULE_ADDRESS)
+            mut fx2.store(address, addr: region, offset: REGION_BASE)
+            let size = mut fx2.load(PTR, addr: entry, offset: START_MODULE_SIZE)
+            mut fx2.store(size, addr: region, offset: REGION_LEN)
+            let name = mut fx2.load(PTR, addr: entry, offset: START_MODULE_NAME)
+            mut fx2.store(name, addr: slot, offset: name_at)
+        })
+        mut fx1.store(count, addr: list, offset: VECTOR_LEN)
+    })
+    supply.ret(mut lo, mut fx, held: Held.Address(list))
+} boot_modules
+
+/// `module.contents()`: a view of the module's memory.
+fn module_contents(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let module = supply.param(0).address_value()
+    let Some(module_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let region_field = mut lo.layouts.field(lo.ck, ty: module_ty, variant: None, label: "region")
+    let region = mut fx.offset(module, offset: region_field.offset)
+    let base = mut fx.load(PTR, addr: region, offset: REGION_BASE)
+    let len = mut fx.load(PTR, addr: region, offset: REGION_LEN)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(base, addr: sret, offset: 0)
+    mut fx.store(len, addr: sret, offset: 8)
+    supply.done(mut lo, mut fx)
+} module_contents
 
 /// Inserts the region from `base` to `end`, when it is not empty, into a list of regions in
 /// address order, trapping when the list cannot grow.

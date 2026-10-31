@@ -15,25 +15,6 @@ const REACHABLE: u64 = 1 << 47
 /// The first mebibyte, which usable memory leaves out on x86_64.
 const LOW_MEMORY: i64 = 0x10_0000
 
-/// The usable entries of the `x86_64-bare` start information's memory map, which version 1 of
-/// it has: the offsets of the map's address and entry count, an entry's size, and in an entry
-/// the offsets of its address, size and type, and the type of usable memory.
-const START_MAP_VERSION: u64 = 4
-
-const START_MAP_ADDRESS: u64 = 40
-
-const START_MAP_COUNT: u64 = 48
-
-const START_MAP_ENTRY: i64 = 24
-
-const START_MAP_BASE: u64 = 0
-
-const START_MAP_SIZE: u64 = 8
-
-const START_MAP_KIND: u64 = 16
-
-const START_MAP_USABLE: i64 = 1
-
 /// The usable entries of a UEFI memory map: in a descriptor the offsets of its type, physical
 /// start and page count, and the types of conventional memory and of boot services' code and
 /// data, which `exit_services` frees.
@@ -293,12 +274,13 @@ fn Lowering.reserve_boot_area(mut self, mut fx: Fx) -> clif::Value {
 } Lowering.reserve_boot_area
 
 /// Visits the usable memory the platform lists below 128 TiB, in its parts outside the `held`
-/// ranges, outside the first MiB on x86_64 and outside the device tree and the ranges it
-/// reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the
-/// usable entries of the start information's memory map, on `aarch64-bare`, the ranges of the
-/// device tree's memory nodes and, on a UEFI target, the usable entries of the firmware's
-/// final memory map. `visit` receives each range's first address and last address plus one;
-/// the range may be empty.
+/// ranges, outside the first MiB on x86_64, outside the start information with its module
+/// list, memory map, command line, modules and their names on a bare target, and outside the
+/// device tree and the ranges it reserves on `aarch64-bare`. Usable memory is, on a bare
+/// target with a start information, the usable entries of its memory map, on `aarch64-bare`
+/// without one, the ranges of the device tree's memory nodes and, on a UEFI target, the
+/// usable entries of the firmware's final memory map. `visit` receives each range's first
+/// address and last address plus one; the range may be empty.
 fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     let state_address = mut self.state(mut fx)
     match self.ck.db().target {
@@ -322,42 +304,80 @@ fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(m
                     let pages = mut fx2.load(PTR, addr: entry, offset: FIRMWARE_MAP_PAGES)
                     let page_bytes = mut fx2.b.ishl_imm_s(pages, y: 12)
                     let end = mut fx2.b.iadd(base, y: page_bytes)
-                    visit_unheld(mut self, fx: mut fx2, held, reserved: None, range: Extent(start: base, end: end), visit)
+                    visit_unheld(mut self, fx: mut fx2, held, holds: Holds(reserved: None, start: None), range: Extent(start: base, end: end), visit)
                 })
             })
         }
-        workspace::Target.Aarch64Bare => tree_memory(mut self, mut fx, state_address, held, visit)
-        else => {
-            let info = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
-            let version = mut fx.load(clif::Type.Int32, addr: info, offset: START_MAP_VERSION)
-            let mapped = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: version, y: 1)
-            mut fx.if_true(mapped, then: fn[mut self](mut fx1: Fx) {
-                let map = mut fx1.load(PTR, addr: info, offset: START_MAP_ADDRESS)
-                let count_word = mut fx1.load(clif::Type.Int32, addr: info, offset: START_MAP_COUNT)
-                let count = mut fx1.b.uextend(PTR, x: count_word)
-                let zero_value = mut fx1.ptr(0)
-                mut fx1.each(zero_value, end: count, body: fn[mut self](mut fx2: Fx, index: clif::Value) {
-                    let offset = mut fx2.b.imul_imm_s(index, y: START_MAP_ENTRY)
-                    let entry = mut fx2.b.iadd(map, y: offset)
-                    let kind = mut fx2.load(clif::Type.Int32, addr: entry, offset: START_MAP_KIND)
-                    let free = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: START_MAP_USABLE)
-                    mut fx2.if_true(free, then: fn[mut self](mut fx3: Fx) {
-                        let base = mut fx3.load(PTR, addr: entry, offset: START_MAP_BASE)
-                        let size = mut fx3.load(PTR, addr: entry, offset: START_MAP_SIZE)
-                        let end = mut fx3.b.iadd(base, y: size)
-                        visit_unheld(mut self, fx: mut fx3, held, reserved: None, range: Extent(start: base, end: end), visit)
-                    })
+        workspace::Target.Aarch64Bare => {
+            let info = mut self.start_info(mut fx)
+            let tree = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+            let given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: info, y: 0)
+            mut fx.if_true(given, then: fn[mut self](mut fx1: Fx) {
+                let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: tree, y: 0)
+                let ends = mut fx1.choose(present, results: fx1.types1(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+                    return fx2.list1(tree_address(mut fx2, tree, field: DEVICE_TREE_SIZE))
+                }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+                    return fx2.list1(mut fx2.ptr(0))
                 })
+                var all_held = mem::List[Extent].empty(self.alloc)
+                mut all_held.push(Extent(start: tree, end: ends[0]))
+                for range in held {
+                    mut all_held.push(range)
+                }
+                start_memory(mut self, fx: mut fx1, start: info, held: all_held.view(), visit)
             })
+            let absent = mut fx.b.bxor_imm_s(given, y: 1)
+            mut fx.if_true(absent, then: fn[mut self](mut fx1: Fx) {
+                tree_memory(mut self, fx: mut fx1, tree, held, visit)
+            })
+        }
+        else => {
+            let info = mut self.start_info(mut fx)
+            start_memory(mut self, mut fx, start: info, held, visit)
         }
     }
 } Lowering.usable_memory
 
-/// Visits the parts of the usable memory `range` outside the `held` ranges and the ranges the
-/// device tree's memory reservation block at `reserved` lists, clipped to start past the first
-/// MiB on x86_64 and to end below 128 TiB. Each pass visits the part before
-/// the one of those ranges overlapping the rest that starts lowest, then skips past that range.
-fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Option[clif::Value], range: Extent, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+/// The usable entries of a start information's memory map, which version 1 of it has, visited
+/// outside the `held` ranges and those the start information holds.
+fn start_memory(mut lo: Lowering, mut fx: Fx, start: clif::Value, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: start, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let version = mut fx1.load(clif::Type.Int32, addr: start, offset: START_INFO_VERSION)
+        let mapped = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: version, y: 1)
+        mut fx1.if_true(mapped, then: fn[mut lo](mut fx2: Fx) {
+            let map = mut fx2.load(PTR, addr: start, offset: START_INFO_MAP)
+            let count = start_count(mut fx2, info: start, offset: START_INFO_MAP_COUNT)
+            let zero_value = mut fx2.ptr(0)
+            mut fx2.each(zero_value, end: count, body: fn[mut lo](mut fx3: Fx, index: clif::Value) {
+                let offset = mut fx3.b.imul_imm_s(index, y: START_MAP_BYTES)
+                let entry = mut fx3.b.iadd(map, y: offset)
+                let kind = mut fx3.load(clif::Type.Int32, addr: entry, offset: START_MAP_KIND)
+                let free = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: START_MAP_USABLE)
+                mut fx3.if_true(free, then: fn[mut lo](mut fx4: Fx) {
+                    let base = mut fx4.load(PTR, addr: entry, offset: START_MAP_BASE)
+                    let size = mut fx4.load(PTR, addr: entry, offset: START_MAP_SIZE)
+                    let end = mut fx4.b.iadd(base, y: size)
+                    visit_unheld(mut lo, fx: mut fx4, held, holds: Holds(reserved: None, start: Some(start)), range: Extent(start: base, end: end), visit)
+                })
+            })
+        })
+    })
+} start_memory
+
+/// The ranges a walk of usable memory leaves out beyond its `held` ones: those the device tree's
+/// memory reservation block at an address lists, and those a start information at an address
+/// holds.
+struct Holds derives Copy {
+    reserved: Option[clif::Value]
+    start: Option[clif::Value]
+} Holds
+
+/// Visits the parts of the usable memory `range` outside the `held` ranges and the `holds`,
+/// clipped to start past the first MiB on x86_64 and to end below 128 TiB. Each pass visits the
+/// part before the one of those ranges overlapping the rest that starts lowest, then skips past
+/// that range.
+fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], holds: Holds, range: Extent, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     var clipped_base = range.start
     if lo.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
         let low = mut fx.ptr(u64.fit(LOW_MEMORY))
@@ -372,7 +392,13 @@ fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Opt
         for range_held in held {
             lowest = lowest_overlap(mut fx1, lowest, range: range_held, rest)
         }
-        match reserved {
+        match holds.start {
+            Some(start) => {
+                lowest = start_lowest(mut fx1, start, lowest, rest)
+            }
+            None => {}
+        }
+        match holds.reserved {
             Some(block) => {
                 let found = mut fx1.repeat(fx1.list3(block, b: lowest.start, c: lowest.end).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
                     expect state.len() > 2
@@ -396,6 +422,50 @@ fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], reserved: Opt
         return Pass(again: more, next: fx1.list1(after))
     })
 } visit_unheld
+
+/// Whichever of `lowest` and the ranges a start information holds starts lowest, each only
+/// where it overlaps `rest`: the start information, its module list, its memory map, its command
+/// line, and each module with its name.
+fn start_lowest(mut fx: Fx, start: clif::Value, lowest: Extent, rest: Extent) -> Extent {
+    let info_end = mut fx.b.iadd_imm_s(start, y: START_INFO_BYTES)
+    var held = lowest_overlap(mut fx, lowest, range: Extent(start: start, end: info_end), rest)
+    let modules = mut fx.load(PTR, addr: start, offset: START_INFO_MODULES)
+    let count = start_count(mut fx, info: start, offset: START_INFO_MODULE_COUNT)
+    let list_bytes = mut fx.b.imul_imm_s(count, y: START_MODULE_BYTES)
+    let list_end = mut fx.b.iadd(modules, y: list_bytes)
+    held = lowest_overlap(mut fx, lowest: held, range: Extent(start: modules, end: list_end), rest)
+    let map = mut fx.load(PTR, addr: start, offset: START_INFO_MAP)
+    let entries = start_count(mut fx, info: start, offset: START_INFO_MAP_COUNT)
+    let map_bytes = mut fx.b.imul_imm_s(entries, y: START_MAP_BYTES)
+    let map_end = mut fx.b.iadd(map, y: map_bytes)
+    held = lowest_overlap(mut fx, lowest: held, range: Extent(start: map, end: map_end), rest)
+    let line = mut fx.load(PTR, addr: start, offset: START_INFO_COMMAND_LINE)
+    let line_end = start_text_end(mut fx, text: line)
+    held = lowest_overlap(mut fx, lowest: held, range: Extent(start: line, end: line_end), rest)
+    let zero_value = mut fx.ptr(0)
+    let found = mut fx.repeat(fx.list3(zero_value, b: held.start, c: held.end).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 2
+        let index = state[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+        let chosen = mut fx1.choose(inside, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let offset = mut fx2.b.imul_imm_s(index, y: START_MODULE_BYTES)
+            let entry = mut fx2.b.iadd(modules, y: offset)
+            let address = mut fx2.load(PTR, addr: entry, offset: START_MODULE_ADDRESS)
+            let size = mut fx2.load(PTR, addr: entry, offset: START_MODULE_SIZE)
+            let module_end = mut fx2.b.iadd(address, y: size)
+            let past_module = lowest_overlap(mut fx2, lowest: Extent(start: state[1], end: state[2]), range: Extent(start: address, end: module_end), rest)
+            let name = mut fx2.load(PTR, addr: entry, offset: START_MODULE_NAME)
+            let label_end = start_text_end(mut fx2, text: name)
+            let past_name = lowest_overlap(mut fx2, lowest: past_module, range: Extent(start: name, end: label_end), rest)
+            return fx2.list2(past_name.start, b: past_name.end)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(state[1], b: state[2])
+        })
+        let next = mut fx1.b.iadd_imm_s(index, y: 1)
+        return Pass(again: inside, next: fx1.list3(next, b: chosen[0], c: chosen[1]))
+    })
+    return Extent(start: found[1], end: found[2])
+} start_lowest
 
 /// Whichever of `lowest` and `range` starts lower, `range` only where it overlaps `rest`.
 fn lowest_overlap(mut fx: Fx, lowest: Extent, range: Extent, rest: Extent) -> Extent {
@@ -421,11 +491,11 @@ struct TreeWalk derives Copy {
     size_cells: clif::Variable
 } TreeWalk
 
-/// The usable memory of `aarch64-bare`: the ranges in the `reg` property of each memory node of
-/// the device tree, a child of its root named `memory` or `memory@` and a unit address, read in
-/// the root's cells, visited outside the device tree and the `held` ranges.
-fn tree_memory(mut lo: Lowering, mut fx: Fx, state_address: clif::Value, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
-    let tree = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+/// The usable memory of `aarch64-bare` without a start information: the ranges in the `reg`
+/// property of each memory node of the device tree, a child of its root named `memory` or
+/// `memory@` and a unit address, read in the root's cells, visited outside the device tree and
+/// the `held` ranges.
+fn tree_memory(mut lo: Lowering, mut fx: Fx, tree: clif::Value, held: Slice[Extent], visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     let structure = tree_address(mut fx, tree, field: DEVICE_TREE_STRUCTURE)
     let strings = tree_address(mut fx, tree, field: DEVICE_TREE_STRINGS)
     let reserved = tree_address(mut fx, tree, field: DEVICE_TREE_RESERVED)
@@ -521,7 +591,7 @@ fn tree_property(mut lo: Lowering, mut fx: Fx, walk: TreeWalk, held: Slice[Exten
             let size_at = mut fx2.b.iadd(base_at, y: size_offset)
             let size = tree_number(mut fx2, at: size_at, count: size_cells)
             let end = mut fx2.b.iadd(base, y: size)
-            visit_unheld(mut lo, fx: mut fx2, held, reserved: Some(walk.reserved), range: Extent(start: base, end: end), visit)
+            visit_unheld(mut lo, fx: mut fx2, held, holds: Holds(reserved: Some(walk.reserved), start: None), range: Extent(start: base, end: end), visit)
         })
     })
     let rounded = mut fx.b.iadd_imm_s(len, y: 3)

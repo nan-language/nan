@@ -12,6 +12,7 @@ use super::super::fx::{Fx, PTR};
 use super::super::runtime::memory::CHUNK;
 use super::super::runtime::{report, state, system};
 use super::heap::{self, BOOT_HEAP};
+use super::start::{self, info, map_entry, module};
 use super::{
     A64_ACCESS, A64_ATTR_NORMAL, A64_INNER, A64_TABLE, A64_VALID, LARGE, MAPPED, PRESENT, Stub,
     WRITABLE,
@@ -31,20 +32,6 @@ const REACHABLE: u64 = 1 << 47;
 
 /// The first mebibyte, which usable memory leaves out on x86_64.
 const LOW_MEMORY: i64 = 0x10_0000;
-
-/// The usable entries of the `x86_64-bare` start information's memory map, which version 1 of
-/// it has: the offsets of the map's address and entry count, an entry's size, and in an entry
-/// the offsets of its address, size and type, and the type of usable memory.
-mod start_map {
-    pub const VERSION: u64 = 4;
-    pub const ADDRESS: u64 = 40;
-    pub const COUNT: u64 = 48;
-    pub const ENTRY: i64 = 24;
-    pub const BASE: u64 = 0;
-    pub const SIZE: u64 = 8;
-    pub const KIND: u64 = 16;
-    pub const USABLE: i64 = 1;
-}
 
 /// The usable entries of a UEFI memory map: in a descriptor the offsets of its type, physical
 /// start and page count, and the types of conventional memory and of boot services' code and
@@ -295,10 +282,12 @@ impl Lowering<'_, '_> {
     }
 
     /// Visits the usable memory the platform lists below 128 TiB, in its parts outside the `held`
-    /// ranges, outside the first MiB on x86_64 and outside the device tree and the ranges it
-    /// reserves on `aarch64-bare`. Usable memory is, on `x86_64-bare`, the usable entries of the
-    /// start information's memory map, on `aarch64-bare`, the ranges of the device tree's memory
-    /// nodes and, on a UEFI target, the usable entries of the firmware's final memory map.
+    /// ranges, outside the first MiB on x86_64, outside the start information with its module
+    /// list, memory map, command line, modules and their names on a bare target, and outside the
+    /// device tree and the ranges it reserves on `aarch64-bare`. Usable memory is, on a bare
+    /// target with a start information, the usable entries of its memory map, on `aarch64-bare`
+    /// without one, the ranges of the device tree's memory nodes and, on a UEFI target, the
+    /// usable entries of the firmware's final memory map.
     pub fn usable_memory(&mut self, fx: &mut Fx, held: &[(Value, Value)], visit: Visit) {
         let state_address = self.state(fx);
         match self.ck.db.target {
@@ -322,49 +311,93 @@ impl Lowering<'_, '_> {
                         let pages = fx.load(PTR, entry, firmware_map::PAGES);
                         let bytes = fx.b.ins().ishl_imm_s(pages, 12);
                         let end = fx.b.ins().iadd(base, bytes);
-                        visit_unheld(self, fx, held, None, (base, end), visit);
+                        visit_unheld(self, fx, held, Holds::default(), (base, end), visit);
                     });
                 });
             }
-            Target::Aarch64Bare => tree_memory(self, fx, state_address, held, visit),
-            _ => {
-                let info = fx.load(PTR, state_address, state::PLATFORM);
-                let version = fx.load(types::I32, info, start_map::VERSION);
-                let mapped =
-                    fx.b.ins()
-                        .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, version, 1);
-                fx.when(mapped, |fx| {
-                    let map = fx.load(PTR, info, start_map::ADDRESS);
-                    let count = fx.load(types::I32, info, start_map::COUNT);
-                    let count = fx.b.ins().uextend(PTR, count);
-                    let zero = fx.ptr(0);
-                    fx.each(zero, count, |fx, index| {
-                        let offset = fx.b.ins().imul_imm_s(index, start_map::ENTRY);
-                        let entry = fx.b.ins().iadd(map, offset);
-                        let kind = fx.load(types::I32, entry, start_map::KIND);
-                        let free = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, start_map::USABLE);
-                        fx.when(free, |fx| {
-                            let base = fx.load(PTR, entry, start_map::BASE);
-                            let size = fx.load(PTR, entry, start_map::SIZE);
-                            let end = fx.b.ins().iadd(base, size);
-                            visit_unheld(self, fx, held, None, (base, end), visit);
-                        });
-                    });
+            Target::Aarch64Bare => {
+                let info = self.start_info(fx);
+                let tree = fx.load(PTR, state_address, state::PLATFORM);
+                let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
+                fx.when(given, |fx| {
+                    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, tree, 0);
+                    let tree_end = fx.choose(
+                        present,
+                        &[PTR],
+                        |fx| vec![tree_address(fx, tree, device_tree::SIZE)],
+                        |fx| vec![fx.ptr(0)],
+                    )[0];
+                    let held = [&[(tree, tree_end)], held].concat();
+                    start_memory(self, fx, info, &held, visit);
                 });
+                let absent = fx.b.ins().bxor_imm_s(given, 1);
+                fx.when(absent, |fx| tree_memory(self, fx, tree, held, visit));
+            }
+            _ => {
+                let info = self.start_info(fx);
+                start_memory(self, fx, info, held, visit);
             }
         }
     }
 }
 
-/// Visits the parts of the usable memory `range` outside the `held` ranges and the ranges the
-/// device tree's memory reservation block at `reserved` lists, clipped to start past the first
-/// MiB on x86_64 and to end below 128 TiB. Each pass visits the part before
-/// the one of those ranges overlapping the rest that starts lowest, then skips past that range.
+/// The usable entries of a start information's memory map, which version 1 of it has, visited
+/// outside the `held` ranges and those the start information holds.
+fn start_memory(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    start: Value,
+    held: &[(Value, Value)],
+    visit: Visit,
+) {
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, start, 0);
+    fx.when(present, |fx| {
+        let version = fx.load(types::I32, start, info::VERSION);
+        let mapped =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, version, 1);
+        fx.when(mapped, |fx| {
+            let map = fx.load(PTR, start, info::MAP);
+            let count = start::count(fx, start, info::MAP_COUNT);
+            let zero = fx.ptr(0);
+            fx.each(zero, count, |fx, index| {
+                let offset = fx.b.ins().imul_imm_s(index, map_entry::BYTES);
+                let entry = fx.b.ins().iadd(map, offset);
+                let kind = fx.load(types::I32, entry, map_entry::KIND);
+                let free = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, map_entry::USABLE);
+                fx.when(free, |fx| {
+                    let base = fx.load(PTR, entry, map_entry::BASE);
+                    let size = fx.load(PTR, entry, map_entry::SIZE);
+                    let end = fx.b.ins().iadd(base, size);
+                    let holds = Holds {
+                        reserved: None,
+                        start: Some(start),
+                    };
+                    visit_unheld(lo, fx, held, holds, (base, end), visit);
+                });
+            });
+        });
+    });
+}
+
+/// The ranges a walk of usable memory leaves out beyond its `held` ones: those the device tree's
+/// memory reservation block at an address lists, and those a start information at an address
+/// holds.
+#[derive(Clone, Copy, Default)]
+struct Holds {
+    reserved: Option<Value>,
+    start: Option<Value>,
+}
+
+/// Visits the parts of the usable memory `range` outside the `held` ranges and the `holds`,
+/// clipped to start past the first MiB on x86_64 and to end below 128 TiB. Each pass visits the
+/// part before the one of those ranges overlapping the rest that starts lowest, then skips past
+/// that range.
 fn visit_unheld(
     lo: &mut Lowering,
     fx: &mut Fx,
     held: &[(Value, Value)],
-    reserved: Option<Value>,
+    holds: Holds,
     range: (Value, Value),
     visit: Visit,
 ) {
@@ -383,7 +416,10 @@ fn visit_unheld(
         for range in held {
             lowest = lowest_overlap(fx, lowest, *range, rest);
         }
-        if let Some(reserved) = reserved {
+        if let Some(start) = holds.start {
+            lowest = start_lowest(fx, start, lowest, rest);
+        }
+        if let Some(reserved) = holds.reserved {
             let found = fx.repeat(&[reserved, lowest.0, lowest.1], |fx, state| {
                 let entry = state[0];
                 let start = fx.load_ordered(PTR, entry, 0, false, true);
@@ -402,6 +438,57 @@ fn visit_unheld(
         let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, after, end);
         (more, vec![after])
     });
+}
+
+/// Whichever of `lowest` and the ranges a start information holds starts lowest, each only
+/// where it overlaps `rest`: the start information, its module list, its memory map, its command
+/// line, and each module with its name.
+fn start_lowest(
+    fx: &mut Fx,
+    start: Value,
+    lowest: (Value, Value),
+    rest: (Value, Value),
+) -> (Value, Value) {
+    let end = fx.b.ins().iadd_imm_s(start, info::BYTES);
+    let mut lowest = lowest_overlap(fx, lowest, (start, end), rest);
+    let modules = fx.load(PTR, start, info::MODULES);
+    let count = start::count(fx, start, info::MODULE_COUNT);
+    let bytes = fx.b.ins().imul_imm_s(count, module::BYTES);
+    let end = fx.b.ins().iadd(modules, bytes);
+    lowest = lowest_overlap(fx, lowest, (modules, end), rest);
+    let map = fx.load(PTR, start, info::MAP);
+    let entries = start::count(fx, start, info::MAP_COUNT);
+    let bytes = fx.b.ins().imul_imm_s(entries, map_entry::BYTES);
+    let end = fx.b.ins().iadd(map, bytes);
+    lowest = lowest_overlap(fx, lowest, (map, end), rest);
+    let line = fx.load(PTR, start, info::COMMAND_LINE);
+    let end = start::text_end(fx, line);
+    lowest = lowest_overlap(fx, lowest, (line, end), rest);
+    let zero = fx.ptr(0);
+    let found = fx.repeat(&[zero, lowest.0, lowest.1], |fx, state| {
+        let index = state[0];
+        let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, count);
+        let found = fx.choose(
+            inside,
+            &[PTR, PTR],
+            |fx| {
+                let offset = fx.b.ins().imul_imm_s(index, module::BYTES);
+                let entry = fx.b.ins().iadd(modules, offset);
+                let address = fx.load(PTR, entry, module::ADDRESS);
+                let size = fx.load(PTR, entry, module::SIZE);
+                let end = fx.b.ins().iadd(address, size);
+                let lowest = lowest_overlap(fx, (state[1], state[2]), (address, end), rest);
+                let name = fx.load(PTR, entry, module::NAME);
+                let end = start::text_end(fx, name);
+                let lowest = lowest_overlap(fx, lowest, (name, end), rest);
+                vec![lowest.0, lowest.1]
+            },
+            |_| vec![state[1], state[2]],
+        );
+        let next = fx.b.ins().iadd_imm_s(index, 1);
+        (inside, vec![next, found[0], found[1]])
+    });
+    (found[1], found[2])
 }
 
 /// Whichever of `lowest` and `range` starts lower, `range` only where it overlaps `rest`.
@@ -434,17 +521,10 @@ struct TreeWalk {
     size_cells: Variable,
 }
 
-/// The usable memory of `aarch64-bare`: the ranges in the `reg` property of each memory node of
+/// The usable memory of `aarch64-bare` without a start information: the ranges in the `reg` property of each memory node of
 /// the device tree, a child of its root named `memory` or `memory@` and a unit address, read in
 /// the root's cells, visited outside the device tree and the `held` ranges.
-fn tree_memory(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    state_address: Value,
-    held: &[(Value, Value)],
-    visit: Visit,
-) {
-    let tree = fx.load(PTR, state_address, state::PLATFORM);
+fn tree_memory(lo: &mut Lowering, fx: &mut Fx, tree: Value, held: &[(Value, Value)], visit: Visit) {
     let structure = tree_address(fx, tree, device_tree::STRUCTURE);
     let strings = tree_address(fx, tree, device_tree::STRINGS);
     let reserved = tree_address(fx, tree, device_tree::RESERVED);
@@ -552,7 +632,11 @@ fn tree_property(
             let size_at = fx.b.ins().iadd(base_at, size_offset);
             let size = tree_number(fx, size_at, size_cells);
             let end = fx.b.ins().iadd(base, size);
-            visit_unheld(lo, fx, held, Some(walk.reserved), (base, end), visit);
+            let holds = Holds {
+                reserved: Some(walk.reserved),
+                start: None,
+            };
+            visit_unheld(lo, fx, held, holds, (base, end), visit);
         });
     });
     let padded = fx.b.ins().iadd_imm_s(len, 3);

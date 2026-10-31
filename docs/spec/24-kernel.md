@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -39,7 +39,7 @@ pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 - `k.alloc()` is the root allocator of `boot::Kernel` ([allocators](12-memory.md#allocators)). Its root cell's supply is the **boot heap**, which the [boot area](#physical-memory) holds in the size its target's [descriptor](27-program-model.md#descriptors) states. Every call returns the same handle.
 - `k.clock()` is the kernel's clock ([kernel time](#kernel-time)), whose nanoseconds count from the minting of the root grant. Every call returns the same handle.
 - `k.wall_clock()` returns `Some` of the kernel's wall clock when the wall clock source of its target's [descriptor](27-program-model.md#descriptors) gave a time as the root grant was minted, the same handle on every call, and `None` otherwise. Its reading is that time, taken as UTC, advanced by the kernel clock.
-- The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64 and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on `x86_64-bare`, the entries of type 1 of the start-info memory map, on `aarch64-bare`, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
+- The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64, outside the [start information](#start-information) with its module list, memory map, command line, modules and their names on a bare target, and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on a bare target with a start information, the entries of type 1 of its memory map, on `aarch64-bare` without one, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable. CPUs are numbered from 0, the boot CPU being 0.
 - `hw::cpu_hardware_id(n)` returns `Some` of the hardware id of CPU n, its local APIC id on x86_64 and its affinity on AArch64, the `MPIDR_EL1` affinity fields at the positions `GICD_IROUTER` holds them, and `None` when n is not below `hw::cpu_count()`. On the host targets the hardware id of CPU n is n.
@@ -727,7 +727,7 @@ pub closed struct Offset[T: AnyBits] derives Copy, Eq {
 ```
 
 - On the machine targets, the **entry root** is the page-table root in use when the entry function starts on a bare target, and the one that `exit_services` installs on a UEFI target. Its tables mapping the first 4 GiB lie in memory the image reserves. Before the entry landing fn on a bare target, and in `exit_services` before installing it on a UEFI target, the runtime extends it in place over the usable memory above 4 GiB, with tables that lie at the end of the boot area on a bare target and, on a UEFI target, at the lowest 64 KiB-aligned address of usable memory outside the image from which they lie wholly in that usable memory below 4 GiB, `exit_services` trapping (`trap.exhausted`) when none holds them. It maps the image, the memory the image reserves, its tables and all usable memory below 128 TiB writable at their physical addresses, where code reaches the memory of frames and regions. The soundness condition of `write_cr3` and `write_ttbr0` keeps the image, the memory it reserves and every live frame and region mapped there ([privileged intrinsics](23-low-level.md#privileged-intrinsics)).
-- On the machine targets, the **boot area** holds the boot heap and the runtime's tables, then on a bare target the entry root's tables mapping usable memory above 4 GiB. On a UEFI target it is memory the image reserves. On a bare target it lies outside the image's loadable segments: before the entry landing fn, the runtime places it at the lowest 64 KiB-aligned address of usable memory outside the image from which it lies wholly in that usable memory below 4 GiB, leaving out the first MiB on x86_64 and the device tree and the ranges its memory reservation block lists on `aarch64-bare` ([anchor](#anchor)). When no usable memory holds it, the run writes `nan: runtime unavailable` and a line feed to the serial port and writes the byte 71 to the [exit port](27-program-model.md#descriptors).
+- On the machine targets, the **boot area** holds the boot heap and the runtime's tables, then on a bare target the entry root's tables mapping usable memory above 4 GiB. On a UEFI target it is memory the image reserves. On a bare target it lies outside the image's loadable segments: before the entry landing fn, the runtime places it at the lowest 64 KiB-aligned address of usable memory outside the image from which it lies wholly in that usable memory below 4 GiB, leaving out the first MiB on x86_64, the [start information](#start-information) and what it holds, and on `aarch64-bare` the device tree and the ranges its memory reservation block lists ([anchor](#anchor)). When no usable memory holds it, the run writes `nan: runtime unavailable` and a line feed to the serial port and writes the byte 71 to the [exit port](27-program-model.md#descriptors).
 - By the soundness condition of `write_cr3` and `write_ttbr0`, no value that safe code reaches holds a frame of a page table that a CPU's root reaches: the trusted code linking a frame into such a table consumes it, such as by storing it through `hw::Ptr.write`.
 - `take region.frames(mut frames)` appends, in address order, every S-aligned frame lying wholly inside the region. Memory of the region outside those frames is never used again.
 - `take frame.split(mut parts)` appends the S ÷ T frames of size T that make up `frame`, in address order. `PhysFrame[S].merge(take parts)` returns `Ok` of the frame they make up when `parts` holds exactly S ÷ T contiguous frames in address order whose first is S-aligned, and otherwise returns `Err(parts)` unchanged. `split` and `frames` grow their list as `push` does ([growth](12-memory.md#growth)).
@@ -765,12 +765,14 @@ pub fn small_frames(take frame: hw::PhysFrame[2_097_152], alloc: mem::Alloc) -> 
 
 ## Firmware services
 
-On the UEFI targets, the [root grant](14-authority.md#root-grants) `boot::Machine` reaches the firmware's services only during the [protocol phase](14-authority.md#protocol-phases) before they exit.
+On the UEFI targets, the [root grant](14-authority.md#root-grants) `boot::Machine` reaches the firmware's services only during the [protocol phase](14-authority.md#protocol-phases) before they exit. It leaves that phase by `exit_services`, continuing as a kernel, or by `enter`, handing the machine to a loaded bare image ([hand-off](#hand-off)).
 
 ```nan-api
 // module: boot
 
 pub fn Machine.alloc(self) -> mem::Alloc
+
+pub fn Machine.ring0(mut self) -> Option[hw::Ring0]
 
 pub fn Machine.with_services[T: Any, E](mut self, body: fn(services: Services) -> T fails E) -> T fails E
 
@@ -781,19 +783,129 @@ pub open view struct Services {
 
 pub fn Services.write_console(self, text: Str) fails ServiceError
 
+pub fn Services.read_key(self, timeout_ms: u64) -> Option[Key] fails ServiceError
+
 pub fn Services.read_file(self, path: Str, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
+
+pub fn Services.write_file(self, path: Str, data: Slice[u8]) fails ServiceError
+
+pub fn Services.delete_file(self, path: Str) fails ServiceError
+
+pub fn Services.list_directory(self, path: Str, alloc: mem::Alloc) -> mem::List[DirectoryEntry] fails ServiceError
+
+pub fn Services.boot_device(self, alloc: mem::Alloc) -> BootDevice fails ServiceError
+
+pub fn Services.get_variable(self, name: Str, vendor: Guid, alloc: mem::Alloc) -> Variable fails ServiceError
+
+pub fn Services.set_variable(self, name: Str, vendor: Guid, attributes: VariableAttributes, data: Slice[u8]) fails ServiceError
+
+pub fn Services.measure(self, pcr: u32, event_type: u32, data: Slice[u8], event: Slice[u8]) fails ServiceError
+
+pub fn Services.event_log(self, alloc: mem::Alloc) -> EventLog fails ServiceError
+
+pub fn Services.submit_tpm(self, command: Slice[u8], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
+
+pub fn Services.random(self, mut buf: SliceMut[u8]) fails ServiceError
+
+pub fn Services.memory_map(self, alloc: mem::Alloc) -> mem::List[MemoryRange] fails ServiceError
+
+pub fn Services.allocate(self, base: u64, byte_len: u64) -> hw::Region fails ServiceError
+
+pub fn Services.free(self, take region: hw::Region) fails ServiceError
+
+pub fn Services.config_table(self, table: ConfigTable, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
+
+pub fn Services.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
 
 pub open enum ServiceError derives Render {
     NotFound
     DeviceError
     OutOfMemory
+    Denied
+    Unsupported
+    Invalid
 } ServiceError
+
+pub closed struct Key derives Copy, Eq {
+    pub text: Option[char]
+    pub scan: u16
+} Key
+
+pub closed struct Guid derives Copy, Eq {
+    pub data1: u32
+    pub data2: u16
+    pub data3: u16
+    pub data4: u64
+} Guid
+
+pub layout VariableAttributes: u32 le {
+    non_volatile: bit 0
+    boot_service_access: bit 1
+    runtime_access: bit 2
+    reserved: rest
+} VariableAttributes
+
+pub closed struct Variable {
+    pub attributes: VariableAttributes
+    pub data: Untrusted[mem::Bytes]
+} Variable
+
+pub closed struct EventLog {
+    pub bytes: Untrusted[mem::Bytes]
+    pub truncated: bool
+} EventLog
+
+pub closed enum ConfigTable derives Copy, Eq {
+    Acpi
+    Smbios
+    DeviceTree
+} ConfigTable
+
+pub closed struct DirectoryEntry {
+    pub name: Untrusted[mem::Bytes]
+    pub byte_len: u64
+    pub directory: bool
+} DirectoryEntry
+
+pub closed struct BootDevice {
+    pub file: Untrusted[mem::Bytes]
+    pub partition: Option[Partition]
+} BootDevice
+
+pub closed struct Partition derives Copy, Eq {
+    pub number: u32
+    pub start: u64
+    pub blocks: u64
+    pub signature: PartitionSignature
+} Partition
+
+pub closed enum PartitionSignature derives Copy, Eq {
+    Gpt(Guid)
+    Mbr(u32)
+    Unsigned
+} PartitionSignature
+
+pub closed struct MemoryRange derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+    pub kind: u32
+    pub attributes: u64
+} MemoryRange
 ```
 
 - `m.alloc()` is the root allocator of `boot::Machine`, whose supply is the boot heap; `exit_services` passes it on unchanged as the `boot::Kernel`'s.
+- `m.ring0()` and `k.ring0()` share the machine's one `hw::Ring0`: the first call of either, before or after `exit_services`, returns `Some` of it, and every later call `None`.
 - `with_services(body)` calls `body` with [`boot::Services`](#kernel-types), a view, so no capability derived from it outlives the call.
-- `write_console` writes `text` to the firmware's console output, each line feed as a carriage return and a line feed. `read_file` reads the file that `path` names from the root directory of the volume the image was loaded from, with `/` between components.
-- Each fails with `NotFound` when the firmware returns `EFI_NOT_FOUND`, with `OutOfMemory` when it returns `EFI_OUT_OF_RESOURCES` or a draw through `alloc` is exhausted, and with `DeviceError` on any other error status.
+- A **path** names a file or directory from the root directory of the volume the image was loaded from, with `/` between components; the empty path names the root directory. A path or variable name holds at most 255 UTF-16 code units. A GUID's fields are the groups of its text form, `data4` the last two.
+- `write_console` writes `text` to the firmware's console output, each line feed as a carriage return and a line feed. `read_key(timeout_ms)` waits at most `timeout_ms` milliseconds for a key at the firmware's console input and returns `Some` of its character, when it has one, and its scan code, or `None` when no key arrives.
+- `read_file` reads a file. `write_file` makes `data` the whole contents of a file, creating it in its existing directory, and flushes it. `delete_file` deletes a file. `list_directory` returns the entries of a directory other than `.` and `..`, in the firmware's order: each one's name in UTF-8, size and whether it is a directory; it fails with `Invalid` when `path` names a file.
+- `boot_device` returns the path of the image's own file, without a leading `/`, and, when the device path of its volume names a hard drive partition, that partition's number, first block, block count and signature: the unique GUID of a GPT partition or the disk signature of an MBR one.
+- `get_variable` returns a firmware variable's attributes and data, and `set_variable` writes one, an empty `data` deleting it. A variable whose attributes lack `runtime_access` is reached only before boot services end.
+- `measure` extends PCR `pcr` of the TPM with the digest of `data` in each of its active banks and logs an event of type `event_type` whose data is `event`, of at most 1,024 bytes, through the firmware's TCG2 protocol. `event_log` returns the firmware's crypto-agile event log, from its first entry to the end of its last, and whether the firmware truncated it; it fails with `Unsupported` when an entry's digest uses an algorithm other than SHA-1, SHA-256, SHA-384, SHA-512 and SM3-256. `submit_tpm` sends a TPM 2.0 command and returns its response, of at most the largest response the TPM states.
+- `random` fills `buf` from the default algorithm of the firmware's RNG protocol.
+- `memory_map` returns the firmware's current memory map, a range for each descriptor in its order, `kind` being the UEFI memory type. `allocate` allocates the pages from `base`, a multiple of 4 KiB, that hold `byte_len` bytes, as `EfiLoaderData`, and returns them as a region of whole pages, which `regions()` never gives; another `base` or an empty length fails with `Invalid`. `free` returns a region's pages to the firmware.
+- `config_table` copies a table the firmware's configuration table lists: the ACPI 2.0 RSDP, the SMBIOS 3.0 entry point followed by the structure table it addresses in its stated maximum size, or the flattened device tree. `acpi_table` copies the ACPI table with a signature: the DSDT and the FACS through the FADT, any other table the XSDT lists, or the RSDT when the RSDP's revision is 0 or it has no XSDT.
+- Each fails with `NotFound` when the firmware returns `EFI_NOT_FOUND` or, for `config_table` and `acpi_table`, has no such table; with `OutOfMemory` when it returns `EFI_OUT_OF_RESOURCES` or a draw through `alloc` is exhausted; with `Denied` for `EFI_ACCESS_DENIED`, `EFI_WRITE_PROTECTED` and `EFI_SECURITY_VIOLATION`; with `Unsupported` for `EFI_UNSUPPORTED` and when the firmware has no protocol the operation calls; with `Invalid` for `EFI_INVALID_PARAMETER`, `EFI_BAD_BUFFER_SIZE` and a path, name or event longer than it takes; and with `DeviceError` on any other error status.
 - `take m.exit_services()` ends the firmware's boot services, installs the entry root and, on x86_64, loads the boot CPU's tables ([anchor](#anchor)), and returns the `boot::Kernel` of the machine, with maskable interrupts disabled. Its regions come from the firmware's final memory map ([anchor](#anchor)).
 
 ```nan
@@ -836,6 +948,96 @@ pub fn kernel_image(services: boot::Services, alloc: mem::Alloc) -> Untrusted[me
     return try services.read_file("kernel.elf", alloc) // error: limit.allocates
 } kernel_image
 ```
+
+```nan
+// file: fwwrite/package.nan
+//! Firmware writes from a loader.
+
+package fwwrite {
+    language 1
+    targets x86_64-uefi
+} fwwrite
+
+// file: fwwrite/fwwrite.nan
+//! Records a boot attempt on the boot volume.
+
+pub fn record_attempt(services: boot::Services, record: Slice[u8]) fails boot::ServiceError {
+    try services.write_file("nanos/boot.rec", data: record)
+} record_attempt
+```
+
+### Hand-off
+
+```nan-api
+// module: boot
+
+pub fn Machine.enter(take self, take image: Image) -> Never
+
+pub closed linear struct Image {
+    pub entry: u64
+    pub segments: mem::List[hw::Region]
+    pub modules: mem::List[ModuleSource]
+    pub command_line: mem::Bytes
+} Image
+
+pub closed struct ModuleSource {
+    pub name: mem::Bytes
+    pub contents: Untrusted[mem::Bytes]
+} ModuleSource
+```
+
+`take m.enter(take image)` hands the machine to a loaded bare image of its architecture and never returns. It is a [trusted primitive](23-low-level.md#trusted-primitives) whose soundness condition is that `image.segments` hold such an image, placed for execution, which its target's boot protocol enters at `image.entry`: the PVH protocol's 32-bit entry on x86_64 and the image's entry on AArch64 ([descriptors](27-program-model.md#descriptors)).
+
+1. In pages below 4 GiB that it allocates from the firmware, it lays out a [start information](#start-information) of version 1 naming the RSDP the configuration table lists and the command line, and listing each module, its contents copied and its name as the entry's command line; on AArch64 it also copies the device tree the configuration table lists. It traps (`trap.exhausted`) when the firmware has no such pages.
+2. It ends boot services as `exit_services` does and fills the start information's memory map from the firmware's final memory map: type 1 for conventional memory and the code and data of boot services and of loaders, 3 for ACPI reclaimable memory, 4 for ACPI NVS, 5 for unusable memory and 2 for any other.
+3. With maskable interrupts disabled, it enters `image.entry`: on x86_64 in 32-bit protected mode with paging off, `CR4` and `EFER` clear, flat 4 GiB code and data segments and the start information's address in `ebx`; on AArch64 at EL1 with the MMU and caches off, those pages and the segments cleaned from the data caches, the device tree's address in `x0`, zero without one, and the start information's in `x1`.
+
+```nan
+// file: chain/package.nan
+//! A loader entering a bare kernel.
+
+package chain {
+    language 1
+    targets x86_64-uefi
+    allow trusted in chain
+} chain
+
+// file: chain/chain.nan
+//! Enters a kernel its caller placed.
+
+pub fn boot_kernel(take m: boot::Machine, take image: boot::Image) -> Never {
+    trusted "the image's segments hold an x86_64-bare kernel entered at its PVH entry" { take m.enter(take image) }
+} boot_kernel
+```
+
+### Start information
+
+```nan-api
+// module: boot
+
+pub fn Kernel.modules(mut self) -> mem::List[Module]
+
+pub fn Kernel.command_line(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes]
+
+pub fn Kernel.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]]
+
+pub fn Kernel.device_tree(self, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]]
+
+pub open linear struct Module {
+} Module
+
+pub fn Module.name(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes]
+
+pub proj fn Module.contents(self) -> Untrusted[Slice[u8]]
+
+pub fn Module.into_region(take self) -> hw::Region
+```
+
+- A bare image's **start information** is a structure in the layout of the PVH boot protocol's naming its modules, command line, RSDP and memory map: on `x86_64-bare` the one the PVH protocol passes, and on `aarch64-bare` the one whose address `x1` holds when it is not zero ([descriptors](27-program-model.md#descriptors)). A UEFI image has none.
+- The first call of `k.modules()` returns a module for each entry of the start information's module list, in its order, drawn through `k.alloc()`; later calls, and calls without a start information, return an empty list. A module owns its memory: `name` copies the NUL-terminated text its entry names, `contents` views its bytes, and `into_region` returns its memory as a region.
+- `k.command_line(alloc)` copies the start information's command line, or on `aarch64-bare` without one the `bootargs` property of the device tree's `/chosen` node; it is empty when neither gives one.
+- `k.acpi_table(signature, alloc)` copies the ACPI table with a signature as `Services.acpi_table` finds it, from the RSDP that the start information names, on `x86_64-bare` otherwise the one in the BIOS area, and on a UEFI target the one the configuration table lists; it is `None` when there is none. `k.device_tree(alloc)` copies the device tree the image entered with on `aarch64-bare`, and is `None` on the other targets.
+- Each draw traps on exhaustion (`trap.exhausted`).
 
 ## Floating point
 

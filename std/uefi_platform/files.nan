@@ -1,0 +1,252 @@
+//! Files of the volume the image was loaded from, and the device path naming that image.
+
+/// The offsets in the loaded image protocol of its device handle and file path; in the simple
+/// file system protocol of `OpenVolume`; and in the file protocol of its functions.
+const DEVICE_HANDLE: u64 = 24
+
+const FILE_PATH: u64 = 32
+
+const OPEN_VOLUME: u64 = 8
+
+const FILE_OPEN: u64 = 8
+
+const FILE_CLOSE: u64 = 16
+
+const FILE_DELETE: u64 = 24
+
+const FILE_READ: u64 = 32
+
+const FILE_WRITE: u64 = 40
+
+const FILE_GET_POSITION: u64 = 48
+
+const FILE_SET_POSITION: u64 = 56
+
+const FILE_GET_INFO: u64 = 64
+
+const FILE_SET_INFO: u64 = 72
+
+const FILE_FLUSH: u64 = 80
+
+/// The modes opening a file for reading, for writing and creating it.
+const MODE_READ: u64 = 1
+
+const MODE_WRITE: u64 = 2
+
+const MODE_CREATE: u64 = 0x8000_0000_0000_0000
+
+/// The position past a file's end, and the words of a file information record: the bytes it
+/// takes, then the file's size, its attributes and where its name starts; a directory's
+/// attribute.
+const END_OF_FILE: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+const INFO_WORDS: usize = 128
+
+const INFO_FILE_SIZE: usize = 1
+
+const INFO_ATTRIBUTE: usize = 9
+
+const INFO_NAME: u64 = 80
+
+const DIRECTORY: u64 = 0x10
+
+/// The device path node types and subtypes the platform reads: a media node, a hard drive and
+/// a file path among them, and the end node; the offsets in a hard drive node of its partition
+/// number, start, size, signature and signature type.
+const MEDIA: u8 = 4
+
+const HARD_DRIVE: u8 = 1
+
+const FILE_PATH_NODE: u8 = 4
+
+const END_NODE: u8 = 0x7F
+
+const DRIVE_NUMBER: u64 = 4
+
+const DRIVE_START: u64 = 8
+
+const DRIVE_SIZE: u64 = 16
+
+const DRIVE_SIGNATURE: u64 = 24
+
+const DRIVE_SIGNATURE_TYPE: u64 = 41
+
+/// The GUIDs of the simple file system protocol, of file information and of the device path
+/// protocol.
+const SIMPLE_FILE_SYSTEM: boot::Guid = boot::Guid(data1: 0x964E_5B22, data2: 0x6459, data3: 0x11D2, data4: 0x8E39_00A0_C969_723B)
+
+const FILE_INFO: boot::Guid = boot::Guid(data1: 0x0957_6E92, data2: 0x6D3F, data3: 0x11D2, data4: 0x8E39_00A0_C969_723B)
+
+const DEVICE_PATH: boot::Guid = boot::Guid(data1: 0x0957_6E91, data2: 0x6D3F, data3: 0x11D2, data4: 0x8E39_00A0_C969_723B)
+
+/// The root directory of the volume the image was loaded from.
+fn root() -> u64 fails boot::ServiceError {
+    let image = try loaded_image()
+    let device = word(image + DEVICE_HANDLE)
+    let volume = try on_handle(device, guid: SIMPLE_FILE_SYSTEM)
+    var found = Array[u64, 1].filled(0)
+    try success(call(word(volume + OPEN_VOLUME), a: volume, b: dst_words(mut found.view_mut()), c: 0, d: 0, e: 0))
+    return found[0]
+} root
+
+/// Opens the file `path` names from the root directory in a mode; the root itself for an empty
+/// path.
+fn open(path: Str, mode: u64) -> u64 fails boot::ServiceError {
+    let volume = try root()
+    if path.is_empty() {
+        return volume
+    }
+    var units = Array[u16, 256].filled(0)
+    let named = attempt wide(path, path: true, mut units)
+    var found = Array[u64, 1].filled(0)
+    var status = INVALID_PARAMETER
+    if named.is_ok() {
+        status = call(word(volume + FILE_OPEN), a: volume, b: dst_words(mut found.view_mut()), c: src_units(units.view()), d: mode, e: 0)
+    }
+    close(volume)
+    try success(status)
+    return found[0]
+} open
+
+fn close(file: u64) {
+    discard call(word(file + FILE_CLOSE), a: file, b: 0, c: 0, d: 0, e: 0)
+} close
+
+/// The information record of an open file.
+fn information(file: u64) -> Array[u64, 128] fails boot::ServiceError {
+    let kind = guid_bits(FILE_INFO)
+    var record = Array[u64, 128].filled(0)
+    var size = Array[u64, 1].filled(u64.widen(INFO_WORDS) * 8)
+    try success(call(word(file + FILE_GET_INFO), a: file, b: src(kind.view()), c: dst_words(mut size.view_mut()), d: dst_words(mut record.view_mut()), e: 0))
+    return record
+} information
+
+pkg fn read_file(path: Str, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails boot::ServiceError {
+    let file = try open(path, mode: MODE_READ)
+    defer close(file)
+    var position = Array[u64, 1].filled(0)
+    try success(call(word(file + FILE_SET_POSITION), a: file, b: END_OF_FILE, c: 0, d: 0, e: 0))
+    try success(call(word(file + FILE_GET_POSITION), a: file, b: dst_words(mut position.view_mut()), c: 0, d: 0, e: 0))
+    try success(call(word(file + FILE_SET_POSITION), a: file, b: 0, c: 0, d: 0, e: 0))
+    let size = position[0]
+    var bytes = try zeroed(size, alloc)
+    let start = dst(mut bytes.view_mut())
+    var filled: u64 = 0
+    while filled < size {
+        var count = Array[u64, 1].filled(size - filled)
+        try success(call(word(file + FILE_READ), a: file, b: dst_words(mut count.view_mut()), c: start + filled, d: 0, e: 0))
+        if count[0] == 0 or count[0] > size - filled {
+            break
+        }
+        filled += count[0]
+    }
+    mut bytes.truncate(usize.widen(filled))
+    return Untrusted.of(take bytes)
+} read_file
+
+pkg fn write_file(path: Str, data: Slice[u8]) fails boot::ServiceError {
+    let file = try open(path, mode: MODE_READ | MODE_WRITE | MODE_CREATE)
+    defer close(file)
+    var record = try information(file)
+    if record[INFO_FILE_SIZE] != 0 {
+        record[INFO_FILE_SIZE] = 0
+        let kind = guid_bits(FILE_INFO)
+        try success(call(word(file + FILE_SET_INFO), a: file, b: src(kind.view()), c: record[0], d: dst_words(mut record.view_mut()), e: 0))
+    }
+    var written: usize = 0
+    while written < data.len() {
+        let Some(parts) = data.split_at(written) else {
+            break
+        }
+        var count = Array[u64, 1].filled(u64.widen(parts.tail.len()))
+        try success(call(word(file + FILE_WRITE), a: file, b: dst_words(mut count.view_mut()), c: src(parts.tail), d: 0, e: 0))
+        if count[0] == 0 or count[0] > u64.widen(parts.tail.len()) {
+            fail boot::ServiceError.DeviceError
+        }
+        written += usize.widen(count[0])
+    }
+    try success(call(word(file + FILE_FLUSH), a: file, b: 0, c: 0, d: 0, e: 0))
+} write_file
+
+pkg fn delete_file(path: Str) fails boot::ServiceError {
+    let file = try open(path, mode: MODE_READ | MODE_WRITE)
+    let status = call(word(file + FILE_DELETE), a: file, b: 0, c: 0, d: 0, e: 0)
+    if status != 0 {
+        try success(status)
+        fail boot::ServiceError.DeviceError
+    }
+} delete_file
+
+pkg fn list_directory(path: Str, alloc: mem::Alloc) -> mem::List[boot::DirectoryEntry] fails boot::ServiceError {
+    let folder = try open(path, mode: MODE_READ)
+    defer close(folder)
+    let own = try information(folder)
+    if (own[INFO_ATTRIBUTE] & DIRECTORY) == 0 {
+        fail boot::ServiceError.Invalid
+    }
+    var entries = mem::List[boot::DirectoryEntry].empty(alloc)
+    loop {
+        var record = Array[u64, 128].filled(0)
+        var size = Array[u64, 1].filled(u64.widen(INFO_WORDS) * 8)
+        let at = dst_words(mut record.view_mut())
+        try success(call(word(folder + FILE_READ), a: folder, b: dst_words(mut size.view_mut()), c: at, d: 0, e: 0))
+        if size[0] <= INFO_NAME {
+            return entries
+        }
+        var name = mem::Bytes.empty(alloc)
+        try narrow(at + INFO_NAME, limit: (size[0] - INFO_NAME) / 2, path: false, out: mut name)
+        let dots = name.view() == b"." or name.view() == b".."
+        if not dots {
+            let entry = boot::DirectoryEntry(name: Untrusted.of(take name), byte_len: record[INFO_FILE_SIZE], directory: (record[INFO_ATTRIBUTE] & DIRECTORY) != 0)
+            let Ok(_) = attempt mut entries.try_push(take entry) else {
+                fail boot::ServiceError.OutOfMemory
+            }
+        }
+    }
+} list_directory
+
+pkg fn boot_device(alloc: mem::Alloc) -> boot::BootDevice fails boot::ServiceError {
+    let image = try loaded_image()
+    var file = mem::Bytes.empty(alloc)
+    var node = word(image + FILE_PATH)
+    while node != 0 and byte_at(node) != END_NODE {
+        let len = bytes_at(node + 2, count: 2)
+        if len < 4 {
+            break
+        }
+        if byte_at(node) == MEDIA and byte_at(node + 1) == FILE_PATH_NODE {
+            if file.len() > 0 {
+                try grown(mut file, bytes: b"/")
+            }
+            try narrow(node + 4, limit: (len - 4) / 2, path: true, out: mut file)
+        }
+        node += len
+    }
+    let device = word(image + DEVICE_HANDLE)
+    let partition = match attempt on_handle(device, guid: DEVICE_PATH) {
+        Ok(path) => drive(path)
+        Err(_) => None
+    }
+    return boot::BootDevice(file: Untrusted.of(take file), partition: partition)
+} boot_device
+
+/// The partition the hard drive node of a device path names, if it has one.
+fn drive(path: u64) -> Option[boot::Partition] {
+    var node = path
+    while byte_at(node) != END_NODE {
+        let len = bytes_at(node + 2, count: 2)
+        if len < 4 {
+            return None
+        }
+        if byte_at(node) == MEDIA and byte_at(node + 1) == HARD_DRIVE {
+            let signature = match byte_at(node + DRIVE_SIGNATURE_TYPE) {
+                1 => boot::PartitionSignature.Mbr(u32.fit(bytes_at(node + DRIVE_SIGNATURE, count: 4)))
+                2 => boot::PartitionSignature.Gpt(guid_at(node + DRIVE_SIGNATURE))
+                else => boot::PartitionSignature.Unsigned
+            }
+            return Some(boot::Partition(number: u32.fit(bytes_at(node + DRIVE_NUMBER, count: 4)), start: bytes_at(node + DRIVE_START, count: 8), blocks: bytes_at(node + DRIVE_SIZE, count: 8), signature: signature))
+        }
+        node += len
+    }
+    return None
+} drive

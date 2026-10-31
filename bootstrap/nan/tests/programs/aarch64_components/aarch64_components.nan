@@ -1,0 +1,152 @@
+//! Steps a component whose held keyed ticker and delayed message reach it, hibernates it to a checkpoint once idle, resumes it from the checkpoint, stepping a post from another task, and ends it with a message still delayed; then abandons the domains of a component whose handler traps and of one whose handler spins.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// The key of the ticker task, and how many ticks it posts.
+const TICKER: u64 = 1
+
+const TICKS: u32 = 3
+
+/// How long the watchdog lets a spinning handler run.
+const WATCHDOG_NS: u64 = 20_000_000
+
+struct Env {
+} Env
+
+enum Note {
+    Start
+    Tick
+    Add(u64)
+    Later(u64)
+    Split(u64)
+    Spin
+} Note
+
+struct Counter derives Encode {
+    ticks: u64
+    total: u64
+} Counter
+
+impl Counter: sys::Component[Env, Note]
+
+fn Counter.start(mut env: Env) -> Counter = Counter(ticks: 0, total: 0)
+
+fn Counter.on(mut self, take message: Note, mut env: Env, mut cx: sys::Cx[Note]) {
+    match message {
+        Note.Start => {
+            mut cx.spawn(key: TICKER, run: fn(out: sys::Outbox[Note]) fails task::Cancelled uses wait limits stack 16_384 {
+                for _ in 0..<TICKS {
+                    let Ok(_) = attempt await out.post(Note.Tick) else {
+                        return
+                    }
+                }
+            })
+            mut cx.after_ns(ns: 1_000_000, send: Note.Add(5))
+        }
+        Note.Tick => {
+            self.ticks += 1
+        }
+        Note.Add(value) => {
+            self.total += value
+        }
+        Note.Later(value) => mut cx.after_ns(ns: 1_000_000_000, send: Note.Add(value))
+        Note.Split(parts) => {
+            self.total = self.total / parts
+        }
+        Note.Spin => {
+            loop {
+                self.ticks = self.ticks.wrapping_add(1)
+            }
+        }
+    }
+} Counter.on
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+/// Steps a component until it is idle.
+fn drive(mut stepper: sys::Stepper[Counter, Env, Note]) fails task::Cancelled uses wait {
+    while try await stepper.ready() {
+        discard mut stepper.step()
+    }
+} drive
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    var regions = mut k.regions()
+    take k.anchor(take regions, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        var stepper = try sys::Stepper[Counter, Env, Note].start(Env(), exec, alloc)
+        defer take stepper.abandon()
+        mut stepper.deliver(Note.Start)
+        let early = mut stepper.step()
+        let started = mut stepper.start_keyed()
+        check(name: "held", held: not early and started == 1)
+        try await drive(mut stepper)
+        let counted = stepper.state()
+        check(name: "idle", held: stepper.idle() and counted.ticks == 3 and counted.total == 5)
+        var checkpoint = mem::Bytes.empty(alloc)
+        mem::wire::Codec[Counter].encode(stepper.state(), out: mut checkpoint)
+        undefer stepper
+        let sys::Stopped(state: _, env: env) = try await take stepper.end()
+        let Ok(restored) = attempt mem::wire::Codec[Counter].decode(Untrusted.of(checkpoint.view()), alloc) else {
+            check(name: "decoded", held: false)
+            return
+        }
+        var resumed = try sys::Stepper[Counter, Env, Note].resume(take restored, take env, exec, alloc)
+        defer take resumed.abandon()
+        let outbox = resumed.outbox()
+        let posted = attempt await task::scope(exec, body: fn[mut resumed](s: task::Scope) fails task::Cancelled uses wait {
+            discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
+                discard attempt await outbox.post(Note.Add(10))
+            })
+            try await resumed.incoming()
+            discard mut resumed.step()
+        })
+        mut resumed.deliver(Note.Later(100))
+        undefer resumed
+        let last = try await take resumed.end()
+        check(name: "resumed", held: posted.is_ok() and last.state.ticks == 3 and last.state.total == 15)
+        let trapped = try await sys::Domain.run(fn() -> u64 fails task::Cancelled limits stack 16_384 {
+            var doomed = try sys::Stepper[Counter, Env, Note].start(Env(), exec, alloc)
+            defer take doomed.abandon()
+            mut doomed.deliver(Note.Start)
+            discard mut doomed.start_keyed()
+            mut doomed.deliver(Note.Split(0))
+            return doomed.state().total
+        }, exec, alloc)
+        check(name: "trapped", held: trapped.is_err())
+        let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc)
+        var spun: Result[u64, sys::Trap] = Ok(0)
+        try await task::scope(exec, body: fn[mut spun](s: task::Scope) fails task::Cancelled uses wait {
+            let watch = abandoner.share()
+            discard s.spawn(fn[take watch]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await clock.sleep_ns(WATCHDOG_NS)
+                watch.contents().trigger()
+            })
+            spun = try await abandoner.contents().run(fn() -> u64 fails task::Cancelled limits stack 16_384 {
+                var spinning = try sys::Stepper[Counter, Env, Note].start(Env(), exec, alloc)
+                defer take spinning.abandon()
+                mut spinning.deliver(Note.Spin)
+                return spinning.state().ticks
+            }, exec, alloc)
+        })
+        check(name: "spun", held: spun.is_err())
+    })
+} main

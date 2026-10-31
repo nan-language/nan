@@ -1,5 +1,5 @@
 //! Components: the state an impl line naming `sys::Component` declares a component of, and the
-//! uses of the runner `host::Runner`.
+//! uses of the runner `host::Runner` and of the steppers `sys::Stepper`.
 
 use std::rc::Rc;
 
@@ -137,9 +137,12 @@ impl Checker<'_> {
         Some(self.fix_appending(item, before as u32, &format!(" derives {entry}")))
     }
 
-    /// The rule a use of `host::Runner.run` breaks: a state that is no component for the Env and
-    /// messages the use fixes, then code checked for a machine target.
-    pub fn runner_problem(&self, head: &FnSig, subst: &Subst) -> Option<Code> {
+    /// The rule a use of `host::Runner.run`, `sys::Stepper.start` or `sys::Stepper.resume`
+    /// breaks: a state that is no component for the Env and messages the use fixes, then, for the
+    /// runner, code checked for a machine target.
+    pub fn component_use_problem(&self, path: &str, head: &FnSig, subst: &Subst) -> Option<Code> {
+        let runner = path == "host::Runner.run";
+        let env_at = if runner { head.inherited } else { 1 };
         let fixed = |index: usize| match head
             .generics
             .get(index)
@@ -150,8 +153,8 @@ impl Checker<'_> {
         };
         let parts = (
             fixed(0),
-            fixed(head.inherited),
-            fixed(head.inherited + 1),
+            fixed(env_at),
+            fixed(env_at + 1),
             self.db.std_item("sys", "Component"),
         );
         if let (Some(state), Some(env), Some(message), Some(component)) = parts {
@@ -163,9 +166,6 @@ impl Checker<'_> {
                 return Some(Code::ComponentNotComponent);
             }
         }
-        self.db
-            .target
-            .is_machine()
-            .then_some(Code::ComponentUnavailable)
+        (runner && self.db.target.is_machine()).then_some(Code::ComponentUnavailable)
     }
 }

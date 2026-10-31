@@ -49,7 +49,7 @@ fn served(lo: &mut Lowering, state: &Ty, name: &str) -> Instance {
 
 /// Passes the message in the slot `args[1]` to its operation's handler, with the state, the Env
 /// and the component context of `args`, and gives a request's reply to the entry `node` that
-/// posted it.
+/// posted it; a message delivered without an entry is never a request.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch(
     lo: &mut Lowering,
@@ -58,7 +58,7 @@ pub fn dispatch(
     protocol: ItemId,
     state: &Ty,
     args: &[Held],
-    node: Value,
+    node: Option<Value>,
 ) {
     let message = Ty::item(protocol, Vec::new());
     let sig = lo.ck.sig(protocol);
@@ -79,7 +79,7 @@ pub fn dispatch(
             let abi = lo.abi(&instance);
             let id = lo.instance(instance);
             let called = lo.invoke(fx, Invoked::Direct(id), &abi, &passed);
-            if lo.ck.is_request(protocol, index) {
+            if let (true, Some(node)) = (lo.ck.is_request(protocol, index), node) {
                 reply(lo, fx, record, node, &operation.sig, called);
             }
         });

@@ -169,6 +169,8 @@ pub enum Glue {
     WithdrawRun,
     /// Withdraws a stopped poster's entry from a runner's intake.
     WithdrawPost,
+    /// Withdraws a stopped holder's wait on its stepper.
+    WithdrawStepper,
     /// Withdraws a waiting operation from the sim waiter slot its record names.
     SimWithdraw,
     /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
@@ -205,6 +207,7 @@ impl Glue {
                 | Glue::WithdrawWhen
                 | Glue::WithdrawRun
                 | Glue::WithdrawPost
+                | Glue::WithdrawStepper
                 | Glue::SimWithdraw
                 | Glue::WithdrawSignal(_)
         )

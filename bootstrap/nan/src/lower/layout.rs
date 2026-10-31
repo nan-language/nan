@@ -177,7 +177,7 @@ const VIEW_PAIRS: [&str; 6] = [
 ];
 
 /// The base types holding one pointer to state the runtime keeps.
-const POINTERS: [&str; 16] = [
+const POINTERS: [&str; 17] = [
     "core::Renderer",
     "core::Choices",
     "mem::Budget",
@@ -193,6 +193,7 @@ const POINTERS: [&str; 16] = [
     "sys::Revoker",
     "sys::Minter",
     "sys::Cx",
+    "sys::Stepper",
     "sys::Trap",
 ];
 

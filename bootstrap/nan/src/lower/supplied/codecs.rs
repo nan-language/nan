@@ -880,7 +880,7 @@ fn encode_kind(
                     let eight = fx.ptr(8);
                     put_bytes(lo, fx, state, slot, eight);
                 }
-                Format::Json => json::put_float(lo, fx, state, *scalar, loaded),
+                Format::Json => json::put_float(lo, fx, state, loaded),
             }
         }
         Kind::Text(fixed) => {
@@ -1337,13 +1337,11 @@ fn decode_kind(
             fx.store(narrowed, target, 0);
         }
         Kind::Float(scalar) => {
+            let float = super::super::layout::scalar_type(Scalar::F64, lo.machine());
             let (value, failed) = match &decoding.format {
-                DecodeFormat::Wire => {
-                    let float = super::super::layout::scalar_type(Scalar::F64, lo.machine());
-                    wire::read_float(fx, reader_state, float)
-                }
-                DecodeFormat::Json => json::read_float(lo, fx, reader_state),
-                DecodeFormat::Construction => construction::read_float(lo, fx, reader_state),
+                DecodeFormat::Wire => wire::read_float(fx, reader_state, float),
+                DecodeFormat::Json => json::read_float(lo, fx, reader_state, float),
+                DecodeFormat::Construction => construction::read_float(lo, fx, reader_state, float),
                 DecodeFormat::Calls(decoder) => {
                     let (value, failed) =
                         calls::read(lo, fx, decoder, reader_state, "read_float", &[]);

@@ -90,13 +90,14 @@ fn secret_code_lowers_without_branches_or_divisions() {
     }
 }
 
-/// A kernel moving floats, through calls, a const, a literal, a wire encoding and decoding and a
-/// total order, and counting bits lowers on each machine architecture without a float or vector
-/// type, and without `popcnt`, which AArch64 computes in its vector registers.
+/// A kernel moving floats, through calls, a const, a literal, wire, JSON and construction
+/// encodings and decodings, a rendering and a total order, and counting bits lowers on each
+/// machine architecture without a float or vector type, and without `popcnt`, which AArch64
+/// computes in its vector registers.
 #[test]
 fn machine_code_holds_no_float_or_vector_value() {
     let source = "//! Moves floats.\n\n\
-        struct Point derives Copy, Encode {\n    x: f64\n    y: f32\n} Point\n\n\
+        struct Point derives Copy, Encode, Render {\n    x: f64\n    y: f32\n} Point\n\n\
         const ORIGIN: Point = Point(x: 1.5, y: 2.5)\n\n\
         fn pick(p: Point, other: Point, near: bool) -> Point {\n    if near {\n        return p\n    }\n    return other\n} pick\n\n\
         fn main(take k: boot::Kernel) -> Never limits stack 16_384 {\n\
@@ -108,6 +109,17 @@ fn machine_code_holds_no_float_or_vector_value() {
         \x20       Ok(back) => {\n            discard back\n        }\n\
         \x20       Err(error) => {\n            discard error\n        }\n\
         \x20   }\n\
+        \x20   var written = text::String.empty(alloc)\n\
+        \x20   text::json::Codec[Point].encode(a, out: mut written)\n\
+        \x20   match attempt text::json::Codec[Point].decode(Untrusted.of(written.as_bytes()), alloc) {\n\
+        \x20       Ok(back) => {\n            discard back\n        }\n\
+        \x20       Err(error) => {\n            discard error\n        }\n\
+        \x20   }\n\
+        \x20   match attempt text::construction::Codec[Point].decode(Untrusted.of(b\"Point(x: -2.5e-3, y: inf)\"), alloc) {\n\
+        \x20       Ok(back) => {\n            discard back\n        }\n\
+        \x20       Err(error) => {\n            discard error\n        }\n\
+        \x20   }\n\
+        \x20   mut written.write(text::fmt(\"{a}\", a), budget: 64)\n\
         \x20   let ordered = core::TotalF64(value: a.x).cmp(core::TotalF64(value: 2.0)) == core::Ordering.Less\n\
         \x20   discard ordered\n\
         \x20   discard 0xF0F0u64.count_ones()\n\

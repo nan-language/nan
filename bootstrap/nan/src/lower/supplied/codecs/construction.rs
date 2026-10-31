@@ -2,7 +2,9 @@
 //! gives its values and the code of its failure, zero for none; whitespace, element lists and
 //! their closing bytes read as in JSON.
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, Signature, Type, Value, condcodes::IntCC, types,
+};
 
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::Routine;
@@ -333,8 +335,9 @@ pub fn read_integer(lo: &mut Lowering, fx: &mut Fx, state: Value, signed: bool) 
     (parts[0], parts[1])
 }
 
-/// A float: `NaN`, `inf`, `-inf`, or a number rounded to f64.
-pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value) {
+/// A float: `NaN`, `inf`, `-inf`, or a number rounded to f64, as a value of `float`, the type
+/// holding an f64.
+pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value, float: Type) -> (Value, Value) {
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
     signature.params.push(AbiParam::new(PTR));
@@ -366,7 +369,7 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
             let capacity = fx.ptr(8);
             let (len, failed) = word(lo, fx, state, buffer, capacity);
             stop(fx, failed);
-            let mut value = fx.b.ins().f64const(0.0);
+            let mut bits = fx.int(types::I64, 0);
             let mut known = fx.int(types::I8, 0);
             for (spelling, below, float) in [
                 (b"NaN".as_slice(), false, f64::NAN),
@@ -379,11 +382,11 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
                     false => fx.b.ins().bxor_imm_s(negative, 1),
                 };
                 let same = fx.b.ins().band(same, sign);
-                let constant = fx.b.ins().f64const(float);
-                value = fx.b.ins().select(same, constant, value);
+                let constant = fx.int(types::I64, float.to_bits() as i64);
+                bits = fx.b.ins().select(same, constant, bits);
                 known = fx.b.ins().bor(known, same);
             }
-            fx.store(value, out, 0);
+            fx.store(bits, out, 0);
             let malformed = code(fx, failure::MALFORMED);
             let none = code(fx, 0);
             let checked = fx.b.ins().select(known, none, malformed);
@@ -392,43 +395,8 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
         let (start, end, _, failed) = number(lo, fx, state);
         stop(fx, failed);
         let len = fx.b.ins().isub(end, start);
-        let size = fx.b.ins().iadd_imm_s(len, 1);
-        let text = lo.record_alloc(fx, size);
-        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, text, 0);
-        fx.when(missing, |fx| {
-            let exhausted = code(fx, failure::OUT_OF_MEMORY);
-            fx.b.ins().return_(&[exhausted]);
-        });
-        let zero = fx.ptr(0);
-        let kept = fx.repeat(&[start, zero], |fx, values| {
-            let (at, kept) = (values[0], values[1]);
-            let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, at, end);
-            let next = fx.choose(
-                inside,
-                &[types::I64, types::I64],
-                |fx| {
-                    let byte = fx.load(types::I8, at, 0);
-                    let digit =
-                        fx.b.ins()
-                            .icmp_imm_s(IntCC::NotEqual, byte, i64::from(b'_'));
-                    fx.when(digit, |fx| {
-                        let place = fx.b.ins().iadd(text, kept);
-                        fx.store(byte, place, 0);
-                    });
-                    let step = fx.b.ins().uextend(types::I64, digit);
-                    vec![fx.b.ins().iadd_imm_s(at, 1), fx.b.ins().iadd(kept, step)]
-                },
-                |_| vec![at, kept],
-            );
-            (inside, next)
-        })[1];
-        let terminator = fx.b.ins().iadd(text, kept);
-        let nul = fx.int(types::I8, 0);
-        fx.store(nul, terminator, 0);
-        let none = fx.ptr(0);
-        let value = lo.call_libc(fx, "strtod", &[text, none], &[types::F64])[0];
-        lo.record_free(fx, text);
-        fx.store(value, out, 0);
+        let bits = super::super::floats::parse(lo, fx, start, len);
+        fx.store(bits, out, 0);
         let none = code(fx, 0);
         fx.b.ins().return_(&[none]);
     });
@@ -436,7 +404,7 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
     let reference = lo.func_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, out]);
     let failed = fx.b.inst_results(call)[0];
-    (fx.load(types::F64, out, 0), failed)
+    (fx.load(float, out, 0), failed)
 }
 
 /// A literal after whitespace, its escapes resolved: at most `capacity` of its bytes written

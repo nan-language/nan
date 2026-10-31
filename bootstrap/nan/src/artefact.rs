@@ -352,6 +352,27 @@ impl Decoded {
         publisher.as_ref().map(|signer| &signer.key) == pinned && trusted && anchored
     }
 
+    /// The source tree hash its attestation file records, none when that file holds none.
+    pub fn source_tree(&self) -> Option<Hash> {
+        let fields = owned_record(&self.attestation)?;
+        Some(Hash(held_bytes(field(&fields, 2)?)?))
+    }
+
+    /// The schema tree of each type its code root records, by canonical path, as its `mem::wire`
+    /// encoding; none when the code root holds no such list.
+    pub fn schema_trees(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        let fields = owned_record(&self.code_root)?;
+        let (count, mut rest) = read_uvar(field(&fields, 10)?)?;
+        let mut trees = Vec::new();
+        for _ in 0..count {
+            let (path, after) = read_bytes(rest)?;
+            let (tree, after) = read_bytes(after)?;
+            trees.push((String::from_utf8(path.to_vec()).ok()?, tree.to_vec()));
+            rest = after;
+        }
+        rest.is_empty().then_some(trees)
+    }
+
     /// The public key of the artefact's publisher, when it holds sections.
     pub fn publisher_key(&self) -> Option<[u8; 32]> {
         Signer::of(&self.sections.as_ref()?.signature, 3).map(|signer| signer.key)

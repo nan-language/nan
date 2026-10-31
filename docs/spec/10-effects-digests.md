@@ -237,7 +237,7 @@ Facts propagate through direct calls. The **own operations** of a function or cl
 - the [declared digest](#indirect-calls) of each indirect call it makes and of each call it makes to a method of a generic parameter's [bound](08-generics-interfaces.md#generic-parameters);
 - what each [function argument](#function-arguments) it supplies charges.
 
-A join holds a boolean fact other than terminates when any part holds it, holds terminates when every part holds it, and holds the union of the parts' sets and the join of their classes. A generic item's digest is computed once, at its definition, and every instantiation has it. A consumer uses a dependency's digest as [reuse](30-artefacts.md#reuse) re-derives it over the dependency closure; the digest an artefact records is the one computed in its publisher's closure.
+A join holds a boolean fact other than terminates when any part holds it, holds terminates when every part holds it, and holds the union of the parts' sets and the join of their classes. A generic item's digest is computed once, at its definition, and every instantiation has it. A consumer uses a dependency's digest as checking the dependency in the consumer's closure derives it ([releases](30-artefacts.md#releases)); the digest an artefact records is the one computed in its publisher's closure.
 
 The **dependencies** of a function or closure are the functions it calls directly and the functions and closures it supplies as function arguments. A **cycle** is a maximal set of functions and closures each of which reaches every member, itself included, through dependencies. Every member of a cycle has the same facts other than wait and terminates: the join of the parts that this section joins into any member, members excepted.
 

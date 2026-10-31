@@ -44,7 +44,7 @@ pub fn build(
     let target = source.program_target();
     let checker = check::checked(workspace, checked, std, target);
     let root = package_id(&checker, source);
-    let closure = closure(&checker, root);
+    let closure = checker.reached(root);
     diagnostics.retain(|diagnostic| {
         diagnostic.path.as_deref().is_none_or(|path| {
             workspace.file(path).is_some_and(|(package, _)| {
@@ -54,6 +54,7 @@ pub fn build(
             })
         })
     });
+    diagnostics.extend(check::release_errors(&checker, root));
     if errors(&diagnostics) {
         return Ok(Build {
             diagnostics,
@@ -283,22 +284,6 @@ fn package_id(checker: &check::Checker, package: &crate::workspace::Package) -> 
     PackageId(index as u32)
 }
 
-/// The workspace packages of a program's dependency closure.
-fn closure(checker: &check::Checker, root: PackageId) -> Vec<PackageId> {
-    let mut found = vec![root];
-    let mut index = 0;
-    while index < found.len() {
-        let package = checker.db.package(found[index]);
-        for dependency in package.deps.values().flatten() {
-            if !found.contains(dependency) {
-                found.push(*dependency);
-            }
-        }
-        index += 1;
-    }
-    found
-}
-
 /// The artefact of each package lowered with the workspace package `root` of a checker's
 /// closure, by package name: of the packages `root` reaches, a workspace package's of its current
 /// state and a release's from the local store, and of each std package the toolchain's.
@@ -307,7 +292,7 @@ pub fn artefacts(
     checker: &check::Checker,
     root: PackageId,
 ) -> BTreeMap<String, Vec<u8>> {
-    let mut packages = closure(checker, root);
+    let mut packages = checker.reached(root);
     packages.extend(
         (0..checker.db.packages.len())
             .map(|index| PackageId(index as u32))

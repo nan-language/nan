@@ -187,6 +187,7 @@ Run in the reproducer directory with the same toolchain hash and [local store](2
 
 - tests, run only by `nan test`, `nan verify` and the commands that [resolve](29-identity-versioning.md#resolution) or [publish](29-identity-versioning.md#publishing);
 - the rules of a final build, applied only by `nan build` and `nan run`;
+- [release checks](30-artefacts.md#releases), applied only by final builds, test runs and the release gate;
 - the [gate codes](31-trust.md#incompleteness), applied only by the release gate and the commands [Trust and the release gate](31-trust.md) names.
 
 Every command checks the items it reads. `nan show`, `nan read`, `nan find`, `nan holes`, `nan context`, `nan explain`, `nan expand`, `nan diff` and `nan primer` print no diagnostic; every other command prints those reported on lines of its scope, and a final build those of its final closure.

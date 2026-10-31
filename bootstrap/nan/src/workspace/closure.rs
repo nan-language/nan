@@ -7,10 +7,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use super::Package;
-use super::manifest::{relative, resolve};
+use super::manifest::{Manifest, relative, resolve};
 use crate::artefact;
 use crate::diagnostic::{Code, Diagnostic};
 use crate::hash::Hash;
+use crate::machine::lock::Locked;
 use crate::store::Entry;
 
 /// Where a package of a closure comes from: a workspace package checked from source, or a
@@ -185,26 +186,29 @@ impl Reader<'_> {
         };
         let mut lines: HashMap<&str, Member> = HashMap::new();
         for line in &lock.deps {
-            let reaching = manifest
-                .deps
-                .iter()
-                .filter(|dep| dep.written == line.source)
-                .map(|dep| dep.line)
-                .next()
-                .unwrap_or(manifest.line);
+            let reaching = reaching_directive(manifest, line);
             let held = self.store.entry(&line.root)?;
             let mismatched = held.as_ref().is_some_and(|entry| entry.root() != line.root);
-            let forged = held.as_ref().is_some_and(|entry| {
-                artefact::decode(&entry.artefact).is_ok_and(|decoded| {
-                    !decoded.accepted(line.signer.as_ref(), package.machine.principals())
-                })
+            let decoded = held
+                .as_ref()
+                .and_then(|entry| artefact::decode(&entry.artefact).ok());
+            let forged = decoded.as_ref().is_some_and(|decoded| {
+                !decoded.accepted(line.signer.as_ref(), package.machine.principals())
             });
+            let unsourced = held
+                .as_ref()
+                .zip(decoded.as_ref())
+                .is_some_and(|(entry, decoded)| {
+                    decoded.source_tree() != Some(artefact::source_tree_hash(&entry.sources))
+                });
             if mismatched {
                 self.report(Code::ArtefactRootMismatch, package, reaching);
             } else if forged {
                 self.report(Code::ArtefactBadSignature, package, reaching);
+            } else if unsourced {
+                self.report(Code::ArtefactSourceMismatch, package, reaching);
             }
-            let refused = mismatched || forged;
+            let refused = mismatched || forged || unsourced;
             let missing = |reader: &mut Reader| {
                 if !refused {
                     reader.report(Code::DepReleaseMissing, package, reaching);
@@ -376,6 +380,16 @@ impl Reader<'_> {
             }
         }
     }
+}
+
+/// The line of the `dep` directive through which a manifest reaches the package of a line of its
+/// lock: the directive writing the line's source, else the `package` line.
+pub fn reaching_directive(manifest: &Manifest, line: &Locked) -> u32 {
+    manifest
+        .deps
+        .iter()
+        .find(|dep| dep.written == line.source)
+        .map_or(manifest.line, |dep| dep.line)
 }
 
 /// Whether a store entry holds a package's current source files, its machine files aside.

@@ -56,10 +56,10 @@ No command of the toolchain opens a network connection.
 **Fetching** is making available to the toolchain a release that a [lock](29-identity-versioning.md#lock) does not name: taking a [candidate](29-identity-versioning.md#resolution) into resolution, or appending a path release to the local store. Fetching reads only path sources and the local store.
 
 - Only `nan dep add`, `nan dep sync` and `nan upgrade` without `--language`, which resolves as `nan dep sync` does, fetch.
-- Every other command reaches a dependency other than std only through its locked release, read as [Lock](29-identity-versioning.md#lock) states: from source when that release is the current state of its path source, and otherwise from its artefact.
+- Every other command reaches a dependency other than std only through its locked release, read as [Lock](29-identity-versioning.md#lock) states: from source when that release is the current state of its path source, and otherwise from the source tree its local store entry holds.
 - Reading the current state of a path source, or the releases the local store holds, to report `name.newer-release` is not fetching.
 
-In the next example, `nan dep sync` in `wire` fetches the current state of `ring` as a path release, and `nan check` of `wire` then checks `ring` from source, since its locked release is the current state of `../ring`; after `ring` changes, `nan check` reads the locked release from its artefact in the local store until `nan dep sync` runs again.
+In the next example, `nan dep sync` in `wire` fetches the current state of `ring` as a path release, and `nan check` of `wire` then checks `ring` from source, since its locked release is the current state of `../ring`; after `ring` changes, `nan check` reads the locked release from its source tree in the local store until `nan dep sync` runs again.
 
 ```nan
 // file: ring/package.nan

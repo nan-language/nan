@@ -40,6 +40,7 @@ mod published;
 mod reading;
 mod references;
 mod registry;
+mod releases;
 pub(crate) mod requires;
 mod resolve;
 pub(crate) mod reversibility;
@@ -82,6 +83,7 @@ pub use preserved::not_preserved;
 pub use published::summaries as publish_summaries;
 pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
 pub use references::Relocated;
+pub use releases::{release_check, release_errors};
 pub use root::{nir_streams, package_files as package_sources};
 use sig::{GenericDef, Sig};
 pub use snapshot::{Snapshots, Unsealed};
@@ -937,7 +939,8 @@ pub fn has_public_docs(workspace: &Workspace, path: &str) -> bool {
 }
 
 /// The errors checking a closure finds under each target its packages are checked for: on the
-/// packages it checks, and on each of its other members, checked whole.
+/// packages it checks, and on each of its other members, checked whole, with the release checks'
+/// stale schema trees.
 pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnostic> {
     let std = crate::stdlib::packages();
     let mut found = Vec::new();
@@ -947,8 +950,18 @@ pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnosti
             .map(|index| PackageId(index as u32))
             .filter(|package| checker.db.package(*package).quiet)
             .collect();
+        for package in &quiet {
+            checker.check_whole(*package);
+        }
         for package in quiet {
-            checker.check_whole(package);
+            let because = checker.stale_schemas(package);
+            let stale = Diagnostic {
+                because,
+                ..Diagnostic::new(Code::ArtefactRecheckFailed)
+            };
+            if !stale.because.is_empty() && !found.contains(&stale) {
+                found.push(stale);
+            }
         }
         found.extend(
             checker

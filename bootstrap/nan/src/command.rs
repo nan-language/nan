@@ -20,7 +20,7 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, Role};
 use crate::fix;
 use crate::journal;
 use crate::output::{self, Format, Output, Record, Verdict};
@@ -695,6 +695,26 @@ fn unlocated(code: Code, lines: Vec<String>) -> Record {
     }
 }
 
+/// The file a reason lies in: a `diagnostic` reason's in a release the workspace's locks read,
+/// any other's in the workspace, and otherwise in std.
+fn reason_file<'a>(
+    workspace: &'a Workspace,
+    role: Role,
+    path: &str,
+) -> (&'a workspace::Package, &'a workspace::File) {
+    let local = match role {
+        Role::Diagnostic => workspace
+            .release_file(path)
+            .or_else(|| workspace.file(path)),
+        _ => workspace
+            .file(path)
+            .or_else(|| workspace.release_file(path)),
+    };
+    local
+        .or_else(|| crate::stdlib::workspace().file(path))
+        .expect("reasons lie in workspace, release or std files")
+}
+
 /// A diagnostic as its record prints it.
 fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Record {
     let location = match (&diagnostic.path, diagnostic.line) {
@@ -745,19 +765,16 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
             ));
             continue;
         };
-        let home = match workspace.file(path) {
-            Some(_) => workspace,
-            None => crate::stdlib::workspace(),
-        };
-        let item = item_written(home, writer, path, *line, None);
+        let (package, file) = reason_file(workspace, reason.role, path);
+        let item = package.item_at(file, *line).map_or_else(
+            || "-".to_owned(),
+            |item| written_for(&item.canonical(), writer),
+        );
         lines.push(format!(
             "because {} {path}:{line} {item} {}",
             reason.role.word(),
             reason.subject
         ));
-        let (_, file) = home
-            .file(path)
-            .expect("reasons lie in workspace or std files");
         lines.push(output::printable(file.syntax.line_text(*line)));
     }
     lines.extend(fix::shown(workspace, &diagnostic.fixes));

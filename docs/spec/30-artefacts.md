@@ -1,6 +1,6 @@
 # Artefacts
 
-This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, reuse, lowering with type layout, niche packing and the ABI, and host symbol names.
+This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, releases with their release checks, lowering with type layout, niche packing and the ABI, and host symbol names.
 
 ## Artefacts
 
@@ -20,7 +20,7 @@ record               sections
 - A list whose order this chapter does not state is sorted by the bytes of its elements' encodings.
 - An implementation must write exactly this encoding. An artefact that does not decode, does not start with the magic, holds a record key this chapter does not define, or is not the canonical encoding of what it decodes to is an error (`artefact.malformed`). A defect of the NIR stream of part 4 is reported only as [Encoding](19-nir.md#encoding) states (`nir.malformed`, `nir.version-unsupported`). An artefact of a format version the toolchain does not implement is an error (`artefact.version-unsupported`).
 - An artefact whose code root hash differs from the code root that its package's lock line names is an error (`artefact.root-mismatch`).
-- The errors of this section and of [Reuse](#reuse) are reported on the `dep` [directive](03-packages-modules.md#manifest) through which the checked package reaches the artefact's package, and for a std package without a source line, naming the package.
+- The errors of this section and of [Releases](#releases) are reported on the `dep` [directive](03-packages-modules.md#manifest) through which the checked package reaches the artefact's package, and for a std package without a source line, naming the package.
 
 The attestation file is a record with these keys:
 
@@ -80,7 +80,6 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 5 | the texts its row says it holds, in the row's order: each premise, reason and `todo` text as its literal's content; each condition in normalised form; a validator's class as `parsing` or `declassifying`; a waiver's threshold as written and its reason as its literal's content; a grant as `device` or `priv` followed by its modules and aliases; a device premise's class as a digest line writes it; an undoer as its canonical path |
 
 - A unit holds its digests and its `example` functions, and the units of [reliance tests](22-testing.md#reliance-tests) are in part 4.
-- Trap reports and diagnostics quote the lines of a package whose units come from an artefact from its line tables.
 
 ## Sections
 
@@ -98,23 +97,20 @@ An artefact **verifies** when every signature it holds [verifies](31-trust.md#si
 
 ## Host ELF section
 
-Every image of a host target's [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state. An image a toolchain written in NaN writes also holds exactly one ELF section named `.nan.tree`, of the same type, flags and alignment, holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order.
+Every image of a host target's [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state, and a release the artefact its local store entry holds, whose attestation file hashes the source tree it was checked from. An image a toolchain written in NaN writes also holds exactly one ELF section named `.nan.tree`, of the same type, flags and alignment, holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order.
 
 The runtime never reads these sections; a toolchain written in NaN reads its own image's for its [toolchain hash](36-builds.md#toolchain-hash). Images of the machine targets hold no artefact.
 
-## Reuse
+## Releases
 
-**Reuse** is using a dependency's checked NIR without checking it again. In a dependency closure, the checked package and each package whose locked release is the current state of a path source ([lock](29-identity-versioning.md#lock)) are checked from source. The units of every other package come from the artefact of its locked release, or for a std package from the toolchain's.
+In a dependency closure, the checked package and each package whose locked release is the current state of its path source ([lock](29-identity-versioning.md#lock)) are checked from source, and std as the toolchain carries it. Every other package is checked from the [source tree](29-identity-versioning.md#local-store) its local store entry holds, by the rules of a package checked from source, none of its diagnostics reported but as this section states. No status, digest, unit or example outcome is read from an artefact: the toolchain's prover decides every obligation site of a release under the release's language version, and every digest is derived across the closure. An artefact only identifies its release, by its code root, and attests it, by its attestation file and sections.
 
-For each package whose units come from an artefact, after every package it depends on, the checker:
+- A store entry whose source tree does not have the source tree hash that its artefact's attestation file records is an error (`artefact.source-mismatch`), and its release is not read. A release whose artefact holds [sections](#sections) is thus checked only from the source tree its publisher signed.
 
-1. decides anew, under the package's language version, each obligation site whose proven or assumed [status](18-contracts.md#statuses) an [advisory](37-evolution.md#prover-monotonicity) the toolchain carries retracts;
-2. when the closure [satisfies](29-identity-versioning.md#requires-sets) the package's requires-set, reuses its units: their well-formedness and other statuses stand;
-3. otherwise checks the package again from its NIR: each unit must name only items of the closure that the package may name ([visibility](03-packages-modules.md#visibility)) and be [well formed](19-nir.md#well-formedness), the prover decides each obligation site anew under the package's language version, the interpreter runs each [example](21-interpreter.md#example-runs), and each schema tree of the code root must be the tree its type has in the closure;
-4. re-derives the digest of each function of each unit, for each target, by [propagation](10-effects-digests.md#propagation) from its NIR, its statuses and the digests of the closure, and checks each [limit](10-effects-digests.md#limits) of the unit other than `stack N` against them.
+A **release check** checks a locked release whole: each of its items, every obligation site and every [example](21-interpreter.md#example-runs), not only those the checked package reads. A [final build](27-program-model.md#final-builds) release-checks each release of its final closure as it checks that closure, a [test run](22-testing.md#test-runs) each release of the final closure of its test image, and the [release gate](31-trust.md#release-gate) each release of the dependency closure of each package it judges, under each target that package is checked for.
 
-- Reuse changes a unit only in its digests and statuses.
-- A violation found in step 3 or 4 is an error (`artefact.recheck-failed`), with the diagnostic of the violated rule, when it has one, in its because-chain.
+- An error a release check finds is an error (`artefact.recheck-failed`), whose because-chain holds a `diagnostic` reason for each such error, quoting the release's source tree.
+- A release check also compares each schema tree that the code root of the release's artefact records with the tree its type has in the closure, since images carry that artefact. A type whose two trees differ is an error (`artefact.recheck-failed`), whose because-chain holds a `note` reason naming the type, after the `diagnostic` reasons. The schema hashes that the release's [requires-set](29-identity-versioning.md#requires-sets) records let a reader of code roots alone make the same judgement.
 
 ## Lowering
 
@@ -224,8 +220,9 @@ In the table, `<C>` stands for the package's code root prefix and `<I>` for the 
 | --- | --- | --- |
 | `artefact.bad-signature` | error | [Sections](#sections) |
 | `artefact.malformed` | error | [Artefacts](#artefacts), [Sections](#sections) |
-| `artefact.recheck-failed` | error | [Reuse](#reuse) |
+| `artefact.recheck-failed` | error | [Releases](#releases) |
 | `artefact.reserved-section` | error | [Sections](#sections) |
 | `artefact.root-mismatch` | error | [Artefacts](#artefacts) |
+| `artefact.source-mismatch` | error | [Releases](#releases) |
 | `artefact.symbol-collision` | error | [Host symbol names](#host-symbol-names) |
 | `artefact.version-unsupported` | error | [Artefacts](#artefacts) |

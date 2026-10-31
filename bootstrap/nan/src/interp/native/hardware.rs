@@ -48,6 +48,10 @@ pub fn member(
         }
         ("hw::UserAddr", "value") => interp.deref(&args[0]).fields()[0].clone(),
         ("hw::cpu_count", "") => Val::Int(1),
+        ("hw::cpu_hardware_id", "") => match args[0].int() {
+            0 => Val::some(option, Val::Int(0)),
+            _ => Val::none(option),
+        },
         ("hw::fence", "") => Val::Unit,
         ("hw::without_irqs", "") => {
             let token = Val::Struct(interp.ty_item("hw", "IrqsDisabled"), Rc::new(Vec::new()));
@@ -72,6 +76,29 @@ pub fn member(
             let (module, name) = owner.split_once("::").expect("a std path");
             Val::Struct(interp.ty_item(module, name), Rc::new(vec![reference(held)]))
         }
+        ("hw::IrqShared", "install_on") => {
+            if args[1].int() != 0 {
+                return Some(Err(interp.trap("trap.bounds", at)));
+            }
+            let held = interp.memory.alloc(args[0].clone(), true, 0);
+            Val::Struct(
+                interp.ty_item("hw", "IrqShared"),
+                Rc::new(vec![reference(held)]),
+            )
+        }
+        ("hw::IrqShared", "install_msi") => {
+            if args[1].int() != 0 {
+                return Some(Err(interp.trap("trap.bounds", at)));
+            }
+            let unsupported =
+                Val::Variant(interp.ty_item("hw", "MsiError"), 2, Rc::new(Vec::new()));
+            let refusal = Val::Struct(
+                interp.ty_item("hw", "MsiRefusal"),
+                Rc::new(vec![args[0].clone(), unsupported]),
+            );
+            Val::Variant(interp.ty_item("core", "Result"), 1, Rc::new(vec![refusal]))
+        }
+        ("hw::IrqShared", "message") => Val::none(option),
         ("hw::SpinLock" | "hw::IrqShared", "with") => {
             let contents = interp.deref(&args[0]).fields()[0].clone();
             return Some(call_value(interp, &args[2], vec![contents], at, site));

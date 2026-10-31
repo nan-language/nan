@@ -21,8 +21,9 @@ const PSCI_PRESENT_MAX: i64 = 2
 /// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
 /// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
 /// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
-/// millisecond; and whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
-/// interrupts.
+/// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
+/// interrupts; and whether the dispatcher running installed devices defers the end of the
+/// interrupt their `hw::IrqContext.complete` would make.
 const CPU_THREAD: u64 = 0
 
 const CPU_VECTOR: u64 = 8
@@ -54,6 +55,8 @@ const CPU_NEXT_PACE: u64 = 256
 const CPU_TIMER_RATE: u64 = 264
 
 const CPU_WAITING: u64 = 272
+
+const CPU_DEFERRED: u64 = 280
 
 const CPU_SIZE: u64 = 320
 
@@ -94,6 +97,12 @@ fn Lowering.cpu_record(mut self, mut fx: Fx, index: clif::Value) -> clif::Value 
     return mut fx.b.iadd(cpus, y: offset)
 } Lowering.cpu_record
 
+/// The hardware id recorded for CPU `index`.
+fn Lowering.hardware_id(mut self, mut fx: Fx, index: clif::Value) -> clif::Value {
+    let record = mut self.cpu_record(mut fx, index)
+    return mut fx.load(PTR, addr: record, offset: CPU_HARDWARE_ID)
+} Lowering.hardware_id
+
 /// The number of the CPU running the caller.
 fn Lowering.running_index(mut self, mut fx: Fx) -> clif::Value {
     let thread_record = mut self.thread(mut fx)
@@ -108,7 +117,8 @@ fn Lowering.running_cpu(mut self, mut fx: Fx) -> clif::Value {
 
 /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
 /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
-/// its clock started and a CPU for each processor the platform reports; an executor thread
+/// its clock started, on x86_64 the local APICs' mode chosen, and a CPU for each processor the
+/// platform reports; an executor thread
 /// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`, the
 /// boot CPU's descriptor tables loaded and AVX enabled when it has it.
 fn Lowering.machine_init(mut self, mut fx: Fx) {
@@ -117,6 +127,9 @@ fn Lowering.machine_init(mut self, mut fx: Fx) {
     discard mut self.call_stub(mut fx, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx.alloc).view())
     if self.kernel() {
         mut self.start_clock(mut fx)
+    }
+    if self.kernel() and self.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        mut self.choose_apic_mode(mut fx)
     }
     let count = if not self.kernel() {
         mut fx.ptr(1)
@@ -232,7 +245,7 @@ fn Lowering.set_interrupt_stack(mut self, mut fx: Fx, record: clif::Value, ist: 
 
 /// The number of CPUs the platform reports as usable, at least 1 and at most `MAX_CPUS`,
 /// recording each one's local APIC id in its record: the boot CPU's first, then the others
-/// in the order of the MADT.
+/// in the order of the MADT's local APIC and local x2APIC entries.
 fn Lowering.discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
     let own = mut self.local_apic_id(mut fx)
     mut fx.store(own, addr: boot, offset: CPU_HARDWARE_ID)
@@ -256,13 +269,19 @@ fn Lowering.discover(mut self, mut fx: Fx, boot: clif::Value) -> clif::Value {
                 let kind = mut fx3.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 0)
                 let len_byte = mut fx3.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 1)
                 let len = mut fx3.b.uextend(PTR, x: len_byte)
-                let processor = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: 0)
+                let apic = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: 0)
+                let x2apic = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: MADT_X2APIC)
+                let processor = mut fx3.b.bor(apic, y: x2apic)
                 mut fx3.if_true(processor, then: fn[mut lo3](mut fx4: Fx) {
-                    let flags = load_u32(mut fx4, address: at, offset: 4)
+                    let short_flags = load_u32(mut fx4, address: at, offset: 4)
+                    let wide_flags = load_u32(mut fx4, address: at, offset: 8)
+                    let flags = mut fx4.b.select(x2apic, x: wide_flags, y: short_flags)
                     let enabled = mut fx4.b.band_imm_s(flags, y: PROCESSOR_ENABLED)
                     let usable = mut fx4.b.icmp_imm_s(clif::IntCC.NotEqual, x: enabled, y: 0)
                     let id_byte = mut fx4.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 3)
-                    let id = mut fx4.b.uextend(PTR, x: id_byte)
+                    let short_id = mut fx4.b.uextend(PTR, x: id_byte)
+                    let wide_id = load_u32(mut fx4, address: at, offset: 4)
+                    let id = mut fx4.b.select(x2apic, x: wide_id, y: short_id)
                     let other = mut fx4.b.icmp(clif::IntCC.NotEqual, x: id, y: own)
                     let counted = mut fx4.b.use_var(count)
                     let room = mut fx4.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: counted, y: i64.fit(MAX_CPUS))
@@ -494,7 +513,11 @@ const MADT_SIGNATURE: i64 = 0x4349_5041
 
 const MADT_ENTRIES: u64 = 44
 
-/// The flag of a MADT processor entry saying its processor is enabled and ready for use.
+/// The kind of a MADT local x2APIC entry, whose id and flags are words at offsets 4 and 8
+/// where a local APIC entry has a byte id at 3 and its flags at 4, and the flag of either saying
+/// its processor is enabled and ready for use.
+const MADT_X2APIC: i64 = 9
+
 const PROCESSOR_ENABLED: i64 = 1
 
 /// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.

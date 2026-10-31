@@ -118,7 +118,14 @@ impl Checker<'_> {
         let (owner, member) = path.rsplit_once('.').unwrap_or((path.as_str(), ""));
         match owner {
             "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" => Some(Authority::Device),
-            "hw::IrqShared" if matches!(member, "install" | "uninstall") => Some(Authority::Device),
+            "hw::IrqShared"
+                if matches!(
+                    member,
+                    "install" | "install_on" | "install_msi" | "uninstall"
+                ) =>
+            {
+                Some(Authority::Device)
+            }
             "hw::dma_fence" => Some(Authority::Device),
             "hw::Ring0" => Some(Authority::Priv),
             _ => None,

@@ -366,7 +366,9 @@ impl Layouts {
             ]));
         }
         if path == "mem::Pool" {
-            return Some(words(&["data", "len", "capacity", "alloc", "count"]));
+            return Some(words(&[
+                "data", "len", "capacity", "alloc", "count", "retired",
+            ]));
         }
         if RESOURCES.contains(&path) {
             return Some(Layout {

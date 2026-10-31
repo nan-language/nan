@@ -4,7 +4,7 @@
 //! of its contents. A shared value is the address of its count, its allocator handle, its reach
 //! and its contents. An arena or once map is the address of the header of its segments. A pool
 //! is a vector of slots, each its generation, whether it is occupied and its value, then the
-//! count of occupied slots.
+//! count of occupied slots and the count of retired slots, those vacant at generation 2^32 − 1.
 
 use cranelift_codegen::ir::{
     AtomicRmwOp, InstBuilder, MemFlagsData, Value, condcodes::IntCC, types,
@@ -30,8 +30,9 @@ mod shared {
     pub const HEADER: u64 = 24;
 }
 
-/// The offset of a pool's count of occupied slots.
+/// The offsets of a pool's count of occupied slots and of its count of retired slots.
 pub const POOL_COUNT: u64 = 32;
+const POOL_RETIRED: u64 = 40;
 
 /// The layout of a pool slot holding a value of a layout: its size and alignment, and the
 /// offset of the value after the generation and the occupied flag.
@@ -522,6 +523,7 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             vector::empty(fx, sret, cell, slot);
             let zero = fx.ptr(0);
             fx.store(zero, sret, POOL_COUNT);
+            fx.store(zero, sret, POOL_RETIRED);
             supply.done(lo, fx);
         }
         "len" => {
@@ -569,7 +571,9 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let additional = supply.param(1).scalar();
             let len = fx.load(PTR, address, vector::LEN);
             let count = fx.load(PTR, address, POOL_COUNT);
+            let retired = fx.load(PTR, address, POOL_RETIRED);
             let free = fx.b.ins().isub(len, count);
+            let free = fx.b.ins().isub(free, retired);
             let short =
                 fx.b.ins()
                     .icmp(IntCC::UnsignedGreaterThan, additional, free);
@@ -635,6 +639,12 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     let count = fx.load(PTR, address, POOL_COUNT);
                     let count = fx.b.ins().iadd_imm_s(count, -1);
                     fx.store(count, address, POOL_COUNT);
+                    let retiring = fx.b.ins().icmp_imm_s(IntCC::Equal, next, -1);
+                    fx.when(retiring, |fx| {
+                        let retired = fx.load(PTR, address, POOL_RETIRED);
+                        let retired = fx.b.ins().iadd_imm_s(retired, 1);
+                        fx.store(retired, address, POOL_RETIRED);
+                    });
                     let held = lo.held_at(fx, &element, result);
                     supply.ret(lo, fx, held);
                 }
@@ -655,7 +665,8 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// The index of the earliest slot not occupied, or the length when every slot is.
+/// The index of the earliest free slot, neither occupied nor retired, or the length when there
+/// is none.
 fn first_free(fx: &mut Fx, data: Value, len: Value, slot: Element) -> Value {
     let zero = fx.ptr(0);
     fx.repeat(&[zero], |fx, state| {
@@ -668,8 +679,11 @@ fn first_free(fx: &mut Fx, data: Value, len: Value, slot: Element) -> Value {
                 let at = slot.at(fx, data, index);
                 let occupied = fx.load(types::I32, at, 4);
                 let occupied = fx.b.ins().icmp_imm_s(IntCC::NotEqual, occupied, 0);
+                let generation = fx.load(types::I32, at, 0);
+                let retired = fx.b.ins().icmp_imm_s(IntCC::Equal, generation, -1);
+                let taken = fx.b.ins().bor(occupied, retired);
                 let next = fx.b.ins().iadd_imm_s(index, 1);
-                vec![fx.b.ins().select(occupied, next, index), occupied]
+                vec![fx.b.ins().select(taken, next, index), taken]
             },
             |fx| vec![index, fx.int(types::I8, 0)],
         );

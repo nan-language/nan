@@ -1,9 +1,9 @@
-//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records and its resolution in nanoseconds, zero standing for one. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record.
+//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record.
 
 /// The capability table's capacity.
 const TABLES_ENTRIES: u64 = 65_536
 
-const TABLES_ENTRY_RECORD: u64 = 64
+const TABLES_ENTRY_RECORD: u64 = 96
 
 const TABLES_ENTRY_GENERATION: u64 = 0
 
@@ -16,6 +16,18 @@ const TABLES_ENTRY_SOURCE: u64 = 12
 const TABLES_ENTRY_STATE: u64 = 16
 
 const TABLES_ENTRY_DEADLINES: u64 = 48
+
+const TABLES_ENTRY_USED: u64 = 48
+
+const TABLES_ENTRY_SERIAL: u64 = 56
+
+const TABLES_ENTRY_TURN: u64 = 64
+
+const TABLES_ENTRY_WAITING: u64 = 72
+
+const TABLES_ENTRY_SEED: u64 = 80
+
+const TABLES_ENTRY_PICKS: u64 = 88
 
 /// The links of a deadline's timer in its clock entry's deadlines and the clock's handle, after
 /// its timeout's time.
@@ -56,6 +68,12 @@ const TABLES_KIND_KIND: i64 = 10
 const TABLES_RESOLUTION: u64 = TABLES_ENTRY_STATE + 8
 
 const TABLES_EXECUTOR_RESOLUTION: u64 = TABLES_ENTRY_STATE + 16
+
+/// The state word of an executor's entry holding its share, and the share of a root grant's
+/// executor: a weight of 1 in class 0 reserving nothing.
+const TABLES_EXECUTOR_SHARE: u64 = TABLES_ENTRY_STATE + 24
+
+const ROOT_SHARE: u64 = 1
 
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100
@@ -144,6 +162,8 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
                     let value = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_STATE + 8 * word)
                     mut fx1.store(value, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
                 }
+                let serial = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_SERIAL)
+                mut fx1.store(serial, addr: record, offset: TABLES_ENTRY_SERIAL)
                 let low = mut fx1.b.band_imm_s(params[0], y: 0xFFFF_FFFF)
                 let plus = mut fx1.b.iadd_imm_s(low, y: 1)
                 let index = mut fx1.b.ireduce(clif::Type.Int32, x: plus)
@@ -435,6 +455,7 @@ fn sweep(mut lo: Lowering, mut fx: Fx) {
         let revoked = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: live, y: 2)
         mut fx1.if_true(revoked, then: fn[mut lo](mut fx2: Fx) {
             expire_deadlines(mut lo, fx: mut fx2, record)
+            release_waiting(mut lo, fx: mut fx2, owner: record)
             let owns = owns_text(mut fx2, record)
             mut fx2.if_true(owns, then: fn[mut lo](mut fx3: Fx) {
                 let text = mut fx3.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
@@ -445,11 +466,14 @@ fn sweep(mut lo: Lowering, mut fx: Fx) {
     })
 } sweep
 
-/// Passes every deadline armed through a revoked clock entry: each one's region is cancelled
+/// Passes every deadline armed through a revoked entry of a clock: each one's region is cancelled
 /// and its timer leaves the entry's deadlines. The caller holds the lock.
 fn expire_deadlines(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let head = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_DEADLINES)
-    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let entry_kind = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+    let clock = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: entry_kind, y: TABLES_KIND_CLOCK)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let armed = mut fx.b.band(clock, y: present)
     mut fx.if_true(armed, then: fn[mut lo](mut fx1: Fx) {
         discard mut fx1.repeat(fx1.list1(head).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
             expect state.len() > 0
@@ -621,6 +645,36 @@ fn snapshot(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> Snapshot {
     return Snapshot(live: mut fx.b.band(same, y: live), words: words)
 } snapshot
 
+/// An executor's share and the handle of its serial executor.
+struct ExecutorTerms {
+    share: clif::Value
+    serial: clif::Value
+} ExecutorTerms
+
+/// The share and the serial executor's handle of the executor's entry a handle names, read
+/// without the lock; a root grant's share and none for a stale handle.
+fn executor_terms(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> ExecutorTerms {
+    let record = entry_at(mut lo, mut fx, handle)
+    let flags = clif::MemFlags.owned()
+    let share_at = mut fx.offset(record, offset: TABLES_EXECUTOR_SHARE)
+    let share = mut fx.b.atomic_load(PTR, flags, p: share_at)
+    let serial_at = mut fx.offset(record, offset: TABLES_ENTRY_SERIAL)
+    let serial = mut fx.b.atomic_load(PTR, flags, p: serial_at)
+    let generation = mut fx.b.atomic_load(clif::Type.Int32, flags, p: record)
+    let live_at = mut fx.offset(record, offset: TABLES_ENTRY_LIVE)
+    let live_word = mut fx.b.atomic_load(clif::Type.Int32, flags, p: live_at)
+    let shifted = mut fx.b.ushr_imm_s(handle, y: 32)
+    let wanted = mut fx.b.ireduce(clif::Type.Int32, x: shifted)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: generation, y: wanted)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: live_word, y: 0)
+    let live = mut fx.b.band(same, y: present)
+    let root = mut fx.ptr(ROOT_SHARE)
+    let none = mut fx.ptr(0)
+    let share_held = mut fx.b.select(live, x: share, y: root)
+    let serial_held = mut fx.b.select(live, x: serial, y: none)
+    return ExecutorTerms(share: share_held, serial: serial_held)
+} executor_terms
+
 /// A copy in runtime memory of the text of the live entry a handle names, taken under the lock,
 /// and its length; zero for a stale handle. The caller frees the copy.
 fn copy_text(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> Stretch {
@@ -681,7 +735,7 @@ fn tables_new_entry(mut lo: Lowering, mut fx: Fx, kind: clif::Value) -> clif::Va
     let zero32 = mut fx.int(clif::Type.Int32, value: 0)
     mut fx.store(zero32, addr: record, offset: TABLES_ENTRY_SOURCE)
     let zero = mut fx.ptr(0)
-    for word in 0u64..<4 {
+    for word in 0u64..<10 {
         mut fx.store(zero, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
     }
     let generation = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_GENERATION)
@@ -715,6 +769,8 @@ fn tables_mint_root(mut lo: Lowering, mut fx: Fx, world: clif::Value) {
     mut fx.store(now, addr: handles[2].record, offset: TABLES_ENTRY_STATE)
     mut fx.store(cell, addr: handles[6].record, offset: TABLES_ENTRY_STATE)
     mut fx.store(handles[2].handle, addr: handles[6].record, offset: TABLES_ENTRY_STATE + 8)
+    let share = mut fx.ptr(ROOT_SHARE)
+    mut fx.store(share, addr: handles[6].record, offset: TABLES_EXECUTOR_SHARE)
     for minted in handles {
         let laid = mut lo.layouts.field(lo.ck, ty: world_ty, variant: None, label: minted.capability.field())
         mut fx.store(minted.handle, addr: world, offset: laid.offset)
@@ -741,6 +797,8 @@ fn mint_machine_root(mut lo: Lowering, mut fx: Fx, grant: clif::Value) {
     let record = entry_at(mut lo, mut fx, handle: exec)
     mut fx.store(cell, addr: record, offset: TABLES_ENTRY_STATE)
     mut fx.store(clock, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    let share = mut fx.ptr(ROOT_SHARE)
+    mut fx.store(share, addr: record, offset: TABLES_EXECUTOR_SHARE)
     let source = mut lo.wall_source(mut fx)
     let walls = mut fx.choose_in(mut lo, condition: source.valid, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let wall_kind = mut fx1.ptr(u64.fit(TABLES_KIND_WALL))

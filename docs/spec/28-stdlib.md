@@ -84,7 +84,7 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::within`, `task::within_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
 | `task` | `task::Cown`, `task::Poisoned` | [Cowns](16-concurrency.md#cowns), [Poisoned cowns](16-concurrency.md#poisoned-cowns) |
 | `task` | `task::Channel`, `task::Sender`, `task::Receiver`, `task::SendError` | [Channels](16-concurrency.md#channels) |
-| `task` | `task::Executor` | [Executors](16-concurrency.md#executors) |
+| `task` | `task::Executor`, `task::Share`, `task::Account` | [Executors](16-concurrency.md#executors) |
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
 | `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
@@ -109,9 +109,10 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::IrqContext`, `hw::TrapFrame`, `hw::NoCode`, `hw::ErrorCode`, `hw::PageFault`, `hw::IrqExit` | [Interrupt functions](24-kernel.md#interrupt-functions) |
 | `hw` | `hw::IrqsDisabled`, `hw::without_irqs` | [Interrupt state](24-kernel.md#interrupt-state) |
 | `hw` | `hw::Signal` | [Signals](24-kernel.md#signals) |
-| `hw` | `hw::SpinLock`, `hw::SpinGuard`, `hw::IrqShared`, `hw::MsiMessage`, `hw::MsiError`, `hw::MsiRefusal` | [Locks](24-kernel.md#locks) |
+| `hw` | `hw::SpinLock`, `hw::IrqShared`, `hw::MsiMessage`, `hw::MsiError`, `hw::MsiRefusal` | [Locks](24-kernel.md#locks) |
 | `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |
-| `hw` | `hw::RunQueue`, `hw::SavedContext`, `hw::Resumable`, `hw::switch_to`, `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
+| `hw` | `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
+| `hw` | `hw::Policy`, `hw::TaskView`, `hw::Placement`, `hw::Idle` | [Policies](24-kernel.md#policies) |
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |
 | `hw` | `hw::vectors`, `hw::Vector`, `hw::VectorHandler`, `hw::syscall_entry`, `hw::SyscallEntry`, `hw::preempt`, `hw::PreemptEntry` | [Platform registries](25-registries.md#platform-registries) |
 | `hw` | `hw::sim::Registers` | [Sim constructors](22-testing.md#sim-constructors) |
@@ -286,12 +287,12 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext`, `hw::TrapFrame[V]`, `hw::SpinGuard[T]` and `hw::SavedContext`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
 
-The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]` and `hw::IrqShared[T]` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
+The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]` and `hw::IrqShared[T]` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
 
 The [authority summary](14-authority.md#authority-summaries) of each std package, published in its artefact, holds only entries of its row. "Trusted code" covers trusted blocks and expressions and `assume`; "decoders" are the decoders that the package's types derive.
 
@@ -300,7 +301,7 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `core` | none | `alloc` | decoders | trusted code, declassifying decoders |
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
 | `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction` | trusted code, declassifying decoders and validators |
-| `task` | `task::Executor`, `sys::Clock` | `alloc` | none | trusted code |
+| `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
 | `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |

@@ -34,7 +34,8 @@ pub fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
     let cell = fx.load(PTR, supply.param(2).address(), 0);
     let shape = shape(lo, &state_ty, &env_ty, &message_ty);
-    let record = draw_record(lo, fx, &shape, cell, exec_cell, clock, resolution);
+    let exec = fx.load(PTR, supply.param(1).address(), 0);
+    let record = draw_record(lo, fx, &shape, cell, exec, exec_cell, clock, resolution);
     let withdraw = withdraw_run(lo);
     let none = fx.ptr(0);
     settle::enter_wait(lo, fx, withdraw, record, none);
@@ -124,6 +125,8 @@ fn start_component(
     )[0];
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, component, 0);
     fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+    let exec = fx.load(PTR, record, runner::HANDLE);
+    super::super::scopes::record_executor(lo, fx, component, exec);
     let done = component_done(lo);
     let done = lo.func_ref(fx, done);
     let done = fx.b.ins().func_addr(PTR, done);

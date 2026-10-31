@@ -18,7 +18,7 @@ use super::tasks::{self, CANCELED, EXPIRED, operation, run, task};
 use super::{Routine, state, timers};
 
 /// The stream serving scheduling choices.
-const SCHEDULING: u64 = 1;
+pub const SCHEDULING: u64 = 1;
 
 /// BLAKE3's initial chaining value and message word permutation.
 const IV: [u32; 8] = [

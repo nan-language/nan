@@ -174,6 +174,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bo
         let none = fx.ptr(0);
         super::fail_cancelled(lo, fx, supply, none);
     });
+    let exec = fx.load(PTR, supply.param(1 + given).address(), 0);
     let cell = fx.load(PTR, supply.param(2 + given).address(), 0);
     let caller_domain = tasks::current_domain(lo, fx);
     let stack = sized.then(|| sized_stack(lo, fx, supply.param(body + 1).scalar()));
@@ -191,6 +192,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bo
         fx,
         &body_ty,
         supply.param(body).address(),
+        exec,
         cell,
         stack,
         true,
@@ -266,9 +268,9 @@ pub struct Nested {
     pub trap: Value,
 }
 
-/// Runs the `task fn` value of a type held at `function` as the first task of a new domain
-/// nested in the running task's, its stack, of `stack` usable bytes or else of the size its type
-/// gives, and its trap record drawn through a cell, the domain's cell, and waits until that task
+/// Runs the `task fn` value of a type held at `function` on an executor as the first task of a
+/// new domain nested in the running task's, its stack, of `stack` usable bytes or else of the
+/// size its type gives, and its trap record drawn through a cell, the domain's cell, and waits until that task
 /// ends or a trap abandons the domain; the spawn is a scheduling point when `point` holds.
 /// Through a claimed abandoner, the domain is the one it runs until the wait ends, and an
 /// abandoner triggered already abandons it before its first task starts, which then never does,
@@ -279,6 +281,7 @@ pub fn run_nested(
     fx: &mut Fx,
     body_ty: &crate::check::ty::FnTy,
     function: Value,
+    exec: Value,
     cell: Value,
     stack: Option<Value>,
     point: bool,
@@ -321,6 +324,7 @@ pub fn run_nested(
             fx,
             body_ty,
             function,
+            exec,
             cell,
             record,
             region,

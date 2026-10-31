@@ -39,8 +39,11 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
 /// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
 /// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
-/// interrupts; and whether the dispatcher running installed devices defers the end of the
-/// interrupt their `hw::IrqContext.complete` would make.
+/// interrupts; whether the dispatcher running installed devices defers the end of the
+/// interrupt their `hw::IrqContext.complete` would make; its queue of ready tasks, the lock of
+/// that queue and the key of its first task; the key of the task it runs, zero for none, and the
+/// nanosecond that task's slice ends, zero for none; whether it idles; and whether it runs a hook
+/// of the kernel's policy.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -59,7 +62,14 @@ pub mod cpu {
     pub const TIMER_RATE: u64 = 264;
     pub const WAITING: u64 = 272;
     pub const DEFERRED: u64 = 280;
-    pub const SIZE: u64 = 320;
+    pub const QUEUE: u64 = 288;
+    pub const QUEUE_LOCK: u64 = 296;
+    pub const HEAD_KEY: u64 = 304;
+    pub const RUNNING_KEY: u64 = 312;
+    pub const SLICE_END: u64 = 320;
+    pub const IDLE: u64 = 328;
+    pub const HOOK: u64 = 336;
+    pub const SIZE: u64 = 384;
 }
 
 /// The model-specific register holding the GS base.

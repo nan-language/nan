@@ -642,7 +642,7 @@ pub fn read_counted(take conn: sys::net::Conn, links: task::Cown[Links], clock: 
 
 ### Threads and memory
 
-- `hw::switch_to(take guard, take from, to)` switches [threads](24-kernel.md#scheduling), handing the run-queue `hw::SpinGuard` to the incoming one; a kernel `await` lowers to it. `hw::PerCpu[T]` holds per-CPU state.
+- A kernel's `hw::Policy`, installed by `k.policy(take p)`, places each ready task on a CPU's queue with a key and gives it a slice ([policies](24-kernel.md#policies)). `hw::PerCpu[T]` holds per-CPU state.
 - A [physical frame](24-kernel.md#physical-memory), `hw::PhysFrame[S]`, is an owned aligned range with `split` and `merge`; `contents_mut` projects it as an AnyBits value, and stores take regions with `.over(take region)`.
 
 ```nan

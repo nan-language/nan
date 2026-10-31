@@ -14,7 +14,7 @@ use super::super::supplied::tasks::cowns;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::WAITING;
 use super::tasks::{self, domain, operation, run, task};
-use super::{Routine, holdings, memory, state, tables};
+use super::{Routine, holdings, memory, serial, state, tables};
 
 /// The offsets of a wait record's fields: the glue withdrawing the wait, given the record and
 /// the waiting task, the structure waited in, the waiting node and the record of the wait it
@@ -353,8 +353,27 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     )[0]
 }
 
-/// Takes a task out of the run queue; gives whether it was there.
+/// Takes a ready task out of the run queue that holds it, passing on its serial executor's turn,
+/// or out of its serial executor's waiting tasks; gives whether it was in either.
 fn remove_ready(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
+    let queued = match lo.kernel() {
+        true => lo.kernel_withdraw(fx, record),
+        false => remove_queued(lo, fx, record),
+    };
+    fx.when(queued, |fx| {
+        lo.call_routine(fx, Routine::Turn, &[record]);
+    });
+    fx.choose_in(
+        lo,
+        queued,
+        &[types::I8],
+        |_, fx| vec![fx.int(types::I8, 1)],
+        |lo, fx| vec![serial::withdraw(lo, fx, record)],
+    )[0]
+}
+
+/// Takes a task out of the run queue the executor threads share; gives whether it was there.
+fn remove_queued(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::QUEUE_LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);

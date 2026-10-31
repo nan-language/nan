@@ -1,8 +1,9 @@
 //! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in
 //! nanoseconds since the runtime started and never below what any CPU read before; the timers
 //! of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the
-//! earlier of its next pacing tick and the earliest timer due; and the wall clock source a
-//! machine root grant reads once.
+//! earliest of the timer first due, the end of its task's slice and its next pacing tick, which
+//! it has while it runs a task or the final build binds the timer's vector; and the wall clock
+//! source a machine root grant reads once.
 //!
 //! On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel
 //! 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the
@@ -23,6 +24,11 @@ use crate::workspace::{Arch, Target};
 
 /// The nanoseconds between a CPU's pacing ticks.
 const PACING: u64 = 10_000_000;
+
+/// The longest a CPU's timer waits, in nanoseconds, and the most ticks it counts down, which
+/// AArch64's signed timer value holds.
+const LONGEST_DELAY: u64 = 1_000_000_000;
+const MOST_TICKS: u64 = 0x7FFF_FFFF;
 
 /// The PIT's input clock, the count its channel 2 counts down while the time-stamp counter is
 /// measured, and the nanoseconds that count takes; its ports: channel 2's data port, the mode
@@ -161,6 +167,11 @@ impl Lowering<'_, '_> {
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let pace = fx.b.ins().iadd_imm_s(now, PACING as i64);
         fx.store(pace, record, cpu::NEXT_PACE);
+        self.reprogram_timer(fx);
+    }
+
+    /// Programs the running CPU's timer again, under the timer lock.
+    pub(super) fn reprogram_timer(&mut self, fx: &mut Fx) {
         let state_address = self.state(fx);
         let lock = fx.offset(state_address, state::TIMER_LOCK);
         self.call_routine(fx, Routine::Lock, &[lock]);
@@ -168,11 +179,27 @@ impl Lowering<'_, '_> {
         self.call_routine(fx, Routine::Unlock, &[lock]);
     }
 
-    /// Programs the running CPU's timer to fire at the earlier of its next pacing tick and the
-    /// earliest timer due, at once when that has passed. The caller holds the timer lock.
+    /// Programs the running CPU's timer to fire at the earliest of the timer first due, the end
+    /// of its task's slice and, while it runs a task or the final build binds the timer's
+    /// vector, its next pacing tick; at once when that has passed. The caller holds the timer
+    /// lock.
     fn program_timer(&mut self, fx: &mut Fx) {
         let record = self.running_cpu(fx);
+        let latest = fx.int(PTR, -1);
         let pace = fx.load(PTR, record, cpu::NEXT_PACE);
+        let pace = match self.statically_bound().contains(&self.vectors().timer) {
+            true => pace,
+            false => {
+                let thread = fx.load(PTR, record, cpu::THREAD);
+                let running = fx.load(PTR, thread, tasks::thread::CURRENT);
+                let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, running, 0);
+                fx.b.ins().select(running, pace, latest)
+            }
+        };
+        let end = fx.load(PTR, record, cpu::SLICE_END);
+        let sliced = fx.b.ins().icmp_imm_s(IntCC::NotEqual, end, 0);
+        let end = fx.b.ins().select(sliced, end, latest);
+        let target = fx.b.ins().umin(pace, end);
         let state_address = self.state(fx);
         let first = fx.load(PTR, state_address, state::TIMERS);
         let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
@@ -181,22 +208,24 @@ impl Lowering<'_, '_> {
             &[PTR],
             |fx| {
                 let due = fx.load(PTR, first, operation::DUE);
-                vec![fx.b.ins().umin(due, pace)]
+                vec![fx.b.ins().umin(due, target)]
             },
-            |_| vec![pace],
+            |_| vec![target],
         )[0];
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, target, now);
         let delay = fx.b.ins().isub(target, now);
         let zero = fx.ptr(0);
         let delay = fx.b.ins().select(ahead, delay, zero);
+        let longest = fx.ptr(LONGEST_DELAY);
+        let delay = fx.b.ins().umin(delay, longest);
         let rate = fx.load(PTR, record, cpu::TIMER_RATE);
         let ticks = fx.b.ins().imul(delay, rate);
         let per_ms = fx.ptr(timers::NS_PER_MS);
         let ticks = fx.b.ins().udiv(ticks, per_ms);
         let one = fx.ptr(1);
         let ticks = fx.b.ins().umax(ticks, one);
-        let most = fx.ptr(0xFFFF_FFFF);
+        let most = fx.ptr(MOST_TICKS);
         let ticks = fx.b.ins().umin(ticks, most);
         match self.machine_arch() {
             Arch::Amd64 => self.x64_set_timer(fx, ticks),
@@ -222,11 +251,7 @@ impl Lowering<'_, '_> {
             let next = fx.b.ins().select(late, fresh, next);
             fx.store(next, record, cpu::NEXT_PACE);
         });
-        let state_address = self.state(fx);
-        let lock = fx.offset(state_address, state::TIMER_LOCK);
-        self.call_routine(fx, Routine::Lock, &[lock]);
-        self.program_timer(fx);
-        self.call_routine(fx, Routine::Unlock, &[lock]);
+        self.reprogram_timer(fx);
         pacing
     }
 

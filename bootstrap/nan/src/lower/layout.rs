@@ -198,11 +198,12 @@ const POINTERS: [&str; 17] = [
 ];
 
 /// The base types that are generational handles, as capability kinds are.
-const HANDLES: [&str; 12] = [
+const HANDLES: [&str; 13] = [
     "mem::Alloc",
     "mem::Heap",
     "mem::Handle",
     "task::Executor",
+    "task::Account",
     "sys::Fs",
     "sys::Net",
     "sys::Clock",
@@ -557,18 +558,13 @@ impl Layouts {
             // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
             // that of its storage.
             "hw::IrqShared" | "hw::PerCpu" => pointers(1, None),
-            // A spin lock is its lock word, then its value; a guard, which no code holds, its
-            // value.
+            // A spin lock is its lock word, then its value.
             "hw::SpinLock" => {
                 let value = ty_arg(0).expect("a wrapped type");
                 self.record(
                     ck,
                     &[("lock".to_owned(), word), ("value".to_owned(), value)],
                 )
-            }
-            "hw::SpinGuard" => {
-                let value = ty_arg(0).expect("a wrapped type");
-                self.record(ck, &[("value".to_owned(), value)])
             }
             // A one-slot mailbox: its lock word, whether it holds a value, the waiting task and
             // the value.

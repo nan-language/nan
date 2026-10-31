@@ -6,13 +6,16 @@ const SCOPES_SCOPE_FAILED: u64 = 48
 
 const SCOPES_SCOPE_ORIGIN: u64 = 56
 
+/// The cell its executor draws through, and that executor's handle.
 const SCOPES_SCOPE_EXECUTOR: u64 = 64
 
-const SCOPES_SCOPE_REFS: u64 = 72
+const SCOPES_SCOPE_HANDLE: u64 = 72
 
-const SCOPES_SCOPE_RETURNED: u64 = 80
+const SCOPES_SCOPE_REFS: u64 = 80
 
-const SCOPES_SCOPE_FAILURE: u64 = 88
+const SCOPES_SCOPE_RETURNED: u64 = 88
+
+const SCOPES_SCOPE_FAILURE: u64 = 96
 
 /// The states of a scope's kept failure.
 const KEPT_RECORDING: i64 = 1
@@ -308,6 +311,8 @@ fn scope_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     expect record_values.len() == 1
     let record = record_values[0]
     mut fx.store(executor.words[0], addr: record, offset: SCOPES_SCOPE_EXECUTOR)
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    mut fx.store(handle, addr: record, offset: SCOPES_SCOPE_HANDLE)
     let one = mut fx.ptr(1)
     mut fx.store(one, addr: record, offset: SCOPES_SCOPE_REFS)
     let current = current_task(mut lo, mut fx)
@@ -455,15 +460,16 @@ fn scopes_storage(mut lo: Lowering, fn_ty: ty::FnTy) -> TaskStorage {
     return TaskStorage(failure_at: failure_at, size: failure_at + failure_size)
 } scopes_storage
 
-/// Starts a task running a `task fn` value of a type held at an address, in a region, owned by
-/// a construct or domain record, its stack drawn through a cell for a domain, of `stack` usable
-/// bytes or else of the size its type gives: its record, ready. It traps when the stack cannot be
-/// drawn.
+/// Starts a task running a `task fn` value of a type held at an address on an executor, in a
+/// region, owned by a construct or domain record, its stack drawn through a cell for a domain, of
+/// `stack` usable bytes or else of the size its type gives: its record, ready. It traps when the
+/// stack cannot be drawn.
 fn start_task(
     mut lo: Lowering,
     mut fx: Fx,
     fn_ty: ty::FnTy,
     function: clif::Value,
+    exec: clif::Value,
     cell: clif::Value,
     domain: clif::Value,
     region_record: clif::Value,
@@ -501,6 +507,7 @@ fn start_task(
     let failure = mut fx.b.iadd_imm_s(record, y: i64.from_bits(TASK_SIZE + storage.failure_at))
     mut fx.store(failure, addr: record, offset: TASK_FAILURE)
     mut fx.store(owner, addr: record, offset: TASK_OWNER)
+    record_executor(mut lo, mut fx, record, exec)
     match end {
         Some(ended) => {
             let end_ref = mut lo.func_ref(mut fx, id: ended)
@@ -520,6 +527,15 @@ fn start_task(
     }
     return record
 } start_task
+
+/// Records in a task's record the executor it runs on, with that executor's share and serial
+/// executor.
+fn record_executor(mut lo: Lowering, mut fx: Fx, record: clif::Value, exec: clif::Value) {
+    mut fx.store(exec, addr: record, offset: TASK_EXECUTOR)
+    let terms = executor_terms(mut lo, mut fx, handle: exec)
+    mut fx.store(terms.share, addr: record, offset: TASK_SHARE)
+    mut fx.store(terms.serial, addr: record, offset: TASK_SERIAL)
+} record_executor
 
 /// The glue running a task's entry, a function value of a type taking at most the argument the
 /// record holds: it writes the result or failure after the record, records the outcome and
@@ -586,6 +602,7 @@ fn scopes_entry_glue(mut lo: Lowering, fn_ty: ty::FnTy) -> object::FuncId {
 /// Spawns a scope's child running a `task fn` value: its join handle, which is its record.
 fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: clif::Value, child_ty: ty::FnTy, scope_fails: Option[ty::Ty], stack: Option[clif::Value]) -> clif::Value {
     let cell = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_EXECUTOR)
+    let exec = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_HANDLE)
     let domain = current_domain(mut lo, mut fx)
     let end = child_end(mut lo, child_ty, scope_fails)
     let done = child_done(mut lo)
@@ -598,7 +615,7 @@ fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: c
     let more_refs = mut fx.b.iadd_imm_s(refs, y: 1)
     mut fx.store(more_refs, addr: scope_record, offset: SCOPES_SCOPE_REFS)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-    let record = start_task(mut lo, mut fx, fn_ty: child_ty, function: child, cell, domain, region_record: scope_record, owner: scope_record, stack, end: Some(end), done)
+    let record = start_task(mut lo, mut fx, fn_ty: child_ty, function: child, exec, cell, domain, region_record: scope_record, owner: scope_record, stack, end: Some(end), done)
     spawned(mut lo, mut fx, record)
     return record
 } spawn_child
@@ -962,6 +979,7 @@ fn race_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         let none = mut fx1.ptr(0)
         tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
     })
+    let exec = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
     let size = mut fx.ptr(RACE_SIZE)
     let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
     expect record_values.len() == 1
@@ -974,7 +992,7 @@ fn race_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     var started = Array[clif::Value, 2].filled(record)
     for index in 0..<2usize {
         let function = supply.param(index + 1).address_value()
-        started[index] = start_task(mut lo, mut fx, fn_ty: task_ty, function, cell: executor.words[0], domain, region_record: record, owner: record, stack: None, end: Some(end), done)
+        started[index] = start_task(mut lo, mut fx, fn_ty: task_ty, function, exec, cell: executor.words[0], domain, region_record: record, owner: record, stack: None, end: Some(end), done)
     }
     for task in started {
         spawned(mut lo, mut fx, record: task)

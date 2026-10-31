@@ -515,7 +515,8 @@ fn Lowering.interrupt_stack_sizes(mut self) -> object::DataId {
 /// Defines the interrupt stack sizes from the largest `limits stack N` among the lowered
 /// interrupt fns: the stack of `ist` 0 holds two of them, one for an interrupt vector and
 /// one for an exception interrupting it, and two seam frames; every other stack holds one
-/// and one seam frame; each also holds what the dispatcher uses.
+/// and one seam frame; each also holds what the dispatcher uses and a call of a policy hook,
+/// which a task the dispatcher makes ready reaches.
 fn Lowering.finish_interrupts(mut self) {
     let Some(id) = self.irq_stacks else {
         return
@@ -538,8 +539,8 @@ fn Lowering.finish_interrupts(mut self) {
             largest = stack_limit
         }
     }
-    let first_size = 2 * (largest + SEAM_FRAME) + DISPATCH_RESERVE
-    let other_size = largest + SEAM_FRAME + DISPATCH_RESERVE
+    let first_size = 2 * (largest + SEAM_FRAME) + DISPATCH_RESERVE + HOOK_STACK
+    let other_size = largest + SEAM_FRAME + DISPATCH_RESERVE + HOOK_STACK
     var sizes = mem::Bytes.empty(self.alloc)
     object::append_u64(mut sizes, value: next_multiple_of(first_size, multiple: 16))
     object::append_u64(mut sizes, value: next_multiple_of(other_size, multiple: 16))
@@ -745,9 +746,9 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
 /// the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared` binds, or the
 /// devices installed on the vector or on the LPI. A timer interrupt first serves the kernel's
 /// clock, and reaches an interrupt fn on a pacing tick alone. The CPU signal first serves a
-/// shootdown on x86_64, and only ends unless bound. When a fn gives `hw::IrqExit.Reschedule`
-/// while a kernel task ran with maskable interrupts enabled and the anchor is installed, the task
-/// is preempted; a task asked to stop is preempted on any interrupt once it may stop, and only
+/// shootdown on x86_64, and only ends unless bound. When a fn gives `hw::IrqExit.Reschedule`, or at
+/// any interrupt once the CPU's policy switches from the task, while a kernel task ran with
+/// maskable interrupts enabled and the anchor is installed, the task is preempted; a task asked to stop is preempted on any interrupt once it may stop, and only
 /// then. An unbound exception vector other than an abort vector, and an exception vector whose fn
 /// gives `hw::IrqExit.Abandon`, trap a kernel task that ran with maskable interrupts enabled on
 /// its own stack; an exception fn's `Abandon` elsewhere halts the kernel. An unbound timer
@@ -1015,7 +1016,7 @@ fn Lowering.traps(mut self, mut fx: Fx, saved: clif::Value) -> clif::Value {
 /// Whether the seam preempts the interrupted code, giving 1 or zero: the final build has a
 /// `hw::preempt` entry, the code is a kernel task where an exception becomes its trap,
 /// outside `hw::Ring0.wait_for_interrupt`, and the task is asked to stop and may stop there, or
-/// else is not asked and its interrupt fn rescheduled.
+/// else is not asked and its interrupt fn rescheduled or its CPU's policy switches from it.
 fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif::Value, preempting: bool) -> clif::Value {
     if not preempting {
         return mut fx.ptr(0)
@@ -1048,7 +1049,9 @@ fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif:
             let stops = stoppable(mut lo2, fx: mut fx2, at)
             return fx2.list1(stops)
         }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
-            return fx2.list1(reschedule)
+            let switches = mut lo2.policy_switches(mut fx2)
+            let preempted = mut fx2.b.bor(reschedule, y: switches)
+            return fx2.list1(preempted)
         })
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let none = mut fx1.int(clif::Type.Int8, value: 0)

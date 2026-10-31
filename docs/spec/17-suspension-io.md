@@ -77,6 +77,7 @@ On the machine targets, every stack has a static bound. The code of each context
 | boot | the entry function | the boot stack ([machine runs](27-program-model.md#machine-runs)) |
 | task | the entry of each task | the task's own stack ([kernel suspension](24-kernel.md#kernel-suspension)) |
 | interrupt | each [interrupt fn](24-kernel.md#interrupt-functions) | the processor's interrupt stack ([interrupt functions](24-kernel.md#interrupt-functions)) |
+| policy | each method of the type a final build's `boot::Kernel.policy` installs, whose interface method states `limits stack 4_096` | the stack of the task, interrupt fn or CPU calling the hook, each of which holds a call of it ([policies](24-kernel.md#policies)) |
 | landing | each [landing fn](23-low-level.md#landing-functions) | the stack its seam switches to ([user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls), [machine runs](27-program-model.md#machine-runs)) |
 
 - An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine target or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.

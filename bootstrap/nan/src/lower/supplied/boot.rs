@@ -41,6 +41,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.regions" => regions(lo, fx, supply),
         "boot::Kernel.modules" => modules(lo, fx, supply),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
+        "boot::Kernel.policy" => lo.install_policy(fx, supply),
         "boot::Module.contents" => module_contents(lo, fx, supply),
         "boot::start_info" => {
             let info = lo.start_info(fx);
@@ -295,7 +296,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let root = fx.load(PTR, state_address, state::ROOT);
     let done = first_task_done(lo);
     let first = scopes::start_task(
-        lo, fx, &run_ty, function, cell, process, root, process, None, None, done,
+        lo, fx, &run_ty, function, exec, cell, process, root, process, None, None, done,
     );
     fx.store(exec, first, task::ARGUMENT);
     fx.store(first, state_address, state::ENTRY_TASK);

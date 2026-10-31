@@ -266,8 +266,8 @@ pub struct Lowering<'c, 'a> {
     glue: u32,
     state_id: Option<DataId>,
     thread_id: Option<DataId>,
-    /// A machine image's compiler stubs, its vector seam, the data objects it reserves by name,
-    /// and the sizes of its interrupt stacks once declared.
+    /// The image's compiler stubs, and a machine image's vector seam, the data objects it reserves
+    /// by name and the sizes of its interrupt stacks, once declared.
     machine_stubs: HashMap<machine::Stub, FuncId>,
     vector_seam: Option<FuncId>,
     reserved: HashMap<&'static str, DataId>,

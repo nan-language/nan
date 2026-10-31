@@ -115,6 +115,11 @@ const SIGINFO: u64 = 128
 
 const SIGPIPE: i64 = 13
 
+/// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
+const AT_HWCAP: u64 = 16
+
+const HWCAP_DIT: i64 = 1 << 24
+
 fn termination_signals() -> Array[i64, 3] {
     var listed = Array[i64, 3].filled(1)
     listed[1] = 2
@@ -671,11 +676,13 @@ fn overflow_caller(mut fx: Fx, ctx: Context, context: clif::Value, entering: cli
 } overflow_caller
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
-/// calling thread being the first, and the reading of termination requests; returns 1 from
-/// `Init` when the system refuses the first thread's ring or the second thread. Each other
+/// calling thread being the first, and the reading of termination requests, after the
+/// data-independent timing mode, which they inherit; returns 1 from `Init` when the system
+/// refuses the first thread's ring or the second thread. Each other
 /// thread sets up its own ring and starts the next, as `ThreadMain` does, so that starting
 /// costs the calling thread one ring and one thread whatever the processors.
 fn start_threads(mut lo: Lowering, mut fx: Fx) {
+    host_constant_time(mut lo, mut fx)
     let state_address = mut lo.state(mut fx)
     if lo.seeded() {
         start_seeded(mut lo, mut fx)
@@ -783,6 +790,21 @@ fn thread_start(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         system_unavailable(mut lo, fx: mut then_fx)
     })
 } thread_start
+
+/// Turns on `PSTATE.DIT` on an AArch64 host whose kernel reports `HWCAP_DIT`, and so emulates the
+/// stub's read of `ID_AA64PFR0_EL1`. An x86_64 process cannot turn on DOITM, which is the
+/// kernel's.
+fn host_constant_time(mut lo: Lowering, mut fx: Fx) {
+    if lo.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        return
+    }
+    let kind = mut fx.ptr(AT_HWCAP)
+    let hwcap = first_result(mut lo.call_libc(mut fx, name: "getauxval", args: Array[clif::Value, 1].filled(kind).view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    let dit = mut fx.b.band_imm_s(hwcap, y: HWCAP_DIT)
+    mut fx.if_true(dit, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} host_constant_time
 
 /// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
 /// thread, without a ring; a fault reports a stack overflow, and the run ends with status

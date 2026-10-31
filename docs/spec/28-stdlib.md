@@ -58,6 +58,7 @@ The table names every pub std type, interface, free function and registry with t
 | `core` | `Render`, `core::Renderer` | [Render](13-text-encode.md#render) |
 | `core` | `Encode`, `core::Encoder`, `core::Decoder`, `core::DecodeError` | [Encode](13-text-encode.md#encode), [Encoders and decoders](13-text-encode.md#encoders-and-decoders) |
 | `core` | `Untrusted`, `core::Parts` | [Untrusted values](15-untrusted.md#untrusted-values), [Content-blind operations](15-untrusted.md#content-blind-operations) |
+| `core` | `core::Secret`, `core::SecretBits` | [Secret values](15-untrusted.md#secret-values) |
 | `core` | `Generate`, `core::Choices` | [Generation](22-testing.md#generation) |
 | `core` | `core::atomic::AtomicU8`, `core::atomic::AtomicU16`, `core::atomic::AtomicU32`, `core::atomic::AtomicU64`, `core::atomic::AtomicUsize`, `core::atomic::AtomicBool` | [Atomics](16-concurrency.md#atomics) |
 | `core` | `core::crypto::PublicKey`, `core::crypto::Signature`, `core::crypto::SecretKey` | [Signatures](31-trust.md#signatures) |

@@ -86,12 +86,8 @@ impl Checker<'_> {
             self.report(item, token, Code::InterfaceImplMisplaced);
             return false;
         }
-        if PROPERTY_INTERFACES.contains(&interface_path.as_str()) {
-            self.report(item, token, Code::PropPropertyImpl);
-            return false;
-        }
-        if interface_path == "core::Encode" && !self.db.is_std(item) {
-            self.report(item, token, Code::EncodeManualImpl);
+        if let Some(code) = impl_interface_problem(&interface_path, self.db.is_std(item)) {
+            self.report(item, token, code);
             return false;
         }
         if self.duplicate_impl(item, key, bound.interface) {
@@ -349,5 +345,19 @@ fn derives(item: &ast::Item) -> &[ast::Name] {
         ItemKind::Struct(structure) => &structure.derives,
         ItemKind::Enum(enumeration) => &enumeration.derives,
         _ => &[],
+    }
+}
+
+/// The rule an impl line breaks by the interface it names alone: a property interface, `Encode`
+/// outside std, or `core::SecretBits`.
+fn impl_interface_problem(path: &str, std: bool) -> Option<Code> {
+    if PROPERTY_INTERFACES.contains(&path) {
+        Some(Code::PropPropertyImpl)
+    } else if path == "core::Encode" && !std {
+        Some(Code::EncodeManualImpl)
+    } else if path == "core::SecretBits" {
+        Some(Code::SecretBitsImpl)
+    } else {
+        None
     }
 }

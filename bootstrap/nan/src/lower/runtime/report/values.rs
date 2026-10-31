@@ -73,7 +73,7 @@ fn form(lo: &mut Lowering, ty: &Ty, visiting: &mut Vec<Ty>) -> Option<Form> {
         "core::Str" | "text::String" => return Some(Form::Text { fixed: false }),
         "text::Fixed" => return Some(Form::Text { fixed: true }),
         "mem::Bytes" => return Some(Form::Bytes),
-        "core::Untrusted" => return None,
+        "core::Untrusted" | "core::Secret" => return None,
         _ => {}
     }
     visiting.push(ty.clone());

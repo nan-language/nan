@@ -397,6 +397,8 @@ codes! {
     SealBadPrincipal = "seal.bad-principal",
     SealSameAuthor = "seal.same-author",
     SealUnneeded = "seal.unneeded",
+    SecretBitsImpl = "secret.bits-impl",
+    SecretPublicUse = "secret.public-use",
     StmtAssignTarget = "stmt.assign-target",
     StmtDiscardUnit = "stmt.discard-unit",
     StmtElseNotDiverging = "stmt.else-not-diverging",

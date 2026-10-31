@@ -1749,6 +1749,19 @@ impl Body<'_, '_> {
                     self.report(token, Code::UntrustedWrappedAlias);
                 }
             }
+            "core::Secret.widen" | "core::Secret.truncate" => {
+                let source = callable
+                    .head
+                    .generics
+                    .get(1)
+                    .and_then(|def| subst.get(def.param));
+                if let (Some(Arg::Ty(Ty::Scalar(target))), Some(Arg::Ty(Ty::Scalar(source)))) =
+                    (wrapped, source)
+                    && let Some(code) = secret_conversion(&path, *source, *target)
+                {
+                    self.report(token, code);
+                }
+            }
             _ => {}
         }
     }
@@ -3117,6 +3130,23 @@ pub fn is_place(expr: &TExpr) -> bool {
         TKind::Field { base, .. } => is_place(base),
         TKind::Index(call) => call.args.first().is_some_and(|base| is_place(&base.expr)),
         _ => false,
+    }
+}
+
+/// The rule `Secret[T].widen(x)` or `Secret[T].truncate(x)` breaks for `x` of `Secret[S]`, the
+/// rules of named conversions over the integer pair `S`, `T`.
+fn secret_conversion(path: &str, source: Scalar, target: Scalar) -> Option<Code> {
+    let widening = widens(source, target);
+    if !source.is_integer() {
+        Some(Code::NumConversionUndefined)
+    } else if source == target {
+        Some(Code::NumSameTypeConversion)
+    } else if path == "core::Secret.widen" && !widening {
+        Some(Code::NumWidenLossy)
+    } else if path == "core::Secret.truncate" && widening {
+        Some(Code::NumWidenApplies)
+    } else {
+        None
     }
 }
 

@@ -102,12 +102,14 @@ impl Lowering<'_, '_> {
     }
 
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
-    /// register addresses from now on; on a kernel, its clock started and a CPU for each processor
-    /// the platform reports; an executor thread record for each CPU; and, on `x86_64-bare`, the
-    /// boot CPU's descriptor tables loaded and AVX enabled when it has it.
+    /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
+    /// its clock started and a CPU for each processor the platform reports; an executor thread
+    /// record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor tables loaded and AVX
+    /// enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
+        self.call_stub(fx, Stub::ConstantTime, &[]);
         if self.kernel() {
             self.start_clock(fx);
         }
@@ -661,9 +663,9 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a started CPU calls with its record: it points its base register at the record,
-    /// on x86_64 loads its descriptor tables and enables AVX when it has it, prepares its
-    /// interrupt delivery through `prepare`, records that it started and runs the executor's
-    /// scheduler.
+    /// sets its data-independent timing mode, on x86_64 loads its descriptor tables and enables
+    /// AVX when it has it, prepares its interrupt delivery through `prepare`, records that it
+    /// started and runs the executor's scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
         signature.params.push(AbiParam::new(PTR));
@@ -678,6 +680,7 @@ impl Lowering<'_, '_> {
             |lo, fx| {
                 let record = fx.entry()[0];
                 lo.set_cpu_base(fx, record);
+                lo.call_stub(fx, Stub::ConstantTime, &[]);
                 if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
                     lo.load_cpu_tables(fx, record);
                     lo.enable_avx(fx, record);

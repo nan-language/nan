@@ -46,7 +46,7 @@ pub fn cpu_count() -> u32 limits pure, notrap, terminates
 `take k.anchor(take state, run: f)` performs these steps and never returns:
 
 1. It moves `state` into storage the image reserves and installs it as the anchor, visible to every CPU from then on.
-2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded and an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
+2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, disabling the CPU's [extended state](#floating-point) and enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded, enables XSAVE with the x87, SSE and AVX state components where the CPU has AVX, and loads an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
 3. It runs `f` as the first kernel task on that executor, whose value it passes as `exec`. The executor draws task stacks and records through `k.alloc()` ([executors](16-concurrency.md#executors)), and `f` is a [task closure](16-concurrency.md#task-closures), capturing by `take` and Copy only; the executor records `k.clock()` ([capability tables](14-authority.md#capability-tables)).
 4. When `f` returns or fails, the kernel halts ([kernel halts](#kernel-halts)).
 
@@ -191,7 +191,7 @@ Contributions bind the interrupt and exception forms through `hw::vectors`, whos
 
 When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 on x86_64 and at EL1 on AArch64, the CPU enters its seam with maskable interrupts disabled, and:
 
-1. The seam saves the interrupted code's registers and [extended state](#floating-point) on its interrupt stack.
+1. The seam saves the interrupted code's general registers on its interrupt stack, and no [extended state](#floating-point).
 2. For a vector bound to an `hw::IrqShared`, it acquires that lock, calls the device's interrupt fn with the device and a new `hw::IrqContext`, and releases the lock. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
 3. On `hw::IrqExit.Reschedule`, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
 4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
@@ -543,7 +543,7 @@ pub fn PerCpu.with[R: Any](self, t: IrqsDisabled, body: fn(mut value: T) -> R li
 
 - An `hw::RunQueue` holds the ready threads of one CPU, behind that CPU's run-queue lock. An `hw::SavedContext` is the save slot of the running thread. An `hw::Resumable` is a [generational handle](12-memory.md#generational-handles) naming a thread whose registers are saved; it is live until that thread resumes. Only the kernel executor creates values of these types.
 - `from.resumable()` names the thread whose save slot `from` is. When that thread resumes, the executor holds its save slot again.
-- `hw::switch_to(take guard, take from, to)` saves the running thread's registers and extended state into `from`, then restores the thread `to` names, whose own pending `switch_to` call returns `guard`: the lock passes to the incoming thread, still held on the same CPU. The outgoing call returns when a later `switch_to` names its thread, with that caller's guard. A stale `to` traps (`trap.stale-handle`) before anything is saved.
+- `hw::switch_to(take guard, take from, to)` saves the running thread's registers into `from`, then restores the thread `to` names, whose own pending `switch_to` call returns `guard`: the lock passes to the incoming thread, still held on the same CPU. The outgoing call returns when a later `switch_to` names its thread, with that caller's guard. A stale `to` traps (`trap.stale-handle`) before anything is saved.
 - `hw::PerCpu.of(init, alloc)` holds `hw::cpu_count()` values drawn through `alloc`, the value of CPU i being `init(i)`, and traps on exhaustion (`trap.exhausted`). `with` calls `body` with `mut` access to the current CPU's value; a `with` on a value whose `with` the calling CPU is already inside never returns, as for a spin lock.
 
 ```nan
@@ -774,7 +774,7 @@ pub fn kernel_image(services: boot::Services, alloc: mem::Alloc) -> Untrusted[me
 
 A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
 
-Every seam and `hw::switch_to` saves the complete extended CPU state (on x86_64 the x87 and SSE registers, and the AVX registers when the CPU has them; on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR) of the code it leaves and restores it before that code resumes. Lowering may use these registers for operations other than float arithmetic.
+Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no `hw::switch_to` saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception, which halts the kernel unless a binding serves its vector. The entry function starts with the extended state enabled ([anchor](#anchor)).
 
 ```nan
 // file: kernel/package.nan

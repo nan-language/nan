@@ -89,3 +89,56 @@ fn secret_code_lowers_without_branches_or_divisions() {
         }
     }
 }
+
+/// A kernel moving floats, through calls, a const, a literal, a wire encoding and decoding and a
+/// total order, and counting bits lowers on each machine architecture without a float or vector
+/// type, and without `popcnt`, which AArch64 computes in its vector registers.
+#[test]
+fn machine_code_holds_no_float_or_vector_value() {
+    let source = "//! Moves floats.\n\n\
+        struct Point derives Copy, Encode {\n    x: f64\n    y: f32\n} Point\n\n\
+        const ORIGIN: Point = Point(x: 1.5, y: 2.5)\n\n\
+        fn pick(p: Point, other: Point, near: bool) -> Point {\n    if near {\n        return p\n    }\n    return other\n} pick\n\n\
+        fn main(take k: boot::Kernel) -> Never limits stack 16_384 {\n\
+        \x20   let alloc = k.alloc()\n\
+        \x20   let a = pick(p: ORIGIN, other: Point(x: 3.0, y: 4.0), near: false)\n\
+        \x20   var out = mem::Bytes.empty(alloc)\n\
+        \x20   mem::wire::Codec[Point].encode(a, mut out)\n\
+        \x20   match attempt mem::wire::Codec[Point].decode(Untrusted.of(out.view()), alloc) {\n\
+        \x20       Ok(back) => {\n            discard back\n        }\n\
+        \x20       Err(error) => {\n            discard error\n        }\n\
+        \x20   }\n\
+        \x20   let ordered = core::TotalF64(value: a.x).cmp(core::TotalF64(value: 2.0)) == core::Ordering.Less\n\
+        \x20   discard ordered\n\
+        \x20   discard 0xF0F0u64.count_ones()\n\
+        \x20   loop {}\n\
+        } main\n";
+    for target in ["x86_64-bare", "aarch64-bare"] {
+        let manifest = format!(
+            "//! Floats moved by a kernel.\n\npackage fl {{\n    language 1\n    targets {target}\n    entry main\n}} fl\n"
+        );
+        let scratch = Scratch::new(&[("fl/package.nan", &manifest), ("fl/fl.nan", source)]);
+        let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+        let texts = crate::final_build::lowered_functions(&workspace, 0);
+        assert!(!texts.is_empty(), "{target}: the kernel lowers");
+        for (name, text) in texts {
+            let floating = text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .find(|token| {
+                    let vector = token.split_once('x').is_some_and(|(lane, count)| {
+                        lane.len() > 1
+                            && lane[1..].bytes().all(|b| b.is_ascii_digit())
+                            && !count.is_empty()
+                            && count.bytes().all(|b| b.is_ascii_digit())
+                    });
+                    matches!(*token, "f32" | "f64")
+                        || (*token == "popcnt" && target.starts_with("aarch64"))
+                        || vector
+                });
+            assert_eq!(
+                floating, None,
+                "{target}: {name} holds {floating:?}:\n{text}"
+            );
+        }
+    }
+}

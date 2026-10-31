@@ -310,9 +310,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         }
     }
     text.push_str(&format!(
-        "\n## Time of the extended-state save of a machine seam and of `hw::switch_to`\n\nBoth save every state component with `xsave64` and restore it with `xrstor64`, which a guest under KVM runs natively: their native times are their times under the emulator. A seam's round trip, a self-interrupt sent through the local APIC and taken, and a thread switch, half of a round trip between two tasks each waking the other with a signal, are timed under the emulator.\n\n| Milestone | Save | Restore | Seam round trip | Thread switch |\n| --- | ---: | ---: | ---: | ---: |\n| M4 | {} | {} | {} | {} |\n",
-        nanoseconds(times.native.get("xsave")),
-        nanoseconds(times.native.get("xrstor")),
+        "\n## Time of a machine seam and of `hw::switch_to`\n\nA seam's round trip, a self-interrupt sent through the local APIC and taken, and a thread switch, half of a round trip between two tasks each waking the other with a signal, are timed under the emulator.\n\n| Milestone | Seam round trip | Thread switch |\n| --- | ---: | ---: |\n| M4 | {} | {} |\n",
         nanoseconds(times.kernel.get("seam")),
         nanoseconds(times.kernel.get("switch"))
     ));

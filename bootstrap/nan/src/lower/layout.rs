@@ -270,7 +270,7 @@ impl Layouts {
 
     fn compute(&mut self, ck: &Checker, ty: &Ty) -> Layout {
         match ty {
-            Ty::Scalar(scalar) => scalar_layout(*scalar),
+            Ty::Scalar(scalar) => scalar_layout(*scalar, ck.db.target.is_machine()),
             Ty::Unit | Ty::Never => empty(),
             Ty::Fn(_) => pointers(2, None),
             Ty::Dyn(_) => pointers(2, Some(0)),
@@ -491,7 +491,7 @@ impl Layouts {
                     "Usize" => Scalar::Usize,
                     _ => Scalar::Bool,
                 };
-                let inner = scalar_layout(scalar);
+                let inner = scalar_layout(scalar, ck.db.target.is_machine());
                 Layout {
                     size: inner.size,
                     align: inner.align,
@@ -728,7 +728,7 @@ impl Layouts {
             LayoutRepr::Integer { ty, order } => {
                 let scalar = Scalar::from_name(&ty.text).expect("a layout representation");
                 let big = order.as_ref().is_some_and(|order| order.text == "be");
-                let base = scalar_layout(scalar);
+                let base = scalar_layout(scalar, ck.db.target.is_machine());
                 let Shape::Scalar { ty: repr, .. } = base.shape else {
                     unreachable!("an integer representation");
                 };
@@ -933,19 +933,23 @@ fn pointers(count: u64, null: Option<u64>) -> Layout {
     }
 }
 
-pub fn scalar_type(scalar: Scalar) -> Type {
+/// The type of a scalar's values. Code for a machine target uses no floating-point register, so
+/// there a float is held as its bit pattern.
+pub fn scalar_type(scalar: Scalar, machine: bool) -> Type {
     match scalar {
         Scalar::U8 | Scalar::I8 | Scalar::Bool => types::I8,
         Scalar::U16 | Scalar::I16 => types::I16,
         Scalar::U32 | Scalar::I32 | Scalar::Char => types::I32,
         Scalar::U64 | Scalar::I64 | Scalar::Usize | Scalar::Isize => types::I64,
+        Scalar::F32 if machine => types::I32,
+        Scalar::F64 if machine => types::I64,
         Scalar::F32 => types::F32,
         Scalar::F64 => types::F64,
     }
 }
 
-fn scalar_layout(scalar: Scalar) -> Layout {
-    let ty = scalar_type(scalar);
+fn scalar_layout(scalar: Scalar, machine: bool) -> Layout {
+    let ty = scalar_type(scalar, machine);
     let size = u64::from(ty.bytes());
     let niche = match scalar {
         Scalar::Bool => Some((2, 254)),

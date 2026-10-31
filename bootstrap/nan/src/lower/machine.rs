@@ -166,11 +166,16 @@ pub mod secondary {
 impl Lowering<'_, '_> {
     /// Switches task stacks: saves the running stack's execution to the context at `store`,
     /// restores the one at `load` and resumes it with `payload`. Cranelift lowers the switch on
-    /// x86_64; on AArch64, which Cranelift's backend cannot, the `Switch` compiler stub does.
+    /// x86_64; on AArch64, which Cranelift's backend cannot, a compiler stub does, keeping the
+    /// floating-point registers host code keeps across calls.
     pub fn switch_stacks(&mut self, fx: &mut Fx, store: Value, load: Value, payload: Value) {
         match self.ck.db.target.arch() {
             Some(Arch::Aarch64) => {
-                self.call_stub(fx, Stub::Switch, &[store, load, payload]);
+                let stub = match self.machine() {
+                    true => Stub::MachineSwitch,
+                    false => Stub::Switch,
+                };
+                self.call_stub(fx, stub, &[store, load, payload]);
             }
             _ => {
                 fx.b.ins().stack_switch(store, load, payload);
@@ -552,3 +557,6 @@ impl Lowering<'_, '_> {
         gdtr
     }
 }
+
+#[cfg(test)]
+mod tests;

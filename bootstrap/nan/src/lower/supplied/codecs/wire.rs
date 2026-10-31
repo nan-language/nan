@@ -2,7 +2,7 @@
 //! code of its failure, zero for none.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
+    AbiParam, InstBuilder, MemFlagsData, Signature, Type, Value, condcodes::IntCC, types,
 };
 
 use super::super::super::fx::{Fx, PTR};
@@ -278,8 +278,9 @@ pub fn read_integer(lo: &mut Lowering, fx: &mut Fx, state: Value, signed: bool) 
     (fx.b.ins().bxor(half, mask), failed)
 }
 
-/// A float: the 8 bytes of an f64 bit pattern, little-endian.
-pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
+/// A float: the 8 bytes of an f64 bit pattern, little-endian, as a value of `float`, the type
+/// holding an f64.
+pub fn read_float(fx: &mut Fx, state: Value, float: Type) -> (Value, Value) {
     let pos = fx.load(PTR, state, reader::POS);
     let left = left(fx, state);
     let enough =
@@ -287,7 +288,7 @@ pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
             .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, left, 8);
     let parts = fx.choose(
         enough,
-        &[types::F64, types::I32],
+        &[float, types::I32],
         |fx| {
             let bits =
                 fx.b.ins()
@@ -295,11 +296,16 @@ pub fn read_float(fx: &mut Fx, state: Value) -> (Value, Value) {
             let next = fx.b.ins().iadd_imm_s(pos, 8);
             fx.store(next, state, reader::POS);
             vec![
-                fx.b.ins().bitcast(types::F64, MemFlagsData::new(), bits),
+                super::super::numbers::from_bits(fx, bits, float),
                 code(fx, 0),
             ]
         },
-        |fx| vec![fx.b.ins().f64const(0.0), code(fx, failure::TRUNCATED)],
+        |fx| {
+            vec![
+                super::super::super::body::zero(fx, float),
+                code(fx, failure::TRUNCATED),
+            ]
+        },
     );
     (parts[0], parts[1])
 }

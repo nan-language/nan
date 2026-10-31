@@ -167,8 +167,9 @@ fn push_region(
 }
 
 /// `take k.anchor(take state, run: f)`: moves `state` into the storage the image reserves for
-/// the anchor and installs it, then starts the kernel executor on every CPU and runs `f` as its
-/// first kernel task, given the executor. The kernel halts once that task ends.
+/// the anchor and installs it, then starts the kernel executor on every CPU, floating point
+/// disabled, and runs `f` as its first kernel task, given the executor. The kernel halts once
+/// that task ends.
 fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state_ty = supply.type_arg(0);
     let layout = lo.layout(&state_ty);
@@ -181,6 +182,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let prepare = lo.interrupt_setup(fx);
     let call = lo.func_ref(fx, prepare);
     fx.b.ins().call(call, &[]);
+    lo.call_stub(fx, Stub::DisableFloats, &[]);
     let boot = lo.cpu_records(fx);
     lo.cpu_started(fx, boot);
     lo.start_cpus(fx, prepare);

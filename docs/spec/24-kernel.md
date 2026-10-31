@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -18,6 +18,10 @@ pub fn Kernel.wall_clock(self) -> Option[sys::WallClock]
 pub fn Kernel.regions(mut self) -> mem::List[hw::Region]
 
 pub fn Kernel.ring0(mut self) -> Option[hw::Ring0]
+
+pub fn Kernel.iommu(mut self) -> Option[hw::Iommu]
+
+pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
 
 pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
 ```
@@ -41,6 +45,10 @@ pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 - `k.wall_clock()` returns `Some` of the kernel's wall clock when the wall clock source of its target's [descriptor](27-program-model.md#descriptors) gave a time as the root grant was minted, the same handle on every call, and `None` otherwise. Its reading is that time, taken as UTC, advanced by the kernel clock.
 - The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64, outside the [start information](#start-information) with its module list, memory map, command line, modules and their names on a bare target, and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on a bare target with a start information, the entries of type 1 of its memory map, on `aarch64-bare` without one, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
+- The first call of `k.iommu()` enables the machine's IOMMU and returns `Some` of its `hw::Iommu` ([I/O domains](23-low-level.md#io-domains)) when the runtime drives it, and `None` otherwise; later calls return `None`. From then on the DMA of every PCI function the IOMMU translates reaches no memory until the function is attached ([PCI functions](#pci-functions)). The runtime drives:
+    - on x86_64, Intel VT-d when the ACPI DMAR table lists one remapping unit, in segment 0, and no reserved memory region, the platform remaps interrupts, and the unit queues invalidations, remaps interrupts and walks four-level tables. It translates the functions of bus 0 that the unit includes, and enables interrupt remapping: the machine then delivers no message-signalled interrupt in the format it delivers without remapping, such as those `install_msi` gave before ([locks](#locks));
+    - on AArch64, the SMMUv3 of the device tree's `arm,smmu-v3` node when it translates stage 1 through AArch64 tables of 4 KiB pages, walks them coherently and has 8 stream id bits or more. It translates every function of bus 0, its stream id being its requester id.
+- The first call of `k.pci_functions()` returns the functions of PCI bus 0 of segment 0 that are endpoints, those of header type 0 and not of the bridge class, in the order of their requester ids, drawn through `k.alloc()`; later calls return an empty list. Each has bus mastering and memory decoding off and INTx disabled. Configuration goes through the configuration mechanism #1 ports on x86_64 and, on AArch64, through the ECAM of the device tree's `pci-host-ecam-generic` node, which lists no function when it lies past the first gigabyte. On AArch64, every memory BAR that holds no address is given one from the 32-bit memory window of that node's `ranges`, aligned to its size, above every BAR the window holds.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable. CPUs are numbered from 0, the boot CPU being 0.
 - `hw::cpu_hardware_id(n)` returns `Some` of the hardware id of CPU n, its local APIC id on x86_64 and its affinity on AArch64, the `MPIDR_EL1` affinity fields at the positions `GICD_IROUTER` holds them, and `None` when n is not below `hw::cpu_count()`. On the host targets the hardware id of CPU n is n.
 - `hw::Anchor[S]` has no values; it names the anchor of type S.
@@ -440,12 +448,12 @@ pub closed struct MsiRefusal[T: Any and Send] {
 - Installing on a vector a contribution binds, or on `hw::SIGNAL_VECTOR`, traps (`trap.duplicate-access`). Devices installed on the same vector of a CPU share it, as devices on one level-triggered line do: when it fires there, the interrupt fn of each runs, those `install_on` installed on that CPU first, each group in the order of installation.
 - On AArch64 a vector from 32 up is a shared peripheral interrupt, which the interrupt controller routes to one CPU: CPU n for `install_on`, the boot CPU for `install`. Installing on a vector whose devices are installed for another CPU traps (`trap.duplicate-access`).
 - `install_msi(take dev, cpu: n, source: s, on_irq: f)` installs `dev` with f on a new **message-signalled interrupt** delivered to CPU n and returns `Ok` of the `hw::IrqShared[T]`, whose `message()` returns `Some` of the address and data a device writes to raise it; for every other installed device it returns `None`. Otherwise it returns `Err` of an `hw::MsiRefusal[T]` holding `dev` and an `hw::MsiError`: `Exhausted` when no such interrupt is free, `Unreachable` when no message reaches CPU n, and `Unsupported` when the machine delivers none, as on the host targets. It traps when n is not below `hw::cpu_count()` (`trap.bounds`).
-- On x86_64 the interrupt is the lowest vector from `0x21` to `0xFD` that no contribution binds and no device is installed on for CPU n; its message is a fixed, edge-triggered interrupt to CPU n's local APIC in physical destination mode, with address `0xFEE0_0000 | id << 12` and the vector as data, and is `Unreachable` when that APIC id exceeds 255. `source` is unused.
+- On x86_64 the interrupt is the lowest vector from `0x21` to `0xFD` that no contribution binds and no device is installed on for CPU n; its message is a fixed, edge-triggered interrupt to CPU n's local APIC in physical destination mode, with address `0xFEE0_0000 | id << 12` and the vector as data, and is `Unreachable` when that APIC id exceeds 255. `source` is unused. Once `boot::Kernel.iommu` has enabled interrupt remapping, the message names instead the remapping entry of CPU n and the vector, in the remapped format with data 0, which reaches APIC ids past 255 when the CPUs run in x2APIC mode.
 - On AArch64 the interrupt is one of the 8,192 LPIs of the interrupt controller's ITS, which translates the event the data names, for device id s, to it; `source` is the device id the ITS receives with the device's writes, a PCI function's requester id on the emulator's machine. Its message's address is that of the ITS's `GITS_TRANSLATER` and its data the event. A device id the ITS does not accept, or a machine without an ITS, is `Unsupported`; an ITS keeps at most 256 device ids.
 - `with` reaches the device from other code, as `SpinLock.with` does.
 - `take shared.uninstall()` removes the device from its interrupt, spins until no CPU runs f for it, and returns the device.
 - An installed device is a resource of the domain that holds its `hw::IrqShared`, which the domain's [settlement](11-errors-domains.md#settlement) uninstalls.
-- `install`, `install_on`, `install_msi` and `uninstall` are the device operations that `allow device` covers ([manifest grants](14-authority.md#manifest-grants)).
+- `install`, `install_on` and `install_msi` are device operations and `uninstall` a confined one ([manifest grants](14-authority.md#manifest-grants)).
 
 ```nan
 // file: serial/package.nan
@@ -535,6 +543,102 @@ interrupt fn Queue.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit lim
     take irq.complete()
     return hw::IrqExit.Resume
 } Queue.on_irq
+```
+
+## PCI functions
+
+A **PCI function** is an `hw::PciFunction`, a function of PCI bus 0 that `boot::Kernel.pci_functions` lists ([anchor](#anchor)). Its DMA reaches the memory of the space it is attached to, through the IOMMU when one is enabled ([I/O domains](23-low-level.md#io-domains)), and its register windows and message-signalled interrupts derive from it with no trusted premise.
+
+```nan-api
+// module: hw
+
+pub open linear struct PciFunction {
+} PciFunction
+
+pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
+    pub bus: u8
+    pub device: u8
+    pub function: u8
+} PciAddress
+
+pub closed enum PciError derives Copy, Eq, Render {
+    NotMemory
+    TooSmall
+    Taken
+    Unmapped
+} PciError
+
+pub fn PciFunction.address(self) -> PciAddress
+
+pub fn PciFunction.config_read(self, offset: u8) -> u32
+    requires offset % 4 == 0
+
+pub fn Mmio.of_bar(mut function: PciFunction, index: u8) -> Mmio[R] fails PciError
+
+pub fn PciFunction.attach(mut self, space: IoSpace) fails IommuError
+
+pub fn PciFunction.attach_physical(mut self) fails IommuError
+
+pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+pub fn PciFunction.release(take self)
+```
+
+- `function.address()` is its bus, device and function numbers; its **requester id** is `device << 3 | function` on bus 0. `function.config_read(offset)` reads the double word at `offset` of its configuration space. Nothing writes its configuration but the runtime.
+- `hw::Mmio[R].of_bar(mut function, index: i)` enables the function's memory decoding and returns a window over R at the start of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)). It fails with `NotMemory` when BAR i is not a memory BAR, with `TooSmall` when the BAR holds fewer bytes than R spans from offset 0 to past its last register, with `Taken` when an earlier call gave a window over the BAR, and with `Unmapped` when the BAR lies outside the memory the entry root maps uncached, the last gigabyte below 4 GiB on x86_64 and the first gigabyte on AArch64 ([physical memory](#physical-memory)).
+- `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, and with `Unsupported` when the IOMMU does not translate the function. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Unsupported` when the IOMMU translates the function and cannot pass its accesses through. A function attached anew leaves the space it was attached to.
+- `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
+- `take function.release()` cuts the function off: its bus mastering and memory decoding end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
+- An `hw::PciFunction` is a resource of the domain run holding it, which its [settlement](11-errors-domains.md#settlement) cuts off as `release` does.
+- Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) but `attach_physical`, which is a device operation (`authority.ungranted`). Each has the device fact.
+
+```nan
+// file: driver/package.nan
+//! An entropy driver confined to an I/O domain.
+
+package driver {
+    language 1
+    targets x86_64-bare
+    allow confined in driver
+} driver
+
+// file: driver/driver.nan
+//! Finds a modern virtio entropy device and maps its common configuration.
+
+const VIRTIO_ENTROPY: u32 = 0x1044_1AF4
+
+pub registers Common {
+    device_status: u8 at 0x14 read write
+} Common
+
+pub fn is_entropy(function: hw::PciFunction) -> bool {
+    return function.config_read(0) == VIRTIO_ENTROPY
+} is_entropy
+
+pub fn reset(mut function: hw::PciFunction, bar: u8) fails hw::PciError {
+    var common = try hw::Mmio[Common].of_bar(mut function, index: bar)
+    mut common.write(Common.device_status, value: 0)
+    take common.unmap()
+} reset
+```
+
+```nan
+// file: driver/package.nan
+//! An entropy driver confined to an I/O domain.
+
+package driver {
+    language 1
+    targets x86_64-bare
+    allow confined in driver
+} driver
+
+// file: driver/driver.nan
+//! Lets a device reach all physical memory.
+
+pub fn unconfine(mut function: hw::PciFunction) -> hw::PciAddress fails hw::IommuError {
+    try mut function.attach_physical() // error: authority.ungranted
+    return function.address()
+} unconfine
 ```
 
 ## Cross-CPU operations

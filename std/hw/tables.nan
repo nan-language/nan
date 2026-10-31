@@ -1,0 +1,168 @@
+//! The platform's tables the IOMMU and PCI enumeration read: the ACPI tables the root pointer lists and the device tree's nodes.
+
+/// The header of an ACPI table, and the offsets in the RSDP of its revision and of its RSDT's
+/// and XSDT's addresses.
+const HEADER_BYTES: u64 = 36
+
+const RSDP_REVISION: u64 = 15
+
+const RSDP_RSDT: u64 = 16
+
+const RSDP_XSDT: u64 = 24
+
+/// The flattened device tree's magic and the offsets of its structure and strings blocks; the
+/// structure block's tokens.
+const TREE_MAGIC: u32 = 0xD00D_FEED
+
+const TREE_STRUCTURE: u64 = 8
+
+const TREE_STRINGS: u64 = 12
+
+const BEGIN_NODE: u32 = 1
+
+const END_NODE: u32 = 2
+
+const PROPERTY: u32 = 3
+
+const TREE_END: u32 = 9
+
+/// The values of a child of the device tree's root node: of its `reg` property and its
+/// `ranges` property with its length in bytes, each zero when missing.
+struct NodeValues {
+    reg: u64
+    ranges: u64
+    ranges_len: u64
+} NodeValues
+
+/// The address of the table with a signature that the XSDT, or the RSDT for an RSDP of revision
+/// 0 or without an XSDT, lists; zero when none.
+fn listed_table(signature: u32) -> u64 {
+    let rsdp = rsdp_address()
+    if rsdp == 0 {
+        return 0
+    }
+    var root = u64.widen(u32_at(rsdp + RSDP_RSDT))
+    var width: u64 = 4
+    if byte_at(rsdp + RSDP_REVISION) >= 2 and u64_at(rsdp + RSDP_XSDT) != 0 {
+        root = u64_at(rsdp + RSDP_XSDT)
+        width = 8
+    }
+    let end = root + u64.widen(u32_at(root + 4))
+    var at = root + HEADER_BYTES
+    while at + width <= end {
+        var table = u64.widen(u32_at(at))
+        if width == 8 {
+            table = u64_at(at)
+        }
+        if table != 0 and u32_at(table) == signature {
+            return table
+        }
+        at += width
+    }
+    return 0
+} listed_table
+
+/// The first child of the device tree's root node whose `compatible` property lists a name.
+fn tree_node(compatible: Str) -> NodeValues {
+    var node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    let tree = tree_address()
+    if tree == 0 or u32_be_at(tree) != TREE_MAGIC {
+        return node
+    }
+    let strings = tree + u64.widen(u32_be_at(tree + TREE_STRINGS))
+    var at = tree + u64.widen(u32_be_at(tree + TREE_STRUCTURE))
+    var depth: u32 = 0
+    var matched = false
+    loop {
+        let token = u32_be_at(at)
+        at += 4
+        if token == BEGIN_NODE {
+            depth += 1
+            if depth == 2 {
+                node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+                matched = false
+            }
+            while byte_at(at) != 0 {
+                at += 1
+            }
+            at = (at + 4) / 4 * 4
+        } else if token == END_NODE {
+            if depth == 2 and matched {
+                return node
+            }
+            depth -= 1
+        } else if token == PROPERTY {
+            let len = u64.widen(u32_be_at(at))
+            let name = strings + u64.widen(u32_be_at(at + 4))
+            let value = at + 8
+            if depth == 2 and text_is(name, text: "compatible") {
+                matched = matched or lists(value, len, text: compatible)
+            } else if depth == 2 and text_is(name, text: "reg") {
+                node.reg = value
+            } else if depth == 2 and text_is(name, text: "ranges") {
+                node.ranges = value
+                node.ranges_len = len
+            }
+            at = value + (len + 3) / 4 * 4
+        } else if token == TREE_END {
+            return NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+        }
+    }
+} tree_node
+
+/// Whether the NUL-terminated text at an address is `text`.
+fn text_is(address: u64, text: Str) -> bool {
+    var at = address
+    for byte in text.as_bytes() {
+        if byte_at(at) != byte {
+            return false
+        }
+        at += 1
+    }
+    return byte_at(at) == 0
+} text_is
+
+/// Whether the NUL-separated texts of `len` bytes at an address include `text`.
+fn lists(address: u64, len: u64, text: Str) -> bool {
+    var at = address
+    while at < address + len {
+        if text_is(at, text) {
+            return true
+        }
+        while at < address + len and byte_at(at) != 0 {
+            at += 1
+        }
+        at += 1
+    }
+    return false
+} lists
+
+/// The byte at a physical address.
+fn byte_at(address: u64) -> u8 {
+    return trusted "the platform's tables lie in memory the running root maps, which nothing writes" { Ptr[u8].of_addr(usize.widen(address)).read() }
+} byte_at
+
+/// The little-endian 32-bit and 64-bit numbers at a physical address, and the big-endian ones.
+fn u32_at(address: u64) -> u32 {
+    var value: u32 = 0
+    for index in 0u64..<4 {
+        value = value | (u32.widen(byte_at(address + index)) << u32.fit(index * 8))
+    }
+    return value
+} u32_at
+
+fn u64_at(address: u64) -> u64 {
+    return u64.widen(u32_at(address)) | (u64.widen(u32_at(address + 4)) << 32)
+} u64_at
+
+fn u32_be_at(address: u64) -> u32 {
+    var value: u32 = 0
+    for index in 0u64..<4 {
+        value = (value << 8) | u32.widen(byte_at(address + index))
+    }
+    return value
+} u32_be_at
+
+fn u64_be_at(address: u64) -> u64 {
+    return (u64.widen(u32_be_at(address)) << 32) | u64.widen(u32_be_at(address + 4))
+} u64_be_at

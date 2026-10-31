@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 36] = [
+const DRAWING: [&str; 39] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -39,12 +39,15 @@ const DRAWING: [&str; 36] = [
     "sys::Stepper.step",
     "sys::sim::fs",
     "sys::sim::stdio",
+    "hw::Dma.of",
+    "hw::DmaShared.of",
     "hw::PerCpu.of",
     "hw::sim::Registers.of",
     "hw::sim::Registers.queue",
     "hw::sim::Registers.queue_at",
     "boot::Kernel.regions",
     "boot::Kernel.modules",
+    "boot::Kernel.pci_functions",
     "boot::Kernel.anchor",
     "boot::Machine.enter",
     "host::Runner.run",
@@ -66,8 +69,8 @@ const FAILING_DRAWS: [&str; 8] = [
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
-/// exhausted capability tables and cells.
-const TRAPPING: [&str; 30] = [
+/// exhausted capability tables, cells and runtime records.
+const TRAPPING: [&str; 32] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -98,6 +101,8 @@ const TRAPPING: [&str; 30] = [
     "hw::IrqShared.install",
     "hw::IrqShared.install_on",
     "hw::IrqShared.install_msi",
+    "hw::runtime_record",
+    "hw::hold",
 ];
 
 /// The supplied operations that change an atomic count without a type with interior mutability.

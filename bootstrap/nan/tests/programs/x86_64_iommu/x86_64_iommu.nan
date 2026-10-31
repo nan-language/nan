@@ -1,0 +1,205 @@
+//! Draws entropy through a confined driver, counts its MSI-X interrupts, aims its device at an unmapped bus address, then abandons a second driver mid-request and reuses its memory.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The byte filling the memory the devices must not reach, the nanoseconds the kernel waits for
+/// writes that must not happen, and the polls of an interrupt count before it gives up.
+const FILL: u8 = 0x5A
+
+const PAUSE_NS: u64 = 20_000_000
+
+const INTERRUPT_POLLS: u32 = 1_000_000
+
+/// A block of memory of the size the abandoned driver's buffers took.
+layout Block: bytes 4096 le {
+    data: Array[u8, 4096] at 0
+} Block
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn rate(level: u32) -> u32 {
+    return 1_000 / level
+} rate
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    let functions = mut k.pci_functions()
+    let Some(iommu) = mut k.iommu() else {
+        say(text: "iommu: none\n")
+        loop {
+        }
+    }
+    say(text: "iommu: enabled\n")
+    let drawing = new_domain(iommu)
+    let abandoning = new_domain(iommu)
+    take k.anchor(take iommu, run: fn[take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        var entropy = mem::List[hw::PciFunction].empty(alloc)
+        for function in take functions {
+            if rng::is_entropy(function) {
+                mut entropy.push(take function)
+            } else {
+                take function.release()
+            }
+        }
+        match mut entropy.pop() {
+            Some(function) => confined(take function, domain: take drawing, alloc)
+            None => {
+                say(text: "pci: no entropy function\n")
+                take drawing.close()
+            }
+        }
+        let next = mut entropy.pop()
+        release(take entropy)
+        match next {
+            Some(function) => try await abandoned(take function, domain: take abandoning, exec, alloc, clock)
+            None => {
+                say(text: "pci: no second entropy function\n")
+                take abandoning.close()
+            }
+        }
+    })
+} main
+
+/// A domain of the IOMMU; the kernel stops here when it has none.
+fn new_domain(iommu: hw::Iommu) -> hw::IoDomain {
+    match attempt iommu.domain() {
+        Ok(created) => return created
+        Err(_) => {
+            say(text: "iommu: no domain\n")
+            loop {
+            }
+        }
+    }
+} new_domain
+
+fn release(take functions: mem::List[hw::PciFunction]) {
+    for function in take functions {
+        take function.release()
+    }
+} release
+
+/// Draws entropy through a buffer of its domain, counts the queue's MSI-X interrupt, then aims
+/// the device at a buffer outside the domain.
+fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: mem::Alloc) {
+    let space = domain.space()
+    match rng::start(take function, space, alloc) {
+        Ok(started) => {
+            var device = started
+            if (attempt mut device.draw(space, alloc)).is_ok() {
+                say(text: "rng: drew 32 bytes through a domain buffer\n")
+            }
+            interrupted(mut device, space, alloc)
+            outside(mut device, alloc)
+            let stopped = take device.stop()
+            take stopped.release()
+        }
+        Err(refused) => {
+            say(text: "rng: did not start\n")
+            take refused.release()
+        }
+    }
+    take domain.close()
+} confined
+
+/// Draws entropy with the queue's completions raising MSI-X entry 0, and reports whether the
+/// interrupt arrived within `INTERRUPT_POLLS` polls of its count.
+fn interrupted(mut device: rng::Rng, space: hw::IoSpace, alloc: mem::Alloc) {
+    let Some(shared) = mut device.count_interrupts() else {
+        say(text: "msi-x: refused\n")
+        return
+    }
+    mut device.signal_used()
+    discard attempt mut device.draw(space, alloc)
+    var counted: u64 = 0
+    for _ in 0..<INTERRUPT_POLLS {
+        counted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut count: u64) -> u64 limits notrap, terminates, noalloc {
+                return count
+            })
+        })
+        if counted > 0 {
+            break
+        }
+    }
+    if counted > 0 {
+        say(text: "msi-x: the queue's interrupt arrived from the confined driver\n")
+    }
+    discard take shared.uninstall()
+} interrupted
+
+/// Restarts the device and asks it to write a buffer of physical memory its domain does not
+/// map, then checks the buffer kept its contents once the device has served the request.
+fn outside(mut device: rng::Rng, alloc: mem::Alloc) {
+    let heap = mem::Heap.of(alloc)
+    let target = hw::Dma.of(heap.boxed(rng::Entropy.from_bits(Array[u8, 32].filled(FILL))), space: hw::IoSpace.physical())
+    var served = false
+    if (attempt mut device.reset()).is_ok() {
+        served = (attempt mut device.request(target.bus_addr().value)).is_ok()
+    }
+    let kept = take target.into_box()
+    if served and untouched(kept.contents().data.view()) {
+        say(text: "fault: the device's write to an unmapped bus address changed nothing\n")
+    }
+} outside
+
+/// Starts a second driver in a domain of the kernel that traps once its request is posted, then
+/// fills memory the settlement freed and checks it keeps its contents.
+fn abandoned(take function: hw::PciFunction, take domain: hw::IoDomain, exec: task::Executor, alloc: mem::Alloc, clock: sys::Clock) fails task::Cancelled uses wait {
+    let level = hw::cpu_count() / 8
+    let ended = try await sys::Domain.run(fn[take function, take domain]() -> u32 limits stack 16_384 {
+        let space = domain.space()
+        var device = match rng::start(take function, space, alloc) {
+            Ok(started) => started
+            Err(refused) => {
+                take refused.release()
+                take domain.close()
+                return 0
+            }
+        }
+        let heap = mem::Heap.of(alloc)
+        let buffer = hw::Dma.of(heap.boxed(rng::Entropy.from_bits(Array[u8, 32].filled(0))), space)
+        mut device.post(buffer.bus_addr().value)
+        let rated = rate(level)
+        discard take buffer.into_box()
+        let stopped = take device.stop()
+        take stopped.release()
+        take domain.close()
+        return rated
+    }, exec, alloc)
+    if ended.is_ok() {
+        say(text: "abandoned: the domain returned\n")
+        return
+    }
+    let heap = mem::Heap.of(alloc)
+    var blocks = mem::List[mem::Box[Block]].empty(alloc)
+    for _ in 0u32..<16 {
+        mut blocks.push(heap.boxed(Block.from_bits(Array[u8, 4096].filled(FILL))))
+    }
+    try await clock.sleep_ns(PAUSE_NS)
+    var kept = true
+    for block in blocks.view() {
+        kept = kept and untouched(block.contents().data.view())
+    }
+    if kept {
+        say(text: "abandoned: settlement cut the device off and its memory kept what it was reused for\n")
+    }
+} abandoned
+
+/// Whether every byte of a view is `FILL`.
+fn untouched(bytes: Slice[u8]) -> bool {
+    for byte in bytes {
+        if byte != FILL {
+            return false
+        }
+    }
+    return true
+} untouched

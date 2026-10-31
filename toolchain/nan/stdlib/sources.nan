@@ -30,8 +30,11 @@ pkg enum StdFile derives Copy, Eq {
     HostPlatformStreams
     HostPlatformSystem
     HwHw
+    HwIommu
     HwPackage
+    HwPci
     HwSimSim
+    HwTables
     MemMem
     MemPackage
     MemWireWire
@@ -91,8 +94,11 @@ pkg fn StdFile.all(alloc: mem::Alloc) -> mem::List[StdFile] {
     mut files.push(StdFile.HostPlatformStreams)
     mut files.push(StdFile.HostPlatformSystem)
     mut files.push(StdFile.HwHw)
+    mut files.push(StdFile.HwIommu)
     mut files.push(StdFile.HwPackage)
+    mut files.push(StdFile.HwPci)
     mut files.push(StdFile.HwSimSim)
+    mut files.push(StdFile.HwTables)
     mut files.push(StdFile.MemMem)
     mut files.push(StdFile.MemPackage)
     mut files.push(StdFile.MemWireWire)
@@ -153,8 +159,11 @@ pkg proj fn StdFile.path(self) -> Str {
         StdFile.HostPlatformStreams => "host_platform/streams.nan"
         StdFile.HostPlatformSystem => "host_platform/system.nan"
         StdFile.HwHw => "hw/hw.nan"
+        StdFile.HwIommu => "hw/iommu.nan"
         StdFile.HwPackage => "hw/package.nan"
+        StdFile.HwPci => "hw/pci.nan"
         StdFile.HwSimSim => "hw/sim/sim.nan"
+        StdFile.HwTables => "hw/tables.nan"
         StdFile.MemMem => "mem/mem.nan"
         StdFile.MemPackage => "mem/package.nan"
         StdFile.MemWireWire => "mem/wire/wire.nan"
@@ -215,8 +224,11 @@ pkg proj fn StdFile.text(self) -> Str {
         StdFile.HostPlatformStreams => TEXT_HOST_PLATFORM_STREAMS
         StdFile.HostPlatformSystem => TEXT_HOST_PLATFORM_SYSTEM
         StdFile.HwHw => TEXT_HW_HW
+        StdFile.HwIommu => TEXT_HW_IOMMU
         StdFile.HwPackage => TEXT_HW_PACKAGE
+        StdFile.HwPci => TEXT_HW_PCI
         StdFile.HwSimSim => TEXT_HW_SIM_SIM
+        StdFile.HwTables => TEXT_HW_TABLES
         StdFile.MemMem => TEXT_MEM_MEM
         StdFile.MemPackage => TEXT_MEM_PACKAGE
         StdFile.MemWireWire => TEXT_MEM_WIRE_WIRE
@@ -368,6 +380,10 @@ const TEXT_BOOT_BOOT: Str =
     \\pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
     \\
     \\pub fn Kernel.modules(mut self) -> mem::List[Module]
+    \\
+    \\pub fn Kernel.iommu(mut self) -> Option[hw::Iommu]
+    \\
+    \\pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
     \\
     \\pub fn Kernel.command_line(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
     \\    let info = start_info()
@@ -8640,20 +8656,20 @@ const TEXT_HW_HW: Str =
     \\pub open linear struct Dma[T: AnyBits] {
     \\} Dma
     \\
-    \\pub fn Dma.of(take contents: mem::Box[T]) -> Dma[T]
+    \\pub fn Dma.of(take contents: mem::Box[T], space: IoSpace) -> Dma[T]
     \\
     \\pub fn Dma.bus_addr(self) -> BusAddr limits notrap, terminates, noalloc
     \\
-    \\pub proj fn Dma.contents(self) -> T
+    \\pub fn Dma.contents(self) -> T
     \\
-    \\pub proj fn Dma.contents_mut(mut self) -> T
+    \\pub fn Dma.write(mut self, take contents: T)
     \\
     \\pub fn Dma.into_box(take self) -> mem::Box[T]
     \\
     \\pub open linear struct DmaShared[T: AnyBits] {
     \\} DmaShared
     \\
-    \\pub fn DmaShared.of(take contents: mem::Box[T]) -> DmaShared[T]
+    \\pub fn DmaShared.of(take contents: mem::Box[T], space: IoSpace) -> DmaShared[T]
     \\
     \\pub fn DmaShared.bus_addr(self) -> BusAddr limits notrap, terminates, noalloc
     \\
@@ -8669,50 +8685,47 @@ const TEXT_HW_HW: Str =
     \\
     \\test dma_buffer_holds_the_boxed_value for Dma.of {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(7)))
+    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(7)), space: IoSpace.physical())
     \\    let contents = take buffer.into_box()
     \\    expect contents.contents()[3] == 7
     \\} dma_buffer_holds_the_boxed_value
     \\
     \\test bus_address_is_the_contents_address_on_the_host for Dma.bus_addr {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)))
-    \\    let start = Ptr.of_view(buffer.contents().view())
+    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)), space: IoSpace.physical())
     \\    let bus = buffer.bus_addr()
-    \\    expect bus.value == u64.widen(start.addr())
-    \\    discard take buffer.into_box()
+    \\    let contents = take buffer.into_box()
+    \\    expect bus.value == u64.widen(Ptr.of_view(contents.contents().view()).addr())
     \\} bus_address_is_the_contents_address_on_the_host
     \\
     \\test contents_reads_the_buffer for Dma.contents {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(3)))
+    \\    let buffer = Dma.of(heap.boxed(Array[u8, 4].filled(3)), space: IoSpace.physical())
     \\    let first_byte = buffer.contents()[0]
     \\    expect first_byte == 3
     \\    discard take buffer.into_box()
     \\} contents_reads_the_buffer
     \\
-    \\test contents_mut_writes_the_buffer for Dma.contents_mut {
+    \\test write_replaces_the_contents for Dma.write {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    var buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)))
-    \\    var bytes = mut buffer.contents_mut().view_mut()
-    \\    bytes[1] = 9
+    \\    var buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)), space: IoSpace.physical())
+    \\    mut buffer.write(Array[u8, 4].filled(9))
     \\    let written = buffer.contents()[1]
     \\    expect written == 9
     \\    discard take buffer.into_box()
-    \\} contents_mut_writes_the_buffer
+    \\} write_replaces_the_contents
     \\
     \\test into_box_returns_the_written_contents for Dma.into_box {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    var buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)))
-    \\    var bytes = mut buffer.contents_mut().view_mut()
-    \\    bytes[2] = 4
+    \\    var buffer = Dma.of(heap.boxed(Array[u8, 4].filled(0)), space: IoSpace.physical())
+    \\    mut buffer.write(Array[u8, 4].filled(4))
     \\    let contents = take buffer.into_box()
     \\    expect contents.contents()[2] == 4
     \\} into_box_returns_the_written_contents
     \\
     \\test shared_buffer_reaches_its_fields for DmaShared.of {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)))
+    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)), space: IoSpace.physical())
     \\    mut ring.write_release(Descriptor.length, value: 512)
     \\    let length = mut ring.read_acquire(Descriptor.length)
     \\    expect length == 512
@@ -8721,7 +8734,7 @@ const TEXT_HW_HW: Str =
     \\
     \\test shared_bus_address_is_the_contents_address_on_the_host for DmaShared.bus_addr {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    let ring = DmaShared.of(heap.boxed(Array[u8, 8].filled(0)))
+    \\    let ring = DmaShared.of(heap.boxed(Array[u8, 8].filled(0)), space: IoSpace.physical())
     \\    let bus = ring.bus_addr()
     \\    let contents = take ring.into_box()
     \\    expect bus.value == u64.widen(Ptr.of_view(contents.contents().view()).addr())
@@ -8729,7 +8742,7 @@ const TEXT_HW_HW: Str =
     \\
     \\test shared_into_box_returns_the_released_fields for DmaShared.into_box {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)))
+    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)), space: IoSpace.physical())
     \\    mut ring.write_release(Descriptor.next, value: 3)
     \\    let contents = take ring.into_box()
     \\    expect contents.contents().next == 3
@@ -8737,7 +8750,7 @@ const TEXT_HW_HW: Str =
     \\
     \\test dma_fence_keeps_earlier_writes for dma_fence {
     \\    let heap = mem::Heap.of(testing::world().alloc)
-    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)))
+    \\    var ring = DmaShared.of(heap.boxed(Descriptor(length: 0, flags: 0, next: 0)), space: IoSpace.physical())
     \\    mut ring.write_release(Descriptor.length, value: 64)
     \\    dma_fence()
     \\    mut ring.write_release(Descriptor.flags, value: 1)
@@ -9285,6 +9298,917 @@ const TEXT_HW_HW: Str =
     \\} PreemptEntry
     \\
 
+const TEXT_HW_IOMMU: Str =
+    \\//! I/O domains: the machine's IOMMU, which translates the DMA of each PCI function through the domain it is attached to, its domains and their spaces, the mappings of DMA buffers in them, and what settlement releases.
+    \\
+    \\/// The kinds of IOMMU the runtime drives: Intel VT-d and Arm SMMUv3.
+    \\const VTD: u64 = 1
+    \\
+    \\const SMMU: u64 = 2
+    \\
+    \\/// The offsets of the unit record, a chunk the runtime's flush and interrupt routines read too:
+    \\/// its kind, register base, command queue, the queue's next entry, the interrupt remapping
+    \\/// table, its flags, then past the runtime's lock and wait words, the table of bus 0's contexts
+    \\/// or streams, the free table pages, a bit per function of bus 0 it translates, and the domain
+    \\/// slots, each a domain record and a generation.
+    \\const UNIT_KIND: u64 = 0
+    \\
+    \\const UNIT_REGISTERS: u64 = 8
+    \\
+    \\const UNIT_QUEUE: u64 = 16
+    \\
+    \\const UNIT_REMAPPING: u64 = 32
+    \\
+    \\const UNIT_FLAGS: u64 = 40
+    \\
+    \\const UNIT_STREAMS: u64 = 64
+    \\
+    \\const UNIT_FREE: u64 = 72
+    \\
+    \\const UNIT_COVERED: u64 = 80
+    \\
+    \\const COVERED_WORDS: u64 = 4
+    \\
+    \\const UNIT_SLOTS: u64 = 128
+    \\
+    \\const SLOTS: u64 = 256
+    \\
+    \\const SLOT_BYTES: u64 = 16
+    \\
+    \\/// The unit's flags: interrupt remapping in extended mode, reads and writes drained by an
+    \\/// invalidation, table walks that miss the caches, and pass-through translation.
+    \\const EXTENDED_MODE: u64 = 1
+    \\
+    \\const DRAIN_READS: u64 = 2
+    \\
+    \\const DRAIN_WRITES: u64 = 4
+    \\
+    \\const UNCOHERENT: u64 = 8
+    \\
+    \\const PASS_THROUGH: u64 = 16
+    \\
+    \\/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function
+    \\/// and a mapping. Every such record holds its holding at offset 0.
+    \\const DOMAIN_TAG: u64 = 1
+    \\
+    \\const FUNCTION_TAG: u64 = 2
+    \\
+    \\const MAPPING_TAG: u64 = 3
+    \\
+    \\const RECORD_HOLDING: u64 = 0
+    \\
+    \\const RECORD_TAG: u64 = 8
+    \\
+    \\/// The holding kinds settlement releases through `settled`.
+    \\const UNMAP: u64 = 9
+    \\
+    \\const DETACH: u64 = 10
+    \\
+    \\/// A domain record, a table page: its slot and its root table; its SMMU context descriptor from
+    \\/// `DOMAIN_CONTEXT`.
+    \\const DOMAIN_SLOT: u64 = 16
+    \\
+    \\const DOMAIN_ROOT: u64 = 24
+    \\
+    \\const DOMAIN_CONTEXT: u64 = 64
+    \\
+    \\/// A mapping record: its space's key, its first address and its bytes.
+    \\const MAPPING_KEY: u64 = 16
+    \\
+    \\const MAPPING_ADDRESS: u64 = 24
+    \\
+    \\const MAPPING_BYTES: u64 = 32
+    \\
+    \\const MAPPING_RECORD: u64 = 40
+    \\
+    \\/// The bytes of a page, of a chunk, and of a cache line; the entries of a table and the bits of
+    \\/// an entry holding the next table or page.
+    \\const PAGE_BYTES: u64 = 4_096
+    \\
+    \\const CHUNK: u64 = 65_536
+    \\
+    \\const LINE_BYTES: u64 = 64
+    \\
+    \\const ENTRIES: u64 = 512
+    \\
+    \\const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000
+    \\
+    \\/// The bits of a present table entry, and of a present page entry: readable and writable on
+    \\/// VT-d; on SMMUv3 a page of normal memory, inner shareable, accessed, not global and
+    \\/// reachable by unprivileged requests, or such a page of device memory.
+    \\const TABLE_ENTRY: u64 = 0x3
+    \\
+    \\const VTD_PAGE: u64 = 0x3
+    \\
+    \\const SMMU_PAGE: u64 = 0xF43
+    \\
+    \\const SMMU_DEVICE_PAGE: u64 = 0xF47
+    \\
+    \\/// The key of the physical space.
+    \\const PHYSICAL_KEY: u64 = 0
+    \\
+    \\/// The domain id of functions VT-d passes through, and the first one of a slot's domain.
+    \\const PASS_DOMAIN: u64 = 1
+    \\
+    \\const FIRST_DOMAIN: u64 = 2
+    \\
+    \\/// The registers of VT-d that the runtime reads and writes, with the global command bits it
+    \\/// sets: translation, the root table pointer, queued invalidation, interrupt remapping and the
+    \\/// remapping table pointer; the status bits that stay set across a command; and the
+    \\/// capability and extended capability bits it needs.
+    \\registers VtdRegisters {
+    \\    capability: u64 at 0x08 read
+    \\    extended: u64 at 0x10 read
+    \\    command: u32 at 0x18 write
+    \\    status: u32 at 0x1C read
+    \\    root: u64 at 0x20 read write
+    \\    queue_tail: u64 at 0x88 read write
+    \\    queue_address: u64 at 0x90 read write
+    \\    remapping: u64 at 0xB8 read write
+    \\} VtdRegisters
+    \\
+    \\const TRANSLATE: u32 = 0x8000_0000
+    \\
+    \\const SET_ROOT: u32 = 0x4000_0000
+    \\
+    \\const QUEUED: u32 = 0x0400_0000
+    \\
+    \\const REMAP: u32 = 0x0200_0000
+    \\
+    \\const SET_REMAPPING: u32 = 0x0100_0000
+    \\
+    \\const KEPT_STATUS: u32 = 0x96FF_FFFF
+    \\
+    \\const FOUR_LEVELS: u64 = 0x400
+    \\
+    \\const DRAINS_READS: u64 = 0x80_0000_0000_0000
+    \\
+    \\const DRAINS_WRITES: u64 = 0x40_0000_0000_0000
+    \\
+    \\const COHERENT: u64 = 0x1
+    \\
+    \\const QUEUES: u64 = 0x2
+    \\
+    \\const REMAPS: u64 = 0x8
+    \\
+    \\const EXTENDS: u64 = 0x10
+    \\
+    \\const PASSES: u64 = 0x40
+    \\
+    \\/// The remapping table: 2^14 entries, one per CPU and vector, its size field, and the bit
+    \\/// selecting the extended mode.
+    \\const REMAPPING_CHUNKS: u64 = 4
+    \\
+    \\const REMAPPING_SIZE: u64 = 13
+    \\
+    \\const REMAPPING_EXTENDED: u64 = 0x800
+    \\
+    \\/// The remapping structures of the DMAR table: where they start, the kinds of a remapping
+    \\/// unit and of a reserved memory region, the flag of a unit including every PCI function, and
+    \\/// the table flag saying the platform remaps interrupts; where a unit's device scopes start, the
+    \\/// kind of an endpoint's scope and the length of one naming a device of its start bus.
+    \\const DMAR_STRUCTURES: u64 = 48
+    \\
+    \\const DMAR_SCOPES: u64 = 16
+    \\
+    \\const ENDPOINT_SCOPE: u8 = 1
+    \\
+    \\const ONE_HOP: u64 = 8
+    \\
+    \\const DMAR_UNIT: u32 = 0
+    \\
+    \\const DMAR_RESERVED: u32 = 1
+    \\
+    \\const ALL_FUNCTIONS: u8 = 1
+    \\
+    \\const REMAPS_INTERRUPTS: u8 = 1
+    \\
+    \\/// The registers of SMMUv3 that the runtime reads and writes.
+    \\registers SmmuRegisters {
+    \\    identity0: u32 at 0x0 read
+    \\    identity1: u32 at 0x4 read
+    \\    identity5: u32 at 0x14 read
+    \\    control: u32 at 0x20 read write
+    \\    control_ack: u32 at 0x24 read
+    \\    control1: u32 at 0x28 read write
+    \\    bypass: u32 at 0x44 read write
+    \\    streams: u64 at 0x80 read write
+    \\    streams_config: u32 at 0x88 read write
+    \\    queue_base: u64 at 0x90 read write
+    \\    queue_produce: u32 at 0x98 read write
+    \\    queue_consume: u32 at 0x9C read write
+    \\} SmmuRegisters
+    \\
+    \\/// The identity bits SMMUv3 needs: stage 1, AArch64 tables, coherent table walks, 4 KiB pages,
+    \\/// and the stream id bits; the control bits enabling it and its command queue; the bypass
+    \\/// register's update and abort bits; the read-allocate hint of a base register; inner
+    \\/// shareable write-back tables and queues; and a stream table and command queue of 2^8
+    \\/// entries.
+    \\const STAGE1: u32 = 0x2
+    \\
+    \\const AARCH64_TABLES: u32 = 0x8
+    \\
+    \\const WALKS_COHERENT: u32 = 0x10
+    \\
+    \\const GRANULE_4K: u32 = 0x10
+    \\
+    \\const ENABLED: u32 = 0x1
+    \\
+    \\const COMMANDS: u32 = 0x8
+    \\
+    \\const UPDATE: u32 = 0x8000_0000
+    \\
+    \\const ABORT: u32 = 0x10_0000
+    \\
+    \\const READ_ALLOCATE: u64 = 0x4000_0000_0000_0000
+    \\
+    \\const SHARED_CACHED: u32 = 0xD75
+    \\
+    \\const LOG2_ENTRIES: u64 = 8
+    \\
+    \\/// A stream table entry's words: valid, then translated by stage 1 through one context
+    \\/// descriptor or bypassing translation; the inner shareable write-back walks of its second word.
+    \\const STREAM_BYTES: u64 = 64
+    \\
+    \\const STREAM_TRANSLATED: u64 = 0xB
+    \\
+    \\const STREAM_BYPASS: u64 = 0x9
+    \\
+    \\const STREAM_WALKS: u64 = 0xD4
+    \\
+    \\/// A context descriptor's first word, a 48-bit space of 4 KiB pages walked inner shareable
+    \\/// write-back, the upper table disabled, valid, AArch64 tables, aborting faults, its output
+    \\/// size at `CONTEXT_SIZE` and its ASID at `CONTEXT_ASID`; its memory attributes, index 0
+    \\/// normal write-back and index 1 device memory.
+    \\const CONTEXT_FIRST: u64 = 0x0000_C200_C000_3510
+    \\
+    \\const CONTEXT_SIZE: u32 = 32
+    \\
+    \\const CONTEXT_ASID: u32 = 48
+    \\
+    \\const CONTEXT_ATTRIBUTES: u64 = 0xFF
+    \\
+    \\/// The ITS page a message-signalled interrupt writes, which a domain's functions reach.
+    \\const ITS_PAGE: u64 = 0x0809_0000
+    \\
+    \\/// The machine's IOMMU.
+    \\pub open linear struct Iommu {
+    \\} Iommu
+    \\
+    \\/// A domain of the IOMMU, which a slot of the unit names.
+    \\pub open linear struct IoDomain {
+    \\    record: u64
+    \\} IoDomain
+    \\
+    \\/// The addresses a function attached to a domain reaches, or physical memory.
+    \\pub open struct IoSpace derives Copy, Send {
+    \\    key: u64
+    \\} IoSpace
+    \\
+    \\pub closed enum IommuError derives Copy, Eq, Render {
+    \\    Exhausted
+    \\    Physical
+    \\    Closed
+    \\    Unsupported
+    \\} IommuError
+    \\
+    \\pub fn Iommu.domain(self) -> IoDomain fails IommuError {
+    \\    let unit = iommu_unit()
+    \\    let flags = iommu_lock()
+    \\    var slot: u64 = SLOTS
+    \\    for index in 0..<SLOTS {
+    \\        let entry = unit + UNIT_SLOTS + index * SLOT_BYTES
+    \\        if slot == SLOTS and peek(entry) == 0 and peek(entry + 8) != 0xFFFF_FFFF {
+    \\            slot = index
+    \\        }
+    \\    }
+    \\    var record: u64 = 0
+    \\    var root: u64 = 0
+    \\    if slot != SLOTS {
+    \\        record = table_page(unit)
+    \\        root = table_page(unit)
+    \\    }
+    \\    if root == 0 {
+    \\        if record != 0 {
+    \\            free_page(unit, page: record)
+    \\        }
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Exhausted
+    \\    }
+    \\    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    \\    poke(entry, value: record)
+    \\    poke(record + RECORD_TAG, value: DOMAIN_TAG)
+    \\    poke(record + DOMAIN_SLOT, value: slot)
+    \\    poke(record + DOMAIN_ROOT, value: root)
+    \\    if peek(unit + UNIT_KIND) == SMMU {
+    \\        let context = record + DOMAIN_CONTEXT
+    \\        let size = (peek(unit + UNIT_FLAGS) >> 8) & 0x7
+    \\        poke(context, value: CONTEXT_FIRST | (size << CONTEXT_SIZE) | ((slot + FIRST_DOMAIN) << CONTEXT_ASID))
+    \\        poke(context + 8, value: root)
+    \\        poke(context + 24, value: CONTEXT_ATTRIBUTES)
+    \\    }
+    \\    iommu_unlock(flags)
+    \\    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
+    \\    return IoDomain(record: record)
+    \\} Iommu.domain
+    \\
+    \\pub fn IoDomain.space(self) -> IoSpace {
+    \\    let unit = iommu_unit()
+    \\    let slot = peek(self.record + DOMAIN_SLOT)
+    \\    let generation = peek(unit + UNIT_SLOTS + slot * SLOT_BYTES + 8)
+    \\    return IoSpace(key: (slot + 1) | (generation << 32))
+    \\} IoDomain.space
+    \\
+    \\pub fn IoDomain.close(take self) {
+    \\    let IoDomain(record: record) = self
+    \\    unhold(peek(record + RECORD_HOLDING))
+    \\    close_domain(record)
+    \\} IoDomain.close
+    \\
+    \\pub fn IoSpace.physical() -> IoSpace {
+    \\    return IoSpace(key: PHYSICAL_KEY)
+    \\} IoSpace.physical
+    \\
+    \\/// The unit record the runtime keeps, zero before `boot::Kernel.iommu` enables the IOMMU.
+    \\pkg fn iommu_unit() -> u64
+    \\
+    \\/// Records the unit record of the enabled IOMMU.
+    \\pkg fn iommu_ready(unit: u64)
+    \\
+    \\/// Takes the unit's lock with maskable interrupts disabled, giving the state to restore.
+    \\pkg fn iommu_lock() -> u64
+    \\
+    \\pkg fn iommu_unlock(flags: u64)
+    \\
+    \\/// Invalidates every context, translation and interrupt entry the unit caches, under its lock,
+    \\/// and waits until it has.
+    \\pkg fn iommu_flush()
+    \\
+    \\/// `count` zeroed chunks of 64 KiB aligned to their size, zero when none is left.
+    \\pkg fn chunks(count: u64) -> u64
+    \\
+    \\/// A zeroed runtime record of `bytes` bytes, trapping with `trap.exhausted` when none is left,
+    \\/// and its release.
+    \\pkg fn runtime_record(bytes: u64) -> u64
+    \\
+    \\pkg fn free_record(address: u64)
+    \\
+    \\/// A holding of a kind and payload, owned by the running task's domain, and its release.
+    \\pkg fn hold(kind: u64, payload: u64) -> u64
+    \\
+    \\pkg fn unhold(holding: u64)
+    \\
+    \\/// Writes the cache line holding an address back to memory.
+    \\pkg fn flush_line(address: u64)
+    \\
+    \\/// Traps with `trap.exhausted`.
+    \\pkg fn exhausted() -> Never
+    \\
+    \\/// Whether the local APICs run in x2APIC mode.
+    \\pkg fn x2apic() -> bool
+    \\
+    \\/// The addresses of the ACPI root system description pointer and of the device tree the
+    \\/// platform gives, zero when none.
+    \\pkg fn rsdp_address() -> u64
+    \\
+    \\pkg fn tree_address() -> u64
+    \\
+    \\/// Whether the image runs on AArch64.
+    \\pkg fn on_aarch64() -> bool
+    \\
+    \\/// What `boot::Kernel.iommu` enables: the machine's IOMMU, with interrupt remapping on VT-d.
+    \\pkg fn started() -> Option[Iommu] {
+    \\    if on_aarch64() {
+    \\        return started_smmu()
+    \\    }
+    \\    return started_vtd()
+    \\} started
+    \\
+    \\/// Maps the pages from `address` holding `bytes` bytes in a space's domain at their own
+    \\/// addresses, giving the mapping's record held for settlement; zero for the physical space.
+    \\/// A closed domain's space maps nothing.
+    \\pkg fn mapped(space: IoSpace, address: u64, bytes: u64) -> u64 {
+    \\    if space.key == PHYSICAL_KEY {
+    \\        return 0
+    \\    }
+    \\    let unit = iommu_unit()
+    \\    let flags = iommu_lock()
+    \\    let domain = live(unit, key: space.key)
+    \\    if domain != 0 {
+    \\        if not map_range(unit, domain, address, bytes, device: false) {
+    \\            unmap_range(unit, domain, address, bytes)
+    \\            iommu_unlock(flags)
+    \\            exhausted()
+    \\        }
+    \\        iommu_flush()
+    \\    }
+    \\    iommu_unlock(flags)
+    \\    let mapping = runtime_record(MAPPING_RECORD)
+    \\    poke(mapping + RECORD_TAG, value: MAPPING_TAG)
+    \\    poke(mapping + MAPPING_KEY, value: space.key)
+    \\    poke(mapping + MAPPING_ADDRESS, value: address)
+    \\    poke(mapping + MAPPING_BYTES, value: bytes)
+    \\    poke(mapping + RECORD_HOLDING, value: hold(UNMAP, payload: mapping))
+    \\    return mapping
+    \\} mapped
+    \\
+    \\/// Ends a mapping `mapped` gave, waiting until the IOMMU no longer translates its pages.
+    \\pkg fn unmapped(mapping: u64) {
+    \\    unhold(peek(mapping + RECORD_HOLDING))
+    \\    end_mapping(mapping)
+    \\} unmapped
+    \\
+    \\/// Releases what a holding of an abandoned domain holds: a mapping ends, and a domain or
+    \\/// function is cut off from memory.
+    \\pkg fn settled(kind: u64, payload: u64) {
+    \\    let tag = peek(payload + RECORD_TAG)
+    \\    if kind == UNMAP {
+    \\        end_mapping(payload)
+    \\    } else if tag == DOMAIN_TAG {
+    \\        close_domain(payload)
+    \\    } else {
+    \\        cut_off(payload)
+    \\    }
+    \\} settled
+    \\
+    \\/// Unmaps a mapping's pages when its domain is live, and frees its record.
+    \\fn end_mapping(mapping: u64) {
+    \\    let unit = iommu_unit()
+    \\    if unit != 0 {
+    \\        let flags = iommu_lock()
+    \\        let domain = live(unit, key: peek(mapping + MAPPING_KEY))
+    \\        if domain != 0 {
+    \\            unmap_range(unit, domain, address: peek(mapping + MAPPING_ADDRESS), bytes: peek(mapping + MAPPING_BYTES))
+    \\            iommu_flush()
+    \\        }
+    \\        iommu_unlock(flags)
+    \\    }
+    \\    free_record(mapping)
+    \\} end_mapping
+    \\
+    \\/// Ends a domain: every function attached to it stops reaching memory, its slot takes a new
+    \\/// generation, and once the unit no longer caches its translations its tables are freed.
+    \\fn close_domain(record: u64) {
+    \\    let unit = iommu_unit()
+    \\    let flags = iommu_lock()
+    \\    let slot = peek(record + DOMAIN_SLOT)
+    \\    for requester in 0..<256u64 {
+    \\        if attached_domain(unit, requester) == slot + FIRST_DOMAIN {
+    \\            clear_entry(unit, requester)
+    \\        }
+    \\    }
+    \\    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    \\    poke(entry, value: 0)
+    \\    poke(entry + 8, value: peek(entry + 8) + 1)
+    \\    iommu_flush()
+    \\    free_tables(unit, root: peek(record + DOMAIN_ROOT))
+    \\    free_page(unit, page: record)
+    \\    iommu_unlock(flags)
+    \\} close_domain
+    \\
+    \\/// The record of the domain a space's key names, zero when the key is stale or names no slot.
+    \\fn live(unit: u64, key: u64) -> u64 {
+    \\    let slot = (key & 0xFFFF_FFFF).wrapping_sub(1)
+    \\    if slot >= SLOTS {
+    \\        return 0
+    \\    }
+    \\    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
+    \\    if peek(entry + 8) != (key >> 32) {
+    \\        return 0
+    \\    }
+    \\    return peek(entry)
+    \\} live
+    \\
+    \\/// The domain id a requester's context or stream reaches, zero when it reaches none: the
+    \\/// pass-through id, or a slot's plus `FIRST_DOMAIN`.
+    \\fn attached_domain(unit: u64, requester: u64) -> u64 {
+    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\    let head = peek(entry)
+    \\    if (head & 1) == 0 {
+    \\        return 0
+    \\    }
+    \\    if peek(unit + UNIT_KIND) == VTD {
+    \\        return (peek(entry + 8) >> 8) & 0xFFFF
+    \\    }
+    \\    if (head & 0xE) == (STREAM_BYPASS & 0xE) {
+    \\        return PASS_DOMAIN
+    \\    }
+    \\    let context = head & 0x000F_FFFF_FFFF_FFC0
+    \\    return peek(context - DOMAIN_CONTEXT + DOMAIN_SLOT) + FIRST_DOMAIN
+    \\} attached_domain
+    \\
+    \\/// The bytes of a context entry or stream table entry.
+    \\fn entry_bytes(unit: u64) -> u64 {
+    \\    if peek(unit + UNIT_KIND) == VTD {
+    \\        return 16
+    \\    }
+    \\    return STREAM_BYTES
+    \\} entry_bytes
+    \\
+    \\/// Points a requester's context or stream at a domain, or passes it through for zero, under
+    \\/// the unit's lock; the first word, holding the valid bit, is written last.
+    \\fn set_entry(unit: u64, requester: u64, domain: u64) {
+    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\    if peek(unit + UNIT_KIND) == VTD {
+    \\        if domain == 0 {
+    \\            poke(entry + 8, value: 0x2 | (PASS_DOMAIN << 8))
+    \\            poke(entry, value: 0x9)
+    \\        } else {
+    \\            poke(entry + 8, value: 0x2 | ((peek(domain + DOMAIN_SLOT) + FIRST_DOMAIN) << 8))
+    \\            poke(entry, value: peek(domain + DOMAIN_ROOT) | 0x1)
+    \\        }
+    \\    } else if domain == 0 {
+    \\        poke(entry + 8, value: STREAM_WALKS)
+    \\        poke(entry, value: STREAM_BYPASS)
+    \\    } else {
+    \\        poke(entry + 8, value: STREAM_WALKS)
+    \\        poke(entry, value: (domain + DOMAIN_CONTEXT) | STREAM_TRANSLATED)
+    \\    }
+    \\    publish(unit, address: entry, bytes: 16)
+    \\} set_entry
+    \\
+    \\/// Makes a requester's DMA reach nothing, under the unit's lock.
+    \\fn clear_entry(unit: u64, requester: u64) {
+    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\    poke(entry, value: 0)
+    \\    publish(unit, address: entry, bytes: 8)
+    \\} clear_entry
+    \\
+    \\/// Maps the pages of a range at their own addresses in a domain's tables, as device memory on
+    \\/// SMMUv3 when `device` holds, under the unit's lock; false when no table page is left.
+    \\fn map_range(unit: u64, domain: u64, address: u64, bytes: u64, device: bool) -> bool {
+    \\    var leaf = VTD_PAGE
+    \\    if peek(unit + UNIT_KIND) == SMMU and device {
+    \\        leaf = SMMU_DEVICE_PAGE
+    \\    } else if peek(unit + UNIT_KIND) == SMMU {
+    \\        leaf = SMMU_PAGE
+    \\    }
+    \\    let root = peek(domain + DOMAIN_ROOT)
+    \\    var page = address & ~(PAGE_BYTES - 1)
+    \\    while page < address + bytes {
+    \\        let entry = leaf_entry(unit, root, address: page, create: true)
+    \\        if entry == 0 {
+    \\            return false
+    \\        }
+    \\        poke(entry, value: page | leaf)
+    \\        publish(unit, address: entry, bytes: 8)
+    \\        page += PAGE_BYTES
+    \\    }
+    \\    return true
+    \\} map_range
+    \\
+    \\/// Unmaps the pages of a range in a domain's tables, under the unit's lock.
+    \\fn unmap_range(unit: u64, domain: u64, address: u64, bytes: u64) {
+    \\    let root = peek(domain + DOMAIN_ROOT)
+    \\    var page = address & ~(PAGE_BYTES - 1)
+    \\    while page < address + bytes {
+    \\        let entry = leaf_entry(unit, root, address: page, create: false)
+    \\        if entry != 0 {
+    \\            poke(entry, value: 0)
+    \\            publish(unit, address: entry, bytes: 8)
+    \\        }
+    \\        page += PAGE_BYTES
+    \\    }
+    \\} unmap_range
+    \\
+    \\/// The address of the last-level entry of a page in a four-level table from `root`, adding the
+    \\/// missing tables when `create` holds; zero when one is missing or no table page is left.
+    \\fn leaf_entry(unit: u64, root: u64, address: u64, create: bool) -> u64 {
+    \\    var table = root
+    \\    for level in 0u32..<3 {
+    \\        let entry = table + ((address >> (39 - 9 * level)) & (ENTRIES - 1)) * 8
+    \\        var next = peek(entry)
+    \\        if (next & 1) == 0 {
+    \\            if not create {
+    \\                return 0
+    \\            }
+    \\            next = table_page(unit)
+    \\            if next == 0 {
+    \\                return 0
+    \\            }
+    \\            poke(entry, value: next | TABLE_ENTRY)
+    \\            publish(unit, address: entry, bytes: 8)
+    \\        }
+    \\        table = next & FRAME_MASK
+    \\    }
+    \\    return table + ((address >> 12) & (ENTRIES - 1)) * 8
+    \\} leaf_entry
+    \\
+    \\/// Frees the tables of a four-level table from `root`, under the unit's lock.
+    \\fn free_tables(unit: u64, root: u64) {
+    \\    for index in 0..<ENTRIES {
+    \\        let entry = peek(root + index * 8)
+    \\        if (entry & 1) != 0 {
+    \\            free_middle(unit, table: entry & FRAME_MASK, levels: 2)
+    \\        }
+    \\    }
+    \\    free_page(unit, page: root)
+    \\} free_tables
+    \\
+    \\/// Frees a table holding `levels` levels of tables below it, and those tables.
+    \\fn free_middle(unit: u64, table: u64, levels: u64) {
+    \\    if levels != 0 {
+    \\        for index in 0..<ENTRIES {
+    \\            let entry = peek(table + index * 8)
+    \\            if (entry & 1) != 0 {
+    \\                free_leaves(unit, table: entry & FRAME_MASK, levels: levels - 1)
+    \\            }
+    \\        }
+    \\    }
+    \\    free_page(unit, page: table)
+    \\} free_middle
+    \\
+    \\fn free_leaves(unit: u64, table: u64, levels: u64) {
+    \\    if levels != 0 {
+    \\        for index in 0..<ENTRIES {
+    \\            let entry = peek(table + index * 8)
+    \\            if (entry & 1) != 0 {
+    \\                free_page(unit, page: entry & FRAME_MASK)
+    \\            }
+    \\        }
+    \\    }
+    \\    free_page(unit, page: table)
+    \\} free_leaves
+    \\
+    \\/// A zeroed table page the hardware sees as zeroed, drawn from the unit's free pages or from a
+    \\/// new chunk; zero when none is left. The caller holds the unit's lock.
+    \\fn table_page(unit: u64) -> u64 {
+    \\    var page = peek(unit + UNIT_FREE)
+    \\    if page != 0 {
+    \\        poke(unit + UNIT_FREE, value: peek(page))
+    \\        poke(page, value: 0)
+    \\    } else {
+    \\        page = chunks(1)
+    \\        if page == 0 {
+    \\            return 0
+    \\        }
+    \\        var rest = page + PAGE_BYTES
+    \\        while rest < page + CHUNK {
+    \\            free_page(unit, page: rest)
+    \\            rest += PAGE_BYTES
+    \\        }
+    \\    }
+    \\    publish(unit, address: page, bytes: PAGE_BYTES)
+    \\    return page
+    \\} table_page
+    \\
+    \\/// Returns a page to the unit's free pages, zeroed but for the link in its first word.
+    \\fn free_page(unit: u64, page: u64) {
+    \\    for index in 1..<ENTRIES {
+    \\        poke(page + index * 8, value: 0)
+    \\    }
+    \\    poke(page, value: peek(unit + UNIT_FREE))
+    \\    poke(unit + UNIT_FREE, value: page)
+    \\} free_page
+    \\
+    \\/// Writes the lines of a range back to memory when the unit's table walks miss the caches.
+    \\fn publish(unit: u64, address: u64, bytes: u64) {
+    \\    if (peek(unit + UNIT_FLAGS) & UNCOHERENT) == 0 {
+    \\        return
+    \\    }
+    \\    var line = address & ~(LINE_BYTES - 1)
+    \\    while line < address + bytes {
+    \\        flush_line(line)
+    \\        line += LINE_BYTES
+    \\    }
+    \\} publish
+    \\
+    \\/// Enables VT-d: the remapping unit of the DMAR table, when it is the only one, the table lists
+    \\/// no reserved memory region, and the unit remaps interrupts, queues invalidations and walks
+    \\/// four-level tables. Every function's DMA then reaches nothing until it is attached,
+    \\/// and interrupts reach CPUs only through the remapping table.
+    \\fn started_vtd() -> Option[Iommu] {
+    \\    let drhd = vtd_unit()
+    \\    if drhd == 0 {
+    \\        return None
+    \\    }
+    \\    let base = u64_at(drhd + 8)
+    \\    var regs = trusted "the DMAR table names the remapping unit's registers, which the entry root maps uncached, and nothing else maps them" { Mmio[VtdRegisters].map(base) }
+    \\    let caps = mut regs.read(VtdRegisters.capability)
+    \\    let features = mut regs.read(VtdRegisters.extended)
+    \\    let needed = QUEUES | REMAPS
+    \\    if (features & needed) != needed or (caps & FOUR_LEVELS) == 0 {
+    \\        take regs.unmap()
+    \\        return None
+    \\    }
+    \\    let unit = chunks(1)
+    \\    let remapping = chunks(REMAPPING_CHUNKS)
+    \\    if unit == 0 or remapping == 0 {
+    \\        take regs.unmap()
+    \\        return None
+    \\    }
+    \\    var flags: u64 = 0
+    \\    if (features & EXTENDS) != 0 and x2apic() {
+    \\        flags |= EXTENDED_MODE
+    \\    }
+    \\    if (caps & DRAINS_READS) != 0 {
+    \\        flags |= DRAIN_READS
+    \\    }
+    \\    if (caps & DRAINS_WRITES) != 0 {
+    \\        flags |= DRAIN_WRITES
+    \\    }
+    \\    if (features & COHERENT) == 0 {
+    \\        flags |= UNCOHERENT
+    \\    }
+    \\    if (features & PASSES) != 0 {
+    \\        flags |= PASS_THROUGH
+    \\    }
+    \\    poke(unit + UNIT_KIND, value: VTD)
+    \\    poke(unit + UNIT_REGISTERS, value: base)
+    \\    poke(unit + UNIT_REMAPPING, value: remapping)
+    \\    poke(unit + UNIT_FLAGS, value: flags)
+    \\    cover_scopes(unit, drhd)
+    \\    let root = table_page(unit)
+    \\    let contexts = table_page(unit)
+    \\    poke(unit + UNIT_QUEUE, value: table_page(unit))
+    \\    poke(unit + UNIT_STREAMS, value: contexts)
+    \\    poke(root, value: contexts | 0x1)
+    \\    publish(unit, address: root, bytes: 16)
+    \\    publish(unit, address: remapping, bytes: REMAPPING_CHUNKS * CHUNK)
+    \\    mut regs.write(VtdRegisters.root, value: root)
+    \\    vtd_command(mut regs, bit: SET_ROOT)
+    \\    mut regs.write(VtdRegisters.queue_tail, value: 0)
+    \\    mut regs.write(VtdRegisters.queue_address, value: peek(unit + UNIT_QUEUE))
+    \\    vtd_command(mut regs, bit: QUEUED)
+    \\    iommu_ready(unit)
+    \\    var remapped = remapping | REMAPPING_SIZE
+    \\    if (flags & EXTENDED_MODE) != 0 {
+    \\        remapped |= REMAPPING_EXTENDED
+    \\    }
+    \\    mut regs.write(VtdRegisters.remapping, value: remapped)
+    \\    vtd_command(mut regs, bit: SET_REMAPPING)
+    \\    let held = iommu_lock()
+    \\    iommu_flush()
+    \\    iommu_unlock(held)
+    \\    vtd_command(mut regs, bit: REMAP)
+    \\    vtd_command(mut regs, bit: TRANSLATE)
+    \\    take regs.unmap()
+    \\    return Some(Iommu())
+    \\} started_vtd
+    \\
+    \\/// Sets a bit of VT-d's global command, keeping the persistent ones its status reports, and
+    \\/// waits until its status reports it.
+    \\fn vtd_command(mut regs: Mmio[VtdRegisters], bit: u32) {
+    \\    let status = mut regs.read(VtdRegisters.status) & KEPT_STATUS
+    \\    mut regs.write(VtdRegisters.command, value: status | bit)
+    \\    while (mut regs.read(VtdRegisters.status) & bit) == 0 {
+    \\    }
+    \\} vtd_command
+    \\
+    \\/// The DMAR table's one remapping unit when it lies in segment 0, the table lists no reserved
+    \\/// memory region and the platform remaps interrupts; zero otherwise.
+    \\fn vtd_unit() -> u64 {
+    \\    let dmar = listed_table(0x5241_4D44)
+    \\    if dmar == 0 or (byte_at(dmar + 37) & REMAPS_INTERRUPTS) == 0 {
+    \\        return 0
+    \\    }
+    \\    let end = dmar + u64.widen(u32_at(dmar + 4))
+    \\    var at = dmar + DMAR_STRUCTURES
+    \\    var unit: u64 = 0
+    \\    var units: u32 = 0
+    \\    while at + 4 <= end {
+    \\        let kind = u32_at(at) & 0xFFFF
+    \\        let length = u64.widen(u32_at(at) >> 16)
+    \\        if length == 0 or kind == DMAR_RESERVED {
+    \\            return 0
+    \\        }
+    \\        if kind == DMAR_UNIT {
+    \\            units += 1
+    \\            if (u32_at(at + 4) >> 16) == 0 {
+    \\                unit = at
+    \\            }
+    \\        }
+    \\        at += length
+    \\    }
+    \\    if units != 1 {
+    \\        return 0
+    \\    }
+    \\    return unit
+    \\} vtd_unit
+    \\
+    \\/// Records in the unit the functions of bus 0 a remapping unit translates: every one when it
+    \\/// includes every PCI function, otherwise the endpoints its device scopes name on bus 0.
+    \\fn cover_scopes(unit: u64, drhd: u64) {
+    \\    if (byte_at(drhd + 4) & ALL_FUNCTIONS) != 0 {
+    \\        cover_all(unit)
+    \\        return
+    \\    }
+    \\    let end = drhd + u64.widen(u32_at(drhd) >> 16)
+    \\    var at = drhd + DMAR_SCOPES
+    \\    while at + 2 <= end {
+    \\        let length = u64.widen(byte_at(at + 1))
+    \\        if length == 0 {
+    \\            return
+    \\        }
+    \\        if byte_at(at) == ENDPOINT_SCOPE and length == ONE_HOP and byte_at(at + 5) == 0 {
+    \\            let requester = (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
+    \\            cover(unit, requester)
+    \\        }
+    \\        at += length
+    \\    }
+    \\} cover_scopes
+    \\
+    \\/// Records that the unit translates every function of bus 0.
+    \\fn cover_all(unit: u64) {
+    \\    for word in 0..<COVERED_WORDS {
+    \\        poke(unit + UNIT_COVERED + word * 8, value: 0xFFFF_FFFF_FFFF_FFFF)
+    \\    }
+    \\} cover_all
+    \\
+    \\/// Records that the unit translates a requester of bus 0.
+    \\fn cover(unit: u64, requester: u64) {
+    \\    let at = unit + UNIT_COVERED + (requester >> 6) * 8
+    \\    poke(at, value: peek(at) | (1u64 << u32.truncate(requester & 0x3F)))
+    \\} cover
+    \\
+    \\/// Whether the unit translates a requester of bus 0.
+    \\fn covered(unit: u64, requester: u64) -> bool {
+    \\    let bits = peek(unit + UNIT_COVERED + (requester >> 6) * 8)
+    \\    return ((bits >> u32.truncate(requester & 0x3F)) & 1) != 0
+    \\} covered
+    \\
+    \\/// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
+    \\/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0. Every
+    \\/// function's DMA then reaches nothing until it is attached.
+    \\fn started_smmu() -> Option[Iommu] {
+    \\    let node = tree_node(compatible: "arm,smmu-v3")
+    \\    if node.reg == 0 {
+    \\        return None
+    \\    }
+    \\    let base = u64_be_at(node.reg)
+    \\    var regs = trusted "the device tree names the SMMU's registers, which the entry root maps as device memory, and nothing else maps them" { Mmio[SmmuRegisters].map(base) }
+    \\    let identity = mut regs.read(SmmuRegisters.identity0)
+    \\    let needed = STAGE1 | WALKS_COHERENT
+    \\    let sizes = mut regs.read(SmmuRegisters.identity5)
+    \\    let stream_bits = u64.widen(mut regs.read(SmmuRegisters.identity1) & 0x3F)
+    \\    if (identity & needed) != needed or (identity & AARCH64_TABLES) == 0 or (sizes & GRANULE_4K) == 0 or stream_bits < LOG2_ENTRIES {
+    \\        take regs.unmap()
+    \\        return None
+    \\    }
+    \\    let unit = chunks(1)
+    \\    let streams = chunks(1)
+    \\    if unit == 0 or streams == 0 {
+    \\        take regs.unmap()
+    \\        return None
+    \\    }
+    \\    poke(unit + UNIT_KIND, value: SMMU)
+    \\    poke(unit + UNIT_REGISTERS, value: base)
+    \\    poke(unit + UNIT_FLAGS, value: u64.widen(sizes & 0x7) << 8)
+    \\    poke(unit + UNIT_STREAMS, value: streams)
+    \\    cover_all(unit)
+    \\    let queue = table_page(unit)
+    \\    poke(unit + UNIT_QUEUE, value: queue)
+    \\    mut regs.write(SmmuRegisters.control, value: 0)
+    \\    while mut regs.read(SmmuRegisters.control_ack) != 0 {
+    \\    }
+    \\    mut regs.write(SmmuRegisters.bypass, value: UPDATE | ABORT)
+    \\    while (mut regs.read(SmmuRegisters.bypass) & UPDATE) != 0 {
+    \\    }
+    \\    mut regs.write(SmmuRegisters.control1, value: SHARED_CACHED)
+    \\    mut regs.write(SmmuRegisters.streams, value: streams | READ_ALLOCATE)
+    \\    mut regs.write(SmmuRegisters.streams_config, value: u32.truncate(LOG2_ENTRIES))
+    \\    mut regs.write(SmmuRegisters.queue_base, value: queue | READ_ALLOCATE | LOG2_ENTRIES)
+    \\    mut regs.write(SmmuRegisters.queue_produce, value: 0)
+    \\    mut regs.write(SmmuRegisters.queue_consume, value: 0)
+    \\    smmu_control(mut regs, value: COMMANDS)
+    \\    iommu_ready(unit)
+    \\    let held = iommu_lock()
+    \\    iommu_flush()
+    \\    iommu_unlock(held)
+    \\    smmu_control(mut regs, value: COMMANDS | ENABLED)
+    \\    take regs.unmap()
+    \\    return Some(Iommu())
+    \\} started_smmu
+    \\
+    \\/// Writes SMMUv3's control register and waits until it acknowledges the value.
+    \\fn smmu_control(mut regs: Mmio[SmmuRegisters], value: u32) {
+    \\    mut regs.write(SmmuRegisters.control, value)
+    \\    while mut regs.read(SmmuRegisters.control_ack) != value {
+    \\    }
+    \\} smmu_control
+    \\
+    \\/// The word at an address of runtime memory.
+    \\fn peek(address: u64) -> u64 {
+    \\    return trusted "the unit's records and tables lie in runtime memory that the running root maps" { Ptr[u64].of_addr(usize.widen(address)).read() }
+    \\} peek
+    \\
+    \\fn poke(address: u64, value: u64) {
+    \\    trusted "the unit's records and tables lie in runtime memory that the running root maps, which only the unit's lock holder writes" {
+    \\        Ptr[u64].of_addr(usize.widen(address)).write(value)
+    \\    }
+    \\} poke
+    \\
+    \\test physical_space_keeps_a_buffer_in_place for IoSpace.physical {
+    \\    let heap = mem::Heap.of(testing::world().alloc)
+    \\    let contents = heap.boxed(Array[u8, 4].filled(7))
+    \\    let address = u64.widen(Ptr.of_view(contents.contents().view()).addr())
+    \\    let buffer = Dma.of(take contents, space: IoSpace.physical())
+    \\    let bus = buffer.bus_addr()
+    \\    discard take buffer.into_box()
+    \\    expect bus.value == address
+    \\} physical_space_keeps_a_buffer_in_place
+    \\
+
 const TEXT_HW_PACKAGE: Str =
     \\//! Pointers, address types, register windows, DMA, privileged intrinsics and kernel primitives.
     \\
@@ -9292,6 +10216,505 @@ const TEXT_HW_PACKAGE: Str =
     \\    language 1
     \\    targets any
     \\} hw
+    \\
+
+const TEXT_HW_PCI: Str =
+    \\//! PCI functions: the endpoints of bus 0, their configuration, the register windows of their memory BARs, their attachment to I/O domains, and their MSI-X interrupts.
+    \\
+    \\/// A function record's offsets: past its holding and tag, its requester id, the ECAM base its
+    \\/// configuration is read through, zero for port I/O, the space it is attached to, its taken
+    \\/// BARs, its MSI-X capability's offset, the offset from its BARs' bus addresses to the CPU's,
+    \\/// then each BAR's base, size and kind.
+    \\const FUNCTION_REQUESTER: u64 = 16
+    \\
+    \\const FUNCTION_ECAM: u64 = 24
+    \\
+    \\const FUNCTION_ATTACHED: u64 = 32
+    \\
+    \\const FUNCTION_TAKEN: u64 = 40
+    \\
+    \\const FUNCTION_MSIX: u64 = 48
+    \\
+    \\const FUNCTION_WINDOW: u64 = 56
+    \\
+    \\const FUNCTION_BARS: u64 = 64
+    \\
+    \\const BAR_BYTES: u64 = 24
+    \\
+    \\const BARS: u64 = 6
+    \\
+    \\const FUNCTION_RECORD: u64 = 208
+    \\
+    \\/// The attachment of a function attached to physical memory.
+    \\const ATTACHED_PHYSICAL: u64 = 0xFFFF_FFFF_FFFF_FFFF
+    \\
+    \\/// The kinds of a BAR: none, 32-bit memory, I/O and 64-bit memory.
+    \\const NO_BAR: u64 = 0
+    \\
+    \\const MEMORY32: u64 = 1
+    \\
+    \\const IO_BAR: u64 = 2
+    \\
+    \\const MEMORY64: u64 = 3
+    \\
+    \\/// The configuration offsets the runtime reads and writes: the ids, the command and status,
+    \\/// the class and revision, the header type, the first BAR and the capability list's head; the
+    \\/// command bits decoding memory, mastering the bus and disabling INTx; the status bit
+    \\/// announcing capabilities; the class of bridges; and the MSI-X capability's id with its
+    \\/// enable and function mask bits.
+    \\const IDS_OFFSET: u32 = 0x00
+    \\
+    \\const COMMAND_OFFSET: u32 = 0x04
+    \\
+    \\const CLASS_OFFSET: u32 = 0x08
+    \\
+    \\const HEADER_OFFSET: u32 = 0x0C
+    \\
+    \\const FIRST_BAR: u32 = 0x10
+    \\
+    \\const CAPABILITIES_OFFSET: u32 = 0x34
+    \\
+    \\const MEMORY: u32 = 0x2
+    \\
+    \\const BUS_MASTER: u32 = 0x4
+    \\
+    \\const INTX_DISABLE: u32 = 0x400
+    \\
+    \\const HAS_CAPABILITIES: u32 = 0x10
+    \\
+    \\const BRIDGE: u32 = 0x06
+    \\
+    \\const MSIX_ID: u32 = 0x11
+    \\
+    \\const MSIX_ENABLE: u32 = 0x8000_0000
+    \\
+    \\const MSIX_MASKED: u32 = 0x4000_0000
+    \\
+    \\/// The configuration space of a bus in an ECAM, and the memory the entry root maps as device
+    \\/// memory: the last gigabyte below 4 GiB on x86_64, the first gigabyte on AArch64.
+    \\const BUS_BYTES: u64 = 0x10_0000
+    \\
+    \\const X86_DEVICES: u64 = 0xC000_0000
+    \\
+    \\const X86_DEVICES_END: u64 = 0x1_0000_0000
+    \\
+    \\const AARCH64_DEVICES_END: u64 = 0x4000_0000
+    \\
+    \\/// The bus address window of 32-bit memory a device tree's `ranges` names, by the space code of
+    \\/// its first cell, and an entry's bytes.
+    \\const MEMORY_SPACE: u32 = 2
+    \\
+    \\const RANGE_BYTES: u64 = 28
+    \\
+    \\/// An MSI-X table entry.
+    \\registers MsixEntry {
+    \\    address_low: u32 at 0x0 write
+    \\    address_high: u32 at 0x4 write
+    \\    data: u32 at 0x8 write
+    \\    control: u32 at 0xC write
+    \\} MsixEntry
+    \\
+    \\/// A function of PCI bus 0.
+    \\pub open linear struct PciFunction {
+    \\    record: u64
+    \\} PciFunction
+    \\
+    \\pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
+    \\    pub bus: u8
+    \\    pub device: u8
+    \\    pub function: u8
+    \\} PciAddress
+    \\
+    \\pub closed enum PciError derives Copy, Eq, Render {
+    \\    NotMemory
+    \\    TooSmall
+    \\    Taken
+    \\    Unmapped
+    \\} PciError
+    \\
+    \\/// The bus addresses of 32-bit memory BARs are assigned from, with the offset turning a bus
+    \\/// address into the CPU's; an empty window assigns none.
+    \\struct BusWindow {
+    \\    start: u64
+    \\    end: u64
+    \\    offset: u64
+    \\} BusWindow
+    \\
+    \\pub fn PciFunction.address(self) -> PciAddress {
+    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
+    \\    return PciAddress(bus: 0, device: u8.truncate(requester >> 3), function: u8.truncate(requester & 0x7))
+    \\} PciFunction.address
+    \\
+    \\pub fn PciFunction.config_read(self, offset: u8) -> u32
+    \\    requires offset % 4 == 0
+    \\{
+    \\    return config(self.record, offset: u32.widen(offset))
+    \\} PciFunction.config_read
+    \\
+    \\pub fn Mmio.of_bar(mut function: PciFunction, index: u8) -> Mmio[R] fails PciError {
+    \\    let record = function.record
+    \\    if u64.widen(index) >= BARS {
+    \\        fail PciError.NotMemory
+    \\    }
+    \\    let bar = record + FUNCTION_BARS + u64.widen(index) * BAR_BYTES
+    \\    let kind = peek(bar + 16)
+    \\    if kind != MEMORY32 and kind != MEMORY64 {
+    \\        fail PciError.NotMemory
+    \\    }
+    \\    let bit = 1u64 << u32.widen(index)
+    \\    if (peek(record + FUNCTION_TAKEN) & bit) != 0 {
+    \\        fail PciError.Taken
+    \\    }
+    \\    let size = peek(bar + 8)
+    \\    if Mmio[R].extent() > size {
+    \\        fail PciError.TooSmall
+    \\    }
+    \\    let base = peek(bar).wrapping_add(peek(record + FUNCTION_WINDOW))
+    \\    if not device_memory(base, size) {
+    \\        fail PciError.Unmapped
+    \\    }
+    \\    poke(record + FUNCTION_TAKEN, value: peek(record + FUNCTION_TAKEN) | bit)
+    \\    set_command(record, set: MEMORY, clear: 0)
+    \\    return trusted "the BAR holds the function's R registers, at an address the entry root maps uncached, and only this window maps it" { Mmio[R].map(base) }
+    \\} Mmio.of_bar
+    \\
+    \\pub fn PciFunction.attach(mut self, space: IoSpace) fails IommuError {
+    \\    if space.key == PHYSICAL_KEY {
+    \\        fail IommuError.Physical
+    \\    }
+    \\    let unit = iommu_unit()
+    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
+    \\    if not covered(unit, requester) {
+    \\        fail IommuError.Unsupported
+    \\    }
+    \\    let flags = iommu_lock()
+    \\    let domain = live(unit, key: space.key)
+    \\    if domain == 0 {
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Closed
+    \\    }
+    \\    if on_aarch64() and not map_range(unit, domain, address: ITS_PAGE, bytes: PAGE_BYTES, device: true) {
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Exhausted
+    \\    }
+    \\    set_entry(unit, requester, domain)
+    \\    iommu_flush()
+    \\    iommu_unlock(flags)
+    \\    poke(self.record + FUNCTION_ATTACHED, value: space.key)
+    \\    set_command(self.record, set: BUS_MASTER, clear: 0)
+    \\} PciFunction.attach
+    \\
+    \\pub fn PciFunction.attach_physical(mut self) fails IommuError {
+    \\    let unit = iommu_unit()
+    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
+    \\    if unit != 0 and covered(unit, requester) {
+    \\        if peek(unit + UNIT_KIND) == VTD and (peek(unit + UNIT_FLAGS) & PASS_THROUGH) == 0 {
+    \\            fail IommuError.Unsupported
+    \\        }
+    \\        let flags = iommu_lock()
+    \\        set_entry(unit, requester, domain: 0)
+    \\        iommu_flush()
+    \\        iommu_unlock(flags)
+    \\    }
+    \\    poke(self.record + FUNCTION_ATTACHED, value: ATTACHED_PHYSICAL)
+    \\    set_command(self.record, set: BUS_MASTER, clear: 0)
+    \\} PciFunction.attach_physical
+    \\
+    \\pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    \\    let record = self.record
+    \\    let table = msix_table_entry(record, entry: u64.widen(entry))
+    \\    if table == 0 {
+    \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    \\    }
+    \\    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
+    \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
+    \\        Ok(shared) => {
+    \\            match shared.message() {
+    \\                Some(message) => program_entry(record, table, message)
+    \\                None => {}
+    \\            }
+    \\            return Ok(take shared)
+    \\        }
+    \\        Err(refusal) => return Err(take refusal)
+    \\    }
+    \\} PciFunction.msix
+    \\
+    \\pub fn PciFunction.release(take self) {
+    \\    let PciFunction(record: record) = self
+    \\    unhold(peek(record + RECORD_HOLDING))
+    \\    cut_off(record)
+    \\} PciFunction.release
+    \\
+    \\/// The register window extent of R: the bytes from its first register to past its last.
+    \\pkg fn Mmio.extent() -> u64
+    \\
+    \\/// A double word of a function's configuration through an ECAM, or through the configuration
+    \\/// ports for a zero `ecam`, and its write.
+    \\pkg fn config_read(ecam: u64, requester: u32, offset: u32) -> u32
+    \\
+    \\pkg fn config_write(ecam: u64, requester: u32, offset: u32, value: u32)
+    \\
+    \\/// Installs a device on a new message-signalled interrupt of CPU `cpu` from requester `source`,
+    \\/// which interrupt remapping lets that requester alone raise.
+    \\pkg fn IrqShared.install_validated(take dev: T, cpu: u32, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+    \\
+    \\/// What `boot::Kernel.pci_functions` lists: the endpoints of PCI bus 0, segment 0, each with
+    \\/// bus mastering and memory decoding off and INTx disabled, their unassigned memory BARs given
+    \\/// addresses from the device tree's window on AArch64.
+    \\pkg fn enumerated(alloc: mem::Alloc) -> mem::List[PciFunction] {
+    \\    var functions = mem::List[PciFunction].empty(alloc)
+    \\    var ecam: u64 = 0
+    \\    var window = BusWindow(start: 0, end: 0, offset: 0)
+    \\    if on_aarch64() {
+    \\        let node = tree_node(compatible: "pci-host-ecam-generic")
+    \\        if node.reg == 0 {
+    \\            return functions
+    \\        }
+    \\        ecam = u64_be_at(node.reg)
+    \\        if ecam + BUS_BYTES > AARCH64_DEVICES_END {
+    \\            return functions
+    \\        }
+    \\        window = memory_window(node)
+    \\    }
+    \\    var records = mem::List[u64].empty(alloc)
+    \\    for device in 0u32..<32 {
+    \\        for function in 0u32..<8 {
+    \\            let requester = (device << 3) | function
+    \\            let ids = config_read(ecam, requester, offset: IDS_OFFSET)
+    \\            let header = (config_read(ecam, requester, offset: HEADER_OFFSET) >> 16) & 0xFF
+    \\            if (ids & 0xFFFF) != 0xFFFF and (header & 0x7F) == 0 and (config_read(ecam, requester, offset: CLASS_OFFSET) >> 24) != BRIDGE {
+    \\                let record = found(ecam, requester, window)
+    \\                mut records.push(record)
+    \\                mut functions.push(PciFunction(record: record))
+    \\            }
+    \\            if function == 0 and ((ids & 0xFFFF) == 0xFFFF or (header & 0x80) == 0) {
+    \\                break
+    \\            }
+    \\        }
+    \\    }
+    \\    assign(records.view(), window)
+    \\    return functions
+    \\} enumerated
+    \\
+    \\/// A function's record, its BARs sized, its MSI-X capability found and its command cleared.
+    \\fn found(ecam: u64, requester: u32, window: BusWindow) -> u64 {
+    \\    let command = config_read(ecam, requester, offset: COMMAND_OFFSET) & 0xFFFF
+    \\    config_write(ecam, requester, offset: COMMAND_OFFSET, value: (command & ~(BUS_MASTER | MEMORY)) | INTX_DISABLE)
+    \\    let record = runtime_record(FUNCTION_RECORD)
+    \\    poke(record + RECORD_TAG, value: FUNCTION_TAG)
+    \\    poke(record + FUNCTION_REQUESTER, value: u64.widen(requester))
+    \\    poke(record + FUNCTION_ECAM, value: ecam)
+    \\    poke(record + FUNCTION_WINDOW, value: window.offset)
+    \\    var index: u64 = 0
+    \\    while index < BARS {
+    \\        index += size_bar(record, index)
+    \\    }
+    \\    poke(record + FUNCTION_MSIX, value: u64.widen(msix_capability(record)))
+    \\    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
+    \\    return record
+    \\} found
+    \\
+    \\/// Records BAR `index` of a function, giving the BARs it occupies: two for 64-bit memory.
+    \\fn size_bar(record: u64, index: u64) -> u64 {
+    \\    let at = FIRST_BAR + u32.fit(index * 4)
+    \\    let low = config(record, offset: at)
+    \\    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    \\    if (low & 0x1) != 0 {
+    \\        poke(bar + 16, value: IO_BAR)
+    \\        return 1
+    \\    }
+    \\    let wide = ((low >> 1) & 0x3) == 2 and index + 1 < BARS
+    \\    let low_mask = probe(record, offset: at, value: low) & 0xFFFF_FFF0
+    \\    var high: u32 = 0
+    \\    var high_mask: u32 = 0xFFFF_FFFF
+    \\    if wide {
+    \\        high = config(record, offset: at + 4)
+    \\        high_mask = probe(record, offset: at + 4, value: high)
+    \\    }
+    \\    let mask = (u64.widen(high_mask) << 32) | u64.widen(low_mask)
+    \\    if low_mask != 0 {
+    \\        poke(bar, value: (u64.widen(high) << 32) | u64.widen(low & 0xFFFF_FFF0))
+    \\        poke(bar + 8, value: (~mask).wrapping_add(1))
+    \\        var kind = MEMORY32
+    \\        if wide {
+    \\            kind = MEMORY64
+    \\        }
+    \\        poke(bar + 16, value: kind)
+    \\    }
+    \\    if wide {
+    \\        return 2
+    \\    }
+    \\    return 1
+    \\} size_bar
+    \\
+    \\/// The bits a BAR keeps of all ones, the BAR then given back `value`.
+    \\fn probe(record: u64, offset: u32, value: u32) -> u32 {
+    \\    set_config(record, offset, value: 0xFFFF_FFFF)
+    \\    let kept = config(record, offset)
+    \\    set_config(record, offset, value)
+    \\    return kept
+    \\} probe
+    \\
+    \\/// The offset of a function's MSI-X capability, zero without one.
+    \\fn msix_capability(record: u64) -> u32 {
+    \\    if ((config(record, offset: COMMAND_OFFSET) >> 16) & HAS_CAPABILITIES) == 0 {
+    \\        return 0
+    \\    }
+    \\    var at = config(record, offset: CAPABILITIES_OFFSET) & 0xFC
+    \\    for _ in 0u32..<48 {
+    \\        if at == 0 {
+    \\            return 0
+    \\        }
+    \\        let head = config(record, offset: at)
+    \\        if (head & 0xFF) == MSIX_ID {
+    \\            return at
+    \\        }
+    \\        at = (head >> 8) & 0xFC
+    \\    }
+    \\    return 0
+    \\} msix_capability
+    \\
+    \\/// The window of 32-bit memory a PCI host's `ranges` names, empty without one.
+    \\fn memory_window(node: NodeValues) -> BusWindow {
+    \\    var at = node.ranges
+    \\    while at + RANGE_BYTES <= node.ranges + node.ranges_len {
+    \\        let space = (u32_be_at(at) >> 24) & 0x3
+    \\        if space == MEMORY_SPACE {
+    \\            let bus = u64_be_at(at + 4)
+    \\            let cpu = u64_be_at(at + 12)
+    \\            return BusWindow(start: bus, end: bus + u64_be_at(at + 20), offset: cpu.wrapping_sub(bus))
+    \\        }
+    \\        at += RANGE_BYTES
+    \\    }
+    \\    return BusWindow(start: 0, end: 0, offset: 0)
+    \\} memory_window
+    \\
+    \\/// Gives each unassigned memory BAR of the functions an address of the window, aligned to its
+    \\/// size, above every BAR the window already holds.
+    \\fn assign(records: Slice[u64], window: BusWindow) {
+    \\    var next = window.start
+    \\    for record in records {
+    \\        for index in 0..<BARS {
+    \\            let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    \\            let base = peek(bar)
+    \\            let end = base + peek(bar + 8)
+    \\            if peek(bar + 16) != NO_BAR and base >= window.start and base < window.end and end > next {
+    \\                next = end
+    \\            }
+    \\        }
+    \\    }
+    \\    for record in records {
+    \\        for index in 0..<BARS {
+    \\            next = assign_bar(record, index, next, window)
+    \\        }
+    \\    }
+    \\} assign
+    \\
+    \\/// Gives BAR `index` of a function an address from `next` when it is an unassigned memory BAR
+    \\/// the window holds, giving the window's next free address.
+    \\fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow) -> u64 {
+    \\    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    \\    let kind = peek(bar + 16)
+    \\    let size = peek(bar + 8)
+    \\    if peek(bar) != 0 or (kind != MEMORY32 and kind != MEMORY64) or size == 0 {
+    \\        return next
+    \\    }
+    \\    let aligned = (next + size - 1) & ~(size - 1)
+    \\    if aligned + size > window.end {
+    \\        return next
+    \\    }
+    \\    let at = FIRST_BAR + u32.fit(index * 4)
+    \\    set_config(record, offset: at, value: u32.truncate(aligned))
+    \\    if kind == MEMORY64 {
+    \\        set_config(record, offset: at + 4, value: u32.truncate(aligned >> 32))
+    \\    }
+    \\    poke(bar, value: aligned)
+    \\    return aligned + size
+    \\} assign_bar
+    \\
+    \\/// Whether the entry root maps a range as device memory.
+    \\fn device_memory(base: u64, size: u64) -> bool {
+    \\    let Some(end) = base.checked_add(size) else {
+    \\        return false
+    \\    }
+    \\    if on_aarch64() {
+    \\        return end <= AARCH64_DEVICES_END
+    \\    }
+    \\    return base >= X86_DEVICES and end <= X86_DEVICES_END
+    \\} device_memory
+    \\
+    \\/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function is not
+    \\/// attached, has no such entry or its table lies outside device memory.
+    \\fn msix_table_entry(record: u64, entry: u64) -> u64 {
+    \\    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
+    \\    if capability == 0 or peek(record + FUNCTION_ATTACHED) == 0 {
+    \\        return 0
+    \\    }
+    \\    if entry > u64.widen((config(record, offset: capability) >> 16) & 0x7FF) {
+    \\        return 0
+    \\    }
+    \\    let location = config(record, offset: capability + 4)
+    \\    let index = u64.widen(location & 0x7)
+    \\    if index >= BARS {
+    \\        return 0
+    \\    }
+    \\    let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    \\    let offset = u64.widen(location & 0xFFFF_FFF8) + entry * 16
+    \\    let kind = peek(bar + 16)
+    \\    if (kind != MEMORY32 and kind != MEMORY64) or offset + 16 > peek(bar + 8) {
+    \\        return 0
+    \\    }
+    \\    let address = peek(bar).wrapping_add(peek(record + FUNCTION_WINDOW)) + offset
+    \\    if not device_memory(address, size: 16) {
+    \\        return 0
+    \\    }
+    \\    return address
+    \\} msix_table_entry
+    \\
+    \\/// Writes a message to an MSI-X table entry, unmasked, and enables MSI-X without the function
+    \\/// mask.
+    \\fn program_entry(record: u64, table: u64, message: MsiMessage) {
+    \\    set_command(record, set: MEMORY, clear: 0)
+    \\    var entry = trusted "the MSI-X entry lies in the function's memory BAR, which the entry root maps uncached; a window of the BAR may also write it, and interrupt remapping or the ITS lets only this function's messages through" { Mmio[MsixEntry].map(table) }
+    \\    mut entry.write(MsixEntry.control, value: 1)
+    \\    mut entry.write(MsixEntry.address_low, value: u32.truncate(message.address))
+    \\    mut entry.write(MsixEntry.address_high, value: u32.truncate(message.address >> 32))
+    \\    mut entry.write(MsixEntry.data, value: message.data)
+    \\    mut entry.write(MsixEntry.control, value: 0)
+    \\    take entry.unmap()
+    \\    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
+    \\    let control = config(record, offset: capability)
+    \\    set_config(record, offset: capability, value: (control | MSIX_ENABLE) & ~MSIX_MASKED)
+    \\} program_entry
+    \\
+    \\/// Cuts a function off: no longer mastering the bus or decoding memory, its context or stream
+    \\/// reaching nothing once the IOMMU no longer caches it; then frees its record.
+    \\fn cut_off(record: u64) {
+    \\    set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
+    \\    let unit = iommu_unit()
+    \\    if unit != 0 and peek(record + FUNCTION_ATTACHED) != 0 {
+    \\        let flags = iommu_lock()
+    \\        clear_entry(unit, requester: peek(record + FUNCTION_REQUESTER))
+    \\        iommu_flush()
+    \\        iommu_unlock(flags)
+    \\    }
+    \\    free_record(record)
+    \\} cut_off
+    \\
+    \\/// Sets and clears bits of a function's command register, leaving its status.
+    \\fn set_command(record: u64, set: u32, clear: u32) {
+    \\    let command = config(record, offset: COMMAND_OFFSET) & 0xFFFF
+    \\    set_config(record, offset: COMMAND_OFFSET, value: (command & ~clear) | set)
+    \\} set_command
+    \\
+    \\/// A double word of a function's configuration, and its write.
+    \\fn config(record: u64, offset: u32) -> u32 {
+    \\    return config_read(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset)
+    \\} config
+    \\
+    \\fn set_config(record: u64, offset: u32, value: u32) {
+    \\    config_write(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset, value)
+    \\} set_config
     \\
 
 const TEXT_HW_SIM_SIM: Str =
@@ -9503,6 +10926,177 @@ const TEXT_HW_SIM_SIM: Str =
     \\    take window.unmap()
     \\    expect regs.last_written(Probe.control) == Some(8)
     \\} ports_unmap_keeps_the_block
+    \\
+
+const TEXT_HW_TABLES: Str =
+    \\//! The platform's tables the IOMMU and PCI enumeration read: the ACPI tables the root pointer lists and the device tree's nodes.
+    \\
+    \\/// The header of an ACPI table, and the offsets in the RSDP of its revision and of its RSDT's
+    \\/// and XSDT's addresses.
+    \\const HEADER_BYTES: u64 = 36
+    \\
+    \\const RSDP_REVISION: u64 = 15
+    \\
+    \\const RSDP_RSDT: u64 = 16
+    \\
+    \\const RSDP_XSDT: u64 = 24
+    \\
+    \\/// The flattened device tree's magic and the offsets of its structure and strings blocks; the
+    \\/// structure block's tokens.
+    \\const TREE_MAGIC: u32 = 0xD00D_FEED
+    \\
+    \\const TREE_STRUCTURE: u64 = 8
+    \\
+    \\const TREE_STRINGS: u64 = 12
+    \\
+    \\const BEGIN_NODE: u32 = 1
+    \\
+    \\const END_NODE: u32 = 2
+    \\
+    \\const PROPERTY: u32 = 3
+    \\
+    \\const TREE_END: u32 = 9
+    \\
+    \\/// The values of a child of the device tree's root node: of its `reg` property and its
+    \\/// `ranges` property with its length in bytes, each zero when missing.
+    \\struct NodeValues {
+    \\    reg: u64
+    \\    ranges: u64
+    \\    ranges_len: u64
+    \\} NodeValues
+    \\
+    \\/// The address of the table with a signature that the XSDT, or the RSDT for an RSDP of revision
+    \\/// 0 or without an XSDT, lists; zero when none.
+    \\fn listed_table(signature: u32) -> u64 {
+    \\    let rsdp = rsdp_address()
+    \\    if rsdp == 0 {
+    \\        return 0
+    \\    }
+    \\    var root = u64.widen(u32_at(rsdp + RSDP_RSDT))
+    \\    var width: u64 = 4
+    \\    if byte_at(rsdp + RSDP_REVISION) >= 2 and u64_at(rsdp + RSDP_XSDT) != 0 {
+    \\        root = u64_at(rsdp + RSDP_XSDT)
+    \\        width = 8
+    \\    }
+    \\    let end = root + u64.widen(u32_at(root + 4))
+    \\    var at = root + HEADER_BYTES
+    \\    while at + width <= end {
+    \\        var table = u64.widen(u32_at(at))
+    \\        if width == 8 {
+    \\            table = u64_at(at)
+    \\        }
+    \\        if table != 0 and u32_at(table) == signature {
+    \\            return table
+    \\        }
+    \\        at += width
+    \\    }
+    \\    return 0
+    \\} listed_table
+    \\
+    \\/// The first child of the device tree's root node whose `compatible` property lists a name.
+    \\fn tree_node(compatible: Str) -> NodeValues {
+    \\    var node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\    let tree = tree_address()
+    \\    if tree == 0 or u32_be_at(tree) != TREE_MAGIC {
+    \\        return node
+    \\    }
+    \\    let strings = tree + u64.widen(u32_be_at(tree + TREE_STRINGS))
+    \\    var at = tree + u64.widen(u32_be_at(tree + TREE_STRUCTURE))
+    \\    var depth: u32 = 0
+    \\    var matched = false
+    \\    loop {
+    \\        let token = u32_be_at(at)
+    \\        at += 4
+    \\        if token == BEGIN_NODE {
+    \\            depth += 1
+    \\            if depth == 2 {
+    \\                node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\                matched = false
+    \\            }
+    \\            while byte_at(at) != 0 {
+    \\                at += 1
+    \\            }
+    \\            at = (at + 4) / 4 * 4
+    \\        } else if token == END_NODE {
+    \\            if depth == 2 and matched {
+    \\                return node
+    \\            }
+    \\            depth -= 1
+    \\        } else if token == PROPERTY {
+    \\            let len = u64.widen(u32_be_at(at))
+    \\            let name = strings + u64.widen(u32_be_at(at + 4))
+    \\            let value = at + 8
+    \\            if depth == 2 and text_is(name, text: "compatible") {
+    \\                matched = matched or lists(value, len, text: compatible)
+    \\            } else if depth == 2 and text_is(name, text: "reg") {
+    \\                node.reg = value
+    \\            } else if depth == 2 and text_is(name, text: "ranges") {
+    \\                node.ranges = value
+    \\                node.ranges_len = len
+    \\            }
+    \\            at = value + (len + 3) / 4 * 4
+    \\        } else if token == TREE_END {
+    \\            return NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\        }
+    \\    }
+    \\} tree_node
+    \\
+    \\/// Whether the NUL-terminated text at an address is `text`.
+    \\fn text_is(address: u64, text: Str) -> bool {
+    \\    var at = address
+    \\    for byte in text.as_bytes() {
+    \\        if byte_at(at) != byte {
+    \\            return false
+    \\        }
+    \\        at += 1
+    \\    }
+    \\    return byte_at(at) == 0
+    \\} text_is
+    \\
+    \\/// Whether the NUL-separated texts of `len` bytes at an address include `text`.
+    \\fn lists(address: u64, len: u64, text: Str) -> bool {
+    \\    var at = address
+    \\    while at < address + len {
+    \\        if text_is(at, text) {
+    \\            return true
+    \\        }
+    \\        while at < address + len and byte_at(at) != 0 {
+    \\            at += 1
+    \\        }
+    \\        at += 1
+    \\    }
+    \\    return false
+    \\} lists
+    \\
+    \\/// The byte at a physical address.
+    \\fn byte_at(address: u64) -> u8 {
+    \\    return trusted "the platform's tables lie in memory the running root maps, which nothing writes" { Ptr[u8].of_addr(usize.widen(address)).read() }
+    \\} byte_at
+    \\
+    \\/// The little-endian 32-bit and 64-bit numbers at a physical address, and the big-endian ones.
+    \\fn u32_at(address: u64) -> u32 {
+    \\    var value: u32 = 0
+    \\    for index in 0u64..<4 {
+    \\        value = value | (u32.widen(byte_at(address + index)) << u32.fit(index * 8))
+    \\    }
+    \\    return value
+    \\} u32_at
+    \\
+    \\fn u64_at(address: u64) -> u64 {
+    \\    return u64.widen(u32_at(address)) | (u64.widen(u32_at(address + 4)) << 32)
+    \\} u64_at
+    \\
+    \\fn u32_be_at(address: u64) -> u32 {
+    \\    var value: u32 = 0
+    \\    for index in 0u64..<4 {
+    \\        value = (value << 8) | u32.widen(byte_at(address + index))
+    \\    }
+    \\    return value
+    \\} u32_be_at
+    \\
+    \\fn u64_be_at(address: u64) -> u64 {
+    \\    return (u64.widen(u32_be_at(address)) << 32) | u64.widen(u32_be_at(address + 4))
+    \\} u64_be_at
     \\
 
 const TEXT_MEM_MEM: Str =

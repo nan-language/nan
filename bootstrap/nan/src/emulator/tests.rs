@@ -36,7 +36,7 @@ fn the_aarch64_machine_runs_under_tcg_with_an_smmu() {
     for kvm in [true, false] {
         let args = written(Arch::Aarch64, kvm, None);
         assert!(args.contains(
-            "-machine virt,gic-version=3,its=on,iommu=smmuv3 -accel tcg -cpu cortex-a72 "
+            "-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off -accel tcg -cpu cortex-a72 "
         ));
         assert!(args.contains("-device tpm-tis-device,tpmdev=tpm "));
     }

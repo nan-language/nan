@@ -54,7 +54,7 @@ pub fn first_byte(source: Slice[u8]) -> u8
 
 ### Trusted primitives
 
-A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `read_msr`, `write_msr`, `write_ttbr0` and `write_sysreg` ([privileged intrinsics](#privileged-intrinsics)), and `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)).
+A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `write_cr3_tagged`, `read_msr`, `write_msr`, `write_ttbr0`, `write_ttbr0_tagged`, `write_sysreg`, `invalidate_data_cache` and `firmware_call` ([privileged intrinsics](#privileged-intrinsics)), and `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)).
 
 - A call of a trusted primitive outside trusted code, or its use as a function value, is an error (`trusted.primitive-outside`).
 - Each primitive has a **soundness condition**, stated with its rules. Its **structured requires** are its `requires` clauses: the part of the condition that [contract terms](18-contracts.md#contract-terms) express. Each is a trusted requirement [obligation](18-contracts.md#obligations) at every call, which the prover proves, a run-time check enforces (`trap.requires`), or an `assume` in the enclosing trusted code makes assumed.
@@ -648,7 +648,7 @@ pub fn reading_box(take buffer: hw::Dma[Reading]) -> mem::Box[Reading] { // erro
 
 ## Privileged intrinsics
 
-A **privileged intrinsic** is a method of `hw::Ring0` performing one privileged operation on the running CPU. `hw::Ring0` is a primitive capability; [Kernel execution model](24-kernel.md#anchor) states where a value comes from. Calling a privileged intrinsic is a `priv` operation (`authority.ungranted`). The privileged intrinsics of `x86_64-uefi` and `x86_64-bare` are exactly these.
+A **privileged intrinsic** is a method of `hw::Ring0` performing one privileged operation on the running CPU or, for the cross-CPU intrinsics, on every CPU. `hw::Ring0` is a primitive capability; [Kernel execution model](24-kernel.md#anchor) states where a value comes from. Calling a privileged intrinsic is a `priv` operation (`authority.ungranted`). The privileged intrinsics of every machine target include these.
 
 ```nan-api
 // module: hw
@@ -656,15 +656,87 @@ A **privileged intrinsic** is a method of `hw::Ring0` performing one privileged 
 pub open linear struct Ring0 {
 } Ring0
 
+pub fn Ring0.invalidate_page(self, page: VirtAddr)
+
+pub fn Ring0.invalidate_all(self)
+
+pub fn Ring0.wait_for_interrupt(self, t: IrqsDisabled)
+
+pub fn Ring0.signal_cpu(self, cpu: u32)
+
+pub fn Ring0.invalidate_everywhere(self, scope: TlbScope) fails task::Cancelled uses wait
+
+pub closed enum TlbScope derives Copy, Eq {
+    Page(VirtAddr)
+    All
+} TlbScope
+```
+
+- `invalidate_page` removes the running CPU's cached translations of the page holding `page` under its current PCID or ASID, and `invalidate_all` every cached translation of the running CPU, global ones and those of every PCID or ASID included.
+- `wait_for_interrupt` halts the running CPU until an interrupt arrives, enabling maskable interrupts while it halts ([interrupt state](24-kernel.md#interrupt-state)). It returns at once inside an interrupt fn and before the [anchor](24-kernel.md#anchor) is installed.
+- `signal_cpu` and `invalidate_everywhere` are the **cross-CPU intrinsics**, which [cross-CPU operations](24-kernel.md#cross-cpu-operations) defines.
+- Every privileged intrinsic has the priv fact, never allocates and never traps, and terminates unless its head states `uses wait`. An intrinsic removing cached translations may remove others too.
+
+The privileged intrinsics of `x86_64-uefi` and `x86_64-bare` are exactly those of every machine target and these.
+
+```nan-api
+// module: hw
+
 pub fn Ring0.load_idt(self, take idt: mem::Box[Idt]) -> IdtInstalled
 
 pub fn Ring0.write_cr3(self, take root: PageTableRoot) -> Option[PageTableRoot]
 
-pub fn Ring0.invalidate_page(self, page: VirtAddr)
+pub fn Ring0.write_cr3_tagged(self, take root: PageTableRoot, pcid: u16, keep: bool) -> Option[PageTableRoot]
+    requires pcid < 4_096
+
+pub fn Ring0.invalidate_pcid(self, pcid: u16)
+    requires pcid < 4_096
+
+pub fn Ring0.invalidate_pcid_page(self, pcid: u16, page: VirtAddr)
+    requires pcid < 4_096
 
 pub fn Ring0.read_msr(self, msr: u32) -> u64
 
 pub fn Ring0.write_msr(self, msr: u32, value: u64)
+
+pub fn Ring0.cpuid(self, leaf: u32, subleaf: u32) -> CpuidRegs
+
+pub fn Ring0.read_tsc(self) -> u64
+
+pub fn Ring0.read_tscp(self) -> TscRead
+
+pub fn Ring0.monitor_wait(self, t: IrqsDisabled, word: core::atomic::AtomicU64, seen: u64, hint: u8)
+
+pub fn Ring0.read_xcr0(self) -> u64
+
+pub fn Ring0.write_xcr0(self, value: u64) -> bool
+
+pub fn Ring0.hardware_random(self) -> Option[u64]
+
+pub fn Ring0.hardware_seed(self) -> Option[u64]
+
+pub fn Ring0.enable_protection(self, feature: Protection) -> bool
+
+pub fn Ring0.clear_cpu_buffers(self)
+
+pub closed struct CpuidRegs derives Copy, Eq {
+    pub eax: u32
+    pub ebx: u32
+    pub ecx: u32
+    pub edx: u32
+} CpuidRegs
+
+pub closed struct TscRead derives Copy, Eq {
+    pub count: u64
+    pub cpu: u32
+} TscRead
+
+pub closed enum Protection derives Copy, Eq {
+    Smep
+    Smap
+    Umip
+    Pcid
+} Protection
 
 pub open struct Idt {
 } Idt
@@ -675,23 +747,46 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 - `hw::Idt` is an interrupt descriptor table whose gate n is an interrupt gate of privilege level 0 entering the [machine seam](#machine-seams) of vector n with the `ist` of n's `hw::vectors` entry, or 0 without one. `Idt.of_vectors()` builds it.
 - `load_idt` loads the table into the running CPU's interrupt descriptor table register.
 - `write_cr3` makes `root` the running CPU's page-table root and returns `Some` of a `hw::PageTableRoot` owning the frame of the root it replaces, or `None` when it replaces the [entry root](24-kernel.md#physical-memory). It is a trusted primitive whose soundness condition is that `root` maps the running code, its stack and every live value at their current addresses, and keeps the image, the memory it reserves and every live frame and region mapped at their physical addresses; that no other `hw::PageTableRoot` owns the frame of the replaced root; and that until a later `write_cr3` on that CPU returns `root`, no value that safe code reaches owns or views memory of a page table that `root` reaches, other than `root` itself.
-- `invalidate_page` removes the running CPU's cached translation of the page holding `page`.
-- `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact.
-- Every privileged intrinsic has the priv fact, terminates, never allocates and never traps.
-- Each privileged intrinsic, and `hw::Idt.of_vectors`, belongs to the architecture whose machine targets' descriptors list it, `invalidate_page` to both. A call of one in code checked for a target of another architecture, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`hw.intrinsic-target`).
+- `write_cr3_tagged` installs `root` as `write_cr3` does, as a later `write_cr3` or `write_cr3_tagged` returns it, but tags the translations the CPU caches from it with PCID `pcid`. It keeps the translations cached under other PCIDs, and those under `pcid` too when `keep` is true. While the CPU has PCIDs disabled it ignores `pcid` and `keep`. It is a trusted primitive whose soundness condition is that of `write_cr3`, and that each translation cached under `pcid` that it keeps maps as `root` does.
+- `invalidate_pcid_page` removes the running CPU's cached translations of the page holding `page` under `pcid`, and `invalidate_pcid` every one under `pcid`; while the CPU has PCIDs disabled, PCID 0 tags every translation.
+- `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact. The indirect branch prediction barrier is `write_msr(0x49, value: 1)`.
+- `cpuid` gives the four registers the `cpuid` instruction leaves for `leaf` in `eax` and `subleaf` in `ecx`.
+- `read_tsc` reads the time-stamp counter once every earlier instruction has completed. `read_tscp` reads it as `count` together with `cpu`, the number of the CPU that read it, which the runtime keeps in each CPU's `TSC_AUX` for `rdtscp`; on a CPU without `rdtscp` it reads both with maskable interrupts disabled.
+- `monitor_wait` arms `monitor` on `word` and, when `word` still holds `seen`, waits in `mwait` with `hint` as its C-state hint until `word` may have changed, an interrupt arrives, or for no reason; maskable interrupts stay disabled and an arriving one ends the wait. It returns at once on a CPU whose `mwait` cannot end on an interrupt while they are disabled.
+- `read_xcr0` gives `XCR0`, or 0 while the CPU has XSAVE disabled. `write_xcr0` writes `value` to `XCR0` and returns true, or changes nothing and returns false while the CPU has XSAVE disabled or when `value` enables a state component the CPU lacks, leaves x87 state disabled, enables AVX state without SSE state, or enables a component other than these three, whose state the [vector seams](#machine-seams) do not save.
+- `hardware_random` gives a value of `rdrand` and `hardware_seed` one of `rdseed`, trying up to 10 times, or `None` when the CPU lacks the instruction or every try fails.
+- `enable_protection` enables `feature` on the running CPU and returns true, or returns false when the CPU lacks it. `Smep` keeps the CPU from executing pages mapped for user mode, `Smap` from accessing them other than through `UserAddr.copy_in`, `Umip` keeps user mode from reading descriptor-table registers, and `Pcid` enables the PCIDs that `write_cr3_tagged` tags. No intrinsic disables one again.
+- `clear_cpu_buffers` overwrites the CPU buffers that microarchitectural data sampling reads, through `verw`.
 
-The privileged intrinsics of `aarch64-uefi` and `aarch64-bare` are exactly `invalidate_page` and these.
+The privileged intrinsics of `aarch64-uefi` and `aarch64-bare` are exactly those of every machine target and these.
 
 ```nan-api
 // module: hw
 
 pub fn Ring0.write_ttbr0(self, take root: PageTableRoot) -> Option[PageTableRoot]
 
+pub fn Ring0.write_ttbr0_tagged(self, take root: PageTableRoot, asid: u8) -> Option[PageTableRoot]
+
+pub fn Ring0.invalidate_asid(self, asid: u8)
+
+pub fn Ring0.invalidate_asid_page(self, asid: u8, page: VirtAddr)
+
 pub fn Ring0.read_sysreg(self, register: SysReg) -> u64
 
 pub fn Ring0.write_sysreg(self, register: SysReg, value: u64)
     requires register.is_writable()
 
+pub fn Ring0.wait_for_event(self, t: IrqsDisabled, word: core::atomic::AtomicU64, seen: u64)
+
+pub fn Ring0.clean_data_cache(self, region: Region)
+
+pub fn Ring0.clean_invalidate_data_cache(self, region: Region)
+
+pub fn Ring0.invalidate_data_cache(self, region: Region)
+
+pub fn Ring0.sync_instruction_cache(self, region: Region)
+
+pub fn Ring0.firmware_call(self, function: u32, a: u64, b: u64, c: u64) -> u64
 pub closed enum SysReg derives Copy, Eq {
     SctlrEl1
     TcrEl1
@@ -723,7 +818,14 @@ pub fn SysReg.is_writable(self) -> bool limits pure, notrap, terminates
 ```
 
 - `write_ttbr0` makes `root` the root of the running CPU's translations of the addresses below `0x0001_0000_0000_0000`, held in `TTBR0_EL1`, invalidates the CPU's cached translations and returns as `write_cr3` does, with the same soundness condition.
+- `write_ttbr0_tagged` installs `root` as `write_ttbr0` does, as a later `write_ttbr0` or `write_ttbr0_tagged` returns it, but tags the translations the CPU caches from it with ASID `asid` and invalidates none. It is a trusted primitive whose soundness condition is that of `write_ttbr0`, and that each translation cached under `asid` maps as `root` does.
+- `invalidate_asid_page` removes the running CPU's cached translations of the page holding `page` under `asid`, and `invalidate_asid` every one under `asid`.
 - `read_sysreg` and `write_sysreg` read and write the system register that `register` names, `SctlrEl1` naming `SCTLR_EL1`, `CntpCtlEl0` naming `CNTP_CTL_EL0` and so on. `register.is_writable()` is true exactly for the registers from `SctlrEl1` to `CntvTvalEl0`. `write_sysreg` is a trusted primitive whose soundness condition is that the write leaves every translation, stack and support routine state that code relies on intact.
+- `wait_for_event` reads `word` with an exclusive load and, when it holds `seen`, waits in `wfe` until `word` may have changed, an event arrives, or for no reason; maskable interrupts stay disabled.
+- `clean_data_cache` writes the data cache lines holding `region` back to memory, `clean_invalidate_data_cache` also removes them from the caches, and `invalidate_data_cache` removes them without writing them back; `sync_instruction_cache` makes instruction fetches on every CPU see the bytes of `region`. Each returns once its maintenance is complete for every observer, devices included. `invalidate_data_cache` is a trusted primitive whose soundness condition is that the lines hold no write that code relies on and that memory lacks.
+- `firmware_call` calls the firmware's PSCI interface through the descriptor's conduit with `function` in `w0` and `a`, `b` and `c` in `x1` to `x3`, and gives `x0`. It is a trusted primitive whose soundness condition is that the call leaves every CPU, translation, stack and support routine state that code relies on intact.
+
+Each privileged intrinsic of one architecture's list, and `hw::Idt.of_vectors`, belongs to that architecture. A call of one in code checked for a target of another architecture, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`hw.intrinsic-target`).
 
 An **install token** is a linear value that an intrinsic returns when the hardware keeps referencing its argument. Owning the token keeps the argument alive and unmoved.
 
@@ -742,7 +844,7 @@ pub fn PageTableRoot.into_frame(take self) -> PhysFrame[4_096]
 ```
 
 - `hw::IdtInstalled` holds the box `load_idt` took. No std operation releases it, so the table stays allocated while the machine runs; a kernel moves the token into its [anchor](24-kernel.md#anchor).
-- `hw::PageTableRoot` owns the [physical frame](24-kernel.md#physical-memory) of a top-level page table and is a primitive capability. The root that `write_cr3` or `write_ttbr0` takes is held by the CPU until a later call of the same intrinsic on that CPU returns it.
+- `hw::PageTableRoot` owns the [physical frame](24-kernel.md#physical-memory) of a top-level page table and is a primitive capability. The root that a root-installing intrinsic takes is held by the CPU until a later call of one installing a root on that CPU returns it.
 
 ```nan
 // file: kernel/package.nan
@@ -808,6 +910,48 @@ package kernel {
 pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::PageTableRoot] {
     return trusted "root maps the running kernel image and the current stack" { cpu.write_cr3(take root) } // error: hw.intrinsic-target
 } activate
+```
+
+```nan
+// file: kcpu/package.nan
+//! CPU identification in a bare kernel.
+
+package kcpu {
+    language 1
+    targets x86_64-bare
+    allow priv in kcpu
+} kcpu
+
+// file: kcpu/kcpu.nan
+//! Reads the highest CPUID leaf and switches address spaces keeping their translations.
+
+pub fn max_leaf(cpu: hw::Ring0) -> u32 {
+    return cpu.cpuid(0, subleaf: 0).eax
+} max_leaf
+
+pub fn switch_to(take root: hw::PageTableRoot, pcid: u16, cpu: hw::Ring0) -> Option[hw::PageTableRoot]
+    requires pcid < 4_096
+{
+    return cpu.write_cr3_tagged(take root, pcid, keep: true) // error: trusted.primitive-outside
+} switch_to
+```
+
+```nan
+// file: kcpu/package.nan
+//! CPU identification in an AArch64 bare kernel.
+
+package kcpu {
+    language 1
+    targets aarch64-bare
+    allow priv in kcpu
+} kcpu
+
+// file: kcpu/kcpu.nan
+//! Reads the highest CPUID leaf.
+
+pub fn max_leaf(cpu: hw::Ring0) -> u32 {
+    return cpu.cpuid(0, subleaf: 0).eax // error: hw.intrinsic-target
+} max_leaf
 ```
 
 ## Machine seams

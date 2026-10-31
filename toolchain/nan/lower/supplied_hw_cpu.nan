@@ -25,19 +25,101 @@ fn irq_context(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } irq_context
 
-/// The privileged intrinsics of `hw::Ring0`, each one compiler stub on the running CPU, by target.
+/// The privileged intrinsics, each one or more compiler stubs on the running CPU. Those both
+/// architectures share are lowered here, the others by the target's architecture, since each
+/// architecture's descriptor names its own set. `invalidate_everywhere` fails at once when
+/// cancelled as it starts, and otherwise completes whatever cancels it.
 fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
-    if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
-        cpu_ring0_aarch64(mut lo, mut fx, supply)
-        return
+    match supply.member() {
+        "wait_for_interrupt" => {
+            mut lo.wait_for_interrupt(mut fx)
+            supply.done(mut lo, mut fx)
+        }
+        "signal_cpu" => {
+            let narrow = supply.param(1).scalar_value()
+            let index = mut fx.b.uextend(PTR, x: narrow)
+            mut lo.signal_cpu(mut fx, index)
+            supply.done(mut lo, mut fx)
+        }
+        "invalidate_everywhere" => {
+            let early = tasks_origin(mut lo, mut fx)
+            let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: early, y: 0)
+            mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+                tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: early)
+            })
+            let scope = tlb_scope(mut lo, mut fx, supply)
+            mut lo.invalidate_everywhere(mut fx, scope)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                cpu_ring0_aarch64(mut lo, mut fx, supply)
+            } else {
+                cpu_ring0_x64(mut lo, mut fx, supply)
+            }
+        }
     }
-    cpu_ring0_x64(mut lo, mut fx, supply)
 } cpu_ring0
 
+/// The scope an `hw::TlbScope` parameter names, as the shootdown stubs take it: the address of
+/// the page `Page` holds, or 1 for `All`.
+fn tlb_scope(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
+    let scope_ty = supply.abi.params[1].nty.ty()
+    let laid = mut lo.layout_of(scope_ty)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.store_held(mut fx, address: slot, held: supply.param(1), ty: scope_ty)
+    let index = mut lo.variant_index(mut fx, ty: scope_ty, address: slot)
+    let page_field = mut lo.layouts.field(lo.ck, ty: scope_ty, variant: Some("Page"), label: "")
+    let address = mut fx.load(PTR, addr: slot, offset: page_field.offset)
+    let page = mut fx.b.band_imm_s(address, y: ~0xFFF)
+    let all = mut fx.ptr(1)
+    let is_page = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: 0)
+    return mut fx.b.select(is_page, x: page, y: all)
+} tlb_scope
+
+/// Gives a root-installing intrinsic's result from the root it replaced: `Some` of a
+/// `hw::PageTableRoot` owning it, none for the entry root.
+fn replaced_root(mut lo: Lowering, mut fx: Fx, supply: Supply, replaced: clif::Value) {
+    let option = supply.abi.result
+    let entry_root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: replaced, y: 0)
+    mut fx.if_true(entry_root, then: fn[mut lo](mut fx1: Fx) {
+        let none = mut lo.none_value(mut fx1, option)
+        supply.ret(mut lo, fx: mut fx1, held: none)
+    })
+    let held = mut fx.slot(8, align: 8)
+    mut fx.store(replaced, addr: held, offset: 0)
+    let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(held)).view(), wrapped: None)
+    supply.ret(mut lo, mut fx, held: some)
+} replaced_root
+
+/// Gives an `Option[u64]` from a stub that writes a value at an address and gives whether it
+/// found one.
+fn found_value(mut lo: Lowering, mut fx: Fx, supply: Supply, stub: Stub) {
+    let value = mut fx.slot(8, align: 8)
+    let found = mut lo.call_stub(mut fx, stub, args: Array[clif::Value, 1].filled(value).view())
+    expect found.len() > 0
+    let option = supply.abi.result
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found[0], y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        let none = mut lo.none_value(mut fx1, option)
+        supply.ret(mut lo, fx: mut fx1, held: none)
+    })
+    let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(value)).view(), wrapped: None)
+    supply.ret(mut lo, mut fx, held: some)
+} found_value
+
+/// Calls a stub and gives its one result.
+fn stub_result(mut lo: Lowering, mut fx: Fx, stub: Stub, args: Slice[clif::Value]) -> clif::Value {
+    let results = mut lo.call_stub(mut fx, stub, args)
+    expect results.len() > 0
+    return results[0]
+} stub_result
+
 /// The x86_64 privileged intrinsics. `load_idt` loads the table the box holds and keeps the box
-/// in its token; `write_cr3` installs a root and gives the one it replaces, which the CPU's
-/// record keeps, none for the entry root.
+/// in its token; `write_cr3` and `write_cr3_tagged` install a root and give the one it replaces,
+/// which the CPU's record keeps, none for the entry root.
 fn cpu_ring0_x64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let none = mem::List[clif::Value].empty(fx.alloc)
     match supply.member() {
         "load_idt" => {
             let table = cpu_word(mut fx, held: supply.param(1))
@@ -46,29 +128,57 @@ fn cpu_ring0_x64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "write_cr3" => {
             let root = cpu_word(mut fx, held: supply.param(1))
-            let replaced = mut lo.swap_root(mut fx, root)
-            let option = supply.abi.result
-            let entry_root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: replaced, y: 0)
-            mut fx.if_true(entry_root, then: fn[mut lo](mut fx1: Fx) {
-                let none = mut lo.none_value(mut fx1, option)
-                supply.ret(mut lo, fx: mut fx1, held: none)
-            })
-            let held = mut fx.slot(8, align: 8)
-            mut fx.store(replaced, addr: held, offset: 0)
-            let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(held)).view(), wrapped: None)
-            supply.ret(mut lo, mut fx, held: some)
+            let replaced = mut lo.swap_root(mut fx, root, tagged: None)
+            replaced_root(mut lo, mut fx, supply, replaced)
+        }
+        "write_cr3_tagged" => {
+            let root = cpu_word(mut fx, held: supply.param(1))
+            let narrow_pcid = supply.param(2).scalar_value()
+            let pcid = mut fx.b.uextend(PTR, x: narrow_pcid)
+            let narrow_keep = supply.param(3).scalar_value()
+            let keep = mut fx.b.uextend(PTR, x: narrow_keep)
+            var args = Array[clif::Value, 2].filled(pcid)
+            args[1] = keep
+            let tag = stub_result(mut lo, mut fx, stub: Stub.Cr3Tag, args: args.view())
+            let tagged = mut fx.b.bor(root, y: tag)
+            let replaced = mut lo.swap_root(mut fx, root, tagged: Some(tagged))
+            replaced_root(mut lo, mut fx, supply, replaced)
         }
         "invalidate_page" => {
             let page = cpu_word(mut fx, held: supply.param(1))
             discard mut lo.call_stub(mut fx, stub: Stub.Invlpg, args: Array[clif::Value, 1].filled(page).view())
             supply.done(mut lo, mut fx)
         }
+        "invalidate_pcid" or "invalidate_pcid_page" => {
+            let page_wide = supply.member() == "invalidate_pcid_page"
+            let kind_value: u64 = if page_wide {
+                0
+            } else {
+                1
+            }
+            let kind = mut fx.ptr(kind_value)
+            let narrow_pcid = supply.param(1).scalar_value()
+            let pcid = mut fx.b.uextend(PTR, x: narrow_pcid)
+            let page = if page_wide {
+                cpu_word(mut fx, held: supply.param(2))
+            } else {
+                mut fx.ptr(0)
+            }
+            var args = Array[clif::Value, 3].filled(kind)
+            args[1] = pcid
+            args[2] = page
+            discard mut lo.call_stub(mut fx, stub: Stub.Invpcid, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        "invalidate_all" => {
+            discard mut lo.call_stub(mut fx, stub: Stub.FlushAll, args: none.view())
+            supply.done(mut lo, mut fx)
+        }
         "read_msr" => {
             let msr_number = supply.param(1).scalar_value()
             let msr = mut fx.b.uextend(PTR, x: msr_number)
-            let read = mut lo.call_stub(mut fx, stub: Stub.Rdmsr, args: Array[clif::Value, 1].filled(msr).view())
-            expect read.len() > 0
-            supply.ret(mut lo, mut fx, held: Held.Scalar(read[0]))
+            let value = stub_result(mut lo, mut fx, stub: Stub.Rdmsr, args: Array[clif::Value, 1].filled(msr).view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
         }
         "write_msr" => {
             let msr_number = supply.param(1).scalar_value()
@@ -79,36 +189,127 @@ fn cpu_ring0_x64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             discard mut lo.call_stub(mut fx, stub: Stub.Wrmsr, args: args.view())
             supply.done(mut lo, mut fx)
         }
+        else => cpu_x64_features(mut lo, mut fx, supply)
+    }
+} cpu_ring0_x64
+
+/// The x86_64 privileged intrinsics reading the CPU's identification, counter, extended
+/// control register and random sources, waiting on a word, and enabling protections.
+fn cpu_x64_features(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let none = mem::List[clif::Value].empty(fx.alloc)
+    match supply.member() {
+        "cpuid" => cpuid(mut lo, mut fx, supply)
+        "read_tsc" => {
+            let count = stub_result(mut lo, mut fx, stub: Stub.ReadTsc, args: none.view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+        }
+        "read_tscp" => read_tscp(mut lo, mut fx, supply)
+        "monitor_wait" => {
+            let word = supply.param(2).address_value()
+            let seen = supply.param(3).scalar_value()
+            let narrow_hint = supply.param(4).scalar_value()
+            let hint = mut fx.b.uextend(PTR, x: narrow_hint)
+            var args = Array[clif::Value, 3].filled(word)
+            args[1] = seen
+            args[2] = hint
+            discard mut lo.call_stub(mut fx, stub: Stub.MonitorWait, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        "read_xcr0" => {
+            let value = stub_result(mut lo, mut fx, stub: Stub.ReadXcr0, args: none.view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "write_xcr0" => {
+            let value = supply.param(1).scalar_value()
+            let wide = stub_result(mut lo, mut fx, stub: Stub.WriteXcr0, args: Array[clif::Value, 1].filled(value).view())
+            let written = mut fx.b.ireduce(clif::Type.Int8, x: wide)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(written))
+        }
+        "hardware_random" => found_value(mut lo, mut fx, supply, stub: Stub.Rdrand)
+        "hardware_seed" => found_value(mut lo, mut fx, supply, stub: Stub.Rdseed)
+        "enable_protection" => {
+            let feature_ty = supply.abi.params[1].nty.ty()
+            let slot = mut fx.slot(8, align: 8)
+            mut lo.store_held(mut fx, address: slot, held: supply.param(1), ty: feature_ty)
+            let index = mut lo.variant_index(mut fx, ty: feature_ty, address: slot)
+            let wide = stub_result(mut lo, mut fx, stub: Stub.EnableProtection, args: Array[clif::Value, 1].filled(index).view())
+            let enabled = mut fx.b.ireduce(clif::Type.Int8, x: wide)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(enabled))
+        }
+        "clear_cpu_buffers" => {
+            discard mut lo.call_stub(mut fx, stub: Stub.ClearBuffers, args: none.view())
+            supply.done(mut lo, mut fx)
+        }
         else => {
             expect false
         }
     }
-} cpu_ring0_x64
+} cpu_x64_features
 
-/// The AArch64 privileged intrinsics. `write_ttbr0` installs a low translation-table root and
-/// gives the one it replaces, as `write_cr3` does; `read_sysreg` and `write_sysreg` read and
-/// write the system register their `hw::SysReg` names, each built as the instruction holding its
-/// encoding; `invalidate_page` removes a page's cached translations.
+/// `cpuid`: the registers its stub writes, as an `hw::CpuidRegs`.
+fn cpuid(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let narrow_leaf = supply.param(1).scalar_value()
+    let leaf = mut fx.b.uextend(PTR, x: narrow_leaf)
+    let narrow_subleaf = supply.param(2).scalar_value()
+    let subleaf = mut fx.b.uextend(PTR, x: narrow_subleaf)
+    let written = mut fx.slot(16, align: 4)
+    var args = Array[clif::Value, 3].filled(leaf)
+    args[1] = subleaf
+    args[2] = written
+    discard mut lo.call_stub(mut fx, stub: Stub.Cpuid, args: args.view())
+    let regs_ty = supply.abi.result
+    let laid = mut lo.layout_of(regs_ty)
+    let regs = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    for position in 0u64..<4 {
+        let name = match position {
+            0 => "eax"
+            1 => "ebx"
+            2 => "ecx"
+            else => "edx"
+        }
+        let value = mut fx.load(clif::Type.Int32, addr: written, offset: 4 * position)
+        let field = mut lo.layouts.field(lo.ck, ty: regs_ty, variant: None, label: name)
+        mut fx.store(value, addr: regs, offset: field.offset)
+    }
+    let held = mut lo.held_at(mut fx, ty: regs_ty, address: regs)
+    supply.ret(mut lo, mut fx, held)
+} cpuid
+
+/// `read_tscp`: the counter its stub gives and the CPU number it writes, as an `hw::TscRead`.
+fn read_tscp(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let written = mut fx.slot(4, align: 4)
+    let count = stub_result(mut lo, mut fx, stub: Stub.Rdtscp, args: Array[clif::Value, 1].filled(written).view())
+    let cpu = mut fx.load(clif::Type.Int32, addr: written, offset: 0)
+    let read_ty = supply.abi.result
+    let laid = mut lo.layout_of(read_ty)
+    let read = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let count_field = mut lo.layouts.field(lo.ck, ty: read_ty, variant: None, label: "count")
+    mut fx.store(count, addr: read, offset: count_field.offset)
+    let cpu_field = mut lo.layouts.field(lo.ck, ty: read_ty, variant: None, label: "cpu")
+    mut fx.store(cpu, addr: read, offset: cpu_field.offset)
+    let held = mut lo.held_at(mut fx, ty: read_ty, address: read)
+    supply.ret(mut lo, mut fx, held)
+} read_tscp
+
+/// The AArch64 privileged intrinsics. `write_ttbr0` and `write_ttbr0_tagged` install a low
+/// translation-table root and give the one it replaces, as `write_cr3` does; `read_sysreg` and
+/// `write_sysreg` read and write the system register their `hw::SysReg` names, each built as the
+/// instruction holding its encoding.
 fn cpu_ring0_aarch64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "write_ttbr0" => {
             let root = cpu_word(mut fx, held: supply.param(1))
-            let replaced = mut lo.swap_root(mut fx, root)
-            let option = supply.abi.result
-            let entry_root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: replaced, y: 0)
-            mut fx.if_true(entry_root, then: fn[mut lo](mut fx1: Fx) {
-                let none = mut lo.none_value(mut fx1, option)
-                supply.ret(mut lo, fx: mut fx1, held: none)
-            })
-            let held = mut fx.slot(8, align: 8)
-            mut fx.store(replaced, addr: held, offset: 0)
-            let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(held)).view(), wrapped: None)
-            supply.ret(mut lo, mut fx, held: some)
+            let replaced = mut lo.swap_root(mut fx, root, tagged: None)
+            replaced_root(mut lo, mut fx, supply, replaced)
         }
-        "invalidate_page" => {
-            let page = cpu_word(mut fx, held: supply.param(1))
-            discard mut lo.call_stub(mut fx, stub: Stub.TlbiPage, args: Array[clif::Value, 1].filled(page).view())
-            supply.done(mut lo, mut fx)
+        "write_ttbr0_tagged" => {
+            let root = cpu_word(mut fx, held: supply.param(1))
+            let narrow_asid = supply.param(2).scalar_value()
+            let wide_asid = mut fx.b.uextend(PTR, x: narrow_asid)
+            let asid = mut fx.b.ishl_imm_s(wide_asid, y: 48)
+            let tagged = mut fx.b.bor(root, y: asid)
+            let replaced = mut lo.swap_root(mut fx, root, tagged: Some(tagged))
+            replaced_root(mut lo, mut fx, supply, replaced)
         }
         "read_sysreg" => {
             let index = sysreg_index(mut lo, mut fx, supply)
@@ -136,11 +337,79 @@ fn cpu_ring0_aarch64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             }
             mut fx.b.trap(clif::TrapCode(user: 1))
         }
+        else => cpu_aarch64_maintenance(mut lo, mut fx, supply)
+    }
+} cpu_ring0_aarch64
+
+/// The AArch64 privileged intrinsics maintaining translations and caches, waiting for an
+/// event and calling the firmware, one stub each.
+fn cpu_aarch64_maintenance(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "invalidate_page" => {
+            let page = cpu_word(mut fx, held: supply.param(1))
+            discard mut lo.call_stub(mut fx, stub: Stub.TlbiPage, args: Array[clif::Value, 1].filled(page).view())
+            supply.done(mut lo, mut fx)
+        }
+        "invalidate_asid" => {
+            let narrow_asid = supply.param(1).scalar_value()
+            let asid = mut fx.b.uextend(PTR, x: narrow_asid)
+            discard mut lo.call_stub(mut fx, stub: Stub.TlbiAsid, args: Array[clif::Value, 1].filled(asid).view())
+            supply.done(mut lo, mut fx)
+        }
+        "invalidate_asid_page" => {
+            let narrow_asid = supply.param(1).scalar_value()
+            let asid = mut fx.b.uextend(PTR, x: narrow_asid)
+            let page = cpu_word(mut fx, held: supply.param(2))
+            var args = Array[clif::Value, 2].filled(asid)
+            args[1] = page
+            discard mut lo.call_stub(mut fx, stub: Stub.TlbiAsidPage, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        "invalidate_all" => {
+            discard mut lo.call_stub(mut fx, stub: Stub.TlbiAll, args: mem::List[clif::Value].empty(fx.alloc).view())
+            supply.done(mut lo, mut fx)
+        }
+        "wait_for_event" => {
+            let word = supply.param(2).address_value()
+            let seen = supply.param(3).scalar_value()
+            var args = Array[clif::Value, 2].filled(word)
+            args[1] = seen
+            discard mut lo.call_stub(mut fx, stub: Stub.WaitEvent, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        "clean_data_cache" or "clean_invalidate_data_cache" or "invalidate_data_cache" or "sync_instruction_cache" => maintain_cache(mut lo, mut fx, supply)
+        "firmware_call" => {
+            let narrow_function = supply.param(1).scalar_value()
+            let function = mut fx.b.uextend(PTR, x: narrow_function)
+            var args = Array[clif::Value, 4].filled(function)
+            args[1] = supply.param(2).scalar_value()
+            args[2] = supply.param(3).scalar_value()
+            args[3] = supply.param(4).scalar_value()
+            let result = stub_result(mut lo, mut fx, stub: Stub.Hvc, args: args.view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(result))
+        }
         else => {
             expect false
         }
     }
-} cpu_ring0_aarch64
+} cpu_aarch64_maintenance
+
+/// The AArch64 cache maintenance intrinsics, each the stub maintaining the lines of its region.
+fn maintain_cache(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let stub = match supply.member() {
+        "clean_data_cache" => Stub.CleanCache
+        "clean_invalidate_data_cache" => Stub.CleanInvalidateCache
+        "invalidate_data_cache" => Stub.InvalidateCache
+        else => Stub.SyncInstructions
+    }
+    let region = supply.param(1).address_value()
+    let base = mut fx.load(PTR, addr: region, offset: REGION_BASE)
+    let len = mut fx.load(PTR, addr: region, offset: REGION_LEN)
+    var args = Array[clif::Value, 2].filled(base)
+    args[1] = len
+    discard mut lo.call_stub(mut fx, stub, args: args.view())
+    supply.done(mut lo, mut fx)
+} maintain_cache
 
 /// The index of the `hw::SysReg` an intrinsic's register parameter holds, in variant order.
 fn sysreg_index(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
@@ -275,7 +544,7 @@ const WRITABLE_SYS_REGS: usize = 15
 /// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
 /// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
 /// mapped readable for user mode in the running CPU's page tables; otherwise it copies the bytes
-/// once each.
+/// once each, allowing the access to user pages where x86_64 SMAP forbids it.
 fn user_addr(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "of" => word_result(mut lo, mut fx, supply, value: supply.param(0).scalar_value())
@@ -340,7 +609,13 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     })
     let mapped = mut fx.b.use_var(mapped_var)
     mut fx.if_true(mapped, then: fn[mut lo](mut fx1: Fx) {
+        if not aarch64 {
+            discard mut lo.call_stub(mut fx1, stub: Stub.UserOpen, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        }
         mut lo.copy(mut fx1, dst: copied, src: start, size, align: 1)
+        if not aarch64 {
+            discard mut lo.call_stub(mut fx1, stub: Stub.UserClose, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        }
     })
     discard mut lo.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved[0]).view())
     let unmapped = mut fx.b.bxor_imm_s(mapped, y: 1)

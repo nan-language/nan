@@ -383,7 +383,12 @@ pub mod state {
     pub const CLOCK_BASE: u64 = 368;
     pub const CLOCK_SCALE: u64 = 376;
     pub const CLOCK_LAST: u64 = 384;
-    pub const SIZE: u64 = 392;
+    /// On an x86_64 kernel, whether a CPU holds the shootdown lock, the scope its shootdown
+    /// invalidates and the number of CPUs yet to serve it.
+    pub const SHOOTDOWN_LOCK: u64 = 392;
+    pub const SHOOTDOWN_SCOPE: u64 = 400;
+    pub const SHOOTDOWN_LEFT: u64 = 408;
+    pub const SIZE: u64 = 416;
 }
 
 impl Lowering<'_, '_> {

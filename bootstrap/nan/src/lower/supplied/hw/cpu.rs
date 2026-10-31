@@ -10,7 +10,8 @@ use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::machine::Stub;
 use super::super::super::machine::{A64_ACCESS, A64_TABLE, A64_VALID, LARGE, PRESENT};
-use super::super::{Supply, sys};
+use super::super::{Supply, sys, tasks as task_ops};
+use super::physical;
 
 /// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
 /// machine target completing one ends the interrupt the running CPU serves, whose vector is its
@@ -35,18 +36,88 @@ pub fn irq_context(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// The privileged intrinsics, each one or more compiler stubs on the running CPU, dispatched by
-/// the target's architecture, since each architecture's descriptor names its own set.
+/// The privileged intrinsics, each one or more compiler stubs on the running CPU. Those both
+/// architectures share are lowered here, the others by the target's architecture, since each
+/// architecture's descriptor names its own set. `invalidate_everywhere` fails at once when
+/// cancelled as it starts, and otherwise completes whatever cancels it.
 pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
-    match lo.ck.db.target.arch() {
-        Some(crate::workspace::Arch::Aarch64) => ring0_aarch64(lo, fx, supply),
-        _ => ring0_x64(lo, fx, supply),
+    match supply.member() {
+        "wait_for_interrupt" => {
+            lo.wait_for_interrupt(fx);
+            supply.done(lo, fx);
+        }
+        "signal_cpu" => {
+            let index = supply.param(1).scalar();
+            let index = fx.b.ins().uextend(PTR, index);
+            lo.signal_cpu(fx, index);
+            supply.done(lo, fx);
+        }
+        "invalidate_everywhere" => {
+            let early = task_ops::origin(lo, fx);
+            let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, early, 0);
+            fx.when(cancelled, |fx| {
+                task_ops::fail_cancelled(lo, fx, supply, early)
+            });
+            let scope = tlb_scope(lo, fx, supply);
+            lo.invalidate_everywhere(fx, scope);
+            supply.done(lo, fx);
+        }
+        _ => match lo.ck.db.target.arch() {
+            Some(crate::workspace::Arch::Aarch64) => ring0_aarch64(lo, fx, supply),
+            _ => ring0_x64(lo, fx, supply),
+        },
     }
 }
 
+/// The scope an `hw::TlbScope` parameter names, as the shootdown stubs take it: the address of
+/// the page `Page` holds, or 1 for `All`.
+fn tlb_scope(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> Value {
+    let scope_ty = supply.abi.params[1].0.ty().clone();
+    let layout = lo.layout(&scope_ty);
+    let slot = fx.slot(layout.size, layout.align);
+    lo.store_held(fx, slot, supply.param(1), &scope_ty);
+    let index = lo.variant_index(fx, &scope_ty, slot);
+    let page_at = lo.layouts.field(lo.ck, &scope_ty, Some("Page"), "").offset;
+    let page = fx.load(PTR, slot, page_at);
+    let page = fx.b.ins().band_imm_s(page, !0xFFF);
+    let all = fx.ptr(1);
+    let is_page = fx.b.ins().icmp_imm_s(IntCC::Equal, index, 0);
+    fx.b.ins().select(is_page, page, all)
+}
+
+/// Gives a root-installing intrinsic's result from the root it replaced: `Some` of a
+/// `hw::PageTableRoot` owning it, none for the entry root.
+fn replaced_root(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, replaced: Value) {
+    let option = supply.abi.result.clone();
+    let entry = fx.b.ins().icmp_imm_s(IntCC::Equal, replaced, 0);
+    fx.when(entry, |fx| {
+        let none = lo.none_value(fx, &option);
+        supply.ret(lo, fx, none);
+    });
+    let held = fx.slot(8, 8);
+    fx.store(replaced, held, 0);
+    let some = lo.variant_value(fx, &option, "Some", &[Held::Address(held)], None);
+    supply.ret(lo, fx, some);
+}
+
+/// Gives an `Option[u64]` from a stub that writes a value at an address and gives whether it
+/// found one.
+fn found_value(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, stub: Stub) {
+    let value = fx.slot(8, 8);
+    let found = lo.call_stub(fx, stub, &[value])[0];
+    let option = supply.abi.result.clone();
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, found, 0);
+    fx.when(missing, |fx| {
+        let none = lo.none_value(fx, &option);
+        supply.ret(lo, fx, none);
+    });
+    let some = lo.variant_value(fx, &option, "Some", &[Held::Address(value)], None);
+    supply.ret(lo, fx, some);
+}
+
 /// The x86_64 privileged intrinsics. `load_idt` loads the table the box holds and keeps the box
-/// in its token; `write_cr3` installs a root and gives the one it replaces, which the CPU's
-/// record keeps, none for the entry root.
+/// in its token; `write_cr3` and `write_cr3_tagged` install a root and give the one it replaces,
+/// which the CPU's record keeps, none for the entry root.
 fn ring0_x64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "load_idt" => {
@@ -56,21 +127,39 @@ fn ring0_x64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "write_cr3" => {
             let root = word(fx, supply.param(1));
-            let replaced = lo.swap_root(fx, root);
-            let option = supply.abi.result.clone();
-            let entry = fx.b.ins().icmp_imm_s(IntCC::Equal, replaced, 0);
-            fx.when(entry, |fx| {
-                let none = lo.none_value(fx, &option);
-                supply.ret(lo, fx, none);
-            });
-            let held = fx.slot(8, 8);
-            fx.store(replaced, held, 0);
-            let some = lo.variant_value(fx, &option, "Some", &[Held::Address(held)], None);
-            supply.ret(lo, fx, some);
+            let replaced = lo.swap_root(fx, root, None);
+            replaced_root(lo, fx, supply, replaced);
+        }
+        "write_cr3_tagged" => {
+            let root = word(fx, supply.param(1));
+            let pcid = supply.param(2).scalar();
+            let pcid = fx.b.ins().uextend(PTR, pcid);
+            let keep = supply.param(3).scalar();
+            let keep = fx.b.ins().uextend(PTR, keep);
+            let tag = lo.call_stub(fx, Stub::Cr3Tag, &[pcid, keep])[0];
+            let tagged = fx.b.ins().bor(root, tag);
+            let replaced = lo.swap_root(fx, root, Some(tagged));
+            replaced_root(lo, fx, supply, replaced);
         }
         "invalidate_page" => {
             let page = word(fx, supply.param(1));
             lo.call_stub(fx, Stub::Invlpg, &[page]);
+            supply.done(lo, fx);
+        }
+        "invalidate_pcid" | "invalidate_pcid_page" => {
+            let page_wide = supply.member() == "invalidate_pcid_page";
+            let kind = fx.ptr(u64::from(!page_wide));
+            let pcid = supply.param(1).scalar();
+            let pcid = fx.b.ins().uextend(PTR, pcid);
+            let page = match page_wide {
+                true => word(fx, supply.param(2)),
+                false => fx.ptr(0),
+            };
+            lo.call_stub(fx, Stub::Invpcid, &[kind, pcid, page]);
+            supply.done(lo, fx);
+        }
+        "invalidate_all" => {
+            lo.call_stub(fx, Stub::FlushAll, &[]);
             supply.done(lo, fx);
         }
         "read_msr" => {
@@ -86,8 +175,91 @@ fn ring0_x64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_stub(fx, Stub::Wrmsr, &[msr, value]);
             supply.done(lo, fx);
         }
+        _ => x64_features(lo, fx, supply),
+    }
+}
+
+/// The x86_64 privileged intrinsics reading the CPU's identification, counter, extended control
+/// register and random sources, waiting on a word, and enabling protections.
+fn x64_features(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    match supply.member() {
+        "cpuid" => cpuid(lo, fx, supply),
+        "read_tsc" => {
+            let count = lo.call_stub(fx, Stub::ReadTsc, &[])[0];
+            supply.ret(lo, fx, Held::Scalar(count));
+        }
+        "read_tscp" => read_tscp(lo, fx, supply),
+        "monitor_wait" => {
+            let word = supply.param(2).address();
+            let seen = supply.param(3).scalar();
+            let hint = supply.param(4).scalar();
+            let hint = fx.b.ins().uextend(PTR, hint);
+            lo.call_stub(fx, Stub::MonitorWait, &[word, seen, hint]);
+            supply.done(lo, fx);
+        }
+        "read_xcr0" => {
+            let value = lo.call_stub(fx, Stub::ReadXcr0, &[])[0];
+            supply.ret(lo, fx, Held::Scalar(value));
+        }
+        "write_xcr0" => {
+            let value = supply.param(1).scalar();
+            let written = lo.call_stub(fx, Stub::WriteXcr0, &[value])[0];
+            let written = fx.b.ins().ireduce(types::I8, written);
+            supply.ret(lo, fx, Held::Scalar(written));
+        }
+        "hardware_random" => found_value(lo, fx, supply, Stub::Rdrand),
+        "hardware_seed" => found_value(lo, fx, supply, Stub::Rdseed),
+        "enable_protection" => {
+            let feature_ty = supply.abi.params[1].0.ty().clone();
+            let slot = fx.slot(8, 8);
+            lo.store_held(fx, slot, supply.param(1), &feature_ty);
+            let index = lo.variant_index(fx, &feature_ty, slot);
+            let enabled = lo.call_stub(fx, Stub::EnableProtection, &[index])[0];
+            let enabled = fx.b.ins().ireduce(types::I8, enabled);
+            supply.ret(lo, fx, Held::Scalar(enabled));
+        }
+        "clear_cpu_buffers" => {
+            lo.call_stub(fx, Stub::ClearBuffers, &[]);
+            supply.done(lo, fx);
+        }
         member => panic!("no x86_64 lowering of hw::Ring0.{member}"),
     }
+}
+
+/// `cpuid`: the registers its stub writes, as an `hw::CpuidRegs`.
+fn cpuid(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let leaf = supply.param(1).scalar();
+    let leaf = fx.b.ins().uextend(PTR, leaf);
+    let subleaf = supply.param(2).scalar();
+    let subleaf = fx.b.ins().uextend(PTR, subleaf);
+    let written = fx.slot(16, 4);
+    lo.call_stub(fx, Stub::Cpuid, &[leaf, subleaf, written]);
+    let regs_ty = supply.abi.result.clone();
+    let layout = lo.layout(&regs_ty);
+    let regs = fx.slot(layout.size, layout.align);
+    for (index, name) in ["eax", "ebx", "ecx", "edx"].into_iter().enumerate() {
+        let value = fx.load(types::I32, written, 4 * index as u64);
+        let at = lo.layouts.field(lo.ck, &regs_ty, None, name).offset;
+        fx.store(value, regs, at);
+    }
+    let held = lo.held_at(fx, &regs_ty, regs);
+    supply.ret(lo, fx, held);
+}
+
+/// `read_tscp`: the counter its stub gives and the CPU number it writes, as an `hw::TscRead`.
+fn read_tscp(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let written = fx.slot(4, 4);
+    let count = lo.call_stub(fx, Stub::Rdtscp, &[written])[0];
+    let cpu = fx.load(types::I32, written, 0);
+    let read_ty = supply.abi.result.clone();
+    let layout = lo.layout(&read_ty);
+    let read = fx.slot(layout.size, layout.align);
+    let at = lo.layouts.field(lo.ck, &read_ty, None, "count").offset;
+    fx.store(count, read, at);
+    let at = lo.layouts.field(lo.ck, &read_ty, None, "cpu").offset;
+    fx.store(cpu, read, at);
+    let held = lo.held_at(fx, &read_ty, read);
+    supply.ret(lo, fx, held);
 }
 
 /// The AArch64 system register each `hw::SysReg` variant names, by the variant's name, as the
@@ -123,30 +295,25 @@ const SYS_REGS: [(&str, u16); 24] = [
 /// `write_sysreg` alone reaches.
 const WRITABLE_SYS_REGS: usize = 15;
 
-/// The AArch64 privileged intrinsics. `write_ttbr0` installs a low translation-table root and
-/// gives the one it replaces, as `write_cr3` does; `read_sysreg` and `write_sysreg` read and
-/// write the system register their `hw::SysReg` names, each built as the instruction holding its
-/// encoding; `invalidate_page` removes a page's cached translations.
+/// The AArch64 privileged intrinsics. `write_ttbr0` and `write_ttbr0_tagged` install a low
+/// translation-table root and give the one it replaces, as `write_cr3` does; `read_sysreg` and
+/// `write_sysreg` read and write the system register their `hw::SysReg` names, each built as the
+/// instruction holding its encoding.
 fn ring0_aarch64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "write_ttbr0" => {
             let root = word(fx, supply.param(1));
-            let replaced = lo.swap_root(fx, root);
-            let option = supply.abi.result.clone();
-            let entry = fx.b.ins().icmp_imm_s(IntCC::Equal, replaced, 0);
-            fx.when(entry, |fx| {
-                let none = lo.none_value(fx, &option);
-                supply.ret(lo, fx, none);
-            });
-            let held = fx.slot(8, 8);
-            fx.store(replaced, held, 0);
-            let some = lo.variant_value(fx, &option, "Some", &[Held::Address(held)], None);
-            supply.ret(lo, fx, some);
+            let replaced = lo.swap_root(fx, root, None);
+            replaced_root(lo, fx, supply, replaced);
         }
-        "invalidate_page" => {
-            let page = word(fx, supply.param(1));
-            lo.call_stub(fx, Stub::TlbiPage, &[page]);
-            supply.done(lo, fx);
+        "write_ttbr0_tagged" => {
+            let root = word(fx, supply.param(1));
+            let asid = supply.param(2).scalar();
+            let asid = fx.b.ins().uextend(PTR, asid);
+            let asid = fx.b.ins().ishl_imm_s(asid, 48);
+            let tagged = fx.b.ins().bor(root, asid);
+            let replaced = lo.swap_root(fx, root, Some(tagged));
+            replaced_root(lo, fx, supply, replaced);
         }
         "read_sysreg" => {
             let index = sysreg_index(lo, fx, supply);
@@ -175,8 +342,70 @@ fn ring0_aarch64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.b.ins()
                 .trap(cranelift_codegen::ir::TrapCode::user(1).expect("a trap code"));
         }
+        _ => aarch64_maintenance(lo, fx, supply),
+    }
+}
+
+/// The AArch64 privileged intrinsics maintaining translations and caches, waiting for an event
+/// and calling the firmware, one stub each.
+fn aarch64_maintenance(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    match supply.member() {
+        "invalidate_page" => {
+            let page = word(fx, supply.param(1));
+            lo.call_stub(fx, Stub::TlbiPage, &[page]);
+            supply.done(lo, fx);
+        }
+        "invalidate_asid" => {
+            let asid = supply.param(1).scalar();
+            let asid = fx.b.ins().uextend(PTR, asid);
+            lo.call_stub(fx, Stub::TlbiAsid, &[asid]);
+            supply.done(lo, fx);
+        }
+        "invalidate_asid_page" => {
+            let asid = supply.param(1).scalar();
+            let asid = fx.b.ins().uextend(PTR, asid);
+            let page = word(fx, supply.param(2));
+            lo.call_stub(fx, Stub::TlbiAsidPage, &[asid, page]);
+            supply.done(lo, fx);
+        }
+        "invalidate_all" => {
+            lo.call_stub(fx, Stub::TlbiAll, &[]);
+            supply.done(lo, fx);
+        }
+        "wait_for_event" => {
+            let word = supply.param(2).address();
+            let seen = supply.param(3).scalar();
+            lo.call_stub(fx, Stub::WaitEvent, &[word, seen]);
+            supply.done(lo, fx);
+        }
+        "clean_data_cache"
+        | "clean_invalidate_data_cache"
+        | "invalidate_data_cache"
+        | "sync_instruction_cache" => maintain_cache(lo, fx, supply),
+        "firmware_call" => {
+            let function = supply.param(1).scalar();
+            let function = fx.b.ins().uextend(PTR, function);
+            let args = [2, 3, 4].map(|index| supply.param(index).scalar());
+            let result = lo.call_stub(fx, Stub::Hvc, &[function, args[0], args[1], args[2]])[0];
+            supply.ret(lo, fx, Held::Scalar(result));
+        }
         member => panic!("no AArch64 lowering of hw::Ring0.{member}"),
     }
+}
+
+/// The AArch64 cache maintenance intrinsics, each the stub maintaining the lines of its region.
+fn maintain_cache(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let stub = match supply.member() {
+        "clean_data_cache" => Stub::CleanCache,
+        "clean_invalidate_data_cache" => Stub::CleanInvalidateCache,
+        "invalidate_data_cache" => Stub::InvalidateCache,
+        _ => Stub::SyncInstructions,
+    };
+    let region = supply.param(1).address();
+    let base = fx.load(PTR, region, physical::region::BASE);
+    let len = fx.load(PTR, region, physical::region::LEN);
+    lo.call_stub(fx, stub, &[base, len]);
+    supply.done(lo, fx);
 }
 
 /// The index of the `hw::SysReg` an intrinsic's register parameter holds, in variant order.
@@ -260,7 +489,7 @@ const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000;
 /// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
 /// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
 /// mapped readable for user mode in the running CPU's page tables; otherwise it copies the bytes
-/// once each.
+/// once each, allowing the access to user pages where x86_64 SMAP forbids it.
 pub fn user_addr(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "of" => word_result(lo, fx, supply, supply.param(0).scalar()),
@@ -318,7 +547,15 @@ fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         fx.b.def_var(mapped, so_far);
     });
     let mapped = fx.b.use_var(mapped);
-    fx.when(mapped, |fx| lo.copy(fx, copied, start, size, 1));
+    fx.when(mapped, |fx| {
+        if !aarch64 {
+            lo.call_stub(fx, Stub::UserOpen, &[]);
+        }
+        lo.copy(fx, copied, start, size, 1);
+        if !aarch64 {
+            lo.call_stub(fx, Stub::UserClose, &[]);
+        }
+    });
     lo.call_stub(fx, Stub::IrqRestore, &[flags]);
     let unmapped = fx.b.ins().bxor_imm_s(mapped, 1);
     fx.when(unmapped, |fx| sys::fail_with(lo, fx, supply, "Unmapped"));

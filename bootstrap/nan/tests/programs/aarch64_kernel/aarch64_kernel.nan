@@ -9,6 +9,9 @@ const UNMAPPED: u64 = 0x1_0000_0000
 
 const DATA_ABORT: u64 = 0x25
 
+/// The PSCI function giving the firmware's PSCI version.
+const PSCI_VERSION: u32 = 0x8400_0000
+
 fn say(text: Str) {
     var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
     for byte in text.as_bytes() {
@@ -107,7 +110,39 @@ fn privileged(cpu: hw::Ring0) {
         Err(error) => error == hw::UserAddrError.Unmapped
     }
     check(name: "copy_in", held: refused)
+    let page = hw::VirtAddr(value: UNMAPPED)
+    cpu.invalidate_page(page)
+    cpu.invalidate_asid_page(1, page)
+    cpu.invalidate_asid(1)
+    cpu.invalidate_all()
+    check(name: "tlbi", held: true)
+    let word = core::atomic::AtomicU64.of(1)
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        cpu.wait_for_event(t, word, seen: 0)
+    })
+    check(name: "wait_for_event", held: true)
+    let version = trusted "PSCI_VERSION only reads the firmware's version" { cpu.firmware_call(PSCI_VERSION, a: 0, b: 0, c: 0) }
+    check(name: "firmware_call", held: (version & 0xFFFF_FFFF) >= 2)
 } privileged
+
+/// Cleans and invalidates the data cache over the smallest usable region, which nothing reads,
+/// and makes the instruction cache see it.
+fn caches(cpu: hw::Ring0, regions: mem::List[hw::Region]) {
+    var smallest: usize = 0
+    for index in 0..<regions.len() {
+        if regions[index].byte_len() < regions[smallest].byte_len() {
+            smallest = index
+        }
+    }
+    let region = regions[smallest]
+    cpu.clean_data_cache(region)
+    cpu.clean_invalidate_data_cache(region)
+    trusted "the region is free memory that no value reads" {
+        cpu.invalidate_data_cache(region)
+    }
+    cpu.sync_instruction_cache(region)
+    check(name: "caches", held: true)
+} caches
 
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let regions = mut k.regions()
@@ -118,6 +153,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         }
     }
     privileged(cpu)
+    caches(cpu, regions)
     take k.anchor(take regions, run: fn(exec: task::Executor) limits stack 65_536 {
         arithmetic()
         frames()

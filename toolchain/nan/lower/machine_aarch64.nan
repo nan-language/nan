@@ -118,6 +118,10 @@ const STOP_INTID: u64 = 0
 
 const STOP_SGI: u64 = (1u64 << 40) | (STOP_INTID << 24)
 
+/// The software-generated interrupt the `SendSignal` stub sends, which the dispatcher receives
+/// as the CPU signal's vector.
+const SIGNAL_INTID: i64 = 1
+
 /// The system-register encodings the `ReadSysReg` and `WriteSysReg` stubs hold to reach the GIC
 /// CPU interface, the vector base and the virtual timer, as the `mrs` and `msr` instructions
 /// encode them.
@@ -188,7 +192,7 @@ fn Lowering.aarch64_interrupt_setup(mut self, mut fx: Fx) -> object::FuncId {
     for bound_entry in bound {
         if bound_entry.vector >= 16 and bound_entry.vector < 32 {
             private = private | (1u64 << u32.fit(bound_entry.vector))
-        } else if bound_entry.vector >= 32 {
+        } else if bound_entry.vector >= 32 and bound_entry.vector != SIGNAL_VECTOR {
             let vector = mut fx.ptr(u64.fit(bound_entry.vector))
             mut self.aarch64_enable(mut fx, vector)
         }
@@ -244,10 +248,10 @@ fn Lowering.aarch64_vector_seam(mut self, dispatch: object::FuncId, preempt: obj
 /// The glue each CPU runs to take interrupts: it draws its interrupt stack, makes it the stack
 /// exceptions switch to while its own code continues on `SP_EL0`, and loads the vector table into
 /// `VBAR_EL1`. It then wakes its redistributor, puts the stop interrupt in group 0 and its other
-/// software-generated and private interrupts in group 1, enables the stop interrupt, the timer's
-/// and the private interrupts in `private`, enables its GIC CPU interface at the lowest priority,
-/// unmasks fast interrupts, and starts and enables its virtual timer. Maskable interrupts stay
-/// disabled until the executor enables them.
+/// software-generated and private interrupts in group 1, enables the stop interrupt, the CPU
+/// signal's, the timer's and the private interrupts in `private`, enables its GIC CPU interface
+/// at the lowest priority, unmasks fast interrupts, and starts and enables its virtual timer.
+/// Maskable interrupts stay disabled until the executor enables them.
 fn Lowering.aarch64_cpu_prepare(mut self, vbar: object::FuncId, private: u64) -> object::FuncId {
     let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     let id = mut self.module.declare_function("_NScpu_prepare", linkage: object::Linkage.Local, signature)
@@ -283,7 +287,7 @@ fn Lowering.aarch64_cpu_prepare(mut self, vbar: object::FuncId, private: u64) ->
         let ones = mut fx1.ptr(0xFFFF_FFFF & ~(1u64 << u32.fit(STOP_INTID)))
         mut lo1.mmio_write(mut fx1, width: 4, address: group, value: ones)
         let enable = mut fx1.b.iadd_imm_s(sgi, y: i64.fit(GICR_ISENABLER0))
-        let bits = mut fx1.ptr((1u64 << u32.fit(STOP_INTID)) | (1u64 << u32.fit(AARCH64_TIMER_INTID)) | private)
+        let bits = mut fx1.ptr((1u64 << u32.fit(STOP_INTID)) | (1u64 << u32.fit(SIGNAL_INTID)) | (1u64 << u32.fit(AARCH64_TIMER_INTID)) | private)
         mut lo1.mmio_write(mut fx1, width: 4, address: enable, value: bits)
         let sre = mut lo1.read_sysreg(mut fx1, register: ICC_SRE_EL1)
         let sre_set = mut fx1.b.bor_imm_s(sre, y: 1)
@@ -315,7 +319,8 @@ fn Lowering.aarch64_set_timer(mut self, mut fx: Fx, ticks: clif::Value) {
 } Lowering.aarch64_set_timer
 
 /// The vector of what the seam took, from the kind of exception it passes: for an IRQ the
-/// interrupt the controller signals, which this acknowledges; for a synchronous exception the
+/// interrupt the controller signals, which this acknowledges, or the CPU signal's vector for its
+/// software-generated interrupt; for a synchronous exception the
 /// abort vector or the other one as its syndrome's class gives, and the SError vector for an
 /// SError interrupt. A fast interrupt is the stop a halting CPU sends, which stops this one; a
 /// spurious IRQ returns from the dispatcher at once.
@@ -334,7 +339,9 @@ fn Lowering.aarch64_vector(mut self, mut fx: Fx, kind: clif::Value, saved: clif:
             let zero_value = mut fx2.ptr(0)
             mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
         })
-        return fx1.list1(intid)
+        let signal = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: intid, y: SIGNAL_INTID)
+        let signalled = mut fx1.ptr(u64.fit(SIGNAL_VECTOR))
+        return fx1.list1(mut fx1.b.select(signal, x: signalled, y: intid))
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let syndrome = mut fx1.load(PTR, addr: saved, offset: AARCH64_FRAME_ESR)
         let class = mut fx1.b.ushr_imm_s(syndrome, y: AARCH64_CLASS_SHIFT)
@@ -352,10 +359,13 @@ fn Lowering.aarch64_vector(mut self, mut fx: Fx, kind: clif::Value, saved: clif:
 } Lowering.aarch64_vector
 
 /// Writes the GIC CPU interface's end-of-interrupt register for the interrupt the running CPU
-/// serves.
+/// serves, the CPU signal's being its software-generated interrupt.
 fn Lowering.aarch64_eoi(mut self, mut fx: Fx) {
     let record = mut self.running_cpu(mut fx)
-    let intid = mut fx.load(PTR, addr: record, offset: CPU_VECTOR)
+    let vector = mut fx.load(PTR, addr: record, offset: CPU_VECTOR)
+    let signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: SIGNAL_VECTOR)
+    let generated = mut fx.ptr(u64.fit(SIGNAL_INTID))
+    let intid = mut fx.b.select(signal, x: generated, y: vector)
     mut self.write_sysreg(mut fx, register: ICC_EOIR1_EL1, value: intid)
 } Lowering.aarch64_eoi
 

@@ -19,9 +19,11 @@ const PSCI_PRESENT_MAX: i64 = 2
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
 /// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
 /// whether it has AVX enabled, which the vector seam reads to save the extended state; the
-/// frame the vector seam saved for the interrupt it serves, zero outside one; and, on a kernel,
-/// the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
-/// millisecond.
+/// frame the vector seam saved for the interrupt it serves, zero outside one; on x86_64, the
+/// features the `CpuFeatures` stub records; on a kernel, the nanosecond of its timer's next
+/// pacing tick and the ticks its timer counts in a millisecond; whether it waits in
+/// `hw::Ring0.wait_for_interrupt`, which no preemption interrupts; and whether a shootdown
+/// another CPU posted awaits it.
 const CPU_THREAD: u64 = 0
 
 const CPU_VECTOR: u64 = 8
@@ -46,9 +48,15 @@ const CPU_AVX: u64 = 232
 
 const CPU_FRAME: u64 = 240
 
+const CPU_FEATURES: u64 = 248
+
 const CPU_NEXT_PACE: u64 = 256
 
 const CPU_TIMER_RATE: u64 = 264
+
+const CPU_WAITING: u64 = 272
+
+const CPU_SHOOTDOWN: u64 = 280
 
 const CPU_SIZE: u64 = 320
 
@@ -104,8 +112,8 @@ fn Lowering.running_cpu(mut self, mut fx: Fx) -> clif::Value {
 /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
 /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
 /// its clock started and a CPU for each processor the platform reports; an executor thread
-/// record for each CPU; and, on `x86_64-bare`, the boot CPU's descriptor tables loaded and AVX
-/// enabled when it has it.
+/// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`, the
+/// boot CPU's descriptor tables loaded and AVX enabled when it has it.
 fn Lowering.machine_init(mut self, mut fx: Fx) {
     let boot = mut self.cpu_records(mut fx)
     mut self.set_cpu_base(mut fx, record: boot)
@@ -138,6 +146,9 @@ fn Lowering.machine_init(mut self, mut fx: Fx) {
         let cpu = mut self.cpu_record(mut fx1, index)
         mut fx1.store(record, addr: cpu, offset: CPU_THREAD)
     })
+    if self.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
+        discard mut self.call_stub(mut fx, stub: Stub.CpuFeatures, args: Array[clif::Value, 1].filled(zero_value).view())
+    }
     if self.ck.db().target == workspace::Target.X64Bare {
         mut self.load_cpu_tables(mut fx, record: boot)
         mut self.enable_avx(mut fx, record: boot)
@@ -184,20 +195,29 @@ fn Lowering.load_cpu_tables(mut self, mut fx: Fx, record: clif::Value) {
 
 /// Installs `root` as the running CPU's page-table root, with maskable interrupts disabled so
 /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
-/// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub.
-fn Lowering.swap_root(mut self, mut fx: Fx, root: clif::Value) -> clif::Value {
+/// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub, which
+/// receives `tagged` instead when given: the root with a PCID or ASID, whose translations
+/// stay cached.
+fn Lowering.swap_root(mut self, mut fx: Fx, root: clif::Value, tagged: Option[clif::Value]) -> clif::Value {
     let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
     expect saved.len() > 0
     let flags = saved[0]
     let record = mut self.running_cpu(mut fx)
     let replaced = mut fx.load(PTR, addr: record, offset: CPU_ROOT)
     mut fx.store(root, addr: record, offset: CPU_ROOT)
-    let install = if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
-        Stub.WriteTtbr0
-    } else {
+    let aarch64 = self.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
+    let install = if not aarch64 {
         Stub.WriteCr3
+    } else if tagged.is_some() {
+        Stub.WriteTtbr0Tagged
+    } else {
+        Stub.WriteTtbr0
     }
-    discard mut self.call_stub(mut fx, stub: install, args: Array[clif::Value, 1].filled(root).view())
+    let installed = match tagged {
+        Some(value) => value
+        None => root
+    }
+    discard mut self.call_stub(mut fx, stub: install, args: Array[clif::Value, 1].filled(installed).view())
     discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(flags).view())
     return replaced
 } Lowering.swap_root
@@ -736,9 +756,9 @@ fn Lowering.trampoline_code(mut self) -> object::DataId {
 } Lowering.trampoline_code
 
 /// The glue a started CPU calls with its record: it points its base register at the record,
-/// sets its data-independent timing mode, on x86_64 loads its descriptor tables and enables
-/// AVX when it has it, prepares its interrupt delivery through `prepare`, records that it
-/// started and runs the executor's scheduler.
+/// sets its data-independent timing mode, on x86_64 records its features, loads its descriptor
+/// tables and enables AVX when it has it, prepares its interrupt delivery through `prepare`,
+/// records that it started and runs the executor's scheduler.
 fn Lowering.cpu_glue(mut self, prepare: object::FuncId) -> object::FuncId {
     var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -750,6 +770,8 @@ fn Lowering.cpu_glue(mut self, prepare: object::FuncId) -> object::FuncId {
         mut lo1.set_cpu_base(mut fx1, record: record)
         discard mut lo1.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
         if lo1.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+            let index = mut lo1.running_index(mut fx1)
+            discard mut lo1.call_stub(mut fx1, stub: Stub.CpuFeatures, args: Array[clif::Value, 1].filled(index).view())
             mut lo1.load_cpu_tables(mut fx1, record)
             mut lo1.enable_avx(mut fx1, record)
         }

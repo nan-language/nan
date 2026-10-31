@@ -1,0 +1,39 @@
+//! The CPU's own operations: a wait for an interrupt, the CPU signal and a shootdown.
+
+/// The ticks a check waits at most for every CPU to take the signal.
+const SIGNAL_TICKS: u32 = 50
+
+/// Counts each CPU signal a CPU takes.
+pub interrupt fn on_signal(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    discard hw::Anchor[State].with(fn(state: State) {
+        discard state.signals.contents().fetch_add(1)
+    })
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_signal
+
+contribute hw::vectors signal = hw::Vector(vector: hw::SIGNAL_VECTOR, ist: 0, handler: hw::VectorHandler.Irq(on_signal), user: None)
+
+/// Reports a wait for an interrupt, every CPU taking the signal, and a shootdown every CPU
+/// serves.
+fn check_cpu(console: hw::IrqShared[Console], cpu: hw::Ring0, signals: mem::Shared[core::atomic::AtomicU64], ticks: mem::Shared[hw::Signal[u64]]) fails task::Cancelled uses wait {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        cpu.wait_for_interrupt(t)
+    })
+    say(console, text: "idle: an interrupt ended a wait\n")
+    let taken = signals.contents().load()
+    for index in 0..<hw::cpu_count() {
+        cpu.signal_cpu(index)
+    }
+    var waited: u32 = 0
+    while signals.contents().load() < taken + u64.widen(hw::cpu_count()) and waited < SIGNAL_TICKS {
+        discard try await ticks.contents().wait()
+        waited = waited + 1
+    }
+    if waited < SIGNAL_TICKS {
+        say_number(console, before: "signal: each of ", value: u64.widen(hw::cpu_count()), after: " cpus took the cpu signal\n")
+    }
+    try await cpu.invalidate_everywhere(hw::TlbScope.Page(hw::VirtAddr(value: 0x20_0000)))
+    try await cpu.invalidate_everywhere(hw::TlbScope.All)
+    say(console, text: "shootdown: every cpu invalidated its translations\n")
+} check_cpu

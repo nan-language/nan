@@ -182,9 +182,10 @@ pub fn is_volatile(path: &str) -> bool {
 }
 
 /// The class of a std operation without a body under a target: the greatest for a volatile
-/// call, and on the machine targets, where the sys capabilities are sims, `traceless` for theirs.
+/// call and a firmware call, and on the machine targets, where the sys capabilities are sims,
+/// `traceless` for theirs.
 pub fn supplied(path: &str, target: Target) -> Class {
-    if is_volatile(path) {
+    if is_volatile(path) || path == "hw::Ring0.firmware_call" {
         return Class::WORST;
     }
     if path == "boot::Services.write_console" {

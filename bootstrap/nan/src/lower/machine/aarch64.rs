@@ -11,6 +11,7 @@ use super::super::fx::{Fx, PTR};
 use super::Lowering;
 use super::cpus::cpu;
 use super::interrupts::{SavedFrame, Vectors};
+use super::signal::SIGNAL_VECTOR;
 use super::stubs::Stub;
 
 /// The EL1 exception vector table and the common seam that follows it. An exception taken from
@@ -279,6 +280,10 @@ const GICR_ISENABLER0: u64 = 0x100;
 const STOP_INTID: u64 = 0;
 const STOP_SGI: u64 = (1 << 40) | (STOP_INTID << 24);
 
+/// The software-generated interrupt the `SendSignal` stub sends, which the dispatcher receives
+/// as the CPU signal's vector.
+const SIGNAL_INTID: i64 = 1;
+
 /// The system-register encodings the `ReadSysReg` and `WriteSysReg` stubs hold to reach the GIC
 /// CPU interface, the vector base, the virtual timer and the virtual counter, as the `mrs` and
 /// `msr` instructions encode them.
@@ -327,6 +332,7 @@ impl Lowering<'_, '_> {
         for entry in &bound {
             match entry.vector {
                 16..32 => private |= 1 << entry.vector,
+                SIGNAL_VECTOR => {}
                 32.. => {
                     let vector = fx.ptr(entry.vector as u64);
                     self.aarch64_enable(fx, vector);
@@ -397,7 +403,8 @@ impl Lowering<'_, '_> {
     /// stack exceptions switch to while its own code continues on `SP_EL0`, and loads the vector
     /// table into `VBAR_EL1`. It then wakes its redistributor, puts the stop interrupt in group 0
     /// and its other software-generated and private interrupts in group 1, enables the stop
-    /// interrupt, the timer's and the private interrupts in `private`, enables its GIC CPU
+    /// interrupt, the CPU signal's, the timer's and the private interrupts in `private`, enables
+    /// its GIC CPU
     /// interface at the lowest priority, unmasks fast interrupts, and starts and enables its
     /// virtual timer.
     /// Maskable interrupts stay disabled until the executor enables them.
@@ -439,7 +446,8 @@ impl Lowering<'_, '_> {
             let ones = fx.ptr(0xFFFF_FFFF & !(1 << STOP_INTID));
             lo.mmio_write(fx, 4, group, ones);
             let enable = fx.b.ins().iadd_imm_s(sgi, GICR_ISENABLER0 as i64);
-            let bits = fx.ptr((1 << STOP_INTID) | (1 << TIMER_INTID) | private);
+            let bits =
+                fx.ptr((1 << STOP_INTID) | (1 << SIGNAL_INTID) | (1 << TIMER_INTID) | private);
             lo.mmio_write(fx, 4, enable, bits);
             let sre = lo.read_sysreg(fx, ICC_SRE_EL1);
             let sre = fx.b.ins().bor_imm_s(sre, 1);
@@ -471,7 +479,8 @@ impl Lowering<'_, '_> {
     }
 
     /// The vector of what the seam took, from the kind of exception it passes: for an IRQ the
-    /// interrupt the controller signals, which this acknowledges; for a synchronous exception
+    /// interrupt the controller signals, which this acknowledges, or the CPU signal's vector for
+    /// its software-generated interrupt; for a synchronous exception
     /// the abort vector or the other one as its syndrome's class gives, and the SError vector for
     /// an SError interrupt. A fast interrupt is the stop a halting CPU sends, which stops this
     /// one; a spurious IRQ returns from the dispatcher at once.
@@ -496,7 +505,9 @@ impl Lowering<'_, '_> {
                     let zero = fx.ptr(0);
                     fx.b.ins().return_(&[zero]);
                 });
-                vec![intid]
+                let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, intid, SIGNAL_INTID);
+                let vector = fx.ptr(SIGNAL_VECTOR as u64);
+                vec![fx.b.ins().select(signal, vector, intid)]
             },
             |_, fx| {
                 let syndrome = fx.load(PTR, saved, frame::ESR);
@@ -514,10 +525,13 @@ impl Lowering<'_, '_> {
     }
 
     /// Writes the GIC CPU interface's end-of-interrupt register for the interrupt the running CPU
-    /// serves.
+    /// serves, the CPU signal's being its software-generated interrupt.
     pub fn aarch64_eoi(&mut self, fx: &mut Fx) {
         let record = self.running_cpu(fx);
-        let intid = fx.load(PTR, record, cpu::VECTOR);
+        let vector = fx.load(PTR, record, cpu::VECTOR);
+        let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, SIGNAL_VECTOR);
+        let intid = fx.ptr(SIGNAL_INTID as u64);
+        let intid = fx.b.ins().select(signal, intid, vector);
         self.write_sysreg(fx, ICC_EOIR1_EL1, intid);
     }
 

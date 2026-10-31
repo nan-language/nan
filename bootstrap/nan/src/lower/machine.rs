@@ -1,8 +1,8 @@
 //! Machine targets: the program entry seams of the UEFI and bare targets, which Cranelift
 //! cannot express, and the boot glue the seams call; its submodules hold the other compiler
-//! stubs, the ports the descriptors name, the CPUs, a kernel's clock and interrupt delivery. Each seam and stub is
-//! fixed machine code the implementation emits, with relocations the image writer resolves into
-//! the image's own addresses.
+//! stubs, the ports the descriptors name, the CPUs, a kernel's clock, interrupt delivery and the
+//! CPU signal. Each seam and stub is fixed machine code the implementation emits, with
+//! relocations the image writer resolves into the image's own addresses.
 
 mod aarch64;
 mod clock;
@@ -11,6 +11,7 @@ pub mod heap;
 mod interrupts;
 mod memory;
 mod ports;
+mod signal;
 mod stubs;
 
 pub use interrupts::{IDT_BYTES, binding, device};

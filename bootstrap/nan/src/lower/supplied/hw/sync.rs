@@ -185,7 +185,7 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 }
 
 /// Binds the vector `install` names to a device record, trapping when the final build or
-/// another installation binds that vector.
+/// another installation binds that vector, or it is the CPU signal's.
 fn bind(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, record: Value) {
     let vector = supply.param(1).scalar();
     let vector = fx.b.ins().uextend(PTR, vector);

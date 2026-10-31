@@ -10,17 +10,18 @@ use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::machine::Stub;
 use super::super::super::machine::{A64_ACCESS, A64_TABLE, A64_VALID, LARGE, PRESENT};
+use super::super::super::runtime::state;
 use super::super::{Supply, sys, tasks as task_ops};
 use super::physical;
 
 /// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
-/// machine target completing one ends the interrupt the running CPU serves, whose vector is its
-/// vector.
+/// machine target completing one ends the interrupt the running CPU serves unless the dispatcher
+/// defers that, and its vector is the interrupt's.
 pub fn irq_context(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "complete" => {
             if lo.machine() {
-                lo.end_of_interrupt(fx);
+                lo.complete_interrupt(fx);
             }
             supply.done(lo, fx);
         }
@@ -34,6 +35,27 @@ pub fn irq_context(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "irqs_disabled" => supply.ret(lo, fx, Held::Empty),
         member => panic!("no lowering of hw::IrqContext.{member}"),
     }
+}
+
+/// `hw::cpu_hardware_id(cpu)`: `Some` of the hardware id a machine target records for the CPU,
+/// or of its number on the host, and `None` past the CPUs.
+pub fn hardware_id(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let option = supply.abi.result.clone();
+    let cpu = supply.param(0).scalar();
+    let cpu = fx.b.ins().uextend(PTR, cpu);
+    let state_address = lo.state(fx);
+    let count = fx.load(PTR, state_address, state::THREAD_COUNT);
+    let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, cpu, count);
+    fx.when(inside, |fx| {
+        let id = match lo.machine() {
+            true => lo.hardware_id(fx, cpu),
+            false => cpu,
+        };
+        let some = lo.variant_value(fx, &option, "Some", &[Held::Scalar(id)], None);
+        supply.ret(lo, fx, some);
+    });
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
 }
 
 /// The privileged intrinsics, each one or more compiler stubs on the running CPU. Those both

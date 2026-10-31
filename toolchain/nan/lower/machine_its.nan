@@ -1,0 +1,459 @@
+//! The ITS of the AArch64 interrupt controller, which translates the messages devices write into LPIs: its tables and command queue, set up with the interrupts when the distributor reports LPIs; each CPU's LPI tables; and the commands mapping a device's event to an LPI on a CPU, which the runtime drives synchronously under the bindings lock. An installed device's event is its LPI's index, so each device id's interrupt table covers every LPI.
+
+/// The first LPI's identifier, and the LPIs the runtime installs devices on: those that
+/// identifiers of `LPI_BITS` bits reach, whose indexes, the events of their devices, take
+/// `EVENT_BITS` bits.
+const LPI_BASE: i64 = 8_192
+
+const LPIS: u64 = 8_192
+
+const LPI_BITS: u64 = 14
+
+const EVENT_BITS: u64 = 13
+
+/// The distributor's type register and its bit reporting LPIs.
+const GICD_TYPER: u64 = 0x4
+
+const GICD_LPIS: i64 = 1i64 << 17
+
+/// The ITS the descriptor names and its registers: its control register with its enable bit,
+/// its type register, the command queue's base, write and read registers, its first table base
+/// register, a doubleword per table, and the translation register devices write.
+const GITS: u64 = 0x0808_0000
+
+const GITS_CTLR: u64 = 0x0
+
+const GITS_ENABLED: u64 = 1
+
+const GITS_TYPER: u64 = 0x8
+
+const GITS_CBASER: u64 = 0x80
+
+const GITS_CWRITER: u64 = 0x88
+
+const GITS_CREADR: u64 = 0x90
+
+const GITS_BASER: u64 = 0x100
+
+const GITS_TABLES: u64 = 8
+
+const GITS_TRANSLATER: u64 = GITS + 0x1_0040
+
+/// The fields of the ITS type register, each at its position under its mask: the bytes of an
+/// interrupt table entry less one, the event id bits less one and the device id bits less one;
+/// and the bit saying collections name redistributors by address.
+const TYPER_ENTRY: RegisterField = RegisterField(position: 4, mask: 0xF)
+
+const TYPER_EVENTS: RegisterField = RegisterField(position: 8, mask: 0x1F)
+
+const TYPER_DEVICES: RegisterField = RegisterField(position: 13, mask: 0x1F)
+
+const TYPER_ADDRESSES: i64 = 1i64 << 19
+
+/// The device id bits the runtime's device table covers at most.
+const DEVICE_BITS: i64 = 16
+
+/// The fields of a table base register: its type and entry size, which it keeps, the device and
+/// collection types, and the size of an entry less one.
+const BASER_KEPT: i64 = (0x7i64 << 56) | (0x1Fi64 << 48)
+
+const BASER_TYPE: RegisterField = RegisterField(position: 56, mask: 0x7)
+
+const BASER_DEVICES: i64 = 1
+
+const BASER_COLLECTIONS: i64 = 4
+
+const BASER_ENTRY: RegisterField = RegisterField(position: 48, mask: 0x1F)
+
+/// The attributes the runtime gives the ITS's tables and queue: valid, inner write-back
+/// cacheable and inner shareable, a table's pages of 64 KiB and the queue's 16 pages of 4 KiB
+/// less one.
+const ITS_VALID: i64 = i64.from_bits(1u64 << 63)
+
+const ITS_CACHED: i64 = 0x7i64 << 59
+
+const ITS_SHAREABLE: i64 = 1i64 << 10
+
+const PAGES_64K: i64 = 0x2i64 << 8
+
+const QUEUE_PAGES: i64 = 15
+
+/// The bytes of the command queue, of a command, and of the chunks the tables draw.
+const QUEUE_BYTES: u64 = 65_536
+
+const COMMAND_BYTES: u64 = 32
+
+const CHUNK_SHIFT: i64 = 16
+
+const CHUNK_ROUNDING: i64 = 0xFFFF
+
+/// A redistributor's control register with its bit enabling LPIs, its type register with the
+/// processor number's field, and its LPI property and pending table base registers, whose
+/// attributes are inner write-back cacheable and inner shareable, the pending table zeroed.
+const GICR_CTLR: u64 = 0x0
+
+const GICR_LPIS: i64 = 1
+
+const GICR_TYPER: u64 = 0x8
+
+const GICR_PROCESSOR: RegisterField = RegisterField(position: 8, mask: 0xFFFF)
+
+const GICR_PROPBASER: u64 = 0x70
+
+const GICR_PENDBASER: u64 = 0x78
+
+const RD_CACHED: i64 = 0x7i64 << 7
+
+const PENDING_ZEROED: i64 = 1i64 << 62
+
+/// The ITS commands the runtime issues, and the property byte of an enabled LPI at the priority
+/// the runtime gives it.
+const ITS_MAPD: i64 = 0x08
+
+const ITS_MAPC: i64 = 0x09
+
+const ITS_MAPTI: i64 = 0x0A
+
+const ITS_INV: i64 = 0x0C
+
+const ITS_DISCARD: i64 = 0x0F
+
+const ITS_SYNC: i64 = 0x05
+
+const LPI_ENABLED: i64 = 0xA1
+
+/// The device ids the ITS keeps interrupt tables for, each entry its id plus one, zero while
+/// free, then its interrupt table.
+const ITS_DEVICES: u64 = 256
+
+const DEVICE_ENTRY: u64 = 16
+
+/// A field of a register: its position and the mask over it once shifted there.
+struct RegisterField derives Copy {
+    position: i64
+    mask: i64
+} RegisterField
+
+/// The binding of an LPI by its identifier, in the image's table of them.
+fn Lowering.lpi_binding(mut self, mut fx: Fx, intid: clif::Value) -> clif::Value {
+    let table = mut self.reserved(mut fx, data_name: "_NSirq_lpis", size: LPIS * BINDING_SIZE, align: 8)
+    let index = mut fx.b.iadd_imm_s(intid, y: -LPI_BASE)
+    let at = mut fx.b.imul_imm_s(index, y: i64.fit(BINDING_SIZE))
+    return mut fx.b.iadd(table, y: at)
+} Lowering.lpi_binding
+
+/// On the boot CPU, when the distributor reports LPIs and the ITS takes the event ids of every
+/// LPI: gives the ITS its device and collection tables, the device table covering at most
+/// `DEVICE_BITS` id bits, and its command queue, enables it, draws the LPI property table and
+/// maps a collection to each CPU's redistributor, numbered as the CPU.
+fn Lowering.its_setup(mut self, mut fx: Fx) {
+    let at = mut fx.ptr(GICD + GICD_TYPER)
+    let distributor_type = mut self.mmio_read(mut fx, width: 4, address: at)
+    let lpi_bit = mut fx.b.band_imm_s(distributor_type, y: GICD_LPIS)
+    let has_lpis = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lpi_bit, y: 0)
+    mut fx.if_true(has_lpis, then: fn[mut self](mut fx1: Fx) {
+        let typer = mut self.its_typer(mut fx1)
+        let event_field = its_field(mut fx1, register: typer, field: TYPER_EVENTS)
+        let events = mut fx1.b.iadd_imm_s(event_field, y: 1)
+        let enough = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: events, y: i64.fit(EVENT_BITS))
+        mut fx1.if_true(enough, then: fn[mut self](mut fx2: Fx) {
+            let device_field = its_field(mut fx2, register: typer, field: TYPER_DEVICES)
+            let bits = mut fx2.b.iadd_imm_s(device_field, y: 1)
+            let wide = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: bits, y: DEVICE_BITS)
+            let most = mut fx2.ptr(u64.fit(DEVICE_BITS))
+            let kept_bits = mut fx2.b.select(wide, x: most, y: bits)
+            let one = mut fx2.ptr(1)
+            let device_limit = mut fx2.b.ishl(one, y: kept_bits)
+            let state_address = mut self.state(mut fx2)
+            mut fx2.store(device_limit, addr: state_address, offset: STATE_ITS_DEVICES)
+            let zero_value = mut fx2.ptr(0)
+            let tables = mut fx2.ptr(GITS_TABLES)
+            mut fx2.each(zero_value, end: tables, body: fn[mut self](mut fx3: Fx, index: clif::Value) {
+                let scaled = mut fx3.b.imul_imm_s(index, y: 8)
+                let register = mut fx3.b.iadd_imm_s(scaled, y: i64.fit(GITS + GITS_BASER))
+                let baser = mut self.mmio_read(mut fx3, width: 8, address: register)
+                let kind = its_field(mut fx3, register: baser, field: BASER_TYPE)
+                let device_table = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_DEVICES)
+                let collections = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: BASER_COLLECTIONS)
+                let used = mut fx3.b.bor(device_table, y: collections)
+                mut fx3.if_true(used, then: fn[mut self](mut fx4: Fx) {
+                    let entry_field = its_field(mut fx4, register: baser, field: BASER_ENTRY)
+                    let size = mut fx4.b.iadd_imm_s(entry_field, y: 1)
+                    let cpus = mut fx4.ptr(MAX_CPUS)
+                    let entries = mut fx4.b.select(device_table, x: device_limit, y: cpus)
+                    let bytes = mut fx4.b.imul(entries, y: size)
+                    let table = mut self.its_chunks(mut fx4, bytes)
+                    let last = mut fx4.b.iadd_imm_s(bytes, y: -1)
+                    let pages = mut fx4.b.ushr_imm_s(last, y: CHUNK_SHIFT)
+                    let kept = mut fx4.b.band_imm_s(baser, y: BASER_KEPT)
+                    let placed = mut fx4.b.bor(kept, y: table)
+                    let sized = mut fx4.b.bor(placed, y: pages)
+                    let value = mut fx4.b.bor_imm_s(sized, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | PAGES_64K)
+                    mut self.mmio_write(mut fx4, width: 8, address: register, value)
+                })
+            })
+            let queue_size = mut fx2.ptr(QUEUE_BYTES)
+            let queue = mut self.its_chunks(mut fx2, bytes: queue_size)
+            let base = mut fx2.b.bor_imm_s(queue, y: ITS_VALID | ITS_CACHED | ITS_SHAREABLE | QUEUE_PAGES)
+            let cbaser = mut fx2.ptr(GITS + GITS_CBASER)
+            mut self.mmio_write(mut fx2, width: 8, address: cbaser, value: base)
+            let cwriter = mut fx2.ptr(GITS + GITS_CWRITER)
+            mut self.mmio_write(mut fx2, width: 8, address: cwriter, value: zero_value)
+            let ctlr = mut fx2.ptr(GITS + GITS_CTLR)
+            let enabled = mut fx2.ptr(GITS_ENABLED)
+            mut self.mmio_write(mut fx2, width: 4, address: ctlr, value: enabled)
+            mut fx2.store(queue, addr: state_address, offset: STATE_ITS_QUEUE)
+            let property_bytes = mut fx2.ptr(LPIS)
+            let properties = mut self.its_chunks(mut fx2, bytes: property_bytes)
+            mut fx2.store(properties, addr: state_address, offset: STATE_ITS_PROPERTIES)
+            let count = mut fx2.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+            mut fx2.each(zero_value, end: count, body: fn[mut self](mut fx3: Fx, cpu: clif::Value) {
+                let target = mut self.its_target(mut fx3, typer, cpu)
+                let collected = mut fx3.b.bor(target, y: cpu)
+                let mapped = mut fx3.b.bor_imm_s(collected, y: ITS_VALID)
+                let none = mut fx3.ptr(0)
+                let command = mut fx3.ptr(u64.fit(ITS_MAPC))
+                mut self.its_command(mut fx3, words: fx3.list4(command, b: none, c: mapped, d: none).view())
+            })
+            mut self.its_flush(mut fx2)
+        })
+    })
+} Lowering.its_setup
+
+/// The ITS's type register.
+fn Lowering.its_typer(mut self, mut fx: Fx) -> clif::Value {
+    let at = mut fx.ptr(GITS + GITS_TYPER)
+    return mut self.mmio_read(mut fx, width: 8, address: at)
+} Lowering.its_typer
+
+/// Zeroed chunks holding at least `bytes`, trapping on exhaustion.
+fn Lowering.its_chunks(mut self, mut fx: Fx, bytes: clif::Value) -> clif::Value {
+    let rounded = mut fx.b.iadd_imm_s(bytes, y: CHUNK_ROUNDING)
+    let count = mut fx.b.ushr_imm_s(rounded, y: CHUNK_SHIFT)
+    let drawn = system_map_chunks(mut self, mut fx, count)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+    mut fx.if_true(missing, then: fn[mut self](mut fx1: Fx) {
+        raise_kind(mut self, fx: mut fx1, kind: "trap.exhausted")
+    })
+    return drawn
+} Lowering.its_chunks
+
+/// The redistributor of CPU `cpu` as ITS commands name it, at the place of their target field:
+/// by its address, or by its processor number.
+fn Lowering.its_target(mut self, mut fx: Fx, typer: clif::Value, cpu: clif::Value) -> clif::Value {
+    let offset = mut fx.b.imul_imm_s(cpu, y: i64.fit(GICR_STRIDE))
+    let base = mut fx.b.iadd_imm_s(offset, y: i64.fit(GICR))
+    let at = mut fx.b.iadd_imm_s(base, y: i64.fit(GICR_TYPER))
+    let rd_typer = mut self.mmio_read(mut fx, width: 8, address: at)
+    let number = its_field(mut fx, register: rd_typer, field: GICR_PROCESSOR)
+    let processor = mut fx.b.ishl_imm_s(number, y: 16)
+    let address_bit = mut fx.b.band_imm_s(typer, y: TYPER_ADDRESSES)
+    let by_address = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: address_bit, y: 0)
+    return mut fx.b.select(by_address, x: base, y: processor)
+} Lowering.its_target
+
+/// Writes a command of four doublewords at the end of the command queue.
+fn Lowering.its_command(mut self, mut fx: Fx, words: Slice[clif::Value]) {
+    let state_address = mut self.state(mut fx)
+    let queue = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_QUEUE)
+    let written = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_WRITE)
+    let at = mut fx.b.iadd(queue, y: written)
+    for index in 0..<words.len() {
+        mut fx.store(words[index], addr: at, offset: 8 * u64.widen(index))
+    }
+    let advanced = mut fx.b.iadd_imm_s(written, y: i64.fit(COMMAND_BYTES))
+    let next = mut fx.b.band_imm_s(advanced, y: i64.fit(QUEUE_BYTES) - 1)
+    mut fx.store(next, addr: state_address, offset: STATE_ITS_WRITE)
+} Lowering.its_command
+
+/// Hands the ITS the commands written and waits until it has processed them.
+fn Lowering.its_flush(mut self, mut fx: Fx) {
+    let state_address = mut self.state(mut fx)
+    let written = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_WRITE)
+    let cwriter = mut fx.ptr(GITS + GITS_CWRITER)
+    mut self.mmio_write(mut fx, width: 8, address: cwriter, value: written)
+    let creadr = mut fx.ptr(GITS + GITS_CREADR)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let raw = mut self.mmio_read(mut fx1, width: 8, address: creadr)
+        let read = mut fx1.b.band_imm_s(raw, y: i64.fit(QUEUE_BYTES) - i64.fit(COMMAND_BYTES))
+        let waiting = mut fx1.b.icmp(clif::IntCC.NotEqual, x: read, y: written)
+        mut fx1.if_true(waiting, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.its_flush
+
+/// Enables LPIs on the running CPU's redistributor at `base` when the ITS is set up, with the
+/// shared property table and a pending table of its own.
+fn Lowering.its_cpu(mut self, mut fx: Fx, base: clif::Value) {
+    let state_address = mut self.state(mut fx)
+    let properties = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_PROPERTIES)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: properties, y: 0)
+    mut fx.if_true(present, then: fn[mut self](mut fx1: Fx) {
+        let propbaser = mut fx1.b.bor_imm_s(properties, y: ITS_SHAREABLE | RD_CACHED | (i64.fit(LPI_BITS) - 1))
+        let property_at = mut fx1.b.iadd_imm_s(base, y: i64.fit(GICR_PROPBASER))
+        mut self.mmio_write(mut fx1, width: 8, address: property_at, value: propbaser)
+        let bytes = mut fx1.ptr(1)
+        let pending = mut self.its_chunks(mut fx1, bytes)
+        let pendbaser = mut fx1.b.bor_imm_s(pending, y: PENDING_ZEROED | ITS_SHAREABLE | RD_CACHED)
+        let pending_at = mut fx1.b.iadd_imm_s(base, y: i64.fit(GICR_PENDBASER))
+        mut self.mmio_write(mut fx1, width: 8, address: pending_at, value: pendbaser)
+        let control_at = mut fx1.b.iadd_imm_s(base, y: i64.fit(GICR_CTLR))
+        let control = mut self.mmio_read(mut fx1, width: 4, address: control_at)
+        let enabled = mut fx1.b.bor_imm_s(control, y: GICR_LPIS)
+        mut self.mmio_write(mut fx1, width: 4, address: control_at, value: enabled)
+    })
+} Lowering.its_cpu
+
+/// The AArch64 part of `install_msi`, under the bindings lock: the device id's interrupt table,
+/// mapped on its first install, and the lowest LPI no device is installed on, whose event of that
+/// device the ITS then translates to it on CPU `cpu`'s redistributor. Gives one of the `MSI_`
+/// outcomes.
+fn Lowering.its_install(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Value, source: clif::Value) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    let accepted_ids = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_DEVICES)
+    let accepted = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: source, y: accepted_ids)
+    let unsupported = mut fx.ptr(u64.fit(MSI_UNSUPPORTED))
+    let outcome = mut fx.variable(PTR, initial: unsupported)
+    mut fx.if_true(accepted, then: fn[mut self](mut fx1: Fx) {
+        let table = mut self.its_device(mut fx1, source)
+        let lpi_table = mut self.reserved(mut fx1, data_name: "_NSirq_lpis", size: LPIS * BINDING_SIZE, align: 8)
+        let start = mut fx1.ptr(0)
+        let searched = mut fx1.repeat(fx1.list1(start).view(), body: fn(mut fx2: Fx, at: Slice[clif::Value]) -> Pass {
+            expect at.len() > 0
+            let scaled = mut fx2.b.imul_imm_s(at[0], y: i64.fit(BINDING_SIZE))
+            let slot = mut fx2.b.iadd(lpi_table, y: scaled)
+            let installed = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+            let taken = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: installed, y: 0)
+            let next = mut fx2.b.iadd_imm_s(at[0], y: 1)
+            let inside = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: i64.fit(LPIS))
+            let more = mut fx2.b.band(taken, y: inside)
+            return Pass(again: more, next: fx2.list1(mut fx2.b.select(taken, x: next, y: at[0])))
+        })
+        expect searched.len() > 0
+        let index = searched[0]
+        let free = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: index, y: i64.fit(LPIS))
+        let mapped = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: table, y: 0)
+        let room = mut fx1.b.band(free, y: mapped)
+        let installed = mut fx1.ptr(u64.fit(MSI_INSTALLED))
+        let exhausted = mut fx1.ptr(u64.fit(MSI_EXHAUSTED))
+        let chosen = mut fx1.b.select(room, x: installed, y: exhausted)
+        mut fx1.b.def_var(outcome, val: chosen)
+        mut fx1.if_true(room, then: fn[mut self](mut fx2: Fx) {
+            let properties = mut fx2.load(PTR, addr: state_address, offset: STATE_ITS_PROPERTIES)
+            let property = mut fx2.b.iadd(properties, y: index)
+            let enabled = mut fx2.int(clif::Type.Int8, value: LPI_ENABLED)
+            mut fx2.store(enabled, addr: property, offset: 0)
+            let intid = mut fx2.b.iadd_imm_s(index, y: LPI_BASE)
+            mut fx2.store(intid, addr: record, offset: DEVICE_RECORD_VECTOR)
+            let address = mut fx2.ptr(GITS_TRANSLATER)
+            mut fx2.store(address, addr: record, offset: DEVICE_RECORD_MESSAGE)
+            mut fx2.store(index, addr: record, offset: DEVICE_RECORD_DATA)
+            mut fx2.store(source, addr: record, offset: DEVICE_RECORD_SOURCE)
+            mut fx2.store(cpu, addr: record, offset: DEVICE_RECORD_CPU)
+            let slot = mut self.lpi_binding(mut fx2, intid)
+            mut self.chain(mut fx2, record, slot)
+            let device_word = mut fx2.b.ishl_imm_s(source, y: 32)
+            let none = mut fx2.ptr(0)
+            let mapti = mut fx2.b.bor_imm_s(device_word, y: ITS_MAPTI)
+            let shifted = mut fx2.b.ishl_imm_s(intid, y: 32)
+            let translated = mut fx2.b.bor(shifted, y: index)
+            mut self.its_command(mut fx2, words: fx2.list4(mapti, b: translated, c: cpu, d: none).view())
+            let inv = mut fx2.b.bor_imm_s(device_word, y: ITS_INV)
+            mut self.its_command(mut fx2, words: fx2.list4(inv, b: index, c: none, d: none).view())
+            mut self.its_sync(mut fx2, cpu)
+        })
+    })
+    return mut fx.b.use_var(outcome)
+} Lowering.its_install
+
+/// The interrupt table of device id `source`, mapping it to a new one on its first install; zero
+/// when `ITS_DEVICES` ids already have one or the chunks run out.
+fn Lowering.its_device(mut self, mut fx: Fx, source: clif::Value) -> clif::Value {
+    let entries = mut self.reserved(mut fx, data_name: "_NSits_devices", size: ITS_DEVICES * DEVICE_ENTRY, align: 8)
+    let key = mut fx.b.iadd_imm_s(source, y: 1)
+    let zero_value = mut fx.ptr(0)
+    let found = mut fx.variable(PTR, initial: zero_value)
+    let free = mut fx.variable(PTR, initial: zero_value)
+    let count = mut fx.ptr(ITS_DEVICES)
+    mut fx.each(zero_value, end: count, body: fn(mut fx1: Fx, index: clif::Value) {
+        let scaled = mut fx1.b.imul_imm_s(index, y: i64.fit(DEVICE_ENTRY))
+        let entry = mut fx1.b.iadd(entries, y: scaled)
+        let held = mut fx1.load(PTR, addr: entry, offset: 0)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: held, y: key)
+        mut fx1.if_true(same, then: fn(mut fx2: Fx) {
+            let table = mut fx2.load(PTR, addr: entry, offset: 8)
+            mut fx2.b.def_var(found, val: table)
+        })
+        let empty = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: held, y: 0)
+        let earliest = mut fx1.b.use_var(free)
+        let unseen = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: earliest, y: 0)
+        let fresh = mut fx1.b.band(empty, y: unseen)
+        mut fx1.if_true(fresh, then: fn(mut fx2: Fx) {
+            mut fx2.b.def_var(free, val: entry)
+        })
+    })
+    let table = mut fx.b.use_var(found)
+    let entry = mut fx.b.use_var(free)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: table, y: 0)
+    let room = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: entry, y: 0)
+    let mapping = mut fx.b.band(missing, y: room)
+    mut fx.if_true(mapping, then: fn[mut self](mut fx1: Fx) {
+        let typer = mut self.its_typer(mut fx1)
+        let entry_field = its_field(mut fx1, register: typer, field: TYPER_ENTRY)
+        let size = mut fx1.b.iadd_imm_s(entry_field, y: 1)
+        let bytes = mut fx1.b.imul_imm_s(size, y: i64.fit(LPIS))
+        let rounded = mut fx1.b.iadd_imm_s(bytes, y: CHUNK_ROUNDING)
+        let table_chunks = mut fx1.b.ushr_imm_s(rounded, y: CHUNK_SHIFT)
+        let drawn_table = system_map_chunks(mut self, fx: mut fx1, count: table_chunks)
+        let drawn = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: drawn_table, y: 0)
+        mut fx1.if_true(drawn, then: fn[mut self](mut fx2: Fx) {
+            mut fx2.store(key, addr: entry, offset: 0)
+            mut fx2.store(drawn_table, addr: entry, offset: 8)
+            let device_word = mut fx2.b.ishl_imm_s(source, y: 32)
+            let mapd = mut fx2.b.bor_imm_s(device_word, y: ITS_MAPD)
+            let size_field = mut fx2.ptr(EVENT_BITS - 1)
+            let valid = mut fx2.b.bor_imm_s(drawn_table, y: ITS_VALID)
+            let none = mut fx2.ptr(0)
+            mut self.its_command(mut fx2, words: fx2.list4(mapd, b: size_field, c: valid, d: none).view())
+            mut fx2.b.def_var(found, val: drawn_table)
+        })
+    })
+    return mut fx.b.use_var(found)
+} Lowering.its_device
+
+/// Ends the translation of an installed device's event, under the bindings lock, and disables
+/// its LPI.
+fn Lowering.its_discard(mut self, mut fx: Fx, record: clif::Value) {
+    let index = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_DATA)
+    let source = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_SOURCE)
+    let cpu = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_CPU)
+    let device_word = mut fx.b.ishl_imm_s(source, y: 32)
+    let discard_command = mut fx.b.bor_imm_s(device_word, y: ITS_DISCARD)
+    let none = mut fx.ptr(0)
+    mut self.its_command(mut fx, words: fx.list4(discard_command, b: index, c: none, d: none).view())
+    let state_address = mut self.state(mut fx)
+    let properties = mut fx.load(PTR, addr: state_address, offset: STATE_ITS_PROPERTIES)
+    let property = mut fx.b.iadd(properties, y: index)
+    let disabled = mut fx.int(clif::Type.Int8, value: 0)
+    mut fx.store(disabled, addr: property, offset: 0)
+    mut self.its_sync(mut fx, cpu)
+} Lowering.its_discard
+
+/// Ends the commands written with a synchronisation of CPU `cpu`'s redistributor and hands them
+/// to the ITS.
+fn Lowering.its_sync(mut self, mut fx: Fx, cpu: clif::Value) {
+    let typer = mut self.its_typer(mut fx)
+    let target = mut self.its_target(mut fx, typer, cpu)
+    let command = mut fx.ptr(u64.fit(ITS_SYNC))
+    let none = mut fx.ptr(0)
+    mut self.its_command(mut fx, words: fx.list4(command, b: none, c: target, d: none).view())
+    mut self.its_flush(mut fx)
+} Lowering.its_sync
+
+/// The field of a register.
+fn its_field(mut fx: Fx, register: clif::Value, field: RegisterField) -> clif::Value {
+    let shifted = mut fx.b.ushr_imm_s(register, y: field.position)
+    return mut fx.b.band_imm_s(shifted, y: field.mask)
+} its_field

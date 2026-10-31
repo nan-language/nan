@@ -2,7 +2,7 @@
 //! IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of
 //! the CPU holding it plus one, each executor thread being a CPU on `x86_64-host`, so a CPU
 //! acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and
-//! vectors to bind a device to.
+//! interrupts to install a device on.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -11,7 +11,7 @@ use cranelift_module::FuncId;
 
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::machine::{Stub, binding, device};
+use super::super::super::machine::{Stub, device, msi};
 use super::super::super::runtime::regions::WAITING;
 use super::super::super::runtime::tasks::{self, thread};
 use super::super::super::runtime::{Routine, report, settle, state};
@@ -19,7 +19,6 @@ use super::super::super::{Glue, Lowering};
 use super::super::{Supply, tasks as task_ops};
 use super::forward;
 use crate::check::ty::{FnTy, Ty};
-use crate::workspace::Arch;
 
 /// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it on
 /// a machine target and their state restored after.
@@ -127,30 +126,55 @@ pub fn device_value(lo: &mut Lowering, value_ty: &Ty) -> u64 {
 }
 
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
-/// `install` moves the device into a new record, and on a machine target binds its vector to
-/// it, unless the final build or another installation binds that vector; `with` takes the
-/// record's lock around its body; `uninstall` unbinds the vector and waits until no CPU runs the
-/// interrupt fn for it, then moves the device out of the freed record. On AArch64, where the
-/// interrupt controller delivers only the interrupts enabled on it, binding a vector from 32 up
-/// enables its interrupt and unbinding disables it.
+/// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
+/// target install it on its interrupt, `install_msi` giving the device back in its refusal
+/// otherwise; `message` reads the message the record holds; `with` takes the record's lock
+/// around its body; `uninstall` removes the device from its interrupt and waits until no CPU
+/// runs its interrupt fn, then moves it out of the freed record. A CPU number past the CPUs
+/// traps.
 pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let value_at = device_value(lo, &value_ty);
     match supply.member() {
         "install" => {
-            let size = value_at + lo.layout(&value_ty).size;
-            let size = fx.ptr(size);
-            let record = lo.record_alloc(fx, size);
-            let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
-            fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
-            let value = fx.offset(record, value_at);
-            lo.store_held(fx, value, supply.param(0), &value_ty);
+            let record = device_record(lo, fx, supply, &value_ty, 2);
             if lo.machine() {
-                bind(lo, fx, supply, &value_ty, record);
+                let vector = supply.param(1).scalar();
+                let vector = fx.b.ins().uextend(PTR, vector);
+                lo.install_device(fx, record, None, vector);
             }
-            let sret = supply.sret.expect("a shared device's slot");
-            fx.store(record, sret, 0);
-            supply.ret(lo, fx, Held::Address(sret));
+            return_shared(lo, fx, supply, record);
+        }
+        "install_on" => {
+            let cpu = cpu_number(lo, fx, supply);
+            let record = device_record(lo, fx, supply, &value_ty, 3);
+            if lo.machine() {
+                let vector = supply.param(2).scalar();
+                let vector = fx.b.ins().uextend(PTR, vector);
+                lo.install_device(fx, record, Some(cpu), vector);
+            }
+            return_shared(lo, fx, supply, record);
+        }
+        "install_msi" => install_msi(lo, fx, supply, &value_ty),
+        "message" => {
+            let record = fx.load(PTR, supply.param(0).address(), 0);
+            let option = supply.abi.result.clone();
+            let address = fx.load(PTR, record, device::MESSAGE);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
+            fx.when(present, |fx| {
+                let message_ty = option.type_arg(0).cloned().expect("a message type");
+                let layout = lo.layout(&message_ty);
+                let message = fx.slot(layout.size, layout.align);
+                let at = lo.layouts.field(lo.ck, &message_ty, None, "address").offset;
+                fx.store(address, message, at);
+                let data = fx.load(types::I32, record, device::DATA);
+                let at = lo.layouts.field(lo.ck, &message_ty, None, "data").offset;
+                fx.store(data, message, at);
+                let some = lo.variant_value(fx, &option, "Some", &[Held::Address(message)], None);
+                supply.ret(lo, fx, some);
+            });
+            let none = lo.none_value(fx, &option);
+            supply.ret(lo, fx, none);
         }
         "with" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -170,32 +194,46 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "uninstall" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
             if lo.machine() {
-                unbind(lo, fx, record);
+                lo.uninstall_device(fx, record);
             }
-            let layout = lo.layout(&value_ty);
-            let kept = fx.slot(layout.size, layout.align);
-            let value = fx.offset(record, value_at);
-            lo.copy(fx, kept, value, layout.size, layout.align);
-            lo.record_free(fx, record);
-            let held = lo.held_at(fx, &value_ty, kept);
+            let held = take_device(lo, fx, &value_ty, record);
             supply.ret(lo, fx, held);
         }
         member => panic!("no lowering of hw::IrqShared.{member}"),
     }
 }
 
-/// Binds the vector `install` names to a device record, trapping when the final build or
-/// another installation binds that vector, or it is the CPU signal's.
-fn bind(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, record: Value) {
-    let vector = supply.param(1).scalar();
-    let vector = fx.b.ins().uextend(PTR, vector);
-    for bound in lo.statically_bound() {
-        let same = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, bound);
-        fx.when(same, |fx| {
-            report::raise_kind(lo, fx, "trap.duplicate-access")
-        });
-    }
-    let Ty::Fn(handler_ty) = supply.abi.params[2].0.ty() else {
+/// The CPU number an install names, as a word, trapping when it is not below the CPU count.
+fn cpu_number(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> Value {
+    let cpu = supply.param(1).scalar();
+    let cpu = fx.b.ins().uextend(PTR, cpu);
+    let state_address = lo.state(fx);
+    let count = fx.load(PTR, state_address, state::THREAD_COUNT);
+    let outside =
+        fx.b.ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, cpu, count);
+    fx.when(outside, |fx| report::raise_kind(lo, fx, "trap.bounds"));
+    cpu
+}
+
+/// A new device record holding the device an install takes, with the interrupt fn its parameter
+/// `handler` gives and the glue calling it.
+fn device_record(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    value_ty: &Ty,
+    handler: usize,
+) -> Value {
+    let value_at = device_value(lo, value_ty);
+    let size = value_at + lo.layout(value_ty).size;
+    let size = fx.ptr(size);
+    let record = lo.record_alloc(fx, size);
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+    let value = fx.offset(record, value_at);
+    lo.store_held(fx, value, supply.param(0), value_ty);
+    let Ty::Fn(handler_ty) = supply.abi.params[handler].0.ty() else {
         panic!("an interrupt fn handling the device");
     };
     let handler_layout = lo.layout(&Ty::Fn(handler_ty.clone()));
@@ -203,7 +241,7 @@ fn bind(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, record: 
     lo.copy(
         fx,
         handler_at,
-        supply.param(2).address(),
+        supply.param(handler).address(),
         handler_layout.size,
         handler_layout.align,
     );
@@ -211,49 +249,78 @@ fn bind(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, record: 
     let glue = lo.func_ref(fx, glue);
     let glue = fx.b.ins().func_addr(PTR, glue);
     fx.store(glue, record, device::GLUE);
-    fx.store(vector, record, device::VECTOR);
-    let slot = lo.irq_binding(fx, vector);
-    let unbound = fx.ptr(0);
-    let seen =
-        fx.b.ins()
-            .atomic_cas(MemFlagsData::trusted(), slot, unbound, record);
-    let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
-    fx.when(taken, |fx| {
-        report::raise_kind(lo, fx, "trap.duplicate-access")
-    });
-    if lo.ck.db.target.arch() == Some(Arch::Aarch64) {
-        let shared =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, vector, 32);
-        fx.when(shared, |fx| lo.aarch64_enable(fx, vector));
-    }
+    record
 }
 
-/// Unbinds a device record's vector and waits until no CPU runs its interrupt fn.
-fn unbind(lo: &mut Lowering, fx: &mut Fx, record: Value) {
-    let vector = fx.load(PTR, record, device::VECTOR);
-    if lo.ck.db.target.arch() == Some(Arch::Aarch64) {
-        let shared =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, vector, 32);
-        fx.when(shared, |fx| lo.aarch64_disable(fx, vector));
-    }
-    let slot = lo.irq_binding(fx, vector);
-    let unbound = fx.ptr(0);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), unbound, slot);
-    let running = fx.offset(slot, binding::RUNNING);
-    fx.repeat(&[], |fx, _| {
-        let count =
-            fx.b.ins()
-                .atomic_load(PTR, MemFlagsData::trusted(), running);
-        let busy = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
-        fx.when(busy, |fx| lo.relax(fx));
-        (busy, Vec::new())
-    });
+/// Returns the `hw::IrqShared` naming a device record.
+fn return_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
+    let sret = supply.sret.expect("a shared device's slot");
+    fx.store(record, sret, 0);
+    supply.ret(lo, fx, Held::Address(sret));
 }
 
-/// The glue the dispatcher calls with a device's record when its vector fires: it takes the
+/// Moves the device out of a device record, which it frees.
+fn take_device(lo: &mut Lowering, fx: &mut Fx, value_ty: &Ty, record: Value) -> Held {
+    let layout = lo.layout(value_ty);
+    let kept = fx.slot(layout.size, layout.align);
+    let value_at = device_value(lo, value_ty);
+    let value = fx.offset(record, value_at);
+    lo.copy(fx, kept, value, layout.size, layout.align);
+    lo.record_free(fx, record);
+    lo.held_at(fx, value_ty, kept)
+}
+
+/// `install_msi`: `Ok` of the shared device once installed on a message-signalled interrupt of a
+/// machine target, or `Err` of a refusal giving back the device with the `hw::MsiError`
+/// variant of the outcome, `Unsupported` on the host.
+fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty) {
+    let cpu = cpu_number(lo, fx, supply);
+    let record = device_record(lo, fx, supply, value_ty, 3);
+    let outcome = match lo.machine() {
+        true => {
+            let source = supply.param(2).scalar();
+            let source = fx.b.ins().uextend(PTR, source);
+            lo.install_msi(fx, record, cpu, source)
+        }
+        false => fx.ptr(msi::UNSUPPORTED as u64),
+    };
+    let result_ty = supply.abi.result.clone();
+    let installed = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, msi::INSTALLED);
+    fx.when(installed, |fx| {
+        let shared = fx.slot(8, 8);
+        fx.store(record, shared, 0);
+        let ok = lo.variant_value(fx, &result_ty, "Ok", &[Held::Address(shared)], None);
+        supply.ret(lo, fx, ok);
+    });
+    let refusal_ty = result_ty.type_arg(1).cloned().expect("a refusal type");
+    let error_ty = lo.layouts.field(lo.ck, &refusal_ty, None, "error").ty;
+    let layout = lo.layout(&refusal_ty);
+    let refusal = fx.slot(layout.size, layout.align);
+    let dev_at = lo.layouts.field(lo.ck, &refusal_ty, None, "dev").offset;
+    let error_at = lo.layouts.field(lo.ck, &refusal_ty, None, "error").offset;
+    let dev = take_device(lo, fx, value_ty, record);
+    let dev_address = fx.offset(refusal, dev_at);
+    lo.store_held(fx, dev_address, dev, value_ty);
+    let error_address = fx.offset(refusal, error_at);
+    for (variant, kind) in [
+        ("Exhausted", msi::EXHAUSTED),
+        ("Unreachable", msi::UNREACHABLE),
+    ] {
+        let this = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, kind);
+        fx.when(this, |fx| {
+            let error = lo.variant_value(fx, &error_ty, variant, &[], None);
+            lo.store_held(fx, error_address, error, &error_ty);
+            let err = lo.variant_value(fx, &result_ty, "Err", &[Held::Address(refusal)], None);
+            supply.ret(lo, fx, err);
+        });
+    }
+    let error = lo.variant_value(fx, &error_ty, "Unsupported", &[], None);
+    lo.store_held(fx, error_address, error, &error_ty);
+    let err = lo.variant_value(fx, &result_ty, "Err", &[Held::Address(refusal)], None);
+    supply.ret(lo, fx, err);
+}
+
+/// The glue the dispatcher calls with a device's record when its interrupt fires: it takes the
 /// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext`, releases
 /// the lock and gives whether the fn's `hw::IrqExit` is `Reschedule`.
 fn device_glue(lo: &mut Lowering, value_ty: &Ty, handler_ty: &FnTy) -> FuncId {

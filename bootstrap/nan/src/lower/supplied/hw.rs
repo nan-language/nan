@@ -39,6 +39,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::Mmio" | "hw::Ports" => windows::window(lo, fx, supply),
         "hw::sim::Registers" => windows::registers(lo, fx, supply),
         "hw::IrqContext" => cpu::irq_context(lo, fx, supply),
+        "hw::cpu_hardware_id" => cpu::hardware_id(lo, fx, supply),
         "hw::Ring0" => cpu::ring0(lo, fx, supply),
         "hw::Idt" => cpu::idt(lo, fx, supply),
         "hw::TrapFrame" => cpu::trap_frame(lo, fx, supply),

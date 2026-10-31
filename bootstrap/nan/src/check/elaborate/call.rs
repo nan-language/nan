@@ -742,8 +742,12 @@ impl Elab<'_, '_> {
     }
 
     /// The predicate checks at an exit of a boundary function, for the values reachable from
-    /// its result or failure and its `mut` parameters.
-    pub fn exit_predicate_checks(&mut self, value: Option<&Operand>, span: Span) -> Elaborated<()> {
+    /// the result or failure it carries, of its type, and from its `mut` parameters.
+    pub fn exit_predicate_checks(
+        &mut self,
+        carried: Option<(Operand, Ty)>,
+        span: Span,
+    ) -> Elaborated<()> {
         let boundary = match self.role {
             Role::Closure => true,
             Role::Body | Role::Default => self.ck.is_boundary(self.item),
@@ -752,8 +756,8 @@ impl Elab<'_, '_> {
         if !boundary {
             return Ok(());
         }
-        if let (Some(operand), Some(ty)) = (value, self.exit_ty.clone())
-            && let Some(place) = operand_place(operand)
+        if let Some((operand, ty)) = carried
+            && let Some(place) = operand_place(&operand)
         {
             self.predicate_checks(place, &ty, span)?;
         }

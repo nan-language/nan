@@ -731,12 +731,12 @@ impl Elab<'_, '_> {
     /// the ensures checks, the release of `take` parameter slots, and the terminator.
     pub fn exit_return(&mut self, value: Option<Operand>, token: Tok) -> Elaborated<()> {
         let carried = value.clone().zip(self.exit_ty.clone());
-        if self.leave_when(Exit::Return, carried, token)? {
+        if self.leave_when(Exit::Return, carried.clone(), token)? {
             return Ok(());
         }
         let span = Self::span(token);
         self.leave_scopes(0, token)?;
-        self.exit_predicate_checks(value.as_ref(), span)?;
+        self.exit_predicate_checks(carried, span)?;
         let ensures = std::mem::take(&mut self.exits.ensures);
         for (index, olds) in &ensures {
             let mut args = self.param_operands_except_taken()?;
@@ -872,12 +872,12 @@ impl Elab<'_, '_> {
     /// checks, the release of `take` parameter slots, and the terminator.
     pub fn exit_fail(&mut self, failure: Operand, token: Tok) -> Elaborated<()> {
         let carried = self.failure_ty.clone().map(|ty| (failure.clone(), ty));
-        if self.leave_when(Exit::Fail, carried, token)? {
+        if self.leave_when(Exit::Fail, carried.clone(), token)? {
             return Ok(());
         }
         let span = Self::span(token);
         self.leave_scopes(0, token)?;
-        self.exit_predicate_checks(Some(&failure), span)?;
+        self.exit_predicate_checks(carried, span)?;
         self.release_take_slots(span);
         self.end(Terminator::Fail(failure), span);
         Ok(())

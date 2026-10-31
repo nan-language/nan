@@ -1,7 +1,6 @@
 //! The times the freeze measures, taken by the benchmark programs of `bootstrap/nanbench/bench/` on the
 //! reference machine's 8 hardware threads: the host runtime's allocation and generation check,
-//! the kernel runtime's generation check, seam and thread switch under the emulator, and the
-//! extended-state save and restore its seams and switches perform.
+//! and the kernel runtime's generation check, seam and thread switch under the emulator.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,7 +22,6 @@ const KERNEL_WAIT: Duration = Duration::from_secs(300);
 pub struct Times {
     pub host: BTreeMap<String, u64>,
     pub kernel: BTreeMap<String, u64>,
-    pub native: BTreeMap<String, u64>,
 }
 
 /// The `<label> <picoseconds>` lines of a benchmark's output.
@@ -73,22 +71,7 @@ pub fn take(repository: &Path, dir: &Path) -> Result<Times, String> {
         &host,
     )?);
     let kernel = kernel(&bench.join("kernel"), &work.join("kernel"))?;
-    let native = work.join("xsave");
-    let compiled = Command::new("cc")
-        .args(["-O2", "-o"])
-        .arg(&native)
-        .arg(bench.join("xsave.c"))
-        .status()
-        .map_err(|error| format!("cc: {error}"))?;
-    if !compiled.success() {
-        return Err("cc could not build xsave.c".to_owned());
-    }
-    let native = times(&pinned(&native, &work)?);
-    Ok(Times {
-        host,
-        kernel,
-        native,
-    })
+    Ok(Times { host, kernel })
 }
 
 /// Runs the kernel benchmark under the emulator, on the timing processors, until its serial

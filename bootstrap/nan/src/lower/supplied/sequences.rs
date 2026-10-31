@@ -387,7 +387,7 @@ fn range_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let low_at = lo.layouts.field(lo.ck, &range_ty, None, "low").offset;
     let high_at = lo.layouts.field(lo.ck, &range_ty, None, "high").offset;
     let inclusive_at = lo.layouts.field(lo.ck, &range_ty, None, "inclusive").offset;
-    let ty = super::super::layout::scalar_type(scalar);
+    let ty = super::super::layout::scalar_type(scalar, lo.machine());
     let low = fx.load(ty, range, low_at);
     let high = fx.load(ty, range, high_at);
     let inclusive = fx.load(types::I8, range, inclusive_at);

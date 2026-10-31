@@ -66,7 +66,7 @@ A **measurement** is a quantity taken, on the build of the bootstrap on which th
 | [Waivers](06-statements-expressions.md#waivers), per threshold, and the [closure radius](33-toolchain.md#closure-radius) of each item | M4, M5 | none |
 | Parameter lists with more than 4 parameters, `self` included ([line breaking](35-format.md#line-breaking)) | M5 | none |
 | Task closures outside [lexical spawns](16-concurrency.md#joins), with their `take` captures | M2, M6 | none |
-| Time of the extended-state save of a [machine seam](23-low-level.md#machine-seams) and of `hw::switch_to` ([floating point](24-kernel.md#floating-point)) | M4 | none |
+| Time of a [machine seam](23-low-level.md#machine-seams)'s round trip and of `hw::switch_to` ([scheduling](24-kernel.md#scheduling)) | M4 | none |
 | Time of a generation check in a [capability table](14-authority.md#capability-tables) | M2, M4 | none |
 | Nanbench's metrics | the bootstrap | none |
 | Token count of each [primer tier](39-primer.md#primer-tiers) | the primer | its cap |

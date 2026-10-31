@@ -252,7 +252,7 @@ pub fn exit_services(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_stub(fx, Stub::WriteCr3, &[root]);
             let boot = lo.cpu_records(fx);
             lo.load_cpu_tables(fx, boot);
-            lo.enable_avx(fx, boot);
+            lo.call_stub(fx, Stub::EnableAvx, &[]);
         }
     }
     let kernel = supply.sret.expect("the kernel's address");

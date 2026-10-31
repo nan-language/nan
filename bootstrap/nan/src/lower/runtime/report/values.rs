@@ -3,7 +3,7 @@
 //! be written as the construction, variant or `[a, b]` form that builds it, each by a glue
 //! writing the value at an address.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
 use super::super::super::data::const_arg;
@@ -256,7 +256,7 @@ fn part(lo: &mut Lowering, fx: &mut Fx, report: Report, ty: &Ty, at: Value) {
 
 /// Writes the scalar at an address.
 fn scalar_part(lo: &mut Lowering, fx: &mut Fx, report: Report, scalar: Scalar, at: Value) {
-    let value = fx.load(scalar_type(scalar), at, 0);
+    let value = fx.load(scalar_type(scalar, lo.machine()), at, 0);
     let bits = bits(fx, scalar, value);
     let how = fx.ptr(written(&Ty::Scalar(scalar)) as u64);
     lo.call_routine(fx, Routine::ReportScalar, &[report.out, bits, how]);
@@ -266,11 +266,10 @@ fn scalar_part(lo: &mut Lowering, fx: &mut Fx, report: Report, scalar: Scalar, a
 /// integer's value sign-extended and any other zero-extended.
 pub fn bits(fx: &mut Fx, scalar: Scalar, value: Value) -> Value {
     match scalar {
-        Scalar::F32 => {
-            let raw = fx.b.ins().bitcast(types::I32, MemFlagsData::new(), value);
-            fx.b.ins().uextend(types::I64, raw)
+        Scalar::F32 | Scalar::F64 => {
+            let raw = super::super::super::supplied::numbers::to_bits(fx, value);
+            super::super::super::body::widen(fx, raw)
         }
-        Scalar::F64 => fx.b.ins().bitcast(types::I64, MemFlagsData::new(), value),
         _ if scalar.is_signed() && scalar.bits() < 64 => fx.b.ins().sextend(types::I64, value),
         _ => super::super::super::body::widen(fx, value),
     }

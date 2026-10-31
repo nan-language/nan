@@ -33,13 +33,12 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
 /// its affinity on AArch64; whether it has started its executor; its global descriptor table, the
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
-/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root;
-/// whether it has AVX enabled, which the vector seam reads to save the extended state; the
-/// frame the vector seam saved for the interrupt it serves, zero outside one; on x86_64, the
-/// features the `CpuFeatures` stub records; on a kernel, the nanosecond of its timer's next
-/// pacing tick and the ticks its timer counts in a millisecond; whether it waits in
-/// `hw::Ring0.wait_for_interrupt`, which no preemption interrupts; and whether a shootdown
-/// another CPU posted awaits it.
+/// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root; whether a
+/// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
+/// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
+/// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
+/// millisecond; and whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
+/// interrupts.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -51,13 +50,12 @@ pub mod cpu {
     pub const GDTR: u64 = 104;
     pub const TSS: u64 = 120;
     pub const ROOT: u64 = 224;
-    pub const AVX: u64 = 232;
+    pub const SHOOTDOWN: u64 = 232;
     pub const FRAME: u64 = 240;
     pub const FEATURES: u64 = 248;
     pub const NEXT_PACE: u64 = 256;
     pub const TIMER_RATE: u64 = 264;
     pub const WAITING: u64 = 272;
-    pub const SHOOTDOWN: u64 = 280;
     pub const SIZE: u64 = 320;
 }
 
@@ -146,14 +144,8 @@ impl Lowering<'_, '_> {
         }
         if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
-            self.enable_avx(fx, boot);
+            self.call_stub(fx, Stub::EnableAvx, &[]);
         }
-    }
-
-    /// Enables AVX on the running CPU when it has it, recording whether in the CPU's record.
-    pub fn enable_avx(&mut self, fx: &mut Fx, record: Value) {
-        let enabled = self.call_stub(fx, Stub::EnableAvx, &[])[0];
-        fx.store(enabled, record, cpu::AVX);
     }
 
     /// Writes a CPU's global descriptor table, task-state segment and pseudo-descriptor into its
@@ -676,7 +668,8 @@ impl Lowering<'_, '_> {
     /// The glue a started CPU calls with its record: it points its base register at the record,
     /// sets its data-independent timing mode, on x86_64 records its features, loads its
     /// descriptor tables and enables AVX when it has it, prepares its interrupt delivery through
-    /// `prepare`, records that it started and runs the executor's scheduler.
+    /// `prepare`, disables floating point, records that it started and runs the executor's
+    /// scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
         let mut signature = Signature::new(super::super::CALL_CONV);
         signature.params.push(AbiParam::new(PTR));
@@ -696,10 +689,11 @@ impl Lowering<'_, '_> {
                     let index = lo.running_index(fx);
                     lo.call_stub(fx, Stub::CpuFeatures, &[index]);
                     lo.load_cpu_tables(fx, record);
-                    lo.enable_avx(fx, record);
+                    lo.call_stub(fx, Stub::EnableAvx, &[]);
                 }
                 let prepare = lo.func_ref(fx, prepare);
                 fx.b.ins().call(prepare, &[]);
+                lo.call_stub(fx, Stub::DisableFloats, &[]);
                 lo.cpu_started(fx, record);
                 lo.call_routine(fx, Routine::Schedule, &[]);
                 fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));

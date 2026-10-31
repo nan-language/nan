@@ -674,7 +674,11 @@ fn encode_kind(
                 Kind::Unsigned(scalar) | Kind::Signed(scalar) => *scalar,
                 _ => Scalar::Char,
             };
-            let loaded = fx.load(super::super::layout::scalar_type(scalar), value, 0);
+            let loaded = fx.load(
+                super::super::layout::scalar_type(scalar, lo.machine()),
+                value,
+                0,
+            );
             let signed = matches!(kind, Kind::Signed(_));
             let wide = match (signed, scalar.bits() < 64) {
                 (true, true) => fx.b.ins().sextend(types::I64, loaded),
@@ -702,18 +706,18 @@ fn encode_kind(
             }
         }
         Kind::Float(scalar) => {
-            let loaded = fx.load(super::super::layout::scalar_type(*scalar), value, 0);
+            let loaded = fx.load(
+                super::super::layout::scalar_type(*scalar, lo.machine()),
+                value,
+                0,
+            );
             match format {
                 Format::Wire => {
                     let wide = match scalar {
-                        Scalar::F32 => fx.b.ins().fpromote(types::F64, loaded),
+                        Scalar::F32 => super::floats::promote(fx, loaded),
                         _ => loaded,
                     };
-                    let bits = fx.b.ins().bitcast(
-                        types::I64,
-                        cranelift_codegen::ir::MemFlagsData::new(),
-                        wide,
-                    );
+                    let bits = super::numbers::to_bits(fx, wide);
                     let slot = fx.slot(8, 8);
                     fx.store(bits, slot, 0);
                     let eight = fx.ptr(8);
@@ -1151,13 +1155,19 @@ fn decode_kind(
             };
             let outside = fx.b.ins().bxor_imm_s(inside, 1);
             fx.when(outside, |fx| fail(fx, failure::OUT_OF_RANGE));
-            let narrowed =
-                super::super::place::resize(fx, value, super::super::layout::scalar_type(*scalar));
+            let narrowed = super::super::place::resize(
+                fx,
+                value,
+                super::super::layout::scalar_type(*scalar, lo.machine()),
+            );
             fx.store(narrowed, target, 0);
         }
         Kind::Float(scalar) => {
             let (value, failed) = match &decoding.format {
-                DecodeFormat::Wire => wire::read_float(fx, reader_state),
+                DecodeFormat::Wire => {
+                    let float = super::super::layout::scalar_type(Scalar::F64, lo.machine());
+                    wire::read_float(fx, reader_state, float)
+                }
                 DecodeFormat::Json => json::read_float(lo, fx, reader_state),
                 DecodeFormat::Construction => construction::read_float(lo, fx, reader_state),
                 DecodeFormat::Calls(decoder) => {
@@ -1168,7 +1178,7 @@ fn decode_kind(
             };
             check(lo, fx, failed, |_, _| {});
             let value = match scalar {
-                Scalar::F32 => fx.b.ins().fdemote(types::F32, value),
+                Scalar::F32 => super::floats::demote(fx, value),
                 _ => value,
             };
             fx.store(value, target, 0);

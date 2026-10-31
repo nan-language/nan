@@ -73,11 +73,17 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
                 panic!("a Secret of a scalar widened");
             };
             match source.is_signed() {
-                true => fx.b.ins().sextend(scalar_type(scalar), value(0)),
-                false => fx.b.ins().uextend(scalar_type(scalar), value(0)),
+                true => {
+                    fx.b.ins()
+                        .sextend(scalar_type(scalar, lo.machine()), value(0))
+                }
+                false => {
+                    fx.b.ins()
+                        .uextend(scalar_type(scalar, lo.machine()), value(0))
+                }
             }
         }
-        "truncate" => super::super::place::resize(fx, value(0), scalar_type(scalar)),
+        "truncate" => super::super::place::resize(fx, value(0), scalar_type(scalar, lo.machine())),
         _ => return false,
     };
     supply.ret(lo, fx, Held::Scalar(held));

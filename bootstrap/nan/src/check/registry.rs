@@ -16,6 +16,15 @@ use crate::interp::{ConstValue, FnVal, Interpreter, Val};
 use crate::syntax::ast::{self, ItemKind};
 use crate::workspace::{Arch, Authority, Kind};
 
+/// The primitive capabilities through which code installs functions that outlive the call: the
+/// root grants and IRQ-safe locks, whose devices' interrupt functions run until uninstalled.
+const INSTALLING: [&str; 4] = [
+    "boot::Machine",
+    "boot::Kernel",
+    "boot::Services",
+    "hw::IrqShared",
+];
+
 /// A contribution as a judging root sees it.
 pub struct Contribution {
     pub item: ItemId,
@@ -96,9 +105,79 @@ impl Checker<'_> {
                 .db
                 .core_item(interface)
                 .is_none_or(|interface| ty.has_error() || self.implements(&ty, interface));
-            if !implemented {
+            if !implemented || registry.loaded && !ty.has_error() && !self.loaded_key(&ty) {
                 self.report(item, name.token, code);
             }
+        }
+        if registry.loaded {
+            self.check_loaded_fields(item, registry, fields, &subst);
+        }
+    }
+
+    /// Whether a type may be a key or unique field of a loaded registry, which loading compares:
+    /// an integer type, `bool`, `char` or `Str`.
+    fn loaded_key(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Scalar(scalar) => !scalar.is_float(),
+            _ => self.is_std(ty, "core::Str"),
+        }
+    }
+
+    /// The rules of a loaded registry's entry type: it holds a function type only as the type of
+    /// one of its fields (`registry.loaded-entry`), and such a field's type demands neither
+    /// `pure` nor `notrap`, has boundary types as its parameters, result and failure, and no
+    /// `mut` parameter of a view type (`registry.loaded-field`).
+    fn check_loaded_fields(
+        &self,
+        item: ItemId,
+        registry: &ast::RegistryItem,
+        fields: &[super::sig::FieldSig],
+        subst: &Subst,
+    ) {
+        for field in fields {
+            let ty = subst.ty(&field.ty);
+            let code = match &ty {
+                Ty::Fn(fn_ty)
+                    if fn_ty.limits.pure
+                        || fn_ty.limits.notrap
+                        || !self.boundary(&fn_ty.result)
+                        || fn_ty
+                            .fails
+                            .as_ref()
+                            .is_some_and(|fails| !self.boundary(fails))
+                        || fn_ty.params.iter().any(|param| {
+                            !self.boundary(&param.ty)
+                                || param.mode == ast::Mode::Mut
+                                    && self.has(&param.ty, Property::View)
+                        }) =>
+                {
+                    Code::RegistryLoadedField
+                }
+                Ty::Fn(_) => continue,
+                _ if self.any_part(&ty, &|part| matches!(part, Ty::Fn(_))) => {
+                    Code::RegistryLoadedEntry
+                }
+                _ => continue,
+            };
+            self.report(item, registry.entry.token, code);
+            return;
+        }
+    }
+
+    /// Whether a type may cross a gate: the unit type, `Never`, a type implementing `Encode`, or a
+    /// handle type: a primitive capability through which no code is installed, a capability
+    /// kind or an outbox.
+    fn boundary(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Unit | Ty::Never | Ty::Error => true,
+            Ty::Item(item, _) if self.is_primitive_capability(*item) => {
+                !INSTALLING.contains(&self.db.canonical(*item).as_str())
+            }
+            Ty::Item(item, _) if self.db.canonical(*item) == "sys::Outbox" => true,
+            _ => self
+                .db
+                .core_item("Encode")
+                .is_none_or(|encode| self.implements(ty, encode)),
         }
     }
 

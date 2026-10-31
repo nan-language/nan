@@ -208,6 +208,8 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Outbox", COPY_SEND),
     ("sys::Abandoner", AFFINE_SEND),
     ("sys::Stepper", LINEAR_ONLY),
+    ("sys::load::Loader", AFFINE_SEND),
+    ("sys::load::Table", COPY_SEND),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::UserAddr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::Register", [No, No, Yes, Yes, Yes, No]),
@@ -234,7 +236,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 32] = [
+const PRIMITIVE_CAPABILITIES: [&str; 33] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -252,6 +254,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 32] = [
     "sys::net::Conn",
     "sys::Revoker",
     "sys::Minter",
+    "sys::load::Loader",
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",

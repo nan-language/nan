@@ -21,11 +21,14 @@ fn std_checks_without_diagnostics() {
 }
 
 /// The types of the values only machine targets give.
-const MACHINE_VALUES: [&str; 13] = [
+const MACHINE_VALUES: [&str; 16] = [
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",
     "boot::Module",
+    "sys::load::Loader",
+    "sys::load::Prepared",
+    "sys::load::Bundle",
     "hw::Ring0",
     "hw::Iommu",
     "hw::IoDomain",
@@ -38,11 +41,12 @@ const MACHINE_VALUES: [&str; 13] = [
 ];
 
 /// The other functions no test or example on the host can call.
-const HOST_UNCALLABLE: [&str; 5] = [
+const HOST_UNCALLABLE: [&str; 6] = [
     "hw::Mmio.map",
     "hw::Ports.map",
     "hw::Idt.of_vectors",
     "hw::Anchor.with",
+    "sys::load::Table.read",
     "core::Untrusted.inspect",
 ];
 

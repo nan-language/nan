@@ -32,6 +32,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleR
 
 use super::body::Held;
 use super::call::Invoked;
+use super::data::Reserved;
 use super::fx::{Fx, PTR};
 use super::runtime::{state, system};
 use super::{Instance, Lowering, Program, lines};
@@ -173,6 +174,32 @@ pub mod secondary {
     pub const SIZE: u64 = 32;
 }
 
+/// The secondary start record.
+const SECONDARY_RECORD: Reserved = Reserved {
+    name: "_NSsecondary_record",
+    size: secondary::SIZE,
+    align: 16,
+};
+
+/// The boot stack of `size` bytes.
+fn boot_stack_data(size: u64) -> Reserved {
+    Reserved {
+        name: "_NSboot_stack",
+        size,
+        align: 16,
+    }
+}
+
+/// The data a kernel's runtime reserves that a bundle's code reaches, which a kernel exports.
+pub fn shared_data(arch: Arch) -> Vec<Reserved> {
+    let mut shared = vec![cpus::CPUS, bindings::IRQ_BINDINGS, heap::HEAP_STATE];
+    match arch {
+        Arch::Amd64 => shared.push(interrupts::IDT),
+        Arch::Aarch64 => shared.extend([its::IRQ_LPIS, its::ITS_DEVICES]),
+    }
+    shared
+}
+
 impl Lowering<'_, '_> {
     /// Switches task stacks: saves the running stack's execution to the context at `store`,
     /// restores the one at `load` and resumes it with `payload`. Cranelift lowers the switch on
@@ -219,7 +246,7 @@ impl Lowering<'_, '_> {
     /// Reserves an `aarch64-uefi` image's boot stack and emits the program entry seam, which the
     /// firmware calls with the image handle and system table and which calls `boot`.
     fn aarch64_uefi_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
-        let stack = self.reserved_data("_NSboot_stack", boot_stack, 16);
+        let stack = self.reserved_data(boot_stack_data(boot_stack));
         let seam = self
             .module
             .declare_function(ENTRY, Linkage::Export, &Signature::new(super::CALL_CONV))
@@ -248,7 +275,7 @@ impl Lowering<'_, '_> {
     /// zero.
     fn aarch64_bare_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
         let root = self.aarch64_entry_root();
-        let stack = self.reserved_data("_NSboot_stack", boot_stack, 16);
+        let stack = self.reserved_data(boot_stack_data(boot_stack));
         let seam = self
             .module
             .declare_function(ENTRY, Linkage::Export, &Signature::new(super::CALL_CONV))
@@ -295,14 +322,14 @@ impl Lowering<'_, '_> {
     /// The address of a machine image's single secondary start record, which the boot CPU fills
     /// before it starts each other CPU.
     pub fn secondary_record(&mut self, fx: &mut Fx) -> Value {
-        self.reserved(fx, "_NSsecondary_record", secondary::SIZE, 16)
+        self.reserved(fx, SECONDARY_RECORD)
     }
 
     /// Reserves an `x86_64-bare` image's boot stack of `boot_stack` bytes, defines its
     /// descriptor table, and emits the program entry seam, which calls `boot`.
     fn bare_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
         let root = self.entry_root();
-        let stack = self.reserved_data("_NSboot_stack", boot_stack, 16);
+        let stack = self.reserved_data(boot_stack_data(boot_stack));
         let gdtr = self.define_gdt();
         let seam = self
             .module
@@ -345,7 +372,7 @@ impl Lowering<'_, '_> {
     /// entry seam. The firmware enters it in long mode under `"win64"` with the image handle and
     /// system table, which it passes to `boot`.
     fn uefi_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
-        let stack = self.reserved_data("_NSboot_stack", boot_stack, 16);
+        let stack = self.reserved_data(boot_stack_data(boot_stack));
         let seam = self
             .module
             .declare_function(ENTRY, Linkage::Export, &Signature::new(super::CALL_CONV))
@@ -437,7 +464,8 @@ impl Lowering<'_, '_> {
 
     /// The x86_64 entry root: a top-level table, a page-directory-pointer table and four page
     /// directories of 2 MiB pages mapping the first 4 GiB writable at their physical addresses,
-    /// the last gigabyte uncached.
+    /// the last gigabyte uncached, and in a kernel exporting the load ABI the top-level entry of
+    /// the load window.
     fn x64_entry_root(&mut self) -> DataId {
         const NAME: &str = "_NSentry_root";
         if let Some(id) = self.reserved.get(NAME) {
@@ -464,6 +492,11 @@ impl Lowering<'_, '_> {
             let entry = 4_096 + 8 * directory;
             let target = 2 * 4_096 + 4_096 * directory + table;
             description.write_data_addr(entry as u32, own, target as i64);
+        }
+        if let Some((window, bits)) = self.window_root_entry() {
+            let reference = self.module.declare_data_in_data(window, &mut description);
+            let entry = 8 * super::load::WINDOW_ENTRY;
+            description.write_data_addr(entry as u32, reference, bits);
         }
         self.module
             .define_data(id, &description)

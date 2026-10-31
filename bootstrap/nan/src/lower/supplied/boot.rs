@@ -7,6 +7,7 @@
 
 pub mod firmware;
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
 use super::super::body::Held;
@@ -329,7 +330,14 @@ fn push_region(
 fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state_ty = supply.type_arg(0);
     let layout = lo.layout(&state_ty);
-    let storage = lo.reserved(fx, "_NSanchor", layout.size.max(1), layout.align.max(1));
+    let storage = lo.reserved(
+        fx,
+        Reserved {
+            name: "_NSanchor",
+            size: layout.size.max(1),
+            align: layout.align.max(1),
+        },
+    );
     lo.store_held(fx, storage, supply.param(1), &state_ty);
     let state_address = lo.state(fx);
     let location = report::caller_location(lo, fx);

@@ -1,8 +1,9 @@
 //! The image writer: links the relocatable object of a machine target's lowering into its image,
-//! a PE32+ EFI application on a UEFI target or a static ELF64 executable on a bare target. It
-//! lays the object's sections out in segments, one per access kind, resolves its symbols and
-//! applies its relocations.
+//! a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a
+//! bundle. It lays the object's sections out in segments, one per access kind, resolves its
+//! symbols and applies its relocations.
 
+pub mod bundle;
 mod elf;
 mod object;
 mod pe;
@@ -24,11 +25,11 @@ pub fn write(target: Target, object: &[u8], entry: &str) -> Vec<u8> {
     let arch = target.arch().expect("a machine target's architecture");
     match target.kind() {
         Some(workspace::Kind::Uefi) => {
-            let linked = link(object, pe::BASE);
+            let linked = link(object, pe::BASE, false);
             pe::write(&linked, linked.symbol(entry), arch)
         }
         Some(workspace::Kind::Bare) => {
-            let linked = link(object, elf::base(arch));
+            let linked = link(object, elf::base(arch), false);
             elf::write(&linked, linked.symbol(entry), arch)
         }
         _ => panic!("the image writer builds no {} image", target.name()),
@@ -36,7 +37,7 @@ pub fn write(target: Target, object: &[u8], entry: &str) -> Vec<u8> {
 }
 
 /// What a segment's memory permits beside reading.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Access {
     Execute,
     Read,
@@ -51,12 +52,14 @@ struct Segment {
     size: u64,
 }
 
-/// An object linked at an address: its segments, the address of each of its symbols, and the
-/// address and width in bytes of each absolute address its relocations wrote.
+/// An object linked at an address: its segments, the address of each of its symbols, the
+/// address and width in bytes of each absolute address its relocations wrote, and the address of
+/// each word holding the address of a symbol it imports, with that symbol's name.
 struct Linked {
     segments: Vec<Segment>,
     symbols: HashMap<String, u64>,
     absolute: Vec<(u64, usize)>,
+    imports: Vec<(u64, String)>,
 }
 
 impl Linked {
@@ -118,12 +121,39 @@ fn patch_a64(bytes: &mut [u8], at: usize, field: u32, value: u32) {
     bytes[at..at + 4].copy_from_slice(&patched.to_le_bytes());
 }
 
-/// Links an object with its first segment at `base`.
-fn link(object: &[u8], base: u64) -> Linked {
+/// The code a bundle calls an imported function through, in its text: an indirect jump through
+/// the word that follows it, which holds the function's address.
+const IMPORT_STUB: [u8; 8] = [0xff, 0x25, 0x02, 0x00, 0x00, 0x00, 0xcc, 0xcc];
+const IMPORT_STUB_BYTES: u64 = 16;
+
+/// Links an object with its first segment at `base`. Only a bundle, when `importing`, leaves
+/// symbols undefined: each absolute address of one is an import, and each call of one goes
+/// through an import stub after the object's code.
+fn link(object: &[u8], base: u64, importing: bool) -> Linked {
     let object = object::read(object);
+    let undefined = |symbol: &object::Symbol| symbol.section.is_none() && !symbol.name.is_empty();
+    let mut called: Vec<String> = Vec::new();
+    for relocation in object
+        .sections
+        .iter()
+        .flat_map(|section| &section.relocations)
+    {
+        let symbol = &object.symbols[relocation.symbol];
+        if undefined(symbol)
+            && matches!(relocation.kind, reloc::X64_PC32 | reloc::X64_PLT32)
+            && !called.contains(&symbol.name)
+        {
+            called.push(symbol.name.clone());
+        }
+    }
+    assert!(
+        importing || called.is_empty(),
+        "an undefined symbol in an image"
+    );
     let mut placed: Vec<Option<u64>> = vec![None; object.sections.len()];
     let mut segments: Vec<Segment> = Vec::new();
     let mut next = base;
+    let mut stubs = 0;
     for (kind, access) in [
         (Kind::Text, Access::Execute),
         (Kind::ReadOnly, Access::Read),
@@ -153,11 +183,26 @@ fn link(object: &[u8], base: u64) -> Linked {
                 }
             }
         }
+        if kind == Kind::Text && !called.is_empty() {
+            let offset = segment.size.next_multiple_of(IMPORT_STUB_BYTES);
+            segment.bytes.resize(offset as usize, 0);
+            for _ in &called {
+                segment.bytes.extend_from_slice(&IMPORT_STUB);
+                segment.bytes.extend_from_slice(&[0; 8]);
+            }
+            stubs = segment.address + offset;
+            segment.size = segment.bytes.len() as u64;
+        }
         if segment.size > 0 {
             next = (segment.address + segment.size).next_multiple_of(PAGE);
             segments.push(segment);
         }
     }
+    let mut imports: Vec<(u64, String)> = called
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (stubs + index as u64 * IMPORT_STUB_BYTES + 8, name.clone()))
+        .collect();
     let address_of = |symbol: &object::Symbol| -> u64 {
         let section = symbol
             .section
@@ -183,8 +228,23 @@ fn link(object: &[u8], base: u64) -> Linked {
             .expect("the segment of a placed section");
         for relocation in &section.relocations {
             let place = start + relocation.offset;
-            let target = address_of(&object.symbols[relocation.symbol]) as i64 + relocation.addend;
+            let symbol = &object.symbols[relocation.symbol];
             let at = (place - segment.address) as usize;
+            let target = match called.iter().position(|name| *name == symbol.name) {
+                Some(index) if undefined(symbol) => {
+                    (stubs + index as u64 * IMPORT_STUB_BYTES) as i64 + relocation.addend
+                }
+                _ if undefined(symbol) => {
+                    assert!(
+                        importing && matches!(relocation.kind, reloc::X64_ABS64 | reloc::A64_ABS64),
+                        "an absolute address of the undefined symbol {}",
+                        symbol.name
+                    );
+                    imports.push((place, symbol.name.clone()));
+                    continue;
+                }
+                _ => address_of(symbol) as i64 + relocation.addend,
+            };
             let relative = target - place as i64;
             match relocation.kind {
                 reloc::X64_ABS64 | reloc::A64_ABS64 => {
@@ -230,10 +290,12 @@ fn link(object: &[u8], base: u64) -> Linked {
             }
         }
     }
+    imports.sort();
     let mut linked = Linked {
         segments,
         symbols,
         absolute,
+        imports,
     };
     linked.record_extent(base);
     linked.absolute.sort();

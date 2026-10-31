@@ -293,7 +293,7 @@ The context words of language 1 are exactly these:
 | `convention` | [calling conventions](23-low-level.md#calling-conventions) |
 | `bit`, `rest`, `bytes`, `le`, `be`, `tags`, `at` | [layouts](23-low-level.md#layouts) |
 | `at`, `stride`, `read`, `write`, `write_one_clear` | [registers](23-low-level.md#registers) items |
-| `keyed`, `by`, `unique` | [registries](25-registries.md#registries) |
+| `loaded`, `keyed`, `by`, `unique` | [registries](25-registries.md#registries) |
 | `protocol`, `summary` | [protocol](26-components.md#protocols) items |
 | `preserves`, `changes`, `manual` | [tombstones](29-identity-versioning.md#tombstones) |
 | `language`, `targets`, `entry`, `dep`, `allow`, `deny`, `device`, `priv`, `validate` | [manifest](03-packages-modules.md#manifest) directives |

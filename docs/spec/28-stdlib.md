@@ -12,7 +12,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 | `mem` | allocators, budgets, stores, ids, handles, boxes, shared values, collections, once maps | `mem::wire` |
 | `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
-| `sys` | the sys capabilities, revocation, domains, components | `sys::fs`, `sys::net`, `sys::sim` |
+| `sys` | the sys capabilities, revocation, domains, components, loading bundles | `sys::fs`, `sys::net`, `sys::sim`, `sys::load` |
 | `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, cross-CPU operations, scheduling, physical memory, platform registries | `hw::sim` |
 | `boot` | the uefi and bare root grants, firmware services | none |
 | `host` | the host root grant, the component runner | none |
@@ -23,7 +23,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
-- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; `sys::load` names `hw::Ptr` and `hw::Order`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -98,6 +98,8 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
 | `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
+| `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
+| `sys` | `sys::load::Table` | [Loaded registries](25-registries.md#loaded-registries) |
 | `hw` | `hw::Ptr` | [Pointers](23-low-level.md#pointers); atomic members in [Trusted atomics](23-low-level.md#trusted-atomics) |
 | `hw` | `hw::Order`, `hw::fence` | [Trusted atomics](23-low-level.md#trusted-atomics) |
 | `hw` | `hw::PhysAddr`, `hw::VirtAddr`, `hw::BusAddr`, `hw::UserAddr`, `hw::UserAddrError` | [Address types](23-low-level.md#address-types) |
@@ -119,7 +121,7 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |
 | `hw` | `hw::vectors`, `hw::Vector`, `hw::VectorHandler`, `hw::syscall_entry`, `hw::SyscallEntry`, `hw::preempt`, `hw::PreemptEntry` | [Platform registries](25-registries.md#platform-registries) |
 | `hw` | `hw::sim::Registers` | [Sim constructors](22-testing.md#sim-constructors) |
-| `boot` | `boot::Machine`, `boot::Kernel` | [Root grants](14-authority.md#root-grants); members of `boot::Kernel` in [Anchor](24-kernel.md#anchor) and of `boot::Machine` in [Firmware services](24-kernel.md#firmware-services) |
+| `boot` | `boot::Machine`, `boot::Kernel` | [Root grants](14-authority.md#root-grants); members of `boot::Kernel` in [Anchor](24-kernel.md#anchor), but `loader` in [Loading](24-kernel.md#loading), and of `boot::Machine` in [Firmware services](24-kernel.md#firmware-services) |
 | `boot` | `boot::Services`, `boot::ServiceError` | [Firmware services](24-kernel.md#firmware-services) |
 | `host` | `host::World` | [Root grants](14-authority.md#root-grants) |
 | `host` | `host::Runner` | [Runner](26-components.md#runner) |
@@ -290,12 +292,12 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; `sys::load::Table.read`, whose receiver only a loaded registry, which no std package declares, gives; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
 
-The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]`, `hw::Iommu`, `hw::IoDomain` and `hw::PciFunction` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
+The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `sys::load::Loader`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]`, `hw::Iommu`, `hw::IoDomain` and `hw::PciFunction` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
 
 The [authority summary](14-authority.md#authority-summaries) of each std package, published in its artefact, holds only entries of its row. "Trusted code" covers trusted blocks and expressions and `assume`; "decoders" are the decoders that the package's types derive.
 
@@ -305,9 +307,9 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
 | `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction` | trusted code, declassifying decoders and validators |
 | `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
-| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `task::Executor` | `alloc` | none | trusted code |
+| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `sys::load::Loader`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
-| `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
+| `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock`, `sys::load::Loader` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `host` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
 | `testing` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | trusted code |
 | platform packages | every primitive capability | `alloc`, `device`, `priv` | none | trusted code, foreign fns, landing fns, its `priv` grant |
@@ -472,7 +474,7 @@ pub fn record_all(mut history: mem::List[u32], values: Slice[u32]) fails mem::Ou
 
 ## Reserved std names
 
-The paths `sys::infer` and `sys::load` are reserved: no std module or item has them, and a path whose first two segments are one of them is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
+The path `sys::infer` is reserved: no std module or item has it, and a path whose first two segments are it is an error (`name.reserved`). The alias `ui` is reserved as [aliases](03-packages-modules.md#aliases) states.
 
 ```nan
 pub fn model_size(model: Str) -> usize {

@@ -1,26 +1,44 @@
-//! Final builds: checking a program's final closure, lowering its reach and linking its image.
+//! Final builds: checking a program's final closure, lowering its reach and linking its image,
+//! and building a bundle against a kernel's interface.
+
+mod bundle;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::artefact;
 use crate::check;
-use crate::check::db::PackageId;
+use crate::check::db::{ItemId, PackageId};
 use crate::diagnostic::{Class, Code, Diagnostic, Reason};
 use crate::encoding::{bytes, list};
 use crate::hash::checksummed_base32;
 use crate::lower;
-use crate::workspace::{Member, Package, Target, Workspace};
+use crate::workspace::{Kind, Level, Member, Package, Target, Workspace};
+
+pub use bundle::{at_manifest, bundle};
 
 /// The entry landing fn each platform package holds.
 const LANDING: &str = "enter";
 
-/// What a final build reports and the image it writes, relative to the workspace root.
+/// What a final build reports and the image it writes, relative to the workspace root, with a
+/// kernel's interface file.
 pub struct Build {
     pub diagnostics: Vec<Diagnostic>,
     pub image: Option<String>,
+    pub interface: Option<String>,
+}
+
+impl Build {
+    fn failed(diagnostics: Vec<Diagnostic>) -> Build {
+        Build {
+            diagnostics,
+            image: None,
+            interface: None,
+        }
+    }
 }
 
 /// Performs the final build of the program at index `program` of the workspace, comparing its
@@ -36,10 +54,7 @@ pub fn build(
         check::reported(workspace, &crate::scope::Scope::Workspace);
     let std = crate::stdlib::packages();
     let Some(checked) = workspace.closure_of(source) else {
-        return Ok(Build {
-            diagnostics,
-            image: None,
-        });
+        return Ok(Build::failed(diagnostics));
     };
     let target = source.program_target();
     let checker = check::checked(workspace, checked, std, target);
@@ -56,23 +71,17 @@ pub fn build(
     });
     diagnostics.extend(check::release_errors(&checker, root));
     if errors(&diagnostics) {
-        return Ok(Build {
-            diagnostics,
-            image: None,
-        });
+        return Ok(Build::failed(diagnostics));
     }
     let name = checker.db.package(root).name.clone();
     let artefacts = artefacts(workspace, &checker, root);
     if let Some((image, written)) = compared {
         diagnostics.extend(crate::stage::compare(&checker, &artefacts, image, written));
         if errors(&diagnostics) {
-            return Ok(Build {
-                diagnostics,
-                image: None,
-            });
+            return Ok(Build::failed(diagnostics));
         }
     }
-    let lowered = lower_program(&checker, source, root, &artefacts);
+    let (lowered, interface) = lower_program(&checker, source, root, &artefacts);
     diagnostics.extend(collisions(source, &lowered));
     diagnostics.extend(lower::stack::judge(
         &checker,
@@ -80,10 +89,7 @@ pub fn build(
         &lowered.demands,
     ));
     if errors(&diagnostics) {
-        return Ok(Build {
-            diagnostics,
-            image: None,
-        });
+        return Ok(Build::failed(diagnostics));
     }
     let image = format!(
         ".nan/images/{}/{name}{}",
@@ -101,26 +107,45 @@ pub fn build(
         let linker = lower::host::linker(target).to_owned();
         diagnostic.envelope = Some((linker, output.lines().map(str::to_owned).collect()));
         diagnostics.push(diagnostic);
-        return Ok(Build {
-            diagnostics,
-            image: None,
-        });
+        return Ok(Build::failed(diagnostics));
     }
+    let interface = match interface {
+        Some(file) => {
+            let path = format!(".nan/images/{}/{name}.nlif", target.name());
+            write_file(&workspace.root.join(&path), &file)?;
+            Some(path)
+        }
+        None => None,
+    };
     Ok(Build {
         diagnostics,
         image: Some(image),
+        interface,
     })
+}
+
+/// Writes a file through a staged file beside it, replacing any earlier file at once.
+fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let directory = path.parent().expect("a file lies in a directory");
+    fs::create_dir_all(directory)?;
+    let name = path
+        .file_name()
+        .expect("a file has a name")
+        .to_string_lossy();
+    let staged = directory.join(format!(".{name}.{}.new", std::process::id()));
+    fs::write(&staged, bytes)?;
+    fs::rename(&staged, path)
 }
 
 /// The lowering of the program of `source`, whose package is `root`, for the checker's target at
 /// the codegen level its manifest gives for the target's architecture, with the artefacts of its
-/// final closure.
+/// final closure, and the interface file of a kernel exporting the load ABI.
 fn lower_program(
     checker: &check::Checker,
     source: &Package,
     root: PackageId,
     artefacts: &BTreeMap<String, Vec<u8>>,
-) -> lower::Lowered {
+) -> (lower::Lowered, Option<Vec<u8>>) {
     let target = checker.db.target;
     let level = source.manifest.as_ref().and_then(|manifest| {
         manifest
@@ -142,6 +167,7 @@ fn lower_program(
         .find(|package| Some(package.name.as_str()) == target.platform_package())
         .and_then(|package| checker.db.lookup(package.root?, LANDING))
         .expect("the platform package's entry landing fn");
+    let kernel = kernel_interface(checker, root, artefacts, level);
     let program = lower::Program {
         entry,
         landing,
@@ -149,11 +175,104 @@ fn lower_program(
         prefixes: prefixes(artefacts),
         section: section(artefacts),
         level,
+        interface: kernel.as_ref().map(|kernel| kernel.interface.clone()),
+        loaded: kernel
+            .as_ref()
+            .map(|kernel| kernel.loaded.clone())
+            .unwrap_or_default(),
     };
-    match target.is_machine() {
+    let lowered = match target.is_machine() {
         true => lower::lower_machine(checker, &program),
         false => lower::lower(checker, &program),
+    };
+    (lowered, kernel.map(|kernel| kernel.file))
+}
+
+/// The interface of a kernel exporting the load ABI: its interface file, what lowering reads of
+/// it, and the loaded registries of its final closure, in byte order of canonical path.
+struct Kernel {
+    file: Vec<u8>,
+    interface: Rc<lower::load::Interface>,
+    loaded: Vec<ItemId>,
+}
+
+/// The interface of the program whose package is `root`, built at a codegen level, when it is a
+/// kernel of a bare target whose final closure declares a loaded registry.
+fn kernel_interface(
+    checker: &check::Checker,
+    root: PackageId,
+    artefacts: &BTreeMap<String, Vec<u8>>,
+    level: Option<Level>,
+) -> Option<Kernel> {
+    let target = checker.db.target;
+    if target.kind() != Some(Kind::Bare) {
+        return None;
     }
+    let packages = final_closure(checker, root);
+    let mut loaded: Vec<(String, ItemId)> = items(checker, &packages)
+        .filter(|item| is_loaded(checker, *item))
+        .map(|item| (checker.db.canonical(item), item))
+        .collect();
+    if loaded.is_empty() {
+        return None;
+    }
+    loaded.sort();
+    let paths: Vec<String> = loaded.iter().map(|(path, _)| path.clone()).collect();
+    let exports = lower::load::export_names(target, &paths);
+    let interrupt_stack = bundle::interrupt_stack(checker, &packages);
+    let file = bundle::interface_file(target, &roots(artefacts), &exports, interrupt_stack, level);
+    let interface = lower::load::Interface {
+        hash: crate::hash::Hash::of(&file).0.to_vec(),
+        exports,
+        interrupt_stack,
+    };
+    Some(Kernel {
+        file,
+        interface: Rc::new(interface),
+        loaded: loaded.into_iter().map(|(_, item)| item).collect(),
+    })
+}
+
+/// Whether an item is a loaded registry.
+fn is_loaded(checker: &check::Checker, item: ItemId) -> bool {
+    matches!(
+        &checker.db.ast(item).kind,
+        crate::syntax::ast::ItemKind::Registry(registry) if registry.loaded
+    )
+}
+
+/// The packages of the final closure of the package `root`: those it reaches and std.
+fn final_closure(checker: &check::Checker, root: PackageId) -> Vec<PackageId> {
+    let reached = checker.reached(root);
+    (0..checker.db.packages.len())
+        .map(|index| PackageId(index as u32))
+        .filter(|id| reached.contains(id) || checker.db.package(*id).std)
+        .collect()
+}
+
+/// The items of packages.
+fn items<'a>(
+    checker: &'a check::Checker,
+    packages: &'a [PackageId],
+) -> impl Iterator<Item = ItemId> + 'a {
+    packages.iter().flat_map(move |package| {
+        checker
+            .db
+            .package(*package)
+            .modules
+            .iter()
+            .flat_map(move |module| checker.db.module(*module).items.iter().copied())
+    })
+}
+
+/// The code root hash of each package of a final closure, by package name.
+fn roots(artefacts: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, crate::hash::Hash> {
+    artefacts
+        .iter()
+        .filter_map(|(name, artefact)| {
+            Some((name.clone(), artefact::decode(artefact).ok()?.root_hash()))
+        })
+        .collect()
 }
 
 /// The symbol name and Cranelift text of each function the final build of the program at index
@@ -168,7 +287,7 @@ pub fn lowered_functions(workspace: &Workspace, program: usize) -> Vec<(String, 
     let checker = check::checked(workspace, checked, std, source.program_target());
     let root = package_id(&checker, source);
     let artefacts = artefacts(workspace, &checker, root);
-    lower::dumping(|| lower_program(&checker, source, root, &artefacts)).1
+    lower::dumping(|| lower_program(&checker, source, root, &artefacts).0).1
 }
 
 /// A task a program or test image starts, as the measurements of the freeze read it: where its
@@ -224,7 +343,7 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
         let artefacts = artefacts(workspace, &checker, root);
         found.extend(tasks(
             &checker,
-            &lower_program(&checker, source, root, &artefacts),
+            &lower_program(&checker, source, root, &artefacts).0,
         ));
     }
     found

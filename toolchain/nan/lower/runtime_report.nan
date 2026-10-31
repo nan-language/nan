@@ -334,13 +334,11 @@ fn ReportReport.located(self, mut fx: Fx, mut lo: Lowering, location: clif::Valu
 fn ReportReport.location_text(self, mut fx: Fx, mut lo: Lowering, location: clif::Value, field: u64)
     requires field <= 16
 {
-    let tables = line_tables(mut lo, mut fx)
-    let strings = mut fx.load(PTR, addr: tables, offset: 24)
     let offset_word = mut fx.load(clif::Type.Int32, addr: location, offset: field)
     let offset = mut fx.b.uextend(PTR, x: offset_word)
     let len_word = mut fx.load(clif::Type.Int32, addr: location, offset: field + 4)
     let len = mut fx.b.uextend(PTR, x: len_word)
-    let start = mut fx.b.iadd(strings, y: offset)
+    let start = mut fx.b.iadd(location, y: offset)
     self.bytes(mut fx, mut lo, text: start, len)
 } ReportReport.location_text
 
@@ -392,31 +390,45 @@ fn decode_utf8(mut fx: Fx, place: clif::Value, head: clif::Value) -> Utf8Point {
     return Utf8Point(point: points[0], len: length)
 } decode_utf8
 
-/// The address of the line tables' header.
-fn line_tables(mut lo: Lowering, mut fx: Fx) -> clif::Value {
-    let id = mut lo.lines.table(mut lo.module)
-    let global = mut lo.data_ref(mut fx, id)
-    return mut fx.b.symbol_value(PTR, global_value: global)
-} line_tables
-
-/// The location record of a code address and whether its function's frames are left out.
+/// The location record of a code address, zero when it has none, whether its function's frames
+/// are left out, and whether a lowered function holds it.
 struct CodeLocation derives Copy {
     location: clif::Value
     hidden: clif::Value
+    inside: clif::Value
 } CodeLocation
 
-/// The location record of a code address and whether its function's frames are left out, or
-/// a zero location for an address no lowered function holds.
+/// The location record of a code address, zero when it has none, whether its function's frames
+/// are left out, and whether a lowered function holds it: searched in the line tables of the
+/// image, or a bundle's kernel, then of each bundle loaded after it.
 fn lookup(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> CodeLocation {
     let machine = lo.machine()
-    let tables = line_tables(mut lo, mut fx)
+    let head = mut lo.line_head(mut fx)
+    let zero = mut fx.ptr(0)
+    let outside = mut fx.int(clif::Type.Int8, value: 0)
+    let found = mut fx.repeat(fx.list4(head, b: zero, c: zero, d: outside).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 0
+        let tables = state[0]
+        let looked_up = lookup_in(mut fx1, tables, address, machine)
+        let next = mut fx1.load(PTR, addr: tables, offset: LINES_NEXT)
+        let missing = mut fx1.b.bxor_imm_s(looked_up.inside, y: 1)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        let again = mut fx1.b.band(missing, y: more)
+        return Pass(again: again, next: fx1.list4(next, b: looked_up.location, c: looked_up.hidden, d: looked_up.inside))
+    })
+    return CodeLocation(location: found[1], hidden: found[2], inside: found[3])
+} lookup
+
+/// The location record of a code address in one image's line tables, whether its function's
+/// frames are left out, and whether a function of these tables holds it.
+fn lookup_in(mut fx: Fx, tables: clif::Value, address: clif::Value, machine: bool) -> CodeLocation {
     let functions = mut fx.load(PTR, addr: tables, offset: 0)
     let entries = mut fx.load(PTR, addr: tables, offset: 8)
-    let locations = mut fx.load(PTR, addr: tables, offset: 16)
-    let count_word = mut fx.load(clif::Type.Int32, addr: tables, offset: 32)
+    let count_word = mut fx.load(clif::Type.Int32, addr: tables, offset: LINES_COUNT)
     let count = mut fx.b.uextend(PTR, x: count_word)
     let zero = mut fx.ptr(0)
-    let found = mut fx.repeat(fx.list3(zero, b: zero, c: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+    let go = mut fx.int(clif::Type.Int8, value: 1)
+    let found = mut fx.repeat(fx.list4(zero, b: zero, c: zero, d: go).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         expect state.len() > 2
         let index = state[0]
         let location = state[1]
@@ -437,38 +449,46 @@ fn lookup(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> CodeLocation {
             let hidden_flag = mut fx2.b.band_imm_s(flags, y: i64.widen(LINES_HIDDEN))
             let hidden_word = mut fx2.b.uextend(PTR, x: hidden_flag)
             let pc = mut fx2.b.iadd_imm_s(offset, y: -1)
-            let none = mut fx2.ptr(0)
-            let best = mut fx2.repeat(fx2.list2(none, b: none).view(), body: fn(mut fx3: Fx, scan: Slice[clif::Value]) -> Pass {
-                expect scan.len() > 1
-                let at = scan[0]
-                let best_so_far = scan[1]
-                let entry_index = mut fx3.b.iadd(first_entry, y: at)
-                let entry_offset = mut fx3.b.imul_imm_s(entry_index, y: i64.fit(LINES_ENTRY_RECORD))
-                let entry = mut fx3.b.iadd(entries, y: entry_offset)
-                let code_word = mut fx3.load(clif::Type.Int32, addr: entry, offset: 0)
-                let code = mut fx3.b.uextend(PTR, x: code_word)
-                let number_word = mut fx3.load(clif::Type.Int32, addr: entry, offset: 4)
-                let number = mut fx3.b.uextend(PTR, x: number_word)
-                let covers = mut fx3.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: code, y: pc)
-                let chosen = mut fx3.b.select(covers, x: number, y: best_so_far)
-                let next = mut fx3.b.iadd_imm_s(at, y: 1)
-                let more = mut fx3.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: entries_count)
-                return Pass(again: more, next: fx3.list2(next, b: chosen))
+            let any = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: entries_count, y: 0)
+            let best = mut fx2.choose(any, results: fx2.types1(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let none = mut fx3.ptr(0)
+                let scanned = mut fx3.repeat(fx3.list2(none, b: none).view(), body: fn(mut fx4: Fx, scan: Slice[clif::Value]) -> Pass {
+                    expect scan.len() > 1
+                    let at = scan[0]
+                    let best_so_far = scan[1]
+                    let entry_index = mut fx4.b.iadd(first_entry, y: at)
+                    let entry_offset = mut fx4.b.imul_imm_s(entry_index, y: i64.fit(LINES_ENTRY_RECORD))
+                    let entry = mut fx4.b.iadd(entries, y: entry_offset)
+                    let code_word = mut fx4.load(clif::Type.Int32, addr: entry, offset: 0)
+                    let code = mut fx4.b.uextend(PTR, x: code_word)
+                    let number_word = mut fx4.load(clif::Type.Int32, addr: entry, offset: 4)
+                    let number = mut fx4.b.uextend(PTR, x: number_word)
+                    let covers = mut fx4.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: code, y: pc)
+                    let chosen = mut fx4.b.select(covers, x: number, y: best_so_far)
+                    let next = mut fx4.b.iadd_imm_s(at, y: 1)
+                    let more = mut fx4.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: entries_count)
+                    return Pass(again: more, next: fx4.list2(next, b: chosen))
+                })
+                return fx3.list1(scanned[1])
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let none = mut fx3.ptr(0)
+                return fx3.list1(none)
             })
-            let found_location = report_location_record(mut fx2, locations, number: best[1])
+            let found_location = report_location_record(mut fx2, tables, number: best[0])
             let stop = mut fx2.int(clif::Type.Int8, value: 0)
             return fx2.list3(found_location, b: hidden_word, c: stop)
         }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let go = mut fx2.int(clif::Type.Int8, value: 1)
-            return fx2.list3(location, b: hidden, c: go)
+            let go_on = mut fx2.int(clif::Type.Int8, value: 1)
+            return fx2.list3(location, b: hidden, c: go_on)
         })
         let next = mut fx1.b.iadd_imm_s(index, y: 1)
         let more_functions = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: count)
         let again = mut fx1.b.band(result[2], y: more_functions)
-        return Pass(again: again, next: fx1.list3(next, b: result[0], c: result[1]))
+        return Pass(again: again, next: fx1.list4(next, b: result[0], c: result[1], d: result[2]))
     })
-    return CodeLocation(location: found[1], hidden: found[2])
-} lookup
+    let inside = mut fx.b.bxor_imm_s(found[3], y: 1)
+    return CodeLocation(location: found[1], hidden: found[2], inside: inside)
+} lookup_in
 
 /// The start of the lowered function holding a code address, and its flags.
 struct CodeFunction derives Copy {
@@ -477,12 +497,30 @@ struct CodeFunction derives Copy {
 } CodeFunction
 
 /// The start of the lowered function holding a code address and its flags, or zeros for an
-/// address outside lowered code.
+/// address outside lowered code: searched in the line tables of the image, or a bundle's kernel,
+/// then of each bundle loaded after it.
 fn function_at(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> CodeFunction {
     let machine = lo.machine()
-    let tables = line_tables(mut lo, mut fx)
+    let head = mut lo.line_head(mut fx)
+    let zero = mut fx.ptr(0)
+    let found = mut fx.repeat(fx.list3(head, b: zero, c: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 0
+        let tables = state[0]
+        let function = function_in(mut fx1, tables, address, machine)
+        let next = mut fx1.load(PTR, addr: tables, offset: LINES_NEXT)
+        let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: function.start, y: 0)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        let again = mut fx1.b.band(missing, y: more)
+        return Pass(again: again, next: fx1.list3(next, b: function.start, c: function.flags))
+    })
+    return CodeFunction(start: found[1], flags: found[2])
+} function_at
+
+/// The start of the function of one image's line tables holding a code address and its flags,
+/// or zeros for none.
+fn function_in(mut fx: Fx, tables: clif::Value, address: clif::Value, machine: bool) -> CodeFunction {
     let functions = mut fx.load(PTR, addr: tables, offset: 0)
-    let count_word = mut fx.load(clif::Type.Int32, addr: tables, offset: 32)
+    let count_word = mut fx.load(clif::Type.Int32, addr: tables, offset: LINES_COUNT)
     let count = mut fx.b.uextend(PTR, x: count_word)
     let zero = mut fx.ptr(0)
     let found = mut fx.repeat(fx.list3(zero, b: zero, c: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
@@ -508,7 +546,7 @@ fn function_at(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> CodeFuncti
         return Pass(again: again, next: fx1.list3(next, b: start_now, c: flags_now))
     })
     return CodeFunction(start: found[1], flags: found[2])
-} function_at
+} function_in
 
 /// The address of the function of a function record.
 fn record_start(mut fx: Fx, record: clif::Value, machine: bool) -> clif::Value {
@@ -520,8 +558,9 @@ fn record_start(mut fx: Fx, record: clif::Value, machine: bool) -> clif::Value {
     return mut fx.b.iadd(record, y: wide)
 } record_start
 
-/// The address of the location record numbered `number`, or zero for number 0.
-fn report_location_record(mut fx: Fx, locations: clif::Value, number: clif::Value) -> clif::Value {
+/// The address of the location record numbered `number` of line tables, or zero for number 0.
+fn report_location_record(mut fx: Fx, tables: clif::Value, number: clif::Value) -> clif::Value {
+    let locations = mut fx.load(PTR, addr: tables, offset: LINES_LOCATIONS)
     let has = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: number, y: 0)
     let index = mut fx.b.iadd_imm_s(number, y: -1)
     let offset = mut fx.b.imul_imm_s(index, y: i64.fit(LOCATION_RECORD))
@@ -576,7 +615,7 @@ fn report_raise(mut lo: Lowering, mut fx: Fx) {
 
 /// Writes, on the running routine's stack, the report of a trap of a kind located at the call of
 /// the routine's caller, with the operands of a record when `count` is not 0, the location
-/// numbered `caller` its first caller line when not 0, and its replay token in a test image.
+/// record at `caller` its first caller line when not 0, and its replay token in a test image.
 fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif::Value, count: clif::Value, caller: clif::Value) -> ReportReport
     waive length "one routine writing the report's lines in order, as the Rust writes them"
 {
@@ -615,7 +654,7 @@ fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif:
         let at_now = mut fx1.b.iadd(at, y: stored)
         let caller_frame = mut fx1.load(PTR, addr: frame, offset: 0)
         let has_caller = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: caller_frame, y: 0)
-        let more = mut fx1.b.band(known, y: has_caller)
+        let more = mut fx1.b.band(looked_up.inside, y: has_caller)
         return Pass(again: more, next: fx1.list5(caller_frame, b: at_now, c: beyond_now, d: beyond_known_now, e: any_shown_now))
     })
     let beyond_shown = walk[2]
@@ -659,7 +698,14 @@ fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif:
     report.bytes(mut fx, mut lo, text: kind_text, len: kind_len)
     let slot = frame_slot(mut fx, frames, index: first_visible)
     let location = mut fx.load(PTR, addr: slot, offset: 0)
-    report.located(mut fx, mut lo, location)
+    let located = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: location, y: 0)
+    discard mut fx.choose_in(mut lo, condition: located, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        report.located(mut fx1, lo: mut lo1, location)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        report.text(mut fx1, lo: mut lo1, text: "\n")
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
     // The operands of a trap are those of its operation, which must be the innermost frame,
     // except those of an exception, which the CPU gives.
     let innermost = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: first_visible, y: 0)
@@ -682,10 +728,7 @@ fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif:
     })
     let named = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: caller, y: 0)
     mut fx.if_true(named, then: fn[mut lo](mut fx1: Fx) {
-        let tables = line_tables(mut lo, fx: mut fx1)
-        let locations = mut fx1.load(PTR, addr: tables, offset: 16)
-        let caller_location_record = report_location_record(mut fx1, locations, number: caller)
-        report.caller_line(mut fx1, mut lo, location: caller_location_record)
+        report.caller_line(mut fx1, mut lo, location: caller)
         let written = mut fx1.b.use_var(lines)
         let next = mut fx1.b.iadd_imm_s(written, y: 1)
         mut fx1.b.def_var(lines, val: next)

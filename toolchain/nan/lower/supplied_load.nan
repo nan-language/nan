@@ -1,0 +1,124 @@
+//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, and the export table, runtime memory, window entries, translation invalidation and instruction visibility the loader of `sys::load` reads.
+
+/// The offset in a version of the count of reads holding it.
+const VERSION_READERS: u64 = 16
+
+fn load_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "boot::Kernel.loader" => {
+            let option = supply.abi.result
+            let loader = match lo.exports() {
+                true => mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Empty).view(), wrapped: None)
+                false => mut lo.none_value(mut fx, option)
+            }
+            supply.ret(mut lo, mut fx, held: loader)
+        }
+        "sys::load::Table.record" => {
+            let table = supply.param(0).address_value()
+            let record = mut fx.load(PTR, addr: table, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(record))
+        }
+        "sys::load::Table.pinned" => {
+            let holding = supply.param(1).scalar_value()
+            let readers = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
+            let version = mut fx.b.iadd_imm_s(readers, y: 0 - i64.fit(VERSION_READERS))
+            let entries = mut fx.load(PTR, addr: version, offset: 0)
+            let len = mut fx.load(PTR, addr: version, offset: 8)
+            let Some(sret) = supply.sret else {
+                expect false
+                return true
+            }
+            mut fx.store(entries, addr: sret, offset: 0)
+            mut fx.store(len, addr: sret, offset: 8)
+            supply.done(mut lo, mut fx)
+        }
+        "sys::load::pin" => {
+            let holding = pin_version(mut lo, mut fx, record: supply.param(0).scalar_value())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(holding))
+        }
+        "sys::load::unpin" => {
+            let holding = supply.param(0).scalar_value()
+            let readers = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+            let less = mut fx.int(PTR, value: -1)
+            discard fetch_add(mut fx, address: readers, amount: less)
+            supply.done(mut lo, mut fx)
+        }
+        else => return memory_lower(mut lo, mut fx, supply)
+    }
+    return true
+} load_lower
+
+/// The operations through which the loader reaches the export table, runtime memory, the
+/// window's entries, translations and instruction visibility.
+fn memory_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "sys::load::exports" => {
+            let table = mut lo.export_table(mut fx)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(table))
+        }
+        "sys::load::reserve" => {
+            let address = mut lo.record_alloc(mut fx, size: supply.param(0).scalar_value())
+            let none = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+            mut fx.if_true(none, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            supply.ret(mut lo, mut fx, held: Held.Scalar(address))
+        }
+        "sys::load::release" => {
+            mut lo.record_free(mut fx, address: supply.param(0).scalar_value())
+            supply.done(mut lo, mut fx)
+        }
+        "sys::load::window_entry" => {
+            let entry = mut lo.window_entry(mut fx, physical: supply.param(0).scalar_value(), kind: supply.param(1).scalar_value())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(entry))
+        }
+        "sys::load::invalidate" => {
+            let early = tasks_origin(mut lo, mut fx)
+            let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: early, y: 0)
+            mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+                tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: early)
+            })
+            let all = mut fx.ptr(1)
+            mut lo.invalidate_everywhere(mut fx, scope: all)
+            supply.done(mut lo, mut fx)
+        }
+        "sys::load::sync" => {
+            if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                discard mut lo.call_stub(mut fx, stub: Stub.TlbiAll, args: mem::List[clif::Value].empty(fx.alloc).view())
+                let args = fx.list2(supply.param(0).scalar_value(), b: supply.param(1).scalar_value())
+                discard mut lo.call_stub(mut fx, stub: Stub.SyncInstructions, args: args.view())
+            }
+            supply.done(mut lo, mut fx)
+        }
+        else => return false
+    }
+    return true
+} memory_lower
+
+/// Pins the current version of the table record at `record` for a read, giving the holding that
+/// keeps the pin.
+fn pin_version(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let pin = mut fx.ptr(u64.fit(HOLDINGS_KIND_PIN))
+    let zero = mut fx.ptr(0)
+    let held_args = fx.list2(pin, b: zero)
+    let held = mut lo.call_routine(mut fx, routine: Routine.Hold, args: held_args.view())
+    let holding = held[0]
+    let found = mut fx.repeat(Array[clif::Value, 1].filled(zero).view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let version = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: record)
+        let readers = mut fx1.offset(version, offset: VERSION_READERS)
+        let one = mut fx1.ptr(1)
+        discard fetch_add(mut fx1, address: readers, amount: one)
+        let again = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: record)
+        let moved = mut fx1.b.icmp(clif::IntCC.NotEqual, x: again, y: version)
+        mut fx1.if_true(moved, then: fn(mut fx2: Fx) {
+            let less = mut fx2.int(PTR, value: -1)
+            discard fetch_add(mut fx2, address: readers, amount: less)
+        })
+        var next = mem::List[clif::Value].empty(fx1.alloc)
+        mut next.push(readers)
+        return Pass(again: moved, next: take next)
+    })
+    mut fx.store(found[0], addr: holding, offset: HOLDING_PAYLOAD)
+    return holding
+} pin_version

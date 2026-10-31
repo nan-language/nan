@@ -1,4 +1,4 @@
-//! `nan build` and `nan run`: final builds, and starting the image built.
+//! `nan build` and `nan run`: final builds, bundle builds, and starting the image built.
 
 /// What a command ends with: its output, the program `nan run` starts, or the status `nan run`
 /// ends with when it cannot start one.
@@ -20,6 +20,10 @@ fn build_run(invocation: Invocation, session: check::Session, current: Str, trac
         return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc))
     }
     trace.scoped(resolved.written.as_str(), alloc)
+    match invocation.value("--against") {
+        Some(against) => return try bundle_run(invocation, session, current, resolved, against, alloc)
+        None => {}
+    }
     let programs = programs_of(held, scope: resolved.scope, alloc)
     var single = programs.len() == 1
     match resolved.scope {
@@ -30,7 +34,7 @@ fn build_run(invocation: Invocation, session: check::Session, current: Str, trac
     }
     let compared_with = invocation.value("--compare-with")
     let host = all_host(held, programs: programs.view())
-    let unusable = programs.len() == 0 or (invocation.name == Name.Run and not single) or (compared_with.is_some() and (not single or not host)) or (invocation.flag("--keep-resets") and host)
+    let unusable = programs.len() == 0 or invocation.value("--as").is_some() or (invocation.name == Name.Run and not single) or (compared_with.is_some() and (not single or not host)) or (invocation.flag("--keep-resets") and host)
     if unusable {
         return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc))
     }
@@ -49,6 +53,78 @@ fn build_run(invocation: Invocation, session: check::Session, current: Str, trac
         }
         return try launched(invocation, held, program: programs[0], image: image.as_str(), alloc)
     }
+    for written in take built.interfaces {
+        mut built.images.push(take written)
+    }
+    built.interfaces = mem::List[text::String].empty(alloc)
+    return Outcome.Output(built_output(invocation, session, resolved, take built, alloc))
+} build_run
+
+/// `nan build --against`: builds the bundle of the package the scope names, which declares no
+/// entry, against a kernel's interface file.
+fn bundle_run(invocation: Invocation, session: check::Session, current: Str, resolved: scope::Resolved, against: Str, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+    let held = session.workspace.contents()
+    var library: Option[usize] = None
+    match resolved.scope.package_index(held) {
+        Some(index) => {
+            match held.package_at(index) {
+                Some(source) => match source.manifest {
+                    Some(manifest) => if manifest.entry.is_none() {
+                        library = Some(index)
+                    }
+                    None => {}
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    var usable = invocation.name == Name.Build and invocation.value("--compare-with").is_none()
+    match resolved.scope {
+        scope::Scope.Package(_) => {}
+        else => {
+            usable = false
+        }
+    }
+    let Some(package_index) = library else {
+        return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc))
+    }
+    if not usable {
+        return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc))
+    }
+    let Some(source) = held.package_at(package_index) else {
+        expect false
+        return Outcome.Ended(emulator::OTHER_END)
+    }
+    var signer: Option[core::crypto::SecretKey] = None
+    match invocation.value("--as") {
+        Some(principal) => {
+            match try publishing_key(session, source, publisher: principal, authors: mem::List[text::String].empty(alloc).view(), alloc) {
+                Ok(secret) => {
+                    signer = Some(take secret)
+                }
+                Err(reported) => {
+                    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+                    mut diagnostics.push(final_build::at_manifest(source, take reported, alloc))
+                    return Outcome.Output(built_output(invocation, session, resolved, built: builds_of(take diagnostics, images: mem::List[text::String].empty(alloc), alloc), alloc))
+                }
+            }
+        }
+        None => {}
+    }
+    let built = try final_build::bundle(session, package_index, against: platform::join(current, name: against, alloc).as_str(), signer, alloc)
+    let final_build::Build(diagnostics: reported, image: image, interface_file: _) = built
+    var images = mem::List[text::String].empty(alloc)
+    match image {
+        Some(written) => mut images.push(take written)
+        None => {}
+    }
+    return Outcome.Output(built_output(invocation, session, resolved, built: builds_of(take reported, take images, alloc), alloc))
+} bundle_run
+
+/// The output of a build: its diagnostics, then a record for each file it wrote.
+fn built_output(invocation: Invocation, session: check::Session, resolved: scope::Resolved, take built: Builds, alloc: mem::Alloc) -> output::Output {
+    let held = session.workspace.contents()
     mut built.images.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
     let std = session.std()
     var records = mem::List[output::Record].empty(alloc)
@@ -68,8 +144,8 @@ fn build_run(invocation: Invocation, session: check::Session, current: Str, trac
     if built.errors > 0 {
         verdict = output::Verdict.Failed
     }
-    return Outcome.Output(output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records))
-} build_run
+    return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} built_output
 
 /// Whether every program declares a host target.
 fn all_host(held: workspace::Workspace, programs: Slice[usize]) -> bool {
@@ -88,11 +164,12 @@ fn all_host(held: workspace::Workspace, programs: Slice[usize]) -> bool {
     return true
 } all_host
 
-/// What the final builds of a command report and the images they write: the diagnostics by path,
-/// line and code, each once, with their counts of errors and incompleteness.
+/// What the final builds of a command report and the images and interface files they write: the
+/// diagnostics by path, line and code, each once, with their counts of errors and incompleteness.
 struct Builds {
     diagnostics: mem::List[diagnostic::Diagnostic]
     images: mem::List[text::String]
+    interfaces: mem::List[text::String]
     errors: usize
     incomplete: usize
 } Builds
@@ -102,17 +179,30 @@ struct Builds {
 fn build_all(session: check::Session, programs: Slice[usize], compared: Option[final_build::Compared], alloc: mem::Alloc) -> Builds fails platform::IoError {
     var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
     var images = mem::List[text::String].empty(alloc)
+    var interfaces = mem::List[text::String].empty(alloc)
     for program in programs {
         let built = try final_build::build(session, program, compared, alloc)
-        let final_build::Build(diagnostics: reported, image: image) = built
+        let final_build::Build(diagnostics: reported, image: image, interface_file: interface_file) = built
         for found in take reported {
             mut diagnostics.push(take found)
+        }
+        match interface_file {
+            Some(written) => mut interfaces.push(take written)
+            None => {}
         }
         let Some(written) = image else {
             continue
         }
         mut images.push(take written)
     }
+    var builds = builds_of(take diagnostics, take images, alloc)
+    builds.interfaces = interfaces
+    return builds
+} build_all
+
+/// What builds report and the images they write: the diagnostics by path, line and code, each
+/// once, with their counts of errors and incompleteness.
+fn builds_of(take diagnostics: mem::List[diagnostic::Diagnostic], take images: mem::List[text::String], alloc: mem::Alloc) -> Builds {
     mut diagnostics.sort_by(fn(left: diagnostic::Diagnostic, right: diagnostic::Diagnostic) => check::located_order(left, right))
     var distinct = mem::List[diagnostic::Diagnostic].empty(alloc)
     var errors: usize = 0
@@ -132,8 +222,8 @@ fn build_all(session: check::Session, programs: Slice[usize], compared: Option[f
         }
         mut distinct.push(take reported)
     }
-    return Builds(diagnostics: take distinct, images: take images, errors: errors, incomplete: incomplete)
-} build_all
+    return Builds(diagnostics: take distinct, images: take images, interfaces: mem::List[text::String].empty(alloc), errors: errors, incomplete: incomplete)
+} builds_of
 
 /// What `nan run` starts once the image of the program at index `program` is built at `image`,
 /// relative to the workspace root: the image on a host target, the emulator booting it on a

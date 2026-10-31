@@ -3,6 +3,7 @@
 //! CPU first; and the starting of the others, through a trampoline the anchor copies below 1 MiB
 //! or through PSCI.
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
 };
@@ -92,10 +93,17 @@ const TSS_SIZE: u64 = 104;
 const TSS_IST: u64 = 36;
 const TSS_IO_MAP: u64 = 102;
 
+/// The CPU records.
+pub const CPUS: Reserved = Reserved {
+    name: "_NScpus",
+    size: MAX_CPUS * cpu::SIZE,
+    align: 64,
+};
+
 impl Lowering<'_, '_> {
     /// The address of the CPU records.
     pub fn cpu_records(&mut self, fx: &mut Fx) -> Value {
-        self.reserved(fx, "_NScpus", MAX_CPUS * cpu::SIZE, 64)
+        self.reserved(fx, CPUS)
     }
 
     /// The record of CPU `index`.
@@ -169,6 +177,7 @@ impl Lowering<'_, '_> {
             self.load_cpu_tables(fx, boot);
             self.call_stub(fx, Stub::EnableAvx, &[]);
         }
+        self.open_window(fx);
     }
 
     /// Writes a CPU's global descriptor table, task-state segment and pseudo-descriptor into its
@@ -726,6 +735,7 @@ impl Lowering<'_, '_> {
                     lo.load_cpu_tables(fx, record);
                     lo.call_stub(fx, Stub::EnableAvx, &[]);
                 }
+                lo.open_window(fx);
                 let prepare = lo.func_ref(fx, prepare);
                 fx.b.ins().call(prepare, &[]);
                 lo.call_stub(fx, Stub::DisableFloats, &[]);

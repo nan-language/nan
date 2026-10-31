@@ -1,17 +1,17 @@
 # Registries
 
-This chapter defines registry items with their key and `unique` fields, contribution items, the judging root and the contributions it admits through `allow contribute`, function-typed entry fields, the tables a registry holds with their duplicate rules, reads and emission, the platform registries `hw::vectors`, `hw::syscall_entry` and `hw::preempt`, and the `registry` diagnostic family.
+This chapter defines registry items with their key and `unique` fields, contribution items, the judging root and the contributions it admits through `allow contribute`, function-typed entry fields, the tables a registry holds with their duplicate rules, reads and emission, loaded registries, whose tables grow as a kernel loads bundles, the platform registries `hw::vectors`, `hw::syscall_entry` and `hw::preempt`, and the `registry` diagnostic family.
 
 ## Registries
 
 A **registry** is a typed table declared by a `registry` item and filled by [contributions](#contributions) across packages. Its **entry type** is the type after `:`, its **key field** is the field named after `keyed by`, and its **unique fields** are the fields its `unique` list names.
 
 ```ebnf
-registry_item = "registry" IDENT ":" type_expr 'keyed' 'by' IDENT unique_list? NL ;
+registry_item = 'loaded'? "registry" IDENT ":" type_expr 'keyed' 'by' IDENT unique_list? NL ;
 unique_list = 'unique' IDENT ( "," IDENT )* ;
 ```
 
-- A registry is a [single-line item](02-items.md#item-shape) with an optional [visibility](03-packages-modules.md#visibility) and no modifiers. Its name is the `IDENT` after `registry`.
+- A registry is a [single-line item](02-items.md#item-shape) with an optional [visibility](03-packages-modules.md#visibility) and no modifiers. Its name is the `IDENT` after `registry`. A registry written `loaded` is a [loaded registry](#loaded-registries).
 - The entry type is a struct type that a [const item](02-items.md#constants) may have: [Inert](05-properties.md#inert) and not [linear](05-properties.md#linear-types). It may be a [view](05-properties.md#views), whose views in each entry then refer only to literal data and to the data of consts and contributions. Any other entry type is an error (`registry.entry-type`).
 - The key field and each unique field name a field of the entry type (`registry.unknown-field`) that is visible in the registry's module (`name.private`).
 - The key field's type implements `Ord` (`registry.key-type`). Each unique field's type implements `Eq` (`registry.unique-type`).
@@ -253,7 +253,7 @@ The **table** of a registry under a target is the sequence of the values of the 
 - Two admitted contributions to one registry that exist under a common target the judging root declares, or under the target of its final build, are an error when their key fields compare `Equal` by `Ord.cmp` (`registry.duplicate-key`), or when their values of a unique field are equal by `Eq.eq` (`registry.duplicate-unique`).
 - Each such diagnostic quotes every contribution of the set and is reported for every contribution of the set except the one whose canonical path sorts first in byte order: on the contribution when it lies in the judging root, and otherwise on the judging root's `dep` directive for its package, or on its `package` line when it declares no alias for that package.
 - A registry keyed by a field of type `Unit` therefore holds at most one entry.
-- A path naming a registry is an expression of type `Slice[E]`, where `E` is the entry type, viewing the table in read-only memory of the image. Every read of it yields the same slice. It names a value, never a [place](07-ownership.md#places), and reading it adds no [digest fact](10-effects-digests.md#digests).
+- A path naming a registry other than a loaded one is an expression of type `Slice[E]`, where `E` is the entry type, viewing the table in read-only memory of the image. Every read of it yields the same slice. It names a value, never a [place](07-ownership.md#places), and reading it adds no [digest fact](10-effects-digests.md#digests).
 - An [interpreter](21-interpreter.md#interpreter) run holds no table: reading a registry in one is uninterpretable ([run ends](21-interpreter.md#run-ends)).
 - A final build, and the build of a test image, emits the table of each registry in its reach as read-only data of the image: an array of the entries in table order, each laid out as [lowering](30-artefacts.md#lowering) lays out the entry type. A function field holds the function's checking entry when it has one.
 
@@ -317,6 +317,92 @@ pub closed struct Port {
 pub registry ports: Port keyed by number
 
 pub const PORT_COUNT: usize = ports.len() // error: const.uninterpretable
+```
+
+## Loaded registries
+
+A **loaded registry** is a registry whose table a kernel extends while it runs: [loading](24-kernel.md#loading) a bundle adds the entries of its contributions, and unloading it removes them.
+
+- Loading compares key and unique fields itself: the key field of a loaded registry has an integer type, `bool`, `char` or `Str`, any other type being an error (`registry.key-type`), and so has each of its unique fields (`registry.unique-type`). It orders them as `Ord.cmp` of these types does: integers, `bool` and `char` by value, `Str` by its bytes and then its length.
+- Its entry type holds a function type only as the type of one of its fields (`registry.loaded-entry`). Such a field's type states neither `pure` nor `notrap`, since a call through the field of an unloaded bundle's entry traps ([loading](24-kernel.md#loading)); each of its parameter, result and failure types is a **boundary type**; and none of its `mut` parameters has a view type (`registry.loaded-field`). A boundary type is the unit type, `Never`, a type implementing `core::Encode`, a [capability kind](14-authority.md#capability-kinds), `sys::Outbox[P]` or a primitive capability other than `boot::Machine`, `boot::Kernel`, `boot::Services` and `hw::IrqShared[T]`, through which code installs functions that outlive a call.
+- A path naming a loaded registry is an expression of type `sys::load::Table[E]`, where `E` is the entry type, naming the registry's table. It names a value, never a place, and reading it adds no digest fact.
+- The table's **versions** are the successive sequences of its entries: its first is the table that [Tables](#tables) gives the final build, and loading publishes each later one. A version never changes.
+
+```nan-api
+// module: sys::load
+
+pub open struct Table[E: Any] {
+} Table
+
+pub fn Table.read[T: Any](self, body: fn(entries: Slice[E]) -> T) -> T
+```
+
+- `table.read(body)` gives what `body` returns for the entries of the current version, in table order, which the read holds until `body` returns, or until the settlement of its domain when `body` never does. It traps (`trap.exhausted`) when runtime memory cannot record the read. A version a later one replaced is reclaimed once no read holds it ([loading](24-kernel.md#loading)).
+- `sys::load::Table[E]` is a base type: Copy and Send, never linear, a view, Inert or AnyBits.
+- An [interpreter](21-interpreter.md#interpreter) run calling `read` is uninterpretable ([run ends](21-interpreter.md#run-ends)).
+
+```nan
+pub closed struct Driver {
+    pub vendor: u16
+    pub class: u8
+    pub probe: fn(device: u32) -> bool
+} Driver
+
+pub loaded registry drivers: Driver keyed by vendor unique class
+
+contribute drivers serial = Driver(vendor: 0x1AF4, class: 7, probe: accepts)
+
+fn accepts(device: u32) -> bool {
+    return device != 0
+} accepts
+
+pub fn probed(vendor: u16, device: u32) -> bool {
+    let table = drivers
+    return table.read(fn(entries: Slice[Driver]) -> bool {
+        for driver in entries {
+            if driver.vendor == vendor {
+                return (driver.probe)(device)
+            }
+        }
+        return false
+    })
+} probed
+```
+
+```nan
+pub closed struct Codec {
+    pub tag: f32
+    pub decode: fn(byte: u8) -> u8
+} Codec
+
+pub loaded registry codecs: Codec keyed by tag // error: registry.key-type
+```
+
+```nan
+pub closed struct Hook {
+    pub slot: u8
+    pub run: Option[fn(value: u32) -> u32]
+} Hook
+
+pub loaded registry hooks: Hook keyed by slot // error: registry.loaded-entry
+```
+
+```nan
+pub closed struct Gauge {
+    pub slot: u8
+    pub read: fn(raw: u32) -> u32 limits notrap
+} Gauge
+
+pub loaded registry gauges: Gauge keyed by slot // error: registry.loaded-field
+```
+
+```nan
+pub closed struct Maker {
+    pub slot: u8
+    pub make: fn(seed: u32) -> fn(value: u32) -> u32
+} Maker
+
+pub loaded registry makers: Maker keyed by slot // error: registry.loaded-field
 ```
 
 ## Platform registries
@@ -417,11 +503,13 @@ contribute hw::vectors timer = hw::Vector(vector: 14, ist: 0, handler: hw::Vecto
 | `registry.duplicate-unique` | error | [Tables](#tables) |
 | `registry.entry-type` | error | [Registries](#registries) |
 | `registry.grant-not-alias` | error | [Contributors](#contributors) |
-| `registry.key-type` | error | [Registries](#registries) |
+| `registry.key-type` | error | [Registries](#registries), [Loaded registries](#loaded-registries) |
+| `registry.loaded-entry` | error | [Loaded registries](#loaded-registries) |
+| `registry.loaded-field` | error | [Loaded registries](#loaded-registries) |
 | `registry.not-registry` | error | [Contributions](#contributions), [Contributors](#contributors) |
 | `registry.platform-entry` | error | [Platform registries](#platform-registries) |
 | `registry.platform-target` | error | [Platform registries](#platform-registries) |
 | `registry.ungranted` | error | [Contributors](#contributors) |
 | `registry.unique-repeated` | error | [Registries](#registries) |
-| `registry.unique-type` | error | [Registries](#registries) |
+| `registry.unique-type` | error | [Registries](#registries), [Loaded registries](#loaded-registries) |
 | `registry.unknown-field` | error | [Registries](#registries) |

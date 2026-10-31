@@ -12,13 +12,13 @@ use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
 };
 
-use cranelift_module::{DataDescription, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use super::super::fx::{Fx, PTR};
 use super::super::host;
 use super::super::machine::Stub;
 use super::super::machine::schedule::HOOK_STACK;
-use super::super::{CALL_CONV, Lowering, stack};
+use super::super::{CALL_CONV, Lowering, lines, stack};
 use super::regions::origin;
 use super::{Routine, state, system, tables};
 use crate::check::db::ItemId;
@@ -390,25 +390,14 @@ impl Lowering<'_, '_> {
             });
         }
     }
-
-    /// The address of the table of task entries' own stacks, declared once.
-    fn entry_table(&mut self, fx: &mut Fx) -> Value {
-        let module = &mut self.module;
-        let id = *self.entry_table.get_or_insert_with(|| {
-            module
-                .declare_data(ENTRY_STACKS, Linkage::Local, false, false)
-                .expect("the entry stacks table")
-        });
-        let global = self.data_ref(fx, id);
-        fx.b.ins().symbol_value(PTR, global)
-    }
 }
 
-/// Defines the table of task entries' own stacks, when a spawn reads it.
-pub fn emit_entry_stacks(lo: &mut Lowering) {
-    let Some(id) = lo.entry_table else {
-        return;
-    };
+/// Defines the table of task entries' own stacks, which the image's line tables point at.
+pub fn emit_entry_stacks(lo: &mut Lowering) -> DataId {
+    let id = lo
+        .module
+        .declare_data(ENTRY_STACKS, Linkage::Local, false, false)
+        .expect("the entry stacks table");
     let mut bytes = (lo.entry_stacks.len() as u64).to_le_bytes().to_vec();
     let mut description = DataDescription::new();
     let mut relocations = Vec::new();
@@ -426,12 +415,26 @@ pub fn emit_entry_stacks(lo: &mut Lowering) {
     lo.module
         .define_data(id, &description)
         .expect("the entry stacks table");
+    id
 }
 
 /// The usable stack a task entry's own `limits stack N` needs, when its code is in the table of
-/// such entries, or `usable`.
+/// such entries of the image, or a bundle's kernel, or of a bundle loaded after it, or `usable`.
 fn own_stack(lo: &mut Lowering, fx: &mut Fx, code: Value, usable: Value) -> Value {
-    let table = lo.entry_table(fx);
+    let head = lo.line_head(fx);
+    let found = fx.repeat(&[head, usable], |fx, state| {
+        let (tables, size) = (state[0], state[1]);
+        let table = fx.load(PTR, tables, lines::ENTRY_STACKS);
+        let size = own_stack_in(fx, table, code, size);
+        let next = fx.load(PTR, tables, lines::NEXT);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        (more, vec![next, size])
+    });
+    found[1]
+}
+
+/// The larger of `usable` and the stack a table of task entries' own stacks gives `code`.
+fn own_stack_in(fx: &mut Fx, table: Value, code: Value, usable: Value) -> Value {
     let count = fx.load(PTR, table, 0);
     let any = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
     fx.choose(

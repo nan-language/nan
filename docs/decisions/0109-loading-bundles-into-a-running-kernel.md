@@ -1,0 +1,36 @@
+# 0109. Loading bundles into a running kernel
+
+Status: accepted
+
+## Context
+
+NaN OS admits drivers, services, kernel policies and their updates into a running kernel. Language 1 fixed every registry table at the final build ([0008](0008-authority-as-values.md)) and kept the machine code of one final closure out of every other image, so each change needed a rebuild and a reboot. Code of different final closures shares no ABI, which the specification leaves unspecified, and function values are Copy, so a value naming loaded code can escape into any kernel state.
+
+## Decision
+
+- **A bundle shares its kernel's ABI.** A bare kernel whose final closure declares a loaded registry exports its load ABI: the runtime state, its line tables, the support routines lowered code calls, the runtime data it reaches and each loaded registry's table record, in an order its interface file records with its toolchain hash, target, closure code roots, interrupt stack bound and codegen level. `nan build --against` lowers a package's contributions against that file at the kernel's codegen level, whose extensions the kernel's entry seam checked, failing unless the toolchain and the code root of every common package agree, so every type has the kernel's layout. A bundle carries its own copy of the code it reaches, std included, and imports only the exports; nothing of the ABI becomes specified.
+- **Images are linked once, loaded by relocation into a window.** The image writer links a bundle at address zero, turning absolute addresses into base relocations, absolute addresses of exports into imports bound by index, and x86-64 calls of exports into jumps through words in the image. Loading copies the image into runtime memory, relocates it for an address in a load window outside the entry root's identity map, and maps it there with its code read-only and executable and its data never executable, so a stray store cannot rewrite loaded code. The window is the entry root's top-level entry 256 on x86-64, which `write_cr3` keeps in every root, and `TTBR1_EL1` on AArch64, which `write_ttbr0` never touches; each CPU enforces read-only pages and execute-never bits for kernel code. The identity map still reaches the image's memory writably: the window guards against mistakes, not against code holding `hw::Ptr`.
+- **Loaded registries are tables of versions read in scopes.** A `loaded registry` reads as a `sys::load::Table`, and `Table.read` passes the current version to a function, holding it until the function returns. Loading publishes new versions under one lock; readers take no lock and never block a load.
+- **Function fields call through kernel gates.** The kernel lowers a gate per function type of its loaded registries' fields. Loading rewrites each function field of an added entry into a function value of that gate, whose environment is a gate record naming a target record, which holds the bundle's code. A call pins its target while it runs; unloading empties the gate records, so a call traps with `trap.stale-handle`, and a replacement points the records of entries sharing registry, key and field at the new targets, so values the kernel already holds call the new code. Fields may not promise `pure` or `notrap`, and only the fields themselves may hold function types, so every function value read from a loaded table is gated.
+- **Only boundary types cross a gate.** A field's parameters, result and failure are the unit type, `Never`, `Encode` types or capability handles, and no `mut` parameter is a view. No value a gated call returns or writes back can then hold a view of the bundle's data or a function of its code, and the handles excluded, root grants and IRQ-safe locks, are those through which a call installs functions that outlive it. Values entering a bundle stay the kernel's, so no constraint on them is needed.
+- **Memory is reclaimed once nothing uses it.** Unloading and replacing retire placements and the versions they replace. `Loader.reclaim` frees a version no read holds and a placement whose targets no call pins and that no held version lists, after unmapping it and invalidating every CPU's translations. Pins and reads are holdings of their domain, so the settlement of an abandoned call releases them. Gate and target records and version headers, a few words per load, stay, so an escaped gate value or a racing reader never sees freed memory.
+- **A bundle has a domain.** `Bundle.domain` shares an abandoner; a kernel contains its calls into the bundle, and what they leave running or installed, by running them in it, and unloading triggers it first, so settlement ends the bundle's tasks and releases their pins, devices, minters and intakes before reclamation waits for the rest.
+- **The loader is NaN code in std.** `sys::load` parses bundles, verifies Ed25519 signatures with `core::crypto`, relocates, maps, compares keys, publishes and retires versions and reclaims in NaN through `hw::Ptr`; lowering supplies the export table's address, runtime memory, window entries, translation invalidation, instruction-cache maintenance, pins of versions and `boot::Kernel.loader`. Keys and unique fields of loaded registries are integers, `bool`, `char` or `Str`, which the loader compares by their bytes as `Ord.cmp` does.
+- **Trap reports and spawns walk every image.** Line tables gain the table of task entries' own stacks and a link to the next bundle's tables; location records hold their texts at offsets from themselves, and a report's first caller is the address of its location record, so the trap routine and spawns reach a bundle's code as the kernel's.
+
+Alternatives rejected:
+
+- **Reclaiming without boundary types:** function values, `Dyn` values and views returned by a bundle may reach any kernel state, so knowing that nothing uses them would need a collector.
+- **Gates in the bundle:** a stale function value would then jump into freed memory; gates in the kernel stay valid after reclamation.
+- **Freeing gate records with their bundle:** a racing call may read a record after its bundle's retirement; the records are a few words each.
+- **Position-independent code with a global offset table:** a bundle linked at zero needs only base relocations, which the image writer already computes for PE images.
+- **Comparing keys through the kernel's `Ord.cmp`:** the loader would need lowered comparators per registry and a way for std code to call code by address.
+- **`Untrusted` bundle bytes:** the signature, not where the bytes came from, decides whether a bundle runs, and declassifying them would need a sealed validator in every kernel.
+
+## Consequences
+
+- A kernel replacing a bundle often keeps a few words per load; the rest returns to runtime memory once reclaimed.
+- A call made outside the bundle's domain traps or loops in its caller's domain, and pins the bundle until it returns or that domain is settled; a kernel containing a bundle runs its calls in the bundle's domain.
+- A kernel update invalidates its bundles: they are rebuilt against its new interface file.
+- A bundle's interrupt fns fit the kernel's interrupt stacks, which a kernel exporting its load ABI sizes for every interrupt fn of its final closure.
+- Loading is available on the bare targets only.

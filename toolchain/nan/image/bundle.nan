@@ -1,0 +1,188 @@
+//! The bundle writer: links the object of a bundle's lowering from address zero and writes the bundle, each import bound to the index of the export its kernel's interface names.
+
+/// The magic and format version of a bundle.
+const BUNDLE_MAGIC: Slice[u8] = b"NBUN"
+
+const BUNDLE_VERSION: u64 = 1
+
+/// The symbol of a bundle's line tables, which the walk from its kernel's reaches.
+pkg const BUNDLE_LINES: Str = "_NSbundle_lines"
+
+/// A field of an entry a bundle adds: its offset in the entry and its form.
+pkg struct FieldForm derives Copy {
+    pkg offset: u64
+    pkg form: u64
+} FieldForm
+
+/// An entry a bundle adds to a loaded registry, by the symbols that hold it: the export name of
+/// the registry's table record, the entry's data, its size, its key and unique fields, and the
+/// offset of each function field.
+pkg struct LoadedEntry {
+    pkg record: text::String
+    pkg entry: text::String
+    pkg size: u64
+    pkg key: FieldForm
+    pkg unique: mem::List[FieldForm]
+    pkg gates: mem::List[u64]
+} LoadedEntry
+
+/// The bundle of a lowered object against the interface of a hash and exports, signed with
+/// `signer` when given, or the names of the symbols it imports that the interface does not
+/// export.
+pkg fn write_bundle(object: Slice[u8], contributed: Slice[LoadedEntry], hash: Slice[u8], exports: Slice[text::String], signer: Option[core::crypto::SecretKey], alloc: mem::Alloc) -> Result[mem::Bytes, mem::List[text::String]] {
+    let linked = link(object, base: 0, importing: true, alloc)
+    var missing = mem::List[text::String].empty(alloc)
+    for import in linked.imports {
+        missing_export(mut missing, name: import.name.as_str(), exports, alloc)
+    }
+    for entry in contributed {
+        missing_export(mut missing, name: entry.record.as_str(), exports, alloc)
+    }
+    if missing.len() > 0 {
+        mut missing.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        return Err(take missing)
+    }
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(BUNDLE_MAGIC)
+    encoding::uvar(mut out, value: BUNDLE_VERSION)
+    encoding::bytes(mut out, value: bundle_body(linked, contributed, hash, exports, alloc).view())
+    var sections = encoding::Record.empty(alloc)
+    match signer {
+        Some(secret) => {
+            var signed = encoding::Record.empty(alloc)
+            mut signed.field(1, content: bytes_of(secret.public_key().bytes.view(), alloc))
+            mut signed.field(2, content: bytes_of(secret.sign(out.view()).bytes.view(), alloc))
+            mut sections.field(1, content: take signed.finish(alloc))
+        }
+        None => {}
+    }
+    let trailer = take sections.finish(alloc)
+    mut out.append(trailer.view())
+    return Ok(take out)
+} write_bundle
+
+/// Adds a name the interface does not export to `missing`, once.
+fn missing_export(mut missing: mem::List[text::String], name: Str, exports: Slice[text::String], alloc: mem::Alloc) {
+    if export_index(name, exports).is_some() {
+        return
+    }
+    if missing.position(fn(known: text::String) => known.as_str() == name).is_none() {
+        mut missing.push(text::String.of(name, alloc))
+    }
+} missing_export
+
+/// The index of the export of a name.
+fn export_index(name: Str, exports: Slice[text::String]) -> Option[usize] {
+    for index in 0..<exports.len() {
+        if exports[index].as_str() == name {
+            return Some(index)
+        }
+    }
+    return None
+} export_index
+
+/// Bytes holding a copy of a slice.
+fn bytes_of(contents: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(contents)
+    return copied
+} bytes_of
+
+/// The body of a bundle: its interface hash, its image, the image's size in memory, its base
+/// relocations, its imports, its line tables' offset, its contributions and where its read-only
+/// and writable data start.
+fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], hash: Slice[u8], exports: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes {
+    var image = mem::Bytes.empty(alloc)
+    for segment in linked.segments {
+        object::resize(mut image, length: usize.widen(segment.address))
+        mut image.append(segment.bytes.view())
+    }
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: bytes_of(hash, alloc))
+    mut record.field(2, content: take image)
+    var size = mem::Bytes.empty(alloc)
+    encoding::uvar(mut size, value: linked.end())
+    mut record.field(3, content: take size)
+    if linked.absolute.len() > 0 {
+        var relocations = mem::Bytes.empty(alloc)
+        encoding::uvar(mut relocations, value: u64.widen(linked.absolute.len()))
+        for absolute in linked.absolute {
+            expect absolute.width == 8
+            encoding::uvar(mut relocations, value: absolute.address)
+        }
+        mut record.field(4, content: take relocations)
+    }
+    if linked.imports.len() > 0 {
+        var imports = mem::Bytes.empty(alloc)
+        encoding::uvar(mut imports, value: u64.widen(linked.imports.len()))
+        for import in linked.imports {
+            encoding::uvar(mut imports, value: import.address)
+            encoding::uvar(mut imports, value: u64.widen(export_index(import.name.as_str(), exports).value_or(0)))
+        }
+        mut record.field(5, content: take imports)
+    }
+    var lines = mem::Bytes.empty(alloc)
+    encoding::uvar(mut lines, value: linked.symbol(BUNDLE_LINES))
+    mut record.field(6, content: take lines)
+    if contributed.len() > 0 {
+        var entries = mem::Bytes.empty(alloc)
+        encoding::uvar(mut entries, value: u64.widen(contributed.len()))
+        for entry in contributed {
+            mut entries.append(bundle_entry(linked, entry, exports, alloc).view())
+        }
+        mut record.field(7, content: take entries)
+    }
+    var starts = mem::Bytes.empty(alloc)
+    encoding::uvar(mut starts, value: segment_start(linked, from: Access.Read))
+    encoding::uvar(mut starts, value: segment_start(linked, from: Access.Write))
+    mut record.field(8, content: take starts)
+    return take record.finish(alloc)
+} bundle_body
+
+/// The address of the first segment whose access is `from` or one permitting writes when `from`
+/// does not, the image's end when there is none.
+fn segment_start(linked: Linked, from: Access) -> u64 {
+    for segment in linked.segments {
+        if segment.access == from or segment.access == Access.Write {
+            return segment.address
+        }
+    }
+    return linked.end()
+} segment_start
+
+/// The record of an entry a bundle adds.
+fn bundle_entry(linked: Linked, entry: LoadedEntry, exports: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes {
+    var fields = encoding::Record.empty(alloc)
+    mut fields.field(1, content: uvar_of(u64.widen(export_index(entry.record.as_str(), exports).value_or(0)), alloc))
+    mut fields.field(2, content: uvar_of(linked.symbol(entry.entry.as_str()), alloc))
+    mut fields.field(3, content: uvar_of(entry.size, alloc))
+    var key = mem::Bytes.empty(alloc)
+    encoding::uvar(mut key, value: entry.key.offset)
+    encoding::uvar(mut key, value: entry.key.form)
+    mut fields.field(4, content: take key)
+    if entry.unique.len() > 0 {
+        var unique = mem::Bytes.empty(alloc)
+        encoding::uvar(mut unique, value: u64.widen(entry.unique.len()))
+        for field in entry.unique {
+            encoding::uvar(mut unique, value: field.offset)
+            encoding::uvar(mut unique, value: field.form)
+        }
+        mut fields.field(5, content: take unique)
+    }
+    if entry.gates.len() > 0 {
+        var gates = mem::Bytes.empty(alloc)
+        encoding::uvar(mut gates, value: u64.widen(entry.gates.len()))
+        for offset in entry.gates {
+            encoding::uvar(mut gates, value: offset)
+        }
+        mut fields.field(6, content: take gates)
+    }
+    return take fields.finish(alloc)
+} bundle_entry
+
+/// The bytes of a uvar.
+fn uvar_of(value: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var written = mem::Bytes.empty(alloc)
+    encoding::uvar(mut written, value)
+    return written
+} uvar_of

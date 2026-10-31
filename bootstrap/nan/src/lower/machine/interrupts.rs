@@ -5,6 +5,7 @@
 //! APIC, in x2APIC mode when the boot CPU has it, and timer; and the stopping of the CPUs in a
 //! kernel halt.
 
+use super::super::data::Reserved;
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -181,6 +182,13 @@ const INTERRUPTS_ENABLED: i64 = 0x200;
 
 /// The size of an interrupt descriptor table, and the type and privilege level of its gates.
 pub const IDT_BYTES: u64 = 256 * 16;
+
+/// The interrupt descriptor table each CPU loads.
+pub const IDT: Reserved = Reserved {
+    name: "_NSidt",
+    size: IDT_BYTES,
+    align: 16,
+};
 const GATE: i64 = 0x8E00;
 
 /// The local APIC, in the memory the entry root maps uncached, and the registers the kernel
@@ -362,7 +370,7 @@ impl Lowering<'_, '_> {
         if self.machine_arch() == Arch::Aarch64 {
             return self.aarch64_interrupt_setup(fx);
         }
-        let idt = self.reserved(fx, "_NSidt", IDT_BYTES, 16);
+        let idt = self.reserved(fx, IDT);
         self.fill_idt(fx, idt);
         let masked = fx.ptr(0xFF);
         for port in [0x21, 0xA1] {
@@ -473,7 +481,7 @@ impl Lowering<'_, '_> {
                 let top = fx.b.ins().iadd(stack, size);
                 lo.set_interrupt_stack(fx, record, *ist, top);
             }
-            let idt = lo.reserved(fx, "_NSidt", IDT_BYTES, 16);
+            let idt = lo.reserved(fx, IDT);
             lo.load_idt(fx, idt);
             let spurious = fx.ptr(APIC_ENABLED | SPURIOUS_VECTOR as u64);
             lo.apic_write(fx, APIC_SPURIOUS, spurious);
@@ -495,7 +503,7 @@ impl Lowering<'_, '_> {
     }
 
     /// Defines the interrupt stack sizes from the largest `limits stack N` among the lowered
-    /// interrupt fns: the stack of `ist` 0 holds two of them, one for an interrupt vector and
+    /// interrupt fns, or the stack a kernel's interface lets interrupt fns use: the stack of `ist` 0 holds two of them, one for an interrupt vector and
     /// one for an exception interrupting it, and two seam frames; every other stack holds one
     /// and one seam frame; each also holds what the dispatcher uses and a call of a policy hook,
     /// which a task the dispatcher makes ready reaches.
@@ -513,7 +521,8 @@ impl Lowering<'_, '_> {
             .filter(|sig| sig.modifier == Some(crate::syntax::ast::FnModifier::Interrupt))
             .filter_map(|sig| sig.limits.stack)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.interface_interrupt_stack());
         let first = 2 * (largest + SEAM_FRAME) + DISPATCH_RESERVE + HOOK_STACK;
         let other = largest + SEAM_FRAME + DISPATCH_RESERVE + HOOK_STACK;
         let mut bytes = first.next_multiple_of(16).to_le_bytes().to_vec();

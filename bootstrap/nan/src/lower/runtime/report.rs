@@ -360,13 +360,11 @@ impl Report {
 
     /// Writes the text a location record holds at `field` (path, item or line).
     fn location_text(self, fx: &mut Fx, lo: &mut Lowering, location: Value, field: u64) {
-        let tables = line_tables(lo, fx);
-        let strings = fx.load(PTR, tables, 24);
         let offset = fx.load(types::I32, location, field);
         let offset = fx.b.ins().uextend(PTR, offset);
         let len = fx.load(types::I32, location, field + 4);
         let len = fx.b.ins().uextend(PTR, len);
-        let start = fx.b.ins().iadd(strings, offset);
+        let start = fx.b.ins().iadd(location, offset);
         self.bytes(fx, lo, start, len);
     }
 }
@@ -423,24 +421,35 @@ pub fn decode_utf8(fx: &mut Fx, place: Value, first: Value) -> (Value, Value) {
     (point, len)
 }
 
-/// The address of the line tables' header.
-fn line_tables(lo: &mut Lowering, fx: &mut Fx) -> Value {
-    let id = lo.lines.table(&mut lo.module);
-    let global = lo.data_ref(fx, id);
-    fx.b.ins().symbol_value(PTR, global)
+/// The location record of a code address, zero when it has none, whether its function's frames
+/// are left out, and whether a lowered function holds it: searched in the line tables of the
+/// image, or a bundle's kernel, then of each bundle loaded after it.
+fn lookup(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value, Value) {
+    let head = lo.line_head(fx);
+    let zero = fx.ptr(0);
+    let outside = fx.int(types::I8, 0);
+    let found = fx.repeat(&[head, zero, zero, outside], |fx, state| {
+        let tables = state[0];
+        let (location, hidden, inside) = lookup_in(fx, tables, address);
+        let next = fx.load(PTR, tables, lines::NEXT);
+        let outside = fx.b.ins().bxor_imm_s(inside, 1);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        let again = fx.b.ins().band(outside, more);
+        (again, vec![next, location, hidden, inside])
+    });
+    (found[1], found[2], found[3])
 }
 
-/// The location record of a code address and whether its function's frames are left out, or
-/// a zero location for an address no lowered function holds.
-fn lookup(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value) {
-    let tables = line_tables(lo, fx);
+/// The location record of a code address in one image's line tables, whether its function's
+/// frames are left out, and whether a function of these tables holds it.
+fn lookup_in(fx: &mut Fx, tables: Value, address: Value) -> (Value, Value, Value) {
     let functions = fx.load(PTR, tables, 0);
     let entries = fx.load(PTR, tables, 8);
-    let locations = fx.load(PTR, tables, 16);
-    let count = fx.load(types::I32, tables, 32);
+    let count = fx.load(types::I32, tables, lines::COUNT);
     let count = fx.b.ins().uextend(PTR, count);
     let zero = fx.ptr(0);
-    let found = fx.repeat(&[zero, zero, zero], |fx, state| {
+    let go = fx.int(types::I8, 1);
+    let found = fx.repeat(&[zero, zero, zero, go], |fx, state| {
         let (index, location, hidden) = (state[0], state[1], state[2]);
         let record_offset = fx.b.ins().imul_imm_s(index, FUNCTION_RECORD as i64);
         let record = fx.b.ins().iadd(functions, record_offset);
@@ -461,23 +470,32 @@ fn lookup(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value) {
                 let hidden = fx.b.ins().band_imm_s(flags, i64::from(lines::HIDDEN));
                 let hidden = fx.b.ins().uextend(PTR, hidden);
                 let pc = fx.b.ins().iadd_imm_s(offset, -1);
-                let zero = fx.ptr(0);
-                let best = fx.repeat(&[zero, zero], |fx, state| {
-                    let (at, best) = (state[0], state[1]);
-                    let index = fx.b.ins().iadd(first, at);
-                    let entry_offset = fx.b.ins().imul_imm_s(index, ENTRY_RECORD as i64);
-                    let entry = fx.b.ins().iadd(entries, entry_offset);
-                    let code = fx.load(types::I32, entry, 0);
-                    let code = fx.b.ins().uextend(PTR, code);
-                    let number = fx.load(types::I32, entry, 4);
-                    let number = fx.b.ins().uextend(PTR, number);
-                    let covers = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, code, pc);
-                    let best = fx.b.ins().select(covers, number, best);
-                    let at = fx.b.ins().iadd_imm_s(at, 1);
-                    let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, at, entries_count);
-                    (more, vec![at, best])
-                })[1];
-                let location = location_record(fx, locations, best);
+                let any = fx.b.ins().icmp_imm_s(IntCC::NotEqual, entries_count, 0);
+                let best = fx.choose(
+                    any,
+                    &[PTR],
+                    |fx| {
+                        let zero = fx.ptr(0);
+                        let found = fx.repeat(&[zero, zero], |fx, state| {
+                            let (at, best) = (state[0], state[1]);
+                            let index = fx.b.ins().iadd(first, at);
+                            let entry_offset = fx.b.ins().imul_imm_s(index, ENTRY_RECORD as i64);
+                            let entry = fx.b.ins().iadd(entries, entry_offset);
+                            let code = fx.load(types::I32, entry, 0);
+                            let code = fx.b.ins().uextend(PTR, code);
+                            let number = fx.load(types::I32, entry, 4);
+                            let number = fx.b.ins().uextend(PTR, number);
+                            let covers = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, code, pc);
+                            let best = fx.b.ins().select(covers, number, best);
+                            let at = fx.b.ins().iadd_imm_s(at, 1);
+                            let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, at, entries_count);
+                            (more, vec![at, best])
+                        });
+                        vec![found[1]]
+                    },
+                    |fx| vec![fx.ptr(0)],
+                )[0];
+                let location = location_record(fx, tables, best);
                 let stop = fx.int(types::I8, 0);
                 vec![location, hidden, stop]
             },
@@ -489,17 +507,35 @@ fn lookup(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value) {
         let next = fx.b.ins().iadd_imm_s(index, 1);
         let more_functions = fx.b.ins().icmp(IntCC::UnsignedLessThan, next, count);
         let again = fx.b.ins().band(result[2], more_functions);
-        (again, vec![next, result[0], result[1]])
+        (again, vec![next, result[0], result[1], result[2]])
+    });
+    let inside = fx.b.ins().bxor_imm_s(found[3], 1);
+    (found[1], found[2], inside)
+}
+
+/// The start of the lowered function holding a code address and its flags, or zeros for an
+/// address outside lowered code: searched in the line tables of the image, or a bundle's kernel,
+/// then of each bundle loaded after it.
+pub fn function_at(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value) {
+    let head = lo.line_head(fx);
+    let zero = fx.ptr(0);
+    let found = fx.repeat(&[head, zero, zero], |fx, state| {
+        let tables = state[0];
+        let (start, flags) = function_in(fx, tables, address);
+        let next = fx.load(PTR, tables, lines::NEXT);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, start, 0);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        let again = fx.b.ins().band(missing, more);
+        (again, vec![next, start, flags])
     });
     (found[1], found[2])
 }
 
-/// The start of the lowered function holding a code address and its flags, or zeros for an
-/// address outside lowered code.
-pub fn function_at(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Value) {
-    let tables = line_tables(lo, fx);
+/// The start of the function of one image's line tables holding a code address and its flags,
+/// or zeros for none.
+fn function_in(fx: &mut Fx, tables: Value, address: Value) -> (Value, Value) {
     let functions = fx.load(PTR, tables, 0);
-    let count = fx.load(types::I32, tables, 32);
+    let count = fx.load(types::I32, tables, lines::COUNT);
     let count = fx.b.ins().uextend(PTR, count);
     let zero = fx.ptr(0);
     let found = fx.repeat(&[zero, zero, zero], |fx, state| {
@@ -524,8 +560,9 @@ pub fn function_at(lo: &mut Lowering, fx: &mut Fx, address: Value) -> (Value, Va
     (found[1], found[2])
 }
 
-/// The address of the location record numbered `number`, or zero for number 0.
-fn location_record(fx: &mut Fx, locations: Value, number: Value) -> Value {
+/// The address of the location record numbered `number` of line tables, or zero for number 0.
+fn location_record(fx: &mut Fx, tables: Value, number: Value) -> Value {
+    let locations = fx.load(PTR, tables, lines::LOCATIONS);
     let has = fx.b.ins().icmp_imm_s(IntCC::NotEqual, number, 0);
     let index = fx.b.ins().iadd_imm_s(number, -1);
     let offset = fx.b.ins().imul_imm_s(index, LOCATION_RECORD as i64);
@@ -553,7 +590,7 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
 
 /// Writes, on the running routine's stack, the report of a trap of a kind located at the call of
 /// the routine's caller, with the operands of a record when `count` is not 0, the location
-/// numbered `caller` its first caller line when not 0, and its replay token in a test image.
+/// record at `caller` its first caller line when not 0, and its replay token in a test image.
 fn write(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -569,7 +606,7 @@ fn write(
         let (frame, at, beyond, beyond_known, any_shown) =
             (state[0], state[1], state[2], state[3], state[4]);
         let address = fx.load(PTR, frame, 8);
-        let (location, hidden) = lookup(lo, fx, address);
+        let (location, hidden, inside) = lookup(lo, fx, address);
         let room =
             fx.b.ins()
                 .icmp_imm_s(IntCC::UnsignedLessThan, at, FRAMES as i64);
@@ -595,7 +632,7 @@ fn write(
         let at = fx.b.ins().iadd(at, stored);
         let caller = fx.load(PTR, frame, 0);
         let has_caller = fx.b.ins().icmp_imm_s(IntCC::NotEqual, caller, 0);
-        let more = fx.b.ins().band(known, has_caller);
+        let more = fx.b.ins().band(inside, has_caller);
         (more, vec![caller, at, beyond, beyond_known, any_shown])
     });
     let (beyond_shown, beyond_known) = (walked[2], walked[3]);
@@ -639,7 +676,20 @@ fn write(
     report.bytes(fx, lo, kind_text, kind_len);
     let slot = frame_at(fx, first_visible);
     let location = fx.load(PTR, slot, 0);
-    report.located(fx, lo, location);
+    let located = fx.b.ins().icmp_imm_s(IntCC::NotEqual, location, 0);
+    fx.choose_in(
+        lo,
+        located,
+        &[],
+        |lo, fx| {
+            report.located(fx, lo, location);
+            Vec::new()
+        },
+        |lo, fx| {
+            report.text(fx, lo, "\n");
+            Vec::new()
+        },
+    );
     // The operands of a trap are those of its operation, which must be the innermost frame,
     // except those of an exception, which the CPU gives.
     let own = fx.b.ins().icmp_imm_s(IntCC::Equal, first_visible, 0);
@@ -688,10 +738,7 @@ fn write(
     });
     let named = fx.b.ins().icmp_imm_s(IntCC::NotEqual, caller, 0);
     fx.when(named, |fx| {
-        let tables = line_tables(lo, fx);
-        let locations = fx.load(PTR, tables, 16);
-        let location = location_record(fx, locations, caller);
-        report.caller_line(fx, lo, location);
+        report.caller_line(fx, lo, caller);
         let written = fx.b.use_var(lines);
         let next = fx.b.ins().iadd_imm_s(written, 1);
         fx.b.def_var(lines, next);

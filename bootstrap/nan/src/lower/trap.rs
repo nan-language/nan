@@ -117,9 +117,9 @@ pub fn raise(body: &mut Body, kind: &str, operands: Operands) {
         Some((item, Role::Requires, _))
             if item != body.item || body.function().role != Role::Entry =>
         {
-            Some(body.lo.lines.location(body.lo.ck, body.item, body.current))
+            body.lo.lines.location(body.lo.ck, body.item, body.current)
         }
-        _ => None,
+        _ => 0,
     };
     let records = records(body, operands);
     let count = records.len() as u64;
@@ -146,7 +146,7 @@ pub fn raise(body: &mut Body, kind: &str, operands: Operands) {
     }
     let kind = body.fx.int(types::I64, kind_number(kind));
     let count = body.fx.ptr(count);
-    let caller = body.fx.ptr(u64::from(caller.unwrap_or(0)));
+    let caller = body.lo.location_address(body.fx, caller);
     if let Some((item, _, span)) = clause {
         body.lo.locate(body.fx, item, span);
     }

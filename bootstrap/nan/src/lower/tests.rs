@@ -33,7 +33,14 @@ fn distinct_instances_with_one_symbol_name_collide() {
     let std = crate::stdlib::packages();
     let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
     let item = item_named(&checker, "example::scale");
-    let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+    let mut lowering = Lowering::new(
+        &checker,
+        HashMap::new(),
+        Vec::new(),
+        None,
+        None,
+        super::load::Linking::Image,
+    );
     lowering.instance(Instance::Nir {
         item,
         role: Role::Body,
@@ -66,7 +73,14 @@ fn secret_code_lowers_without_branches_or_divisions() {
     for target in [Target::X64Host, Target::Aarch64Host] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::step");
-        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+        let mut lowering = Lowering::new(
+            &checker,
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            super::load::Linking::Image,
+        );
         let ((), texts) = dumping(|| {
             lowering.instance(Instance::Nir {
                 item,
@@ -107,7 +121,14 @@ fn secret_lanes_lower_without_branches_or_divisions() {
     for target in [Target::X64Host, Target::X64Bare] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::step");
-        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+        let mut lowering = Lowering::new(
+            &checker,
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            super::load::Linking::Image,
+        );
         let ((), texts) = dumping(|| {
             lowering.instance(Instance::Nir {
                 item,
@@ -153,7 +174,14 @@ fn lanes_lower_to_vectors_on_hosts_alone() {
     for target in [Target::X64Host, Target::X64Bare] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::mixed");
-        let mut lowering = Lowering::new(&checker, HashMap::new(), Vec::new(), None, None);
+        let mut lowering = Lowering::new(
+            &checker,
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            super::load::Linking::Image,
+        );
         let ((), texts) = dumping(|| {
             lowering.instance(Instance::Nir {
                 item,

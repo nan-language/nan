@@ -1,8 +1,21 @@
 //! Line tables: the source location of each instruction of lowered code, by function and code offset, which trap reports read to name the trapping operation and each caller.
 
-/// The symbol of the line tables: the addresses of the function, entry, location and string
-/// arrays and their counts.
+/// The symbol of the line tables: the addresses of the function, entry and location arrays and
+/// of the table of task entries' own stacks, the function count, and the address of the line
+/// tables of the next bundle loaded, zero for none.
 const LINES_SYMBOL: Str = "_NSlines"
+
+/// The offsets in line tables of the location array, of the table of task entries' own stacks,
+/// of the function count and of the next line tables, and their size.
+const LINES_LOCATIONS: u64 = 16
+
+const LINES_ENTRY_STACKS: u64 = 24
+
+const LINES_COUNT: u64 = 32
+
+const LINES_NEXT: u64 = 40
+
+const LINES_HEADER: u64 = 48
 
 /// The flags of a function record: trap reports leave its frames out, and a stopping task
 /// does not stop while one of its frames is on the task's stack.
@@ -18,8 +31,8 @@ const FUNCTION_RECORD: u64 = 24
 /// The size of an entry: a code offset and a location.
 const LINES_ENTRY_RECORD: u64 = 8
 
-/// The size of a location: the offsets and lengths of its path, item and source line texts,
-/// and its line number.
+/// The size of a location: the offsets from the record and lengths of its path, item and source
+/// line texts, which follow the records in the same array, and its line number.
 const LOCATION_RECORD: u64 = 28
 
 struct Lines {
@@ -29,6 +42,7 @@ struct Lines {
     /// The index of each defined function's record.
     records: mem::HashMap[object::FuncId, usize]
     table_id: Option[object::DataId]
+    array_id: Option[object::DataId]
 } Lines
 
 /// A line of an item's file.
@@ -64,7 +78,7 @@ struct RecordFunction derives Copy {
 } RecordFunction
 
 fn Lines.empty(alloc: mem::Alloc) -> Lines {
-    return Lines(locations: mem::List[LinesLocation].empty(alloc), known: mem::HashMap[LineKey, u32].empty(seed: 0, alloc), functions: mem::List[Function].empty(alloc), records: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), table_id: None)
+    return Lines(locations: mem::List[LinesLocation].empty(alloc), known: mem::HashMap[LineKey, u32].empty(seed: 0, alloc), functions: mem::List[Function].empty(alloc), records: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), table_id: None, array_id: None)
 } Lines.empty
 
 /// The number of a span's location, as source locations of lowered code carry it.
@@ -126,16 +140,53 @@ fn Lines.compiled(mut self, id: object::FuncId, size: u32, take entries: mem::Li
     return at
 } Lines.compiled
 
-/// The data object of the line tables, declared once and defined when lowering finishes.
-fn Lines.table(mut self, mut module: object::Module) -> object::DataId {
+/// The data object of the image's line tables, declared once and defined when lowering
+/// finishes: writable in a kernel, whose next field loading links, and named apart in a bundle,
+/// which imports the kernel's.
+fn Lines.table(mut self, mut module: object::Module, linking: Linking) -> object::DataId {
     match self.table_id {
         Some(id) => return id
         None => {}
     }
-    let id = mut module.declare_data(LINES_SYMBOL, linkage: object::Linkage.Local, writable: false, tls: false)
+    let id = match linking {
+        Linking.Image => mut module.declare_data(LINES_SYMBOL, linkage: object::Linkage.Local, writable: false, tls: false)
+        Linking.Kernel(_) => mut module.declare_data(LINES_SYMBOL, linkage: object::Linkage.Local, writable: true, tls: false)
+        Linking.Bundle => mut module.declare_data(image::BUNDLE_LINES, linkage: object::Linkage.Local, writable: false, tls: false)
+    }
     self.table_id = Some(id)
     return id
 } Lines.table
+
+/// The location array, declared once and defined when lowering finishes.
+fn Lines.array(mut self, mut module: object::Module) -> object::DataId {
+    match self.array_id {
+        Some(id) => return id
+        None => {}
+    }
+    let id = mut module.declare_data("_NSlines_locations", linkage: object::Linkage.Local, writable: false, tls: false)
+    self.array_id = Some(id)
+    return id
+} Lines.array
+
+/// The address of the record of a location numbered from 1, zero for 0.
+fn Lowering.location_address(mut self, mut fx: Fx, number: u32) -> clif::Value {
+    if number == 0 {
+        return mut fx.ptr(0)
+    }
+    let array = mut self.lines.array(mut self.module)
+    let base = mut self.data_address(mut fx, id: array)
+    return mut fx.b.iadd_imm_s(base, y: i64.widen(number - 1) * i64.fit(LOCATION_RECORD))
+} Lowering.location_address
+
+/// The address of the line tables a walk starts from: on a bundle the kernel's, which it
+/// imports, on any other image its own.
+fn Lowering.line_head(mut self, mut fx: Fx) -> clif::Value {
+    let id = match self.imports() {
+        true => mut self.module.declare_data(LINES_SYMBOL, linkage: object::Linkage.Import, writable: true, tls: false)
+        false => mut self.lines.table(mut self.module, linking: self.linking)
+    }
+    return mut self.data_address(mut fx, id)
+} Lowering.line_head
 
 /// The path of an item's file as reports write it: its package's name, then the path within
 /// the package's source directory.
@@ -172,31 +223,44 @@ fn append_le(mut bytes: mem::Bytes, value: u64, size: usize)
     }
 } append_le
 
-/// Appends a text to the strings of the line tables, giving its offset there.
-fn lines_append_text(mut strings: mem::Bytes, written: Str) -> u32 {
+/// Appends a text to the strings of the line tables, giving its offset there and its length.
+fn lines_append_text(mut strings: mem::Bytes, written: Str) -> LineText {
     let at = u32.truncate(strings.len())
     mut strings.append(written.as_bytes())
-    return at
+    return LineText(at: at, len: u32.truncate(written.byte_len()))
 } lines_append_text
 
-/// Defines the line tables from every function lowered.
-fn lines_emit(mut lo: Lowering) {
+/// A text of a location among the strings of the line tables: its offset there and its length.
+struct LineText derives Copy {
+    at: u32
+    len: u32
+} LineText
+
+/// Defines the line tables from every function lowered, pointing at the table of task entries'
+/// own stacks.
+fn lines_emit(mut lo: Lowering, own_stacks: object::DataId) {
     let alloc = lo.alloc
-    let table = mut lo.lines.table(mut lo.module)
+    let table = mut lo.lines.table(mut lo.module, linking: lo.linking)
+    let array = mut lo.lines.array(mut lo.module)
     var strings = mem::Bytes.empty(alloc)
-    var locations = mem::Bytes.empty(alloc)
+    var texts = mem::List[LineText].empty(alloc)
     for location in lo.lines.locations {
-        let path = lines_append_text(mut strings, written: location.path.as_str())
-        let item = lines_append_text(mut strings, written: location.item.as_str())
-        let line_text = lines_append_text(mut strings, written: location.text.as_str())
-        append_le(mut locations, value: u64.widen(path), size: 4)
-        append_le(mut locations, value: u64.widen(location.path.byte_len()), size: 4)
-        append_le(mut locations, value: u64.widen(item), size: 4)
-        append_le(mut locations, value: u64.widen(location.item.byte_len()), size: 4)
-        append_le(mut locations, value: u64.widen(line_text), size: 4)
-        append_le(mut locations, value: u64.widen(location.text.byte_len()), size: 4)
-        append_le(mut locations, value: u64.widen(location.line), size: 4)
+        mut texts.push(lines_append_text(mut strings, written: location.path.as_str()))
+        mut texts.push(lines_append_text(mut strings, written: location.item.as_str()))
+        mut texts.push(lines_append_text(mut strings, written: location.text.as_str()))
     }
+    let records = u32.fit(lo.lines.locations.len()) * u32.fit(LOCATION_RECORD)
+    var locations = mem::Bytes.empty(alloc)
+    for index in 0..<lo.lines.locations.len() {
+        let from_record = records - u32.fit(index) * u32.fit(LOCATION_RECORD)
+        for part in 0usize..<3 {
+            let written = texts[3 * index + part]
+            append_le(mut locations, value: u64.widen(from_record + written.at), size: 4)
+            append_le(mut locations, value: u64.widen(written.len), size: 4)
+        }
+        append_le(mut locations, value: u64.widen(lo.lines.locations[index].line), size: 4)
+    }
+    mut locations.append(strings.view())
     var entries = mem::Bytes.empty(alloc)
     var functions = mem::Bytes.empty(alloc)
     var function_relocs = mem::List[RecordFunction].empty(alloc)
@@ -216,10 +280,17 @@ fn lines_emit(mut lo: Lowering) {
     var arrays = mem::List[object::DataId].empty(alloc)
     mut arrays.push(lines_array(mut lo, index: 0, bytes: take functions, function_relocs: function_relocs.view()))
     mut arrays.push(lines_array(mut lo, index: 1, bytes: take entries, function_relocs: function_relocs.view()))
-    mut arrays.push(lines_array(mut lo, index: 2, bytes: take locations, function_relocs: function_relocs.view()))
-    mut arrays.push(lines_array(mut lo, index: 3, bytes: take strings, function_relocs: function_relocs.view()))
-    var header = mem::Bytes.zeroed(40, alloc)
-    write_le(mut header, at: 32, value: u64.widen(lo.lines.functions.len()), size: 4, big: false)
+    var located = object::DataDescription.new(alloc)
+    if locations.len() == 0 {
+        mut locations.push(0)
+    }
+    mut located.define(take locations)
+    mut located.set_align(8)
+    mut lo.module.define_data(array, description: take located)
+    mut arrays.push(array)
+    mut arrays.push(own_stacks)
+    var header = mem::Bytes.zeroed(usize.widen(LINES_HEADER), alloc)
+    write_le(mut header, at: usize.widen(LINES_COUNT), value: u64.widen(lo.lines.functions.len()), size: 4, big: false)
     var description = object::DataDescription.new(alloc)
     mut description.define(take header)
     mut description.set_align(8)
@@ -230,8 +301,8 @@ fn lines_emit(mut lo: Lowering) {
     mut lo.module.define_data(table, take description)
 } lines_emit
 
-/// Defines the array of the line tables at `index`: function records, entries, locations or
-/// strings, the function records with the addresses of their functions.
+/// Defines the array of the line tables at `index`: function records or entries, the function
+/// records with the addresses of their functions.
 fn lines_array(mut lo: Lowering, index: u32, take bytes: mem::Bytes, function_relocs: Slice[RecordFunction]) -> object::DataId {
     var name = text::String.of(LINES_SYMBOL, alloc: lo.alloc)
     mut name.write(text::fmt("_{index}", index), budget: 32)

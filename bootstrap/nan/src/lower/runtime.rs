@@ -31,6 +31,9 @@ use super::fx::{Fx, PTR};
 use super::machine::Stub;
 use super::{CALL_CONV, Lowering};
 
+/// The symbol of the runtime state.
+pub const STATE: &str = "_NSstate";
+
 /// A support routine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Routine {
@@ -460,12 +463,18 @@ impl Lowering<'_, '_> {
         if let Some(id) = self.routines.get(&routine) {
             return *id;
         }
+        let linkage = match self.imports() {
+            true => Linkage::Import,
+            false => Linkage::Local,
+        };
         let id = self
             .module
-            .declare_function(routine.name(), Linkage::Local, &routine.signature())
+            .declare_function(routine.name(), linkage, &routine.signature())
             .expect("a support routine");
         self.routines.insert(routine, id);
-        self.queue.push(super::Pending::Routine(routine, id));
+        if linkage == Linkage::Local {
+            self.queue.push(super::Pending::Routine(routine, id));
+        }
         id
     }
 
@@ -484,20 +493,27 @@ impl Lowering<'_, '_> {
         fx.b.ins().symbol_value(PTR, global)
     }
 
-    fn state_data(&mut self) -> DataId {
+    /// The runtime state's data object, which a bundle imports from its kernel.
+    pub fn state_data(&mut self) -> DataId {
         if let Some(id) = self.state_id {
             return id;
         }
+        let linkage = match self.imports() {
+            true => Linkage::Import,
+            false => Linkage::Local,
+        };
         let id = self
             .module
-            .declare_data("_NSstate", Linkage::Local, true, false)
+            .declare_data(STATE, linkage, true, false)
             .expect("the runtime state");
-        let mut description = DataDescription::new();
-        description.define_zeroinit(state::SIZE as usize);
-        description.set_align(64);
-        self.module
-            .define_data(id, &description)
-            .expect("the runtime state");
+        if linkage == Linkage::Local {
+            let mut description = DataDescription::new();
+            description.define_zeroinit(state::SIZE as usize);
+            description.set_align(64);
+            self.module
+                .define_data(id, &description)
+                .expect("the runtime state");
+        }
         self.state_id = Some(id);
         id
     }

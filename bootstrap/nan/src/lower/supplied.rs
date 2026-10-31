@@ -8,6 +8,7 @@ pub mod floats;
 pub mod generate;
 pub mod hw;
 pub mod kinds;
+pub mod load;
 pub mod mem;
 pub mod numbers;
 pub mod pointers;
@@ -231,6 +232,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         || (lo.seeded() && sims::lower(lo, fx, &supply))
         || same::lower(lo, fx, &supply)
         || hw::lower(lo, fx, &supply)
+        || load::lower(lo, fx, &supply)
         || boot::lower(lo, fx, &supply)
         || sys::lower(lo, fx, &supply)
         || kinds::lower(lo, fx, &supply)

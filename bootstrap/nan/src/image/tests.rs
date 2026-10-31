@@ -113,7 +113,7 @@ fn aarch64_object() -> Vec<u8> {
 #[test]
 fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memory_only() {
     let base = 0x0010_0000;
-    let linked = link(&object(Reloc::X86PCRel4), base);
+    let linked = link(&object(Reloc::X86PCRel4), base, false);
     let [text, data] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };
@@ -133,7 +133,7 @@ fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memor
 #[test]
 fn link_patches_aarch64_branches_pages_and_page_offsets() {
     let base = elf::base(workspace::Arch::Aarch64);
-    let linked = link(&aarch64_object(), base);
+    let linked = link(&aarch64_object(), base, false);
     let [text, data] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };

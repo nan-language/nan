@@ -354,7 +354,7 @@ pub fn run(
 /// The seed of the publisher's secret key, or why the package is not published: a principal out
 /// of form, or a key the user directory lacks or whose public key differs from the one the
 /// package's principals file gives the publisher.
-fn publishing_key(
+pub(crate) fn publishing_key(
     package: &Package,
     publisher: &str,
     authors: &[String],

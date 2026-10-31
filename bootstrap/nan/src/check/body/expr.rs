@@ -44,6 +44,18 @@ impl Checker<'_> {
         self.core_ty("Slice", vec![Arg::Ty(element)])
     }
 
+    /// The type of a path naming a registry: a slice of its table, or for a loaded registry its
+    /// `sys::load::Table`.
+    pub fn registry_ty(&self, registry: &ast::RegistryItem, entry: Ty) -> Ty {
+        if !registry.loaded {
+            return self.slice_ty(entry);
+        }
+        match self.db.std_item("sys::load", "Table") {
+            Some(table) => Ty::item(table, vec![Arg::Ty(entry)]),
+            None => Ty::Error,
+        }
+    }
+
     pub fn option_ty(&self, value: Ty) -> Ty {
         self.core_ty("Option", vec![Arg::Ty(value)])
     }
@@ -631,7 +643,9 @@ impl Body<'_, '_> {
         let sig = self.ck.sig(item);
         let ty = match (&self.ck.db.ast(item).kind, &sig.kind) {
             (ItemKind::Const(_), SigKind::Const { ty }) => ty.clone(),
-            (ItemKind::Registry(_), SigKind::Registry { entry }) => self.ck.slice_ty(entry.clone()),
+            (ItemKind::Registry(registry), SigKind::Registry { entry }) => {
+                self.ck.registry_ty(registry, entry.clone())
+            }
             (ItemKind::Contribute(contribution), _) => {
                 self.ck.contribution_entry(item, contribution)
             }

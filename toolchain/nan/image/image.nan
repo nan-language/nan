@@ -1,4 +1,4 @@
-//! The image writer: links the relocatable object of a machine target's lowering into its image, a PE32+ EFI application on a UEFI target or a static ELF64 executable on a bare target. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
+//! The image writer: links the relocatable object of a machine target's lowering into its image, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
 
 /// The size of a page, to which every segment is aligned.
 const PAGE: u64 = 4_096
@@ -15,11 +15,11 @@ pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: me
     }
     match target.kind() {
         Some(workspace::Kind.Uefi) => {
-            let linked = link(object, base: PE_BASE, alloc)
+            let linked = link(object, base: PE_BASE, importing: false, alloc)
             return pe_write(linked, entry: linked.symbol(entry), arch, alloc)
         }
         Some(workspace::Kind.Bare) => {
-            let linked = link(object, base: elf_base(arch), alloc)
+            let linked = link(object, base: elf_base(arch), importing: false, alloc)
             return elf_write(linked, entry: linked.symbol(entry), arch, alloc)
         }
         else => {
@@ -52,13 +52,27 @@ struct Absolute derives Copy, Eq {
     width: u64
 } Absolute
 
-/// An object linked at an address: its segments, the address of each of its symbols, and the
-/// absolute addresses its relocations wrote.
+/// An object linked at an address: its segments, the address of each of its symbols, the
+/// absolute addresses its relocations wrote, and each word holding the address of a symbol it
+/// imports.
 struct Linked {
     segments: mem::List[Segment]
     symbols: mem::Map[text::String, u64]
     absolute: mem::List[Absolute]
+    imports: mem::List[Import]
 } Linked
+
+/// The address of a word holding the address of a symbol an object imports, and its name.
+struct Import {
+    address: u64
+    name: text::String
+} Import
+
+/// The code a bundle calls an imported function through, in its text: an indirect jump through
+/// the word that follows it, which holds the function's address.
+const IMPORT_STUB: Slice[u8] = b"\xff\x25\x02\x00\x00\x00\xcc\xcc"
+
+const IMPORT_STUB_BYTES: u64 = 16
 
 /// The address of a symbol the lowering defines.
 fn Linked.symbol(self, name: Str) -> u64 {
@@ -132,18 +146,30 @@ fn next_multiple_of(value: u64, multiple: u64) -> u64 {
     return value + (multiple - rest)
 } next_multiple_of
 
-/// Links an object with its first segment at `base`.
-fn link(object: Slice[u8], base: u64, alloc: mem::Alloc) -> Linked {
+/// Links an object with its first segment at `base`. Only a bundle, when `importing`, leaves
+/// symbols undefined: each absolute address of one is an import, and each call of one goes
+/// through an import stub after the object's code.
+fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Linked {
     let read_object = read(object, alloc)
+    let called = called_imports(read_object, alloc)
+    expect importing or called.len() == 0
     var placed = mem::List[Option[u64]].empty(alloc)
     for _ in read_object.sections {
         mut placed.push(None)
     }
     var segments = mem::List[Segment].empty(alloc)
     let sections = read_object.sections.view()
-    var next = add_segment(mut segments, mut placed, sections, address: base, access: Access.Execute, alloc)
-    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, alloc)
-    discard add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, alloc)
+    var next = add_segment(mut segments, mut placed, sections, address: base, access: Access.Execute, stubs: u64.widen(called.len()), alloc)
+    var stubs: u64 = 0
+    if called.len() > 0 and segments.len() > 0 {
+        stubs = segments[0].address + segments[0].size - u64.widen(called.len()) * IMPORT_STUB_BYTES
+    }
+    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, stubs: 0, alloc)
+    discard add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, stubs: 0, alloc)
+    var imports = mem::List[Import].empty(alloc)
+    for index in 0..<called.len() {
+        mut imports.push(Import(address: stubs + u64.widen(index) * IMPORT_STUB_BYTES + 8, name: text::String.of(called[index].as_str(), alloc)))
+    }
     var symbols = mem::Map[text::String, u64].empty(alloc)
     for symbol in read_object.symbols {
         let Some(section) = symbol.section else {
@@ -173,15 +199,58 @@ fn link(object: Slice[u8], base: u64, alloc: mem::Alloc) -> Linked {
         var segment = mut segments.at_mut(at)
         for relocation in read_object.sections[index].relocations {
             expect relocation.symbol < read_object.symbols.len()
-            let target = i64.from_bits(address_of(read_object.symbols[relocation.symbol], placed: placed.view())) + relocation.addend
-            mut segment.relocate(at: start + relocation.offset, kind: relocation.kind, target, mut absolute)
+            let symbol = read_object.symbols[relocation.symbol]
+            let place = start + relocation.offset
+            var target: i64 = 0
+            if undefined(symbol) {
+                match called.position(fn(name: text::String) => name == symbol.name) {
+                    Some(stub) => {
+                        target = i64.from_bits(stubs + u64.widen(stub) * IMPORT_STUB_BYTES) + relocation.addend
+                    }
+                    None => {
+                        expect importing and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
+                        mut imports.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
+                        continue
+                    }
+                }
+            } else {
+                target = i64.from_bits(address_of(symbol, placed: placed.view())) + relocation.addend
+            }
+            mut segment.relocate(at: place, kind: relocation.kind, target, mut absolute)
         }
     }
-    var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute)
+    mut imports.sort_by(import_order)
+    var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute, imports: take imports)
     mut linked.record_extent(base)
     mut linked.absolute.sort_by(absolute_order)
     return linked
 } link
+
+/// Whether a symbol is one the object leaves undefined.
+fn undefined(symbol: Symbol) -> bool = symbol.section.is_none() and not symbol.name.is_empty()
+
+/// The names of the undefined symbols an object calls, in the order of their first calls.
+fn called_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[text::String] {
+    var called = mem::List[text::String].empty(alloc)
+    for section in read_object.sections {
+        for relocation in section.relocations {
+            expect relocation.symbol < read_object.symbols.len()
+            let symbol = read_object.symbols[relocation.symbol]
+            let calls = relocation.kind == PC32 or relocation.kind == PLT32
+            if undefined(symbol) and calls and called.position(fn(name: text::String) => name == symbol.name).is_none() {
+                mut called.push(text::String.of(symbol.name.as_str(), alloc))
+            }
+        }
+    }
+    return called
+} called_imports
+
+fn import_order(left: Import, right: Import) -> core::Ordering {
+    if left.address != right.address {
+        return left.address.cmp(right.address)
+    }
+    return left.name.as_str().cmp(right.name.as_str())
+} import_order
 
 fn absolute_order(left: Absolute, right: Absolute) -> core::Ordering {
     if left.address != right.address {
@@ -191,8 +260,9 @@ fn absolute_order(left: Absolute, right: Absolute) -> core::Ordering {
 } absolute_order
 
 /// Adds the segment of an access at an address when it holds any section, its sections of
-/// zeros after the others, returning the address of the next segment.
-fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], address: u64, access: Access, alloc: mem::Alloc) -> u64 {
+/// zeros after the others and a code segment's `stubs` import stubs after its code, returning the
+/// address of the next segment.
+fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], address: u64, access: Access, stubs: u64, alloc: mem::Alloc) -> u64 {
     var segment = Segment(address: address, access: access, bytes: mem::Bytes.empty(alloc), size: 0)
     match access {
         Access.Execute => place_kind(mut segment, mut placed, sections, kind: Kind.Text)
@@ -201,6 +271,16 @@ fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u6
             place_kind(mut segment, mut placed, sections, kind: Kind.Data)
             place_kind(mut segment, mut placed, sections, kind: Kind.Zeroed)
         }
+    }
+    if stubs > 0 {
+        object::resize(mut segment.bytes, length: usize.widen(next_multiple_of(segment.size, multiple: IMPORT_STUB_BYTES)))
+        for _ in 0..<stubs {
+            mut segment.bytes.append(IMPORT_STUB)
+            for _ in 0..<8usize {
+                mut segment.bytes.push(0)
+            }
+        }
+        segment.size = u64.widen(segment.bytes.len())
     }
     if segment.size == 0 {
         return address

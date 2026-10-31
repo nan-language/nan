@@ -447,7 +447,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
 
 ## Codegen levels
 
-A **codegen level** names extensions beyond the base instruction set of a [descriptor](#descriptors), which code generation may then use. A program selects at most one level per architecture with the `codegen` directive of its manifest ([manifest](03-packages-modules.md#manifest)); its final builds for a target of that architecture use that level, and every other build, test images included, uses the base set.
+A **codegen level** names extensions beyond the base instruction set of a [descriptor](#descriptors), which code generation may then use. A program selects at most one level per architecture with the `codegen` directive of its manifest ([manifest](03-packages-modules.md#manifest)); its final builds for a target of that architecture use that level, a [bundle build](30-artefacts.md#bundles) uses the level of its kernel's interface file, and every other build, test images included, uses the base set.
 
 | Level | Architecture | Extensions |
 | --- | --- | --- |
@@ -519,7 +519,7 @@ An **image** is the output of a final build:
 - On `x86_64-bare`, a statically linked ELF64 executable with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x0010_0000`, named after the package with `.elf`. A `XEN_ELFNOTE_PHYS32_ENTRY` note names the program entry seam, which a PVH loader enters in 32-bit protected mode with paging disabled and `ebx` holding the physical address of the start information. The seam maps all physical memory the start information lists at its physical addresses, in page tables the image reserves, enables long mode and passes the `ebx` value to the entry landing fn.
 - On `aarch64-bare`, a statically linked ELF64 executable for AArch64 with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x4020_0000`, named after the package with `.elf`. Its entry point is the program entry seam, which the platform enters at EL1 with the MMU off. The seam enables floating point, installs the entry root, turns the MMU and caches on and passes the device tree's address, `0x4000_0000`, to the entry landing fn.
 
-The implementation's own image writer builds the images of the machine targets.
+The implementation's own image writer builds the images of the machine targets. A kernel exporting its load ABI ([loading](24-kernel.md#loading)) also has its [interface file](30-artefacts.md#interface-files) beside its image.
 
 Every image keeps frame pointers in every function, stubs and support routines included, and holds line tables mapping each instruction of lowered code to its source path, line and item. The trap routine reads both to write [trap reports](11-errors-domains.md#trap-reports); their encoding belongs to the ABI inside the final closure, which is unspecified.
 

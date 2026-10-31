@@ -1,0 +1,1312 @@
+//! Loading bundles into a running kernel through its load window, reclaiming them once nothing uses them, and the tables of loaded registries.
+
+/// The kernel's export table: its interface hash, the address of its line tables, the loader's
+/// lock, the load window's table of 1 GiB entries, the window's next address, the loader's list
+/// of retirements, its list of free window tables, the export count, then the address of each
+/// export.
+const HASH_BYTES: u64 = 33
+
+const EXPORT_LINES: u64 = 40
+
+const EXPORT_LOCK: u64 = 48
+
+const EXPORT_WINDOW: u64 = 56
+
+const EXPORT_NEXT: u64 = 64
+
+const EXPORT_RETIRED: u64 = 72
+
+const EXPORT_TABLES: u64 = 80
+
+const EXPORT_COUNT: u64 = 88
+
+const EXPORT_FIRST: u64 = 96
+
+/// The bytes of line tables, and the offset in them of the next line tables the trap routine
+/// reads.
+const LINES_BYTES: u64 = 48
+
+const LINES_NEXT: u64 = 40
+
+/// The format version of a bundle.
+const VERSION: u64 = 1
+
+/// The bytes of a page and the entries of a window table, the bits of an entry holding the
+/// address it maps, and the address bits that index the window's tables, from the 1 GiB entries
+/// down.
+const PAGE: u64 = 4_096
+
+const TABLE_ENTRIES: u64 = 512
+
+const ADDRESS_BITS: u64 = 0x000F_FFFF_FFFF_F000
+
+const GIGABYTE_SHIFT: u32 = 30
+
+const MEGABYTES_SHIFT: u32 = 21
+
+const PAGE_SHIFT: u32 = 12
+
+/// The kinds of the window's entries: a page of code, of read-only data, of writable data, and
+/// a table.
+const KIND_CODE: u64 = 0
+
+const KIND_READ_ONLY: u64 = 1
+
+const KIND_WRITABLE: u64 = 2
+
+const KIND_TABLE: u64 = 3
+
+/// The bytes of a function value.
+const FN_BYTES: u64 = 16
+
+/// A table record: its current version, then the count of function fields and, for each, its
+/// offset and the gate calling through it.
+const RECORD_GATES: u64 = 8
+
+const RECORD_FIRST: u64 = 16
+
+/// A version: its entry array's address and length, the count of reads holding it, and 1 when
+/// the loader made it.
+const VERSION_BYTES: u64 = 32
+
+const VERSION_READERS: u64 = 16
+
+const VERSION_MADE: u64 = 24
+
+/// A target record: the code of a bundle's function, and the count of calls running it.
+const TARGET_BYTES: u64 = 16
+
+const TARGET_PINS: u64 = 8
+
+/// A retirement: the next one, its kind, then a version, the memory a placement takes, or memory
+/// detached from the window until translations of it are invalidated.
+const RETIRED_BYTES: u64 = 64
+
+const RETIRED_KIND: u64 = 8
+
+const RETIRED_FIRST: u64 = 16
+
+const RETIRED_VERSION: u64 = 0
+
+const RETIRED_PLACEMENT: u64 = 1
+
+const RETIRED_MEMORY: u64 = 2
+
+const RETIRED_TABLE: u64 = 3
+
+/// The forms of a key or unique field: text, or an integer of 1, 2, 4 or 8 bytes, signed when
+/// `SIGNED` is set.
+const TEXT: u64 = 0
+
+const SIGNED: u64 = 0x80
+
+pub open struct Loader {
+} Loader
+
+pub closed enum LoadError derives Copy, Eq, Render {
+    Malformed
+    Signature
+    Interface
+    DuplicateKey
+    DuplicateUnique
+} LoadError
+
+pub open linear struct Prepared {
+    placed: Placed
+} Prepared
+
+pub open linear struct Bundle {
+    current: Placed
+    words: mem::List[Word]
+    abandoner: mem::Shared[sys::Abandoner]
+} Bundle
+
+pub open struct Table[E: Any] {
+} Table
+
+/// A placed image: its placement, the entries it adds, the target records its gates named, and
+/// the allocator of this bookkeeping.
+struct Placed {
+    placement: Placement
+    contributions: mem::List[Contribution]
+    targets: mem::List[u64]
+    alloc: mem::Alloc
+} Placed
+
+/// The memory a bundle's image takes: the runtime memory holding it, its address in the window,
+/// its pages, and the address of its line tables in that memory.
+struct Placement derives Copy {
+    memory: u64
+    window: u64
+    pages: u64
+    lines: u64
+} Placement
+
+/// An entry a bundle adds to a loaded registry: the registry's table record, the entry's address
+/// in the window and its bytes, its key and unique fields, and its function fields.
+struct Contribution {
+    record: u64
+    entry: u64
+    size: u64
+    key: Field
+    unique: mem::List[Field]
+    gates: mem::List[Gate]
+} Contribution
+
+/// A field of an entry: its offset and form.
+struct Field derives Copy {
+    offset: u64
+    form: u64
+} Field
+
+/// A function field of an entry: its offset, and the kernel's gate for its type.
+struct Gate derives Copy {
+    offset: u64
+    glue: u64
+} Gate
+
+/// A gate record of a bundle, naming the target its function field's gate calls, zero once
+/// stale: the table record, the entry whose key names the gate, its key field and the function
+/// field.
+struct Word derives Copy {
+    record: u64
+    entry: u64
+    key: Field
+    offset: u64
+    address: u64
+} Word
+
+/// The function field of an added entry and its gate: the gate code, the gate record and the
+/// target record it then names.
+struct Gating derives Copy {
+    entry: u64
+    offset: u64
+    glue: u64
+    word: u64
+    target: u64
+} Gating
+
+/// What a change of the tables publishes for a registry: its table record, its entry size and
+/// the entries of its new version, in order, each the address of its bytes.
+struct Planned {
+    record: u64
+    size: u64
+    entries: mem::List[u64]
+} Planned
+
+/// A range of a bundle's bytes.
+struct Span derives Copy {
+    start: usize
+    len: usize
+} Span
+
+/// The parts of a bundle's body.
+struct Parts derives Copy {
+    hash: Span
+    image: Span
+    size: u64
+    relocations: Span
+    imports: Span
+    lines: u64
+    contributions: Span
+    read_only: u64
+    writable: u64
+} Parts
+
+/// A signature section: the public key and the signature.
+struct SignatureSection derives Copy {
+    key: core::crypto::PublicKey
+    signature: core::crypto::Signature
+} SignatureSection
+
+/// A reader of a bundle's bytes from `at` to `end`.
+struct Reader derives Copy {
+    at: usize
+    end: usize
+} Reader
+
+pub fn Loader.prepare(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicKey], alloc: mem::Alloc) -> Prepared fails LoadError {
+    let body = try body_of(bundle)
+    if not verified(bundle, body, keys) {
+        fail LoadError.Signature
+    }
+    return try place(bundle, body, alloc)
+} Loader.prepare
+
+pub fn Loader.prepare_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> Prepared fails LoadError {
+    let body = try body_of(bundle)
+    return try place(bundle, body, alloc)
+} Loader.prepare_unverified
+
+pub fn Loader.reclaim(self) -> usize fails task::Cancelled uses wait {
+    let table = exports()
+    lock(table)
+    if retire_unused(table) {
+        match attempt await invalidate() {
+            Ok(_) => release_detached(table)
+            Err(cancelled) => {
+                unlock(table)
+                fail cancelled
+            }
+        }
+    }
+    let left = placements_left(table)
+    unlock(table)
+    return left
+} Loader.reclaim
+
+pub fn Prepared.load(take self) -> Bundle fails LoadError {
+    let Prepared(placed: placed) = self
+    var current = placed
+    var words = mem::List[Word].empty(current.alloc)
+    let none = mem::List[Contribution].empty(current.alloc)
+    match attempt publish(none.view(), added: current.contributions.view(), mut words, made: mut current.targets, alloc: current.alloc) {
+        Ok(_) => {}
+        Err(error) => {
+            retire_placement(current.placement, targets: current.targets.view())
+            fail error
+        }
+    }
+    let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: current.alloc)
+    return Bundle(current: take current, words: take words, abandoner: take abandoner)
+} Prepared.load
+
+pub fn Bundle.domain(self) -> mem::Shared[sys::Abandoner] {
+    return self.abandoner.share()
+} Bundle.domain
+
+pub fn Bundle.replace(mut self, take next: Prepared) fails LoadError {
+    let Prepared(placed: placed) = next
+    var added = placed
+    match attempt publish(self.current.contributions.view(), added: added.contributions.view(), words: mut self.words, made: mut added.targets, alloc: self.current.alloc) {
+        Ok(_) => {}
+        Err(error) => {
+            retire_placement(added.placement, targets: added.targets.view())
+            fail error
+        }
+    }
+    retire_placement(self.current.placement, targets: self.current.targets.view())
+    self.current = added
+} Bundle.replace
+
+pub fn Bundle.unload(take self) {
+    let Bundle(current: current, words: words, abandoner: abandoner) = self
+    abandoner.contents().trigger()
+    var stale = words
+    var made = mem::List[u64].empty(current.alloc)
+    let none = mem::List[Contribution].empty(current.alloc)
+    discard attempt publish(current.contributions.view(), added: none.view(), words: mut stale, made: mut made, alloc: current.alloc)
+    retire_placement(current.placement, targets: current.targets.view())
+} Bundle.unload
+
+pub fn Table.read[T: Any](self, body: fn(entries: Slice[E]) -> T) -> T {
+    let holding = pin(self.record())
+    let result = body(self.pinned(holding))
+    unpin(holding)
+    return result
+} Table.read
+
+/// The address of the kernel's export table, zero in an image that exports none.
+fn exports() -> u64
+
+/// The address of `bytes` zeroed bytes of runtime memory, which `release` frees.
+fn reserve(bytes: u64) -> u64
+
+/// Frees the runtime memory `reserve` gave at an address.
+fn release(address: u64)
+
+/// The window entry of a kind mapping the page or table at a physical address.
+fn window_entry(physical: u64, kind: u64) -> u64
+
+/// Invalidates every translation of every started CPU.
+fn invalidate() fails task::Cancelled uses wait
+
+/// Makes the instructions mapped over `len` bytes from `address` visible to the instruction
+/// fetches of every CPU, after the window's entries mapping them.
+fn sync(address: u64, len: u64)
+
+/// Pins the current version of the table record at an address for a read, giving the holding
+/// that keeps the pin until `unpin` or the settlement of the domain holding it.
+fn pin(record: u64) -> u64
+
+fn unpin(holding: u64)
+
+/// The address of the table's record.
+fn Table.record(self) -> u64
+
+/// The entries of the version a holding pins.
+proj fn Table.pinned(self, holding: u64) -> Slice[E]
+
+/// Places a bundle's image: copies it into runtime memory, applies its relocations for its
+/// address in the window, binds its imports, maps it into the window, its code read and executed,
+/// its read-only data read and its writable data written, makes its code visible and links its
+/// line tables after the kernel's.
+fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails LoadError {
+    let parts = try parts_of(bundle, body)
+    let table = exports()
+    if table == 0 or not same_interface(bundle, hash: parts.hash, table) {
+        fail LoadError.Interface
+    }
+    let image = u64.widen(parts.image.len)
+    let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
+    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered {
+        fail LoadError.Malformed
+    }
+    let pages = (parts.size + PAGE - 1) / PAGE
+    let memory = reserve(pages * PAGE + PAGE)
+    let base = aligned(memory)
+    copy_in(bundle, from: parts.image, to: base)
+    lock(table)
+    let window = word_at(table + EXPORT_NEXT)
+    set_word(table + EXPORT_NEXT, value: window + (pages + 1) * PAGE)
+    unlock(table)
+    let contributions = match attempt relocated(bundle, parts, base, window, table, alloc) {
+        Ok(found) => found
+        Err(error) => {
+            release(memory)
+            fail error
+        }
+    }
+    lock(table)
+    for index in 0..<pages {
+        var kind = KIND_WRITABLE
+        if index * PAGE < parts.read_only {
+            kind = KIND_CODE
+        } else if index * PAGE < parts.writable {
+            kind = KIND_READ_ONLY
+        }
+        store_word(slot_for(table, address: window + index * PAGE), value: window_entry(base + index * PAGE, kind))
+    }
+    let lines = base + parts.lines
+    let kernel = word_at(table + EXPORT_LINES)
+    set_word(lines + LINES_NEXT, value: load_word(kernel + LINES_NEXT))
+    store_word(kernel + LINES_NEXT, value: lines)
+    unlock(table)
+    sync(window, len: pages * PAGE)
+    let placement = Placement(memory: memory, window: window, pages: pages, lines: lines)
+    return Prepared(placed: Placed(placement: placement, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
+} place
+
+/// Relocates and binds the image copied at `base` for its address in the window, giving the
+/// entries it adds.
+fn relocated(bundle: Slice[u8], parts: Parts, base: u64, window: u64, table: u64, alloc: mem::Alloc) -> mem::List[Contribution] fails LoadError {
+    try relocate(bundle, parts, base, window)
+    try bind(bundle, parts, base, table)
+    return try contributions_of(bundle, parts, window, table, alloc)
+} relocated
+
+/// The parts a bundle's body records, keyed from 1.
+fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
+    let empty = Span(start: 0, len: 0)
+    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0)
+    var reader = Reader(at: body.start, end: body.start + body.len)
+    var last: u64 = 0
+    var held: u64 = 0
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        let key = try mut reader.uvar(bundle)
+        let content = try mut reader.span(bundle)
+        if key <= last {
+            fail LoadError.Malformed
+        }
+        last = key
+        match key {
+            1 => {
+                parts.hash = content
+                held += 1
+            }
+            2 => {
+                parts.image = content
+                held += 1
+            }
+            3 => {
+                parts.size = try number(bundle, content)
+                held += 1
+            }
+            4 => {
+                parts.relocations = content
+            }
+            5 => {
+                parts.imports = content
+            }
+            6 => {
+                parts.lines = try number(bundle, content)
+                held += 1
+            }
+            7 => {
+                parts.contributions = content
+            }
+            8 => {
+                var starts = Reader(at: content.start, end: content.start + content.len)
+                parts.read_only = try mut starts.uvar(bundle)
+                parts.writable = try mut starts.uvar(bundle)
+                if starts.at != starts.end {
+                    fail LoadError.Malformed
+                }
+                held += 1
+            }
+            else => fail LoadError.Malformed
+        }
+    }
+    if held != 5 or reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+    return parts
+} parts_of
+
+/// The span of a bundle's body, after its magic and version and before its sections, which
+/// extend to its end.
+fn body_of(bundle: Slice[u8]) -> Span fails LoadError {
+    if bundle.len() < 4 or bundle[0] != b'N' or bundle[1] != b'B' or bundle[2] != b'U' or bundle[3] != b'N' {
+        fail LoadError.Malformed
+    }
+    var reader = Reader(at: 4, end: bundle.len())
+    if try mut reader.uvar(bundle) != VERSION {
+        fail LoadError.Malformed
+    }
+    let body = try mut reader.span(bundle)
+    var sections = Reader(at: reader.at, end: bundle.len())
+    let count = try mut sections.uvar(bundle)
+    if count > 1 {
+        fail LoadError.Malformed
+    }
+    if count == 1 {
+        if try mut sections.uvar(bundle) != 1 {
+            fail LoadError.Malformed
+        }
+        discard try mut sections.span(bundle)
+    }
+    if sections.at != bundle.len() {
+        fail LoadError.Malformed
+    }
+    return body
+} body_of
+
+/// Whether the sections after a bundle's body hold a signature of the bytes before them by one of
+/// `keys`.
+fn verified(bundle: Slice[u8], body: Span, keys: Slice[core::crypto::PublicKey]) -> bool {
+    let end = body.start + body.len
+    var reader = Reader(at: end, end: bundle.len())
+    let Ok(count) = attempt mut reader.uvar(bundle) else {
+        return false
+    }
+    if count != 1 {
+        return false
+    }
+    let Ok(_) = attempt mut reader.uvar(bundle) else {
+        return false
+    }
+    let Ok(section) = attempt mut reader.span(bundle) else {
+        return false
+    }
+    let Ok(found) = attempt signature_of(bundle, section) else {
+        return false
+    }
+    let Some(message) = bundle.prefix(end) else {
+        return false
+    }
+    for key in keys {
+        if key == found.key and key.verify(message, signature: found.signature) {
+            return true
+        }
+    }
+    return false
+} verified
+
+/// The public key and signature a signature section records, keyed from 1.
+fn signature_of(bundle: Slice[u8], section: Span) -> SignatureSection fails LoadError {
+    var reader = Reader(at: section.start, end: section.start + section.len)
+    if try mut reader.uvar(bundle) != 2 or try mut reader.uvar(bundle) != 1 {
+        fail LoadError.Malformed
+    }
+    let key = try mut reader.span(bundle)
+    if try mut reader.uvar(bundle) != 2 {
+        fail LoadError.Malformed
+    }
+    let signature = try mut reader.span(bundle)
+    if key.len != 32 or signature.len != 64 or reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+    var key_bytes = Array[u8, 32].filled(0)
+    for index in 0usize..<32 {
+        key_bytes[index] = bundle[key.start + index]
+    }
+    var signature_bytes = Array[u8, 64].filled(0)
+    for index in 0usize..<64 {
+        signature_bytes[index] = bundle[signature.start + index]
+    }
+    return SignatureSection(key: core::crypto::PublicKey(bytes: key_bytes), signature: core::crypto::Signature(bytes: signature_bytes))
+} signature_of
+
+/// The uvar a part holds whole.
+fn number(bundle: Slice[u8], content: Span) -> u64 fails LoadError {
+    var reader = Reader(at: content.start, end: content.start + content.len)
+    let value = try mut reader.uvar(bundle)
+    if reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+    return value
+} number
+
+/// Whether a bundle was built against the interface the kernel's export table names.
+fn same_interface(bundle: Slice[u8], hash: Span, table: u64) -> bool {
+    if u64.widen(hash.len) != HASH_BYTES {
+        return false
+    }
+    for index in 0u64..<HASH_BYTES {
+        if bundle[hash.start + usize.widen(index)] != byte_at(table + index) {
+            return false
+        }
+    }
+    return true
+} same_interface
+
+/// Adds the image's address in the window to each word its base relocations name, in its copy
+/// at `base`.
+fn relocate(bundle: Slice[u8], parts: Parts, base: u64, window: u64) fails LoadError {
+    if parts.relocations.len == 0 {
+        return
+    }
+    var reader = Reader(at: parts.relocations.start, end: parts.relocations.start + parts.relocations.len)
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        let offset = try mut reader.uvar(bundle)
+        if offset > parts.size or parts.size - offset < 8 {
+            fail LoadError.Malformed
+        }
+        set_word(base + offset, value: word_at(base + offset).wrapping_add(window))
+    }
+    if reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+} relocate
+
+/// Writes the address of the export each import names into the word it names.
+fn bind(bundle: Slice[u8], parts: Parts, base: u64, table: u64) fails LoadError {
+    if parts.imports.len == 0 {
+        return
+    }
+    var reader = Reader(at: parts.imports.start, end: parts.imports.start + parts.imports.len)
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        let offset = try mut reader.uvar(bundle)
+        let index = try mut reader.uvar(bundle)
+        if offset > parts.size or parts.size - offset < 8 {
+            fail LoadError.Malformed
+        }
+        set_word(base + offset, value: try export(table, index))
+    }
+    if reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+} bind
+
+/// The address of the export of an index.
+fn export(table: u64, index: u64) -> u64 fails LoadError {
+    if index >= word_at(table + EXPORT_COUNT) {
+        fail LoadError.Malformed
+    }
+    return word_at(table + EXPORT_FIRST + index * 8)
+} export
+
+/// The entries a bundle adds, in its order, at their addresses in the window.
+fn contributions_of(bundle: Slice[u8], parts: Parts, window: u64, table: u64, alloc: mem::Alloc) -> mem::List[Contribution] fails LoadError {
+    var found = mem::List[Contribution].empty(alloc)
+    if parts.contributions.len == 0 {
+        return found
+    }
+    var reader = Reader(at: parts.contributions.start, end: parts.contributions.start + parts.contributions.len)
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        mut found.push(try contribution_of(bundle, reader: mut reader, parts, window, table, alloc))
+    }
+    if reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+    return found
+} contributions_of
+
+/// The record of a contribution, keyed from 1: its registry's export index, its entry's offset
+/// and size, its key field, its unique fields and the offsets of its function fields, whose
+/// gates its registry's table record names.
+fn contribution_of(bundle: Slice[u8], mut reader: Reader, parts: Parts, window: u64, table: u64, alloc: mem::Alloc) -> Contribution fails LoadError {
+    var record: u64 = 0
+    var entry: u64 = 0
+    var size: u64 = 0
+    var key = Field(offset: 0, form: TEXT)
+    var unique = mem::List[Field].empty(alloc)
+    var gates = mem::List[Gate].empty(alloc)
+    var last: u64 = 0
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        let field = try mut reader.uvar(bundle)
+        let content = try mut reader.span(bundle)
+        if field <= last {
+            fail LoadError.Malformed
+        }
+        last = field
+        var part = Reader(at: content.start, end: content.start + content.len)
+        match field {
+            1 => {
+                record = try export(table, index: try mut part.uvar(bundle))
+            }
+            2 => {
+                entry = try mut part.uvar(bundle)
+            }
+            3 => {
+                size = try mut part.uvar(bundle)
+            }
+            4 => {
+                key = try mut part.field(bundle)
+            }
+            5 => try mut part.fields(bundle, found: mut unique)
+            6 => try mut part.gates(bundle, found: mut gates, record)
+            else => fail LoadError.Malformed
+        }
+        if part.at != part.end {
+            fail LoadError.Malformed
+        }
+    }
+    if last < 4 or entry > parts.size or parts.size - entry < size {
+        fail LoadError.Malformed
+    }
+    try check_fields(key, unique: unique.view(), gates: gates.view(), size)
+    return Contribution(record: record, entry: window + entry, size: size, key: key, unique: take unique, gates: take gates)
+} contribution_of
+
+/// Checks that each field and function field lies inside an entry of `size` bytes.
+fn check_fields(key: Field, unique: Slice[Field], gates: Slice[Gate], size: u64) fails LoadError {
+    if not inside(key, size) {
+        fail LoadError.Malformed
+    }
+    for field in unique {
+        if not inside(field, size) {
+            fail LoadError.Malformed
+        }
+    }
+    for gate in gates {
+        if gate.offset > size or size - gate.offset < FN_BYTES {
+            fail LoadError.Malformed
+        }
+    }
+} check_fields
+
+fn inside(field: Field, size: u64) -> bool {
+    let width = width_of(field.form)
+    return width != 0 and field.offset <= size and size - field.offset >= width
+} inside
+
+/// The bytes a field of a form occupies, zero for an unknown form.
+fn width_of(form: u64) -> u64 {
+    return match form {
+        0 => 16
+        1 or 2 or 4 or 8 => form
+        0x81 or 0x82 or 0x84 or 0x88 => form - SIGNED
+        else => 0
+    }
+} width_of
+
+/// The gate a table record names for the function field at an offset, zero when it names none.
+fn glue_of(record: u64, offset: u64) -> u64 {
+    for index in 0..<word_at(record + RECORD_GATES) {
+        let at = record + RECORD_FIRST + index * 16
+        if word_at(at) == offset {
+            return word_at(at + 8)
+        }
+    }
+    return 0
+} glue_of
+
+/// Publishes a change of the tables under the loader's lock: removes the entries of `removed`,
+/// adds those of `added` behind gates, retargets or retires the gate records of `words`, adds
+/// the target records it makes to `made` and retires the versions it replaces.
+fn publish(removed: Slice[Contribution], added: Slice[Contribution], mut words: mem::List[Word], mut made: mem::List[u64], alloc: mem::Alloc) fails LoadError {
+    let table = exports()
+    lock(table)
+    let result = attempt publish_locked(table, removed, added, mut words, mut made, alloc)
+    unlock(table)
+    match result {
+        Ok(_) => {}
+        Err(error) => fail error
+    }
+} publish
+
+fn publish_locked(table: u64, removed: Slice[Contribution], added: Slice[Contribution], mut words: mem::List[Word], mut made: mem::List[u64], alloc: mem::Alloc) fails LoadError {
+    var plans = mem::List[Planned].empty(alloc)
+    for contribution in removed {
+        try start_plan(mut plans, record: contribution.record, size: contribution.size, alloc)
+    }
+    for contribution in added {
+        try start_plan(mut plans, record: contribution.record, size: contribution.size, alloc)
+    }
+    for contribution in removed {
+        withdraw(mut plans, contribution)
+    }
+    for contribution in added {
+        try insert(mut plans, contribution)
+    }
+    let fields = gate_fields(added, mut words, mut made, alloc)
+    var versions = mem::List[u64].empty(alloc)
+    for planned in plans {
+        mut versions.push(version_of(planned, gatings: fields.view()))
+    }
+    for gating in fields {
+        store_word(gating.word, value: gating.target)
+    }
+    for word in words {
+        if not gated(word, gatings: fields.view()) {
+            store_word(word.address, value: 0)
+        }
+    }
+    mut words.retain(fn(word: Word) => gated(word, gatings: fields.view()))
+    for index in 0..<plans.len() {
+        let replaced = load_word(plans[index].record)
+        store_word(plans[index].record, value: versions[index])
+        if word_at(replaced + VERSION_MADE) == 1 {
+            discard retire(table, kind: RETIRED_VERSION, content: replaced)
+        }
+    }
+} publish_locked
+
+/// Adds a plan for a registry not yet planned, starting from the entries of its current version.
+fn start_plan(mut plans: mem::List[Planned], record: u64, size: u64, alloc: mem::Alloc) fails LoadError {
+    for known in plans {
+        if known.record == record {
+            if known.size != size {
+                fail LoadError.Malformed
+            }
+            return
+        }
+    }
+    let current = load_word(record)
+    let array = word_at(current)
+    var entries = mem::List[u64].empty(alloc)
+    for index in 0..<word_at(current + 8) {
+        mut entries.push(array + index * size)
+    }
+    mut plans.push(Planned(record: record, size: size, entries: take entries))
+} start_plan
+
+/// Removes from its registry's plan the entry whose key equals a contribution's.
+fn withdraw(mut plans: mem::List[Planned], contribution: Contribution) {
+    let key = contribution.key
+    let at = contribution.entry + key.offset
+    for planned in mut plans {
+        if planned.record == contribution.record {
+            mut planned.entries.retain(fn(entry: u64) => compare(key.form, left: entry + key.offset, right: at) != core::Ordering.Equal)
+        }
+    }
+} withdraw
+
+/// Inserts a contribution's entry into its registry's plan before the first entry whose key is
+/// greater, failing when an entry has an equal key or an equal unique field.
+fn insert(mut plans: mem::List[Planned], contribution: Contribution) fails LoadError {
+    let key = contribution.key
+    let at = contribution.entry
+    for planned in mut plans {
+        if planned.record != contribution.record {
+            continue
+        }
+        var position = planned.entries.len()
+        for index in 0..<planned.entries.len() {
+            let entry = planned.entries[index]
+            let order = compare(key.form, left: entry + key.offset, right: at + key.offset)
+            if order == core::Ordering.Equal {
+                fail LoadError.DuplicateKey
+            }
+            if order == core::Ordering.Greater and position == planned.entries.len() {
+                position = index
+            }
+            try distinct(contribution.unique.view(), entry, at)
+        }
+        mut planned.entries.insert(position, value: at)
+    }
+} insert
+
+/// Fails when two entries hold equal values of a unique field.
+fn distinct(unique: Slice[Field], entry: u64, at: u64) fails LoadError {
+    for field in unique {
+        if compare(field.form, left: entry + field.offset, right: at + field.offset) == core::Ordering.Equal {
+            fail LoadError.DuplicateUnique
+        }
+    }
+} distinct
+
+/// The gate of each function field of the added entries: a new target record naming the
+/// field's function, which `made` holds, and the gate record of the same registry, key and field
+/// when `words` holds one, now naming the added entry, otherwise a new one, which `words` then
+/// holds.
+fn gate_fields(added: Slice[Contribution], mut words: mem::List[Word], mut made: mem::List[u64], alloc: mem::Alloc) -> mem::List[Gating] {
+    var found = mem::List[Gating].empty(alloc)
+    for contribution in added {
+        for gate in contribution.gates {
+            let target = reserve(TARGET_BYTES)
+            set_word(target, value: word_at(contribution.entry + gate.offset))
+            mut made.push(target)
+            var word: u64 = 0
+            for known in mut words {
+                let same = known.record == contribution.record and known.offset == gate.offset
+                if same and compare(known.key.form, left: known.entry + known.key.offset, right: contribution.entry + contribution.key.offset) == core::Ordering.Equal {
+                    word = known.address
+                    known.entry = contribution.entry
+                    known.key = contribution.key
+                }
+            }
+            if word == 0 {
+                word = reserve(8)
+                mut words.push(Word(record: contribution.record, entry: contribution.entry, key: contribution.key, offset: gate.offset, address: word))
+            }
+            mut found.push(Gating(entry: contribution.entry, offset: gate.offset, glue: gate.glue, word: word, target: target))
+        }
+    }
+    return found
+} gate_fields
+
+/// Whether a gating uses a gate record.
+fn gated(word: Word, gatings: Slice[Gating]) -> bool {
+    for gating in gatings {
+        if gating.word == word.address {
+            return true
+        }
+    }
+    return false
+} gated
+
+/// A version the loader makes holding a plan's entries, the function fields of each added one
+/// calling through their gates.
+fn version_of(planned: Planned, gatings: Slice[Gating]) -> u64 {
+    let count = u64.widen(planned.entries.len())
+    var bytes = count * planned.size
+    if bytes == 0 {
+        bytes = 1
+    }
+    let array = reserve(bytes)
+    for index in 0..<planned.entries.len() {
+        let from = planned.entries[index]
+        let to = array + u64.widen(index) * planned.size
+        copy_memory(from, to, len: planned.size)
+        for gating in gatings {
+            if gating.entry == from {
+                set_word(to + gating.offset, value: gating.glue)
+                set_word(to + gating.offset + 8, value: gating.word)
+            }
+        }
+    }
+    let made = reserve(VERSION_BYTES)
+    set_word(made, value: array)
+    set_word(made + 8, value: count)
+    set_word(made + VERSION_MADE, value: 1)
+    return made
+} version_of
+
+/// Retires a placement once no version still lists its entries: its target records stay, and
+/// what it takes is reclaimed once none of them runs a call.
+fn retire_placement(placement: Placement, targets: Slice[u64]) {
+    let table = exports()
+    let count = u64.widen(targets.len())
+    var array: u64 = 0
+    if count > 0 {
+        array = reserve(count * 8)
+        for index in 0..<targets.len() {
+            set_word(array + u64.widen(index) * 8, value: targets[index])
+        }
+    }
+    lock(table)
+    let record = retire(table, kind: RETIRED_PLACEMENT, content: placement.memory)
+    set_word(record + RETIRED_FIRST + 8, value: placement.window)
+    set_word(record + RETIRED_FIRST + 16, value: placement.pages)
+    set_word(record + RETIRED_FIRST + 24, value: placement.lines)
+    set_word(record + RETIRED_FIRST + 32, value: array)
+    set_word(record + RETIRED_FIRST + 40, value: count)
+    unlock(table)
+} retire_placement
+
+/// Appends a retirement of a kind to the loader's list, under its lock, giving its record.
+fn retire(table: u64, kind: u64, content: u64) -> u64 {
+    let record = reserve(RETIRED_BYTES)
+    set_word(record + RETIRED_KIND, value: kind)
+    set_word(record + RETIRED_FIRST, value: content)
+    var link = table + EXPORT_RETIRED
+    while word_at(link) != 0 {
+        link = word_at(link)
+    }
+    set_word(link, value: record)
+    return record
+} retire
+
+/// Under the loader's lock, frees each retired version no read holds, and detaches from the
+/// window each retired placement no older retired version lists and whose targets run no call,
+/// unlinking its line tables. Gives whether memory detached from the window awaits invalidation.
+fn retire_unused(table: u64) -> bool {
+    var older = false
+    var detached = false
+    var link = table + EXPORT_RETIRED
+    loop {
+        let record = word_at(link)
+        if record == 0 {
+            return detached
+        }
+        let kind = word_at(record + RETIRED_KIND)
+        let content = word_at(record + RETIRED_FIRST)
+        var done = false
+        if kind == RETIRED_VERSION {
+            if load_word(content + VERSION_READERS) == 0 {
+                release(word_at(content))
+                done = true
+            } else {
+                older = true
+            }
+        } else if kind == RETIRED_PLACEMENT {
+            if not older and unpinned(record) {
+                detach(table, record)
+                done = true
+            }
+        } else {
+            detached = true
+        }
+        if done {
+            set_word(link, value: word_at(record))
+            release(record)
+        } else {
+            link = record
+        }
+    }
+} retire_unused
+
+/// Whether no target record of a retired placement runs a call.
+fn unpinned(record: u64) -> bool {
+    let targets = word_at(record + RETIRED_FIRST + 32)
+    for index in 0..<word_at(record + RETIRED_FIRST + 40) {
+        if load_word(word_at(targets + index * 8) + TARGET_PINS) != 0 {
+            return false
+        }
+    }
+    return true
+} unpinned
+
+/// Detaches a retired placement: unlinks its line tables, clears its window entries and the
+/// window tables they leave empty, and retires its memory and those tables until translations
+/// of them are invalidated.
+fn detach(table: u64, record: u64) {
+    let lines = word_at(record + RETIRED_FIRST + 24)
+    var at = word_at(table + EXPORT_LINES)
+    loop {
+        let next = load_word(at + LINES_NEXT)
+        if next == 0 {
+            break
+        }
+        if next == lines {
+            store_word(at + LINES_NEXT, value: load_word(lines + LINES_NEXT))
+            break
+        }
+        at = next
+    }
+    let window = word_at(record + RETIRED_FIRST + 8)
+    let pages = word_at(record + RETIRED_FIRST + 16)
+    for index in 0..<pages {
+        let slot = leaf_slot(table, address: window + index * PAGE)
+        if slot != 0 {
+            store_word(slot, value: 0)
+        }
+    }
+    let span = 1u64 << MEGABYTES_SHIFT
+    var region = window / span * span
+    while region < window + pages * PAGE {
+        prune(table, region)
+        region += span
+    }
+    discard retire(table, kind: RETIRED_MEMORY, content: word_at(record + RETIRED_FIRST))
+    let targets = word_at(record + RETIRED_FIRST + 32)
+    if targets != 0 {
+        release(targets)
+    }
+} detach
+
+/// Clears the window entries of the tables mapping the 2 MiB region at an address that it leaves
+/// empty, retiring those tables.
+fn prune(table: u64, region: u64) {
+    let top_slot = word_at(table + EXPORT_WINDOW) + index_of(region, shift: GIGABYTE_SHIFT) * 8
+    let middle = load_word(top_slot) & ADDRESS_BITS
+    if middle == 0 {
+        return
+    }
+    let middle_slot = middle + index_of(region, shift: MEGABYTES_SHIFT) * 8
+    let leaf = load_word(middle_slot) & ADDRESS_BITS
+    if leaf != 0 and holds_nothing(leaf) {
+        store_word(middle_slot, value: 0)
+        discard retire(table, kind: RETIRED_TABLE, content: leaf)
+    }
+    if holds_nothing(middle) {
+        store_word(top_slot, value: 0)
+        discard retire(table, kind: RETIRED_TABLE, content: middle)
+    }
+} prune
+
+/// Under the loader's lock, once translations of them are invalidated, frees the memory detached
+/// from the window and keeps the detached tables for later mappings.
+fn release_detached(table: u64) {
+    var link = table + EXPORT_RETIRED
+    loop {
+        let record = word_at(link)
+        if record == 0 {
+            return
+        }
+        let kind = word_at(record + RETIRED_KIND)
+        let content = word_at(record + RETIRED_FIRST)
+        if kind == RETIRED_MEMORY or kind == RETIRED_TABLE {
+            if kind == RETIRED_MEMORY {
+                release(content)
+            } else {
+                set_word(content, value: word_at(table + EXPORT_TABLES))
+                set_word(table + EXPORT_TABLES, value: content)
+            }
+            set_word(link, value: word_at(record))
+            release(record)
+        } else {
+            link = record
+        }
+    }
+} release_detached
+
+/// The retired placements not yet reclaimed.
+fn placements_left(table: u64) -> usize {
+    var left: usize = 0
+    var record = word_at(table + EXPORT_RETIRED)
+    while record != 0 {
+        if word_at(record + RETIRED_KIND) == RETIRED_PLACEMENT {
+            left += 1
+        }
+        record = word_at(record)
+    }
+    return left
+} placements_left
+
+/// The slot of the window entry mapping the page at an address, adding the tables it lacks.
+fn slot_for(table: u64, address: u64) -> u64 {
+    let middle = descend(table, at: word_at(table + EXPORT_WINDOW), address, shift: GIGABYTE_SHIFT)
+    let leaf = descend(table, at: middle, address, shift: MEGABYTES_SHIFT)
+    return leaf + index_of(address, shift: PAGE_SHIFT) * 8
+} slot_for
+
+/// The table an entry of the window table at `at` names for an address, a new one when it names
+/// none.
+fn descend(table: u64, at: u64, address: u64, shift: u32) -> u64 {
+    let slot = at + index_of(address, shift) * 8
+    let held = load_word(slot) & ADDRESS_BITS
+    if held != 0 {
+        return held
+    }
+    var fresh = word_at(table + EXPORT_TABLES)
+    if fresh != 0 {
+        set_word(table + EXPORT_TABLES, value: word_at(fresh))
+        set_word(fresh, value: 0)
+    } else {
+        fresh = aligned(reserve(2 * PAGE))
+    }
+    store_word(slot, value: window_entry(fresh, kind: KIND_TABLE))
+    return fresh
+} descend
+
+/// The slot of the window entry mapping the page at an address, zero when a table is missing.
+fn leaf_slot(table: u64, address: u64) -> u64 {
+    let middle = load_word(word_at(table + EXPORT_WINDOW) + index_of(address, shift: GIGABYTE_SHIFT) * 8) & ADDRESS_BITS
+    if middle == 0 {
+        return 0
+    }
+    let leaf = load_word(middle + index_of(address, shift: MEGABYTES_SHIFT) * 8) & ADDRESS_BITS
+    if leaf == 0 {
+        return 0
+    }
+    return leaf + index_of(address, shift: PAGE_SHIFT) * 8
+} leaf_slot
+
+/// The index in a window table of the entry for an address, its entries each covering
+/// `1 << shift` bytes.
+fn index_of(address: u64, shift: u32) -> u64 {
+    return (address >> shift) & (TABLE_ENTRIES - 1)
+} index_of
+
+/// Whether a window table holds no entry.
+fn holds_nothing(held: u64) -> bool {
+    for index in 0..<TABLE_ENTRIES {
+        if load_word(held + index * 8) != 0 {
+            return false
+        }
+    }
+    return true
+} holds_nothing
+
+/// How the field values of a form at two addresses compare: text by its bytes, then its length,
+/// integers by value.
+fn compare(form: u64, left: u64, right: u64) -> core::Ordering {
+    if form == TEXT {
+        return compare_text(left, right)
+    }
+    let width = width_of(form)
+    var a = read_le(left, width)
+    var b = read_le(right, width)
+    if form > SIGNED {
+        let flip = 1u64 << u32.fit(width * 8 - 1)
+        a = a ^ flip
+        b = b ^ flip
+    }
+    return a.cmp(b)
+} compare
+
+fn compare_text(left: u64, right: u64) -> core::Ordering {
+    let left_text = word_at(left)
+    let right_text = word_at(right)
+    let left_len = word_at(left + 8)
+    let right_len = word_at(right + 8)
+    var shorter = left_len
+    if right_len < shorter {
+        shorter = right_len
+    }
+    for index in 0..<shorter {
+        let order = byte_at(left_text + index).cmp(byte_at(right_text + index))
+        if order != core::Ordering.Equal {
+            return order
+        }
+    }
+    return left_len.cmp(right_len)
+} compare_text
+
+/// The little-endian integer of `width` bytes at an address.
+fn read_le(address: u64, width: u64) -> u64 {
+    var value: u64 = 0
+    for index in 0..<width {
+        value = value | (u64.widen(byte_at(address + index)) << u32.fit(index * 8))
+    }
+    return value
+} read_le
+
+/// An address rounded up to a page.
+fn aligned(address: u64) -> u64 {
+    return (address + PAGE - 1) / PAGE * PAGE
+} aligned
+
+/// Takes the loader's lock in the kernel's export table.
+fn lock(table: u64) {
+    let word = hw::Ptr[u64].of_addr(usize.widen(table + EXPORT_LOCK))
+    loop {
+        let taken = trusted "the export table's lock word lies in the kernel's writable data, aligned" { word.atomic_compare_swap(0, replacement: 1, order: hw::Order.Acquire) }
+        if taken.is_ok() {
+            return
+        }
+    }
+} lock
+
+/// Releases the loader's lock.
+fn unlock(table: u64) {
+    let word = hw::Ptr[u64].of_addr(usize.widen(table + EXPORT_LOCK))
+    trusted "the export table's lock word lies in the kernel's writable data, aligned" {
+        word.atomic_store(0, order: hw::Order.Release)
+    }
+} unlock
+
+/// Copies a span of a bundle's bytes into the runtime memory the loader reserved at `to`.
+fn copy_in(bundle: Slice[u8], from: Span, to: u64) {
+    let source = hw::Ptr.of_view(bundle)
+    trusted "the span lies inside the bundle, and the reserved memory at `to` holds the span's bytes" {
+        source.offset(isize.fit(from.start)).copy(hw::Ptr[u8].of_addr(usize.widen(to)), count: from.len)
+    }
+} copy_in
+
+/// Copies `len` bytes of an entry into a table version not yet published.
+fn copy_memory(from: u64, to: u64, len: u64) {
+    trusted "the entry lies in a placed image or a table version, and `to` in a version not yet published" {
+        hw::Ptr[u8].of_addr(usize.widen(from)).copy(hw::Ptr[u8].of_addr(usize.widen(to)), count: usize.widen(len))
+    }
+} copy_memory
+
+/// The byte at an address of the kernel's tables or of a placed image.
+fn byte_at(address: u64) -> u8 {
+    return trusted "the address lies in the kernel's export table, its tables, an image the loader placed or the text an entry's key views" { hw::Ptr[u8].of_addr(usize.widen(address)).read() }
+} byte_at
+
+/// The little-endian word at an address, whatever its alignment.
+fn word_at(address: u64) -> u64 {
+    return read_le(address, width: 8)
+} word_at
+
+/// Writes a little-endian word at an address of memory the loader reserved and has not
+/// published.
+fn set_word(address: u64, value: u64) {
+    for index in 0u64..<8 {
+        let byte = u8.truncate(value >> u32.fit(index * 8))
+        trusted "the address lies in an image or a table version the loader has not published" {
+            hw::Ptr[u8].of_addr(usize.widen(address + index)).write(byte)
+        }
+    }
+} set_word
+
+/// Reads an aligned word that other CPUs write: a table record's version or line-table link.
+fn load_word(address: u64) -> u64 {
+    return trusted "the word is an aligned table record or line-table link" { hw::Ptr[u64].of_addr(usize.widen(address)).atomic_load(hw::Order.Acquire) }
+} load_word
+
+/// Writes an aligned word that other CPUs read: a table record's version, a gate word or a
+/// line-table link.
+fn store_word(address: u64, value: u64) {
+    trusted "the word is an aligned table record, gate word or line-table link" {
+        hw::Ptr[u64].of_addr(usize.widen(address)).atomic_store(value, order: hw::Order.Release)
+    }
+} store_word
+
+/// Reads a uvar, failing past the reader's end.
+fn Reader.uvar(mut self, bytes: Slice[u8]) -> u64 fails LoadError {
+    var value: u64 = 0
+    var shift: u32 = 0
+    loop {
+        if self.at >= self.end or self.end > bytes.len() or shift > 63 {
+            fail LoadError.Malformed
+        }
+        let byte = bytes[self.at]
+        self.at += 1
+        value = value | (u64.widen(byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            return value
+        }
+        shift += 7
+    }
+} Reader.uvar
+
+/// Reads bytes: their length, then the span they occupy.
+fn Reader.span(mut self, bytes: Slice[u8]) -> Span fails LoadError {
+    let len = try mut self.uvar(bytes)
+    if len > u64.widen(self.end - self.at) {
+        fail LoadError.Malformed
+    }
+    let span = Span(start: self.at, len: usize.widen(len))
+    self.at += usize.widen(len)
+    return span
+} Reader.span
+
+/// Reads a field: its offset, then its form.
+fn Reader.field(mut self, bytes: Slice[u8]) -> Field fails LoadError {
+    let offset = try mut self.uvar(bytes)
+    let form = try mut self.uvar(bytes)
+    return Field(offset: offset, form: form)
+} Reader.field
+
+/// Reads a list of fields into `found`.
+fn Reader.fields(mut self, bytes: Slice[u8], mut found: mem::List[Field]) fails LoadError {
+    let count = try mut self.uvar(bytes)
+    for _ in 0..<count {
+        mut found.push(try mut self.field(bytes))
+    }
+} Reader.fields
+
+/// Reads a list of function fields, each its offset, into `found` with the gate the table
+/// record at `record` names for it.
+fn Reader.gates(mut self, bytes: Slice[u8], mut found: mem::List[Gate], record: u64) fails LoadError {
+    let count = try mut self.uvar(bytes)
+    for _ in 0..<count {
+        let offset = try mut self.uvar(bytes)
+        let glue = glue_of(record, offset)
+        if record == 0 or glue == 0 {
+            fail LoadError.Malformed
+        }
+        mut found.push(Gate(offset: offset, glue: glue))
+    }
+} Reader.gates

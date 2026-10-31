@@ -1,4 +1,4 @@
-//! Allocators, budgets and stores: heaps, boxes, shared values, arenas, pools and once maps. An allocator or heap is a cell handle, and a budget the holding of one. A box is the address of its contents. A shared value is the address of its count, its allocator handle, its reach and its contents. An arena or once map is the address of the header of its segments. A pool is a vector of slots, each its generation, whether it is occupied and its value, then the count of occupied slots.
+//! Allocators, budgets and stores: heaps, boxes, shared values, arenas, pools and once maps. An allocator or heap is a cell handle, and a budget the holding of one. A box is the address of its contents. A shared value is the address of its count, its allocator handle, its reach and its contents. An arena or once map is the address of the header of its segments. A pool is a vector of slots, each its generation, whether it is occupied and its value, then the count of occupied slots and the count of retired slots, those vacant at generation 2^32 − 1.
 
 /// The offsets of a shared value's count, allocator handle and reach, and of its contents.
 const SHARED_COUNT: u64 = 0
@@ -9,8 +9,10 @@ const SHARED_REACH: u64 = 16
 
 const SHARED_HEADER: u64 = 24
 
-/// The offset of a pool's count of occupied slots.
+/// The offsets of a pool's count of occupied slots and of its count of retired slots.
 const POOL_COUNT: u64 = 32
+
+const POOL_RETIRED: u64 = 40
 
 /// The layout of a pool slot: its size and alignment, and the offset of its value.
 struct SlotShape derives Copy {
@@ -606,6 +608,7 @@ fn stores_pool(mut lo: Lowering, mut fx: Fx, supply: Supply)
             vector_empty(mut fx, address: sret, alloc: cell, element: slot)
             let zero = mut fx.ptr(0)
             mut fx.store(zero, addr: sret, offset: POOL_COUNT)
+            mut fx.store(zero, addr: sret, offset: POOL_RETIRED)
             supply.done(mut lo, mut fx)
         }
         "len" => {
@@ -657,7 +660,9 @@ fn stores_pool(mut lo: Lowering, mut fx: Fx, supply: Supply)
             let additional = supply.param(1).scalar_value()
             let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
             let count = mut fx.load(PTR, addr: address, offset: POOL_COUNT)
-            let free = mut fx.b.isub(len, y: count)
+            let retired_slots = mut fx.load(PTR, addr: address, offset: POOL_RETIRED)
+            let unoccupied = mut fx.b.isub(len, y: count)
+            let free = mut fx.b.isub(unoccupied, y: retired_slots)
             let short = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: additional, y: free)
             mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
                 let missing = mut fx1.b.isub(additional, y: free)
@@ -759,13 +764,20 @@ fn pool_handle_member(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty:
             let count = mut fx.load(PTR, addr: address, offset: POOL_COUNT)
             let counted = mut fx.b.iadd_imm_s(count, y: -1)
             mut fx.store(counted, addr: address, offset: POOL_COUNT)
+            let retiring = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: -1)
+            mut fx.if_true(retiring, then: fn(mut fx1: Fx) {
+                let retired_slots = mut fx1.load(PTR, addr: address, offset: POOL_RETIRED)
+                let counted_retired = mut fx1.b.iadd_imm_s(retired_slots, y: 1)
+                mut fx1.store(counted_retired, addr: address, offset: POOL_RETIRED)
+            })
             let removed = mut lo.held_at(mut fx, ty: element, address: result)
             supply.ret(mut lo, mut fx, held: removed)
         }
     }
 } pool_handle_member
 
-/// The index of the earliest slot not occupied, or the length when every slot is.
+/// The index of the earliest free slot, neither occupied nor retired, or the length when there
+/// is none.
 fn first_free(mut fx: Fx, data: clif::Value, len: clif::Value, slot: Element) -> clif::Value {
     let zero = mut fx.ptr(0)
     let initial = fx.list1(zero)
@@ -778,9 +790,12 @@ fn first_free(mut fx: Fx, data: clif::Value, len: clif::Value, slot: Element) ->
             let at = slot.at(mut fx2, data, index)
             let flag = mut fx2.load(clif::Type.Int32, addr: at, offset: 4)
             let occupied = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+            let generation = mut fx2.load(clif::Type.Int32, addr: at, offset: 0)
+            let last = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: generation, y: -1)
+            let taken = mut fx2.b.bor(occupied, y: last)
             let following = mut fx2.b.iadd_imm_s(index, y: 1)
-            let position = mut fx2.b.select(occupied, x: following, y: index)
-            return fx2.list2(position, b: occupied)
+            let position = mut fx2.b.select(taken, x: following, y: index)
+            return fx2.list2(position, b: taken)
         }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
             let stop = mut fx2.int(clif::Type.Int8, value: 0)
             return fx2.list2(index, b: stop)

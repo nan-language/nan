@@ -28,6 +28,9 @@ const ALLOCATION: usize = 3;
 const GENERATION: usize = 0;
 const OCCUPANT: usize = 1;
 
+/// The generation of a retired pool slot, which never holds an occupant again.
+const RETIRED: i128 = u32::MAX as i128;
+
 /// The positions of a shared value's or cown's parts: its contents, its count, the cell its box
 /// was drawn through and the box's allocation.
 const CONTENTS: usize = 0;
@@ -186,7 +189,7 @@ pub fn member(
             let pool = place(&args[0]);
             let current = interp.memory.get(&pool).clone();
             let slots = entries(interp, &current);
-            let free = slots.iter().filter(|slot| !occupied(slot)).count();
+            let free = slots.iter().filter(|slot| free(slot)).count();
             let needed = slots.len() + (args[1].int() as usize).saturating_sub(free);
             let Some(grown) = grow(interp, &current, needed, &element) else {
                 return Some(exhausted(interp, member == "try_reserve", at));
@@ -259,7 +262,7 @@ pub fn member(
 fn insert_slot(interp: &mut Interpreter, pool: &Loc, value: Val, element: &Ty) -> Option<Val> {
     let current = interp.memory.get(pool).clone();
     let mut slots = entries(interp, &current);
-    let index = match slots.iter().position(|slot| !occupied(slot)) {
+    let index = match slots.iter().position(free) {
         Some(index) => index,
         None => {
             let grown = grow(interp, &current, slots.len() + 1, element)?;
@@ -284,6 +287,11 @@ fn slot(generation: Val, occupant: Val) -> Val {
 
 fn occupied(slot: &Val) -> bool {
     slot.fields()[OCCUPANT] != Val::Absent
+}
+
+/// Whether a slot can take an occupant: neither occupied nor retired.
+fn free(slot: &Val) -> bool {
+    !occupied(slot) && slot.fields()[GENERATION] != Val::Int(RETIRED)
 }
 
 /// A new box holding a value, drawn through a cell; none on exhaustion.
@@ -625,3 +633,6 @@ fn release_container(interp: &mut Interpreter, container: &Val) {
     }
     interp.memory.kill(place(&parts[STORAGE]).extent);
 }
+
+#[cfg(test)]
+mod tests;

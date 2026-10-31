@@ -462,22 +462,9 @@ fn Lowering.entry_stack(mut self, code: object::FuncId, own: Option[u64]) {
     }
 } Lowering.entry_stack
 
-/// The address of the table of task entries' own stacks, declared once.
-fn Lowering.entry_table(mut self, mut fx: Fx) -> clif::Value {
-    let id = match self.entry_table_id {
-        Some(known) => known
-        None => mut self.module.declare_data(ENTRY_STACKS, linkage: object::Linkage.Local, writable: false, tls: false)
-    }
-    self.entry_table_id = Some(id)
-    let global = mut self.data_ref(mut fx, id)
-    return mut fx.b.symbol_value(PTR, global_value: global)
-} Lowering.entry_table
-
-/// Defines the table of task entries' own stacks, when a spawn reads it.
-fn emit_entry_stacks(mut lo: Lowering) {
-    let Some(id) = lo.entry_table_id else {
-        return
-    }
+/// Defines the table of task entries' own stacks, which the image's line tables point at.
+fn emit_entry_stacks(mut lo: Lowering) -> object::DataId {
+    let id = mut lo.module.declare_data(ENTRY_STACKS, linkage: object::Linkage.Local, writable: false, tls: false)
     var bytes = mem::Bytes.empty(lo.alloc)
     object::append_u64(mut bytes, value: u64.widen(lo.entry_stacks.len()))
     var description = object::DataDescription.new(lo.alloc)
@@ -494,12 +481,27 @@ fn emit_entry_stacks(mut lo: Lowering) {
         index += 1
     }
     mut lo.module.define_data(id, take description)
+    return id
 } emit_entry_stacks
 
 /// The usable stack a task entry's own `limits stack N` needs, when its code is in the table of
-/// such entries, or `usable`.
+/// such entries of the image, or a bundle's kernel, or of a bundle loaded after it, or `usable`.
 fn tasks_own_stack(mut lo: Lowering, mut fx: Fx, code: clif::Value, usable: clif::Value) -> clif::Value {
-    let table = mut lo.entry_table(mut fx)
+    let head = mut lo.line_head(mut fx)
+    let found = mut fx.repeat(fx.list2(head, b: usable).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let tables = state[0]
+        let table = mut fx1.load(PTR, addr: tables, offset: LINES_ENTRY_STACKS)
+        let size = own_stack_in(mut fx1, table, code, usable: state[1])
+        let next = mut fx1.load(PTR, addr: tables, offset: LINES_NEXT)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        return Pass(again: more, next: fx1.list2(next, b: size))
+    })
+    return found[1]
+} tasks_own_stack
+
+/// The larger of `usable` and the stack a table of task entries' own stacks gives `code`.
+fn own_stack_in(mut fx: Fx, table: clif::Value, code: clif::Value, usable: clif::Value) -> clif::Value {
     let count = mut fx.load(PTR, addr: table, offset: 0)
     let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
     let stacks = mut fx.choose(any, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
@@ -524,7 +526,7 @@ fn tasks_own_stack(mut lo: Lowering, mut fx: Fx, code: clif::Value, usable: clif
         return fx1.list1(usable)
     })
     return stacks[0]
-} tasks_own_stack
+} own_stack_in
 
 /// `Spawn(glue, code, env, extra, stack, cell, domain, region)`: a new task record with `extra`
 /// bytes after it for the entry's result and failure, and a stack of `stack` usable bytes, or

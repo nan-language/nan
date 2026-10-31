@@ -444,6 +444,8 @@ pub struct ConstItem {
 
 #[derive(Clone, Debug)]
 pub struct RegistryItem {
+    /// Whether the registry is written `loaded`, its table extending as bundles load.
+    pub loaded: bool,
     pub name: Name,
     pub entry: TypeExpr,
     pub key: Name,

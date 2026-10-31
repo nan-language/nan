@@ -7,7 +7,10 @@
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
 //! A host program with a `codegen` file is also built and run at each codegen level it lists, one
 //! per line, writing what it expects where this machine has the level's extensions and refusing
-//! to run otherwise. Its builds use the harnesses' home directory.
+//! to run otherwise. A kernel's `bundles` directory holds packages that the harness builds against
+//! the kernel's interface, signed by the principal `tester`, and passes to each boot as the fw_cfg
+//! file `opt/nan/<package>`. Each package's dependencies are synced before its build. The builds
+//! use the harnesses' home directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,6 +114,70 @@ fn runs_level(level: &str) -> bool {
     }
 }
 
+/// Builds each package of a kernel's `bundles` directory against the kernel's interface, signed
+/// by `tester`, and gives the emulator arguments passing each bundle to the kernel.
+fn bundles(root: &Path, name: &str, target: &str) -> datatest_stable::Result<Vec<String>> {
+    let Ok(entries) = fs::read_dir(root.join(name).join("bundles")) else {
+        return Ok(Vec::new());
+    };
+    let mut packages: Vec<String> = entries
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    packages.sort();
+    sign_as_tester()?;
+    let images = format!(".nan/images/{target}");
+    let interface = format!("{images}/{name}.nlif");
+    let mut args = Vec::new();
+    for package in packages {
+        synced(root, &package)?;
+        let build = ["build", &package, "--against", &interface, "--as", "tester"];
+        let built = nan::run(&build.map(str::to_owned), root);
+        if built.status != 0 {
+            return Err(format!(
+                "building {package} exits with {} and reports\n{}",
+                built.status, built.output
+            )
+            .into());
+        }
+        let bundle = root.join(&images).join(format!("{package}.nbun"));
+        args.push("-fw_cfg".to_owned());
+        args.push(format!("name=opt/nan/{package},file={}", bundle.display()));
+    }
+    Ok(args)
+}
+
+/// Syncs the dependencies of a package of the program's workspace, which puts each path release
+/// it locks in the local store.
+fn synced(root: &Path, package: &str) -> datatest_stable::Result<()> {
+    let sync = nan::run(&["dep", "sync", package].map(str::to_owned), root);
+    match sync.status {
+        0 => Ok(()),
+        status => Err(format!(
+            "syncing {package} exits with {status} and reports\n{}",
+            sync.output
+        )
+        .into()),
+    }
+}
+
+/// Gives the principal `tester` the key of the seed of 32 bytes 7 in the harnesses' home
+/// directory.
+fn sign_as_tester() -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let keys = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("home/.nan/keys");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&keys)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(keys.join("tester.key"))?;
+    std::io::Write::write_all(&mut file, &[7; 32])
+}
+
 fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     let source = path.parent().expect("a program directory");
     let name = source.file_name().expect("a program name");
@@ -119,9 +186,11 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     copy_dir(source.as_std_path(), &root.join(name))?;
     fs::create_dir_all(tmp.join("home"))?;
     nan::use_home(tmp.join("home"), None);
+    synced(&root, name)?;
     build(&root, name)?;
     let (wanted_status, wanted) = expected.split_once('\n').expect("an expected status line");
     let target = target(&root.join(name))?;
+    let bundles = bundles(&root, name, &target)?;
     let mut runs = Vec::new();
     match target.strip_suffix("-host") {
         Some(arch) if arch != std::env::consts::ARCH => {}
@@ -162,6 +231,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 launch
                     .args
                     .extend(extra.split_whitespace().map(str::to_owned));
+                launch.args.extend(bundles.iter().cloned());
                 let booted = machine::boot(&launch)?;
                 let label = format!(" booted with `{extra}`");
                 runs.push((

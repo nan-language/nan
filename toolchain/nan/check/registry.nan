@@ -83,6 +83,7 @@ fn Checker.check_registry(self, item: ty::ItemId, declared: ast::RegistryItem) {
         fields: fields.view(),
         name: declared.key,
         keyed: true,
+        loaded: declared.loaded,
         subst,
         module,
         mut named,
@@ -94,12 +95,107 @@ fn Checker.check_registry(self, item: ty::ItemId, declared: ast::RegistryItem) {
             fields: fields.view(),
             name,
             keyed: false,
+            loaded: declared.loaded,
             subst,
             module,
             mut named,
         )
     }
+    if declared.loaded {
+        self.check_loaded_fields(item, declared, fields: fields.view(), subst)
+    }
 } Checker.check_registry
+
+/// Whether a type may be a key or unique field of a loaded registry, which loading compares:
+/// an integer type, `bool`, `char` or `Str`.
+fn Checker.loaded_key(self, ty: ty::Ty) -> bool {
+    return match self.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => not scalar.is_float()
+        else => self.is_std(ty, path: "core::Str")
+    }
+} Checker.loaded_key
+
+/// The rules of a loaded registry's entry type: it holds a function type only as the type of
+/// one of its fields (`registry.loaded-entry`), and such a field's type demands neither `pure`
+/// nor `notrap`, has boundary types as its parameters, result and failure, and no `mut` parameter
+/// of a view type (`registry.loaded-field`).
+fn Checker.check_loaded_fields(self, item: ty::ItemId, declared: ast::RegistryItem, fields: Slice[FieldSig], subst: ty::Subst) {
+    let types = self.types()
+    for field in fields {
+        let Some(code) = self.loaded_field_problem(subst.ty(types, ty: field.ty)) else {
+            continue
+        }
+        self.report(item, token: declared.entry.token, code)
+        return
+    }
+} Checker.check_loaded_fields
+
+/// The rule of loaded registries a field's type breaks, none when it breaks none.
+fn Checker.loaded_field_problem(self, field_ty: ty::Ty) -> Option[diagnostic::Code] {
+    let types = self.types()
+    match types.kind(field_ty) {
+        ty::TyKind.Fn(id) => {
+            let fn_type = types.fn_of(id)
+            if fn_type.limit_set.pure or fn_type.limit_set.notrap or not self.boundary(fn_type.result) {
+                return Some(diagnostic::Code.RegistryLoadedField)
+            }
+            match fn_type.failure {
+                Some(failure) => {
+                    if not self.boundary(failure) {
+                        return Some(diagnostic::Code.RegistryLoadedField)
+                    }
+                }
+                None => {}
+            }
+            for param in fn_type.params {
+                if not self.boundary(param.ty) or (param.mode == ast::Mode.Mut and self.has(param.ty, property: Property.View)) {
+                    return Some(diagnostic::Code.RegistryLoadedField)
+                }
+            }
+            return None
+        }
+        else => {}
+    }
+    if self.any_part(field_ty, test_part: fn(part: ty::Ty) => is_function(types, ty: part)) {
+        return Some(diagnostic::Code.RegistryLoadedEntry)
+    }
+    return None
+} Checker.loaded_field_problem
+
+/// The primitive capabilities through which code installs functions that outlive the call: the
+/// root grants and IRQ-safe locks, whose devices' interrupt functions run until uninstalled.
+const INSTALLING: Str = "boot::Machine boot::Kernel boot::Services hw::IrqShared"
+
+/// Whether a type may cross a gate: the unit type, `Never`, a type implementing `Encode`, or a
+/// handle type: a primitive capability through which no code is installed, a capability kind or
+/// an outbox.
+fn Checker.boundary(self, ty: ty::Ty) -> bool {
+    match self.types().kind(ty) {
+        ty::TyKind.Unit or ty::TyKind.Never or ty::TyKind.Error => return true
+        ty::TyKind.Item(item: item, args: _) => {
+            if self.is_primitive_capability(item) {
+                return not is_listed(INSTALLING, word: self.db().canonical_text(item))
+            }
+            if self.db().canonical_text(item) == "sys::Outbox" {
+                return true
+            }
+        }
+        else => {}
+    }
+    return match self.db().core_item("Encode") {
+        Some(encode) => self.implements(ty, interface_item: encode)
+        None => true
+    }
+} Checker.boundary
+
+/// Whether a type is a function type.
+fn is_function(types: ty::Types, ty: ty::Ty) -> bool {
+    return match types.kind(ty) {
+        ty::TyKind.Fn(_) => true
+        else => false
+    }
+} is_function
+
 
 /// A key or unique field a registry names: named once, a field of its entry type visible here,
 /// whose type implements `Ord` for the key and `Eq` for a unique field.
@@ -110,6 +206,7 @@ fn Checker.check_registry_name(
     fields: Slice[FieldSig],
     name: ast::Name,
     keyed: bool,
+    loaded: bool,
     subst: ty::Subst,
     module: ty::ModuleId,
     mut named: mem::List[text::String],
@@ -152,7 +249,7 @@ fn Checker.check_registry_name(
         Some(interface_item) => types.has_error(field_ty) or self.implements(field_ty, interface_item)
         None => true
     }
-    if not implemented {
+    if not implemented or (loaded and not types.has_error(field_ty) and not self.loaded_key(field_ty)) {
         self.report(item, token: name.token, code)
     }
 } Checker.check_registry_name

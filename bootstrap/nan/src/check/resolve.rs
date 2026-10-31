@@ -70,14 +70,14 @@ pub fn is_core_vocabulary(name: &str) -> bool {
 }
 
 /// Whether a path is reserved: one of two or more segments starting with `ui`, or starting with
-/// `sys::infer` or `sys::load`.
+/// `sys::infer`.
 fn reserved(path: &Path) -> bool {
     let words: Vec<&str> = path
         .segments
         .iter()
         .map(|segment| segment.text.as_str())
         .collect();
-    matches!(words[..], ["ui", _, ..] | ["sys", "infer" | "load", ..])
+    matches!(words[..], ["ui", _, ..] | ["sys", "infer", ..])
 }
 
 impl Db<'_> {

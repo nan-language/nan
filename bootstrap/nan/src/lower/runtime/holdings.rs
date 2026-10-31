@@ -4,12 +4,14 @@
 //! whose cell closes; a channel's sender or receiver, which counts as released; a minter of a
 //! capability kind, which revokes its entries and keeps its state; a device installed behind an
 //! IRQ-safe lock, which is uninstalled and whose record is freed, the device left as it is; a
-//! stepper, whose record is settled; and on a machine target a DMA buffer's mapping in an I/O
-//! domain, an I/O domain or a PCI function, which std's `hw` unmaps, closes or cuts off.
+//! stepper, whose record is settled; a gate's pin of the code it calls, which counts as released;
+//! and on a machine target a DMA buffer's mapping in an I/O domain, an I/O domain or a PCI
+//! function, which std's `hw` unmaps, closes or cuts off.
 //!
 //! A holding's record is its links, its owner, zero while no domain owns it, its kind and what
 //! it holds: a descriptor, a capability or cell handle, a channel's record, a minter's state
-//! record, a device's record, a stepper's record or the record `hw` keeps. The lock of the cell
+//! record, a device's record, a stepper's record, the address of a pin count, zero while it pins
+//! nothing, or the record `hw` keeps. The lock of the cell
 //! and capability tables guards the lists.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
@@ -44,6 +46,7 @@ pub mod kind {
     pub const STEPPER: i64 = 8;
     pub const UNMAP: i64 = 9;
     pub const DETACH: i64 = 10;
+    pub const PIN: i64 = 11;
 }
 
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
@@ -219,6 +222,13 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
         });
         let stepper = is(fx, kind::STEPPER);
         fx.when(stepper, |fx| components::withdraw(lo, fx, payload));
+        let pin = is(fx, kind::PIN);
+        let pinned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, payload, 0);
+        let unpin = fx.b.ins().band(pin, pinned);
+        fx.when(unpin, |fx| {
+            let less = fx.int(PTR, -1);
+            super::fetch_add(fx, payload, less);
+        });
         if lo.machine() {
             let unmap = is(fx, kind::UNMAP);
             let detach = is(fx, kind::DETACH);

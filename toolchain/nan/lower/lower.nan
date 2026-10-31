@@ -120,13 +120,15 @@ enum Glue derives Eq, Hash {
     Captures(Instance)
     /// Calls a hook of a kernel policy of a type.
     Policy(hook: Hook, ty: ty::Ty)
+    /// Calls, for a function type, the target its gate record names.
+    Gate(ty::FnTyId)
 } Glue
 
 /// Whether a stopping task does not stop inside the glue: one completing the end of a
 /// task or of a construct.
 fn Glue.critical(self) -> bool {
     return match self {
-        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainEnd or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.WithdrawStepper or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
+        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainEnd or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.WithdrawStepper or Glue.SimWithdraw or Glue.WithdrawSignal(_) or Glue.Gate(_) => true
         else => false
     }
 } Glue.critical
@@ -149,6 +151,8 @@ pkg struct Lowered {
     /// A build cache entry holding the code of every function compiled, when some was compiled
     /// anew.
     pkg codes: Option[object::CodesEntry]
+    /// The entries a bundle adds to loaded registries.
+    pkg contributed: mem::List[image::LoadedEntry]
 } Lowered
 
 /// Two entities lowered with one host symbol name, as diagnostics name them: the one named
@@ -181,13 +185,34 @@ pkg struct Program {
     pkg kept: mem::Bytes
     /// The codegen level of the program's manifest for the target's architecture.
     pkg level: Option[workspace::Level]
+    /// A kernel's interface, when it exports the load ABI, and the loaded registries of its
+    /// final closure.
+    pkg kernel: Option[mem::Shared[Interface]]
+    pkg loaded: mem::List[ty::ItemId]
 } Program
+
+/// What a bundle's build lowers: the entries its contributions add to loaded registries.
+pkg struct BundleProgram {
+    pkg contributions: mem::List[BundleContribution]
+    pkg roots: mem::List[ty::PackageId]
+    pkg prefixes: mem::HashMap[text::String, text::String]
+    /// The codegen level of the kernel's interface.
+    pkg level: Option[workspace::Level]
+    pkg dump: bool
+} BundleProgram
+
+/// A contribution a bundle adds and its loaded registry.
+pkg struct BundleContribution derives Copy {
+    pkg item: ty::ItemId
+    pkg registry_item: ty::ItemId
+} BundleContribution
 
 struct Lowering {
     ck: check::Checker
     module: object::Module
     /// The codegen level the image's code is generated for, none for the base set.
     level: Option[workspace::Level]
+    linking: Linking
     layouts: Layouts
     prefixes: mem::HashMap[text::String, text::String]
     roots: mem::List[ty::PackageId]
@@ -217,14 +242,15 @@ struct Lowering {
     data: Data
     lines: Lines
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
-    /// function value naming them holds, and the table of them that spawns read.
+    /// function value naming them holds.
     entry_stacks: mem::List[TaskEntryStack]
-    entry_table_id: Option[object::DataId]
     frames: mem::List[Frame]
     demands: mem::List[Demand]
     /// For a test image, what its tests' runs need, and the sim table once declared.
     test_runtime: Option[Runtime]
     sims: Option[object::DataId]
+    /// For a bundle, the entries it adds to loaded registries.
+    contributed: mem::List[image::LoadedEntry]
     /// Whether the symbol name and text of each function defined are kept, and those kept.
     dumping: bool
     dumped: mem::List[LoweredFunction]
@@ -292,7 +318,7 @@ fn Instance.sides_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
 /// artefacts of its `.nan` section.
 pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValue) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None, linking: Linking.Image)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     entry_seam(mut lowering, program)
@@ -305,15 +331,34 @@ pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValu
 /// image.
 pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     let alloc = ck.alloc()
-    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None)
+    let linking = match program.kernel {
+        Some(kernel) => Linking.Kernel(kernel.share())
+        None => Linking.Image
+    }
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None, linking: take linking)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
     let boot = mut lowering.boot_glue(program)
     let stack = lowering.boot_stack(program)
     mut lowering.entry_seam(boot, stack_bytes: stack)
+    mut lowering.export_abi(program.loaded.view())
     mut lowering.drain()
     return take lowering.finish(None)
 } lower_machine
+
+/// Lowers a bundle: the entries its contributions add to loaded registries, with every function
+/// they reach, importing the load ABI.
+pkg fn lower_bundle(ck: check::Checker, bundle: BundleProgram) -> Lowered {
+    let alloc = ck.alloc()
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(bundle.prefixes, alloc), roots: copied_roots(bundle.roots.view(), alloc), level: bundle.level, test_runtime: None, linking: Linking.Bundle)
+    lowering.dumping = bundle.dump
+    for contribution in bundle.contributions {
+        let contributed = mut lowering.contributed_entry(contribution.item, registry_item: contribution.registry_item)
+        mut lowering.contributed.push(take contributed)
+    }
+    mut lowering.drain()
+    return take lowering.finish(None)
+} lower_bundle
 
 /// A copy of the package names of a final closure with the prefix their symbols carry.
 fn copied_prefixes(prefixes: mem::HashMap[text::String, text::String], alloc: mem::Alloc) -> mem::HashMap[text::String, text::String] {
@@ -335,13 +380,14 @@ fn copied_roots(roots: Slice[ty::PackageId], alloc: mem::Alloc) -> mem::List[ty:
 
 /// A lowering into a new object, for a codegen level when `level` is given, of a test image when
 /// `test_runtime` is given.
-fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], level: Option[workspace::Level], take test_runtime: Option[Runtime]) -> Lowering {
+fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], level: Option[workspace::Level], take test_runtime: Option[Runtime], take linking: Linking) -> Lowering {
     let alloc = ck.alloc()
     let target = ck.db().target
     return Lowering(
         ck: take ck,
         module: object::Module.new(target, level, alloc),
         level: level,
+        linking: take linking,
         layouts: Layouts.new(alloc),
         prefixes: take prefixes,
         roots: take roots,
@@ -363,11 +409,11 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         data: Data.empty(alloc),
         lines: Lines.empty(alloc),
         entry_stacks: mem::List[TaskEntryStack].empty(alloc),
-        entry_table_id: None,
         frames: mem::List[Frame].empty(alloc),
         demands: mem::List[Demand].empty(alloc),
         test_runtime: take test_runtime,
         sims: None,
+        contributed: mem::List[image::LoadedEntry].empty(alloc),
         dumping: false,
         dumped: mem::List[LoweredFunction].empty(alloc),
         item_hashes: mem::OnceMap[ty::ItemId, text::String].empty(seed: 0, alloc),
@@ -801,8 +847,8 @@ fn Lowering.layout_of(mut self, ty: ty::Ty) -> mem::Shared[Layout] {
 /// The object of the lowering, holding a `.nan` section with `section` when given.
 fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lowered {
     mut self.compile_waiting()
-    lines_emit(mut self)
-    emit_entry_stacks(mut self)
+    let own_stacks = emit_entry_stacks(mut self)
+    lines_emit(mut self, own_stacks)
     mut self.finish_interrupts()
     mut self.compile_waiting()
     var collisions = mem::List[Collision].empty(self.alloc)
@@ -811,7 +857,7 @@ fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lower
     }
     let codes = self.module.codes_entry()
     let image_bytes = take self.module.finish(closure, alloc: self.alloc)
-    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped, codes: take codes)
+    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped, codes: take codes, contributed: take self.contributed)
 } Lowering.finish
 
 /// The calling convention of every lowered function.

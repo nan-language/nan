@@ -632,6 +632,9 @@ impl<'a> Checker<'a> {
                         }),
                     );
                 }
+                if registry.loaded {
+                    record.field(4, content(|out| uvar(out, 1)));
+                }
                 declaration.field(7, record.finish());
             }
             (ItemKind::Contribute(contribution), _) => {

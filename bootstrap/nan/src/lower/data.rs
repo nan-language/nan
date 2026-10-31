@@ -26,9 +26,20 @@ pub struct Data {
     views: HashMap<Vec<u8>, DataId>,
     /// The value of each const item and contribution, by item and type.
     consts: HashMap<(ItemId, Ty), DataId>,
-    /// The table of each registry.
+    /// The table of each registry, and the table record and `sys::load::Table` value of each
+    /// loaded registry.
     tables: HashMap<ItemId, DataId>,
+    pub records: HashMap<ItemId, DataId>,
+    handles: HashMap<ItemId, DataId>,
     next: u32,
+}
+
+/// A writable data object of zeros a machine image reserves: its name, size and alignment.
+#[derive(Clone, Copy)]
+pub struct Reserved {
+    pub name: &'static str,
+    pub size: u64,
+    pub align: u64,
 }
 
 /// The bytes of a value with the addresses it holds: each a function's or data's, at an offset.
@@ -86,28 +97,36 @@ impl Lowering<'_, '_> {
         self.define_data(kind, image, 8)
     }
 
-    /// The writable data object of zeros a machine image reserves under a name, declared once.
-    pub fn reserved_data(&mut self, name: &'static str, size: u64, align: u64) -> DataId {
+    /// The writable data object of zeros a machine image reserves under a name, declared once;
+    /// a bundle imports it from its kernel.
+    pub fn reserved_data(&mut self, data: Reserved) -> DataId {
+        let Reserved { name, size, align } = data;
         if let Some(id) = self.reserved.get(name) {
             return *id;
         }
+        let linkage = match self.imports() {
+            true => Linkage::Import,
+            false => Linkage::Local,
+        };
         let id = self
             .module
-            .declare_data(name, Linkage::Local, true, false)
+            .declare_data(name, linkage, true, false)
             .unwrap_or_else(|error| panic!("declaring {name}: {error}"));
-        let mut description = DataDescription::new();
-        description.define_zeroinit(size as usize);
-        description.set_align(align);
-        self.module
-            .define_data(id, &description)
-            .unwrap_or_else(|error| panic!("defining {name}: {error}"));
+        if linkage == Linkage::Local {
+            let mut description = DataDescription::new();
+            description.define_zeroinit(size as usize);
+            description.set_align(align);
+            self.module
+                .define_data(id, &description)
+                .unwrap_or_else(|error| panic!("defining {name}: {error}"));
+        }
         self.reserved.insert(name, id);
         id
     }
 
     /// The address of the writable data object of zeros a machine image reserves under a name.
-    pub fn reserved(&mut self, fx: &mut Fx, name: &'static str, size: u64, align: u64) -> Value {
-        let id = self.reserved_data(name, size, align);
+    pub fn reserved(&mut self, fx: &mut Fx, data: Reserved) -> Value {
+        let id = self.reserved_data(data);
         self.data_address(fx, id)
     }
 
@@ -164,11 +183,15 @@ impl Lowering<'_, '_> {
         Held::Address(fx.b.ins().symbol_value(PTR, global))
     }
 
-    /// The value of a const item or contribution, or a registry's table as a slice.
+    /// The value of a const item or contribution, or of a path naming a registry: its table as
+    /// a slice, or a loaded registry's `sys::load::Table`.
     pub fn const_item(&mut self, fx: &mut Fx, item: ItemId, ty: &Ty) -> Held {
-        if matches!(self.ck.db.ast(item).kind, ItemKind::Registry(_)) {
-            let table = self.table(item);
-            let global = self.data_ref(fx, table);
+        if let ItemKind::Registry(registry) = &self.ck.db.ast(item).kind {
+            let id = match registry.loaded {
+                true => self.table_handle(item),
+                false => self.table(item),
+            };
+            let global = self.data_ref(fx, id);
             return Held::Address(fx.b.ins().symbol_value(PTR, global));
         }
         let value = self
@@ -187,15 +210,7 @@ impl Lowering<'_, '_> {
             }
             Shape::Empty => Held::Empty,
             _ => {
-                let key = (item, ty.clone());
-                let id = match self.data.consts.get(&key) {
-                    Some(id) => *id,
-                    None => {
-                        let id = self.value_data(&value, ty);
-                        self.data.consts.insert(key, id);
-                        id
-                    }
-                };
+                let id = self.const_data(item, ty);
                 let global = self.data_ref(fx, id);
                 Held::Address(fx.b.ins().symbol_value(PTR, global))
             }
@@ -407,8 +422,35 @@ impl Lowering<'_, '_> {
         bits
     }
 
-    /// The table of a registry: its admitted contributions in key order, as a slice record.
-    fn table(&mut self, registry: ItemId) -> DataId {
+    /// The data object holding the value of a const item or contribution of a type.
+    pub fn const_data(&mut self, item: ItemId, ty: &Ty) -> DataId {
+        let key = (item, ty.clone());
+        if let Some(id) = self.data.consts.get(&key) {
+            return *id;
+        }
+        let value = self
+            .ck
+            .const_value(item)
+            .unwrap_or_else(|| panic!("the value of {}", self.ck.db.canonical(item)));
+        let id = self.value_data(&value, ty);
+        self.data.consts.insert(key, id);
+        id
+    }
+
+    /// The `sys::load::Table` value of a loaded registry: the address of its table record.
+    fn table_handle(&mut self, registry: ItemId) -> DataId {
+        if let Some(id) = self.data.handles.get(&registry) {
+            return *id;
+        }
+        let record = self.loaded_record(registry);
+        let id = self.relocated_data("handle", vec![0; 8], &[(0, 0)], record);
+        self.data.handles.insert(registry, id);
+        id
+    }
+
+    /// The table of a registry: its admitted contributions in key order, as a slice record,
+    /// which for a loaded registry is its first version, read by no one and made by the build.
+    pub(super) fn table(&mut self, registry: ItemId) -> DataId {
         if let Some(id) = self.data.tables.get(&registry) {
             return *id;
         }
@@ -429,8 +471,9 @@ impl Lowering<'_, '_> {
             self.write_val(value, &value.value, &entry, at, &mut image, &mut extents);
         }
         let array = self.define_data("table", image, layout.align);
-        let mut record = vec![0; 16];
-        record[8..].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+        let loaded = matches!(&self.ck.db.ast(registry).kind, ItemKind::Registry(declared) if declared.loaded);
+        let mut record = vec![0; if loaded { 32 } else { 16 }];
+        record[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
         let id = self.define_data(
             "registry",
             Image {

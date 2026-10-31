@@ -26,7 +26,9 @@ use crate::journal;
 use crate::output::{self, Format, Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::toolchain;
+
 use crate::workspace::{self, Workspace};
+pub(crate) use publish::publishing_key;
 
 pub use build::Launch;
 
@@ -180,7 +182,7 @@ impl Name {
             | Name::KeyShow
             | Name::KeyTrust => (&[], &[]),
             Name::Run => (&["--keep-resets"], &[]),
-            Name::Build => (&[], &["--compare-with"]),
+            Name::Build => (&[], &["--compare-with", "--against", "--as"]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
             Name::Show => (&["--api"], &[]),
             Name::Find => (&["--contributors"], &[]),

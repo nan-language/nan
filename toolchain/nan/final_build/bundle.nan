@@ -1,0 +1,514 @@
+//! Bundle builds: the entries a package adds to the loaded registries of a kernel, lowered against the kernel's interface file, and that file, which a kernel's final build writes.
+
+/// The magic and format version of an interface file.
+const INTERFACE_MAGIC: Slice[u8] = b"NLIF"
+
+const INTERFACE_VERSION: u64 = 1
+
+/// The interface of a kernel exporting the load ABI: its interface file, what lowering reads of
+/// it, and the loaded registries of its final closure, in byte order of canonical path.
+struct KernelInterface {
+    file: mem::Bytes
+    shared: mem::Shared[lower::Interface]
+    loaded: mem::List[ty::ItemId]
+} KernelInterface
+
+/// A loaded registry with its canonical path.
+struct LoadedRegistry {
+    path: text::String
+    item: ty::ItemId
+} LoadedRegistry
+
+/// The interface of the program whose package is `root`, built at a codegen level, when it is a
+/// kernel of a bare target whose final closure declares a loaded registry, its interface file
+/// naming `toolchain`.
+fn kernel_interface(checker: check::Checker, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], level: Option[workspace::Level], toolchain: hashing::HashValue, alloc: mem::Alloc) -> Option[KernelInterface] {
+    let target = checker.db().target
+    if target.kind() != Some(workspace::Kind.Bare) {
+        return None
+    }
+    let packages = final_closure(checker, root, alloc)
+    var loaded = mem::List[LoadedRegistry].empty(alloc)
+    for item in closure_items(checker, packages: packages.view(), alloc) {
+        if is_loaded(checker, item) {
+            mut loaded.push(LoadedRegistry(path: checker.db().canonical(item), item: item))
+        }
+    }
+    if loaded.len() == 0 {
+        return None
+    }
+    mut loaded.sort_by(fn(left: LoadedRegistry, right: LoadedRegistry) => left.path.as_str().cmp(right.path.as_str()))
+    var paths = mem::List[text::String].empty(alloc)
+    var items = mem::List[ty::ItemId].empty(alloc)
+    for loaded_registry in loaded {
+        mut paths.push(text::String.of(loaded_registry.path.as_str(), alloc))
+        mut items.push(loaded_registry.item)
+    }
+    let exports = lower::export_names(target, registries: paths.view(), alloc)
+    let interrupt_stack = interrupt_stack_of(checker, packages: packages.view())
+    let file = interface_file(toolchain, target, roots: closure_roots(artefacts, alloc).view(), exports: exports.view(), interrupt_stack, level, alloc)
+    let kernel = lower::Interface(hash: copied_bytes(hashing::HashValue.of(file.view()).bytes.view(), alloc), exports: take exports, interrupt_stack: interrupt_stack)
+    return Some(KernelInterface(file: take file, shared: mem::Shared.of(take kernel, alloc), loaded: take items))
+} kernel_interface
+
+/// Whether an item is a loaded registry.
+fn is_loaded(checker: check::Checker, item: ty::ItemId) -> bool {
+    return match checker.db().ast(item).kind {
+        ast::ItemKind.Registry(registry_item) => registry_item.loaded
+        else => false
+    }
+} is_loaded
+
+/// The packages of the final closure of the package `root`: those it reaches and std.
+fn final_closure(checker: check::Checker, root: ty::PackageId, alloc: mem::Alloc) -> mem::List[ty::PackageId] {
+    let reached = checker.reached(root, alloc)
+    let db = checker.db()
+    var packages = mem::List[ty::PackageId].empty(alloc)
+    for index in 0..<db.packages.len() {
+        let id = ty::PackageId(index: u32.fit(index))
+        if reached.position(fn(found: ty::PackageId) => found == id).is_some() or db.packages[index].std {
+            mut packages.push(id)
+        }
+    }
+    return packages
+} final_closure
+
+/// The items of packages.
+fn closure_items(checker: check::Checker, packages: Slice[ty::PackageId], alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    let db = checker.db()
+    var items = mem::List[ty::ItemId].empty(alloc)
+    for each_package in packages {
+        for module in db.package_data(each_package).modules {
+            for item in db.module(module).items {
+                mut items.push(item)
+            }
+        }
+    }
+    return items
+} closure_items
+
+/// A code root hash of a package of a final closure, by name.
+struct PackageRoot {
+    name: text::String
+    root: hashing::HashValue
+} PackageRoot
+
+/// The code root hash of each package of a final closure, in byte order of name.
+fn closure_roots(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::List[PackageRoot] {
+    var found = mem::List[PackageRoot].empty(alloc)
+    for entry in artefacts {
+        let Ok(decoded) = artefact::decode(entry.value().view(), alloc) else {
+            continue
+        }
+        mut found.push(PackageRoot(name: text::String.of(entry.key().as_str(), alloc), root: decoded.root_hash()))
+    }
+    return found
+} closure_roots
+
+/// A copy of bytes.
+fn copied_bytes(contents: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(contents)
+    return copied
+} copied_bytes
+
+/// A kernel's interface file: its toolchain hash, its target, the code root hash of each package
+/// of its final closure by name, the names of its exports in order, the stack its interrupt
+/// functions may use, and its codegen level's name, empty for the base set.
+fn interface_file(toolchain: hashing::HashValue, target: workspace::Target, roots: Slice[PackageRoot], exports: Slice[text::String], interrupt_stack: u64, level: Option[workspace::Level], alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: copied_bytes(toolchain.bytes.view(), alloc))
+    mut record.field(2, content: copied_bytes(target.name().as_bytes(), alloc))
+    var closure = mem::Bytes.empty(alloc)
+    encoding::uvar(mut closure, value: u64.widen(roots.len()))
+    for package_root in roots {
+        encoding::bytes(mut closure, value: package_root.name.as_bytes())
+        encoding::bytes(mut closure, value: package_root.root.bytes.view())
+    }
+    mut record.field(3, content: take closure)
+    var names = mem::Bytes.empty(alloc)
+    encoding::uvar(mut names, value: u64.widen(exports.len()))
+    for name in exports {
+        encoding::bytes(mut names, value: name.as_bytes())
+    }
+    mut record.field(4, content: take names)
+    var stack = mem::Bytes.empty(alloc)
+    encoding::uvar(mut stack, value: interrupt_stack)
+    mut record.field(5, content: take stack)
+    let level_name = match level {
+        Some(found) => found.name()
+        None => ""
+    }
+    mut record.field(6, content: copied_bytes(level_name.as_bytes(), alloc))
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(INTERFACE_MAGIC)
+    encoding::uvar(mut out, value: INTERFACE_VERSION)
+    let body = take record.finish(alloc)
+    mut out.append(body.view())
+    return out
+} interface_file
+
+/// What an interface file records.
+struct ReadInterface {
+    toolchain: mem::Bytes
+    target: workspace::Target
+    roots: mem::List[PackageRoot]
+    exports: mem::List[text::String]
+    interrupt_stack: u64
+    level: Option[workspace::Level]
+} ReadInterface
+
+/// The interface file a toolchain wrote, none for any other bytes.
+fn read_interface(file: Slice[u8], alloc: mem::Alloc) -> Option[ReadInterface] {
+    if file.len() < 4 or file[0] != b'N' or file[1] != b'L' or file[2] != b'I' or file[3] != b'F' {
+        return None
+    }
+    let Some(version) = artefact::read_uvar(file, at: 4) else {
+        return None
+    }
+    let Some(count) = artefact::read_uvar(file, at: version.next) else {
+        return None
+    }
+    if version.value.to_u64() != Some(INTERFACE_VERSION) or count.value.to_u64() != Some(6) {
+        return None
+    }
+    var fields = mem::List[artefact::Chunk].empty(alloc)
+    var at = count.next
+    for key in 1u64..=6 {
+        let Some(held) = artefact::read_uvar(file, at) else {
+            return None
+        }
+        let Some(content) = artefact::read_bytes(file, at: held.next) else {
+            return None
+        }
+        if held.value.to_u64() != Some(key) {
+            return None
+        }
+        mut fields.push(content)
+        at = content.next
+    }
+    if at != file.len() {
+        return None
+    }
+    return interface_parts(file, fields: fields.view(), alloc)
+} read_interface
+
+/// The parts of an interface file, from the chunks of its fields.
+fn interface_parts(file: Slice[u8], fields: Slice[artefact::Chunk], alloc: mem::Alloc) -> Option[ReadInterface] {
+    expect fields.len() == 6
+    let toolchain = fields[0].copy(file, alloc)
+    let target_name = fields[1].copy(file, alloc)
+    let Ok(written_target) = attempt text::String.try_from_utf8(target_name.view(), alloc) else {
+        return None
+    }
+    let Some(target) = workspace::Target.from_name(written_target.as_str()) else {
+        return None
+    }
+    var roots = mem::List[PackageRoot].empty(alloc)
+    let Some(root_count) = artefact::read_uvar(file, at: fields[2].start) else {
+        return None
+    }
+    var at = root_count.next
+    for _ in 0..<root_count.value.to_u64().value_or(0) {
+        let Some(name) = artefact::read_bytes(file, at) else {
+            return None
+        }
+        let Some(root) = artefact::read_bytes(file, at: name.next) else {
+            return None
+        }
+        let Ok(package_name) = attempt text::String.try_from_utf8(name.copy(file, alloc).view(), alloc) else {
+            return None
+        }
+        let Some(hash) = hash_of(file, chunk: root) else {
+            return None
+        }
+        mut roots.push(PackageRoot(name: take package_name, root: hash))
+        at = root.next
+    }
+    if at != fields[2].next {
+        return None
+    }
+    var exports = mem::List[text::String].empty(alloc)
+    let Some(export_count) = artefact::read_uvar(file, at: fields[3].start) else {
+        return None
+    }
+    at = export_count.next
+    for _ in 0..<export_count.value.to_u64().value_or(0) {
+        let Some(name) = artefact::read_bytes(file, at) else {
+            return None
+        }
+        let Ok(export) = attempt text::String.try_from_utf8(name.copy(file, alloc).view(), alloc) else {
+            return None
+        }
+        mut exports.push(take export)
+        at = name.next
+    }
+    if at != fields[3].next {
+        return None
+    }
+    let Some(stack) = artefact::read_uvar(file, at: fields[4].start) else {
+        return None
+    }
+    let Some(interrupt_stack) = stack.value.to_u64() else {
+        return None
+    }
+    if stack.next != fields[4].next {
+        return None
+    }
+    let Ok(level_name) = attempt text::String.try_from_utf8(fields[5].copy(file, alloc).view(), alloc) else {
+        return None
+    }
+    var level: Option[workspace::Level] = None
+    if level_name.byte_len() > 0 {
+        let Some(named) = workspace::Level.from_name(level_name.as_str()) else {
+            return None
+        }
+        level = Some(named)
+    }
+    return Some(ReadInterface(toolchain: take toolchain, target: target, roots: take roots, exports: take exports, interrupt_stack: interrupt_stack, level: level))
+} interface_parts
+
+/// The hash a chunk holding exactly 33 bytes holds.
+fn hash_of(file: Slice[u8], chunk: artefact::Chunk) -> Option[hashing::HashValue] {
+    if chunk.next - chunk.start != 33 {
+        return None
+    }
+    var bytes = Array[u8, 33].filled(0)
+    for index in 0usize..<33 {
+        bytes[index] = file[chunk.start + index]
+    }
+    return Some(hashing::HashValue(bytes: bytes))
+} hash_of
+
+/// The largest `limits stack N` among the interrupt fns of packages.
+fn interrupt_stack_of(checker: check::Checker, packages: Slice[ty::PackageId]) -> u64 {
+    var largest: u64 = 0
+    for item in closure_items(checker, packages, alloc: checker.alloc()) {
+        let Some(head) = checker.fn_sig(item) else {
+            continue
+        }
+        if head.modifier != Some(ast::FnModifier.Interrupt) {
+            continue
+        }
+        let Some(stack) = head.limit_set.stack else {
+            continue
+        }
+        if stack > largest {
+            largest = stack
+        }
+    }
+    return largest
+} interrupt_stack_of
+
+/// Builds the bundle of the package at index `package` of the session's workspace against the
+/// interface file at `against`, signed with `signer` when given, writing it into
+/// `.nan/images/<target>/`.
+pkg fn bundle(session: check::Session, package_index: usize, against: Str, signer: Option[core::crypto::SecretKey], alloc: mem::Alloc) -> Build fails platform::IoError
+    waive length "the steps of a bundle build in order, as the Rust writes them"
+{
+    let held = session.workspace.contents()
+    let Some(source) = held.package_at(package_index) else {
+        expect false
+        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc))
+    }
+    let Ok(file) = attempt platform::read_file(against, alloc) else {
+        return unusable(source, reason: "the interface file cannot be read", alloc)
+    }
+    let Some(read) = read_interface(file.view(), alloc) else {
+        return unusable(source, reason: "the interface file does not decode", alloc)
+    }
+    if hash_of(read.toolchain.view(), chunk: artefact::Chunk(start: 0, next: read.toolchain.len())) != Some(session.toolchain_hash()) {
+        return unusable(source, reason: "another toolchain built the kernel", alloc)
+    }
+    let declared = match source.manifest {
+        Some(manifest) => manifest.targets.position(fn(target: workspace::Target) => target == read.target).is_some()
+        None => false
+    }
+    if not declared {
+        var reason = text::String.of("the package does not declare ", alloc)
+        mut reason.append(read.target.name())
+        return unusable(source, reason: reason.as_str(), alloc)
+    }
+    let closures = session.check_closures_coding(package_index)
+    var diagnostics = session.reported_by(closures, scope: scope::Scope.Workspace)
+    let Some(checked) = held.closure_of(package_index) else {
+        return Build.failed(take diagnostics)
+    }
+    let program_checker = session.checker_in(take closures, package_index: package_index, target: read.target)
+    let coding = program_checker.is_some() and session.codes_in_check(checked, package_index: package_index, target: read.target)
+    let checker = match program_checker {
+        Some(found) => found
+        None => session.checked(checked, target: read.target)
+    }
+    let root = package_id(checker, program: package_index)
+    let closure = checker.reached(root, alloc)
+    mut diagnostics.retain(fn(reported: diagnostic::Diagnostic) -> bool {
+        let Some(path) = reported.path else {
+            return true
+        }
+        let Some(at) = held.file(path.as_str()) else {
+            return false
+        }
+        return holds_source(checker, closure: closure.view(), package_index: at.package_index)
+    })
+    for reported in take checker.release_errors(root, alloc) {
+        mut diagnostics.push(take reported)
+    }
+    let artefacts = artefacts_of(session, checker, root, coding, alloc)
+    for package_root in closure_roots(artefacts, alloc) {
+        let Some(at) = read.roots.position(fn(kernel: PackageRoot) => kernel.name == package_root.name) else {
+            continue
+        }
+        if read.roots[at].root != package_root.root {
+            var reason = text::String.of(package_root.name.as_str(), alloc)
+            mut reason.append(" differs from the kernel's release of it")
+            mut diagnostics.push(interface_error(source, reason: reason.as_str(), alloc))
+        }
+    }
+    var own = mem::List[ty::PackageId].empty(alloc)
+    for id in final_closure(checker, root, alloc) {
+        let name = checker.db().package_data(id).name.as_str()
+        if not names_package(read.roots.view(), name) {
+            mut own.push(id)
+        }
+    }
+    if interrupt_stack_of(checker, packages: own.view()) > read.interrupt_stack {
+        mut diagnostics.push(interface_error(source, reason: "an interrupt fn demands more stack than the kernel's interrupt stacks hold", alloc))
+    }
+    if errors(diagnostics.view()) {
+        return Build.failed(take diagnostics)
+    }
+    let kernel = lower::Interface(hash: copied_bytes(hashing::HashValue.of(file.view()).bytes.view(), alloc), exports: take read.exports, interrupt_stack: read.interrupt_stack)
+    let program = lower::BundleProgram(contributions: bundle_contributions(checker, root, kernel: read.roots.view(), alloc), roots: single_root(root, alloc), prefixes: prefixes(artefacts, alloc), level: read.level, dump: false)
+    let lowered = lower::lower_bundle(checker, bundle: program)
+    for reported in take collisions(source, lowered, alloc) {
+        mut diagnostics.push(take reported)
+    }
+    for reported in take lower::stack_judge(checker, all_frames: lowered.frames.view(), demands: lowered.demands.view(), alloc) {
+        mut diagnostics.push(take reported)
+    }
+    if errors(diagnostics.view()) {
+        return Build.failed(take diagnostics)
+    }
+    let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
+        Ok(bytes) => bytes
+        Err(missing) => {
+            var reason = text::String.of("the kernel exports no ", alloc)
+            for index in 0..<missing.len() {
+                if index > 0 {
+                    mut reason.append(", ")
+                }
+                mut reason.append(missing[index].as_str())
+            }
+            mut diagnostics.push(interface_error(source, reason: reason.as_str(), alloc))
+            return Build.failed(take diagnostics)
+        }
+    }
+    var path = text::String.of(".nan/images/", alloc)
+    mut path.append(read.target.name())
+    mut path.push('/')
+    mut path.append(checker.db().package_data(root).name.as_str())
+    mut path.append(".nbun")
+    try write_file(platform::join(held.root.as_str(), name: path.as_str(), alloc).as_str(), contents: written.view(), alloc)
+    return Build(diagnostics: take diagnostics, image: Some(take path), interface_file: None)
+} bundle
+
+/// The final-link roots of a bundle: its package.
+fn single_root(root: ty::PackageId, alloc: mem::Alloc) -> mem::List[ty::PackageId] {
+    var roots = mem::List[ty::PackageId].empty(alloc)
+    mut roots.push(root)
+    return roots
+} single_root
+
+/// A bundle build writing nothing, failing with `target.bundle-interface` for a reason.
+fn unusable(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> Build {
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    mut diagnostics.push(interface_error(source, reason, alloc))
+    return Build.failed(take diagnostics)
+} unusable
+
+/// Whether package roots name a package.
+fn names_package(roots: Slice[PackageRoot], name: Str) -> bool {
+    for package_root in roots {
+        if package_root.name.as_str() == name {
+            return true
+        }
+    }
+    return false
+} names_package
+
+/// A contribution with its canonical path.
+struct PathedContribution {
+    path: text::String
+    contribution: lower::BundleContribution
+} PathedContribution
+
+/// The admitted contributions of a bundle's closure to loaded registries by packages outside the
+/// kernel's final closure, whose packages `kernel` names, with their registries, in byte order of
+/// canonical path.
+fn bundle_contributions(checker: check::Checker, root: ty::PackageId, kernel: Slice[PackageRoot], alloc: mem::Alloc) -> mem::List[lower::BundleContribution] {
+    var found = mem::List[PathedContribution].empty(alloc)
+    for contribution in checker.contributions(root) {
+        if not contribution.admitted or not is_loaded(checker, item: contribution.registry_item) {
+            continue
+        }
+        let contributor = checker.db().package_data(contribution.contributor).name.as_str()
+        if names_package(kernel, name: contributor) {
+            continue
+        }
+        let path = checker.db().canonical(contribution.item)
+        if found.position(fn(known: PathedContribution) => known.path == path).is_some() {
+            continue
+        }
+        mut found.push(PathedContribution(path: take path, contribution: lower::BundleContribution(item: contribution.item, registry_item: contribution.registry_item)))
+    }
+    mut found.sort_by(fn(left: PathedContribution, right: PathedContribution) => left.path.as_str().cmp(right.path.as_str()))
+    var ordered = mem::List[lower::BundleContribution].empty(alloc)
+    for pathed in found {
+        mut ordered.push(pathed.contribution)
+    }
+    return ordered
+} bundle_contributions
+
+/// A `target.bundle-interface` error on a package's `package` line, with its reason.
+fn interface_error(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    var reported = at_manifest(source, reported: diagnostic::Diagnostic.new(diagnostic::Code.TargetBundleInterface, alloc), alloc)
+    mut reported.because.push(diagnostic::Reason.note(reason, alloc))
+    return reported
+} interface_error
+
+/// A diagnostic located on a package's `package` line.
+pkg fn at_manifest(source: workspace::Package, take reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    var line: u32 = 1
+    match source.manifest {
+        Some(manifest) => {
+            line = manifest.line
+        }
+        None => {}
+    }
+    let Some(manifest_file) = source.files.get(0) else {
+        expect false
+        return reported
+    }
+    var located = diagnostic::Diagnostic.at(reported.code, path: manifest_file.path.as_str(), line, alloc)
+    for reason in take reported.because {
+        mut located.because.push(take reason)
+    }
+    return located
+} at_manifest
+
+/// Writes a file through a staged file beside it, replacing any earlier file at once.
+fn write_file(path: Str, contents: Slice[u8], alloc: mem::Alloc) fails platform::IoError {
+    let Some(directory) = platform::parent(path, alloc) else {
+        expect false
+        fail platform::IoError.NotFound
+    }
+    try platform::create_dir_all(directory.as_str(), alloc)
+    let Some(name) = platform::file_name(path, alloc) else {
+        expect false
+        fail platform::IoError.NotFound
+    }
+    let staged_new = staged(directory.as_str(), name: name.as_str(), extension: "new", alloc)
+    try platform::write_file(staged_new.as_str(), contents)
+    try platform::rename_path(staged_new.as_str(), to: path)
+} write_file

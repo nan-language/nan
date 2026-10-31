@@ -1,0 +1,627 @@
+//! Loading: the load ABI a kernel exports and the bundles built against its interface import, the table records of loaded registries, the gates through which the entries a bundle adds call its functions, and the load window into which the loader maps bundles.
+
+/// What lowering reads of a kernel's interface: its hash, the names of its exports in export
+/// order, and the stack its interrupt functions may use.
+pkg struct Interface {
+    pkg hash: mem::Bytes
+    pkg exports: mem::List[text::String]
+    pkg interrupt_stack: u64
+} Interface
+
+/// How an image takes part in loading: as a kernel exporting the load ABI, as a bundle built
+/// against a kernel's interface, or not at all.
+pkg enum Linking {
+    Image
+    Kernel(mem::Shared[Interface])
+    Bundle
+} Linking
+
+/// The symbol of the export table, and the offsets in it of the line tables' address, the load
+/// window's table, the window's next address, the export count and the first export's address.
+const LOAD_EXPORTS: Str = "_NSexports"
+
+const EXPORT_LINES: u32 = 40
+
+const EXPORT_WINDOW: u32 = 56
+
+const EXPORT_NEXT: usize = 64
+
+const EXPORT_COUNT: usize = 88
+
+const EXPORT_FIRST: u32 = 96
+
+/// The load window's tables, and the window's first address: on x86_64 the table of 1 GiB
+/// entries to which the entry root's top-level entry 256 points, the window starting at that
+/// entry's addresses; on AArch64 the top-level table `TTBR1_EL1` holds, whose first entry points
+/// to the table of 1 GiB entries following it, the window starting at the first address
+/// `TTBR1_EL1` translates.
+const LOAD_WINDOW: Str = "_NSload_window"
+
+const X64_WINDOW: u64 = 0xFFFF_8000_0000_0000
+
+const A64_WINDOW: u64 = 0xFFFF_0000_0000_0000
+
+pkg const WINDOW_ENTRY: u64 = 256
+
+/// The `TCR_EL1` and `TTBR1_EL1` system registers, and the translation control's fields for
+/// `TTBR1_EL1`: its region size, walks disabled, cacheability, shareability and granule, which
+/// the window sets to a 48-bit region walked with write-back, inner-shareable 4 KiB tables.
+const TCR_EL1: u16 = 0x4102
+
+const TTBR1_EL1: u16 = 0x4101
+
+const TCR_HIGH_FIELDS: i64 = 0xFFBF_0000
+
+const TCR_HIGH: i64 = 0xB510_0000
+
+/// The bits of the window's entries the loader writes, by kind: a page of code, of read-only
+/// data and of writable data, then a table. On x86_64 present, writable and execute-disable; on
+/// AArch64 a table or page descriptor, the access flag, inner-shareable normal write-back memory,
+/// read-only and execute-never for EL1 and for EL0.
+const X64_CODE: u64 = 0x1
+
+const X64_READ_ONLY: u64 = 0x8000_0000_0000_0001
+
+const X64_WRITABLE: u64 = 0x8000_0000_0000_0003
+
+const WINDOW_TABLE: u64 = 0x3
+
+const A64_CODE: u64 = 0x0040_0000_0000_078B
+
+const A64_READ_ONLY: u64 = 0x0060_0000_0000_078B
+
+const A64_WRITABLE: u64 = 0x0060_0000_0000_070B
+
+/// The bytes of the stack a gate's own frame and calls use within the `stack N` of its function
+/// type; the function it calls fits in the rest.
+const GATE_STACK: u64 = 1_024
+
+/// The prefix of the symbol of a loaded registry's table record, before its canonical path.
+const LOAD_RECORD: Str = "_NSloaded_"
+
+/// The support routines a kernel exports: every one the lowered code of a kernel calls.
+fn exported_routines(alloc: mem::Alloc) -> mem::List[Routine] {
+    var routines = mem::List[Routine].empty(alloc)
+    mut routines.push(Routine.Copy)
+    mut routines.push(Routine.Fill)
+    mut routines.push(Routine.Compare)
+    mut routines.push(Routine.Alloc)
+    mut routines.push(Routine.AllocIn)
+    mut routines.push(Routine.Free)
+    mut routines.push(Routine.RecordAlloc)
+    mut routines.push(Routine.RecordFree)
+    mut routines.push(Routine.RecordResize)
+    mut routines.push(Routine.Split)
+    mut routines.push(Routine.Close)
+    mut routines.push(Routine.Charged)
+    mut routines.push(Routine.Limit)
+    mut routines.push(Routine.TaskEnv)
+    mut routines.push(Routine.TaskEnvFree)
+    mut routines.push(Routine.Lift)
+    mut routines.push(Routine.Hold)
+    mut routines.push(Routine.Unhold)
+    mut routines.push(Routine.Rehome)
+    mut routines.push(Routine.MintRoot)
+    mut routines.push(Routine.Derive)
+    mut routines.push(Routine.Revoke)
+    mut routines.push(Routine.OutboxMint)
+    mut routines.push(Routine.OutboxRetire)
+    mut routines.push(Routine.OutboxClaim)
+    mut routines.push(Routine.KindMint)
+    mut routines.push(Routine.KindPin)
+    mut routines.push(Routine.KindDerive)
+    mut routines.push(Routine.KindRevoke)
+    mut routines.push(Routine.KindClose)
+    mut routines.push(Routine.TrapRaise)
+    mut routines.push(Routine.TrapReport)
+    mut routines.push(Routine.Reacquired)
+    mut routines.push(Routine.Settle)
+    mut routines.push(Routine.ReportScalar)
+    mut routines.push(Routine.ReportText)
+    mut routines.push(Routine.WriteErr)
+    mut routines.push(Routine.OverflowRaise)
+    mut routines.push(Routine.Stop)
+    mut routines.push(Routine.Spawn)
+    mut routines.push(Routine.Wake)
+    mut routines.push(Routine.Park)
+    mut routines.push(Routine.RegionOpen)
+    mut routines.push(Routine.Cancel)
+    mut routines.push(Routine.Origin)
+    mut routines.push(Routine.CownRelease)
+    mut routines.push(Routine.Lock)
+    mut routines.push(Routine.Unlock)
+    mut routines.push(Routine.ClockNow)
+    mut routines.push(Routine.IommuFlush)
+    return routines
+} exported_routines
+
+/// A data object a kernel's runtime reserves that a bundle's code reaches: its name, size and
+/// alignment.
+struct SharedData {
+    name: text::String
+    size: u64
+    align: u64
+} SharedData
+
+/// The data a kernel's runtime reserves that a bundle's code reaches, which a kernel exports.
+fn shared_data(arch: workspace::Arch, alloc: mem::Alloc) -> mem::List[SharedData] {
+    var shared = mem::List[SharedData].empty(alloc)
+    mut shared.push(SharedData(name: text::String.of("_NScpus", alloc), size: MAX_CPUS * CPU_SIZE, align: 64))
+    mut shared.push(SharedData(name: text::String.of("_NSirq_bindings", alloc), size: BINDING_ROWS * BINDING_VECTORS * BINDING_SIZE, align: 8))
+    mut shared.push(SharedData(name: text::String.of("_NSheap_state", alloc), size: ALLOCATORS_SIZE, align: 64))
+    match arch {
+        workspace::Arch.Amd64 => mut shared.push(SharedData(name: text::String.of("_NSidt", alloc), size: IDT_BYTES, align: 16))
+        workspace::Arch.Aarch64 => {
+            mut shared.push(SharedData(name: text::String.of("_NSirq_lpis", alloc), size: LPIS * BINDING_SIZE, align: 8))
+            mut shared.push(SharedData(name: text::String.of("_NSits_devices", alloc), size: ITS_DEVICES * DEVICE_ENTRY, align: 8))
+        }
+    }
+    return shared
+} shared_data
+
+/// The names of the exports of a kernel of a target whose final closure declares the loaded
+/// registries of these canonical paths, in export order.
+pkg fn export_names(target: workspace::Target, registries: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(arch) = target.arch() else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    var names = mem::List[text::String].empty(alloc)
+    mut names.push(text::String.of(RUNTIME_STATE, alloc))
+    mut names.push(text::String.of(LINES_SYMBOL, alloc))
+    for routine in exported_routines(alloc) {
+        mut names.push(text::String.of(routine.name(), alloc))
+    }
+    for data in shared_data(arch, alloc) {
+        mut names.push(text::String.of(data.name.as_str(), alloc))
+    }
+    for path in registries {
+        mut names.push(record_symbol(path.as_str(), alloc))
+    }
+    return names
+} export_names
+
+/// The symbol of the table record of the loaded registry of a canonical path.
+fn record_symbol(path: Str, alloc: mem::Alloc) -> text::String {
+    var name = text::String.of(LOAD_RECORD, alloc)
+    mut name.append(path)
+    return name
+} record_symbol
+
+/// The form in which loading compares a key or unique field of a type: 0 for `Str`, otherwise
+/// the integer's width in bytes, with `0x80` set for a signed one.
+fn field_form(types: ty::Types, ty: ty::Ty) -> u64 {
+    let ty::TyKind.Scalar(scalar) = types.kind(ty) else {
+        return 0
+    }
+    return match scalar {
+        ty::Scalar.Unsigned8 or ty::Scalar.Bool => 1
+        ty::Scalar.Unsigned16 => 2
+        ty::Scalar.Unsigned32 or ty::Scalar.Char => 4
+        ty::Scalar.Signed8 => 0x81
+        ty::Scalar.Signed16 => 0x82
+        ty::Scalar.Signed32 => 0x84
+        ty::Scalar.Signed64 or ty::Scalar.SignedSize => 0x88
+        else => 8
+    }
+} field_form
+
+/// Whether the image is a bundle, importing the load ABI.
+fn Lowering.imports(self) -> bool {
+    return match self.linking {
+        Linking.Bundle => true
+        else => false
+    }
+} Lowering.imports
+
+/// Whether the image is a kernel exporting the load ABI.
+fn Lowering.exports(self) -> bool {
+    return match self.linking {
+        Linking.Kernel(_) => true
+        else => false
+    }
+} Lowering.exports
+
+/// The stack a kernel's interface lets interrupt functions use, zero for another image.
+fn Lowering.interface_interrupt_stack(self) -> u64 {
+    return match self.linking {
+        Linking.Kernel(kernel) => kernel.contents().interrupt_stack
+        else => 0
+    }
+} Lowering.interface_interrupt_stack
+
+/// The address of the export table, zero in an image that exports none.
+fn Lowering.export_table(mut self, mut fx: Fx) -> clif::Value {
+    if not self.exports() {
+        return mut fx.ptr(0)
+    }
+    let id = mut self.module.declare_data(LOAD_EXPORTS, linkage: object::Linkage.Local, writable: true, tls: false)
+    return mut self.data_address(mut fx, id)
+} Lowering.export_table
+
+/// An export the export table holds: the address of a function, or of a data object plus an
+/// addend, at an offset.
+enum Exported derives Copy {
+    Function(at: u32, id: object::FuncId)
+    Data(at: u32, id: object::DataId, addend: i64)
+} Exported
+
+/// The bytes of the load window's tables on an architecture.
+fn window_bytes(arch: workspace::Arch) -> u64 {
+    return match arch {
+        workspace::Arch.Amd64 => 4_096
+        workspace::Arch.Aarch64 => 8_192
+    }
+} window_bytes
+
+/// Defines a kernel's export table over every export its interface names, the loaded
+/// registries of its final closure being `registries`.
+fn Lowering.export_abi(mut self, registries: Slice[ty::ItemId]) {
+    let Linking.Kernel(held) = self.linking else {
+        return
+    }
+    let kernel = held.share()
+    let Some(arch) = self.ck.db().target.arch() else {
+        expect false
+        return
+    }
+    let shared = shared_data(arch, alloc: self.alloc)
+    let routines = exported_routines(self.alloc)
+    var functions = mem::List[Exported].empty(self.alloc)
+    var data_objects = mem::List[Exported].empty(self.alloc)
+    let window = mut self.reserved_data(LOAD_WINDOW, size: window_bytes(arch), align: 4_096)
+    var window_offset: i64 = 0
+    var base = X64_WINDOW
+    if arch == workspace::Arch.Aarch64 {
+        window_offset = 4_096
+        base = A64_WINDOW
+    }
+    let tables = mut self.lines.table(mut self.module, linking: self.linking)
+    mut data_objects.push(Exported.Data(at: EXPORT_LINES, id: tables, addend: 0))
+    mut data_objects.push(Exported.Data(at: EXPORT_WINDOW, id: window, addend: window_offset))
+    for index in 0..<kernel.contents().exports.len() {
+        let name = kernel.contents().exports[index].as_str()
+        let at = EXPORT_FIRST + 8 * u32.fit(index)
+        match routines.position(fn(routine: Routine) => routine.name() == name) {
+            Some(found) => {
+                mut functions.push(Exported.Function(at: at, id: mut self.routine(routines[found])))
+                continue
+            }
+            None => {}
+        }
+        mut data_objects.push(Exported.Data(at: at, id: mut self.exported_data(name, shared: shared.view(), registries), addend: 0))
+    }
+    let exports = kernel.contents()
+    var bytes = mem::Bytes.empty(self.alloc)
+    mut bytes.append(exports.hash.view())
+    while bytes.len() < usize.widen(EXPORT_FIRST) {
+        mut bytes.push(0)
+    }
+    write_le(mut bytes, at: EXPORT_NEXT, value: base, size: 8, big: false)
+    write_le(mut bytes, at: EXPORT_COUNT, value: u64.widen(exports.exports.len()), size: 8, big: false)
+    for _ in 0..<exports.exports.len() {
+        object::append_u64(mut bytes, value: 0)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    for exported in functions {
+        let Exported.Function(at: at, id: id) = exported else {
+            continue
+        }
+        let reference = mut description.import_function(id)
+        mut description.write_function_addr(at, function: reference)
+    }
+    for exported in data_objects {
+        let Exported.Data(at: at, id: id, addend: addend) = exported else {
+            continue
+        }
+        let reference = mut description.import_data(id)
+        mut description.write_data_addr(at, data: reference, addend)
+    }
+    let id = mut self.module.declare_data(LOAD_EXPORTS, linkage: object::Linkage.Local, writable: true, tls: false)
+    mut self.module.define_data(id, take description)
+} Lowering.export_abi
+
+/// The data object an export of a name other than a routine's names: the runtime state, the
+/// line tables, the runtime data a bundle reaches, or a loaded registry's table record.
+fn Lowering.exported_data(mut self, name: Str, shared: Slice[SharedData], registries: Slice[ty::ItemId]) -> object::DataId {
+    if name == RUNTIME_STATE {
+        return mut self.state_data()
+    }
+    if name == LINES_SYMBOL {
+        return mut self.lines.table(mut self.module, linking: self.linking)
+    }
+    for data in shared {
+        if data.name.as_str() == name {
+            return mut self.reserved_data(name, size: data.size, align: data.align)
+        }
+    }
+    for registry_item in registries {
+        let symbol = record_symbol(self.ck.db().canonical(registry_item).as_str(), alloc: self.alloc)
+        if symbol.as_str() == name {
+            return mut self.loaded_record(registry_item)
+        }
+    }
+    expect false
+    return object::DataId(index: 0)
+} Lowering.exported_data
+
+/// The table record of a loaded registry, declared once: a bundle imports it, any other image
+/// defines it holding the registry's table as its first version, with the gate of each function
+/// field of the entry type.
+fn Lowering.loaded_record(mut self, registry_item: ty::ItemId) -> object::DataId {
+    match self.data.records.get(registry_item) {
+        Some(known) => return known
+        None => {}
+    }
+    let name = record_symbol(self.ck.db().canonical(registry_item).as_str(), alloc: self.alloc)
+    if self.imports() {
+        let imported = mut self.module.declare_data(name.as_str(), linkage: object::Linkage.Import, writable: true, tls: false)
+        discard mut self.data.records.insert(registry_item, value: imported)
+        return imported
+    }
+    let id = mut self.module.declare_data(name.as_str(), linkage: object::Linkage.Local, writable: true, tls: false)
+    let table = mut self.table(registry_item)
+    let gates = mut self.gates(registry_item)
+    var bytes = mem::Bytes.zeroed(16 + 16 * gates.len(), alloc: self.alloc)
+    write_le(mut bytes, at: 8, value: u64.widen(gates.len()), size: 8, big: false)
+    for index in 0..<gates.len() {
+        write_le(mut bytes, at: 16 + 16 * index, value: gates[index].offset, size: 8, big: false)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    let reference = mut description.import_data(table)
+    mut description.write_data_addr(0, data: reference, addend: 0)
+    for index in 0..<gates.len() {
+        let gate_reference = mut description.import_function(gates[index].gate)
+        mut description.write_function_addr(24 + 16 * u32.fit(index), function: gate_reference)
+    }
+    mut self.module.define_data(id, take description)
+    discard mut self.data.records.insert(registry_item, value: id)
+    return id
+} Lowering.loaded_record
+
+/// A function field of a loaded registry's entry type: its offset and the gate of its type.
+struct FieldGate derives Copy {
+    offset: u64
+    gate: object::FuncId
+} FieldGate
+
+/// The offset of each function field of a loaded registry's entry type, with the gate of its
+/// type.
+fn Lowering.gates(mut self, registry_item: ty::ItemId) -> mem::List[FieldGate] {
+    var gates = mem::List[FieldGate].empty(self.alloc)
+    let sig = self.ck.sig(registry_item)
+    let check::SigKind.Registry(entry: entry) = sig.contents().kind else {
+        expect false
+        return gates
+    }
+    let ty::TyKind.Item(item: structure, args: _) = self.ck.types().kind(entry) else {
+        expect false
+        return gates
+    }
+    let structure_sig = self.ck.sig(structure)
+    let check::SigKind.Struct(fields: fields) = structure_sig.contents().kind else {
+        expect false
+        return gates
+    }
+    for index in 0..<fields.len() {
+        let ty::TyKind.Fn(fn_ty) = self.ck.types().kind(fields[index].ty) else {
+            continue
+        }
+        let field_name = text::String.of(fields[index].name.as_str(), alloc: self.alloc)
+        let field = mut self.layouts.field(self.ck, ty: entry, variant: None, label: field_name.as_str())
+        let gate = mut self.gate(fn_ty, registry_item)
+        mut gates.push(FieldGate(offset: field.offset, gate: gate))
+    }
+    return gates
+} Lowering.gates
+
+/// The gate of a function type, called with a gate record as its environment. It takes a
+/// holding pinning the target its record names, trapping with `trap.stale-handle` when the record
+/// names none, calls the target's code, then releases the pin. A `stack N` of the type demands it
+/// of the gate with the target bounded by `N` less `GATE_STACK`, reported at the registry.
+fn Lowering.gate(mut self, fn_ty: ty::FnTyId, registry_item: ty::ItemId) -> object::FuncId {
+    let fresh = self.glues.get(Glue.Gate(fn_ty)).is_none()
+    let fn_type = ty::copy_fn_ty(self.ck.types().fn_of(fn_ty), alloc: self.alloc)
+    let stack_limit = fn_type.limit_set.stack
+    let abi = mut self.fn_abi(fn_type)
+    var bound: Option[u64] = None
+    match stack_limit {
+        Some(stack) => {
+            bound = Some(stack.saturating_sub(GATE_STACK))
+        }
+        None => {}
+    }
+    let id = mut self.glue_function(Glue.Gate(fn_ty), signature: abi.signature(self.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() > 0
+        let record = params[0]
+        let pin = mut fx1.ptr(u64.fit(HOLDINGS_KIND_PIN))
+        let zero = mut fx1.ptr(0)
+        let held_args = fx1.list2(pin, b: zero)
+        let held = mut lo1.call_routine(mut fx1, routine: Routine.Hold, args: held_args.view())
+        let holding = held[0]
+        let found = mut fx1.repeat(Array[clif::Value, 1].filled(zero).view(), body: fn[mut lo1](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            let target = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: record)
+            let stale = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: target, y: 0)
+            mut fx2.if_true(stale, then: fn[mut lo1](mut fx3: Fx) {
+                discard mut lo1.call_routine(mut fx3, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+                raise_kind(mut lo1, fx: mut fx3, kind: "trap.stale-handle")
+            })
+            let pins = mut fx2.offset(target, offset: 8)
+            let one = mut fx2.ptr(1)
+            discard fetch_add(mut fx2, address: pins, amount: one)
+            let again = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: record)
+            let moved = mut fx2.b.icmp(clif::IntCC.NotEqual, x: again, y: target)
+            mut fx2.if_true(moved, then: fn(mut fx3: Fx) {
+                let less = mut fx3.int(PTR, value: -1)
+                discard fetch_add(mut fx3, address: pins, amount: less)
+            })
+            var next = mem::List[clif::Value].empty(fx2.alloc)
+            mut next.push(target)
+            return Pass(again: moved, next: take next)
+        })
+        let pins = mut fx1.offset(found[0], offset: 8)
+        mut fx1.store(pins, addr: holding, offset: HOLDING_PAYLOAD)
+        let code = mut fx1.load(PTR, addr: found[0], offset: 0)
+        var args = mem::List[clif::Value].empty(fx1.alloc)
+        mut args.push(mut fx1.ptr(0))
+        for index in 1..<params.len() {
+            mut args.push(params[index])
+        }
+        let signature = mut fx1.b.import_signature(abi.signature(lo1.alloc))
+        let inst = mut fx1.b.call_indirect(signature, callee: code, args: args.view())
+        mut fx1.sites.push(CallSite(inst: inst, site: Site(kind: StackKind.Bounded(bound), at: None)))
+        let results = fx1.b.inst_results(inst, alloc: fx1.alloc)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+        let less = mut fx1.int(PTR, value: -1)
+        discard fetch_add(mut fx1, address: pins, amount: less)
+        mut fx1.b.ret(results.view())
+    })
+    match stack_limit {
+        Some(stack) => {
+            if fresh {
+                let span = nir::Span.at(self.ck.db().ast(registry_item).token)
+                mut self.demands.push(Demand(judged: Judged.Function(id), stack: stack, report: StackReport.Fit(At(item: registry_item, span: span))))
+            }
+        }
+        None => {}
+    }
+    return id
+} Lowering.gate
+
+/// The entry a bundle's contribution adds to a loaded registry, lowering its value; a `stack N`
+/// of a function field's type demands `N` less `GATE_STACK` of its function, reported at the
+/// contribution.
+fn Lowering.contributed_entry(mut self, contribution: ty::ItemId, registry_item: ty::ItemId) -> image::LoadedEntry {
+    let sig = self.ck.sig(registry_item)
+    let check::SigKind.Registry(entry: entry) = sig.contents().kind else {
+        expect false
+        return self.no_entry()
+    }
+    let ast::ItemKind.Registry(declared) = self.ck.db().ast(registry_item).kind else {
+        expect false
+        return self.no_entry()
+    }
+    let Some(value) = self.ck.const_value(contribution) else {
+        expect false
+        return self.no_entry()
+    }
+    let key_name = text::String.of(declared.key.text.as_str(), alloc: self.alloc)
+    var unique_names = mem::List[text::String].empty(self.alloc)
+    for name in declared.unique {
+        mut unique_names.push(text::String.of(name.text.as_str(), alloc: self.alloc))
+    }
+    let data = mut self.const_data(contribution, ty: entry)
+    let entry_layout = mut self.layout_of(entry)
+    let key_field = mut self.layouts.field(self.ck, ty: entry, variant: None, label: key_name.as_str())
+    let key = image::FieldForm(offset: key_field.offset, form: field_form(self.ck.types(), ty: key_field.ty))
+    var unique = mem::List[image::FieldForm].empty(self.alloc)
+    for name in unique_names {
+        let unique_field = mut self.layouts.field(self.ck, ty: entry, variant: None, label: name.as_str())
+        mut unique.push(image::FieldForm(offset: unique_field.offset, form: field_form(self.ck.types(), ty: unique_field.ty)))
+    }
+    let check::Val.Struct(item: _, fields: values) = value.contents().value else {
+        expect false
+        return self.no_entry()
+    }
+    let ty::TyKind.Item(item: structure, args: _) = self.ck.types().kind(entry) else {
+        expect false
+        return self.no_entry()
+    }
+    let structure_sig = self.ck.sig(structure)
+    let check::SigKind.Struct(fields: fields) = structure_sig.contents().kind else {
+        expect false
+        return self.no_entry()
+    }
+    var gates = mem::List[u64].empty(self.alloc)
+    for index in 0..<fields.len() {
+        let ty::TyKind.Fn(fn_ty) = self.ck.types().kind(fields[index].ty) else {
+            continue
+        }
+        expect index < values.contents().len()
+        let check::Val.Fn(function) = values.contents()[index] else {
+            continue
+        }
+        let check::FnVal.Function(fn_ref) = function.contents() else {
+            expect false
+            continue
+        }
+        match self.ck.types().fn_of(fn_ty).limit_set.stack {
+            Some(stack) => {
+                let inner = mut self.callable_instance(fn_ref, as_value: true)
+                let id = mut self.instance(Instance.value_of(take inner, alloc: self.alloc))
+                let span = nir::Span.at(self.ck.db().ast(contribution).token)
+                mut self.demands.push(Demand(judged: Judged.Function(id), stack: stack.saturating_sub(GATE_STACK), report: StackReport.Fit(At(item: contribution, span: span))))
+            }
+            None => {}
+        }
+        let gate_field = mut self.layouts.field(self.ck, ty: entry, variant: None, label: fields[index].name.as_str())
+        mut gates.push(gate_field.offset)
+    }
+    return image::LoadedEntry(record: record_symbol(self.ck.db().canonical(registry_item).as_str(), alloc: self.alloc), entry: text::String.of(self.module.data_name(data), alloc: self.alloc), size: entry_layout.contents().size, key: key, unique: take unique, gates: take gates)
+} Lowering.contributed_entry
+
+/// Opens the load window to the running CPU of a kernel exporting the load ABI: on x86_64 kernel
+/// writes honour read-only pages and execute-disable bits are enabled; on AArch64 `TTBR1_EL1`
+/// walks the window's tables.
+fn Lowering.open_window(mut self, mut fx: Fx) {
+    if not self.exports() {
+        return
+    }
+    let Some(arch) = self.ck.db().target.arch() else {
+        expect false
+        return
+    }
+    if arch == workspace::Arch.Amd64 {
+        discard mut self.call_stub(mut fx, stub: Stub.WriteProtect, args: mem::List[clif::Value].empty(fx.alloc).view())
+        return
+    }
+    let window = mut self.reserved(mut fx, data_name: LOAD_WINDOW, size: window_bytes(arch), align: 4_096)
+    let table = mut fx.offset(window, offset: 4_096)
+    let entry = mut fx.b.bor_imm_s(table, y: i64.fit(WINDOW_TABLE))
+    mut fx.store(entry, addr: window, offset: 0)
+    discard mut self.call_stub(mut fx, stub: Stub.WriteSysReg(TTBR1_EL1), args: Array[clif::Value, 1].filled(window).view())
+    let read = mut self.call_stub(mut fx, stub: Stub.ReadSysReg(TCR_EL1), args: mem::List[clif::Value].empty(fx.alloc).view())
+    let cleared = mut fx.b.band_imm_s(read[0], y: ~TCR_HIGH_FIELDS)
+    let set = mut fx.b.bor_imm_s(cleared, y: TCR_HIGH)
+    discard mut self.call_stub(mut fx, stub: Stub.WriteSysReg(TCR_EL1), args: Array[clif::Value, 1].filled(set).view())
+    discard mut self.call_stub(mut fx, stub: Stub.TlbiAll, args: mem::List[clif::Value].empty(fx.alloc).view())
+} Lowering.open_window
+
+/// The window entry of a kind, `kind` being 0 for code, 1 for read-only data, 2 for writable
+/// data and 3 for a table, over the page or table at a physical address.
+fn Lowering.window_entry(mut self, mut fx: Fx, physical: clif::Value, kind: clif::Value) -> clif::Value {
+    var entries = Array[u64, 3].filled(X64_CODE)
+    entries[1] = X64_READ_ONLY
+    entries[2] = X64_WRITABLE
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        entries[0] = A64_CODE
+        entries[1] = A64_READ_ONLY
+        entries[2] = A64_WRITABLE
+    }
+    var bits = mut fx.ptr(WINDOW_TABLE)
+    for index in 0usize..<3 {
+        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: i64.fit(index))
+        let value = mut fx.ptr(entries[index])
+        bits = mut fx.b.select(this, x: value, y: bits)
+    }
+    return mut fx.b.bor(physical, y: bits)
+} Lowering.window_entry
+
+/// The window table the entry root's top-level entry of the load window names on x86_64, with
+/// the entry's bits, in a kernel exporting the load ABI.
+fn Lowering.window_root_entry(mut self) -> Option[object::DataId] {
+    if not self.exports() or self.ck.db().target.arch() != Some(workspace::Arch.Amd64) {
+        return None
+    }
+    return Some(mut self.reserved_data(LOAD_WINDOW, size: window_bytes(workspace::Arch.Amd64), align: 4_096))
+} Lowering.window_root_entry
+
+/// An entry that no well-formed contribution gives.
+fn Lowering.no_entry(self) -> image::LoadedEntry {
+    return image::LoadedEntry(record: text::String.empty(self.alloc), entry: text::String.empty(self.alloc), size: 0, key: image::FieldForm(offset: 0, form: 0), unique: mem::List[image::FieldForm].empty(self.alloc), gates: mem::List[u64].empty(self.alloc))
+} Lowering.no_entry

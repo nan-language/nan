@@ -821,10 +821,15 @@ impl<'a> Lower<'a> {
     }
 
     fn registry_item(&self, node: NodeId) -> RegistryItem {
+        let loaded = self
+            .tokens(node)
+            .first()
+            .is_some_and(|token| self.kind(*token) == TokenKind::Ident);
         let idents = self.idents(node);
         let key = *idents.last().expect("a key field");
         RegistryItem {
-            name: self.name(idents[0]),
+            loaded,
+            name: self.name(idents[usize::from(loaded)]),
             entry: self.type_expr(self.find(node, Rule::TypeExpr).expect("an entry type")),
             key: self.name(key),
             unique: self

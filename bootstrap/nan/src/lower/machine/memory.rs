@@ -4,6 +4,7 @@
 //! tables at its end, from usable memory as it starts; a UEFI target's image reserves the boot
 //! area, and `exit_services` carves the tables alone.
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_frontend::Variable;
 
@@ -276,7 +277,14 @@ impl Lowering<'_, '_> {
     /// The boot area in the zeroed data the image reserves for it with one chunk more, so that it
     /// aligns to a chunk wherever the image is loaded.
     fn reserve_boot_area(&mut self, fx: &mut Fx) -> Value {
-        let reserved = self.reserved(fx, "_NSboot_area", BOOT_AREA + CHUNK, 4_096);
+        let reserved = self.reserved(
+            fx,
+            Reserved {
+                name: "_NSboot_area",
+                size: BOOT_AREA + CHUNK,
+                align: 4_096,
+            },
+        );
         let bumped = fx.b.ins().iadd_imm_s(reserved, CHUNK as i64 - 1);
         fx.b.ins().band_imm_s(bumped, -(CHUNK as i64))
     }

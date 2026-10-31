@@ -5,6 +5,7 @@
 //! remaps interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to
 //! the CPU of its devices.
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
 };
@@ -63,10 +64,17 @@ const MSI_VECTORS: (i64, i64) = (0x21, 0xFE);
 const MSI_ID_MAX: i64 = 255;
 const MSI_ADDRESS: i64 = 0xFEE0_0000;
 
+/// The binding table.
+pub const IRQ_BINDINGS: Reserved = Reserved {
+    name: "_NSirq_bindings",
+    size: ROWS * VECTORS * binding::SIZE,
+    align: 8,
+};
+
 impl Lowering<'_, '_> {
     /// The binding of a vector in a row of the binding table.
     pub fn irq_binding(&mut self, fx: &mut Fx, row: Value, vector: Value) -> Value {
-        let table = self.reserved(fx, "_NSirq_bindings", ROWS * VECTORS * binding::SIZE, 8);
+        let table = self.reserved(fx, IRQ_BINDINGS);
         let at = fx.b.ins().imul_imm_s(row, VECTORS as i64);
         let at = fx.b.ins().iadd(at, vector);
         let at = fx.b.ins().imul_imm_s(at, binding::SIZE as i64);

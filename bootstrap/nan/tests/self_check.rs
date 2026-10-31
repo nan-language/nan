@@ -6,7 +6,8 @@
 //! its section's `text` blocks, with the canonical NIR, the text of each function a final build
 //! lowers and what each host program of this machine's architecture writes; for every std
 //! package, `nan check` with its NIR and `nan test`; for every program of `tests/programs`, its
-//! final build and lowering and what it writes, a machine program's under its emulator; and for
+//! final build and lowering and what it writes, a machine program's under its emulator, a
+//! kernel's with the bundles each toolchain builds of its `bundles` directory; and for
 //! the toolchain workspace, which must check without a diagnostic and pass `nan verify` with
 //! both. The toolchain test then checks the self-built toolchain by diverse
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
@@ -1043,6 +1044,12 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
     fs::remove_file(dir.join(name).join("expected"))?;
     drop(fs::remove_file(dir.join(name).join("emulator")));
+    let bundles = bundle_packages(&dir.join(name))?;
+    if !bundles.is_empty() {
+        for package in std::iter::once(name).chain(bundles.iter().map(String::as_str)) {
+            compare_published(&toolchain, &dir, &store, &["dep", "sync", package])?;
+        }
+    }
     compare(&toolchain, &dir, &store, &["build", name])?;
     let manifest = fs::read_to_string(dir.join(name).join("package.nan"))?;
     let target = manifest
@@ -1050,11 +1057,132 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         .find_map(|line| line.trim().strip_prefix("targets "))
         .expect("a program's targets directive")
         .to_owned();
+    if !bundles.is_empty() {
+        compare_bundled(&toolchain, &dir, &store, name, &target, &bundles)?;
+    }
     compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-host"))?;
-    compare_program(&toolchain, &dir, &store, name, &target)?;
+    if bundles.is_empty() {
+        compare_program(&toolchain, &dir, &store, name, &target)?;
+    }
     fs::remove_dir_all(&dir)?;
     fs::remove_dir_all(fronts(&dir, &store).0)?;
     Ok(())
+}
+
+/// The packages of a kernel's `bundles` directory, in order of name.
+fn bundle_packages(kernel: &Path) -> std::io::Result<Vec<String>> {
+    let Ok(entries) = fs::read_dir(kernel.join("bundles")) else {
+        return Ok(Vec::new());
+    };
+    let mut packages: Vec<String> = entries
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    packages.sort();
+    Ok(packages)
+}
+
+/// Builds each of the `bundles` of the kernel `program` against the interface file of the kernel
+/// each toolchain built in its workspace, signed by `tester`, and compares what both print and
+/// the interface files but the toolchain hash each names; then boots each kernel with its
+/// toolchain's bundles and compares what both write to the serial port and the statuses their
+/// runs end with.
+fn compare_bundled(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+    target: &str,
+    bundles: &[String],
+) -> Result<(), String> {
+    let (front_dir, front_store) = fronts(bootstrap, store);
+    let images = format!(".nan/images/{target}");
+    let interface = format!("{images}/{program}.nlif");
+    let read = |dir: &Path, file: &str| {
+        fs::read(dir.join(file)).map_err(|error| format!("{}: {error}", dir.join(file).display()))
+    };
+    if interface_compared(read(bootstrap, &interface)?)
+        != interface_compared(read(&front_dir, &interface)?)
+    {
+        return Err(format!(
+            "{interface} differs beyond its toolchain hash in {}",
+            front_dir.display()
+        ));
+    }
+    secret_key("tester", 7).map_err(|error| error.to_string())?;
+    let home = front_home();
+    let given = Given {
+        home: &home,
+        store: &front_store,
+        asked: &[],
+        spread: false,
+    };
+    let mut passed = [Vec::new(), Vec::new()];
+    for package in bundles {
+        let build = ["build", package, "--against", &interface, "--as", "tester"];
+        let run = front(toolchain, &front_dir, &given, &build)?;
+        let (expected, status) = nan(bootstrap, &build)?;
+        let (printed, code) = run.output()?;
+        agree(&build, (expected.as_bytes(), status), (&printed, code))?;
+        let bundle = format!("{images}/{package}.nbun");
+        for (dir, args) in [bootstrap, front_dir.as_path()].iter().zip(&mut passed) {
+            args.push("-fw_cfg".to_owned());
+            args.push(format!(
+                "name=opt/nan/{package},file={}",
+                dir.join(&bundle).display()
+            ));
+        }
+    }
+    let run = nan::run(&["run".to_owned(), program.to_owned()], bootstrap);
+    let mut launch = run
+        .launch
+        .ok_or_else(|| format!("nan run {program} reports\n{}", run.output))?;
+    let ours = format!("{}/", bootstrap.display());
+    let theirs = format!("{}/", front_dir.display());
+    let [own, front_bundles] = passed;
+    let front_args: Vec<String> = launch
+        .args
+        .iter()
+        .map(|arg| arg.replace(&ours, &theirs))
+        .chain(front_bundles)
+        .collect();
+    launch.args.extend(own);
+    let booted = machine::boot(&launch)?;
+    launch.args = front_args;
+    let front_booted = machine::boot(&launch)?;
+    if (front_booted.status, &front_booted.written) != (booted.status, &booted.written) {
+        return Err(format!(
+            "{program} and its bundles built by the bootstrap write\n{}exiting with {}\nbuilt by the NaN toolchain\n{}exiting with {}",
+            booted.written, booted.status, front_booted.written, front_booted.status
+        ));
+    }
+    Ok(())
+}
+
+/// The uvar at `at` in `bytes`, moving `at` past it.
+fn uvar_at(bytes: &[u8], at: &mut usize) -> Option<usize> {
+    let mut value = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        value |= usize::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+}
+
+/// An interface file, its magic and version followed by its record, with the toolchain hash of
+/// the record's first field zeroed.
+fn interface_compared(mut file: Vec<u8>) -> Option<Vec<u8>> {
+    let mut at = 4;
+    for _ in 0..3 {
+        uvar_at(&file, &mut at)?;
+    }
+    let len = uvar_at(&file, &mut at)?;
+    file.get_mut(at..at + len)?.fill(0);
+    Some(file)
 }
 
 /// Starts building the toolchain workspace copied into `dir` with the NaN toolchain `builder`,
@@ -1300,9 +1428,10 @@ fn shown_key(
         .ok_or_else(|| format!("nan key show {principal} prints\n{shown}"))
 }
 
-/// Compares as `compare` does a run of `nan publish`, but the local stores, whose artefacts
-/// each toolchain attests with its own toolchain hash; the next comparison copies the
-/// bootstrap's store for both.
+/// Compares as `compare` does a run of a command putting releases in the local store, `nan
+/// publish` or `nan dep sync` over path dependencies, but the local stores, whose artefacts each
+/// toolchain attests with its own toolchain hash; the next comparison copies the bootstrap's store
+/// for both.
 fn compare_published(
     toolchain: &Toolchain,
     bootstrap: &Path,

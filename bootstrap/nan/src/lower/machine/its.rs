@@ -4,6 +4,7 @@
 //! which the runtime drives synchronously under the bindings lock. An installed device's event
 //! is its LPI's index, so each device id's interrupt table covers every LPI.
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
 use super::super::fx::{Fx, PTR};
@@ -102,10 +103,22 @@ const LPI_ENABLED: i64 = 0xA1;
 const DEVICES: u64 = 256;
 const DEVICE_ENTRY: u64 = 16;
 
+/// The bindings of the LPIs, and the interrupt table of each device id.
+pub const IRQ_LPIS: Reserved = Reserved {
+    name: "_NSirq_lpis",
+    size: LPIS * binding::SIZE,
+    align: 8,
+};
+pub const ITS_DEVICES: Reserved = Reserved {
+    name: "_NSits_devices",
+    size: DEVICES * DEVICE_ENTRY,
+    align: 8,
+};
+
 impl Lowering<'_, '_> {
     /// The binding of an LPI by its identifier, in the image's table of them.
     pub(super) fn lpi_binding(&mut self, fx: &mut Fx, intid: Value) -> Value {
-        let table = self.reserved(fx, "_NSirq_lpis", LPIS * binding::SIZE, 8);
+        let table = self.reserved(fx, IRQ_LPIS);
         let index = fx.b.ins().iadd_imm_s(intid, -LPI_BASE);
         let at = fx.b.ins().imul_imm_s(index, binding::SIZE as i64);
         fx.b.ins().iadd(table, at)
@@ -305,7 +318,7 @@ impl Lowering<'_, '_> {
         let outcome = fx.var(PTR, unsupported);
         fx.when(accepted, |fx| {
             let table = self.its_device(fx, source);
-            let lpis = self.reserved(fx, "_NSirq_lpis", LPIS * binding::SIZE, 8);
+            let lpis = self.reserved(fx, IRQ_LPIS);
             let first = fx.ptr(0);
             let index = fx.repeat(&[first], |fx, at| {
                 let slot = fx.b.ins().imul_imm_s(at[0], binding::SIZE as i64);
@@ -359,7 +372,7 @@ impl Lowering<'_, '_> {
     /// The interrupt table of device id `source`, mapping it to a new one on its first install;
     /// zero when `DEVICES` ids already have one or the chunks run out.
     fn its_device(&mut self, fx: &mut Fx, source: Value) -> Value {
-        let entries = self.reserved(fx, "_NSits_devices", DEVICES * DEVICE_ENTRY, 8);
+        let entries = self.reserved(fx, ITS_DEVICES);
         let key = fx.b.ins().iadd_imm_s(source, 1);
         let zero = fx.ptr(0);
         let found = fx.var(PTR, zero);

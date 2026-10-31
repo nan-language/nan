@@ -18,6 +18,7 @@ pub(crate) mod host;
 mod layout;
 mod levels;
 mod lines;
+pub mod load;
 pub mod machine;
 mod place;
 mod release;
@@ -188,6 +189,8 @@ pub enum Glue {
     Captures(Instance),
     /// Calls a hook of a kernel policy of a type.
     Policy(machine::schedule::Hook, Ty),
+    /// Calls, for a function type, the target its gate record names.
+    Gate(ty::FnTy),
 }
 
 impl Glue {
@@ -213,6 +216,7 @@ impl Glue {
                 | Glue::WithdrawStepper
                 | Glue::SimWithdraw
                 | Glue::WithdrawSignal(_)
+                | Glue::Gate(_)
         )
     }
 }
@@ -247,6 +251,8 @@ pub struct Lowered {
     pub tasks: Vec<stack::Task>,
     /// The two entities of each pair lowered with one host symbol name, as diagnostics name them.
     pub collisions: Vec<(String, String)>,
+    /// The entries a bundle adds to loaded registries.
+    pub contributed: Vec<load::Contributed>,
 }
 
 /// What a final build lowers: the program's entry function and its target's entry landing fn,
@@ -261,11 +267,25 @@ pub struct Program {
     pub section: Vec<u8>,
     /// The codegen level of the program's manifest for the target's architecture.
     pub level: Option<Level>,
+    /// A kernel's interface, when it exports the load ABI, and the loaded registries of its
+    /// final closure.
+    pub interface: Option<Rc<load::Interface>>,
+    pub loaded: Vec<ItemId>,
+}
+
+/// What a bundle's build lowers: the entries its contributions add to loaded registries.
+pub struct Bundle {
+    pub contributions: Vec<(ItemId, ItemId)>,
+    pub roots: Vec<PackageId>,
+    pub prefixes: HashMap<String, String>,
+    /// The codegen level of the kernel's interface.
+    pub level: Option<Level>,
 }
 
 pub struct Lowering<'c, 'a> {
     pub ck: &'c Checker<'a>,
     pub module: ObjectModule,
+    pub linking: load::Linking,
     pub layouts: Layouts,
     isa: OwnedTargetIsa,
     /// The codegen level the image's code is generated for, none for the base set.
@@ -296,15 +316,16 @@ pub struct Lowering<'c, 'a> {
     pub data: data::Data,
     pub lines: lines::Lines,
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
-    /// function value naming them holds, and the table of them that spawns read.
+    /// function value naming them holds.
     pub entry_stacks: Vec<(FuncId, u64)>,
-    pub entry_table: Option<DataId>,
     frames: Vec<Frame>,
     pub demands: Vec<Demand>,
     pub tasks: Vec<stack::Task>,
     /// For a test image, what its tests' runs need, and the sim table once declared.
     test: Option<test_image::Runtime>,
     sims: Option<DataId>,
+    /// For a bundle, the entries it adds to loaded registries.
+    contributed: Vec<load::Contributed>,
 }
 
 /// A function declared and not yet defined.
@@ -354,12 +375,14 @@ fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
 
 /// Lowers the reach of a program's final build.
 pub fn lower(ck: &Checker, program: &Program) -> Lowered {
+    let linking = load::Linking::Image;
     let mut lowering = Lowering::new(
         ck,
         program.prefixes.clone(),
         program.roots.clone(),
         program.level,
         None,
+        linking,
     );
     host::entry_seam(&mut lowering, program);
     lowering.drain();
@@ -370,16 +393,42 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
 /// entry landing fn behind the machine entry seam, into an object the image writer turns into an
 /// image.
 pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
+    let linking = match &program.interface {
+        Some(interface) => load::Linking::Kernel(interface.clone()),
+        None => load::Linking::Image,
+    };
     let mut lowering = Lowering::new(
         ck,
         program.prefixes.clone(),
         program.roots.clone(),
         program.level,
         None,
+        linking,
     );
     let boot = lowering.boot_glue(program);
     let stack = lowering.boot_stack(program);
     lowering.entry_seam(boot, stack);
+    lowering.export_abi(&program.loaded);
+    lowering.drain();
+    lowering.finish(None)
+}
+
+/// Lowers a bundle: the entries its contributions add to loaded registries, with every function
+/// they reach, importing the load ABI.
+pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
+    let linking = load::Linking::Bundle;
+    let mut lowering = Lowering::new(
+        ck,
+        bundle.prefixes.clone(),
+        bundle.roots.clone(),
+        bundle.level,
+        None,
+        linking,
+    );
+    for (contribution, registry) in &bundle.contributions {
+        let contributed = lowering.contribute(*contribution, *registry);
+        lowering.contributed.push(contributed);
+    }
     lowering.drain();
     lowering.finish(None)
 }
@@ -393,6 +442,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         roots: Vec<PackageId>,
         level: Option<Level>,
         test: Option<test_image::Runtime>,
+        linking: load::Linking,
     ) -> Self {
         let isa = isa(ck.db.target, level);
         let builder = ObjectBuilder::new(
@@ -404,6 +454,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         Lowering {
             ck,
             module: ObjectModule::new(builder),
+            linking,
             layouts: Layouts::new(),
             isa,
             level,
@@ -427,12 +478,12 @@ impl<'c, 'a> Lowering<'c, 'a> {
             data: data::Data::default(),
             lines: lines::Lines::default(),
             entry_stacks: Vec::new(),
-            entry_table: None,
             frames: Vec::new(),
             demands: Vec::new(),
             tasks: Vec::new(),
             test,
             sims: None,
+            contributed: Vec::new(),
         }
     }
 
@@ -822,12 +873,13 @@ impl<'c, 'a> Lowering<'c, 'a> {
 
     /// The object of the lowering, holding a `.nan` section with `section` when given.
     fn finish(mut self, section: Option<&[u8]>) -> Lowered {
-        lines::emit(&mut self);
-        runtime::tasks::emit_entry_stacks(&mut self);
+        let entry_stacks = runtime::tasks::emit_entry_stacks(&mut self);
+        lines::emit(&mut self, entry_stacks);
         self.finish_interrupts();
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
         let tasks = std::mem::take(&mut self.tasks);
+        let contributed = std::mem::take(&mut self.contributed);
         let collisions = std::mem::take(&mut self.collisions)
             .iter()
             .map(|(first, second)| {
@@ -852,6 +904,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             demands,
             tasks,
             collisions,
+            contributed,
         }
     }
 }

@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; loading bundles into a running kernel; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -1272,6 +1272,65 @@ pub fn Module.into_region(take self) -> hw::Region
 - `k.acpi_table(signature, alloc)` copies the ACPI table with a signature as `Services.acpi_table` finds it, from the RSDP that the start information names, on `x86_64-bare` otherwise the one in the BIOS area, and on a UEFI target the one the configuration table lists; it is `None` when there is none. `k.device_tree(alloc)` copies the device tree the image entered with on `aarch64-bare`, and is `None` on the other targets.
 - Each draw traps on exhaustion (`trap.exhausted`).
 
+## Loading
+
+A kernel of a bare target **exports its load ABI** when its final closure declares a [loaded registry](25-registries.md#loaded-registries). Its final build then also writes its [interface file](30-artefacts.md#interface-files), and a [bundle](30-artefacts.md#bundles) built against that file adds entries to its loaded registries while it runs.
+
+```nan-api
+// module: boot
+
+pub fn Kernel.loader(self) -> Option[sys::load::Loader]
+```
+
+```nan-api
+// module: sys::load
+
+pub open struct Loader {
+} Loader
+
+pub fn Loader.prepare(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicKey], alloc: mem::Alloc) -> Prepared fails LoadError
+
+pub fn Loader.prepare_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> Prepared fails LoadError
+
+pub fn Loader.reclaim(self) -> usize fails task::Cancelled uses wait
+
+pub open linear struct Prepared {
+} Prepared
+
+pub fn Prepared.load(take self) -> Bundle fails LoadError
+
+pub open linear struct Bundle {
+} Bundle
+
+pub fn Bundle.domain(self) -> mem::Shared[sys::Abandoner]
+
+pub fn Bundle.replace(mut self, take next: Prepared) fails LoadError
+
+pub fn Bundle.unload(take self)
+
+pub closed enum LoadError derives Copy, Eq, Render {
+    Malformed
+    Signature
+    Interface
+    DuplicateKey
+    DuplicateUnique
+} LoadError
+```
+
+- `k.loader()` returns `Some` of a loader when the image exports its load ABI, and `None` otherwise. `sys::load::Loader` is a primitive capability.
+- A kernel exporting its load ABI has a **load window**, a range of 512 GiB of addresses outside the [entry root](#physical-memory)'s identity map, from `0xFFFF_8000_0000_0000` on x86_64, which the entry root's top-level entry 256 maps, and from `0xFFFF_0000_0000_0000` on AArch64, which `TTBR1_EL1` maps on each CPU. Every CPU of such a kernel enforces read-only pages for kernel writes and execute-never bits, `CR0.WP` and `EFER.NXE` on x86_64.
+- `loader.prepare(bundle, keys, alloc)` places a bundle's image without publishing its entries. It fails with `Malformed` when `bundle` is not a bundle's encoding, with `Signature` when its sections hold no signature that one of `keys` verifies, and with `Interface` when it was built against another interface than the kernel's. It then copies the image into runtime memory, applies its relocations for the image's address in the load window, binds each import to the kernel's export, maps the image's pages into the window, its code readable and executable, its read-only data readable and its writable data readable and writable, never executable, makes the code visible to every CPU's instruction fetch and adds its line tables to those the trap routine reads; it traps (`trap.exhausted`) when runtime memory cannot hold the image. The prepared bundle's bookkeeping is drawn through `alloc`. A store through a mapped page of a bundle's code or read-only data raises a page fault ([interrupt functions](#interrupt-functions)).
+- `loader.prepare_unverified(bundle, alloc)` is `prepare` without the signature check. It is a trusted primitive whose soundness condition is that `bundle` is a bundle the toolchain built against the kernel's interface file.
+- `take prepared.load()` publishes the bundle's entries: for each loaded registry it contributes to, a new version holding the current version's entries and the bundle's, each of these inserted, in the bundle's order, before the first entry whose key is greater ([loaded registries](25-registries.md#loaded-registries)). It fails with `DuplicateKey` when two entries of a new version have equal keys and with `DuplicateUnique` when they have equal values of a unique field, publishing nothing and retiring the placement.
+- Each function field of an entry a bundle adds holds a **gate**: a function value of the kernel's calling the bundle's function while the gate is live, and trapping (`trap.stale-handle`) once it is stale. While it calls the function, the call **pins** the function's code, a pin its domain's [settlement](11-errors-domains.md#settlement) releases when the call never returns. A call through a gate is the call of its function in every other respect; the gate itself uses at most 1 KiB of the stack ([stack limits](10-effects-digests.md#stack-limits)) that the `stack N` of the field's type bounds.
+- `bundle.domain()` shares the bundle's **domain**, an abandoner ([domain run](11-errors-domains.md#domain-run)) that runs no domain when the bundle is loaded. A kernel contains the calls it makes into a bundle, and what they leave running or installed, by making them in a domain run of that abandoner.
+- `bundle.replace(take next)` publishes in one change versions without the entries of `bundle` and with those of `next`, failing as `load` does and then changing nothing and retiring `next`'s placement. Each gate of `bundle` whose registry, key and field an entry of `next` shares then calls `next`'s function, and every other gate of `bundle` goes stale; `bundle` holds `next` from then on, with the same domain, and retires the placement it held.
+- `take bundle.unload()` triggers the bundle's domain, then publishes versions without the bundle's entries; every gate of the bundle goes stale and its placement is retired.
+- Loads, replacements, unloads and reclamations take one lock of the kernel's, each publishing all its versions before the next starts.
+- A bundle's code runs on the kernel's runtime: its tasks, cells, capabilities and domains are the kernel's.
+- **Retired** memory is reclaimed by `loader.reclaim()`: each version a publication replaced once no [read](25-registries.md#loaded-registries) holds it, and each retired placement once no older retired version is held and no call pins its code. Reclaiming a placement unlinks its line tables, clears its window entries and the window tables they leave empty, invalidates every CPU's translations as `hw::Ring0.invalidate_everywhere(hw::TlbScope.All)` does ([cross-CPU operations](#cross-cpu-operations)), then frees its runtime memory. `reclaim` gives the number of retired placements it leaves, and fails at once, keeping what it had cleared for the next call, when cancelled as its invalidation starts. A gate's function value and the records a gate reads, a few words per function field and load, are never reclaimed, so a value holding a gate stays valid after its bundle is reclaimed.
+- No value returned from a gate's call refers to its bundle's memory, since the types crossing a gate are [boundary types](25-registries.md#loaded-registries); what a bundle's code leaves running or installed beyond a call belongs to the domain the call runs in.
+
 ## Floating point
 
 A function, closure or const whose own operations or calls of std functions have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation or call.
@@ -1339,14 +1398,14 @@ halt first-task-ended at kernel/kernel.nan:24 in kernel::main
 
 ## Kernel types
 
-The types of this table are [base types](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]` and `boot::Services`.
+The types of this table are [base types](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]`, `boot::Services` and `sys::load::Loader`.
 
 | Type | linear | view | Copy | Send | Inert | AnyBits |
 | --- | --- | --- | --- | --- | --- | --- |
 | `hw::IrqContext` | yes | no | no | no | no | no |
 | `hw::TrapFrame[V]` | no | no | no | no | no | no |
 | `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]` | yes | no | no | yes | no | no |
-| `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]` | no | no | no | yes | no | no |
+| `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]`, `sys::load::Loader` | no | no | no | yes | no | no |
 | `boot::Services` | no | yes | no | no | no | no |
 | `hw::Anchor[S]` | no | no | no | no | no | no |
 

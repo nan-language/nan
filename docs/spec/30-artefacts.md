@@ -1,6 +1,6 @@
 # Artefacts
 
-This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, releases with their release checks, lowering with type layout, niche packing and the ABI, and host symbol names.
+This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, releases with their release checks, lowering with type layout, niche packing and the ABI, the interface files of kernels and the bundles built against them, and host symbol names.
 
 ## Artefacts
 
@@ -125,7 +125,7 @@ A **release check** checks a locked release whole: each of its items, every obli
 
 - Lowered code behaves exactly as its NIR does, with the same results, failures, traps, trap reports and bit patterns.
 - Lowered code computes on Secret values as [constant-time lowering](15-untrusted.md#constant-time-lowering) states.
-- Machine code lowered for one final closure is part of no image of another.
+- Machine code lowered for one final closure is part of no image of another, except that a [bundle](#bundles) calls the support routines of the kernel it is built against.
 - The [stack limits](10-effects-digests.md#stack-limits) check reads the frame sizes lowering reports.
 
 ### Type layout
@@ -190,7 +190,45 @@ An enum is **packed** when exactly one of its variants has a payload that is not
 
 The **ABI** of a final closure is every choice of representation and calling that this chapter leaves open: the layouts of structs, enums that are not packed, views, boxes, function values, closures, `Dyn` values and task frames; field order, padding and tag values; the niche representing each unit variant of a packed enum; how NaN functions pass arguments, results and failures; the encoding of an image's line tables and frame records; the binding of symbols, every symbol name the specification does not fix, and the objects lowering produces. The ABI is unspecified.
 
-Between code of different final closures, the only defined representations are the fixed layouts and the conventions of [foreign fns](23-low-level.md#foreign-functions) and function types with a [convention clause](23-low-level.md#calling-conventions).
+Between code of different final closures, the only defined representations are the fixed layouts and the conventions of [foreign fns](23-low-level.md#foreign-functions) and function types with a [convention clause](23-low-level.md#calling-conventions), except that a kernel and the bundles built against its interface share the kernel's ABI, which its toolchain and the code roots of their common packages fix.
+
+## Interface files
+
+A kernel that exports its load ABI ([loading](24-kernel.md#loading)) has an **interface file**, `<package>.nlif`, which its final build writes beside its image. Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 4C 49 46`, the format version 1 as a uvar, then a record with exactly these keys:
+
+| Key | Content |
+| --- | --- |
+| 1 | the toolchain hash for language 1 of the toolchain that built the kernel, as its 33 bytes |
+| 2 | the kernel's target, as a text |
+| 3 | a list of pairs, one per package of its final closure, std included, in byte order of name: the name and the code root hash |
+| 4 | its **exports**, a list of texts: the names of the runtime state, the line tables, the support routines lowered code calls, the runtime data lowered code reaches, and the table record of each loaded registry of its final closure, in byte order of canonical path, which the kernel's image lays out in this order |
+| 5 | the `stack N` its interrupt stacks hold for an interrupt fn: the largest among the interrupt fns of its final closure, a uvar |
+| 6 | the name of the [codegen level](27-program-model.md#codegen-levels) its final build used, as a text, empty for the base instruction set |
+
+The **interface hash** of a kernel is the hash of its interface file's bytes, which its image holds.
+
+## Bundles
+
+A **bundle** is the `.nbun` file that `nan build <package> --against <interface file>` writes into `.nan/images/<target>/`, for the target the interface file names. Its **bundle build** lowers the contributions to loaded registries that the package admits as the judging root and that packages outside the kernel's final closure make, with every function their values reach, at the codegen level of the interface file's part 6. Registries that are not loaded have the tables of the package's own dependency closure.
+
+- A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, and when the bundle's code reaches a support routine or runtime data the kernel does not export.
+- A `stack N` of the type of a loaded registry's function field demands `N` less 1 KiB of each function a contribution names for it, the rest left to its gate, reported at the contribution, and demands `N` of the gate in the kernel's final build, reported at the registry.
+- `nan build --as <principal>` signs the bundle with the principal's secret key, as [publishing](29-identity-versioning.md#publishing) signs an artefact, failing as publishing does when the user directory lacks it.
+
+Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4E`, the format version 1 as a uvar, its **body** as bytes, then its **sections**: a record holding no field, or exactly field 1, the signature, a record of 1 the public key and 2 the [signature](31-trust.md#signatures), as bytes, of every byte of the bundle before its sections. The body is a record with these keys:
+
+| Key | Content |
+| --- | --- |
+| 1 | the interface hash of the kernel, as its 33 bytes |
+| 2 | the bytes of the image, laid out from offset 0: its code, then its read-only data, then its writable data, each part from a 4 KiB boundary |
+| 3 | the bytes the image occupies in memory, those past part 2 being zeros, a uvar |
+| 4 | the base relocations, absent when there are none: the offset of each word to which loading adds the image's address, a list of uvars |
+| 5 | the imports, absent when there are none: pairs of the offset of a word and the index of the export whose address loading writes into it |
+| 6 | the offset of the image's line tables, a uvar |
+| 7 | the contributions, absent when there are none, in byte order of canonical path: each a record of 1 the export index of its registry's table record, 2 the offset and 3 the size of its entry, 4 its key field and 5 its unique fields, absent when there are none, as pairs of an offset in the entry and a form, and 6 the offsets in the entry of its function fields, absent when there are none; a form is 0 for `Str` and otherwise the integer's width in bytes, plus 128 when it is signed |
+| 8 | the offsets in the image of its read-only data and of its writable data, a pair of uvars |
+
+- Words are 8 bytes, least significant byte first. The encoding of the image's code and line tables belongs to the kernel's ABI.
 
 ## Host symbol names
 
@@ -227,3 +265,4 @@ In the table, `<C>` stands for the package's code root prefix and `<I>` for the 
 | `artefact.source-mismatch` | error | [Releases](#releases) |
 | `artefact.symbol-collision` | error | [Host symbol names](#host-symbol-names) |
 | `artefact.version-unsupported` | error | [Artefacts](#artefacts) |
+| `target.bundle-interface` | error | [Bundles](#bundles) |

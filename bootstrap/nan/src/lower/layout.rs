@@ -497,8 +497,11 @@ impl Layouts {
                     niche: None,
                 }
             }
-            "task::Poisoned" | "sys::Domain" | "host::Runner" | "hw::Anchor" | "hw::IrqContext" => {
-                empty()
+            "task::Poisoned" | "sys::Domain" | "host::Runner" | "hw::Anchor" | "hw::IrqContext"
+            | "sys::load::Loader" => empty(),
+            // A loaded registry's table: the address of its table record.
+            "sys::load::Table" => {
+                self.record(ck, &[("record".to_owned(), Ty::Scalar(Scalar::U64))])
             }
             // A machine root grant: the handles of its root allocator, executor, clock and wall
             // clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU and its PCI

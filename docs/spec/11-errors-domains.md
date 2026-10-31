@@ -320,7 +320,7 @@ The **trap kinds** are exactly these, forming the `trap` family:
 | `trap.division-by-zero` | an integer division or remainder has the divisor 0 ([division](09-numbers.md#division)) |
 | `trap.shift` | a shift amount is at least the width of the shifted type ([shifts](09-numbers.md#shifts), [Secret values](15-untrusted.md#secret-values)) |
 | `trap.conversion` | a value is converted into, or stored in, a type or field that cannot represent it ([conversions](09-numbers.md#conversions), [layout values](23-low-level.md#layout-values)) |
-| `trap.stale-handle` | a handle is used after what it names has ended ([generational handles](12-memory.md#generational-handles)) |
+| `trap.stale-handle` | a handle is used after what it names has ended ([generational handles](12-memory.md#generational-handles)), or a stale gate is called ([loading](24-kernel.md#loading)) |
 | `trap.exhausted` | an allocation or a fixed capacity runs out ([growth](12-memory.md#growth)) |
 | `trap.predicate` | a predicate check fails ([predicate obligations](04-types.md#obligations)) |
 | `trap.requires` | a requires check fails, a trusted primitive's included ([run-time checks](18-contracts.md#run-time-checks)) |

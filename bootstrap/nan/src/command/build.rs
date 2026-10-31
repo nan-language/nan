@@ -1,4 +1,4 @@
-//! The commands that perform final builds: `nan build` and `nan run`.
+//! The commands that perform final builds, and build bundles: `nan build` and `nan run`.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -49,6 +49,9 @@ pub fn run(
         ));
     };
     trace.scope = Some(written.clone());
+    if let Some(against) = invocation.value("--against") {
+        return bundle(invocation, workspace, current, &scope, &written, against);
+    }
     let programs = programs(workspace, &scope);
     let single = matches!(scope, Scope::Package(_) | Scope::Workspace) && programs.len() == 1;
     let compared = invocation.value("--compare-with");
@@ -58,6 +61,7 @@ pub fn run(
     });
     let resets = invocation.flag("--keep-resets");
     let unusable = programs.is_empty()
+        || invocation.value("--as").is_some()
         || (invocation.name == Name::Run && !single)
         || (compared.is_some() && (!single || !host))
         || (resets && host);
@@ -69,6 +73,7 @@ pub fn run(
     let compared = compared.map(|image| (current.join(image), image));
     let mut diagnostics = Vec::new();
     let mut images = Vec::new();
+    let mut interfaces = Vec::new();
     for program in &programs {
         let compared = compared
             .as_ref()
@@ -76,19 +81,9 @@ pub fn run(
         let build = final_build::build(workspace, *program, compared)?;
         diagnostics.extend(build.diagnostics);
         images.extend(build.image);
+        interfaces.extend(build.interface);
     }
-    diagnostics.sort_by(|left, right| {
-        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
-    });
-    diagnostics.dedup();
-    let count = |class: Class| {
-        diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code.class() == class)
-            .count()
-    };
-    let (errors, incomplete) = (count(Class::Error), count(Class::Incompleteness));
-    if invocation.name == Name::Run && errors == 0 {
+    if invocation.name == Name::Run && !errors(&diagnostics) {
         let image = images.pop().expect("a built image");
         let path = workspace.root.join(&image);
         let target = workspace.packages[programs[0]].program_target();
@@ -113,19 +108,116 @@ pub fn run(
         };
         return Ok(Outcome::Launch(launch));
     }
+    images.extend(interfaces);
+    Ok(Outcome::Output(report(
+        invocation,
+        workspace,
+        &scope,
+        &written,
+        diagnostics,
+        images,
+    )))
+}
+
+/// `nan build --against`: builds the bundle of the package the scope names, which declares no
+/// entry, against a kernel's interface file.
+fn bundle(
+    invocation: &Invocation,
+    workspace: &Workspace,
+    current: &Path,
+    scope: &Scope,
+    written: &str,
+    against: &str,
+) -> io::Result<Outcome> {
+    let package = scope.package(workspace).and_then(|package| {
+        workspace
+            .packages
+            .iter()
+            .position(|candidate| std::ptr::eq(&**candidate, package))
+    });
+    let library = package.filter(|index| {
+        workspace.packages[*index]
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.entry.is_none())
+    });
+    let usable = invocation.name == Name::Build
+        && matches!(scope, Scope::Package(_))
+        && invocation.value("--compare-with").is_none();
+    let Some(package) = library.filter(|_| usable) else {
+        return Ok(Outcome::Output(
+            invocation.tool_error(Code::ToolUsage, written),
+        ));
+    };
+    let source = &workspace.packages[package];
+    let seed = match invocation.value("--as") {
+        Some(principal) => match super::publishing_key(source, principal, &[])? {
+            Ok(seed) => Some(seed),
+            Err(diagnostic) => {
+                let diagnostics = vec![final_build::at_manifest(source, diagnostic)];
+                return Ok(Outcome::Output(report(
+                    invocation,
+                    workspace,
+                    scope,
+                    written,
+                    diagnostics,
+                    Vec::new(),
+                )));
+            }
+        },
+        None => None,
+    };
+    let build = final_build::bundle(workspace, package, &current.join(against), seed)?;
+    Ok(Outcome::Output(report(
+        invocation,
+        workspace,
+        scope,
+        written,
+        build.diagnostics,
+        build.image.into_iter().collect(),
+    )))
+}
+
+/// Whether diagnostics hold an error.
+fn errors(diagnostics: &[crate::diagnostic::Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.class() == Class::Error)
+}
+
+/// The output of a build: its diagnostics, then a record for each file it wrote.
+fn report(
+    invocation: &Invocation,
+    workspace: &Workspace,
+    scope: &Scope,
+    written: &str,
+    mut diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    mut images: Vec<String>,
+) -> Output {
+    diagnostics.sort_by(|left, right| {
+        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
+    });
+    diagnostics.dedup();
+    let count = |class: Class| {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.class() == class)
+            .count()
+    };
+    let (errors, incomplete) = (count(Class::Error), count(Class::Incompleteness));
     images.sort();
     let mut records: Vec<Record> = diagnostics
         .iter()
-        .map(|diagnostic| record(workspace, &scope, diagnostic))
+        .map(|diagnostic| record(workspace, scope, diagnostic))
         .collect();
     records.extend(images.iter().map(|image| Record {
         word: "wrote".to_owned(),
         fields: vec![image.clone()],
         lines: Vec::new(),
     }));
-    let output = Output {
-        command: invocation.command(&written, true),
-        elision: invocation.command(&written, false),
+    Output {
+        command: invocation.command(written, true),
+        elision: invocation.command(written, false),
         verdict: if errors > 0 {
             Verdict::Failed
         } else {
@@ -137,8 +229,7 @@ pub fn run(
             ("incomplete", incomplete),
         ],
         records,
-    };
-    Ok(Outcome::Output(output))
+    }
 }
 
 /// The image files of the workspace's programs for the machine targets of a UEFI target's

@@ -201,7 +201,7 @@ fn x64_stubs_test_the_features_cpu_features_records() {
 
 #[test]
 fn x64_stubs_run_their_instructions() {
-    let cases: [(Stub, &[&[u8]]); 11] = [
+    let cases: [(Stub, &[&[u8]]); 12] = [
         (Stub::Cpuid, &[&[0x53], &[0x0f, 0xa2], &[0x5b, 0xc3]]),
         (
             Stub::Rdtscp,
@@ -228,6 +228,15 @@ fn x64_stubs_run_their_instructions() {
         (Stub::WriteXcr0, &[&[0x0f, 0xa2], &[0x0f, 0x01, 0xd1]]),
         (Stub::ClearBuffers, &[&[0x6a, 0x10, 0x0f, 0x00, 0x2c, 0x24]]),
         (Stub::UserOpen, &[&[0x0f, 0x01, 0xcb]]),
+        (
+            Stub::WriteProtect,
+            &[
+                &[
+                    0x0f, 0x20, 0xc0, 0x48, 0x0d, 0x00, 0x00, 0x01, 0x00, 0x0f, 0x22, 0xc0,
+                ],
+                &[0x0f, 0x32, 0x0d, 0x00, 0x08, 0x00, 0x00, 0x0f, 0x30],
+            ],
+        ),
     ];
     for (stub, expected) in cases {
         let code = bytes(stub);

@@ -47,8 +47,10 @@ use crate::workspace::Arch;
 /// privilege, 0 where CPUID reports XSAVE disabled; `WriteXcr0` writes it and gives
 /// 1, or gives 0 for a value `xsetbv` would fault on; `EnableProtection` sets the
 /// control-register bit of the `hw::Protection` variant at an index and gives 1, or
-/// gives 0 where the CPU lacks it; `ClearBuffers` runs `verw`; and `UserOpen` and `UserClose`
-/// allow and forbid access to user pages where SMAP is enabled. The AArch64 stubs are
+/// gives 0 where the CPU lacks it; `ClearBuffers` runs `verw`; `UserOpen` and `UserClose`
+/// allow and forbid access to user pages where SMAP is enabled; and `WriteProtect` sets
+/// `CR0.WP` and `EFER.NXE`, so that kernel writes honour read-only pages and execute-disable
+/// bits take effect. The AArch64 stubs are
 /// `ReadSysReg` and `WriteSysReg`, each naming a system register by its 15-bit encoding, which
 /// the instruction holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base
 /// register, and `WriteTtbr0Tagged`, which writes it without invalidating; `TlbiPage`, which
@@ -129,6 +131,7 @@ pub enum Stub {
     ClearBuffers,
     UserOpen,
     UserClose,
+    WriteProtect,
     ReadSysReg(u16),
     WriteSysReg(u16),
     ReadTtbr0,
@@ -473,6 +476,15 @@ impl Stub {
                 0,
                 &[
                     0x0f, 0x20, 0xe0, 0x0f, 0xba, 0xe0, 0x15, 0x73, 0x03, 0x0f, 0x01, 0xca, 0xc3,
+                ],
+            ),
+            Stub::WriteProtect => (
+                0,
+                0,
+                &[
+                    0x0f, 0x20, 0xc0, 0x48, 0x0d, 0x00, 0x00, 0x01, 0x00, 0x0f, 0x22, 0xc0, 0xb9,
+                    0x80, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x0d, 0x00, 0x08, 0x00, 0x00, 0x0f, 0x30,
+                    0xc3,
                 ],
             ),
             Stub::Halt => (0, 0, &[0xfa, 0xf4, 0xeb, 0xfd]),
@@ -901,7 +913,8 @@ impl Stub {
             | Stub::EnableProtection
             | Stub::ClearBuffers
             | Stub::UserOpen
-            | Stub::UserClose => panic!("no AArch64 code for the x86_64 stub {self:?}"),
+            | Stub::UserClose
+            | Stub::WriteProtect => panic!("no AArch64 code for the x86_64 stub {self:?}"),
             Stub::ReadSysReg(_) | Stub::WriteSysReg(_) => unreachable!("handled before the match"),
         }
     }

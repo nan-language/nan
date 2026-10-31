@@ -5,6 +5,7 @@
 //! later record of the class takes it. Every record and chunk is cleared once its lock is
 //! released.
 
+use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
@@ -43,6 +44,13 @@ mod allocators {
     pub const FREE: u64 = MAP + super::CHUNKS / 8;
     pub const SIZE: u64 = FREE + 8 * super::CLASSES;
 }
+
+/// The allocators' state.
+pub const HEAP_STATE: Reserved = Reserved {
+    name: "_NSheap_state",
+    size: allocators::SIZE,
+    align: 64,
+};
 
 /// A run of chunks handed out: its first chunk's address, its chunk count and a map holding a
 /// bit per chunk, set while the chunk is handed out.
@@ -174,7 +182,7 @@ fn boot_supply(lo: &mut Lowering, fx: &mut Fx, state: Value) -> ChunkSupply {
 
 /// The address of the allocators' state.
 fn heap_state(lo: &mut Lowering, fx: &mut Fx) -> Value {
-    lo.reserved(fx, "_NSheap_state", allocators::SIZE, 64)
+    lo.reserved(fx, HEAP_STATE)
 }
 
 /// Takes the allocators' spin lock, which no interrupt fn takes. A kernel's holder disables

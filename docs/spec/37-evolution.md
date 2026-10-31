@@ -166,7 +166,7 @@ A **reservation** is a word, syntax, name, format or seam space that language 1 
 | `self.{a, b}` | syntax | a `self` parameter | `item.self-field-set` | [Reserved forms](02-items.md#reserved-forms) |
 | `uses` with a word other than `wait` | syntax | a `uses` clause | `effect.uses-unknown` | [Waiting](10-effects-digests.md#waiting) |
 | `ui` | name | first segment of a path of two or more segments | `name.reserved` | [Aliases](03-packages-modules.md#aliases) |
-| `sys::infer`, `sys::load` | name | first two segments of a path | `name.reserved` | [Reserved std names](28-stdlib.md#reserved-std-names) |
+| `sys::infer` | name | first two segments of a path | `name.reserved` | [Reserved std names](28-stdlib.md#reserved-std-names) |
 | `x86_64-nanos`, `aarch64-nanos` | name | the `targets` directive | `manifest.reserved-target` | [Manifest](03-packages-modules.md#manifest) |
 | coverage classes other than `sc` | name | the class of a replay token | `test.replay-token` | [Coverage classes](22-testing.md#coverage-classes) |
 | framing of record fields by key in `text::json` and `text::construction` | format | Encode records | skipped fields are discarded | [Decoding rules](13-text-encode.md#decoding-rules) |

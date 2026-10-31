@@ -133,6 +133,7 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
         tests.roots.clone(),
         None,
         Some(runtime),
+        super::load::Linking::Image,
     );
     let entry = entry_glue(&mut lowering, tests);
     match lowering.machine() {

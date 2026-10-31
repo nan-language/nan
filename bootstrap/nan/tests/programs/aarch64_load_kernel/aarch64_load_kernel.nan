@@ -1,0 +1,285 @@
+//! Loads a signed bundle, refuses it again, faults writing its code, contains a trap in its domain, replaces and unloads it, finds its domain abandoned, calls a stale gate, reclaims many loads, then traps in its code.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+registers FwCfg {
+    data: u8 at 0x0 read
+    selector: u16 at 0x8 write
+} FwCfg
+
+/// The fw_cfg key of the file directory, and the bytes of a file's name in it.
+const DIRECTORY: u16 = 0x19
+
+const NAME_BYTES: usize = 56
+
+/// The seed of the key the harness signs the bundles with.
+const SEED: Array[u8, 32] = Array[u8, 32].filled(7)
+
+/// The loads and unloads whose memory the kernel reclaims, more than its runtime memory holds
+/// at once.
+const LOADS: u32 = 300
+
+/// The loads and unloads between two reclamations.
+const RECLAIMED: u32 = 50
+
+contribute greeting::greeters incrementing = greeting::Greeter(id: 1, answer: increment)
+
+fn increment(value: u32) -> u32 {
+    return value + 1
+} increment
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+fn say_number(value: u32) {
+    var digits = Array[u8, 10].filled(0)
+    var count: usize = 0
+    var left = value
+    loop {
+        digits[count] = b'0' + u8.truncate(left % 10)
+        count += 1
+        left = left / 10
+        if left == 0 {
+            break
+        }
+    }
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    while count > 0 {
+        count -= 1
+        mut port.write(Pl011.data, value: digits[count])
+    }
+    take port.unmap()
+} say_number
+
+/// Reads a big-endian number of `count` bytes from the fw_cfg data register.
+fn read_be(mut fw_cfg: hw::Mmio[FwCfg], count: u32) -> u64 {
+    var value: u64 = 0
+    for _ in 0..<count {
+        value = (value << 8) | u64.widen(mut fw_cfg.read(FwCfg.data))
+    }
+    return value
+} read_be
+
+/// Selects a fw_cfg item, whose key the selector register takes big-endian.
+fn select(mut fw_cfg: hw::Mmio[FwCfg], key: u16) {
+    mut fw_cfg.write(FwCfg.selector, value: (key << 8) | (key >> 8))
+} select
+
+/// The fw_cfg file of a name: its key and size, a zero key when there is none.
+struct Found derives Copy {
+    key: u16
+    size: u64
+} Found
+
+fn find_file(mut fw_cfg: hw::Mmio[FwCfg], name: Str) -> Found {
+    var found = Found(key: 0, size: 0)
+    for _ in 0..<read_be(mut fw_cfg, count: 4) {
+        let size = read_be(mut fw_cfg, count: 4)
+        let key = u16.truncate(read_be(mut fw_cfg, count: 2))
+        discard read_be(mut fw_cfg, count: 2)
+        var same = true
+        for index in 0..<NAME_BYTES {
+            let byte = mut fw_cfg.read(FwCfg.data)
+            var wanted: u8 = 0
+            if index < name.as_bytes().len() {
+                wanted = name.as_bytes()[index]
+            }
+            same = same and byte == wanted
+        }
+        if same {
+            found = Found(key: key, size: size)
+        }
+    }
+    return found
+} find_file
+
+/// The bytes of the fw_cfg file of a name, empty when there is none.
+fn fw_file(name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var fw_cfg = trusted "the virt board maps fw_cfg at 0x0902_0000 and nothing else maps it" { hw::Mmio[FwCfg].map(0x0902_0000) }
+    select(mut fw_cfg, key: DIRECTORY)
+    let found = find_file(mut fw_cfg, name)
+    var bytes = mem::Bytes.empty(alloc)
+    if found.key != 0 {
+        select(mut fw_cfg, key: found.key)
+        for _ in 0..<found.size {
+            mut bytes.push(mut fw_cfg.read(FwCfg.data))
+        }
+    }
+    take fw_cfg.unmap()
+    return bytes
+} fw_file
+
+/// Writes a line naming the greeters of the table and the answer each gives 3.
+fn list(text: Str) {
+    say(text)
+    let table = greeting::greeters
+    table.read(fn(entries: Slice[greeting::Greeter]) {
+        for greeter in entries {
+            say(text: " ")
+            say_number(greeter.id)
+            say(text: ":")
+            say_number((greeter.answer)(3))
+        }
+    })
+    say(text: "\n")
+} list
+
+/// The answer of the greeter of an id.
+fn answer_of(id: u32) -> fn(value: u32) -> u32 limits stack 4_096 {
+    let table = greeting::greeters
+    return table.read(fn(entries: Slice[greeting::Greeter]) -> fn(value: u32) -> u32 limits stack 4_096 {
+        for greeter in entries {
+            if greeter.id == id {
+                return greeter.answer
+            }
+        }
+        return increment
+    })
+} answer_of
+
+/// The address of the code a gate calls, through the gate record its function value holds after
+/// its code and the target record that record names.
+fn code_of(answer: fn(value: u32) -> u32 limits stack 4_096) -> u64 {
+    let value = hw::Ptr.of(answer)
+    let gate = trusted "a gate's function value holds its code, then its gate record" { hw::Ptr[u64].cast(value).offset(1).read() }
+    let target = trusted "a live gate record names its target record" { hw::Ptr[u64].of_addr(usize.widen(gate)).read() }
+    return trusted "a target record starts with the code it calls" { hw::Ptr[u64].of_addr(usize.widen(target)).read() }
+} code_of
+
+fn stop(text: Str) -> Never {
+    say(text)
+    loop {
+    }
+} stop
+
+/// A bundle the toolchain built against this kernel, placed without checking its signature.
+fn unverified(loader: sys::load::Loader, bundle: Slice[u8], alloc: mem::Alloc) -> sys::load::Prepared {
+    let prepared = trusted "the harness builds each bundle against this kernel's interface" { attempt loader.prepare_unverified(bundle, alloc) }
+    let Ok(placed) = prepared else {
+        stop(text: "unplaced\n")
+    }
+    return placed
+} unverified
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let Some(loader) = k.loader() else {
+        stop(text: "no loader\n")
+    }
+    take k.anchor(0u8, run: fn[take loader](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
+        try await run(loader, exec, alloc)
+        loop {
+        }
+    })
+} main
+
+fn run(loader: sys::load::Loader, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let doubler = fw_file(name: "opt/nan/doubler", alloc)
+    let tripler = fw_file(name: "opt/nan/tripler", alloc)
+    let keys = Array[core::crypto::PublicKey, 1].filled(core::crypto::SecretKey.of_seed(SEED).public_key())
+    list(text: "base")
+    let Ok(prepared) = attempt loader.prepare(doubler.view(), keys: keys.view(), alloc) else {
+        stop(text: "unverified\n")
+    }
+    let Ok(bundle) = attempt take prepared.load() else {
+        stop(text: "unloadable\n")
+    }
+    var loaded = bundle
+    list(text: "loaded")
+    let held = answer_of(7)
+    match attempt unverified(loader, bundle: doubler.view(), alloc).load() {
+        Ok(twice) => {
+            take twice.unload()
+            say(text: "loaded twice\n")
+        }
+        Err(error) => {
+            match error {
+                sys::load::LoadError.DuplicateKey => say(text: "duplicate key\n")
+                else => say(text: "another refusal\n")
+            }
+        }
+    }
+    let code = code_of(held)
+    let written = attempt await sys::Domain.run(fn() -> u32 limits stack 4_096 {
+        trusted "the write faults, the window mapping loaded code read-only" { hw::Ptr[u8].of_addr(usize.widen(code)).write(0) }
+        return 0
+    }, exec, alloc)
+    let domain = loaded.domain()
+    let contained = attempt await domain.contents().run(fn() -> u32 limits stack 8_192 {
+        return answer_of(8)(0)
+    }, exec, alloc)
+    let Ok(write_outcome) = written else {
+        take loaded.unload()
+        stop(text: "cancelled\n")
+    }
+    let Ok(contained_outcome) = contained else {
+        take loaded.unload()
+        stop(text: "cancelled\n")
+    }
+    say_trap(text: "code read-only", outcome: write_outcome)
+    say_trap(text: "contained", outcome: contained_outcome)
+    let Ok(_) = attempt mut loaded.replace(unverified(loader, bundle: tripler.view(), alloc)) else {
+        stop(text: "unreplaced\n")
+    }
+    list(text: "replaced")
+    say(text: "held ")
+    say_number(held(3))
+    say(text: "\n")
+    take loaded.unload()
+    list(text: "unloaded")
+    let abandoned = try await domain.contents().run(fn() -> u32 limits stack 8_192 {
+        return answer_of(1)(0)
+    }, exec, alloc)
+    say_trap(text: "domain", outcome: abandoned)
+    let spare = unverified(loader, bundle: doubler.view(), alloc)
+    let stale = try await sys::Domain.run(fn[take spare]() -> u32 limits stack 65_536 {
+        let Ok(again) = attempt take spare.load() else {
+            return 0
+        }
+        let kept = answer_of(7)
+        take again.unload()
+        return kept(3)
+    }, exec, alloc)
+    say_trap(text: "stale", outcome: stale)
+    for index in 0..<LOADS {
+        let Ok(again) = attempt unverified(loader, bundle: doubler.view(), alloc).load() else {
+            stop(text: "unloadable\n")
+        }
+        take again.unload()
+        if index % RECLAIMED == RECLAIMED - 1 {
+            discard try await loader.reclaim()
+        }
+    }
+    say(text: "reclaimed, left ")
+    say_number(u32.fit(try await loader.reclaim()))
+    say(text: "\n")
+    let Ok(last) = attempt unverified(loader, bundle: doubler.view(), alloc).load() else {
+        stop(text: "unloadable\n")
+    }
+    say_number(answer_of(8)(0))
+    take last.unload()
+} run
+
+/// Writes a line naming the trap a domain run ended with.
+fn say_trap(text: Str, outcome: Result[u32, sys::Trap]) {
+    say(text)
+    match outcome {
+        Ok(_) => say(text: " returned\n")
+        Err(trap) => {
+            match trap.kind() {
+                sys::TrapKind.Exception => say(text: " trap.exception\n")
+                sys::TrapKind.DivisionByZero => say(text: " trap.division-by-zero\n")
+                sys::TrapKind.StaleHandle => say(text: " trap.stale-handle\n")
+                sys::TrapKind.Abandoned => say(text: " trap.abandoned\n")
+                else => say(text: " another trap\n")
+            }
+        }
+    }
+} say_trap

@@ -6,8 +6,11 @@ struct Data {
     views: mem::HashMap[mem::Bytes, object::DataId]
     /// The value of each const item and contribution, by item and type.
     consts: mem::HashMap[ConstKey, object::DataId]
-    /// The table of each registry.
+    /// The table of each registry, and the table record and `sys::load::Table` value of each
+    /// loaded registry.
     tables: mem::HashMap[ty::ItemId, object::DataId]
+    records: mem::HashMap[ty::ItemId, object::DataId]
+    handles: mem::HashMap[ty::ItemId, object::DataId]
     next: u32
 } Data
 
@@ -56,7 +59,7 @@ struct Contributed {
 } Contributed
 
 fn Data.empty(alloc: mem::Alloc) -> Data {
-    return Data(bytes: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), views: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), consts: mem::HashMap[ConstKey, object::DataId].empty(seed: 0, alloc), tables: mem::HashMap[ty::ItemId, object::DataId].empty(seed: 0, alloc), next: 0)
+    return Data(bytes: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), views: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), consts: mem::HashMap[ConstKey, object::DataId].empty(seed: 0, alloc), tables: mem::HashMap[ty::ItemId, object::DataId].empty(seed: 0, alloc), records: mem::HashMap[ty::ItemId, object::DataId].empty(seed: 0, alloc), handles: mem::HashMap[ty::ItemId, object::DataId].empty(seed: 0, alloc), next: 0)
 } Data.empty
 
 /// The image of bytes holding no address.
@@ -104,13 +107,19 @@ fn Lowering.relocated_data(mut self, kind: Str, take contents: mem::Bytes, reloc
     return mut self.define_data(kind, take image, align: 8)
 } Lowering.relocated_data
 
-/// The writable data object of zeros a machine image reserves under a name, declared once.
+/// The writable data object of zeros a machine image reserves under a name, declared once; a
+/// bundle imports it from its kernel.
 fn Lowering.reserved_data(mut self, data_name: Str, size: u64, align: u64) -> object::DataId {
     let key = text::String.of(data_name, alloc: self.alloc)
     let known = self.reservations.get(key)
     match known {
         Some(id) => return id
         None => {}
+    }
+    if self.imports() {
+        let imported = mut self.module.declare_data(data_name, linkage: object::Linkage.Import, writable: true, tls: false)
+        discard mut self.reservations.insert(take key, value: imported)
+        return imported
     }
     let id = mut self.module.declare_data(data_name, linkage: object::Linkage.Local, writable: true, tls: false)
     var description = object::DataDescription.new(self.alloc)
@@ -200,16 +209,26 @@ fn write_le(mut bytes: mem::Bytes, at: usize, value: u64, size: usize, big: bool
     }
 } write_le
 
-/// The value of a const item or contribution, or a registry's table as a slice.
+/// The value of a const item or contribution, or of a path naming a registry: its table as a
+/// slice, or a loaded registry's `sys::load::Table`.
 fn Lowering.const_item(mut self, mut fx: Fx, item: ty::ItemId, ty: ty::Ty) -> Held {
-    let registry_table = match self.ck.db().ast(item).kind {
-        ast::ItemKind.Registry(_) => true
-        else => false
+    var loaded_registry: Option[bool] = None
+    match self.ck.db().ast(item).kind {
+        ast::ItemKind.Registry(registry_item) => {
+            loaded_registry = Some(registry_item.loaded)
+        }
+        else => {}
     }
-    if registry_table {
-        let table = mut self.table(item)
-        let global = mut self.data_ref(mut fx, id: table)
-        return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
+    match loaded_registry {
+        Some(loaded) => {
+            let table = match loaded {
+                true => mut self.table_handle(item)
+                false => mut self.table(item)
+            }
+            let global = mut self.data_ref(mut fx, id: table)
+            return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
+        }
+        None => {}
     }
     let Some(value) = self.ck.const_value(item) else {
         expect false
@@ -230,21 +249,40 @@ fn Lowering.const_item(mut self, mut fx: Fx, item: ty::ItemId, ty: ty::Ty) -> He
         LayoutShape.Empty => return Held.Empty
         else => {}
     }
-    let key = ConstKey(item: item, ty: ty)
-    let known = self.data.consts.get(key)
-    var id = object::DataId(index: 0)
-    match known {
-        Some(found) => {
-            id = found
-        }
-        None => {
-            id = mut self.value_data(value, ty)
-            discard mut self.data.consts.insert(key, value: id)
-        }
-    }
+    let id = mut self.const_data(item, ty)
     let global = mut self.data_ref(mut fx, id)
     return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
 } Lowering.const_item
+
+/// The data object holding the value of a const item or contribution of a type.
+fn Lowering.const_data(mut self, item: ty::ItemId, ty: ty::Ty) -> object::DataId {
+    let key = ConstKey(item: item, ty: ty)
+    match self.data.consts.get(key) {
+        Some(found) => return found
+        None => {}
+    }
+    let Some(value) = self.ck.const_value(item) else {
+        expect false
+        return object::DataId(index: 0)
+    }
+    let id = mut self.value_data(value, ty)
+    discard mut self.data.consts.insert(key, value: id)
+    return id
+} Lowering.const_data
+
+/// The `sys::load::Table` value of a loaded registry: the address of its table record.
+fn Lowering.table_handle(mut self, registry_item: ty::ItemId) -> object::DataId {
+    match self.data.handles.get(registry_item) {
+        Some(known) => return known
+        None => {}
+    }
+    let record = mut self.loaded_record(registry_item)
+    var relocations = mem::List[Relocation].empty(self.alloc)
+    mut relocations.push(Relocation(offset: 0, addend: 0))
+    let id = mut self.relocated_data("handle", contents: mem::Bytes.zeroed(8, alloc: self.alloc), relocations: relocations.view(), target: record)
+    discard mut self.data.handles.insert(registry_item, value: id)
+    return id
+} Lowering.table_handle
 
 /// A data object holding a const value of a type.
 fn Lowering.value_data(mut self, value: mem::Shared[check::ConstValue], ty: ty::Ty) -> object::DataId {
@@ -474,7 +512,15 @@ fn Lowering.table(mut self, registry_item: ty::ItemId) -> object::DataId {
         mut self.write_val(constant: entries[index], value: entries[index].contents().value, ty: entry, offset: at, mut image, mut extents)
     }
     let array = mut self.define_data("table", take image, align: laid.align)
-    var record = Image.of_bytes(view_record(u64.widen(entries.len()), alloc: self.alloc), alloc: self.alloc)
+    var record_bytes = view_record(u64.widen(entries.len()), alloc: self.alloc)
+    let loaded = match self.ck.db().ast(registry_item).kind {
+        ast::ItemKind.Registry(declared) => declared.loaded
+        else => false
+    }
+    if loaded {
+        object::resize(mut record_bytes, length: 32)
+    }
+    var record = Image.of_bytes(take record_bytes, alloc: self.alloc)
     mut record.data.push(DataAddress(offset: 0, target: array, addend: 0))
     let id = mut self.define_data("registry", image: take record, align: 8)
     discard mut self.data.tables.insert(registry_item, value: id)

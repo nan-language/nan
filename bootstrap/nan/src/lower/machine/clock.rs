@@ -280,6 +280,13 @@ impl Lowering<'_, '_> {
     /// Cancels a timer of the clock that is armed and has not expired: it leaves the timers and
     /// completes cancelled.
     pub fn kernel_cancel(&mut self, fx: &mut Fx, op: Value) {
+        let claimed = self.kernel_claim(fx, op);
+        fx.when(claimed, |fx| self.kernel_cancelled(fx, op));
+    }
+
+    /// Takes a timer of the clock that is armed and has not expired out of the timers, giving
+    /// whether it did so; its cancelled completion is then the caller's to deliver.
+    pub fn kernel_claim(&mut self, fx: &mut Fx, op: Value) -> Value {
         let state_address = self.state(fx);
         let lock = fx.offset(state_address, state::TIMER_LOCK);
         self.call_routine(fx, Routine::Lock, &[lock]);
@@ -293,10 +300,13 @@ impl Lowering<'_, '_> {
             claim(fx, op);
         });
         self.call_routine(fx, Routine::Unlock, &[lock]);
-        fx.when(in_flight, |fx| {
-            let cancelled = fx.int(types::I32, CANCELED);
-            tasks::deliver(self, fx, op, cancelled);
-        });
+        in_flight
+    }
+
+    /// Delivers the cancelled completion of a timer the caller claimed.
+    pub fn kernel_cancelled(&mut self, fx: &mut Fx, op: Value) {
+        let cancelled = fx.int(types::I32, CANCELED);
+        tasks::deliver(self, fx, op, cancelled);
     }
 
     /// Reads the target's wall clock source: whether it gave a time, and that time in

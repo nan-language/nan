@@ -1779,8 +1779,8 @@ impl Body<'_, '_> {
             {
                 self.report(token, Code::HwIntrinsicTarget);
             }
-            "host::Runner.run" => {
-                if let Some(code) = self.ck.runner_problem(&callable.head, subst) {
+            "host::Runner.run" | "sys::Stepper.start" | "sys::Stepper.resume" => {
+                if let Some(code) = self.ck.component_use_problem(&path, &callable.head, subst) {
                     self.report(token, code);
                 }
             }

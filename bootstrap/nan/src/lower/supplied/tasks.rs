@@ -31,7 +31,9 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::Executor" => super::sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
         "sys::Domain" | "sys::Abandoner" | "sys::Trap" => domains::lower(lo, fx, supply),
-        "host::Runner" | "sys::Cx" | "sys::Outbox" => components::lower(lo, fx, supply),
+        "host::Runner" | "sys::Cx" | "sys::Outbox" | "sys::Stepper" => {
+            components::lower(lo, fx, supply)
+        }
         _ => return false,
     }
     true
@@ -75,7 +77,7 @@ pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "task::Join" | "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
         "task::Scope" | "task::Executor" | "task::Cancelled" | "task::Poisoned" | "sys::Cx"
-        | "sys::Outbox" | "sys::Abandoner" => Some(false),
+        | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper" => Some(false),
         _ => None,
     }
 }

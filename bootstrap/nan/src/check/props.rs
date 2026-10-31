@@ -206,6 +206,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Cx", VIEW_ONLY),
     ("sys::Outbox", COPY_SEND),
     ("sys::Abandoner", AFFINE_SEND),
+    ("sys::Stepper", LINEAR_ONLY),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::UserAddr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::Register", [No, No, Yes, Yes, Yes, No]),

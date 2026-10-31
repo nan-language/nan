@@ -244,7 +244,7 @@ An operation through a stale handle behaves as follows:
 | `sys::Log` | the record is discarded |
 | a [capability kind](#capability-kinds) | `sys::reach` returns `None` and `sys::derive` fails with `sys::Revoked.Stale` |
 | `mem::Alloc` | draws through it are exhaustion ([budgets](12-memory.md#budgets)) |
-| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`. |
+| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains), `host::Runner.run` and the [stepper](26-components.md#steppers) constructors `start` and `resume` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`. |
 
 ```nan
 pub fn read_config(fs: sys::Fs, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails sys::fs::FsError uses wait {

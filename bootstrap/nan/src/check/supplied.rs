@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 32] = [
+const DRAWING: [&str; 36] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -33,6 +33,10 @@ const DRAWING: [&str; 32] = [
     "sys::Cx.after",
     "sys::Cx.after_ns",
     "sys::Cx.spawn",
+    "sys::Stepper.start",
+    "sys::Stepper.resume",
+    "sys::Stepper.deliver",
+    "sys::Stepper.step",
     "sys::sim::fs",
     "sys::sim::stdio",
     "hw::PerCpu.of",
@@ -96,6 +100,14 @@ const TRAPPING: [&str; 27] = [
 /// The supplied operations that change an atomic count without a type with interior mutability.
 const COUNTED: [&str; 2] = ["mem::Shared.share", "mem::Shared.make_mut"];
 
+/// The supplied operations calling a component's handlers on the calling task, whose digests
+/// hold the declared digest of a call through `sys::Component`.
+const HANDLING: [&str; 3] = [
+    "sys::Stepper.start",
+    "sys::Stepper.deliver",
+    "sys::Stepper.step",
+];
+
 /// The std types storing their contents inline, which never draw memory.
 const INLINE: [&str; 2] = ["text::Fixed", "mem::Bounded"];
 
@@ -126,7 +138,8 @@ impl Checker<'_> {
     /// waits; the facts its owning chapter states; drawing memory when it grows or makes
     /// storage; the sync fact on a type with interior mutability or an atomic count; the
     /// primitive capabilities it receives or is a member of, other than allocators; float use
-    /// when its head takes or gives a float; and the class of its operation under the target.
+    /// when its head takes or gives a float; the class of its operation under the target; and
+    /// the declared digest of the handlers it calls.
     /// A head demanding `pure` or `noalloc` leaves out what it excludes.
     pub fn supplied(&self, item: ItemId) -> Digest {
         let Some(head) = self.fn_sig(item) else {
@@ -169,6 +182,9 @@ impl Checker<'_> {
             })
             .collect();
         digest.capabilities = Some(capabilities);
+        if HANDLING.contains(&path.as_str()) {
+            digest.join(&Digest::declared(false, &Default::default()));
+        }
         digest
     }
 

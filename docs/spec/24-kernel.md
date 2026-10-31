@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, thread switching, preemption, per-CPU state, the kernel lowering of waiting and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -198,15 +198,15 @@ When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 
 
 1. The seam saves the interrupted code's general registers on its interrupt stack, and no [extended state](#floating-point).
 2. For an interrupt that reaches devices `hw::IrqShared` installs ([locks](#locks)), it calls the interrupt fn of each in turn, acquiring that device's lock around the call, with the device and a new `hw::IrqContext`, then ends the interrupt. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound exception vector other than an abort vector and x86_64's vector 2, the non-maskable interrupt's, makes the interrupted code trap when it may; any other unbound vector, and one whose code may not trap, halts the kernel.
-3. On `hw::IrqExit.Reschedule` from any interrupt fn it called, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`. On `hw::IrqExit.Abandon` from an interrupt fn of an exception vector, the interrupted code traps when it may, and the kernel halts otherwise; from any other interrupt fn, `Abandon` acts as `Resume`.
+3. On `hw::IrqExit.Reschedule` from any interrupt fn it called, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption); under the same conditions it is also preempted, whatever the interrupt fns gave, once its CPU's policy switches from it. Otherwise `Reschedule` acts as `Resume`. On `hw::IrqExit.Abandon` from an interrupt fn of an exception vector, the interrupted code traps when it may, and the kernel halts otherwise; from any other interrupt fn, `Abandon` acts as `Resume`.
 4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
 
 Code **may trap** where a vector interrupted it when it is a kernel task's that ran with maskable interrupts enabled on the task's own stack, and the anchor is installed. Its trap there, of kind `trap.exception`, abandons the task's domain ([abandoning a domain](11-errors-domains.md#abandoning-a-domain)); its report locates the interrupted instruction as if it called the trap, with the operand line `vector = v, code = c`, followed by `, address = a` for a page fault, v being the vector, c the error code the CPU pushed on x86_64 or the exception's syndrome on AArch64, and a the faulting address. An exception in a kernel task means that trusted code broke a soundness condition or that the hardware faulted: abandoning the task's domain restores none of the guarantees that broke.
 
 Each CPU has an interrupt stack, reserved by the image, for each `ist` value that its bindings use, those of `hw::IrqShared.install` using 0 ([platform registries](25-registries.md#platform-registries)). A seam entered while its stack is in use on its CPU continues on it below the frames in use.
 
-- The stack of `ist` 0 holds at least the largest stack use among the lowered interrupt fns that run on it for interrupt vectors, plus the largest among those for exception vectors, plus two [seam frames](27-program-model.md#descriptors).
-- The stack of a nonzero `ist` holds at least the largest stack use among the lowered interrupt fns that run on it, plus one seam frame.
+- The stack of `ist` 0 holds at least the largest stack use among the lowered interrupt fns that run on it for interrupt vectors, plus the largest among those for exception vectors, plus two [seam frames](27-program-model.md#descriptors), plus a call of a [policy](#policies) hook.
+- The stack of a nonzero `ist` holds at least the largest stack use among the lowered interrupt fns that run on it, plus one seam frame, plus a call of a policy hook.
 
 On AArch64 the interrupt controller delivers an interrupt only while it is enabled: the anchor enables the timer's vector and each interrupt vector a contribution binds, on every CPU, routing those from 32 up to the boot CPU; installing the first device on a vector enables it and routes it to that device's CPU ([locks](#locks)), and uninstalling the last one disables it.
 
@@ -396,11 +396,6 @@ pub fn SpinLock.of(take value: T) -> SpinLock[T] limits notrap, terminates, noal
 
 pub fn SpinLock.with[R: Any](self, t: IrqsDisabled, body: fn(mut value: T) -> R limits notrap, terminates, noalloc) -> R limits notrap, terminates, noalloc
 
-pub open linear struct SpinGuard[T] {
-} SpinGuard
-
-pub proj fn SpinGuard.contents_mut(mut self) -> T
-
 pub open linear struct IrqShared[T: Any and Send] {
 } IrqShared
 
@@ -438,7 +433,6 @@ pub closed struct MsiRefusal[T: Any and Send] {
 - `with` spins until it acquires the lock, calls `body` with exclusive `mut` access to the value, releases the lock and returns `body`'s result. Acquisition orders `body` after every earlier holder's accesses.
 - A `with` on a lock that the calling CPU already holds never returns: the kernel halts, and on the host targets the innermost process or test [domain](11-errors-domains.md#domains) holding the call is [abandoned](11-errors-domains.md#abandoning-a-domain), with the halt report ([kernel halts](#kernel-halts)) in place of a trap report.
 - A spin lock is never [poisoned](11-errors-domains.md#poisoning): its bodies cannot trap and run with maskable interrupts disabled, where no task stops.
-- An `hw::SpinGuard[T]` is the holding of an acquired spin lock outside a `with` body. Only the kernel executor obtains and releases one, on its run-queue lock ([scheduling](#scheduling)).
 
 `hw::IrqShared[T]` keeps a device of type T behind an IRQ-safe lock that the interrupt path also takes:
 
@@ -554,7 +548,7 @@ pub const SIGNAL_VECTOR: u8 = 0xFE
 ```
 
 - `cpu.signal_cpu(n)` sends the CPU signal to CPU n when it is a started CPU, the calling one included, and does nothing otherwise. A CPU takes the signal once it has maskable interrupts enabled; signals sent to it meanwhile may arrive as one.
-- When the signal arrives, the CPU serves the shootdowns posted to it, then calls the interrupt fn that an `hw::vectors` contribution binds to `hw::SIGNAL_VECTOR`, or only ends the interrupt without one. The settlement of an abandoned domain sends it to the CPU of each running task it stops ([preemption](#preemption)).
+- When the signal arrives, the CPU serves the shootdowns posted to it, then calls the interrupt fn that an `hw::vectors` contribution binds to `hw::SIGNAL_VECTOR`, or only ends the interrupt without one. The settlement of an abandoned domain sends it to the CPU of each running task it stops ([preemption](#preemption)), and placing a ready task sends it to a CPU that idles or runs a later task ([policies](#policies)).
 - `cpu.invalidate_everywhere(scope)` removes, on every started CPU, the cached translations of the page that `Page` holds under every PCID or ASID, or every cached translation for `All`, and returns once each CPU has. On x86_64 the calling CPU removes its own, posts a **shootdown** of the scope to each other started CPU, sends it the CPU signal and waits, with maskable interrupts enabled, until each has served it; one shootdown runs at a time, and a CPU waiting to start one serves the others meanwhile. On AArch64 one broadcast invalidation reaches every CPU.
 - `invalidate_everywhere` is a cancellation point ([acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation)) whose invalidations acknowledge a cancellation only once done: called cancelled, it fails at once and removes nothing; once started, it completes.
 - Interrupt fns and bodies with maskable interrupts disabled cannot wait, so no CPU waits for a shootdown that waits for it. A CPU that keeps maskable interrupts disabled delays every signal to it and every shootdown waiting for it.
@@ -586,23 +580,10 @@ pub fn unmap_everywhere(cpu: hw::Ring0, page: hw::VirtAddr) fails task::Cancelle
 
 ## Scheduling
 
-**Thread context** is kernel execution in a schedulable thread: every kernel task, and the landing fns of user-origin seams. Each kernel task runs as one **thread**, whose stack and saved registers the kernel executor owns. The boot context and interrupt fns are not thread context. Each CPU also has an idle thread, which halts the CPU until an interrupt arrives.
+**Thread context** is kernel execution in a schedulable thread: every kernel task, and the landing fns of user-origin seams. Each kernel task runs as one **thread**, whose stack and saved registers the kernel executor owns. The boot context and interrupt fns are not thread context. A CPU **idles** while it finds no task to run.
 
 ```nan-api
 // module: hw
-
-pub open struct RunQueue {
-} RunQueue
-
-pub open linear struct SavedContext {
-} SavedContext
-
-pub open struct Resumable {
-} Resumable
-
-pub fn SavedContext.resumable(self) -> Resumable
-
-pub fn switch_to(take guard: SpinGuard[RunQueue], take from: SavedContext, to: Resumable) -> SpinGuard[RunQueue]
 
 pub open struct PerCpu[T: Send] {
 } PerCpu
@@ -612,9 +593,6 @@ pub fn PerCpu.of(init: fn(cpu: u32) -> T, alloc: mem::Alloc) -> PerCpu[T]
 pub fn PerCpu.with[R: Any](self, t: IrqsDisabled, body: fn(mut value: T) -> R limits notrap, terminates, noalloc) -> R limits notrap, terminates, noalloc
 ```
 
-- An `hw::RunQueue` holds the ready threads of one CPU, behind that CPU's run-queue lock. An `hw::SavedContext` is the save slot of the running thread. An `hw::Resumable` is a [generational handle](12-memory.md#generational-handles) naming a thread whose registers are saved; it is live until that thread resumes. Only the kernel executor creates values of these types.
-- `from.resumable()` names the thread whose save slot `from` is. When that thread resumes, the executor holds its save slot again.
-- `hw::switch_to(take guard, take from, to)` saves the running thread's registers into `from`, then restores the thread `to` names, whose own pending `switch_to` call returns `guard`: the lock passes to the incoming thread, still held on the same CPU. The outgoing call returns when a later `switch_to` names its thread, with that caller's guard. A stale `to` traps (`trap.stale-handle`) before anything is saved.
 - `hw::PerCpu.of(init, alloc)` holds `hw::cpu_count()` values drawn through `alloc`, the value of CPU i being `init(i)`, and traps on exhaustion (`trap.exhausted`). `with` calls `body` with `mut` access to the current CPU's value; a `with` on a value whose `with` the calling CPU is already inside never returns, as for a spin lock.
 
 ```nan
@@ -642,14 +620,157 @@ pub fn count_switch(switches: hw::PerCpu[Switches]) {
 } count_switch
 ```
 
+### Policies
+
+Each CPU has a **run queue** of ready tasks, ordered by key, tasks of equal keys in the order they joined it. A kernel's **policy** decides on which CPU's queue and with which key a task that becomes ready is placed, from which CPUs a CPU with an empty queue takes a task, how long a task runs before it is preempted, and how a CPU idles.
+
+```nan-api
+// module: boot
+
+pub fn Kernel.policy[P: hw::Policy and Send](mut self, take policy: P)
+```
+
+```nan-api
+// module: hw
+
+pub interface Policy {
+    fn place(self, t: IrqsDisabled, task: TaskView) -> Placement limits notrap, terminates, noalloc, stack 4_096
+    fn steal(self, t: IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096
+    fn slice(self, t: IrqsDisabled, cpu: u32, task: TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096
+    fn idle(self, t: IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> Idle limits notrap, terminates, noalloc, stack 4_096
+} Policy
+
+pub closed struct TaskView derives Copy, Eq {
+    pub task: u64
+    pub executor: u64
+    pub share: task::Share
+    pub last_cpu: Option[u32]
+    pub ran_ns: u64
+    pub deadline_ns: Option[u64]
+} TaskView
+
+pub closed struct Placement derives Copy, Eq {
+    pub cpu: u32
+    pub key: u64
+} Placement
+
+pub closed enum Idle derives Copy, Eq {
+    Halt
+    Poll
+} Idle
+```
+
+- `k.policy(take p)` makes p the kernel's policy for the rest of the run, keeping p in memory of the support routines; a second call traps (`trap.duplicate-access`), and so does a call when that memory is exhausted (`trap.exhausted`). Without a call the **default policy** applies.
+- The executor calls each method of the policy, a **hook**, on the CPU it concerns, with maskable interrupts disabled and its `t` witnessing that. A task made ready while a hook runs on its CPU joins that CPU's queue last, without a call of `place`. Neither the host targets nor the seeded scheduler call hooks.
+- An `hw::TaskView` shows a hook a task: `task` distinguishes it from every other live task; `executor` distinguishes the executor it was started on from every other live executor; `share` is that executor's [share](16-concurrency.md#executors); `last_cpu` is the CPU it last ran on, `None` before it first runs; `ran_ns` is the nanoseconds of the kernel clock it has run; and `deadline_ns` is the earliest end, in nanoseconds of the kernel clock, of the deadlines of the `task::within` and `task::within_ns` constructs it runs, `None` without one.
+- When a task becomes ready, as it starts, as an event wakes it, as it is preempted and as a [serial executor](16-concurrency.md#executors)'s turn passes to it, `place(t, task)` gives its placement: the task joins the queue of the CPU `cpu` names, of the running CPU when `cpu` is not below `hw::cpu_count()`, with the key `key`. The CPU signal ([cross-CPU operations](#cross-cpu-operations)) then goes to the CPU it names when that is another CPU that idles or runs a task placed with a greater key, or when it is the running CPU, outside an interrupt fn, running a task placed with a greater key.
+- A CPU runs the first task of its queue. When its queue is empty it calls `steal(t, cpu, round)` for rounds 0, 1 and on, at most `hw::cpu_count()` − 1 of them, until a round gives `None` or names another CPU whose queue holds a task, the first of which it then runs.
+- As a CPU switches to a task, `slice(t, cpu, task)` gives the task's **slice**: it is preempted once that many nanoseconds of the kernel clock have passed since, unless it suspends before; 0 gives no slice.
+- A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest deadline of the kernel clock, `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once. Either way the CPU then looks for a task again.
+- The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready; steals in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice; and halts.
+- Every method of a policy type is judged against the `stack 4_096` its interface method demands ([stack limits](10-effects-digests.md#stack-limits)), and every stack a hook runs on holds a call of it ([static bounds](17-suspension-io.md#static-bounds)).
+
+```nan
+// file: earliest/package.nan
+//! A bare kernel running its tasks earliest deadline first.
+
+package earliest {
+    language 1
+    targets x86_64-bare
+    entry main
+} earliest
+
+// file: earliest/earliest.nan
+//! Places every task on CPU 0, keyed by its earliest deadline, in slices of 1 ms.
+
+struct Earliest {
+} Earliest
+
+impl Earliest: hw::Policy
+
+fn Earliest.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement {
+    return hw::Placement(cpu: 0, key: task.deadline_ns.value_or(0))
+} Earliest.place
+
+fn Earliest.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] {
+    return None
+} Earliest.steal
+
+fn Earliest.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 {
+    return 1_000_000
+} Earliest.slice
+
+fn Earliest.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle {
+    return hw::Idle.Halt
+} Earliest.idle
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let clock = k.clock()
+    mut k.policy(Earliest())
+    take k.anchor(Unit, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        loop {
+            discard try await task::within_ns(clock, ns: 1_000_000, body: fn() fails task::Cancelled uses wait {
+                try await clock.sleep_ns(500_000)
+            })
+        }
+    })
+} main
+```
+
+```nan
+// file: weighted/package.nan
+//! A bare kernel weighing its tasks.
+
+package weighted {
+    language 1
+    targets x86_64-bare
+    entry main
+} weighted
+
+// file: weighted/weighted.nan
+//! Places every task on CPU 0, keyed by the time it ran over its executor's weight.
+
+struct Weighted {
+} Weighted
+
+impl Weighted: hw::Policy
+
+fn Weighted.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement {
+    return hw::Placement(cpu: 0, key: task.ran_ns / u64.widen(task.share.weight))
+} Weighted.place
+
+fn Weighted.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] {
+    return None
+} Weighted.steal
+
+fn Weighted.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 { // error: limit.stack-exceeded
+    let lengths = Array[u64, 1_024].filled(1_000_000)
+    return lengths[usize.widen(cpu) % 1_024]
+} Weighted.slice
+
+fn Weighted.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle {
+    return hw::Idle.Halt
+} Weighted.idle
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let clock = k.clock()
+    mut k.policy(Weighted())
+    take k.anchor(Unit, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        loop {
+            try await clock.sleep_ns(1_000_000)
+        }
+    })
+} main
+```
+
 ### Kernel suspension
 
 On the machine targets, a task suspends ([stackful tasks](17-suspension-io.md#stackful-tasks)) through the kernel executor's suspend routine, part of the stack-switching [support routine](27-program-model.md#runtime-support):
 
 1. The waiting primitive registers the task as a waiter of the event it awaits.
-2. The routine disables maskable interrupts, acquires the CPU's run-queue lock and calls `hw::switch_to` with the CPU's next ready thread, or with its idle thread when none is ready.
-3. When the event occurs, its operation makes the task ready on a CPU the executor chooses.
-4. On resumption the routine releases the run-queue lock and restores the saved interrupt state.
+2. The routine disables maskable interrupts and switches the CPU to the next task it runs, idling until it finds one ([policies](#policies)).
+3. When the event occurs, its operation makes the task ready, which places it ([policies](#policies)).
+4. On resumption the routine restores the saved interrupt state.
 
 Interrupt fns make tasks ready only through `hw::Signal.post`; a task waiting for a device waits on a signal that the device's interrupt fn posts.
 
@@ -658,18 +779,20 @@ Interrupt fns make tasks ready only through `hw::Signal.post`; a task waiting fo
 On the machine targets, the [platform package](28-stdlib.md#platform-packages) contributes the one `hw::preempt` entry ([platform registries](25-registries.md#platform-registries)). **Preemption** of a thread proceeds in this order:
 
 1. The seam moves the thread's saved state from the interrupt stack onto the thread's own stack.
-2. It calls the landing fn that the `handler` of the `hw::preempt` entry holds there, with maskable interrupts disabled. That landing fn makes the thread ready and switches the CPU to its next ready thread as [kernel suspension](#kernel-suspension) step 2 does.
+2. It calls the landing fn that the `handler` of the `hw::preempt` entry holds there, with maskable interrupts disabled. That landing fn makes the thread ready and switches the CPU to its next task as [kernel suspension](#kernel-suspension) step 2 does.
 3. When a later switch resumes the thread, the landing fn returns, and the seam restores the saved state and resumes the thread.
+
+A kernel task running with maskable interrupts enabled on its own stack, outside `hw::Ring0.wait_for_interrupt`, is preempted at an interrupt reaching its CPU when its interrupt fn gives `hw::IrqExit.Reschedule`, when its slice has ended, or when the first task of its CPU's queue was placed with a smaller key than it ([policies](#policies)), and never otherwise.
 
 A kernel task asked to stop ([abandoning a domain](11-errors-domains.md#abandoning-a-domain)) is preempted at every interrupt reaching its CPU while it runs with maskable interrupts enabled on its own stack, outside `hw::Ring0.wait_for_interrupt` and outside every operation it completes before stopping, whatever its interrupt fn gave, and is never preempted elsewhere. It then stops instead of becoming ready. Each pacing tick of its CPU's timer is such an interrupt.
 
-A kernel task's stack is drawn through the executor's allocator as the task starts. It holds at least the N of its entry's `limits stack N` ([task stacks](17-suspension-io.md#task-stacks)), plus the stack use of the `hw::preempt` landing fn, plus one [seam frame](27-program-model.md#descriptors).
+A kernel task's stack is drawn through the executor's allocator as the task starts. It holds at least the N of its entry's `limits stack N` ([task stacks](17-suspension-io.md#task-stacks)), plus the stack use of the `hw::preempt` landing fn, plus one [seam frame](27-program-model.md#descriptors), plus a call of a policy hook.
 
 ### Kernel time
 
 The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline.
 
-- Each CPU's timer fires at its **pacing ticks**, 10 ms apart, and at the earliest deadline, whichever comes first. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
+- Each CPU's timer fires at the earliest deadline, at the end of the slice of the task it runs and at its **pacing ticks**, 10 ms apart, whichever comes first. A CPU has pacing ticks while it runs a task, and when idle only if a contribution binds the timer's vector, so an idle CPU of another kernel sleeps until a deadline or the CPU signal. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
 - A deadline armed on a CPU ahead of every other deadline programs that CPU's timer to fire at it.
 - Cancelling a task that sleeps ends its sleep at once, and a deadline that its construct no longer needs leaves the deadlines at once.
 
@@ -1049,7 +1172,7 @@ pub fn Module.into_region(take self) -> hw::Region
 
 A function, closure or const whose own operations have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation.
 
-Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no `hw::switch_to` saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The entry function starts with the extended state enabled ([anchor](#anchor)).
+Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no thread switch saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The entry function starts with the extended state enabled ([anchor](#anchor)).
 
 ```nan
 // file: kernel/package.nan
@@ -1099,11 +1222,10 @@ The types of this table are [base types](05-properties.md#structural-properties)
 
 | Type | linear | view | Copy | Send | Inert | AnyBits |
 | --- | --- | --- | --- | --- | --- | --- |
-| `hw::IrqContext`, `hw::SavedContext`, `hw::SpinGuard[T]` | yes | no | no | no | no | no |
+| `hw::IrqContext` | yes | no | no | no | no | no |
 | `hw::TrapFrame[V]` | no | no | no | no | no | no |
 | `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]` | yes | no | no | yes | no | no |
-| `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]`, `hw::RunQueue` | no | no | no | yes | no | no |
-| `hw::Resumable` | no | no | yes | yes | no | no |
+| `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]` | no | no | no | yes | no | no |
 | `boot::Services` | no | yes | no | no | no | no |
 | `hw::Anchor[S]` | no | no | no | no | no | no |
 

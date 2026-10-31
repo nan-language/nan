@@ -10,7 +10,10 @@
 //! operation reads its words through a snapshot that rechecks the handle once they are read; a
 //! text, which revocation frees, is read only under the lock. An outbox's state is its runner's
 //! record, its key and whether it is a keyed task's. An executor's state is its cell, the handle
-//! of the clock it records and its resolution in nanoseconds, zero standing for one. A `Clock`
+//! of the clock it records, its resolution in nanoseconds, zero standing for one, and its share,
+//! packed; its entry also counts the nanoseconds its tasks and those of the executors deriving
+//! from it ran, and names the serial executor whose turn its tasks run in, which a serial
+//! executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock`
 //! entry's state is the nanosecond of the clock that delays count at which its root was minted,
 //! then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in
 //! flight that `task::within` calls armed through it, linked through their timers. A
@@ -32,7 +35,7 @@ use crate::workspace::Kind;
 
 /// The capability table's capacity.
 pub const ENTRIES: u64 = 65_536;
-pub const ENTRY_RECORD: u64 = 64;
+pub const ENTRY_RECORD: u64 = 96;
 
 pub mod entry {
     pub const GENERATION: u64 = 0;
@@ -41,6 +44,12 @@ pub mod entry {
     pub const SOURCE: u64 = 12;
     pub const STATE: u64 = 16;
     pub const DEADLINES: u64 = 48;
+    pub const USED: u64 = 48;
+    pub const SERIAL: u64 = 56;
+    pub const TURN: u64 = 64;
+    pub const WAITING: u64 = 72;
+    pub const SEED: u64 = 80;
+    pub const PICKS: u64 = 88;
 }
 
 /// The links of a deadline's timer in its clock entry's deadlines and the clock's handle, after
@@ -74,6 +83,11 @@ pub mod kind {
 pub const RESOLUTION: u64 = entry::STATE + 8;
 pub const EXECUTOR_RESOLUTION: u64 = entry::STATE + 16;
 
+/// The state word of an executor's entry holding its share, and the share of a root grant's
+/// executor: a weight of 1 in class 0 reserving nothing.
+pub const EXECUTOR_SHARE: u64 = entry::STATE + 24;
+const ROOT_SHARE: u64 = 1;
+
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100;
 
@@ -98,6 +112,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                         let value = fx.load(PTR, source, entry::STATE + 8 * word);
                         fx.store(value, record, entry::STATE + 8 * word);
                     }
+                    let serial = fx.load(PTR, source, entry::SERIAL);
+                    fx.store(serial, record, entry::SERIAL);
                     let index = fx.b.ins().band_imm_s(params[0], 0xFFFF_FFFF);
                     let index = fx.b.ins().iadd_imm_s(index, 1);
                     let index = fx.b.ins().ireduce(types::I32, index);
@@ -377,6 +393,7 @@ fn sweep(lo: &mut Lowering, fx: &mut Fx) {
         let revoked = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 2);
         fx.when(revoked, |fx| {
             expire_deadlines(lo, fx, record);
+            super::serial::release_waiting(lo, fx, record);
             let owns = owns_text(fx, record);
             fx.when(owns, |fx| {
                 let text = fx.load(PTR, record, entry::STATE + 8);
@@ -387,11 +404,14 @@ fn sweep(lo: &mut Lowering, fx: &mut Fx) {
     });
 }
 
-/// Passes every deadline armed through a revoked clock entry: each one's region is cancelled
+/// Passes every deadline armed through a revoked entry of a clock: each one's region is cancelled
 /// and its timer leaves the entry's deadlines. The caller holds the lock.
 fn expire_deadlines(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let first = fx.load(PTR, record, entry::DEADLINES);
+    let entry_kind = fx.load(types::I32, record, entry::KIND);
+    let clock = fx.b.ins().icmp_imm_s(IntCC::Equal, entry_kind, kind::CLOCK);
     let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
+    let armed = fx.b.ins().band(clock, armed);
     fx.when(armed, |fx| {
         fx.repeat(&[first], |fx, state| {
             let timer = state[0];
@@ -555,6 +575,31 @@ pub fn snapshot(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value
     (fx.b.ins().band(same, live), words)
 }
 
+/// The share and the serial executor's handle of the executor's entry a handle names, read
+/// without the lock; a root grant's share and none for a stale handle.
+pub fn executor_terms(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
+    let record = entry_at(lo, fx, handle);
+    let flags = MemFlagsData::trusted();
+    let [share, serial] = [EXECUTOR_SHARE, entry::SERIAL].map(|word| {
+        let at = fx.offset(record, word);
+        fx.b.ins().atomic_load(PTR, flags, at)
+    });
+    let generation = fx.b.ins().atomic_load(types::I32, flags, record);
+    let live_at = fx.offset(record, entry::LIVE);
+    let live = fx.b.ins().atomic_load(types::I32, flags, live_at);
+    let wanted = fx.b.ins().ushr_imm_s(handle, 32);
+    let wanted = fx.b.ins().ireduce(types::I32, wanted);
+    let same = fx.b.ins().icmp(IntCC::Equal, generation, wanted);
+    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, live, 0);
+    let live = fx.b.ins().band(same, live);
+    let root = fx.ptr(ROOT_SHARE);
+    let none = fx.ptr(0);
+    (
+        fx.b.ins().select(live, share, root),
+        fx.b.ins().select(live, serial, none),
+    )
+}
+
 /// A copy in runtime memory of the text of the live entry a handle names, taken under the lock,
 /// and its length; zero for a stale handle. The caller frees the copy.
 pub fn copy_text(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
@@ -624,7 +669,7 @@ fn new_entry(lo: &mut Lowering, fx: &mut Fx, kind: Value) -> Value {
     let zero32 = fx.int(types::I32, 0);
     fx.store(zero32, record, entry::SOURCE);
     let zero = fx.ptr(0);
-    for word in 0..4 {
+    for word in 0..10 {
         fx.store(zero, record, entry::STATE + 8 * word);
     }
     let generation = fx.load(types::I32, record, entry::GENERATION);
@@ -666,6 +711,8 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
     fx.store(now, handles[2].2, entry::STATE);
     fx.store(cell, handles[6].2, entry::STATE);
     fx.store(handles[2].1, handles[6].2, entry::STATE + 8);
+    let share = fx.ptr(ROOT_SHARE);
+    fx.store(share, handles[6].2, EXECUTOR_SHARE);
     for (field, handle, _) in &handles {
         let at = lo.layouts.field(lo.ck, &world_ty, None, field).offset;
         fx.store(*handle, world, at);
@@ -692,6 +739,8 @@ fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
     let record = entry_at(lo, fx, exec);
     fx.store(cell, record, entry::STATE);
     fx.store(clock, record, entry::STATE + 8);
+    let share = fx.ptr(ROOT_SHARE);
+    fx.store(share, record, EXECUTOR_SHARE);
     let (valid, wall_now) = lo.wall_source(fx);
     let wall = fx.choose_in(
         lo,

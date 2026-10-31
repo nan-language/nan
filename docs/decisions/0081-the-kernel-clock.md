@@ -1,6 +1,6 @@
 # 0081. The kernel clock
 
-Status: accepted
+Status: accepted; its pacing of idle CPUs superseded by 0107
 
 ## Context
 

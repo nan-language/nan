@@ -6,7 +6,7 @@ mod physical;
 mod sync;
 mod windows;
 
-use cranelift_codegen::ir::{InstBuilder, TrapCode, Value};
+use cranelift_codegen::ir::Value;
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
@@ -47,11 +47,6 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::Region" => physical::lower_region(lo, fx, supply),
         "hw::PhysFrame" => physical::lower_frame(lo, fx, supply),
         "hw::PageTableRoot" => physical::page_table_root(lo, fx, supply),
-        // Only the kernel executor creates the values these take, and it switches threads
-        // through its own routines, so their code never runs.
-        "hw::SavedContext" | "hw::switch_to" | "hw::SpinGuard" => {
-            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
-        }
         _ => return false,
     }
     true
@@ -78,7 +73,7 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         }
         "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
-        | "hw::PageTableRoot" | "hw::SpinGuard" => false,
+        | "hw::PageTableRoot" => false,
         _ => return None,
     })
 }
@@ -130,8 +125,7 @@ pub fn needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         }
         "hw::PerCpu" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Idt" | "hw::IdtInstalled"
-        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::SpinGuard"
-        | "hw::IrqShared" => false,
+        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::IrqShared" => false,
         _ => return None,
     })
 }

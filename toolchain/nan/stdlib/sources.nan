@@ -359,6 +359,8 @@ const TEXT_BOOT_BOOT: Str =
     \\
     \\pub fn Kernel.ring0(mut self) -> Option[hw::Ring0]
     \\
+    \\pub fn Kernel.policy[P: hw::Policy and Send](mut self, take policy: P)
+    \\
     \\pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
     \\
     \\pub fn Kernel.modules(mut self) -> mem::List[Module]
@@ -6453,11 +6455,6 @@ const TEXT_HW_HW: Str =
     \\    expect value == 6
     \\} with_keeps_changes_for_the_next_holder
     \\
-    \\pub open linear struct SpinGuard[T] {
-    \\} SpinGuard
-    \\
-    \\pub proj fn SpinGuard.contents_mut(mut self) -> T
-    \\
     \\pub open linear struct IrqShared[T: Any and Send] {
     \\} IrqShared
     \\
@@ -6548,18 +6545,31 @@ const TEXT_HW_HW: Str =
     \\    discard take shared.uninstall()
     \\} message_is_none_without_an_msi
     \\
-    \\pub open struct RunQueue {
-    \\} RunQueue
+    \\pub interface Policy {
+    \\    fn place(self, t: IrqsDisabled, task: TaskView) -> Placement limits notrap, terminates, noalloc, stack 4_096
+    \\    fn steal(self, t: IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096
+    \\    fn slice(self, t: IrqsDisabled, cpu: u32, task: TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096
+    \\    fn idle(self, t: IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> Idle limits notrap, terminates, noalloc, stack 4_096
+    \\} Policy
     \\
-    \\pub open linear struct SavedContext {
-    \\} SavedContext
+    \\pub closed struct TaskView derives Copy, Eq {
+    \\    pub task: u64
+    \\    pub executor: u64
+    \\    pub share: task::Share
+    \\    pub last_cpu: Option[u32]
+    \\    pub ran_ns: u64
+    \\    pub deadline_ns: Option[u64]
+    \\} TaskView
     \\
-    \\pub open struct Resumable {
-    \\} Resumable
+    \\pub closed struct Placement derives Copy, Eq {
+    \\    pub cpu: u32
+    \\    pub key: u64
+    \\} Placement
     \\
-    \\pub fn SavedContext.resumable(self) -> Resumable
-    \\
-    \\pub fn switch_to(take guard: SpinGuard[RunQueue], take from: SavedContext, to: Resumable) -> SpinGuard[RunQueue]
+    \\pub closed enum Idle derives Copy, Eq {
+    \\    Halt
+    \\    Poll
+    \\} Idle
     \\
     \\pub open struct PerCpu[T: Send] {
     \\} PerCpu
@@ -10261,7 +10271,7 @@ const TEXT_TASK_PACKAGE: Str =
     \\
 
 const TEXT_TASK_TASK: Str =
-    \\//! Task scopes, joins, deadlines, races, cowns, channels and executors.
+    \\//! Task scopes, joins, deadlines, races, cowns, channels, executors and their accounts.
     \\
     \\pub open struct Cancelled derives Send {
     \\} Cancelled
@@ -10348,6 +10358,25 @@ const TEXT_TASK_TASK: Str =
     \\} Executor
     \\
     \\pub fn Executor.coarse(self, ns: u64) -> Executor fails sys::Revoked
+    \\
+    \\pub closed struct Share derives Copy, Eq {
+    \\    pub weight: u32 where weight >= 1
+    \\    pub class: u8
+    \\    pub reserve_ppm: u32 where reserve_ppm <= 1_000_000
+    \\} Share
+    \\
+    \\pub fn Executor.split(self, share: Share) -> Account
+    \\
+    \\pub fn Executor.serial(self, seed: u64) -> Account
+    \\
+    \\pub open linear struct Account {
+    \\} Account
+    \\
+    \\pub fn Account.executor(self) -> Executor
+    \\
+    \\pub fn Account.used_ns(self) -> u64
+    \\
+    \\pub fn Account.close(take self)
     \\
     \\pub closed struct Completion[B: Any, T: Any, E] {
     \\    pub buf: B
@@ -10487,6 +10516,72 @@ const TEXT_TASK_TASK: Str =
     \\    let outcome = attempt exec.coarse(1_000)
     \\    expect outcome.is_err()
     \\} stale_executor_cannot_coarsen
+    \\
+    \\test split_account_runs_tasks for Executor.split {
+    \\    let world = testing::world()
+    \\    let account = world.exec.split(Share(weight: 3, class: 1, reserve_ppm: 250_000))
+    \\    defer take account.close()
+    \\    var product: u32 = 0
+    \\    try await scope(account.executor(), body: fn[mut product](s: Scope) fails Cancelled uses wait {
+    \\        let job = s.spawn(fn() -> u32 {
+    \\            return 6 * 7
+    \\        })
+    \\        product = try await take job.join()
+    \\    })
+    \\    expect product == 42
+    \\} split_account_runs_tasks
+    \\
+    \\test serial_account_runs_every_task for Executor.serial {
+    \\    let world = testing::world()
+    \\    let account = world.exec.serial(7)
+    \\    defer take account.close()
+    \\    let hits = Cown.of(0u32, alloc: world.alloc)
+    \\    try await scope(account.executor(), body: fn(s: Scope) {
+    \\        for _ in 0..<4u32 {
+    \\            discard s.spawn(fn() fails Cancelled uses wait {
+    \\                await when mut hits {
+    \\                    hits += 1
+    \\                }
+    \\            })
+    \\        }
+    \\    })
+    \\    let total = await when hits => hits
+    \\    expect total == 4
+    \\} serial_account_runs_every_task
+    \\
+    \\test account_executor_is_stale_once_closed for Account.executor {
+    \\    let world = testing::world()
+    \\    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    \\    let exec = account.executor()
+    \\    let live = attempt exec.coarse(1_000)
+    \\    take account.close()
+    \\    let closed = attempt exec.coarse(1_000)
+    \\    expect live.is_ok()
+    \\    expect closed.is_err()
+    \\} account_executor_is_stale_once_closed
+    \\
+    \\test seeded_runs_use_no_time for Account.used_ns {
+    \\    let world = testing::world()
+    \\    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    \\    defer take account.close()
+    \\    try await scope(account.executor(), body: fn(s: Scope) {
+    \\        discard s.spawn(fn() -> u32 {
+    \\            return 1
+    \\        })
+    \\    })
+    \\    let used = account.used_ns()
+    \\    expect used == 0
+    \\} seeded_runs_use_no_time
+    \\
+    \\test closed_account_starts_no_task for Account.close {
+    \\    let world = testing::world()
+    \\    let account = world.exec.split(Share(weight: 1, class: 0, reserve_ppm: 0))
+    \\    let exec = account.executor()
+    \\    take account.close()
+    \\    let outcome = attempt await scope(exec, body: fn(s: Scope) {
+    \\    })
+    \\    expect outcome.is_err()
+    \\} closed_account_starts_no_task
     \\
     \\test earlier_end_decides_the_race for race {
     \\    let world = testing::world()

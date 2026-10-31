@@ -1,0 +1,217 @@
+//! Serial executors: their tasks run one at a time. The task holding a serial executor's turn runs; a task made ready while another holds it waits among the executor's waiting tasks, the last to wait first. When the holder parks, ends or stops, the turn passes to the waiting task at the position the next value of the scheduling stream of the executor's seed gives, so a run that makes the same tasks ready in the same order passes the turn alike. A task records the entry of its serial executor; once that entry is revoked its tasks run without a turn.
+
+/// Whether a task made ready may run now: it records no serial executor or a stale one, or it
+/// takes or holds the turn; otherwise it joins the waiting tasks.
+fn serial_admit(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let serial = mut fx.load(PTR, addr: record, offset: TASK_SERIAL)
+    let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
+    let admitted = mut fx.choose_in(mut lo, condition: gated, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let state_address = mut lo1.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let owner = live_entry(mut lo1, fx: mut fx1, handle: serial)
+        let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
+        let decided = mut fx1.choose(live, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let turn = mut fx2.load(PTR, addr: owner, offset: TABLES_ENTRY_TURN)
+            let free = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: turn, y: 0)
+            let held = mut fx2.b.icmp(clif::IntCC.Equal, x: turn, y: record)
+            let takes = mut fx2.b.bor(free, y: held)
+            return mut fx2.choose(takes, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                mut fx3.store(record, addr: owner, offset: TABLES_ENTRY_TURN)
+                let yes = mut fx3.int(clif::Type.Int8, value: 1)
+                return fx3.list1(yes)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let waiting = mut fx3.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+                mut fx3.store(waiting, addr: record, offset: TASK_NEXT)
+                mut fx3.store(record, addr: owner, offset: TABLES_ENTRY_WAITING)
+                let no = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(no)
+            })
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let yes = mut fx2.int(clif::Type.Int8, value: 1)
+            return fx2.list1(yes)
+        })
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        return fx1.list1(decided[0])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let yes = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(yes)
+    })
+    return admitted[0]
+} serial_admit
+
+/// `Turn(task)`: when the task holds its serial executor's turn, passes it to the waiting task the
+/// executor's seed chooses, which joins a run queue, or frees it when none waits.
+fn define_turn(mut lo: Lowering, mut fx: Fx) {
+    let params = mut fx.entry()
+    expect params.len() > 0
+    let record = params[0]
+    let serial = mut fx.load(PTR, addr: record, offset: TASK_SERIAL)
+    let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
+    mut fx.if_true(gated, then: fn[mut lo](mut fx1: Fx) {
+        let state_address = mut lo.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let owner = live_entry(mut lo, fx: mut fx1, handle: serial)
+        let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
+        let passed_to = mut fx1.choose_in(mut lo, condition: live, results: fx1.types1(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let turn = mut fx2.load(PTR, addr: owner, offset: TABLES_ENTRY_TURN)
+            let holds = mut fx2.b.icmp(clif::IntCC.Equal, x: turn, y: record)
+            return mut fx2.choose_in(mut lo2, condition: holds, results: fx2.types1(PTR).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let next = serial_pick(mut lo3, fx: mut fx3, owner)
+                mut fx3.store(next, addr: owner, offset: TABLES_ENTRY_TURN)
+                return fx3.list1(next)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let none = mut fx3.ptr(0)
+                return fx3.list1(none)
+            })
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.ptr(0)
+            return fx2.list1(none)
+        })
+        let next = passed_to[0]
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        let passed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        mut fx1.if_true(passed, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Enqueue, args: fx2.list1(next).view())
+        })
+    })
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} define_turn
+
+/// Takes the waiting task the serial executor's seed chooses out of its waiting tasks, zero when
+/// none waits. The caller holds the lock.
+fn serial_pick(mut lo: Lowering, mut fx: Fx, owner: clif::Value) -> clif::Value {
+    let waiting = mut fx.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+    let zero = mut fx.ptr(0)
+    let counted = mut fx.repeat(fx.list2(waiting, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let count = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            let more = mut fx2.b.iadd_imm_s(count, y: 1)
+            return fx2.list2(following, b: more)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: count)
+        })
+        return Pass(again: present, next: take next)
+    })
+    let count = counted[1]
+    let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    let picked = mut fx.choose_in(mut lo, condition: waits, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let seed = mut fx1.load(PTR, addr: owner, offset: TABLES_ENTRY_SEED)
+        let picks = mut fx1.load(PTR, addr: owner, offset: TABLES_ENTRY_PICKS)
+        let next_picks = mut fx1.b.iadd_imm_s(picks, y: 1)
+        mut fx1.store(next_picks, addr: owner, offset: TABLES_ENTRY_PICKS)
+        let stream = mut fx1.ptr(SEEDED_SCHEDULING)
+        let drawn = mut lo1.call_routine(mut fx1, routine: Routine.Stream, args: fx1.list3(seed, b: stream, c: picks).view())
+        expect drawn.len() > 0
+        let position = mut fx1.b.urem(drawn[0], y: count)
+        let head = mut fx1.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+        let none = mut fx1.ptr(0)
+        let found = mut fx1.repeat(fx1.list3(head, b: none, c: position).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 2
+            let current = state[0]
+            let previous = state[1]
+            let left = state[2]
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: left, y: 0)
+            let next = mut fx2.choose(more, results: fx2.types3(PTR, b: PTR, c: PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let following = mut fx3.load(PTR, addr: current, offset: TASK_NEXT)
+                let fewer = mut fx3.b.iadd_imm_s(left, y: -1)
+                return fx3.list3(following, b: current, c: fewer)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list3(current, b: previous, c: left)
+            })
+            return Pass(again: more, next: take next)
+        })
+        serial_unlink(mut fx1, owner, record: found[0], previous: found[1])
+        return fx1.list1(found[0])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    return picked[0]
+} serial_pick
+
+/// Takes a waiting task, after `previous` or first when it is zero, out of the waiting tasks.
+fn serial_unlink(mut fx: Fx, owner: clif::Value, record: clif::Value, previous: clif::Value) {
+    let next = mut fx.load(PTR, addr: record, offset: TASK_NEXT)
+    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: owner, offset: TABLES_ENTRY_WAITING)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: previous, offset: TASK_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} serial_unlink
+
+/// Takes a task out of its serial executor's waiting tasks; gives whether it waited there.
+fn serial_withdraw(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let serial = mut fx.load(PTR, addr: record, offset: TASK_SERIAL)
+    let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
+    let withdrawn = mut fx.choose_in(mut lo, condition: gated, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let state_address = mut lo1.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let owner = live_entry(mut lo1, fx: mut fx1, handle: serial)
+        let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
+        let found = mut fx1.choose(live, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let waiting = mut fx2.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+            let zero = mut fx2.ptr(0)
+            let searched = mut fx2.repeat(fx2.list2(waiting, b: zero).view(), body: fn(mut fx3: Fx, state: Slice[clif::Value]) -> Pass {
+                expect state.len() > 1
+                let current = state[0]
+                let previous = state[1]
+                let present = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+                let other = mut fx3.b.icmp(clif::IntCC.NotEqual, x: current, y: record)
+                let more = mut fx3.b.band(present, y: other)
+                let next = mut fx3.choose(more, results: fx3.types2(PTR, b: PTR).view(), then: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    let following = mut fx4.load(PTR, addr: current, offset: TASK_NEXT)
+                    return fx4.list2(following, b: current)
+                }, otherwise: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    return fx4.list2(current, b: previous)
+                })
+                return Pass(again: more, next: take next)
+            })
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: searched[0], y: 0)
+            mut fx2.if_true(present, then: fn(mut fx3: Fx) {
+                serial_unlink(mut fx3, owner, record: searched[0], previous: searched[1])
+            })
+            return fx2.list1(present)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        return fx1.list1(found[0])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(no)
+    })
+    return withdrawn[0]
+} serial_withdraw
+
+/// Puts every task waiting for the turn of a serial executor's entry being revoked in a run queue.
+/// The caller holds the lock.
+fn release_waiting(mut lo: Lowering, mut fx: Fx, owner: clif::Value) {
+    let waiting = mut fx.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+    discard mut fx.repeat(fx.list1(waiting).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 0
+        let current = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: fx1.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Enqueue, args: fx2.list1(current).view())
+            return fx2.list1(following)
+        }, otherwise: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.ptr(0)
+            return fx2.list1(none)
+        })
+        return Pass(again: present, next: take next)
+    })
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: owner, offset: TABLES_ENTRY_WAITING)
+} release_waiting

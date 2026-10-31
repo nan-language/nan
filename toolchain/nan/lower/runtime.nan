@@ -1,4 +1,4 @@
-//! The support routines: the fixed routines of the implementation that lowered code, compiler stubs and seams call, each named `_NS`, its routine's name, `_` and a suffix, with their state in the writable data object `_NSstate` and the thread-local `_NSthread`. `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the seeded scheduler of test images.
+//! The support routines: the fixed routines of the implementation that lowered code, compiler stubs and seams call, each named `_NS`, its routine's name, `_` and a suffix, with their state in the writable data object `_NSstate` and the thread-local `_NSthread`. `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability tables; `stack_switch` keeps tasks, their stacks, the executors' run queues and the turns of serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the seeded scheduler of test images.
 
 /// A support routine.
 enum Routine derives Copy, Eq, Hash {
@@ -121,6 +121,12 @@ enum Routine derives Copy, Eq, Hash {
     Spawn
     /// `(task)`: makes a task ready.
     Wake
+    /// `(task)`: makes a ready task run once its serial executor's turn admits it.
+    Ready
+    /// `(task)`: puts a ready task in a run queue.
+    Enqueue
+    /// `(task)`: passes on the turn of a task's serial executor when the task holds it.
+    Turn
     /// `()`: suspends the running task until a wake.
     Park
     /// `(task)`: the first code a task runs on its own stack.
@@ -223,6 +229,9 @@ proj fn Routine.name(self) -> Str {
         Routine.WriteErr => "_NStrap_write_err"
         Routine.Spawn => "_NSstack_switch_spawn"
         Routine.Wake => "_NSstack_switch_wake"
+        Routine.Ready => "_NSstack_switch_ready"
+        Routine.Enqueue => "_NSstack_switch_enqueue"
+        Routine.Turn => "_NSstack_switch_turn"
         Routine.Park => "_NSstack_switch_park"
         Routine.TaskStart => "_NSstack_switch_task_start"
         Routine.IoSubmit => "_NSstack_switch_io_submit"
@@ -266,7 +275,7 @@ fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
         Routine.KindPin => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.OutboxClaim or Routine.RegionOpen or Routine.RecordAlloc => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.RecordResize => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
-        Routine.Free or Routine.RecordFree or Routine.Close or Routine.TaskEnvFree or Routine.Unhold or Routine.MintRoot or Routine.Revoke or Routine.KindClose or Routine.OutboxRetire or Routine.Wake or Routine.TaskStart or Routine.Cancel or Routine.CownRelease or Routine.Exit or Routine.ThreadMain or Routine.Terminations or Routine.Lock or Routine.Unlock or Routine.Settle or Routine.Reacquired or Routine.Stop => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Free or Routine.RecordFree or Routine.Close or Routine.TaskEnvFree or Routine.Unhold or Routine.MintRoot or Routine.Revoke or Routine.KindClose or Routine.OutboxRetire or Routine.Wake or Routine.Ready or Routine.Enqueue or Routine.Turn or Routine.TaskStart or Routine.Cancel or Routine.CownRelease or Routine.Exit or Routine.ThreadMain or Routine.Terminations or Routine.Lock or Routine.Unlock or Routine.Settle or Routine.Reacquired or Routine.Stop => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Preempt or Routine.Overflow or Routine.CpuLimit => RoutineTypes(params: type_list(Some(int32), count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.OverflowRaise => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.TrapRaise or Routine.ReportText => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
@@ -471,7 +480,13 @@ const STATE_ITS_PROPERTIES: u64 = 448
 
 const STATE_ITS_DEVICES: u64 = 456
 
-const STATE_SIZE: u64 = 464
+/// On a kernel, the record of the policy `boot::Kernel.policy` installed, zero for the default
+/// one, and the last key the default policy gave.
+const STATE_POLICY: u64 = 464
+
+const STATE_TICKET: u64 = 472
+
+const STATE_SIZE: u64 = 480
 
 /// The function of a routine, declared now and defined once lowering reaches the end of its
 /// queue.
@@ -667,10 +682,11 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.MintRoot or Routine.Derive or Routine.Revoke or Routine.OutboxMint or Routine.OutboxRetire or Routine.OutboxClaim or Routine.KindMint or Routine.KindPin or Routine.KindDerive or Routine.KindRevoke or Routine.KindClose => tables_define(mut lo, mut fx, routine)
         Routine.TrapRaise or Routine.TrapReport or Routine.Reacquired or Routine.ReportScalar or Routine.ReportText or Routine.WriteErr or Routine.OverflowRaise => report_define(mut lo, mut fx, routine)
         Routine.Settle => settle_define(mut lo, mut fx, routine)
-        Routine.Spawn or Routine.Wake or Routine.Park or Routine.TaskStart or Routine.IoSubmit or Routine.Schedule or Routine.ThreadMain or Routine.Thread or Routine.Stop => tasks_define(mut lo, mut fx, routine)
+        Routine.Spawn or Routine.Wake or Routine.Ready or Routine.Enqueue or Routine.Park or Routine.TaskStart or Routine.IoSubmit or Routine.Schedule or Routine.ThreadMain or Routine.Thread or Routine.Stop => tasks_define(mut lo, mut fx, routine)
         Routine.RegionOpen or Routine.Cancel or Routine.Origin => regions_define(mut lo, mut fx, routine)
         Routine.CownRelease => release_routine(mut lo, mut fx)
         Routine.Yield or Routine.Stream => seeded_define(mut lo, mut fx, routine)
+        Routine.Turn => define_turn(mut lo, mut fx)
         Routine.ClockNow => define_clock_now(mut lo, mut fx)
         Routine.Draw => define_draw(mut lo, mut fx)
         Routine.Lock or Routine.Unlock => locks_define(mut lo, mut fx, routine)

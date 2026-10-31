@@ -25,10 +25,12 @@ mod scope {
     pub const LOCK: u64 = 40;
     pub const FAILED: u64 = 48;
     pub const ORIGIN: u64 = 56;
+    /// The cell its executor draws through, and that executor's handle.
     pub const EXECUTOR: u64 = 64;
-    pub const REFS: u64 = 72;
-    pub const RETURNED: u64 = 80;
-    pub const FAILURE: u64 = 88;
+    pub const HANDLE: u64 = 72;
+    pub const REFS: u64 = 80;
+    pub const RETURNED: u64 = 88;
+    pub const FAILURE: u64 = 96;
 }
 
 /// The states of a scope's kept failure.
@@ -252,6 +254,8 @@ fn scope_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let size = fx.ptr(scope::FAILURE + layout.size.max(8));
     let record = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
     fx.store(cell, record, scope::EXECUTOR);
+    let handle = fx.load(PTR, supply.param(0).address(), 0);
+    fx.store(handle, record, scope::HANDLE);
     let one = fx.ptr(1);
     fx.store(one, record, scope::REFS);
     let current = tasks::current_task(lo, fx);
@@ -393,16 +397,17 @@ fn storage(lo: &mut Lowering, fn_ty: &FnTy) -> (u64, u64) {
     (failure_at, failure_at + failure.0)
 }
 
-/// Starts a task running a `task fn` value of a type held at an address, in a region, owned by
-/// a construct or domain record, its stack drawn through a cell for a domain, of `stack` usable
-/// bytes or else of the size its type gives: its record, ready. It traps when the stack cannot be
-/// drawn.
+/// Starts a task running a `task fn` value of a type held at an address on an executor, in a
+/// region, owned by a construct or domain record, its stack drawn through a cell for a domain, of
+/// `stack` usable bytes or else of the size its type gives: its record, ready. It traps when the
+/// stack cannot be drawn.
 #[allow(clippy::too_many_arguments)]
 pub fn start_task(
     lo: &mut Lowering,
     fx: &mut Fx,
     fn_ty: &FnTy,
     function: Value,
+    exec: Value,
     cell: Value,
     domain: Value,
     region_record: Value,
@@ -431,6 +436,7 @@ pub fn start_task(
             .iadd_imm_s(record, (task::SIZE + failure_at) as i64);
     fx.store(failure, record, task::FAILURE);
     fx.store(owner, record, task::OWNER);
+    record_executor(lo, fx, record, exec);
     if let Some(end) = end {
         let end = lo.func_ref(fx, end);
         let end = fx.b.ins().func_addr(PTR, end);
@@ -446,6 +452,15 @@ pub fn start_task(
         fx.store(release, record, task::RESULT_RELEASE);
     }
     record
+}
+
+/// Records in a task's record the executor it runs on, with that executor's share and serial
+/// executor.
+pub fn record_executor(lo: &mut Lowering, fx: &mut Fx, record: Value, exec: Value) {
+    fx.store(exec, record, task::EXECUTOR);
+    let (share, serial) = tables::executor_terms(lo, fx, exec);
+    fx.store(share, record, task::SHARE);
+    fx.store(serial, record, task::SERIAL);
 }
 
 /// The glue running a task's entry, a function value of a type taking at most the argument the
@@ -511,6 +526,7 @@ fn spawn_child(
     stack: Option<Value>,
 ) -> Value {
     let cell = fx.load(PTR, scope_record, scope::EXECUTOR);
+    let exec = fx.load(PTR, scope_record, scope::HANDLE);
     let domain = tasks::current_domain(lo, fx);
     let end = child_end(lo, child_ty, scope_fails);
     let done = child_done(lo);
@@ -528,6 +544,7 @@ fn spawn_child(
         fx,
         child_ty,
         child,
+        exec,
         cell,
         domain,
         scope_record,
@@ -862,6 +879,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let none = fx.ptr(0);
         super::fail_cancelled(lo, fx, supply, none);
     });
+    let exec = fx.load(PTR, supply.param(0).address(), 0);
     let size = fx.ptr(race::SIZE);
     let record = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
     let two = fx.ptr(2);
@@ -877,6 +895,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx,
             &task_ty,
             function,
+            exec,
             cell,
             domain,
             record,

@@ -130,7 +130,8 @@ fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, resumed: bool) {
     });
     let cell = fx.load(PTR, supply.param(first + 2).address(), 0);
     let shape = shape(lo, &state_ty, &env_ty, &message_ty);
-    let record = draw_record(lo, fx, &shape, cell, exec_cell, clock, resolution);
+    let exec = fx.load(PTR, supply.param(first + 1).address(), 0);
+    let record = draw_record(lo, fx, &shape, cell, exec, exec_cell, clock, resolution);
     let kind = fx.ptr(holdings::kind::STEPPER as u64);
     let holding = lo.call_routine(fx, Routine::Hold, &[kind, record])[0];
     fx.store(holding, record, runner::HOLDING);

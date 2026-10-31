@@ -1,0 +1,155 @@
+//! Capability kinds: minters, reaches and derivations. A minter is the holding of its state's record, which is a shared value's whose count holds one for the minter and one for each reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that record and the two words of its own record; a reach pins the state under the table lock and calls its body outside it.
+
+/// The bytes of the slot holding a record's two words.
+const KINDS_RECORD_SLOT: u64 = 16
+
+fn kinds_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "sys::Minter.of" => kinds_of(mut lo, mut fx, supply)
+        "sys::Minter.mint" => {
+            let minter = holdings_payload(mut fx, address: supply.param(0).address_value())
+            let words = kinds_record_words(mut lo, mut fx, record: supply.param(1), record_ty: supply.type_arg(lo, index: 2))
+            let minted = mut lo.call_routine(mut fx, routine: Routine.KindMint, args: fx.list3(minter, b: words.low, c: words.high).view())
+            expect minted.len() == 1
+            let Some(sret) = supply.sret else {
+                expect false
+                return true
+            }
+            mut fx.store(minted[0], addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "sys::Minter.revoke" => {
+            let minter = holdings_payload(mut fx, address: supply.param(0).address_value())
+            let handle = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            discard mut lo.call_routine(mut fx, routine: Routine.KindRevoke, args: fx.list2(handle, b: minter).view())
+            supply.done(mut lo, mut fx)
+        }
+        "sys::Minter.close" => {
+            let holding = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let minter = holdings_payload(mut fx, address: supply.param(0).address_value())
+            discard mut lo.call_routine(mut fx, routine: Routine.KindClose, args: fx.list1(minter).view())
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(holding).view())
+            kinds_unpin(mut lo, mut fx, state_ty: supply.type_arg(lo, index: 1), minter)
+            supply.done(mut lo, mut fx)
+        }
+        "sys::reach" => kinds_reach(mut lo, mut fx, supply)
+        "sys::derive" => kinds_derive(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} kinds_lower
+
+/// `sys::Minter.of(state, alloc)`: the state moves into a shared record drawn through `alloc`,
+/// which passes to the outermost domain, and the minter holds it.
+fn kinds_of(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let state_ty = supply.type_arg(lo, index: 1)
+    let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+    let record = new_shared(mut lo, mut fx, cell, value_ty: state_ty, value: supply.param(0))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        supply.exhausted(mut lo, fx: mut fx1, taken: mem::List[Taken].empty(fx1.alloc).view())
+    })
+    let state_address = mut lo.state(mut fx)
+    let process = mut fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
+    let held = mut fx.slot(8, align: 8)
+    mut fx.store(record, addr: held, offset: 0)
+    transfer_shared(mut lo, mut fx, value_ty: state_ty, address: held, lift: process)
+    let kind = mut fx.ptr(u64.fit(HOLDINGS_KIND_MINTER))
+    let holdings = mut lo.call_routine(mut fx, routine: Routine.Hold, args: fx.list2(kind, b: record).view())
+    expect holdings.len() == 1
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(holdings[0], addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} kinds_of
+
+/// `sys::reach(c, body)`: `None` for a stale handle, else `Some` of what `body` returns given
+/// the pinned state and the entry's record, its failure becoming the operation's.
+fn kinds_reach(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let option = supply.abi.result
+    let state_ty = supply.type_arg(lo, index: 1)
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let record = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
+    let pinned = mut lo.call_routine(mut fx, routine: Routine.KindPin, args: fx.list2(handle, b: record).view())
+    expect pinned.len() == 1
+    let minter = pinned[0]
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: minter, y: 0)
+    mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
+        let called = kinds_call_pinned(mut lo, fx: mut fx1, supply, state_ty, minter, record)
+        kinds_unpin(mut lo, fx: mut fx1, state_ty, minter)
+        supply.forward_failure(mut lo, fx: mut fx1, called)
+        let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(called.result).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: some)
+    })
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} kinds_reach
+
+/// `sys::derive(c, narrow)`: an entry deriving from `c`'s, recording what `narrow` returns given
+/// the pinned state and `c`'s record; `Revoked.Stale` when `c` is stale before or after.
+fn kinds_derive(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let state_ty = supply.type_arg(lo, index: 1)
+    let record_ty = supply.type_arg(lo, index: 2)
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let record = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
+    let pinned = mut lo.call_routine(mut fx, routine: Routine.KindPin, args: fx.list2(handle, b: record).view())
+    expect pinned.len() == 1
+    let minter = pinned[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: minter, y: 0)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let called = kinds_call_pinned(mut lo, mut fx, supply, state_ty, minter, record)
+    kinds_unpin(mut lo, mut fx, state_ty, minter)
+    let words = kinds_record_words(mut lo, mut fx, record: called.result, record_ty)
+    let derived = mut lo.call_routine(mut fx, routine: Routine.KindDerive, args: fx.list3(handle, b: words.low, c: words.high).view())
+    expect derived.len() == 1
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived[0], y: -1)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(derived[0], addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} kinds_derive
+
+/// Calls the operation's function argument with the state of a pinned minter and the record the
+/// pin wrote.
+fn kinds_call_pinned(mut lo: Lowering, mut fx: Fx, supply: Supply, state_ty: ty::Ty, minter: clif::Value, record: clif::Value) -> Called {
+    let at = contents_at(mut lo, value: state_ty)
+    let state = mut fx.offset(minter, offset: at)
+    let body_ty = fn_param(lo, supply, index: 1)
+    var args = Array[Held, 2].filled(Held.Address(state))
+    args[1] = Held.Address(record)
+    return mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(1).address_value(), args: args.view())
+} kinds_call_pinned
+
+/// Ends one holder of a minter's state: the last releases the state and frees its record.
+fn kinds_unpin(mut lo: Lowering, mut fx: Fx, state_ty: ty::Ty, minter: clif::Value) {
+    let held = mut fx.slot(8, align: 8)
+    mut fx.store(minter, addr: held, offset: 0)
+    release_shared(mut lo, mut fx, value_ty: state_ty, address: held)
+} kinds_unpin
+
+/// The two words of a record.
+struct RecordWords derives Copy {
+    low: clif::Value
+    high: clif::Value
+} RecordWords
+
+/// The two words of a record held one way or another, its bytes past its size zero.
+fn kinds_record_words(mut lo: Lowering, mut fx: Fx, record: Held, record_ty: ty::Ty) -> RecordWords {
+    let slot = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: slot, offset: 0)
+    mut fx.store(zero, addr: slot, offset: 8)
+    mut lo.store_held(mut fx, address: slot, held: record, ty: record_ty)
+    let low = mut fx.load(PTR, addr: slot, offset: 0)
+    let high = mut fx.load(PTR, addr: slot, offset: 8)
+    return RecordWords(low: low, high: high)
+} kinds_record_words

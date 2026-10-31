@@ -42,7 +42,7 @@ target = IDENT ( "-" IDENT )? ;
 entry_directive = 'entry' IDENT NL ;
 dep_directive = 'dep' IDENT TEXT NL ;
 allow_directive = 'allow' authority "in" name_list NL ;
-authority = 'device' | 'priv' | "trusted" | 'validate' | "contribute" path ;
+authority = 'device' | 'priv' | "trusted" | 'validate' | 'capability' | "contribute" path ;
 name_list = IDENT ( "," IDENT )* ;
 deny_directive = 'deny' IDENT "->" IDENT NL ;
 ```

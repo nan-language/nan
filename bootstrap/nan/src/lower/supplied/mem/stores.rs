@@ -45,7 +45,7 @@ fn slot_shape(lo: &mut Lowering, value: &Ty) -> (Element, u64) {
 }
 
 /// The offset of a shared value's contents of a type.
-fn contents_at(lo: &mut Lowering, value: &Ty) -> u64 {
+pub fn contents_at(lo: &mut Lowering, value: &Ty) -> u64 {
     shared::HEADER.next_multiple_of(lo.layout(value).align.max(1))
 }
 

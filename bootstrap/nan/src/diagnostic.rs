@@ -57,6 +57,8 @@ codes! {
     AuthorityCapabilityImpl = "authority.capability-impl",
     AuthorityDeniedDependency = "authority.denied-dependency",
     AuthorityDependencyUngranted = "authority.dependency-ungranted",
+    AuthorityKindForeign = "authority.kind-foreign",
+    AuthorityKindForm = "authority.kind-form",
     AuthorityUngranted = "authority.ungranted",
     AuthorityUnknownName = "authority.unknown-name",
     AuthorityWideningUnapproved = "authority.widening-unapproved",

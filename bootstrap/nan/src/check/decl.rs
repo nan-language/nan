@@ -470,6 +470,7 @@ impl Checker<'_> {
             ItemKind::Retired(_) => self.check_tombstone(item),
             ItemKind::Impl(_) if !self.check_generate_impl(item) && self.check_impl(item) => {
                 self.check_capability_impl(item);
+                self.check_kind_impl(item);
                 self.check_decoder_impl(item);
                 self.check_component_impl(item);
             }

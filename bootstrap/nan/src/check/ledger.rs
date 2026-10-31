@@ -1,6 +1,6 @@
 //! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns,
-//! validators and declassifying decoders, `device` and `priv` grants, waivers, `todo`, `dbg`,
-//! device premises and undo clauses, each with its line and parts.
+//! validators and declassifying decoders, `device`, `priv` and `capability` grants, waivers,
+//! `todo`, `dbg`, device premises and undo clauses, each with its line and parts.
 
 use super::Checker;
 use super::db::{ItemId, PackageId};
@@ -197,7 +197,8 @@ impl Checker<'_> {
         entries
     }
 
-    /// The ledger entries of a package's `package` item: one per `device` or `priv` grant.
+    /// The ledger entries of a package's `package` item: one per `device`, `priv` or `capability`
+    /// grant.
     pub fn grant_ledger(&self, package: PackageId) -> Vec<Entry> {
         let data = self.db.package(package);
         let Some(manifest) = data.source.manifest.as_ref() else {
@@ -207,7 +208,12 @@ impl Checker<'_> {
         manifest
             .allows
             .iter()
-            .filter(|allow| matches!(allow.authority, Authority::Device | Authority::Priv))
+            .filter(|allow| {
+                matches!(
+                    allow.authority,
+                    Authority::Device | Authority::Priv | Authority::Capability
+                )
+            })
             .map(|allow| {
                 let mut texts = vec![allow.authority.written()];
                 texts.extend(allow.names.iter().cloned());

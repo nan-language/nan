@@ -202,6 +202,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::net::Listener", AFFINE_SEND),
     ("sys::net::Conn", LINEAR_SEND),
     ("sys::Revoker", LINEAR_SEND),
+    ("sys::Minter", LINEAR_SEND),
     ("sys::Cx", VIEW_ONLY),
     ("sys::Outbox", COPY_SEND),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
@@ -234,7 +235,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 27] = [
+const PRIMITIVE_CAPABILITIES: [&str; 28] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -250,6 +251,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 27] = [
     "sys::net::Listener",
     "sys::net::Conn",
     "sys::Revoker",
+    "sys::Minter",
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",
@@ -303,8 +305,10 @@ impl Checker<'_> {
         self.base_facts(item).is_some()
     }
 
+    /// Whether a type item is a primitive capability: one std lists, or a capability kind.
     pub fn is_primitive_capability(&self, item: ItemId) -> bool {
         self.db.is_std(item) && PRIMITIVE_CAPABILITIES.contains(&self.db.canonical(item).as_str())
+            || self.is_kind(item)
     }
 
     /// The properties of a type, as code of the item `from` sees them.
@@ -451,6 +455,13 @@ impl Checker<'_> {
     }
 
     fn compute_definition_props(&self, item: ItemId) -> Props {
+        if self.is_kind(item) {
+            return Props {
+                copy: true,
+                send: true,
+                ..Props::default()
+            };
+        }
         let ast = self.db.ast(item);
         let derives = |name: &str| match &ast.kind {
             ItemKind::Struct(structure) => structure.derives.iter().any(|entry| entry.text == name),

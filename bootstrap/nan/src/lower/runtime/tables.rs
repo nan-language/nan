@@ -16,7 +16,8 @@
 //! flight that `task::within` calls armed through it, linked through their timers. A
 //! `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock
 //! that delays count, which a host's wall clock reads from the platform instead, then its
-//! resolution.
+//! resolution. An entry of a capability kind holds its minter's state record, then the two words
+//! of its record.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -63,6 +64,7 @@ pub mod kind {
     pub const EXECUTOR: i64 = 7;
     pub const OUTBOX: i64 = 8;
     pub const WALL: i64 = 9;
+    pub const KIND: i64 = 10;
 }
 
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
@@ -116,6 +118,110 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let lock = fx.offset(state_address, state::LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
             revoke(lo, fx, params[0]);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.b.ins().return_(&[]);
+        }
+        Routine::KindMint => {
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let kind = fx.ptr(kind::KIND as u64);
+            let handle = new_entry(lo, fx, kind);
+            let record = entry_at(lo, fx, handle);
+            for (word, value) in params.iter().enumerate() {
+                fx.store(*value, record, entry::STATE + 8 * word as u64);
+            }
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.b.ins().return_(&[handle]);
+        }
+        Routine::KindPin => {
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let record = live_entry(lo, fx, params[0]);
+            let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+            let minter = fx.choose(
+                live,
+                &[PTR],
+                |fx| {
+                    let minter = fx.load(PTR, record, entry::STATE);
+                    let one = fx.ptr(1);
+                    super::fetch_add(fx, minter, one);
+                    for word in [1, 2] {
+                        let value = fx.load(PTR, record, entry::STATE + 8 * word);
+                        fx.store(value, params[1], 8 * (word - 1));
+                    }
+                    vec![minter]
+                },
+                |fx| vec![fx.ptr(0)],
+            )[0];
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.b.ins().return_(&[minter]);
+        }
+        Routine::KindDerive => {
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let source = live_entry(lo, fx, params[0]);
+            let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
+            let handle = fx.choose(
+                live,
+                &[PTR],
+                |fx| {
+                    let kind = fx.ptr(kind::KIND as u64);
+                    let handle = new_entry(lo, fx, kind);
+                    let record = entry_at(lo, fx, handle);
+                    let minter = fx.load(PTR, source, entry::STATE);
+                    fx.store(minter, record, entry::STATE);
+                    fx.store(params[1], record, entry::STATE + 8);
+                    fx.store(params[2], record, entry::STATE + 16);
+                    let index = fx.b.ins().band_imm_s(params[0], 0xFFFF_FFFF);
+                    let index = fx.b.ins().iadd_imm_s(index, 1);
+                    let index = fx.b.ins().ireduce(types::I32, index);
+                    fx.store(index, record, entry::SOURCE);
+                    vec![handle]
+                },
+                |fx| vec![fx.int(PTR, -1)],
+            )[0];
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.b.ins().return_(&[handle]);
+        }
+        Routine::KindRevoke => {
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let record = live_entry(lo, fx, params[0]);
+            let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+            fx.when(live, |fx| {
+                let minter = fx.load(PTR, record, entry::STATE);
+                let belongs = fx.b.ins().icmp(IntCC::Equal, minter, params[1]);
+                fx.when(belongs, |fx| revoke(lo, fx, params[0]));
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.b.ins().return_(&[]);
+        }
+        Routine::KindClose => {
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let count = fx.load(PTR, state_address, state::ENTRY_COUNT);
+            let zero = fx.ptr(0);
+            fx.each(zero, count, |fx, index| {
+                let record = entry_at(lo, fx, index);
+                let kind = fx.load(types::I32, record, entry::KIND);
+                let of_kind = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::KIND);
+                let live = fx.load(types::I32, record, entry::LIVE);
+                let live = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 1);
+                let minter = fx.load(PTR, record, entry::STATE);
+                let belongs = fx.b.ins().icmp(IntCC::Equal, minter, params[0]);
+                let revoked = fx.b.ins().band(of_kind, live);
+                let revoked = fx.b.ins().band(revoked, belongs);
+                fx.when(revoked, |fx| {
+                    let revoking = fx.int(types::I32, 2);
+                    fx.store(revoking, record, entry::LIVE);
+                });
+            });
+            sweep(lo, fx);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             fx.b.ins().return_(&[]);
         }
@@ -226,49 +332,55 @@ fn revoke(lo: &mut Lowering, fx: &mut Fx, handle: Value) {
     fx.when(present, |fx| {
         let revoking = fx.int(types::I32, 2);
         fx.store(revoking, target, entry::LIVE);
-        let state_address = lo.state(fx);
-        let count = fx.load(PTR, state_address, state::ENTRY_COUNT);
-        let no = fx.int(types::I8, 0);
-        fx.repeat(&[], |fx, _| {
-            let zero = fx.ptr(0);
-            let changed = fx.var(types::I8, no);
-            fx.each(zero, count, |fx, index| {
-                let record = entry_at(lo, fx, index);
-                let live = fx.load(types::I32, record, entry::LIVE);
-                let live = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 1);
-                let source = fx.load(types::I32, record, entry::SOURCE);
-                let derived = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
-                let candidate = fx.b.ins().band(live, derived);
-                fx.when(candidate, |fx| {
-                    let source = fx.b.ins().uextend(PTR, source);
-                    let source = fx.b.ins().iadd_imm_s(source, -1);
-                    let parent = entry_at(lo, fx, source);
-                    let parent_live = fx.load(types::I32, parent, entry::LIVE);
-                    let spreading = fx.b.ins().icmp_imm_s(IntCC::Equal, parent_live, 2);
-                    fx.when(spreading, |fx| {
-                        let revoking = fx.int(types::I32, 2);
-                        fx.store(revoking, record, entry::LIVE);
-                        let yes = fx.int(types::I8, 1);
-                        fx.b.def_var(changed, yes);
-                    });
-                });
-            });
-            (fx.b.use_var(changed), Vec::new())
-        });
+        sweep(lo, fx);
+    });
+}
+
+/// Revokes the entries being revoked and every live entry deriving from one, transitively:
+/// each becomes free, its generation advanced and its text freed. The caller holds the lock.
+fn sweep(lo: &mut Lowering, fx: &mut Fx) {
+    let state_address = lo.state(fx);
+    let count = fx.load(PTR, state_address, state::ENTRY_COUNT);
+    let no = fx.int(types::I8, 0);
+    fx.repeat(&[], |fx, _| {
         let zero = fx.ptr(0);
+        let changed = fx.var(types::I8, no);
         fx.each(zero, count, |fx, index| {
             let record = entry_at(lo, fx, index);
             let live = fx.load(types::I32, record, entry::LIVE);
-            let revoked = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 2);
-            fx.when(revoked, |fx| {
-                expire_deadlines(lo, fx, record);
-                let owns = owns_text(fx, record);
-                fx.when(owns, |fx| {
-                    let text = fx.load(PTR, record, entry::STATE + 8);
-                    lo.record_free(fx, text);
+            let live = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 1);
+            let source = fx.load(types::I32, record, entry::SOURCE);
+            let derived = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
+            let candidate = fx.b.ins().band(live, derived);
+            fx.when(candidate, |fx| {
+                let source = fx.b.ins().uextend(PTR, source);
+                let source = fx.b.ins().iadd_imm_s(source, -1);
+                let parent = entry_at(lo, fx, source);
+                let parent_live = fx.load(types::I32, parent, entry::LIVE);
+                let spreading = fx.b.ins().icmp_imm_s(IntCC::Equal, parent_live, 2);
+                fx.when(spreading, |fx| {
+                    let revoking = fx.int(types::I32, 2);
+                    fx.store(revoking, record, entry::LIVE);
+                    let yes = fx.int(types::I8, 1);
+                    fx.b.def_var(changed, yes);
                 });
-                free_entry(lo, fx, record, index);
             });
+        });
+        (fx.b.use_var(changed), Vec::new())
+    });
+    let zero = fx.ptr(0);
+    fx.each(zero, count, |fx, index| {
+        let record = entry_at(lo, fx, index);
+        let live = fx.load(types::I32, record, entry::LIVE);
+        let revoked = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 2);
+        fx.when(revoked, |fx| {
+            expire_deadlines(lo, fx, record);
+            let owns = owns_text(fx, record);
+            fx.when(owns, |fx| {
+                let text = fx.load(PTR, record, entry::STATE + 8);
+                lo.record_free(fx, text);
+            });
+            free_entry(lo, fx, record, index);
         });
     });
 }

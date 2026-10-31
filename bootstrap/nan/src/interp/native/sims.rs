@@ -20,13 +20,13 @@ const RANDOM_STREAM: u64 = 2;
 
 /// The positions of a capability's parts: its entry, then a random stream's seed and the index
 /// of its next byte.
-const ENTRY: usize = 0;
+pub(super) const ENTRY: usize = 0;
 const SEED: usize = 1;
 const NEXT: usize = 2;
 
 /// The positions of an entry's parts: whether it is live and the entry it derives from.
-const LIVE: usize = 0;
-const SOURCE: usize = 1;
+pub(super) const LIVE: usize = 0;
+pub(super) const SOURCE: usize = 1;
 
 /// The positions of a revoker's parts: the capability and what revoking it ends, its entry or
 /// an allocator's cell.
@@ -204,7 +204,7 @@ fn entry(interp: &mut Interpreter, source: Option<Loc>) -> Val {
 }
 
 /// Whether a capability's entry, or one it derives from, is revoked.
-fn stale(interp: &Interpreter, capability: &Val) -> bool {
+pub(super) fn stale(interp: &Interpreter, capability: &Val) -> bool {
     let mut entry = place(&interp.deref(capability).fields()[ENTRY]);
     loop {
         if !interp.memory.get(&entry.with(LIVE as u32)).bool() {
@@ -218,7 +218,7 @@ fn stale(interp: &Interpreter, capability: &Val) -> bool {
 }
 
 /// `sys::Revoked.Stale`.
-fn revoked(interp: &Interpreter) -> Val {
+pub(super) fn revoked(interp: &Interpreter) -> Val {
     Val::Variant(interp.ty_item("sys", "Revoked"), 0, Rc::new(Vec::new()))
 }
 

@@ -656,19 +656,21 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, _ty: &Ty, address: Va
 /// declares in full.
 pub fn transfers(path: &str) -> Option<bool> {
     match path {
-        "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" | "sys::Revoker" => Some(true),
+        "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" | "sys::Revoker"
+        | "sys::Minter" => Some(true),
         _ => None,
     }
 }
 
-/// Moves a resource or revoker into another domain's reach: its holding passes to `owner`.
+/// Moves a resource, revoker or minter into another domain's reach: its holding passes to
+/// `owner`.
 pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, owner: Value) -> bool {
     match path {
         "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" => {
             let holding = fx.offset(address, 8);
             transfer::rehome(lo, fx, holding, owner);
         }
-        "sys::Revoker" => transfer::rehome(lo, fx, address, owner),
+        "sys::Revoker" | "sys::Minter" => transfer::rehome(lo, fx, address, owner),
         _ => return false,
     }
     true
@@ -678,7 +680,7 @@ pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, owne
 pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "sys::fs::File" | "sys::net::Listener" => Some(true),
-        "sys::net::Conn" | "sys::Revoker" => Some(false),
+        "sys::net::Conn" | "sys::Revoker" | "sys::Minter" => Some(false),
         _ => None,
     }
 }

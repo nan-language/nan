@@ -164,7 +164,7 @@ The **ledger** of an item is the list of its entries of the kinds this table giv
 | `landing` | a [landing fn](23-low-level.md#landing-functions) | none | the landing fn | yes |
 | `validator` | a [validator](15-untrusted.md#validator-classes), a method of an impl of `core::Decoder` included | its class | the validator | when declassifying |
 | `decoder` | a declassifying decoder | none | the type item whose `derives` clause writes it | yes |
-| `grant` | a `device` or `priv` [grant](14-authority.md#device-and-priv-grants) | its authority and the names it lists | the `package` item | yes |
+| `grant` | a `device`, `priv` or `capability` [grant](14-authority.md#device-and-priv-grants) | its authority and the names it lists | the `package` item | yes |
 | `waiver` | a [waiver](06-statements-expressions.md#waivers) | its threshold and reason | the function | no |
 | `todo` | a `todo` | its text | the item containing it | no |
 | `dbg` | a `dbg` | none | the item containing it | no |

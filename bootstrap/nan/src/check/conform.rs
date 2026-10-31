@@ -176,6 +176,13 @@ impl Checker<'_> {
                 return Some((Conformance::Builtin, no_args()));
             }
         }
+        if let Ty::Item(item, _) = ty
+            && self.db.is_std(interface)
+            && self.db.canonical(interface) == "sys::Capability"
+            && self.is_kind(*item)
+        {
+            return Some((Conformance::Builtin, no_args()));
+        }
         self.builtin_conformance(ty, interface)
             .map(|args| (Conformance::Builtin, args))
     }

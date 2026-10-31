@@ -21,6 +21,13 @@ pub fn member(
     let inner = |index: usize| held[index].fields()[0].clone();
     let scalar = match type_args.first().and_then(Arg::ty) {
         Some(Ty::Scalar(scalar)) => *scalar,
+        Some(Ty::Item(lanes, _)) if member != "select" => {
+            let value = lanes_member(interp, member, *lanes, &held, at)?;
+            return Ok(Flow::Return(match member {
+                "reveal" | "eq" | "ne" => value,
+                _ => Val::Struct(secret, Rc::new(vec![value])),
+            }));
+        }
         other => panic!("a Secret of a scalar, not {other:?}"),
     };
     let a = || inner(0).int();
@@ -94,4 +101,57 @@ fn unsigned(scalar: Scalar) -> Scalar {
         32 => Scalar::U32,
         _ => Scalar::U64,
     }
+}
+
+/// A member of `core::Secret[L]` for an integer lane type `L`: lane by lane on the lanes of the
+/// values it holds, `eq` and `ne` comparing every lane.
+fn lanes_member(
+    interp: &mut Interpreter,
+    member: &str,
+    lanes: ItemId,
+    held: &[Val],
+    at: (ItemId, Span),
+) -> Exec<Val> {
+    let lanes_of = |index: usize| match &held[index].fields()[0].fields()[0] {
+        Val::Array(values) => values.iter().map(Val::int).collect::<Vec<i128>>(),
+        other => panic!("the lanes of a lane value, not {other:?}"),
+    };
+    let path = interp.ck.db.canonical(lanes);
+    let (signedness, shape) = path.trim_start_matches("core::simd::").split_at(1);
+    let bits = shape.split('x').next().unwrap_or_default();
+    let scalar = Scalar::from_name(&format!("{}{bits}", signedness.to_lowercase()))
+        .expect("an integer lane type's lane scalar");
+    let value = match member {
+        "of" => return Ok(held[0].clone()),
+        "reveal" => return Ok(held[0].fields()[0].clone()),
+        "eq" => return Ok(Val::Bool(lanes_of(0) == lanes_of(1))),
+        "ne" => return Ok(Val::Bool(lanes_of(0) != lanes_of(1))),
+        _ => lanes_of(0),
+    };
+    let amount = || held[1].int();
+    if matches!(member, "shl" | "shr") && amount() >= i128::from(scalar.bits()) {
+        return Err(interp.trap("trap.shift", at));
+    }
+    let computed: Vec<Val> = value
+        .iter()
+        .enumerate()
+        .map(|(index, &a)| {
+            let b = || lanes_of(1)[index];
+            Val::Int(match member {
+                "wrapping_add" => wrap(a + b(), scalar),
+                "wrapping_sub" => wrap(a - b(), scalar),
+                "wrapping_mul" => wrap(a.wrapping_mul(b()), scalar),
+                "bit_and" => wrap(a & b(), scalar),
+                "bit_or" => wrap(a | b(), scalar),
+                "bit_xor" => wrap(a ^ b(), scalar),
+                "bit_not" => wrap(!a, scalar),
+                "shl" => wrap(a << amount(), scalar),
+                _ => wrap(a, scalar) >> amount(),
+            })
+        })
+        .collect();
+    Ok(Val::Struct(
+        lanes,
+        Rc::new(vec![Val::Array(Rc::new(computed))]),
+    ))
 }

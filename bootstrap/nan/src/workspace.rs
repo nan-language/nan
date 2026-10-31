@@ -16,7 +16,8 @@ pub use closure::{
 };
 pub use machine::Machine;
 pub use manifest::{
-    Arch, Authority, Kind, Manifest, Target, relative as relative_source, resolve as resolve_source,
+    Arch, Authority, Kind, Level, Manifest, Target, relative as relative_source,
+    resolve as resolve_source,
 };
 pub use modules::Module;
 

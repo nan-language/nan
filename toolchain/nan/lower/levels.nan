@@ -1,0 +1,178 @@
+//! The run check of a codegen level: an image of a level first checks that its processor has the level's extensions, and on a host target that Linux enables the register state they use, ending with status 71 when one is missing.
+
+/// A bit set in a register a CPUID leaf gives: the leaf, the register's index among `eax`, `ebx`,
+/// `ecx` and `edx`, and the bit.
+struct CpuidBit derives Copy, Eq {
+    leaf: u32
+    register: u64
+    bit: u32
+} CpuidBit
+
+/// The CPUID leaves holding the extensions' bits, read below the highest leaf of their range.
+const LEVEL_BASIC: u32 = 0
+const LEVEL_FEATURES: u32 = 1
+const LEVEL_EXTENDED_FEATURES: u32 = 7
+const LEVEL_EXTENDED: u32 = 0x8000_0000
+const LEVEL_EXTENDED_SIGNATURE: u32 = 0x8000_0001
+
+const LEVEL_EBX: u64 = 1
+const LEVEL_ECX: u64 = 2
+
+/// The `XCR0` state components AVX uses, SSE and AVX, and those AVX-512 adds, the opmask and the
+/// upper halves of the first sixteen registers and the sixteen others.
+const LEVEL_AVX_STATE: i64 = 0x6
+const LEVEL_AVX512_STATE: i64 = 0xE6
+
+/// The `getauxval` type of the hardware capabilities, and their AArch64 bits for LSE atomics and
+/// the dot product instructions.
+const LEVEL_AT_HWCAP: u64 = 16
+const LEVEL_HWCAP_ATOMICS: i64 = 0x100
+const LEVEL_HWCAP_ASIMDDP: i64 = 0x10_0000
+
+/// The encoding of `ID_AA64ISAR0_EL1` for the `ReadSysReg` stub, and its fields: atomics at bit
+/// 20, at least 2 with LSE, and dot product at bit 44, at least 1 with it.
+const LEVEL_ID_AA64ISAR0_EL1: u16 = 0x4030
+const LEVEL_ATOMIC_FIELD: i64 = 20
+const LEVEL_DP_FIELD: i64 = 44
+
+/// The CPUID bits of an x86_64 level: those of `x86_64-v2`, SSE3, SSSE3, CMPXCHG16B, SSE4.1,
+/// SSE4.2 and POPCNT; those `x86_64-v3` adds, FMA, AVX, BMI1, AVX2, BMI2 and LZCNT; and those
+/// `x86_64-v4` adds, AVX-512F, AVX-512DQ and AVX-512VL.
+fn level_bits(level: workspace::Level, alloc: mem::Alloc) -> mem::List[CpuidBit] {
+    var bits = mem::List[CpuidBit].empty(alloc)
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 0))
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 9))
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 13))
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 19))
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 20))
+    mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 23))
+    if level != workspace::Level.X64v2 {
+        mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 12))
+        mut bits.push(CpuidBit(leaf: LEVEL_FEATURES, register: LEVEL_ECX, bit: 28))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 3))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 5))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 8))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_SIGNATURE, register: LEVEL_ECX, bit: 5))
+    }
+    if level == workspace::Level.X64v4 {
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 16))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 17))
+        mut bits.push(CpuidBit(leaf: LEVEL_EXTENDED_FEATURES, register: LEVEL_EBX, bit: 31))
+    }
+    return bits
+} level_bits
+
+/// Checks the image's codegen level before anything else runs, writing
+/// `nan: codegen <level> unsupported` and ending with status 71 when the processor lacks it.
+fn Lowering.check_level(mut self, mut fx: Fx) {
+    let Some(level) = self.level else {
+        return
+    }
+    let missing = mut self.level_missing(mut fx, level)
+    mut fx.if_true(missing, then: fn[mut self](mut fx1: Fx) {
+        var why = text::String.of("nan: codegen ", alloc: fx1.alloc)
+        mut why.append(level.name())
+        mut why.append(" unsupported\n")
+        system_refuse(mut self, fx: mut fx1, why: why.as_str())
+    })
+} Lowering.check_level
+
+/// Whether the processor lacks an extension of a level.
+fn Lowering.level_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif::Value {
+    if level != workspace::Level.Aarch64Dotprod {
+        return mut self.x64_missing(mut fx, level)
+    }
+    if self.machine() {
+        let features = mut self.read_sysreg(mut fx, register: LEVEL_ID_AA64ISAR0_EL1)
+        let atomics = level_field(mut fx, register: features, at: LEVEL_ATOMIC_FIELD)
+        let dot = level_field(mut fx, register: features, at: LEVEL_DP_FIELD)
+        let no_atomic = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: atomics, y: 2)
+        let no_dot = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: dot, y: 0)
+        return mut fx.b.bor(no_atomic, y: no_dot)
+    }
+    let kind = mut fx.ptr(LEVEL_AT_HWCAP)
+    let returns = Array[clif::Type, 1].filled(PTR)
+    let hwcap = mut self.call_libc(mut fx, name: "getauxval", args: fx.list1(kind).view(), returns: returns.view())
+    expect hwcap.len() > 0
+    return level_lacks(mut fx, word: hwcap[0], mask: LEVEL_HWCAP_ATOMICS | LEVEL_HWCAP_ASIMDDP)
+} Lowering.level_missing
+
+/// Whether the processor lacks an extension of an x86_64 level, or on a host target Linux leaves
+/// the register state of its AVX or AVX-512 extensions disabled.
+fn Lowering.x64_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif::Value {
+    let bits = level_bits(level, alloc: fx.alloc)
+    let words = mut fx.slot(16, align: 4)
+    var missing = mut fx.b.iconst(clif::Type.Int8, imm: 0)
+    let basic = mut self.cpuid(mut fx, words, leaf: LEVEL_BASIC)
+    let extended = mut self.cpuid(mut fx, words, leaf: LEVEL_EXTENDED)
+    var leaves = Array[u32, 3].filled(LEVEL_FEATURES)
+    leaves[1] = LEVEL_EXTENDED_FEATURES
+    leaves[2] = LEVEL_EXTENDED_SIGNATURE
+    for leaf in leaves {
+        var wanted = false
+        for bit in bits {
+            wanted = wanted or bit.leaf == leaf
+        }
+        if not wanted {
+            continue
+        }
+        var highest = basic
+        if leaf >= LEVEL_EXTENDED {
+            highest = extended
+        }
+        let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: highest, y: i64.widen(leaf))
+        missing = mut fx.b.bor(missing, y: beyond)
+        discard mut self.cpuid(mut fx, words, leaf)
+        var registers_read = Array[u64, 2].filled(LEVEL_EBX)
+        registers_read[1] = LEVEL_ECX
+        for register in registers_read {
+            var mask: i64 = 0
+            for bit in bits {
+                if bit.leaf == leaf and bit.register == register {
+                    mask = mask | (1i64 << bit.bit)
+                }
+            }
+            if mask != 0 {
+                let word = mut fx.load(clif::Type.Int32, addr: words, offset: register * 4)
+                let widened = mut fx.b.uextend(clif::Type.Int64, x: word)
+                let lacking = level_lacks(mut fx, word: widened, mask)
+                missing = mut fx.b.bor(missing, y: lacking)
+            }
+        }
+    }
+    if not self.machine() {
+        let state = match level {
+            workspace::Level.X64v2 => 0i64
+            workspace::Level.X64v4 => LEVEL_AVX512_STATE
+            else => LEVEL_AVX_STATE
+        }
+        if state != 0 {
+            let xcr0 = mut self.call_stub(mut fx, stub: Stub.Xgetbv, args: mem::List[clif::Value].empty(fx.alloc).view())
+            expect xcr0.len() > 0
+            let disabled = level_lacks(mut fx, word: xcr0[0], mask: state)
+            missing = mut fx.b.bor(missing, y: disabled)
+        }
+    }
+    return missing
+} Lowering.x64_missing
+
+/// Runs CPUID for a leaf and subleaf 0 into the four words at `words`, giving `eax` widened.
+fn Lowering.cpuid(mut self, mut fx: Fx, words: clif::Value, leaf: u32) -> clif::Value {
+    let leaf_value = mut fx.ptr(u64.widen(leaf))
+    let subleaf = mut fx.ptr(0)
+    discard mut self.call_stub(mut fx, stub: Stub.Cpuid, args: fx.list3(leaf_value, b: subleaf, c: words).view())
+    let eax = mut fx.load(clif::Type.Int32, addr: words, offset: 0)
+    return mut fx.b.uextend(clif::Type.Int64, x: eax)
+} Lowering.cpuid
+
+/// Whether some bit of `mask` is clear in `word`.
+fn level_lacks(mut fx: Fx, word: clif::Value, mask: i64) -> clif::Value {
+    let held = mut fx.b.band_imm_s(word, y: mask)
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: mask)
+} level_lacks
+
+/// The four-bit field of an AArch64 ID register at a bit.
+fn level_field(mut fx: Fx, register: clif::Value, at: i64) -> clif::Value {
+    let shifted = mut fx.b.ushr_imm_s(register, y: at)
+    return mut fx.b.band_imm_s(shifted, y: 0xF)
+} level_field

@@ -299,13 +299,14 @@ impl Facts {
                             Rule::LanguageDirective => (0, String::new()),
                             Rule::TargetsDirective => (1, String::new()),
                             Rule::EntryDirective => (2, String::new()),
-                            Rule::DepDirective => (3, idents.join(" ")),
+                            Rule::CodegenDirective => (3, String::new()),
+                            Rule::DepDirective => (4, idents.join(" ")),
                             Rule::AllowDirective => {
                                 let authority =
                                     tree.find(inner, Rule::Authority).expect("an authority");
-                                (4, joined(file, tree, authority))
+                                (5, joined(file, tree, authority))
                             }
-                            _ => (5, idents.join(" ")),
+                            _ => (6, idents.join(" ")),
                         }
                     });
                 }

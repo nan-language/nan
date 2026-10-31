@@ -143,6 +143,19 @@ pub fn call(
             }
             Val::Unit
         }
+        (lanes, "store") if lanes.starts_with("core::simd::") => {
+            let held = interp.deref(&args[0]);
+            let Val::Array(values) = &held.fields()[0] else {
+                panic!("the lanes of a {lanes}");
+            };
+            let view = interp.view(&args[1]);
+            let at = args[2].int() as usize;
+            for (index, value) in values.iter().enumerate() {
+                let element = view.array.with((view.start + at + index) as u32);
+                interp.memory.set(&element, value.clone());
+            }
+            Val::Unit
+        }
         ("core::Array", "view" | "view_mut")
         | ("core::SliceMut", "view")
         | ("core::Str", "as_bytes") => Val::View(interp.view(&args[0])),

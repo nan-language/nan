@@ -156,6 +156,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         .expect("the program entry seam");
     lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
         let params = fx.entry();
+        lo.check_level(fx);
         system::start(lo, fx);
         let world_ty = lo.std_ty("host", "World", Vec::new());
         let layout = lo.layout(&world_ty);

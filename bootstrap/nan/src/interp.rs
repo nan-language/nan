@@ -199,13 +199,23 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         )
     }
 
+    /// The kept fields of a flexible struct value that holds none; none for another item.
+    pub fn kept_empty(&self, item: ItemId) -> Option<Val> {
+        let Ty::Item(kept, _) = self.ck.kept_type(item)? else {
+            return None;
+        };
+        Some(Val::Variant(kept, 0, Rc::new(Vec::new())))
+    }
+
     fn input(&mut self, input: Input) -> Val {
         match input {
             Input::Value(value) => value,
-            Input::Struct(item, fields) => Val::Struct(
-                item,
-                Rc::new(fields.into_iter().map(|field| self.input(field)).collect()),
-            ),
+            Input::Struct(item, fields) => {
+                let mut values: Vec<Val> =
+                    fields.into_iter().map(|field| self.input(field)).collect();
+                values.extend(self.kept_empty(item));
+                Val::Struct(item, Rc::new(values))
+            }
             Input::Variant(item, index, payload) => Val::Variant(
                 item,
                 index,
@@ -581,6 +591,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 if !self.layout_fits(*item, &values) {
                     self.obligation_fails(site, "trap.conversion", at)?;
                 }
+                let mut values = values;
+                values.extend(self.kept_empty(*item));
                 Some(Val::Struct(*item, Rc::new(values)))
             }
             Op::Variant {

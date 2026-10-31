@@ -15,6 +15,7 @@ pub const DATA: u64 = 0;
 pub const LEN: u64 = 8;
 pub const CAPACITY: u64 = 16;
 pub const ALLOC: u64 = 24;
+pub const SIZE: u64 = 32;
 
 /// The size and alignment of a vector's elements.
 #[derive(Clone, Copy)]

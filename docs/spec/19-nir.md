@@ -63,7 +63,7 @@ NIR types are the types of source plus `ref T` and `ref mut T`, designating a pl
 
 ### Places
 
-A **NIR place** is a value, its root, and steps naming a field (`.seq`), the unlabelled payload of a variant (`.Some`) or a labelled payload field (`.Data.len`); [naming conventions](03-packages-modules.md#naming-conventions) tell fields from variants. A step reaching a reference continues at the place it designates, so a place's type is never a reference type. A root is a slot, a reference or an owned value.
+A **NIR place** is a value, its root, and steps naming a field (`.seq`), the [kept fields](13-text-encode.md#flexible-structs) of a flexible struct (`.#kept`), the unlabelled payload of a variant (`.Some`) or a labelled payload field (`.Data.len`); [naming conventions](03-packages-modules.md#naming-conventions) tell fields from variants. A step reaching a reference continues at the place it designates, so a place's type is never a reference type. A root is a slot, a reference or an owned value.
 
 ### Instructions
 
@@ -78,7 +78,7 @@ The instructions, with their results and behaviour, are:
 - `release P`: releases what P still holds ([end of scope](07-ownership.md#ownership)).
 - `fnref F[A]`: F instantiated with A as a value, called through F's `entry` function if any.
 - `constant C`: the value of the const item, contribution or const parameter C.
-- `construct T(f: o, ...)`: a struct value, fields in declaration order; for a layout, obligation `conversion` on each ranged `bit` field and each `rest` field ([layout values](23-low-level.md#layout-values)).
+- `construct T(f: o, ...)`: a struct value, fields in declaration order, without [kept fields](13-text-encode.md#flexible-structs); for a layout, obligation `conversion` on each ranged `bit` field and each `rest` field ([layout values](23-low-level.md#layout-values)).
 - `variant E.V`, `variant E.V(...)`: an enum value.
 - `is P, E.V`: whether the enum value at P is variant V.
 - `closure K(o, ...)`: a value of the unit's `closure K` holding the capture operands.
@@ -405,7 +405,7 @@ region = "{" nir_block+ "}" ;
 operands = operand ( "," operand )* ;
 operand = value | literal | ( 'read' | "mut" | "take" ) place ;
 labelled = IDENT ":" operand ;
-place = value ( "." IDENT )* ;
+place = value ( "." ( IDENT | "#kept" ) )* ;
 value = "%" INT ;
 label = "^" INT ;
 literal = INT | FLOAT | TEXT | BYTES | CHAR | BYTE | "true" | "false" | 'Unit' ;

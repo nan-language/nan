@@ -11,7 +11,8 @@ use super::ty::{Arg, Args, Bound, Const, FnParam, FnTy, LimitSet, Param, Scalar,
 use crate::diagnostic::Code;
 use crate::interp::Val;
 use crate::syntax::ast::{
-    self, FnKind, FnModifier, GenericArg, ItemKind, LimitKind, Mode, Tok, TypeKind, Visibility,
+    self, FnKind, FnModifier, GenericArg, ItemKind, LimitKind, Mode, Tok, TypeKind, TypeModifier,
+    Visibility,
 };
 
 /// A diagnostic found resolving a signature, reported when its item is checked.
@@ -150,6 +151,16 @@ pub struct FieldSig {
     pub ty: Ty,
     pub visibility: Visibility,
     pub token: Tok,
+}
+
+/// The name of the field of a flexible struct holding its kept fields, which no source names.
+pub const KEPT: &str = "#kept";
+
+impl FieldSig {
+    /// Whether it holds a flexible struct's kept fields.
+    pub fn is_kept(&self) -> bool {
+        self.name == KEPT
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +313,17 @@ impl Checker<'_> {
         shapes
     }
 
+    /// The type of the kept fields of a flexible struct; none for another item.
+    pub fn kept_type(&self, item: ItemId) -> Option<Ty> {
+        match &self.sig(item).kind {
+            SigKind::Struct { fields } => fields
+                .last()
+                .filter(|field| field.is_kept())
+                .map(|field| field.ty.clone()),
+            _ => None,
+        }
+    }
+
     /// The signature of a function item.
     pub fn fn_sig(&self, item: ItemId) -> Option<FnSig> {
         match &self.sig(item).kind {
@@ -400,7 +422,7 @@ impl Checker<'_> {
                     generics: &generics,
                     self_param: None,
                 };
-                let fields = structure
+                let mut fields: Vec<FieldSig> = structure
                     .fields()
                     .map(|field| FieldSig {
                         name: field.name.text.clone(),
@@ -409,6 +431,21 @@ impl Checker<'_> {
                         token: field.token,
                     })
                     .collect();
+                let flexible = data
+                    .ast
+                    .type_modifiers
+                    .iter()
+                    .find(|(modifier, _)| *modifier == TypeModifier::Flexible);
+                if let Some((_, token)) = flexible
+                    && let Some(kept) = self.db.std_item("mem::wire", "Kept")
+                {
+                    fields.push(FieldSig {
+                        name: KEPT.to_owned(),
+                        ty: Ty::item(kept, Vec::new()),
+                        visibility: Visibility::Private,
+                        token: *token,
+                    });
+                }
                 (generics, SigKind::Struct { fields })
             }
             ItemKind::Enum(enumeration) => {

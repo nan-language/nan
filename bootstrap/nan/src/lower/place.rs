@@ -11,7 +11,7 @@ use super::fx::PTR;
 use super::layout::{Field, Shape};
 use super::types::Wrap;
 use super::{Instance, trap};
-use crate::check::sig::SigKind;
+use crate::check::sig::{KEPT, SigKind};
 use crate::check::ty::{Arg, Const, Ty};
 use crate::nir::{
     BlockId, Constant, FnRef, NTy, Operand, Payload, Place, Role, Value, is_variant_step,
@@ -498,6 +498,14 @@ impl Body<'_, '_, '_, '_> {
             let (held, nty) = self.owned_operand(operand);
             let location = self.field_step(target.clone(), name);
             self.write_location(&location, held, &nty);
+        }
+        if let Ty::Item(item, _) = ty
+            && let Some(kept) = self.lo.ck.kept_type(*item)
+        {
+            let empty = self.lo.variant_value(self.fx, &kept, "Empty", &[], None);
+            let at = self.lo.layouts.field(self.lo.ck, ty, None, KEPT).offset;
+            let address = self.fx.offset(slot, at);
+            self.lo.store_held(self.fx, address, empty, &kept);
         }
         Held::Address(slot)
     }

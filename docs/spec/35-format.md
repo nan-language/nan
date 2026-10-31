@@ -247,11 +247,11 @@ history_file = COL0 'nan' 'history' INT NL COL0 history_tail ;
 history_tail = history_record NL COL0 history_tail
     | retired_item COL0 history_tail
     | check_record NL EOF ;
-history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT ;
+history_record = 'name' TEXT | 'head' TEXT | 'module' IDENT | 'schema' IDENT TEXT ;
 ```
 
 - `name S` holds the store name and `head H` the code root of the [history head](29-identity-versioning.md#publishing). Each comes once, in that order.
-- Each `module M` record follows them, in byte order of M, followed by the tombstones of module M that the history holds, in byte order of their text.
+- Each `module M` record follows them, in byte order of M, followed by a `schema T H` record for each type `T` of module M and schema hash `H` that the history holds, in byte order of `T` and then of the bytes of `H`, then by the tombstones of module M that the history holds, in byte order of their text. A module record is followed by at least one of these.
 - A tombstone is written as its `retired` item in canonical format, as it stood in the source of M. Its paths and rewrite resolve as in M.
 
 This diagram shows the history `meter/.nan/history.nan` of a package `meter` first published without `--name`, after a release that moved the tombstone `retired Counter.bump(mut self) => mut self.record() changes "the count saturates instead of trapping"` of its root module out of source, with the head hash written `<...>`:

@@ -1,4 +1,4 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas and erased decoders, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas, erased decoders and migrations, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const DECODE_DEPTH_LIMIT: usize = 128
@@ -29,7 +29,34 @@ enum Tree {
     /// Fields by key, in ascending byte order of keys.
     Record(mem::List[TreeField])
     Variant(key: mem::Bytes, payload: Option[mem::Box[Tree]])
+    /// The `mem::wire` bytes of a kept field's value.
+    Raw(mem::Bytes)
 } Tree
+
+/// Whether it is a kept field's value, which only `mem::wire` writes.
+fn Tree.is_raw(self) -> bool {
+    return match self {
+        Tree.Raw(_) => true
+        else => false
+    }
+} Tree.is_raw
+
+/// The fields `Kept.Fields` holds: each key with the bytes of its value.
+fn kept_entries(take bytes: mem::Bytes, alloc: mem::Alloc) -> mem::List[TreeField] {
+    let len = bytes.len()
+    var reader = WireReader.new(take bytes, alloc)
+    var entries = mem::List[TreeField].empty(alloc)
+    while reader.input.at < len {
+        let Ok(key) = attempt mut reader.framed() else {
+            break
+        }
+        let Ok(value) = attempt mut reader.framed() else {
+            break
+        }
+        mut entries.push(TreeField(key: take key, value: Tree.Raw(take value)))
+    }
+    return entries
+} kept_entries
 
 const BASE64_ALPHABET: Slice[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
@@ -54,6 +81,7 @@ enum DecodeKind derives Copy, Eq {
     Trailing
     Truncated
     UnknownKey
+    UnknownSchema
     UnknownVariant
 } DecodeKind
 
@@ -86,6 +114,8 @@ enum WireFrame {
 struct WireReader {
     input: CodecInput
     frames: mem::List[WireFrame]
+    /// The start of the record field whose key was read last.
+    key_start: usize
 } WireReader
 
 /// What the JSON reader is inside: an array, an object, a map entry array, or a variant
@@ -135,6 +165,12 @@ interface Reader {
     fn payload_follows(mut self, mut interp: Interpreter) -> bool fails Failure
     /// Passes over the value of the field whose key was just read, at a nesting depth.
     fn skip(mut self, mut interp: Interpreter, depth: usize) fails Failure
+    /// Passes over the field whose key was just read, giving its key and value as `mem::wire`
+    /// frames them when the reader keeps skipped fields.
+    fn keep(mut self, mut interp: Interpreter, depth: usize) -> Option[mem::Bytes] fails Failure {
+        try mut self.skip(mut interp, depth)
+        return None
+    } keep
     fn end(mut self, mut interp: Interpreter) fails Failure
     /// Fails on what is left after the value.
     fn finish(mut self, mut interp: Interpreter) fails Failure
@@ -232,41 +268,163 @@ fn Interpreter.codec_member(
         if format == CodecFormat.Construction {
             return None
         }
-        let tree = self.encoded(args[0], ty)
-        var out = mem::Bytes.empty(alloc)
-        if format == CodecFormat.Json {
-            tree.write_json(mut out, alloc)
-        } else {
-            tree.write_wire(mut out, alloc)
-        }
-        let bytes = byte_values(out.view(), alloc)
-        if mut self.append(place: args[1].place(), values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) {
+        if mut self.appended(format, value: args[0], ty, out: args[1]) {
             return Some(InterpFlow.Return(Val.Unit))
         }
         return Some(try self.exhausted(fallible: member == "try_encode", at))
     }
+    if member == "decode_from" {
+        return Some(try mut self.codec_decode_from(format, args, ty, at, site))
+    }
+    if member == "encode_as" {
+        return Some(try mut self.codec_encode_as(format, args, ty, at, site))
+    }
     if member == "decode" {
-        let decoded = attempt mut self.read_value(format, args, ty, at, site)
+        let decoded = attempt mut self.read_value(format, raw: args[0], alloc_value: args[1], ty, at, site)
         return Some(try self.decode_outcome(take decoded))
     }
     if member != "canonical" {
         return None
     }
-    let canonical = match attempt mut self.read_value(format, args, ty, at, site) {
+    let canonical = match attempt mut self.read_value(format, raw: args[0], alloc_value: args[1], ty, at, site) {
         Ok(value) => attempt mut self.canonical_bytes(take value, ty, cell: self.cell_of(args[1]))
         Err(failure) => Err(take failure)
     }
     return Some(try self.decode_outcome(take canonical))
 } Interpreter.codec_member
 
-/// One value of a type read from a format's bytes, the Untrusted slice `args[0]`, drawing on
-/// the allocator `args[1]`, and nothing left after it.
-fn Interpreter.read_value(mut self, format: CodecFormat, args: Slice[Val], ty: ty::Ty, at: ItemSpan, site: RunSite) -> Val fails Failure {
-    let wrapped = self.deref(args[0])
+/// `Codec.decode_from(schema, raw, alloc)`: one value read as `decode` reads it under the type's
+/// own schema hash, or one of a frozen shape that a forward migration converts, failing with
+/// `UnknownSchema` under another.
+fn Interpreter.codec_decode_from(mut self, format: CodecFormat, args: Slice[Val], ty: ty::Ty, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    expect args.len() > 2
+    let wanted = self.hash_bytes(args[0])
+    var decoded: Result[Val, Failure] = Err(Failure.Decode(DecodeKind.UnknownSchema))
+    match self.migrated(ty, wanted: wanted.view(), forward: true) {
+        Some(None) => {
+            decoded = attempt mut self.read_value(format, raw: args[1], alloc_value: args[2], ty, at, site)
+        }
+        Some(Some(conversion)) => {
+            decoded = mut self.migrated_value(format, args, conversion, at, site)
+        }
+        None => {}
+    }
+    return try self.decode_outcome(take decoded)
+} Interpreter.codec_decode_from
+
+/// `Codec.encode_as(value, schema, mut out, alloc)`: the value appended as `encode` appends it
+/// under its type's own schema hash, or the encoding of an inverse's conversion of it under a
+/// frozen shape's; `false` under another.
+fn Interpreter.codec_encode_as(mut self, format: CodecFormat, args: Slice[Val], ty: ty::Ty, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    expect args.len() > 3
+    let alloc = self.alloc
+    let wanted = self.hash_bytes(args[1])
+    let Some(converted) = self.migrated(ty, wanted: wanted.view(), forward: false) else {
+        return InterpFlow.Return(Val.Bool(false))
+    }
+    var written = false
+    match converted {
+        None => {
+            written = mut self.appended(format, value: args[0], ty, out: args[2])
+        }
+        Some(conversion) => {
+            var old = Val.Unit
+            match try mut self.migrate(conversion.function, value: args[0].copy(alloc), alloc_value: args[3], at, site) {
+                InterpFlow.Fail(_) => return try self.exhausted(fallible: false, at)
+                InterpFlow.Return(value) or InterpFlow.Yield(value) => {
+                    old = value
+                }
+            }
+            let shape = self.ck.types().item(conversion.shape, args: mem::List[ty::Arg].empty(alloc))
+            written = mut self.appended(format, value: old, ty: shape, out: args[2])
+            mut self.release_value(old)
+        }
+    }
+    if written {
+        return InterpFlow.Return(Val.Bool(true))
+    }
+    return try self.exhausted(fallible: false, at)
+} Interpreter.codec_encode_as
+
+/// Appends a value's encoding in a format to the bytes at the place `out` holds; false on
+/// exhaustion, which leaves them unchanged.
+fn Interpreter.appended(mut self, format: CodecFormat, value: Val, ty: ty::Ty, out: Val) -> bool {
+    let alloc = self.alloc
+    let tree = self.encoded(value, ty)
+    var written = mem::Bytes.empty(alloc)
+    if format == CodecFormat.Json {
+        tree.write_json(mut written, alloc)
+    } else {
+        tree.write_wire(mut written, alloc)
+    }
+    let bytes = byte_values(written.view(), alloc)
+    return mut self.append(place: out.place(), values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8))
+} Interpreter.appended
+
+/// The bytes a `mem::wire::SchemaHash` value holds.
+fn Interpreter.hash_bytes(self, value: Val) -> mem::Bytes {
+    let held = self.deref(value)
+    expect held.fields().len() > 0
+    return value_bytes(held.fields()[0].fields(), alloc: self.alloc)
+} Interpreter.hash_bytes
+
+/// How values of a type convert from or to the schema hash `wanted`: as themselves, through a
+/// forward migration or an inverse, or not at all.
+fn Interpreter.migrated(self, ty: ty::Ty, wanted: Slice[u8], forward: bool) -> Option[Option[Conversion]] {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    if schema_hash(ck.schema(ty), alloc).bytes.view() == wanted {
+        return Some(None)
+    }
+    let ty::TyKind.Item(item: item, args: _) = ck.types().kind(ty) else {
+        return None
+    }
+    for conversion in ck.migrations(item) {
+        if conversion.forward == forward and ck.shape_hash(conversion.shape).bytes.view() == wanted {
+            return Some(Some(conversion))
+        }
+    }
+    return None
+} Interpreter.migrated
+
+/// A value of a frozen shape read as `decode` reads it from the bytes `args[1]`, drawing on the
+/// allocator `args[2]`, and the forward migration's conversion of it.
+fn Interpreter.migrated_value(mut self, format: CodecFormat, args: Slice[Val], conversion: Conversion, at: ItemSpan, site: RunSite) -> Result[Val, Failure] {
+    let alloc = self.alloc
+    let shape = self.ck.types().item(conversion.shape, args: mem::List[ty::Arg].empty(alloc))
+    let old = match attempt mut self.read_value(format, raw: args[1], alloc_value: args[2], ty: shape, at, site) {
+        Ok(value) => value
+        Err(failure) => return Err(take failure)
+    }
+    return match attempt mut self.migrate(conversion.function, value: take old, alloc_value: args[2], at, site) {
+        Ok(InterpFlow.Return(converted)) or Ok(InterpFlow.Yield(converted)) => Ok(take converted)
+        Ok(InterpFlow.Fail(_)) => Err(Failure.Decode(DecodeKind.OutOfMemory))
+        Err(end) => Err(Failure.Run(take end))
+    }
+} Interpreter.migrated_value
+
+/// Runs a migration on a value, with the allocator `alloc_value` when it takes one.
+fn Interpreter.migrate(mut self, function: ty::ItemId, take value: Val, alloc_value: Val, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    var args = Val.single(take value, alloc)
+    let takes_alloc = match self.ck.fn_sig(function) {
+        Some(sig) => sig.params.len() == 2
+        None => false
+    }
+    if takes_alloc {
+        mut args.push(alloc_value.copy(alloc))
+    }
+    let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: function, role: nir::Role.Body, index: 0), args: self.ck.types().args(mem::List[ty::Arg].empty(alloc)))
+    return try mut self.call_function(fn_ref, take args, at, site)
+} Interpreter.migrate
+
+/// One value of a type read from a format's bytes, the Untrusted slice `raw`, drawing on the
+/// allocator `alloc_value`, and nothing left after it.
+fn Interpreter.read_value(mut self, format: CodecFormat, raw: Val, alloc_value: Val, ty: ty::Ty, at: ItemSpan, site: RunSite) -> Val fails Failure {
+    let wrapped = self.deref(raw)
     expect wrapped.fields().len() > 0
-    let raw = wrapped.fields()[0].copy(self.alloc)
-    let input = mut self.bytes(raw)
-    let cell = self.cell_of(args[1])
+    let input = mut self.bytes(wrapped.fields()[0].copy(self.alloc))
+    let cell = self.cell_of(alloc_value)
     return try mut self.decode_value(format, take input, cell, ty, at, site)
 } Interpreter.read_value
 
@@ -396,8 +554,17 @@ fn CodecCalls.write(self, mut interp: Interpreter, tree: Tree) fails End {
             try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
         }
         Tree.Record(fields) => {
-            try self.put(mut interp, name: "begin_record", args: Val.single(Val.of_usize(fields.len()), alloc))
+            var count: usize = 0
             for field in fields.view() {
+                if not field.value.is_raw() {
+                    count += 1
+                }
+            }
+            try self.put(mut interp, name: "begin_record", args: Val.single(Val.of_usize(count), alloc))
+            for field in fields.view() {
+                if field.value.is_raw() {
+                    continue
+                }
                 let key = mut interp.byte_view(field.key.view(), writable: false)
                 try self.put(mut interp, name: "write_key", args: Val.single(take key, alloc))
                 try self.write(mut interp, tree: field.value)
@@ -413,6 +580,9 @@ fn CodecCalls.write(self, mut interp: Interpreter, tree: Tree) fails End {
                 None => {}
             }
             try self.put(mut interp, name: "end", args: mem::List[Val].empty(alloc))
+        }
+        Tree.Raw(_) => {
+            expect false
         }
     }
 } CodecCalls.write
@@ -711,8 +881,15 @@ fn Interpreter.encoded_declared(self, value: Val, item: ty::ItemId, args: Slice[
             var fields = mem::List[TreeField].empty(alloc)
             var index: usize = 0
             while index < declared.len() and index < parts.len() {
-                let field_ty = subst.ty(types, ty: declared[index].ty)
-                mut fields.push(TreeField(key: name_bytes(declared[index].name.as_str(), alloc), value: self.encoded(parts[index], ty: field_ty)))
+                if declared[index].is_kept() {
+                    var entries = kept_entries(self.kept_bytes(parts[index]), alloc)
+                    for entry in take entries {
+                        mut fields.push(take entry)
+                    }
+                } else {
+                    let field_ty = subst.ty(types, ty: declared[index].ty)
+                    mut fields.push(TreeField(key: name_bytes(declared[index].name.as_str(), alloc), value: self.encoded(parts[index], ty: field_ty)))
+                }
                 index += 1
             }
             return sorted_record(take fields)
@@ -743,6 +920,22 @@ fn Interpreter.encoded_declared(self, value: Val, item: ty::ItemId, args: Slice[
     expect false
     return Tree.Bool(false)
 } Interpreter.encoded_declared
+
+/// The bytes the kept fields of a flexible struct value are written as, empty for none.
+fn Interpreter.kept_bytes(self, value: Val) -> mem::Bytes {
+    let alloc = self.alloc
+    let Val.Variant(item: _, index: index, fields: held) = self.deref(value) else {
+        return mem::Bytes.empty(alloc)
+    }
+    if index != 1 or held.contents().len() == 0 {
+        return mem::Bytes.empty(alloc)
+    }
+    let untrusted = self.deref(held.contents()[0])
+    expect untrusted.fields().len() > 0
+    let bytes = self.deref(untrusted.fields()[0])
+    let storage = self.storage(bytes)
+    return value_bytes(self.memory.get(storage).fields(), alloc)
+} Interpreter.kept_bytes
 
 /// The encoded record of a labelled payload's values.
 fn Interpreter.encoded_labelled(self, labels: Slice[LabelledTy], values: Slice[Val], subst: ty::Subst) -> Tree {
@@ -846,6 +1039,7 @@ fn Tree.write_wire(self, mut out: mem::Bytes, alloc: mem::Alloc) {
                 write_framed(written.view(), mut out)
             }
         }
+        Tree.Raw(bytes) => mut out.append(bytes.view())
         Tree.Variant(key: key, payload: payload) => {
             write_framed(key.view(), mut out)
             match payload {
@@ -914,6 +1108,9 @@ fn Tree.write_json(self, mut out: mem::Bytes, alloc: mem::Alloc) {
                 }
             }
         }
+        Tree.Raw(_) => {
+            expect false
+        }
     }
 } Tree.write_json
 
@@ -955,13 +1152,18 @@ fn write_json_map(pairs: Slice[TreeEntry], mut out: mem::Bytes, alloc: mem::Allo
 /// Writes a record's fields as a JSON object.
 fn write_json_record(fields: Slice[TreeField], mut out: mem::Bytes, alloc: mem::Alloc) {
     mut out.push(b'{')
-    for index in 0..<fields.len() {
-        if index > 0 {
+    var written = false
+    for field in fields {
+        if field.value.is_raw() {
+            continue
+        }
+        if written {
             mut out.push(b',')
         }
-        write_json_string(fields[index].key.view(), mut out, alloc)
+        written = true
+        write_json_string(field.key.view(), mut out, alloc)
         mut out.push(b':')
-        fields[index].value.write_json(mut out, alloc)
+        field.value.write_json(mut out, alloc)
     }
     mut out.push(b'}')
 } write_json_record
@@ -1133,6 +1335,7 @@ proj fn DecodeKind.name(self) -> Str {
         DecodeKind.Trailing => "Trailing"
         DecodeKind.Truncated => "Truncated"
         DecodeKind.UnknownKey => "UnknownKey"
+        DecodeKind.UnknownSchema => "UnknownSchema"
         DecodeKind.UnknownVariant => "UnknownVariant"
     }
 } DecodeKind.name
@@ -1381,15 +1584,22 @@ fn Decoding.declared[R: Reader](mut self, mut interp: Interpreter, mut reader: R
         mut params.push(def.param)
     }
     let subst = ty::Subst.of(params.view(), args, alloc)
-    let open = ck.db().ast(item).has_modifier(ast::TypeModifier.Open)
+    let open = ck.db().ast(item).is_open()
     let aliases = ck.key_aliases(item)
     match sig.contents().kind {
         SigKind.Struct(fields: fields) => {
             var named = mem::List[LabelledTy].empty(alloc)
             for field in fields {
-                mut named.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+                if not field.is_kept() {
+                    mut named.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+                }
             }
-            let values = try mut self.record(mut interp, mut reader, named: named.view(), open, labelled: false, aliases)
+            let keeping = ck.kept_type(item).is_some()
+            var kept = mem::Bytes.empty(alloc)
+            var values = try mut self.record(mut interp, mut reader, named: named.view(), open, labelled: false, aliases, keeping, mut kept)
+            if keeping {
+                mut values.push(try mut self.kept(mut interp, bytes: take kept))
+            }
             let value = Val.Struct(item: item, fields: mem::Shared.of(take values, alloc))
             var type_args = mem::List[ty::Arg].empty(alloc)
             for arg in args {
@@ -1453,7 +1663,8 @@ fn Decoding.declared_variant[R: Reader](
             for label in labels {
                 mut named.push(LabelledTy(name: text::String.of(label.name.as_str(), alloc), ty: subst.ty(ck.types(), ty: label.ty)))
             }
-            payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, labelled: true, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc))
+            var unkept = mem::Bytes.empty(alloc)
+            payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, labelled: true, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc), keeping: false, kept: mut unkept)
         }
     }
     try mut reader.end(mut interp)
@@ -1521,7 +1732,8 @@ fn name_copy(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
 } name_copy
 
 /// The values of a record's named fields in order, as the decoding rules read them, given
-/// whether it decodes as open and whether it is a labelled payload.
+/// whether it decodes as open, whether it is a labelled payload, and whether `kept` gathers the
+/// fields it skips, as a flexible struct keeps them.
 fn Decoding.record[R: Reader](
     mut self,
     mut interp: Interpreter,
@@ -1530,6 +1742,8 @@ fn Decoding.record[R: Reader](
     open: bool,
     labelled: bool,
     aliases: mem::HashMap[mem::Bytes, mem::Bytes],
+    keeping: bool,
+    mut kept: mem::Bytes,
     ) -> mem::List[Val] fails Failure {
     let alloc = interp.alloc
     let outer = self.depth
@@ -1561,7 +1775,14 @@ fn Decoding.record[R: Reader](
                 if not open {
                     fail Failure.Decode(DecodeKind.UnknownKey)
                 }
-                try mut reader.skip(mut interp, depth: self.depth)
+                if not keeping {
+                    try mut reader.skip(mut interp, depth: self.depth)
+                    continue
+                }
+                match try mut reader.keep(mut interp, depth: self.depth) {
+                    Some(entry) => mut kept.append(entry.view())
+                    None => {}
+                }
             }
         }
     }
@@ -1584,6 +1805,20 @@ fn Decoding.record[R: Reader](
     }
     return decoded
 } Decoding.record
+
+/// The kept fields of a flexible struct, its skipped fields' bytes as `mem::wire` frames them.
+fn Decoding.kept(mut self, mut interp: Interpreter, take bytes: mem::Bytes) -> Val fails Failure {
+    let alloc = interp.alloc
+    let kept = interp.ty_item("mem::wire", name: "Kept")
+    if bytes.len() == 0 {
+        return Val.Variant(item: kept, index: 0, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))
+    }
+    let Some(held) = mut interp.holding(path: "mem::Bytes", elements: byte_values(bytes.view(), alloc), cell: self.cell, element: ty::Ty.scalar(ty::Scalar.Unsigned8)) else {
+        fail Failure.Decode(DecodeKind.OutOfMemory)
+    }
+    let untrusted = Val.Struct(item: interp.ty_item("core", name: "Untrusted"), fields: mem::Shared.of(Val.single(take held, alloc), alloc))
+    return Val.Variant(item: kept, index: 1, fields: mem::Shared.of(Val.single(take untrusted, alloc), alloc))
+} Decoding.kept
 
 /// The default of a missing field's type, when it implements `Default`.
 fn Decoding.default(mut self, mut interp: Interpreter, ty: ty::Ty) -> Val fails Failure {
@@ -1724,7 +1959,7 @@ fn CodecInput.expect_byte(mut self, byte: u8) fails Failure {
 } CodecInput.expect_byte
 
 fn WireReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> WireReader {
-    return WireReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[WireFrame].empty(alloc))
+    return WireReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[WireFrame].empty(alloc), key_start: 0)
 } WireReader.new
 
 fn WireReader.uvar(mut self) -> u64 fails Failure
@@ -1871,6 +2106,7 @@ fn WireReader.map_value(mut self, mut interp: Interpreter) {
 } WireReader.map_value
 
 fn WireReader.read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes]) -> Option[usize] fails Failure {
+    let start = self.input.at
     let key = try mut self.framed()
     let end = try mut self.length_end()
     let Some(frame) = mut self.frames.pop() else {
@@ -1892,6 +2128,7 @@ fn WireReader.read_key(mut self, mut interp: Interpreter, keys: Slice[mem::Bytes
         None => {}
     }
     mut self.frames.push(WireFrame.Record(left: left, value_end: Some(end), last: Some(name_copy(key.view(), alloc: self.input.alloc))))
+    self.key_start = start
     return key_position(keys, key: key.view())
 } WireReader.read_key
 
@@ -1938,6 +2175,27 @@ fn WireReader.skip(mut self, mut interp: Interpreter, depth: usize) fails Failur
         }
     }
 } WireReader.skip
+
+fn WireReader.keep(mut self, mut interp: Interpreter, depth: usize) -> Option[mem::Bytes] fails Failure {
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let WireFrame.Record(left: left, value_end: value_end, last: last) = frame else {
+        mut self.frames.push(take frame)
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: take last))
+    let Some(end) = value_end else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    expect self.key_start <= end and end <= self.input.bytes.len()
+    var kept = mem::Bytes.empty(self.input.alloc)
+    for at in self.key_start..<end {
+        mut kept.push(self.input.bytes[at])
+    }
+    self.input.at = end
+    return Some(take kept)
+} WireReader.keep
 
 fn WireReader.end(mut self, mut interp: Interpreter) fails Failure {
     try mut self.close_value()

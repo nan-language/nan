@@ -31,6 +31,7 @@ mod kernel;
 pub(crate) mod ledger;
 pub(crate) mod lowlevel;
 mod measure;
+pub(crate) mod migrate;
 mod newer;
 mod package;
 mod preserved;
@@ -72,7 +73,7 @@ use std::rc::Rc;
 
 pub use approval::approvals;
 pub use changes::{Change, changes, semantic_conflicts};
-pub use compatible::{compatible, encode_class};
+pub use compatible::{compatible, encode_class, schema_records};
 pub use context::{Context, Green, context_gaps, contexts, greens};
 use db::{Db, ItemId, ModuleId, PackageId};
 pub use edits::{identity, moved, renamed};

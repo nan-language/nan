@@ -219,15 +219,15 @@ pub fn Gauge.level(self) -> u32 = self.level // error: item.duplicate
 A **modifier** is a word between the visibility and the kind keyword that changes the rules of an item.
 
 ```ebnf
-type_modifier = 'closed' | 'open' | "linear" | 'view' ;
-fn_modifier = "proj" | "interrupt" | "landing" | "foreign" | "validator" ;
+type_modifier = 'closed' | 'open' | 'flexible' | "linear" | 'view' ;
+fn_modifier = "proj" | "interrupt" | "landing" | "foreign" | "validator" | 'migrate' ;
 ```
 
 - Type modifiers precede only `struct` and `enum`, and function modifiers only `fn`; any other placement is an error (`item.modifier-misplaced`).
-- A repeated type modifier, `closed` beside `open`, and a second function modifier are errors (`item.modifier-conflict`); for a repeated modifier, the exact fix deletes the repetition.
-- A `pub` struct or enum states `closed` or `open`; one stating neither is an error (`item.openness-missing`). A private or `pkg` struct or enum stating either is an error (`item.openness-not-pub`); its exact fix deletes the word.
-- `nan fmt` writes type modifiers in the order `closed` or `open`, `linear`, `view`.
-- `closed` and `open` are defined in [Data types](04-types.md#closed-and-open-types); `linear` in [Structural properties](05-properties.md#linear-types); `view` in [Structural properties](05-properties.md#views); `proj` in [Ownership and access](07-ownership.md#projections); `interrupt` in [Kernel execution model](24-kernel.md#interrupt-functions); `landing` and `foreign` in [Low-level programming](23-low-level.md#landing-functions); `validator` in [Untrusted and secret data](15-untrusted.md#validators).
+- A repeated type modifier, two of `closed`, `open` and `flexible`, and a second function modifier are errors (`item.modifier-conflict`); for a repeated modifier, the exact fix deletes the repetition.
+- A `pub` struct or enum states `closed`, `open` or `flexible`; one stating none is an error (`item.openness-missing`). A private or `pkg` struct or enum stating `closed`, or stating `open` or `flexible` without deriving `Encode`, is an error (`item.openness-not-pub`); its exact fix deletes the word. On a private or `pkg` type, `open` and `flexible` govern only its [decoding](13-text-encode.md#decoding-rules).
+- `nan fmt` writes type modifiers in the order `closed`, `open` or `flexible`, `linear`, `view`.
+- `closed` and `open` are defined in [Data types](04-types.md#closed-and-open-types); `flexible` in [Flexible structs](13-text-encode.md#flexible-structs); `linear` in [Structural properties](05-properties.md#linear-types); `view` in [Structural properties](05-properties.md#views); `proj` in [Ownership and access](07-ownership.md#projections); `interrupt` in [Kernel execution model](24-kernel.md#interrupt-functions); `landing` and `foreign` in [Low-level programming](23-low-level.md#landing-functions); `validator` in [Untrusted and secret data](15-untrusted.md#validators); `migrate` in [Migrations](13-text-encode.md#migrations).
 
 ```nan
 pub open linear struct Lease {
@@ -566,11 +566,11 @@ Language 1 reserves two forms of item heads.
 
 ```ebnf
 self_field_set = "." "{" IDENT ( "," IDENT )* "}" {!item.self-field-set} ;
-reserved_head_word = ( 'stable' | 'flexible' | 'migrate' | 'machine' | 'protocol' | 'ipc' ) {!item.reserved-word} ;
+reserved_head_word = ( 'stable' | 'machine' | 'protocol' | 'ipc' ) {!item.reserved-word} ;
 ```
 
 - A `self` parameter followed by a field set, such as `mut self.{level, peak}`, is an error (`item.self-field-set`); the exact fix replaces it with `self` in the same mode.
-- The words `stable`, `flexible`, `migrate`, `machine`, `protocol` and `ipc` are reserved in modifier and kind position of an item; there they are an error (`item.reserved-word`). Everywhere else they are identifiers.
+- The words `stable`, `machine`, `protocol` and `ipc` are reserved in modifier and kind position of an item; there they are an error (`item.reserved-word`). Everywhere else they are identifiers.
 
 ```nan
 pub closed struct Reading {

@@ -767,7 +767,7 @@ impl Interpreter<'_, '_> {
 
     /// Structural order: scalars by value, enum values by variant then payload, structs and
     /// arrays part by part in order, the std types the interpreter models by their compared
-    /// parts.
+    /// parts, and all kept fields equal.
     pub(super) fn order(&self, left: &Val, right: &Val) -> Ordering {
         match (self.deref(left), self.deref(right)) {
             (Val::F32(a), Val::F32(b)) => a.total_cmp(&b),
@@ -775,6 +775,11 @@ impl Interpreter<'_, '_> {
             (Val::View(a), Val::View(b)) => {
                 let (a, b) = (self.view_values(&a), self.view_values(&b));
                 self.order_all(&a, &b)
+            }
+            (Val::Variant(item, ..), Val::Variant(..))
+                if self.ck.db.is_std(item) && self.ck.db.canonical(item) == "mem::wire::Kept" =>
+            {
+                Ordering::Equal
             }
             (Val::Variant(_, a, payload_a), Val::Variant(_, b, payload_b)) => a
                 .cmp(&b)

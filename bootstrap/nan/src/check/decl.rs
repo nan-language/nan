@@ -346,6 +346,9 @@ impl Checker<'_> {
                     self.check_thresholds(item, &function.clauses, block);
                     match function.modifier.map(|(modifier, _)| modifier) {
                         Some(FnModifier::Validator) => self.check_validator(item, fn_sig),
+                        Some(FnModifier::Migrate) => {
+                            self.check_migration(item, function, fn_sig);
+                        }
                         Some(FnModifier::Landing) => {
                             self.check_landing(item, fn_sig);
                             self.require(item, ast.token, Authority::Priv);

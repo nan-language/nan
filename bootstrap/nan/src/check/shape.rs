@@ -30,6 +30,24 @@ impl Checker<'_> {
         self.check_recursion(item);
         self.check_declared_properties(item);
         self.check_derives(item);
+        self.check_flexible(item);
+    }
+
+    /// `flexible` only on a struct deriving `Encode`.
+    fn check_flexible(&self, item: ItemId) {
+        let ast = self.db.ast(item);
+        let Some((_, token)) = ast
+            .type_modifiers
+            .iter()
+            .find(|(modifier, _)| *modifier == TypeModifier::Flexible)
+        else {
+            return;
+        };
+        let encoded = matches!(&ast.kind, ItemKind::Struct(structure)
+            if structure.derives.iter().any(|entry| entry.text == "Encode"));
+        if !encoded {
+            self.report(item, *token, Code::EncodeFlexible);
+        }
     }
 
     /// Distinct member names, labelled payloads, and the `pub` fields of a closed struct.
@@ -362,8 +380,7 @@ impl Checker<'_> {
             "Copy" => (linear || view || !constituents_have(Property::Copy))
                 .then_some(Code::PropCopyIneligible),
             "Send" | "Inert" | "AnyBits" => {
-                let open =
-                    ast.visibility == Visibility::Pub && ast.has_modifier(TypeModifier::Open);
+                let open = ast.visibility == Visibility::Pub && ast.is_open();
                 if !open {
                     return Some(Code::PropPromiseNotOpen);
                 }
@@ -518,10 +535,14 @@ impl Checker<'_> {
             })
             .collect();
         let saved = self.scope.replace(generics);
-        let implemented = self
-            .constituents(item)
+        let written = ["Encode", "Render"]
             .iter()
-            .all(|ty| self.implements(ty, interface));
+            .any(|name| self.db.core_item(name) == Some(interface));
+        let constituents = match written {
+            true => self.declared_constituents(item),
+            false => self.constituents(item),
+        };
+        let implemented = constituents.iter().all(|ty| self.implements(ty, interface));
         *self.scope.borrow_mut() = saved;
         implemented
     }

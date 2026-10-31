@@ -313,7 +313,7 @@ Files match by path and absence counts as a version; a file other than a source 
 4. When one side deleted X and wrote `retired X => Y preserves` and the other changed X, the driver merges that change into Y, X's base and changed versions renamed to Y. In the file form, a Y outside the file is a conflict.
 5. Items and members keep ours' order; one only theirs holds follows the nearest preceding one in theirs that the result holds, after those ours added there, or comes first.
 
-The lock takes the version with the later [snapshot](29-identity-versioning.md#lock), ours when neither is later; the history takes the union of the tombstones, ours' winning for equal identities, and the `name` and `head` records of the version that changed them from the base, ours' when both did; an API snapshot merges per entry as items do, an entry both sides changed differently taking ours' records and theirs' `pending` records; the principals file merges as one unit. In the workspace form, the driver then checks the merged workspace and prints its diagnostics.
+The lock takes the version with the later [snapshot](29-identity-versioning.md#lock), ours when neither is later; the history takes the union of the schema records and of the tombstones, ours' winning for tombstones of equal identities, and the `name` and `head` records of the version that changed them from the base, ours' when both did; an API snapshot merges per entry as items do, an entry both sides changed differently taking ours' records and theirs' `pending` records; the principals file merges as one unit. In the workspace form, the driver then checks the merged workspace and prints its diagnostics.
 
 ### Order-free members
 

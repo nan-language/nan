@@ -12,15 +12,13 @@ use crate::check::conform::{Candidate, type_key};
 use crate::check::db::ItemId;
 use crate::check::props::Property;
 use crate::check::resolve::Named;
-use crate::check::sig::{FnSig, ParamSig, Payload, SigKind};
+use crate::check::sig::{FieldSig, FnSig, ParamSig, Payload, SigKind};
 use crate::check::tir::{Builtin, Call, Callee, Form, Lit, LocalKind, TArg, TExpr, TKind};
 use crate::check::ty::{Arg, Args, Const, FnTy, Param, Scalar, Subst, Ty, no_args};
 use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
 use crate::nir::{self, BitConversion, BitsOwner, Conversion};
-use crate::syntax::ast::{
-    self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok, TypeModifier,
-};
+use crate::syntax::ast::{self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok};
 use crate::workspace::{Arch, Authority};
 
 /// The std functions that belong to one architecture's machine targets: its privileged
@@ -2224,12 +2222,14 @@ impl Body<'_, '_> {
         let consumer = self.ck.db.package_of(item) != self.ck.db.module(self.module).package;
         let (fields, labelled): (Vec<(String, Ty)>, bool) = match (&sig.kind, variant) {
             (SigKind::Struct { fields }, None) => {
-                if consumer && self.ck.db.ast(item).has_modifier(TypeModifier::Open) {
+                if consumer && self.ck.db.ast(item).is_open() {
                     self.report(token, Code::TypeOpenConstruction);
                     self.skim_args(args);
                     return TExpr::failed(token);
                 }
-                for field in fields {
+                let fields: Vec<&FieldSig> =
+                    fields.iter().filter(|field| !field.is_kept()).collect();
+                for field in &fields {
                     if !self
                         .ck
                         .db

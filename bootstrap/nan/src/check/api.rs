@@ -11,7 +11,7 @@ use super::tir::ClauseRole;
 use crate::nir::Role;
 use crate::output;
 use crate::prover::Status;
-use crate::syntax::ast::{ItemKind, TypeModifier, Visibility};
+use crate::syntax::ast::{ItemKind, Visibility};
 
 impl Checker<'_> {
     /// Whether consumers see an item: a `pub` item, or an impl line whose impl target and
@@ -129,7 +129,7 @@ impl Checker<'_> {
     pub fn consumer_props(&self, item: ItemId) -> Props {
         let ast = self.db.ast(item);
         let props = self.definition_props(item);
-        if !ast.has_modifier(TypeModifier::Open) {
+        if !ast.is_open() {
             return props;
         }
         let derived = |name: &str| match &ast.kind {

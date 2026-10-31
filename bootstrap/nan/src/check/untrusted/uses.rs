@@ -66,7 +66,8 @@ impl Checker<'_> {
 
     /// The codec uses of a function: of its body, or for a supplied `Codec` member of
     /// `mem::wire`, `text::json` or `text::construction`, the decoder of `T` for `decode`,
-    /// `canonical` and `erased` and its encoder for `encode` and `try_encode`.
+    /// `canonical`, `erased` and `decode_from` and its encoder for `encode`, `try_encode` and
+    /// `encode_as`.
     pub fn codec_uses(&self, function: ItemId) -> Vec<(Param, Codec)> {
         let Some(head) = self.fn_sig(function) else {
             return Vec::new();
@@ -89,10 +90,12 @@ impl Checker<'_> {
             "mem::wire::Codec.decode"
             | "mem::wire::Codec.canonical"
             | "mem::wire::Codec.erased"
+            | "mem::wire::Codec.decode_from"
             | "text::json::Codec.decode"
             | "text::construction::Codec.decode" => Codec::Decode,
             "mem::wire::Codec.encode"
             | "mem::wire::Codec.try_encode"
+            | "mem::wire::Codec.encode_as"
             | "text::json::Codec.encode"
             | "text::json::Codec.try_encode" => Codec::Encode,
             _ => return Vec::new(),
@@ -419,8 +422,8 @@ impl Walk<'_, '_> {
     /// A use of the decoder or encoder of `ty`: of a type parameter of the body, one of its codec
     /// uses; of a type parameter of another item, which no argument substituted, declassifying;
     /// of another type, declassifying when it decodes no parsing type or encodes one holding an
-    /// Untrusted instantiation, and a use of the same codec of each type parameter of the body the
-    /// type holds.
+    /// Untrusted instantiation, a use of the same codec of each type parameter of the body the
+    /// type holds, and of each frozen shape its migrations of that direction convert.
     fn codec(&mut self, token: Tok, ty: &Ty, codec: Codec) {
         if ty.has_error() {
             return;
@@ -433,10 +436,22 @@ impl Walk<'_, '_> {
             }
             return;
         }
-        let declassifying = match codec {
+        let mut converted = vec![ty.clone()];
+        if let Ty::Item(item, args) = ty
+            && args.is_empty()
+        {
+            converted.extend(
+                self.ck
+                    .migrations(*item)
+                    .into_iter()
+                    .filter(|migration| migration.forward == (codec == Codec::Decode))
+                    .map(|migration| Ty::item(migration.shape, Vec::new())),
+            );
+        }
+        let declassifying = converted.iter().any(|ty| match codec {
             Codec::Decode => !self.ck.is_parsing(ty),
             Codec::Encode => self.ck.holds_untrusted(ty),
-        };
+        });
         if declassifying {
             self.uses.declassifying.insert(token);
         }

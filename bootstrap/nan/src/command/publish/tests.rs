@@ -233,3 +233,39 @@ fn a_release_is_built_only_from_the_sources_its_attestation_hashes_and_that_chec
         assert!(output.contains(&refused), "{output}");
     }
 }
+
+#[test]
+fn a_release_records_its_schemas_from_which_the_next_migrates() {
+    let scratch = Scratch::new(&[(
+        "settings/package.nan",
+        "//! Settings.\n\npackage settings {\n    language 1\n    targets any\n} settings\n",
+    )]);
+    let dir = &scratch.0;
+    let source = dir.join("settings/settings.nan");
+    let name = format!(
+        "nan-test/{}",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    );
+    fs::write(
+        &source,
+        "//! Settings.\n\n/// Settings.\npub open struct Config derives Encode {\n    pub retries: u8\n} Config\n",
+    )
+    .expect("the first release");
+    run_in(dir, "api update");
+    run_in(dir, &format!("publish --local settings --name {name}"));
+    let history = fs::read_to_string(dir.join("settings/.nan/history.nan")).expect("a history");
+    assert!(history.contains("\nschema Config \""), "{history}");
+    fs::write(
+        &source,
+        "//! Settings.\n\n/// Settings.\npub flexible struct Config derives Encode {\n    pub retries: u8\n    pub verbose: bool\n} Config\n\nopen struct FirstConfig derives Encode {\n    retries: u8\n} FirstConfig\n\nmigrate fn Config.from_first(take old: FirstConfig) -> Config limits notrap, terminates {\n    return Config(retries: old.retries, verbose: true)\n} Config.from_first\n",
+    )
+    .expect("the second release");
+    run_in(dir, "api update --confirm-docs settings::Config");
+    let second = run_in(dir, "publish --local settings");
+    assert_eq!(
+        classes(&second.output),
+        "additive additive",
+        "{}",
+        second.output
+    );
+}

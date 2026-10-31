@@ -155,7 +155,8 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             }
             return_shared(lo, fx, supply, record);
         }
-        "install_msi" => install_msi(lo, fx, supply, &value_ty),
+        "install_msi" => install_msi(lo, fx, supply, &value_ty, false),
+        "install_validated" => install_msi(lo, fx, supply, &value_ty, true),
         "message" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
             let option = supply.abi.result.clone();
@@ -280,17 +281,18 @@ fn take_device(lo: &mut Lowering, fx: &mut Fx, value_ty: &Ty, record: Value) -> 
     lo.held_at(fx, value_ty, kept)
 }
 
-/// `install_msi`: `Ok` of the shared device once installed on a message-signalled interrupt of a
-/// machine target, or `Err` of a refusal giving back the device with the `hw::MsiError`
-/// variant of the outcome, `Unsupported` on the host.
-fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty) {
+/// `install_msi`, and `install_validated` whose interrupt its source alone raises: `Ok` of the
+/// shared device once installed on a message-signalled interrupt of a machine target, or `Err`
+/// of a refusal giving back the device with the `hw::MsiError` variant of the outcome,
+/// `Unsupported` on the host.
+fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, validated: bool) {
     let cpu = cpu_number(lo, fx, supply);
     let record = device_record(lo, fx, supply, value_ty, 3);
     let outcome = match lo.machine() {
         true => {
             let source = supply.param(2).scalar();
             let source = fx.b.ins().uextend(PTR, source);
-            lo.install_msi(fx, record, cpu, source)
+            lo.install_msi(fx, record, cpu, source, validated)
         }
         false => fx.ptr(msi::UNSUPPORTED as u64),
     };

@@ -147,7 +147,7 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
         ],
         (Arch::Aarch64, _) => &[
             "-machine",
-            "virt,gic-version=3,its=on,iommu=smmuv3",
+            "virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off",
             "-accel",
             "tcg",
             "-cpu",

@@ -1,6 +1,6 @@
 # Capabilities and authority
 
-This chapter defines authority and the absence of ambient authority, capabilities and the capability tables behind Copy capabilities, the std capabilities, revocation, resources, root grants, attenuation, capability kinds, protocol phases, manifest grants, denied dependencies, the trust that device and priv grants carry, and authority summaries with their approval by final-link roots.
+This chapter defines authority and the absence of ambient authority, capabilities and the capability tables behind Copy capabilities, the std capabilities, revocation, resources, root grants, attenuation, capability kinds, protocol phases, manifest grants, denied dependencies, the trust that device and priv grants carry and confined grants do not, and authority summaries with their approval by final-link roots.
 
 ## Authority
 
@@ -8,7 +8,7 @@ This chapter defines authority and the absence of ambient authority, capabilitie
 
 - Code acts outside its own values only through [capabilities](#capabilities) it holds as parameters, captures or values reached from them. A [manifest grant](#manifest-grants) confers no capability; it permits the operations its authority covers.
 - No item holds mutable state: a [const item](02-items.md#constants) is immutable and Inert, so it holds no capability, and every other value an item holds, such as a registry entry, is const data. The one value reachable without being passed is the [kernel anchor](24-kernel.md#anchor), reached only from entry contexts.
-- Every std operation that performs I/O, reads a clock, draws randomness or allocates reaches a capability: its receiver, an argument, or a capability its receiver stores. A device operation that reaches no capability, such as `hw::IrqShared.install`, is permitted only by an `allow device` grant; `hw::Mmio.map` and `hw::Ports.map` are also [trusted primitives](23-low-level.md#trusted-primitives), called inside trusted code of a module that an `allow trusted` grant names as well.
+- Every std operation that performs I/O, reads a clock, draws randomness or allocates reaches a capability: its receiver, an argument, or a capability its receiver stores. A device operation that reaches no capability, such as `hw::IrqShared.install`, is permitted only by an `allow device` grant, and a confined one by an `allow confined` or `allow device` grant; `hw::Mmio.map` and `hw::Ports.map` are also [trusted primitives](23-low-level.md#trusted-primitives), called inside trusted code of a module that an `allow trusted` grant names as well.
 - Capabilities come only from [root grants](#root-grants), from operations on other capabilities, from [sim](22-testing.md#simulated-capabilities) constructors and `testing::world()`, from the minters of [capability kinds](#capability-kinds) and from [trusted primitives](23-low-level.md#trusted-primitives); no operation of safe code builds one from bits, integers or text.
 
 ```nan
@@ -686,23 +686,24 @@ pub closed struct Stage {
 
 ## Manifest grants
 
-A **manifest grant** is an `allow <authority> in <names>` [directive](03-packages-modules.md#manifest), granting an authority no value carries. Each name a `device`, `priv`, `trusted` or `validate` grant lists is a module of the package or an alias a `dep` directive of the manifest declares, and each name a `capability` grant lists a module of the package; [contributors](25-registries.md#contributors) fixes the names of a `contribute` grant. In a `deny a -> b` directive, `a` is a module of the package and `b` a module of the package, an alias a `dep` directive declares or a std alias. Any other name is an error (`authority.unknown-name`), whose candidates are ranked as for `name.unknown` ([unknown names](03-packages-modules.md#unknown-names)).
+A **manifest grant** is an `allow <authority> in <names>` [directive](03-packages-modules.md#manifest), granting an authority no value carries. Each name a `device`, `confined`, `priv`, `trusted` or `validate` grant lists is a module of the package or an alias a `dep` directive of the manifest declares, and each name a `capability` grant lists a module of the package; [contributors](25-registries.md#contributors) fixes the names of a `contribute` grant. In a `deny a -> b` directive, `a` is a module of the package and `b` a module of the package, an alias a `dep` directive declares or a std alias. Any other name is an error (`authority.unknown-name`), whose candidates are ranked as for `name.unknown` ([unknown names](03-packages-modules.md#unknown-names)).
 
 A module performs an authority **directly** when one of its items, under a declared target, contains an operation of this table:
 
 | Authority | Operations |
 | --- | --- |
-| `device` | the device operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma) and [locks](24-kernel.md#locks) |
+| `device` | the device operations of [register windows](23-low-level.md#register-windows), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions), and every confined operation |
+| `confined` | the confined operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions) |
 | `priv` | calls of [privileged intrinsics](23-low-level.md#privileged-intrinsics) and declarations of landing fns |
 | `trusted` | [trusted code](23-low-level.md#trusted-code), `assume` and declarations of [foreign fns](23-low-level.md#foreign-functions) |
 | `validate` | the operations that [validate grants](15-untrusted.md#validate-grants) list |
 | `capability` | declarations of [capability kinds](#capability-kinds) |
 
 - A call of a function whose body performs an authority is not itself an operation of that authority.
-- A module performing `device`, `priv`, `trusted`, `validate` or `capability` directly that no grant of that authority names is an error (`authority.ungranted`), reported on the line of each such operation. Its exact fix adds the module to the authority's `allow` directive, writing the directive when the manifest has none.
-- A package is **granted** `device`, `priv`, `trusted` or `validate` when its manifest grants it to any name. A dependency granted one of these whose alias the dependent's manifest does not list for it is an error (`authority.dependency-ungranted`), reported on the dependency's `dep` directive, with an exact fix adding the alias as for `authority.ungranted`. A std package needs no grant from its dependents.
+- A module performing `device`, `confined`, `priv`, `trusted`, `validate` or `capability` directly that no grant of that authority names is an error (`authority.ungranted`), reported on the line of each such operation, a `device` grant also naming the modules that perform `confined`. Its exact fix adds the module to the authority's `allow` directive, writing the directive when the manifest has none.
+- A package is **granted** `device`, `confined`, `priv`, `trusted` or `validate` when its manifest grants it to any name. A dependency granted one of these whose alias the dependent's manifest does not list for it, under `device` or `confined` for `confined`, is an error (`authority.dependency-ungranted`), reported on the dependency's `dep` directive, with an exact fix adding the alias as for `authority.ungranted`. A std package needs no grant from its dependents.
 - `allow contribute R in <names>` lists the aliases of packages whose contributions to the registry `R` the package admits, as contributors defines.
-- A name a `device`, `priv`, `trusted`, `validate` or `capability` grant lists is incompleteness (`unused.grant`), reported on the name, when it is a module performing the authority directly under no declared target or the alias of a dependency not granted the authority. Contributors states the rule for `contribute`.
+- A name a `device`, `confined`, `priv`, `trusted`, `validate` or `capability` grant lists is incompleteness (`unused.grant`), reported on the name, when it is a module performing the authority directly under no declared target or the alias of a dependency not granted the authority. A module performing `confined` alone uses a `device` grant naming it when no `confined` grant names it, and the alias of a dependency granted `confined` alone uses one. Contributors states the rule for `contribute`.
 
 ```nan
 // file: uart/package.nan
@@ -883,6 +884,8 @@ pub fn log_total(log: sys::Log, total: u64) { // error: authority.denied-depende
 ## Device and priv grants
 
 The device and privileged operations that `device` and `priv` grants permit reach memory and machine state no type describes ([systems guarantees](00-charter.md#systems-guarantees)), and the kinds that `capability` grants permit stand for authority that no std capability states. A manifest granting `device`, `priv` or `capability` to any name gives its `package` item a [ledger](31-trust.md#ledger) entry that is a [trust escape](31-trust.md#trust-escapes), so `nan verify` requires a current [seal](31-trust.md#seals) on that item.
+
+The confined operations that a `confined` grant permits reach, through a device, only the memory its [I/O domain](23-low-level.md#io-domains) maps, so a confined driver programming its device wrongly harms its device and its own buffers alone. A manifest granting `confined` gives its `package` item a ledger entry that is no trust escape.
 
 ## Authority summaries
 

@@ -1,6 +1,6 @@
 # 0009. Low level and kernel without assembly
 
-Status: accepted
+Status: accepted; its consequence that a driver can point a device at memory it does not own until an IOMMU is modelled superseded by 0108
 
 ## Context
 

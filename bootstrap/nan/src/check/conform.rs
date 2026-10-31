@@ -497,6 +497,20 @@ impl Checker<'_> {
                         dynamic: false,
                     });
                 }
+                if let Some(protocol) = self.outbox_protocol(ty)
+                    && let Some(method) = self.outbox_method(protocol, name)
+                {
+                    candidates.push(Candidate::Method {
+                        bound: Bound {
+                            interface: protocol,
+                            args: no_args(),
+                        },
+                        method,
+                        self_ty: ty.clone(),
+                        function: None,
+                        dynamic: false,
+                    });
+                }
             }
         }
         let mut distinct: Vec<Candidate> = Vec::new();
@@ -561,11 +575,25 @@ impl Checker<'_> {
             .collect()
     }
 
-    /// The index of an interface's method of that name.
+    /// The index of an interface's method of that name, or of the method of that name an outbox
+    /// of a protocol calls.
     pub fn interface_method(&self, interface: ItemId, name: &str) -> Option<usize> {
         match &self.sig(interface).kind {
             SigKind::Interface { methods } => methods.iter().position(|method| method.name == name),
+            SigKind::Protocol { .. } => self.outbox_method(interface, name),
             _ => None,
+        }
+    }
+
+    /// The name of an interface's method, or of a method an outbox of a protocol calls.
+    pub fn method_name(&self, interface: ItemId, method: usize) -> String {
+        match &self.sig(interface).kind {
+            SigKind::Interface { methods } => methods[method].name.clone(),
+            SigKind::Protocol { operations, .. } => match operations.get(method) {
+                Some(operation) => operation.name.clone(),
+                None => "summary".to_owned(),
+            },
+            _ => panic!("a method of no interface or protocol"),
         }
     }
 
@@ -585,9 +613,13 @@ impl Checker<'_> {
             .find(|function| self.db.module_of(*function) == module)
     }
 
-    /// The head of an interface method with `Self` and the interface's parameters substituted.
+    /// The head of an interface method with `Self` and the interface's parameters substituted,
+    /// or of a method an outbox of a protocol calls.
     pub fn method_head(&self, bound: &Bound, method: usize, self_ty: &Ty) -> Option<FnSig> {
         let sig = self.sig(bound.interface);
+        if let SigKind::Protocol { .. } = &sig.kind {
+            return self.outbox_head(bound.interface, method, self_ty);
+        }
         let SigKind::Interface { methods } = &sig.kind else {
             return None;
         };

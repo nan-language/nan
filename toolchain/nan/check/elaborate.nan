@@ -13,7 +13,28 @@ pkg struct Implemented derives Copy {
     pkg item: ty::ItemId
     pkg method: usize
     pkg args: ty::Args
+    /// The positions of the implementing function's parameters the method's contract functions
+    /// read.
+    pkg params: core::Range[usize]
 } Implemented
+
+/// The requires a function's body meets at entry, as the functions computing them, with the
+/// positions of the function's parameters they read.
+pkg struct EntryRequires {
+    pkg refs: mem::List[nir::FnRef]
+    pkg params: core::Range[usize]
+} EntryRequires
+
+/// The operands at the positions of a range, copied in order.
+fn operands_within(operands: Slice[nir::Operand], positions: core::Range[usize], alloc: mem::Alloc) -> mem::List[nir::Operand] {
+    var found = mem::List[nir::Operand].empty(alloc)
+    for position in positions {
+        if position < operands.len() {
+            mut found.push(operands[position].copy(alloc))
+        }
+    }
+    return found
+} operands_within
 
 /// An ensures clause as its unit's functions compute it: its ensures function's index, the
 /// `old` functions it reads, in order, and whether it is disputed.
@@ -338,7 +359,7 @@ fn Checker.elaborate(self, item: ty::ItemId) -> Option[nir::NirUnit] fails Fault
             }
             unit = try self.function_unit(take unit, sig: fn_sig, body, has_body, role: nir::Role.Body)
         }
-        ast::ItemKind.Interface(_) => {
+        ast::ItemKind.Interface(_) or ast::ItemKind.Protocol(_) => {
             let Some(methods) = try self.method_units(take unit) else {
                 return None
             }
@@ -374,7 +395,7 @@ fn Checker.elaborate(self, item: ty::ItemId) -> Option[nir::NirUnit] fails Fault
 fn Checker.method_units(self, take unit: UnitDraft) -> Option[UnitDraft] fails Fault {
     let item = unit.item
     let sig = self.sig(item)
-    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+    let Some(methods) = sig.contents().kind.methods() else {
         return None
     }
     var bodies = mem::List[mem::Shared[TBody]].empty(self.alloc())
@@ -425,7 +446,7 @@ fn Checker.type_parts(self, item: ty::ItemId) {
     let state = self.state.contents()
     let typed = match self.db().ast(item).kind {
         ast::ItemKind.Struct(_) => state.typed_predicates.get(item).is_some()
-        ast::ItemKind.Interface(_) => state.method_bodies.get(MethodKey(item: item, method: 0)).is_some()
+        ast::ItemKind.Interface(_) or ast::ItemKind.Protocol(_) => state.method_bodies.get(MethodKey(item: item, method: 0)).is_some()
         else => true
     }
     if not typed {
@@ -882,9 +903,13 @@ fn Checker.requires_clauses(self, function: ty::ItemId) -> mem::List[RequiresCla
 /// The requires a function's body meets at entry, as the functions computing them: its own
 /// clauses that are not disputed, or, for an implementing function with none, those of the
 /// interface method it implements.
-fn Checker.entry_requires(self, function: ty::ItemId) -> mem::List[nir::FnRef] {
+fn Checker.entry_requires(self, function: ty::ItemId) -> EntryRequires {
     let alloc = self.alloc()
     var refs = mem::List[nir::FnRef].empty(alloc)
+    let count = match self.fn_sig(function) {
+        Some(sig) => sig.params.len()
+        None => 0
+    }
     let own = self.requires_clauses(function)
     var undisputed = false
     for clause in own {
@@ -904,17 +929,17 @@ fn Checker.entry_requires(self, function: ty::ItemId) -> mem::List[nir::FnRef] {
                 mut refs.push(nir::FnRef(callable: nir::Callable.Item(item: function, role: nir::Role.Requires, index: clause.index), args: args))
             }
         }
-        return refs
+        return EntryRequires(refs: take refs, params: 0..<count)
     }
     let Some(implemented) = self.implemented_method(function) else {
-        return refs
+        return EntryRequires(refs: take refs, params: 0..<count)
     }
     for clause in self.method_requires(implemented.item, method: implemented.method) {
         if not clause.disputed {
             mut refs.push(nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Requires, index: clause.index), args: implemented.args))
         }
     }
-    return refs
+    return EntryRequires(refs: take refs, params: implemented.params)
 } Checker.entry_requires
 
 /// The typed bodies of an interface's methods, in method order.
@@ -922,7 +947,7 @@ fn Checker.method_typed(self, interface_item: ty::ItemId) -> mem::List[mem::Shar
     var bodies = mem::List[mem::Shared[TBody]].empty(self.alloc())
     let sig = self.sig(interface_item)
     let count = match sig.contents().kind {
-        SigKind.Interface(methods: methods) => methods.len()
+        SigKind.Interface(methods: methods) or SigKind.Protocol(operations: methods, variants: _, summary: _) => methods.len()
         else => 0
     }
     let state = self.state.contents()
@@ -1225,6 +1250,19 @@ pkg fn Checker.implemented_method(self, function: ty::ItemId) -> Option[Implemen
     let ast::ItemKind.Fn(item) = db.ast(function).kind else {
         return None
     }
+    let count = match self.fn_sig(function) {
+        Some(sig) => sig.params.len()
+        None => 0
+    }
+    match self.served(function) {
+        Some(by) => {
+            let Served.Handler(method) = by.served else {
+                return None
+            }
+            return Some(Implemented(item: by.protocol, method: method, args: ty::Args.none(), params: self.contract_params(interface_item: by.protocol, method, count)))
+        }
+        None => {}
+    }
     let Some(key) = db.owners.get(function) else {
         return None
     }
@@ -1242,7 +1280,7 @@ pkg fn Checker.implemented_method(self, function: ty::ItemId) -> Option[Implemen
             continue
         }
         let args = self.interface_args(bound.item, self_ty, args: self.types().arg_list(bound.args))
-        return Some(Implemented(item: bound.item, method: method, args: args))
+        return Some(Implemented(item: bound.item, method: method, args: args, params: 0..<count))
     }
     return None
 } Checker.implemented_method
@@ -1276,6 +1314,9 @@ fn Checker.inherited(self, function: ty::ItemId) -> Option[Inherited] {
 /// The type arguments of an interface's unit for a `Self` type and the arguments of a bound
 /// naming the interface: the interface's own parameters', then `Self`.
 fn Checker.interface_args(self, interface_item: ty::ItemId, self_ty: ty::Ty, args: Slice[ty::Arg]) -> ty::Args {
+    if self.is_protocol(interface_item) {
+        return ty::Args.none()
+    }
     let sig = self.sig(interface_item)
     let declared = sig.contents().generics.len()
     var own: usize = 0
@@ -1750,6 +1791,7 @@ fn Elab.enter_inherited(mut self, args: Slice[nir::Operand]) {
     var inherited = taken
     let span = nir::Span.at(self.ck.db().ast(self.item).token)
     let implemented = inherited.implemented
+    let shared = operands_within(args, positions: implemented.params, alloc)
     let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
     var required = mem::List[u32].empty(alloc)
     for index in inherited.requires_clauses {
@@ -1757,7 +1799,7 @@ fn Elab.enter_inherited(mut self, args: Slice[nir::Operand]) {
     }
     for index in required {
         let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Requires, index: index), args: implemented.args)
-        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(args, alloc), ty: bool_ty, span)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(shared.view(), alloc), ty: bool_ty, span)
         mut inherited.requires_values.push(value)
     }
     var olds = mem::List[u32].empty(alloc)
@@ -1769,7 +1811,7 @@ fn Elab.enter_inherited(mut self, args: Slice[nir::Operand]) {
     for old in olds {
         let ty = self.interface_old_ty(implemented, old)
         let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Old, index: old), args: implemented.args)
-        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(args, alloc), ty, span)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(shared.view(), alloc), ty, span)
         discard mut inherited.old_values.insert(old, value: value)
     }
     self.exits.inherited = Some(take inherited)

@@ -57,6 +57,7 @@ A **code root** is the reproducible part of an artefact ([reproducibility](36-bu
 | 8 | ledger | the package's [ledger](31-trust.md#ledger), a list of records keyed as the ledger table states |
 | 9 | line tables | a list of pairs, one per source file of the package holding the first line of a [span](19-nir.md#spans) in part 4: the file's path as spans write it, and a list of pairs, in line order, of each such line's number and its text without its line end |
 | 10 | schema trees | a list of pairs, one per exported type implementing `Encode` ([encode class](29-identity-versioning.md#encode-class)) and per [component state](26-components.md#component-state) the package declares: its canonical path and the `mem::wire` encoding, as bytes, of its [schema tree](13-text-encode.md#schema-hashes) |
+| 11 | protocols | a list, absent when empty, of one element per `pub` [protocol](26-components.md#protocol-hashes) the package declares: its canonical path, its protocol hash as bytes, and a list of pairs of the name and the operation hash, as bytes, of each of its `pub` operations, in byte order of name |
 
 | Entry key | Content |
 | --- | --- |

@@ -165,10 +165,7 @@ impl Names for ItemNames<'_, '_> {
     }
 
     fn method(&self, interface: ItemId, method: u32) -> String {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].name.clone(),
-            _ => panic!("a method of an interface"),
-        }
+        self.ck.method_name(interface, method as usize)
     }
 
     fn register(&self, block: ItemId, register: u32) -> String {
@@ -223,6 +220,7 @@ fn kind_position(kind: &ItemKind) -> u64 {
         ItemKind::Test(_) => 11,
         ItemKind::Retired(_) => 12,
         ItemKind::Package => 13,
+        ItemKind::Protocol(_) => 14,
     }
 }
 
@@ -674,6 +672,40 @@ impl<'a> Checker<'a> {
                     declaration.field(10, content(|out| text(out, &target)));
                 }
             }
+            (
+                ItemKind::Protocol(protocol),
+                SigKind::Protocol {
+                    operations,
+                    summary,
+                    ..
+                },
+            ) => {
+                let mut record = Record::default();
+                if let Some(summary) = summary {
+                    record.field(1, content(|out| encoder.ty(out, summary)));
+                }
+                record.field(
+                    2,
+                    content(|out| {
+                        list(
+                            out,
+                            protocol.operations.iter().zip(operations),
+                            |out, (written, operation)| {
+                                let mut element = Record::default();
+                                element
+                                    .field(1, content(|out| visibility(out, written.visibility)));
+                                element.field(2, content(|out| text(out, &operation.name)));
+                                element.field(
+                                    3,
+                                    self.method_head_record(false, &operation.sig, encoder),
+                                );
+                                out.extend(element.finish());
+                            },
+                        );
+                    }),
+                );
+                declaration.field(11, record.finish());
+            }
             _ => {}
         }
         declaration.finish_if_any()
@@ -771,7 +803,10 @@ impl<'a> Checker<'a> {
     fn properties_record(&self, item: ItemId) -> Vec<u8> {
         let mut record = Record::default();
         match &self.db.ast(item).kind {
-            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+            ItemKind::Struct(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Layout(_)
+            | ItemKind::Protocol(_) => {
                 let Props {
                     linear,
                     view,

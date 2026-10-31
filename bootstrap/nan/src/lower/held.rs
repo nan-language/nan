@@ -198,7 +198,8 @@ impl Lowering<'_, '_> {
     /// The names of an enum's variants in order.
     pub fn variant_names(&self, item: crate::check::db::ItemId) -> Vec<String> {
         match &self.ck.sig(item).kind {
-            crate::check::sig::SigKind::Enum { variants } => variants
+            crate::check::sig::SigKind::Enum { variants }
+            | crate::check::sig::SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .map(|variant| variant.name.clone())
                 .collect(),

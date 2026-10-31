@@ -2,6 +2,7 @@
 //! exits that run deferred calls, release slots and check contracts before leaving.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use super::expr::Out;
 use super::{Deferred, Elab, Elaborated, Exit, Fault, Held, Leave, Loop, Scope};
@@ -739,7 +740,7 @@ impl Elab<'_, '_> {
         self.exit_predicate_checks(carried, span)?;
         let ensures = std::mem::take(&mut self.exits.ensures);
         for (index, olds) in &ensures {
-            let mut args = self.param_operands_except_taken()?;
+            let mut args = self.param_operands_except_taken(0..self.body.params.len())?;
             args.push(value.clone().unwrap_or(Operand::Literal(Literal::Unit)));
             args.extend(olds.iter().map(|old| Operand::Value(self.old_values[old])));
             let fn_ref = self.own(Role::Ensures, *index);
@@ -776,7 +777,8 @@ impl Elab<'_, '_> {
             self.b.at(next);
         }
         for clause in &inherited.ensures {
-            let mut args = self.param_operands_except_taken()?;
+            let mut args =
+                self.param_operands_except_taken(inherited.implemented.params.clone())?;
             args.push(value.cloned().unwrap_or(Operand::Literal(Literal::Unit)));
             args.extend(
                 clause
@@ -809,10 +811,9 @@ impl Elab<'_, '_> {
     }
 
     /// The operands passing the parameters other than `take` ones by read, as ensures take them.
-    fn param_operands_except_taken(&mut self) -> Elaborated<Vec<Operand>> {
-        let locals: Vec<LocalId> = self
-            .body
-            .params
+    /// The operands of the parameters at `positions` the function does not take.
+    fn param_operands_except_taken(&mut self, positions: Range<usize>) -> Elaborated<Vec<Operand>> {
+        let locals: Vec<LocalId> = self.body.params[positions]
             .iter()
             .copied()
             .filter(|local| !matches!(self.body.local(*local).kind, LocalKind::Param(Mode::Take)))

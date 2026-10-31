@@ -1692,13 +1692,16 @@ impl<'w, 'a> Walk<'w, 'a> {
         if let Some((interface, method, unit_args)) = through {
             let clauses = self.ck.ensures_clauses(interface, Some(method as usize));
             let modes = self.method_modes(interface, method as usize);
+            let shared = self
+                .ck
+                .contract_params(interface, method as usize, args.len());
             let ensures = self.ensures_facts(
                 interface,
                 &clauses,
                 &modes,
                 &unit_args,
-                args,
-                &after_args,
+                &args[shared.clone()],
+                &after_args[shared],
                 result,
             );
             for fact in ensures {
@@ -1738,6 +1741,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                 let generics = &self.ck.sig(*item).generics;
                 let unit_args = Subst::of(generics.iter().map(|def| def.param), &fn_ref.args)
                     .args(&implemented.args);
+                let shared = implemented.params.clone();
                 let held: Vec<TermId> = self
                     .ck
                     .method_requires(implemented.interface, implemented.method)
@@ -1749,7 +1753,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                             Role::Requires,
                             index,
                             &unit_args,
-                            args.to_vec(),
+                            args[shared.clone()].to_vec(),
                         )
                     })
                     .collect();
@@ -1757,13 +1761,14 @@ impl<'w, 'a> Walk<'w, 'a> {
                 let clauses = self
                     .ck
                     .ensures_clauses(implemented.interface, Some(implemented.method));
+                let modes = modes[shared.clone()].to_vec();
                 let inherited = self.ensures_facts(
                     implemented.interface,
                     &clauses,
                     &modes,
                     &unit_args,
-                    args,
-                    &after_args,
+                    &args[shared.clone()],
+                    &after_args[shared],
                     result,
                 );
                 for fact in inherited {
@@ -1822,11 +1827,14 @@ impl<'w, 'a> Walk<'w, 'a> {
     /// The modes of an interface method's parameters.
     fn method_modes(&self, interface: ItemId, method: usize) -> Vec<Mode> {
         match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method]
-                .sig
-                .params
-                .iter()
-                .map(|param| param.mode)
+            SigKind::Interface { methods }
+            | SigKind::Protocol {
+                operations: methods,
+                ..
+            } => methods
+                .get(method)
+                .into_iter()
+                .flat_map(|method| method.sig.params.iter().map(|param| param.mode))
                 .collect(),
             _ => Vec::new(),
         }

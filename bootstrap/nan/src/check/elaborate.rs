@@ -10,6 +10,7 @@ mod pattern;
 mod stmt;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 use build::Builder;
@@ -70,8 +71,14 @@ impl Checker<'_> {
                 let has_body = !matches!(function.body, ast::FnBody::None);
                 self.function_unit(&mut unit, &sig, &body, has_body, Role::Body)?;
             }
-            ItemKind::Interface(_) => {
-                let SigKind::Interface { methods } = &self.sig(item).kind else {
+            ItemKind::Interface(_) | ItemKind::Protocol(_) => {
+                let sig = self.sig(item);
+                let (SigKind::Interface { methods }
+                | SigKind::Protocol {
+                    operations: methods,
+                    ..
+                }) = &sig.kind
+                else {
                     return Ok(None);
                 };
                 let bodies: Vec<Rc<TBody>> = (0..methods.len())
@@ -127,7 +134,9 @@ impl Checker<'_> {
         let ast = self.db.ast(item);
         let typed = match &ast.kind {
             ItemKind::Struct(_) => self.typed_predicates.borrow().contains_key(&item),
-            ItemKind::Interface(_) => self.method_bodies.borrow().contains_key(&(item, 0)),
+            ItemKind::Interface(_) | ItemKind::Protocol(_) => {
+                self.method_bodies.borrow().contains_key(&(item, 0))
+            }
             _ => true,
         };
         if !typed {
@@ -482,9 +491,11 @@ impl Checker<'_> {
 
     /// The requires a function's body meets at entry, as the functions computing them: its own
     /// clauses that are not disputed, or, for an implementing function with none, those of the
-    /// interface method it implements.
-    pub fn entry_requires(&self, function: ItemId) -> Vec<FnRef> {
+    /// interface method it implements; with the positions of the function's parameters they
+    /// read.
+    pub fn entry_requires(&self, function: ItemId) -> (Vec<FnRef>, Range<usize>) {
         let own = self.requires_clauses(function);
+        let count = self.fn_sig(function).map_or(0, |sig| sig.params.len());
         if own.iter().any(|(_, disputed)| !disputed) {
             let args: Args = self
                 .sig(function)
@@ -492,7 +503,7 @@ impl Checker<'_> {
                 .iter()
                 .map(super::sig::param_arg)
                 .collect();
-            return own
+            let requires = own
                 .into_iter()
                 .filter(|(_, disputed)| !disputed)
                 .map(|(index, _)| FnRef {
@@ -504,11 +515,13 @@ impl Checker<'_> {
                     args: args.clone(),
                 })
                 .collect();
+            return (requires, 0..count);
         }
         let Some(implemented) = self.implemented_method(function) else {
-            return Vec::new();
+            return (Vec::new(), 0..count);
         };
-        self.method_requires(implemented.interface, implemented.method)
+        let requires = self
+            .method_requires(implemented.interface, implemented.method)
             .into_iter()
             .filter(|(_, disputed)| !disputed)
             .map(|(index, _)| FnRef {
@@ -519,13 +532,18 @@ impl Checker<'_> {
                 },
                 args: implemented.args.clone(),
             })
-            .collect()
+            .collect();
+        (requires, implemented.params)
     }
 
     /// The typed bodies of an interface's methods, in method order.
     pub fn method_typed(&self, interface: ItemId) -> Vec<Rc<TBody>> {
         let count = match &self.sig(interface).kind {
-            SigKind::Interface { methods } => methods.len(),
+            SigKind::Interface { methods }
+            | SigKind::Protocol {
+                operations: methods,
+                ..
+            } => methods.len(),
             _ => 0,
         };
         (0..count)
@@ -739,11 +757,24 @@ impl Checker<'_> {
         }
     }
 
-    /// The interface method a function implements through an impl line naming its type.
+    /// The interface method a function implements through an impl line naming its type, or the
+    /// operation a handler handles.
     pub fn implemented_method(&self, function: ItemId) -> Option<Implemented> {
         let ItemKind::Fn(item) = &self.db.ast(function).kind else {
             return None;
         };
+        let count = self.fn_sig(function).map_or(0, |sig| sig.params.len());
+        if let Some((_, protocol, served)) = self.served(function) {
+            let super::protocol::Served::Handler(method) = served else {
+                return None;
+            };
+            return Some(Implemented {
+                interface: protocol,
+                method,
+                args: Args::from(Vec::new()),
+                params: self.contract_params(protocol, method, count),
+            });
+        }
         let self_ty = match self.db.owners.get(&function)? {
             TypeKey::Item(owner) => self.own_type(*owner),
             TypeKey::Scalar(scalar) => Ty::Scalar(*scalar),
@@ -764,6 +795,7 @@ impl Checker<'_> {
                     interface: bound.interface,
                     method,
                     args: self.interface_args(bound.interface, &self_ty, &bound.args),
+                    params: 0..count,
                 })
             })
     }
@@ -796,8 +828,12 @@ impl Checker<'_> {
     }
 
     /// The type arguments of an interface's unit for a `Self` type and the arguments of a bound
-    /// naming the interface: the interface's own parameters', then `Self`.
+    /// naming the interface: the interface's own parameters', then `Self`; none for a protocol's
+    /// unit.
     pub fn interface_args(&self, interface: ItemId, self_ty: &Ty, args: &[Arg]) -> Args {
+        if self.is_protocol(interface) {
+            return Args::from(Vec::new());
+        }
         let own = self.sig(interface).generics.len().saturating_sub(1);
         args.iter()
             .take(own)
@@ -866,6 +902,9 @@ pub struct Implemented {
     pub interface: ItemId,
     pub method: usize,
     pub args: Args,
+    /// The positions of the implementing function's parameters the method's contract functions
+    /// read.
+    pub params: Range<usize>,
 }
 
 /// An ensures clause as its unit's functions compute it: its ensures function's index, the
@@ -1335,6 +1374,7 @@ impl<'e, 'a> Elab<'e, 'a> {
         }
         let args = self.param_operands()?;
         if let Some(mut inherited) = self.exits.inherited.take() {
+            let args = args[inherited.implemented.params.clone()].to_vec();
             let span = Span::at(self.ck.db.ast(self.item).token);
             let interface = |role, index| FnRef {
                 callable: Callable::Item {

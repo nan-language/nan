@@ -422,6 +422,7 @@ Each term links to its home, whose definition governs.
 | [NIR](19-nir.md#nir) | Specified checked intermediate representation. |
 | [obligation](18-contracts.md#obligations) | Condition required at a program point. |
 | [open type](04-types.md#closed-and-open-types) | `pub` type that may grow compatibly. |
+| [operation](26-components.md#protocols) | Typed message or request a protocol declares. |
 | [order-free member](33-toolchain.md#merge-driver) | Member whose order means nothing. |
 | [outbox](26-components.md#keyed-tasks) | `sys::Outbox[M]` posting to a component. |
 | [outcome](20-prover.md#outcomes) | Proved, refuted or unknown. |
@@ -453,6 +454,7 @@ Each term links to its home, whose definition governs.
 | [projection](07-ownership.md#projections) | `proj` function, deriving its result from its receiver. |
 | [promise](05-properties.md#promises) | Fact consumers may rely on. |
 | [property test](22-testing.md#property-tests) | Test with generated inputs. |
+| [protocol](26-components.md#protocols) | Item declaring the operations of the components serving it. |
 | [prover](20-prover.md#procedure) | Specified procedure discharging obligations. |
 | [punning](06-statements-expressions.md#calls) | Omitting a label matching the binding. |
 | [pure](10-effects-digests.md#purity) | Of a function without effects or authority. |
@@ -470,6 +472,7 @@ Each term links to its home, whose definition governs.
 | [reliance test](22-testing.md#reliance-tests) | Test of a dependency's item. |
 | [render budget](13-text-encode.md#render) | `Render` call's output limit. |
 | [replay token](22-testing.md#replay) | Value reproducing a failure. |
+| [request](26-components.md#protocols) | Operation whose caller waits for its handler's result or failure. |
 | [requires-set](29-identity-versioning.md#requires-sets) | What a consumer relied on. |
 | [reservation](37-evolution.md#reservations) | Space reserved without meaning. |
 | [reserved word](01-lexical.md#keywords) | Word rejected where reserved. |
@@ -506,6 +509,7 @@ Each term links to its home, whose definition governs.
 | [std](28-stdlib.md#std-layers) | Nine packages the reserved std aliases name, and the three platform packages. |
 | [store](12-memory.md#stores) | Manager of values in memory. |
 | [structural property](05-properties.md#structural-properties) | Property computed from structure. |
+| [summary](26-components.md#servers) | Value a component serving a protocol publishes at quiescence. |
 | [support routine](27-program-model.md#runtime-support) | Fixed runtime routine. |
 | [suspension point](17-suspension-io.md#stackful-tasks) | An `await`, where a task may suspend. |
 | [table](25-registries.md#tables) | Sequence of a registry's admitted contributions under a target. |

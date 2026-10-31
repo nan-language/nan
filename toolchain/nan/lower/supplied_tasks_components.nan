@@ -1,4 +1,4 @@
-//! Components: `host::Runner.run`, which runs a component's handlers on a task of their own while a body runs, the operations of the component context, keyed tasks and posts through outboxes. A runner's record, drawn through the run's allocator, holds its lock, the intake from its oldest to its newest entry, whether the intake has stopped, the component task and whether it waits for a message, the task waiting for the run's tasks, the delayed entries in the order they enter the intake, the timers in flight and their count, the keyed tasks and the count of those not ended, the count of what references the record, its allocator and executor cells, the number of `after` calls so far, whether the component task has ended, the body's outbox, and the nanosecond at which the executor's clock was minted with the executor's resolution, on whose grid delays end; the state and the Env follow. An intake entry holds its links, the task posting it (zero for a message the component sends itself), its status, its deadline and order while delayed, whether a keyed outbox posted it and that outbox's key, and the message; a posted entry lies on the posting task's stack, any other is drawn through the runner's allocator. A keyed task's node holds its links, its task, key, outbox and region, whether its key was superseded and whether it has ended.
+//! Components: `host::Runner.run`, which runs a component's handlers on a task of their own while a body runs, the operations of the component context, keyed tasks and posts through outboxes. A runner's record, drawn through the run's allocator, holds its lock, the intake from its oldest to its newest entry, whether the intake has stopped, the component task and whether it waits for a message, the task waiting for the run's tasks, the delayed entries in the order they enter the intake, the timers in flight and their count, the keyed tasks and the count of those not ended, the count of what references the record, its allocator and executor cells, the number of `after` calls so far, whether the component task has ended, the body's outbox, the nanosecond at which the executor's clock was minted with the executor's resolution, on whose grid delays end, and the request whose handler runs; the state, the Env and, for a protocol declaring one, the summary follow. An intake entry holds its links, the task posting it (zero for a message the component sends itself), its status, its deadline and order while delayed, whether a keyed outbox posted it and that outbox's key, where a request's reply goes (zero for any other message), and the message; a posted entry lies on the posting task's stack, any other is drawn through the runner's allocator. A keyed task's node holds its links, its task, key, outbox and region, whether its key was superseded and whether it has ended.
 
 const RUNNER_LOCK: u64 = 0
 
@@ -40,7 +40,9 @@ const RUNNER_ORIGIN: u64 = 144
 
 const RUNNER_RESOLUTION: u64 = 152
 
-const RUNNER_HEADER: u64 = 160
+const RUNNER_CURRENT: u64 = 160
+
+const RUNNER_HEADER: u64 = 168
 
 const COMPONENTS_ENTRY_NEXT: u64 = 0
 
@@ -58,12 +60,24 @@ const COMPONENTS_ENTRY_KEY: u64 = 48
 
 const COMPONENTS_ENTRY_KEYED: u64 = 56
 
-const COMPONENTS_ENTRY_MESSAGE: u64 = 64
+const COMPONENTS_ENTRY_REPLY: u64 = 64
 
-/// The statuses of a posted entry.
+const COMPONENTS_ENTRY_MESSAGE: u64 = 72
+
+/// The statuses of a posted entry: taken by the component task, removed from the intake untaken,
+/// a request's handler having returned or failed, its poster stopped, or the component task
+/// stopped while its handler ran.
 const STATUS_TAKEN: i64 = 1
 
 const STATUS_REMOVED: i64 = 2
+
+const STATUS_REPLIED: i64 = 3
+
+const STATUS_FAILED: i64 = 4
+
+const STATUS_WITHDRAWN: i64 = 5
+
+const STATUS_ABANDONED: i64 = 6
 
 const KEYED_NEXT: u64 = 0
 
@@ -112,34 +126,55 @@ fn components_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
             supply.done(mut lo, mut fx)
         }
-        "sys::Outbox.post" => post(mut lo, mut fx, supply)
+        "sys::Outbox.post" => {
+            let message = supply.type_arg(lo, index: 0)
+            let posted = components_enqueue(mut lo, mut fx, supply, message, held: supply.param(1), reply: None)
+            await_taken(mut lo, mut fx, supply, message, record: posted.record, node: posted.node)
+        }
         else => {
             expect false
         }
     }
 } components_lower
 
-/// Where a runner's record holds the state and the Env, and its size and alignment.
+/// Where a runner's record holds the summary, the state and the Env, and its size and
+/// alignment.
 struct ComponentsShape derives Copy {
     state_at: u64
     env_at: u64
+    summary: Option[ty::Ty]
+    summary_at: u64
     size: u64
     align: u64
 } ComponentsShape
 
-fn components_shape(mut lo: Lowering, state: ty::Ty, env: ty::Ty) -> ComponentsShape {
+fn components_shape(mut lo: Lowering, state: ty::Ty, env: ty::Ty, message: ty::Ty) -> ComponentsShape {
+    let summary = protocols_summary_type(lo, message)
+    var summary_at: u64 = 0
+    var end = RUNNER_HEADER
+    var align: u64 = 8
+    match summary {
+        Some(summary_ty) => {
+            summary_at = protocols_summary_offset(mut lo, summary: summary_ty)
+            let summary_laid = mut lo.layout_of(summary_ty)
+            end = summary_at + summary_laid.contents().size
+            if summary_laid.contents().align > align {
+                align = summary_laid.contents().align
+            }
+        }
+        None => {}
+    }
     let state_laid = mut lo.layout_of(state)
     let env_laid = mut lo.layout_of(env)
-    let state_at = next_multiple_of(RUNNER_HEADER, multiple: at_least_one(state_laid.contents().align))
+    let state_at = next_multiple_of(end, multiple: at_least_one(state_laid.contents().align))
     let env_at = next_multiple_of(state_at + state_laid.contents().size, multiple: at_least_one(env_laid.contents().align))
-    var align: u64 = 8
     if state_laid.contents().align > align {
         align = state_laid.contents().align
     }
     if env_laid.contents().align > align {
         align = env_laid.contents().align
     }
-    return ComponentsShape(state_at: state_at, env_at: env_at, size: env_at + env_laid.contents().size, align: align)
+    return ComponentsShape(state_at: state_at, env_at: env_at, summary: summary, summary_at: summary_at, size: env_at + env_laid.contents().size, align: align)
 } components_shape
 
 /// The instance of a handler, `start` or `on`, of a component state for its Env and messages.
@@ -201,7 +236,7 @@ fn components_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
     })
     let cell = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
-    let shape = components_shape(mut lo, state: state_ty, env: env_ty)
+    let shape = components_shape(mut lo, state: state_ty, env: env_ty, message: message_ty)
     let size = mut fx.ptr(shape.size)
     let align = mut fx.ptr(shape.align)
     var alloc_args = Array[clif::Value, 3].filled(cell)
@@ -237,6 +272,7 @@ fn components_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let state = call_handler(mut lo, mut fx, instance: take start, args: Array[Held, 1].filled(Held.Address(env_at)).view())
     let state_at = mut fx.offset(record, offset: shape.state_at)
     mut lo.store_held(mut fx, address: state_at, held: state, ty: state_ty)
+    protocols_publish(mut lo, mut fx, record, shape, state: state_ty)
     start_component(mut lo, mut fx, record, exec_cell: executor.words[0], state: state_ty, env: env_ty, message: message_ty)
     let keyed = mut fx.ptr(0)
     var mint_args = Array[clif::Value, 3].filled(record)
@@ -364,48 +400,49 @@ fn start_component(mut lo: Lowering, mut fx: Fx, record: clif::Value, exec_cell:
 } start_component
 
 /// The component task: removes the intake's messages one at a time, oldest first, passing each
-/// to `on`, until the intake has stopped and is empty; then releases the Env.
+/// to `on`, or to its operation's handler for a protocol, and publishing the summary after, until
+/// the intake has stopped and is empty; then releases the Env.
 fn component_glue(mut lo: Lowering, state: ty::Ty, env: ty::Ty, message: ty::Ty) -> object::FuncId {
     let signature = record_signature(lo.alloc)
     return mut lo.glue_function(Glue.Component(state: state, env: env, message: message), signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
         let params = mut fx1.entry()
         expect params.len() == 1
         let record = mut fx1.load(PTR, addr: params[0], offset: TASK_ENV)
-        let shape = components_shape(mut lo1, state, env)
+        let shape = components_shape(mut lo1, state, env, message)
         let state_at = mut fx1.offset(record, offset: shape.state_at)
         let env_at = mut fx1.offset(record, offset: shape.env_at)
         let laid = mut lo1.layout_of(message)
         let slot = mut fx1.slot(laid.contents().size, align: laid.contents().align)
         let cx = mut fx1.slot(8, align: 8)
         mut fx1.store(record, addr: cx, offset: 0)
-        let on = components_handler(mut lo1, method: "on", state, env, message)
+        let served = protocols_served(lo1, message)
+        var on: Option[Instance] = None
+        if served.is_none() {
+            on = Some(components_handler(mut lo1, method: "on", state, env, message))
+        }
         let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
         discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo1](mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
             discard mut lo1.call_routine(mut fx2, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
             let oldest = mut fx2.load(PTR, addr: record, offset: RUNNER_OLDEST)
             let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: oldest, y: 0)
             let again_values = mut fx2.choose_in(mut lo1, condition: present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
-                components_unlink(mut fx3, record, node: oldest)
-                let source = mut fx3.offset(oldest, offset: COMPONENTS_ENTRY_MESSAGE)
-                mut lo3.copy(mut fx3, dst: slot, src: source, size: laid.contents().size, align: laid.contents().align)
-                let poster = mut fx3.load(PTR, addr: oldest, offset: COMPONENTS_ENTRY_POSTER)
-                let posted = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: poster, y: 0)
-                mut fx3.if_true(posted, then: fn[mut lo3](mut fx4: Fx) {
-                    take_posted(mut lo3, fx: mut fx4, message, address: slot, poster)
-                    let taken = mut fx4.ptr(u64.fit(STATUS_TAKEN))
-                    mut fx4.store(taken, addr: oldest, offset: COMPONENTS_ENTRY_STATUS)
-                    discard mut lo3.call_routine(mut fx4, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
-                })
-                discard mut lo3.call_routine(mut fx3, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-                let sent = mut fx3.b.bxor_imm_s(posted, y: 1)
-                mut fx3.if_true(sent, then: fn[mut lo3](mut fx4: Fx) {
-                    discard mut lo3.call_routine(mut fx4, routine: Routine.Free, args: Array[clif::Value, 1].filled(oldest).view())
-                })
+                component_take(mut lo3, fx: mut fx3, record, oldest, message, slot, lock)
                 var handler_args = Array[Held, 4].filled(Held.Address(state_at))
                 handler_args[1] = Held.Address(slot)
                 handler_args[2] = Held.Address(env_at)
                 handler_args[3] = Held.Address(cx)
-                discard call_handler(mut lo3, fx: mut fx3, instance: on.copy(lo3.alloc), args: handler_args.view())
+                match served {
+                    Some(protocol) => protocols_dispatch(mut lo3, fx: mut fx3, record, protocol, state, args: handler_args.view(), node: oldest)
+                    None => {
+                        match on {
+                            Some(handler) => {
+                                discard call_handler(mut lo3, fx: mut fx3, instance: handler.copy(lo3.alloc), args: handler_args.view())
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                protocols_publish(mut lo3, fx: mut fx3, record, shape, state)
                 var handled = mem::List[clif::Value].empty(fx3.alloc)
                 mut handled.push(mut fx3.int(clif::Type.Int8, value: 1))
                 return handled
@@ -432,6 +469,37 @@ fn component_glue(mut lo: Lowering, state: ty::Ty, env: ty::Ty, message: ty::Ty)
         mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
     })
 } component_glue
+
+/// Removes the oldest message of a component's intake into `slot` under the runner's lock,
+/// marks a posted one taken, waking a one-way poster or recording a request as the one being
+/// handled, then unlocks and frees an entry sent without a poster.
+fn component_take(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif::Value, message: ty::Ty, slot: clif::Value, lock: clif::Value) {
+    let laid = mut lo.layout_of(message)
+    components_unlink(mut fx, record, node: oldest)
+    let source = mut fx.offset(oldest, offset: COMPONENTS_ENTRY_MESSAGE)
+    mut lo.copy(mut fx, dst: slot, src: source, size: laid.contents().size, align: laid.contents().align)
+    let poster = mut fx.load(PTR, addr: oldest, offset: COMPONENTS_ENTRY_POSTER)
+    let posted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: poster, y: 0)
+    let reply = mut fx.load(PTR, addr: oldest, offset: COMPONENTS_ENTRY_REPLY)
+    let request = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: reply, y: 0)
+    mut fx.if_true(posted, then: fn[mut lo](mut fx1: Fx) {
+        take_posted(mut lo, fx: mut fx1, message, address: slot, poster)
+        let taken = mut fx1.ptr(u64.fit(STATUS_TAKEN))
+        mut fx1.store(taken, addr: oldest, offset: COMPONENTS_ENTRY_STATUS)
+        let one_way = mut fx1.b.bxor_imm_s(request, y: 1)
+        mut fx1.if_true(one_way, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
+        })
+    })
+    mut fx.if_true(request, then: fn(mut fx1: Fx) {
+        mut fx1.store(oldest, addr: record, offset: RUNNER_CURRENT)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let sent = mut fx.b.bxor_imm_s(posted, y: 1)
+    mut fx.if_true(sent, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: Array[clif::Value, 1].filled(oldest).view())
+    })
+} component_take
 
 /// What the executor thread does once a component task has ended: the run's caller wakes and
 /// the task's record is freed.
@@ -475,10 +543,19 @@ fn withdraw_run(mut lo: Lowering) -> object::FuncId {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
         let one = mut fx1.ptr(1)
         mut fx1.store(one, addr: record, offset: RUNNER_STOPPED)
+        let current = mut fx1.load(PTR, addr: record, offset: RUNNER_CURRENT)
+        let handling = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        mut fx1.if_true(handling, then: fn[mut lo1](mut fx2: Fx) {
+            let abandoned = mut fx2.ptr(u64.fit(STATUS_ABANDONED))
+            mut fx2.store(abandoned, addr: current, offset: COMPONENTS_ENTRY_STATUS)
+            let poster = mut fx2.load(PTR, addr: current, offset: COMPONENTS_ENTRY_POSTER)
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
+        })
         let zero = mut fx1.ptr(0)
         mut fx1.store(zero, addr: record, offset: RUNNER_COMPONENT)
         mut fx1.store(zero, addr: record, offset: RUNNER_IDLE)
         mut fx1.store(zero, addr: record, offset: RUNNER_WAITER)
+        mut fx1.store(zero, addr: record, offset: RUNNER_CURRENT)
         let oldest = mut fx1.load(PTR, addr: record, offset: RUNNER_OLDEST)
         discard mut fx1.repeat(Array[clif::Value, 1].filled(oldest).view(), body: fn[mut lo1](mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
             expect walk_state.len() == 1
@@ -545,7 +622,8 @@ fn cancel_timers(mut lo: Lowering, mut fx: Fx, first_timer: clif::Value) {
 } cancel_timers
 
 /// Withdraws a stopped poster's entry from a runner's intake unless the runner has taken or
-/// removed it, and drops the poster's reference to the runner.
+/// removed it, marks a taken one so that no reply reaches it, and drops the poster's reference
+/// to the runner.
 fn withdraw_post(mut lo: Lowering) -> object::FuncId {
     let signature = withdraw_signature(lo.alloc)
     return mut lo.glue_function(Glue.WithdrawPost, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
@@ -559,6 +637,11 @@ fn withdraw_post(mut lo: Lowering) -> object::FuncId {
         let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: 0)
         mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
             components_unlink(mut fx2, record, node)
+        })
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_TAKEN)
+        mut fx1.if_true(taken, then: fn(mut fx2: Fx) {
+            let withdrawn = mut fx2.ptr(u64.fit(STATUS_WITHDRAWN))
+            mut fx2.store(withdrawn, addr: node, offset: COMPONENTS_ENTRY_STATUS)
         })
         discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
         components_unreference(mut lo1, fx: mut fx1, record)
@@ -634,6 +717,20 @@ fn take_posted(mut lo: Lowering, mut fx: Fx, message: ty::Ty, address: clif::Val
         mut lo.transfer(mut fx1, ty: message, address, lift: domain, owner: domain)
     })
 } take_posted
+
+/// Gives a reply to a poster of another domain than the component task's; the caller holds the
+/// runner's lock.
+fn give_posted(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, poster: clif::Value) {
+    if not mut lo.transfers(ty) {
+        return
+    }
+    let to = mut fx.load(PTR, addr: poster, offset: TASK_DOMAIN)
+    let domain = current_domain(mut lo, mut fx)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: to, y: domain)
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.transfer(mut fx1, ty, address, lift: to, owner: to)
+    })
+} give_posted
 
 /// Wakes a runner's component task when it waits for a message. The caller holds the lock.
 fn wake_component(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
@@ -1120,13 +1217,17 @@ fn components_unreference(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     })
 } components_unreference
 
-/// Fails a post with `SendError.Closed`.
+/// Fails a post with `SendError.Closed`, or a request with `CallError.Closed` holding it.
 fn components_fail_closed(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let Some(failure_ty) = supply.abi.failure else {
         expect false
         return
     }
-    let value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "Closed", payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+    let send_error = lo.std_ty("task", type_name: "SendError", args: mem::List[ty::Ty].empty(lo.alloc))
+    var value = mut lo.variant_value(mut fx, ty: send_error, variant: "Closed", payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+    if failure_ty != send_error {
+        value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "Closed", payload_values: Array[Held, 1].filled(value).view(), wrapped: None)
+    }
     let Some(failure) = supply.failure else {
         expect false
         return
@@ -1143,12 +1244,17 @@ fn release_message(mut lo: Lowering, mut fx: Fx, message: ty::Ty, held: Held) {
     }
 } release_message
 
-/// `out.post(m)`: `m` enters the intake and the call waits until the component task takes it.
-/// A cancellation point, failing with `SendError.Closed` when `out` is stale or the intake has
-/// stopped, or once `out` goes stale while `m` waits.
-fn post(mut lo: Lowering, mut fx: Fx, supply: Supply) {
-    let message = supply.type_arg(lo, index: 0)
-    let held = supply.param(1)
+/// A posted entry and the runner's record it entered.
+struct Enqueued derives Copy {
+    record: clif::Value
+    node: clif::Value
+} Enqueued
+
+/// The steps of a post before it waits: a cancellation point, failing when the call is
+/// cancelled at its start or `out` is stale or the intake has stopped; otherwise `m` enters the
+/// intake in an entry on the posting task's stack, which a request's reply follows. Gives the
+/// runner's record, which the post references, and the entry.
+fn components_enqueue(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, held: Held, reply: Option[clif::Value]) -> Enqueued {
     let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
     let origin = tasks_origin(mut lo, mut fx)
     let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
@@ -1193,6 +1299,10 @@ fn post(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.store(current, addr: node, offset: COMPONENTS_ENTRY_POSTER)
     mut fx.store(outbox.words[1], addr: node, offset: COMPONENTS_ENTRY_KEY)
     mut fx.store(outbox.words[2], addr: node, offset: COMPONENTS_ENTRY_KEYED)
+    match reply {
+        Some(written) => mut fx.store(written, addr: node, offset: COMPONENTS_ENTRY_REPLY)
+        None => {}
+    }
     let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
     mut lo.store_held(mut fx, address: at, held, ty: message)
     components_append(mut lo, mut fx, record, node)
@@ -1200,45 +1310,61 @@ fn post(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
     let withdraw = withdraw_post(mut lo)
     enter_wait(mut lo, mut fx, glue: withdraw, object: record, node)
-    post_wait(mut lo, mut fx, supply, record, lock, node, message, at)
-    mut fx.b.trap(clif::TrapCode(user: 1))
-} post
+    return Enqueued(record: record, node: node)
+} components_enqueue
 
-/// Waits until the component task takes a post's entry, whose message is at `at`, or leaves
-/// once the entry is removed or the posting task is cancelled.
-fn post_wait(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, lock: clif::Value, node: clif::Value, message: ty::Ty, at: clif::Value) {
+/// Ends a post that leaves its wait: it stops waiting and drops its reference to the runner.
+/// The caller holds the runner's lock, which this releases.
+fn leave_post(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    leave_wait(mut lo, mut fx)
+    waiting_on(mut lo, mut fx, what: 0)
+    components_unreference(mut lo, mut fx, record)
+} leave_post
+
+/// Waits until the component task takes a posted message, which completes the post. Fails, the
+/// message leaving the intake, with the cancellation when the call is cancelled while it waits
+/// and with `SendError.Closed` once it is removed.
+fn await_taken(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, record: clif::Value, node: clif::Value) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
         discard mut lo.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
         discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
         let status = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
         let taken = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_TAKEN)
         mut fx1.if_true(taken, then: fn[mut lo](mut fx2: Fx) {
-            discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-            leave_wait(mut lo, fx: mut fx2)
-            waiting_on(mut lo, fx: mut fx2, what: 0)
-            components_unreference(mut lo, fx: mut fx2, record)
+            leave_post(mut lo, fx: mut fx2, record)
             supply.done(mut lo, fx: mut fx2)
         })
-        let removed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_REMOVED)
-        let origin = tasks_origin(mut lo, fx: mut fx1)
-        let cancelled = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
-        let leaving = mut fx1.b.bor(removed, y: cancelled)
-        mut fx1.if_true(leaving, then: fn[mut lo](mut fx2: Fx) {
-            let waiting = mut fx2.b.bxor_imm_s(removed, y: 1)
-            mut fx2.if_true(waiting, then: fn(mut fx3: Fx) {
-                components_unlink(mut fx3, record, node)
-            })
-            discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-            leave_wait(mut lo, fx: mut fx2)
-            waiting_on(mut lo, fx: mut fx2, what: 0)
-            components_unreference(mut lo, fx: mut fx2, record)
-            mut lo.release(mut fx2, ty: message, address: at)
-            mut fx2.if_true(cancelled, then: fn[mut lo](mut fx3: Fx) {
-                tasks_fail_cancelled(mut lo, fx: mut fx3, supply, origin)
-            })
-            components_fail_closed(mut lo, fx: mut fx2, supply)
-        })
+        leave_untaken(mut lo, fx: mut fx1, supply, message, record, node, status, at)
         discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
         return Pass(again: mut fx1.int(clif::Type.Int8, value: 1), next: mem::List[clif::Value].empty(fx1.alloc))
     })
-} post_wait
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} await_taken
+
+/// Leaves a post whose message the component task has not taken once it is removed, or once
+/// the call is cancelled while the message waits in the intake, which it then leaves: the
+/// message is released and the call fails with the cancellation or as closed. The caller holds
+/// the runner's lock.
+fn leave_untaken(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, record: clif::Value, node: clif::Value, status: clif::Value, at: clif::Value) {
+    let removed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_REMOVED)
+    let waiting = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: 0)
+    let origin = tasks_origin(mut lo, mut fx)
+    let interrupted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    let cancelled = mut fx.b.band(interrupted, y: waiting)
+    let leaving = mut fx.b.bor(removed, y: cancelled)
+    mut fx.if_true(leaving, then: fn[mut lo](mut fx1: Fx) {
+        mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
+            components_unlink(mut fx2, record, node)
+        })
+        leave_post(mut lo, fx: mut fx1, record)
+        mut lo.release(mut fx1, ty: message, address: at)
+        mut fx1.if_true(cancelled, then: fn[mut lo](mut fx2: Fx) {
+            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
+        })
+        components_fail_closed(mut lo, fx: mut fx1, supply)
+    })
+} leave_untaken

@@ -305,7 +305,7 @@ impl Layouts {
                     .collect();
                 self.record(ck, &types)
             }
-            SigKind::Enum { variants } => {
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                 let variants: Vec<(String, Vec<(String, Ty)>)> = variants
                     .iter()
                     .map(|variant| {

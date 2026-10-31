@@ -81,10 +81,11 @@ impl Lowering<'_, '_> {
             return values[index];
         }
         match &self.ck.sig(*item).kind {
-            SigKind::Enum { variants } => variants
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .position(|candidate| candidate.name == variant)
-                .expect("a variant of the enum") as u64,
+                .expect("a variant of the enum")
+                as u64,
             _ => panic!("a tag of {ty:?}"),
         }
     }

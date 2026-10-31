@@ -8,11 +8,13 @@
 //! they enter the intake, the timers in flight and their count, the keyed tasks and the count of
 //! those not ended, the count of what references the record, its allocator and executor cells,
 //! the number of `after` calls so far, whether the component task has ended, the body's outbox,
-//! and the nanosecond at which the executor's clock was minted with the executor's resolution,
-//! on whose grid delays end; the state and the Env follow. An intake entry holds its links, the task posting it
-//! (zero for a message the component sends itself), its status, its deadline and order while
-//! delayed, whether a keyed outbox posted it and that outbox's key, and the message; a posted
-//! entry lies on the posting task's stack, any other is drawn through the runner's allocator. A
+//! the nanosecond at which the executor's clock was minted with the executor's resolution, on
+//! whose grid delays end, and the request whose handler runs; the state, the Env and, for a
+//! protocol declaring one, the summary follow. An intake entry holds its links, the task posting
+//! it (zero for a message the component sends itself), its status, its deadline and order while
+//! delayed, whether a keyed outbox posted it and that outbox's key, where a request's reply goes
+//! (zero for any other message), and the message; a posted entry lies on the posting task's
+//! stack, any other is drawn through the runner's allocator. A
 //! keyed task's node holds its links, its task, key, outbox and region, whether its key was
 //! superseded and whether it has ended.
 
@@ -55,10 +57,11 @@ pub mod runner {
     pub const INBOX: u64 = 136;
     pub const ORIGIN: u64 = 144;
     pub const RESOLUTION: u64 = 152;
-    pub const HEADER: u64 = 160;
+    pub const CURRENT: u64 = 160;
+    pub const HEADER: u64 = 168;
 }
 
-mod entry {
+pub mod entry {
     pub const NEXT: u64 = 0;
     pub const PREVIOUS: u64 = 8;
     pub const POSTER: u64 = 16;
@@ -67,13 +70,20 @@ mod entry {
     pub const ORDER: u64 = 40;
     pub const KEY: u64 = 48;
     pub const KEYED: u64 = 56;
-    pub const MESSAGE: u64 = 64;
+    pub const REPLY: u64 = 64;
+    pub const MESSAGE: u64 = 72;
 }
 
-/// The statuses of a posted entry.
-mod status {
+/// The statuses of a posted entry: taken by the component task, removed from the intake untaken,
+/// a request's handler having returned or failed, its poster stopped, or the component task
+/// stopped while its handler ran.
+pub mod status {
     pub const TAKEN: i64 = 1;
     pub const REMOVED: i64 = 2;
+    pub const REPLIED: i64 = 3;
+    pub const FAILED: i64 = 4;
+    pub const WITHDRAWN: i64 = 5;
+    pub const ABANDONED: i64 = 6;
 }
 
 mod keyed {
@@ -116,29 +126,47 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             supply.done(lo, fx);
         }
-        "sys::Outbox.post" => post(lo, fx, supply),
+        "sys::Outbox.post" => {
+            let message = supply.type_arg(0);
+            let (record, node) = enqueue(lo, fx, supply, &message, supply.param(1), None);
+            await_taken(lo, fx, supply, &message, record, node);
+        }
         other => panic!("no lowering of {other}"),
     }
 }
 
-/// Where a runner's record holds the state and the Env, and its size and alignment.
-struct Shape {
-    state_at: u64,
-    env_at: u64,
+/// Where a runner's record holds the summary, the state and the Env, and its size and
+/// alignment.
+pub struct Shape {
+    pub state_at: u64,
+    pub env_at: u64,
+    pub summary_at: Option<(u64, Ty)>,
     size: u64,
     align: u64,
 }
 
-fn shape(lo: &mut Lowering, state: &Ty, env: &Ty) -> Shape {
+pub fn shape(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Shape {
+    let summary = super::protocols::summary_type(lo, message).map(|summary| {
+        let at = super::protocols::summary_offset(lo, &summary);
+        (at, summary)
+    });
+    let mut end = runner::HEADER;
+    let mut align = 8;
+    if let Some((at, summary)) = &summary {
+        let layout = lo.layout(summary);
+        end = at + layout.size;
+        align = align.max(layout.align);
+    }
     let state_layout = lo.layout(state);
     let env_layout = lo.layout(env);
-    let state_at = runner::HEADER.next_multiple_of(state_layout.align.max(1));
+    let state_at = end.next_multiple_of(state_layout.align.max(1));
     let env_at = (state_at + state_layout.size).next_multiple_of(env_layout.align.max(1));
     Shape {
         state_at,
         env_at,
+        summary_at: summary,
         size: env_at + env_layout.size,
-        align: state_layout.align.max(env_layout.align).max(8),
+        align: align.max(state_layout.align).max(env_layout.align),
     }
 }
 
@@ -166,7 +194,7 @@ fn handler(lo: &mut Lowering, name: &str, state: &Ty, env: &Ty, message: &Ty) ->
 }
 
 /// Calls an instance with values held as its parameters take them.
-fn call_handler(lo: &mut Lowering, fx: &mut Fx, instance: Instance, args: &[Held]) -> Held {
+pub fn call_handler(lo: &mut Lowering, fx: &mut Fx, instance: Instance, args: &[Held]) -> Held {
     let abi = lo.abi(&instance);
     let id = lo.instance(instance);
     lo.invoke(fx, Invoked::Direct(id), &abi, args).result
@@ -211,7 +239,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         super::fail_cancelled(lo, fx, supply, none);
     });
     let cell = fx.load(PTR, supply.param(2).address(), 0);
-    let shape = shape(lo, &state_ty, &env_ty);
+    let shape = shape(lo, &state_ty, &env_ty, &message_ty);
     let size = fx.ptr(shape.size);
     let align = fx.ptr(shape.align);
     let record = lo.call_routine(fx, Routine::Alloc, &[cell, size, align])[0];
@@ -237,6 +265,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state = call_handler(lo, fx, start, &[Held::Address(env_at)]);
     let state_at = fx.offset(record, shape.state_at);
     lo.store_held(fx, state_at, state, &state_ty);
+    super::protocols::publish(lo, fx, record, &shape, &state_ty);
     start_component(lo, fx, record, exec_cell, &state_ty, &env_ty, &message_ty);
     let keyed = fx.ptr(0);
     let inbox = lo.call_routine(fx, Routine::OutboxMint, &[record, zero, keyed])[0];
@@ -329,21 +358,25 @@ fn start_component(
 }
 
 /// The component task: removes the intake's messages one at a time, oldest first, passing each
-/// to `on`, until the intake has stopped and is empty; then releases the Env.
+/// to `on`, or to its operation's handler for a protocol, and publishing the summary after, until
+/// the intake has stopped and is empty; then releases the Env.
 fn component_glue(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> FuncId {
     let glue = Glue::Component(state.clone(), env.clone(), message.clone());
     let (state, env, message) = (state.clone(), env.clone(), message.clone());
     lo.glue_function(glue, super::record_signature(), move |lo, fx| {
         let params = fx.entry();
         let record = fx.load(PTR, params[0], task::ENV);
-        let shape = shape(lo, &state, &env);
+        let shape = shape(lo, &state, &env, &message);
         let state_at = fx.offset(record, shape.state_at);
         let env_at = fx.offset(record, shape.env_at);
         let layout = lo.layout(&message);
         let slot = fx.slot(layout.size, layout.align);
         let cx = fx.slot(8, 8);
         fx.store(record, cx, 0);
-        let on = handler(lo, "on", &state, &env, &message);
+        let served = super::protocols::served_protocol(lo, &message);
+        let on = served
+            .is_none()
+            .then(|| handler(lo, "on", &state, &env, &message));
         let lock = fx.offset(record, runner::LOCK);
         fx.repeat(&[], |fx, _| {
             lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -360,28 +393,39 @@ fn component_glue(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Func
                     lo.copy(fx, slot, source, layout.size, layout.align);
                     let poster = fx.load(PTR, oldest, entry::POSTER);
                     let posted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, poster, 0);
+                    let reply = fx.load(PTR, oldest, entry::REPLY);
+                    let request = fx.b.ins().icmp_imm_s(IntCC::NotEqual, reply, 0);
                     fx.when(posted, |fx| {
                         take_posted(lo, fx, &message, slot, poster);
                         let taken = fx.ptr(status::TAKEN as u64);
                         fx.store(taken, oldest, entry::STATUS);
-                        lo.call_routine(fx, Routine::Wake, &[poster]);
+                        let one_way = fx.b.ins().bxor_imm_s(request, 1);
+                        fx.when(one_way, |fx| {
+                            lo.call_routine(fx, Routine::Wake, &[poster]);
+                        });
                     });
+                    fx.when(request, |fx| fx.store(oldest, record, runner::CURRENT));
                     lo.call_routine(fx, Routine::Unlock, &[lock]);
                     let sent = fx.b.ins().bxor_imm_s(posted, 1);
                     fx.when(sent, |fx| {
                         lo.call_routine(fx, Routine::Free, &[oldest]);
                     });
-                    call_handler(
-                        lo,
-                        fx,
-                        on,
-                        &[
-                            Held::Address(state_at),
-                            Held::Address(slot),
-                            Held::Address(env_at),
-                            Held::Address(cx),
-                        ],
-                    );
+                    let args = [
+                        Held::Address(state_at),
+                        Held::Address(slot),
+                        Held::Address(env_at),
+                        Held::Address(cx),
+                    ];
+                    match (served, on.clone()) {
+                        (Some(protocol), _) => super::protocols::dispatch(
+                            lo, fx, record, protocol, &state, &args, oldest,
+                        ),
+                        (None, Some(on)) => {
+                            call_handler(lo, fx, on, &args);
+                        }
+                        (None, None) => unreachable!("a component's on handler"),
+                    }
+                    super::protocols::publish(lo, fx, record, &shape, &state);
                     vec![fx.int(types::I8, 1)]
                 },
                 |lo, fx| {
@@ -443,8 +487,21 @@ fn withdraw_run(lo: &mut Lowering) -> FuncId {
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let one = fx.ptr(1);
         fx.store(one, record, runner::STOPPED);
+        let current = fx.load(PTR, record, runner::CURRENT);
+        let handling = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+        fx.when(handling, |fx| {
+            let abandoned = fx.ptr(status::ABANDONED as u64);
+            fx.store(abandoned, current, entry::STATUS);
+            let poster = fx.load(PTR, current, entry::POSTER);
+            lo.call_routine(fx, Routine::Wake, &[poster]);
+        });
         let zero = fx.ptr(0);
-        for field in [runner::COMPONENT, runner::IDLE, runner::WAITER] {
+        for field in [
+            runner::COMPONENT,
+            runner::IDLE,
+            runner::WAITER,
+            runner::CURRENT,
+        ] {
             fx.store(zero, record, field);
         }
         let oldest = fx.load(PTR, record, runner::OLDEST);
@@ -506,7 +563,8 @@ fn withdraw_run(lo: &mut Lowering) -> FuncId {
 }
 
 /// Withdraws a stopped poster's entry from a runner's intake unless the runner has taken or
-/// removed it, and drops the poster's reference to the runner.
+/// removed it, marks a taken one so that no reply reaches it, and drops the poster's reference
+/// to the runner.
 fn withdraw_post(lo: &mut Lowering) -> FuncId {
     lo.glue_function(
         Glue::WithdrawPost,
@@ -520,6 +578,11 @@ fn withdraw_post(lo: &mut Lowering) -> FuncId {
             let status = fx.load(PTR, node, entry::STATUS);
             let waiting = fx.b.ins().icmp_imm_s(IntCC::Equal, status, 0);
             fx.when(waiting, |fx| unlink(fx, record, node));
+            let taken = fx.b.ins().icmp_imm_s(IntCC::Equal, status, status::TAKEN);
+            fx.when(taken, |fx| {
+                let withdrawn = fx.ptr(status::WITHDRAWN as u64);
+                fx.store(withdrawn, node, entry::STATUS);
+            });
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             unreference(lo, fx, record);
             fx.b.ins().return_(&[]);
@@ -608,6 +671,18 @@ fn take_posted(lo: &mut Lowering, fx: &mut Fx, message: &Ty, address: Value, pos
     fx.when(other, |fx| {
         lo.transfer(fx, message, address, domain, domain)
     });
+}
+
+/// Gives a reply to a poster of another domain than the component task's; the caller holds the
+/// runner's lock.
+pub fn give_posted(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value, poster: Value) {
+    if !lo.transfers(ty) {
+        return;
+    }
+    let to = fx.load(PTR, poster, task::DOMAIN);
+    let domain = tasks::current_domain(lo, fx);
+    let other = fx.b.ins().icmp(IntCC::NotEqual, to, domain);
+    fx.when(other, |fx| lo.transfer(fx, ty, address, to, to));
 }
 
 /// Wakes a runner's component task when it waits for a message. The caller holds the lock.
@@ -1090,7 +1165,7 @@ fn keyed_done(lo: &mut Lowering) -> FuncId {
 }
 
 /// Drops one reference to a runner's record, freeing it with the last.
-fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+pub fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let refs = fx.offset(record, runner::REFS);
     let minus = fx.ptr(u64::MAX);
     let previous = fetch_add(fx, refs, minus);
@@ -1100,25 +1175,35 @@ fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     });
 }
 
-/// Fails a post with `SendError.Closed`.
-fn fail_closed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+/// Fails a post with `SendError.Closed`, or a request with `CallError.Closed` holding it.
+pub fn fail_closed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let fails = supply.abi.fails.clone().expect("a post's failure type");
-    let value = lo.variant_value(fx, &fails, "Closed", &[], None);
+    let send_error = lo.std_ty("task", "SendError", Vec::new());
+    let mut value = lo.variant_value(fx, &send_error, "Closed", &[], None);
+    if fails != send_error {
+        value = lo.variant_value(fx, &fails, "Closed", &[value], None);
+    }
     let failure = supply.failure.expect("a failure address");
     lo.store_held(fx, failure, value, &fails);
     supply.fail(fx);
 }
 
-/// `out.post(m)`: `m` enters the intake and the call waits until the component task takes it.
-/// A cancellation point, failing with `SendError.Closed` when `out` is stale or the intake has
-/// stopped, or once `out` goes stale while `m` waits.
-fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
-    let message = supply.type_arg(0);
-    let held = supply.param(1);
+/// The steps of a post before it waits: a cancellation point, failing when the call is
+/// cancelled at its start or `out` is stale or the intake has stopped; otherwise `m` enters the
+/// intake in an entry on the posting task's stack, which a request's reply follows. Gives the
+/// runner's record, which the post references, and the entry.
+pub fn enqueue(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    message: &Ty,
+    held: Held,
+    reply: Option<Value>,
+) -> (Value, Value) {
     let handle = fx.load(PTR, supply.param(0).address(), 0);
     let release_held = |lo: &mut Lowering, fx: &mut Fx| {
         if let Held::Address(address) = held {
-            lo.release(fx, &message, address);
+            lo.release(fx, message, address);
         }
     };
     let origin = super::origin(lo, fx);
@@ -1146,7 +1231,7 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         release_held(lo, fx);
         fail_closed(lo, fx, supply);
     });
-    let layout = lo.layout(&message);
+    let layout = lo.layout(message);
     let node = fx.slot(entry::MESSAGE + layout.size, layout.align.max(8));
     let zero = fx.ptr(0);
     let header = fx.ptr(entry::MESSAGE);
@@ -1155,45 +1240,87 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(current, node, entry::POSTER);
     fx.store(key, node, entry::KEY);
     fx.store(keyed_post, node, entry::KEYED);
+    if let Some(reply) = reply {
+        fx.store(reply, node, entry::REPLY);
+    }
     let at = fx.offset(node, entry::MESSAGE);
-    lo.store_held(fx, at, held, &message);
+    lo.store_held(fx, at, held, message);
     append(lo, fx, record, node);
     tasks::waiting_on(lo, fx, WAITING);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     let withdraw = withdraw_post(lo);
     settle::enter_wait(lo, fx, withdraw, record, node);
+    (record, node)
+}
+
+/// Ends a post that leaves its wait: it stops waiting and drops its reference to the runner.
+/// The caller holds the runner's lock, which this releases.
+pub fn leave_post(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    let lock = fx.offset(record, runner::LOCK);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    settle::leave_wait(lo, fx);
+    tasks::waiting_on(lo, fx, 0);
+    unreference(lo, fx, record);
+}
+
+/// Waits until the component task takes a posted message, which completes the post. Fails, the
+/// message leaving the intake, with the cancellation when the call is cancelled while it waits
+/// and with `SendError.Closed` once it is removed.
+pub fn await_taken(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    message: &Ty,
+    record: Value,
+    node: Value,
+) {
+    let lock = fx.offset(record, runner::LOCK);
+    let at = fx.offset(node, entry::MESSAGE);
     fx.repeat(&[], |fx, _| {
         lo.call_routine(fx, Routine::Park, &[]);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let status = fx.load(PTR, node, entry::STATUS);
         let taken = fx.b.ins().icmp_imm_s(IntCC::Equal, status, status::TAKEN);
         fx.when(taken, |fx| {
-            lo.call_routine(fx, Routine::Unlock, &[lock]);
-            settle::leave_wait(lo, fx);
-            tasks::waiting_on(lo, fx, 0);
-            unreference(lo, fx, record);
+            leave_post(lo, fx, record);
             supply.done(lo, fx);
         });
-        let removed = fx.b.ins().icmp_imm_s(IntCC::Equal, status, status::REMOVED);
-        let origin = super::origin(lo, fx);
-        let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, origin, 0);
-        let leaving = fx.b.ins().bor(removed, cancelled);
-        fx.when(leaving, |fx| {
-            let waiting = fx.b.ins().bxor_imm_s(removed, 1);
-            fx.when(waiting, |fx| unlink(fx, record, node));
-            lo.call_routine(fx, Routine::Unlock, &[lock]);
-            settle::leave_wait(lo, fx);
-            tasks::waiting_on(lo, fx, 0);
-            unreference(lo, fx, record);
-            lo.release(fx, &message, at);
-            fx.when(cancelled, |fx| {
-                super::fail_cancelled(lo, fx, supply, origin)
-            });
-            fail_closed(lo, fx, supply);
-        });
+        leave_untaken(lo, fx, supply, message, record, node, status, at);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         (fx.int(types::I8, 1), Vec::new())
     });
     fx.b.ins()
         .trap(cranelift_codegen::ir::TrapCode::user(1).expect("a trap code"));
+}
+
+/// Leaves a post whose message the component task has not taken once it is removed, or once
+/// the call is cancelled while the message waits in the intake, which it then leaves: the
+/// message is released and the call fails with the cancellation or as closed. The caller holds
+/// the runner's lock.
+#[allow(clippy::too_many_arguments)]
+pub fn leave_untaken(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    message: &Ty,
+    record: Value,
+    node: Value,
+    status: Value,
+    at: Value,
+) {
+    let removed = fx.b.ins().icmp_imm_s(IntCC::Equal, status, status::REMOVED);
+    let waiting = fx.b.ins().icmp_imm_s(IntCC::Equal, status, 0);
+    let origin = super::origin(lo, fx);
+    let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, origin, 0);
+    let cancelled = fx.b.ins().band(cancelled, waiting);
+    let leaving = fx.b.ins().bor(removed, cancelled);
+    fx.when(leaving, |fx| {
+        fx.when(waiting, |fx| unlink(fx, record, node));
+        leave_post(lo, fx, record);
+        lo.release(fx, message, at);
+        fx.when(cancelled, |fx| {
+            super::fail_cancelled(lo, fx, supply, origin)
+        });
+        fail_closed(lo, fx, supply);
+    });
 }

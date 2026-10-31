@@ -1120,6 +1120,16 @@ impl Checker<'_> {
                 }
                 None
             }
+            ItemKind::Protocol(protocol) => {
+                if let SigKind::Protocol { operations, .. } = &sig.kind {
+                    for (index, (operation, head)) in
+                        protocol.operations.iter().zip(operations).enumerate()
+                    {
+                        self.method_body(item, index, &operation.method, &head.sig);
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }

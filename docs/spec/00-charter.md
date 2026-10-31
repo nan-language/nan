@@ -506,6 +506,7 @@ Each term links to its home, whose definition governs.
 | [state token](05-properties.md#state-tokens) | Zero-size view of machine state. |
 | [statement](06-statements-expressions.md#statements) | One logical line of a body. |
 | [status](18-contracts.md#statuses) | Proven, checked, assumed or open. |
+| [stepper](26-components.md#steppers) | `sys::Stepper[S, Env, M]`, running a component on the task holding it. |
 | [std](28-stdlib.md#std-layers) | Nine packages the reserved std aliases name, and the three platform packages. |
 | [store](12-memory.md#stores) | Manager of values in memory. |
 | [structural property](05-properties.md#structural-properties) | Property computed from structure. |

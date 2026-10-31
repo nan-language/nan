@@ -1,0 +1,616 @@
+//! The intake of a runner's record: messages entering it through sends, delays and posts, its stop, and the posts waiting until their messages are taken.
+
+/// The fields of a delayed message's timer after its operation record: its links in its
+/// runner's timers, its relative time, and on a kernel the next timer a cancellation claimed.
+const TIMER_NEXT: u64 = OPERATION_SIZE
+
+const TIMER_PREVIOUS: u64 = OPERATION_SIZE + 8
+
+const TIMER_SPEC: u64 = OPERATION_SIZE + 16
+
+const TIMER_CLAIMED: u64 = OPERATION_SIZE + 32
+
+const COMPONENTS_TIMER_SIZE: u64 = OPERATION_SIZE + 40
+
+/// Cancels the timers of a runner's delayed messages. On a kernel, where a cancelled timer
+/// completes at once, it only claims them, giving the chain of those it claimed, whose
+/// completions the caller delivers once it has released the lock. The caller holds the lock.
+fn cancel_timers(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> Option[clif::Value] {
+    let first_timer = mut fx.load(PTR, addr: record, offset: RUNNER_TIMERS)
+    if lo.seeded() or not lo.kernel() {
+        discard mut fx.repeat(Array[clif::Value, 1].filled(first_timer).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let op = walk_state[0]
+            let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+            let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                mut lo2.cancel_operation(mut fx2, op)
+                var stepped = mem::List[clif::Value].empty(fx2.alloc)
+                mut stepped.push(mut fx2.load(PTR, addr: op, offset: TIMER_NEXT))
+                return stepped
+            }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                var ended = mem::List[clif::Value].empty(fx2.alloc)
+                mut ended.push(mut fx2.ptr(0))
+                return ended
+            })
+            return Pass(again: present, next: take next)
+        })
+        return None
+    }
+    let zero = mut fx.ptr(0)
+    var initial = Array[clif::Value, 2].filled(first_timer)
+    initial[1] = zero
+    let claimed = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let op = walk_state[0]
+        let chain = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+        var results = Array[clif::Type, 2].filled(PTR)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let taken = mut lo2.kernel_claim(mut fx2, op)
+            mut fx2.store(chain, addr: op, offset: TIMER_CLAIMED)
+            let kept = mut fx2.b.select(taken, x: op, y: chain)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: op, offset: TIMER_NEXT))
+            mut stepped.push(kept)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            mut ended.push(chain)
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect claimed.len() == 2
+    return Some(claimed[1])
+} cancel_timers
+
+/// Delivers the cancelled completions of the timers `cancel_timers` claimed.
+fn complete_claimed(mut lo: Lowering, mut fx: Fx, claimed: Option[clif::Value]) {
+    let Some(head) = claimed else {
+        return
+    }
+    discard mut fx.repeat(Array[clif::Value, 1].filled(head).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let op = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_op = mut fx2.load(PTR, addr: op, offset: TIMER_CLAIMED)
+            mut lo2.kernel_cancelled(mut fx2, op)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_op)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+} complete_claimed
+
+/// Stops a runner's intake: no message enters it afterwards, the delayed messages are released
+/// and their timers cancelled, and the task waiting for a message wakes.
+fn components_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value, message: ty::Ty) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: record, offset: RUNNER_STOPPED)
+    let delayed = mut fx.load(PTR, addr: record, offset: RUNNER_DELAYED)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: RUNNER_DELAYED)
+    let claimed = cancel_timers(mut lo, mut fx, record)
+    wake_component(mut lo, mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    complete_claimed(mut lo, mut fx, claimed)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(delayed).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let node = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_node = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            let held = mut fx2.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+            mut lo2.release(mut fx2, ty: message, address: held)
+            discard mut lo2.call_routine(mut fx2, routine: Routine.Free, args: Array[clif::Value, 1].filled(node).view())
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_node)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+} components_stop
+
+/// Takes a message a task of another domain posted into the component task's domain, before
+/// the post completes; the caller holds the runner's lock.
+fn take_posted(mut lo: Lowering, mut fx: Fx, message: ty::Ty, address: clif::Value, poster: clif::Value) {
+    if not mut lo.transfers(message) {
+        return
+    }
+    let from = mut fx.load(PTR, addr: poster, offset: TASK_DOMAIN)
+    let domain = current_domain(mut lo, mut fx)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: from, y: domain)
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.transfer(mut fx1, ty: message, address, lift: domain, owner: domain)
+    })
+} take_posted
+
+/// Gives a reply to a poster of another domain than the component task's; the caller holds the
+/// runner's lock.
+fn give_posted(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, poster: clif::Value) {
+    if not mut lo.transfers(ty) {
+        return
+    }
+    let to = mut fx.load(PTR, addr: poster, offset: TASK_DOMAIN)
+    let domain = current_domain(mut lo, mut fx)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: to, y: domain)
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.transfer(mut fx1, ty, address, lift: to, owner: to)
+    })
+} give_posted
+
+/// Wakes a runner's component task when it waits for a message. The caller holds the lock.
+fn wake_component(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let idle_word = mut fx.load(PTR, addr: record, offset: RUNNER_IDLE)
+    let idle = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: idle_word, y: 0)
+    mut fx.if_true(idle, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: RUNNER_IDLE)
+        let component = mut fx1.load(PTR, addr: record, offset: RUNNER_COMPONENT)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(component).view())
+    })
+} wake_component
+
+/// Appends an entry to a runner's intake, waking the component task. The caller holds the lock.
+fn components_append(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::Value) {
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+    let newest = mut fx.load(PTR, addr: record, offset: RUNNER_NEWEST)
+    mut fx.store(newest, addr: node, offset: COMPONENTS_ENTRY_PREVIOUS)
+    let has_newest = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: newest, y: 0)
+    discard mut fx.choose(has_newest, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(node, addr: newest, offset: COMPONENTS_ENTRY_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(node, addr: record, offset: RUNNER_OLDEST)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.store(node, addr: record, offset: RUNNER_NEWEST)
+    wake_component(mut lo, mut fx, record)
+} components_append
+
+/// Removes an entry from a runner's intake. The caller holds the lock.
+fn components_unlink(mut fx: Fx, record: clif::Value, node: clif::Value) {
+    let next = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+    let previous = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_PREVIOUS)
+    let has_previous = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+    discard mut fx.choose(has_previous, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: previous, offset: COMPONENTS_ENTRY_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: record, offset: RUNNER_OLDEST)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+    discard mut fx.choose(has_next, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(previous, addr: next, offset: COMPONENTS_ENTRY_PREVIOUS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(previous, addr: record, offset: RUNNER_NEWEST)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} components_unlink
+
+/// A new entry holding a message, drawn through a runner's allocator; traps when it is
+/// exhausted.
+fn components_new_entry(mut lo: Lowering, mut fx: Fx, record: clif::Value, message: ty::Ty, held: Held) -> clif::Value {
+    let laid = mut lo.layout_of(message)
+    let cell = mut fx.load(PTR, addr: record, offset: RUNNER_CELL)
+    let size = mut fx.ptr(COMPONENTS_ENTRY_MESSAGE + laid.contents().size)
+    var aligned: u64 = 8
+    if laid.contents().align > 8 {
+        aligned = laid.contents().align
+    }
+    let align = mut fx.ptr(aligned)
+    var alloc_args = Array[clif::Value, 3].filled(cell)
+    alloc_args[1] = size
+    alloc_args[2] = align
+    let node_values = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect node_values.len() == 1
+    let node = node_values[0]
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: node, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let zero = mut fx.ptr(0)
+    let header = mut fx.ptr(COMPONENTS_ENTRY_MESSAGE)
+    var fill_args = Array[clif::Value, 3].filled(node)
+    fill_args[1] = zero
+    fill_args[2] = header
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+    mut lo.store_held(mut fx, address: at, held, ty: message)
+    return node
+} components_new_entry
+
+/// `mut cx.send(m)`, and `after` with no delay: appends `m` to the intake, or releases it once
+/// the intake has stopped.
+fn send_now(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, held: Held) {
+    let message = supply.type_arg(lo, index: 0)
+    let node = components_new_entry(mut lo, mut fx, record, message, held)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let stopped_word = mut fx.load(PTR, addr: record, offset: RUNNER_STOPPED)
+    let stopped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stopped_word, y: 0)
+    discard mut fx.choose_in(mut lo, condition: stopped, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let at = mut fx1.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+        mut lo1.release(mut fx1, ty: message, address: at)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Free, args: Array[clif::Value, 1].filled(node).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        components_append(mut lo1, fx: mut fx1, record, node)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    supply.done(mut lo, mut fx)
+} send_now
+
+/// `mut cx.after(ms: n, send: m)` and `mut cx.after_ns(ns: n, send: m)`: `m` enters the intake
+/// once `n` milliseconds or nanoseconds have elapsed and the elapsed time of the executor's clock
+/// is a multiple of the executor's resolution, through a timer whose expiry moves the messages
+/// due.
+fn components_after(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let message = supply.type_arg(lo, index: 0)
+    let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let ns = if supply.path.as_str() == "sys::Cx.after" {
+        from_ms(mut fx, ms: supply.param(1).scalar_value())
+    } else {
+        supply.param(1).scalar_value()
+    }
+    let held = supply.param(2)
+    let immediate = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ns, y: 0)
+    mut fx.if_true(immediate, then: fn[mut lo](mut fx1: Fx) {
+        send_now(mut lo, fx: mut fx1, supply, record, held)
+    })
+    let node = components_new_entry(mut lo, mut fx, record, message, held)
+    let size = mut fx.ptr(COMPONENTS_TIMER_SIZE)
+    let op = mut lo.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: op, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let after_kind = mut fx.ptr(u64.fit(TASKS_KIND_AFTER))
+    mut fx.store(after_kind, addr: op, offset: OPERATION_KIND)
+    mut fx.store(record, addr: op, offset: OPERATION_TASK)
+    let spec = mut fx.offset(op, offset: TIMER_SPEC)
+    let origin = mut fx.load(PTR, addr: record, offset: RUNNER_ORIGIN)
+    let resolution = mut fx.load(PTR, addr: record, offset: RUNNER_RESOLUTION)
+    let now = mut lo.now_ns(mut fx)
+    let delay = on_grid(mut fx, now, origin, resolution, ns)
+    let deadline = due_after(mut fx, now, delay)
+    mut fx.store(deadline, addr: node, offset: COMPONENTS_ENTRY_DEADLINE)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let stopped_word = mut fx.load(PTR, addr: record, offset: RUNNER_STOPPED)
+    let stopped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stopped_word, y: 0)
+    discard mut fx.choose_in(mut lo, condition: stopped, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let at = mut fx1.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+        mut lo1.release(mut fx1, ty: message, address: at)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Free, args: Array[clif::Value, 1].filled(node).view())
+        mut lo1.record_free(mut fx1, address: op)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let order = mut fx1.load(PTR, addr: record, offset: RUNNER_ORDER)
+        let bumped = mut fx1.b.iadd_imm_s(order, y: 1)
+        mut fx1.store(bumped, addr: record, offset: RUNNER_ORDER)
+        mut fx1.store(bumped, addr: node, offset: COMPONENTS_ENTRY_ORDER)
+        insert_delayed(mut fx1, record, node, deadline)
+        let timers = mut fx1.load(PTR, addr: record, offset: RUNNER_TIMERS)
+        mut fx1.store(timers, addr: op, offset: TIMER_NEXT)
+        let has_timers = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: timers, y: 0)
+        mut fx1.if_true(has_timers, then: fn(mut fx2: Fx) {
+            mut fx2.store(op, addr: timers, offset: TIMER_PREVIOUS)
+        })
+        mut fx1.store(op, addr: record, offset: RUNNER_TIMERS)
+        let count = mut fx1.load(PTR, addr: record, offset: RUNNER_TIMER_COUNT)
+        let more = mut fx1.b.iadd_imm_s(count, y: 1)
+        mut fx1.store(more, addr: record, offset: RUNNER_TIMER_COUNT)
+        components_reference(mut fx1, record)
+        mut lo1.arm_timer(mut fx1, op, ns: delay, spec)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    supply.done(mut lo, mut fx)
+} components_after
+
+/// Inserts a delayed entry after every delayed entry whose deadline is not later than its own.
+/// The caller holds the lock.
+fn insert_delayed(mut fx: Fx, record: clif::Value, node: clif::Value, deadline: clif::Value) {
+    let first_delayed = mut fx.load(PTR, addr: record, offset: RUNNER_DELAYED)
+    let zero = mut fx.ptr(0)
+    var initial = Array[clif::Value, 2].filled(zero)
+    initial[1] = first_delayed
+    discard mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let previous = walk_state[0]
+        let current = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let later_values = mut fx1.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let due = mut fx2.load(PTR, addr: current, offset: COMPONENTS_ENTRY_DEADLINE)
+            var compared = mem::List[clif::Value].empty(fx2.alloc)
+            mut compared.push(mut fx2.b.icmp(clif::IntCC.UnsignedGreaterThan, x: due, y: deadline))
+            return compared
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var at_end = mem::List[clif::Value].empty(fx2.alloc)
+            mut at_end.push(mut fx2.int(clif::Type.Int8, value: 1))
+            return at_end
+        })
+        expect later_values.len() == 1
+        let later = later_values[0]
+        mut fx1.if_true(later, then: fn(mut fx2: Fx) {
+            mut fx2.store(current, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            let has_previous = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+            discard mut fx2.choose(has_previous, results: mem::List[clif::Type].empty(fx2.alloc).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                mut fx3.store(node, addr: previous, offset: COMPONENTS_ENTRY_NEXT)
+                return mem::List[clif::Value].empty(fx3.alloc)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                mut fx3.store(node, addr: record, offset: RUNNER_DELAYED)
+                return mem::List[clif::Value].empty(fx3.alloc)
+            })
+        })
+        let next_values = mut fx1.choose(later, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var kept = mem::List[clif::Value].empty(fx2.alloc)
+            mut kept.push(current)
+            return kept
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: current, offset: COMPONENTS_ENTRY_NEXT))
+            return stepped
+        })
+        expect next_values.len() == 1
+        let next = next_values[0]
+        let again = mut fx1.b.bxor_imm_s(later, y: 1)
+        var carried = mem::List[clif::Value].empty(fx1.alloc)
+        mut carried.push(current)
+        mut carried.push(next)
+        return Pass(again: again, next: take carried)
+    })
+} insert_delayed
+
+/// What the thread whose ring held a delayed message's timer does once it completes: every
+/// delayed message now due enters the intake, in order, the timer's record is freed and its
+/// reference to the runner's record dropped.
+fn timer_completed(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let record = mut fx.load(PTR, addr: op, offset: OPERATION_TASK)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    let now = mut lo.now_ns(mut fx)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        let first_delayed = mut fx1.load(PTR, addr: record, offset: RUNNER_DELAYED)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: first_delayed, y: 0)
+        let due_values = mut fx1.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let deadline = mut fx2.load(PTR, addr: first_delayed, offset: COMPONENTS_ENTRY_DEADLINE)
+            var compared = mem::List[clif::Value].empty(fx2.alloc)
+            mut compared.push(mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: deadline, y: now))
+            return compared
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var none_due = mem::List[clif::Value].empty(fx2.alloc)
+            mut none_due.push(mut fx2.int(clif::Type.Int8, value: 0))
+            return none_due
+        })
+        expect due_values.len() == 1
+        let due = due_values[0]
+        mut fx1.if_true(due, then: fn[mut lo](mut fx2: Fx) {
+            let next = mut fx2.load(PTR, addr: first_delayed, offset: COMPONENTS_ENTRY_NEXT)
+            mut fx2.store(next, addr: record, offset: RUNNER_DELAYED)
+            components_append(mut lo, fx: mut fx2, record, node: first_delayed)
+        })
+        return Pass(again: due, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let next = mut fx.load(PTR, addr: op, offset: TIMER_NEXT)
+    let previous = mut fx.load(PTR, addr: op, offset: TIMER_PREVIOUS)
+    let has_previous = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+    discard mut fx.choose(has_previous, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: previous, offset: TIMER_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: record, offset: RUNNER_TIMERS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+    mut fx.if_true(has_next, then: fn(mut fx1: Fx) {
+        mut fx1.store(previous, addr: next, offset: TIMER_PREVIOUS)
+    })
+    let count = mut fx.load(PTR, addr: record, offset: RUNNER_TIMER_COUNT)
+    let fewer = mut fx.b.iadd_imm_s(count, y: -1)
+    mut fx.store(fewer, addr: record, offset: RUNNER_TIMER_COUNT)
+    wake_waiter(mut lo, mut fx, record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    mut lo.record_free(mut fx, address: op)
+    components_unreference(mut lo, mut fx, record)
+} timer_completed
+
+/// Fails a post with `SendError.Closed`, or a request with `CallError.Closed` holding it.
+fn components_fail_closed(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(failure_ty) = supply.abi.failure else {
+        expect false
+        return
+    }
+    let send_error = lo.std_ty("task", type_name: "SendError", args: mem::List[ty::Ty].empty(lo.alloc))
+    var value = mut lo.variant_value(mut fx, ty: send_error, variant: "Closed", payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+    if failure_ty != send_error {
+        value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "Closed", payload_values: Array[Held, 1].filled(value).view(), wrapped: None)
+    }
+    let Some(failure) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: failure, held: value, ty: failure_ty)
+    supply.raise_failure(mut fx)
+} components_fail_closed
+
+/// Releases a posted message held at an address.
+fn release_message(mut lo: Lowering, mut fx: Fx, message: ty::Ty, held: Held) {
+    match held {
+        Held.Address(address) => mut lo.release(mut fx, ty: message, address)
+        else => {}
+    }
+} release_message
+
+/// A posted entry and the runner's record it entered.
+struct Enqueued derives Copy {
+    record: clif::Value
+    node: clif::Value
+} Enqueued
+
+/// The steps of a post before it waits: a cancellation point, failing when the call is
+/// cancelled at its start or `out` is stale or the intake has stopped; otherwise `m` enters the
+/// intake in an entry on the posting task's stack, which a request's reply follows. Gives the
+/// runner's record, which the post references, and the entry.
+fn components_enqueue(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, held: Held, reply: Option[clif::Value]) -> Enqueued {
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let origin = tasks_origin(mut lo, mut fx)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        release_message(mut lo, fx: mut fx1, message, held)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin)
+    })
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.OutboxClaim, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let unclaimed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(unclaimed, then: fn[mut lo](mut fx1: Fx) {
+        release_message(mut lo, fx: mut fx1, message, held)
+        components_fail_closed(mut lo, fx: mut fx1, supply)
+    })
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let outbox = snapshot(mut lo, mut fx, handle)
+    let stale = mut fx.b.bxor_imm_s(outbox.live, y: 1)
+    let stopped_word = mut fx.load(PTR, addr: record, offset: RUNNER_STOPPED)
+    let stopped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stopped_word, y: 0)
+    let closed = mut fx.b.bor(stale, y: stopped)
+    mut fx.if_true(closed, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        components_unreference(mut lo, fx: mut fx1, record)
+        release_message(mut lo, fx: mut fx1, message, held)
+        components_fail_closed(mut lo, fx: mut fx1, supply)
+    })
+    let laid = mut lo.layout_of(message)
+    var aligned: u64 = 8
+    if laid.contents().align > 8 {
+        aligned = laid.contents().align
+    }
+    let node = mut fx.slot(COMPONENTS_ENTRY_MESSAGE + laid.contents().size, align: aligned)
+    let zero = mut fx.ptr(0)
+    let header = mut fx.ptr(COMPONENTS_ENTRY_MESSAGE)
+    var fill_args = Array[clif::Value, 3].filled(node)
+    fill_args[1] = zero
+    fill_args[2] = header
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let current = current_task(mut lo, mut fx)
+    mut fx.store(current, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+    mut fx.store(outbox.words[1], addr: node, offset: COMPONENTS_ENTRY_KEY)
+    mut fx.store(outbox.words[2], addr: node, offset: COMPONENTS_ENTRY_KEYED)
+    match reply {
+        Some(written) => mut fx.store(written, addr: node, offset: COMPONENTS_ENTRY_REPLY)
+        None => {}
+    }
+    let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+    mut lo.store_held(mut fx, address: at, held, ty: message)
+    components_append(mut lo, mut fx, record, node)
+    waiting_on(mut lo, mut fx, what: REGIONS_WAITING)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let withdraw = withdraw_post(mut lo)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node)
+    return Enqueued(record: record, node: node)
+} components_enqueue
+
+/// Ends a post that leaves its wait: it stops waiting and drops its reference to the runner.
+/// The caller holds the runner's lock, which this releases.
+fn leave_post(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    leave_wait(mut lo, mut fx)
+    waiting_on(mut lo, mut fx, what: 0)
+    components_unreference(mut lo, mut fx, record)
+} leave_post
+
+/// Waits until the component task takes a posted message, which completes the post. Fails, the
+/// message leaving the intake, with the cancellation when the call is cancelled while it waits
+/// and with `SendError.Closed` once it is removed.
+fn await_taken(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, record: clif::Value, node: clif::Value) {
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    let at = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let status = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_TAKEN)
+        mut fx1.if_true(taken, then: fn[mut lo](mut fx2: Fx) {
+            leave_post(mut lo, fx: mut fx2, record)
+            supply.done(mut lo, fx: mut fx2)
+        })
+        leave_untaken(mut lo, fx: mut fx1, supply, message, record, node, status, at)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        return Pass(again: mut fx1.int(clif::Type.Int8, value: 1), next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} await_taken
+
+/// Leaves a post whose message the component task has not taken once it is removed, or once
+/// the call is cancelled while the message waits in the intake, which it then leaves: the
+/// message is released and the call fails with the cancellation or as closed. The caller holds
+/// the runner's lock.
+fn leave_untaken(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, record: clif::Value, node: clif::Value, status: clif::Value, at: clif::Value) {
+    let removed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_REMOVED)
+    let waiting = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: 0)
+    let origin = tasks_origin(mut lo, mut fx)
+    let interrupted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    let cancelled = mut fx.b.band(interrupted, y: waiting)
+    let leaving = mut fx.b.bor(removed, y: cancelled)
+    mut fx.if_true(leaving, then: fn[mut lo](mut fx1: Fx) {
+        mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
+            components_unlink(mut fx2, record, node)
+        })
+        leave_post(mut lo, fx: mut fx1, record)
+        mut lo.release(mut fx1, ty: message, address: at)
+        mut fx1.if_true(cancelled, then: fn[mut lo](mut fx2: Fx) {
+            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
+        })
+        components_fail_closed(mut lo, fx: mut fx1, supply)
+    })
+} leave_untaken
+
+/// Withdraws a stopped poster's entry from a runner's intake unless the runner has taken or
+/// removed it, marks a taken one so that no reply reaches it, and drops the poster's reference
+/// to the runner.
+fn withdraw_post(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawPost, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = mut fx1.load(PTR, addr: params[0], offset: WAIT_OBJECT)
+        let node = mut fx1.load(PTR, addr: params[0], offset: WAIT_NODE)
+        let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let status = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: 0)
+        mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
+            components_unlink(mut fx2, record, node)
+        })
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: STATUS_TAKEN)
+        mut fx1.if_true(taken, then: fn(mut fx2: Fx) {
+            let withdrawn = mut fx2.ptr(u64.fit(STATUS_WITHDRAWN))
+            mut fx2.store(withdrawn, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+        })
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        components_unreference(mut lo1, fx: mut fx1, record)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_post

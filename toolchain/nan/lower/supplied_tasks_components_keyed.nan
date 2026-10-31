@@ -1,0 +1,348 @@
+//! Keyed tasks: their spawns, held on a stepper until its holder starts them, and the superseding of their keys. A keyed task's node holds its links, its task, key, outbox and region, whether its key was superseded, whether it has ended and whether it is held.
+
+const KEYED_NEXT: u64 = 0
+
+const KEYED_PREVIOUS: u64 = 8
+
+const KEYED_TASK: u64 = 16
+
+const KEYED_KEY: u64 = 24
+
+const COMPONENTS_KEYED_OUTBOX: u64 = 32
+
+const KEYED_REGION: u64 = 40
+
+const KEYED_SUPERSEDED: u64 = 48
+
+const KEYED_ENDED: u64 = 56
+
+const KEYED_RUNNER: u64 = 64
+
+const KEYED_HELD: u64 = 72
+
+const KEYED_SIZE: u64 = 80
+
+/// `mut cx.spawn(key: k, run: f)`: supersedes `k`, then starts a keyed task running `f` with a
+/// new outbox of key `k`, in a region of its own, or holds it on a stepper.
+fn components_spawn(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let run_ty = fn_param(lo, supply, index: 2)
+    let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let key = supply.param(1).scalar_value()
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    supersede_key(mut lo, mut fx, record, key)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let size = mut fx.ptr(REGIONS_REGION_SIZE)
+    let task_region_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
+    expect task_region_values.len() == 1
+    let task_region = task_region_values[0]
+    let keyed_outbox = mut fx.ptr(1)
+    var mint_args = Array[clif::Value, 3].filled(record)
+    mint_args[1] = key
+    mint_args[2] = keyed_outbox
+    let outbox_values = mut lo.call_routine(mut fx, routine: Routine.OutboxMint, args: mint_args.view())
+    expect outbox_values.len() == 1
+    let outbox = outbox_values[0]
+    let node_size = mut fx.ptr(KEYED_SIZE)
+    let node = mut lo.record_alloc(mut fx, size: node_size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: node, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    mut fx.store(key, addr: node, offset: KEYED_KEY)
+    mut fx.store(outbox, addr: node, offset: COMPONENTS_KEYED_OUTBOX)
+    mut fx.store(task_region, addr: node, offset: KEYED_REGION)
+    mut fx.store(record, addr: node, offset: KEYED_RUNNER)
+    components_reference(mut fx, record)
+    let cell = mut fx.load(PTR, addr: record, offset: RUNNER_EXECUTOR)
+    let domain = current_domain(mut lo, mut fx)
+    let done = keyed_done(mut lo)
+    let started = start_task(mut lo, mut fx, fn_ty: run_ty, function: supply.param(2).address_value(), cell, domain, region_record: task_region, owner: node, stack: None, end: None, done)
+    mut fx.store(outbox, addr: started, offset: TASK_ARGUMENT)
+    mut fx.store(started, addr: node, offset: KEYED_TASK)
+    let holding = mut fx.load(PTR, addr: record, offset: RUNNER_HOLDING)
+    let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: holding, y: 0)
+    mut fx.if_true(held, then: fn(mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: node, offset: KEYED_HELD)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    mut fx.store(head, addr: node, offset: KEYED_NEXT)
+    let has_head = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(has_head, then: fn(mut fx1: Fx) {
+        mut fx1.store(node, addr: head, offset: KEYED_PREVIOUS)
+    })
+    mut fx.store(node, addr: record, offset: RUNNER_KEYED)
+    let live = mut fx.load(PTR, addr: record, offset: RUNNER_LIVE_KEYED)
+    let more_live = mut fx.b.iadd_imm_s(live, y: 1)
+    mut fx.store(more_live, addr: record, offset: RUNNER_LIVE_KEYED)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let now = mut fx.b.bxor_imm_s(held, y: 1)
+    mut fx.if_true(now, then: fn[mut lo](mut fx1: Fx) {
+        spawned(mut lo, fx: mut fx1, record: started)
+    })
+    supply.done(mut lo, mut fx)
+} components_spawn
+
+/// Runs `visit` on each keyed task node of a runner, which may free the node. The caller holds
+/// the lock.
+fn each_keyed(mut lo: Lowering, mut fx: Fx, record: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, node: clif::Value)) {
+    let first_keyed = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(first_keyed).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let node = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_node = mut fx2.load(PTR, addr: node, offset: KEYED_NEXT)
+            visit(mut lo2, fx: mut fx2, node)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_node)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+} each_keyed
+
+/// Supersedes a key: every outbox of the key goes stale, the posts waiting through them leave
+/// the intake and every keyed task of the key still running is cancelled. The caller holds the
+/// lock.
+fn supersede_key(mut lo: Lowering, mut fx: Fx, record: clif::Value, key: clif::Value) {
+    each_keyed(mut lo, mut fx, record, visit: fn(mut lo1: Lowering, mut fx1: Fx, node: clif::Value) {
+        let node_key = mut fx1.load(PTR, addr: node, offset: KEYED_KEY)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: node_key, y: key)
+        let superseded = mut fx1.load(PTR, addr: node, offset: KEYED_SUPERSEDED)
+        let live = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: superseded, y: 0)
+        let target = mut fx1.b.band(same, y: live)
+        mut fx1.if_true(target, then: fn[mut lo1](mut fx2: Fx) {
+            supersede_node(mut lo1, fx: mut fx2, node)
+        })
+    })
+    let oldest = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(oldest).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let node = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let after_node = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            let poster = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+            let posted = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: poster, y: 0)
+            let keyed_word = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_KEYED)
+            let keyed_post = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: keyed_word, y: 0)
+            let node_key = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_KEY)
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: node_key, y: key)
+            let posted_keyed = mut fx2.b.band(posted, y: keyed_post)
+            let removed = mut fx2.b.band(posted_keyed, y: same)
+            mut fx2.if_true(removed, then: fn[mut lo2](mut fx3: Fx) {
+                components_unlink(mut fx3, record, node)
+                let status = mut fx3.ptr(u64.fit(STATUS_REMOVED))
+                mut fx3.store(status, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+                discard mut lo2.call_routine(mut fx3, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
+            })
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(after_node)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+} supersede_key
+
+/// Supersedes one keyed task: its outbox goes stale and the task is cancelled unless it has
+/// ended, in which case its node is freed. The caller holds the lock.
+fn supersede_node(mut lo: Lowering, mut fx: Fx, node: clif::Value) {
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: node, offset: KEYED_SUPERSEDED)
+    let outbox = mut fx.load(PTR, addr: node, offset: COMPONENTS_KEYED_OUTBOX)
+    discard mut lo.call_routine(mut fx, routine: Routine.OutboxRetire, args: Array[clif::Value, 1].filled(outbox).view())
+    let ended_word = mut fx.load(PTR, addr: node, offset: KEYED_ENDED)
+    let ended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: ended_word, y: 0)
+    discard mut fx.choose_in(mut lo, condition: ended, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        free_node(mut lo1, fx: mut fx1, node)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let task_region = mut fx1.load(PTR, addr: node, offset: KEYED_REGION)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(task_region).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} supersede_node
+
+/// Supersedes the key of every keyed task of a runner and starts each held one, which that
+/// cancellation then reaches. The caller holds the lock.
+fn supersede_all(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    each_keyed(mut lo, mut fx, record, visit: fn(mut lo1: Lowering, mut fx1: Fx, node: clif::Value) {
+        let held_word = mut fx1.load(PTR, addr: node, offset: KEYED_HELD)
+        let held = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_word, y: 0)
+        let superseded = mut fx1.load(PTR, addr: node, offset: KEYED_SUPERSEDED)
+        let live = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: superseded, y: 0)
+        mut fx1.if_true(live, then: fn[mut lo1](mut fx2: Fx) {
+            supersede_node(mut lo1, fx: mut fx2, node)
+        })
+        mut fx1.if_true(held, then: fn[mut lo1](mut fx2: Fx) {
+            start_node(mut lo1, fx: mut fx2, node)
+        })
+    })
+} supersede_all
+
+/// Starts the held keyed tasks of a stepper's record in the order of their spawns, giving how
+/// many it started. The caller holds the lock.
+fn start_held(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    var initial = Array[clif::Value, 2].filled(zero)
+    initial[1] = head
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let previous = walk_state[0]
+        let current = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next_values = mut fx1.choose(present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: current, offset: KEYED_NEXT))
+            return stepped
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        expect next_values.len() == 1
+        let kept = mut fx1.b.select(present, x: current, y: previous)
+        var carried = mem::List[clif::Value].empty(fx1.alloc)
+        mut carried.push(kept)
+        mut carried.push(next_values[0])
+        return Pass(again: present, next: take carried)
+    })
+    expect found.len() == 2
+    var walk = Array[clif::Value, 2].filled(found[0])
+    walk[1] = zero
+    let counted = mut fx.repeat(walk.view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let current = walk_state[0]
+        let count = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        var results = Array[clif::Type, 2].filled(PTR)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let held_word = mut fx2.load(PTR, addr: current, offset: KEYED_HELD)
+            let held = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_word, y: 0)
+            mut fx2.if_true(held, then: fn[mut lo2](mut fx3: Fx) {
+                start_node(mut lo2, fx: mut fx3, node: current)
+            })
+            let started = mut fx2.b.uextend(PTR, x: held)
+            let more = mut fx2.b.iadd(count, y: started)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: current, offset: KEYED_PREVIOUS))
+            mut stepped.push(more)
+            return stepped
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            mut ended.push(count)
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect counted.len() == 2
+    return counted[1]
+} start_held
+
+/// The count of a runner's keyed tasks that have not ended. The caller holds the lock.
+fn keyed_unended(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    let zero = mut fx.ptr(0)
+    var initial = Array[clif::Value, 2].filled(head)
+    initial[1] = zero
+    let counted = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let current = walk_state[0]
+        let count = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        var results = Array[clif::Type, 2].filled(PTR)
+        let next = mut fx1.choose(present, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let ended = mut fx2.load(PTR, addr: current, offset: KEYED_ENDED)
+            let live = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: ended, y: 0)
+            let widened = mut fx2.b.uextend(PTR, x: live)
+            let more = mut fx2.b.iadd(count, y: widened)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: current, offset: KEYED_NEXT))
+            mut stepped.push(more)
+            return stepped
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            mut ended.push(count)
+            return ended
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect counted.len() == 2
+    return counted[1]
+} keyed_unended
+
+/// Starts a held keyed task. The caller holds the lock.
+fn start_node(mut lo: Lowering, mut fx: Fx, node: clif::Value) {
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: node, offset: KEYED_HELD)
+    let started = mut fx.load(PTR, addr: node, offset: KEYED_TASK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: Array[clif::Value, 1].filled(started).view())
+} start_node
+
+/// Removes a keyed task's node from its runner's list and frees it. The caller holds the lock.
+fn free_node(mut lo: Lowering, mut fx: Fx, node: clif::Value) {
+    let record = mut fx.load(PTR, addr: node, offset: KEYED_RUNNER)
+    let next = mut fx.load(PTR, addr: node, offset: KEYED_NEXT)
+    let previous = mut fx.load(PTR, addr: node, offset: KEYED_PREVIOUS)
+    let has_previous = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+    discard mut fx.choose(has_previous, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: previous, offset: KEYED_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: record, offset: RUNNER_KEYED)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+    mut fx.if_true(has_next, then: fn(mut fx1: Fx) {
+        mut fx1.store(previous, addr: next, offset: KEYED_PREVIOUS)
+    })
+    mut lo.record_free(mut fx, address: node)
+} free_node
+
+/// What the executor thread does once a keyed task has ended: its region is freed, its node too
+/// once its key is superseded, the task waiting for the record's tasks wakes, the task's record
+/// is freed and its reference to the runner's record dropped. Its failure, a cancellation, needs
+/// no release.
+fn keyed_done(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.KeyedDone, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let started = params[0]
+        let node = mut fx1.load(PTR, addr: started, offset: TASK_OWNER)
+        let record = mut fx1.load(PTR, addr: node, offset: KEYED_RUNNER)
+        let lock = mut fx1.offset(record, offset: RUNNER_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: node, offset: KEYED_ENDED)
+        let live = mut fx1.load(PTR, addr: record, offset: RUNNER_LIVE_KEYED)
+        let fewer = mut fx1.b.iadd_imm_s(live, y: -1)
+        mut fx1.store(fewer, addr: record, offset: RUNNER_LIVE_KEYED)
+        let task_region = mut fx1.load(PTR, addr: node, offset: KEYED_REGION)
+        mut lo1.record_free(mut fx1, address: task_region)
+        let superseded_word = mut fx1.load(PTR, addr: node, offset: KEYED_SUPERSEDED)
+        let superseded = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: superseded_word, y: 0)
+        mut fx1.if_true(superseded, then: fn[mut lo1](mut fx2: Fx) {
+            free_node(mut lo1, fx: mut fx2, node)
+        })
+        wake_waiter(mut lo1, fx: mut fx1, record)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut lo1.record_free(mut fx1, address: started)
+        components_unreference(mut lo1, fx: mut fx1, record)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} keyed_done

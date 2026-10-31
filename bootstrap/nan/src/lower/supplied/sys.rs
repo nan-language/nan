@@ -6,9 +6,9 @@
 //! Each operation checks its capability's entry first, reading its state words through a
 //! snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor,
 //! the address and length of its path prefix, and whether it is read-only; a `Net` entry's is
-//! the address and length of the one host it reaches, when restricted. A file,
-//! listener or connection is the entry it was opened through and the holding of its
-//! descriptor; a revoker is the holding of its entry or cell.
+//! the address and length of its host and whether it reaches every host, only that one or
+//! none. A file, listener or connection is the entry it was opened through and the holding of
+//! its descriptor; a revoker is the holding of its entry or cell.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -25,8 +25,10 @@ use super::sims;
 use crate::check::ty::Ty;
 
 /// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
-/// whether it is restricted.
+/// which hosts it reaches: every host, `ONLY_HOST` or `NO_HOST`.
 const FLAGS: u64 = entry::STATE + 24;
+const ONLY_HOST: i64 = 1;
+const NO_HOST: i64 = 2;
 
 /// The render budget of a log record's value.
 const LOG_BUDGET: u64 = 1_024;
@@ -299,15 +301,18 @@ fn descriptor(fx: &mut Fx, address: Value) -> Value {
 
 fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let [network, _, _, restricted] = checked(lo, fx, supply, capability);
-    let restricted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, restricted, 0);
+    let [network, _, _, hosts] = checked(lo, fx, supply, capability);
     match supply.member() {
         "only_host" => {
+            let reached = reaches(lo, fx, supply, capability, hosts, supply.param(1));
+            let only = fx.int(PTR, ONLY_HOST);
+            let none = fx.int(PTR, NO_HOST);
+            let floor = fx.b.ins().select(reached, only, none);
             let host = view(fx, supply.param(1));
-            let floor = fx.ptr(1);
             attenuate(lo, fx, supply, FLAGS, floor, Some(host));
         }
         "listen" => {
+            let restricted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, hosts, 0);
             fx.when(restricted, |fx| fail_with(lo, fx, supply, "Denied"));
             if lo.seeded() {
                 sims::net::listen(lo, fx, supply, network);
@@ -322,14 +327,9 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "connect" => {
             let host = supply.param(1);
-            fx.when(restricted, |fx| {
-                let (copy, len) = checked_text(lo, fx, supply, capability);
-                let stored = new_view(fx, copy, len);
-                let same = lo.views_equal(fx, stored, host);
-                lo.record_free(fx, copy);
-                let other = fx.b.ins().bxor_imm_s(same, 1);
-                fx.when(other, |fx| fail_with(lo, fx, supply, "Denied"));
-            });
+            let reached = reaches(lo, fx, supply, capability, hosts, host);
+            let denied = fx.b.ins().bxor_imm_s(reached, 1);
+            fx.when(denied, |fx| fail_with(lo, fx, supply, "Denied"));
             if lo.seeded() {
                 sims::net::connect(lo, fx, supply, network);
                 return;
@@ -343,6 +343,31 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         member => panic!("no lowering of sys::Net.{member}"),
     }
+}
+
+/// Whether the `Net` held at `capability`, whose entry's flags word is `hosts`, reaches
+/// `host`: compared byte for byte with its own host when it reaches only that one.
+fn reaches(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    capability: Value,
+    hosts: Value,
+    host: Held,
+) -> Value {
+    let only = fx.b.ins().icmp_imm_s(IntCC::Equal, hosts, ONLY_HOST);
+    fx.choose(
+        only,
+        &[types::I8],
+        |fx| {
+            let (copy, len) = checked_text(lo, fx, supply, capability);
+            let stored = new_view(fx, copy, len);
+            let same = lo.views_equal(fx, stored, host);
+            lo.record_free(fx, copy);
+            vec![same]
+        },
+        |fx| vec![fx.b.ins().icmp_imm_s(IntCC::Equal, hosts, 0)],
+    )[0]
 }
 
 fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {

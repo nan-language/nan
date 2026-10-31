@@ -388,7 +388,7 @@ fn main(take world: host::World) fails GreetError uses wait {
 
 ## Attenuation
 
-**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
+**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received and the source's `connect` does not deny that `host`, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
 
 - A std attenuation other than `split` adds an entry deriving from its source's entry to its source's table and returns a handle to it. The new entry keeps every restriction of its source, and revoking the source revokes it. An implementation may instead return a handle to an existing entry with the same source and restriction.
 - Any code may attenuate: a type whose private field holds a capability and whose methods expose less authority attenuates it.
@@ -420,6 +420,34 @@ test reading_rounds_down for millisecond_reading {
     let reading = try millisecond_reading(world.clock)
     expect reading == 1_000_000
 } reading_rounds_down
+```
+
+```nan
+pub fn denies(net: sys::Net, host: Str) -> bool fails task::Cancelled uses wait {
+    let outcome = attempt await net.connect(host, port: 7)
+    var denied = false
+    match outcome {
+        Ok(conn) => take conn.abandon()
+        Err(failure) => {
+            denied = match failure {
+                sys::net::NetError.Denied => true
+                else => false
+            }
+        }
+    }
+    return denied
+} denies
+
+test narrowing_keeps_the_host for denies {
+    let world = testing::world()
+    let narrow = try world.net.only_host("localhost")
+    let same = try narrow.only_host("localhost")
+    let other = try narrow.only_host("127.0.0.1")
+    let kept = try await denies(same, host: "localhost")
+    let moved = try await denies(other, host: "127.0.0.1")
+    expect not kept
+    expect moved
+} narrowing_keeps_the_host
 ```
 
 ## Protocol phases

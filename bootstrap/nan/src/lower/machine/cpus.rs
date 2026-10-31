@@ -37,8 +37,9 @@ const PSCI_PRESENT_MAX: i64 = 2;
 /// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
 /// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
 /// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
-/// millisecond; and whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
-/// interrupts.
+/// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
+/// interrupts; and whether the dispatcher running installed devices defers the end of the
+/// interrupt their `hw::IrqContext.complete` would make.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -56,6 +57,7 @@ pub mod cpu {
     pub const NEXT_PACE: u64 = 256;
     pub const TIMER_RATE: u64 = 264;
     pub const WAITING: u64 = 272;
+    pub const DEFERRED: u64 = 280;
     pub const SIZE: u64 = 320;
 }
 
@@ -92,6 +94,12 @@ impl Lowering<'_, '_> {
         fx.b.ins().iadd(cpus, offset)
     }
 
+    /// The hardware id recorded for CPU `index`.
+    pub fn hardware_id(&mut self, fx: &mut Fx, index: Value) -> Value {
+        let record = self.cpu_record(fx, index);
+        fx.load(PTR, record, cpu::HARDWARE_ID)
+    }
+
     /// The number of the CPU running the caller.
     pub fn running_index(&mut self, fx: &mut Fx) -> Value {
         let thread_record = self.thread(fx);
@@ -106,7 +114,8 @@ impl Lowering<'_, '_> {
 
     /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
     /// register addresses from now on; the boot CPU's data-independent timing mode; on a kernel,
-    /// its clock started and a CPU for each processor the platform reports; an executor thread
+    /// its clock started, on x86_64 the local APICs' mode chosen, and a CPU for each processor
+    /// the platform reports; an executor thread
     /// record for each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
     /// the boot CPU's descriptor tables loaded and AVX enabled when it has it.
     pub fn machine_init(&mut self, fx: &mut Fx) {
@@ -117,7 +126,10 @@ impl Lowering<'_, '_> {
             self.start_clock(fx);
         }
         let count = match (self.kernel(), self.ck.db.target.arch()) {
-            (true, Some(Arch::Amd64)) => self.discover(fx, boot),
+            (true, Some(Arch::Amd64)) => {
+                self.choose_apic_mode(fx);
+                self.discover(fx, boot)
+            }
             (true, Some(Arch::Aarch64)) => self.aarch64_discover(fx, boot),
             _ => fx.ptr(1),
         };
@@ -264,7 +276,7 @@ impl Lowering<'_, '_> {
 
     /// The number of CPUs the platform reports as usable, at least 1 and at most `MAX_CPUS`,
     /// recording each one's local APIC id in its record: the boot CPU's first, then the others
-    /// in the order of the MADT.
+    /// in the order of the MADT's local APIC and local x2APIC entries.
     fn discover(&mut self, fx: &mut Fx, boot: Value) -> Value {
         let own = self.local_apic_id(fx);
         fx.store(own, boot, cpu::HARDWARE_ID);
@@ -289,13 +301,19 @@ impl Lowering<'_, '_> {
                         let kind = fx.b.ins().load(types::I8, unaligned(), at, 0);
                         let len = fx.b.ins().load(types::I8, unaligned(), at, 1);
                         let len = fx.b.ins().uextend(PTR, len);
-                        let processor = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+                        let apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+                        let x2apic = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, MADT_X2APIC);
+                        let processor = fx.b.ins().bor(apic, x2apic);
                         fx.when(processor, |fx| {
-                            let flags = load_u32(fx, at, 4);
+                            let short_flags = load_u32(fx, at, 4);
+                            let wide_flags = load_u32(fx, at, 8);
+                            let flags = fx.b.ins().select(x2apic, wide_flags, short_flags);
                             let usable = fx.b.ins().band_imm_s(flags, PROCESSOR_ENABLED);
                             let usable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, usable, 0);
-                            let id = fx.b.ins().load(types::I8, unaligned(), at, 3);
-                            let id = fx.b.ins().uextend(PTR, id);
+                            let short_id = fx.b.ins().load(types::I8, unaligned(), at, 3);
+                            let short_id = fx.b.ins().uextend(PTR, short_id);
+                            let wide_id = load_u32(fx, at, 4);
+                            let id = fx.b.ins().select(x2apic, wide_id, short_id);
                             let other = fx.b.ins().icmp(IntCC::NotEqual, id, own);
                             let counted = fx.b.use_var(count);
                             let room = fx.b.ins().icmp_imm_s(
@@ -443,7 +461,10 @@ const SDT_HEADER: u64 = 36;
 const MADT_SIGNATURE: i64 = 0x4349_5041;
 const MADT_ENTRIES: u64 = 44;
 
-/// The flag of a MADT processor entry saying its processor is enabled and ready for use.
+/// The kind of a MADT local x2APIC entry, whose id and flags are words at offsets 4 and 8
+/// where a local APIC entry has a byte id at 3 and its flags at 4, and the flag of either saying
+/// its processor is enabled and ready for use.
+const MADT_X2APIC: i64 = 9;
 const PROCESSOR_ENABLED: i64 = 1;
 
 /// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.

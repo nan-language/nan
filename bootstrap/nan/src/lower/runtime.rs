@@ -410,7 +410,18 @@ pub mod state {
     pub const SHOOTDOWN_LOCK: u64 = 392;
     pub const SHOOTDOWN_SCOPE: u64 = 400;
     pub const SHOOTDOWN_LEFT: u64 = 408;
-    pub const SIZE: u64 = 416;
+    /// On a kernel, the lock of the bindings of installed devices; on an x86_64 kernel, nonzero
+    /// when the local APICs run in x2APIC mode.
+    pub const IRQ_LOCK: u64 = 416;
+    pub const X2APIC: u64 = 424;
+    /// On an AArch64 kernel whose interrupt controller has an ITS: its command queue and the
+    /// offset of the next command, zero without one; the LPI property table; and the number of
+    /// device ids it accepts.
+    pub const ITS_QUEUE: u64 = 432;
+    pub const ITS_WRITE: u64 = 440;
+    pub const ITS_PROPERTIES: u64 = 448;
+    pub const ITS_DEVICES: u64 = 456;
+    pub const SIZE: u64 = 464;
 }
 
 impl Lowering<'_, '_> {

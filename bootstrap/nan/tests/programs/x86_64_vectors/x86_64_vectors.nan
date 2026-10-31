@@ -1,0 +1,228 @@
+//! Checks x2APIC mode, then raises through the HPET's messages one vector of two CPUs with a device each, a vector two devices share and a message-signalled interrupt, each device counting its runs.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The HPET's registers: its configuration, whose low bit starts its counter, the counter's two
+/// halves, and the eight words of each of its first three timers, of which the first is its
+/// configuration, the third and fourth its comparator and the fifth and sixth its message's data
+/// and address.
+registers Hpet {
+    config: u32 at 0x10 read write
+    counter_low: u32 at 0xF0 write
+    counter_high: u32 at 0xF4 write
+    timers: Array[u32, 24] at 0x100 stride 4 read write
+} Hpet
+
+const HPET_BASE: u64 = 0xFED0_0000
+
+/// The HPET's running bit, a timer's bit saying it delivers messages and the bits making it
+/// deliver one when its comparator matches, the counter's ticks before then, about a millisecond,
+/// and the timers the kernel uses.
+const RUNNING: u32 = 1
+
+const MESSAGES: u32 = 0x8000
+
+const DELIVERING: u32 = 0x4004
+
+const DELAY: u32 = 100_000
+
+const TIMERS: usize = 3
+
+/// The model-specific register holding the local APIC's mode and its x2APIC bit, and the base of
+/// a message's address, to which the local APIC id it reaches is added from bit 12.
+const APIC_BASE: u32 = 0x1B
+
+const X2APIC: u64 = 0x400
+
+const MESSAGE_BASE: u64 = 0xFEE0_0000
+
+/// The vector two CPUs each have a device on, the vector two devices share, and the polls of a
+/// device's count before the kernel gives up.
+const PER_CPU_VECTOR: u8 = 0x40
+
+const SHARED_VECTOR: u8 = 0x41
+
+const POLLS: u32 = 50_000_000
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+/// Writes `value` in hexadecimal.
+fn say_hex(value: u64) {
+    var digits = Array[u8, 16].filled(b'0')
+    var rest = value
+    var leading: usize = 15
+    for at in 0..<16usize {
+        let digit = u8.truncate(rest & 0xF)
+        let index = 15 - at
+        if digit < 10 {
+            digits[index] = b'0' + digit
+        } else {
+            digits[index] = b'A' + digit - 10
+        }
+        if digit != 0 {
+            leading = index
+        }
+        rest = rest >> 4
+    }
+    say(text: "0x")
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for at in leading..<16usize {
+        mut uart.write(Uart.data, value: digits[at])
+    }
+    take uart.unmap()
+} say_hex
+
+interrupt fn tally(mut tallied: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    tallied = tallied.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} tally
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let Some(cpu) = mut k.ring0() else {
+        say(text: "ring0 missing\n")
+        loop {
+        }
+    }
+    let base = trusted "the APIC base register only reports the local APIC's base and mode" { cpu.read_msr(APIC_BASE) }
+    check(name: "x2apic", held: (base & X2APIC) != 0)
+    take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 32_768 {
+        if hw::cpu_count() < 4 {
+            say(text: "fewer than 4 cpus\n")
+            return
+        }
+        var hpet = trusted "the board decodes 0xFED0_0000 to the HPET, uncached in the entry root, and nothing else maps it" { hw::Mmio[Hpet].map(HPET_BASE) }
+        if (mut hpet.read_at(Hpet.timers, index: 0) & MESSAGES) == 0 {
+            say(text: "the HPET delivers no messages\n")
+        } else {
+            per_cpu(mut hpet)
+            shared(mut hpet)
+            message_signalled(mut hpet)
+            stop(mut hpet)
+        }
+        take hpet.unmap()
+    })
+} main
+
+/// Installs a device on vector `PER_CPU_VECTOR` of CPU 1 and another on the same vector of
+/// CPU 2, and raises it on CPU 1, then on CPU 2.
+fn per_cpu(mut hpet: hw::Mmio[Hpet]) {
+    let one = hw::IrqShared.install_on(0u64, cpu: 1, vector: PER_CPU_VECTOR, on_irq: tally)
+    let other = hw::IrqShared.install_on(0u64, cpu: 2, vector: PER_CPU_VECTOR, on_irq: tally)
+    stop(mut hpet)
+    arm(mut hpet, timer: 0, address: address_of(cpu: 1), data: u32.widen(PER_CPU_VECTOR))
+    mut hpet.write(Hpet.config, value: RUNNING)
+    let alone = runs(one) == 1
+    stop(mut hpet)
+    arm(mut hpet, timer: 1, address: address_of(cpu: 2), data: u32.widen(PER_CPU_VECTOR))
+    mut hpet.write(Hpet.config, value: RUNNING)
+    let ran = alone and runs(other) == 1 and runs(one) == 1
+    discard take one.uninstall()
+    discard take other.uninstall()
+    check(name: "per-cpu vector", held: ran)
+} per_cpu
+
+/// Installs two devices on vector `SHARED_VECTOR` of every CPU and raises it on CPU 0.
+fn shared(mut hpet: hw::Mmio[Hpet]) {
+    let one = hw::IrqShared.install(0u64, vector: SHARED_VECTOR, on_irq: tally)
+    let other = hw::IrqShared.install(0u64, vector: SHARED_VECTOR, on_irq: tally)
+    stop(mut hpet)
+    arm(mut hpet, timer: 2, address: address_of(cpu: 0), data: u32.widen(SHARED_VECTOR))
+    mut hpet.write(Hpet.config, value: RUNNING)
+    let ran = runs(one) == 1 and runs(other) == 1
+    discard take one.uninstall()
+    discard take other.uninstall()
+    check(name: "shared vector", held: ran)
+} shared
+
+/// Installs a device on a message-signalled interrupt of CPU 3 and has the HPET write its
+/// message.
+fn message_signalled(mut hpet: hw::Mmio[Hpet]) {
+    match hw::IrqShared.install_msi(0u64, cpu: 3, source: 0, on_irq: tally) {
+        Ok(device) => {
+            let message = device.message()
+            let Some(sent) = message else {
+                say(text: "msi without a message\n")
+                discard take device.uninstall()
+                return
+            }
+            stop(mut hpet)
+            arm(mut hpet, timer: 0, address: sent.address, data: sent.data)
+            mut hpet.write(Hpet.config, value: RUNNING)
+            let ran = runs(device) == 1
+            discard take device.uninstall()
+            say(text: "msi data ")
+            say_hex(value: u64.widen(sent.data))
+            say(text: " address ")
+            say_hex(value: sent.address)
+            check(name: "", held: ran)
+        }
+        Err(refusal) => {
+            say(text: "msi refused\n")
+            discard refusal
+        }
+    }
+} message_signalled
+
+/// The address of a message to CPU `cpu`'s local APIC.
+fn address_of(cpu: u32) -> u64 {
+    let Some(id) = hw::cpu_hardware_id(cpu) else {
+        return MESSAGE_BASE
+    }
+    return MESSAGE_BASE | (id << 12)
+} address_of
+
+/// Stops the HPET's counter and every timer the kernel uses, and sets the counter to zero.
+fn stop(mut hpet: hw::Mmio[Hpet]) {
+    mut hpet.write(Hpet.config, value: 0)
+    for timer in 0..<TIMERS {
+        mut hpet.write_at(Hpet.timers, index: 8 * timer, value: 0)
+    }
+    mut hpet.write(Hpet.counter_low, value: 0)
+    mut hpet.write(Hpet.counter_high, value: 0)
+} stop
+
+/// Has timer `timer` write `data` to `address` once the counter reaches `DELAY`.
+fn arm(mut hpet: hw::Mmio[Hpet], timer: usize, address: u64, data: u32)
+    requires timer < TIMERS
+{
+    let at = 8 * timer
+    mut hpet.write_at(Hpet.timers, index: at + 2, value: DELAY)
+    mut hpet.write_at(Hpet.timers, index: at + 3, value: 0)
+    mut hpet.write_at(Hpet.timers, index: at + 4, value: data)
+    mut hpet.write_at(Hpet.timers, index: at + 5, value: u32.truncate(address))
+    mut hpet.write_at(Hpet.timers, index: at, value: DELIVERING)
+} arm
+
+/// The runs a device counts once it counts any, or after `POLLS` polls.
+fn runs(device: hw::IrqShared[u64]) -> u64 {
+    var seen: u64 = 0
+    for _ in 0..<POLLS {
+        seen = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+            return device.with(t, body: fn(mut tallied: u64) -> u64 limits notrap, terminates, noalloc {
+                return tallied
+            })
+        })
+        if seen != 0 {
+            break
+        }
+    }
+    return seen
+} runs

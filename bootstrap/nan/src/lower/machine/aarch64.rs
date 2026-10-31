@@ -1,6 +1,6 @@
 //! AArch64 interrupt delivery: the EL1 exception vector table and its common seam, the GICv3 the
-//! descriptor names, the virtual timer of each CPU, and the vectors the dispatcher of
-//! `interrupts.rs` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every
+//! descriptor names, its ITS set up by `its.rs`, the virtual timer of each CPU, and the vectors
+//! the dispatcher of `interrupts.rs` finds for what the seam took. Kernel code runs on `SP_EL0`, so that every
 //! exception switches to `SP_EL1`, the CPU's interrupt stack.
 
 use cranelift_codegen::binemit::Reloc;
@@ -223,9 +223,10 @@ const ABORT_CLASS_BITS: i64 = 0x3A;
 const ABORT_CLASS: i64 = 0x20;
 
 /// The virtual timer's private interrupt; the interrupt controller reports a spurious interrupt
-/// with an identifier of at least `SPURIOUS`.
+/// with one of the `SPECIAL` identifiers from `SPURIOUS`.
 const TIMER_INTID: i64 = 27;
 const SPURIOUS: i64 = 1020;
+const SPECIAL: i64 = 4;
 
 pub(super) const VECTORS: Vectors = Vectors {
     stop: None,
@@ -234,14 +235,15 @@ pub(super) const VECTORS: Vectors = Vectors {
     aborts: &[SERROR_VECTOR],
     page_fault: ABORT_VECTOR,
     installable_end: Some(256),
+    lpis: true,
 };
 
 /// The GICv3 the descriptor names: its distributor, and the first CPU's redistributor, each
 /// CPU's a stride after the previous one with its frame of software-generated and private
 /// interrupts a page after its control frame.
-const GICD: u64 = 0x0800_0000;
-const GICR: u64 = 0x080A_0000;
-const GICR_STRIDE: u64 = 0x2_0000;
+pub(super) const GICD: u64 = 0x0800_0000;
+pub(super) const GICR: u64 = 0x080A_0000;
+pub(super) const GICR_STRIDE: u64 = 0x2_0000;
 const GICR_SGI: u64 = 0x1_0000;
 
 /// The distributor's registers the kernel programs: its control register, set to affinity
@@ -306,8 +308,8 @@ impl Lowering<'_, '_> {
 
     /// Sets up the GICv3 for a kernel's executor and gives the glue each CPU runs to take
     /// interrupts. The distributor routes with affinity, puts every shared peripheral interrupt
-    /// in group 1 and enables each that a contribution binds; the glue enables the private
-    /// interrupts on each CPU.
+    /// in group 1 and enables each that a contribution binds, routed to the boot CPU, and the
+    /// ITS is set up; the glue enables the private interrupts on each CPU.
     pub fn aarch64_interrupt_setup(&mut self, fx: &mut Fx) -> FuncId {
         let ctlr = fx.ptr(GICD + GICD_CTLR);
         let groups = fx.ptr(GICD_ARE_GROUPS);
@@ -325,29 +327,30 @@ impl Lowering<'_, '_> {
                 SIGNAL_VECTOR => {}
                 32.. => {
                     let vector = fx.ptr(entry.vector as u64);
-                    self.aarch64_enable(fx, vector);
+                    let boot = fx.ptr(0);
+                    self.aarch64_route(fx, vector, boot);
                 }
                 _ => {}
             }
         }
+        self.its_setup(fx);
         let dispatch = self.dispatcher(&bound);
         let preempt = self.preempt_glue();
         let vbar = self.aarch64_vector_seam(dispatch, preempt);
         self.aarch64_cpu_prepare(vbar, private)
     }
 
-    /// Enables a shared peripheral interrupt, routed to the boot CPU, for a contribution's
-    /// binding or `hw::IrqShared.install`.
-    pub fn aarch64_enable(&mut self, fx: &mut Fx, vector: Value) {
-        let boot = self.cpu_records(fx);
-        let affinity = fx.load(PTR, boot, cpu::HARDWARE_ID);
+    /// Enables a shared peripheral interrupt routed to CPU `cpu`, for a contribution's binding or
+    /// an installed device.
+    pub fn aarch64_route(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
+        let affinity = self.hardware_id(fx, cpu);
         let route = fx.b.ins().ishl_imm_s(vector, 3);
         let route = fx.b.ins().iadd_imm_s(route, (GICD + GICD_IROUTER) as i64);
         self.mmio_write(fx, 8, route, affinity);
         self.gic_spi_bit(fx, GICD_ISENABLER, vector);
     }
 
-    /// Disables a shared peripheral interrupt, for `hw::IrqShared.uninstall`.
+    /// Disables a shared peripheral interrupt, once no installed device is left on it.
     pub fn aarch64_disable(&mut self, fx: &mut Fx, vector: Value) {
         self.gic_spi_bit(fx, GICD_ICENABLER, vector);
     }
@@ -394,9 +397,8 @@ impl Lowering<'_, '_> {
     /// table into `VBAR_EL1`. It then wakes its redistributor, puts the stop interrupt in group 0
     /// and its other software-generated and private interrupts in group 1, enables the stop
     /// interrupt, the CPU signal's, the timer's and the private interrupts in `private`, enables
-    /// its GIC CPU
-    /// interface at the lowest priority, unmasks fast interrupts, and starts and enables its
-    /// virtual timer.
+    /// its LPIs when the ITS is set up, enables its GIC CPU interface at the lowest priority,
+    /// unmasks fast interrupts, and starts and enables its virtual timer.
     /// Maskable interrupts stay disabled until the executor enables them.
     fn aarch64_cpu_prepare(&mut self, vbar: FuncId, private: u64) -> FuncId {
         let signature = Signature::new(super::super::CALL_CONV);
@@ -439,6 +441,7 @@ impl Lowering<'_, '_> {
             let bits =
                 fx.ptr((1 << STOP_INTID) | (1 << SIGNAL_INTID) | (1 << TIMER_INTID) | private);
             lo.mmio_write(fx, 4, enable, bits);
+            lo.its_cpu(fx, base);
             let sre = lo.read_sysreg(fx, ICC_SRE_EL1);
             let sre = fx.b.ins().bor_imm_s(sre, 1);
             lo.write_sysreg(fx, ICC_SRE_EL1, sre);
@@ -469,8 +472,9 @@ impl Lowering<'_, '_> {
     }
 
     /// The vector of what the seam took, from the kind of exception it passes: for an IRQ the
-    /// interrupt the controller signals, which this acknowledges, or the CPU signal's vector for
-    /// its software-generated interrupt; for a synchronous exception
+    /// interrupt the controller signals, which this acknowledges, an LPI's identifier included,
+    /// or the CPU signal's vector for its software-generated interrupt; for a synchronous
+    /// exception
     /// the abort vector or the other one as its syndrome's class gives, and the SError vector for
     /// an SError interrupt. A fast interrupt is the stop a halting CPU sends, which stops this
     /// one; a spurious IRQ returns from the dispatcher at once.
@@ -488,9 +492,10 @@ impl Lowering<'_, '_> {
             &[PTR],
             |lo, fx| {
                 let intid = lo.read_sysreg(fx, ICC_IAR1_EL1);
+                let special = fx.b.ins().iadd_imm_s(intid, -SPURIOUS);
                 let spurious =
                     fx.b.ins()
-                        .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, intid, SPURIOUS);
+                        .icmp_imm_s(IntCC::UnsignedLessThan, special, SPECIAL);
                 fx.when(spurious, |fx| {
                     let zero = fx.ptr(0);
                     fx.b.ins().return_(&[zero]);

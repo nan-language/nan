@@ -48,8 +48,9 @@ const DRAWING: [&str; 28] = [
 const FAILING_DRAWS: [&str; 2] = ["mem::wire::Codec.canonical", "boot::Services.read_file"];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
-/// handles, indexes past an end, duplicate windows, and exhausted capability tables and cells.
-const TRAPPING: [&str; 22] = [
+/// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
+/// exhausted capability tables and cells.
+const TRAPPING: [&str; 25] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -72,6 +73,9 @@ const TRAPPING: [&str; 22] = [
     "hw::sim::Registers.ports",
     "hw::sim::Registers.set_at",
     "hw::sim::Registers.last_written_at",
+    "hw::IrqShared.install",
+    "hw::IrqShared.install_on",
+    "hw::IrqShared.install_msi",
 ];
 
 /// The supplied operations that change an atomic count without a type with interior mutability.

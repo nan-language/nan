@@ -964,7 +964,7 @@ A **machine seam** is a compiler-generated stub at a fixed hardware entry, calli
 | vector n, n from 0 to 255 | the machine targets | on x86_64, an interrupt or exception through gate n; on AArch64, an exception of vector n's kind, or interrupt n of the interrupt controller | the [interrupt fn](24-kernel.md#interrupt-functions) or landing fn bound to n |
 | syscall | the bare targets | the `syscall` instruction on x86_64 and the `svc` instruction on AArch64, in user mode | the landing fn of `hw::syscall_entry` |
 
-- [Platform registries](25-registries.md#platform-registries) and `hw::IrqShared.install` ([locks](24-kernel.md#locks)) bind the vector and syscall seams. [Interrupt functions](24-kernel.md#interrupt-functions) and [kernel halts](24-kernel.md#kernel-halts) state what a vector seam without a binding does, and platform registries what the syscall seam does without one.
+- [Platform registries](25-registries.md#platform-registries) and the installs of `hw::IrqShared` ([locks](24-kernel.md#locks)) bind the vector and syscall seams. [Interrupt functions](24-kernel.md#interrupt-functions) and [kernel halts](24-kernel.md#kernel-halts) state what a vector seam without a binding does, and platform registries what the syscall seam does without one.
 - A seam saves the interrupted state, switches to its context's stack, passes its function the arguments that function's kind receives, and restores the state that function's result selects. [Kernel execution model](24-kernel.md) fixes the saved state and stacks.
 
 ### Compiler stubs

@@ -31,6 +31,8 @@ pub open struct Anchor[S: Any and Send] {
 pub fn Anchor.with[R: Any, E](body: fn(state: S) -> R fails E) -> Option[R] fails E limits notrap, terminates, noalloc
 
 pub fn cpu_count() -> u32 limits pure, notrap, terminates
+
+pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 ```
 
 - The [entry function](27-program-model.md#entry) of a bare target's image starts on the boot CPU with maskable interrupts disabled and every other CPU stopped, on `x86_64-bare` with SSE enabled and AVX enabled when the CPU has it, and on `aarch64-bare` with floating point and Advanced SIMD enabled.
@@ -40,6 +42,7 @@ pub fn cpu_count() -> u32 limits pure, notrap, terminates
 - The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64 and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on `x86_64-bare`, the entries of type 1 of the start-info memory map, on `aarch64-bare`, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable. CPUs are numbered from 0, the boot CPU being 0.
+- `hw::cpu_hardware_id(n)` returns `Some` of the hardware id of CPU n, its local APIC id on x86_64 and its affinity on AArch64, the `MPIDR_EL1` affinity fields at the positions `GICD_IROUTER` holds them, and `None` when n is not below `hw::cpu_count()`. On the host targets the hardware id of CPU n is n.
 - `hw::Anchor[S]` has no values; it names the anchor of type S.
 - On x86_64, each CPU's **CPU tables** are a global descriptor table holding a null descriptor, 64-bit code and data segments of privilege level 0, data and 64-bit code segments of privilege level 3, and the CPU's task-state segment, whose interrupt stack table entries 1 to 7 hold the tops of the CPU's interrupt stacks. On `x86_64-bare` the program entry seam loads the boot CPU's tables; on `x86_64-uefi`, `exit_services` does ([firmware services](#firmware-services)). Step 2 of `anchor` loads those of every other CPU. AArch64 has no CPU tables.
 
@@ -184,7 +187,8 @@ The head of an interrupt fn has no generic parameters, `fails` or `uses wait`, i
 - An interrupt fn's digest is checked as if its head stated `limits notrap, terminates, noalloc` ([limits](10-effects-digests.md#limits)). Its limits clause states only the `stack N` that [static bounds](17-suspension-io.md#static-bounds) requires and a [class](10-effects-digests.md#reversibility); any other limit there is an error (`kernel.irq-limit`) whose exact fix deletes it.
 - An `interrupt fn` [function type](10-effects-digests.md#function-types) has the parameters and result of one form and no `fails` or `uses wait` (`kernel.irq-head`), and its limits clause states at most `stack N` (`kernel.irq-limit`). Its values carry the implied limits.
 - A call of an interrupt fn, or of a value of an `interrupt fn` type, is an error (`kernel.irq-call`).
-- `irq.complete()` ends the interrupt it serves, writing the end-of-interrupt register of the CPU's local APIC on x86_64 and of the CPU's interface of the interrupt controller on AArch64. `hw::IrqContext` is [linear](05-properties.md#linear-types), so every path completes it.
+- `irq.vector()` is the vector of the interrupt it serves, 0 for a message-signalled interrupt on AArch64, which has no vector ([locks](#locks)).
+- `irq.complete()` ends the interrupt it serves, writing the end-of-interrupt register of the CPU's local APIC on x86_64 and of the CPU's interface of the interrupt controller on AArch64. For a device that `hw::IrqShared` installs, the seam ends the interrupt instead, once the interrupt fn of every device the interrupt reaches has returned. `hw::IrqContext` is [linear](05-properties.md#linear-types), so every path completes it.
 - `frame.set_ip(ip)` makes the interrupted code resume at `ip`. It is a [trusted primitive](23-low-level.md#trusted-primitives) whose soundness condition is that execution may continue at `ip` with the saved state.
 
 Contributions bind the interrupt and exception forms through `hw::vectors`, whose entries [platform registries](25-registries.md#platform-registries) check against the class of their vector (`registry.platform-entry`).
@@ -192,8 +196,8 @@ Contributions bind the interrupt and exception forms through `hw::vectors`, whos
 When a vector fires while the CPU runs in **kernel mode**, at privilege level 0 on x86_64 and at EL1 on AArch64, the CPU enters its seam with maskable interrupts disabled, and:
 
 1. The seam saves the interrupted code's general registers on its interrupt stack, and no [extended state](#floating-point).
-2. For a vector bound to an `hw::IrqShared`, it acquires that lock, calls the device's interrupt fn with the device and a new `hw::IrqContext`, and releases the lock. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
-3. On `hw::IrqExit.Reschedule`, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
+2. For an interrupt that reaches devices `hw::IrqShared` installs ([locks](#locks)), it calls the interrupt fn of each in turn, acquiring that device's lock around the call, with the device and a new `hw::IrqContext`, then ends the interrupt. For a vector bound by contribution, it calls the interrupt fn with a new `hw::IrqContext` or with the `hw::TrapFrame` of the interrupted code. An unbound vector halts the kernel.
+3. On `hw::IrqExit.Reschedule` from any interrupt fn it called, when the interrupted code ran in [thread context](#scheduling) with maskable interrupts enabled, outside `hw::Ring0.wait_for_interrupt`, and the anchor is installed, the interrupted thread is [preempted](#preemption). Otherwise `Reschedule` acts as `Resume`.
 4. The seam restores the saved state and resumes the interrupted code. After an interrupt fn for an abort vector returns, the kernel halts instead.
 
 Each CPU has an interrupt stack, reserved by the image, for each `ist` value that its bindings use, those of `hw::IrqShared.install` using 0 ([platform registries](25-registries.md#platform-registries)). A seam entered while its stack is in use on its CPU continues on it below the frames in use.
@@ -201,7 +205,7 @@ Each CPU has an interrupt stack, reserved by the image, for each `ist` value tha
 - The stack of `ist` 0 holds at least the largest stack use among the lowered interrupt fns that run on it for interrupt vectors, plus the largest among those for exception vectors, plus two [seam frames](27-program-model.md#descriptors).
 - The stack of a nonzero `ist` holds at least the largest stack use among the lowered interrupt fns that run on it, plus one seam frame.
 
-On AArch64 the interrupt controller delivers an interrupt only while it is enabled: the anchor enables the timer's vector and each interrupt vector a contribution binds, on every CPU, `hw::IrqShared.install` enables its vector and `uninstall` disables it. Every interrupt from 32 up goes to the boot CPU.
+On AArch64 the interrupt controller delivers an interrupt only while it is enabled: the anchor enables the timer's vector and each interrupt vector a contribution binds, on every CPU, routing those from 32 up to the boot CPU; installing the first device on a vector enables it and routes it to that device's CPU ([locks](#locks)), and uninstalling the last one disables it.
 
 ```nan
 // file: timer/package.nan
@@ -307,7 +311,7 @@ pub fn without_irqs[T: Any, E](body: fn(t: IrqsDisabled) -> T fails E limits not
 
 - Its values come only from `IrqContext.irqs_disabled`, `TrapFrame.irqs_disabled` and `hw::without_irqs`.
 - `hw::without_irqs(body)` saves whether maskable interrupts are enabled on the current CPU, disables them, calls `body` with a token, restores the saved state and returns what `body` returned or fails with its failure.
-- On the host targets, each executor thread is a CPU for this chapter and has no maskable interrupts: `hw::cpu_count()` is the number of executor threads, `without_irqs` only calls `body`, `IrqContext.complete` does nothing and `hw::IrqShared.install` binds no vector.
+- On the host targets, each executor thread is a CPU for this chapter and has no maskable interrupts: `hw::cpu_count()` is the number of executor threads, `without_irqs` only calls `body`, `IrqContext.complete` does nothing and `hw::IrqShared` installs devices on no interrupt ([locks](#locks)).
 
 ```nan
 // file: ticker/package.nan
@@ -400,9 +404,32 @@ pub open linear struct IrqShared[T: Any and Send] {
 pub fn IrqShared.install(take dev: T, vector: u8, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> IrqShared[T]
     requires vector >= 32
 
+pub fn IrqShared.install_on(take dev: T, cpu: u32, vector: u8, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> IrqShared[T]
+    requires vector >= 32
+
+pub fn IrqShared.install_msi(take dev: T, cpu: u32, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+pub fn IrqShared.message(self) -> Option[MsiMessage]
+
 pub fn IrqShared.with[R: Any](self, t: IrqsDisabled, body: fn(mut dev: T) -> R limits notrap, terminates, noalloc) -> R limits notrap, terminates, noalloc
 
 pub fn IrqShared.uninstall(take self) -> T
+
+pub closed struct MsiMessage derives Copy, Eq {
+    pub address: u64
+    pub data: u32
+} MsiMessage
+
+pub closed enum MsiError derives Copy, Eq, Render {
+    Exhausted
+    Unreachable
+    Unsupported
+} MsiError
+
+pub closed struct MsiRefusal[T: Any and Send] {
+    pub dev: T
+    pub error: MsiError
+} MsiRefusal
 ```
 
 - `with` spins until it acquires the lock, calls `body` with exclusive `mut` access to the value, releases the lock and returns `body`'s result. Acquisition orders `body` after every earlier holder's accesses.
@@ -412,10 +439,15 @@ pub fn IrqShared.uninstall(take self) -> T
 
 `hw::IrqShared[T]` keeps a device of type T behind an IRQ-safe lock that the interrupt path also takes:
 
-- `install(take dev, vector: v, on_irq: f)` keeps `dev`, binds interrupt vector v to f on every CPU and returns the linear `hw::IrqShared[T]`. Installing on a vector already bound, or on `hw::SIGNAL_VECTOR`, traps (`trap.duplicate-access`).
+- `install(take dev, vector: v, on_irq: f)` keeps `dev`, installs it with f on interrupt vector v of every CPU and returns the linear `hw::IrqShared[T]`. `install_on(take dev, cpu: n, vector: v, on_irq: f)` installs it on vector v of CPU n alone, and traps when n is not below `hw::cpu_count()` (`trap.bounds`).
+- Installing on a vector a contribution binds, or on `hw::SIGNAL_VECTOR`, traps (`trap.duplicate-access`). Devices installed on the same vector of a CPU share it, as devices on one level-triggered line do: when it fires there, the interrupt fn of each runs, those `install_on` installed on that CPU first, each group in the order of installation.
+- On AArch64 a vector from 32 up is a shared peripheral interrupt, which the interrupt controller routes to one CPU: CPU n for `install_on`, the boot CPU for `install`. Installing on a vector whose devices are installed for another CPU traps (`trap.duplicate-access`).
+- `install_msi(take dev, cpu: n, source: s, on_irq: f)` installs `dev` with f on a new **message-signalled interrupt** delivered to CPU n and returns `Ok` of the `hw::IrqShared[T]`, whose `message()` returns `Some` of the address and data a device writes to raise it; for every other installed device it returns `None`. Otherwise it returns `Err` of an `hw::MsiRefusal[T]` holding `dev` and an `hw::MsiError`: `Exhausted` when no such interrupt is free, `Unreachable` when no message reaches CPU n, and `Unsupported` when the machine delivers none, as on the host targets. It traps when n is not below `hw::cpu_count()` (`trap.bounds`).
+- On x86_64 the interrupt is the lowest vector from `0x21` to `0xFD` that no contribution binds and no device is installed on for CPU n; its message is a fixed, edge-triggered interrupt to CPU n's local APIC in physical destination mode, with address `0xFEE0_0000 | id << 12` and the vector as data, and is `Unreachable` when that APIC id exceeds 255. `source` is unused.
+- On AArch64 the interrupt is one of the 8,192 LPIs of the interrupt controller's ITS, which translates the event the data names, for device id s, to it; `source` is the device id the ITS receives with the device's writes, a PCI function's requester id on the emulator's machine. Its message's address is that of the ITS's `GITS_TRANSLATER` and its data the event. A device id the ITS does not accept, or a machine without an ITS, is `Unsupported`; an ITS keeps at most 256 device ids.
 - `with` reaches the device from other code, as `SpinLock.with` does.
-- `take shared.uninstall()` unbinds the vector, spins until no CPU runs f for it, and returns the device.
-- `install` and `uninstall` are the device operations that `allow device` covers ([manifest grants](14-authority.md#manifest-grants)).
+- `take shared.uninstall()` removes the device from its interrupt, spins until no CPU runs f for it, and returns the device.
+- `install`, `install_on`, `install_msi` and `uninstall` are the device operations that `allow device` covers ([manifest grants](14-authority.md#manifest-grants)).
 
 ```nan
 // file: serial/package.nan
@@ -470,6 +502,41 @@ interrupt fn Serial.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit li
     take irq.complete()
     return hw::IrqExit.Resume
 } Serial.on_irq
+```
+
+```nan
+// file: queues/package.nan
+//! Per-CPU completion queues for a bare kernel.
+
+package queues {
+    language 1
+    targets x86_64-bare
+    allow device in queues
+} queues
+
+// file: queues/queues.nan
+//! A completion queue whose interrupt reaches the CPU that owns it.
+
+const QUEUE_VECTOR: u8 = 0x40
+
+pub closed struct Queue {
+    pub completed: u64
+} Queue
+
+/// Installs CPU `cpu`'s queue on a message-signalled interrupt of that CPU, whose message the
+/// device `source` is then given, or on vector `QUEUE_VECTOR` of that CPU without one.
+pub fn attach(cpu: u32, source: u32) -> hw::IrqShared[Queue] {
+    match hw::IrqShared.install_msi(Queue(completed: 0), cpu, source, on_irq: Queue.on_irq) {
+        Ok(shared) => return shared
+        Err(refusal) => return hw::IrqShared.install_on(take refusal.dev, cpu, vector: QUEUE_VECTOR, on_irq: Queue.on_irq)
+    }
+} attach
+
+interrupt fn Queue.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 256 {
+    self.completed = self.completed.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Queue.on_irq
 ```
 
 ## Cross-CPU operations

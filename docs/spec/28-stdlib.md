@@ -103,11 +103,11 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::Dma`, `hw::DmaShared`, `hw::dma_fence` | [DMA](23-low-level.md#dma) |
 | `hw` | `hw::Ring0`, `hw::TlbScope`, `hw::CpuidRegs`, `hw::TscRead`, `hw::Protection`, `hw::Idt`, `hw::IdtInstalled`, `hw::PageTableRoot`, `hw::SysReg` | [Privileged intrinsics](23-low-level.md#privileged-intrinsics) |
 | `hw` | `hw::mint_root` | [Landing functions](23-low-level.md#landing-functions) |
-| `hw` | `hw::Anchor`, `hw::cpu_count` | [Anchor](24-kernel.md#anchor) |
+| `hw` | `hw::Anchor`, `hw::cpu_count`, `hw::cpu_hardware_id` | [Anchor](24-kernel.md#anchor) |
 | `hw` | `hw::IrqContext`, `hw::TrapFrame`, `hw::NoCode`, `hw::ErrorCode`, `hw::PageFault`, `hw::IrqExit` | [Interrupt functions](24-kernel.md#interrupt-functions) |
 | `hw` | `hw::IrqsDisabled`, `hw::without_irqs` | [Interrupt state](24-kernel.md#interrupt-state) |
 | `hw` | `hw::Signal` | [Signals](24-kernel.md#signals) |
-| `hw` | `hw::SpinLock`, `hw::SpinGuard`, `hw::IrqShared` | [Locks](24-kernel.md#locks) |
+| `hw` | `hw::SpinLock`, `hw::SpinGuard`, `hw::IrqShared`, `hw::MsiMessage`, `hw::MsiError`, `hw::MsiRefusal` | [Locks](24-kernel.md#locks) |
 | `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |
 | `hw` | `hw::RunQueue`, `hw::SavedContext`, `hw::Resumable`, `hw::switch_to`, `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |

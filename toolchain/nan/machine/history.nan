@@ -1,19 +1,37 @@
-//! The history `.nan/history.nan`: a package's store name, its history head and the tombstones publishing moved out of its source, by module.
+//! The history `.nan/history.nan`: a package's store name, its history head, and by module the schema hashes its releases recorded and the tombstones publishing moved out of its source.
 
 pkg struct History derives Eq {
     pkg name: text::String
     /// The code root of the release last published from the package, once one is.
     pkg head: Option[hashing::HashValue]
-    /// Each module's tombstones, as their canonical format writes them, in byte order of module
-    /// and then of text.
-    pkg modules: mem::List[ModuleTombstones]
+    /// In byte order of module, each module holding a schema record or a tombstone.
+    pkg modules: mem::List[HistoryModule]
 } History
 
-/// The tombstones of a module that a history holds.
-pkg struct ModuleTombstones derives Eq {
+/// What a history holds of a module: each type's name with a schema hash its releases
+/// recorded, in byte order of name and then of hash, and the tombstones, as their canonical
+/// format writes them, in byte order of text.
+pkg struct HistoryModule derives Eq {
     pkg module: text::String
+    pkg schemas: mem::List[TypeSchema]
     pkg tombstones: mem::List[text::String]
-} ModuleTombstones
+} HistoryModule
+
+/// A type's name with a schema hash.
+pkg struct TypeSchema derives Eq, Ord {
+    pkg ty: text::String
+    pkg hash: hashing::HashValue
+} TypeSchema
+
+/// The schema hash of a type of a module.
+pkg struct SchemaRecord {
+    pkg module: text::String
+    pkg ty: text::String
+    pkg hash: hashing::HashValue
+} SchemaRecord
+
+/// Whether it holds a schema record or a tombstone.
+pkg fn HistoryModule.holds(self) -> bool = self.schemas.len() > 0 or self.tombstones.len() > 0
 
 pkg fn History.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[mem::Bytes] {
     var lines = mem::List[text::String].empty(alloc)
@@ -23,10 +41,16 @@ pkg fn History.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Optio
         None => {}
     }
     for held in self.modules {
-        if held.tombstones.len() == 0 {
+        if not held.holds() {
             continue
         }
         mut lines.push(keyed("module", value: held.module.as_str(), alloc))
+        for schema in held.schemas {
+            var line = keyed("schema", value: schema.ty.as_str(), alloc)
+            mut line.push(' ')
+            mut line.append(escaped(schema.hash.full(alloc).as_str(), grammar, alloc).as_str())
+            mut lines.push(take line)
+        }
         for tombstone in held.tombstones {
             mut lines.push(text::String.of(tombstone.as_str(), alloc))
         }
@@ -62,7 +86,7 @@ pkg fn History.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Allo
         }
         None => {}
     }
-    var history = History(name: take name, head: head, modules: mem::List[ModuleTombstones].empty(alloc))
+    var history = History(name: take name, head: head, modules: mem::List[HistoryModule].empty(alloc))
     for index in at..<records.len() {
         let record = records[index]
         match mut history.held_record(record, alloc) {
@@ -71,7 +95,7 @@ pkg fn History.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Allo
         }
     }
     let count = history.modules.len()
-    if count > 0 and history.modules[count - 1].tombstones.len() == 0 {
+    if count > 0 and not history.modules[count - 1].holds() {
         var last: u32 = 1
         if records.len() > 0 {
             last = records[records.len() - 1].line
@@ -82,7 +106,7 @@ pkg fn History.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Allo
 } History.read
 
 /// Reads a record after a history's name and head into its modules: a `module` record, or a
-/// tombstone of the module last read; why it is not valid when it is neither.
+/// schema record or tombstone of the module last read; why it is not valid when it is none.
 fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[Invalid] {
     var cursor = record.cursor(alloc)
     let invalid = Invalid.at(record.line)
@@ -95,16 +119,39 @@ fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[In
         var after = true
         if count > 0 {
             let last = self.modules[count - 1]
-            after = last.module < module and last.tombstones.len() > 0
+            after = last.module < module and last.holds()
         }
         if not cursor.done() or not after {
             return Some(invalid)
         }
-        mut self.modules.push(ModuleTombstones(module: take module, tombstones: mem::List[text::String].empty(alloc)))
+        mut self.modules.push(HistoryModule(module: take module, schemas: mem::List[TypeSchema].empty(alloc), tombstones: mem::List[text::String].empty(alloc)))
         return None
     }
     if count == 0 {
         return Some(invalid)
+    }
+    let schema = mut cursor.takes("schema")
+    if schema {
+        let Some(ty) = mut cursor.word() else {
+            return Some(invalid)
+        }
+        let Some(written) = mut cursor.text() else {
+            return Some(invalid)
+        }
+        let Some(hash) = hash_of(written.as_str(), alloc) else {
+            return Some(invalid)
+        }
+        let last_module = self.modules[count - 1]
+        let schema_entry = TypeSchema(ty: take ty, hash: hash)
+        var ordered = last_module.tombstones.len() == 0
+        if last_module.schemas.len() > 0 {
+            ordered = ordered and last_module.schemas[last_module.schemas.len() - 1] < schema_entry
+        }
+        if not cursor.done() or not ordered {
+            return Some(invalid)
+        }
+        mut (mut self.modules.at_mut(count - 1)).schemas.push(take schema_entry)
+        return None
     }
     var ordered = true
     let held = self.modules[count - 1].tombstones.view()
@@ -118,6 +165,22 @@ fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[In
     mut (mut self.modules.at_mut(count - 1)).tombstones.push(text::String.of(record.text.as_str(), alloc))
     return None
 } History.held_record
+
+/// The schema hashes the history records for a type of a module.
+pkg fn History.schemas(self, module: Str, ty: Str, alloc: mem::Alloc) -> mem::List[hashing::HashValue] {
+    var found = mem::List[hashing::HashValue].empty(alloc)
+    for held in self.modules {
+        if held.module.as_str() != module {
+            continue
+        }
+        for schema in held.schemas {
+            if schema.ty.as_str() == ty {
+                mut found.push(schema.hash)
+            }
+        }
+    }
+    return found
+} History.schemas
 
 /// The value of a record of a word and a text, and the record's line.
 struct KeyedText {

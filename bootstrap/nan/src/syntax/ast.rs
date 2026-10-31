@@ -233,6 +233,7 @@ pub enum FnModifier {
     Landing,
     Foreign,
     Validator,
+    Migrate,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +286,7 @@ pub struct FnItem {
 pub enum TypeModifier {
     Closed,
     Open,
+    Flexible,
     Linear,
     View,
 }
@@ -520,6 +522,17 @@ impl Item {
         self.type_modifiers
             .iter()
             .any(|(written, _)| *written == modifier)
+    }
+
+    /// Whether it states `open` or `flexible`.
+    pub fn is_open(&self) -> bool {
+        self.has_modifier(TypeModifier::Open) || self.has_modifier(TypeModifier::Flexible)
+    }
+
+    /// Whether it is a function stating a modifier.
+    pub fn has_fn_modifier(&self, modifier: FnModifier) -> bool {
+        matches!(&self.kind, ItemKind::Fn(function)
+            if function.modifier.is_some_and(|(written, _)| written == modifier))
     }
 
     /// The name the item declares, `Type.name` for a function named after a type.

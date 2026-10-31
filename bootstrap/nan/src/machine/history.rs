@@ -1,5 +1,5 @@
-//! The history `.nan/history.nan`: a package's store name, its history head and the tombstones
-//! publishing moved out of its source, by module.
+//! The history `.nan/history.nan`: a package's store name, its history head, and by module the
+//! schema hashes its releases recorded and the tombstones publishing moved out of its source.
 
 use super::{Cursor, Invalid, Kind, escaped, read, write};
 use crate::hash::Hash;
@@ -9,9 +9,24 @@ pub struct History {
     pub name: String,
     /// The code root of the release last published from the package, once one is.
     pub head: Option<Hash>,
-    /// Each module's tombstones, as their canonical format writes them, in byte order of module
-    /// and then of text.
-    pub modules: Vec<(String, Vec<String>)>,
+    /// In byte order of name, each module holding a schema record or a tombstone.
+    pub modules: Vec<Module>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Module {
+    pub name: String,
+    /// Each type's name with a schema hash its releases recorded, in byte order of name and
+    /// then of hash.
+    pub schemas: Vec<(String, Hash)>,
+    /// The tombstones, as their canonical format writes them, in byte order of text.
+    pub tombstones: Vec<String>,
+}
+
+impl Module {
+    fn holds(&self) -> bool {
+        !self.schemas.is_empty() || !self.tombstones.is_empty()
+    }
 }
 
 impl History {
@@ -21,9 +36,15 @@ impl History {
             self.head
                 .map(|head| format!("head {}", escaped(&head.full()))),
         );
-        for (module, tombstones) in self.modules.iter().filter(|(_, held)| !held.is_empty()) {
-            lines.push(format!("module {module}"));
-            lines.extend(tombstones.iter().cloned());
+        for module in self.modules.iter().filter(|module| module.holds()) {
+            lines.push(format!("module {}", module.name));
+            lines.extend(
+                module
+                    .schemas
+                    .iter()
+                    .map(|(ty, hash)| format!("schema {ty} {}", escaped(&hash.full()))),
+            );
+            lines.extend(module.tombstones.iter().cloned());
         }
         write(Kind::History, &lines)
     }
@@ -58,34 +79,62 @@ impl History {
         for record in records {
             let mut cursor = Cursor::new(record);
             if cursor.takes("module") {
-                let module = cursor.word().ok_or(Invalid::at(record.line))?;
+                let name = cursor.word().ok_or(Invalid::at(record.line))?;
                 let after = history
                     .modules
                     .last()
-                    .is_none_or(|(last, held)| last.as_str() < module && !held.is_empty());
+                    .is_none_or(|last| last.name.as_str() < name && last.holds());
                 if !cursor.done() || !after {
                     return Err(Invalid::at(record.line));
                 }
-                history.modules.push((module.to_owned(), Vec::new()));
+                history.modules.push(Module {
+                    name: name.to_owned(),
+                    ..Module::default()
+                });
                 continue;
             }
-            let Some((_, held)) = history.modules.last_mut() else {
+            let Some(module) = history.modules.last_mut() else {
                 return Err(Invalid::at(record.line));
             };
-            let ordered = held.last().is_none_or(|last| *last < record.text);
+            if cursor.takes("schema") {
+                let ty = cursor.word();
+                let hash = cursor.text().and_then(super::hash_of);
+                let schema = ty
+                    .zip(hash)
+                    .map(|(ty, hash)| (ty.to_owned(), hash))
+                    .filter(|schema| {
+                        cursor.done()
+                            && module.tombstones.is_empty()
+                            && module.schemas.last().is_none_or(|last| last < schema)
+                    })
+                    .ok_or(Invalid::at(record.line))?;
+                module.schemas.push(schema);
+                continue;
+            }
+            let ordered = module
+                .tombstones
+                .last()
+                .is_none_or(|last| *last < record.text);
             if !cursor.takes("retired") || !ordered {
                 return Err(Invalid::at(record.line));
             }
-            held.push(record.text.clone());
+            module.tombstones.push(record.text.clone());
         }
-        if history
-            .modules
-            .last()
-            .is_some_and(|(_, held)| held.is_empty())
-        {
+        if history.modules.last().is_some_and(|module| !module.holds()) {
             let last = parsed.records.last().map_or(1, |record| record.line);
             return Err(Invalid::at(last));
         }
         parsed.checked(history)
+    }
+
+    /// The schema hashes the history records for a type of a module.
+    pub fn schemas(&self, module: &str, ty: &str) -> Vec<Hash> {
+        self.modules
+            .iter()
+            .filter(|held| held.name == module)
+            .flat_map(|held| &held.schemas)
+            .filter(|(name, _)| name == ty)
+            .map(|(_, hash)| *hash)
+            .collect()
     }
 }

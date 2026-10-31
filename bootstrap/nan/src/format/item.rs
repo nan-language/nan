@@ -257,7 +257,7 @@ impl Facts {
                         let rank = |modifier: &NodeId| match text(
                             tree.span(*modifier).expect("a modifier").0,
                         ) {
-                            "closed" | "open" => 0,
+                            "closed" | "open" | "flexible" => 0,
                             "linear" => 1,
                             _ => 2,
                         };

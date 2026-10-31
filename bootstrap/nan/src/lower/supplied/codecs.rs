@@ -18,6 +18,8 @@ mod wire;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
+use super::super::body::Held;
+use super::super::call::{Called, Invoked};
 use super::super::data::const_arg;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::Routine;
@@ -25,11 +27,10 @@ use super::super::{CALL_CONV, Glue, Instance, Lowering};
 use super::Supply;
 use super::mem::maps::Entries;
 use super::mem::vector::{self, Element};
-use crate::check::db::TypeKey;
-use crate::check::sig::{Payload, SigKind};
+use crate::check::db::{ItemId, TypeKey};
+use crate::check::sig::{KEPT, Payload, SigKind};
 use crate::check::ty::{Arg, Scalar, Subst, Ty};
 use crate::nir::{Callable, FnRef, Role};
-use crate::syntax::ast::TypeModifier;
 
 /// A format values encode in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,10 +75,11 @@ pub mod failure {
     pub const INVALID_TEXT: i64 = 10;
     pub const INVALID: i64 = 11;
     pub const OUT_OF_MEMORY: i64 = 12;
+    pub const UNKNOWN_SCHEMA: i64 = 13;
 }
 
 /// The `core::DecodeError` variants, in order.
-const DECODE_ERRORS: [&str; 12] = [
+const DECODE_ERRORS: [&str; 13] = [
     "Truncated",
     "Malformed",
     "Trailing",
@@ -90,6 +92,7 @@ const DECODE_ERRORS: [&str; 12] = [
     "InvalidText",
     "Invalid",
     "OutOfMemory",
+    "UnknownSchema",
 ];
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
@@ -116,18 +119,34 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         ("schema", _) => schema(lo, fx, supply),
         ("erased", _) => erased(lo, fx, supply),
+        ("decode_from", _) => decode_from(lo, fx, supply),
+        ("encode_as", _) => encode_as(lo, fx, supply),
         (member, _) => panic!("no lowering of {owner}.{member}"),
     }
     true
 }
 
-/// `Codec.encode(value, mut out)` and `try_encode`: the encoding measured, room made in `out`
-/// for exactly it, then written there.
+/// `Codec.encode(value, mut out)` and `try_encode`.
 fn encode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: Format) {
     let ty = supply.type_arg(0);
     let value = super::tasks::address_of(lo, fx, &ty, supply.param(0));
     let out = supply.param(1).address();
-    let function = encoder(lo, format, &ty);
+    append(lo, fx, supply, format, &ty, value, out);
+    supply.done(lo, fx);
+}
+
+/// Appends the encoding of the value of `ty` at `value` to the bytes at `out`: the encoding
+/// measured, room made for exactly it, then written there.
+fn append(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    format: Format,
+    ty: &Ty,
+    value: Value,
+    out: Value,
+) {
+    let function = encoder(lo, format, ty);
     let zero = fx.ptr(0);
     let size = measure(lo, fx, function, value);
     let len = fx.load(PTR, out, vector::LEN);
@@ -148,7 +167,6 @@ fn encode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: Format) {
     fx.store(zero, state, writer::LEN);
     call(lo, fx, function, &[value, state]);
     fx.store(needed, out, vector::LEN);
-    supply.done(lo, fx);
 }
 
 /// The bytes an encoding function writes for a value.
@@ -174,25 +192,27 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: &DecodeFormat
     let target = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let code = read(lo, fx, supply, format, &ty, target);
+    let code = read(lo, fx, supply, 0, format, &ty, target);
     returned(lo, fx, supply, &ty, target, code);
 }
 
-/// Reads one value of `ty` at `target` from the bytes of the operation's Untrusted slice,
-/// drawing through its allocator: the code of a decoding function, `Trailing` on what is left
-/// after the value, which is then released.
+/// Reads one value of `ty` at `target` from the bytes of the operation's Untrusted slice, its
+/// parameter `raw`, drawing through the allocator of the parameter after it: the code of a
+/// decoding function, `Trailing` on what is left after the value, which is then released.
 fn read(
     lo: &mut Lowering,
     fx: &mut Fx,
     supply: &Supply,
+    raw: usize,
     format: &DecodeFormat,
     ty: &Ty,
     target: Value,
 ) -> Value {
-    let raw = supply.param(0).address();
+    let alloc = supply.param(raw + 1).address();
+    let raw = supply.param(raw).address();
     let start = fx.load(PTR, raw, 0);
     let len = fx.load(PTR, raw, 8);
-    let alloc = fx.load(PTR, supply.param(1).address(), 0);
+    let alloc = fx.load(PTR, alloc, 0);
     let state = fx.slot(reader::SIZE, 8);
     fx.store(start, state, reader::POS);
     let end = fx.b.ins().iadd(start, len);
@@ -227,7 +247,7 @@ fn canonical(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let ty = supply.type_arg(0);
     let layout = lo.layout(&ty);
     let value = fx.slot(layout.size, layout.align);
-    let code = read(lo, fx, supply, &DecodeFormat::Wire, &ty, value);
+    let code = read(lo, fx, supply, 0, &DecodeFormat::Wire, &ty, value);
     let result = supply.abi.result.clone();
     let bytes = supply.sret.unwrap_or_else(|| {
         let layout = lo.layout(&result);
@@ -274,6 +294,134 @@ fn schema_hash(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) -> Value {
     let hash = lo.ck.schema(ty).hash();
     let data = lo.bytes_data(&hash.0);
     lo.data_address(fx, data)
+}
+
+/// Whether the schema hash at `wanted` is the one at `hash`.
+fn same_hash(lo: &mut Lowering, fx: &mut Fx, wanted: Value, hash: Value) -> Value {
+    let len = fx.ptr(33);
+    let order = lo.call_routine(fx, Routine::Compare, &[wanted, hash, len])[0];
+    fx.b.ins().icmp_imm_s(IntCC::Equal, order, 0)
+}
+
+/// The migrations of a type in one direction, each with its frozen shape.
+fn migrations_of(lo: &Lowering, ty: &Ty, forward: bool) -> Vec<(ItemId, Ty)> {
+    let Ty::Item(item, _) = ty else {
+        return Vec::new();
+    };
+    lo.ck
+        .migrations(*item)
+        .into_iter()
+        .filter(|migration| migration.forward == forward)
+        .map(|migration| (migration.function, Ty::item(migration.shape, Vec::new())))
+        .collect()
+}
+
+/// Calls a migration on a value, with the allocator `alloc` when it takes one.
+fn migrate(lo: &mut Lowering, fx: &mut Fx, function: ItemId, value: Held, alloc: Held) -> Called {
+    let instance = Instance::Nir {
+        item: function,
+        role: Role::Body,
+        index: 0,
+        args: Vec::new().into(),
+    };
+    let abi = lo.abi(&instance);
+    let mut args = vec![value];
+    if abi.params.len() == 2 {
+        args.push(alloc);
+    }
+    let id = lo.instance(instance);
+    lo.invoke(fx, Invoked::Direct(id), &abi, &args)
+}
+
+/// `Codec.decode_from(schema, raw, alloc)`: one value read as `decode` reads it under the type's
+/// own schema hash, or one of a frozen shape that a forward migration converts, failing with
+/// `UnknownSchema` under another.
+fn decode_from(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let ty = supply.type_arg(0);
+    let layout = lo.layout(&ty);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let wanted = supply.param(0).address();
+    let code = fx.slot(4, 4);
+    let unknown = fx.int(types::I32, failure::UNKNOWN_SCHEMA);
+    fx.store(unknown, code, 0);
+    let own = schema_hash(lo, fx, &ty);
+    let same = same_hash(lo, fx, wanted, own);
+    fx.when(same, |fx| {
+        let read = read(lo, fx, supply, 1, &DecodeFormat::Wire, &ty, target);
+        fx.store(read, code, 0);
+    });
+    for (function, shape) in migrations_of(lo, &ty, true) {
+        let hash = schema_hash(lo, fx, &shape);
+        let same = same_hash(lo, fx, wanted, hash);
+        fx.when(same, |fx| {
+            let layout = lo.layout(&shape);
+            let old = fx.slot(layout.size, layout.align);
+            let read = read(lo, fx, supply, 1, &DecodeFormat::Wire, &shape, old);
+            let ok = fx.b.ins().icmp_imm_s(IntCC::Equal, read, 0);
+            let result = fx.choose_in(
+                lo,
+                ok,
+                &[types::I32],
+                |lo, fx| {
+                    let held = lo.held_at(fx, &shape, old);
+                    let called = migrate(lo, fx, function, held, supply.param(2));
+                    lo.store_held(fx, target, called.result, &ty);
+                    let none = fx.int(types::I32, 0);
+                    let Some(failed) = called.failed else {
+                        return vec![none];
+                    };
+                    let exhausted = fx.int(types::I32, failure::OUT_OF_MEMORY);
+                    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+                    vec![fx.b.ins().select(failed, exhausted, none)]
+                },
+                |_, _| vec![read],
+            )[0];
+            fx.store(result, code, 0);
+        });
+    }
+    let code = fx.load(types::I32, code, 0);
+    returned(lo, fx, supply, &ty, target, code);
+}
+
+/// `Codec.encode_as(value, schema, mut out, alloc)`: the value appended as `encode` appends it
+/// under its type's own schema hash, or the encoding of an inverse's conversion of it under a
+/// frozen shape's; `false` under another.
+fn encode_as(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let ty = supply.type_arg(0);
+    let value = super::tasks::address_of(lo, fx, &ty, supply.param(0));
+    let wanted = supply.param(1).address();
+    let out = supply.param(2).address();
+    let written = fx.slot(1, 1);
+    let no = fx.int(types::I8, 0);
+    fx.store(no, written, 0);
+    let own = schema_hash(lo, fx, &ty);
+    let same = same_hash(lo, fx, wanted, own);
+    fx.when(same, |fx| {
+        append(lo, fx, supply, Format::Wire, &ty, value, out);
+        let yes = fx.int(types::I8, 1);
+        fx.store(yes, written, 0);
+    });
+    for (function, shape) in migrations_of(lo, &ty, false) {
+        let hash = schema_hash(lo, fx, &shape);
+        let same = same_hash(lo, fx, wanted, hash);
+        fx.when(same, |fx| {
+            let held = lo.held_at(fx, &ty, value);
+            let called = migrate(lo, fx, function, held, supply.param(3));
+            if let Some(failed) = called.failed {
+                let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+                fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
+            }
+            let old = super::tasks::address_of(lo, fx, &shape, called.result);
+            append(lo, fx, supply, Format::Wire, &shape, old, out);
+            lo.release(fx, &shape, old);
+            let yes = fx.int(types::I8, 1);
+            fx.store(yes, written, 0);
+        });
+    }
+    let written = fx.load(types::I8, written, 0);
+    supply.ret(lo, fx, Held::Scalar(written));
 }
 
 /// `Codec.schema(alloc)`: the type's schema tree, decoded from its `mem::wire` encoding.
@@ -391,14 +539,15 @@ enum Form {
 }
 
 /// A record: its fields with their keys, types and offsets, in declaration order, whether it
-/// decodes as open, the aliases of its keys, and the struct it builds, whose predicates hold
-/// of every value decoded.
+/// decodes as open, the aliases of its keys, the struct it builds, whose predicates hold of
+/// every value decoded, and the offset and type of a flexible struct's kept fields.
 #[derive(Clone)]
 struct Record {
     fields: Vec<(String, Ty, u64)>,
     open: bool,
     aliases: Vec<(Vec<u8>, Vec<u8>)>,
     owner: Option<(crate::check::db::ItemId, Vec<Arg>)>,
+    kept: Option<(u64, Ty)>,
 }
 
 /// A variant of an enum: its key and payload.
@@ -429,6 +578,7 @@ fn kind_of(lo: &mut Lowering, ty: &Ty) -> Kind {
             open: false,
             aliases: Vec::new(),
             owner: None,
+            kept: None,
         }),
         Ty::Item(item, args) => {
             let arg = |index: usize| {
@@ -462,22 +612,28 @@ fn declared(lo: &mut Lowering, item: crate::check::db::ItemId, args: &[Arg]) -> 
     let sig = lo.ck.sig(item);
     let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
     let ty = Ty::Item(item, args.to_vec().into());
-    let open = lo.ck.db.ast(item).has_modifier(TypeModifier::Open);
+    let open = lo.ck.db.ast(item).is_open();
     let aliases: Vec<(Vec<u8>, Vec<u8>)> = lo.ck.key_aliases(item).into_iter().collect();
     match &sig.kind {
         SigKind::Struct { fields } => {
             let fields = fields
                 .iter()
+                .filter(|field| !field.is_kept())
                 .map(|field| {
                     let offset = lo.layouts.field(lo.ck, &ty, None, &field.name).offset;
                     (field.name.clone(), subst.ty(&field.ty), offset)
                 })
                 .collect();
+            let kept = lo.ck.kept_type(item).map(|kept| {
+                let offset = lo.layouts.field(lo.ck, &ty, None, KEPT).offset;
+                (offset, kept)
+            });
             Kind::Record(Record {
                 fields,
                 open,
                 aliases,
                 owner: Some((item, args.to_vec())),
+                kept,
             })
         }
         SigKind::Enum { variants } => Kind::Variant(
@@ -502,6 +658,7 @@ fn declared(lo: &mut Lowering, item: crate::check::db::ItemId, args: &[Arg]) -> 
                             open: false,
                             aliases: Vec::new(),
                             owner: None,
+                            kept: None,
                         }),
                     },
                 })
@@ -826,7 +983,7 @@ fn encode_kind(
 }
 
 /// Writes a record: per field, in ascending byte order of keys, its key and value; in the wire
-/// format each value framed by its byte length.
+/// format each value framed by its byte length, a flexible struct's kept fields among them.
 fn encode_record(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -836,9 +993,20 @@ fn encode_record(
     state: Value,
 ) {
     let fields = by_key(record);
+    let kept = match (format, &record.kept) {
+        (Format::Wire, Some((offset, kept_ty))) => {
+            let at = fx.offset(value, *offset);
+            Some(wire::kept_cursor(lo, fx, kept_ty, at))
+        }
+        _ => None,
+    };
     match format {
         Format::Wire => {
-            let count = fx.ptr(fields.len() as u64);
+            let mut count = fx.ptr(fields.len() as u64);
+            if let Some(cursor) = kept {
+                let held = wire::kept_count(lo, fx, cursor);
+                count = fx.b.ins().iadd(count, held);
+            }
             wire::put_uvar(fx, state, count);
         }
         Format::Json => put_literal(lo, fx, state, b"{"),
@@ -848,6 +1016,9 @@ fn encode_record(
         let function = encoder(lo, format, field_ty);
         match format {
             Format::Wire => {
+                if let Some(cursor) = kept {
+                    wire::put_kept(lo, fx, state, cursor, Some(key.as_bytes()));
+                }
                 wire::put_literal_text(lo, fx, state, key.as_bytes());
                 let size = measure(lo, fx, function, field);
                 wire::put_uvar(fx, state, size);
@@ -861,6 +1032,9 @@ fn encode_record(
             }
         }
         call(lo, fx, function, &[field, state]);
+    }
+    if let Some(cursor) = kept {
+        wire::put_kept(lo, fx, state, cursor, None);
     }
     if format == Format::Json {
         put_literal(lo, fx, state, b"}");
@@ -1856,7 +2030,15 @@ fn decode_record(
     let size = fx.ptr(count.max(1) as u64);
     lo.call_routine(fx, Routine::Fill, &[read, zero, size]);
     let fields = record.fields.clone();
+    let kept = (record.kept.is_some() && decoding.format == DecodeFormat::Wire).then(|| {
+        let kept = fx.slot(vector::SIZE, 8);
+        vector::empty(fx, kept, decoding.alloc, BYTE);
+        kept
+    });
     let release_read = |lo: &mut Lowering, fx: &mut Fx| {
+        if let Some(kept) = kept {
+            vector::free_storage(lo, fx, kept);
+        }
         for (position, (_, field_ty, offset)) in fields.iter().enumerate() {
             if !lo.needs_release(field_ty) {
                 continue;
@@ -1892,6 +2074,7 @@ fn decode_record(
         let index = state[0];
         let follows = element_follows(lo, fx, decoding, index, left, close, release_read);
         fx.when(follows, |fx| {
+            let entry = kept.map(|_| fx.load(PTR, reader_state, reader::POS));
             let (matched, value_end) = match &decoding.format {
                 DecodeFormat::Wire => {
                     let (start, len, end, failed) = wire::read_key(lo, fx, reader_state, last);
@@ -1938,7 +2121,24 @@ fn decode_record(
                     return;
                 }
                 match value_end {
-                    Some(end) => fx.store(end, reader_state, reader::POS),
+                    Some(end) => {
+                        if let (Some(kept), Some(entry)) = (kept, entry) {
+                            let len = fx.load(PTR, kept, vector::LEN);
+                            let size = fx.b.ins().isub(end, entry);
+                            let needed = fx.b.ins().iadd(len, size);
+                            let drawn = vector::reserve(lo, fx, kept, needed, BYTE);
+                            let exhausted = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
+                            fx.when(exhausted, |fx| {
+                                release_read(lo, fx);
+                                fail(fx, failure::OUT_OF_MEMORY);
+                            });
+                            let data = fx.load(PTR, kept, vector::DATA);
+                            let at = fx.b.ins().iadd(data, len);
+                            lo.call_routine(fx, Routine::Copy, &[at, entry, size]);
+                            fx.store(needed, kept, vector::LEN);
+                        }
+                        fx.store(end, reader_state, reader::POS);
+                    }
                     None => {
                         let failed = match &decoding.format {
                             DecodeFormat::Construction => {
@@ -2004,6 +2204,19 @@ fn decode_record(
             let one = fx.int(types::I8, 1);
             fx.store(one, read, position as u64);
         });
+    }
+    if let Some((offset, kept_ty)) = &record.kept {
+        let at = fx.offset(target, *offset);
+        let empty = lo.variant_value(fx, kept_ty, "Empty", &[], None);
+        lo.store_held(fx, at, empty, kept_ty);
+        if let Some(kept) = kept {
+            let len = fx.load(PTR, kept, vector::LEN);
+            let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, len, 0);
+            fx.when(held, |fx| {
+                let fields = lo.variant_value(fx, kept_ty, "Fields", &[Held::Address(kept)], None);
+                lo.store_held(fx, at, fields, kept_ty);
+            });
+        }
     }
 }
 
@@ -2073,6 +2286,7 @@ fn decode_variant(
             _ => Vec::new(),
         },
         owner: None,
+        kept: None,
     };
     nest(fx, reader_state);
     let room = key_room(&record);

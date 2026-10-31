@@ -202,6 +202,11 @@ pub fn clause_group(tree: &Tree, clause: NodeId) -> u8 {
     }
 }
 
+/// Whether a type modifier states openness.
+fn is_openness(word: &str) -> bool {
+    matches!(word, "closed" | "open" | "flexible")
+}
+
 /// Checks the rules of item shape that the parse leaves to the parsed item.
 pub fn check(item: Item) -> Vec<FileDiagnostic> {
     let mut found = Vec::new();
@@ -243,13 +248,12 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
                 report(item.line(token), Code::ItemModifierMisplaced)
             }
             Rule::TypeModifier => {
-                let openness = |word: &str| word == "closed" || word == "open";
                 if type_modifiers.iter().any(|(other, _)| *other == word) {
                     let deleted = item.with_space_after(token);
                     fixed.push(item.fixed((token, token), Code::ItemModifierConflict, deleted, ""));
                 } else if type_modifiers
                     .iter()
-                    .any(|(other, _)| openness(other) && openness(&word))
+                    .any(|(other, _)| is_openness(other) && is_openness(&word))
                 {
                     report(item.line(token), Code::ItemModifierConflict);
                 }
@@ -276,16 +280,19 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
         }
     }
     if matches!(kind, Rule::StructItem | Rule::EnumItem) {
-        let openness = type_modifiers
-            .iter()
-            .find(|(word, _)| word == "closed" || word == "open");
+        let openness = type_modifiers.iter().find(|(word, _)| is_openness(word));
         let public =
             visibility.is_some_and(|token| item.kind_of(token) == TokenKind::Keyword(Keyword::Pub));
+        let encoded = tree.find(node, Rule::DerivesClause).is_some_and(|clause| {
+            tree.child_tokens(clause)
+                .any(|token| item.text(token) == "Encode")
+        });
         match (public, openness) {
             (true, None) => report(
                 item.head_line().expect("a parsed item has a head"),
                 Code::ItemOpennessMissing,
             ),
+            (false, Some((word, _))) if encoded && word != "closed" => {}
             (false, Some((_, token))) => {
                 let deleted = item.with_space_after(*token);
                 fixed.push(item.fixed((*token, *token), Code::ItemOpennessNotPub, deleted, ""));

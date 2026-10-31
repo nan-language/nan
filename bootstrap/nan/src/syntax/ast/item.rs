@@ -119,6 +119,7 @@ impl<'a> Lower<'a> {
                             let modifier = match self.text(token) {
                                 "closed" => TypeModifier::Closed,
                                 "open" => TypeModifier::Open,
+                                "flexible" => TypeModifier::Flexible,
                                 "linear" => TypeModifier::Linear,
                                 _ => TypeModifier::View,
                             };
@@ -130,7 +131,8 @@ impl<'a> Lower<'a> {
                                 TokenKind::Keyword(Keyword::Interrupt) => FnModifier::Interrupt,
                                 TokenKind::Keyword(Keyword::Landing) => FnModifier::Landing,
                                 TokenKind::Keyword(Keyword::Foreign) => FnModifier::Foreign,
-                                _ => FnModifier::Validator,
+                                TokenKind::Keyword(Keyword::Validator) => FnModifier::Validator,
+                                _ => FnModifier::Migrate,
                             };
                             fn_modifier.get_or_insert((modifier, token));
                         }

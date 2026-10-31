@@ -334,6 +334,7 @@ Each term links to its home, whose definition governs.
 | [final closure](27-program-model.md#final-builds) | Final-link root's dependency closure. |
 | [final-link root](27-program-model.md#final-builds) | Program built into an image. |
 | [first dead token](41-grammar.md#prefix-viability) | First token of a file or prefix that the grammar, outside rejected alternatives, does not accept at its position, or the token after a line holding a lexical diagnostic when that is earlier. |
+| [flexible struct](13-text-encode.md#flexible-structs) | Struct keeping the fields its `mem::wire` decoding skips. |
 | [foreign anchor](34-diagnostics.md#idiom-table) | First token of a foreign form that the grammar does not accept. |
 | [foreign fn](23-low-level.md#foreign-functions) | Function declaring an external symbol. |
 | [frame rule](20-prover.md#frame-rule) | Which places a call leaves unchanged. |
@@ -376,6 +377,7 @@ Each term links to its home, whose definition governs.
 | [item kind](02-items.md#item-kinds) | One of fourteen item forms. |
 | [join handle](16-concurrency.md#joins) | `task::Join[T, E]` a spawn returns. |
 | [judging root](25-registries.md#contributors) | Package against which registry admission and tables are judged. |
+| [kept fields](13-text-encode.md#flexible-structs) | Skipped fields a flexible struct holds as bytes. |
 | [key](13-text-encode.md#encode) | Encoded name of a field or variant. |
 | [key field](25-registries.md#registries) | Field of the entry type a registry is keyed by. |
 | [keyed task](26-components.md#keyed-tasks) | Task that `cx.spawn(key: k, ...)` starts, identified by its key and cancelling an earlier task with that key. |
@@ -406,6 +408,7 @@ Each term links to its home, whose definition governs.
 | [message](26-components.md#components) | Value delivered to a component. |
 | [method](02-items.md#methods) | `Type.name` function taking `self`. |
 | [method resolution](08-generics-interfaces.md#method-resolution) | Finding the function `x.f(...)` names. |
+| [migration](13-text-encode.md#migrations) | Conversion from or to an earlier shape of a type. |
 | [milestone](38-self-hosting.md#milestones) | One of M1 to M6, checks the bootstrap passes before language 1 freezes. |
 | [mode](07-ownership.md#modes) | Read, `mut` or `take`. |
 | [modifier](02-items.md#modifiers) | Word before the item kind. |

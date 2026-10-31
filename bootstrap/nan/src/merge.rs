@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::machine::api::{Entry, Snapshot};
-use crate::machine::history::History;
+use crate::machine::history::{History, Module};
 use crate::machine::lock::Lock;
 use crate::syntax::ast::{self, ItemKind};
 use crate::syntax::file::{SourceFile, parse};
@@ -533,8 +533,9 @@ fn lock(ours: &[u8], theirs: &[u8]) -> Merged {
     }
 }
 
-/// The union of two histories' tombstones, ours' winning for equal identities, with the store
-/// name and head of the version that changed them from the base, ours' when both did.
+/// The union of two histories' schema records and tombstones, ours' winning for tombstones of
+/// equal identities, with the store name and head of the version that changed them from the
+/// base, ours' when both did.
 fn history(base: Option<&[u8]>, ours: &[u8], theirs: &[u8]) -> Merged {
     let read = |bytes: &[u8]| History::read(bytes).ok();
     let (Some(o), Some(t)) = (read(ours), read(theirs)) else {
@@ -556,23 +557,39 @@ fn history(base: Option<&[u8]>, ours: &[u8], theirs: &[u8]) -> Merged {
             .unwrap_or(tombstone)
             .to_owned()
     };
-    let mut modules: BTreeMap<String, Vec<String>> = o.modules.iter().cloned().collect();
-    for (module, tombstones) in &t.modules {
-        let held = modules.entry(module.clone()).or_default();
-        for tombstone in tombstones {
+    let mut modules: BTreeMap<String, Module> = o
+        .modules
+        .iter()
+        .map(|module| (module.name.clone(), module.clone()))
+        .collect();
+    for module in &t.modules {
+        let held = modules
+            .entry(module.name.clone())
+            .or_insert_with(|| Module {
+                name: module.name.clone(),
+                ..Module::default()
+            });
+        for schema in &module.schemas {
+            if !held.schemas.contains(schema) {
+                held.schemas.push(schema.clone());
+            }
+        }
+        held.schemas.sort();
+        for tombstone in &module.tombstones {
             if !held
+                .tombstones
                 .iter()
                 .any(|known| identity(known) == identity(tombstone))
             {
-                held.push(tombstone.clone());
+                held.tombstones.push(tombstone.clone());
             }
         }
-        held.sort();
+        held.tombstones.sort();
     }
     let merged = History {
         name,
         head,
-        modules: modules.into_iter().collect(),
+        modules: modules.into_values().collect(),
     };
     Merged {
         content: merged.bytes(),

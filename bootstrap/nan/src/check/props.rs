@@ -476,9 +476,7 @@ impl Checker<'_> {
             _ => false,
         };
         let is_enum = matches!(ast.kind, ItemKind::Enum(_));
-        let foreign_open = !self.db.is_std(item)
-            && ast.has_modifier(TypeModifier::Open)
-            && self.consumer_view(item);
+        let foreign_open = !self.db.is_std(item) && ast.is_open() && self.consumer_view(item);
         let promise = |property: Property, name: &str| {
             if foreign_open {
                 derives(name)
@@ -507,6 +505,19 @@ impl Checker<'_> {
     fn consumer_view(&self, item: ItemId) -> bool {
         self.current_package()
             .is_some_and(|package| package != self.db.package_of(item))
+    }
+
+    /// The constituent types of a struct or enum but a flexible struct's kept fields, which
+    /// derived `Render` and `Encode` pass over.
+    pub fn declared_constituents(&self, item: ItemId) -> Vec<Ty> {
+        match &self.sig(item).kind {
+            SigKind::Struct { fields } => fields
+                .iter()
+                .filter(|field| !field.is_kept())
+                .map(|field| field.ty.clone())
+                .collect(),
+            _ => self.constituents(item),
+        }
     }
 
     /// The field and payload types of a struct or enum, over its own type parameters.

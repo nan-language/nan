@@ -1,0 +1,235 @@
+//! Migrations: the functions declared `migrate` that convert a type's values from or to a frozen shape, a type of one of its earlier schema trees, which its package's history records.
+
+/// A migration of a type: its function, its frozen shape and whether it converts from it.
+pkg struct Conversion derives Copy, Eq {
+    pkg function: ty::ItemId
+    pkg shape: ty::ItemId
+    pkg forward: bool
+} Conversion
+
+/// The migrations of a type of the forms their rule states, by file path and line.
+pkg fn Checker.migrations(self, item: ty::ItemId) -> mem::List[Conversion] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var found = mem::List[Conversion].empty(alloc)
+    let Some(members) = db.member_table.get(TypeKey.Item(item)) else {
+        return found
+    }
+    for entry in members {
+        for function in entry.value() {
+            match self.migration(function) {
+                Some(migration) => mut found.push(migration)
+                None => {}
+            }
+        }
+    }
+    mut found.sort_by(fn(left: Conversion, right: Conversion) -> core::Ordering {
+        let left_path = db.item_file(left.function).path.as_str()
+        let right_path = db.item_file(right.function).path.as_str()
+        let by_path = left_path.cmp(right_path)
+        if by_path != core::Ordering.Equal {
+            return by_path
+        }
+        return db.head_line(left.function).cmp(db.head_line(right.function))
+    })
+    return found
+} Checker.migrations
+
+/// A function declared `migrate` of one of the forms its rule states.
+fn Checker.migration(self, function: ty::ItemId) -> Option[Conversion] {
+    let db = self.db()
+    if not db.ast(function).has_fn_modifier(ast::FnModifier.Migrate) {
+        return None
+    }
+    let Some(TypeKey.Item(owner)) = db.owners.get(function) else {
+        return None
+    }
+    let Some(sig) = self.fn_sig(function) else {
+        return None
+    }
+    let package_id = db.package_of(function)
+    let types = self.types()
+    let own = types.item(owner, args: mem::List[ty::Arg].empty(self.alloc()))
+    if self.encoded_shape(own, package_id).is_none() {
+        return None
+    }
+    var plain = sig.params.len() >= 1 and sig.params.len() <= 2 and not sig.wait and sig.own_generics().is_empty()
+    if sig.params.len() == 2 {
+        let alloc_param = sig.params[1]
+        plain = plain and alloc_param.mode == ast::Mode.Read and self.is_std(alloc_param.ty, path: "mem::Alloc")
+    }
+    match sig.failure {
+        Some(failure) => {
+            plain = plain and self.is_std(failure, path: "mem::OutOfMemory")
+        }
+        None => {}
+    }
+    let Some(receiver) = sig.params.get(0) else {
+        return None
+    }
+    var shape_ty = receiver.ty
+    var forward = true
+    if receiver.is_self and receiver.mode == ast::Mode.Read {
+        shape_ty = sig.result
+        forward = false
+    } else if receiver.is_self or receiver.mode != ast::Mode.Take or sig.result != own {
+        return None
+    }
+    let Some(shape) = self.encoded_shape(shape_ty, package_id) else {
+        return None
+    }
+    if not plain or shape == owner {
+        return None
+    }
+    return Some(Conversion(function: function, shape: shape, forward: forward))
+} Checker.migration
+
+/// The struct or enum of a type of a package's without type arguments that derives `Encode`.
+fn Checker.encoded_shape(self, held: ty::Ty, package_id: ty::PackageId) -> Option[ty::ItemId] {
+    let db = self.db()
+    let ty::TyKind.Item(item: item, args: args) = self.types().kind(held) else {
+        return None
+    }
+    if not self.types().arg_list(args).is_empty() {
+        return None
+    }
+    let typed = match db.ast(item).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
+        else => false
+    }
+    let derived = match db.core_item("Encode") {
+        Some(encode) => self.derives_interface(item, interface_item: encode)
+        None => false
+    }
+    if typed and derived and db.package_of(item) == package_id {
+        return Some(item)
+    }
+    return None
+} Checker.encoded_shape
+
+/// The rules of a function declared `migrate`.
+fn Checker.check_migration(self, item: ty::ItemId, function: ast::FnItem, sig: FnSig) {
+    let db = self.db()
+    let token = db.ast(item).token
+    let Some(migration) = self.migration(item) else {
+        self.report(item, token, code: diagnostic::Code.EncodeMigrateForm)
+        return
+    }
+    if not sig.limit_set.notrap or not sig.limit_set.terminates {
+        var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+        mut fixes.push(self.limits_fix(item, head: function.head, sig))
+        self.report_fixed(item, construct: nir::Span.at(token), code: diagnostic::Code.EncodeMigrateLimits, take fixes, offer: diagnostic::Offer.Each)
+    }
+    let digest = self.digest(item)
+    let held = digest.contents()
+    var effects = held.device or held.privileged or held.sync or held.wait or held.class != ty::Class.Traceless
+    match held.capabilities {
+        Some(set) => {
+            effects = effects or set.len() > 0
+        }
+        None => {
+            effects = true
+        }
+    }
+    match held.validators {
+        Some(set) => {
+            effects = effects or set.len() > 0
+        }
+        None => {
+            effects = true
+        }
+    }
+    if effects {
+        self.report(item, token, code: diagnostic::Code.EncodeMigrateEffect)
+    }
+    let Some(TypeKey.Item(owner)) = db.owners.get(item) else {
+        return
+    }
+    let hash = self.shape_hash(migration.shape)
+    let own = self.shape_hash(owner)
+    let recorded = self.recorded_hashes(owner)
+    if hash == own or recorded.position(fn(known: hashing::HashValue) => known == hash).is_none() {
+        self.report(item, token, code: diagnostic::Code.EncodeMigrateSchema)
+        return
+    }
+    var earliest: Option[ty::ItemId] = None
+    var forward_found = false
+    for other in self.migrations(owner) {
+        if self.shape_hash(other.shape) != hash {
+            continue
+        }
+        if other.forward == migration.forward and earliest.is_none() {
+            earliest = Some(other.function)
+        }
+        forward_found = forward_found or other.forward
+    }
+    if earliest != Some(item) {
+        self.report(item, token, code: diagnostic::Code.EncodeMigrateDuplicate)
+    } else if not migration.forward and not forward_found {
+        self.report(item, token, code: diagnostic::Code.EncodeMigrateInverseAlone)
+    }
+} Checker.check_migration
+
+/// The schema hash of a type without type parameters.
+pkg fn Checker.shape_hash(self, item: ty::ItemId) -> hashing::HashValue {
+    let alloc = self.alloc()
+    return schema_hash(self.schema(self.types().item(item, args: mem::List[ty::Arg].empty(alloc))), alloc)
+} Checker.shape_hash
+
+/// The schema hashes the history of a type's package records for it.
+fn Checker.recorded_hashes(self, item: ty::ItemId) -> mem::List[hashing::HashValue] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let module = db.module(db.module_of(item)).name.as_str()
+    let Some(name) = db.ast(item).name(alloc) else {
+        return mem::List[hashing::HashValue].empty(alloc)
+    }
+    let Some(history) = db.source(db.package_of(item)).machine.history() else {
+        return mem::List[hashing::HashValue].empty(alloc)
+    }
+    return history.schemas(module, ty: name.as_str(), alloc)
+} Checker.recorded_hashes
+
+/// The fix adding `notrap` and `terminates` to a head in the order `nan fmt` writes limits.
+fn Checker.limits_fix(self, item: ty::ItemId, head: ast::Head, sig: FnSig) -> diagnostic::Fix {
+    let alloc = self.alloc()
+    var words = text::String.empty(alloc)
+    if not sig.limit_set.notrap {
+        mut words.append("notrap")
+    }
+    if not sig.limit_set.terminates {
+        if not words.is_empty() {
+            mut words.append(", ")
+        }
+        mut words.append("terminates")
+    }
+    let Some(written) = head.limit_set else {
+        return self.limits_appended(item, head, words: words.as_str())
+    }
+    if written.entries.len() == 0 {
+        return self.limits_appended(item, head, words: words.as_str())
+    }
+    var anchored = false
+    var anchor: u32 = 0
+    for limit in written.entries {
+        let earlier = limit.kind == ast::LimitKind.Pure or (sig.limit_set.notrap and limit.kind == ast::LimitKind.Notrap)
+        if earlier and (not anchored or limit.token > anchor) {
+            anchored = true
+            anchor = limit.token
+        }
+    }
+    if anchored {
+        var added = text::String.of(", ", alloc)
+        mut added.append(words.as_str())
+        return self.fix_appending(item, after: anchor, text: added.as_str())
+    }
+    mut words.append(", ")
+    return self.fix_inserting(item, before: written.entries[0].token, text: words.as_str())
+} Checker.limits_fix
+
+/// The fix adding a limits clause of `words` to a head without one.
+fn Checker.limits_appended(self, item: ty::ItemId, head: ast::Head, words: Str) -> diagnostic::Fix {
+    var added = text::String.of(" limits ", alloc: self.alloc())
+    mut added.append(words)
+    return self.fix_appending(item, after: head_last(head), text: added.as_str())
+} Checker.limits_appended

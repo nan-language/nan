@@ -9,7 +9,7 @@ use super::sig::{Payload, SigKind};
 use super::ty::{Arg, Const, Scalar, Subst, Ty};
 use crate::encoding::uvar;
 use crate::hash::Hash;
-use crate::syntax::ast::{ItemKind, RetiredNew, TypeModifier, Visibility};
+use crate::syntax::ast::{ItemKind, RetiredNew, Visibility};
 
 /// A node of a schema tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,13 +423,14 @@ impl Checker<'_> {
         }
         let sig = self.sig(*item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
-        let open = self.db.ast(*item).has_modifier(TypeModifier::Open);
+        let open = self.db.ast(*item).is_open();
         walk.enclosing.push((ty.clone(), 1));
         let node = match &sig.kind {
             SigKind::Struct { fields } => Node::Record {
                 open,
                 fields: fields
                     .iter()
+                    .filter(|field| !field.is_kept())
                     .map(|field| {
                         let value_ty = subst.ty(&field.ty);
                         let defaulted = open && self.implements_default(&value_ty);

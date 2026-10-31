@@ -7,7 +7,7 @@ use crate::check::db::{ItemId, ModuleId};
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Ty};
 use crate::diagnostic::{Fix, Replacement};
-use crate::syntax::ast::{ItemKind, Mode, ParamKind, TypeModifier};
+use crate::syntax::ast::{ItemKind, Mode, ParamKind};
 
 /// The depth of enclosing generator calls from which collections draw no elements and enums
 /// only their variants that do not hold themselves.
@@ -149,6 +149,7 @@ fn derived(ck: &Checker, ty: &Ty, item: ItemId, draws: &mut Draws, depth: u32) -
         SigKind::Struct { fields } => {
             let fields = fields
                 .iter()
+                .filter(|field| !field.is_kept())
                 .map(|field| {
                     let field_ty = ck.field_type(ty, &field.name).unwrap_or(Ty::Unit);
                     (field.name.clone(), rebuild(ck, &field_ty, draws, inner))
@@ -403,7 +404,7 @@ impl Writer<'_> {
             return false;
         };
         db.visible(self.module, *item)
-            && (own || !ast.has_modifier(TypeModifier::Open))
+            && (own || !ast.is_open())
             && structure
                 .fields()
                 .all(|field| db.field_visible(self.module, *item, field.visibility))

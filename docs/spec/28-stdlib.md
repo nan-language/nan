@@ -69,7 +69,8 @@ The table names every pub std type, interface, free function and registry with t
 | `mem` | `mem::Entry`, `mem::KeyValue`, `mem::List`, `mem::Bytes`, `mem::Map`, `mem::HashMap`, `mem::Set`, `mem::Bounded` | [Collections](12-memory.md#collections); `get_by`, `get_by_mut` and `contains_by` in [Ordered lookup](#ordered-lookup); `mem::Map.at`, `mem::Map.at_mut`, `mem::HashMap.at` and `mem::HashMap.at_mut` in [Maps and sets](12-memory.md#maps-and-sets) |
 | `mem` | `mem::ArenaCursor`, `mem::PoolCursor`, `mem::ListCursor`, `mem::BoundedCursor`, `mem::MapCursor`, `mem::MapCursorMut`, `mem::MapIntoCursor`, `mem::HashMapCursor`, `mem::HashMapCursorMut`, `mem::HashMapIntoCursor`, `mem::SetCursor`, `mem::SetIntoCursor` | [Memory types](12-memory.md#memory-types) |
 | `mem` | `mem::OnceMap` | [Once maps](12-memory.md#once-maps) |
-| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format); `schema_hash` and `schema` in [Schema hashes](13-text-encode.md#schema-hashes), `canonical` and `erased` in [Erased decoders](13-text-encode.md#erased-decoders) |
+| `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format); `schema_hash` and `schema` in [Schema hashes](13-text-encode.md#schema-hashes), `canonical` and `erased` in [Erased decoders](13-text-encode.md#erased-decoders), `decode_from` and `encode_as` in [Migrations](13-text-encode.md#migrations) |
+| `mem` | `mem::wire::Kept` | [Flexible structs](13-text-encode.md#flexible-structs) |
 | `mem` | `mem::wire::SchemaHash`, `mem::wire::Schema`, `mem::wire::SchemaField`, `mem::wire::SchemaVariant` | [Schema hashes](13-text-encode.md#schema-hashes); `mem::wire::Schema.accepts` in [Encode class](29-identity-versioning.md#encode-class) |
 | `mem` | `mem::wire::Erased` | [Erased decoders](13-text-encode.md#erased-decoders) |
 | `text` | `text::String`, `text::Fixed` | [Text types](13-text-encode.md#text-types) |

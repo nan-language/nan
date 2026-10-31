@@ -101,6 +101,7 @@ fn form(lo: &mut Lowering, ty: &Ty, visiting: &mut Vec<Ty>) -> Option<Form> {
                 SigKind::Struct { fields } => {
                     let fields: Vec<Part> = fields
                         .iter()
+                        .filter(|field| !field.is_kept())
                         .map(|field| {
                             let offset = lo.layouts.field(lo.ck, ty, None, &field.name).offset;
                             (field.name.clone(), subst.ty(&field.ty), offset)

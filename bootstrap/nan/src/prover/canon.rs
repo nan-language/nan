@@ -13,7 +13,6 @@ use crate::check::sig::SigKind;
 use crate::check::ty::{Scalar, Ty};
 use crate::hash::Hash;
 use crate::nir::{BinaryOp, UnaryOp};
-use crate::syntax::ast::TypeModifier;
 
 /// Σ ci × ti and a constant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -694,8 +693,7 @@ impl<'a, 'c> Canon<'a, 'c> {
 
     /// Whether an enum is open and declared by another package than the code judged.
     fn foreign_open(&self, item: ItemId) -> bool {
-        self.ck.db.ast(item).has_modifier(TypeModifier::Open)
-            && self.ck.db.package_of(item) != self.package
+        self.ck.db.ast(item).is_open() && self.ck.db.package_of(item) != self.package
     }
 }
 

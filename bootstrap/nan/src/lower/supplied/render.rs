@@ -769,7 +769,7 @@ fn render_composite(
         SigKind::Struct { fields } => {
             let address = value.address();
             append_text(lo, fx, renderer_value, &format!("{name}("));
-            for (index, field) in fields.iter().enumerate() {
+            for (index, field) in fields.iter().filter(|field| !field.is_kept()).enumerate() {
                 if index > 0 {
                     append_text(lo, fx, renderer_value, ", ");
                 }

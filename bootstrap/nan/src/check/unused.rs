@@ -214,16 +214,17 @@ impl Checker<'_> {
 
     /// The private items of a module that no reachable item names, each reported on its first
     /// line with the fix deleting it. Reachable are its items that are not private, its tests,
-    /// impl lines, contributions and const asserts, its landing fns, the function its package's
-    /// `entry` directive names, and each private item a reachable item names, a test naming its
-    /// target; a tombstone is neither reachable nor unused. None is reported when a reachable
-    /// item holds a failed construct or the module an item abandoned at a syntax failure.
+    /// impl lines, contributions and const asserts, its landing fns and migrations, the function
+    /// its package's `entry` directive names, and each private item a reachable item names, a
+    /// test naming its target; a tombstone is neither reachable nor unused. None is reported when
+    /// a reachable item holds a failed construct or the module an item abandoned at a syntax
+    /// failure.
     fn check_unused_items(&self, module: ModuleId) {
         let items = &self.db.module(module).items;
         let private = |item: ItemId| {
             let ast = self.db.ast(item);
-            let landing = matches!(&ast.kind, ItemKind::Fn(function)
-                if function.modifier.is_some_and(|(modifier, _)| modifier == FnModifier::Landing));
+            let rooted = ast.has_fn_modifier(FnModifier::Landing)
+                || ast.has_fn_modifier(FnModifier::Migrate);
             ast.visibility == Visibility::Private
                 && matches!(
                     ast.kind,
@@ -236,7 +237,7 @@ impl Checker<'_> {
                         | ItemKind::Const(_)
                         | ItemKind::Registry(_)
                 )
-                && !landing
+                && !rooted
                 && !self.names_entry(item)
         };
         let mut reached: HashSet<ItemId> = items

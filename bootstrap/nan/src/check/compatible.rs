@@ -10,7 +10,9 @@ use super::reversibility;
 use super::schema::Node;
 use super::sig::SigKind;
 use super::synthetic::{self, Synthetic};
+use super::ty::Ty;
 use super::{Checker, check_targets, checked};
+use crate::hash::Hash;
 use crate::machine::api::{Accepted, Entry};
 use crate::store::{self, Class};
 use crate::workspace::Workspace;
@@ -174,14 +176,13 @@ fn judging(ck: &Checker, item: ItemId, old: &Entry, new: &Entry) -> Judging {
                 .collect();
             Judging::Function { contract, examples }
         }
-        SigKind::Enum { .. } if opened(old_head, new_head) && held(&old.text) => {
+        SigKind::Enum { .. } if opened(old_head, new_head) && held(&old.text[1..]) => {
             Judging::Compatible
         }
-        SigKind::Struct { fields } if opened(old_head, new_head) && held(&old.text) => {
+        SigKind::Struct { fields } if opened(old_head, new_head) && held(&old.text[1..]) => {
             let encoded = new_head.contains("Encode");
             let default = ck.db.core_item("Default");
-            let defaulted = new
-                .text
+            let defaulted = new.text[1..]
                 .iter()
                 .filter(|line| !old.text.contains(line))
                 .all(|line| {
@@ -216,9 +217,11 @@ fn judging(ck: &Checker, item: ItemId, old: &Entry, new: &Entry) -> Judging {
     }
 }
 
-/// Whether a struct or enum keeps its declaration line and is open.
+/// Whether a struct or enum keeps its declaration line and is open, `open` and `flexible`
+/// replacing each other.
 fn opened(old: &str, new: &str) -> bool {
-    old == new && new.contains(" open ")
+    let open = |line: &str| line.replacen(" flexible ", " open ", 1);
+    open(old) == open(new) && open(new).contains(" open ")
 }
 
 /// A function's head line without its limits, its limits other than a class, and its class.
@@ -288,6 +291,34 @@ pub fn encode_class(workspace: &Workspace, index: usize, parent: Option<&store::
         class = Class::Breaking;
     }
     class
+}
+
+/// The schema hash of each type whose schema tree the code root of the workspace package at
+/// `index` records, with its module's and its own name, as its history records them.
+pub fn schema_records(workspace: &Workspace, index: usize) -> Vec<(String, String, Hash)> {
+    let package = &workspace.packages[index];
+    let (Some(closure), Some(&target)) = (
+        workspace.closure_of(package),
+        check_targets(package).first(),
+    ) else {
+        return Vec::new();
+    };
+    let checker = checked(workspace, closure, crate::stdlib::packages(), target);
+    let Some(id) = package.name().and_then(|name| checker.package_named(name)) else {
+        return Vec::new();
+    };
+    checker
+        .recorded_schemas(id)
+        .into_values()
+        .filter_map(|ty| {
+            let Ty::Item(item, _) = ty else {
+                return None;
+            };
+            let module = checker.db.module(checker.db.module_of(item)).name.clone();
+            let name = checker.db.ast(item).name()?;
+            Some((module, name, checker.schema(&ty).hash()))
+        })
+        .collect()
 }
 
 /// The schema tree of each exported type implementing `Encode` of the workspace package at

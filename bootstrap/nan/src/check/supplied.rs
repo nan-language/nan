@@ -12,9 +12,11 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 25] = [
+const DRAWING: [&str; 27] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
+    "mem::wire::Codec.decode_from",
+    "mem::wire::Codec.encode_as",
     "mem::wire::Codec.schema",
     "text::json::Codec.decode",
     "text::construction::Codec.decode",

@@ -5,7 +5,7 @@ use super::Body;
 use crate::check::Member;
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::resolve::Named;
-use crate::check::sig::{Payload, SigKind, VariantSig};
+use crate::check::sig::{FieldSig, Payload, SigKind, VariantSig};
 use crate::check::tir::{
     Compared, Lit, LocalId, LocalKind, TArm, TKind, TPattern, TPatternKind, ValueSpace, ValueTest,
 };
@@ -13,7 +13,7 @@ use crate::check::ty::{Scalar, Subst, Ty};
 use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
 use crate::interp::{ConstValue, Val};
-use crate::syntax::ast::{self, ItemKind, LiteralKind, PatternKind, RangeKind, Tok, TypeModifier};
+use crate::syntax::ast::{self, ItemKind, LiteralKind, PatternKind, RangeKind, Tok};
 
 /// A pattern as exhaustiveness reads it.
 #[derive(Clone, Debug, PartialEq)]
@@ -458,10 +458,12 @@ impl Body<'_, '_> {
                 }
             },
             (SigKind::Struct { fields: declared }, None) => {
-                if consumer && self.ck.db.ast(item).has_modifier(TypeModifier::Open) {
+                if consumer && self.ck.db.ast(item).is_open() {
                     self.report(token, Code::PatternOpenStruct);
                     return failed(self, fields);
                 }
+                let declared: Vec<&FieldSig> =
+                    declared.iter().filter(|field| !field.is_kept()).collect();
                 if declared.iter().any(|field| {
                     !self
                         .ck
@@ -823,7 +825,13 @@ impl Body<'_, '_> {
                 let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
                 match &sig.kind {
                     SigKind::Struct { fields } => Shape::Ctors {
-                        fields: vec![fields.iter().map(|field| subst.ty(&field.ty)).collect()],
+                        fields: vec![
+                            fields
+                                .iter()
+                                .filter(|field| !field.is_kept())
+                                .map(|field| subst.ty(&field.ty))
+                                .collect(),
+                        ],
                         open: false,
                     },
                     SigKind::Layout { fields, tags, .. } if tags.is_empty() => Shape::Ctors {
@@ -836,7 +844,7 @@ impl Body<'_, '_> {
                     },
                     SigKind::Enum { variants } => {
                         let open = !self.closed.get()
-                            && self.ck.db.ast(*item).has_modifier(TypeModifier::Open)
+                            && self.ck.db.ast(*item).is_open()
                             && self.ck.db.package_of(*item)
                                 != self.ck.db.module(self.module).package;
                         Shape::Ctors {

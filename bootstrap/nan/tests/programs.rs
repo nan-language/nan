@@ -19,7 +19,7 @@ datatest_stable::harness! {
     { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
 }
 
-/// Copies a directory's files into another, made anew.
+/// Copies a directory's files and directories into another, made anew.
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     if to.exists() {
         fs::remove_dir_all(to)?;
@@ -27,8 +27,11 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
-        if entry.file_name() != "expected" && entry.file_name() != "emulator" {
-            fs::copy(entry.path(), to.join(entry.file_name()))?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if entry.file_name() != "expected" && entry.file_name() != "emulator" {
+            fs::copy(entry.path(), target)?;
         }
     }
     Ok(())

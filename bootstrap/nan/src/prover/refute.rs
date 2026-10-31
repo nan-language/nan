@@ -9,7 +9,7 @@ use super::solve::{Solver, State};
 use super::term::{Sort, Term, TermId};
 use crate::check::Checker;
 use crate::check::db::ModuleId;
-use crate::check::sig::{Payload, SigKind};
+use crate::check::sig::{FieldSig, Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
 use crate::interp::{Input, Val};
 use crate::nir::{Callable, FnRef};
@@ -236,6 +236,8 @@ impl<'b, 'c> Builder<'b, 'c> {
         match &sig.kind {
             SigKind::Struct { .. } if self.ck.is_base_type(item) => None,
             SigKind::Struct { fields } => {
+                let fields: Vec<&FieldSig> =
+                    fields.iter().filter(|field| !field.is_kept()).collect();
                 if !fields.iter().all(|field| {
                     self.ck
                         .db

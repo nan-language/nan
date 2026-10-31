@@ -887,11 +887,17 @@ impl<'w, 'a> Walk<'w, 'a> {
                 Some(self.constant(constant, result_ty.clone().expect("a constant's type")))
             }
             NirOp::Construct { ty, fields } => {
-                let operands = fields
+                let mut operands: Vec<TermId> = fields
                     .iter()
                     .map(|(_, operand)| self.operand(operand, contents))
                     .collect();
                 let ty = self.subst.ty(ty);
+                if let Ty::Item(item, _) = &ty
+                    && let Some(kept) = self.ck.kept_type(*item)
+                {
+                    let empty = Term::App(Op::Variant(kept.clone(), 0), Vec::new());
+                    operands.push(self.terms.intern(empty, kept));
+                }
                 Some(
                     self.terms
                         .intern(Term::App(Op::Construct(ty.clone()), operands), ty),

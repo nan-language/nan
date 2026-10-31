@@ -1,5 +1,5 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas and erased
-//! decoders, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
+//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas, erased decoders and
+//! migrations, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
 //! type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then
 //! writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through
 //! the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
@@ -17,8 +17,8 @@ use super::stores::{boxed, cell_of, counted, entries, exhausted, holding, place}
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
+use crate::hash::Hash;
 use crate::nir::{Callable, FnRef, Role, Span};
-use crate::syntax::ast::TypeModifier;
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const MAX_DEPTH: usize = 128;
@@ -51,17 +51,47 @@ pub fn member(
                 Format::Json => write_json,
                 Format::Construction => return None,
             };
-            let mut out = Vec::new();
-            write(&encoded(interp, &args[0], &ty), &mut out);
-            let bytes: Vec<Val> = out
-                .into_iter()
-                .map(|byte| Val::Int(i128::from(byte)))
-                .collect();
-            let target = place(&args[1]);
-            let byte = Ty::Scalar(Scalar::U8);
-            match super::stores::append(interp, &target, &bytes, &byte) {
+            match appended(interp, write, &args[0], &ty, &args[1]) {
                 Some(()) => Ok(Flow::Return(Val::Unit)),
                 None => exhausted(interp, member == "try_encode", at),
+            }
+        }
+        "decode_from" => {
+            let wanted = hash_value(interp, &args[0]);
+            let decoded = match migrated(interp, &ty, wanted, true) {
+                Some(None) => read(interp, format, &ty, &args[1..], at, site),
+                Some(Some((migration, shape))) => {
+                    read(interp, format, &shape, &args[1..], at, site).and_then(
+                        |old| match migrate(interp, migration, old, &args[2], at, site)? {
+                            Flow::Return(value) => Ok(value),
+                            _ => fail("OutOfMemory"),
+                        },
+                    )
+                }
+                None => fail("UnknownSchema"),
+            };
+            outcome(interp, decoded)
+        }
+        "encode_as" => {
+            let wanted = hash_value(interp, &args[1]);
+            let written = match migrated(interp, &ty, wanted, false) {
+                Some(None) => appended(interp, write_wire, &args[0], &ty, &args[2]),
+                Some(Some((migration, shape))) => {
+                    let old = match migrate(interp, migration, args[0].clone(), &args[3], at, site)
+                    {
+                        Ok(Flow::Return(old)) => old,
+                        Ok(_) => return Some(exhausted(interp, false, at)),
+                        Err(end) => return Some(Err(end)),
+                    };
+                    let written = appended(interp, write_wire, &old, &shape, &args[2]);
+                    super::stores::release(interp, &old);
+                    written
+                }
+                None => return Some(Ok(Flow::Return(Val::Bool(false)))),
+            };
+            match written {
+                Some(()) => Ok(Flow::Return(Val::Bool(true))),
+                None => exhausted(interp, false, at),
             }
         }
         "decode" => {
@@ -156,6 +186,86 @@ fn read(
         decoding.reader.finish(decoding.interp)?;
         Ok(value)
     })
+}
+
+/// Appends a value's encoding in a format to the bytes at the place `out` holds; none on
+/// exhaustion, which leaves them unchanged.
+fn appended(
+    interp: &mut Interpreter,
+    write: fn(&Tree, &mut Vec<u8>),
+    value: &Val,
+    ty: &Ty,
+    out: &Val,
+) -> Option<()> {
+    let mut written = Vec::new();
+    write(&encoded(interp, value, ty), &mut written);
+    let bytes: Vec<Val> = written
+        .into_iter()
+        .map(|byte| Val::Int(i128::from(byte)))
+        .collect();
+    super::stores::append(interp, &place(out), &bytes, &Ty::Scalar(Scalar::U8))
+}
+
+/// The hash a `mem::wire::SchemaHash` value holds.
+fn hash_value(interp: &Interpreter, value: &Val) -> Hash {
+    let bytes = interp.deref(value).fields()[0].clone();
+    let mut hash = [0; 33];
+    for (byte, held) in hash.iter_mut().zip(bytes.fields()) {
+        *byte = held.int() as u8;
+    }
+    Hash(hash)
+}
+
+/// How values of a type convert from or to the schema hash `wanted`: as themselves, through a
+/// forward migration or an inverse with its frozen shape, or not at all.
+fn migrated(
+    interp: &Interpreter,
+    ty: &Ty,
+    wanted: Hash,
+    forward: bool,
+) -> Option<Option<(ItemId, Ty)>> {
+    if interp.ck.schema(ty).hash() == wanted {
+        return Some(None);
+    }
+    let Ty::Item(item, _) = ty else {
+        return None;
+    };
+    interp
+        .ck
+        .migrations(*item)
+        .into_iter()
+        .find(|migration| {
+            migration.forward == forward && interp.ck.shape_hash(migration.shape) == wanted
+        })
+        .map(|migration| Some((migration.function, Ty::item(migration.shape, Vec::new()))))
+}
+
+/// Runs a migration on a value, with the allocator `alloc` when it takes one.
+fn migrate(
+    interp: &mut Interpreter,
+    function: ItemId,
+    value: Val,
+    alloc: &Val,
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<Flow> {
+    let mut args = vec![value];
+    if interp
+        .ck
+        .fn_sig(function)
+        .is_some_and(|sig| sig.params.len() == 2)
+    {
+        args.push(alloc.clone());
+    }
+    let fn_ref = FnRef {
+        callable: Callable::Item {
+            item: function,
+            role: Role::Body,
+            index: 0,
+        },
+        args: Rc::from(Vec::new()),
+    };
+    interp.call_function(&fn_ref, args, at, site)
 }
 
 /// The `mem::wire::SchemaHash` of a type implementing `Encode`.
@@ -308,6 +418,7 @@ impl Calls {
                 call(interp, "end", Vec::new())
             }
             Tree::Record(fields) => {
+                let fields = declared(fields);
                 call(interp, "begin_record", vec![count(fields.len())])?;
                 for (key, value) in fields {
                     let key = byte_view(interp, key, false);
@@ -325,6 +436,7 @@ impl Calls {
                 }
                 call(interp, "end", Vec::new())
             }
+            Tree::Raw(_) => unreachable!("kept fields written through calls"),
         }
     }
 
@@ -503,6 +615,29 @@ enum Tree {
     /// Fields by key, in ascending byte order of keys.
     Record(Vec<(Vec<u8>, Tree)>),
     Variant(Vec<u8>, Option<Box<Tree>>),
+    /// The `mem::wire` bytes of a kept field's value.
+    Raw(Vec<u8>),
+}
+
+/// The fields of a record but its kept ones, which only `mem::wire` writes.
+fn declared(fields: &[(Vec<u8>, Tree)]) -> Vec<&(Vec<u8>, Tree)> {
+    fields
+        .iter()
+        .filter(|(_, value)| !matches!(value, Tree::Raw(_)))
+        .collect()
+}
+
+/// The fields `Kept.Fields` holds: each key with the bytes of its value.
+fn kept_entries(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut reader = WireReader::new(bytes.to_vec());
+    let mut entries = Vec::new();
+    while reader.input.at < bytes.len() {
+        let (Ok(key), Ok(value)) = (reader.framed(), reader.framed()) else {
+            break;
+        };
+        entries.push((key, value));
+    }
+    entries
 }
 
 /// The encoded tree of a value of a type.
@@ -568,44 +703,59 @@ fn encoded(interp: &Interpreter, value: &Val, ty: &Ty) -> Tree {
                     encoded(interp, &value.fields()[0], &arg(0))
                 }
                 "mem::Id" => Tree::Unsigned(value.fields()[0].int() as u64),
-                _ => {
-                    match &interp.ck.sig(*item).kind {
-                        SigKind::Struct { fields } => {
-                            let subst = Subst::of(
-                                interp.ck.sig(*item).generics.iter().map(|def| def.param),
-                                args,
+                _ => match &interp.ck.sig(*item).kind {
+                    SigKind::Struct { fields } => {
+                        let subst = Subst::of(
+                            interp.ck.sig(*item).generics.iter().map(|def| def.param),
+                            args,
+                        );
+                        let named = fields
+                            .iter()
+                            .zip(value.fields())
+                            .filter(|(field, _)| !field.is_kept())
+                            .map(|(field, part)| (field.name.as_str(), part, subst.ty(&field.ty)));
+                        let mut tree = record(interp, named);
+                        if let (Some(Val::Variant(_, 1, held)), Tree::Record(fields)) =
+                            (value.fields().last(), &mut tree)
+                            && interp.ck.kept_type(*item).is_some()
+                        {
+                            let bytes = interp.deref(&held[0]).fields()[0].clone();
+                            let kept = bytes_of(&entries(interp, &bytes));
+                            fields.extend(
+                                kept_entries(&kept)
+                                    .into_iter()
+                                    .map(|(key, value)| (key, Tree::Raw(value))),
                             );
-                            let named = fields.iter().zip(value.fields()).map(|(field, part)| {
-                                (field.name.as_str(), part, subst.ty(&field.ty))
-                            });
-                            record(interp, named)
+                            fields.sort_by(|left, right| left.0.cmp(&right.0));
                         }
-                        SigKind::Enum { variants } => {
-                            let Val::Variant(_, index, payload) = &value else {
-                                panic!("an enum value");
-                            };
-                            let subst = Subst::of(
-                                interp.ck.sig(*item).generics.iter().map(|def| def.param),
-                                args,
-                            );
-                            let variant = &variants[*index as usize];
-                            let encoded_payload = match &variant.payload {
-                                Payload::None => None,
-                                Payload::Single(ty) => {
-                                    Some(Box::new(encoded(interp, &payload[0], &subst.ty(ty))))
-                                }
-                                Payload::Labelled(labels) => {
-                                    let named = labels.iter().zip(payload.iter()).map(
-                                        |((name, ty), part)| (name.as_str(), part, subst.ty(ty)),
-                                    );
-                                    Some(Box::new(record(interp, named)))
-                                }
-                            };
-                            Tree::Variant(variant.name.clone().into_bytes(), encoded_payload)
-                        }
-                        other => panic!("an Encode type of kind {other:?}"),
+                        tree
                     }
-                }
+                    SigKind::Enum { variants } => {
+                        let Val::Variant(_, index, payload) = &value else {
+                            panic!("an enum value");
+                        };
+                        let subst = Subst::of(
+                            interp.ck.sig(*item).generics.iter().map(|def| def.param),
+                            args,
+                        );
+                        let variant = &variants[*index as usize];
+                        let encoded_payload = match &variant.payload {
+                            Payload::None => None,
+                            Payload::Single(ty) => {
+                                Some(Box::new(encoded(interp, &payload[0], &subst.ty(ty))))
+                            }
+                            Payload::Labelled(labels) => {
+                                let named = labels
+                                    .iter()
+                                    .zip(payload.iter())
+                                    .map(|((name, ty), part)| (name.as_str(), part, subst.ty(ty)));
+                                Some(Box::new(record(interp, named)))
+                            }
+                        };
+                        Tree::Variant(variant.name.clone().into_bytes(), encoded_payload)
+                    }
+                    other => panic!("an Encode type of kind {other:?}"),
+                },
             }
         }
         other => panic!("an Encode value of {other:?}"),
@@ -670,6 +820,7 @@ fn write_wire(tree: &Tree, out: &mut Vec<u8>) {
                 framed(&written, out);
             }
         }
+        Tree::Raw(bytes) => out.extend_from_slice(bytes),
         Tree::Variant(key, payload) => {
             framed(key, out);
             match payload {
@@ -724,7 +875,7 @@ fn write_json(tree: &Tree, out: &mut Vec<u8>) {
         }
         Tree::Record(fields) => {
             out.push(b'{');
-            for (index, (key, value)) in fields.iter().enumerate() {
+            for (index, (key, value)) in declared(fields).into_iter().enumerate() {
                 if index > 0 {
                     out.push(b',');
                 }
@@ -742,6 +893,7 @@ fn write_json(tree: &Tree, out: &mut Vec<u8>) {
             write_json(payload, out);
             out.push(b'}');
         }
+        Tree::Raw(_) => unreachable!("kept fields written to JSON"),
     }
 }
 
@@ -855,6 +1007,11 @@ trait Reader {
     fn payload_follows(&mut self, interp: &mut Interpreter) -> Decoded<bool>;
     /// Passes over the value of the field whose key was just read, at a nesting depth.
     fn skip(&mut self, interp: &mut Interpreter, depth: usize) -> Decoded<()>;
+    /// Passes over the field whose key was read last, giving its key and value as `mem::wire`
+    /// frames them when the reader keeps skipped fields.
+    fn keep(&mut self, interp: &mut Interpreter, depth: usize) -> Decoded<Option<Vec<u8>>> {
+        self.skip(interp, depth).map(|()| None)
+    }
     fn end(&mut self, interp: &mut Interpreter) -> Decoded<()>;
     /// Fails on what is left after the value.
     fn finish(&mut self, interp: &mut Interpreter) -> Decoded<()>;
@@ -1069,15 +1226,20 @@ impl Decoding<'_, '_, '_, '_> {
     fn declared(&mut self, item: ItemId, args: &[Arg]) -> Decoded<Val> {
         let sig = self.interp.ck.sig(item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
-        let open = self.interp.ck.db.ast(item).has_modifier(TypeModifier::Open);
+        let open = self.interp.ck.db.ast(item).is_open();
         let aliases = self.interp.ck.key_aliases(item);
         match &sig.kind {
             SigKind::Struct { fields } => {
                 let named: Vec<(String, Ty)> = fields
                     .iter()
+                    .filter(|field| !field.is_kept())
                     .map(|field| (field.name.clone(), subst.ty(&field.ty)))
                     .collect();
-                let values = self.record(&named, open, false, &aliases)?;
+                let kept = self.interp.ck.kept_type(item).map(|_| Vec::new());
+                let (mut values, kept) = self.record(&named, open, kept, &aliases)?;
+                if let Some(kept) = kept {
+                    values.push(self.kept(kept)?);
+                }
                 let value = Val::Struct(item, Rc::new(values));
                 let ty = Ty::item(item, args.to_vec());
                 match self.interp.predicates_hold(item, true, &value, &ty) {
@@ -1103,7 +1265,7 @@ impl Decoding<'_, '_, '_, '_> {
                             .iter()
                             .map(|(name, ty)| (name.clone(), subst.ty(ty)))
                             .collect();
-                        self.record(&named, false, true, &BTreeMap::new())?
+                        self.labelled(&named)?
                     }
                     _ => return fail("Malformed"),
                 };
@@ -1115,33 +1277,56 @@ impl Decoding<'_, '_, '_, '_> {
         }
     }
 
-    /// The values of a record's named fields in order, as the decoding rules read them, given
-    /// whether it decodes as open and whether it is a labelled payload.
+    /// The values of a labelled payload's fields in order.
+    fn labelled(&mut self, named: &[(String, Ty)]) -> Decoded<Vec<Val>> {
+        self.nest()?;
+        self.reader.begin_labelled(self.interp)?;
+        self.fields(named, false, None, &BTreeMap::new())
+            .map(|(values, _)| values)
+    }
+
+    /// The values of a struct's named fields in order, as the decoding rules read them, given
+    /// whether it decodes as open, and the kept fields of a flexible struct, empty at first.
     fn record(
         &mut self,
         named: &[(String, Ty)],
         open: bool,
-        labelled: bool,
+        kept: Option<Vec<u8>>,
         aliases: &BTreeMap<Vec<u8>, Vec<u8>>,
-    ) -> Decoded<Vec<Val>> {
+    ) -> Decoded<(Vec<Val>, Option<Vec<u8>>)> {
         self.nest()?;
-        match labelled {
-            true => self.reader.begin_labelled(self.interp)?,
-            false => self.reader.begin_record(self.interp)?,
-        }
+        self.reader.begin_record(self.interp)?;
+        self.fields(named, open, kept, aliases)
+    }
+
+    /// The fields of a record or labelled payload begun, and its end.
+    fn fields(
+        &mut self,
+        named: &[(String, Ty)],
+        open: bool,
+        mut kept: Option<Vec<u8>>,
+        aliases: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Decoded<(Vec<Val>, Option<Vec<u8>>)> {
         let mut values: Vec<Option<Val>> = vec![None; named.len()];
         let names: Vec<&[u8]> = named.iter().map(|(name, _)| name.as_bytes()).collect();
         while self.reader.next_follows(self.interp)? {
             match self.named(&names, aliases, false)? {
                 Some(index) if values[index].is_some() => return fail("DuplicateKey"),
                 Some(index) => values[index] = Some(self.value(&named[index].1)?),
-                None if open => self.reader.skip(self.interp, self.depth)?,
+                None if open => match kept.as_mut() {
+                    Some(kept) => kept.extend(
+                        self.reader
+                            .keep(self.interp, self.depth)?
+                            .unwrap_or_default(),
+                    ),
+                    None => self.reader.skip(self.interp, self.depth)?,
+                },
                 None => return fail("UnknownKey"),
             }
         }
         self.reader.end(self.interp)?;
         self.depth -= 1;
-        named
+        let values = named
             .iter()
             .zip(values)
             .map(|((_, ty), value)| match value {
@@ -1149,7 +1334,25 @@ impl Decoding<'_, '_, '_, '_> {
                 None if open => self.default(ty),
                 None => fail("MissingField"),
             })
-            .collect()
+            .collect::<Decoded<Vec<Val>>>()?;
+        Ok((values, kept))
+    }
+
+    /// The kept fields of a flexible struct, its skipped fields' bytes as `mem::wire` frames
+    /// them.
+    fn kept(&mut self, bytes: Vec<u8>) -> Decoded<Val> {
+        let kept = self.interp.ty_item("mem::wire", "Kept");
+        if bytes.is_empty() {
+            return Ok(Val::Variant(kept, 0, Rc::new(Vec::new())));
+        }
+        let values = bytes
+            .into_iter()
+            .map(|byte| Val::Int(i128::from(byte)))
+            .collect();
+        let held = self.held("mem::Bytes", values, &Ty::Scalar(Scalar::U8))?;
+        let untrusted = self.interp.ty_item("core", "Untrusted");
+        let fields = Val::Struct(untrusted, Rc::new(vec![held]));
+        Ok(Val::Variant(kept, 1, Rc::new(vec![fields])))
     }
 
     /// The position among `names` of the field or variant the key read next names, directly or
@@ -1318,6 +1521,7 @@ enum WireFrame {
         left: u64,
         value_end: Option<usize>,
         last: Option<Vec<u8>>,
+        key_start: usize,
     },
     Variant {
         payload_end: Option<usize>,
@@ -1441,6 +1645,7 @@ impl Reader for WireReader {
             left,
             value_end: None,
             last: None,
+            key_start: 0,
         });
         Ok(())
     }
@@ -1462,14 +1667,19 @@ impl Reader for WireReader {
     }
 
     fn read_key(&mut self, _: &mut Interpreter, keys: &[&[u8]]) -> Decoded<Option<usize>> {
+        let start = self.input.at;
         let key = self.framed()?;
         let end = self.length_end()?;
         let Some(WireFrame::Record {
-            value_end, last, ..
+            value_end,
+            last,
+            key_start,
+            ..
         }) = self.frames.last_mut()
         else {
             return fail("Malformed");
         };
+        *key_start = start;
         match last.as_ref().map(|last| key.as_slice().cmp(last)) {
             Some(std::cmp::Ordering::Equal) => return fail("DuplicateKey"),
             Some(std::cmp::Ordering::Less) => return fail("Malformed"),
@@ -1507,6 +1717,21 @@ impl Reader for WireReader {
         {
             self.input.at = end;
             return Ok(());
+        }
+        fail("Malformed")
+    }
+
+    fn keep(&mut self, _: &mut Interpreter, _: usize) -> Decoded<Option<Vec<u8>>> {
+        if let Some(WireFrame::Record {
+            value_end,
+            key_start,
+            ..
+        }) = self.frames.last_mut()
+            && let Some(end) = value_end.take()
+        {
+            let entry = self.input.bytes[*key_start..end].to_vec();
+            self.input.at = end;
+            return Ok(Some(entry));
         }
         fail("Malformed")
     }

@@ -191,7 +191,10 @@ impl Checker<'_> {
                     SigKind::Struct { fields } | SigKind::Layout { fields, .. } => found.extend(
                         fields
                             .iter()
-                            .filter(|field| self.db.field_visible(module, *item, field.visibility))
+                            .filter(|field| {
+                                !field.is_kept()
+                                    && self.db.field_visible(module, *item, field.visibility)
+                            })
                             .map(|field| field.name.clone()),
                     ),
                     SigKind::Enum { variants } => {

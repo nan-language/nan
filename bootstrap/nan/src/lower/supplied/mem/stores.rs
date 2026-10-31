@@ -4,7 +4,9 @@
 //! of its contents. A shared value is the address of its count, its allocator handle, its reach
 //! and its contents. An arena or once map is the address of the header of its segments. A pool
 //! is a vector of slots, each its generation, whether it is occupied and its value, then the
-//! count of occupied slots and the count of retired slots, those vacant at generation 2^32 − 1.
+//! count of occupied slots and its free list: the count of free slots and the indexes of the
+//! first and last freed. A free slot holds the index of the next one in place of its value; a
+//! retired slot, vacant at generation 2^32 − 1, is in no list.
 
 use cranelift_codegen::ir::{
     AtomicRmwOp, InstBuilder, MemFlagsData, Value, condcodes::IntCC, types,
@@ -30,17 +32,19 @@ mod shared {
     pub const HEADER: u64 = 24;
 }
 
-/// The offsets of a pool's count of occupied slots and of its count of retired slots.
+/// The offsets of a pool's count of occupied slots and of its free list's count, first and last.
 pub const POOL_COUNT: u64 = 32;
-const POOL_RETIRED: u64 = 40;
+const POOL_FREE: u64 = 40;
+const POOL_FIRST: u64 = 48;
+const POOL_LAST: u64 = 56;
 
 /// The layout of a pool slot holding a value of a layout: its size and alignment, and the
-/// offset of the value after the generation and the occupied flag.
+/// offset of the value after the generation and the occupied flag, with room for a `u32` link.
 fn slot_shape(lo: &mut Lowering, value: &Ty) -> (Element, u64) {
     let layout = lo.layout(value);
     let align = layout.align.max(4);
     let at = 8u64.next_multiple_of(layout.align.max(1));
-    let size = (at + layout.size).next_multiple_of(align);
+    let size = (at + layout.size.max(4)).next_multiple_of(align);
     (Element { size, align }, at)
 }
 
@@ -523,7 +527,7 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             vector::empty(fx, sret, cell, slot);
             let zero = fx.ptr(0);
             fx.store(zero, sret, POOL_COUNT);
-            fx.store(zero, sret, POOL_RETIRED);
+            fx.store(zero, sret, POOL_FREE);
             supply.done(lo, fx);
         }
         "len" => {
@@ -533,25 +537,40 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "insert" | "try_insert" => {
             let address = supply.param(0).address();
             let value = supply.param(1);
+            let free = fx.load(PTR, address, POOL_FREE);
+            let reused = fx.b.ins().icmp_imm_s(IntCC::NotEqual, free, 0);
+            let index = fx.choose(
+                reused,
+                &[PTR],
+                |fx| {
+                    let first = fx.load(PTR, address, POOL_FIRST);
+                    let data = fx.load(PTR, address, vector::DATA);
+                    let at = slot.at(fx, data, first);
+                    let next = fx.load(types::I32, at, value_at);
+                    let next = fx.b.ins().uextend(PTR, next);
+                    fx.store(next, address, POOL_FIRST);
+                    let free = fx.b.ins().iadd_imm_s(free, -1);
+                    fx.store(free, address, POOL_FREE);
+                    vec![first]
+                },
+                |fx| {
+                    let len = fx.load(PTR, address, vector::LEN);
+                    let needed = fx.b.ins().iadd_imm_s(len, 1);
+                    let room = vector::reserve(lo, fx, address, needed, slot);
+                    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
+                    fx.when(failed, |fx| {
+                        supply.exhausted(lo, fx, &[(value, element.clone())])
+                    });
+                    let data = fx.load(PTR, address, vector::DATA);
+                    let at = slot.at(fx, data, len);
+                    let zero = fx.int(types::I32, 0);
+                    fx.store(zero, at, 0);
+                    fx.store(needed, address, vector::LEN);
+                    vec![len]
+                },
+            )[0];
             let data = fx.load(PTR, address, vector::DATA);
-            let len = fx.load(PTR, address, vector::LEN);
-            let free = first_free(fx, data, len, slot);
-            let appended = fx.b.ins().icmp(IntCC::Equal, free, len);
-            fx.when(appended, |fx| {
-                let needed = fx.b.ins().iadd_imm_s(len, 1);
-                let room = vector::reserve(lo, fx, address, needed, slot);
-                let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
-                fx.when(failed, |fx| {
-                    supply.exhausted(lo, fx, &[(value, element.clone())])
-                });
-                let data = fx.load(PTR, address, vector::DATA);
-                let at = slot.at(fx, data, len);
-                let zero = fx.int(types::I32, 0);
-                fx.store(zero, at, 0);
-                fx.store(needed, address, vector::LEN);
-            });
-            let data = fx.load(PTR, address, vector::DATA);
-            let at = slot.at(fx, data, free);
+            let at = slot.at(fx, data, index);
             let occupied = fx.int(types::I32, 1);
             fx.store(occupied, at, 4);
             let stored = fx.offset(at, value_at);
@@ -561,7 +580,7 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.store(count, address, POOL_COUNT);
             let generation = fx.load(types::I32, at, 0);
             let sret = supply.sret.expect("a handle's address");
-            let index = fx.b.ins().ireduce(types::I32, free);
+            let index = fx.b.ins().ireduce(types::I32, index);
             fx.store(index, sret, 0);
             fx.store(generation, sret, 4);
             supply.done(lo, fx);
@@ -570,10 +589,7 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let address = supply.param(0).address();
             let additional = supply.param(1).scalar();
             let len = fx.load(PTR, address, vector::LEN);
-            let count = fx.load(PTR, address, POOL_COUNT);
-            let retired = fx.load(PTR, address, POOL_RETIRED);
-            let free = fx.b.ins().isub(len, count);
-            let free = fx.b.ins().isub(free, retired);
+            let free = fx.load(PTR, address, POOL_FREE);
             let short =
                 fx.b.ins()
                     .icmp(IntCC::UnsignedGreaterThan, additional, free);
@@ -639,11 +655,9 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     let count = fx.load(PTR, address, POOL_COUNT);
                     let count = fx.b.ins().iadd_imm_s(count, -1);
                     fx.store(count, address, POOL_COUNT);
-                    let retiring = fx.b.ins().icmp_imm_s(IntCC::Equal, next, -1);
-                    fx.when(retiring, |fx| {
-                        let retired = fx.load(PTR, address, POOL_RETIRED);
-                        let retired = fx.b.ins().iadd_imm_s(retired, 1);
-                        fx.store(retired, address, POOL_RETIRED);
+                    let reusable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, -1);
+                    fx.when(reusable, |fx| {
+                        free_slot(fx, address, data, index, slot, value_at)
                     });
                     let held = lo.held_at(fx, &element, result);
                     supply.ret(lo, fx, held);
@@ -665,30 +679,28 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// The index of the earliest free slot, neither occupied nor retired, or the length when there
-/// is none.
-fn first_free(fx: &mut Fx, data: Value, len: Value, slot: Element) -> Value {
-    let zero = fx.ptr(0);
-    fx.repeat(&[zero], |fx, state| {
-        let index = state[0];
-        let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-        let next = fx.choose(
-            inside,
-            &[PTR, types::I8],
-            |fx| {
-                let at = slot.at(fx, data, index);
-                let occupied = fx.load(types::I32, at, 4);
-                let occupied = fx.b.ins().icmp_imm_s(IntCC::NotEqual, occupied, 0);
-                let generation = fx.load(types::I32, at, 0);
-                let retired = fx.b.ins().icmp_imm_s(IntCC::Equal, generation, -1);
-                let taken = fx.b.ins().bor(occupied, retired);
-                let next = fx.b.ins().iadd_imm_s(index, 1);
-                vec![fx.b.ins().select(taken, next, index), taken]
-            },
-            |fx| vec![index, fx.int(types::I8, 0)],
-        );
-        (next[1], vec![next[0]])
-    })[0]
+/// Appends the slot at an index to the free list of the pool at an address.
+fn free_slot(fx: &mut Fx, address: Value, data: Value, index: Value, slot: Element, value_at: u64) {
+    let free = fx.load(PTR, address, POOL_FREE);
+    let empty = fx.b.ins().icmp_imm_s(IntCC::Equal, free, 0);
+    fx.choose(
+        empty,
+        &[],
+        |fx| {
+            fx.store(index, address, POOL_FIRST);
+            Vec::new()
+        },
+        |fx| {
+            let last = fx.load(PTR, address, POOL_LAST);
+            let at = slot.at(fx, data, last);
+            let link = fx.b.ins().ireduce(types::I32, index);
+            fx.store(link, at, value_at);
+            Vec::new()
+        },
+    );
+    fx.store(index, address, POOL_LAST);
+    let free = fx.b.ins().iadd_imm_s(free, 1);
+    fx.store(free, address, POOL_FREE);
 }
 
 /// `PoolCursor.next`: the pool's address and the next index; it skips slots not occupied.

@@ -27,11 +27,14 @@ fn a_pool_slot_freed_at_generation_2_32_minus_1_is_retired() {
     let mut interp = Interpreter::new(&checker);
     let cell = interp.budgets.root(WORLD_LIMIT);
     let last = slot(Val::Int(RETIRED - 1), Val::Absent);
-    let pool = container(&mut interp, "mem::Pool", vec![last], cell);
-    let pool = Val::Ref(Loc {
+    let pool = pool(&mut interp, vec![last], cell);
+    let place = Loc {
         extent: interp.memory.alloc(pool, true, 0),
         path: Vec::new(),
-    });
+    };
+    let freed = Val::Array(Rc::new(vec![Val::Int(0)]));
+    interp.memory.set(&place.with(FREED as u32), freed);
+    let pool = Val::Ref(place);
     let first = pool_member(&mut interp, "insert", &[pool.clone(), Val::Int(1)]);
     assert_eq!(*first.fields(), [Val::Int(0), Val::Int(RETIRED - 1)]);
     pool_member(&mut interp, "remove", &[pool.clone(), first.clone()]);

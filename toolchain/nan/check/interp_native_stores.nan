@@ -12,6 +12,10 @@ const CONTAINER_CAPACITY: usize = 2
 
 const CONTAINER_ALLOCATION: usize = 3
 
+/// The position of a pool's part after its container's: the indexes of its free slots in the
+/// order they were freed.
+const POOL_FREED: usize = 4
+
 /// The positions of a pool slot's parts: its generation and its occupant.
 const SLOT_GENERATION: usize = 0
 
@@ -294,7 +298,7 @@ fn Interpreter.pool_member(
         "empty" => {
             expect args.len() > 0
             let cell = self.cell_of(args[0])
-            return Some(InterpFlow.Return(mut self.container(path: owner, elements: mem::List[Val].empty(alloc), cell)))
+            return Some(InterpFlow.Return(mut self.pool(slots: mem::List[Val].empty(alloc), cell)))
         }
         "len" => {
             expect args.len() > 0
@@ -320,15 +324,10 @@ fn Interpreter.pool_member(
             expect args.len() >= 2
             let pool = args[0].place()
             let current = self.memory.get(pool).copy(alloc)
+            expect current.fields().len() > POOL_FREED
+            let free = current.fields()[POOL_FREED].fields().len()
             let storage = self.storage(current)
             let slots = self.memory.get(storage).fields()
-            var free: usize = 0
-            for index in 0..<slots.len() {
-                invariant free <= index
-                if slots[index].is_free() {
-                    free += 1
-                }
-            }
             let needed = slots.len().wrapping_add(usize.widen(args[1].int_value().low_bits()).saturating_sub(free))
             let Some(grown) = mut self.grow(current, needed, element) else {
                 return Some(try self.exhausted(fallible: member == "try_reserve", at))
@@ -377,8 +376,14 @@ fn Interpreter.pool_access(mut self, member: Str, option: ty::ItemId, args: Slic
     }
     if member == "remove" {
         let removed = self.memory.get(occupant).copy(alloc)
-        let next = Val.Int(generation.int_value().wrapping_add(wide::Wide.one()))
-        mut self.memory.set(storage.with(u32.truncate(index), alloc), stored: Val.slot(take next, occupant: Val.Absent, alloc))
+        let next = generation.int_value().wrapping_add(wide::Wide.one())
+        mut self.memory.set(storage.with(u32.truncate(index), alloc), stored: Val.slot(Val.Int(next), occupant: Val.Absent, alloc))
+        if next != SLOT_RETIRED {
+            let freed = args[0].place().with(u32.fit(POOL_FREED), alloc)
+            var indexes = Val.copies(self.memory.get(freed).fields(), alloc)
+            mut indexes.push(Val.of_usize(index))
+            mut self.memory.set(freed, stored: Val.Array(mem::Shared.of(take indexes, alloc)))
+        }
         return InterpFlow.Return(take removed)
     }
     return InterpFlow.Return(Val.Ref(take occupant))
@@ -455,25 +460,40 @@ fn Interpreter.store_boxed(mut self, owner: Str, member: Str, type_args: Slice[t
     return InterpFlow.Return(take made)
 } Interpreter.store_boxed
 
-/// Places a value in the earliest freed slot of the pool at a place, or in a new slot, and
-/// returns its handle; none on exhaustion.
+/// A new pool drawing through a cell, holding slots none of which is free.
+fn Interpreter.pool(mut self, take slots: mem::List[Val], cell: u32) -> Val {
+    let alloc = self.alloc
+    let Val.Struct(item: item, fields: parts) = mut self.container(path: "mem::Pool", elements: take slots, cell) else {
+        expect false
+        return Val.Absent
+    }
+    var fields = Val.copies(parts.contents().view(), alloc)
+    mut fields.push(Val.Array(mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+    return Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc))
+} Interpreter.pool
+
+/// Places a value in the slot freed earliest of the pool at a place, or in a new slot when none
+/// is free, and returns its handle; none on exhaustion.
 fn Interpreter.insert_slot(mut self, pool: Loc, take value: Val, element: ty::Ty) -> Option[Val] {
     let alloc = self.alloc
     let current = self.memory.get(pool).copy(alloc)
     var slots = self.entries(current)
+    expect current.fields().len() > POOL_FREED
+    let freed = current.fields()[POOL_FREED].fields()
     var index = slots.len()
-    for position in 0..<slots.len() {
-        if slots[position].is_free() {
-            index = position
-            break
+    match freed.split_at(1) {
+        Some(parts) => {
+            index = usize.widen(parts.head[0].int_value().low_bits())
+            let rest = Val.copies(parts.tail, alloc)
+            mut self.memory.set(pool.with(u32.fit(POOL_FREED), alloc), stored: Val.Array(mem::Shared.of(take rest, alloc)))
         }
-    }
-    if index == slots.len() {
-        mut slots.push(Val.slot(Val.of_usize(0), occupant: Val.Absent, alloc))
-        let Some(grown) = mut self.grow(current, needed: slots.len(), element) else {
-            return None
+        None => {
+            mut slots.push(Val.slot(Val.of_usize(0), occupant: Val.Absent, alloc))
+            let Some(grown) = mut self.grow(current, needed: slots.len(), element) else {
+                return None
+            }
+            mut self.memory.set(pool, stored: take grown)
         }
-        mut self.memory.set(pool, stored: take grown)
     }
     expect slots[index].fields().len() > SLOT_GENERATION
     let generation = slots[index].fields()[SLOT_GENERATION].copy(alloc)
@@ -495,12 +515,6 @@ fn Val.is_occupied(self) -> bool {
     expect self.fields().len() > SLOT_OCCUPANT
     return not self.fields()[SLOT_OCCUPANT].is_absent()
 } Val.is_occupied
-
-/// Whether a pool slot can take an occupant: neither occupied nor retired.
-fn Val.is_free(self) -> bool {
-    expect self.fields().len() > SLOT_OCCUPANT
-    return not self.is_occupied() and self.fields()[SLOT_GENERATION].int_value() != SLOT_RETIRED
-} Val.is_free
 
 /// Whether a pool slot is occupied at a generation.
 fn Val.is_live_at(self, generation: Val) -> bool {
@@ -795,10 +809,10 @@ fn Interpreter.resized(mut self, container: Val, capacity: usize, element: ty::T
     if not previous.is_negative() {
         mut self.budgets.free(u32.truncate(previous.low_bits()))
     }
-    var fields = Val.single(held[CONTAINER_STORAGE].copy(alloc), alloc)
-    mut fields.push(held[CONTAINER_CELL].copy(alloc))
-    mut fields.push(Val.of_usize(capacity))
-    mut fields.push(Val.Int(allocation))
+    var fields = Val.copies(held.view(), alloc)
+    expect fields.len() > CONTAINER_ALLOCATION
+    fields[CONTAINER_CAPACITY] = Val.of_usize(capacity)
+    fields[CONTAINER_ALLOCATION] = Val.Int(allocation)
     return Some(Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc)))
 } Interpreter.resized
 

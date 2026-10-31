@@ -4,9 +4,9 @@
 //! record of the executor thread running.
 //!
 //! `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability
-//! tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes
-//! trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the
-//! seeded scheduler of test images.
+//! tables; `stack_switch` keeps tasks, their stacks, the executors' run queues and the turns of
+//! serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned
+//! domains; `replay` runs the seeded scheduler of test images.
 
 pub mod holdings;
 pub mod locks;
@@ -14,6 +14,7 @@ pub mod memory;
 pub mod regions;
 pub mod report;
 pub mod seeded;
+pub mod serial;
 pub mod settle;
 pub mod stops;
 pub mod system;
@@ -136,6 +137,12 @@ pub enum Routine {
     Spawn,
     /// `(task)`: makes a task ready.
     Wake,
+    /// `(task)`: makes a ready task run once its serial executor's turn admits it.
+    Ready,
+    /// `(task)`: puts a ready task in a run queue.
+    Enqueue,
+    /// `(task)`: passes on the turn of a task's serial executor when the task holds it.
+    Turn,
     /// `()`: suspends the running task until a wake.
     Park,
     /// `(task)`: the first code a task runs on its own stack.
@@ -227,6 +234,9 @@ impl Routine {
             Routine::WriteErr => "_NStrap_write_err",
             Routine::Spawn => "_NSstack_switch_spawn",
             Routine::Wake => "_NSstack_switch_wake",
+            Routine::Ready => "_NSstack_switch_ready",
+            Routine::Enqueue => "_NSstack_switch_enqueue",
+            Routine::Turn => "_NSstack_switch_turn",
             Routine::Park => "_NSstack_switch_park",
             Routine::TaskStart => "_NSstack_switch_task_start",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
@@ -285,6 +295,9 @@ impl Routine {
             | Routine::KindClose
             | Routine::OutboxRetire
             | Routine::Wake
+            | Routine::Ready
+            | Routine::Enqueue
+            | Routine::Turn
             | Routine::TaskStart
             | Routine::Cancel
             | Routine::CownRelease
@@ -426,7 +439,11 @@ pub mod state {
     pub const ITS_WRITE: u64 = 440;
     pub const ITS_PROPERTIES: u64 = 448;
     pub const ITS_DEVICES: u64 = 456;
-    pub const SIZE: u64 = 464;
+    /// On a kernel, the record of the policy `boot::Kernel.policy` installed, zero for the
+    /// default one, and the last key the default policy gave.
+    pub const POLICY: u64 = 464;
+    pub const TICKET: u64 = 472;
+    pub const SIZE: u64 = 480;
 }
 
 impl Lowering<'_, '_> {
@@ -650,6 +667,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Settle => settle::define(lo, fx, routine),
         Routine::Spawn
         | Routine::Wake
+        | Routine::Ready
+        | Routine::Enqueue
         | Routine::Park
         | Routine::TaskStart
         | Routine::IoSubmit
@@ -660,6 +679,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
+        Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),

@@ -185,6 +185,8 @@ pub enum Glue {
     /// Moves the captures of a task closure, the closure function's instance, into another
     /// domain's reach.
     Captures(Instance),
+    /// Calls a hook of a kernel policy of a type.
+    Policy(machine::schedule::Hook, Ty),
 }
 
 impl Glue {

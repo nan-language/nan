@@ -191,6 +191,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("task::Sender", AFFINE_SEND),
     ("task::Receiver", [First, No, No, Yes, No, No]),
     ("task::Executor", COPY_SEND),
+    ("task::Account", LINEAR_SEND),
     ("sys::Fs", COPY_SEND),
     ("sys::Net", COPY_SEND),
     ("sys::Clock", COPY_SEND),
@@ -219,8 +220,6 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::IdtInstalled", LINEAR_SEND),
     ("hw::Idt", [No, No, No, Yes, Yes, No]),
     ("hw::IrqContext", LINEAR_ONLY),
-    ("hw::SavedContext", LINEAR_ONLY),
-    ("hw::SpinGuard", LINEAR_ONLY),
     ("hw::TrapFrame", [No, No, No, No, No, No]),
     ("hw::Region", LINEAR_SEND),
     ("hw::PhysFrame", LINEAR_SEND),
@@ -228,8 +227,6 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::Signal", AFFINE_SEND),
     ("hw::SpinLock", AFFINE_SEND),
     ("hw::PerCpu", AFFINE_SEND),
-    ("hw::RunQueue", AFFINE_SEND),
-    ("hw::Resumable", COPY_SEND),
     ("hw::Anchor", [No, No, No, No, No, No]),
     ("boot::Machine", LINEAR_ONLY),
     ("boot::Kernel", LINEAR_ONLY),
@@ -237,11 +234,12 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 28] = [
+const PRIMITIVE_CAPABILITIES: [&str; 29] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
     "task::Executor",
+    "task::Account",
     "sys::Fs",
     "sys::Net",
     "sys::Clock",

@@ -442,6 +442,7 @@ Each term links to its home, whose definition governs.
 | [platform package](28-stdlib.md#platform-packages) | Std package minting a target's root grant and implementing its target-dependent operations. |
 | [platform registry](25-registries.md#platform-registries) | Registry binding stubs to handlers. |
 | [poisoning](11-errors-domains.md#poisoning) | State of a cown held by a domain that trapped. |
+| [policy](24-kernel.md#policies) | `hw::Policy` deciding where, in which order and how long a kernel's tasks run. |
 | [predicate](04-types.md#predicates) | `where` or `invariant` condition. |
 | [prefix viability](#guarantees) | Written text fixes all meaning: the first dead token is defined, and every prefix before it closes with typed holes and closers into a file the grammar derives. |
 | [premise](23-low-level.md#trusted-code) | What trusted code relies on. |
@@ -493,6 +494,7 @@ Each term links to its home, whose definition governs.
 | [Secret](15-untrusted.md#secret-values) | Wrapper `core::Secret[T]` whose operations run in constant time. |
 | [secret key](31-trust.md#principals) | Seed a principal signs with, in the user directory. |
 | [Send](05-properties.md#send) | Of a type whose values may pass to another task. |
+| [serial executor](16-concurrency.md#executors) | Executor running one task at a time, passing its turn by its seed. |
 | [settlement](11-errors-domains.md#domains) | Settling a trapped domain's I/O before freeing. |
 | [shootdown](24-kernel.md#cross-cpu-operations) | Invalidation one x86_64 CPU posts to the others with the CPU signal. |
 | [shrinking](22-testing.md#property-tests) | Minimising a failing input. |

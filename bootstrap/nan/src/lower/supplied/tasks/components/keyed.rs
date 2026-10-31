@@ -55,6 +55,7 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(record, node, node::RUNNER);
     reference(fx, record);
     let cell = fx.load(PTR, record, runner::EXECUTOR);
+    let exec = fx.load(PTR, record, runner::HANDLE);
     let domain = tasks::current_domain(lo, fx);
     let done = keyed_done(lo);
     let started = start_task(
@@ -62,6 +63,7 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         fx,
         &run_ty,
         supply.param(2).address(),
+        exec,
         cell,
         domain,
         task_region,

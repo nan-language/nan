@@ -105,6 +105,23 @@ pub fn member(
             true => return Some(Ok(Flow::Fail(revoked(interp)))),
             false => derived(interp, &args[0]),
         },
+        ("task::Executor", "split" | "serial") => {
+            let exec = match stale(interp) {
+                true => interp.deref(&args[0]),
+                false => derived(interp, &args[0]),
+            };
+            Val::Struct(interp.ty_item("task", "Account"), Rc::new(vec![exec]))
+        }
+        ("task::Account", "executor") => interp.deref(&args[0]).fields()[0].clone(),
+        ("task::Account", "used_ns") => Val::Int(0),
+        ("task::Account", "close") => {
+            let exec = interp.deref(&args[0]).fields()[0].clone();
+            let entry = place(&exec.fields()[ENTRY]);
+            interp
+                .memory
+                .set(&entry.with(LIVE as u32), Val::Bool(false));
+            Val::Unit
+        }
         ("sys::Log", "info" | "warn" | "error") => Val::Unit,
         ("sys::revocable", "") => {
             let alloc = type_args.first().and_then(Arg::ty).is_some_and(|ty| {

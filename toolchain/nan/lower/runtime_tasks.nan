@@ -1,4 +1,4 @@
-//! Tasks: their records and stacks, the run queue, the protocol by which a task parks and a waker makes it ready, the scheduler each executor thread runs, the start and end of a task, and the waits of tasks on kernel operations. A task's state word moves from running to parking when it suspends, then to parked once its executor thread has switched away from its stack; a waker turns new or parked into ready, and running or parking into notified, which the task or its thread turns back into ready. A task asked to stop, or trapping, becomes stopped once off its thread instead, and is never resumed.
+//! Tasks: their records and stacks, the run queue, the protocol by which a task parks and a waker makes it ready, the scheduler each executor thread runs, the time each task runs, the start and end of a task, and the waits of tasks on kernel operations. A task's state word moves from running to parking when it suspends, then to parked once its executor thread has switched away from its stack; a waker turns new or parked into ready, and running or parking into notified, which the task or its thread turns back into ready. A task asked to stop, or trapping, becomes stopped once off its thread instead, and is never resumed.
 
 /// The offsets of a task record's fields. The saved stack pointer, frame pointer and resume
 /// address.
@@ -96,7 +96,26 @@ const TASK_ORDER: u64 = 272
 /// On a kernel, nonzero while an interrupt that preempted the task waits to return into it.
 const TASK_PREEMPTED: u64 = 280
 
-const TASK_SIZE: u64 = 288
+/// The handle of the executor it was started on, and that executor's share, packed.
+const TASK_EXECUTOR: u64 = 288
+
+const TASK_SHARE: u64 = 296
+
+/// The handle of the serial executor whose turn it runs in, zero for none.
+const TASK_SERIAL: u64 = 304
+
+/// The nanoseconds it has run.
+const TASK_RAN: u64 = 312
+
+/// On a kernel, the key its placement gave, the index plus one of the CPU it last ran on and
+/// that of the CPU whose queue holds it, zero for none.
+const TASK_KEY: u64 = 320
+
+const TASK_CPU: u64 = 328
+
+const TASK_QUEUE: u64 = 336
+
+const TASK_SIZE: u64 = 344
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
 /// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
@@ -276,7 +295,7 @@ const TASKS_GUARD: u64 = 4_096
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library
 /// functions that its calls of support routines run, whose use past the stub call bound the
-/// usable size does not count.
+/// usable size does not count; a kernel task's also holds a call of a policy hook.
 const ROUTINE_RESERVE: u64 = 32_768
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation the
@@ -299,6 +318,21 @@ fn tasks_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.Park => {
             discard mut fx.entry()
             park(mut lo, mut fx)
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Ready => {
+            let params = mut fx.entry()
+            expect params.len() > 0
+            let admitted = serial_admit(mut lo, mut fx, record: params[0])
+            mut fx.if_true(admitted, then: fn[mut lo](mut fx1: Fx) {
+                discard mut lo.call_routine(mut fx1, routine: Routine.Enqueue, args: fx1.list1(params[0]).view())
+            })
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Enqueue => {
+            let params = mut fx.entry()
+            expect params.len() > 0
+            tasks_enqueue(mut lo, mut fx, record: params[0])
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
         Routine.TaskStart => task_start(mut lo, mut fx)
@@ -516,7 +550,12 @@ fn tasks_spawn(mut lo: Lowering, mut fx: Fx)
     mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
         raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
     })
-    let reserved = mut fx.b.iadd_imm_s(usable, y: i64.fit(TASKS_GUARD + ROUTINE_RESERVE + 15))
+    let reserve = if lo.kernel() {
+        ROUTINE_RESERVE + HOOK_STACK
+    } else {
+        ROUTINE_RESERVE
+    }
+    let reserved = mut fx.b.iadd_imm_s(usable, y: i64.fit(TASKS_GUARD + reserve + 15))
     let length = mut fx.b.band_imm_s(reserved, y: -16)
     let mapped = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: cell, y: 0)
     let stacks = mut fx.choose_in(mut lo, condition: mapped, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
@@ -710,10 +749,20 @@ fn spawned(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     scheduling_point(mut lo, mut fx)
 } spawned
 
-/// Appends a ready task to the run queue, waking an idle executor thread.
+/// Makes a ready task run once its serial executor's turn admits it.
 fn tasks_push_ready(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    discard mut lo.call_routine(mut fx, routine: Routine.Ready, args: fx.list1(record).view())
+} tasks_push_ready
+
+/// Appends a ready task to the run queue, waking an idle executor thread; on a kernel, places it
+/// on a CPU's queue.
+fn tasks_enqueue(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     if lo.seeded() {
         seeded_push_ready(mut lo, mut fx, record)
+        return
+    }
+    if lo.kernel() {
+        mut lo.kernel_enqueue(mut fx, record)
         return
     }
     let state_address = mut lo.state(mut fx)
@@ -733,7 +782,7 @@ fn tasks_push_ready(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     mut fx.store(record, addr: state_address, offset: STATE_READY_TAIL)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
     system_wake_idle(mut lo, mut fx)
-} tasks_push_ready
+} tasks_enqueue
 
 /// Takes the first ready task, zero when none.
 fn pop_ready(mut lo: Lowering, mut fx: Fx) -> clif::Value {
@@ -757,7 +806,8 @@ fn pop_ready(mut lo: Lowering, mut fx: Fx) -> clif::Value {
 
 /// The scheduler of an executor thread: runs ready tasks, handling the completions on its ring
 /// between them, and waits for a completion when no task is ready; the seeded scheduler chooses
-/// each task it runs and advances its virtual clock instead of waiting. Never returns.
+/// each task it runs and advances its virtual clock instead of waiting, and a kernel's CPU takes
+/// its tasks from its own queue or steals them, idling as its policy says. Never returns.
 fn schedule(mut lo: Lowering, mut fx: Fx) {
     discard mut fx.entry()
     let header = mut fx.block()
@@ -768,6 +818,8 @@ fn schedule(mut lo: Lowering, mut fx: Fx) {
     }
     let record = if lo.seeded() {
         seeded_pick(mut lo, mut fx)
+    } else if lo.kernel() {
+        mut lo.kernel_pick(mut fx)
     } else {
         pop_ready(mut lo, mut fx)
     }
@@ -779,6 +831,8 @@ fn schedule(mut lo: Lowering, mut fx: Fx) {
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         if lo1.seeded() {
             seeded_idle(mut lo1, fx: mut fx1)
+        } else if lo1.kernel() {
+            mut lo1.kernel_idle(mut fx1)
         } else {
             system_idle(mut lo1, fx: mut fx1)
         }
@@ -792,11 +846,13 @@ fn schedule(mut lo: Lowering, mut fx: Fx) {
 
 /// Switches to a ready task until it parks or ends, then settles its state; an ended task's
 /// stack returns. A task asked to stop is not switched to, and one that parks or is notified
-/// while asked to stop, or that traps, becomes stopped.
+/// while asked to stop, or that traps, becomes stopped. A task that parks, ends or stops passes on
+/// its serial executor's turn.
 fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let word = mut fx.offset(record, offset: TASK_STATE)
     let asked = stop_asked(mut fx, record)
     discard mut fx.choose_in(mut lo, condition: asked, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -806,14 +862,28 @@ fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     })
 } run_task
 
-/// Runs a task on the executor thread until it switches away, then settles its state.
-fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+/// Runs a task on the executor thread until it switches away, charging the time it ran, then
+/// settles its state.
+fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
+    waive length "the switch, the time it charges and the settling of the state the task left, in order, as the Rust does"
+{
     let word = mut fx.offset(record, offset: TASK_STATE)
     let thread = mut lo.thread(mut fx)
     let running = mut fx.int(clif::Type.Int32, value: RUN_RUNNING)
     mut fx.b.atomic_store(clif::MemFlags.owned(), x: running, p: word)
     mut fx.store(record, addr: thread, offset: THREAD_CURRENT)
     mut fx.store(thread, addr: record, offset: TASK_THREAD)
+    var started: Option[clif::Value] = None
+    if not lo.seeded() {
+        started = Some(mut lo.now_ns(mut fx))
+    }
+    if lo.kernel() {
+        let Some(now) = started else {
+            expect false
+            return
+        }
+        mut lo.kernel_switch_in(mut fx, record, now)
+    }
     let scheduler = mut fx.offset(thread, offset: THREAD_CONTEXT)
     let context = mut fx.offset(record, offset: TASK_CONTEXT)
     if lo.kernel() {
@@ -831,6 +901,17 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         })
     }
     mut lo.switch_stacks(mut fx, store: scheduler, load: context, payload: record)
+    if lo.kernel() {
+        mut lo.kernel_switch_out(mut fx)
+    }
+    match started {
+        Some(start) => {
+            let ended_at = mut lo.now_ns(mut fx)
+            let ran = mut fx.b.isub(ended_at, y: start)
+            tasks_charge(mut lo, mut fx, record, ns: ran)
+        }
+        None => {}
+    }
     let resumed_thread = mut lo.thread(mut fx)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: resumed_thread, offset: THREAD_CURRENT)
@@ -842,12 +923,19 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let asked = mut fx.b.band(stop_requested, y: not_ended)
     let stops = mut fx.b.bor(trapped, y: asked)
     discard mut fx.choose_in(mut lo, condition: stops, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        // A task switching away notified was woken after it parked, or was preempted.
+        // A task switching away notified was woken after it parked, or was preempted, and keeps
+        // its serial executor's turn; one parking passes it on before it is parked, so a wake
+        // once parked finds the turn passed.
         let parking_now = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_PARKING)
+        let ending = mut fx1.b.bor(parking_now, y: ended)
+        mut fx1.if_true(ending, then: fn[mut lo1](mut fx2: Fx) {
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Turn, args: fx2.list1(record).view())
+        })
         let notified_now = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_NOTIFIED)
         let parking = mut fx1.b.bor(parking_now, y: notified_now)
         mut fx1.if_true(parking, then: fn[mut lo1](mut fx2: Fx) {
@@ -875,6 +963,46 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         return mem::List[clif::Value].empty(fx1.alloc)
     })
 } switch_in
+
+/// Adds `ns` to the time a task ran and to the time its executor's entry and each entry that
+/// entry derives from account, while the executor's handle is live; a task started outside any
+/// executor records the zero handle.
+fn tasks_charge(mut lo: Lowering, mut fx: Fx, record: clif::Value, ns: clif::Value) {
+    let ran_before = mut fx.load(PTR, addr: record, offset: TASK_RAN)
+    let ran = mut fx.b.iadd(ran_before, y: ns)
+    mut fx.store(ran, addr: record, offset: TASK_RAN)
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let handle = mut fx.load(PTR, addr: record, offset: TASK_EXECUTOR)
+    let live = live_entry(mut lo, mut fx, handle)
+    let started = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: handle, y: 0)
+    let zero = mut fx.ptr(0)
+    let charged = mut fx.b.select(started, x: live, y: zero)
+    discard mut fx.repeat(fx.list1(charged).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 0
+        let entry = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: entry, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: fx1.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let used_before = mut fx2.load(PTR, addr: entry, offset: TABLES_ENTRY_USED)
+            let used = mut fx2.b.iadd(used_before, y: ns)
+            mut fx2.store(used, addr: entry, offset: TABLES_ENTRY_USED)
+            let source_word = mut fx2.load(clif::Type.Int32, addr: entry, offset: TABLES_ENTRY_SOURCE)
+            let source = mut fx2.b.uextend(PTR, x: source_word)
+            let derived = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
+            let index = mut fx2.b.iadd_imm_s(source, y: -1)
+            let parent = entry_at(mut lo1, fx: mut fx2, handle: index)
+            let none = mut fx2.ptr(0)
+            let chosen = mut fx2.b.select(derived, x: parent, y: none)
+            return fx2.list1(chosen)
+        }, otherwise: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.ptr(0)
+            return fx2.list1(none)
+        })
+        return Pass(again: present, next: fx1.list1(next[0]))
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+} tasks_charge
 
 /// Whether the abandoning of a task's domain asks it to stop.
 fn stop_asked(mut fx: Fx, record: clif::Value) -> clif::Value {

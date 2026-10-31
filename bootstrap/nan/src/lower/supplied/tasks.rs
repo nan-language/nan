@@ -1,5 +1,7 @@
-//! Tasks: scopes, joins, deadlines and races, cowns and `await when`, channels, and domains.
+//! Tasks: scopes, joins, deadlines and races, cowns and `await when`, channels, executors and
+//! their accounts, and domains.
 
+pub mod accounts;
 pub mod channels;
 pub mod components;
 pub mod cowns;
@@ -28,7 +30,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::within_ns"
         | "task::race" => scopes::lower(lo, fx, supply),
         "task::Cown" => cowns::lower(lo, fx, supply),
-        "task::Executor" => super::sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
+        "task::Executor" | "task::Account" => accounts::lower(lo, fx, supply),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
         "sys::Domain" | "sys::Abandoner" | "sys::Trap" => domains::lower(lo, fx, supply),
         "host::Runner" | "sys::Cx" | "sys::Outbox" | "sys::Stepper" => {
@@ -76,8 +78,10 @@ pub fn origin(lo: &mut Lowering, fx: &mut Fx) -> Value {
 pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "task::Join" | "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Scope" | "task::Executor" | "task::Cancelled" | "task::Poisoned" | "sys::Cx"
-        | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper" => Some(false),
+        "task::Scope" | "task::Executor" | "task::Account" | "task::Cancelled"
+        | "task::Poisoned" | "sys::Cx" | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper" => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -87,7 +91,7 @@ pub fn needs_release(path: &str) -> Option<bool> {
 pub fn transfers(path: &str) -> Option<bool> {
     match path {
         "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Cancelled" | "task::Poisoned" | "sys::Abandoner" => Some(false),
+        "task::Account" | "task::Cancelled" | "task::Poisoned" | "sys::Abandoner" => Some(false),
         _ => None,
     }
 }

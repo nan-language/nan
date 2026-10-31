@@ -84,7 +84,7 @@ Each item's radius is in `radii.tsv`.
 | M2 | settle/settle.nan:15 |  |
 | M6 | tally/tally.nan:29 | listener |
 
-## Time of the extended-state save of a machine seam and of `hw::switch_to`
+## Time of the extended-state save of a machine seam and of a thread switch
 
 Both save every state component with `xsave64` and restore it with `xrstor64`, which a guest under KVM runs natively: their native times are their times under the emulator. A seam's round trip, a self-interrupt sent through the local APIC and taken, and a thread switch, half of a round trip between two tasks each waking the other with a signal, are timed under the emulator.
 

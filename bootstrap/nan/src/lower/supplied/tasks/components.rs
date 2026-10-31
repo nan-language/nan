@@ -64,7 +64,9 @@ pub mod runner {
     pub const RESOLUTION: u64 = 152;
     pub const CURRENT: u64 = 160;
     pub const HOLDING: u64 = 168;
-    pub const HEADER: u64 = 176;
+    /// The handle of the executor its tasks run on.
+    pub const HANDLE: u64 = 176;
+    pub const HEADER: u64 = 184;
 }
 
 pub mod entry {
@@ -255,12 +257,15 @@ pub fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 
 /// A new runner's record drawn through an allocator's cell, trapping when it is exhausted, with
 /// its header cleared but for the reference its drawer holds, the cells of the allocator and the
-/// executor, and the origin and resolution of the executor's clock, given its handle.
+/// executor, the executor's handle, and the origin and resolution of the executor's clock, given
+/// its handle.
+#[allow(clippy::too_many_arguments)]
 fn draw_record(
     lo: &mut Lowering,
     fx: &mut Fx,
     shape: &Shape,
     cell: Value,
+    exec: Value,
     exec_cell: Value,
     clock: Value,
     resolution: Value,
@@ -277,6 +282,7 @@ fn draw_record(
     fx.store(one, record, runner::REFS);
     fx.store(cell, record, runner::CELL);
     fx.store(exec_cell, record, runner::EXECUTOR);
+    fx.store(exec, record, runner::HANDLE);
     fx.store(resolution, record, runner::RESOLUTION);
     let clock = tables::entry_at(lo, fx, clock);
     let origin = fx.load(PTR, clock, cap_entry::STATE);

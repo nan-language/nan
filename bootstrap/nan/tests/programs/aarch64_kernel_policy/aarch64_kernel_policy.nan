@@ -1,0 +1,146 @@
+//! Runs every task on CPU 0 in 1 ms slices keyed by deadline or weighted time, ordering tasks by deadline, sharing the CPU by weight and passing a serial executor's turn by seed.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// The iterations each spinning task of the deadline and serial runs counts, more than a slice
+/// takes.
+const SPINS: u64 = 4_000_000
+
+/// The nanoseconds the weighted accounts share the CPU.
+const SHARING_NS: u64 = 300_000_000
+
+struct Paced {
+} Paced
+
+impl Paced: hw::Policy
+
+fn Paced.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    let key = match task.deadline_ns {
+        Some(deadline) => deadline
+        None => task.ran_ns / u64.widen(task.share.weight)
+    }
+    return hw::Placement(cpu: 0, key: key)
+} Paced.place
+
+fn Paced.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096 {
+    return None
+} Paced.steal
+
+fn Paced.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return 1_000_000
+} Paced.slice
+
+fn Paced.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} Paced.idle
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+/// Writes a digit after a space.
+fn say_digit(value: u64) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    mut port.write(Pl011.data, value: 32)
+    mut port.write(Pl011.data, value: 48 + u8.truncate(value % 10))
+    take port.unmap()
+} say_digit
+
+/// Counts to `SPINS` without awaiting, then records `id` at the next place of `order`.
+fn spin_then_record(id: u64, order: mem::List[core::atomic::AtomicU64], done: core::atomic::AtomicU64) {
+    var count: u64 = 0
+    while count < SPINS {
+        count = count.wrapping_add(1)
+    }
+    let Some(place) = done.fetch_add(1) else {
+        return
+    }
+    discard order[usize.widen(place)].swap(id)
+} spin_then_record
+
+/// Writes a line of a name and the ids `order` holds.
+fn say_order(name: Str, order: mem::List[core::atomic::AtomicU64]) {
+    say(text: name)
+    for slot in order {
+        say_digit(value: slot.load())
+    }
+    say(text: "\n")
+} say_order
+
+/// A list of `count` zeroed atomic words.
+fn slots(count: u64, alloc: mem::Alloc) -> mem::List[core::atomic::AtomicU64] {
+    var made = mem::List[core::atomic::AtomicU64].empty(alloc)
+    for _ in 0..<count {
+        mut made.push(core::atomic::AtomicU64.of(0))
+    }
+    return made
+} slots
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    mut k.policy(Paced())
+    take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        let edf = slots(count: 3, alloc)
+        let edf_done = core::atomic::AtomicU64.of(0)
+        try await task::scope(exec, body: fn(s: task::Scope) {
+            for at in 0..<3u64 {
+                let id = (at + 2) % 3 + 1
+                discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+                    discard try await task::within_ns(clock, ns: id * 1_000_000_000, body: fn() limits stack 4_096 {
+                        spin_then_record(id, order: edf, done: edf_done)
+                    })
+                })
+            }
+        })
+        say_order(name: "edf", order: edf)
+        let heavy = exec.split(task::Share(weight: 3, class: 0, reserve_ppm: 0))
+        defer take heavy.close()
+        let light = exec.split(task::Share(weight: 1, class: 0, reserve_ppm: 0))
+        defer take light.close()
+        let stop = core::atomic::AtomicBool.of(false)
+        var shared = false
+        try await task::scope(exec, body: fn[mut shared](s: task::Scope) fails task::Cancelled uses wait {
+            for account in 0..<2u32 {
+                let spinner = match account {
+                    0 => heavy.executor()
+                    else => light.executor()
+                }
+                discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+                    try await task::scope(spinner, body: fn(inner: task::Scope) {
+                        discard inner.spawn(fn() limits stack 4_096 {
+                            while not stop.load() {
+                            }
+                        })
+                    })
+                })
+            }
+            try await clock.sleep_ns(SHARING_NS)
+            let heavy_ns = heavy.used_ns()
+            let light_ns = light.used_ns()
+            shared = light_ns > 0 and heavy_ns >= 2 * light_ns and heavy_ns <= 4 * light_ns
+            discard stop.swap(true)
+        })
+        if shared {
+            say(text: "shares 3:1\n")
+        }
+        let serial = exec.serial(42)
+        defer take serial.close()
+        let turns = slots(count: 4, alloc)
+        let turns_done = core::atomic::AtomicU64.of(0)
+        try await task::scope(serial.executor(), body: fn(s: task::Scope) {
+            for id in 0..<4u64 {
+                discard s.spawn(fn() limits stack 4_096 {
+                    spin_then_record(id, order: turns, done: turns_done)
+                })
+            }
+        })
+        say_order(name: "serial", order: turns)
+    })
+} main

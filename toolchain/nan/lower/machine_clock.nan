@@ -1,7 +1,13 @@
-//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earlier of its next pacing tick and the earliest timer due; and the wall clock source a machine root grant reads once. On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 at `0x0901_0000` on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
+//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 at `0x0901_0000` on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
 
 /// The nanoseconds between a CPU's pacing ticks.
 const PACING_PERIOD: u64 = 10_000_000
+
+/// The longest a CPU's timer waits, in nanoseconds, and the most ticks it counts down, which
+/// AArch64's signed timer value holds.
+const LONGEST_DELAY: u64 = 1_000_000_000
+
+const MOST_TICKS: u64 = 0x7FFF_FFFF
 
 /// The PIT's input clock, the count its channel 2 counts down while the time-stamp counter is
 /// measured, and the nanoseconds that count takes; its ports: channel 2's data port, the mode
@@ -185,27 +191,53 @@ fn Lowering.start_timer(mut self, mut fx: Fx) {
     expect read.len() > 0
     let pace = mut fx.b.iadd_imm_s(read[0], y: i64.fit(PACING_PERIOD))
     mut fx.store(pace, addr: record, offset: CPU_NEXT_PACE)
+    mut self.reprogram_timer(mut fx)
+} Lowering.start_timer
+
+/// Programs the running CPU's timer again, under the timer lock.
+fn Lowering.reprogram_timer(mut self, mut fx: Fx) {
     let state_address = mut self.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
     discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
     mut self.program_timer(mut fx)
     discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
-} Lowering.start_timer
+} Lowering.reprogram_timer
 
-/// Programs the running CPU's timer to fire at the earlier of its next pacing tick and the
-/// earliest timer due, at once when that has passed. The caller holds the timer lock.
+/// Programs the running CPU's timer to fire at the earliest of the timer first due, the end of
+/// its task's slice and, while it runs a task or the final build binds the timer's vector, its
+/// next pacing tick; at once when that has passed. The caller holds the timer lock.
 fn Lowering.program_timer(mut self, mut fx: Fx) {
     let record = mut self.running_cpu(mut fx)
-    let pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
+    let latest = mut fx.int(PTR, value: -1)
+    let next_pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
+    let timer = self.vectors().timer
+    let statically = mut self.statically_bound()
+    var bound = false
+    for vector in statically {
+        if vector == timer {
+            bound = true
+        }
+    }
+    var pace = next_pace
+    if not bound {
+        let thread = mut fx.load(PTR, addr: record, offset: CPU_THREAD)
+        let current = mut fx.load(PTR, addr: thread, offset: THREAD_CURRENT)
+        let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        pace = mut fx.b.select(running, x: next_pace, y: latest)
+    }
+    let slice_end = mut fx.load(PTR, addr: record, offset: CPU_SLICE_END)
+    let sliced = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: slice_end, y: 0)
+    let end = mut fx.b.select(sliced, x: slice_end, y: latest)
+    let due_first = mut fx.b.umin(pace, y: end)
     let state_address = mut self.state(mut fx)
     let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
     let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
     let targets = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
         let due = mut fx1.load(PTR, addr: head, offset: OPERATION_DUE)
-        let earlier = mut fx1.b.umin(due, y: pace)
+        let earlier = mut fx1.b.umin(due, y: due_first)
         return fx1.list1(earlier)
     }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        return fx1.list1(pace)
+        return fx1.list1(due_first)
     })
     let target = targets[0]
     let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
@@ -214,14 +246,16 @@ fn Lowering.program_timer(mut self, mut fx: Fx) {
     let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: target, y: now)
     let remaining = mut fx.b.isub(target, y: now)
     let zero = mut fx.ptr(0)
-    let delay = mut fx.b.select(ahead, x: remaining, y: zero)
+    let waited = mut fx.b.select(ahead, x: remaining, y: zero)
+    let longest = mut fx.ptr(LONGEST_DELAY)
+    let delay = mut fx.b.umin(waited, y: longest)
     let rate = mut fx.load(PTR, addr: record, offset: CPU_TIMER_RATE)
     let scaled = mut fx.b.imul(delay, y: rate)
     let per_ms = mut fx.ptr(NS_PER_MS)
     let counted = mut fx.b.udiv(scaled, y: per_ms)
     let one = mut fx.ptr(1)
     let least = mut fx.b.umax(counted, y: one)
-    let most = mut fx.ptr(0xFFFF_FFFF)
+    let most = mut fx.ptr(MOST_TICKS)
     let ticks = mut fx.b.umin(least, y: most)
     match self.machine_arch() {
         workspace::Arch.Amd64 => mut self.x64_set_timer(mut fx, ticks)
@@ -247,11 +281,7 @@ fn Lowering.timer_interrupt(mut self, mut fx: Fx) -> clif::Value {
         let chosen = mut fx1.b.select(late, x: fresh, y: next)
         mut fx1.store(chosen, addr: record, offset: CPU_NEXT_PACE)
     })
-    let state_address = mut self.state(mut fx)
-    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
-    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
-    mut self.program_timer(mut fx)
-    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    mut self.reprogram_timer(mut fx)
     return pacing
 } Lowering.timer_interrupt
 

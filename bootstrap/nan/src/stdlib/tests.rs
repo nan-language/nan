@@ -21,7 +21,7 @@ fn std_checks_without_diagnostics() {
 }
 
 /// The types of the values only machine targets give.
-const MACHINE_VALUES: [&str; 12] = [
+const MACHINE_VALUES: [&str; 10] = [
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",
@@ -32,8 +32,6 @@ const MACHINE_VALUES: [&str; 12] = [
     "hw::PageTableRoot",
     "hw::IrqContext",
     "hw::TrapFrame",
-    "hw::SpinGuard",
-    "hw::SavedContext",
 ];
 
 /// The other functions no test or example on the host can call.

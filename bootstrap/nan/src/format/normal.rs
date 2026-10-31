@@ -334,6 +334,16 @@ impl Normal<'_> {
                 Rule::RegistryItem | Rule::TestItem | Rule::ConstItem | Rule::ContributeItem => {
                     spans.extend(self.first_ident(node).map(|token| (token, token)));
                 }
+                Rule::ProtocolItem => {
+                    let name = (tree.child_tokens(node))
+                        .filter(|token| self.kind(*token) == TokenKind::Ident)
+                        .nth(1);
+                    spans.extend(name.map(|token| (token, token)));
+                    spans.extend(
+                        tree.find(node, Rule::ItemLabel)
+                            .and_then(|label| tree.span(label)),
+                    );
+                }
                 Rule::RetiredOld => {
                     let path = tree.find(node, Rule::Path).and_then(|path| tree.span(path));
                     let member = tree
@@ -707,6 +717,26 @@ fn reduction(file: &SourceFile, tree: &Tree, known: &Known, reading: Reading) ->
             }
         }
         Rule::ConstItem if reading == Reading::Form => return None,
+        Rule::ProtocolItem => {
+            for operation in tree
+                .child_nodes(item)
+                .filter(|member| tree.rule(*member) == Rule::ProtocolOperation)
+            {
+                let visibility = tree
+                    .find(operation, Rule::Visibility)
+                    .and_then(|visibility| tree.child_tokens(visibility).next())
+                    .map(kind);
+                let seen = match known.fields {
+                    Reach::Module => true,
+                    Reach::Package => visibility.is_some(),
+                    Reach::Consumer => visibility == Some(TokenKind::Keyword(Keyword::Pub)),
+                };
+                match seen {
+                    true => clause_regions.extend(tree.find(operation, Rule::ClauseRegion)),
+                    false => reduction.dropped.extend(tokens(operation)),
+                }
+            }
+        }
         _ => {}
     }
     for region in clause_regions {

@@ -163,6 +163,7 @@ impl<'a> Lower<'a> {
             Rule::ContributeItem => ItemKind::Contribute(self.contribute_item(node)),
             Rule::TestItem => ItemKind::Test(self.test_item(node)),
             Rule::RetiredItem => ItemKind::Retired(self.retired_item(node)),
+            Rule::ProtocolItem => ItemKind::Protocol(self.protocol_item(node)),
             _ => ItemKind::Package,
         };
         Some(Item {
@@ -835,6 +836,69 @@ impl<'a> Lower<'a> {
                         .collect()
                 })
                 .unwrap_or_default(),
+        }
+    }
+
+    fn protocol_item(&self, node: NodeId) -> ProtocolItem {
+        let operations = self
+            .nodes(node)
+            .into_iter()
+            .filter(|member| self.rule(*member) == Rule::ProtocolOperation)
+            .map(|member| {
+                let (result, fails, _, limits) = self.head_tail(member);
+                let fn_token = self.tokens_of(member, TokenKind::Keyword(Keyword::Fn))[0];
+                let params = self
+                    .tree
+                    .list_elements(
+                        self.find(member, Rule::OperationParams),
+                        Rule::OperationParam,
+                    )
+                    .into_iter()
+                    .map(|param| Param {
+                        token: self.first(param),
+                        mode: Mode::Take,
+                        kind: ParamKind::Named {
+                            name: self.name(self.idents(param)[0]),
+                            ty: self.type_expr(self.find(param, Rule::TypeExpr).expect("a type")),
+                        },
+                    })
+                    .collect();
+                let written = self
+                    .find(member, Rule::Visibility)
+                    .map(|visibility| self.tokens(visibility)[0]);
+                let visibility = match written.map(|token| self.kind(token)) {
+                    None => Visibility::Private,
+                    Some(TokenKind::Keyword(Keyword::Pub)) => Visibility::Pub,
+                    Some(_) => Visibility::Pkg,
+                };
+                Operation {
+                    visibility,
+                    method: Method {
+                        token: written.unwrap_or(fn_token),
+                        proj: false,
+                        name: self.name(self.idents(member)[0]),
+                        head: Head {
+                            token: fn_token,
+                            generics: Vec::new(),
+                            params,
+                            close: self.close(member),
+                            result,
+                            fails,
+                            uses: None,
+                            limits,
+                        },
+                        clauses: self.clauses(self.find(member, Rule::ClauseRegion)),
+                        body: None,
+                    },
+                }
+            })
+            .collect();
+        ProtocolItem {
+            name: self.name(self.idents(node)[1]),
+            summary: self
+                .find(node, Rule::TypeExpr)
+                .map(|summary| self.type_expr(summary)),
+            operations,
         }
     }
 

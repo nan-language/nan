@@ -223,6 +223,13 @@ pub enum SigKind {
     Registry {
         entry: Ty,
     },
+    /// A protocol: the head of each operation as written, and the message of each as the
+    /// variant of an enum holding its parameters.
+    Protocol {
+        operations: Vec<MethodSig>,
+        variants: Vec<VariantSig>,
+        summary: Option<Ty>,
+    },
     Other,
 }
 
@@ -257,6 +264,14 @@ impl Sig {
                 registers.iter().any(|register| register.ty.has_error())
             }
             SigKind::Const { ty } | SigKind::Registry { entry: ty } => ty.has_error(),
+            SigKind::Protocol {
+                operations,
+                summary,
+                ..
+            } => {
+                operations.iter().any(|operation| operation.sig.has_error())
+                    || summary.as_ref().is_some_and(Ty::has_error)
+            }
             SigKind::Other => false,
         }
     }
@@ -699,6 +714,62 @@ impl Checker<'_> {
                 let entry = self.type_expr(ctx, &registry.entry, &mut problems);
                 (Vec::new(), SigKind::Registry { entry })
             }
+            ItemKind::Protocol(protocol) => {
+                let operations: Vec<MethodSig> = protocol
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, operation)| MethodSig {
+                        name: operation.method.name.text.clone(),
+                        sig: self.head_sig(
+                            module,
+                            item,
+                            index + 1,
+                            &operation.method.head,
+                            Vec::new(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            &mut problems,
+                        ),
+                        default: false,
+                    })
+                    .collect();
+                let variants = operations
+                    .iter()
+                    .zip(&protocol.operations)
+                    .map(|(operation, written)| VariantSig {
+                        name: operation.name.clone(),
+                        payload: match operation.sig.params.is_empty() {
+                            true => Payload::None,
+                            false => Payload::Labelled(
+                                (operation.sig.params.iter())
+                                    .map(|param| (param.name.clone(), param.ty.clone()))
+                                    .collect(),
+                            ),
+                        },
+                        from: false,
+                        token: written.method.name.token,
+                    })
+                    .collect();
+                let ctx = TypeCtx {
+                    item,
+                    module,
+                    generics: &[],
+                    self_param: None,
+                };
+                let summary = (protocol.summary.as_ref())
+                    .map(|summary| self.type_expr(ctx, summary, &mut problems));
+                (
+                    Vec::new(),
+                    SigKind::Protocol {
+                        operations,
+                        variants,
+                        summary,
+                    },
+                )
+            }
             _ => (Vec::new(), SigKind::Other),
         };
         Sig {
@@ -741,10 +812,15 @@ impl Checker<'_> {
                     let ItemKind::Impl(implementation) = &self.db.ast(line).kind else {
                         return false;
                     };
-                    self.db.owner_key(module, &implementation.target) == Some(key)
-                        && matches!(self.db.resolve(module, &implementation.interface.path), Ok(Named::Item(interface))
-                            if matches!(&self.db.ast(interface).kind,
-                                ItemKind::Interface(declared) if declared.methods.iter().any(|method| method.name.text == *name)))
+                    if self.db.owner_key(module, &implementation.target) != Some(key) {
+                        return false;
+                    }
+                    if let Some(protocol) = self.written_protocol(module, implementation) {
+                        return name == "start" || self.serves(protocol, name).is_some();
+                    }
+                    matches!(self.db.resolve(module, &implementation.interface.path), Ok(Named::Item(interface))
+                        if matches!(&self.db.ast(interface).kind,
+                            ItemKind::Interface(declared) if declared.methods.iter().any(|method| method.name.text == *name)))
                 })
                 .collect()
         })
@@ -1231,7 +1307,10 @@ impl Checker<'_> {
                             });
                         }
                         match &self.db.ast(item).kind {
-                            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+                            ItemKind::Struct(_)
+                            | ItemKind::Enum(_)
+                            | ItemKind::Layout(_)
+                            | ItemKind::Protocol(_) => {
                                 let params = self.shapes(item);
                                 match self.generic_args(
                                     ctx,

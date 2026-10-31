@@ -38,6 +38,7 @@ mod package;
 mod preserved;
 mod program;
 pub(crate) mod props;
+pub(crate) mod protocol;
 mod published;
 mod reading;
 mod references;
@@ -577,7 +578,7 @@ impl Checker<'_> {
                 self.check_proofs(item);
                 self.check_predicates(item);
             }
-            ast::ItemKind::Interface(_) => self.check_proofs(item),
+            ast::ItemKind::Interface(_) | ast::ItemKind::Protocol(_) => self.check_proofs(item),
             _ => {}
         }
     }

@@ -332,7 +332,7 @@ impl Body<'_, '_> {
             }
             ExprKind::Field { base, name } => match self.type_target(base) {
                 Some(TypeTarget::Type(Ty::Item(item, _))) => match &self.ck.sig(item).kind {
-                    SigKind::Enum { variants } => {
+                    SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                         variants.iter().any(|variant| variant.name == name.text)
                     }
                     _ => false,
@@ -926,6 +926,22 @@ impl Body<'_, '_> {
                     args,
                     expected,
                 );
+            }
+            if let SigKind::Protocol { variants, .. } = &self.ck.sig(item).kind
+                && let Some(variant) = variants
+                    .iter()
+                    .position(|variant| variant.name == name.text)
+            {
+                self.no_markers(token, markers);
+                if !self.ck.operation_visible(self.module, item, variant) {
+                    self.report(name.token, Code::NamePrivate);
+                }
+                if self.ck.is_request(item, variant) {
+                    self.report(token, Code::ComponentRequestValue);
+                    self.skim_args(args);
+                    return TExpr::failed(token);
+                }
+                return self.construct(token, item, Some(variant), None, args, expected);
             }
         }
         if let Some(scalar) = ty.scalar()
@@ -1705,6 +1721,16 @@ impl Body<'_, '_> {
     /// validators, and where `inspect` and `Untrusted.of` stand.
     fn check_callee(&self, token: Tok, callable: &Callable) {
         let subst = &callable.infer.subst;
+        if let Callee::Method {
+            interface, method, ..
+        } = &callable.callee
+            && self.ck.is_protocol(interface.interface)
+            && !self
+                .ck
+                .operation_visible(self.module, interface.interface, *method)
+        {
+            self.report(token, Code::NamePrivate);
+        }
         let Callee::Function { item, .. } = &callable.callee else {
             return;
         };
@@ -2287,6 +2313,10 @@ impl Body<'_, '_> {
                     }
                     (fields.clone(), true)
                 }
+            },
+            (SigKind::Protocol { variants, .. }, Some(index)) => match &variants[index].payload {
+                Payload::Labelled(fields) => (fields.clone(), true),
+                _ => (Vec::new(), true),
             },
             _ => {
                 self.report(token, Code::NameUnknown);

@@ -128,7 +128,7 @@ pub fn layout(ck: &Checker, ty: &Ty) -> (u64, u64) {
                     let types: Vec<Ty> = fields.iter().map(|field| subst.ty(&field.ty)).collect();
                     place_fields(ck, 0, 1, &types)
                 }
-                SigKind::Enum { variants } => {
+                SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                     let mut end = 4;
                     let mut align = 4;
                     for variant in variants {

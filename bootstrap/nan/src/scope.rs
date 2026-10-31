@@ -190,6 +190,7 @@ fn member_node(item: Item, node: NodeId, name: &str) -> Option<NodeId> {
                     | Rule::LayoutMember
                     | Rule::RegisterLine
                     | Rule::InterfaceMember
+                    | Rule::ProtocolOperation
             ) && tree
                 .child_tokens(inner)
                 .find(|token| item.file.tokens[*token as usize].kind == TokenKind::Ident)
@@ -206,6 +207,7 @@ fn member_node(item: Item, node: NodeId, name: &str) -> Option<NodeId> {
                     | Rule::LayoutMember
                     | Rule::RegisterMember
                     | Rule::InterfaceMember
+                    | Rule::ProtocolOperation
             )
         })
         .find(|line| declares(*line))

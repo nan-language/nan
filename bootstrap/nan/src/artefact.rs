@@ -34,6 +34,15 @@ pub struct Parts {
     /// The canonical path of each type whose schema tree the code root records, with the
     /// tree's `mem::wire` encoding.
     pub schemas: Vec<(String, Vec<u8>)>,
+    pub protocols: Vec<ProtocolRoot>,
+}
+
+/// A `pub` protocol as a code root records it: its canonical path, its protocol hash, and the
+/// name and operation hash of each of its `pub` operations.
+pub struct ProtocolRoot {
+    pub path: String,
+    pub hash: Hash,
+    pub operations: Vec<(String, Hash)>,
 }
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -126,6 +135,26 @@ pub fn code_root(parts: &Parts) -> Vec<u8> {
                 .collect(),
         ),
     );
+    if !parts.protocols.is_empty() {
+        record.field(
+            11,
+            sorted_list(
+                parts
+                    .protocols
+                    .iter()
+                    .map(|protocol| {
+                        let mut out = text(&protocol.path);
+                        out.extend(hash_bytes(&protocol.hash));
+                        list(&mut out, protocol.operations.iter(), |out, (name, hash)| {
+                            out.extend(text(name));
+                            out.extend(hash_bytes(hash));
+                        });
+                        out
+                    })
+                    .collect(),
+            ),
+        );
+    }
     record.finish()
 }
 

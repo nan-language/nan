@@ -128,11 +128,14 @@ impl<'a> Item<'a> {
             | Rule::PackageItem
             | Rule::RegistryItem
             | Rule::ConstItem
-            | Rule::ContributeItem => {
+            | Rule::ContributeItem
+            | Rule::ProtocolItem => {
+                let skipped = usize::from(rule == Rule::ProtocolItem);
                 let ident = self
                     .tree
                     .child_tokens(node)
-                    .find(|token| self.kind_of(*token) == TokenKind::Ident)?;
+                    .filter(|token| self.kind_of(*token) == TokenKind::Ident)
+                    .nth(skipped)?;
                 Some(self.text(ident).to_owned())
             }
             _ => None,
@@ -303,6 +306,17 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
 
     match kind {
         Rule::FnItem => check_fn(item, node, &mut report, &mut fixed),
+        Rule::ProtocolItem => {
+            for operation in tree
+                .child_nodes(node)
+                .filter(|member| tree.rule(*member) == Rule::ProtocolOperation)
+            {
+                check_head(item, operation, true, &mut report, &mut fixed);
+                if let Some(region) = tree.find(operation, Rule::ClauseRegion) {
+                    check_clause_order(item, region, &mut fixed);
+                }
+            }
+        }
         Rule::InterfaceItem => {
             for member in tree
                 .child_nodes(node)

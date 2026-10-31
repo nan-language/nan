@@ -325,7 +325,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             Role::Requires => function.index,
             _ => u32::MAX,
         };
-        for requires in self.ck.entry_requires(item) {
+        let (entry_requires, shared) = self.ck.entry_requires(item);
+        for requires in entry_requires {
             let Callable::Item {
                 item: holder,
                 index,
@@ -346,7 +347,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             let passed: Vec<Val> = checked
                 .params
                 .iter()
-                .zip(args)
+                .zip(&args[shared.clone()])
                 .map(|(param, arg)| match checked.ty(param.value) {
                     NTy::Owned(_) => self.deref(arg),
                     _ => arg.clone(),
@@ -787,10 +788,11 @@ impl<'c, 'a> Interpreter<'c, 'a> {
 
     fn variant_index(&self, item: ItemId, name: &str) -> u32 {
         match &self.ck.sig(item).kind {
-            SigKind::Enum { variants } => variants
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .position(|variant| variant.name == name)
-                .expect("a variant of the enum") as u32,
+                .expect("a variant of the enum")
+                as u32,
             SigKind::Layout { tags, .. } => {
                 tags.iter().position(|tag| tag == name).expect("a tag") as u32
             }

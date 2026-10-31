@@ -25,6 +25,8 @@ struct RequiresClause derives Copy {
 struct Requires {
     callee: nir::FnRef
     clauses: mem::List[RequiresClause]
+    /// The positions of the call's arguments the requires functions read.
+    params: core::Range[usize]
 } Requires
 
 fn Elab.call(mut self, call: Call, ty: ty::Ty, span: nir::Span) -> Out fails Fault {
@@ -407,7 +409,7 @@ fn Elab.callee(self, call: Call) -> nir::FnRef fails Fault {
     match call.callee {
         Callee.Function(item: item) => return nir::FnRef.item(item, args: call.type_args)
         Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: _) => {
-            let name = try self.method_name(bound.item, method)
+            let name = self.ck.method_name(bound.item, method)
             match types.kind(self_ty) {
                 ty::TyKind.Param(_) => return nir::FnRef(callable: nir::Callable.Method(item: bound.item, method: u32.fit(method)), args: call.type_args)
                 else => {}
@@ -446,16 +448,6 @@ fn Elab.builtin_callee(self, call: Call, builtin: Builtin) -> nir::FnRef {
         Builtin.MintRoot => return nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Intrinsic(text::String.of("hw::mint_root", alloc))), args: ty::Args.none())
     }
 } Elab.builtin_callee
-
-fn Elab.method_name(self, interface_item: ty::ItemId, method: usize) -> text::String fails Fault {
-    let alloc = self.ck.alloc()
-    let sig = self.ck.sig(interface_item)
-    let SigKind.Interface(methods: methods) = sig.contents().kind else {
-        fail Fault.Unsupported(text::String.of("a method of no interface", alloc))
-    }
-    expect method < methods.len()
-    return text::String.of(methods[method].name.as_str(), alloc)
-} Elab.method_name
 
 /// The checks a call carries before it runs: the predicates of its arguments, then each
 /// requires of its callee, then its decreases obligation within a cycle.
@@ -520,7 +512,7 @@ fn Elab.requires_checks(mut self, required: Requires, read: Slice[nir::Operand],
             else => required.callee.callable.copy(alloc)
         }
         let fn_ref = nir::FnRef(callable: take callable, args: required.callee.args)
-        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(read, alloc), ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+        let value = mut self.call_value(take fn_ref, args: operands_within(read, positions: required.params, alloc), ty: ty::Ty.scalar(ty::Scalar.Bool), span)
         mut self.emit(nir::Op.Check(kind: nir::CheckKind.Requires, operand: nir::Operand.Value(value), open: clause.disputed), span)
     }
 } Elab.requires_checks
@@ -637,7 +629,7 @@ fn Elab.requires_of(self, call: Call, callee: nir::FnRef) -> Option[Requires] {
                 }
             }
             if undisputed {
-                return Some(Requires(callee: callee.copy(alloc), clauses: take clauses))
+                return Some(Requires(callee: callee.copy(alloc), clauses: take clauses, params: 0..<call.args.len()))
             }
         }
         else => {}
@@ -650,13 +642,16 @@ fn Elab.requires_of(self, call: Call, callee: nir::FnRef) -> Option[Requires] {
                 mut listed.push(arg)
             }
             let given = types.arg_list(call.type_args)
-            let start = types.arg_list(interface_args).len()
+            var start = self.ck.sig(bound.item).contents().generics.len()
+            if start == 0 {
+                start = 1
+            }
             if start <= given.len() {
                 for position in start..<given.len() {
                     mut listed.push(given[position])
                 }
             }
-            return Some(self.method_requirements(bound.item, method, args: types.args(take listed)))
+            return Some(self.method_requirements(bound.item, method, args: types.args(take listed), count: call.args.len()))
         }
         else => {}
     }
@@ -682,13 +677,13 @@ fn Elab.requires_of(self, call: Call, callee: nir::FnRef) -> Option[Requires] {
             mut listed.push(given[position])
         }
     }
-    return Some(self.method_requirements(implemented.item, method: implemented.method, args: types.args(take listed)))
+    return Some(self.method_requirements(implemented.item, method: implemented.method, args: types.args(take listed), count: call.args.len()))
 } Elab.requires_of
 
 /// The requires clauses of an interface method, computed by the interface's unit for type
 /// arguments.
-fn Elab.method_requirements(self, interface_item: ty::ItemId, method: usize, args: ty::Args) -> Requires {
-    return Requires(callee: nir::FnRef(callable: nir::Callable.Item(item: interface_item, role: nir::Role.Requires, index: 0), args: args), clauses: self.ck.method_requires(interface_item, method))
+fn Elab.method_requirements(self, interface_item: ty::ItemId, method: usize, args: ty::Args, count: usize) -> Requires {
+    return Requires(callee: nir::FnRef(callable: nir::Callable.Item(item: interface_item, role: nir::Role.Requires, index: 0), args: args), clauses: self.ck.method_requires(interface_item, method), params: self.ck.contract_params(interface_item, method, count))
 } Elab.method_requirements
 
 /// The measure type of a callee in the cycle of the function being elaborated, both with a

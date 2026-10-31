@@ -6,7 +6,6 @@ use std::rc::Rc;
 use super::canon::{Atom, Clause, Literal};
 use super::term::{Op, Term, TermId, Terms};
 use crate::check::Checker;
-use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Const, Scalar, Ty};
 use crate::encoding::bytes;
 use crate::hash::blake3;
@@ -282,10 +281,7 @@ fn fn_ref(ck: &Checker, out: &mut Vec<u8>, callee: &FnRef) {
     let (path, role, index) = match &callee.callable {
         Callable::Item { item, role, index } => (ck.db.canonical(*item), *role as u64, *index),
         Callable::Method { interface, method } => {
-            let name = match &ck.sig(*interface).kind {
-                SigKind::Interface { methods } => methods[*method as usize].name.clone(),
-                _ => method.to_string(),
-            };
+            let name = ck.method_name(*interface, *method as usize);
             (format!("{}.{name}", ck.db.canonical(*interface)), 0, 0)
         }
         Callable::Derived { owner, method } => {

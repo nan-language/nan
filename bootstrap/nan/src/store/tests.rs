@@ -14,6 +14,7 @@ fn release(manifest: &str) -> Vec<u8> {
         ledger: Vec::new(),
         lines: Vec::new(),
         schemas: Vec::new(),
+        protocols: Vec::new(),
     };
     artefact(
         &code_root(&parts),

@@ -4,6 +4,7 @@ pub mod channels;
 pub mod components;
 pub mod cowns;
 pub mod domains;
+pub mod protocols;
 pub mod scopes;
 
 use cranelift_codegen::ir::{AbiParam, Signature, Value};

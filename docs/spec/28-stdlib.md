@@ -94,6 +94,7 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::Component` | [Components](26-components.md#components) |
 | `sys` | `sys::Cx` | [Component context](26-components.md#component-context); `spawn` and `cancel` in [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
+| `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
 | `hw` | `hw::Ptr` | [Pointers](23-low-level.md#pointers); atomic members in [Trusted atomics](23-low-level.md#trusted-atomics) |
 | `hw` | `hw::Order`, `hw::fence` | [Trusted atomics](23-low-level.md#trusted-atomics) |

@@ -486,7 +486,7 @@ impl Checker<'_> {
             }),
             _ => false,
         };
-        let is_enum = matches!(ast.kind, ItemKind::Enum(_));
+        let is_enum = matches!(ast.kind, ItemKind::Enum(_) | ItemKind::Protocol(_));
         let foreign_open = !self.db.is_std(item) && ast.is_open() && self.consumer_view(item);
         let promise = |property: Property, name: &str| {
             if foreign_open {
@@ -531,11 +531,12 @@ impl Checker<'_> {
         }
     }
 
-    /// The field and payload types of a struct or enum, over its own type parameters.
+    /// The field and payload types of a struct or enum, over its own type parameters, and the
+    /// parameter types of a protocol's operations.
     pub fn constituents(&self, item: ItemId) -> Vec<Ty> {
         match &self.sig(item).kind {
             SigKind::Struct { fields } => fields.iter().map(|field| field.ty.clone()).collect(),
-            SigKind::Enum { variants } => variants
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => variants
                 .iter()
                 .flat_map(|variant| match &variant.payload {
                     super::sig::Payload::None => Vec::new(),

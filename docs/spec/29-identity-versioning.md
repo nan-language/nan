@@ -83,6 +83,7 @@ The **interface hash** is the hash of the UTF-8 bytes `interface`, LF and the it
 | `enum` | the whole normalised form, then the facts line |
 | `layout`, `registers`, `impl`, `registry`, `contribute`, `retired`, `const assert` | the whole normalised form |
 | `interface` | the normalised form with each default body replaced by the word `default` |
+| `protocol` | the normalised form without the operations not visible wherever the protocol is visible |
 | `const` | the head, `=` and, separated by single spaces, the lowercase hexadecimal of the [canonical NIR encoding](19-nir.md#encoding) of the value that [const evaluation](21-interpreter.md#const-evaluation) gives under each declared concrete target, in byte order of target name, or once for a package declaring `any` |
 | `test` | the line `test <name> for <target>` |
 | `package` | the `package` line and the `language` and `targets` directives |

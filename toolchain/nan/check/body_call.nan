@@ -384,7 +384,7 @@ fn Body.is_construction(mut self, callee: ast::Expr) -> bool {
             let ty::TyKind.Item(item: item, args: _) = ck.types().kind(found) else {
                 return false
             }
-            return self.variant_named(item, name: name.text.as_str()).is_some()
+            return self.variant_named(item, name: name.text.as_str()).is_some() or self.operation_named(item, name: name.text.as_str()).is_some()
         }
         else => return false
     }
@@ -398,6 +398,29 @@ fn Body.variant_named(self, item: ty::ItemId, name: Str) -> Option[usize] {
     }
     return variants.position(fn(value: VariantSig) => value.name.as_str() == name)
 } Body.variant_named
+
+/// The index of the operation of that name when an item is a protocol.
+fn Body.operation_named(self, item: ty::ItemId, name: Str) -> Option[usize] {
+    let sig = self.ck.sig(item)
+    let SigKind.Protocol(operations: _, variants: variants, summary: _) = sig.contents().kind else {
+        return None
+    }
+    return variants.position(fn(value: VariantSig) => value.name.as_str() == name)
+} Body.operation_named
+
+/// The message of a one-way operation `P.op(...)`: an operation visible here and no request.
+fn Body.operation_message(mut self, token: u32, item: ty::ItemId, variant: usize, name: ast::Name, args: Slice[ast::Arg], expected: Option[ty::Ty], markers: Markers) -> TExpr {
+    self.no_markers(token, markers)
+    if not self.ck.operation_visible(self.module, protocol: item, index: variant) {
+        self.report(name.token, code: diagnostic::Code.NamePrivate)
+    }
+    if self.ck.is_request(item, index: variant) {
+        self.report(token, code: diagnostic::Code.ComponentRequestValue)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    return mut self.construct(token, item, variant: Some(variant), generic_args: None, args, expected)
+} Body.operation_message
 
 /// A call expression, a construction included.
 fn Body.call(mut self, expr: ast::Expr, expected: Option[ty::Ty], markers: Option[Markers]) -> TExpr {
@@ -1197,6 +1220,10 @@ fn Body.member_call(
             }
             match self.variant_named(item, name: member) {
                 Some(variant) => return mut self.variant_construction(token, item, variant, base, name, args, expected, markers)
+                None => {}
+            }
+            match self.operation_named(item, name: member) {
+                Some(variant) => return mut self.operation_message(token, item, variant, name, args, expected, markers)
                 None => {}
             }
         }
@@ -2329,6 +2356,14 @@ fn Body.fix_failures(self, mut infer: Infer) {
 /// The rules a call obeys for what it calls: the grant its operation needs, the uses of
 /// validators, decoders and encoders, and where `inspect` and `Untrusted.of` stand.
 fn Body.check_callee(self, token: u32, callable: Callable) {
+    match callable.callee {
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
+            if self.ck.is_protocol(bound.item) and not self.ck.operation_visible(self.module, protocol: bound.item, index: method) {
+                self.report(token, code: diagnostic::Code.NamePrivate)
+            }
+        }
+        else => {}
+    }
     let Callee.Function(item: item) = callable.callee else {
         return
     }
@@ -3065,6 +3100,23 @@ fn Body.construction_fields(
                 Some(index) => {
                     expect index < variants.len()
                     return mut self.construction_payload(token, payload: variants[index].payload, args)
+                }
+                None => {}
+            }
+        }
+        SigKind.Protocol(operations: _, variants: variants, summary: _) => {
+            match variant {
+                Some(index) => {
+                    expect index < variants.len()
+                    match variants[index].payload {
+                        Payload.Labelled(labelled) => {
+                            for field in labelled {
+                                mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                            }
+                        }
+                        else => {}
+                    }
+                    return Some(ConstructionFields(fields: take fields, labelled: true))
                 }
                 None => {}
             }

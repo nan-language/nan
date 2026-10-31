@@ -73,6 +73,8 @@ pub enum Instance {
     /// A method of an interface that a type implements through a conformance the toolchain
     /// supplies; `args` are the method's own type arguments.
     Conformance { ty: Ty, method: String, args: Args },
+    /// An operation of a protocol, or its summary, called through an outbox.
+    Operation { protocol: ItemId, method: u32 },
     /// The release of a value of a type.
     Release(Ty),
     /// The code of a function value naming a function: the instance called through the ABI of
@@ -481,6 +483,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
             Instance::Conformance { ty, method, .. } => {
                 conform::supplied(self, fx, abi, ty, method)
             }
+            Instance::Operation { protocol, method } => {
+                supplied::tasks::protocols::call(self, fx, abi, *protocol, *method as usize)
+            }
             Instance::Release(ty) => release::define(self, fx, ty),
             Instance::Value(inner) => call::value_glue(self, fx, abi, inner),
             Instance::Dyn {
@@ -539,8 +544,11 @@ impl<'c, 'a> Lowering<'c, 'a> {
             Role::Body => {
                 demanded.extend(self.ck.fn_sig(item).and_then(|sig| sig.limits.stack));
                 if let Some(implemented) = self.ck.implemented_method(item)
-                    && let crate::check::sig::SigKind::Interface { methods } =
-                        &self.ck.sig(implemented.interface).kind
+                    && let crate::check::sig::SigKind::Interface { methods }
+                    | crate::check::sig::SigKind::Protocol {
+                        operations: methods,
+                        ..
+                    } = &self.ck.sig(implemented.interface).kind
                 {
                     demanded.extend(methods[implemented.method].sig.limits.stack);
                 }
@@ -570,6 +578,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 let std = self.ck.db.is_std(*item);
                 (std, std && self.critical_owner(*item, args))
             }
+            Instance::Operation { .. } => (true, true),
             _ => (true, false),
         };
         let hidden = if hidden { lines::HIDDEN } else { 0 };

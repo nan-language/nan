@@ -629,6 +629,12 @@ impl Lowering<'_, '_> {
                 method,
                 args: fn_ref.args.clone(),
             },
+            Callable::Method { interface, method } if self.ck.is_protocol(*interface) => {
+                Instance::Operation {
+                    protocol: *interface,
+                    method: *method,
+                }
+            }
             Callable::Method { interface, method } => {
                 let self_ty = fn_ref
                     .args
@@ -636,7 +642,7 @@ impl Lowering<'_, '_> {
                     .and_then(Arg::ty)
                     .cloned()
                     .expect("a Self type");
-                let name = self.method_name(*interface, *method);
+                let name = self.ck.method_name(*interface, *method as usize);
                 match self.ck.implementation(&self_ty, *interface, &name) {
                     Some(implementation)
                         if !matches!(implementation.callable, Callable::Method { .. }) =>
@@ -671,13 +677,6 @@ impl Lowering<'_, '_> {
         let none = fx.ptr(0);
         fx.store(none, slot, 8);
         Held::Address(slot)
-    }
-
-    pub fn method_name(&self, interface: ItemId, method: u32) -> String {
-        match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].name.clone(),
-            _ => panic!("a method of no interface"),
-        }
     }
 
     /// How calls of a callable give their result, none unless it is a projection.
@@ -763,6 +762,13 @@ impl Lowering<'_, '_> {
                 args,
             } => self.derived_head(*owner, method, args),
             Instance::Conformance { ty, method, args } => self.conformance_head(ty, method, args),
+            Instance::Operation { protocol, method } => {
+                let outbox = self.std_ty("sys", "Outbox", vec![Ty::item(*protocol, Vec::new())]);
+                (self.ck)
+                    .outbox_head(*protocol, *method as usize, &outbox)
+                    .expect("an operation's head")
+                    .fn_ty()
+            }
             other => panic!("the head of {other:?}"),
         }
     }

@@ -7,11 +7,11 @@ use super::db::PackageId;
 use super::requires::Entry as Required;
 use super::snapshot::Items;
 use super::{Checker, check_targets, unchecked};
-use crate::artefact::{self, AttestedSeal, Parts};
+use crate::artefact::{self, AttestedSeal, Parts, ProtocolRoot};
 use crate::cache::Cache;
 use crate::encoding::{Record, bytes, list, uvar};
 use crate::hash::Hash;
-use crate::syntax::ast::ItemKind;
+use crate::syntax::ast::{ItemKind, Visibility};
 use crate::workspace::{Closure, Member, Package, Target, Workspace};
 
 /// The artefact of a package's current state and the source and machine files its attestation
@@ -262,6 +262,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
         ledger,
         lines,
         schemas: first.schema_trees(id),
+        protocols: first.protocol_roots(id),
     };
     let code_root = artefact::code_root(&parts);
     let seals: Vec<AttestedSeal> = computed
@@ -361,6 +362,28 @@ impl Checker<'_> {
             .filter(|item| matches!(self.db.ast(*item).kind, ItemKind::Retired(_)))
             .filter(|item| self.db.in_history(*item) == history)
             .map(|item| self.forms(item).normalised)
+            .collect()
+    }
+
+    /// The hashes of each `pub` protocol a package declares, by canonical path, with those of its
+    /// `pub` operations.
+    pub(super) fn protocol_roots(&self, package: PackageId) -> Vec<ProtocolRoot> {
+        self.db
+            .package(package)
+            .modules
+            .iter()
+            .flat_map(|module| self.db.module(*module).items.clone())
+            .filter(|item| {
+                self.is_protocol(*item) && self.db.ast(*item).visibility == Visibility::Pub
+            })
+            .map(|item| {
+                let (hash, operations) = self.protocol_hashes(item);
+                ProtocolRoot {
+                    path: self.db.canonical(item),
+                    hash,
+                    operations,
+                }
+            })
             .collect()
     }
 

@@ -450,6 +450,21 @@ pub struct RegistryItem {
     pub unique: Vec<Name>,
 }
 
+/// An operation of a protocol: its visibility, and its head and clauses as an interface method
+/// without a body.
+#[derive(Clone, Debug)]
+pub struct Operation {
+    pub visibility: Visibility,
+    pub method: Method,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProtocolItem {
+    pub name: Name,
+    pub summary: Option<TypeExpr>,
+    pub operations: Vec<Operation>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ContributeItem {
     pub registry: Path,
@@ -499,6 +514,7 @@ pub enum ItemKind {
     Test(TestItem),
     Retired(RetiredItem),
     Package,
+    Protocol(ProtocolItem),
 }
 
 #[derive(Clone, Debug)]
@@ -548,6 +564,7 @@ impl Item {
             ItemKind::Registry(item) => item.name.text.clone(),
             ItemKind::Contribute(item) => item.name.text.clone(),
             ItemKind::Test(item) => item.name.text.clone(),
+            ItemKind::Protocol(item) => item.name.text.clone(),
             ItemKind::Impl(_)
             | ItemKind::ConstAssert(_)
             | ItemKind::Retired(_)

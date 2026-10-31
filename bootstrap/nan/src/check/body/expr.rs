@@ -924,7 +924,10 @@ impl Body<'_, '_> {
                 Some(TypeTarget::Type(self.type_expr(&type_expr)))
             }
             Named::Item(item) => match &self.ck.db.ast(item).kind {
-                ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+                ItemKind::Struct(_)
+                | ItemKind::Enum(_)
+                | ItemKind::Layout(_)
+                | ItemKind::Protocol(_) => {
                     if !self.ck.db.visible(self.module, item) {
                         self.report(base.token, Code::NamePrivate);
                     }

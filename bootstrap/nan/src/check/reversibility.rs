@@ -211,10 +211,13 @@ pub fn supplied(path: &str, target: Target) -> Class {
 }
 
 impl Checker<'_> {
-    /// Whether a function has an undo clause, which compensates its digest.
+    /// Whether a function has an undo clause, which compensates its digest, or handles an
+    /// operation with one.
     pub fn compensates(&self, item: ItemId) -> bool {
-        matches!(&self.db.ast(item).kind, ItemKind::Fn(function)
-            if function.clauses.iter().any(|clause| matches!(clause.kind, ClauseKind::Undo { .. })))
+        let own = matches!(&self.db.ast(item).kind, ItemKind::Fn(function)
+            if function.clauses.iter().any(|clause| matches!(clause.kind, ClauseKind::Undo { .. })));
+        own || matches!(self.served(item), Some((_, protocol, super::protocol::Served::Handler(index)))
+            if self.operation_undoes(protocol, index))
     }
 
     /// The undoer an undo clause of a function names: a function item of the function's

@@ -462,6 +462,8 @@ A **support routine** is one of these fixed routines of the implementation, each
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
 
+The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-host`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-host` the mode is the kernel's, which a user process cannot set.
+
 ### Host I/O backend
 
 On the host targets every waiting primitive of the platform package performs its operation through io_uring:

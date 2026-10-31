@@ -754,7 +754,7 @@ pub closed struct Reading derives Eq { // error: derive.constituent-missing
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `derive.constituent-missing` | error | [Derives](#derives), [Opacity](15-untrusted.md#opacity) |
+| `derive.constituent-missing` | error | [Derives](#derives), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `derive.duplicate` | error | [Derives](#derives) |
 | `derive.enum-default` | error | [Derives](#derives) |
 | `derive.unknown` | error | [Derives](#derives) |
@@ -763,7 +763,7 @@ pub closed struct Reading derives Eq { // error: derive.constituent-missing
 | `generic.const-type` | error | [Generic parameters](#generic-parameters) |
 | `generic.parameter-unused` | error | [Generic parameters](#generic-parameters) |
 | `generic.uninferred` | error | [Inference](#inference) |
-| `generic.unsatisfied-bound` | error | [Conformance](#conformance), [Instantiation](#instantiation), [Failure bounds](11-errors-domains.md#failure-bounds), [Templates](13-text-encode.md#templates), [Opacity](15-untrusted.md#opacity) |
+| `generic.unsatisfied-bound` | error | [Conformance](#conformance), [Instantiation](#instantiation), [Failure bounds](11-errors-domains.md#failure-bounds), [Templates](13-text-encode.md#templates), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `generic.where-misplaced` | error | [Generic parameters](#generic-parameters) |
 | `generic.where-unmet` | error | [Instantiation](#instantiation) |
 | `interface.ambiguous-method` | error | [Method resolution](#method-resolution) |
@@ -778,6 +778,6 @@ pub closed struct Reading derives Eq { // error: derive.constituent-missing
 | `interface.method-collision` | error | [Conformance](#conformance) |
 | `interface.missing-method` | error | [Conformance](#conformance) |
 | `interface.not-dyn-usable` | error | [Dynamic dispatch](#dynamic-dispatch) |
-| `interface.not-implemented` | error | [Method resolution](#method-resolution), [Operator interfaces](#operator-interfaces), [Dynamic dispatch](#dynamic-dispatch), [Opacity](15-untrusted.md#opacity) |
+| `interface.not-implemented` | error | [Method resolution](#method-resolution), [Operator interfaces](#operator-interfaces), [Dynamic dispatch](#dynamic-dispatch), [Opacity](15-untrusted.md#opacity), [Secret values](15-untrusted.md#secret-values) |
 | `interface.not-interface` | error | [Impl lines](#impl-lines), [Generic parameters](#generic-parameters), [Dynamic dispatch](#dynamic-dispatch) |
 | `interface.unqualified-call` | error | [Method resolution](#method-resolution) |

@@ -139,6 +139,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("core::Option", [AnyArg, AnyArg, All, All, All, No]),
     ("core::Result", [AnyArg, AnyArg, All, All, All, No]),
     ("core::Untrusted", [First, First, First, First, First, No]),
+    ("core::Secret", [No, No, Yes, Yes, Yes, No]),
     ("core::Slice", VIEW_SEND_INERT_AS),
     ("core::SliceMut", VIEW_SEND_INERT_AS),
     ("core::Str", [No, Yes, No, Yes, Yes, No]),

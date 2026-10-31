@@ -1,6 +1,6 @@
 //! The std operations the interpreter supplies, its supplied operations and intrinsics: named
-//! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`
-//! and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
+//! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`,
+//! `Secret` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
 //! capabilities of the testing world, channels, rendering, and the conformances the toolchain
 //! supplies and the methods derives write.
 
@@ -12,6 +12,7 @@ mod hashing;
 mod numbers;
 mod pointers;
 mod render;
+mod secret;
 mod sims;
 mod stores;
 mod tasks;
@@ -50,6 +51,9 @@ pub fn call(
     }
     if let Some(scalar) = owner.strip_prefix("core::").and_then(Scalar::from_name) {
         return numbers::scalar_member(interp, scalar, member, &args, at);
+    }
+    if owner == "core::Secret" {
+        return secret::member(interp, member, type_args, &args, at);
     }
     if owner == "hw::Ptr"
         && let Some(flow) = pointers::member(interp, member, type_args, &args, at)

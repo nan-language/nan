@@ -24,9 +24,11 @@ use crate::workspace::Arch;
 /// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
 /// their pseudo-descriptor; `EnableAvx`; `GigabytePages`, which gives 1 when the CPU maps
 /// 1 GiB pages and 0 otherwise; and `ReadTsc`, which reads the time-stamp counter once every
-/// earlier instruction has completed. The AArch64 stubs are `ReadSysReg` and
-/// `WriteSysReg`, each naming a system register by its 15-bit encoding, which the instruction
-/// holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base register; `TlbiPage`,
+/// earlier instruction has completed. `ConstantTime` sets the running CPU's data-independent
+/// timing mode when it has one: on x86_64 DOITM, when `IA32_ARCH_CAPABILITIES` enumerates it,
+/// and on AArch64 `PSTATE.DIT`, when `ID_AA64PFR0_EL1` does. The AArch64 stubs are
+/// `ReadSysReg` and `WriteSysReg`, each naming a system register by its 15-bit encoding, which
+/// the instruction holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base register; `TlbiPage`,
 /// which invalidates a page's translations; `EnterRoot`, which installs the entry root with the
 /// memory attributes and translation control the entry seams program; `InterruptStack`, which
 /// makes a stack top the one exceptions switch to and leaves the caller on its stack through
@@ -73,6 +75,7 @@ pub enum Stub {
     EnableAvx,
     GigabytePages,
     ReadTsc,
+    ConstantTime,
     ReadSysReg(u16),
     WriteSysReg(u16),
     ReadTtbr0,
@@ -212,6 +215,16 @@ impl Stub {
                 1,
                 &[
                     0x0f, 0xae, 0xe8, 0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3,
+                ],
+            ),
+            Stub::ConstantTime => (
+                0,
+                0,
+                &[
+                    0x53, 0x31, 0xc0, 0x0f, 0xa2, 0x83, 0xf8, 0x07, 0x72, 0x28, 0xb8, 0x07, 0x00,
+                    0x00, 0x00, 0x31, 0xc9, 0x0f, 0xa2, 0x0f, 0xba, 0xe2, 0x1d, 0x73, 0x19, 0xb9,
+                    0x0a, 0x01, 0x00, 0x00, 0x0f, 0x32, 0x0f, 0xba, 0xe0, 0x0c, 0x73, 0x0c, 0xb9,
+                    0x01, 0x1b, 0x00, 0x00, 0x0f, 0x32, 0x83, 0xc8, 0x01, 0x0f, 0x30, 0x5b, 0xc3,
                 ],
             ),
             Stub::Halt => (0, 0, &[0xfa, 0xf4, 0xeb, 0xfd]),
@@ -433,6 +446,14 @@ impl Stub {
                 ],
             ),
             Stub::Hvc => (4, 1, &[0x02, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::ConstantTime => (
+                0,
+                0,
+                &[
+                    0x00, 0x04, 0x38, 0xd5, 0x00, 0xcc, 0x70, 0xd3, 0x40, 0x00, 0x00, 0xb4, 0x5f,
+                    0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
             Stub::FiqOn => (0, 0, &[0xff, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::FiqOff => (0, 0, &[0xdf, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::Out1

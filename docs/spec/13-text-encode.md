@@ -334,7 +334,7 @@ Core and std types render as follows:
 | `mem::Box[T]`, `mem::Shared[T]` | the rendering of the contents |
 
 - A finite float renders as `-` when its sign bit is set, then the shortest digits d1…dk and exponent e for which d1.d2…dk × 10^e rounds to its magnitude m in its own type by roundTiesToEven, choosing the nearest to m, then an even last digit. For m 0 or in [10^-5, 10^16) the digits are positional with at least one each side of `.` (`0.1`, `100.0`, `-0.0`); otherwise they are d1, `.`, d2…dk or `0`, `e`, then e with `-` when negative (`1.5e-7`, `2.0e16`).
-- The generic types of the table implement `Render` when their type arguments do. Other core and std types implement it only as their declarations state; `Untrusted[T]` renders as [Untrusted data](15-untrusted.md#opacity) defines.
+- The generic types of the table implement `Render` when their type arguments do. Other core and std types implement it only as their declarations state; `Untrusted[T]` renders as [Untrusted and secret data](15-untrusted.md#opacity) defines.
 
 ### Derived Render
 

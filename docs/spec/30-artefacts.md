@@ -126,6 +126,7 @@ For each package whose units come from an artefact, after every package it depen
 5. emits the [registry tables](25-registries.md#tables), [compiler stubs](23-low-level.md#compiler-stubs) and [support routines](27-program-model.md#runtime-support) the image needs.
 
 - Lowered code behaves exactly as its NIR does, with the same results, failures, traps, trap reports and bit patterns.
+- Lowered code computes on Secret values as [constant-time lowering](15-untrusted.md#constant-time-lowering) states.
 - Machine code lowered for one final closure is part of no image of another.
 - The [stack limits](10-effects-digests.md#stack-limits) check reads the frame sizes lowering reports.
 

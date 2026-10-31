@@ -5,7 +5,7 @@ The token count of each tier's `nan primer` text under each tokenizer; a tier's 
 | Tier | o200k_base | cl100k_base | Llama 3 | Size | Cap |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | core | 7960 | 7929 | 7929 | 7960 | 8000 |
-| low-level | 1373 | 1370 | 1370 | 1373 | 3000 |
+| low-level | 1456 | 1451 | 1451 | 1456 | 3000 |
 | concurrency | 1669 | 1674 | 1674 | 1674 | 3000 |
 | kernel | 1308 | 1311 | 1311 | 1311 | 3000 |
 | packages | 1833 | 1832 | 1832 | 1833 | 3000 |

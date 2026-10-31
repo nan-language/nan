@@ -596,12 +596,12 @@ pub fn precedes(left: f64, right: f64) -> bool
 
 | Code | Class | Rule |
 | --- | --- | --- |
-| `num.conversion-undefined` | error | [Conversions](#conversions) |
+| `num.conversion-undefined` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |
 | `num.conversion-value` | error | [Conversions](#conversions) |
 | `num.from-bits-not-anybits` | error | [Bit patterns](#bit-patterns) |
-| `num.same-type-conversion` | error | [Conversions](#conversions), [Bit patterns](#bit-patterns) |
+| `num.same-type-conversion` | error | [Conversions](#conversions), [Bit patterns](#bit-patterns), [Secret values](15-untrusted.md#secret-values) |
 | `num.signed-division` | error | [Division](#division), [Number operators](#number-operators) |
 | `num.signed-shift-right` | error | [Shifts](#shifts), [Number operators](#number-operators) |
 | `num.unsigned-negation` | error | [Overflow](#overflow), [Number operators](#number-operators) |
-| `num.widen-applies` | error | [Conversions](#conversions) |
-| `num.widen-lossy` | error | [Conversions](#conversions) |
+| `num.widen-applies` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |
+| `num.widen-lossy` | error | [Conversions](#conversions), [Secret values](15-untrusted.md#secret-values) |

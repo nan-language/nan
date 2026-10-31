@@ -746,4 +746,4 @@ pub fn record_twice(mut counter: Counter) {
 | `name.private-in-interface` | error | [Visibility](#visibility) |
 | `name.redundant-path` | error | [Paths](#paths) |
 | `name.reserved` | error | [Aliases](#aliases), [Reserved std names](28-stdlib.md#reserved-std-names) |
-| `name.unknown` | error | [Unknown names](#unknown-names), [Untrusted values](15-untrusted.md#untrusted-values), [Array and slice members](28-stdlib.md#array-and-slice-members), [Option and Result members](28-stdlib.md#option-and-result-members) |
+| `name.unknown` | error | [Unknown names](#unknown-names), [Untrusted values](15-untrusted.md#untrusted-values), [Secret values](15-untrusted.md#secret-values), [Array and slice members](28-stdlib.md#array-and-slice-members), [Option and Result members](28-stdlib.md#option-and-result-members) |

@@ -405,8 +405,8 @@ impl Layouts {
                     ],
                 )
             }
-            "core::Untrusted" => {
-                let inner = ty_arg(0).expect("an Untrusted type argument");
+            "core::Untrusted" | "core::Secret" => {
+                let inner = ty_arg(0).expect("a wrapped type argument");
                 return Some(self.transparent(ck, &inner));
             }
             "hw::Ptr" => Layout {

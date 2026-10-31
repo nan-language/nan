@@ -227,7 +227,7 @@ fn_modifier = "proj" | "interrupt" | "landing" | "foreign" | "validator" ;
 - A repeated type modifier, `closed` beside `open`, and a second function modifier are errors (`item.modifier-conflict`); for a repeated modifier, the exact fix deletes the repetition.
 - A `pub` struct or enum states `closed` or `open`; one stating neither is an error (`item.openness-missing`). A private or `pkg` struct or enum stating either is an error (`item.openness-not-pub`); its exact fix deletes the word.
 - `nan fmt` writes type modifiers in the order `closed` or `open`, `linear`, `view`.
-- `closed` and `open` are defined in [Data types](04-types.md#closed-and-open-types); `linear` in [Structural properties](05-properties.md#linear-types); `view` in [Structural properties](05-properties.md#views); `proj` in [Ownership and access](07-ownership.md#projections); `interrupt` in [Kernel execution model](24-kernel.md#interrupt-functions); `landing` and `foreign` in [Low-level programming](23-low-level.md#landing-functions); `validator` in [Untrusted data](15-untrusted.md#validators).
+- `closed` and `open` are defined in [Data types](04-types.md#closed-and-open-types); `linear` in [Structural properties](05-properties.md#linear-types); `view` in [Structural properties](05-properties.md#views); `proj` in [Ownership and access](07-ownership.md#projections); `interrupt` in [Kernel execution model](24-kernel.md#interrupt-functions); `landing` and `foreign` in [Low-level programming](23-low-level.md#landing-functions); `validator` in [Untrusted and secret data](15-untrusted.md#validators).
 
 ```nan
 pub open linear struct Lease {

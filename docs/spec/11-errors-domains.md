@@ -318,7 +318,7 @@ The **trap kinds** are exactly these, forming the `trap` family:
 | `trap.bounds` | an index, offset or id lies outside what it reaches, or an offset is not aligned for its type ([indexing](07-ownership.md#indexing)) |
 | `trap.overflow` | an integer result is not a value of its type ([overflow](09-numbers.md#overflow)) |
 | `trap.division-by-zero` | an integer division or remainder has the divisor 0 ([division](09-numbers.md#division)) |
-| `trap.shift` | a shift amount is at least the width of the shifted type ([shifts](09-numbers.md#shifts)) |
+| `trap.shift` | a shift amount is at least the width of the shifted type ([shifts](09-numbers.md#shifts), [Secret values](15-untrusted.md#secret-values)) |
 | `trap.conversion` | a value is converted into, or stored in, a type or field that cannot represent it ([conversions](09-numbers.md#conversions), [layout values](23-low-level.md#layout-values)) |
 | `trap.stale-handle` | a handle is used after what it names has ended ([generational handles](12-memory.md#generational-handles)) |
 | `trap.exhausted` | an allocation or a fixed capacity runs out ([growth](12-memory.md#growth)) |

@@ -319,6 +319,7 @@ impl Checker<'_> {
                     }
                     "Neg" if float || scalar.is_signed() => Rc::from(vec![Arg::Ty(ty.clone())]),
                     "BitNot" if integer => Rc::from(vec![Arg::Ty(ty.clone())]),
+                    "SecretBits" if integer || *scalar == Scalar::Bool => no_args(),
                     _ => return None,
                 };
                 Some(args)
@@ -664,6 +665,9 @@ impl Checker<'_> {
                     .scalar()
                     .is_some_and(|scalar| scalar.is_integer() || scalar == Scalar::Char)
             }),
+            Receivers::Integer => element.and_then(Ty::scalar).is_some_and(Scalar::is_integer),
+            Receivers::Wide => matches!(element, Some(Ty::Scalar(Scalar::U64 | Scalar::I64))),
+            Receivers::Bool => element == Some(&Ty::Scalar(Scalar::Bool)),
         }
     }
 
@@ -688,6 +692,13 @@ impl Checker<'_> {
             ("core::Untrusted", "append" | "try_append") => Receivers::OwnedBytes,
             ("core::Untrusted", "into_cleared") => Receivers::Clearable,
             ("core::Range", "next") => Receivers::Stepped,
+            (
+                "core::Secret",
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "shl" | "shr" | "rotate_left"
+                | "rotate_right" | "lt" | "le" | "gt" | "ge" | "widen" | "truncate",
+            ) => Receivers::Integer,
+            ("core::Secret", "mul_high") => Receivers::Wide,
+            ("core::Secret", "select") => Receivers::Bool,
             _ => return None,
         })
     }
@@ -1105,6 +1116,11 @@ enum Receivers {
     OwnedBytes,
     Clearable,
     Stepped,
+    /// The integer types.
+    Integer,
+    /// `u64` and `i64`.
+    Wide,
+    Bool,
 }
 
 impl Receivers {

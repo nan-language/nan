@@ -21,6 +21,7 @@ use cranelift_module::{Linkage, Module};
 
 use super::abi::Returned;
 use super::fx::{Fx, PTR};
+use super::machine::Stub;
 use super::runtime::system::{self, unavailable_unless};
 use super::runtime::tasks::{self, kind, operation, task, thread};
 use super::runtime::{Routine, memory, state};
@@ -128,6 +129,10 @@ const SIGNAL_STACK: u64 = 65_536;
 const SIGNALS: [i64; 3] = [1, 2, 15];
 const SIGINFO: u64 = 128;
 const SIGPIPE: i64 = 13;
+
+/// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
+const AT_HWCAP: u64 = 16;
+const HWCAP_DIT: i64 = 1 << 24;
 
 /// Defines the program entry seam `main` and the glue running the entry function as the first
 /// task.
@@ -591,9 +596,11 @@ fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
 }
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
-/// calling thread being the first, and the reading of termination requests; returns 1 from
-/// `Init` when the system refuses one.
+/// calling thread being the first, and the reading of termination requests, after the
+/// data-independent timing mode, which they inherit; returns 1 from `Init` when the system
+/// refuses one.
 pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
+    constant_time(lo, fx);
     let state_address = lo.state(fx);
     if lo.seeded() {
         start_seeded(lo, fx);
@@ -654,6 +661,21 @@ pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
             let one = fx.ptr(1);
             fx.b.ins().return_(&[one]);
         });
+    });
+}
+
+/// Turns on `PSTATE.DIT` on an AArch64 host whose kernel reports `HWCAP_DIT`, and so emulates the
+/// stub's read of `ID_AA64PFR0_EL1`. An x86_64 process cannot turn on DOITM, which is the
+/// kernel's.
+fn constant_time(lo: &mut Lowering, fx: &mut Fx) {
+    if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
+        return;
+    }
+    let kind = fx.ptr(AT_HWCAP);
+    let hwcap = lo.call_libc(fx, "getauxval", &[kind], &[PTR])[0];
+    let dit = fx.b.ins().band_imm_s(hwcap, HWCAP_DIT);
+    fx.when(dit, |fx| {
+        lo.call_stub(fx, Stub::ConstantTime, &[]);
     });
 }
 

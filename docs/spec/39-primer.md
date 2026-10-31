@@ -526,6 +526,10 @@ pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::Page
 - The [memory model](23-low-level.md#memory-model): safe code is data-race-free and sequentially consistent; trusted code follows the Ptr rules (provenance, alignment, initialisation, no access overlapping a live `mut` place) and C++20 atomics without consume.
 - uefi and bare targets reject reachable float use.
 
+### Secret values
+
+- Keys and other secrets go in [`core::Secret[T]`](15-untrusted.md#secret-values), over the integer types and `bool`. Its members, such as `wrapping_add`, `bit_xor`, `rotate_left`, `eq`, `lt` and `select`, lower without branches, and a `Secret[bool]` decides nothing until `reveal` (`secret.public-use`).
+
 ## Concurrency topic
 
 ### Task scopes

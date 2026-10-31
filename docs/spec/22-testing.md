@@ -230,7 +230,7 @@ test total_is_bounded_regression_1 for total {
 
 ## Simulated capabilities
 
-A **sim** is a capability of a std capability type acting on state that a test or [example](21-interpreter.md#example-runs) run simulates, meeting the heads and contracts of its type's operations. An awaited sim operation leaves its task ready once the sim's state decides its result.
+A **sim** is a capability of a std capability type acting on state that a test or [example](21-interpreter.md#example-runs) run simulates, meeting the heads and contracts of its type's operations. An awaited sim operation leaves its task ready once the sim's state decides its result. A [capability kind](14-authority.md#capability-kinds) has no sims: the module declaring it mints the substitutes that tests and dry runs act through.
 
 ```nan-api
 // module: testing

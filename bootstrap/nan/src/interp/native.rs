@@ -1,14 +1,15 @@
 //! The std operations the interpreter supplies, its supplied operations and intrinsics: named
 //! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`,
 //! `Secret` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
-//! capabilities of the testing world, channels, rendering, and the conformances the toolchain
-//! supplies and the methods derives write.
+//! capabilities of the testing world, capability kinds, channels, rendering, and the
+//! conformances the toolchain supplies and the methods derives write.
 
 mod atomics;
 mod codecs;
 mod collections;
 mod hardware;
 mod hashing;
+mod kinds;
 mod numbers;
 mod pointers;
 mod render;
@@ -70,6 +71,9 @@ pub fn call(
         return flow;
     }
     if let Some(flow) = sims::member(interp, owner, member, type_args, &args) {
+        return flow;
+    }
+    if let Some(flow) = kinds::member(interp, owner, member, type_args, &args, at, site) {
         return flow;
     }
     if let Some(flow) = codecs::member(interp, owner, member, type_args, &args, at, site) {

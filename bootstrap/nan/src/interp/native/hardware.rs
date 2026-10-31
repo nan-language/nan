@@ -232,7 +232,7 @@ pub fn member(
     Some(Ok(Flow::Return(value)))
 }
 
-fn reference(extent: u32) -> Val {
+pub(super) fn reference(extent: u32) -> Val {
     Val::Ref(Loc {
         extent,
         path: Vec::new(),
@@ -240,7 +240,7 @@ fn reference(extent: u32) -> Val {
 }
 
 /// Calls a function value with arguments.
-fn call_value(
+pub(super) fn call_value(
     interp: &mut Interpreter,
     function: &Val,
     args: Vec<Val>,

@@ -157,6 +157,24 @@ pub fn Revoker.capability(self) -> C
 
 pub fn Revoker.revoke(take self)
 
+pub interface Kind[S: Send, R: AnyBits and Copy] {
+} Kind
+
+pub open linear struct Minter[C: Kind[S, R], S: Send, R: AnyBits and Copy] {
+} Minter
+
+pub fn Minter.of(take state: S, alloc: mem::Alloc) -> Minter[C, S, R]
+
+pub fn Minter.mint(self, record: R) -> C
+
+pub fn Minter.revoke(self, capability: C)
+
+pub fn Minter.close(take self)
+
+pub fn reach[C: Kind[S, R], S: Send, R: AnyBits and Copy, T: Any, E](capability: C, body: fn(state: S, record: R) -> T fails E) -> Option[T] fails E
+
+pub fn derive[C: Kind[S, R], S: Send, R: AnyBits and Copy](capability: C, narrow: fn(state: S, record: R) -> R) -> C fails Revoked
+
 pub interface Component[Env: Any and Send, M: Send] {
     fn start(mut env: Env) -> Self
     fn on(mut self, take message: M, mut env: Env, mut cx: Cx[M])
@@ -198,6 +216,22 @@ enum ProbeMessage {
 } ProbeMessage
 
 impl Probe: Component[ProbeEnv, ProbeMessage]
+
+struct Tally {
+} Tally
+
+impl Tally: Kind[core::atomic::AtomicU64, u64]
+
+fn tallies(start: u64, alloc: mem::Alloc) -> Minter[Tally, core::atomic::AtomicU64, u64] {
+    return Minter.of(core::atomic::AtomicU64.of(start), alloc)
+} tallies
+
+fn tally_record(state: core::atomic::AtomicU64, record: u64) -> u64 = record
+
+fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
+    discard state.fetch_add(record)
+    return state.load()
+} tally_count
 
 fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0)
 
@@ -526,6 +560,85 @@ test revoke_reaches_derived_capabilities for Revoker.revoke {
     }
     expect revoked
 } revoke_reaches_derived_capabilities
+
+test new_minter_keeps_its_state for Minter.of {
+    let world = testing::world()
+    let minter = tallies(5, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(0)
+    let start = reach(tally, body: fn(state: core::atomic::AtomicU64, record: u64) => state.load())
+    expect start == Some(5)
+} new_minter_keeps_its_state
+
+test minted_handle_keeps_its_record for Minter.mint {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(7)
+    let record = reach(tally, body: fn(state: core::atomic::AtomicU64, record: u64) => record)
+    expect record == Some(7)
+} minted_handle_keeps_its_record
+
+test revoke_reaches_only_its_own_entries for Minter.revoke {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let other = tallies(0, alloc: world.alloc)
+    defer take other.close()
+    let tally = minter.mint(1)
+    let kept = minter.mint(2)
+    let stranger = other.mint(3)
+    let narrowed = try derive(tally, narrow: tally_record)
+    minter.revoke(tally)
+    minter.revoke(stranger)
+    expect reach(tally, body: tally_record) == None
+    expect reach(narrowed, body: tally_record) == None
+    expect reach(kept, body: tally_record) == Some(2)
+    expect reach(stranger, body: tally_record) == Some(3)
+} revoke_reaches_only_its_own_entries
+
+test closed_minter_stales_its_handles for Minter.close {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(1)
+    let revoker = try revocable(tally)
+    let copy = revoker.capability()
+    undefer minter
+    take minter.close()
+    expect reach(tally, body: tally_record) == None
+    expect reach(copy, body: tally_record) == None
+    take revoker.revoke()
+} closed_minter_stales_its_handles
+
+test reaches_share_their_minter_state for reach {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    discard reach(minter.mint(2), body: tally_count)
+    let revoker = try revocable(minter.mint(3))
+    let copy = revoker.capability()
+    let total = reach(copy, body: tally_count)
+    take revoker.revoke()
+    let after = reach(copy, body: tally_count)
+    expect total == Some(5)
+    expect after == None
+} reaches_share_their_minter_state
+
+test derived_handle_records_the_narrowed_record for derive {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    defer take minter.close()
+    let tally = minter.mint(6)
+    let half = try derive(tally, narrow: fn(state: core::atomic::AtomicU64, record: u64) => record / 2)
+    expect reach(half, body: tally_record) == Some(3)
+    minter.revoke(tally)
+    let stale = match attempt derive(tally, narrow: tally_record) {
+        Err(Revoked.Stale) => true
+        else => false
+    }
+    expect stale
+} derived_handle_records_the_narrowed_record
 
 test sent_message_is_handled for Cx.send {
     let world = testing::world()

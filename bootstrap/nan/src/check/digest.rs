@@ -98,6 +98,19 @@ impl Digest {
             && self.class == Class::Traceless
     }
 
+    /// The digest of a function of a capability kind as code reaching it sees it: without the
+    /// device, priv and sync facts, with the kind as its one capability and no validators.
+    fn kind_view(&self, kind: ItemId) -> Digest {
+        Digest {
+            device: false,
+            privileged: false,
+            sync: false,
+            capabilities: Some(BTreeSet::from([kind])),
+            validators: Some(BTreeSet::new()),
+            ..self.clone()
+        }
+    }
+
     /// The code of the rule a limit demanding facts this digest lacks breaks.
     fn broken(&self, limits: &LimitSet) -> Option<Code> {
         if limits.pure && !self.pure() {
@@ -233,9 +246,20 @@ pub struct Cycles {
 }
 
 impl Checker<'_> {
-    /// The digest of a function item: computed from its body, supplied for a std function
-    /// without one, and otherwise declared; compensated when the function has an undo clause.
+    /// The digest of a function item: its code's, which a function of a capability kind gives
+    /// as the kind's view of it.
     pub fn digest(&self, item: ItemId) -> Rc<Digest> {
+        let digest = self.code_digest(item);
+        match self.kind_member(item) {
+            Some(kind) => Rc::new(digest.kind_view(kind)),
+            None => digest,
+        }
+    }
+
+    /// The digest a function item's code gives: computed from its body, supplied for a std
+    /// function without one, and otherwise declared; compensated when the function has an undo
+    /// clause.
+    pub fn code_digest(&self, item: ItemId) -> Rc<Digest> {
         let digest = self.uncompensated_digest(item);
         match self.compensates(item) {
             true => Rc::new(Digest {

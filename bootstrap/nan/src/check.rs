@@ -28,6 +28,7 @@ mod head;
 mod identity;
 mod interface;
 mod kernel;
+mod kinds;
 pub(crate) mod ledger;
 pub(crate) mod lowlevel;
 mod measure;

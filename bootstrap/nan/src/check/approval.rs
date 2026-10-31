@@ -18,9 +18,9 @@ pub struct Needed {
 }
 
 impl Checker<'_> {
-    /// The authority summary of a package: the capabilities and validators its functions' digests
-    /// hold, `alloc`, `device` and `priv` when a digest holds them, and each trust escape kind of
-    /// each item holding one.
+    /// The authority summary of a package: the capabilities and validators its functions' digests,
+    /// and the digests their code gives, hold, `alloc`, `device` and `priv` when one holds them,
+    /// and each trust escape kind of each item holding one.
     pub fn authority_summary(&self, package: PackageId) -> BTreeSet<Entry> {
         let mut summary = BTreeSet::new();
         for entry in self.package_ledger(package) {
@@ -37,21 +37,22 @@ impl Checker<'_> {
                 if !matches!(self.db.ast(item).kind, crate::syntax::ast::ItemKind::Fn(_)) {
                     continue;
                 }
-                let digest = self.digest(item);
-                for (holds, entry) in [
-                    (digest.alloc, Entry::Alloc),
-                    (digest.device, Entry::Device),
-                    (digest.privileged, Entry::Priv),
-                ] {
-                    if holds {
-                        summary.insert(entry);
+                for digest in [self.digest(item), self.code_digest(item)] {
+                    for (holds, entry) in [
+                        (digest.alloc, Entry::Alloc),
+                        (digest.device, Entry::Device),
+                        (digest.privileged, Entry::Priv),
+                    ] {
+                        if holds {
+                            summary.insert(entry);
+                        }
                     }
-                }
-                for capability in digest.capabilities.iter().flatten() {
-                    summary.insert(Entry::Capability(self.db.canonical(*capability)));
-                }
-                for validator in digest.validators.iter().flatten() {
-                    summary.insert(Entry::Validator(self.db.canonical(*validator)));
+                    for capability in digest.capabilities.iter().flatten() {
+                        summary.insert(Entry::Capability(self.db.canonical(*capability)));
+                    }
+                    for validator in digest.validators.iter().flatten() {
+                        summary.insert(Entry::Validator(self.db.canonical(*validator)));
+                    }
                 }
             }
         }

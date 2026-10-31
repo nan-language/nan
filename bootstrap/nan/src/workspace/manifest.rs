@@ -194,6 +194,7 @@ pub enum Authority {
     Priv,
     Trusted,
     Validate,
+    Capability,
     /// The registry path of a `contribute` grant, as written.
     Contribute(String),
 }
@@ -206,6 +207,7 @@ impl Authority {
             Authority::Priv => "priv".to_owned(),
             Authority::Trusted => "trusted".to_owned(),
             Authority::Validate => "validate".to_owned(),
+            Authority::Capability => "capability".to_owned(),
             Authority::Contribute(registry) => format!("contribute {registry}"),
         }
     }
@@ -444,6 +446,7 @@ impl Reader<'_> {
                         "priv" => Authority::Priv,
                         "trusted" => Authority::Trusted,
                         "validate" => Authority::Validate,
+                        "capability" => Authority::Capability,
                         _ => Authority::Contribute(authority["contribute".len()..].to_owned()),
                     };
                     manifest.allows.push(Allow {

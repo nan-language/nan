@@ -694,7 +694,9 @@ impl Body<'_, '_> {
                 Some(_) => subst.arg(&Arg::Const(crate::check::ty::Const::Param(def.param))),
                 None => Arg::Ty(subst.ty(&Ty::Param(def.param))),
             })
-            .collect();
+            .collect::<crate::check::ty::Args>();
+        self.ck
+            .check_kind_use(self.item, token, item, type_args.first());
         TExpr {
             token,
             last: token,

@@ -1725,6 +1725,7 @@ impl Body<'_, '_> {
             .generics
             .first()
             .and_then(|def| subst.get(def.param));
+        self.ck.check_kind_use(self.item, token, item, wrapped);
         if path
             .strip_prefix("hw::Ptr.")
             .is_some_and(|member| member.starts_with("atomic_"))
@@ -2224,6 +2225,11 @@ impl Body<'_, '_> {
             (SigKind::Struct { fields }, None) => {
                 if consumer && self.ck.db.ast(item).is_open() {
                     self.report(token, Code::TypeOpenConstruction);
+                    self.skim_args(args);
+                    return TExpr::failed(token);
+                }
+                if self.ck.is_kind(item) {
+                    self.report(token, Code::AuthorityKindForm);
                     self.skim_args(args);
                     return TExpr::failed(token);
                 }

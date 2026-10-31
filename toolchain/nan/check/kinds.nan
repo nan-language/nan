@@ -1,0 +1,123 @@
+//! Capability kinds: the structs an impl line naming `sys::Kind` declares kinds, the form of those lines, and the uses of minters, reaches and derivations, which only the module declaring a kind makes.
+
+/// The largest record a kind's entries keep, in bytes.
+const RECORD_BYTES: u64 = 16
+
+/// The std functions only the module declaring their kind uses.
+const KIND_USES: Str = "sys::Minter.of sys::Minter.mint sys::Minter.revoke sys::Minter.close sys::reach sys::derive"
+
+/// The `sys::Kind` impl line of a type item, when it has one.
+fn Checker.kind_line(self, item: ty::ItemId) -> Option[ty::ItemId] {
+    let db = self.db()
+    for line in self.impl_lines(TypeKey.Item(item)) {
+        let held = self.sig(line)
+        let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = held.contents().kind else {
+            continue
+        }
+        if db.canonical_text(bound.item) == "sys::Kind" {
+            return Some(line)
+        }
+    }
+    return None
+} Checker.kind_line
+
+/// Whether a type item is a capability kind: a struct of the form kinds take that a
+/// `sys::Kind` impl line names.
+pkg fn Checker.is_kind(self, item: ty::ItemId) -> bool {
+    return self.kind_shaped(item) and self.kind_line(item).is_some()
+} Checker.is_kind
+
+/// Whether a type item has the form of a kind: a struct without members, generic parameters,
+/// derives or a modifier other than `open`.
+fn Checker.kind_shaped(self, item: ty::ItemId) -> bool {
+    let node = self.db().ast(item)
+    let ast::ItemKind.Struct(structure) = node.kind else {
+        return false
+    }
+    if structure.members.len() > 0 or structure.generics.len() > 0 or structure.derived.len() > 0 {
+        return false
+    }
+    for modifier in node.type_modifiers {
+        if modifier.kind != ast::TypeModifier.Open {
+            return false
+        }
+    }
+    return true
+} Checker.kind_shaped
+
+/// The kind whose function an item is, when its head does not demand `pure`.
+fn Checker.kind_member(self, function: ty::ItemId) -> Option[ty::ItemId] {
+    let Some(TypeKey.Item(owner)) = self.db().owners.get(function) else {
+        return None
+    }
+    if not self.is_kind(owner) {
+        return None
+    }
+    match self.fn_sig(function) {
+        Some(sig) => {
+            if sig.limit_set.pure {
+                return None
+            }
+        }
+        None => {}
+    }
+    return Some(owner)
+} Checker.kind_member
+
+/// The rules of an impl line naming `sys::Kind`: its module performs `capability`, and it names
+/// a struct of a kind's form and a record of at most 16 bytes.
+fn Checker.check_kind_impl(self, line: ty::ItemId) {
+    let db = self.db()
+    let held = self.sig(line)
+    let SigKind.Impl(target: Some(key), target_ty: _, bound: Some(bound)) = held.contents().kind else {
+        return
+    }
+    if db.canonical_text(bound.item) != "sys::Kind" {
+        return
+    }
+    let token = db.ast(line).token
+    self.require(line, token, authority: workspace::Authority.Capability)
+    let shaped = match key {
+        TypeKey.Item(item) => self.kind_shaped(item)
+        else => false
+    }
+    let types = self.types()
+    let args = types.arg_list(bound.args)
+    var sized = true
+    if args.len() > 1 {
+        match args[1].ty() {
+            Some(record) => {
+                if not types.has_error(record) {
+                    sized = match self.fixed_size(record) {
+                        Some(size) => size <= RECORD_BYTES
+                        None => false
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    if not shaped or not sized {
+        self.report(line, token, code: diagnostic::Code.AuthorityKindForm)
+    }
+} Checker.check_kind_impl
+
+/// A use of a minter's operation, `sys::reach` or `sys::derive` by an item, `kind` the kind it
+/// fixes: one that is not a kind the item's module declares is reported.
+fn Checker.check_kind_use(self, user: ty::ItemId, token: u32, function: ty::ItemId, kind: Option[ty::Arg]) {
+    let db = self.db()
+    if not db.is_std(function) or not is_listed(KIND_USES, word: db.canonical_text(function)) {
+        return
+    }
+    let types = self.types()
+    let declared = match kind {
+        Some(ty::Arg.Ty(fixed)) => match types.kind(fixed) {
+            ty::TyKind.Item(item: item, args: _) => self.is_kind(item) and db.module_of(item) == db.module_of(user)
+            else => types.has_error(fixed)
+        }
+        else => true
+    }
+    if not declared {
+        self.report(user, token, code: diagnostic::Code.AuthorityKindForeign)
+    }
+} Checker.check_kind_use

@@ -88,6 +88,21 @@ pub enum Routine {
     /// `(handle) -> runner`: the runner of a live outbox, taking a reference to its record;
     /// zero for a stale outbox.
     OutboxClaim,
+    /// `(minter, low, high) -> handle`: a new entry of a capability kind belonging to a minter,
+    /// recording the two words of a record.
+    KindMint,
+    /// `(handle, record) -> minter`: for a live entry of a capability kind, its minter, on whose
+    /// state the call counts one holder more, its record's two words written at `record`; zero
+    /// for a stale handle.
+    KindPin,
+    /// `(handle, low, high) -> handle`: a new entry deriving from a live entry of a capability
+    /// kind and recording the two words of a record; all ones for a stale handle.
+    KindDerive,
+    /// `(handle, minter)`: revokes an entry belonging to a minter and every entry deriving from
+    /// it.
+    KindRevoke,
+    /// `(minter)`: revokes every entry belonging to a minter.
+    KindClose,
     /// `(kind, operands, count, caller) -> Never`: traps the running task.
     TrapRaise,
     /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
@@ -189,6 +204,11 @@ impl Routine {
             Routine::OutboxMint => "_NScap_table_outbox_mint",
             Routine::OutboxRetire => "_NScap_table_outbox_retire",
             Routine::OutboxClaim => "_NScap_table_outbox_claim",
+            Routine::KindMint => "_NScap_table_kind_mint",
+            Routine::KindPin => "_NScap_table_kind_pin",
+            Routine::KindDerive => "_NScap_table_kind_derive",
+            Routine::KindRevoke => "_NScap_table_kind_revoke",
+            Routine::KindClose => "_NScap_table_kind_close",
             Routine::TrapRaise => "_NStrap_raise",
             Routine::Reacquired => "_NStrap_reacquired",
             Routine::ReportScalar => "_NStrap_scalar",
@@ -234,14 +254,15 @@ impl Routine {
         const P: cranelift_codegen::ir::Type = types::I64;
         match self {
             Routine::Copy | Routine::Fill => (&[P, P, P], &[]),
-            Routine::OutboxMint => (&[P, P, P], &[P]),
+            Routine::OutboxMint | Routine::KindMint | Routine::KindDerive => (&[P, P, P], &[P]),
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
             Routine::AllocIn => (&[P, P, P, P], &[P]),
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
             Routine::Derive => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
-            Routine::Rehome => (&[P, P], &[]),
+            Routine::Rehome | Routine::KindRevoke => (&[P, P], &[]),
+            Routine::KindPin => (&[P, P], &[P]),
             Routine::Charged
             | Routine::Limit
             | Routine::TaskEnv
@@ -256,6 +277,7 @@ impl Routine {
             | Routine::Unhold
             | Routine::MintRoot
             | Routine::Revoke
+            | Routine::KindClose
             | Routine::OutboxRetire
             | Routine::Wake
             | Routine::TaskStart
@@ -596,7 +618,12 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Revoke
         | Routine::OutboxMint
         | Routine::OutboxRetire
-        | Routine::OutboxClaim => tables::define(lo, fx, routine),
+        | Routine::OutboxClaim
+        | Routine::KindMint
+        | Routine::KindPin
+        | Routine::KindDerive
+        | Routine::KindRevoke
+        | Routine::KindClose => tables::define(lo, fx, routine),
         Routine::TrapRaise
         | Routine::Reacquired
         | Routine::ReportScalar

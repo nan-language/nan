@@ -1,10 +1,12 @@
 //! Holdings: what a domain owns that settlement releases once the domain is abandoned, each a
 //! record linked in its owner's list: a file or listener, whose descriptor closes; a
 //! connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker,
-//! whose cell closes; and a channel's sender or receiver, which counts as released.
+//! whose cell closes; a channel's sender or receiver, which counts as released; and a minter of
+//! a capability kind, which revokes its entries and keeps its state.
 //!
 //! A holding's record is its links, its owner, zero while no domain owns it, its kind and what
-//! it holds: a descriptor, a capability or cell handle, or a channel's record. The lock of the
+//! it holds: a descriptor, a capability or cell handle, a channel's record or a minter's state
+//! record. The lock of the
 //! cell and capability tables guards the lists.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
@@ -33,6 +35,7 @@ pub mod kind {
     pub const CLOSE_CELL: i64 = 3;
     pub const SENDER: i64 = 4;
     pub const RECEIVER: i64 = 5;
+    pub const MINTER: i64 = 6;
 }
 
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
@@ -183,6 +186,7 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
         for (wanted, routine) in [
             (kind::REVOKE, Routine::Revoke),
             (kind::CLOSE_CELL, Routine::Close),
+            (kind::MINTER, Routine::KindClose),
         ] {
             let this = is(fx, wanted);
             fx.when(this, |fx| {

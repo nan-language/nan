@@ -1,0 +1,91 @@
+//! Mints ports of a capability kind, narrows, copies and revokes them, sends through one from several tasks, and closes their minter.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// How many tasks send through one port, and how many messages each sends.
+const SENDERS: u64 = 4
+
+const SENDS: u64 = 250
+
+/// A port counting the messages sent through it in its minter's state.
+struct Port {
+} Port
+
+layout Grant: u64 le {
+    slot: u32 at 0
+    send: bit 32
+    reserved: rest
+} Grant
+
+impl Port: sys::Kind[core::atomic::AtomicU64, Grant]
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+fn Port.send(self) -> bool {
+    let sent = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: Grant) -> bool {
+        if not record.send {
+            return false
+        }
+        discard state.fetch_add(1)
+        return true
+    })
+    return sent == Some(true)
+} Port.send
+
+fn Port.sent(self) -> Option[u64] {
+    return sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: Grant) => state.load())
+} Port.sent
+
+fn Port.receive_only(self) -> Port fails sys::Revoked {
+    return try sys::derive(self, narrow: fn(state: core::atomic::AtomicU64, record: Grant) => Grant(slot: record.slot, send: false, reserved: 0))
+} Port.receive_only
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let minter = sys::Minter[Port, core::atomic::AtomicU64, Grant].of(core::atomic::AtomicU64.of(0), alloc: k.alloc())
+    let port = minter.mint(Grant(slot: 1, send: true, reserved: 0))
+    let other = minter.mint(Grant(slot: 2, send: true, reserved: 0))
+    let sent = port.send()
+    check(name: "send", held: sent)
+    let refused = match attempt port.receive_only() {
+        Ok(narrowed) => not narrowed.send()
+        Err(_) => false
+    }
+    check(name: "narrowed refuses", held: refused)
+    var regions = mut k.regions()
+    take k.anchor(take regions, run: fn[take minter](exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        let joined = attempt await task::scope(exec, body: fn(s: task::Scope) {
+            for _ in 0..<SENDERS {
+                discard s.spawn(fn() limits stack 16_384 {
+                    for _ in 0..<SENDS {
+                        discard port.send()
+                    }
+                })
+            }
+        })
+        let counted = other.sent()
+        check(name: "sends from every task", held: joined.is_ok() and counted == Some(SENDERS * SENDS + 1))
+        minter.revoke(port)
+        let stale = port.sent()
+        check(name: "revoked", held: stale == None)
+        take minter.close()
+        let closed = other.sent()
+        check(name: "closed", held: closed == None)
+    })
+} main

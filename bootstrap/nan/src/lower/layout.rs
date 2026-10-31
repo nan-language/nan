@@ -177,7 +177,7 @@ const VIEW_PAIRS: [&str; 6] = [
 ];
 
 /// The base types holding one pointer to state the runtime keeps.
-const POINTERS: [&str; 15] = [
+const POINTERS: [&str; 16] = [
     "core::Renderer",
     "core::Choices",
     "mem::Budget",
@@ -191,11 +191,12 @@ const POINTERS: [&str; 15] = [
     "task::Join",
     "task::Scope",
     "sys::Revoker",
+    "sys::Minter",
     "sys::Cx",
     "sys::Trap",
 ];
 
-/// The base types that are generational handles: a slot index and its generation.
+/// The base types that are generational handles, as capability kinds are.
 const HANDLES: [&str; 12] = [
     "mem::Alloc",
     "mem::Heap",
@@ -291,6 +292,9 @@ impl Layouts {
         if let ItemKind::Layout(layout) = &ck.db.ast(item).kind {
             return self.layout_item(ck, item, &layout.repr);
         }
+        if ck.is_kind(item) {
+            return handle();
+        }
         let sig = ck.sig(item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
         match &sig.kind {
@@ -338,15 +342,7 @@ impl Layouts {
             return Some(pointers(1, None));
         }
         if HANDLES.contains(&path) {
-            return Some(Layout {
-                size: 8,
-                align: 4,
-                shape: Shape::Record(vec![
-                    field("index", Ty::Scalar(Scalar::U32), 0),
-                    field("generation", Ty::Scalar(Scalar::U32), 4),
-                ]),
-                niche: None,
-            });
+            return Some(handle());
         }
         if VECTORS.contains(&path) {
             return Some(words(&["data", "len", "capacity", "alloc"]));
@@ -892,6 +888,19 @@ fn words(names: &[&str]) -> Layout {
                 .map(|(index, name)| field(name, Ty::Scalar(Scalar::U64), 8 * index as u64))
                 .collect(),
         ),
+        niche: None,
+    }
+}
+
+/// A generational handle: a slot index and its generation.
+fn handle() -> Layout {
+    Layout {
+        size: 8,
+        align: 4,
+        shape: Shape::Record(vec![
+            field("index", Ty::Scalar(Scalar::U32), 0),
+            field("generation", Ty::Scalar(Scalar::U32), 4),
+        ]),
         niche: None,
     }
 }

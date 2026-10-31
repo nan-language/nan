@@ -1,6 +1,6 @@
 //! Authority: the manifest grants a module needs for the device, priv, trusted and validate
-//! operations it performs directly, the grants its dependencies need, the names grants and
-//! denials list, and denied dependencies.
+//! operations it performs directly and the capability kinds it declares, the grants its
+//! dependencies need, the names grants and denials list, and denied dependencies.
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId};
@@ -94,7 +94,10 @@ impl Checker<'_> {
                             .contains(&(module, allow.authority.clone()))
                             || self.module_holds_failure(module)
                     }
-                    (None, None, Some(&Some(dep))) => self.grants_any(dep, &allow.authority),
+                    (None, None, Some(&Some(dep))) => {
+                        !RELAYED.contains(&allow.authority)
+                            || self.grants_any(dep, &allow.authority)
+                    }
                     _ => true,
                 };
                 if !used {
@@ -132,10 +135,14 @@ impl Checker<'_> {
         let module = |name: &str| self.db.module_named(package, name).is_some();
         let alias = |name: &str| data.deps.contains_key(name);
         for allow in &manifest.allows {
+            let named = |name: &str| match allow.authority {
+                Authority::Capability => module(name),
+                _ => module(name) || alias(name),
+            };
             if let Authority::Contribute(_) = allow.authority {
                 continue;
             }
-            if allow.names.iter().any(|name| !module(name) && !alias(name)) {
+            if allow.names.iter().any(|name| !named(name)) {
                 self.report_file(path, allow.line, Code::AuthorityUnknownName);
             }
         }

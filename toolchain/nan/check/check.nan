@@ -27,7 +27,7 @@ pkg fn Session.of(
     take home: Option[cache::HomeOverride],
     alloc: mem::Alloc,
     ) -> Session {
-    return Session(workspace: take workspace, carried: take std, grammar: take grammar, types: mem::Shared.of(ty::Types.empty(alloc), alloc), home: take home, tree_hash: mem::Shared.of(mem::OnceMap[u8, Option[hashing::HashValue]].empty(seed: 0, alloc), alloc), states: mem::Shared.of(mem::OnceMap[usize, hashing::HashValue].empty(seed: 0, alloc), alloc), crew: mem::Shared.of(Crew.empty(alloc), alloc), alloc: alloc)
+    return Session(workspace: take workspace, carried: take std, grammar: take grammar, types: mem::Shared.of(ty::Types.empty(alloc), alloc), home: take home, tree_hash: mem::Shared.of(mem::OnceMap[u8, Option[hashing::HashValue]].empty(seed: 0, alloc), alloc), states: mem::Shared.of(mem::OnceMap[usize, hashing::HashValue].empty(seed: 0, alloc), alloc), crew: mem::Shared.of(Crew.empty(served: false, alloc), alloc), alloc: alloc)
 } Session.of
 
 /// The session of another workspace, with this one's std packages, grammar, home directory and
@@ -37,6 +37,12 @@ pkg fn Session.over(self, take workspace: mem::Shared[workspace::Workspace], all
     session.crew = self.crew.share()
     return session
 } Session.over
+
+/// The session of another workspace, with this one's std packages, grammar and home directory
+/// and a crew of its own, no worker serving it, so that its checkers are released with it.
+pkg fn Session.apart(self, take workspace: mem::Shared[workspace::Workspace], alloc: mem::Alloc) -> Session {
+    return Session.of(take workspace, std: self.carried.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+} Session.apart
 
 /// The std packages the toolchain carries, as a workspace of their own.
 pkg proj fn Session.std(self) -> workspace::Workspace {
@@ -165,6 +171,10 @@ struct CheckerState {
     judged_all: core::atomic::AtomicBool
     /// The items checked, each judged alone.
     judged: mem::OnceMap[ty::ItemId, Unit]
+    /// The workspace package, by index, that the check is narrowed to: the one package it checks
+    /// whole, its closure's other packages judged item by item as it reads them; none when it
+    /// checks each package its closure checks.
+    narrowed: Option[usize]
     /// The NIR units elaborated, none for an item without one.
     units: mem::OnceMap[ty::ItemId, Option[mem::Shared[nir::NirUnit]]]
     /// The values const evaluation computed, none for one that ends without a value.
@@ -395,7 +405,7 @@ pkg fn is_listed(list: Str, word: Str) -> bool {
     return false
 } is_listed
 
-fn Checker.new(take db: Db) -> Checker {
+fn Checker.new(take db: Db, narrowed: Option[usize]) -> Checker {
     let session = db.session.share()
     let alloc = session.alloc
     let state = CheckerState(
@@ -432,6 +442,7 @@ fn Checker.new(take db: Db) -> Checker {
         rejections: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
         judged_all: core::atomic::AtomicBool.of(false),
         judged: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
+        narrowed: narrowed,
         units: mem::OnceMap[ty::ItemId, Option[mem::Shared[nir::NirUnit]]].empty(seed: 0, alloc),
         const_values: mem::OnceMap[ty::ItemId, Option[mem::Shared[ConstValue]]].empty(seed: 0, alloc),
         needs: mem::Arena[Need].empty(alloc),
@@ -930,11 +941,11 @@ fn Checker.report_file_fixed(self, path: Str, line: u32, code: diagnostic::Code,
 /// The diagnostics check time reports on lines of a scope, those of loading, lexing and parsing
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pkg fn Session.reported(self, scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
-    return self.located(self.diagnostics(), scope)
+    return self.located(self.diagnostics(scope), scope)
 } Session.reported
 
 /// The diagnostics check time reports on lines of a scope, as `reported` gives them, from the
-/// checkers of the workspace's closures.
+/// checkers of a check of the scope.
 pkg fn Session.reported_by(self, checked: Checked, scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
     var gathered = Gathered.empty(self.alloc)
     for entry in checked.checkers {
@@ -1141,14 +1152,24 @@ fn Checker.check_elaborated(self, item: ty::ItemId) {
 } Checker.check_elaborated
 
 /// Whether the checker reports an error on a line of an item. Before every package is
-/// checked, the item is judged alone.
+/// checked, and for an item of a package a narrowed check leaves out, the item is judged
+/// alone.
 fn Checker.rejected(self, item: ty::ItemId) -> bool {
     let state = self.state.contents()
-    if not state.judged_all.load() {
+    if not state.judged_all.load() or self.leaves_out(self.db().package_of(item)) {
         self.judge_alone(item)
     }
     return state.rejections.get(item).is_some()
 } Checker.rejected
+
+/// Whether the check is narrowed to another package than one it reports on.
+fn Checker.leaves_out(self, package_id: ty::PackageId) -> bool {
+    let Some(narrowed) = self.state.contents().narrowed else {
+        return false
+    }
+    let data = self.db().package_data(package_id)
+    return not data.carried and not data.quiet and data.member != Some(workspace::Member.Source(narrowed))
+} Checker.leaves_out
 
 /// Checks an item unless it is checked, judging it alone: rejected when its syntax errors or
 /// those its check reports lie on its lines.
@@ -1310,10 +1331,12 @@ fn check_targets(source: workspace::Package, alloc: mem::Alloc) -> mem::List[wor
 } check_targets
 
 /// The packages a checker checks under its target, by their ids in its database: the workspace
-/// packages its closure checks that declare the target, in workspace order.
+/// packages its closure checks that declare the target, the one it is narrowed to alone, in
+/// workspace order.
 fn Checker.packages_checked(self) -> mem::List[ty::PackageId] {
     let db = self.db()
     let alloc = self.alloc()
+    let narrowed = self.state.contents().narrowed
     var checked = mem::List[ty::PackageId].empty(alloc)
     for index in 0..<db.packages.len() {
         let data = db.packages[index]
@@ -1325,7 +1348,9 @@ fn Checker.packages_checked(self) -> mem::List[ty::PackageId] {
             continue
         }
         match data.member {
-            Some(workspace::Member.Source(_)) => mut checked.push(ty::PackageId(index: u32.fit(index)))
+            Some(workspace::Member.Source(source)) => if narrowed.is_none() or narrowed == Some(source) {
+                mut checked.push(ty::PackageId(index: u32.fit(index)))
+            }
             else => {}
         }
     }
@@ -1336,7 +1361,7 @@ fn Checker.packages_checked(self) -> mem::List[ty::PackageId] {
 fn closure_targets(held: workspace::Workspace, closure: workspace::Closure, alloc: mem::Alloc) -> mem::List[workspace::Target] {
     var targets = mem::List[workspace::Target].empty(alloc)
     for index in closure.checked {
-        let Some(source) = held.packages.get(index) else {
+        let Some(source) = held.package_at(index) else {
             expect false
             continue
         }
@@ -1403,10 +1428,48 @@ fn Checker.check_all(self) {
 
 /// The checker of a closure under a target before it checks anything.
 pkg fn Session.unchecked(self, closure: workspace::Closure, target: workspace::Target) -> Checker {
+    return self.unchecked_narrowed(closure, target, narrowed: None)
+} Session.unchecked
+
+/// The checker of a closure under a target before it checks anything, narrowed to the workspace
+/// package at an index, if any.
+fn Session.unchecked_narrowed(self, closure: workspace::Closure, target: workspace::Target, narrowed: Option[usize]) -> Checker {
     var db = Db.build(self, closure, target)
     mut db.link()
-    return Checker.new(take db)
-} Session.unchecked
+    return Checker.new(take db, narrowed)
+} Session.unchecked_narrowed
+
+/// What checking a scope lying in one package runs: the part of the closure checking that
+/// package that it reaches, under each target it declares, narrowed to it.
+struct Narrowing {
+    package_index: usize
+    closure: workspace::Closure
+    targets: mem::List[workspace::Target]
+} Narrowing
+
+/// What checking a scope runs when it lies in one package; none for a scope holding several,
+/// whose check runs each closure under each target its packages are checked for.
+fn Session.narrowing(self, scope: scope::Scope) -> Option[Narrowing] {
+    let held = self.workspace.contents()
+    let Some(package_index) = scope.package_index(held) else {
+        return None
+    }
+    let Some(closure) = held.closure_of(package_index) else {
+        return Some(Narrowing(package_index: package_index, closure: workspace::Closure.empty(self.alloc), targets: mem::List[workspace::Target].empty(self.alloc)))
+    }
+    let Some(source) = held.package_at(package_index) else {
+        expect false
+        return None
+    }
+    let declared = check_targets(source, alloc: self.alloc)
+    var targets = mem::List[workspace::Target].empty(self.alloc)
+    for target in closure_targets(held, closure, alloc: self.alloc) {
+        if declared.position(fn(value: workspace::Target) => value == target).is_some() {
+            mut targets.push(target)
+        }
+    }
+    return Some(Narrowing(package_index: package_index, closure: closure.reached_from(held, package_index: package_index, alloc: self.alloc), targets: take targets))
+} Session.narrowing
 
 /// A checked checker of each closure under each target its packages are checked for.
 fn Session.closures_checked(self) -> mem::List[TargetChecker] {
@@ -1434,6 +1497,19 @@ fn Session.closures_coding(self, coded: Option[usize]) -> mem::List[TargetChecke
     return checkers
 } Session.closures_coding
 
+/// Unchecked checkers of what checking a scope runs, as `narrowing` gives it, or of each closure
+/// under each target its packages are checked for.
+fn Session.scope_checkers(self, scope: scope::Scope) -> mem::List[TargetChecker] {
+    let Some(narrowing) = self.narrowing(scope) else {
+        return self.checkers()
+    }
+    var checkers = mem::List[TargetChecker].empty(self.alloc)
+    for target in narrowing.targets {
+        mut checkers.push(TargetChecker(target: target, checker: self.unchecked_narrowed(narrowing.closure, target, narrowed: Some(narrowing.package_index))))
+    }
+    return checkers
+} Session.scope_checkers
+
 /// An unchecked checker of each closure under each target its packages are checked for.
 fn Session.checkers(self) -> mem::List[TargetChecker] {
     let held = self.workspace.contents()
@@ -1453,13 +1529,23 @@ struct UnusedCount {
 } UnusedCount
 
 /// The diagnostics of the workspace's items under each target their packages are checked for,
-/// those of unused code once found under every target checking their file.
-fn Session.diagnostics(self) -> mem::List[diagnostic::Diagnostic] {
-    let held = self.workspace.contents()
+/// those of unused code once found under every target checking their file: of the package a
+/// scope lies in, checked as `narrowing` gives, or of every package for a scope holding several.
+fn Session.diagnostics(self, scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
     var gathered = Gathered.empty(self.alloc)
-    for closure in held.closures {
-        for target in closure_targets(held, closure, alloc: self.alloc) {
-            mut gathered.add(self.kept_checked(closure, target))
+    match self.narrowing(scope) {
+        Some(narrowing) => {
+            for target in narrowing.targets {
+                mut gathered.add(self.kept_checked(narrowing.closure, target, narrowed: Some(narrowing.package_index)))
+            }
+        }
+        None => {
+            let held = self.workspace.contents()
+            for closure in held.closures {
+                for target in closure_targets(held, closure, alloc: self.alloc) {
+                    mut gathered.add(self.kept_checked(closure, target, narrowed: None))
+                }
+            }
         }
     }
     return take gathered.finish()
@@ -1477,11 +1563,23 @@ pkg fn Session.check_closures(self) -> Checked {
     var checkers = mem::List[TargetChecker].empty(self.alloc)
     for closure in held.closures {
         for target in closure_targets(held, closure, alloc: self.alloc) {
-            mut checkers.push(TargetChecker(target: target, checker: self.kept_checked(closure, target)))
+            mut checkers.push(TargetChecker(target: target, checker: self.kept_checked(closure, target, narrowed: None)))
         }
     }
     return Checked(checkers: take checkers)
 } Session.check_closures
+
+/// The checkers of what checking a scope runs, as `diagnostics` checks them.
+pkg fn Session.check_scope(self, scope: scope::Scope) -> Checked {
+    let Some(narrowing) = self.narrowing(scope) else {
+        return self.check_closures()
+    }
+    var checkers = mem::List[TargetChecker].empty(self.alloc)
+    for target in narrowing.targets {
+        mut checkers.push(TargetChecker(target: target, checker: self.kept_checked(narrowing.closure, target, narrowed: Some(narrowing.package_index))))
+    }
+    return Checked(checkers: take checkers)
+} Session.check_scope
 
 /// Whether a checker of the closures rejects an item.
 pkg fn Checked.rejects(self) -> bool {
@@ -1667,7 +1765,7 @@ pkg fn Session.encode_key_tombstones(self, package_index: usize) -> mem::List[di
     let Some(closure) = held.closure_of(package_index) else {
         return found
     }
-    let Some(source) = held.packages.get(package_index) else {
+    let Some(source) = held.package_at(package_index) else {
         expect false
         return found
     }
@@ -1709,7 +1807,7 @@ fn Session.package_checkers(self, index: usize) -> mem::List[TargetChecker] {
     let Some(closure) = held.closure_of(index) else {
         return checkers
     }
-    let Some(source) = held.packages.get(index) else {
+    let Some(source) = held.package_at(index) else {
         expect false
         return checkers
     }
@@ -1723,7 +1821,7 @@ fn Session.package_checkers(self, index: usize) -> mem::List[TargetChecker] {
 /// the public docs of the items `confirmed` names by canonical path.
 pkg fn Session.package_snapshots(self, index: usize, confirmed: Slice[text::String]) -> Snapshots {
     let checkers = self.package_checkers(index)
-    let Some(source) = self.workspace.contents().packages.get(index) else {
+    let Some(source) = self.workspace.contents().package_at(index) else {
         expect false
         return Snapshots(modules: mem::List[ModuleSnapshot].empty(self.alloc), recorded: mem::List[Recorded].empty(self.alloc))
     }
@@ -1734,7 +1832,7 @@ pkg fn Session.package_snapshots(self, index: usize, confirmed: Slice[text::Stri
 /// The snapshots `nan api update` computes for the workspace package at `index`, from its items
 /// across the checkers of its targets, its pending weakenings judged by entailment.
 pkg fn Session.computed_snapshots(self, index: usize, items: Items, confirmed: Slice[text::String]) -> Snapshots {
-    let Some(source) = self.workspace.contents().packages.get(index) else {
+    let Some(source) = self.workspace.contents().package_at(index) else {
         expect false
         return Snapshots(modules: mem::List[ModuleSnapshot].empty(self.alloc), recorded: mem::List[Recorded].empty(self.alloc))
     }
@@ -1749,7 +1847,7 @@ pkg fn Session.computed_snapshots(self, index: usize, items: Items, confirmed: S
 pkg fn Session.sealed(self, index: usize, path: Str, principal: Str, signer: Option[core::crypto::SecretKey]) -> Result[Sealed, Unsealed] {
     let alloc = self.alloc
     let checkers = self.package_checkers(index)
-    let Some(source) = self.workspace.contents().packages.get(index) else {
+    let Some(source) = self.workspace.contents().package_at(index) else {
         expect false
         return Err(Unsealed.Unneeded)
     }

@@ -124,7 +124,7 @@ fn matches_run_as_their_arms_test_and_bind() {
     );
     let scratch = scratch(&source);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
-    let reported: Vec<_> = crate::check::diagnostics(&workspace)
+    let reported: Vec<_> = crate::check::reported(&workspace, &crate::scope::Scope::Workspace)
         .into_iter()
         .map(|diagnostic| (diagnostic.line, diagnostic.code))
         .collect();

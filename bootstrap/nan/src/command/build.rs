@@ -183,7 +183,7 @@ fn programs(workspace: &Workspace, scope: &Scope) -> Vec<usize> {
                 workspace
                     .packages
                     .iter()
-                    .position(|candidate| std::ptr::eq(candidate, package))
+                    .position(|candidate| std::ptr::eq(&**candidate, package))
             })
             .into_iter()
             .collect(),

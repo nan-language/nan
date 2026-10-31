@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use super::ty::Scalar;
 use crate::syntax::ast;
@@ -127,7 +128,7 @@ impl<'a> Db<'a> {
     pub fn build(
         workspace: &'a Workspace,
         closure: &Closure,
-        std: &'a [Package],
+        std: &'a [Arc<Package>],
         target: Target,
     ) -> Db<'a> {
         let mut db = Db {

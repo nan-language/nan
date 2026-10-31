@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::sync::Arc;
 
 use super::Package;
 use super::manifest::{Manifest, relative, resolve};
@@ -30,16 +31,67 @@ pub struct Closure {
     pub aliases: HashMap<(Member, String), Member>,
 }
 
+impl Closure {
+    /// The part of the closure that checking one workspace package it checks reads: that
+    /// package, the members named like std packages, and each member their `dep` aliases reach.
+    pub fn reached_from(&self, workspace: &super::Workspace, package: usize) -> Closure {
+        let mut reached: Vec<Member> = self
+            .members
+            .iter()
+            .filter(|(name, _)| crate::stdlib::is_std(name))
+            .map(|(_, member)| *member)
+            .collect();
+        reached.push(Member::Source(package));
+        let mut at = 0;
+        while let Some(&member) = reached.get(at) {
+            at += 1;
+            let manifest = workspace.member(member).manifest.as_ref();
+            for dep in manifest.into_iter().flat_map(|manifest| &manifest.deps) {
+                if let Some(next) = self.aliases.get(&(member, dep.alias.clone()))
+                    && !reached.contains(next)
+                {
+                    reached.push(*next);
+                }
+            }
+        }
+        Closure {
+            members: self
+                .members
+                .iter()
+                .filter(|(_, member)| reached.contains(member))
+                .map(|(name, member)| (name.clone(), *member))
+                .collect(),
+            checked: self
+                .checked
+                .iter()
+                .copied()
+                .filter(|index| reached.contains(&Member::Source(*index)))
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .filter(|((member, _), _)| reached.contains(member))
+                .map(|(key, member)| (key.clone(), *member))
+                .collect(),
+        }
+    }
+}
+
 /// A store entry loaded as a package, by the code root of its release.
 pub struct Release {
     pub root: Hash,
     pub entry: Entry,
-    pub package: Package,
+    pub package: Arc<Package>,
 }
 
 /// What reading closures needs: the store entry holding a release, by its code root.
 pub trait Store {
     fn entry(&mut self, root: &Hash) -> io::Result<Option<Entry>>;
+
+    /// The package of a release already loaded into a directory, by its code root.
+    fn loaded(&self, _root: &Hash, _dir: &str) -> Option<Arc<Package>> {
+        None
+    }
 }
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
@@ -52,7 +104,7 @@ pub struct Read {
     pub found: Vec<Diagnostic>,
 }
 
-pub fn closures(packages: &[Package], store: &mut dyn Store) -> io::Result<Read> {
+pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<Read> {
     let mut reader = Reader {
         packages,
         store,
@@ -112,7 +164,7 @@ struct Own {
 }
 
 struct Reader<'a> {
-    packages: &'a [Package],
+    packages: &'a [Arc<Package>],
     store: &'a mut dyn Store,
     releases: Vec<Release>,
     confirmed: Vec<Entry>,
@@ -145,7 +197,10 @@ impl Reader<'_> {
         {
             return Ok(index);
         }
-        let package = Package::from_entry(&entry, dir)?;
+        let package = match self.store.loaded(&root, dir) {
+            Some(package) => package,
+            None => Arc::new(Package::from_entry(&entry, dir)?),
+        };
         self.releases.push(Release {
             root,
             entry,

@@ -9,13 +9,13 @@ use super::abi::{Abi, Given, Repr, Returned};
 use super::body::{Body, Held};
 use super::fx::{Fx, PTR};
 use super::types::Wrap;
-use super::{Instance, Lowering, stack, supplied};
+use super::{Glue, Instance, Lowering, stack, supplied};
 use crate::check::db::ItemId;
 use crate::check::sig::{FnSig, SigKind};
 use crate::check::tir::Form;
 use crate::check::ty::{Arg, Args, FnTy, Subst, Ty};
 use crate::nir::{BlockId, Call, Callable, Callee, FnRef, NTy, Op, Operand, Role, Value};
-use crate::syntax::ast::Mode;
+use crate::syntax::ast::{FnKind, Mode};
 
 /// What a call calls.
 enum Target {
@@ -279,8 +279,13 @@ impl Body<'_, '_, '_, '_> {
                     .iter()
                     .zip(&abi.params)
                     .enumerate()
-                    .filter(|(_, (_, (nty, _)))| matches!(nty.ty(), Ty::Fn(_)))
-                    .map(|(position, (operand, _))| (position, self.binding(operand)))
+                    .filter_map(|(position, (operand, (nty, _)))| match nty.ty() {
+                        Ty::Fn(fn_ty) if fn_ty.kind == FnKind::Task => {
+                            Some((position, self.walk_binding(operand)))
+                        }
+                        Ty::Fn(_) => Some((position, self.binding(operand))),
+                        _ => None,
+                    })
                     .collect();
                 stack::Kind::Direct {
                     callee: *callee,
@@ -487,6 +492,29 @@ impl Body<'_, '_, '_, '_> {
             FnSource::Named(fn_ref) => stack::Binding::Function(self.named_function(&fn_ref)),
             FnSource::Param(position) => stack::Binding::Param(position),
             FnSource::Other(bound) => stack::Binding::Bounded(bound),
+        }
+    }
+
+    /// What an operand passes for a `task fn` parameter of a direct call's callee: the walk
+    /// moving its captures, which a closure without captures that move and a named function
+    /// do not need.
+    fn walk_binding(&mut self, operand: &Operand) -> stack::Binding {
+        match self.fn_source(operand) {
+            FnSource::Closure(index) => {
+                let closure = Instance::Nir {
+                    item: self.item,
+                    role: Role::Closure,
+                    index,
+                    args: self.args.clone(),
+                };
+                match self.lo.glue(&Glue::Captures(closure)) {
+                    Some(walk) => stack::Binding::Walk(walk),
+                    None => stack::Binding::Bounded(Some(0)),
+                }
+            }
+            FnSource::Named(_) => stack::Binding::Bounded(Some(0)),
+            FnSource::Param(position) => stack::Binding::Param(position),
+            FnSource::Other(_) => stack::Binding::Bounded(None),
         }
     }
 

@@ -583,6 +583,16 @@ impl Layouts {
                     ],
                 )
             }
+            // A domain run's abandoner: its lock word, whether it was triggered, and the record
+            // of the domain it runs.
+            "sys::Abandoner" => self.record(
+                ck,
+                &[
+                    ("lock".to_owned(), word.clone()),
+                    ("triggered".to_owned(), word.clone()),
+                    ("domain".to_owned(), word),
+                ],
+            ),
             _ => return None,
         })
     }

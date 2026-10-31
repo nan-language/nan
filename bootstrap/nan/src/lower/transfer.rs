@@ -10,14 +10,14 @@
 //! inside it are raised to that reach.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
+    AbiParam, Inst, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
 };
 use cranelift_module::FuncId;
 
 use super::fx::{Fx, PTR};
 use super::layout::Shape;
 use super::runtime::Routine;
-use super::{CALL_CONV, Glue, Instance, Lowering, supplied};
+use super::{CALL_CONV, Glue, Instance, Lowering, stack, supplied};
 use crate::check::props::Property;
 use crate::check::sig::SigKind;
 use crate::check::ty::Ty;
@@ -117,9 +117,31 @@ pub fn signature() -> Signature {
 }
 
 /// Calls a walk through its address, which is not zero.
-pub fn call_walker(fx: &mut Fx, walker: Value, args: &[Value]) {
+pub fn call_walker(fx: &mut Fx, walker: Value, args: &[Value]) -> Inst {
     let signature = fx.b.import_signature(signature());
-    fx.b.ins().call_indirect(signature, walker, args);
+    fx.b.ins().call_indirect(signature, walker, args)
+}
+
+/// Moves the captures of the task closure a function value at an address holds, through the
+/// walk its environment names; as the walk of the calling function's own `task fn` parameter at
+/// `own` when given, for stack limits.
+pub fn move_captures(fx: &mut Fx, function: Value, lift: Value, owner: Value, own: Option<usize>) {
+    let env = fx.load(PTR, function, 8);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, env, 0);
+    fx.when(present, |fx| {
+        let walker = fx.load(PTR, env, 0);
+        let walks = fx.b.ins().icmp_imm_s(IntCC::NotEqual, walker, 0);
+        fx.when(walks, |fx| {
+            let inst = call_walker(fx, walker, &[env, lift, owner]);
+            if let Some(position) = own {
+                let site = stack::Site {
+                    kind: stack::Kind::Param(position),
+                    at: None,
+                };
+                fx.sites.push((inst, site));
+            }
+        });
+    });
 }
 
 /// Passes the chunks an allocation lies in to `lift` unless it is zero; gives whether they
@@ -215,13 +237,7 @@ fn define(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value, lift: Value, 
         return;
     }
     if let Ty::Fn(_) = ty {
-        let env = fx.load(PTR, address, 8);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, env, 0);
-        fx.when(present, |fx| {
-            let walker = fx.load(PTR, env, 0);
-            let walks = fx.b.ins().icmp_imm_s(IntCC::NotEqual, walker, 0);
-            fx.when(walks, |fx| call_walker(fx, walker, &[env, lift, owner]));
-        });
+        move_captures(fx, address, lift, owner, None);
         return;
     }
     let layout = lo.layout(ty);

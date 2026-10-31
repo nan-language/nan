@@ -537,7 +537,8 @@ On a `pub` item, each limit other than `stack N` is a [promise](05-properties.md
 The **stack use** of a lowered function is its frame size plus the largest stack use among its call sites. Each function-typed parameter of the function has a **stack bound**: when the function is judged on its own, the N of the `stack N` its type demands, or none; inside the stack use of a direct call site, the stack use of the argument that site supplies for it.
 
 - A direct call site uses the callee's stack use computed with each of the callee's function-typed parameters that receives a function argument at that site bound to that argument's stack use: a closure's own stack use, a named function's stack use through its [checking entry](18-contracts.md#checking-entries), the stack bound of the calling function's own parameter when the argument is that parameter, or the N of the `stack N` that a function value's type demands, none when it demands none. In lowered code, a call to a method of a generic parameter's bound is a direct call to the implementing function that the instantiation selects.
-- A call through the function's own function-typed parameter uses that parameter's stack bound.
+- A `task fn` argument runs on a stack of its own, so the stack bound of a `task fn` parameter is instead the stack use of moving the argument's captures into another domain ([domain memory](11-errors-domains.md#domain-memory)): the stack use of the walk over a closure's captures, 0 for a named function or a closure none of whose captures moving reaches, the stack bound of the calling function's own parameter, and none for another function value or for a parameter of a function judged on its own. The walk calls the move of each capture's type, which calls the move of each type the values it holds have, so it reaches itself, and is unbounded, exactly when a capture's type holds itself through what moving it reaches, as an enum holding a `mem::Box` of itself does; the `raised` reason then names that type.
+- A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call.
 - An indirect call site uses the N of the `stack N` that its function type, registry field type or interface method head demands; a call to a foreign fn the N of its `stack N`; a call to a compiler stub or support routine the stub call bound that [descriptors](27-program-model.md#descriptors) give.
 - A call site is **unbounded** when it is a call through the function's own function-typed parameter whose stack bound is none, an indirect call whose type or head demands no `stack` limit, a call to a foreign fn whose head demands none, or a direct call whose callee reaches itself through [dependencies](#propagation) or holds a call site that is unbounded under the bounds that call gives it.
 
@@ -634,6 +635,44 @@ pub fn digits(value: u64) -> u32 limits stack 4_096 {
 
 fn main(take world: host::World) fails task::Cancelled uses wait {
     world.log.info("digits", value: digits(1_234))
+} main
+```
+
+```nan
+// file: chains/package.nan
+//! Chain checks in a domain of their own.
+
+package chains {
+    language 1
+    targets x86_64-host
+    entry main
+} chains
+
+// file: chains/chains.nan
+//! Tells whether a chain has a link, in a domain of its own.
+
+pub closed enum Chain {
+    End
+    Link(mem::Box[Chain])
+} Chain
+
+pub fn linked(take chain: Chain, exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait limits stack 16_384 {
+    let outcome = try await sys::Domain.run(fn[take chain]() -> bool { // error: limit.stack-unbounded
+        return match chain {
+            Chain.End => false
+            Chain.Link(_) => true
+        }
+    }, exec, alloc)
+    let Ok(link) = outcome else {
+        return false
+    }
+    return link
+} linked
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let heap = mem::Heap.of(world.alloc)
+    let chain = Chain.Link(heap.boxed(Chain.End))
+    world.log.info("linked", value: try await linked(take chain, exec: world.exec, alloc: world.alloc))
 } main
 ```
 

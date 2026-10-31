@@ -115,10 +115,10 @@ fn device_value(mut lo: Lowering, value_ty: ty::Ty) -> u64 {
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
 /// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
 /// target install it on its interrupt, `install_msi` giving the device back in its refusal
-/// otherwise; `message` reads the message the record holds; `with` takes the record's lock
-/// around its body; `uninstall` removes the device from its interrupt and waits until no CPU
-/// runs its interrupt fn, then moves it out of the freed record. A CPU number past the CPUs
-/// traps.
+/// otherwise; the running task's domain then owns the record as a holding. `message` reads the
+/// message the record holds; `with` takes the record's lock around its body; `uninstall` ends
+/// the holding, removes the device from its interrupt and waits until no CPU runs its interrupt
+/// fn, then moves it out of the freed record. A CPU number past the CPUs traps.
 fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let value_ty = supply.type_arg(lo, index: 0)
     let value_at = device_value(mut lo, value_ty)
@@ -178,6 +178,8 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "uninstall" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let holding = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_HOLDING)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(holding).view())
             if lo.machine() {
                 mut lo.uninstall_device(mut fx, record)
             }
@@ -232,8 +234,9 @@ fn device_record(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty,
     return record
 } device_record
 
-/// Returns the `hw::IrqShared` naming a device record.
+/// Returns the `hw::IrqShared` naming a device record installed.
 fn return_shared(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    hold_device(mut lo, mut fx, record)
     let Some(sret) = supply.sret else {
         expect false
         return
@@ -241,6 +244,14 @@ fn return_shared(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Val
     mut fx.store(record, addr: sret, offset: 0)
     supply.ret(mut lo, mut fx, held: Held.Address(sret))
 } return_shared
+
+/// Makes a device record installed a holding of the running task's domain.
+fn hold_device(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let kind = mut fx.ptr(u64.fit(HOLDINGS_KIND_UNINSTALL))
+    let held = mut lo.call_routine(mut fx, routine: Routine.Hold, args: fx.list2(kind, b: record).view())
+    expect held.len() == 1
+    mut fx.store(held[0], addr: record, offset: DEVICE_RECORD_HOLDING)
+} hold_device
 
 /// Moves the device out of a device record, which it frees.
 fn take_device(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, record: clif::Value) -> Held {
@@ -263,6 +274,7 @@ fn shared_install_msi(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty
     let result_ty = supply.abi.result
     let installed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_INSTALLED)
     mut fx.if_true(installed, then: fn[mut lo](mut fx1: Fx) {
+        hold_device(mut lo, fx: mut fx1, record)
         let shared = mut fx1.slot(8, align: 8)
         mut fx1.store(record, addr: shared, offset: 0)
         let ok = mut lo.variant_value(mut fx1, ty: result_ty, variant: "Ok", payload_values: Array[Held, 1].filled(Held.Address(shared)).view(), wrapped: None)

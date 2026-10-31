@@ -40,7 +40,7 @@ test sleeps_in_nested_frames for pause_twice {
 The **entry** of a task is the code it starts with: the [task closure](16-concurrency.md#task-closures) or named function whose `task fn` value starts it, the body of a [test](22-testing.md#test-items) for the task of that test, or, on the host targets, the [entry function](27-program-model.md#entry) for the first task of a program.
 
 - When the entry's own head states `limits stack N`, the task's stack holds at least N bytes, and every final build lowering the entry checks that its stack use is at most N ([stack limits](10-effects-digests.md#stack-limits)).
-- The stack of the first task of a domain that `sys::Domain.run_sized` runs holds at least the `stack` bytes the call gives ([domain run](11-errors-domains.md#domain-run)), and so does the stack of a child that `task::Scope.spawn_sized` starts ([joins](16-concurrency.md#joins)).
+- The stack of the first task of a domain that `run_sized` of `sys::Domain` or `sys::Abandoner` runs holds at least the `stack` bytes the call gives ([domain run](11-errors-domains.md#domain-run)), and so does the stack of a child that `task::Scope.spawn_sized` starts ([joins](16-concurrency.md#joins)).
 - Otherwise, on the host targets, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
 - On the host targets, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
 

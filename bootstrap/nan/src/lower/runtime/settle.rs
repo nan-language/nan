@@ -3,7 +3,8 @@
 //! domains hold is released and their memory is freed.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
+    AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC,
+    types,
 };
 use cranelift_module::FuncId;
 
@@ -271,11 +272,23 @@ fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
 }
 
 /// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to
-/// stop.
+/// stop. A running task's thread receives the stop signal; on a kernel, its CPU receives the
+/// CPU signal when the task is first asked, and the CPU's timer interrupts ask again.
 fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let one = fx.ptr(1);
     let asked = fx.offset(record, task::STOP);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), one, asked);
+    let first = match lo.kernel() {
+        true => {
+            let before =
+                fx.b.ins()
+                    .atomic_rmw(PTR, MemFlagsData::trusted(), AtomicRmwOp::Xchg, asked, one);
+            Some(fx.b.ins().icmp_imm_s(IntCC::Equal, before, 0))
+        }
+        false => {
+            fx.b.ins().atomic_store(MemFlagsData::trusted(), one, asked);
+            None
+        }
+    };
     let word = fx.offset(record, task::STATE);
     let current =
         fx.b.ins()
@@ -311,9 +324,18 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                 },
                 |lo, fx| {
                     let running = fx.b.ins().bxor_imm_s(is_stopped, 1);
+                    if let Some(first) = first {
+                        let signals = fx.b.ins().band(running, first);
+                        fx.when(signals, |fx| {
+                            let thread = fx.load(PTR, record, task::THREAD);
+                            let index = fx.load(PTR, thread, tasks::thread::INDEX);
+                            lo.signal_cpu(fx, index);
+                        });
+                        return vec![running];
+                    }
                     fx.when(running, |fx| {
-                        // A machine image settles domains only in a test run, on its one
-                        // executor, which runs the settling task.
+                        // A machine test image settles domains on its one executor, which runs
+                        // the settling task.
                         if lo.machine() {
                             fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
                             return;

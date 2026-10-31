@@ -25,7 +25,7 @@ use crate::syntax::grammar::{Keyword, Punct};
 use crate::syntax::token::TokenKind;
 
 /// The trap kinds, numbered by their position, as reports and `sys::TrapKind` order them.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 17] = [
     "trap.bounds",
     "trap.overflow",
     "trap.division-by-zero",
@@ -41,6 +41,8 @@ pub const KINDS: [&str; 15] = [
     "trap.stack-overflow",
     "trap.duplicate-access",
     "trap.poisoned",
+    "trap.exception",
+    "trap.abandoned",
 ];
 
 /// How a report writes an operand's value.

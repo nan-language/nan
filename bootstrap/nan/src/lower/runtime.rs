@@ -15,6 +15,7 @@ pub mod regions;
 pub mod report;
 pub mod seeded;
 pub mod settle;
+pub mod stops;
 pub mod system;
 pub mod tables;
 pub mod tasks;
@@ -105,6 +106,9 @@ pub enum Routine {
     KindClose,
     /// `(kind, operands, count, caller) -> Never`: traps the running task.
     TrapRaise,
+    /// `(kind, record)`: writes into a trap record the report of a kind, without operands,
+    /// located at the call of the caller.
+    TrapReport,
     /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
     Reacquired,
     /// `(domain)`: settles an abandoned `sys::Domain` body.
@@ -210,6 +214,7 @@ impl Routine {
             Routine::KindRevoke => "_NScap_table_kind_revoke",
             Routine::KindClose => "_NScap_table_kind_close",
             Routine::TrapRaise => "_NStrap_raise",
+            Routine::TrapReport => "_NStrap_report",
             Routine::Reacquired => "_NStrap_reacquired",
             Routine::ReportScalar => "_NStrap_scalar",
             Routine::Settle => "_NSsettle_domain",
@@ -261,7 +266,7 @@ impl Routine {
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
             Routine::Derive => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
-            Routine::Rehome | Routine::KindRevoke => (&[P, P], &[]),
+            Routine::Rehome | Routine::KindRevoke | Routine::TrapReport => (&[P, P], &[]),
             Routine::KindPin => (&[P, P], &[P]),
             Routine::Charged
             | Routine::Limit
@@ -636,6 +641,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::KindRevoke
         | Routine::KindClose => tables::define(lo, fx, routine),
         Routine::TrapRaise
+        | Routine::TrapReport
         | Routine::Reacquired
         | Routine::ReportScalar
         | Routine::ReportText

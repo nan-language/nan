@@ -366,7 +366,7 @@ impl Checker<'_> {
 
     /// The schema tree of each type a package's code root records, by canonical path, as its
     /// `mem::wire` encoding.
-    fn schema_trees(&self, package: PackageId) -> Vec<(String, Vec<u8>)> {
+    pub(super) fn schema_trees(&self, package: PackageId) -> Vec<(String, Vec<u8>)> {
         self.recorded_schemas(package)
             .into_iter()
             .map(|(path, ty)| (path, self.schema(&ty).wire()))

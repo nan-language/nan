@@ -128,8 +128,7 @@ An **advisory** is a published notice retracting proofs after a prover soundness
 
 A toolchain carries an advisory when the advisory is part of its source tree, so carrying one changes its [toolchain hash](36-builds.md#toolchain-hash). A toolchain's prover for a version is the procedure amended by every advisory it carries that names that version ([determinism](20-prover.md#determinism)).
 
-- A proven or assumed [status](18-contracts.md#statuses) recorded in an artefact is retracted when the query of its obligation site, built from the unit's NIR, meets the retraction condition of an advisory the toolchain carries that names the artefact's version. [Reuse](30-artefacts.md#reuse) decides that site anew.
-- A diagnostic whose because-chain passes through a retracted status names the number of the advisory that retracted it.
+No status recorded in an artefact is read ([releases](30-artefacts.md#releases)), so an advisory a toolchain carries amends the statuses of every package it checks, releases included.
 
 ## Trade-in
 

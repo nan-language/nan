@@ -51,6 +51,7 @@ codes! {
     ArtefactRecheckFailed = "artefact.recheck-failed",
     ArtefactReservedSection = "artefact.reserved-section",
     ArtefactRootMismatch = "artefact.root-mismatch",
+    ArtefactSourceMismatch = "artefact.source-mismatch",
     ArtefactSymbolCollision = "artefact.symbol-collision",
     ArtefactVersionUnsupported = "artefact.version-unsupported",
     AuthorityCapabilityImpl = "authority.capability-impl",
@@ -552,6 +553,8 @@ pub enum Role {
     Called,
     /// Its line is the site of a fact; the subject is the operation.
     Raised,
+    /// Its line is the reported line of another diagnostic, whose code is the subject.
+    Diagnostic,
     /// The command making the change the owning rule requires, on no line.
     Command,
     /// A value the owning rule names, on no line.
@@ -570,6 +573,7 @@ impl Role {
             Role::Accessed => "accessed",
             Role::Called => "called",
             Role::Raised => "raised",
+            Role::Diagnostic => "diagnostic",
             Role::Command => "command",
             Role::Note => "note",
         }

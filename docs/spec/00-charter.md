@@ -462,6 +462,7 @@ Each term links to its home, whose definition governs.
 | [registry](25-registries.md#registries) | Table filled by contributions. |
 | [release](29-identity-versioning.md#releases) | Package state recorded in the local store. |
 | [release class](29-identity-versioning.md#releases) | Identical, additive or breaking. |
+| [release check](30-artefacts.md#releases) | Checking a release whole from its source tree. |
 | [release gate](31-trust.md#release-gate) | `nan verify`. |
 | [reliance test](22-testing.md#reliance-tests) | Test of a dependency's item. |
 | [render budget](13-text-encode.md#render) | `Render` call's output limit. |
@@ -472,7 +473,6 @@ Each term links to its home, whose definition governs.
 | [resource](14-authority.md#resources) | Value opened through a capability. |
 | [result location](07-ownership.md#result-location) | Where a value is built. |
 | [retired form](37-evolution.md#successive-versions) | Form a later language version rejects with an exact rewrite. |
-| [reuse](30-artefacts.md#reuse) | Using a dependency's checked NIR as is. |
 | [reversibility class](10-effects-digests.md#reversibility) | Digest fact bounding what code does to state outside the program. |
 | [revocation](14-authority.md#revocation) | Ending every copy of a capability. |
 | [root grant](14-authority.md#root-grants) | Capability minted at entry. |

@@ -11,7 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub use closure::{Closure, Member, Release, Store as ReleaseStore, holds_sources};
+pub use closure::{
+    Closure, Member, Release, Store as ReleaseStore, holds_sources, reaching_directive,
+};
 pub use machine::Machine;
 pub use manifest::{
     Arch, Authority, Kind, Manifest, Target, relative as relative_source, resolve as resolve_source,
@@ -375,6 +377,18 @@ impl Workspace {
         Some((package, &package.files[file]))
     }
 
+    /// A source file of a release the packages' locks read, by path.
+    pub fn release_file(&self, path: &str) -> Option<(&Package, &File)> {
+        self.releases.iter().find_map(|release| {
+            let file = release
+                .package
+                .files
+                .iter()
+                .find(|file| file.path == path)?;
+            Some((&release.package, file))
+        })
+    }
+
     /// The bytes of a source or machine file of the workspace, by path.
     pub fn bytes(&self, path: &str) -> Option<&[u8]> {
         if let Some((_, file)) = self.file(path) {
@@ -415,14 +429,7 @@ impl Workspace {
     /// computes.
     pub fn item_at(&self, path: &str, line: u32) -> Option<ItemPath> {
         let (package, file) = self.file(path)?;
-        let item = file.syntax.item_at(line)?;
-        package.item_path(
-            file,
-            Item {
-                file: &file.syntax,
-                tree: item.tree.as_ref()?,
-            },
-        )
+        package.item_at(file, line)
     }
 }
 
@@ -715,6 +722,19 @@ impl Package {
             module,
             name: None,
         })
+    }
+
+    /// The path of the item holding a line of one of its files, if that item has one this
+    /// implementation computes.
+    pub fn item_at(&self, file: &File, line: u32) -> Option<ItemPath> {
+        let item = file.syntax.item_at(line)?;
+        self.item_path(
+            file,
+            Item {
+                file: &file.syntax,
+                tree: item.tree.as_ref()?,
+            },
+        )
     }
 
     /// The canonical path of an item of `file`, when it is named and the path of a function named

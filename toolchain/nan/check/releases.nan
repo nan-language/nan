@@ -1,0 +1,233 @@
+//! Release checks: each locked release a workspace package reaches, checked whole from its source tree with the schema trees its artefact records, its errors reported on the directive through which the package reaches it.
+
+/// The packages a package of the checker's closure reaches through its `dep` aliases, itself
+/// first.
+pkg fn Checker.reached(self, root: ty::PackageId, alloc: mem::Alloc) -> mem::List[ty::PackageId] {
+    let db = self.db()
+    var found = mem::List[ty::PackageId].empty(alloc)
+    mut found.push(root)
+    var index: usize = 0
+    while index < found.len() {
+        for entry in db.package_data(found[index]).deps {
+            let Some(dependency) = entry.value() else {
+                continue
+            }
+            if found.position(fn(known: ty::PackageId) => known == dependency).is_none() {
+                mut found.push(dependency)
+            }
+        }
+        index += 1
+    }
+    return found
+} Checker.reached
+
+/// A `note` reason naming each type whose schema tree the code root of a release's artefact
+/// records differs from the tree the type has in the checker's closure.
+pkg fn Checker.stale_schemas(self, release: ty::PackageId, alloc: mem::Alloc) -> mem::List[diagnostic::Reason] {
+    var reasons = mem::List[diagnostic::Reason].empty(alloc)
+    let db = self.db()
+    let Some(workspace::Member.Release(index)) = db.package_data(release).member else {
+        return reasons
+    }
+    let Some(held) = db.session.workspace.contents().releases.get(index) else {
+        expect false
+        return reasons
+    }
+    var recorded = mem::List[artefact::Schema].empty(alloc)
+    match artefact::decode(held.entry.contents().artefact.view(), alloc) {
+        Ok(decoded) => {
+            match decoded.schema_trees(alloc) {
+                Some(trees) => {
+                    recorded = trees
+                }
+                None => {}
+            }
+        }
+        Err(_) => {}
+    }
+    let derived = self.schema_trees(release)
+    var stale = mem::List[text::String].empty(alloc)
+    for tree in derived {
+        let same = recorded.position(fn(known: artefact::Schema) => known.path == tree.path and known.tree.view() == tree.tree.view()).is_some()
+        if not same {
+            mut stale.push(text::String.of(tree.path.as_str(), alloc))
+        }
+    }
+    for tree in recorded {
+        if derived.position(fn(known: artefact::Schema) => known.path == tree.path).is_none() {
+            mut stale.push(text::String.of(tree.path.as_str(), alloc))
+        }
+    }
+    mut stale.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    for path in stale {
+        mut reasons.push(diagnostic::Reason.note(path.as_str(), alloc))
+    }
+    return reasons
+} Checker.stale_schemas
+
+/// The release checks of the releases a workspace package of the checker's closure reaches: one
+/// `artefact.recheck-failed` per release whose check finds errors, each error a `diagnostic`
+/// reason of its because-chain, followed by a `note` reason per stale schema tree.
+pkg fn Checker.release_errors(self, root: ty::PackageId, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let db = self.db()
+    let source = db.source(root)
+    let Some(manifest) = source.manifest else {
+        return found
+    }
+    let Some(lock) = source.machine.lock() else {
+        return found
+    }
+    var releases = mem::List[ty::PackageId].empty(alloc)
+    for id in self.reached(root, alloc) {
+        match db.package_data(id).member {
+            Some(workspace::Member.Release(_)) => mut releases.push(id)
+            else => {}
+        }
+    }
+    for id in releases {
+        self.check_whole(id)
+    }
+    var path = text::String.of(source.dir.as_str(), alloc)
+    mut path.append("/package.nan")
+    for id in releases {
+        var because = release_reasons(db.source(id), quiet: self.state.contents().quiet, alloc)
+        for reason in take self.stale_schemas(id, alloc) {
+            mut because.push(take reason)
+        }
+        if because.len() == 0 {
+            continue
+        }
+        var line = manifest.line
+        for locked in lock.deps {
+            if locked.package_name == db.package_data(id).name {
+                line = workspace::reaching_directive(manifest, line: locked)
+                break
+            }
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.ArtefactRecheckFailed, path: path.as_str(), line, alloc)
+        reported.because = because
+        mut found.push(take reported)
+    }
+    return found
+} Checker.release_errors
+
+/// The `diagnostic` reasons of the errors on a release's files, in path and line order, those on
+/// no line last: those of loading it, of parsing its files and of checking it.
+fn release_reasons(release: workspace::Package, quiet: mem::Arena[diagnostic::Diagnostic], alloc: mem::Alloc) -> mem::List[diagnostic::Reason] {
+    var prefix = text::String.of(release.dir.as_str(), alloc)
+    mut prefix.push('/')
+    var reasons = mem::List[diagnostic::Reason].empty(alloc)
+    for reported in release.diagnostics {
+        if reported.code.class() == diagnostic::Class.Error {
+            mut reasons.push(reported_reason(reported, alloc))
+        }
+    }
+    for file in release.files {
+        for written in file.syntax.diagnostics {
+            if written.code.class() == diagnostic::Class.Error {
+                mut reasons.push(diagnostic_reason(written.code, at: Some(diagnostic::At(path: text::String.of(file.path.as_str(), alloc), line: written.line)), alloc))
+            }
+        }
+    }
+    for reported in quiet.cursor() {
+        let Some(path) = reported.path else {
+            continue
+        }
+        if reported.code.class() == diagnostic::Class.Error and path.starts_with(prefix.as_str()) {
+            mut reasons.push(reported_reason(reported, alloc))
+        }
+    }
+    mut reasons.sort_by(fn(left: diagnostic::Reason, right: diagnostic::Reason) => reason_order(left, right))
+    var distinct = mem::List[diagnostic::Reason].empty(alloc)
+    for reason in take reasons {
+        let count = distinct.len()
+        if count > 0 and same_reason(reason, other: distinct[count - 1]) {
+            continue
+        }
+        mut distinct.push(take reason)
+    }
+    return distinct
+} release_reasons
+
+/// The `diagnostic` reason of a diagnostic.
+fn reported_reason(reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> diagnostic::Reason {
+    var at: Option[diagnostic::At] = None
+    match reported.path {
+        Some(path) => match reported.line {
+            Some(line) => {
+                at = Some(diagnostic::At(path: text::String.of(path.as_str(), alloc), line: line))
+            }
+            None => {}
+        }
+        None => {}
+    }
+    return diagnostic_reason(reported.code, at: take at, alloc)
+} reported_reason
+
+fn diagnostic_reason(code: diagnostic::Code, take at: Option[diagnostic::At], alloc: mem::Alloc) -> diagnostic::Reason {
+    return diagnostic::Reason(role: diagnostic::Role.Diagnostic, subject: text::String.of(code.name(), alloc), at: take at)
+} diagnostic_reason
+
+/// The order of reasons by path, then line, those on no line last, then subject.
+fn reason_order(left: diagnostic::Reason, right: diagnostic::Reason) -> core::Ordering {
+    match left.at {
+        None => {
+            if right.at.is_some() {
+                return core::Ordering.Greater
+            }
+        }
+        Some(held) => {
+            let Some(other) = right.at else {
+                return core::Ordering.Less
+            }
+            let paths = held.path.as_str().cmp(other.path.as_str())
+            if paths != core::Ordering.Equal {
+                return paths
+            }
+            let lines = held.line.cmp(other.line)
+            if lines != core::Ordering.Equal {
+                return lines
+            }
+        }
+    }
+    return left.subject.as_str().cmp(right.subject.as_str())
+} reason_order
+
+/// The release checks of the releases the workspace package at an index reaches, under each
+/// target it is checked for.
+pkg fn Session.release_check(self, package_index: usize) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.alloc
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(closure) = held.closure_of(package_index) else {
+        return found
+    }
+    var releases = false
+    for entry in closure.members {
+        match entry.value() {
+            workspace::Member.Release(_) => {
+                releases = true
+            }
+            workspace::Member.Source(_) => {}
+        }
+    }
+    let Some(source) = held.packages.get(package_index) else {
+        expect false
+        return found
+    }
+    if not releases {
+        return found
+    }
+    for target in check_targets(source, alloc) {
+        let checker = self.checked(closure, target)
+        let Some(root) = checker.db().package_of_member(workspace::Member.Source(package_index)) else {
+            expect false
+            return found
+        }
+        for reported in take checker.release_errors(root, alloc) {
+            mut found.push(take reported)
+        }
+    }
+    return found
+} Session.release_check

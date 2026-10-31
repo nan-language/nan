@@ -147,9 +147,10 @@ The **release gate** is `nan verify`. It accepts a package exactly when, for the
 3. every [API snapshot](#api-snapshots) is current (`api.stale`);
 4. no [pending weakening](#weakening) remains (`api.weakening-pending`);
 5. every item holding a trust escape has a current seal (`trust.unsealed`) that meets the [author rule](#author-rule) (`seal.same-author`);
-6. in a VCS workspace, every acceptance of a weakening was made by a seal of another author (`api.weakening-pending`), as [acceptances](#acceptances) states.
+6. in a VCS workspace, every acceptance of a weakening was made by a seal of another author (`api.weakening-pending`), as [acceptances](#acceptances) states;
+7. the [release check](30-artefacts.md#releases) of each release of its dependency closure finds no error (`artefact.recheck-failed`).
 
-A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing), and `nan verify` checks it no further.
+A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing); `nan verify` judges it only by its release check.
 
 ## Ledger
 

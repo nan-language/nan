@@ -394,7 +394,7 @@ The **reach** of a final build is the smallest set of items holding the entry fu
 
 A final build proceeds in this order:
 
-1. It checks every package of the final closure, a package declaring `any` under `any` and every other package for the root's target, reusing checked NIR as [Artefacts](30-artefacts.md#reuse) defines.
+1. It checks every package of the final closure, a package declaring `any` under `any` and every other package for the root's target, and [release-checks](30-artefacts.md#releases) each release of it.
 2. It computes the reach and applies to it the rules of its target's environment that judge reachable code.
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.

@@ -12,7 +12,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::Variable;
 
-use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
 use super::super::lines::{self, ENTRY_RECORD, FUNCTION_RECORD, LOCATION_RECORD};
 use super::super::trap::{KINDS, OPERAND_RECORD, Written};
@@ -269,19 +268,11 @@ impl Report {
 
     /// Writes a float as `Render` writes it, from its bit pattern.
     fn float(self, fx: &mut Fx, lo: &mut Lowering, bits: Value, single: bool) {
-        let value = match single {
-            true => {
-                let narrow = fx.b.ins().ireduce(types::I32, bits);
-                fx.b.ins().bitcast(types::F32, MemFlagsData::new(), narrow)
-            }
-            false => fx.b.ins().bitcast(types::F64, MemFlagsData::new(), bits),
+        let bits = match single {
+            true => fx.b.ins().ireduce(types::I32, bits),
+            false => bits,
         };
-        let buffer = fx.slot(40, 8);
-        let name = if single { "f32_text" } else { "f64_text" };
-        let len = lo
-            .platform_call(fx, name, &[Held::Scalar(value), Held::Address(buffer)])
-            .result
-            .scalar();
+        let (buffer, len) = super::super::supplied::floats::text(lo, fx, bits);
         self.bytes(fx, lo, buffer, len);
     }
 

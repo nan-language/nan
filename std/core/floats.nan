@@ -1,0 +1,627 @@
+//! The decimal text of floats, in integer arithmetic over their bit patterns.
+
+/// The limbs of the naturals reading a decimal: room for the greatest, below 2^2600, that a
+/// decimal of 769 significant digits gives.
+const READ_LIMBS: usize = 88
+
+/// The limbs of the naturals writing a float's digits: room for the greatest, below 2^1140, that
+/// scaling an `f64` gives.
+const WRITE_LIMBS: usize = 40
+
+/// The significant digits of a decimal that reading keeps: a halfway point between two `f64`
+/// values has at most 767, so the nonzero digits past them only count as one further digit 1.
+const KEPT: u64 = 768
+
+const F64_INFINITY: u64 = 0x7FF0_0000_0000_0000
+
+/// A natural number over a view of 32-bit limbs, least significant first: the first `count` in
+/// use, the highest in use not zero.
+view struct Natural {
+    limbs: SliceMut[u32]
+    count: usize
+} Natural
+
+/// Makes the number `value`.
+fn Natural.set(mut self, value: u64) {
+    self.limbs[0] = u32.truncate(value)
+    self.limbs[1] = u32.truncate(value >> 32)
+    self.count = 2
+    mut self.trim()
+} Natural.set
+
+/// Makes the number a copy of another.
+fn Natural.assign(mut self, other: Natural) {
+    for index in 0..<other.count {
+        self.limbs[index] = other.limbs[index]
+    }
+    self.count = other.count
+} Natural.assign
+
+/// Drops the zero limbs at the high end.
+fn Natural.trim(mut self) {
+    while self.count > 0 and self.limbs[self.count - 1] == 0 {
+        self.count -= 1
+    }
+} Natural.trim
+
+/// The number of bits up to the highest set one.
+fn Natural.bits(self) -> i64 {
+    if self.count == 0 {
+        return 0
+    }
+    return i64.fit(self.count - 1) * 32 + i64.widen(32 - self.limbs[self.count - 1].leading_zeros())
+} Natural.bits
+
+/// Multiplies the number by a nonzero `factor` and adds `addend`.
+fn Natural.mul_add(mut self, factor: u32, addend: u32) {
+    var carry = u64.widen(addend)
+    for index in 0..<self.count {
+        let product = u64.widen(self.limbs[index]) * u64.widen(factor) + carry
+        self.limbs[index] = u32.truncate(product)
+        carry = product >> 32
+    }
+    if carry > 0 {
+        self.limbs[self.count] = u32.truncate(carry)
+        self.count += 1
+    }
+} Natural.mul_add
+
+/// Multiplies the number by 5 to the power `power`.
+fn Natural.mul_pow5(mut self, power: u64) {
+    var rest = power
+    while rest >= 13 {
+        mut self.mul_add(1_220_703_125, addend: 0)
+        rest -= 13
+    }
+    var factor: u32 = 1
+    while rest > 0 {
+        factor *= 5
+        rest -= 1
+    }
+    mut self.mul_add(factor, addend: 0)
+} Natural.mul_pow5
+
+/// Multiplies the number by 10 to the power `power`.
+fn Natural.mul_pow10(mut self, power: u64) {
+    mut self.mul_pow5(power)
+    mut self.shl(usize.widen(power))
+} Natural.mul_pow10
+
+/// Multiplies the number by 2 to the power `power`.
+fn Natural.shl(mut self, power: usize) {
+    let count = self.count
+    if count == 0 {
+        return
+    }
+    let whole = power / 32
+    let part = u32.truncate(power % 32)
+    if part == 0 {
+        var index = count
+        while index > 0 {
+            index -= 1
+            self.limbs[index + whole] = self.limbs[index]
+        }
+        self.count = count + whole
+    } else {
+        self.limbs[count + whole] = self.limbs[count - 1] >> (32 - part)
+        var index = count - 1
+        while index > 0 {
+            self.limbs[index + whole] = (self.limbs[index] << part) | (self.limbs[index - 1] >> (32 - part))
+            index -= 1
+        }
+        self.limbs[whole] = self.limbs[0] << part
+        self.count = count + whole + 1
+    }
+    for index in 0..<whole {
+        self.limbs[index] = 0
+    }
+    mut self.trim()
+} Natural.shl
+
+fn Natural.compare(self, other: Natural) -> Ordering {
+    if self.count != other.count {
+        return self.count.cmp(other.count)
+    }
+    var index = self.count
+    while index > 0 {
+        index -= 1
+        if self.limbs[index] != other.limbs[index] {
+            return self.limbs[index].cmp(other.limbs[index])
+        }
+    }
+    return Ordering.Equal
+} Natural.compare
+
+fn Natural.add(mut self, other: Natural) {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < self.count or index < other.count {
+        var sum = carry
+        if index < self.count {
+            sum += u64.widen(self.limbs[index])
+        }
+        if index < other.count {
+            sum += u64.widen(other.limbs[index])
+        }
+        self.limbs[index] = u32.truncate(sum)
+        carry = sum >> 32
+        index += 1
+    }
+    if carry > 0 {
+        self.limbs[index] = u32.truncate(carry)
+        index += 1
+    }
+    self.count = index
+} Natural.add
+
+/// Subtracts a number no greater than this one.
+fn Natural.subtract(mut self, other: Natural) {
+    var borrow: u64 = 0
+    for index in 0..<self.count {
+        var subtrahend = borrow
+        if index < other.count {
+            subtrahend += u64.widen(other.limbs[index])
+        }
+        let minuend = u64.widen(self.limbs[index])
+        if minuend < subtrahend {
+            self.limbs[index] = u32.truncate(minuend + 0x1_0000_0000 - subtrahend)
+            borrow = 1
+        } else {
+            self.limbs[index] = u32.truncate(minuend - subtrahend)
+            borrow = 0
+        }
+    }
+    mut self.trim()
+} Natural.subtract
+
+/// The integer part of a quotient, and whether no remainder follows it.
+struct Quotient derives Copy {
+    value: u64
+    exact: bool
+} Quotient
+
+/// The quotient of two naturals when below 2^56, a bit at a time, leaving the remainder in the
+/// dividend and the divisor times 2^56 in the divisor.
+fn divided(mut dividend: Natural, mut divisor: Natural) -> Quotient {
+    mut divisor.shl(56)
+    var value: u64 = 0
+    for _ in 0..<56u32 {
+        mut dividend.shl(1)
+        value = value << 1
+        if dividend.compare(divisor) != Ordering.Less {
+            mut dividend.subtract(divisor)
+            value = value | 1
+        }
+    }
+    return Quotient(value: value, exact: dividend.count == 0)
+} divided
+
+/// The significant digits of a decimal number read so far: the value of the first `count`, at
+/// most `KEPT`, with the next ones in `chunk`, and whether a nonzero digit past them was dropped.
+view struct Significant {
+    value: Natural
+    count: u64
+    chunk: u32
+    chunk_digits: u32
+    dropped: bool
+} Significant
+
+fn Significant.push(mut self, digit: u32) {
+    if self.count == KEPT {
+        if digit != 0 {
+            self.dropped = true
+        }
+        return
+    }
+    self.chunk = self.chunk * 10 + digit
+    self.chunk_digits += 1
+    self.count += 1
+    if self.chunk_digits == 9 {
+        mut self.value.mul_add(1_000_000_000, addend: self.chunk)
+        self.chunk = 0
+        self.chunk_digits = 0
+    }
+} Significant.push
+
+/// The value of the digits, a nonzero digit dropped counting as a further digit 1.
+fn Significant.finished(mut self) {
+    var factor: u32 = 1
+    for _ in 0..<self.chunk_digits {
+        factor *= 10
+    }
+    mut self.value.mul_add(factor, addend: self.chunk)
+    if self.dropped {
+        mut self.value.mul_add(10, addend: 1)
+        self.count += 1
+    }
+} Significant.finished
+
+/// The bit pattern of the `f64` nearest the value of a decimal number, ties to an even
+/// significand and infinity past the greatest finite value: `-` optionally, digits, optionally
+/// `.` and digits, then optionally `e` or `E`, `+` or `-` optionally and digits, any `_` among
+/// them ignored.
+pkg fn f64_bits_of(number: Slice[u8]) -> u64 {
+    var at: usize = 0
+    var sign: u64 = 0
+    if number.len() > 0 and number[0] == b'-' {
+        sign = 1u64 << 63
+        at = 1
+    }
+    var digit_limbs = Array[u32, READ_LIMBS].filled(0)
+    var digits = Significant(value: Natural(limbs: mut digit_limbs.view_mut(), count: 0), count: 0, chunk: 0, chunk_digits: 0, dropped: false)
+    var point: i64 = 0
+    var fraction = false
+    while at < number.len() and number[at] != b'e' and number[at] != b'E' {
+        let byte = number[at]
+        at += 1
+        if byte == b'.' {
+            fraction = true
+            continue
+        }
+        if byte == b'_' {
+            continue
+        }
+        let leading = digits.count == 0 and byte == b'0'
+        if leading and fraction {
+            point -= 1
+        }
+        if not leading {
+            if not fraction {
+                point += 1
+            }
+            mut digits.push(u32.widen(byte - b'0'))
+        }
+    }
+    if digits.count == 0 {
+        return sign
+    }
+    let exponent = point + exponent_of(number, at)
+    if exponent > 310 {
+        return sign | F64_INFINITY
+    }
+    if exponent < -324 {
+        return sign
+    }
+    mut digits.finished()
+    let fraction_digits = i64.fit(digits.count) - exponent
+    var denominator_limbs = Array[u32, READ_LIMBS].filled(0)
+    var denominator = Natural(limbs: mut denominator_limbs.view_mut(), count: 0)
+    mut denominator.set(1)
+    if fraction_digits < 0 {
+        mut digits.value.mul_pow5(u64.fit(-fraction_digits))
+    } else {
+        mut denominator.mul_pow5(u64.fit(fraction_digits))
+    }
+    let shift = 55 - digits.value.bits() + denominator.bits()
+    if shift >= 0 {
+        mut digits.value.shl(usize.fit(shift))
+    } else {
+        mut denominator.shl(usize.fit(-shift))
+    }
+    let quotient = divided(mut digits.value, divisor: mut denominator)
+    return sign | nearest_f64(quotient, exponent: -fraction_digits - shift)
+} f64_bits_of
+
+/// The exponent of a decimal number's text from `at`, where its `e` or `E` is, 0 without one, its
+/// magnitude capped at 10^17, past the count of digits any text holds.
+fn exponent_of(number: Slice[u8], at: usize) -> i64 {
+    if at >= number.len() {
+        return 0
+    }
+    var index = at + 1
+    var negative = false
+    if index < number.len() and (number[index] == b'-' or number[index] == b'+') {
+        negative = number[index] == b'-'
+        index += 1
+    }
+    var magnitude: i64 = 0
+    while index < number.len() {
+        let byte = number[index]
+        if byte != b'_' and magnitude < 100_000_000_000_000_000 {
+            magnitude = magnitude * 10 + i64.widen(byte - b'0')
+        }
+        index += 1
+    }
+    if negative {
+        return -magnitude
+    }
+    return magnitude
+} exponent_of
+
+/// The bits of the `f64` nearest `quotient × 2^exponent`, the quotient from 2^54 below 2^56.
+fn nearest_f64(quotient: Quotient, exponent: i64) -> u64 {
+    var dropped = 64 - i64.widen(quotient.value.leading_zeros()) - 53
+    var power = exponent + dropped
+    if power < -1_074 {
+        dropped += -1_074 - power
+        power = -1_074
+    }
+    if dropped > 60 {
+        return 0
+    }
+    let shift = u32.fit(dropped)
+    var significand = quotient.value >> shift
+    let half = (quotient.value >> (shift - 1)) & 1
+    let beyond = (quotient.value & ((1u64 << (shift - 1)) - 1)) != 0 or not quotient.exact
+    if half == 1 and (beyond or (significand & 1) == 1) {
+        significand += 1
+    }
+    if significand == (1u64 << 53) {
+        significand = 1u64 << 52
+        power += 1
+    }
+    if significand < (1u64 << 52) {
+        return significand
+    }
+    let biased = power + 1_075
+    if biased >= 2_047 {
+        return F64_INFINITY
+    }
+    return (u64.fit(biased) << 52) | (significand - (1u64 << 52))
+} nearest_f64
+
+/// A binary float format: the bits of its fraction field and its greatest exponent.
+struct Binary derives Copy {
+    fraction_bits: u32
+    max_exponent: i64
+} Binary
+
+/// Writes the text of the `f64` of a bit pattern and returns its length: `NaN`, `inf`, `-inf`, or
+/// the shortest digits that read back as the value, positional for 0 and magnitudes from 10^-5
+/// below 10^16, otherwise with an exponent.
+pkg fn f64_text(bits: u64, mut out: Array[u8, 40]) -> usize {
+    let magnitude = bits & 0x7FFF_FFFF_FFFF_FFFF
+    let positional = magnitude == 0 or (magnitude >= 0x3EE4_F8B5_88E3_68F1 and magnitude < 0x4341_C379_37E0_8000)
+    return float_text(Binary(fraction_bits: 52, max_exponent: 1_023), negative: (bits >> 63) == 1, magnitude, positional, mut out)
+} f64_text
+
+/// Writes the text of the `f32` of a bit pattern as `f64_text` does, its digits the shortest that
+/// read back as an `f32`.
+pkg fn f32_text(bits: u32, mut out: Array[u8, 40]) -> usize {
+    let magnitude = u64.widen(bits & 0x7FFF_FFFF)
+    let positional = magnitude == 0 or (magnitude >= 0x3727_C5AD and magnitude < 0x5A0E_1BCA)
+    return float_text(Binary(fraction_bits: 23, max_exponent: 127), negative: (bits >> 31) == 1, magnitude, positional, mut out)
+} f32_text
+
+fn float_text(
+    format: Binary,
+    negative: bool,
+    magnitude: u64,
+    positional: bool,
+    mut out: Array[u8, 40],
+    ) -> usize {
+    let infinity = u64.fit(2 * format.max_exponent + 1) << format.fraction_bits
+    if magnitude > infinity {
+        return append(mut out, at: 0, bytes: b"NaN")
+    }
+    var len: usize = 0
+    if negative {
+        len = append(mut out, at: len, bytes: b"-")
+    }
+    if magnitude == infinity {
+        return append(mut out, at: len, bytes: b"inf")
+    }
+    if magnitude == 0 {
+        return append(mut out, at: len, bytes: b"0.0")
+    }
+    let decimal = shortest(Decoded.of(format, magnitude))
+    if positional {
+        return positional_text(decimal, mut out, at: len)
+    }
+    return scientific_text(decimal, mut out, at: len)
+} float_text
+
+/// A positive finite float as `mant × 2^exp`, the values halfway to the floats beside it
+/// `(mant - minus) × 2^exp` and `(mant + plus) × 2^exp`, which read back as it when `inclusive`.
+struct Decoded derives Copy {
+    mant: u64
+    minus: u64
+    plus: u64
+    exp: i64
+    inclusive: bool
+} Decoded
+
+fn Decoded.of(format: Binary, magnitude: u64) -> Decoded {
+    let biased = magnitude >> format.fraction_bits
+    let fraction = magnitude & ((1u64 << format.fraction_bits) - 1)
+    let shift = format.max_exponent + i64.widen(format.fraction_bits)
+    if biased == 0 {
+        return Decoded(mant: fraction << 1, minus: 1, plus: 1, exp: -shift, inclusive: true)
+    }
+    let mant = fraction | (1u64 << format.fraction_bits)
+    if fraction == 0 {
+        return Decoded(mant: mant << 2, minus: 1, plus: 2, exp: i64.fit(biased) - shift - 2, inclusive: true)
+    }
+    return Decoded(mant: mant << 1, minus: 1, plus: 1, exp: i64.fit(biased) - shift - 1, inclusive: (mant & 1) == 0)
+} Decoded.of
+
+/// A decimal: its digits and the power of ten of the first.
+struct Decimal derives Copy {
+    digits: Array[u8, 24]
+    count: usize
+    exponent: i64
+} Decimal
+
+/// Whether an order of `a` against `b` puts `a` below `b`, or at most `b` when `inclusive`.
+fn below(order: Ordering, inclusive: bool) -> bool {
+    if inclusive {
+        return order != Ordering.Greater
+    }
+    return order == Ordering.Less
+} below
+
+/// Whether `mant + plus` passes `scale`, or reaches it when `inclusive`, the sum computed in
+/// `sum`.
+fn reaches(mant: Natural, plus: Natural, scale: Natural, inclusive: bool, mut sum: Natural) -> bool {
+    mut sum.assign(mant)
+    mut sum.add(plus)
+    return below(scale.compare(sum), inclusive)
+} reaches
+
+/// The shortest digits between a float's halfway values, the nearer of the last two candidates
+/// and the greater on a tie: the digits of Dragon4's free-format algorithm.
+fn shortest(decoded: Decoded) -> Decimal {
+    let high = decoded.mant + decoded.plus
+    var k = ((64 - i64.widen((high - 1).leading_zeros()) + decoded.exp) * 1_292_913_986).shr_arith(32)
+    var mant_limbs = Array[u32, WRITE_LIMBS].filled(0)
+    var mant = Natural(limbs: mut mant_limbs.view_mut(), count: 0)
+    mut mant.set(decoded.mant)
+    var minus_limbs = Array[u32, WRITE_LIMBS].filled(0)
+    var minus = Natural(limbs: mut minus_limbs.view_mut(), count: 0)
+    mut minus.set(decoded.minus)
+    var plus_limbs = Array[u32, WRITE_LIMBS].filled(0)
+    var plus = Natural(limbs: mut plus_limbs.view_mut(), count: 0)
+    mut plus.set(decoded.plus)
+    var scale_limbs = Array[u32, WRITE_LIMBS].filled(0)
+    var scale = Natural(limbs: mut scale_limbs.view_mut(), count: 0)
+    mut scale.set(1)
+    var scratch_limbs = Array[u32, WRITE_LIMBS].filled(0)
+    var scratch = Natural(limbs: mut scratch_limbs.view_mut(), count: 0)
+    if decoded.exp < 0 {
+        mut scale.shl(usize.fit(-decoded.exp))
+    } else {
+        let power = usize.fit(decoded.exp)
+        mut mant.shl(power)
+        mut minus.shl(power)
+        mut plus.shl(power)
+    }
+    if k >= 0 {
+        mut scale.mul_pow10(u64.fit(k))
+    } else {
+        let power = u64.fit(-k)
+        mut mant.mul_pow10(power)
+        mut minus.mul_pow10(power)
+        mut plus.mul_pow10(power)
+    }
+    if reaches(mant, plus, scale, inclusive: decoded.inclusive, sum: mut scratch) {
+        k += 1
+    } else {
+        mut mant.mul_add(10, addend: 0)
+        mut minus.mul_add(10, addend: 0)
+        mut plus.mul_add(10, addend: 0)
+    }
+    var decimal = Decimal(digits: Array[u8, 24].filled(b'0'), count: 0, exponent: k - 1)
+    var down = false
+    var up = false
+    loop {
+        var digit = b'0'
+        while mant.compare(scale) != Ordering.Less {
+            mut mant.subtract(scale)
+            digit += 1
+        }
+        decimal.digits[decimal.count] = digit
+        decimal.count += 1
+        down = below(mant.compare(minus), inclusive: decoded.inclusive)
+        up = reaches(mant, plus, scale, inclusive: decoded.inclusive, sum: mut scratch)
+        if down or up {
+            break
+        }
+        mut mant.mul_add(10, addend: 0)
+        mut minus.mul_add(10, addend: 0)
+        mut plus.mul_add(10, addend: 0)
+    }
+    if up {
+        mut scratch.assign(mant)
+        mut scratch.shl(1)
+        if not down or scratch.compare(scale) != Ordering.Less {
+            mut decimal.round_up()
+        }
+    }
+    return decimal
+} shortest
+
+/// Adds one to the last digit; when every digit is a nine, the digits become a one and zeros, one
+/// more than before, and the exponent grows.
+fn Decimal.round_up(mut self) {
+    var index = self.count
+    while index > 0 {
+        index -= 1
+        if self.digits[index] != b'9' {
+            self.digits[index] += 1
+            for later in (index + 1)..<self.count {
+                self.digits[later] = b'0'
+            }
+            return
+        }
+    }
+    self.digits[0] = b'1'
+    for later in 1..=self.count {
+        self.digits[later] = b'0'
+    }
+    self.count += 1
+    self.exponent += 1
+} Decimal.round_up
+
+/// Appends bytes to a text from `at` and returns its new length.
+fn append(mut out: Array[u8, 40], at: usize, bytes: Slice[u8]) -> usize {
+    var len = at
+    for byte in bytes {
+        out[len] = byte
+        len += 1
+    }
+    return len
+} append
+
+/// Writes a decimal positionally: at least one digit on each side of the point.
+fn positional_text(decimal: Decimal, mut out: Array[u8, 40], at: usize) -> usize {
+    var len = at
+    if decimal.exponent < 0 {
+        len = append(mut out, at: len, bytes: b"0.")
+        for _ in 1..<(-decimal.exponent) {
+            len = append(mut out, at: len, bytes: b"0")
+        }
+        for index in 0..<decimal.count {
+            out[len] = decimal.digits[index]
+            len += 1
+        }
+        return len
+    }
+    let whole = usize.fit(decimal.exponent) + 1
+    for index in 0..<whole {
+        if index < decimal.count {
+            out[len] = decimal.digits[index]
+        } else {
+            out[len] = b'0'
+        }
+        len += 1
+    }
+    len = append(mut out, at: len, bytes: b".")
+    if decimal.count <= whole {
+        return append(mut out, at: len, bytes: b"0")
+    }
+    for index in whole..<decimal.count {
+        out[len] = decimal.digits[index]
+        len += 1
+    }
+    return len
+} positional_text
+
+/// Writes a decimal as its first digit, `.`, the others or `0`, `e` and the exponent.
+fn scientific_text(decimal: Decimal, mut out: Array[u8, 40], at: usize) -> usize {
+    var len = at
+    out[len] = decimal.digits[0]
+    len = append(mut out, at: len + 1, bytes: b".")
+    if decimal.count == 1 {
+        len = append(mut out, at: len, bytes: b"0")
+    }
+    for index in 1..<decimal.count {
+        out[len] = decimal.digits[index]
+        len += 1
+    }
+    len = append(mut out, at: len, bytes: b"e")
+    var exponent = decimal.exponent
+    if exponent < 0 {
+        len = append(mut out, at: len, bytes: b"-")
+        exponent = -exponent
+    }
+    if exponent >= 100 {
+        out[len] = b'0' + u8.fit(exponent.div_trunc(100))
+        len += 1
+    }
+    if exponent >= 10 {
+        out[len] = b'0' + u8.fit(exponent.div_trunc(10).rem_trunc(10))
+        len += 1
+    }
+    out[len] = b'0' + u8.fit(exponent.rem_trunc(10))
+    return len + 1
+} scientific_text

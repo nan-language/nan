@@ -27,6 +27,7 @@ use super::super::fx::{Fx, PTR};
 use super::super::supplied::tasks::components;
 use super::super::{Instance, Lowering};
 use super::{Routine, memory, state, tasks};
+use crate::check::db::ItemId;
 use crate::workspace::Kind;
 
 /// The capability table's capacity.
@@ -764,21 +765,40 @@ impl Lowering<'_, '_> {
     /// Calls the function of the target's platform package named `name` with values held as it
     /// takes them.
     pub fn platform_call(&mut self, fx: &mut Fx, name: &str, args: &[Held]) -> Called {
-        let instance = self.platform_instance(name);
+        let item = self.platform_function(name);
+        self.call_function(fx, item, args)
+    }
+
+    /// Calls the function of the core package named `name` with values held as it takes them.
+    pub fn core_call(&mut self, fx: &mut Fx, name: &str, args: &[Held]) -> Called {
+        let item = self
+            .ck
+            .db
+            .core_item(name)
+            .unwrap_or_else(|| panic!("the core function core::{name}"));
+        self.call_function(fx, item, args)
+    }
+
+    fn call_function(&mut self, fx: &mut Fx, item: ItemId, args: &[Held]) -> Called {
+        let instance = Instance::Nir {
+            item,
+            role: crate::nir::Role::Body,
+            index: 0,
+            args: crate::check::ty::no_args(),
+        };
         let abi = self.abi(&instance);
         let id = self.instance(instance);
         self.invoke(fx, Invoked::Direct(id), &abi, args)
     }
 
-    /// The instance of the function of the target's platform package named `name`.
-    fn platform_instance(&mut self, name: &str) -> Instance {
+    /// The function of the target's platform package named `name`.
+    fn platform_function(&self, name: &str) -> ItemId {
         let platform = match self.ck.db.target.kind() {
             Some(Kind::Uefi) => "uefi_platform",
             Some(Kind::Bare) => "bare_platform",
             _ => "host_platform",
         };
-        let item = self
-            .ck
+        self.ck
             .db
             .packages
             .iter()
@@ -788,12 +808,6 @@ impl Lowering<'_, '_> {
                 let root = package.root?;
                 self.ck.db.lookup(root, name)
             })
-            .unwrap_or_else(|| panic!("the platform function {platform}::{name}"));
-        Instance::Nir {
-            item,
-            role: crate::nir::Role::Body,
-            index: 0,
-            args: crate::check::ty::no_args(),
-        }
+            .unwrap_or_else(|| panic!("the platform function {platform}::{name}"))
     }
 }

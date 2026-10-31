@@ -381,8 +381,9 @@ fn separated_digit(mut fx: Fx, at: clif::Value, value: clif::Value, overflowed: 
     return fx.list3(next, b: kept, c: still)
 } separated_digit
 
-/// A float: `NaN`, `inf`, `-inf`, or a number rounded to f64.
-fn construction_read_float(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> Reading {
+/// A float: `NaN`, `inf`, `-inf`, or a number rounded to f64, as a value of `float`, the type
+/// holding an f64.
+fn construction_read_float(mut lo: Lowering, mut fx: Fx, state: clif::Value, float: clif::Type) -> Reading {
     var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
     mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -396,7 +397,7 @@ fn construction_read_float(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> 
     let call = mut fx.b.call(reference, args: call_args.view())
     let results = fx.b.inst_results(call, alloc: fx.alloc)
     expect results.len() == 1
-    let value = mut fx.load(clif::Type.Float64, addr: out, offset: 0)
+    let value = mut fx.load(float, addr: out, offset: 0)
     return Reading(value: value, failed: results[0])
 } construction_read_float
 
@@ -428,25 +429,8 @@ fn float_glue(mut lo: Lowering, mut fx: Fx) {
     let read = construction_number(mut lo, mut fx, state)
     construction_stop(mut fx, failed: read.failed)
     let len = mut fx.b.isub(read.end, y: read.start)
-    let size = mut fx.b.iadd_imm_s(len, y: 1)
-    let text = mut lo.record_alloc(mut fx, size)
-    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: text, y: 0)
-    mut fx.if_true(missing, then: fn(mut fx1: Fx) {
-        let exhausted = json_code(mut fx1, code: FAILURE_OUT_OF_MEMORY)
-        let returned = fx1.list1(exhausted)
-        mut fx1.b.ret(returned.view())
-    })
-    let kept = float_digits(mut fx, read, text)
-    let terminator = mut fx.b.iadd(text, y: kept)
-    let nul = mut fx.int(clif::Type.Int8, value: 0)
-    mut fx.store(nul, addr: terminator, offset: 0)
-    let none = mut fx.ptr(0)
-    let strtod_args = fx.list2(text, b: none)
-    let returned_types = fx.types1(clif::Type.Float64)
-    let values = mut lo.call_libc(mut fx, name: "strtod", args: strtod_args.view(), returns: returned_types.view())
-    expect values.len() == 1
-    mut lo.record_free(mut fx, address: text)
-    mut fx.store(values[0], addr: out, offset: 0)
+    let bits = floats_parse(mut lo, mut fx, start: read.start, len)
+    mut fx.store(bits, addr: out, offset: 0)
     let ok_code = json_code(mut fx, code: 0)
     let returned = fx.list1(ok_code)
     mut fx.b.ret(returned.view())
@@ -459,7 +443,7 @@ fn float_named(mut lo: Lowering, mut fx: Fx, state: clif::Value, out: clif::Valu
     let capacity = mut fx.ptr(8)
     let read = construction_word(mut lo, mut fx, state, buffer, capacity)
     construction_stop(mut fx, failed: read.failed)
-    var value = mut fx.b.f64const(0)
+    var value = mut fx.int(clif::Type.Int64, value: 0)
     var known = mut fx.int(clif::Type.Int8, value: 0)
     let not_a_number = named_float(mut lo, mut fx, buffer, len: read.value, spelling: b"NaN", below: false, negative, bits: 0x7FF8_0000_0000_0000, value, known)
     let infinite = named_float(mut lo, mut fx, buffer, len: read.value, spelling: b"inf", below: false, negative, bits: 0x7FF0_0000_0000_0000, value: not_a_number.value, known: not_a_number.known)
@@ -481,41 +465,11 @@ fn named_float(mut lo: Lowering, mut fx: Fx, buffer: clif::Value, len: clif::Val
         sign = mut fx.b.bxor_imm_s(negative, y: 1)
     }
     let signed_same = mut fx.b.band(same, y: sign)
-    let constant = mut fx.b.f64const(bits)
+    let constant = mut fx.int(clif::Type.Int64, value: i64.from_bits(bits))
     let chosen = mut fx.b.select(signed_same, x: constant, y: value)
     let now_known = mut fx.b.bor(known, y: signed_same)
     return FloatWord(value: chosen, known: now_known)
 } named_float
-
-/// Copies a number's text without its `_` to `text`: the bytes copied.
-fn float_digits(mut fx: Fx, read: NumberReading, text: clif::Value) -> clif::Value {
-    let zero = mut fx.ptr(0)
-    let initial = fx.list2(read.start, b: zero)
-    let ended = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
-        expect current.len() == 2
-        let at = current[0]
-        let kept = current[1]
-        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: at, y: read.end)
-        let results = fx1.types2(clif::Type.Int64, b: clif::Type.Int64)
-        let next = mut fx1.choose(inside, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let byte = mut fx2.load(clif::Type.Int8, addr: at, offset: 0)
-            let digit = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: byte, y: i64.widen(b'_'))
-            mut fx2.if_true(digit, then: fn(mut fx3: Fx) {
-                let place = mut fx3.b.iadd(text, y: kept)
-                mut fx3.store(byte, addr: place, offset: 0)
-            })
-            let step = mut fx2.b.uextend(clif::Type.Int64, x: digit)
-            let advanced = mut fx2.b.iadd_imm_s(at, y: 1)
-            let counted = mut fx2.b.iadd(kept, y: step)
-            return fx2.list2(advanced, b: counted)
-        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            return fx2.list2(at, b: kept)
-        })
-        return Pass(again: inside, next: take next)
-    })
-    expect ended.len() == 2
-    return ended[1]
-} float_digits
 
 /// A literal after whitespace, its escapes resolved: at most `capacity` of its bytes written
 /// to `buffer` unless it is zero, and its whole length.

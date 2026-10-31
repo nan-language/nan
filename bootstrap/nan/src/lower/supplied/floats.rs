@@ -2,12 +2,13 @@
 //! in integer arithmetic over the operands' bit patterns: the remainder of a division, and the
 //! fused multiply-add, rounded once. Each is a function per float width that lowered code calls.
 //! The conversions between f32 and f64 are computed the same way, inline, where code holds floats
-//! as bit patterns.
+//! as bit patterns, and the decimal text of floats by core's functions over bit patterns.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, Type, Value, types};
 use cranelift_module::FuncId;
 
+use super::super::body::Held;
 use super::super::fx::Fx;
 use super::super::{CALL_CONV, Glue, Lowering};
 
@@ -74,6 +75,30 @@ impl Width {
             Width::Double => 0x7FF8_0000_0000_0000,
         }
     }
+}
+
+/// The text `Render` writes for a float or its bit pattern, by core's function of its width: a
+/// buffer of 40 bytes holding it, and its length.
+pub fn text(lo: &mut Lowering, fx: &mut Fx, value: Value) -> (Value, Value) {
+    let bits = super::numbers::to_bits(fx, value);
+    let name = match fx.b.func.dfg.value_type(bits) {
+        types::I32 => "f32_text",
+        _ => "f64_text",
+    };
+    let buffer = fx.slot(40, 8);
+    let called = lo.core_call(fx, name, &[Held::Scalar(bits), Held::Address(buffer)]);
+    (buffer, called.result.scalar())
+}
+
+/// The bit pattern of the f64 nearest a decimal number's text of `len` bytes from `start`, by
+/// core's function.
+pub fn parse(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value) -> Value {
+    let text = fx.slot(16, 8);
+    fx.store(start, text, 0);
+    fx.store(len, text, 8);
+    lo.core_call(fx, "f64_bits_of", &[Held::Address(text)])
+        .result
+        .scalar()
 }
 
 /// Calls the remainder function of a width on two floats.

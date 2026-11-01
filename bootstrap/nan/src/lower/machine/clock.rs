@@ -177,9 +177,9 @@ impl Lowering<'_, '_> {
     }
 
     /// Programs the running CPU's timer to fire at the earliest of the timer first due, the end
-    /// of its task's slice and, while it runs a task or the final build binds the timer's
-    /// vector, its next pacing tick; at once when that has passed. The caller holds the timer
-    /// lock.
+    /// of its task's slice while that is ahead and, while it runs a task or the final build
+    /// binds the timer's vector, its next pacing tick; at once when that has passed. The caller
+    /// holds the timer lock.
     fn program_timer(&mut self, fx: &mut Fx) {
         let record = self.running_cpu(fx);
         let latest = fx.int(PTR, -1);
@@ -193,8 +193,9 @@ impl Lowering<'_, '_> {
                 fx.b.ins().select(running, pace, latest)
             }
         };
+        let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let end = fx.load(PTR, record, cpu::SLICE_END);
-        let sliced = fx.b.ins().icmp_imm_s(IntCC::NotEqual, end, 0);
+        let sliced = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, end, now);
         let end = fx.b.ins().select(sliced, end, latest);
         let target = fx.b.ins().umin(pace, end);
         let state_address = self.state(fx);
@@ -209,7 +210,6 @@ impl Lowering<'_, '_> {
             },
             |_| vec![target],
         )[0];
-        let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, target, now);
         let delay = fx.b.ins().isub(target, now);
         let zero = fx.ptr(0);

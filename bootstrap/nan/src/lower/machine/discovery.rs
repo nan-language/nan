@@ -477,7 +477,8 @@ impl Lowering<'_, '_> {
     /// or else the first PL011; the first GICv3, ITS and PL031; the PSCI node's method; and each
     /// node of `device_type` `cpu` other than the boot CPU. A device's `reg` is translated
     /// through its ancestors' `ranges`, and a node whose `status` is neither `okay` nor `ok` is
-    /// passed over.
+    /// passed over, but for a PL031, which UEFI firmware disables on taking it for its runtime
+    /// services.
     fn tree_discovery(&mut self) -> FuncId {
         let helpers = Helpers {
             listed: self.listed_helper(),
@@ -905,7 +906,11 @@ impl Lowering<'_, '_> {
         helpers: Helpers,
     ) {
         let disabled = fx.b.use_var(node.disabled);
+        let kinds = fx.b.use_var(node.kinds);
+        let rtc = fx.b.ins().band_imm_s(kinds, compatible::RTC);
+        let rtc = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rtc, 0);
         let enabled = fx.b.ins().icmp_imm_s(IntCC::Equal, disabled, 0);
+        let enabled = fx.b.ins().bor(enabled, rtc);
         let nested =
             fx.b.ins()
                 .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, depth, 2);
@@ -932,7 +937,6 @@ impl Lowering<'_, '_> {
             let zero = fx.ptr(0);
             let count = fx.b.ins().select(none, zero, count);
             let has_reg = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
-            let kinds = fx.b.use_var(node.kinds);
             let cpu = fx.b.use_var(node.cpu);
             let cpu = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cpu, 0);
             let cpu = fx.b.ins().band(cpu, has_reg);

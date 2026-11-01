@@ -21,6 +21,7 @@
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,7 +168,7 @@ fn fresh_store(store: &str) -> std::io::Result<PathBuf> {
 }
 
 /// Copies a directory tree into another, made anew, without the `.nan` directory at its top
-/// when `machine_root` is false.
+/// when `machine_root` is false, and without the sockets an emulator left in a machine directory.
 fn copy_tree(from: &Path, to: &Path, machine_root: bool) -> std::io::Result<()> {
     if to.exists() {
         fs::remove_dir_all(to)?;
@@ -179,9 +180,11 @@ fn copy_tree(from: &Path, to: &Path, machine_root: bool) -> std::io::Result<()> 
             continue;
         }
         let target = to.join(entry.file_name());
-        match entry.file_type()?.is_dir() {
-            true => copy_tree(&entry.path(), &target, true)?,
-            false => drop(fs::copy(entry.path(), target)?),
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target, true)?;
+        } else if !kind.is_socket() {
+            fs::copy(entry.path(), target)?;
         }
     }
     Ok(())

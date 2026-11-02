@@ -52,6 +52,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::Region" => physical::lower_region(lo, fx, supply),
         "hw::PhysFrame" => physical::lower_frame(lo, fx, supply),
         "hw::PageTableRoot" => physical::page_table_root(lo, fx, supply),
+        "hw::UserFrame" => physical::user_frame(lo, fx, supply),
         _ => return false,
     }
     true
@@ -79,7 +80,7 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
         | "hw::IoDomain" | "hw::PciFunction" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
-        | "hw::PageTableRoot" => false,
+        | "hw::PageTableRoot" | "hw::UserFrame" => false,
         _ => return None,
     })
 }
@@ -144,7 +145,8 @@ pub fn needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         }
         "hw::PerCpu" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Idt" | "hw::IdtInstalled"
-        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::IrqShared" => false,
+        | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserFrame"
+        | "hw::IrqShared" => false,
         _ => return None,
     })
 }

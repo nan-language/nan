@@ -11,7 +11,7 @@ use crate::syntax::ast::{self, Access, ItemKind, LayoutFieldKind, LayoutRepr, Mo
 use crate::workspace::Target;
 
 /// The trusted primitives: std functions callable only inside trusted code.
-const PRIMITIVES: [&str; 11] = [
+const PRIMITIVES: [&str; 12] = [
     "hw::Ptr.read",
     "hw::Ptr.write",
     "hw::Ptr.offset",
@@ -23,10 +23,11 @@ const PRIMITIVES: [&str; 11] = [
     "hw::TrapFrame.set_ip",
     "boot::Machine.enter",
     "sys::load::Loader.prepare_unverified",
+    "hw::UserFrame.into_frame",
 ];
 
 /// The privileged intrinsics that are trusted primitives too.
-const PRIVILEGED_PRIMITIVES: [&str; 9] = [
+const PRIVILEGED_PRIMITIVES: [&str; 10] = [
     "write_cr3",
     "read_msr",
     "write_msr",
@@ -36,6 +37,7 @@ const PRIVILEGED_PRIMITIVES: [&str; 9] = [
     "write_ttbr0_tagged",
     "invalidate_data_cache",
     "firmware_call",
+    "run_user_split",
 ];
 
 /// The calling conventions and the targets each serves.

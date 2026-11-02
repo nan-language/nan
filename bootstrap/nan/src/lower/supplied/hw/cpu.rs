@@ -1,16 +1,17 @@
 //! The CPU-facing operations of `hw`: the context of an interrupt fn, the privileged intrinsics
 //! of `hw::Ring0`, the interrupt descriptor table `hw::Idt.of_vectors` builds, the interrupted
-//! state an exception's `hw::TrapFrame` names, and copies from user memory through
-//! `hw::UserAddr`. Only an interrupt fn's context exists on the host, where no interrupt fires.
+//! state an exception's `hw::TrapFrame` names, entering user mode, and copies between user and
+//! kernel memory through `hw::UserAddr`. Only an interrupt fn's context exists on the host, where
+//! no interrupt fires.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::super::Lowering;
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::machine::Stub;
-use super::super::super::machine::{A64_ACCESS, A64_TABLE, A64_VALID, LARGE, PRESENT};
-use super::super::super::runtime::state;
+use super::super::super::machine::{A64_ACCESS, A64_TABLE, A64_VALID, LARGE, PRESENT, WRITABLE};
+use super::super::super::machine::{FAULT, SYSCALL, Stub};
+use super::super::super::runtime::{Routine, state};
 use super::super::{Supply, sys, tasks as task_ops};
 use super::physical;
 
@@ -84,11 +85,72 @@ pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.invalidate_everywhere(fx, scope);
             supply.done(lo, fx);
         }
+        "run_user" => run_user(lo, fx, supply, false),
+        "run_user_split" => run_user(lo, fx, supply, true),
+        "entry_area" => {
+            let (base, len) = lo.entry_area(fx);
+            let area_ty = supply.abi.result.clone();
+            let layout = lo.layout(&area_ty);
+            let area = fx.slot(layout.size, layout.align);
+            for (name, value) in [("base", base), ("len", len)] {
+                let field = lo.layouts.field(lo.ck, &area_ty, None, name);
+                fx.store(value, area, field.offset);
+            }
+            let held = lo.held_at(fx, &area_ty, area);
+            supply.ret(lo, fx, held);
+        }
         _ => match lo.ck.db.target.arch() {
             Some(crate::workspace::Arch::Aarch64) => ring0_aarch64(lo, fx, supply),
             _ => ring0_x64(lo, fx, supply),
         },
     }
+}
+
+/// `run_user` and, under the user root its third parameter holds, `run_user_split` give
+/// `Interrupted` at once outside thread context, and otherwise enter user mode through the vector
+/// seam's user path and give the exit it reports.
+fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
+    let exit_ty = supply.abi.result.clone();
+    let user_state = supply.param(1).address();
+    let (_, enters) = lo.thread_context(fx);
+    let outside = fx.b.ins().bxor_imm_s(enters, 1);
+    fx.when(outside, |fx| {
+        let exit = lo.variant_value(fx, &exit_ty, "Interrupted", &[], None);
+        supply.ret(lo, fx, exit);
+    });
+    let fault = fx.slot(24, 8);
+    let (user_root, kernel_root) = match split {
+        true => {
+            let root = word(fx, supply.param(2));
+            lo.split_roots(fx, root)
+        }
+        false => (fx.ptr(0), fx.ptr(0)),
+    };
+    let kind = lo.enter_user(fx, user_state, fault, user_root, kernel_root);
+    let syscall = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, SYSCALL);
+    fx.when(syscall, |fx| {
+        let exit = lo.variant_value(fx, &exit_ty, "Syscall", &[], None);
+        supply.ret(lo, fx, exit);
+    });
+    let faulted = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, FAULT);
+    fx.when(faulted, |fx| {
+        let fault_ty = lo.layouts.field(lo.ck, &exit_ty, Some("Fault"), "").ty;
+        let layout = lo.layout(&fault_ty);
+        let record = fx.slot(layout.size, layout.align);
+        for (index, name) in ["vector", "code", "address"].into_iter().enumerate() {
+            let value = fx.load(PTR, fault, index as u64 * 8);
+            let field = lo.layouts.field(lo.ck, &fault_ty, None, name);
+            let value = match name {
+                "vector" => fx.b.ins().ireduce(types::I8, value),
+                _ => value,
+            };
+            fx.store(value, record, field.offset);
+        }
+        let exit = lo.variant_value(fx, &exit_ty, "Fault", &[Held::Address(record)], None);
+        supply.ret(lo, fx, exit);
+    });
+    let exit = lo.variant_value(fx, &exit_ty, "Interrupted", &[], None);
+    supply.ret(lo, fx, exit);
 }
 
 /// The scope an `hw::TlbScope` parameter names, as the shootdown stubs take it: the address of
@@ -490,7 +552,7 @@ pub fn trap_frame(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// The upper end of each architecture's user address space, below which `copy_in` reads: the
+/// The upper end of each architecture's user address space, below which the copies reach: the
 /// x86_64 canonical lower half and the AArch64 `TTBR0_EL1` range.
 const USER_END_X64: i64 = 0x0000_8000_0000_0000;
 const USER_END_AARCH64: i64 = 0x0001_0000_0000_0000;
@@ -500,18 +562,19 @@ const USER_END_AARCH64: i64 = 0x0001_0000_0000_0000;
 const USER: i64 = 0x4;
 const FRAME_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000;
 
-/// The AArch64 descriptor bits `copy_in` reads beside the valid, table and access bits:
-/// unprivileged access, whose `AP[1]` bit is set for an EL0-readable mapping, and `APTable[0]`,
-/// set in a table descriptor to forbid EL0 access to everything below it; and the mask of a
-/// descriptor's output address, which leaves out the `TTBR0_EL1` address space identifier.
+/// The AArch64 descriptor bits the copies read beside the valid, table and access bits:
+/// unprivileged access, whose `AP[1]` bit is set for an EL0 mapping, and `AP[2]`, set for a
+/// read-only one; `APTable[0]` and `APTable[1]`, set in a table descriptor to forbid EL0 access
+/// and writes to everything below it; and the mask of a descriptor's output address, which
+/// leaves out the `TTBR0_EL1` address space identifier.
 const A64_EL0: i64 = 0x40;
+const A64_READ_ONLY: i64 = 0x80;
 const A64_TABLE_NO_EL0: i64 = 1 << 61;
+const A64_TABLE_NO_WRITE: i64 = 1 << 62;
 const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000;
 
-/// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
-/// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
-/// mapped readable for user mode in the running CPU's page tables; otherwise it copies the bytes
-/// once each, allowing the access to user pages where x86_64 SMAP forbids it.
+/// `hw::UserAddr[T]`, one word. `copy_in` and `copy_out` copy a `T` at the address, the byte
+/// copies their slice's bytes from it.
 pub fn user_addr(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "of" => word_result(lo, fx, supply, supply.param(0).scalar()),
@@ -519,18 +582,62 @@ pub fn user_addr(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let value = word(fx, supply.param(0));
             supply.ret(lo, fx, Held::Scalar(value));
         }
-        "copy_in" => copy_in(lo, fx, supply),
+        "copy_in" => {
+            let layout = lo.layout(&supply.type_arg(0));
+            let copied = fx.slot(layout.size.max(1), layout.align.max(1));
+            copy_user(lo, fx, supply, copied, Length::Fixed(layout.size), false);
+            let held = lo.held_at(fx, &supply.abi.result, copied);
+            supply.ret(lo, fx, held);
+        }
+        "copy_out" => {
+            let value_ty = supply.type_arg(0);
+            let layout = lo.layout(&value_ty);
+            let value = fx.slot(layout.size.max(1), layout.align.max(1));
+            lo.store_held(fx, value, supply.param(2), &value_ty);
+            copy_user(lo, fx, supply, value, Length::Fixed(layout.size), true);
+            supply.done(lo, fx);
+        }
+        member @ ("copy_in_bytes" | "copy_out_bytes") => {
+            let view = supply.param(2).address();
+            let start = fx.load(PTR, view, 0);
+            let len = fx.load(PTR, view, 8);
+            let out = member == "copy_out_bytes";
+            copy_user(lo, fx, supply, start, Length::Bytes(len), out);
+            supply.done(lo, fx);
+        }
         member => panic!("no lowering of hw::UserAddr.{member}"),
     }
 }
 
-fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+/// The bytes a copy between user and kernel memory moves: the size of its type, or a slice's
+/// length.
+#[derive(Clone, Copy)]
+enum Length {
+    Fixed(u64),
+    Bytes(Value),
+}
+
+/// Copies between the user memory at the address the operation's receiver holds and `kernel`,
+/// into user memory when `out` is set. It fails with `OutsideUser` when the range does not lie
+/// below the user address space's end, and with `Unmapped` when a page of it is not mapped for
+/// user mode in the running CPU's page tables, readable, and writable for a copy out; otherwise
+/// it copies the bytes once each with maskable interrupts disabled, allowing the access to user
+/// pages where x86_64 SMAP forbids it.
+fn copy_user(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    kernel: Value,
+    length: Length,
+    out: bool,
+) {
     let aarch64 = lo.ck.db.target.arch() == Some(crate::workspace::Arch::Aarch64);
     let start = word(fx, supply.param(0));
-    let value_ty = supply.type_arg(0);
-    let size = lo.layout(&value_ty).size;
-    let size_value = fx.ptr(size);
-    let (end, wrapped) = fx.b.ins().uadd_overflow(start, size_value);
+    let len = match length {
+        Length::Fixed(size) => fx.ptr(size),
+        Length::Bytes(len) => len,
+    };
+    let (end, wrapped) = fx.b.ins().uadd_overflow(start, len);
     let user_end = if aarch64 {
         USER_END_AARCH64
     } else {
@@ -545,8 +652,6 @@ fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let pages = fx.b.ins().iadd_imm_s(end, 0xFFF);
     let pages = fx.b.ins().isub(pages, first);
     let pages = fx.b.ins().ushr_imm_s(pages, 12);
-    let layout = lo.layout(&value_ty);
-    let copied = fx.slot(size.max(1), layout.align.max(1));
     let flags = lo.call_stub(fx, Stub::IrqSave, &[])[0];
     let read_root = if aarch64 {
         Stub::ReadTtbr0
@@ -560,12 +665,12 @@ fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.each(zero, pages, |fx, index| {
         let offset = fx.b.ins().ishl_imm_s(index, 12);
         let page = fx.b.ins().iadd(first, offset);
-        let readable = match aarch64 {
-            true => user_readable_aarch64(fx, root, page),
-            false => user_readable_x64(fx, root, page),
+        let allowed = match aarch64 {
+            true => user_mapped_aarch64(fx, root, page, out),
+            false => user_mapped_x64(fx, root, page, out),
         };
         let so_far = fx.b.use_var(mapped);
-        let so_far = fx.b.ins().band(so_far, readable);
+        let so_far = fx.b.ins().band(so_far, allowed);
         fx.b.def_var(mapped, so_far);
     });
     let mapped = fx.b.use_var(mapped);
@@ -573,7 +678,16 @@ fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         if !aarch64 {
             lo.call_stub(fx, Stub::UserOpen, &[]);
         }
-        lo.copy(fx, copied, start, size, 1);
+        let (to, from) = match out {
+            true => (start, kernel),
+            false => (kernel, start),
+        };
+        match length {
+            Length::Fixed(size) => lo.copy(fx, to, from, size, 1),
+            Length::Bytes(len) => {
+                lo.call_routine(fx, Routine::Copy, &[to, from, len]);
+            }
+        }
         if !aarch64 {
             lo.call_stub(fx, Stub::UserClose, &[]);
         }
@@ -581,13 +695,16 @@ fn copy_in(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     lo.call_stub(fx, Stub::IrqRestore, &[flags]);
     let unmapped = fx.b.ins().bxor_imm_s(mapped, 1);
     fx.when(unmapped, |fx| sys::fail_with(lo, fx, supply, "Unmapped"));
-    let held = lo.held_at(fx, &supply.abi.result, copied);
-    supply.ret(lo, fx, held);
 }
 
 /// Whether the x86_64 page tables from `root` map the page at `page` present and user-accessible
-/// at every level, a large page ending the walk; the tables lie at their physical addresses.
-fn user_readable_x64(fx: &mut Fx, root: Value, page: Value) -> Value {
+/// at every level, and writable at every level when `write` is set, a large page ending the
+/// walk; the tables lie at their physical addresses.
+fn user_mapped_x64(fx: &mut Fx, root: Value, page: Value, write: bool) -> Value {
+    let required = match write {
+        true => PRESENT as i64 | USER | WRITABLE as i64,
+        false => PRESENT as i64 | USER,
+    };
     let table = fx.b.ins().band_imm_s(root, FRAME_ADDRESS);
     let top = fx.ptr(1);
     let readable = fx.int(types::I8, 1);
@@ -600,10 +717,8 @@ fn user_readable_x64(fx: &mut Fx, root: Value, page: Value) -> Value {
         let slot = fx.b.ins().imul_imm_s(index, 8);
         let slot = fx.b.ins().iadd(table, slot);
         let entry = fx.load(PTR, slot, 0);
-        let flags = fx.b.ins().band_imm_s(entry, PRESENT as i64 | USER);
-        let allowed =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::Equal, flags, PRESENT as i64 | USER);
+        let flags = fx.b.ins().band_imm_s(entry, required);
+        let allowed = fx.b.ins().icmp_imm_s(IntCC::Equal, flags, required);
         let readable = fx.b.ins().band(readable, allowed);
         let large = fx.b.ins().band_imm_s(entry, LARGE as i64);
         let large = fx.b.ins().icmp_imm_s(IntCC::NotEqual, large, 0);
@@ -619,12 +734,20 @@ fn user_readable_x64(fx: &mut Fx, root: Value, page: Value) -> Value {
     walked[2]
 }
 
-/// Whether the AArch64 page tables from `root` map the page at `page` EL0-readable: each table
-/// descriptor on the way valid without `APTable[0]`, and the descriptor ending the walk a valid,
-/// accessed and EL0-readable block at level 1 or 2 or page at level 3. The 4 KiB-granule walk
-/// reads levels 0 to 3, each indexed by nine bits of the address from bit 39 down, the tables
-/// lying at their physical addresses.
-fn user_readable_aarch64(fx: &mut Fx, root: Value, page: Value) -> Value {
+/// Whether the AArch64 page tables from `root` map the page at `page` for EL0, and writable when
+/// `write` is set: each table descriptor on the way valid without `APTable[0]`, nor
+/// `APTable[1]` for a write, and the descriptor ending the walk a valid, accessed and EL0 block
+/// at level 1 or 2 or page at level 3, not read-only for a write. The 4 KiB-granule walk reads
+/// levels 0 to 3, each indexed by nine bits of the address from bit 39 down, the tables lying at
+/// their physical addresses.
+fn user_mapped_aarch64(fx: &mut Fx, root: Value, page: Value, write: bool) -> Value {
+    let (closed, leaf_bits) = match write {
+        true => (
+            A64_TABLE_NO_EL0 | A64_TABLE_NO_WRITE,
+            A64_EL0 | A64_ACCESS as i64 | A64_READ_ONLY,
+        ),
+        false => (A64_TABLE_NO_EL0, A64_EL0 | A64_ACCESS as i64),
+    };
     let table = fx.b.ins().band_imm_s(root, A64_ADDRESS);
     let top = fx.ptr(0);
     let readable = fx.int(types::I8, 1);
@@ -653,13 +776,13 @@ fn user_readable_aarch64(fx: &mut Fx, root: Value, page: Value) -> Value {
         let block = fx.b.ins().bxor_imm_s(not_block, 1);
         let page_leaf = fx.b.ins().band(table_bit, bottom);
         let leaf = fx.b.ins().bor(block, page_leaf);
-        let el0 = fx.b.ins().band_imm_s(entry, A64_EL0 | A64_ACCESS as i64);
+        let el0 = fx.b.ins().band_imm_s(entry, leaf_bits);
         let el0 =
             fx.b.ins()
                 .icmp_imm_s(IntCC::Equal, el0, A64_EL0 | A64_ACCESS as i64);
         let leaf_allowed = fx.b.ins().band(valid, leaf);
         let leaf_allowed = fx.b.ins().band(leaf_allowed, el0);
-        let open = fx.b.ins().band_imm_s(entry, A64_TABLE_NO_EL0);
+        let open = fx.b.ins().band_imm_s(entry, closed);
         let open = fx.b.ins().icmp_imm_s(IntCC::Equal, open, 0);
         let more = fx.b.ins().band(walks, open);
         let allowed = fx.b.ins().bor(more, leaf_allowed);

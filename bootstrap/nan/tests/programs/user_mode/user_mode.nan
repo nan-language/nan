@@ -1,0 +1,414 @@
+//! Runs user threads, switching between two on a system call and on interrupts that let another task run, with copies between user and kernel memory, a page fault, a fault on a vector register and a refused entry.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// Where the user threads' code and data lie, under entry 1 of the root, and an address under it
+/// that maps nothing.
+const USER_CODE: u64 = 0x80_0000_0000
+
+const USER_DATA: u64 = USER_CODE + 0x1000
+
+const UNMAPPED: u64 = USER_CODE + 0x1_0000
+
+/// Thread A: `syscall` 1 with `rdi` 7, then reads the word at `USER_DATA`, writes it plus one
+/// after it, `syscall` 2, then reads `UNMAPPED`.
+const THREAD_A: Slice[u8] = b"\xbf\x07\x00\x00\x00\xb8\x01\x00\x00\x00\x0f\x05\x48\x8b\x05\xed\x0f\x00\x00\x48\x83\xc0\x01\x48\x89\x05\xea\x0f\x00\x00\xb8\x02\x00\x00\x00\x0f\x05\x48\x8b\x05\xd4\xff\x00\x00"
+
+/// Thread B, at `USER_CODE + 0x100`: `syscall` 3 with the address and length of the text after
+/// its code in `rdi` and `rsi`, then spins.
+const THREAD_B: Slice[u8] = b"\x48\x8d\x3d\x0e\x00\x00\x00\xbe\x05\x00\x00\x00\xb8\x03\x00\x00\x00\x0f\x05\xeb\xfe\x68\x65\x6c\x6c\x6f"
+
+/// Thread C, at `USER_CODE + 0x200`: moves `rax` to a vector register.
+const THREAD_C: Slice[u8] = b"\x66\x48\x0f\x6e\xc0"
+
+/// Thread D, at `USER_CODE + 0x300`: reads the time-stamp counter.
+const THREAD_D: Slice[u8] = b"\x0f\x31"
+
+/// Thread E, at `USER_CODE + 0x380`: `syscall` 4 with the doorbell's first word in `rdi`, after
+/// writing 0x55 to its second.
+const THREAD_E: Slice[u8] = b"\x48\x8b\x3d\x79\x1c\x00\x00\x48\xc7\x05\x76\x1c\x00\x00\x55\x00\x00\x00\xb8\x04\x00\x00\x00\x0f\x05"
+
+/// Thread F, at `USER_CODE + 0x400`: reads the word at the address in `rdi`.
+const THREAD_F: Slice[u8] = b"\x48\x8b\x07"
+
+/// Kernel memory outside the image, which thread F probes.
+const KERNEL_PROBE: u64 = 0x1000_0000
+
+/// The bits of a page-table entry: present, writable, user mode, a 2 MiB page, and uncached.
+const PRESENT: u64 = 0x1
+
+const WRITABLE: u64 = 0x2
+
+const USER: u64 = 0x4
+
+const LARGE: u64 = 0x80
+
+const UNCACHED: u64 = 0x18
+
+/// The kernel's policy, which keeps every task on CPU 0, where the threads' root is installed.
+struct OneCpu {
+} OneCpu
+
+impl OneCpu: hw::Policy
+
+fn OneCpu.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Placement(cpu: 0, key: 0)
+} OneCpu.place
+
+fn OneCpu.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096 {
+    return None
+} OneCpu.steal
+
+fn OneCpu.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return 1_000_000
+} OneCpu.slice
+
+fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} OneCpu.idle
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+validator fn word(raw: Untrusted[u64]) -> u64 {
+    return raw.inspect()
+} word
+
+validator fn text_is(raw: Untrusted[Slice[u8]], expected: Str) -> bool {
+    return raw.inspect() == expected.as_bytes()
+} text_is
+
+fn set_byte(mut slot: u8, value: u8) {
+    slot = value
+} set_byte
+
+/// Writes `bytes` into a frame from an offset.
+fn fill(mut frame: hw::PhysFrame[4_096], at: u64, bytes: Slice[u8]) {
+    var offset = at
+    for byte in bytes {
+        set_byte(mut frame.contents_mut(hw::Offset[u8](bytes: offset)), value: byte)
+        offset += 1
+    }
+} fill
+
+fn set_entry(mut slot: u64, value: u64) {
+    slot = value
+} set_entry
+
+fn write_entry(table: u64, index: u64, value: u64) {
+    trusted "the entry lies in a page table no value owns" { hw::Ptr[u64].of_addr(usize.widen(table + 8 * index)).write(value) }
+} write_entry
+
+/// The last frame of a list, or a stop when none is left.
+fn next_frame(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::PhysFrame[4_096] {
+    let Some(frame) = mut frames.pop() else {
+        say(text: "out of frames\n")
+        loop {
+        }
+    }
+    return frame
+} next_frame
+
+/// Gives up an emptied frame as a page table, which no value owns from now on, and gives its
+/// address.
+fn page_table(take frame: hw::PhysFrame[4_096]) -> u64 {
+    let base = frame.base()
+    for index in 0u64..<512 {
+        set_entry(mut frame.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+    trusted "a page table's frame holds the frame, which no value owns from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(base)).write(take frame) }
+    write_entry(base, index: 0, value: 0)
+    return base
+} page_table
+
+/// Maps `frame` as the page of entry `index` of the page table at `table`, which holds it from now
+/// on.
+fn link(table: u64, index: u64, take frame: hw::PhysFrame[4_096], flags: u64) {
+    let base = frame.base()
+    trusted "the entry lies in a page table no value owns, which holds the frame from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(table + 8 * index)).write(take frame) }
+    write_entry(table, index, value: base | flags)
+} link
+
+/// The tables of the user window at entry 1 of a root, mapping the threads' code read-only at
+/// `USER_CODE`, a writable page at `USER_DATA` and the doorbell after it, and their address.
+fn user_window(mut frames: mem::List[hw::PhysFrame[4_096]], doorbell: hw::UserFrame) -> u64 {
+    let user_table = page_table(next_frame(mut frames))
+    let directory = page_table(next_frame(mut frames))
+    let pages = page_table(next_frame(mut frames))
+    write_entry(user_table, index: 0, value: directory | PRESENT | WRITABLE | USER)
+    write_entry(directory, index: 0, value: pages | PRESENT | WRITABLE | USER)
+    var code = next_frame(mut frames)
+    fill(mut code, at: 0, bytes: THREAD_A)
+    fill(mut code, at: 0x100, bytes: THREAD_B)
+    fill(mut code, at: 0x200, bytes: THREAD_C)
+    fill(mut code, at: 0x300, bytes: THREAD_D)
+    fill(mut code, at: 0x380, bytes: THREAD_E)
+    fill(mut code, at: 0x400, bytes: THREAD_F)
+    link(pages, index: 0, frame: take code, flags: PRESENT | USER)
+    link(pages, index: 1, frame: next_frame(mut frames), flags: PRESENT | WRITABLE | USER)
+    write_entry(pages, index: 2, value: doorbell.base() | PRESENT | WRITABLE | USER)
+    return user_table
+} user_window
+
+/// A root mapping the first 4 GiB at their physical addresses as the entry root does, and the
+/// user window at `window`.
+fn build_root(mut frames: mem::List[hw::PhysFrame[4_096]], window: u64) -> hw::PageTableRoot {
+    var root = empty_root(mut frames)
+    let kernel = page_table(next_frame(mut frames))
+    for gigabyte in 0u64..<4 {
+        let directory = page_table(next_frame(mut frames))
+        var flags = PRESENT | WRITABLE | LARGE
+        if gigabyte == 3 {
+            flags = flags | UNCACHED
+        }
+        for index in 0u64..<512 {
+            write_entry(directory, index, value: ((gigabyte << 30) + (index << 21)) | flags)
+        }
+        write_entry(kernel, index: gigabyte, value: directory | PRESENT | WRITABLE)
+    }
+    set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 0)), value: kernel | PRESENT | WRITABLE)
+    set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 8)), value: window | PRESENT | WRITABLE | USER)
+    return hw::PageTableRoot.of(take root)
+} build_root
+
+/// A user root mapping the 2 MiB pages holding the entry area as `build_root` maps them, and the
+/// user window at `window`.
+fn build_split(mut frames: mem::List[hw::PhysFrame[4_096]], area: hw::EntryArea, window: u64) -> hw::PageTableRoot {
+    var root = empty_root(mut frames)
+    let kernel = page_table(next_frame(mut frames))
+    let directory = page_table(next_frame(mut frames))
+    var page = area.base >> 21
+    while page <= ((area.base + area.len - 1) >> 21) {
+        write_entry(directory, index: page, value: (page << 21) | PRESENT | WRITABLE | LARGE)
+        page += 1
+    }
+    write_entry(kernel, index: 0, value: directory | PRESENT | WRITABLE)
+    set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 0)), value: kernel | PRESENT | WRITABLE)
+    set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 8)), value: window | PRESENT | WRITABLE | USER)
+    return hw::PageTableRoot.of(take root)
+} build_split
+
+/// An emptied frame for a root.
+fn empty_root(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::PhysFrame[4_096] {
+    var root = next_frame(mut frames)
+    for index in 0u64..<512 {
+        set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+    return root
+} empty_root
+
+/// An emptied frame as the doorbell, which user threads map.
+fn new_doorbell(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::UserFrame {
+    var frame = next_frame(mut frames)
+    for index in 0u64..<512 {
+        set_entry(mut frame.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+    return hw::UserFrame.of(take frame)
+} new_doorbell
+
+/// Installs `root` on the running CPU, giving up the root it replaces.
+fn install_root(take root: hw::PageTableRoot, cpu: hw::Ring0) {
+    let replaced = trusted "root maps the first 4 GiB, which hold the image, the memory it reserves and every frame and region, as the entry root does, and maps for user mode only the threads' pages, which no value owns" { cpu.write_cr3(take root) }
+    match replaced {
+        Some(previous) => {
+            discard page_table(take previous.into_frame())
+        }
+        None => {
+        }
+    }
+} install_root
+
+/// The state of a thread starting at `ip` with the stack pointer `sp`, every other register 0.
+fn start(ip: u64, sp: u64) -> hw::UserState {
+    return hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(sp), ip: Untrusted.of(ip), flags: Untrusted.of(0))
+} start
+
+/// Runs a thread until an exit other than an interrupt.
+fn run_until_exit(cpu: hw::Ring0, mut state: hw::UserState) -> hw::UserExit {
+    loop {
+        let exit = cpu.run_user(mut state)
+        if exit != hw::UserExit.Interrupted {
+            return exit
+        }
+    }
+} run_until_exit
+
+/// Names an exit other than the one a step expects, and gives whether it was a system call with
+/// `number` in `rax`.
+fn syscall_numbered(exit: hw::UserExit, state: hw::UserState, number: u64) -> bool {
+    match exit {
+        hw::UserExit.Syscall => {
+            if word(state.regs[0]) == number {
+                return true
+            }
+            say(text: "another system call\n")
+        }
+        hw::UserExit.Fault(_) => say(text: "an unexpected fault\n")
+        hw::UserExit.Interrupted => say(text: "an unexpected interrupt\n")
+    }
+    return false
+} syscall_numbered
+
+/// Runs thread A until its second system call, then thread B until its system call and until
+/// another task has run while it spins, then thread A until its fault, with the copies the system calls ask for, then
+/// thread C until its fault.
+fn run_threads(cpu: hw::Ring0, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var a = start(ip: USER_CODE, sp: USER_DATA + 0x1000)
+    var b = start(ip: USER_CODE + 0x100, sp: USER_DATA + 0x800)
+    if not syscall_numbered(exit: run_until_exit(cpu, state: mut a), state: a, number: 1) {
+        return
+    }
+    if word(a.regs[6]) == 7 {
+        say(text: "syscall 1 from 7\n")
+    }
+    match attempt hw::UserAddr[u64].of(USER_DATA).copy_out(cpu, value: 41) {
+        Ok(_) => {
+        }
+        Err(_) => say(text: "copy out failed\n")
+    }
+    if not syscall_numbered(exit: run_until_exit(cpu, state: mut a), state: a, number: 2) {
+        return
+    }
+    match attempt hw::UserAddr[u64].of(USER_DATA + 8).copy_in(cpu) {
+        Ok(copied) => {
+            if word(copied) == 42 {
+                say(text: "copied in 42\n")
+            }
+        }
+        Err(_) => say(text: "copy in failed\n")
+    }
+    if not syscall_numbered(exit: run_until_exit(cpu, state: mut b), state: b, number: 3) {
+        return
+    }
+    var text = Untrusted.of(Array[u8, 5].filled(0))
+    match attempt hw::UserAddr[u8].of(word(b.regs[6])).copy_in_bytes(cpu, into: mut text.view_mut()) {
+        Ok(_) => {
+        }
+        Err(_) => say(text: "byte copy failed\n")
+    }
+    if word(b.regs[5]) == 5 and text_is(text.view(), expected: "hello") {
+        say(text: "thread b says hello\n")
+    }
+    let ran = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    try await task::scope(exec, body: fn[mut b](s: task::Scope) {
+        let flag = ran.share()
+        discard s.spawn(fn[take flag]() limits stack 4_096 {
+            discard flag.contents().swap(1)
+        })
+        var interrupts: u32 = 0
+        while ran.contents().load() == 0 and interrupts < 1_000 and cpu.run_user(mut b) == hw::UserExit.Interrupted {
+            interrupts += 1
+        }
+    })
+    if ran.contents().load() == 1 {
+        say(text: "another task ran while thread b spun\n")
+    }
+    match run_until_exit(cpu, state: mut a) {
+        hw::UserExit.Fault(fault) => {
+            if fault.vector == 14 and fault.code == 4 and fault.address == UNMAPPED {
+                say(text: "thread a faulted on the unmapped page\n")
+            }
+        }
+        else => say(text: "thread a did not fault\n")
+    }
+    var c = start(ip: USER_CODE + 0x200, sp: USER_DATA + 0x400)
+    match run_until_exit(cpu, state: mut c) {
+        hw::UserExit.Fault(fault) => {
+            if fault.vector == 7 {
+                say(text: "thread c faulted on its vector register\n")
+            }
+        }
+        else => say(text: "thread c did not fault\n")
+    }
+} run_threads
+
+/// Copies refused for a read-only page and an address outside user memory, and an entry refused
+/// for an instruction pointer outside the canonical lower half.
+fn refusals(cpu: hw::Ring0) {
+    if attempt hw::UserAddr[u64].of(USER_CODE).copy_out(cpu, value: 0) == Err(hw::UserAddrError.Unmapped) {
+        say(text: "read-only page refused\n")
+    }
+    match attempt hw::UserAddr[u64].of(0x7FFF_FFFF_FFFC).copy_in(cpu) {
+        Err(hw::UserAddrError.OutsideUser) => say(text: "address outside user memory refused\n")
+        else => {
+        }
+    }
+    var wild = start(ip: 0x8000_0000_0000, sp: USER_DATA + 0x1000)
+    if run_until_exit(cpu, state: mut wild) == hw::UserExit.Fault(hw::UserFault(vector: 13, code: 0, address: 0)) {
+        say(text: "non-canonical entry refused\n")
+    }
+} refusals
+
+/// Thread D under the time-stamp disable, thread E with the doorbell, and thread F probing kernel
+/// memory under the root and under the user root, which maps none outside the entry area, then
+/// thread B under the user root until its system call and an interrupt.
+fn isolation(cpu: hw::Ring0, doorbell: hw::UserFrame, split: hw::PageTableRoot) {
+    if cpu.enable_protection(hw::Protection.Tsd) {
+        var d = start(ip: USER_CODE + 0x300, sp: USER_DATA + 0x400)
+        if run_until_exit(cpu, state: mut d) == hw::UserExit.Fault(hw::UserFault(vector: 13, code: 0, address: 0)) {
+            say(text: "thread d refused the time-stamp counter\n")
+        }
+    }
+    discard doorbell.fetch_or(hw::Offset[u64](bytes: 0), bits: 8)
+    var e = start(ip: USER_CODE + 0x380, sp: USER_DATA + 0x400)
+    if syscall_numbered(exit: run_until_exit(cpu, state: mut e), state: e, number: 4) and word(e.regs[6]) == 8 and word(doorbell.load(hw::Offset[u64](bytes: 8))) == 0x55 {
+        say(text: "thread e rang the doorbell\n")
+    }
+    var f = start(ip: USER_CODE + 0x400, sp: USER_DATA + 0x400)
+    f.regs[6] = Untrusted.of(KERNEL_PROBE)
+    var under_split = f
+    let shared = run_until_exit(cpu, state: mut f)
+    let split_exit = trusted "the user root maps the entry area as the root does and the user window alone, and no translation is cached under its PCID" { cpu.run_user_split(mut under_split, root: split) }
+    if shared == hw::UserExit.Fault(hw::UserFault(vector: 14, code: 5, address: KERNEL_PROBE)) and split_exit == hw::UserExit.Fault(hw::UserFault(vector: 14, code: 4, address: KERNEL_PROBE)) {
+        say(text: "the user root leaves kernel memory unmapped\n")
+    }
+    var b = start(ip: USER_CODE + 0x100, sp: USER_DATA + 0x800)
+    var called = hw::UserExit.Interrupted
+    while called == hw::UserExit.Interrupted {
+        called = trusted "as for thread F" { cpu.run_user_split(mut b, root: split) }
+    }
+    let interrupted = trusted "as for thread F" { cpu.run_user_split(mut b, root: split) }
+    if called == hw::UserExit.Syscall and interrupted == hw::UserExit.Interrupted {
+        say(text: "thread b ran under the user root until interrupted\n")
+    }
+} isolation
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let Some(cpu) = mut k.ring0() else {
+        say(text: "ring0 missing\n")
+        loop {
+        }
+    }
+    var regions = mut k.regions()
+    var frames = mem::List[hw::PhysFrame[4_096]].empty(k.alloc())
+    match mut regions.pop() {
+        Some(region) => take region.frames(mut frames)
+        None => say(text: "no usable memory\n")
+    }
+    let doorbell = new_doorbell(mut frames)
+    let window = user_window(mut frames, doorbell)
+    let root = build_root(mut frames, window)
+    let split = build_split(mut frames, area: cpu.entry_area(), window)
+    let alloc = k.alloc()
+    mut k.policy(OneCpu())
+    take k.anchor(take frames, run: fn[take cpu, take root, take doorbell, take split](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        install_root(take root, cpu)
+        if cpu.enable_protection(hw::Protection.Smep) and cpu.enable_protection(hw::Protection.Smap) {
+            say(text: "smep and smap\n")
+        }
+        discard cpu.enable_protection(hw::Protection.Pcid)
+        discard attempt await run_threads(cpu, exec, alloc)
+        refusals(cpu)
+        isolation(cpu, doorbell, split)
+        discard trusted "the read faults, nothing mapping the address" { hw::Ptr[u64].of_addr(usize.widen(UNMAPPED)).read() }
+        loop {
+        }
+    })
+} main

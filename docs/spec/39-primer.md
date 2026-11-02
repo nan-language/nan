@@ -632,7 +632,7 @@ pub fn read_counted(take conn: sys::net::Conn, links: task::Cown[Links], clock: 
 ### Interrupt functions
 
 - An [interrupt fn](24-kernel.md#interrupt-functions) receives `take irq: hw::IrqContext`, or `mut frame: hw::TrapFrame[V]` for an exception vector, plus its device by `mut` when one is installed. It returns `hw::IrqExit.Resume` or `hw::IrqExit.Reschedule`.
-- An interrupt fn implies `limits notrap, terminates, noalloc`, never waits, and states `limits stack N`. User exceptions and syscalls reach landing fns, which switch to thread context.
+- An interrupt fn implies `limits notrap, terminates, noalloc`, never waits, and states `limits stack N`. A kernel task runs user code through `hw::Ring0.run_user`, which returns at its next system call, exception or interrupt.
 - An interrupt fn without a device is bound by a `contribute hw::vectors` entry. One that takes its device is bound only by `hw::IrqShared.install(take dev, vector: v, on_irq: T.on_irq)` (`allow device`), which returns the linear `hw::IrqShared[T]`; `take shared.uninstall()` unbinds it once in-flight handlers finish and returns the device.
 
 ### Signals and locks

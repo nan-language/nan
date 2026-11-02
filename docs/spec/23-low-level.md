@@ -1,6 +1,6 @@
 # Low-level programming
 
-This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and `UserAddr.copy_in`, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, I/O domains, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
+This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and the copies between user and kernel memory, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, I/O domains, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
 
 ## Trusted code
 
@@ -161,6 +161,12 @@ pub fn UserAddr.value(self) -> u64 limits pure, notrap, terminates
 
 pub fn UserAddr.copy_in(self, cpu: Ring0) -> Untrusted[T] fails UserAddrError
 
+pub fn UserAddr.copy_out(self, cpu: Ring0, value: T) fails UserAddrError
+
+pub fn UserAddr.copy_in_bytes(self, cpu: Ring0, mut into: Untrusted[SliceMut[u8]]) fails UserAddrError
+
+pub fn UserAddr.copy_out_bytes(self, cpu: Ring0, bytes: Slice[u8]) fails UserAddrError
+
 pub closed enum UserAddrError derives Copy, Eq, Render {
     OutsideUser
     Unmapped
@@ -169,9 +175,10 @@ pub closed enum UserAddrError derives Copy, Eq, Render {
 
 - `hw::UserAddr[T]` holds one `u64`, the address of a `T` in the user address space of the page-table root the running CPU uses.
 - The T of `hw::UserAddr[T]` has a [fixed layout](21-interpreter.md#interpreter-memory); another T is an error (`hw.layout-unfixed`), reported where the type is written.
-- `addr.copy_in(cpu)` copies the bytes of a `T` from user memory in one fetch: it reads each byte exactly once and returns the copy as [Untrusted](15-untrusted.md#untrusted-values).
-- It fails with `UserAddrError.OutsideUser` when the range from the address to the address plus the size of `T` does not lie below `0x0000_8000_0000_0000` on x86_64 and `0x0001_0000_0000_0000` on AArch64, and with `UserAddrError.Unmapped` when a page of the range is not mapped readable for user mode. Neither case traps.
-- `copy_in` needs no manifest grant: holding `hw::Ring0` is its authority. It terminates, allocates nothing and has the sync fact ([digests](10-effects-digests.md#digests)).
+- `addr.copy_in(cpu)` copies the bytes of a `T` from user memory in one fetch: it reads each byte exactly once and returns the copy as [Untrusted](15-untrusted.md#untrusted-values). `addr.copy_out(cpu, value)` writes the bytes of `value` to user memory, each exactly once.
+- `addr.copy_in_bytes(cpu, into)` copies into `into` as many bytes as it holds from user memory from the address, whatever `T` is, and `addr.copy_out_bytes(cpu, bytes)` copies `bytes` there, each byte exactly once.
+- A copy fails with `UserAddrError.OutsideUser` when the range from the address to the address plus the bytes it copies does not lie below `0x0000_8000_0000_0000` on x86_64 and `0x0001_0000_0000_0000` on AArch64, and with `UserAddrError.Unmapped` when a page of the range is not mapped for user mode, readable for a copy from user memory and writable for one to it. A failing copy copies nothing and does not trap.
+- The copies need no manifest grant: holding `hw::Ring0` is their authority. Each runs with maskable interrupts disabled, terminates, allocates nothing and has the sync fact ([digests](10-effects-digests.md#digests)).
 
 ```nan
 // file: kernel/package.nan
@@ -194,6 +201,10 @@ pub layout Request: bytes 16 le {
 pub fn fetch_request(addr: hw::UserAddr[Request], cpu: hw::Ring0) -> Untrusted[Request] fails hw::UserAddrError {
     return try addr.copy_in(cpu)
 } fetch_request
+
+pub fn reply(addr: hw::UserAddr[u64], value: u64, cpu: hw::Ring0) fails hw::UserAddrError {
+    try addr.copy_out(cpu, value)
+} reply
 ```
 
 ## Layouts
@@ -778,6 +789,12 @@ pub fn Ring0.signal_cpu(self, cpu: u32)
 
 pub fn Ring0.invalidate_everywhere(self, scope: TlbScope) fails task::Cancelled uses wait
 
+pub fn Ring0.run_user(self, mut state: UserState) -> UserExit
+
+pub fn Ring0.run_user_split(self, mut state: UserState, root: PageTableRoot) -> UserExit
+
+pub fn Ring0.entry_area(self) -> EntryArea
+
 pub closed enum TlbScope derives Copy, Eq {
     Page(VirtAddr)
     All
@@ -787,6 +804,7 @@ pub closed enum TlbScope derives Copy, Eq {
 - `invalidate_page` removes the running CPU's cached translations of the page holding `page` under its current PCID or ASID, and `invalidate_all` every cached translation of the running CPU, global ones and those of every PCID or ASID included.
 - `wait_for_interrupt` halts the running CPU until an interrupt arrives, enabling maskable interrupts while it halts ([interrupt state](24-kernel.md#interrupt-state)). It returns at once inside an interrupt fn and before the [anchor](24-kernel.md#anchor) is installed.
 - `signal_cpu` and `invalidate_everywhere` are the **cross-CPU intrinsics**, which [cross-CPU operations](24-kernel.md#cross-cpu-operations) defines.
+- `run_user` runs user code until its next system call, exception or interrupt ([user mode](24-kernel.md#user-mode)), and `run_user_split` runs it under a user root, whose mappings `entry_area` bounds ([split tables](24-kernel.md#split-tables)).
 - Every privileged intrinsic has the priv fact, never allocates and never traps, and terminates unless its head states `uses wait`. An intrinsic removing cached translations may remove others too.
 
 The privileged intrinsics of `x86_64-uefi` and `x86_64-bare` are exactly those of every machine target and these.
@@ -848,6 +866,7 @@ pub closed enum Protection derives Copy, Eq {
     Smap
     Umip
     Pcid
+    Tsd
 } Protection
 
 pub open struct Idt {
@@ -858,7 +877,7 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 
 - `hw::Idt` is an interrupt descriptor table whose gate n is an interrupt gate of privilege level 0 entering the [machine seam](#machine-seams) of vector n with the `ist` of n's `hw::vectors` entry, or 0 without one. `Idt.of_vectors()` builds it.
 - `load_idt` loads the table into the running CPU's interrupt descriptor table register.
-- `write_cr3` makes `root` the running CPU's page-table root and returns `Some` of a `hw::PageTableRoot` owning the frame of the root it replaces, or `None` when it replaces the [entry root](24-kernel.md#physical-memory). It is a trusted primitive whose soundness condition is that `root` maps the running code, its stack and every live value at their current addresses, and keeps the image, the memory it reserves and every live frame and region mapped at their physical addresses, every live window `hw::Mmio.of_bar` gave mapped uncached at its address, and, in a kernel with a [load window](24-kernel.md#loading), its top-level entry 256 that of the entry root; that no other `hw::PageTableRoot` owns the frame of the replaced root; and that until a later `write_cr3` on that CPU returns `root`, no value that safe code reaches owns or views memory of a page table that `root` reaches, other than `root` itself.
+- `write_cr3` makes `root` the running CPU's page-table root and returns `Some` of a `hw::PageTableRoot` owning the frame of the root it replaces, or `None` when it replaces the [entry root](24-kernel.md#physical-memory). It is a trusted primitive whose soundness condition is that `root` maps the running code, its stack and every live value at their current addresses, and keeps the image, the memory it reserves and every live frame and region mapped at their physical addresses, every live window `hw::Mmio.of_bar` gave mapped uncached at its address, and, in a kernel with a [load window](24-kernel.md#loading), its top-level entry 256 that of the entry root; that no other `hw::PageTableRoot` owns the frame of the replaced root; and that until a later `write_cr3` on that CPU returns `root`, no value that safe code reaches owns or views memory of a page table that `root` reaches, other than `root` itself, and no page that `root` maps for user mode holds the image, memory the image reserves, a page table or memory that a value safe code reaches owns or views, other than that of an `hw::UserFrame` ([user frames](24-kernel.md#user-frames)).
 - `write_cr3_tagged` installs `root` as `write_cr3` does, as a later `write_cr3` or `write_cr3_tagged` returns it, but tags the translations the CPU caches from it with PCID `pcid`. It keeps the translations cached under other PCIDs, and those under `pcid` too when `keep` is true. While the CPU has PCIDs disabled it ignores `pcid` and `keep`. It is a trusted primitive whose soundness condition is that of `write_cr3`, and that each translation cached under `pcid` that it keeps maps as `root` does.
 - `invalidate_pcid_page` removes the running CPU's cached translations of the page holding `page` under `pcid`, and `invalidate_pcid` every one under `pcid`; while the CPU has PCIDs disabled, PCID 0 tags every translation.
 - `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact. The indirect branch prediction barrier is `write_msr(0x49, value: 1)`.
@@ -867,7 +886,7 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 - `monitor_wait` arms `monitor` on `word` and, when `word` still holds `seen`, waits in `mwait` with `hint` as its C-state hint until `word` may have changed, an interrupt arrives, or for no reason; maskable interrupts stay disabled and an arriving one ends the wait. It returns at once on a CPU whose `mwait` cannot end on an interrupt while they are disabled.
 - `read_xcr0` gives `XCR0`, or 0 while the CPU has XSAVE disabled. `write_xcr0` writes `value` to `XCR0` and returns true, or changes nothing and returns false while the CPU has XSAVE disabled or when `xsetbv` would refuse `value`: it enables a state component the CPU lacks, leaves x87 state disabled, enables AVX state without SSE state, enables the three AVX-512 components other than all together or without AVX state, or enables one of the two MPX components or of the two AMX components without the other.
 - `hardware_random` gives a value of `rdrand` and `hardware_seed` one of `rdseed`, trying up to 10 times, or `None` when the CPU lacks the instruction or every try fails.
-- `enable_protection` enables `feature` on the running CPU and returns true, or returns false when the CPU lacks it. `Smep` keeps the CPU from executing pages mapped for user mode, `Smap` from accessing them other than through `UserAddr.copy_in`, `Umip` keeps user mode from reading descriptor-table registers, and `Pcid` enables the PCIDs that `write_cr3_tagged` tags. No intrinsic disables one again.
+- `enable_protection` enables `feature` on the running CPU and returns true, or returns false when the CPU lacks it. `Smep` keeps the CPU from executing pages mapped for user mode, `Smap` from accessing them other than through the copies of `hw::UserAddr`, `Umip` keeps user mode from reading descriptor-table registers, `Pcid` enables the PCIDs that `write_cr3_tagged` tags, and `Tsd` keeps user mode from reading the time-stamp counter. No intrinsic disables one again.
 - `clear_cpu_buffers` overwrites the CPU buffers that microarchitectural data sampling reads, through `verw`.
 
 The privileged intrinsics of `aarch64-uefi` and `aarch64-bare` are exactly those of every machine target and these.
@@ -1073,15 +1092,16 @@ A **machine seam** is a compiler-generated stub at a fixed hardware entry, calli
 | Seam | Targets | Entered by | Calls |
 | --- | --- | --- | --- |
 | program entry | every concrete target | the platform starting the image | the descriptor's entry landing fn, then the [entry function](27-program-model.md#entry) with the root grant it returns |
-| vector n, n from 0 to 255 | the machine targets | on x86_64, an interrupt or exception through gate n; on AArch64, an exception of vector n's kind, or interrupt n of the interrupt controller | the [interrupt fn](24-kernel.md#interrupt-functions) or landing fn bound to n |
-| syscall | the bare targets | the `syscall` instruction on x86_64 and the `svc` instruction on AArch64, in user mode | the landing fn of `hw::syscall_entry` |
+| vector n, n from 0 to 255 | the machine targets | on x86_64, an interrupt or exception through gate n; on AArch64, an exception of vector n's kind, or interrupt n of the interrupt controller | the [interrupt fn](24-kernel.md#interrupt-functions) bound to n |
+| syscall | the machine targets | the `syscall` instruction on x86_64 and the `svc` instruction on AArch64, in user mode | none |
 
-- [Platform registries](25-registries.md#platform-registries) and the installs of `hw::IrqShared` ([locks](24-kernel.md#locks)) bind the vector and syscall seams. [Interrupt functions](24-kernel.md#interrupt-functions) and [kernel halts](24-kernel.md#kernel-halts) state what a vector seam without a binding does, and platform registries what the syscall seam does without one.
+- [Platform registries](25-registries.md#platform-registries) and the installs of `hw::IrqShared` ([locks](24-kernel.md#locks)) bind the vector seams. [Interrupt functions](24-kernel.md#interrupt-functions) and [kernel halts](24-kernel.md#kernel-halts) state what a vector seam without a binding does.
+- The syscall seam, and a vector seam entered from user mode, first end the `hw::Ring0.run_user` call running the user code ([user mode](24-kernel.md#user-mode)).
 - A seam saves the interrupted state, switches to its context's stack, passes its function the arguments that function's kind receives, and restores the state that function's result selects. [Kernel execution model](24-kernel.md) fixes the saved state and stacks.
 
 ### Compiler stubs
 
-A **compiler stub** is machine code that the implementation emits from its descriptor's fixed list: the machine seams, and one **out-of-line stub** for each privileged intrinsic, `hw::UserAddr.copy_in`, each volatile access kind and width (memory-mapped reads and writes of 1, 2, 4 and 8 bytes; on x86_64, port reads and writes of 1, 2 and 4 bytes), each width of a DMA access call and `hw::dma_fence`.
+A **compiler stub** is machine code that the implementation emits from its descriptor's fixed list: the machine seams, and one **out-of-line stub** for each privileged intrinsic, each copy of `hw::UserAddr`, each volatile access kind and width (memory-mapped reads and writes of 1, 2, 4 and 8 bytes; on x86_64, port reads and writes of 1, 2 and 4 bytes), each width of a DMA access call and `hw::dma_fence`.
 
 - Lowering performs each of these operations as a call of its out-of-line stub, never inlined. No memory access moves across that call.
 - The list of a descriptor changes only with the [language version](37-evolution.md#language-versions). The machine code of an image is exactly its lowered code, its compiler stubs and its [support routines](27-program-model.md#runtime-support).
@@ -1099,7 +1119,7 @@ A **landing fn** is a function with the `landing` modifier, entered from a machi
 
 ```nan
 // file: kernel/package.nan
-//! System call entry for a bare kernel.
+//! Raw entry for a bare kernel.
 
 package kernel {
     language 1
@@ -1109,23 +1129,23 @@ package kernel {
 } kernel
 
 // file: kernel/kernel.nan
-//! Decodes system call numbers.
+//! Decodes raw words.
 
-validator fn call_word(raw: Untrusted[u64]) -> u64 {
+validator fn raw_word(raw: Untrusted[u64]) -> u64 {
     return raw.inspect()
-} call_word
+} raw_word
 
-pub landing fn enter_syscall(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 limits stack 4_096 {
-    if call_word(number) == 0 {
-        return call_word(args[0])
+pub landing fn enter_raw(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 limits stack 4_096 {
+    if raw_word(number) == 0 {
+        return raw_word(args[0])
     }
     return 0
-} enter_syscall
+} enter_raw
 ```
 
 ```nan
 // file: kernel/package.nan
-//! System call entry for a bare kernel.
+//! Raw entry for a bare kernel.
 
 package kernel {
     language 1
@@ -1135,21 +1155,21 @@ package kernel {
 } kernel
 
 // file: kernel/kernel.nan
-//! Decodes system call numbers.
+//! Decodes raw words.
 
-validator fn call_word(raw: Untrusted[u64]) -> u64 {
+validator fn raw_word(raw: Untrusted[u64]) -> u64 {
     return raw.inspect()
-} call_word
+} raw_word
 
-pub landing fn enter_syscall(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 limits stack 4_096 {
-    if call_word(number) == 0 {
-        return call_word(args[0])
+pub landing fn enter_raw(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 limits stack 4_096 {
+    if raw_word(number) == 0 {
+        return raw_word(args[0])
     }
     return 0
-} enter_syscall
+} enter_raw
 
 pub fn echo(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 {
-    return enter_syscall(number, args) // error: hw.landing-called
+    return enter_raw(number, args) // error: hw.landing-called
 } echo
 ```
 

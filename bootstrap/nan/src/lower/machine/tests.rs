@@ -1,7 +1,11 @@
 use super::aarch64::{self, VBAR_SEAM};
 use super::handoff::PVH_TRAMPOLINE;
-use super::interrupts::{RESERVED, SEAM_COMMON, SEAM_DISPATCH, SEAM_PREEMPT, SEAM_STAY};
+use super::interrupts::{
+    CHECK, CHECKS_AT, COMMON_AT, RESERVED, SEAM_CHECKS, SEAM_COMMON, SEAM_DISPATCH, SEAM_PREEMPT,
+    SEAM_STAY, USER_AT,
+};
 use super::stubs::Stub;
+use super::user;
 use super::{
     AARCH64_BARE_SEAM, AARCH64_SEAM_BOOT, AARCH64_SEAM_RELOCATIONS, AARCH64_SEAM_ROOT,
     AARCH64_SEAM_STACK, AARCH64_SECONDARY_SEAM,
@@ -62,6 +66,62 @@ fn x64_seam_saves_registers_alone_and_calls_where_relocated() {
     }
 }
 
+/// The target of the x86-64 jump whose 32-bit displacement lies at `at` in code placed at `base`.
+fn x64_target(code: &[u8], base: u32, at: u32) -> u32 {
+    let displacement = &code[at as usize..at as usize + 4];
+    let displacement = i32::from_le_bytes(displacement.try_into().expect("four bytes"));
+    (base + at + 4).wrapping_add_signed(displacement)
+}
+
+#[test]
+fn x64_user_path_meets_the_vector_seam() {
+    for jump in [7, 0x14] {
+        assert_eq!(
+            x64_target(SEAM_CHECKS, CHECKS_AT, jump),
+            USER_AT + user::X64_VECTOR,
+            "the check's jump at {jump:#x} reaches the user path's entry for vectors"
+        );
+    }
+    let stay = CHECKS_AT + CHECK + u32::from(SEAM_CHECKS[CHECK as usize - 1]);
+    assert_eq!(stay, COMMON_AT + SEAM_STAY, "the first check's short jump");
+    assert_eq!(
+        x64_target(user::X64_USER, USER_AT, user::X64_COMMON_JUMP),
+        COMMON_AT,
+        "the user path's interrupts enter the common seam"
+    );
+    assert!(!saves_extended_state(user::X64_USER));
+}
+
+/// The target of the AArch64 `b` or `bl` at `at`.
+fn a64_branch_target(word: u32, at: usize) -> usize {
+    let words = ((word << 6) as i32) >> 6;
+    at.wrapping_add_signed(words as isize * 4)
+}
+
+#[test]
+fn aarch64_user_path_meets_the_vector_table() {
+    let table = words(VBAR_SEAM);
+    for kind in 0..4 {
+        let at = 0x408 + 0x80 * kind;
+        assert_eq!(
+            a64_branch_target(table[at / 4], at),
+            aarch64::USER_AT as usize + user::AARCH64_ENTRY as usize,
+            "the EL0 entry of kind {kind} branches to the user path"
+        );
+    }
+    let path = words(user::AARCH64_USER);
+    for (from, to) in user::AARCH64_KERNEL_ENTRIES {
+        let at = aarch64::USER_AT as usize + from as usize;
+        assert_eq!(a64_branch_target(path[from as usize / 4], at), to as usize);
+    }
+    for word in &path {
+        assert!(
+            !touches_floats(*word),
+            "{word:#010x} touches the floating-point registers"
+        );
+    }
+}
+
 #[test]
 fn aarch64_seam_frames_hold_the_general_state_alone() {
     let code = words(VBAR_SEAM);
@@ -69,8 +129,8 @@ fn aarch64_seam_frames_hold_the_general_state_alone() {
     let sub_sp = 0xD100_03FF | bytes << 10;
     let entries = code.iter().filter(|word| **word == sub_sp).count();
     assert_eq!(
-        entries, 12,
-        "each entry but those for AArch32 opens a frame of {bytes} bytes"
+        entries, 8,
+        "each entry for an exception taken at EL1 opens a frame of {bytes} bytes"
     );
     let pop = 0x9100_03FF | bytes << 10;
     assert!(code.contains(&pop), "the return pops the frame");

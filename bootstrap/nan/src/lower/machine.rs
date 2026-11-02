@@ -2,7 +2,7 @@
 //! cannot express, and the boot glue the seams call; its submodules hold the other compiler
 //! stubs, the ports the descriptors name, the CPUs, a kernel's clock and scheduling, interrupt
 //! delivery with the devices installed on it and the AArch64 ITS, the IOMMU's invalidations and
-//! interrupt remapping, and the CPU signal. Each seam and stub is fixed machine code the
+//! interrupt remapping, the CPU signal, and user mode. Each seam and stub is fixed machine code the
 //! implementation emits, with relocations the image writer resolves into the image's own
 //! addresses.
 
@@ -23,10 +23,12 @@ pub mod schedule;
 mod signal;
 pub mod start;
 mod stubs;
+mod user;
 
 pub use bindings::{device, msi};
 pub use interrupts::IDT_BYTES;
 pub use stubs::Stub;
+pub use user::{FAULT, SYSCALL};
 
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value};
@@ -75,7 +77,7 @@ pub const MAPPED: u64 = 1 << 32;
 
 /// The bits of a page-table entry: present, writable, a large page, and caching disabled.
 pub const PRESENT: u64 = 0x1;
-const WRITABLE: u64 = 0x2;
+pub const WRITABLE: u64 = 0x2;
 pub const LARGE: u64 = 0x80;
 const UNCACHED: u64 = 0x18;
 

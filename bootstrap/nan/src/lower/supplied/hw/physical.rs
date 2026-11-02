@@ -3,7 +3,9 @@
 //! memory's physical address, which the entry root maps at the same address, and a region its
 //! length too.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    AtomicRmwOp, InstBuilder, MemFlagsData, Value, condcodes::IntCC, types,
+};
 
 use super::super::super::Lowering;
 use super::super::super::body::Held;
@@ -170,6 +172,48 @@ pub fn page_table_root(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             word_result(lo, fx, supply, base);
         }
         member => panic!("no lowering of hw::PageTableRoot.{member}"),
+    }
+}
+
+/// `hw::UserFrame`, one word, the base of its frame: `of` and `into_frame` convert, and each
+/// access of a word of the frame is atomic, trapping when the word does not lie inside the frame
+/// or its offset is not a multiple of 8.
+pub fn user_frame(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let base = word(fx, supply.param(0));
+    let member = supply.member();
+    match member {
+        "of" | "into_frame" => return word_result(lo, fx, supply, base),
+        "base" => return supply.ret(lo, fx, Held::Scalar(base)),
+        _ => {}
+    }
+    let offset = word(fx, supply.param(1));
+    let beyond =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, 4_096 - 8);
+    let misaligned = fx.b.ins().band_imm_s(offset, 7);
+    let misaligned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, misaligned, 0);
+    let out = fx.b.ins().bor(beyond, misaligned);
+    fx.when(out, |fx| report::raise_kind(lo, fx, "trap.bounds"));
+    let address = fx.b.ins().iadd(base, offset);
+    let flags = MemFlagsData::trusted();
+    match member {
+        "load" => {
+            let value = fx.b.ins().atomic_load(types::I64, flags, address);
+            supply.ret(lo, fx, Held::Scalar(value));
+        }
+        "store" => {
+            let value = supply.param(2).scalar();
+            fx.b.ins().atomic_store(flags, value, address);
+            supply.done(lo, fx);
+        }
+        "fetch_or" => {
+            let bits = supply.param(2).scalar();
+            let value =
+                fx.b.ins()
+                    .atomic_rmw(types::I64, flags, AtomicRmwOp::Or, address, bits);
+            supply.ret(lo, fx, Held::Scalar(value));
+        }
+        member => panic!("no lowering of hw::UserFrame.{member}"),
     }
 }
 

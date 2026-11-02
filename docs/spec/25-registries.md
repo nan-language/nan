@@ -1,6 +1,6 @@
 # Registries
 
-This chapter defines registry items with their key and `unique` fields, contribution items, the judging root and the contributions it admits through `allow contribute`, function-typed entry fields, the tables a registry holds with their duplicate rules, reads and emission, loaded registries, whose tables grow as a kernel loads bundles, the platform registries `hw::vectors`, `hw::syscall_entry` and `hw::preempt`, and the `registry` diagnostic family.
+This chapter defines registry items with their key and `unique` fields, contribution items, the judging root and the contributions it admits through `allow contribute`, function-typed entry fields, the tables a registry holds with their duplicate rules, reads and emission, loaded registries, whose tables grow as a kernel loads bundles, the platform registries `hw::vectors` and `hw::preempt`, and the `registry` diagnostic family.
 
 ## Registries
 
@@ -407,7 +407,7 @@ pub loaded registry makers: Maker keyed by slot // error: registry.loaded-field
 
 ## Platform registries
 
-A **platform registry** is a std registry binding [compiler stubs](23-low-level.md#machine-seams) to handlers. The platform registries are exactly `hw::vectors`, `hw::syscall_entry` and `hw::preempt`:
+A **platform registry** is a std registry binding [compiler stubs](23-low-level.md#machine-seams) to handlers. The platform registries are exactly `hw::vectors` and `hw::preempt`:
 
 ```nan-api
 // module: hw
@@ -418,7 +418,6 @@ pub closed struct Vector {
     pub vector: u8
     pub ist: u8 where ist <= 7
     pub handler: VectorHandler
-    pub user: Option[fn(vector: u8, code: u64, address: u64)]
 } Vector
 
 pub closed enum VectorHandler {
@@ -428,13 +427,6 @@ pub closed enum VectorHandler {
     PageFault(interrupt fn(mut frame: TrapFrame[PageFault]) -> IrqExit)
 } VectorHandler
 
-pub registry syscall_entry: SyscallEntry keyed by slot
-
-pub closed struct SyscallEntry {
-    pub slot: Unit
-    pub handler: fn(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64
-} SyscallEntry
-
 pub registry preempt: PreemptEntry keyed by slot
 
 pub closed struct PreemptEntry {
@@ -443,16 +435,15 @@ pub closed struct PreemptEntry {
 } PreemptEntry
 ```
 
-- The **landing fields** are `hw::Vector.user`, `hw::SyscallEntry.handler` and `hw::PreemptEntry.handler`.
+- The **landing field** is `hw::PreemptEntry.handler`.
 - The target's [descriptor](27-program-model.md#descriptors) assigns each vector a class, one of the four `hw::VectorHandler` variant names or none, and lists the vectors that need a nonzero `ist` or that every vector takes `ist` 0.
-- These are errors (`registry.platform-entry`): an `hw::Vector` whose vector has no class or a class other than its handler's variant name, whose `ist` is 0 for a vector that needs a nonzero one or nonzero for a vector that takes 0, or whose `user` is not `None` for a vector of class `Irq`; a landing field holding a function that is not a [landing fn](23-low-level.md#landing-functions); and a contribution to `hw::preempt` outside a [platform package](28-stdlib.md#platform-packages).
-- A contribution to `hw::vectors` or `hw::preempt` under a declared target without vector seams, or to `hw::syscall_entry` under one without the syscall seam ([machine seams](23-low-level.md#machine-seams)), is an error (`registry.platform-target`).
+- These are errors (`registry.platform-entry`): an `hw::Vector` whose vector has no class or a class other than its handler's variant name, or whose `ist` is 0 for a vector that needs a nonzero one or nonzero for a vector that takes 0; a landing field holding a function that is not a [landing fn](23-low-level.md#landing-functions); and a contribution to `hw::preempt` outside a [platform package](28-stdlib.md#platform-packages).
+- A contribution to `hw::vectors` or `hw::preempt` under a declared target without vector seams ([machine seams](23-low-level.md#machine-seams)) is an error (`registry.platform-target`).
 
-The `hw::vectors` entry whose key field is a vector **binds** that vector, except that it binds an exception raised in user code only when its `user` is not `None`. The seams use the tables as follows:
+The `hw::vectors` entry whose key field is a vector **binds** that vector. The seams use the tables as follows:
 
 - On x86_64 the gate of each vector holds the entry's `ist` as its interrupt stack table index, 0 selecting none; on AArch64 every vector's seam runs on the CPU's interrupt stack of `ist` 0.
-- The seam of a bound vector calls the interrupt fn of `handler` ([interrupt functions](24-kernel.md#interrupt-functions)), that of `hw::SIGNAL_VECTOR` once the CPU has served its shootdowns ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), or, for an exception raised in user code, the landing fn of `user`, with the arguments [user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) gives. Interrupt functions fixes what the seam of an unbound vector does.
-- The syscall seam calls the `handler` of the `hw::syscall_entry` entry with the arguments user exceptions and syscalls gives. Without an entry, the image leaves the `syscall` instruction disabled on x86_64, and an `svc` instruction in user mode halts the kernel on AArch64.
+- The seam of a bound vector calls the interrupt fn of `handler` ([interrupt functions](24-kernel.md#interrupt-functions)), that of `hw::SIGNAL_VECTOR` once the CPU has served its shootdowns ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), except for an exception raised in user mode ([user mode](24-kernel.md#user-mode)). Interrupt functions fixes what the seam of an unbound vector does.
 - The vector seams call the `handler` of the `hw::preempt` entry, which the platform package contributes, where [preemption](24-kernel.md#preemption) has the interrupted thread yield.
 
 ```nan
@@ -472,7 +463,7 @@ interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_02
     return hw::IrqExit.Reschedule
 } on_timer
 
-contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None)
+contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer))
 ```
 
 ```nan
@@ -492,7 +483,7 @@ interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_02
     return hw::IrqExit.Reschedule
 } on_timer
 
-contribute hw::vectors timer = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None) // error: registry.platform-entry
+contribute hw::vectors timer = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.Irq(on_timer)) // error: registry.platform-entry
 ```
 
 ## Diagnostics

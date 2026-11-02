@@ -14,7 +14,7 @@ use super::ty::{Subst, Ty};
 use crate::diagnostic::{Code, Offer};
 use crate::interp::{ConstValue, FnVal, Interpreter, Val};
 use crate::syntax::ast::{self, ItemKind};
-use crate::workspace::{Arch, Authority, Kind};
+use crate::workspace::{Arch, Authority};
 
 /// The primitive capabilities through which code installs functions that outlive the call: the
 /// root grants and IRQ-safe locks, whose devices' interrupt functions run until uninstalled.
@@ -213,7 +213,7 @@ impl Checker<'_> {
             self.db.is_std(registry)
                 && matches!(
                     self.db.canonical(registry).as_str(),
-                    "hw::vectors" | "hw::syscall_entry" | "hw::preempt"
+                    "hw::vectors" | "hw::preempt"
                 )
         })
     }
@@ -247,7 +247,6 @@ impl Checker<'_> {
                 }
                 vectors
             }
-            "hw::syscall_entry" => self.db.target.kind() == Some(Kind::Bare),
             _ => true,
         };
         if !seams {
@@ -473,7 +472,8 @@ impl Checker<'_> {
     }
 
     /// The rules of a contribution to `hw::vectors` against the target's vector classes, and of
-    /// a landing field holding a function that is not a landing fn (`registry.platform-entry`).
+    /// an `hw::preempt` entry holding a function that is not a landing fn
+    /// (`registry.platform-entry`).
     pub fn check_platform_entry(&self, item: ItemId) {
         if !self.is_platform_contribution(item) {
             return;
@@ -497,18 +497,10 @@ impl Checker<'_> {
                     Val::Variant(_, index, _) => *index,
                     _ => return,
                 };
-                let user = &fields[3];
                 let class = vector_class(arch, vector);
-                let landing = match user {
-                    Val::Variant(_, 0, payload) => Some(&payload[0]),
-                    _ => None,
-                };
-                class != Some(handler)
-                    || !ist_allowed(arch, vector, fields[1].int())
-                    || landing.is_some() && class == Some(0)
-                    || landing.is_some_and(|function| !self.is_landing(function))
+                class != Some(handler) || !ist_allowed(arch, vector, fields[1].int())
             }
-            Some("hw::syscall_entry") => !self.is_landing(&fields[1]),
+            Some("hw::preempt") => !self.is_landing(&fields[1]),
             _ => false,
         };
         if broken {

@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; loading bundles into a running kernel; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks; user mode, which kernel tasks run user threads in, with split tables and user frames; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; loading bundles into a running kernel; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -57,7 +57,7 @@ pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 `take k.anchor(take state, run: f)` performs these steps and never returns:
 
 1. It moves `state` into storage the image reserves and installs it as the anchor, visible to every CPU from then on.
-2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, disabling the CPU's [extended state](#floating-point) and enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded, enables XSAVE with the x87, SSE and AVX state components where the CPU has AVX, and loads an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall` when the final build has an `hw::syscall_entry` entry ([platform registries](25-registries.md#platform-registries)), with the syscall seam as its target and the interrupt, direction and trap flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
+2. On each CPU, the boot CPU included, it installs the vector seams and starts the kernel executor, disabling the CPU's [extended state](#floating-point) and enabling maskable interrupts as that executor starts. On x86_64 it loads the CPU's tables where they are not loaded, enables XSAVE with the x87, SSE and AVX state components where the CPU has AVX, and loads an interrupt descriptor table equal to `hw::Idt.of_vectors()`, held in storage the image reserves, and enables `syscall`, with the syscall seam as its target and the trap, interrupt, direction, I/O privilege, nested task and alignment check flags cleared on entry. On AArch64 it makes the vector seams the CPU's exception vectors, which an exception enters on the CPU's interrupt stack, and enables the CPU's interface of the interrupt controller. Each other CPU starts in long mode on x86_64 and at EL1 on AArch64, on the [entry root](#physical-memory).
 3. It runs `f` as the first kernel task on that executor, whose value it passes as `exec`. The executor draws task stacks and records through `k.alloc()` ([executors](16-concurrency.md#executors)), and `f` is a [task closure](16-concurrency.md#task-closures), capturing by `take` and Copy only; the executor records `k.clock()` ([capability tables](14-authority.md#capability-tables)).
 4. When `f` returns or fails, the kernel halts ([kernel halts](#kernel-halts)).
 
@@ -109,7 +109,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     })
 } main
 
-contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None)
+contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer))
 ```
 
 ```nan
@@ -293,19 +293,132 @@ pub fn replay_spurious(take irq: hw::IrqContext) -> hw::IrqExit {
 } replay_spurious
 ```
 
-### User exceptions and syscalls
+## User mode
 
-An exception raised while the CPU runs in **user mode**, at privilege level 3 on x86_64 and at EL0 on AArch64, and the system call instruction, `syscall` on x86_64 and `svc` on AArch64, never reach an interrupt fn. Their seams call landing fns bound in [platform registries](25-registries.md#platform-registries): for an exception, the landing fn that `hw::vectors` binds for user-origin occurrences of its vector; for `syscall`, that of `hw::syscall_entry`.
+**User mode** is execution at privilege level 3 on x86_64 and at EL0 on AArch64, which reaches only the memory the running CPU's root maps for it ([privileged intrinsics](23-low-level.md#privileged-intrinsics)). A kernel task runs a **user thread**, user code in an `hw::UserState`, through `hw::Ring0.run_user`, which returns at the thread's next system call, exception or interrupt. The task then chooses which thread runs next: the same one, another one, or none.
 
-No operation of language 1 enters user mode, so these seams are never entered; the [reservation register](37-evolution.md#reservations) lists them.
+```nan-api
+// module: hw
 
-- The seam saves the user state on the kernel stack of the thread that ran the user code, enables maskable interrupts and calls the landing fn there, in thread context as part of that thread.
-- The landing fn of an `hw::Vector.user` field receives the vector; the error code the CPU pushed, or 0 when it pushed none, on x86_64 and the syndrome on AArch64; and the faulting address for a vector of class `PageFault` or 0 for other vectors.
-- The landing fn of the `hw::SyscallEntry.handler` field receives as `number` and `args`, each an `Untrusted[u64]` ([sources](15-untrusted.md#sources)), the user's `rax` and its `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` on x86_64, and its `x8` and its `x0` to `x5` on AArch64, in that order; its result replaces the user's `rax` on x86_64 and `x0` on AArch64.
-- When the landing fn returns, the seam restores the user state and resumes the user code.
-- A user-origin exception on a vector without such a landing fn halts the kernel.
+pub closed struct UserState derives Copy {
+    pub regs: Array[Untrusted[u64], 31]
+    pub sp: Untrusted[u64]
+    pub ip: Untrusted[u64]
+    pub flags: Untrusted[u64]
+} UserState
 
-The kernel stack of a thread that runs user code holds at least the largest stack use among these landing fns plus one [seam frame](27-program-model.md#descriptors).
+pub closed enum UserExit derives Copy, Eq {
+    Syscall
+    Fault(UserFault)
+    Interrupted
+} UserExit
+
+pub closed struct UserFault derives Copy, Eq {
+    pub vector: u8
+    pub code: u64
+    pub address: u64
+} UserFault
+```
+
+- `state.regs` holds the general registers: on x86_64 `rax`, `rcx`, `rdx`, `rbx`, `rbp`, `rsi`, `rdi` and `r8` to `r15` in its first 15 entries, the others unused, and on AArch64 `x0` to `x30`. `sp` is the stack pointer, `ip` the address of the next instruction, and `flags` the flags: `RFLAGS` on x86_64, and on AArch64 the condition flags at their `SPSR_EL1` positions. User code sets them, so they are [untrusted](15-untrusted.md#sources).
+- `cpu.run_user(mut state)` runs the thread on the running CPU, under its root, from `state`, with maskable interrupts enabled and of its flags only the arithmetic and direction flags on x86_64 and the condition flags on AArch64. At the thread's next exit it writes the thread's state into `state` and returns:
+    - `Syscall` for the system call instruction, `syscall` on x86_64 and `svc` on AArch64. `state.ip` addresses the instruction after it; on x86_64 `rcx` and `r11` hold what `syscall` leaves in them, that address and the flags.
+    - `Fault(f)` for an exception the thread raises: `f.vector` is its vector, `f.code` the error code the CPU pushed or 0 on x86_64 and the syndrome on AArch64, and `f.address` the faulting address for a vector of class `PageFault` and 0 for other vectors ([interrupt functions](#interrupt-functions)). On x86_64, vectors 2, 8 and 18 are interrupts for this rule, and an `ip` outside the canonical lower half gives `Fault` with vector 13 and code and address 0 without running the thread.
+    - `Interrupted` for an interrupt, once its seam has served it as one interrupting the calling task in the call, with the interrupt state the task called with, where the task may be [preempted](#preemption).
+- `run_user` returns `Interrupted` at once inside an interrupt fn and before the anchor is installed. It restores the caller's interrupt state as it returns.
+- A thread that owns no [extended state](#floating-point) runs with it disabled, so that its first floating-point or vector instruction raises an exception: vector 7 on x86_64, and on AArch64 vector 0 with a syndrome of class `0x07`. On x86_64 a thread runs at I/O privilege level 0 with the CPU tables' privilege-level-3 segments. The seams save a thread's state and serve its interrupts on the kernel stack of the task running it, and no register or flag of kernel code reaches the thread.
+
+```nan
+// file: kernel/package.nan
+//! User threads for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow priv in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Runs two user threads in turn until one faults, answering each system call with 0.
+
+pub fn run_pair(cpu: hw::Ring0, mut threads: Array[hw::UserState, 2]) -> hw::UserFault {
+    var next: usize = 0
+    loop {
+        match cpu.run_user(mut threads[next]) {
+            hw::UserExit.Syscall => {
+                threads[next].regs[0] = Untrusted.of(0)
+            }
+            hw::UserExit.Fault(fault) => return fault
+            hw::UserExit.Interrupted => {
+            }
+        }
+        next = 1 - next
+    }
+} run_pair
+```
+
+```nan
+// file: kernel/package.nan
+//! User threads for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+} kernel
+
+// file: kernel/kernel.nan
+//! Runs a user thread until it faults.
+
+pub fn run_thread(cpu: hw::Ring0, mut thread: hw::UserState) {
+    while cpu.run_user(mut thread) != hw::UserExit.Fault(hw::UserFault(vector: 6, code: 0, address: 0)) { // error: authority.ungranted
+    }
+} run_thread
+```
+
+### Split tables
+
+A **user root** is a page-table root under which `hw::Ring0.run_user_split` runs a thread, in place of the running root, which stays installed for kernel code. A CPU affected by Meltdown reads through the running root's supervisor mappings speculatively from user mode; under a user root that maps little beyond the thread's own pages it reads nothing more.
+
+```nan-api
+// module: hw
+
+pub closed struct EntryArea derives Copy, Eq {
+    pub base: u64
+    pub len: u64
+} EntryArea
+```
+
+- The **entry area** is the memory the seams use before they reinstall the running root: the image and the memory it reserves, which hold the vector seams and their user paths, the CPU records with each CPU's tables and entry stack, the interrupt descriptor table and the stacks of nonzero `ist`. `cpu.entry_area()` gives its first address as `base` and its length in bytes as `len`.
+- `cpu.run_user_split(mut state, root)` runs the thread as `run_user` does, but the user path installs `root` just before the thread runs and reinstalls the running root at the thread's exit before any other kernel code runs. On x86_64 with PCIDs enabled, translations the CPU caches from `root` are tagged with the running root's PCID with bit 11 flipped, and both roots keep their cached translations across the switches; on AArch64, with the running root's ASID with bit 7 flipped, and none are invalidated.
+- `run_user_split` is a trusted primitive whose soundness condition is that `root` maps the entry area at the addresses and with the attributes the running root maps it; that no page `root` maps for user mode holds what the soundness condition of `write_cr3` keeps out of such pages ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); and that each translation cached under the user root's tag maps as `root` does. `root` need map nothing else: unlike a root `write_cr3` installs, it need not map the frames, regions and windows of the kernel.
+- A translation that the running root marks global on x86_64, or does not mark non-global on AArch64, stays usable under the user root, so the running root keeps out of the user root's reach only what it maps non-globally.
+
+### User frames
+
+A **user frame** is an `hw::UserFrame`, a physical frame of 4 KiB that the kernel holds while user threads map it, such as a doorbell or a ring shared with them. User code may change its words at any time, so the kernel reads them as untrusted.
+
+```nan-api
+// module: hw
+
+pub open linear struct UserFrame {
+} UserFrame
+
+pub fn UserFrame.of(take frame: PhysFrame[4_096]) -> UserFrame
+
+pub fn UserFrame.base(self) -> u64 limits pure, notrap, terminates
+
+pub fn UserFrame.load(self, at: Offset[u64]) -> Untrusted[u64]
+
+pub fn UserFrame.store(self, at: Offset[u64], value: u64)
+
+pub fn UserFrame.fetch_or(self, at: Offset[u64], bits: u64) -> Untrusted[u64]
+
+pub fn UserFrame.into_frame(take self) -> PhysFrame[4_096]
+```
+
+- `hw::UserFrame.of(take frame)` makes `frame` a user frame, and `base()` gives its physical address.
+- `frame.load(at)` reads the word `at.bytes` bytes into the frame with acquire ordering, `frame.store(at, value)` writes it with release ordering, and `frame.fetch_or(at, bits)` sets `bits` in it with acquire and release ordering in one atomic step and gives the word it held. Each traps (`trap.bounds`) when `at.bytes` is not a multiple of 8 or the word does not lie inside the frame, and has the sync fact ([digests](10-effects-digests.md#digests)).
+- `take frame.into_frame()` gives the frame back. It is a trusted primitive whose soundness condition is that no root maps the frame for user mode and no CPU caches a translation of it for user mode.
 
 ## Interrupt state
 
@@ -675,7 +788,7 @@ pub interrupt fn on_signal(take irq: hw::IrqContext) -> hw::IrqExit limits stack
     return hw::IrqExit.Resume
 } on_signal
 
-contribute hw::vectors signal = hw::Vector(vector: hw::SIGNAL_VECTOR, ist: 0, handler: hw::VectorHandler.Irq(on_signal), user: None)
+contribute hw::vectors signal = hw::Vector(vector: hw::SIGNAL_VECTOR, ist: 0, handler: hw::VectorHandler.Irq(on_signal))
 
 pub fn unmap_everywhere(cpu: hw::Ring0, page: hw::VirtAddr) fails task::Cancelled uses wait {
     try await cpu.invalidate_everywhere(hw::TlbScope.Page(page))
@@ -684,7 +797,7 @@ pub fn unmap_everywhere(cpu: hw::Ring0, page: hw::VirtAddr) fails task::Cancelle
 
 ## Scheduling
 
-**Thread context** is kernel execution in a schedulable thread: every kernel task, and the landing fns of user-origin seams. Each kernel task runs as one **thread**, whose stack and saved registers the kernel executor owns. The boot context and interrupt fns are not thread context. A CPU **idles** while it finds no task to run.
+**Thread context** is kernel execution in a schedulable thread: every kernel task. Each kernel task runs as one **thread**, whose stack and saved registers the kernel executor owns. The boot context and interrupt fns are not thread context. A CPU **idles** while it finds no task to run.
 
 ```nan-api
 // module: hw
@@ -1398,13 +1511,13 @@ halt first-task-ended at kernel/kernel.nan:24 in kernel::main
 
 ## Kernel types
 
-The types of this table are [base types](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]`, `boot::Services` and `sys::load::Loader`.
+The types of this table are [base types](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]`, `boot::Services` and `sys::load::Loader`.
 
 | Type | linear | view | Copy | Send | Inert | AnyBits |
 | --- | --- | --- | --- | --- | --- | --- |
 | `hw::IrqContext` | yes | no | no | no | no | no |
 | `hw::TrapFrame[V]` | no | no | no | no | no | no |
-| `hw::Region`, `hw::PhysFrame[S]`, `hw::IrqShared[T]` | yes | no | no | yes | no | no |
+| `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]` | yes | no | no | yes | no | no |
 | `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]`, `sys::load::Loader` | no | no | no | yes | no | no |
 | `boot::Services` | no | yes | no | no | no | no |
 | `hw::Anchor[S]` | no | no | no | no | no | no |

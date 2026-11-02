@@ -204,7 +204,11 @@ impl Lowering<'_, '_> {
                 let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
                 let given = self.sig_given(&sig);
                 let mut abi = self.head_abi(&sig.fn_ty(), &subst, given);
-                if self.ck.reads_in_place(*item) {
+                // A projection's scalar receiver is passed as the place holding it, which its
+                // part lies in.
+                let scalar_receiver =
+                    matches!(abi.params.first(), Some((NTy::Owned(_), Repr::Scalar(_))));
+                if self.ck.reads_in_place(*item) || given.is_some() && scalar_receiver {
                     let read = abi.params[0].0.ty().clone();
                     abi.params[0] = (NTy::Ref(read), Repr::Address);
                 }

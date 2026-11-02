@@ -148,7 +148,7 @@ interrupt fn on_key(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 
     return hw::IrqExit.Resume
 } on_key
 
-contribute hw::vectors keyboard = hw::Vector(vector: 0x21, ist: 0, handler: hw::VectorHandler.Irq(on_key), user: None)
+contribute hw::vectors keyboard = hw::Vector(vector: 0x21, ist: 0, handler: hw::VectorHandler.Irq(on_key))
 ```
 
 ```nan
@@ -167,7 +167,7 @@ interrupt fn on_double_fault(mut frame: hw::TrapFrame[hw::ErrorCode]) -> hw::Irq
     return hw::IrqExit.Resume
 } on_double_fault
 
-contribute hw::vectors double_fault = hw::Vector(vector: 8, ist: 0, handler: hw::VectorHandler.TrapWithCode(on_double_fault), user: None) // error: registry.platform-entry
+contribute hw::vectors double_fault = hw::Vector(vector: 8, ist: 0, handler: hw::VectorHandler.TrapWithCode(on_double_fault)) // error: registry.platform-entry
 ```
 
 ```nan
@@ -186,7 +186,7 @@ interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit li
     return hw::IrqExit.Resume
 } on_abort
 
-contribute hw::vectors abort = hw::Vector(vector: 1, ist: 0, handler: hw::VectorHandler.PageFault(on_abort), user: None)
+contribute hw::vectors abort = hw::Vector(vector: 1, ist: 0, handler: hw::VectorHandler.PageFault(on_abort))
 ```
 
 ```nan
@@ -205,7 +205,7 @@ interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit li
     return hw::IrqExit.Resume
 } on_abort
 
-contribute hw::vectors abort = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.PageFault(on_abort), user: None) // error: registry.platform-entry
+contribute hw::vectors abort = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.PageFault(on_abort)) // error: registry.platform-entry
 ```
 
 ```nan
@@ -224,7 +224,7 @@ interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit li
     return hw::IrqExit.Resume
 } on_abort
 
-contribute hw::vectors abort = hw::Vector(vector: 1, ist: 1, handler: hw::VectorHandler.PageFault(on_abort), user: None) // error: registry.platform-entry
+contribute hw::vectors abort = hw::Vector(vector: 1, ist: 1, handler: hw::VectorHandler.PageFault(on_abort)) // error: registry.platform-entry
 ```
 
 ### Environments

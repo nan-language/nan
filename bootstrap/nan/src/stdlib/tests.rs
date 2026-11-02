@@ -21,7 +21,7 @@ fn std_checks_without_diagnostics() {
 }
 
 /// The types of the values only machine targets give.
-const MACHINE_VALUES: [&str; 16] = [
+const MACHINE_VALUES: [&str; 17] = [
     "boot::Machine",
     "boot::Kernel",
     "boot::Services",
@@ -35,6 +35,7 @@ const MACHINE_VALUES: [&str; 16] = [
     "hw::PciFunction",
     "hw::Region",
     "hw::PhysFrame",
+    "hw::UserFrame",
     "hw::PageTableRoot",
     "hw::IrqContext",
     "hw::TrapFrame",

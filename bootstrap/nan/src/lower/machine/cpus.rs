@@ -39,7 +39,11 @@ const PSCI_CPU_ON: u64 = 0xC400_0003;
 /// interrupt their `hw::IrqContext.complete` would make; its queue of ready tasks, the lock of
 /// that queue and the key of its first task; the key of the task it runs, zero for none, and the
 /// nanosecond that task's slice ends, zero for none; whether it idles; whether it runs a hook
-/// of the kernel's policy; and on AArch64, the base of its GICv3 redistributor's frames.
+/// of the kernel's policy; on AArch64, the base of its GICv3 redistributor's frames; and while
+/// `hw::Ring0.run_user` runs user code, the stack pointer it keeps, its `hw::UserState`, on
+/// x86_64 the user stack pointer of a system call, and the root to reinstall at an exit from a
+/// user root, zero for none; on x86_64, the top of its entry stack, which takes up the rest of
+/// the record.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -66,7 +70,12 @@ pub mod cpu {
     pub const IDLE: u64 = 328;
     pub const HOOK: u64 = 336;
     pub const REDISTRIBUTOR: u64 = 344;
-    pub const SIZE: u64 = 384;
+    pub const USER_SP: u64 = 352;
+    pub const USER_STATE: u64 = 360;
+    pub const USER_SCRATCH: u64 = 368;
+    pub const KERNEL_ROOT: u64 = 376;
+    pub const ENTRY_TOP: u64 = 384;
+    pub const SIZE: u64 = 512;
 }
 
 /// The model-specific register holding the GS base.

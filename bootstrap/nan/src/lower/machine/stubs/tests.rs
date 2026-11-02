@@ -184,7 +184,7 @@ fn x64_stubs_test_the_features_cpu_features_records() {
         assert!(sets(u32::from(mask)), "CpuFeatures records {mask:#x}");
     }
     let protection = bytes(Stub::EnableProtection);
-    let table = &protection[protection.len() - 32..];
+    let table = &protection[protection.len() - 40..];
     let entries: Vec<(u32, u32)> = table
         .chunks(8)
         .map(|entry| {
@@ -192,9 +192,9 @@ fn x64_stubs_test_the_features_cpu_features_records() {
             (word(0), word(4))
         })
         .collect();
-    let cr4 = [1 << 20, 1 << 21, 1 << 11, 1 << 17];
+    let cr4 = [1 << 20, 1 << 21, 1 << 11, 1 << 17, 1 << 2];
     for (index, (mask, bit)) in entries.into_iter().enumerate() {
-        assert!(sets(mask), "CpuFeatures records {mask:#x}");
+        assert!(mask == 0 || sets(mask), "CpuFeatures records {mask:#x}");
         assert_eq!(bit, cr4[index], "variant {index} sets its CR4 bit");
     }
 }

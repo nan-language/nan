@@ -51,7 +51,7 @@ Every std operation that delivers data from outside the program delivers it in a
 
 - bytes read from a connection, a file, standard input or firmware services, which arrive in the `Untrusted[SliceMut[u8]]` the read writes into or in the Untrusted value it returns ([std capabilities](14-authority.md#std-capabilities), [firmware services](24-kernel.md#firmware-services));
 - the `args` and `environment` fields of `host::World` ([root grants](14-authority.md#root-grants));
-- the values that `hw::UserAddr[T].copy_in` fetches from user memory ([address types](23-low-level.md#address-types)), and each syscall argument, as an `Untrusted[u64]` ([user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls));
+- the values that `hw::UserAddr[T].copy_in` and `copy_in_bytes` fetch from user memory ([address types](23-low-level.md#address-types)), and each register, stack pointer, instruction pointer and flags of an `hw::UserState`, as an `Untrusted[u64]` ([user mode](24-kernel.md#user-mode));
 - the buffer of a [completion](17-suspension-io.md#completion-io) that a device or the kernel wrote.
 
 Register values and the results of `hw::DmaShared` access calls are typed device state, never Untrusted.

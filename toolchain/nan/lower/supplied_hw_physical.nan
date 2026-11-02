@@ -170,6 +170,49 @@ fn page_table_root(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } page_table_root
 
+/// `hw::UserFrame`, one word, the base of its frame: `of` and `into_frame` convert, and each
+/// access of a word of the frame is atomic, trapping when the word does not lie inside the frame
+/// or its offset is not a multiple of 8.
+fn user_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let base = cpu_word(mut fx, held: supply.param(0))
+    let member = supply.member()
+    if member == "of" or member == "into_frame" {
+        word_result(mut lo, mut fx, supply, value: base)
+        return
+    }
+    if member == "base" {
+        supply.ret(mut lo, mut fx, held: Held.Scalar(base))
+        return
+    }
+    let offset = cpu_word(mut fx, held: supply.param(1))
+    let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: offset, y: 4_096 - 8)
+    let low_bits = mut fx.b.band_imm_s(offset, y: 7)
+    let misaligned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: low_bits, y: 0)
+    let out = mut fx.b.bor(beyond, y: misaligned)
+    mut fx.if_true(out, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+    })
+    let address = mut fx.b.iadd(base, y: offset)
+    let flags = clif::MemFlags.owned()
+    match member {
+        "load" => {
+            let value = mut fx.b.atomic_load(clif::Type.Int64, flags, p: address)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "store" => {
+            mut fx.b.atomic_store(flags, x: supply.param(2).scalar_value(), p: address)
+            supply.done(mut lo, mut fx)
+        }
+        "fetch_or" => {
+            let value = mut fx.b.atomic_rmw(clif::Type.Int64, flags, op: clif::AtomicRmwOp.Or, p: address, x: supply.param(2).scalar_value())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        else => {
+            expect false
+        }
+    }
+} user_frame
+
 /// The new root cell over a region a store's `over` takes: its supply is the 64 KiB-aligned
 /// chunks lying wholly inside the region, and its limit their total size.
 fn physical_region_cell(mut lo: Lowering, mut fx: Fx, region: Held) -> clif::Value {

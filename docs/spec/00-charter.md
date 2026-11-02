@@ -315,6 +315,7 @@ Each term links to its home, whose definition governs.
 | [Dyn-usable](08-generics-interfaces.md#dynamic-dispatch) | Usable through `Dyn[I]`. |
 | [elaboration](19-nir.md#elaboration) | Translating checked source into NIR. |
 | [end of scope](07-ownership.md#ownership) | Where memory returns without user code. |
+| [entry area](24-kernel.md#split-tables) | Memory a user root maps for the seams. |
 | [entry context](24-kernel.md#anchor) | Code a machine seam enters. |
 | [entry function](27-program-model.md#entry) | Function `entry` names. |
 | [entry type](25-registries.md#registries) | Type after `:` of a registry item. |
@@ -381,7 +382,7 @@ Each term links to its home, whose definition governs.
 | [key](13-text-encode.md#encode) | Encoded name of a field or variant. |
 | [key field](25-registries.md#registries) | Field of the entry type a registry is keyed by. |
 | [keyed task](26-components.md#keyed-tasks) | Task that `cx.spawn(key: k, ...)` starts, identified by its key and cancelling an earlier task with that key. |
-| [landing field](25-registries.md#platform-registries) | Registry entry field holding a landing fn: `hw::Vector.user`, `hw::SyscallEntry.handler`, `hw::PreemptEntry.handler`. |
+| [landing field](25-registries.md#platform-registries) | Registry entry field holding a landing fn: `hw::PreemptEntry.handler`. |
 | [landing fn](23-low-level.md#landing-functions) | Function a machine seam enters with raw values. |
 | [language version](37-evolution.md#language-versions) | Integer of the `language` directive. |
 | [last-green record](33-toolchain.md#last-green) | Interfaces at an agent's last clean state. |
@@ -545,6 +546,10 @@ Each term links to its home, whose definition governs.
 | [undo clause](10-effects-digests.md#compensation) | Claim, sealed as a trust escape, that another function puts back what a function changes. |
 | [Untrusted](15-untrusted.md#untrusted-values) | Wrapper `Untrusted[T]` for outside data. |
 | [user directory](36-builds.md#cache) | Per-user `.nan` directory holding the build cache and local store. |
+| [user frame](24-kernel.md#user-frames) | Frame the kernel holds while user threads map it. |
+| [user mode](24-kernel.md#user-mode) | Unprivileged execution of user threads. |
+| [user root](24-kernel.md#split-tables) | Root a user thread runs under in place of the kernel's. |
+| [user thread](24-kernel.md#user-mode) | User code a kernel task runs through `hw::Ring0.run_user`. |
 | [validator](15-untrusted.md#validators) | `validator fn`, reading Untrusted contents. |
 | [variant](04-types.md#enums) | Enum alternative. |
 | [verdict line](33-toolchain.md#output-contract) | First or last line of a command's output. |

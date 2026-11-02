@@ -308,11 +308,13 @@ pub struct Lowering<'c, 'a> {
     state_id: Option<DataId>,
     thread_id: Option<DataId>,
     /// The image's compiler stubs, and a machine image's vector seam, the data objects it reserves
-    /// by name and the sizes of its interrupt stacks, once declared.
+    /// by name, the sizes of its interrupt stacks, and the stacks of nonzero `ist` with how many
+    /// each CPU has, once declared.
     machine_stubs: HashMap<machine::Stub, FuncId>,
     vector_seam: Option<FuncId>,
     reserved: HashMap<&'static str, DataId>,
     irq_stacks: Option<DataId>,
+    ist_stacks: Option<(DataId, u64)>,
     pub data: data::Data,
     pub lines: lines::Lines,
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
@@ -475,6 +477,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             vector_seam: None,
             reserved: HashMap::new(),
             irq_stacks: None,
+            ist_stacks: None,
             data: data::Data::default(),
             lines: lines::Lines::default(),
             entry_stacks: Vec::new(),

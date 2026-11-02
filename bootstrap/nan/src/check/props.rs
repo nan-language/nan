@@ -225,6 +225,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::TrapFrame", [No, No, No, No, No, No]),
     ("hw::Region", LINEAR_SEND),
     ("hw::PhysFrame", LINEAR_SEND),
+    ("hw::UserFrame", LINEAR_SEND),
     ("hw::IrqShared", LINEAR_SEND),
     ("hw::Signal", AFFINE_SEND),
     ("hw::SpinLock", AFFINE_SEND),
@@ -236,7 +237,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 33] = [
+const PRIMITIVE_CAPABILITIES: [&str; 34] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -266,6 +267,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 33] = [
     "hw::PageTableRoot",
     "hw::Region",
     "hw::PhysFrame",
+    "hw::UserFrame",
     "hw::IrqShared",
     "hw::Iommu",
     "hw::IoDomain",

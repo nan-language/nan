@@ -144,13 +144,7 @@ impl Lowering<'_, '_> {
     /// waits and its record saying so, which keeps the seam from preempting the caller. Returns at
     /// once inside an interrupt fn and before the anchor is installed.
     pub fn wait_for_interrupt(&mut self, fx: &mut Fx) {
-        let state_address = self.state(fx);
-        let anchor = fx.load(PTR, state_address, state::ANCHOR);
-        let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, anchor, 0);
-        let record = self.running_cpu(fx);
-        let serving = fx.load(PTR, record, cpu::FRAME);
-        let outside = fx.b.ins().icmp_imm_s(IntCC::Equal, serving, 0);
-        let waits = fx.b.ins().band(installed, outside);
+        let (record, waits) = self.thread_context(fx);
         fx.when(waits, |fx| {
             let one = fx.ptr(1);
             fx.store(one, record, cpu::WAITING);

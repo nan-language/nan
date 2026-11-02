@@ -174,7 +174,6 @@ A **reservation** is a word, syntax, name, format or seam space that language 1 
 | sections native cache and availability | format | an artefact | `artefact.reserved-section` | [Sections](30-artefacts.md#sections) |
 | registry snapshot and policy floor fields | format | the lock | `format.reserved-field` | [Lock](35-format.md#lock) |
 | algorithm tags other than `0x01` | format | a hash | the bytes are no hash | [Hash values](29-identity-versioning.md#hash-values) |
-| the user-origin seams, `hw::Vector.user` and `hw::SyscallEntry.handler` | seam | an exception raised in user mode, and the system call instruction | contributions are checked; the seams are never entered | [User exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls) |
 
 ## Diagnostics
 

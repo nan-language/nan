@@ -8,7 +8,7 @@ const ERROR_CODE_VECTORS: Slice[u8] = b"\x08\x0a\x0b\x0c\x0d\x0e\x11\x15\x1d\x1e
 const VECTOR_STUB: u32 = 12
 
 /// The bytes of one vector's entry stub, which normalises the error code and pushes the vector
-/// number, then jumps to the common seam's entry at `seam_entry` from the stub's start at `at`.
+/// number, then jumps to the check at `seam_entry` from the stub's start at `at`.
 fn interrupts_vector_stub(vector: u8, at: u32, seam_entry: u32) -> Array[u8, 12]
     requires at <= 255 * VECTOR_STUB
 {
@@ -63,6 +63,35 @@ const SEAM_STAY: u32 = 0x39
 const SEAM_DISPATCH: u32 = 0x60
 
 const SEAM_PREEMPT: u32 = 0xb3
+
+/// The checks the vector stubs jump to, which the common seam follows: each jumps to the user
+/// path's entry for vectors when the interrupted code segment's privilege level is nonzero, and
+/// otherwise the check at `SEAM_CHECK_STAY`, for vectors on another stack, to the common seam's
+/// entry for them, and that at `SEAM_CHECK` into the common seam.
+const SEAM_CHECKS: Slice[u8] = b"\xf6\x44\x24\x18\x03\x0f\x85\x09\x02\x00\x00\xeb\x44\xf6\x44\x24\x18\x03\x0f\x85\xfc\x01\x00\x00"
+
+const SEAM_CHECK_STAY: u32 = 0
+
+const SEAM_CHECK: u32 = 0xd
+
+/// The offsets in the vector seam of the checks, the common seam and the user path.
+const CHECKS_AT: u32 = 256 * VECTOR_STUB
+
+const COMMON_AT: u32 = CHECKS_AT + 24
+
+const SEAM_USER_AT: u32 = COMMON_AT + 185
+
+// The checks and the common seam have these lengths, and the short jump of the check at
+// `SEAM_CHECK_STAY` reaches the common seam's entry for vectors on another stack.
+const assert SEAM_CHECKS.len() == 24 and SEAM_COMMON.len() == 185
+
+const assert SEAM_CHECK + 0x44 == 24 + SEAM_STAY
+
+/// The vector seam holding the user path, and the path's offset in it.
+struct UserPath derives Copy {
+    seam: object::FuncId
+    at: u32
+} UserPath
 
 // The common seam's code reads the CPU record and the saved frame at these offsets, and copies
 // frames of this size.
@@ -470,14 +499,30 @@ fn Lowering.seam(mut self) -> object::FuncId {
     return seam
 } Lowering.seam
 
+/// The vector seam, which holds the user path, and the path's offset in it.
+fn Lowering.user_path(mut self) -> UserPath {
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        return UserPath(seam: mut self.aarch64_seam(), at: AARCH64_USER_AT)
+    }
+    return UserPath(seam: mut self.seam(), at: SEAM_USER_AT)
+} Lowering.user_path
+
 /// The glue a CPU runs to take interrupts: it puts its local APIC in the runtime's mode, draws
-/// its interrupt stack and one for each of `stacks`, the nonzero `ist` values bindings use,
-/// loads the interrupt descriptor table, enables its local APIC and starts its timer, firing
+/// its interrupt stack, records its entry stack's top, takes its stack for each of `stacks`, the
+/// nonzero `ist` values bindings use, from those the image reserves, loads the interrupt
+/// descriptor table, enables `syscall`, enables its local APIC and starts its timer, firing
 /// `TIMER_VECTOR`.
 fn Lowering.cpu_interrupts(mut self, stacks: Slice[u8]) -> object::FuncId {
     let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     let id = mut self.module.declare_function("_NScpu_interrupts", linkage: object::Linkage.Local, signature)
     let sizes = mut self.interrupt_stack_sizes()
+    let count = u32.fit(stacks.len())
+    var ist_stacks: Option[object::DataId] = None
+    if stacks.len() > 0 {
+        let area_id = mut self.module.declare_data("_NSist_stacks", linkage: object::Linkage.Local, writable: true, tls: false)
+        self.ist_stacks = Some(IstStacks(id: area_id, count: u64.widen(count)))
+        ist_stacks = Some(area_id)
+    }
     mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
         discard mut fx1.entry()
         mut lo1.enter_apic_mode(mut fx1)
@@ -488,14 +533,28 @@ fn Lowering.cpu_interrupts(mut self, stacks: Slice[u8]) -> object::FuncId {
         let top = mut fx1.b.iadd(stack_base, y: size)
         mut fx1.store(top, addr: record, offset: CPU_STACK_TOP)
         mut fx1.store(stack_base, addr: record, offset: CPU_STACK_BASE)
-        for ist in stacks {
-            let ist_size = mut fx1.load(PTR, addr: sizes_address, offset: 8)
-            let ist_stack = mut lo1.interrupt_stack(mut fx1, size: ist_size)
-            let ist_top = mut fx1.b.iadd(ist_stack, y: ist_size)
-            mut lo1.set_interrupt_stack(mut fx1, record, ist, top: ist_top)
+        let entry_top = mut fx1.offset(record, offset: CPU_SIZE)
+        mut fx1.store(entry_top, addr: record, offset: CPU_ENTRY_TOP)
+        match ist_stacks {
+            Some(area_id) => {
+                let area = mut lo1.data_address(mut fx1, id: area_id)
+                let ist_size = mut fx1.load(PTR, addr: sizes_address, offset: 8)
+                let index = mut lo1.running_index(mut fx1)
+                let first_slot = mut fx1.b.imul_imm_s(index, y: i64.widen(count))
+                var at: i64 = 0
+                for ist in stacks {
+                    let slot = mut fx1.b.iadd_imm_s(first_slot, y: at + 1)
+                    let offset = mut fx1.b.imul(slot, y: ist_size)
+                    let ist_top = mut fx1.b.iadd(area, y: offset)
+                    mut lo1.set_interrupt_stack(mut fx1, record, ist, top: ist_top)
+                    at += 1
+                }
+            }
+            None => {}
         }
         let idt = mut lo1.reserved(mut fx1, data_name: "_NSidt", size: IDT_BYTES, align: 16)
         mut lo1.load_idt(mut fx1, table: idt)
+        mut lo1.enable_syscall(mut fx1)
         let spurious = mut fx1.ptr(APIC_ENABLED | u64.fit(SPURIOUS_VECTOR))
         mut lo1.apic_write(mut fx1, register: APIC_SPURIOUS, value: spurious)
         mut lo1.start_timer(mut fx1)
@@ -513,10 +572,11 @@ fn Lowering.interrupt_stack_sizes(mut self) -> object::DataId {
 } Lowering.interrupt_stack_sizes
 
 /// Defines the interrupt stack sizes from the largest `limits stack N` among the lowered
-/// interrupt fns, or the stack a kernel's interface lets interrupt fns use: the stack of `ist` 0 holds two of them, one for an interrupt vector and
-/// one for an exception interrupting it, and two seam frames; every other stack holds one
-/// and one seam frame; each also holds what the dispatcher uses and a call of a policy hook,
-/// which a task the dispatcher makes ready reaches.
+/// interrupt fns, or the stack a kernel's interface lets interrupt fns use: the stack of `ist` 0
+/// holds two of them, one for an interrupt vector and one for an exception interrupting it, and
+/// two seam frames; every other stack holds one and one seam frame; each also holds what the
+/// dispatcher uses and a call of a policy hook, which a task the dispatcher makes ready reaches.
+/// The image reserves the stacks of nonzero `ist` of every CPU.
 fn Lowering.finish_interrupts(mut self) {
     let Some(id) = self.irq_stacks else {
         return
@@ -552,29 +612,46 @@ fn Lowering.finish_interrupts(mut self) {
     mut description.define(take sizes)
     mut description.set_align(8)
     mut self.module.define_data(id, take description)
+    match self.ist_stacks {
+        Some(stacks) => {
+            var area = object::DataDescription.new(self.alloc)
+            mut area.define_zeroinit(MAX_CPUS * stacks.count * next_multiple_of(other_size, multiple: 16))
+            mut area.set_align(16)
+            mut self.module.define_data(stacks.id, description: take area)
+        }
+        None => {}
+    }
 } Lowering.finish_interrupts
 
+/// The stacks of nonzero `ist` the image reserves, and how many each CPU has.
+struct IstStacks derives Copy {
+    id: object::DataId
+    count: u64
+} IstStacks
+
 /// Emits the vector seam: a stub per vector, each entered through its interrupt gate, then
-/// the common seam they jump to, which calls `dispatch` and, to preempt, `preemption`. Gives
-/// the seam's symbol, whose stub for vector n lies at `n * VECTOR_STUB` bytes.
+/// the checks they jump to, the common seam, which calls `dispatch` and, to preempt,
+/// `preemption`, and the user path. Gives the seam's symbol, whose stub for vector n lies at
+/// `n * VECTOR_STUB` bytes.
 fn Lowering.vector_seam(mut self, dispatch: object::FuncId, preemption: object::FuncId, ists: Array[u8, 256]) -> object::FuncId {
-    let common = 256 * VECTOR_STUB
     var seam_bytes = mem::Bytes.empty(self.alloc)
-    mut seam_bytes.reserve(usize.widen(common) + SEAM_COMMON.len())
+    mut seam_bytes.reserve(usize.widen(SEAM_USER_AT) + X64_USER.len())
     for vector in 0..<256u32 {
         let at = vector * VECTOR_STUB
-        var stub_entry = common
+        var stub_entry = CHECKS_AT + SEAM_CHECK
         if ists[usize.widen(vector)] != 0 {
-            stub_entry = common + SEAM_STAY
+            stub_entry = CHECKS_AT + SEAM_CHECK_STAY
         }
         let stub = interrupts_vector_stub(u8.fit(vector), at, seam_entry: stub_entry)
         mut seam_bytes.append(stub.view())
     }
+    mut seam_bytes.append(SEAM_CHECKS)
     mut seam_bytes.append(SEAM_COMMON)
+    mut seam_bytes.append(X64_USER)
     let seam = mut self.module.declare_function("_NSseam", linkage: object::Linkage.Local, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
     var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
-    mut relocs.push(object::ModuleReloc(offset: common + SEAM_DISPATCH, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(dispatch), addend: -4))
-    mut relocs.push(object::ModuleReloc(offset: common + SEAM_PREEMPT, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(preemption), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: COMMON_AT + SEAM_DISPATCH, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(dispatch), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: COMMON_AT + SEAM_PREEMPT, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(preemption), addend: -4))
     mut self.module.define_function_bytes(seam, align: 16, bytes: seam_bytes.view(), relocs: relocs.view())
     return seam
 } Lowering.vector_seam

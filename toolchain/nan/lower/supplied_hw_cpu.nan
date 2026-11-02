@@ -1,4 +1,4 @@
-//! The CPU-facing operations of `hw`: the context of an interrupt fn, the privileged intrinsics of `hw::Ring0`, the interrupt descriptor table `hw::Idt.of_vectors` builds, the interrupted state an exception's `hw::TrapFrame` names, and copies from user memory through `hw::UserAddr`. Only an interrupt fn's context exists on the host, where no interrupt fires.
+//! The CPU-facing operations of `hw`: the context of an interrupt fn, the privileged intrinsics of `hw::Ring0`, the interrupt descriptor table `hw::Idt.of_vectors` builds, the interrupted state an exception's `hw::TrapFrame` names, entering user mode, and copies between user and kernel memory through `hw::UserAddr`. Only an interrupt fn's context exists on the host, where no interrupt fires.
 
 /// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
 /// machine target completing one ends the interrupt the running CPU serves unless the dispatcher
@@ -72,6 +72,20 @@ fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             mut lo.invalidate_everywhere(mut fx, scope)
             supply.done(mut lo, mut fx)
         }
+        "run_user" => run_user(mut lo, mut fx, supply, split: false)
+        "run_user_split" => run_user(mut lo, mut fx, supply, split: true)
+        "entry_area" => {
+            let span = mut lo.entry_area(mut fx)
+            let area_ty = supply.abi.result
+            let laid = mut lo.layout_of(area_ty)
+            let area = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            let base_field = mut lo.layouts.field(lo.ck, ty: area_ty, variant: None, label: "base")
+            mut fx.store(span.base, addr: area, offset: base_field.offset)
+            let len_field = mut lo.layouts.field(lo.ck, ty: area_ty, variant: None, label: "len")
+            mut fx.store(span.len, addr: area, offset: len_field.offset)
+            let held = mut lo.held_at(mut fx, ty: area_ty, address: area)
+            supply.ret(mut lo, mut fx, held)
+        }
         else => {
             if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
                 cpu_ring0_aarch64(mut lo, mut fx, supply)
@@ -81,6 +95,57 @@ fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
     }
 } cpu_ring0
+
+/// `run_user` and, under the user root its third parameter holds, `run_user_split` give
+/// `Interrupted` at once outside thread context, and otherwise enter user mode through the vector
+/// seam's user path and give the exit it reports.
+fn run_user(mut lo: Lowering, mut fx: Fx, supply: Supply, split: bool) {
+    let exit_ty = supply.abi.result
+    let user_state = supply.param(1).address_value()
+    let context = mut lo.thread_context(mut fx)
+    let outside = mut fx.b.bxor_imm_s(context.inside, y: 1)
+    mut fx.if_true(outside, then: fn[mut lo](mut fx1: Fx) {
+        let exit = mut lo.variant_value(mut fx1, ty: exit_ty, variant: "Interrupted", payload_values: mem::List[Held].empty(fx1.alloc).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: exit)
+    })
+    let fault = mut fx.slot(24, align: 8)
+    var roots = SplitRoots(user_root: fault, kernel_root: fault)
+    if split {
+        let root = cpu_word(mut fx, held: supply.param(2))
+        roots = mut lo.split_roots(mut fx, root)
+    } else {
+        let user_root = mut fx.ptr(0)
+        let kernel_root = mut fx.ptr(0)
+        roots = SplitRoots(user_root: user_root, kernel_root: kernel_root)
+    }
+    let kind = mut lo.enter_user(mut fx, user_state, fault, user_root: roots.user_root, kernel_root: roots.kernel_root)
+    let is_syscall = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: USER_SYSCALL)
+    mut fx.if_true(is_syscall, then: fn[mut lo](mut fx1: Fx) {
+        let exit = mut lo.variant_value(mut fx1, ty: exit_ty, variant: "Syscall", payload_values: mem::List[Held].empty(fx1.alloc).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: exit)
+    })
+    let faulted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: USER_FAULT)
+    mut fx.if_true(faulted, then: fn[mut lo](mut fx1: Fx) {
+        let fault_field = mut lo.layouts.field(lo.ck, ty: exit_ty, variant: Some("Fault"), label: "")
+        let fault_ty = fault_field.ty
+        let laid = mut lo.layout_of(fault_ty)
+        let record = mut fx1.slot(laid.contents().size, align: laid.contents().align)
+        let vector_word = mut fx1.load(PTR, addr: fault, offset: 0)
+        let vector_field = mut lo.layouts.field(lo.ck, ty: fault_ty, variant: None, label: "vector")
+        let vector = mut fx1.b.ireduce(clif::Type.Int8, x: vector_word)
+        mut fx1.store(vector, addr: record, offset: vector_field.offset)
+        let code = mut fx1.load(PTR, addr: fault, offset: 8)
+        let code_field = mut lo.layouts.field(lo.ck, ty: fault_ty, variant: None, label: "code")
+        mut fx1.store(code, addr: record, offset: code_field.offset)
+        let address = mut fx1.load(PTR, addr: fault, offset: 16)
+        let address_field = mut lo.layouts.field(lo.ck, ty: fault_ty, variant: None, label: "address")
+        mut fx1.store(address, addr: record, offset: address_field.offset)
+        let exit = mut lo.variant_value(mut fx1, ty: exit_ty, variant: "Fault", payload_values: Array[Held, 1].filled(Held.Address(record)).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: exit)
+    })
+    let exit = mut lo.variant_value(mut fx, ty: exit_ty, variant: "Interrupted", payload_values: mem::List[Held].empty(fx.alloc).view(), wrapped: None)
+    supply.ret(mut lo, mut fx, held: exit)
+} run_user
 
 /// The scope an `hw::TlbScope` parameter names, as the shootdown stubs take it: the address of
 /// the page `Page` holds, or 1 for `All`.
@@ -500,7 +565,7 @@ fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } cpu_trap_frame
 
-/// The upper end of each architecture's user address space, below which `copy_in` reads: the
+/// The upper end of each architecture's user address space, below which the copies reach: the
 /// x86_64 canonical lower half and the AArch64 `TTBR0_EL1` range.
 const USER_END_X64: i64 = 0x0000_8000_0000_0000
 
@@ -512,13 +577,18 @@ const CPU_USER: i64 = 0x4
 
 const FRAME_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000
 
-/// The AArch64 descriptor bits `copy_in` reads beside the valid, table and access bits:
-/// unprivileged access, whose `AP[1]` bit is set for an EL0-readable mapping, and `APTable[0]`,
-/// set in a table descriptor to forbid EL0 access to everything below it; and the mask of a
-/// descriptor's output address, which leaves out the `TTBR0_EL1` address space identifier.
+/// The AArch64 descriptor bits the copies read beside the valid, table and access bits:
+/// unprivileged access, whose `AP[1]` bit is set for an EL0 mapping, and `AP[2]`, set for a
+/// read-only one; `APTable[0]` and `APTable[1]`, set in a table descriptor to forbid EL0 access
+/// and writes to everything below it; and the mask of a descriptor's output address, which
+/// leaves out the `TTBR0_EL1` address space identifier.
 const A64_EL0: u64 = 0x40
 
+const A64_EL0_READ_ONLY: u64 = 0x80
+
 const A64_TABLE_NO_EL0: i64 = 1 << 61
+
+const A64_TABLE_NO_WRITE: i64 = 1 << 62
 
 const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000
 
@@ -559,10 +629,8 @@ fn listed_sys_reg_fields() -> Array[u16, 24] {
 /// `write_sysreg` alone reaches.
 const WRITABLE_SYS_REGS: usize = 15
 
-/// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
-/// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
-/// mapped readable for user mode in the running CPU's page tables; otherwise it copies the bytes
-/// once each, allowing the access to user pages where x86_64 SMAP forbids it.
+/// `hw::UserAddr[T]`, one word. `copy_in` and `copy_out` copy a `T` at the address, the byte
+/// copies their slice's bytes from it.
 fn user_addr(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "of" => word_result(mut lo, mut fx, supply, value: supply.param(0).scalar_value())
@@ -570,21 +638,56 @@ fn user_addr(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let value = cpu_word(mut fx, held: supply.param(0))
             supply.ret(mut lo, mut fx, held: Held.Scalar(value))
         }
-        "copy_in" => copy_in(mut lo, mut fx, supply)
+        "copy_in" => {
+            let laid = mut lo.layout_of(supply.type_arg(lo, index: 0))
+            let copied = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+            copy_user(mut lo, mut fx, supply, kernel: copied, length: Length.Fixed(laid.contents().size), out: false)
+            let held = mut lo.held_at(mut fx, ty: supply.abi.result, address: copied)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "copy_out" => {
+            let value_ty = supply.type_arg(lo, index: 0)
+            let laid = mut lo.layout_of(value_ty)
+            let value = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+            mut lo.store_held(mut fx, address: value, held: supply.param(2), ty: value_ty)
+            copy_user(mut lo, mut fx, supply, kernel: value, length: Length.Fixed(laid.contents().size), out: true)
+            supply.done(mut lo, mut fx)
+        }
+        "copy_in_bytes" or "copy_out_bytes" => {
+            let view = supply.param(2).address_value()
+            let start = mut fx.load(PTR, addr: view, offset: 0)
+            let len = mut fx.load(PTR, addr: view, offset: 8)
+            let out = supply.member() == "copy_out_bytes"
+            copy_user(mut lo, mut fx, supply, kernel: start, length: Length.Bytes(len), out)
+            supply.done(mut lo, mut fx)
+        }
         else => {
             expect false
         }
     }
 } user_addr
 
-fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+/// The bytes a copy between user and kernel memory moves: the size of its type, or a slice's
+/// length.
+enum Length derives Copy {
+    Fixed(u64)
+    Bytes(clif::Value)
+} Length
+
+/// Copies between the user memory at the address the operation's receiver holds and `kernel`,
+/// into user memory when `out` is set. It fails with `OutsideUser` when the range does not lie
+/// below the user address space's end, and with `Unmapped` when a page of it is not mapped for
+/// user mode in the running CPU's page tables, readable, and writable for a copy out; otherwise
+/// it copies the bytes once each with maskable interrupts disabled, allowing the access to user
+/// pages where x86_64 SMAP forbids it.
+fn copy_user(mut lo: Lowering, mut fx: Fx, supply: Supply, kernel: clif::Value, length: Length, out: bool) {
     let aarch64 = lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
     let start = cpu_word(mut fx, held: supply.param(0))
-    let value_ty = supply.type_arg(lo, index: 0)
-    let value_layout = mut lo.layout_of(value_ty)
-    let size = value_layout.contents().size
-    let size_value = mut fx.ptr(size)
-    let summed = mut fx.b.uadd_overflow(start, y: size_value)
+    let len = match length {
+        Length.Fixed(size) => mut fx.ptr(size)
+        Length.Bytes(bytes) => bytes
+    }
+    let summed = mut fx.b.uadd_overflow(start, y: len)
     let end = summed.value
     let user_end = if aarch64 {
         USER_END_AARCH64
@@ -600,8 +703,6 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let past_end = mut fx.b.iadd_imm_s(end, y: 0xFFF)
     let spanned = mut fx.b.isub(past_end, y: head)
     let pages = mut fx.b.ushr_imm_s(spanned, y: 12)
-    let laid = mut lo.layout_of(value_ty)
-    let copied = mut fx.slot(at_least_one(size), align: at_least_one(laid.contents().align))
     let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
     let read_root = if aarch64 {
         Stub.ReadTtbr0
@@ -617,12 +718,12 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.each(zero_value, end: pages, body: fn(mut fx1: Fx, index: clif::Value) {
         let offset = mut fx1.b.ishl_imm_s(index, y: 12)
         let page = mut fx1.b.iadd(head, y: offset)
-        let readable = match aarch64 {
-            true => user_readable_aarch64(mut fx1, root, page)
-            false => user_readable_x64(mut fx1, root, page)
+        let allowed = match aarch64 {
+            true => user_mapped_aarch64(mut fx1, root, page, write: out)
+            false => user_mapped_x64(mut fx1, root, page, write: out)
         }
         let so_far = mut fx1.b.use_var(mapped_var)
-        let still = mut fx1.b.band(so_far, y: readable)
+        let still = mut fx1.b.band(so_far, y: allowed)
         mut fx1.b.def_var(mapped_var, val: still)
     })
     let mapped = mut fx.b.use_var(mapped_var)
@@ -630,7 +731,22 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         if not aarch64 {
             discard mut lo.call_stub(mut fx1, stub: Stub.UserOpen, args: mem::List[clif::Value].empty(fx1.alloc).view())
         }
-        mut lo.copy(mut fx1, dst: copied, src: start, size, align: 1)
+        var to = kernel
+        var from = start
+        if out {
+            to = start
+            from = kernel
+        }
+        match length {
+            Length.Fixed(size) => mut lo.copy(mut fx1, dst: to, src: from, size, align: 1)
+            Length.Bytes(bytes) => {
+                var routine_args = mem::List[clif::Value].empty(fx1.alloc)
+                mut routine_args.push(to)
+                mut routine_args.push(from)
+                mut routine_args.push(bytes)
+                discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: routine_args.view())
+            }
+        }
         if not aarch64 {
             discard mut lo.call_stub(mut fx1, stub: Stub.UserClose, args: mem::List[clif::Value].empty(fx1.alloc).view())
         }
@@ -640,13 +756,16 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.if_true(unmapped, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "Unmapped")
     })
-    let held = mut lo.held_at(mut fx, ty: supply.abi.result, address: copied)
-    supply.ret(mut lo, mut fx, held)
-} copy_in
+} copy_user
 
 /// Whether the x86_64 page tables from `root` map the page at `page` present and user-accessible
-/// at every level, a large page ending the walk; the tables lie at their physical addresses.
-fn user_readable_x64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
+/// at every level, and writable at every level when `write` is set, a large page ending the
+/// walk; the tables lie at their physical addresses.
+fn user_mapped_x64(mut fx: Fx, root: clif::Value, page: clif::Value, write: bool) -> clif::Value {
+    var required = i64.fit(MACHINE_PRESENT) | CPU_USER
+    if write {
+        required = required | i64.fit(MACHINE_WRITABLE)
+    }
     let table = mut fx.b.band_imm_s(root, y: FRAME_ADDRESS)
     let top = mut fx.ptr(1)
     let readable = mut fx.int(clif::Type.Int8, value: 1)
@@ -665,8 +784,8 @@ fn user_readable_x64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::
         let slot_offset = mut fx1.b.imul_imm_s(index, y: 8)
         let slot = mut fx1.b.iadd(level_table, y: slot_offset)
         let entry = mut fx1.load(PTR, addr: slot, offset: 0)
-        let flags = mut fx1.b.band_imm_s(entry, y: i64.fit(MACHINE_PRESENT) | CPU_USER)
-        let allowed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: flags, y: i64.fit(MACHINE_PRESENT) | CPU_USER)
+        let flags = mut fx1.b.band_imm_s(entry, y: required)
+        let allowed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: flags, y: required)
         let still_readable = mut fx1.b.band(readable_so_far, y: allowed)
         let large_bit = mut fx1.b.band_imm_s(entry, y: i64.fit(MACHINE_LARGE))
         let large = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: large_bit, y: 0)
@@ -684,14 +803,21 @@ fn user_readable_x64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::
         return Pass(again: more, next: take state)
     })
     return walked[2]
-} user_readable_x64
+} user_mapped_x64
 
-/// Whether the AArch64 page tables from `root` map the page at `page` EL0-readable: each table
-/// descriptor on the way valid without `APTable[0]`, and the descriptor ending the walk a valid,
-/// accessed and EL0-readable block at level 1 or 2 or page at level 3. The 4 KiB-granule walk
-/// reads levels 0 to 3, each indexed by nine bits of the address from bit 39 down, the tables
-/// lying at their physical addresses.
-fn user_readable_aarch64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
+/// Whether the AArch64 page tables from `root` map the page at `page` for EL0, and writable when
+/// `write` is set: each table descriptor on the way valid without `APTable[0]`, nor
+/// `APTable[1]` for a write, and the descriptor ending the walk a valid, accessed and EL0 block
+/// at level 1 or 2 or page at level 3, not read-only for a write. The 4 KiB-granule walk reads
+/// levels 0 to 3, each indexed by nine bits of the address from bit 39 down, the tables lying at
+/// their physical addresses.
+fn user_mapped_aarch64(mut fx: Fx, root: clif::Value, page: clif::Value, write: bool) -> clif::Value {
+    var closed = A64_TABLE_NO_EL0
+    var leaf_bits = A64_EL0 | A64_ACCESS
+    if write {
+        closed = A64_TABLE_NO_EL0 | A64_TABLE_NO_WRITE
+        leaf_bits = A64_EL0 | A64_ACCESS | A64_EL0_READ_ONLY
+    }
     let table = mut fx.b.band_imm_s(root, y: A64_ADDRESS)
     let top = mut fx.ptr(0)
     let readable = mut fx.int(clif::Type.Int8, value: 1)
@@ -726,11 +852,11 @@ fn user_readable_aarch64(mut fx: Fx, root: clif::Value, page: clif::Value) -> cl
         let block = mut fx1.b.bxor_imm_s(not_block, y: 1)
         let page_leaf = mut fx1.b.band(table_bit, y: bottom)
         let leaf = mut fx1.b.bor(block, y: page_leaf)
-        let el0_bits = mut fx1.b.band_imm_s(entry, y: i64.fit(A64_EL0 | A64_ACCESS))
+        let el0_bits = mut fx1.b.band_imm_s(entry, y: i64.fit(leaf_bits))
         let el0 = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: el0_bits, y: i64.fit(A64_EL0 | A64_ACCESS))
         let valid_leaf = mut fx1.b.band(valid, y: leaf)
         let leaf_allowed = mut fx1.b.band(valid_leaf, y: el0)
-        let forbidding = mut fx1.b.band_imm_s(entry, y: A64_TABLE_NO_EL0)
+        let forbidding = mut fx1.b.band_imm_s(entry, y: closed)
         let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: forbidding, y: 0)
         let more = mut fx1.b.band(walks, y: open)
         let allowed = mut fx1.b.bor(more, y: leaf_allowed)
@@ -744,7 +870,7 @@ fn user_readable_aarch64(mut fx: Fx, root: clif::Value, page: clif::Value) -> cl
         return Pass(again: more, next: take state)
     })
     return walked[2]
-} user_readable_aarch64
+} user_mapped_aarch64
 
 /// The word a one-word value holds, whether held by address or as a scalar.
 fn cpu_word(mut fx: Fx, held: Held) -> clif::Value {

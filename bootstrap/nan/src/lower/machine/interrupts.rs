@@ -21,10 +21,11 @@ use super::super::trap::{OPERAND_RECORD, Written, kind_number};
 use super::super::{Instance, Lowering};
 use super::SEAM_FRAME;
 use super::aarch64;
-use super::cpus::cpu;
+use super::cpus::{MAX_CPUS, cpu};
 use super::schedule::HOOK_STACK;
 use super::signal::SIGNAL_VECTOR;
 use super::stubs::Stub;
+use super::user;
 use crate::check::ty::Ty;
 use crate::interp::{FnVal, Val};
 use crate::workspace::Arch;
@@ -37,7 +38,7 @@ const ERROR_CODE_VECTORS: [u8; 10] = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30];
 const VECTOR_STUB: u32 = 12;
 
 /// The bytes of one vector's entry stub, which normalises the error code and pushes the vector
-/// number, then jumps to the common seam's entry at `entry` from the stub's start at `at`.
+/// number, then jumps to the check at `entry` from the stub's start at `at`.
 fn vector_stub(vector: u8, at: u32, entry: u32) -> [u8; VECTOR_STUB as usize] {
     let mut bytes = [0x90u8; VECTOR_STUB as usize];
     let number = u32::from(vector).to_le_bytes();
@@ -90,9 +91,26 @@ const _: () = assert!(3 * OPERAND_RECORD <= RESERVED);
 
 /// The offsets within `SEAM_COMMON` of its entry for vectors on another stack, and of the
 /// displacements of its calls of the dispatcher and the preemption glue.
+#[cfg(test)]
 pub(super) const SEAM_STAY: u32 = 0x39;
 pub(super) const SEAM_DISPATCH: u32 = 0x60;
 pub(super) const SEAM_PREEMPT: u32 = 0xb3;
+
+/// The checks the vector stubs jump to, which the common seam follows: each jumps to the user
+/// path's entry for vectors when the interrupted code segment's privilege level is nonzero, and
+/// otherwise the check at `CHECK_STAY`, for vectors on another stack, to the common seam's entry
+/// for them, and that at `CHECK` into the common seam.
+pub(super) const SEAM_CHECKS: &[u8] = &[
+    0xf6, 0x44, 0x24, 0x18, 0x03, 0x0f, 0x85, 0x09, 0x02, 0x00, 0x00, 0xeb, 0x44, 0xf6, 0x44, 0x24,
+    0x18, 0x03, 0x0f, 0x85, 0xfc, 0x01, 0x00, 0x00,
+];
+const CHECK_STAY: u32 = 0;
+pub(super) const CHECK: u32 = 0xd;
+
+/// The offsets in the vector seam of the checks, the common seam and the user path.
+pub(super) const CHECKS_AT: u32 = 256 * VECTOR_STUB;
+pub(super) const COMMON_AT: u32 = CHECKS_AT + SEAM_CHECKS.len() as u32;
+pub(super) const USER_AT: u32 = COMMON_AT + SEAM_COMMON.len() as u32;
 
 // The common seam's code reads the CPU record and the saved frame at these offsets, and copies
 // frames of this size.
@@ -454,9 +472,10 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a CPU runs to take interrupts: it puts its local APIC in the runtime's mode,
-    /// draws its interrupt stack and one for each of `stacks`, the nonzero `ist` values bindings
-    /// use, loads the interrupt descriptor table, enables its local APIC and starts its timer,
-    /// firing `TIMER_VECTOR`.
+    /// draws its interrupt stack, records its entry stack's top, takes its stack for each of
+    /// `stacks`, the nonzero `ist` values bindings use, from those the image reserves, loads the
+    /// interrupt descriptor table, enables `syscall`, enables its local APIC and starts its
+    /// timer, firing `TIMER_VECTOR`.
     fn cpu_interrupts(&mut self, stacks: &[u8]) -> FuncId {
         let signature = Signature::new(super::super::CALL_CONV);
         let id = self
@@ -465,6 +484,15 @@ impl Lowering<'_, '_> {
             .expect("the CPU interrupt glue");
         let sizes = self.interrupt_stack_sizes();
         let stacks = stacks.to_vec();
+        let count = stacks.len() as u64;
+        let ist_stacks = (!stacks.is_empty()).then(|| {
+            let id = self
+                .module
+                .declare_data("_NSist_stacks", Linkage::Local, true, false)
+                .expect("the stacks of nonzero ist");
+            self.ist_stacks = Some((id, count));
+            id
+        });
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
             fx.entry();
             lo.enter_apic_mode(fx);
@@ -475,14 +503,23 @@ impl Lowering<'_, '_> {
             let top = fx.b.ins().iadd(stack, size);
             fx.store(top, record, cpu::STACK_TOP);
             fx.store(stack, record, cpu::STACK_BASE);
-            for ist in &stacks {
+            let entry_top = fx.offset(record, cpu::SIZE);
+            fx.store(entry_top, record, cpu::ENTRY_TOP);
+            if let Some(area) = ist_stacks {
+                let area = lo.data_address(fx, area);
                 let size = fx.load(PTR, sizes, 8);
-                let stack = lo.interrupt_stack(fx, size);
-                let top = fx.b.ins().iadd(stack, size);
-                lo.set_interrupt_stack(fx, record, *ist, top);
+                let index = lo.running_index(fx);
+                let first = fx.b.ins().imul_imm_s(index, count as i64);
+                for (at, ist) in stacks.iter().enumerate() {
+                    let slot = fx.b.ins().iadd_imm_s(first, at as i64 + 1);
+                    let top = fx.b.ins().imul(slot, size);
+                    let top = fx.b.ins().iadd(area, top);
+                    lo.set_interrupt_stack(fx, record, *ist, top);
+                }
             }
             let idt = lo.reserved(fx, IDT);
             lo.load_idt(fx, idt);
+            lo.enable_syscall(fx);
             let spurious = fx.ptr(APIC_ENABLED | SPURIOUS_VECTOR as u64);
             lo.apic_write(fx, APIC_SPURIOUS, spurious);
             lo.start_timer(fx);
@@ -503,10 +540,11 @@ impl Lowering<'_, '_> {
     }
 
     /// Defines the interrupt stack sizes from the largest `limits stack N` among the lowered
-    /// interrupt fns, or the stack a kernel's interface lets interrupt fns use: the stack of `ist` 0 holds two of them, one for an interrupt vector and
-    /// one for an exception interrupting it, and two seam frames; every other stack holds one
-    /// and one seam frame; each also holds what the dispatcher uses and a call of a policy hook,
-    /// which a task the dispatcher makes ready reaches.
+    /// interrupt fns, or the stack a kernel's interface lets interrupt fns use: the stack of `ist`
+    /// 0 holds two of them, one for an interrupt vector and one for an exception interrupting it,
+    /// and two seam frames; every other stack holds one and one seam frame; each also holds what
+    /// the dispatcher uses and a call of a policy hook, which a task the dispatcher makes ready
+    /// reaches. The image reserves the stacks of nonzero `ist` of every CPU.
     pub fn finish_interrupts(&mut self) {
         let Some(id) = self.irq_stacks else {
             return;
@@ -533,23 +571,34 @@ impl Lowering<'_, '_> {
         self.module
             .define_data(id, &description)
             .expect("the interrupt stack sizes");
+        if let Some((stacks, count)) = self.ist_stacks {
+            let mut description = DataDescription::new();
+            let bytes = MAX_CPUS * count * other.next_multiple_of(16);
+            description.define_zeroinit(bytes as usize);
+            description.set_align(16);
+            self.module
+                .define_data(stacks, &description)
+                .expect("the stacks of nonzero ist");
+        }
     }
 
     /// Emits the vector seam: a stub per vector, each entered through its interrupt gate, then
-    /// the common seam they jump to, which calls `dispatch` and, to preempt, `preempt`. Gives the
-    /// seam's symbol, whose stub for vector n lies at `n * VECTOR_STUB` bytes.
+    /// the checks they jump to, the common seam, which calls `dispatch` and, to preempt,
+    /// `preempt`, and the user path. Gives the seam's symbol, whose stub for vector n lies at
+    /// `n * VECTOR_STUB` bytes.
     fn vector_seam(&mut self, dispatch: FuncId, preempt: FuncId, ists: &[u8; 256]) -> FuncId {
-        let common = 256 * VECTOR_STUB;
-        let mut bytes = Vec::with_capacity(common as usize + SEAM_COMMON.len());
+        let mut bytes = Vec::with_capacity(USER_AT as usize + user::X64_USER.len());
         for vector in 0..=255u8 {
             let at = u32::from(vector) * VECTOR_STUB;
             let entry = match ists[vector as usize] {
-                0 => common,
-                _ => common + SEAM_STAY,
+                0 => CHECKS_AT + CHECK,
+                _ => CHECKS_AT + CHECK_STAY,
             };
             bytes.extend_from_slice(&vector_stub(vector, at, entry));
         }
+        bytes.extend_from_slice(SEAM_CHECKS);
         bytes.extend_from_slice(SEAM_COMMON);
+        bytes.extend_from_slice(user::X64_USER);
         let seam = self
             .module
             .declare_function(
@@ -559,7 +608,7 @@ impl Lowering<'_, '_> {
             )
             .expect("the vector seam");
         let call = |offset: u32, target: FuncId| ModuleReloc {
-            offset: common + offset,
+            offset: COMMON_AT + offset,
             kind: Reloc::X86PCRel4,
             name: target.into(),
             addend: -4,
@@ -569,6 +618,14 @@ impl Lowering<'_, '_> {
             .define_function_bytes(seam, 16, &bytes, &relocs)
             .expect("the vector seam");
         seam
+    }
+
+    /// The vector seam, which holds the user path, and the path's offset in it.
+    pub(super) fn user_path(&mut self) -> (FuncId, u32) {
+        match self.machine_arch() {
+            Arch::Amd64 => (self.seam(), USER_AT),
+            Arch::Aarch64 => (self.aarch64_seam(), aarch64::USER_AT),
+        }
     }
 
     /// The glue the seam calls on an interrupted task's stack with the copy of its saved frame

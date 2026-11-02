@@ -72,7 +72,7 @@ const FAILING_DRAWS: [&str; 8] = [
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
 /// exhausted capability tables, cells and runtime records.
-const TRAPPING: [&str; 32] = [
+const TRAPPING: [&str; 35] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -105,6 +105,9 @@ const TRAPPING: [&str; 32] = [
     "hw::IrqShared.install_msi",
     "hw::runtime_record",
     "hw::hold",
+    "hw::UserFrame.load",
+    "hw::UserFrame.store",
+    "hw::UserFrame.fetch_or",
 ];
 
 /// The supplied operations that change an atomic count without a type with interior mutability.
@@ -133,7 +136,8 @@ pub fn stated(path: &str) -> Option<Digest> {
                 matches!(member, "read" | "write" | "copy") || member.starts_with("atomic_")
         }
         "hw::fence" => digest.sync = true,
-        "hw::UserAddr" if member == "copy_in" => digest.sync = true,
+        "hw::UserAddr" if member.starts_with("copy_") => digest.sync = true,
+        "hw::UserFrame" => digest.sync = matches!(member, "load" | "store" | "fetch_or"),
         "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::dma_fence" => {
             digest.device = true
         }

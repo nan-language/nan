@@ -1,9 +1,9 @@
 //! The boot heap, which starts a machine image's boot area and from which its runtime draws its
 //! records and the chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a
 //! record is a block of a power-of-two size class behind a 16-byte header naming the class,
-//! carved from chunks the map hands out. A freed block joins its class's free list, from which a
-//! later record of the class takes it. Every record and chunk is cleared once its lock is
-//! released.
+//! carved from chunks the map hands out. A freed block smaller than a chunk joins its class's
+//! free list, from which a later record of the class takes it, and a freed run of chunks returns
+//! to the map. Every record and chunk is cleared once its lock is released.
 
 use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
@@ -342,7 +342,7 @@ fn carve(lo: &mut Lowering, fx: &mut Fx, state: Value, bytes: Value) -> Value {
     at
 }
 
-/// Returns a block to its size class's free list.
+/// Returns a block to its size class's free list, or a run of chunks to the map.
 fn record_free(lo: &mut Lowering, fx: &mut Fx, address: Value) {
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
     fx.when(present, |fx| {
@@ -350,11 +350,29 @@ fn record_free(lo: &mut Lowering, fx: &mut Fx, address: Value) {
         let class = fx.load(PTR, block, 0);
         let state = heap_state(lo, fx);
         let flags = lock(lo, fx, state);
-        let slot = fx.b.ins().imul_imm_s(class, 8);
-        let slot = fx.b.ins().iadd(state, slot);
-        let head = fx.load(PTR, slot, allocators::FREE);
-        fx.store(head, address, 0);
-        fx.store(block, slot, allocators::FREE);
+        let large =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, class, CHUNK_CLASS);
+        fx.choose_in(
+            lo,
+            large,
+            &[],
+            |lo, fx| {
+                let bytes = block_bytes(fx, class);
+                let count = fx.b.ins().ushr_imm_s(bytes, CHUNK_CLASS);
+                let supply = boot_supply(lo, fx, state);
+                give_chunks(fx, supply, block, count);
+                Vec::new()
+            },
+            |_, fx| {
+                let slot = fx.b.ins().imul_imm_s(class, 8);
+                let slot = fx.b.ins().iadd(state, slot);
+                let head = fx.load(PTR, slot, allocators::FREE);
+                fx.store(head, address, 0);
+                fx.store(block, slot, allocators::FREE);
+                Vec::new()
+            },
+        );
         unlock(lo, fx, state, flags);
     });
 }

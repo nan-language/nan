@@ -1,7 +1,8 @@
 //! Stack limits: the frame size and call sites of each lowered function, the `stack N` demands
-//! on lowered functions and function values, and the final build's judging of each demand.
+//! on lowered functions and function values, the final build's judging of each demand, and the
+//! stack each grown call needs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_module::FuncId;
 
@@ -47,6 +48,13 @@ pub enum Kind {
     Bounded(Option<u64>),
     /// A call of a support routine, a compiler stub or the C library.
     Stub,
+    /// A grown call: a call of a wrapper, which calls its thunk through the support routine
+    /// growing the stack, the thunk making the call `inner` describes.
+    Grown {
+        wrapper: FuncId,
+        thunk: FuncId,
+        inner: Box<Kind>,
+    },
 }
 
 /// What a direct call passes for a function-typed parameter of its callee.
@@ -95,6 +103,12 @@ pub enum Report {
     Own { head: At },
     /// A demand of a function type that a named function or function value fits: at the use.
     Fit(At),
+}
+
+/// A grown call's thunk and the lowered function it calls, none for a function value's code.
+pub struct Grown {
+    pub thunk: FuncId,
+    pub callee: Option<FuncId>,
 }
 
 /// A task entry a lowering writes: the function its task starts in, where it is written, and
@@ -185,7 +199,7 @@ impl Judge<'_> {
         let mut deepest: (u64, Vec<(FuncId, usize)>) = (0, Vec::new());
         let mut unbounded = Vec::new();
         for (index, site) in frame.sites.iter().enumerate() {
-            match self.site(site, &bounds) {
+            match self.site(&site.kind, &bounds) {
                 Use::Unbounded(path) => unbounded.push((index, path)),
                 Use::Bounded(bytes, path) if bytes > deepest.0 => {
                     deepest = (bytes, prepend((function, index), path));
@@ -232,7 +246,7 @@ impl Judge<'_> {
         let mut deepest = (0, Vec::new());
         let mut unbounded = None;
         for (index, site) in frame.sites.iter().enumerate() {
-            match self.site(site, bounds) {
+            match self.site(&site.kind, bounds) {
                 Use::Unbounded(path) => {
                     unbounded = Some(prepend((function, index), path));
                     break;
@@ -253,13 +267,24 @@ impl Judge<'_> {
     }
 
     /// The stack use of a call site under the bounds of its function's parameters.
-    fn site(&mut self, site: &Site, bounds: &[Bound]) -> Use {
+    fn site(&mut self, kind: &Kind, bounds: &[Bound]) -> Use {
         let bound = |bytes: Bound| match bytes {
             Ok(bytes) => Use::Bounded(bytes, Vec::new()),
             Err(path) => Use::Unbounded(path),
         };
-        match &site.kind {
+        match kind {
             Kind::Stub => Use::Bounded(STUB_CALL_BOUND, Vec::new()),
+            Kind::Grown {
+                wrapper,
+                thunk,
+                inner,
+            } => match self.site(inner, bounds) {
+                Use::Bounded(bytes, path) => {
+                    let carried = self.size(*wrapper) + STUB_CALL_BOUND + self.size(*thunk);
+                    Use::Bounded(bytes + carried, path)
+                }
+                unbounded => unbounded,
+            },
             Kind::Bounded(bytes) => bound(bytes.ok_or_else(Vec::new)),
             Kind::Param(position) => bound(bound_at(bounds, *position)),
             Kind::Direct { callee, bindings } => {
@@ -310,12 +335,7 @@ impl Judge<'_> {
                 true => Role::Raised,
                 false => Role::Called,
             };
-            let subject = match &site.kind {
-                Kind::Direct { callee, .. } => self.name(*callee),
-                Kind::Param(_) => "function parameter".to_owned(),
-                Kind::Bounded(_) => "function value".to_owned(),
-                Kind::Stub => String::new(),
-            };
+            let subject = self.subject(&site.kind);
             if subject.is_empty() {
                 continue;
             }
@@ -328,10 +348,114 @@ impl Judge<'_> {
         because
     }
 
+    /// What a call site's reason names: its callee, empty for code lowering writes itself.
+    fn subject(&self, kind: &Kind) -> String {
+        match kind {
+            Kind::Direct { callee, .. } => self.name(*callee),
+            Kind::Param(_) => "function parameter".to_owned(),
+            Kind::Bounded(_) => "function value".to_owned(),
+            Kind::Stub => String::new(),
+            Kind::Grown { inner, .. } => self.subject(inner),
+        }
+    }
+
+    fn size(&self, function: FuncId) -> u64 {
+        self.frames.get(&function).map_or(0, |frame| frame.size)
+    }
+
     fn name(&self, function: FuncId) -> String {
         self.frames
             .get(&function)
             .map_or_else(String::new, |frame| frame.name.clone())
+    }
+}
+
+/// The stack each grown call's thunk needs on the stack it runs on: its frame and the stack use
+/// of what it calls up to the grown calls that code makes, each using its wrapper's frame and
+/// the stub call bound there. A function value's code needs the most any lowered function but
+/// those `excluded` needs, that function called directly.
+pub fn needs(frames: &[Frame], grown: &[Grown], excluded: &HashSet<FuncId>) -> Vec<u64> {
+    let mut segments = Segments {
+        frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
+        known: HashMap::new(),
+        active: HashSet::new(),
+    };
+    let value = frames
+        .iter()
+        .filter(|frame| !excluded.contains(&frame.function))
+        .filter_map(|frame| segments.segment(frame.function))
+        .max()
+        .unwrap_or(0);
+    grown
+        .iter()
+        .map(|grown| {
+            let called = match grown.callee {
+                Some(callee) => segments
+                    .segment(callee)
+                    .expect("a grown call's callee reaching only grown calls unbounded"),
+                None => value,
+            };
+            segments.size(grown.thunk) + called
+        })
+        .collect()
+}
+
+/// The stack a task whose entry is `function` starts with when its stack grows: 64 KiB, or the
+/// stack use of the entry up to the grown calls it makes if more.
+pub fn grown_start(frames: &[Frame], function: FuncId) -> u64 {
+    let mut segments = Segments {
+        frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
+        known: HashMap::new(),
+        active: HashSet::new(),
+    };
+    let used = segments
+        .segment(function)
+        .expect("a grown entry reaching only grown calls unbounded");
+    used.max(super::runtime::tasks::STACK)
+}
+
+/// The stack use of lowered functions up to the grown calls they make, none for a function
+/// reaching an unbounded call site another way.
+struct Segments<'f> {
+    frames: HashMap<FuncId, &'f Frame>,
+    known: HashMap<FuncId, Option<u64>>,
+    active: HashSet<FuncId>,
+}
+
+impl Segments<'_> {
+    fn segment(&mut self, function: FuncId) -> Option<u64> {
+        if let Some(known) = self.known.get(&function) {
+            return *known;
+        }
+        let Some(frame) = self.frames.get(&function).copied() else {
+            return Some(STUB_CALL_BOUND);
+        };
+        if !self.active.insert(function) {
+            return None;
+        }
+        let mut deepest = Some(0);
+        for site in &frame.sites {
+            let used = match &site.kind {
+                Kind::Stub => Some(STUB_CALL_BOUND),
+                Kind::Grown { wrapper, .. } => Some(self.size(*wrapper) + STUB_CALL_BOUND),
+                Kind::Bounded(bytes) => *bytes,
+                Kind::Param(position) => frame
+                    .params
+                    .iter()
+                    .find(|(at, _)| at == position)
+                    .and_then(|(_, bytes)| *bytes),
+                Kind::Direct { callee, .. } => self.segment(*callee),
+            };
+            deepest = deepest.zip(used).map(|(deepest, used)| deepest.max(used));
+        }
+        self.active.remove(&function);
+        let segment = deepest.map(|deepest| frame.size + deepest);
+        self.known.insert(function, segment);
+        segment
+    }
+
+    fn size(&self, function: FuncId) -> u64 {
+        self.frames.get(&function).map_or(0, |frame| frame.size)
     }
 }
 

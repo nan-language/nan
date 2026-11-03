@@ -167,7 +167,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
             index: 0,
             args: crate::check::ty::no_args(),
         });
-        let reference = lo.func_ref(fx, landing);
+        let reference = lo.call_ref(fx, landing);
         fx.b.ins()
             .call(reference, &[world, params[0], params[1], params[2]]);
         let env_size = fx.ptr(layout.size.max(8));
@@ -256,7 +256,7 @@ fn entry_glue(lo: &mut Lowering, program: &Program) -> cranelift_module::FuncId 
         let failure_ty = abi.fails.clone().expect("an entry function that may fail");
         let failure_layout = lo.layout(&failure_ty);
         let failure = fx.slot(failure_layout.size, failure_layout.align);
-        let reference = lo.func_ref(fx, main);
+        let reference = lo.call_ref(fx, main);
         let call = fx.b.ins().call(reference, &[failure, world]);
         let results = fx.b.inst_results(call).to_vec();
         let state_address = lo.state(fx);
@@ -416,6 +416,7 @@ fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
             link,
             low,
             high,
+            segment: None,
         };
         let free = stops::stoppable(lo, fx, &at);
         fx.when(free, |fx| {

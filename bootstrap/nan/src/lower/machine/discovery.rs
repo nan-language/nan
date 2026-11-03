@@ -215,7 +215,7 @@ impl Lowering<'_, '_> {
             _ => fx.load(PTR, state_address, state::PLATFORM),
         };
         let walk = self.tree_discovery();
-        let walk = self.func_ref(fx, walk);
+        let walk = self.call_ref(fx, walk);
         let call = fx.b.ins().call(walk, &[tree, boot]);
         let found = fx.b.inst_results(call)[0];
         let absent = fx.b.ins().icmp_imm_s(IntCC::Equal, found, 0);
@@ -1000,7 +1000,7 @@ impl Lowering<'_, '_> {
 
     /// Calls a helper function, giving its result.
     fn call_helper(&mut self, fx: &mut Fx, helper: FuncId, args: &[Value]) -> Value {
-        let reference = self.func_ref(fx, helper);
+        let reference = self.call_ref(fx, helper);
         let call = fx.b.ins().call(reference, args);
         fx.b.inst_results(call)[0]
     }

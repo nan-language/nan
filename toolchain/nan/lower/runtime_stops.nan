@@ -1,7 +1,8 @@
 //! Where a task asked to stop may stop: at a point of its stack outside every frame of a function a stopping task completes before it stops.
 
 /// The registers of a task interrupted on its stack: its instruction, stack and frame pointers,
-/// its link register where the architecture has one, and the bounds of the stack's usable part.
+/// its link register where the architecture has one, the bounds of its own stack's usable part,
+/// and in an image keeping segments the newest segment it runs on, zero for none.
 struct Interrupted derives Copy {
     ip: clif::Value
     sp: clif::Value
@@ -9,6 +10,7 @@ struct Interrupted derives Copy {
     link: Option[clif::Value]
     low: clif::Value
     high: clif::Value
+    segment: Option[clif::Value]
 } Interrupted
 
 /// Whether a code address lies in a function a stopping task does not stop inside; an address
@@ -49,29 +51,52 @@ fn stoppable(mut lo: Lowering, mut fx: Fx, at: Interrupted) -> clif::Value {
     }
     let free = mut fx.b.bxor_imm_s(busy, y: 1)
     let chosen = mut fx.choose_in(mut lo, condition: free, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let walked = mut fx1.repeat(fx1.list2(at.fp, b: free).view(), body: fn[mut lo1](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
-            expect current.len() > 1
-            let frame = current[0]
-            let walk_free = current[1]
-            let frame_above = mut pass_fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: frame, y: at.low)
-            let end = mut pass_fx.b.iadd_imm_s(frame, y: 16)
-            let frame_below = mut pass_fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: at.high)
-            let inside = mut pass_fx.b.band(frame_above, y: frame_below)
-            let stepped = mut pass_fx.choose_in(mut lo1, condition: inside, results: pass_fx.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-                let address = mut yes_fx.load(PTR, addr: frame, offset: 8)
-                let at_base = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
-                let frame_critical = critical_at(mut cx, fx: mut yes_fx, address, unknown: true)
-                let frame_free = mut yes_fx.b.bxor_imm_s(frame_critical, y: 1)
-                let free_or_base = mut yes_fx.b.bor(at_base, y: frame_free)
-                let caller = mut yes_fx.load(PTR, addr: frame, offset: 0)
-                return yes_fx.list2(caller, b: free_or_base)
-            }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-                let none = mut no_fx.ptr(0)
-                return no_fx.list2(none, b: walk_free)
+        let walked = match at.segment {
+            None => mut fx1.repeat(fx1.list2(at.fp, b: free).view(), body: fn[mut lo1](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+                expect current.len() > 1
+                let frame = current[0]
+                let walk_free = current[1]
+                let inside = frame_within(mut pass_fx, frame, low: at.low, high: at.high)
+                let stepped = mut pass_fx.choose_in(mut lo1, condition: inside, results: pass_fx.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+                    return frame_free(mut cx, fx: mut yes_fx, frame)
+                }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+                    let none = mut no_fx.ptr(0)
+                    return no_fx.list2(none, b: walk_free)
+                })
+                let more = mut pass_fx.b.band(inside, y: stepped[1])
+                return Pass(again: more, next: take stepped)
             })
-            let more = mut pass_fx.b.band(inside, y: stepped[1])
-            return Pass(again: more, next: take stepped)
-        })
+            // A frame outside the segment the walk is in lies on an older one, or on the task's
+            // own stack once none is left.
+            Some(segment) => mut fx1.repeat(fx1.list3(at.fp, b: free, c: segment).view(), body: fn[mut lo1](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+                expect current.len() > 2
+                let frame = current[0]
+                let walk_free = current[1]
+                let walk_segment = current[2]
+                let bounds = stack_bounds(mut pass_fx, segment: walk_segment, low: at.low, high: at.high)
+                expect bounds.len() == 2
+                let inside = frame_within(mut pass_fx, frame, low: bounds[0], high: bounds[1])
+                let grown = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: walk_segment, y: 0)
+                let stepped = mut pass_fx.choose_in(mut lo1, condition: inside, results: pass_fx.types4(PTR, b: clif::Type.Int8, c: PTR, d: clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+                    var stepped_free = frame_free(mut cx, fx: mut yes_fx, frame)
+                    let still_free = stepped_free[1]
+                    mut stepped_free.push(walk_segment)
+                    mut stepped_free.push(still_free)
+                    return stepped_free
+                }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+                    let olders = mut no_fx.choose(grown, results: no_fx.types1(PTR).view(), then: fn(mut older_fx: Fx) -> mem::List[clif::Value] {
+                        let older = mut older_fx.load(PTR, addr: walk_segment, offset: 0)
+                        return older_fx.list1(older)
+                    }, otherwise: fn(mut older_fx: Fx) -> mem::List[clif::Value] {
+                        let none = mut older_fx.ptr(0)
+                        return older_fx.list1(none)
+                    })
+                    return no_fx.list4(frame, b: walk_free, c: olders[0], d: grown)
+                })
+                expect stepped.len() == 4
+                return Pass(again: stepped[3], next: carried_walk(stepped.view(), alloc: pass_fx.alloc))
+            })
+        }
         return fx1.list1(walked[1])
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let none = mut fx1.int(clif::Type.Int8, value: 0)
@@ -79,3 +104,34 @@ fn stoppable(mut lo: Lowering, mut fx: Fx, at: Interrupted) -> clif::Value {
     })
     return chosen[0]
 } stoppable
+
+/// Whether a frame record lies within the bounds of a stack.
+fn frame_within(mut fx: Fx, frame: clif::Value, low: clif::Value, high: clif::Value) -> clif::Value {
+    let frame_above = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: frame, y: low)
+    let end = mut fx.b.iadd_imm_s(frame, y: 16)
+    let frame_below = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: high)
+    return mut fx.b.band(frame_above, y: frame_below)
+} frame_within
+
+/// The frame record a frame record links to, and whether its function is one a stopping task
+/// may stop outside of, as the base frame's is.
+fn frame_free(mut lo: Lowering, mut fx: Fx, frame: clif::Value) -> mem::List[clif::Value] {
+    let address = mut fx.load(PTR, addr: frame, offset: 8)
+    let at_base = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+    let frame_critical = critical_at(mut lo, mut fx, address, unknown: true)
+    let is_free = mut fx.b.bxor_imm_s(frame_critical, y: 1)
+    let free_or_base = mut fx.b.bor(at_base, y: is_free)
+    let caller = mut fx.load(PTR, addr: frame, offset: 0)
+    return fx.list2(caller, b: free_or_base)
+} frame_free
+
+/// The state a walk across segments carries from a step: its frame record, whether it is free
+/// so far and its segment.
+fn carried_walk(stepped: Slice[clif::Value], alloc: mem::Alloc) -> mem::List[clif::Value] {
+    expect stepped.len() > 2
+    var next = mem::List[clif::Value].empty(alloc)
+    mut next.push(stepped[0])
+    mut next.push(stepped[1])
+    mut next.push(stepped[2])
+    return next
+} carried_walk

@@ -195,7 +195,7 @@ fn measure(lo: &mut Lowering, fx: &mut Fx, function: FuncId, value: Value) -> Va
 }
 
 fn call(lo: &mut Lowering, fx: &mut Fx, function: FuncId, args: &[Value]) -> Vec<Value> {
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, args);
     fx.b.inst_results(call).to_vec()
 }

@@ -105,7 +105,7 @@ pub fn parse(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value) -> Value 
 pub fn remainder(lo: &mut Lowering, fx: &mut Fx, a: Value, b: Value) -> Value {
     let width = Width::of(fx.b.func.dfg.value_type(a));
     let function = remainder_function(lo, width);
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[a, b]);
     fx.b.inst_results(call)[0]
 }
@@ -114,7 +114,7 @@ pub fn remainder(lo: &mut Lowering, fx: &mut Fx, a: Value, b: Value) -> Value {
 pub fn fused_mul_add(lo: &mut Lowering, fx: &mut Fx, a: Value, b: Value, c: Value) -> Value {
     let width = Width::of(fx.b.func.dfg.value_type(a));
     let function = fused_function(lo, width);
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[a, b, c]);
     fx.b.inst_results(call)[0]
 }

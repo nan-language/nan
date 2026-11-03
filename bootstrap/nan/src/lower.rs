@@ -13,6 +13,7 @@ mod call;
 mod conform;
 mod data;
 mod fx;
+mod grown;
 mod held;
 mod jobs;
 
@@ -196,6 +197,10 @@ pub enum Glue {
     Policy(machine::schedule::Hook, Ty),
     /// Calls, for a function type, the target its gate record names.
     Gate(ty::FnTy),
+    /// A grown call's wrapper, taking the call's arguments, a function value's code first.
+    Grown(grown::Called),
+    /// A grown call's thunk, making the call from the record of its arguments.
+    GrownThunk(grown::Called),
 }
 
 impl Glue {
@@ -337,6 +342,8 @@ pub struct Lowering<'c, 'a> {
     sims: Option<DataId>,
     /// For a bundle, the entries it adds to loaded registries.
     contributed: Vec<load::Contributed>,
+    /// For an image whose task stacks grow, its grown calls.
+    growth: Option<grown::Growth>,
 }
 
 /// A function declared and not yet defined.
@@ -442,10 +449,10 @@ pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
     }
     let job = bundle.entry.map(|entry| lowering.job_entry(entry));
     lowering.drain();
-    Lowered {
-        job,
-        ..lowering.finish(None)
-    }
+    let lowered = lowering.finish(None);
+    let job = job
+        .map(|(entry, stack)| stack.unwrap_or_else(|| stack::grown_start(&lowered.frames, entry)));
+    Lowered { job, ..lowered }
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
@@ -500,6 +507,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             test,
             sims: None,
             contributed: Vec::new(),
+            growth: ck.db.target.is_nanos().then(grown::Growth::default),
         }
     }
 
@@ -566,7 +574,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 }
                 Pending::Routine(routine, id) => {
                     let flags = match routine {
-                        Routine::TaskStart => lines::HIDDEN,
+                        Routine::TaskStart | Routine::Grow | Routine::GrownStart => lines::HIDDEN,
                         _ => lines::HIDDEN | lines::CRITICAL,
                     };
                     self.define(id, routine.signature(), flags, |lo, fx| {
@@ -737,6 +745,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         context.func.signature = signature;
         context.func.name = UserFuncName::user(0, id.as_u32());
         let mut builder_context = FunctionBuilderContext::new();
+        self.enter_definition(id);
         let recorded = {
             let mut fx = Fx::new(FunctionBuilder::new(
                 &mut context.func,
@@ -748,6 +757,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             fx.b.finalize(self.isa.frontend_config());
             recorded
         };
+        self.leave_definition();
         DUMP.with(|dump| {
             if let Some(texts) = dump.borrow_mut().as_mut() {
                 let declaration = self.module.declarations().get_function_decl(id);
@@ -793,8 +803,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
     }
 
     /// The call sites of a function built: those lowering classified as it emitted them, a
-    /// direct call of a routine or the C library bounded by the stub call bound, of another
-    /// lowered function direct, and an unclassified call through an address unbounded.
+    /// direct call of a routine or the C library bounded by the stub call bound, of a grown
+    /// call's wrapper grown, of another lowered function direct, and an unclassified call through
+    /// an address unbounded.
     fn sites(
         &self,
         func: &ir::Function,
@@ -804,7 +815,31 @@ impl<'c, 'a> Lowering<'c, 'a> {
         let mut sites = Vec::new();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
-                if let Some(site) = recorded.remove(&inst) {
+                let wrapper = match func.dfg.insts[inst] {
+                    ir::InstructionData::Call { func_ref, .. } => {
+                        match &func.dfg.ext_funcs[func_ref].name {
+                            ir::ExternalName::User(name) => Some(FuncId::from_u32(
+                                func.params.user_named_funcs()[*name].index,
+                            )),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let site = recorded.remove(&inst);
+                let grown = self
+                    .growth
+                    .as_ref()
+                    .zip(wrapper)
+                    .and_then(|(growth, callee)| {
+                        growth.site(callee, site.as_ref().map(|site| site.kind.clone()))
+                    });
+                if let Some(kind) = grown {
+                    let at = site.and_then(|site| site.at);
+                    sites.push(stack::Site { kind, at });
+                    continue;
+                }
+                if let Some(site) = site {
                     sites.push(site);
                     continue;
                 }
@@ -902,6 +937,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         let entry_stacks = runtime::tasks::emit_entry_stacks(&mut self);
         lines::emit(&mut self, entry_stacks);
         self.finish_interrupts();
+        self.emit_needs();
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
         let tasks = std::mem::take(&mut self.tasks);

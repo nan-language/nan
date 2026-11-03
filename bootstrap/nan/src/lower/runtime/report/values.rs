@@ -249,7 +249,7 @@ fn part(lo: &mut Lowering, fx: &mut Fx, report: Report, ty: &Ty, at: Value) {
         Ty::Scalar(scalar) => scalar_part(lo, fx, report, *scalar, at),
         _ => {
             let glue = writer(lo, ty);
-            let reference = lo.func_ref(fx, glue);
+            let reference = lo.call_ref(fx, glue);
             fx.b.ins().call(reference, &[report.out, at]);
         }
     }

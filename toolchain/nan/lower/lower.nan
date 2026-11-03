@@ -124,6 +124,10 @@ enum Glue derives Eq, Hash {
     Policy(hook: Hook, ty: ty::Ty)
     /// Calls, for a function type, the target its gate record names.
     Gate(ty::FnTyId)
+    /// A grown call's wrapper, taking the call's arguments, a function value's code first.
+    Grown(GrownCall)
+    /// A grown call's thunk, making the call from the record of its arguments.
+    GrownThunk(GrownCall)
 } Glue
 
 /// Whether a stopping task does not stop inside the glue: one completing the end of a
@@ -261,6 +265,16 @@ struct Lowering {
     /// Whether the symbol name and text of each function defined are kept, and those kept.
     dumping: bool
     dumped: mem::List[LoweredFunction]
+    /// Whether the image's task stacks grow; and for its grown calls, the functions being
+    /// defined, innermost last, the direct calls emitted from functions whose calls may grow, by
+    /// caller, each wrapper's thunk and callee, each grown call's thunk and callee by the index of
+    /// its need, and the table of needs once declared.
+    grows: bool
+    defining: mem::List[Defining]
+    emitted_calls: mem::HashMap[object::FuncId, mem::List[object::FuncId]]
+    wrappers: mem::HashMap[object::FuncId, Grown]
+    grown: mem::List[Grown]
+    needs: Option[object::DataId]
     /// The full form of each item hash symbol names read, once computed.
     item_hashes: mem::OnceMap[ty::ItemId, text::String]
     alloc: mem::Alloc
@@ -364,7 +378,7 @@ pkg fn lower_bundle(ck: check::Checker, bundle: BundleProgram) -> Lowered {
         let contributed = mut lowering.contributed_entry(contribution.item, registry_item: contribution.registry_item)
         mut lowering.contributed.push(take contributed)
     }
-    var job: Option[u64] = None
+    var job: Option[JobEntry] = None
     match bundle.entry {
         Some(entry) => {
             job = Some(mut lowering.job_entry(entry))
@@ -373,7 +387,12 @@ pkg fn lower_bundle(ck: check::Checker, bundle: BundleProgram) -> Lowered {
     }
     mut lowering.drain()
     var lowered = take lowering.finish(None)
-    lowered.job = job
+    match job {
+        Some(entry) => {
+            lowered.job = Some(entry.stack.value_or(grown_start(lowered.frames.view(), function: entry.id, alloc)))
+        }
+        None => {}
+    }
     return lowered
 } lower_bundle
 
@@ -434,6 +453,12 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         contributed: mem::List[image::LoadedEntry].empty(alloc),
         dumping: false,
         dumped: mem::List[LoweredFunction].empty(alloc),
+        grows: target.is_nanos(),
+        defining: mem::List[Defining].empty(alloc),
+        emitted_calls: mem::HashMap[object::FuncId, mem::List[object::FuncId]].empty(seed: 0, alloc),
+        wrappers: mem::HashMap[object::FuncId, Grown].empty(seed: 0, alloc),
+        grown: mem::List[Grown].empty(alloc),
+        needs: None,
         item_hashes: mem::OnceMap[ty::ItemId, text::String].empty(seed: 0, alloc),
         alloc: alloc,
     )
@@ -509,7 +534,7 @@ fn Lowering.drain(mut self) {
             Pending.Instance(instance: instance, id: id) => mut self.define_instance(instance, id)
             Pending.Routine(routine: routine, id: id) => {
                 var flags = LINES_HIDDEN | LINES_CRITICAL
-                if routine == Routine.TaskStart {
+                if routine == Routine.TaskStart or routine == Routine.Grow or routine == Routine.GrownStart {
                     flags = LINES_HIDDEN
                 }
                 mut self.define(id, signature: routine.signature(self.alloc), flags, build: fn(mut lo1: Lowering, mut fx1: Fx) {
@@ -714,10 +739,12 @@ fn Lowering.critical_owner(self, item: ty::ItemId, args: ty::Args) -> bool {
 fn Lowering.define(mut self, id: object::FuncId, take signature: clif::Signature, flags: u32, build: fn(mut lo: Lowering, mut fx: Fx)) {
     let func = clif::Function.new(clif::ExternalName(namespace: 0, index: id.index), take signature, alloc: self.alloc)
     var fx = Fx.new(clif::Builder.new(take func, alloc: self.alloc), alloc: self.alloc)
+    mut self.enter_definition(id)
     build(mut self, mut fx)
     mut fx.b.seal_all_blocks()
     let Fx(b: b, sites: recorded, fn_params: _, mark: _, alloc: _) = fx
     let built = take b.finalize()
+    mut self.leave_definition()
     if self.dumping {
         let dumped_name = text::String.of(self.module.function_name(id), alloc: self.alloc)
         let dumped_text = built.display(self.alloc)
@@ -754,8 +781,9 @@ fn Lowering.compile_waiting(mut self) {
 } Lowering.compile_waiting
 
 /// The call sites of a function built: those lowering classified as it emitted them, a
-/// direct call of a routine or the C library bounded by the stub call bound, of another
-/// lowered function direct, and an unclassified call through an address unbounded.
+/// direct call of a routine or the C library bounded by the stub call bound, of a grown
+/// call's wrapper grown, of another lowered function direct, and an unclassified call through
+/// an address unbounded.
 fn Lowering.sites(self, func: clif::Function, take recorded: mem::List[CallSite]) -> mem::List[Site] {
     var classified = mem::HashMap[clif::Inst, Site].empty(seed: 0, alloc: self.alloc)
     for call_site in take recorded {
@@ -766,6 +794,17 @@ fn Lowering.sites(self, func: clif::Function, take recorded: mem::List[CallSite]
     for block in func.layout_blocks(self.alloc) {
         for inst in func.block_insts(block, alloc: self.alloc) {
             let removed = mut classified.remove(inst)
+            match self.called_wrapper(func, inst) {
+                Some(callee) => {
+                    let Some(grown) = self.grown_site(callee, recorded: take removed) else {
+                        expect false
+                        continue
+                    }
+                    mut sites.push(take grown)
+                    continue
+                }
+                None => {}
+            }
             let Some(site) = removed else {
                 let Some(kind) = self.unclassified_kind(func, inst) else {
                     continue
@@ -778,6 +817,18 @@ fn Lowering.sites(self, func: clif::Function, take recorded: mem::List[CallSite]
     }
     return sites
 } Lowering.sites
+
+/// The wrapper of a grown call an instruction calls, none for any other instruction.
+fn Lowering.called_wrapper(self, func: clif::Function, inst: clif::Inst) -> Option[object::FuncId] {
+    let clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) = func.inst_data(inst) else {
+        return None
+    }
+    let callee = object::FuncId(index: func.ext_func(func_ref).name.index)
+    if not self.wrappers.contains(callee) {
+        return None
+    }
+    return Some(callee)
+} Lowering.called_wrapper
 
 /// How a call lowering did not classify reaches its callee: directly for another lowered
 /// function, as a stub for an imported function or a routine, or unbounded through an
@@ -877,6 +928,7 @@ fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lower
     lines_emit(mut self, own_stacks)
     mut self.finish_interrupts()
     mut self.compile_waiting()
+    mut self.emit_needs()
     var collisions = mem::List[Collision].empty(self.alloc)
     for collision in self.collisions {
         mut collisions.push(Collision(named: entity(self.ck, instance: collision.named), colliding: entity(self.ck, instance: collision.colliding)))

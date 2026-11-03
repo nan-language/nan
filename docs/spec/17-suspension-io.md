@@ -1,6 +1,6 @@
 # Suspension, I/O and cleanup
 
-This chapter defines stackful tasks, suspension points and waiting primitives; task stacks, their sizes, their static bounds and overflow; completion I/O, with views lent to ordinary operations and buffers returned in `task::Completion`; acknowledged cancellation and cancellation points; which values may be live at a suspension point; deferred calls with `defer` and `undefer`; and abandon methods.
+This chapter defines stackful tasks, suspension points and waiting primitives; task stacks, their sizes, their static bounds, their growth and overflow; completion I/O, with views lent to ordinary operations and buffers returned in `task::Completion`; acknowledged cancellation and cancellation points; which values may be live at a suspension point; deferred calls with `defer` and `undefer`; and abandon methods.
 
 ## Stackful tasks
 
@@ -41,7 +41,7 @@ The **entry** of a task is the code it starts with: the [task closure](16-concur
 
 - When the entry's own head states `limits stack N`, the task's stack holds at least N bytes, and every final build lowering the entry checks that its stack use is at most N ([stack limits](10-effects-digests.md#stack-limits)).
 - The stack of the first task of a domain that `run_sized` of `sys::Domain` or `sys::Abandoner` runs holds at least the `stack` bytes the call gives ([domain run](11-errors-domains.md#domain-run)), and so does the stack of a child that `task::Scope.spawn_sized` starts ([joins](16-concurrency.md#joins)).
-- Otherwise, on the host targets, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
+- Otherwise, on the host targets, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack; on the nanos targets, every such stack starts with 64 KiB and [grows](#grown-stacks).
 - On the host targets, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
 
 ```nan
@@ -70,7 +70,7 @@ pub fn contained_triangle(n: u64, exec: task::Executor, alloc: mem::Alloc) -> Op
 
 ### Static bounds
 
-On the machine and nanos targets, every stack has a static bound. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
+On the machine targets, every stack has a static bound, and on the nanos targets every stack but a task's. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
 
 | Context | Entry | Stack |
 | --- | --- | --- |
@@ -80,7 +80,7 @@ On the machine and nanos targets, every stack has a static bound. The code of ea
 | policy | each method of the type a final build's `boot::Kernel.policy` installs, whose interface method states `limits stack 4_096` | the stack of the task, interrupt fn or CPU calling the hook, each of which holds a call of it ([policies](24-kernel.md#policies)) |
 | landing | each [landing fn](23-low-level.md#landing-functions) | the stack its seam switches to ([machine runs](27-program-model.md#machine-runs), [preemption](24-kernel.md#preemption)) |
 
-- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine or nanos target or within the reach of a final build for a machine target ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.
+- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine target or within the reach of a final build for one ([environments](27-program-model.md#environments)), or an interrupt fn or landing fn whose head states none in code checked for a nanos target, is an error (`suspend.stack-missing`), reported on the line of its head.
 - A test body states no limits. On these targets, the build of a test image ([emulator runs](22-testing.md#emulator-runs)) computes the body's stack use as [stack limits](10-effects-digests.md#stack-limits) does for a function demanding `stack N`, reporting each unbounded call site of the body (`limit.stack-unbounded`), and the test's task runs on a stack holding that stack use.
 
 ```nan
@@ -125,11 +125,46 @@ fn main(take m: boot::Machine) -> Never { // error: suspend.stack-missing
 } main
 ```
 
+### Grown stacks
+
+On the nanos targets, a task's stack grows. A **grown call** is a call that the code lowered for a nanos target makes through the support routines of the kernel running it rather than directly: a direct call that closes a cycle of the calls lowered before it, and a call of a function value whose type or head demands no `stack N`. Every cycle of lowered calls holds one.
+
+- The **need** of a grown call is the stack use of what it calls ([stack limits](10-effects-digests.md#stack-limits)), each grown call that code makes counted only up to where the support routines check that call's own need; for a function value, the most need of any lowered function.
+- When the task's stack lacks the call's need, the call runs on a new **segment** of the task's stack, of 64 KiB or of the need if more, drawn through the cell of the task's domain ([domain memory](11-errors-domains.md#domain-memory)) and returned once the call returns or the task ends. A segment that cannot be drawn traps the task (`trap.exhausted`), so a stack never overflows: its domain's limit bounds it.
+- A stack use a final build judges counts each grown call as the call it makes, with the frames of the support routines between.
+
+```nan
+// file: survey/package.nan
+//! A tree survey for NaN OS.
+
+package survey {
+    language 1
+    targets x86_64-nanos
+    entry main
+} survey
+
+// file: survey/survey.nan
+//! Counts the nodes of a tree as deep as its input asks.
+
+fn nodes(depth: u32) -> u64 {
+    if depth == 0 {
+        return 1
+    }
+    return 1u64.wrapping_add(nodes(depth - 1)).wrapping_add(nodes(depth - 1))
+} nodes
+
+fn main(take world: nanos::World, take input: u32) -> u64 fails task::Cancelled uses wait {
+    let counted = nodes(input)
+    world.log.info("nodes", value: counted)
+    return counted
+} main
+```
+
 ### Stack overflow
 
 On the host targets, an access to a task's guard region traps (`trap.stack-overflow`). Before using a frame larger than 4 KiB, lowered code accesses that frame once per 4 KiB, starting at the end nearest the caller's frame, so a task whose stack use exceeds its stack accesses the guard region before writing outside the stack.
 
-On the machine targets, each stack holds at least the stack use of the code running on it, counting a [foreign fn](23-low-level.md#foreign-functions) at the `stack N` it declares, so `trap.stack-overflow` never occurs there.
+On the machine targets, each stack holds at least the stack use of the code running on it, counting a [foreign fn](23-low-level.md#foreign-functions) at the `stack N` it declares, so `trap.stack-overflow` never occurs there, nor on the nanos targets, whose task stacks [grow](#grown-stacks).
 
 ## Completion I/O
 

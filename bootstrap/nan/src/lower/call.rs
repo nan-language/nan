@@ -20,21 +20,22 @@ use crate::syntax::ast::{FnKind, Mode};
 /// What a call calls.
 enum Target {
     Direct(FuncId, Abi),
-    /// Through a function value: its code address and environment, and how its stack use is
-    /// bounded.
+    /// Through a function value: its code address and environment, how its stack use is
+    /// bounded, and the `stack N` its type demands.
     Indirect {
         code: IrValue,
         env: IrValue,
         abi: Abi,
         kind: stack::Kind,
+        stack: Option<u64>,
     },
     /// Through the method table of a `Dyn` value: the method's code address, which takes the
-    /// address of the value as its receiver, and how its stack use is bounded.
+    /// address of the value as its receiver, and the `stack N` the method's head demands.
     Dyn {
         code: IrValue,
         data: IrValue,
         abi: Abi,
-        kind: stack::Kind,
+        stack: Option<u64>,
     },
     /// An external symbol under the C convention of the host, with the `stack N` its head
     /// demands.
@@ -112,6 +113,7 @@ impl Body<'_, '_, '_, '_> {
                     env,
                     abi,
                     kind,
+                    stack: fn_ty.limits.stack,
                 }
             }
             Callee::Dyn {
@@ -134,7 +136,7 @@ impl Body<'_, '_, '_, '_> {
                     code,
                     data,
                     abi,
-                    kind: stack::Kind::Bounded(head.limits.stack),
+                    stack: head.limits.stack,
                 }
             }
         };
@@ -264,14 +266,22 @@ impl Body<'_, '_, '_, '_> {
         };
         args.extend(passed);
         let inst = match &target {
-            Target::Direct(id, _) | Target::Foreign(id, ..) => {
+            Target::Direct(id, _) => {
+                let reference = self.lo.call_ref(self.fx, *id);
+                self.fx.b.ins().call(reference, &args)
+            }
+            Target::Foreign(id, ..) => {
                 let reference = self.lo.func_ref(self.fx, *id);
                 self.fx.b.ins().call(reference, &args)
             }
-            Target::Indirect { code, abi, .. } | Target::Dyn { code, abi, .. } => {
-                let signature = self.fx.b.import_signature(abi.signature());
-                self.fx.b.ins().call_indirect(signature, *code, &args)
+            Target::Indirect {
+                code, abi, stack, ..
             }
+            | Target::Dyn {
+                code, abi, stack, ..
+            } => self
+                .lo
+                .call_code(self.fx, abi.signature(), *code, &args, *stack),
         };
         let kind = match &target {
             Target::Direct(callee, abi) => {
@@ -293,7 +303,8 @@ impl Body<'_, '_, '_, '_> {
                 }
             }
             Target::Foreign(.., stack) => stack::Kind::Bounded(*stack),
-            Target::Indirect { kind, .. } | Target::Dyn { kind, .. } => kind.clone(),
+            Target::Indirect { kind, .. } => kind.clone(),
+            Target::Dyn { stack: bound, .. } => stack::Kind::Bounded(*bound),
         };
         self.record_site(inst, kind);
         let returns = self.fx.b.inst_results(inst).to_vec();
@@ -388,7 +399,7 @@ impl Body<'_, '_, '_, '_> {
         let record = self.fx.slot(size, 8);
         let mut args = vec![record];
         args.extend(self.passed(operands, &abi.params, false));
-        let reference = self.lo.func_ref(self.fx, id);
+        let reference = self.lo.call_ref(self.fx, id);
         self.fx.b.ins().call(reference, &args);
         record
     }
@@ -981,7 +992,7 @@ impl Lowering<'_, '_> {
         }
         let inst = match invoked {
             Invoked::Direct(id) => {
-                let reference = self.func_ref(fx, id);
+                let reference = self.call_ref(fx, id);
                 fx.b.ins().call(reference, &values)
             }
             Invoked::Bound(callee, position, function) => {
@@ -1001,8 +1012,7 @@ impl Lowering<'_, '_> {
             }
             Invoked::Value(function, bound) => {
                 let code = fx.load(PTR, function, 0);
-                let signature = fx.b.import_signature(abi.signature());
-                let inst = fx.b.ins().call_indirect(signature, code, &values);
+                let inst = self.call_code(fx, abi.signature(), code, &values, bound);
                 let kind = match fx.fn_params.get(&function) {
                     Some(position) => stack::Kind::Param(*position),
                     None => stack::Kind::Bounded(bound),
@@ -1112,7 +1122,7 @@ fn forward(lo: &mut Lowering, fx: &mut Fx, outer: &Abi, inner: &Abi, callee: Fun
         let held = adapt_value(lo, fx, held, outer_nty, *inner_repr);
         args.extend(held.values());
     }
-    let reference = lo.func_ref(fx, callee);
+    let reference = lo.call_ref(fx, callee);
     let inst = fx.b.ins().call(reference, &args);
     let mut returns = fx.b.inst_results(inst).to_vec();
     if outer.flagged && !inner.flagged {

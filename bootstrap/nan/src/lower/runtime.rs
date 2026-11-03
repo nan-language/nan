@@ -4,8 +4,8 @@
 //! record of the executor thread running.
 //!
 //! `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability
-//! tables; `stack_switch` keeps tasks, their stacks, the executors' run queues and the turns of
-//! serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned
+//! tables; `stack_switch` keeps tasks, their stacks and the segments grown calls run on, the
+//! executors' run queues and the turns of serial executors; `trap` writes trap reports and abandons domains; `settle` settles abandoned
 //! domains; `replay` runs the seeded scheduler of test images.
 
 pub mod holdings;
@@ -14,6 +14,7 @@ pub mod memory;
 pub mod regions;
 pub mod report;
 pub mod seeded;
+pub mod segments;
 pub mod serial;
 pub mod settle;
 pub mod stops;
@@ -69,6 +70,12 @@ pub enum Routine {
     TaskEnv,
     /// `(address)`: frees a task closure's environment.
     TaskEnvFree,
+    /// `(thunk, record, need)`: calls a grown call's thunk with its record, on a new segment of
+    /// the running task's stack when the running one lacks `need` bytes above its limit.
+    Grow,
+    /// `(record)`: the first code a segment runs: the thunk and record of the grown call that
+    /// `Grow` keeps in its frame, then back to `Grow`.
+    GrownStart,
     /// `(address, domain) -> lifted`: passes the chunks an allocation lies in to a domain when
     /// a domain nested in it owns them; nonzero when they passed.
     Lift,
@@ -247,6 +254,8 @@ impl Routine {
             Routine::Turn => "_NSstack_switch_turn",
             Routine::Park => "_NSstack_switch_park",
             Routine::TaskStart => "_NSstack_switch_task_start",
+            Routine::Grow => "_NSstack_switch_grow",
+            Routine::GrownStart => "_NSstack_switch_grown_start",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
             Routine::Schedule => "_NSstack_switch_schedule",
             Routine::ThreadMain => "_NSstack_switch_thread_main",
@@ -278,7 +287,7 @@ impl Routine {
     ) {
         const P: cranelift_codegen::ir::Type = types::I64;
         match self {
-            Routine::Copy | Routine::Fill => (&[P, P, P], &[]),
+            Routine::Copy | Routine::Fill | Routine::Grow => (&[P, P, P], &[]),
             Routine::OutboxMint | Routine::KindMint | Routine::KindDerive => (&[P, P, P], &[P]),
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
@@ -310,6 +319,7 @@ impl Routine {
             | Routine::Enqueue
             | Routine::Turn
             | Routine::TaskStart
+            | Routine::GrownStart
             | Routine::Cancel
             | Routine::CownRelease
             | Routine::Exit
@@ -707,6 +717,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
+        Routine::Grow => segments::grow(lo, fx),
+        Routine::GrownStart => segments::grown_start(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),

@@ -344,7 +344,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(location, state_address, state::ANCHOR_CALL);
     fx.store(storage, state_address, state::ANCHOR);
     let prepare = lo.interrupt_setup(fx);
-    let call = lo.func_ref(fx, prepare);
+    let call = lo.call_ref(fx, prepare);
     fx.b.ins().call(call, &[]);
     lo.call_stub(fx, Stub::DisableFloats, &[]);
     let boot = lo.cpu_records(fx);

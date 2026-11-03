@@ -220,7 +220,7 @@ impl Shown {
     fn write(&self, lo: &mut Lowering, fx: &mut Fx, report: Report) {
         match self.writer {
             Some(writer) => {
-                let writer = lo.func_ref(fx, writer);
+                let writer = lo.call_ref(fx, writer);
                 fx.b.ins().call(writer, &[report.out, self.bits]);
             }
             None => {

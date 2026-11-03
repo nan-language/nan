@@ -2,6 +2,8 @@
 //! own task, one call at a time, and decides when its keyed tasks start. A stepper's value is its
 //! runner's record, a holding of the domain that started it, which settlement withdraws.
 
+use std::rc::Rc;
+
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
@@ -15,7 +17,7 @@ use super::{
     call_handler, draw_record, entry, handle, handle_oldest, handler, intake, keyed, release_env,
     runner, shape, status, unreference, wait_for,
 };
-use crate::check::ty::Ty;
+use crate::check::ty::{Arg, Bound, Ty};
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let record = |fx: &mut Fx| fx.load(PTR, supply.param(0).address(), 0);
@@ -100,6 +102,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let record = record(fx);
             abandon(lo, fx, supply, record);
         }
+        "resumed" => system(lo, fx, supply, "Resume", "resume"),
+        "pressure" => system(lo, fx, supply, "Pressure", "pressure"),
+        "health" => system(lo, fx, supply, "Health", "health"),
+        "suspend" => system(lo, fx, supply, "Suspend", "suspend"),
+        "wake" => system(lo, fx, supply, "Suspend", "wake"),
         member => panic!("no lowering of sys::Stepper.{member}"),
     }
 }
@@ -140,7 +147,7 @@ fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, resumed: bool) {
     let state = if resumed {
         supply.param(0)
     } else {
-        let start = handler(lo, "start", &state_ty, &env_ty, &message_ty);
+        let start = handler(lo, "Component", "start", &state_ty, &env_ty, &message_ty);
         call_handler(lo, fx, start, &[Held::Address(env_at)])
     };
     let state_at = fx.offset(record, shape.state_at);
@@ -152,6 +159,40 @@ fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, resumed: bool) {
     let sret = supply.sret.expect("a stepper's address");
     fx.store(record, sret, 0);
     supply.done(lo, fx);
+}
+
+/// `mut s.resumed(reason)`, `mut s.pressure(level)`, `mut s.health()`, `mut s.suspend()` and
+/// `mut s.wake()`: when the state implements the system interface for the stepper's Env and
+/// messages, a call of its method on the calling task with the state, the operation's argument,
+/// the Env and a context, then the summary published; otherwise nothing, `health` giving
+/// `Healthy`.
+fn system(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, owner: &str, method: &str) {
+    let (state_ty, env_ty, message_ty) = types_of(supply);
+    let bound = Bound {
+        interface: lo.ck.db.std_item("sys", owner).expect("a system interface"),
+        args: Rc::from(vec![Arg::Ty(env_ty.clone()), Arg::Ty(message_ty.clone())]),
+    };
+    if !lo.ck.satisfies(&state_ty, &bound) {
+        let reply = match supply.member() {
+            "health" => lo.variant_value(fx, &supply.abi.result, "Healthy", &[], None),
+            _ => Held::Empty,
+        };
+        supply.ret(lo, fx, reply);
+        return;
+    }
+    let record = fx.load(PTR, supply.param(0).address(), 0);
+    let shape = shape(lo, &state_ty, &env_ty, &message_ty);
+    let state_at = fx.offset(record, shape.state_at);
+    let env_at = fx.offset(record, shape.env_at);
+    let cx = fx.slot(8, 8);
+    fx.store(record, cx, 0);
+    let mut args = vec![Held::Address(state_at)];
+    args.extend(supply.params.get(1).copied());
+    args.extend([Held::Address(env_at), Held::Address(cx)]);
+    let instance = handler(lo, owner, method, &state_ty, &env_ty, &message_ty);
+    let reply = call_handler(lo, fx, instance, &args);
+    super::super::protocols::publish(lo, fx, record, &shape, &state_ty);
+    supply.ret(lo, fx, reply);
 }
 
 /// Whether a runner's record is idle: its intake is empty, no message waits for its delay and no

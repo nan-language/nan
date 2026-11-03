@@ -155,13 +155,21 @@ pub fn shape(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Shape {
     }
 }
 
-/// The instance of a handler, `start` or `on`, of a component state for its Env and messages.
-fn handler(lo: &mut Lowering, name: &str, state: &Ty, env: &Ty, message: &Ty) -> Instance {
+/// The instance of a handler of a component state for its Env and messages: a method of
+/// `sys::Component` or of a system interface, whose name in `sys` is `owner`.
+fn handler(
+    lo: &mut Lowering,
+    owner: &str,
+    name: &str,
+    state: &Ty,
+    env: &Ty,
+    message: &Ty,
+) -> Instance {
     let interface = lo
         .ck
         .db
-        .std_item("sys", "Component")
-        .expect("the interface sys::Component");
+        .std_item("sys", owner)
+        .expect("a component interface of sys");
     let method = lo
         .ck
         .interface_method(interface, name)
@@ -360,7 +368,7 @@ fn handle(
             super::protocols::dispatch(lo, fx, record, protocol, state, &args, node);
         }
         None => {
-            let on = handler(lo, "on", state, env, message);
+            let on = handler(lo, "Component", "on", state, env, message);
             call_handler(lo, fx, on, &args);
         }
     }

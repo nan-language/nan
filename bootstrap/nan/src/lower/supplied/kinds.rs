@@ -1,10 +1,11 @@
-//! Capability kinds: minters, reaches and derivations. A minter is the holding of its state's
-//! record, which is a shared value's whose count holds one for the minter and one for each reach
-//! or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that
-//! record and the two words of its own record; a reach pins the state under the table lock and
-//! calls its body outside it.
+//! Capability kinds: minters, reaches and derivations, and the handles and type tags of the
+//! capabilities a `nanos::Caps` holds. A minter is the holding of its state's record, which is a
+//! shared value's whose count holds one for the minter and one for each reach or derivation in
+//! flight, and which the outermost domain reaches. An entry of a kind holds that record and the two
+//! words of its own record; a reach pins the state under the table lock and calls its body outside
+//! it.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::body::Held;
@@ -46,6 +47,19 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "sys::reach" => reach(lo, fx, supply),
         "sys::derive" => derive(lo, fx, supply),
+        "nanos::Cap.tag" => {
+            let tag = fx.int(types::I64, tag(lo, &supply.type_arg(0)) as i64);
+            supply.ret(lo, fx, Held::Scalar(tag));
+        }
+        "nanos::Cap.handle" => {
+            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            supply.ret(lo, fx, Held::Scalar(handle));
+        }
+        "nanos::Cap.of_handle" => {
+            let sret = supply.sret.expect("a capability's address");
+            fx.store(supply.param(0).scalar(), sret, 0);
+            supply.done(lo, fx);
+        }
         _ => return false,
     }
     true
@@ -148,4 +162,13 @@ fn record_words(lo: &mut Lowering, fx: &mut Fx, record: Held, record_ty: &Ty) ->
     fx.store(zero, slot, 8);
     lo.store_held(fx, slot, record, record_ty);
     (fx.load(PTR, slot, 0), fx.load(PTR, slot, 8))
+}
+
+/// The tag of a capability type: the first 8 bytes, little-endian, of the digest of the hash of
+/// its normalised text.
+fn tag(lo: &Lowering, ty: &Ty) -> u64 {
+    let text = format!("capability\n{}\n", super::super::symbols::ty_text(lo, ty));
+    let hash = crate::hash::Hash::of(text.as_bytes());
+    let digest: [u8; 8] = hash.0[1..9].try_into().expect("a digest's first 8 bytes");
+    u64::from_le_bytes(digest)
 }

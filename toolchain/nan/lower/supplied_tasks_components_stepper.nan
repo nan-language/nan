@@ -48,6 +48,11 @@ fn stepper_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let record = stepper_record(mut fx, supply)
             stepper_abandon(mut lo, mut fx, supply, record)
         }
+        "resumed" => stepper_system(mut lo, mut fx, supply, owner: "Resume", method: "resume")
+        "pressure" => stepper_system(mut lo, mut fx, supply, owner: "Pressure", method: "pressure")
+        "health" => stepper_system(mut lo, mut fx, supply, owner: "Health", method: "health")
+        "suspend" => stepper_system(mut lo, mut fx, supply, owner: "Suspend", method: "suspend")
+        "wake" => stepper_system(mut lo, mut fx, supply, owner: "Suspend", method: "wake")
         else => {
             expect false
         }
@@ -104,6 +109,48 @@ fn stepper_is_idle(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     supply.ret(mut lo, mut fx, held: Held.Scalar(idle))
 } stepper_is_idle
 
+/// `mut s.resumed(reason)`, `mut s.pressure(level)`, `mut s.health()`, `mut s.suspend()` and
+/// `mut s.wake()`: when the state implements the system interface for the stepper's Env and
+/// messages, a call of its method on the calling task with the state, the operation's argument,
+/// the Env and a context, then the summary published; otherwise nothing, `health` giving
+/// `Healthy`.
+fn stepper_system(mut lo: Lowering, mut fx: Fx, supply: Supply, owner: Str, method: Str) {
+    let types = stepper_types(lo, supply)
+    let Some(interface_item) = lo.ck.db().std_item("sys", name: owner) else {
+        expect false
+        return
+    }
+    var bound_args = mem::List[ty::Arg].empty(lo.alloc)
+    mut bound_args.push(ty::Arg.Ty(types.env))
+    mut bound_args.push(ty::Arg.Ty(types.message))
+    let bound = ty::Bound(item: interface_item, args: lo.ck.types().args(take bound_args))
+    if not lo.ck.satisfies(types.state, bound) {
+        var reply = Held.Empty
+        if supply.member() == "health" {
+            reply = mut lo.variant_value(mut fx, ty: supply.abi.result, variant: "Healthy", payload_values: mem::List[Held].empty(fx.alloc).view(), wrapped: None)
+        }
+        supply.ret(mut lo, mut fx, held: reply)
+        return
+    }
+    let record = stepper_record(mut fx, supply)
+    let shape = components_shape(mut lo, state: types.state, env: types.env, message: types.message)
+    let state_at = mut fx.offset(record, offset: shape.state_at)
+    let env_at = mut fx.offset(record, offset: shape.env_at)
+    let cx = mut fx.slot(8, align: 8)
+    mut fx.store(record, addr: cx, offset: 0)
+    var handler_args = mem::List[Held].empty(fx.alloc)
+    mut handler_args.push(Held.Address(state_at))
+    if supply.params.len() > 1 {
+        mut handler_args.push(supply.param(1))
+    }
+    mut handler_args.push(Held.Address(env_at))
+    mut handler_args.push(Held.Address(cx))
+    let instance = components_handler(mut lo, owner, method, state: types.state, env: types.env, message: types.message)
+    let reply = call_handler(mut lo, mut fx, take instance, args: handler_args.view())
+    protocols_publish(mut lo, mut fx, record, shape, state: types.state)
+    supply.ret(mut lo, mut fx, held: reply)
+} stepper_system
+
 /// The record of the stepper an operation receives first.
 fn stepper_record(mut fx: Fx, supply: Supply) -> clif::Value {
     return mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -152,7 +199,7 @@ fn stepper_open(mut lo: Lowering, mut fx: Fx, supply: Supply, resumed: bool) {
     mut lo.store_held(mut fx, address: env_at, held: env, ty: types.env)
     var state = supply.param(0)
     if not resumed {
-        let start = components_handler(mut lo, method: "start", state: types.state, env: types.env, message: types.message)
+        let start = components_handler(mut lo, owner: "Component", method: "start", state: types.state, env: types.env, message: types.message)
         state = call_handler(mut lo, mut fx, instance: take start, args: Array[Held, 1].filled(Held.Address(env_at)).view())
     }
     let state_at = mut fx.offset(record, offset: shape.state_at)

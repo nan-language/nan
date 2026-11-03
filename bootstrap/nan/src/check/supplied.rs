@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 41] = [
+const DRAWING: [&str; 46] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -37,6 +37,11 @@ const DRAWING: [&str; 41] = [
     "sys::Stepper.resume",
     "sys::Stepper.deliver",
     "sys::Stepper.step",
+    "sys::Stepper.resumed",
+    "sys::Stepper.pressure",
+    "sys::Stepper.health",
+    "sys::Stepper.suspend",
+    "sys::Stepper.wake",
     "sys::load::pin",
     "sys::load::reserve",
     "sys::sim::fs",
@@ -114,11 +119,16 @@ const TRAPPING: [&str; 35] = [
 const COUNTED: [&str; 2] = ["mem::Shared.share", "mem::Shared.make_mut"];
 
 /// The supplied operations calling a component's handlers on the calling task, whose digests
-/// hold the declared digest of a call through `sys::Component`.
-const HANDLING: [&str; 3] = [
+/// hold the declared digest of a call through `sys::Component` or a system interface.
+const HANDLING: [&str; 8] = [
     "sys::Stepper.start",
     "sys::Stepper.deliver",
     "sys::Stepper.step",
+    "sys::Stepper.resumed",
+    "sys::Stepper.pressure",
+    "sys::Stepper.health",
+    "sys::Stepper.suspend",
+    "sys::Stepper.wake",
 ];
 
 /// The std types storing their contents inline, which never draw memory.

@@ -332,6 +332,7 @@ A **root grant** is the capability a platform [landing fn](23-low-level.md#landi
 | `x86_64-host`, `aarch64-host` | `host::World` |
 | `x86_64-uefi`, `aarch64-uefi` | `boot::Machine` |
 | `x86_64-bare`, `aarch64-bare` | `boot::Kernel` |
+| `x86_64-nanos`, `aarch64-nanos` | `nanos::World` |
 
 ```nan-api
 // module: host
@@ -363,6 +364,57 @@ pub open linear struct Kernel {
 
 - `host::World` is affine; the table it was minted with lives as long as the process. `fs` reaches the process's working directory, `alloc` is the process domain's allocator and `exec` runs its tasks. `args` holds the command-line arguments after the program name and `environment` the environment variables, both [Untrusted](15-untrusted.md#untrusted-values).
 - `boot::Machine` and `boot::Kernel` are linear; their tables live as long as the machine runs, and [Kernel execution model](24-kernel.md) defines their operations.
+
+The root grant of the nanos targets holds the capabilities of a host program's but the wall clock, with the command-line arguments and environment replaced by a table of further capabilities:
+
+```nan-api
+// module: nanos
+
+pub closed struct World {
+    pub alloc: mem::Alloc
+    pub exec: task::Executor
+    pub clock: sys::Clock
+    pub random: sys::Random
+    pub log: sys::Log
+    pub stdio: sys::Stdio
+    pub fs: sys::Fs
+    pub net: sys::Net
+    pub caps: Caps
+} World
+
+pub open struct Caps derives Send {
+} Caps
+
+pub open struct Cap[C: sys::Capability and Copy] {
+} Cap
+
+pub closed enum CapError derives Copy, Eq, Render {
+    Missing
+} CapError
+
+pub fn Caps.empty(alloc: mem::Alloc) -> Caps
+
+pub fn Cap.put(mut caps: Caps, key: Str, capability: C)
+
+pub fn Cap.get(caps: Caps, key: Str) -> C fails CapError
+```
+
+- A `nanos::Caps` holds capabilities of any Copy capability type, each under a text key; `Caps.empty(alloc)` draws its entries through `alloc`.
+- `mut nanos::Cap[C].put(caps, key, capability)` holds `capability` under `key`, in place of what `caps` held under it. `nanos::Cap[C].get(caps, key)` gives the capability held under `key` when it is a `C`, and fails with `CapError.Missing` otherwise. Every closure lowered by one toolchain tells capability types apart alike, so a table built in one closure is read by another.
+
+```nan
+pub fn storage_clock(caps: nanos::Caps) -> sys::Clock fails nanos::CapError {
+    return try nanos::Cap[sys::Clock].get(caps, key: "storage")
+} storage_clock
+
+test held_clock_is_found for storage_clock {
+    let world = testing::world()
+    var caps = nanos::Caps.empty(world.alloc)
+    mut nanos::Cap[sys::Clock].put(mut caps, key: "storage", capability: world.clock)
+    let found = attempt storage_clock(caps)
+    expect found.is_ok()
+} held_clock_is_found
+```
 
 ```nan
 // file: greet/package.nan

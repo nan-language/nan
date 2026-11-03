@@ -1,5 +1,6 @@
-//! Components: the state an impl line naming `sys::Component` declares a component of, and the
-//! uses of the runner `host::Runner` and of the steppers `sys::Stepper`.
+//! Components: the state an impl line naming `sys::Component` declares a component of, the
+//! component an impl line naming a system interface needs, and the uses of the runner
+//! `host::Runner` and of the steppers `sys::Stepper`.
 
 use std::rc::Rc;
 
@@ -19,6 +20,14 @@ const DERIVES_ORDER: [&str; 11] = [
     "AnyBits",
 ];
 
+/// The system interfaces, which a stepper calls for a component of the same Env and messages.
+const SYSTEM_INTERFACES: [&str; 4] = [
+    "sys::Resume",
+    "sys::Pressure",
+    "sys::Health",
+    "sys::Suspend",
+];
+
 impl Checker<'_> {
     /// The component of an impl line naming `sys::Component`: a state without generic parameters,
     /// Inert and implementing `Encode`, and an Env the runner can release, the first failing
@@ -32,7 +41,12 @@ impl Checker<'_> {
         else {
             return;
         };
-        if self.db.canonical(bound.interface) != "sys::Component" {
+        let named = self.db.canonical(bound.interface);
+        if SYSTEM_INTERFACES.contains(&named.as_str()) {
+            self.check_system_impl(item, target_ty, bound);
+            return;
+        }
+        if named != "sys::Component" {
             return;
         }
         let state = match key {
@@ -64,6 +78,30 @@ impl Checker<'_> {
         };
         let token = self.db.ast(item).token;
         self.report_fixed(item, (token, token), code, fixes, Offer::Each);
+    }
+
+    /// The rule an impl line naming a system interface breaks: a target implementing no
+    /// `sys::Component` for the same Env and messages, whose stepper would never call it.
+    fn check_system_impl(&self, item: ItemId, target: &Ty, bound: &Bound) {
+        let Some(component) = self.db.std_item("sys", "Component") else {
+            return;
+        };
+        let failed = target.has_error()
+            || bound
+                .args
+                .iter()
+                .any(|arg| arg.ty().is_some_and(Ty::has_error));
+        let matching = Bound {
+            interface: component,
+            args: bound.args.clone(),
+        };
+        if !failed && !self.satisfies(target, &matching) {
+            self.report(
+                item,
+                self.db.ast(item).token,
+                Code::ComponentSystemUnmatched,
+            );
+        }
     }
 
     /// Whether the runner can release the Env of the component an impl line declares: one that
@@ -166,6 +204,6 @@ impl Checker<'_> {
                 return Some(Code::ComponentNotComponent);
             }
         }
-        (runner && self.db.target.is_machine()).then_some(Code::ComponentUnavailable)
+        (runner && self.db.target.bounds_stacks()).then_some(Code::ComponentUnavailable)
     }
 }

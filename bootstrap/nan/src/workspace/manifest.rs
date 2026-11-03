@@ -25,12 +25,14 @@ impl Arch {
     }
 }
 
-/// What a concrete target's programs run on: Linux, UEFI firmware or the bare machine.
+/// What a concrete target's programs run on: Linux, UEFI firmware, the bare machine or a running
+/// NaN OS kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Host,
     Uefi,
     Bare,
+    Nanos,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,18 +43,22 @@ pub enum Target {
     Aarch64Host,
     Aarch64Uefi,
     Aarch64Bare,
+    X64Nanos,
+    Aarch64Nanos,
     Any,
 }
 
 impl Target {
     /// The concrete targets.
-    pub const CONCRETE: [Target; 6] = [
+    pub const CONCRETE: [Target; 8] = [
         Target::X64Host,
         Target::X64Uefi,
         Target::X64Bare,
         Target::Aarch64Host,
         Target::Aarch64Uefi,
         Target::Aarch64Bare,
+        Target::X64Nanos,
+        Target::Aarch64Nanos,
     ];
 
     pub fn name(self) -> &'static str {
@@ -63,6 +69,8 @@ impl Target {
             Target::Aarch64Host => "aarch64-host",
             Target::Aarch64Uefi => "aarch64-uefi",
             Target::Aarch64Bare => "aarch64-bare",
+            Target::X64Nanos => "x86_64-nanos",
+            Target::Aarch64Nanos => "aarch64-nanos",
             Target::Any => "any",
         }
     }
@@ -85,8 +93,13 @@ impl Target {
     /// A concrete target's architecture; `any` has none.
     pub fn arch(self) -> Option<Arch> {
         match self {
-            Target::X64Host | Target::X64Uefi | Target::X64Bare => Some(Arch::Amd64),
-            Target::Aarch64Host | Target::Aarch64Uefi | Target::Aarch64Bare => Some(Arch::Aarch64),
+            Target::X64Host | Target::X64Uefi | Target::X64Bare | Target::X64Nanos => {
+                Some(Arch::Amd64)
+            }
+            Target::Aarch64Host
+            | Target::Aarch64Uefi
+            | Target::Aarch64Bare
+            | Target::Aarch64Nanos => Some(Arch::Aarch64),
             Target::Any => None,
         }
     }
@@ -97,6 +110,7 @@ impl Target {
             Target::X64Host | Target::Aarch64Host => Some(Kind::Host),
             Target::X64Uefi | Target::Aarch64Uefi => Some(Kind::Uefi),
             Target::X64Bare | Target::Aarch64Bare => Some(Kind::Bare),
+            Target::X64Nanos | Target::Aarch64Nanos => Some(Kind::Nanos),
             Target::Any => None,
         }
     }
@@ -112,6 +126,17 @@ impl Target {
         matches!(self.kind(), Some(Kind::Uefi | Kind::Bare))
     }
 
+    /// Whether the target is a nanos target, whose images run on a running NaN OS kernel.
+    pub fn is_nanos(self) -> bool {
+        self.kind() == Some(Kind::Nanos)
+    }
+
+    /// Whether the target's code states the stack bound of every task it starts: a machine or
+    /// nanos target's.
+    pub fn bounds_stacks(self) -> bool {
+        self.is_machine() || self.is_nanos()
+    }
+
     /// Whether a target variant's selector matches the target: its name, its architecture's or
     /// its kind's.
     pub fn selected_by(self, selector: &str) -> bool {
@@ -124,17 +149,20 @@ impl Target {
             Some(Kind::Host) => "host",
             Some(Kind::Uefi) => "uefi",
             Some(Kind::Bare) => "bare",
+            Some(Kind::Nanos) => "nanos",
             None => return false,
         };
         selector == self.name() || selector == arch || selector == kind
     }
 
-    /// The platform package a concrete target's descriptor names; `any` names none.
+    /// The platform package a concrete target's descriptor names; `any` and the nanos targets
+    /// name none.
     pub fn platform_package(self) -> Option<&'static str> {
         match self.kind()? {
             Kind::Host => Some("host_platform"),
             Kind::Uefi => Some("uefi_platform"),
             Kind::Bare => Some("bare_platform"),
+            Kind::Nanos => None,
         }
     }
 
@@ -144,6 +172,7 @@ impl Target {
             Kind::Host => Some(("host", "World")),
             Kind::Uefi => Some(("boot", "Machine")),
             Kind::Bare => Some(("boot", "Kernel")),
+            Kind::Nanos => Some(("nanos", "World")),
         }
     }
 
@@ -152,7 +181,7 @@ impl Target {
         match self.kind() {
             Some(Kind::Uefi) => ".efi",
             Some(Kind::Bare) => ".elf",
-            Some(Kind::Host) | None => "",
+            Some(Kind::Host | Kind::Nanos) | None => "",
         }
     }
 }
@@ -468,9 +497,6 @@ impl Reader<'_> {
                     for name in &names {
                         match Target::from_name(name) {
                             Some(target) => manifest.targets.push(target),
-                            None if name == "x86_64-nanos" || name == "aarch64-nanos" => {
-                                self.report(line, Code::ManifestReservedTarget)
-                            }
                             None => self.report(line, Code::ManifestUnknownTarget),
                         }
                     }

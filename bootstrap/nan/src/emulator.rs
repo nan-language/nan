@@ -234,14 +234,17 @@ fn kvm_usable(arch: Arch) -> bool {
             .is_ok()
 }
 
-/// Whether a target's images can run on this machine: a host target's when the machine has its
-/// architecture, and a machine target's when its emulator can start, the emulator program
+/// Whether a target's images can run on this machine, never a nanos target's: a host target's when
+/// the machine has its architecture, and a machine target's when its emulator can start, the emulator program
 /// running and able to end with the process that starts it, the TPM emulator running, and the
 /// firmware present for a UEFI target.
 pub fn available(target: Target) -> bool {
     let Some(arch) = target.arch() else {
         return false;
     };
+    if target.is_nanos() {
+        return false;
+    }
     if target.is_host() {
         return arch == Arch::running();
     }

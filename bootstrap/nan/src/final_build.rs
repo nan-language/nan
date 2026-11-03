@@ -50,13 +50,17 @@ pub fn build(
     compared: Option<(&Path, &str)>,
 ) -> io::Result<Build> {
     let source = &workspace.packages[program];
+    let target = source.program_target();
+    if target.is_nanos() {
+        let unavailable = at_entry(source, Code::TargetImageUnavailable);
+        return Ok(Build::failed(vec![unavailable]));
+    }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
     let std = crate::stdlib::packages();
     let Some(checked) = workspace.closure_of(source) else {
         return Ok(Build::failed(diagnostics));
     };
-    let target = source.program_target();
     let checker = check::checked(workspace, checked, std, target);
     let root = package_id(&checker, source);
     let closure = checker.reached(root);
@@ -98,12 +102,7 @@ pub fn build(
     );
     let written = workspace.root.join(&image);
     if let Err(output) = write_image(target, &lowered.object, &written)? {
-        let manifest = source.manifest.as_ref().expect("a program's manifest");
-        let line = manifest
-            .entry
-            .as_ref()
-            .map_or(manifest.line, |(_, line)| *line);
-        let mut diagnostic = Diagnostic::at(Code::TargetLinkFailed, &source.files[0].path, line);
+        let mut diagnostic = at_entry(source, Code::TargetLinkFailed);
         let linker = lower::host::linker(target).to_owned();
         diagnostic.envelope = Some((linker, output.lines().map(str::to_owned).collect()));
         diagnostics.push(diagnostic);
@@ -186,6 +185,16 @@ fn lower_program(
         false => lower::lower(checker, &program),
     };
     (lowered, kernel.map(|kernel| kernel.file))
+}
+
+/// A diagnostic on a program's `entry` directive.
+fn at_entry(source: &Package, code: Code) -> Diagnostic {
+    let manifest = source.manifest.as_ref().expect("a program's manifest");
+    let line = manifest
+        .entry
+        .as_ref()
+        .map_or(manifest.line, |(_, line)| *line);
+    Diagnostic::at(code, &source.files[0].path, line)
 }
 
 /// The interface of a kernel exporting the load ABI: its interface file, what lowering reads of

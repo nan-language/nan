@@ -1669,10 +1669,12 @@ impl<'w, 'a> Walk<'w, 'a> {
                     callable: Callable::Method { interface, method },
                     args: type_args,
                 }),
-            ) => type_args.split_first().and_then(|(self_ty, rest)| {
-                let unit_args = self.ck.interface_args(*interface, self_ty.ty()?, rest);
-                Some((*interface, *method, unit_args))
-            }),
+            ) if !callee.is_some_and(|callee| self.ck.encodes(callee)) => {
+                type_args.split_first().and_then(|(self_ty, rest)| {
+                    let unit_args = self.ck.interface_args(*interface, self_ty.ty()?, rest);
+                    Some((*interface, *method, unit_args))
+                })
+            }
             (
                 Callee::Dyn {
                     interface, method, ..

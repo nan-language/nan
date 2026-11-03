@@ -14984,7 +14984,7 @@ const TEXT_SYS_SIM_SIM: Str =
     \\
 
 const TEXT_SYS_SYS: Str =
-    \\//! The sys capabilities, revocation and domains.
+    \\//! The sys capabilities, revocation, domains, components and the wire encoding of protocols.
     \\
     \\pub open struct Domain {
     \\} Domain
@@ -15271,9 +15271,43 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub closed enum CallError[E: Send] derives Render {
     \\    Failed(E)
+    \\    Malformed(core::DecodeError)
     \\    Closed(task::SendError) from
     \\    Cancelled(task::Cancelled) from
     \\} CallError
+    \\
+    \\pub interface Protocol {
+    \\} Protocol
+    \\
+    \\pub closed struct ProtocolHash derives Copy, Eq, Ord, Hash, Encode {
+    \\    pub bytes: Array[u8, 33]
+    \\} ProtocolHash
+    \\
+    \\pub open struct Handle {
+    \\} Handle
+    \\
+    \\pub closed struct Encoded {
+    \\    pub bytes: mem::Bytes
+    \\    pub handles: mem::List[Handle]
+    \\} Encoded
+    \\
+    \\pub fn Encoded.empty(alloc: mem::Alloc) -> Encoded
+    \\    example Encoded.empty(testing::world().alloc).bytes.len() == 0
+    \\{
+    \\    return Encoded(bytes: mem::Bytes.empty(alloc), handles: mem::List.empty(alloc))
+    \\} Encoded.empty
+    \\
+    \\pub open struct Wire[P: Protocol] {
+    \\} Wire
+    \\
+    \\pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
+    \\
+    \\pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+    \\
+    \\pub open struct Reply[R: Send, E: Send] {
+    \\} Reply
+    \\
+    \\pub fn Reply.decode(self, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> R fails CallError[E]
     \\
     \\struct Probe derives Encode {
     \\    handled: u64
@@ -16133,6 +16167,126 @@ const TEXT_SYS_SYS: Str =
     \\        return
     \\    }
     \\} component_without_system_interfaces_is_healthy
+    \\
+    \\enum Full derives Render, Encode {
+    \\    Over
+    \\} Full
+    \\
+    \\protocol Meter {
+    \\    pub fn add(amount: u32) -> u64 fails Full limits pure
+    \\        requires amount > 0
+    \\    pub fn clear() limits pure
+    \\    pub fn keep(clock: Clock) -> Clock limits pure
+    \\} Meter
+    \\
+    \\struct MeterEnv {
+    \\} MeterEnv
+    \\
+    \\struct Gauge derives Encode {
+    \\    total: u64
+    \\} Gauge
+    \\
+    \\impl Gauge: Component[MeterEnv, Meter]
+    \\
+    \\fn Gauge.start(mut env: MeterEnv) -> Gauge = Gauge(total: 0)
+    \\
+    \\fn Gauge.add(mut self, take amount: u32, mut env: MeterEnv, mut cx: Cx[Meter]) -> u64 fails Full {
+    \\    if amount > 100 {
+    \\        fail Full.Over
+    \\    }
+    \\    self.total = self.total.wrapping_add(u64.widen(amount))
+    \\    return self.total
+    \\} Gauge.add
+    \\
+    \\fn Gauge.clear(mut self, mut env: MeterEnv, mut cx: Cx[Meter]) {
+    \\    self.total = 0
+    \\} Gauge.clear
+    \\
+    \\fn Gauge.keep(mut self, take clock: Clock, mut env: MeterEnv, mut cx: Cx[Meter]) -> Clock = clock
+    \\
+    \\/// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it.
+    \\fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait {
+    \\    return try await Wire[Meter].serve(inbox, hash: Wire[Meter].hash(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
+    \\} served
+    \\
+    \\test hashes_differ_by_protocol for Wire.hash {
+    \\    expect Wire[Meter].hash() == Wire[Meter].hash()
+    \\    expect Wire[Meter].hash() != Wire[MeterSpare].hash()
+    \\} hashes_differ_by_protocol
+    \\
+    \\protocol MeterSpare {
+    \\    pub fn clear() limits pure
+    \\} MeterSpare
+    \\
+    \\test calls_are_served_from_their_encodings for Wire.serve {
+    \\    let world = testing::world()
+    \\    let alloc = world.alloc
+    \\    let last = try await host::Runner[Gauge].run(MeterEnv(), exec: world.exec, alloc, body: fn(inbox: Outbox[Meter]) fails CallError[Full] uses wait {
+    \\        var call = Encoded.empty(alloc)
+    \\        let reply = Wire[Meter].add(mut call, amount: 7)
+    \\        expect call.bytes.view() == b"\\x03add\\x01\\x0A\\x01\\x06amount\\x01\\x07"
+    \\        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        expect answer.bytes.view() == b"\\x02Ok\\x01\\x01\\x07"
+    \\        let total = try reply.decode(Untrusted.of(answer.bytes.view()), handles: answer.handles.view(), alloc)
+    \\        expect total == 7
+    \\        var zero = Encoded.empty(alloc)
+    \\        discard Wire[Meter].add(mut zero, amount: 0)
+    \\        let Err(CallError.Malformed(core::DecodeError.Invalid)) = attempt await served(inbox, call: zero, handles: zero.handles.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        var cleared = Encoded.empty(alloc)
+    \\        Wire[Meter].clear(mut cleared)
+    \\        expect cleared.bytes.view() == b"\\x05clear\\x00"
+    \\        let Ok(none) = attempt await served(inbox, call: cleared, handles: cleared.handles.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        expect none.bytes.len() == 0
+    \\    })
+    \\    expect last.total == 0
+    \\} calls_are_served_from_their_encodings
+    \\
+    \\test handles_travel_beside_their_encodings for Reply.decode {
+    \\    let world = testing::world()
+    \\    let alloc = world.alloc
+    \\    let clock = world.clock
+    \\    discard try await host::Runner[Gauge].run(MeterEnv(), exec: world.exec, alloc, body: fn(inbox: Outbox[Meter]) fails CallError[Never] uses wait {
+    \\        var call = Encoded.empty(alloc)
+    \\        let reply = Wire[Meter].keep(mut call, clock)
+    \\        expect call.bytes.view() == b"\\x04keep\\x01\\x09\\x01\\x05clock\\x01\\x00"
+    \\        expect call.handles.len() == 1
+    \\        let missing = mem::List[Handle].empty(alloc)
+    \\        let Err(CallError.Malformed(core::DecodeError.Truncated)) = attempt await served(inbox, call, handles: missing.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        var doubled = mem::List[Handle].empty(alloc)
+    \\        mut doubled.push(call.handles.at(0))
+    \\        mut doubled.push(call.handles.at(0))
+    \\        let Err(CallError.Malformed(core::DecodeError.Trailing)) = attempt await served(inbox, call, handles: doubled.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\        let kept = try reply.decode(Untrusted.of(answer.bytes.view()), handles: answer.handles.view(), alloc)
+    \\        let elapsed = attempt kept.elapsed_ns()
+    \\        expect elapsed.is_ok()
+    \\        var other = Encoded.empty(alloc)
+    \\        discard Wire[Meter].add(mut other, amount: 1)
+    \\        let refused = attempt reply.decode(Untrusted.of(answer.bytes.view()), handles: other.handles.view(), alloc)
+    \\        let Err(CallError.Malformed(core::DecodeError.Truncated)) = refused else {
+    \\            expect false
+    \\            return
+    \\        }
+    \\    })
+    \\} handles_travel_beside_their_encodings
     \\
 
 const TEXT_TASK_PACKAGE: Str =

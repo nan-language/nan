@@ -13,7 +13,7 @@ use super::sig::SigKind;
 use super::tir::{
     Builtin, Call, Callee, LocalKind, TBlock, TBody, TClosure, TExpr, TKind, TStmtKind,
 };
-use super::ty::{LimitSet, Ty};
+use super::ty::{Arg, LimitSet, Ty};
 use crate::diagnostic::{Code, Reason, Role};
 use crate::syntax::ast::{ClauseKind, FnKind, ItemKind, Tok};
 
@@ -1123,6 +1123,10 @@ impl Walk<'_, '_, '_> {
         match &call.callee {
             Callee::Function { item, .. } => {
                 let mut facts = (*self.ck.digest(*item)).clone();
+                if self.ck.db.is_std(*item) && self.ck.db.canonical(*item) == "sys::Wire.serve" {
+                    let served = call.type_args.first().and_then(Arg::ty);
+                    facts.class = facts.class.join(self.ck.served_class(served));
+                }
                 if self.ck.db.is_std(*item) && self.ck.is_primitive_capability_member(*item) {
                     let mut capabilities = facts.capabilities.clone().unwrap_or_default();
                     capabilities.insert(self.ck.owner_item(*item));
@@ -1146,6 +1150,15 @@ impl Walk<'_, '_, '_> {
                     self.site(token, float, Brought::Operation);
                 }
                 self.site(token, facts, Brought::Call(body_owned.then_some(*item)));
+            }
+            Callee::Method {
+                interface, self_ty, ..
+            } if self.ck.is_protocol(interface.interface)
+                && self.ck.wire_protocol(self_ty).is_some() =>
+            {
+                let mut facts = Digest::none();
+                facts.alloc = true;
+                self.site(token, facts, Brought::Operation);
             }
             Callee::Method {
                 interface, method, ..

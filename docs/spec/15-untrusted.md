@@ -217,6 +217,7 @@ A **parsing type** is one of these, and no other type is one:
 - a scalar, `Unit`, `Never` or an Untrusted instantiation;
 - a struct or enum that is not a [base type](05-properties.md#structural-properties) and has no type parameters, whose constituent types are all parsing types;
 - a layout whose field types are all parsing types;
+- a [protocol](26-components.md#protocols) whose operations' parameter types are all parsing types;
 - an instantiation of a generic struct or enum that is not a base type, `Option` and `Result` included, whose type arguments are all parsing types and whose definition is a parsing type when its type parameters are counted as parsing types.
 
 The checker decides whether a struct or enum is a parsing type, its type parameters counted as parsing types, from its full definition in the package declaring it. For a `pub` struct or enum this result is an [interface fact](05-properties.md#interface-facts), which consumers read instead of its fields.

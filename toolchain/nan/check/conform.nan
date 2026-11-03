@@ -213,8 +213,12 @@ pkg fn Checker.conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Opti
     match types.kind(ty) {
         ty::TyKind.Item(item: item, args: _) => {
             let db = self.db()
-            if db.is_std(interface_item) and db.canonical_text(interface_item) == "sys::Capability" and self.is_kind(item) {
-                return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
+            if db.is_std(interface_item) {
+                let interface_path = db.canonical_text(interface_item)
+                let builtin = (interface_path == "sys::Capability" and self.is_kind(item)) or (interface_path == "sys::Protocol" and self.is_protocol(item))
+                if builtin {
+                    return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
+                }
             }
         }
         else => {}
@@ -679,14 +683,41 @@ fn Checker.conform_candidates(self, ty: ty::Ty, key: TypeKey, name: Str, mut can
         }
         mut candidates.push(Candidate.Method(bound: ty::Bound(item: interface_item, args: args), method: method, self_ty: ty, function: take function, dynamic: false))
     }
-    let Some(protocol) = self.outbox_protocol(ty) else {
-        return
+    var operation: Option[OperationOf] = None
+    match self.outbox_protocol(ty) {
+        Some(protocol) => {
+            match self.outbox_method(protocol, name) {
+                Some(method) => {
+                    operation = Some(OperationOf(protocol: protocol, method: method))
+                }
+                None => {}
+            }
+        }
+        None => {
+            match self.wire_protocol(ty) {
+                Some(protocol) => {
+                    match self.wire_method(protocol, name) {
+                        Some(method) => {
+                            operation = Some(OperationOf(protocol: protocol, method: method))
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
     }
-    let Some(method) = self.outbox_method(protocol, name) else {
+    let Some(OperationOf(protocol: protocol, method: method)) = operation else {
         return
     }
     mut candidates.push(Candidate.Method(bound: ty::Bound(item: protocol, args: ty::Args.none()), method: method, self_ty: ty, function: None, dynamic: false))
 } Checker.conform_candidates
+
+/// An operation of a protocol, by its index.
+struct OperationOf derives Copy {
+    protocol: ty::ItemId
+    method: usize
+} OperationOf
 
 /// The candidates without those standing for an earlier one's function or method.
 fn distinct_candidates(take candidates: mem::List[Candidate], alloc: mem::Alloc) -> mem::List[Candidate] {
@@ -889,7 +920,12 @@ fn Checker.method_head(self, bound: ty::Bound, method: usize, self_ty: ty::Ty) -
     let held = self.sig(bound.item)
     let sig = held.contents()
     match sig.kind {
-        SigKind.Protocol(operations: _, variants: _, summary: _) => return self.outbox_head(bound.item, method, outbox: self_ty)
+        SigKind.Protocol(operations: _, variants: _, summary: _) => {
+            return match self.wire_protocol(self_ty) {
+                Some(protocol) => self.wire_head(protocol, method)
+                None => self.outbox_head(bound.item, method, outbox: self_ty)
+            }
+        }
         else => {}
     }
     let SigKind.Interface(methods: methods) = sig.kind else {

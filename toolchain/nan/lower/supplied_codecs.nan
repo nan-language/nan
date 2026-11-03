@@ -15,22 +15,34 @@ enum DecodeFormat derives Copy, Eq, Hash {
 } DecodeFormat
 
 /// The words of a writer: the buffer bytes go to, zero while measuring, and the count of bytes
-/// written.
+/// written, then for the encoding of a protocol's call or reply the list its handles go to and
+/// the index of the next.
 const WRITER_BUFFER: u64 = 0
 
 const WRITER_LEN: u64 = 8
 
-const WRITER_SIZE: u64 = 16
+const WRITER_HANDLES: u64 = 16
+
+const WRITER_NEXT: u64 = 24
+
+const WRITER_SIZE: u64 = 32
 
 /// The words of a reader: the address of the next byte, or the decoder's address, the end of
-/// the input and the nesting depth.
+/// the input and the nesting depth, then for such an encoding the first of its handles, their
+/// count and the count read.
 const READER_POS: u64 = 0
 
 const READER_END: u64 = 8
 
 const READER_DEPTH: u64 = 16
 
-const READER_SIZE: u64 = 24
+const READER_HANDLES: u64 = 24
+
+const READER_COUNT: u64 = 32
+
+const READER_TAKEN: u64 = 40
+
+const READER_SIZE: u64 = 48
 
 /// The codes of decoding failures: one plus the index of each `core::DecodeError` variant.
 const FAILURE_TRUNCATED: i64 = 1
@@ -67,6 +79,9 @@ const MOST_DEPTH: i64 = 128
 
 const CODECS_BYTE: Element = Element(size: 1, align: 1)
 
+/// The element storage of a list of `sys::Handle`.
+const CODECS_HANDLE: Element = Element(size: 48, align: 8)
+
 /// A value read, and the code of its failure, zero for none.
 struct Reading derives Copy {
     value: clif::Value
@@ -96,6 +111,10 @@ enum CodecsKind {
     Id
     Record(Record)
     Variant(mem::List[Case])
+    /// A value of a handle type, whose handle carries this handle hash.
+    Handle(hashing::HashValue)
+    /// `Never`, the failure of a request without a `fails` clause, which no reply holds.
+    Never
 } CodecsKind
 
 /// The element storage of a sequence.
@@ -148,9 +167,11 @@ struct RecordOwner derives Copy {
     args: ty::Args
 } RecordOwner
 
-/// A variant of an enum: its key and payload.
+/// A variant of an enum or a protocol's message: its key, its index among the type's variants
+/// and its payload.
 struct Case {
     key: text::String
+    index: usize
     payload: CasePayload
 } Case
 
@@ -168,6 +189,9 @@ struct Decoding derives Copy {
 } Decoding
 
 fn codecs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    if protocols_lower(mut lo, mut fx, supply) {
+        return true
+    }
     let written = supply.path.as_str()
     let spelling = written.as_bytes()
     var at = spelling.len()
@@ -317,18 +341,37 @@ fn codecs_result_at(mut lo: Lowering, mut fx: Fx, sret: Option[clif::Value], ty:
 /// parameter `raw`, drawing through the allocator of the parameter after it: the code of a
 /// decoding function, `Trailing` on what is left after the value, which is then released.
 fn codecs_read(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usize, format: DecodeFormat, ty: ty::Ty, target: clif::Value) -> clif::Value {
-    let raw_address = supply.param(raw).address_value()
-    let start = mut fx.load(PTR, addr: raw_address, offset: 0)
-    let len = mut fx.load(PTR, addr: raw_address, offset: 8)
-    let alloc = mut fx.load(PTR, addr: supply.param(raw + 1).address_value(), offset: 0)
+    return codecs_read_from(mut lo, mut fx, raw: supply.param(raw).address_value(), alloc: supply.param(raw + 1).address_value(), handles: None, format, ty, target)
+} codecs_read
+
+/// Reads one value of `ty` at `target` from the bytes of the slice at `raw`, and in the wire
+/// format against the handles of the slice at `handles`, drawing through the allocator at
+/// `alloc`: the code of a decoding function, `Trailing` on bytes or handles left after the value,
+/// which is then released.
+fn codecs_read_from(mut lo: Lowering, mut fx: Fx, raw: clif::Value, alloc: clif::Value, handles: Option[clif::Value], format: DecodeFormat, ty: ty::Ty, target: clif::Value) -> clif::Value {
+    let start = mut fx.load(PTR, addr: raw, offset: 0)
+    let len = mut fx.load(PTR, addr: raw, offset: 8)
+    let alloc_handle = mut fx.load(PTR, addr: alloc, offset: 0)
     let state = mut fx.slot(READER_SIZE, align: 8)
     mut fx.store(start, addr: state, offset: READER_POS)
     let end = mut fx.b.iadd(start, y: len)
     mut fx.store(end, addr: state, offset: READER_END)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: state, offset: READER_DEPTH)
+    var count: Option[clif::Value] = None
+    match handles {
+        Some(handle_slice) => {
+            let first_handle = mut fx.load(PTR, addr: handle_slice, offset: 0)
+            mut fx.store(first_handle, addr: state, offset: READER_HANDLES)
+            let held = mut fx.load(PTR, addr: handle_slice, offset: 8)
+            mut fx.store(held, addr: state, offset: READER_COUNT)
+            mut fx.store(zero, addr: state, offset: READER_TAKEN)
+            count = Some(held)
+        }
+        None => {}
+    }
     let function = decoder(mut lo, format, ty)
-    let call_args = fx.list3(state, b: alloc, c: target)
+    let call_args = fx.list3(state, b: alloc_handle, c: target)
     let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
     expect codes.len() == 1
     let code = codes[0]
@@ -339,7 +382,15 @@ fn codecs_read(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usize, format:
             space(mut fx1, state)
         }
         let pos = mut fx1.load(PTR, addr: state, offset: READER_POS)
-        let left = mut fx1.b.icmp(clif::IntCC.NotEqual, x: pos, y: end)
+        var left = mut fx1.b.icmp(clif::IntCC.NotEqual, x: pos, y: end)
+        match count {
+            Some(held) => {
+                let taken = mut fx1.load(PTR, addr: state, offset: READER_TAKEN)
+                let unread = mut fx1.b.icmp(clif::IntCC.NotEqual, x: taken, y: held)
+                left = mut fx1.b.bor(left, y: unread)
+            }
+            None => {}
+        }
         mut fx1.if_true(left, then: fn[mut lo](mut fx2: Fx) {
             mut lo.release(mut fx2, ty, address: target)
         })
@@ -352,7 +403,7 @@ fn codecs_read(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usize, format:
     })
     expect checked.len() == 1
     return checked[0]
-} codecs_read
+} codecs_read_from
 
 /// `Codec.canonical(raw, alloc)`: one value read as `decode` reads it, then released once its
 /// encoding is written to new bytes, failing with `OutOfMemory` when they cannot be drawn.
@@ -605,19 +656,7 @@ fn decode_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, code: clif::Value
         expect false
         return
     }
-    let laid = mut lo.layout_of(failure_ty)
-    let error = mut fx.slot(laid.contents().size, align: laid.contents().align)
-    let no_payload = mem::List[Held].empty(lo.alloc)
-    var position: i64 = 0
-    for name in check::Words(list: DECODE_ERRORS, at: 0) {
-        expect position < 0xFFFF_FFFF
-        position += 1
-        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: position)
-        mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
-            let value = mut lo.variant_value(mut fx1, ty: failure_ty, variant: name, payload_values: no_payload.view(), wrapped: None)
-            mut lo.store_held(mut fx1, address: error, held: value, ty: failure_ty)
-        })
-    }
+    let error = decode_error(mut lo, mut fx, code)
     let held = mut lo.held_at(mut fx, ty: failure_ty, address: error)
     let Some(target) = supply.failure else {
         expect false
@@ -627,8 +666,41 @@ fn decode_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, code: clif::Value
     supply.raise_failure(mut fx)
 } decode_failed
 
+/// The address of the `core::DecodeError` value a decoding function's nonzero code names.
+fn decode_error(mut lo: Lowering, mut fx: Fx, code: clif::Value) -> clif::Value {
+    let Some(item) = lo.ck.db().core_item("DecodeError") else {
+        expect false
+        return code
+    }
+    let error_ty = lo.ck.types().item(item, args: mem::List[ty::Arg].empty(lo.alloc))
+    let laid = mut lo.layout_of(error_ty)
+    let error = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let no_payload = mem::List[Held].empty(lo.alloc)
+    var position: i64 = 0
+    for name in check::Words(list: DECODE_ERRORS, at: 0) {
+        expect position < 0xFFFF_FFFF
+        position += 1
+        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: position)
+        mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+            let value = mut lo.variant_value(mut fx1, ty: error_ty, variant: name, payload_values: no_payload.view(), wrapped: None)
+            mut lo.store_held(mut fx1, address: error, held: value, ty: error_ty)
+        })
+    }
+    return error
+} decode_error
+
 fn kind_of(mut lo: Lowering, ty: ty::Ty) -> CodecsKind {
-    match lo.ck.types().kind(ty) {
+    let types = lo.ck.types()
+    match types.kind(ty) {
+        ty::TyKind.Never => return CodecsKind.Never
+        ty::TyKind.Item(item: _, args: _) => {
+            if lo.ck.is_handle(ty) {
+                return CodecsKind.Handle(lo.ck.handle_hash(ty))
+            }
+        }
+        else => {}
+    }
+    match types.kind(ty) {
         ty::TyKind.Scalar(scalar) => {
             return match scalar {
                 ty::Scalar.Bool => CodecsKind.Bool
@@ -706,8 +778,17 @@ fn codecs_declared(mut lo: Lowering, item: ty::ItemId, args: ty::Args) -> Codecs
         }
         check::SigKind.Enum(variants: variants) => {
             var cases = mem::List[Case].empty(lo.alloc)
-            for variant in variants {
-                mut cases.push(Case(key: text::String.of(variant.name.as_str(), alloc: lo.alloc), payload: case_payload(mut lo, ty, variant, subst)))
+            for index in 0..<variants.len() {
+                let variant = variants[index]
+                mut cases.push(Case(key: text::String.of(variant.name.as_str(), alloc: lo.alloc), index: index, payload: case_payload(mut lo, ty, variant, subst)))
+            }
+            return CodecsKind.Variant(take cases)
+        }
+        check::SigKind.Protocol(operations: _, variants: variants, summary: _) => {
+            var cases = mem::List[Case].empty(lo.alloc)
+            for index in lo.ck.hashed_operations(item) {
+                let variant = variants[index]
+                mut cases.push(Case(key: text::String.of(variant.name.as_str(), alloc: lo.alloc), index: index, payload: case_payload(mut lo, ty, variant, subst)))
             }
             return CodecsKind.Variant(take cases)
         }
@@ -936,16 +1017,64 @@ fn encode_kind(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, kind: C
         CodecsKind.Record(record) => encode_record(mut lo, mut fx, format, record, value, state)
         CodecsKind.Variant(cases) => {
             let index = mut lo.variant_index(mut fx, ty, address: value)
-            for position in 0..<cases.len() {
-                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
-                let case = cases[position]
+            for case in cases {
+                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(case.index))
                 mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
                     encode_case(mut lo, fx: mut fx1, format, ty, case, value, state)
                 })
             }
         }
+        CodecsKind.Handle(hash) => encode_handle(mut lo, mut fx, hash, value, state)
+        CodecsKind.Never => {}
     }
 } encode_kind
+
+/// Writes a value of a handle type: the index of its handle, which goes to the writer's list
+/// unless measuring.
+fn encode_handle(mut lo: Lowering, mut fx: Fx, hash: hashing::HashValue, value: clif::Value, state: clif::Value) {
+    let next = mut fx.load(PTR, addr: state, offset: WRITER_NEXT)
+    put_uvar(mut fx, state, value: next)
+    let buffer = mut fx.load(PTR, addr: state, offset: WRITER_BUFFER)
+    let writing = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: buffer, y: 0)
+    mut fx.if_true(writing, then: fn[mut lo](mut fx1: Fx) {
+        let list = mut fx1.load(PTR, addr: state, offset: WRITER_HANDLES)
+        let data = mut fx1.load(PTR, addr: list, offset: VECTOR_DATA)
+        let len = mut fx1.load(PTR, addr: list, offset: VECTOR_LEN)
+        let entry = CODECS_HANDLE.at(mut fx1, data, index: len)
+        let handle = mut fx1.load(clif::Type.Int64, addr: value, offset: 0)
+        mut fx1.store(handle, addr: entry, offset: HANDLE_HANDLE)
+        let data_id = mut lo.bytes_data(hash.bytes.view())
+        let hash_at = mut lo.data_address(mut fx1, id: data_id)
+        let at = mut fx1.offset(entry, offset: HANDLE_HASH)
+        mut lo.copy(mut fx1, dst: at, src: hash_at, size: 33, align: 1)
+        let grown = mut fx1.b.iadd_imm_s(len, y: 1)
+        mut fx1.store(grown, addr: list, offset: VECTOR_LEN)
+    })
+    let advanced = mut fx.b.iadd_imm_s(next, y: 1)
+    mut fx.store(advanced, addr: state, offset: WRITER_NEXT)
+} encode_handle
+
+/// A writer measuring what follows in `state`, counting its handles from the next index of
+/// `state` when it writes any.
+fn codecs_counting(mut fx: Fx, state: clif::Value, handles: bool) -> clif::Value {
+    let counting = mut fx.slot(WRITER_SIZE, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: counting, offset: WRITER_BUFFER)
+    mut fx.store(zero, addr: counting, offset: WRITER_LEN)
+    if handles {
+        let next = mut fx.load(PTR, addr: state, offset: WRITER_NEXT)
+        mut fx.store(next, addr: counting, offset: WRITER_NEXT)
+    }
+    return counting
+} codecs_counting
+
+/// The bytes an encoding function writes for a value of `ty` that follows in `state`.
+fn codecs_measure_within(mut lo: Lowering, mut fx: Fx, function: object::FuncId, ty: ty::Ty, value: clif::Value, state: clif::Value) -> clif::Value {
+    let counting = codecs_counting(mut fx, state, handles: lo.ck.is_handle(ty))
+    let call_args = fx.list2(value, b: counting)
+    discard codecs_call(mut lo, mut fx, function, args: call_args.view())
+    return mut fx.load(PTR, addr: counting, offset: WRITER_LEN)
+} codecs_measure_within
 
 /// Writes an unsigned or signed integer or a char of a scalar type at `value`.
 fn encode_number(mut lo: Lowering, mut fx: Fx, format: Format, scalar: ty::Scalar, signed: bool, value: clif::Value, state: clif::Value) {
@@ -1102,7 +1231,7 @@ fn encode_record(mut lo: Lowering, mut fx: Fx, format: Format, record: Record, v
                 None => {}
             }
             put_literal_text(mut lo, mut fx, state, bytes: field.key.as_bytes())
-            let size = codecs_measure(mut lo, mut fx, function, value: field_at)
+            let size = codecs_measure_within(mut lo, mut fx, function, ty: field.ty, value: field_at, state)
             put_uvar(mut fx, state, value: size)
         } else {
             if position > 0 {
@@ -1151,7 +1280,7 @@ fn encode_case(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, case: C
             let payload = mut lo.payload_address(mut fx, ty, variant: case.key.as_str(), label: "", address: value)
             let function = encoder(mut lo, format, ty: payload_ty)
             if format == Format.Wire {
-                let size = codecs_measure(mut lo, mut fx, function, value: payload)
+                let size = codecs_measure_within(mut lo, mut fx, function, ty: payload_ty, value: payload, state)
                 put_uvar(mut fx, state, value: size)
             }
             let call_args = fx.list2(payload, b: state)
@@ -1159,10 +1288,11 @@ fn encode_case(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, case: C
         }
         CasePayload.Labelled(record) => {
             if format == Format.Wire {
-                let counting = mut fx.slot(WRITER_SIZE, align: 8)
-                let zero = mut fx.ptr(0)
-                mut fx.store(zero, addr: counting, offset: WRITER_BUFFER)
-                mut fx.store(zero, addr: counting, offset: WRITER_LEN)
+                var handles = false
+                for field in record.fields {
+                    handles = handles or lo.ck.is_handle(field.ty)
+                }
+                let counting = codecs_counting(mut fx, state, handles)
                 encode_record(mut lo, mut fx, format, record, value, state: counting)
                 let size = mut fx.load(PTR, addr: counting, offset: WRITER_LEN)
                 put_uvar(mut fx, state, value: size)
@@ -1453,8 +1583,46 @@ fn decode_kind(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, kin
             }
         }
         CodecsKind.Variant(cases) => decode_variant(mut lo, mut fx, decoding, ty, cases: cases.view(), target)
+        CodecsKind.Handle(hash) => decode_handle(mut lo, mut fx, decoding, hash, target)
+        CodecsKind.Never => {
+            let always = mut fx.int(clif::Type.Int8, value: 1)
+            mut fx.if_true(always, then: fn(mut fx1: Fx) {
+                codecs_fail(mut fx1, code: FAILURE_INVALID)
+            })
+        }
     }
 } decode_kind
+
+/// Reads a value of a handle type: the index of the next handle the reader has not read, whose
+/// handle hash is `hash`.
+fn decode_handle(mut lo: Lowering, mut fx: Fx, decoding: Decoding, hash: hashing::HashValue, target: clif::Value) {
+    let reader_state = decoding.reader
+    let index = codecs_read_integer(mut lo, mut fx, decoding, signed: false)
+    let taken = mut fx.load(PTR, addr: reader_state, offset: READER_TAKEN)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: index, y: taken)
+    mut fx.if_true(other, then: fn(mut fx1: Fx) {
+        codecs_fail(mut fx1, code: FAILURE_MALFORMED)
+    })
+    let count = mut fx.load(PTR, addr: reader_state, offset: READER_COUNT)
+    let past = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: taken, y: count)
+    mut fx.if_true(past, then: fn(mut fx1: Fx) {
+        codecs_fail(mut fx1, code: FAILURE_TRUNCATED)
+    })
+    let first_handle = mut fx.load(PTR, addr: reader_state, offset: READER_HANDLES)
+    let entry = CODECS_HANDLE.at(mut fx, data: first_handle, index: taken)
+    let data_id = mut lo.bytes_data(hash.bytes.view())
+    let wanted = mut lo.data_address(mut fx, id: data_id)
+    let carried = mut fx.offset(entry, offset: HANDLE_HASH)
+    let same = same_hash(mut lo, mut fx, wanted, hash: carried)
+    let mismatched = mut fx.b.bxor_imm_s(same, y: 1)
+    mut fx.if_true(mismatched, then: fn(mut fx1: Fx) {
+        codecs_fail(mut fx1, code: FAILURE_INVALID)
+    })
+    let handle = mut fx.load(clif::Type.Int64, addr: entry, offset: HANDLE_HANDLE)
+    mut fx.store(handle, addr: target, offset: 0)
+    let advanced = mut fx.b.iadd_imm_s(taken, y: 1)
+    mut fx.store(advanced, addr: reader_state, offset: READER_TAKEN)
+} decode_handle
 
 /// Reads an unsigned or signed integer of a scalar type into `target`, failing with
 /// `OutOfRange` outside the type's range.

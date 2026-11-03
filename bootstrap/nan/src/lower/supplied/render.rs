@@ -462,6 +462,7 @@ pub fn define_render(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty) {
 pub fn render_to(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_value: Value) {
     match ty {
         Ty::Unit => append_text(lo, fx, renderer_value, "Unit"),
+        Ty::Never => {}
         Ty::Scalar(scalar) => render_scalar(lo, fx, *scalar, value.scalar(), renderer_value),
         Ty::Item(item, args) => {
             let path = lo.ck.db.canonical(*item);

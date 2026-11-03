@@ -14,11 +14,12 @@ use super::sig::{FnSig, ParamSig, SigKind};
 use super::ty::{Arg, Const, LimitSet, Ty};
 use crate::diagnostic::Code;
 use crate::hash::Hash;
+use crate::nir::{Callable, FnRef};
 use crate::syntax::ast::{self, ClauseKind, ItemKind, Mode, ProtocolItem, Visibility};
 
-/// The names no operation takes: the outbox's own method, the component's `start` and the
-/// summary read.
-const RESERVED: [&str; 3] = ["post", "start", "summary"];
+/// The names no operation takes: the outbox's own method, the component's `start`, the summary
+/// read and the members of `sys::Wire`.
+const RESERVED: [&str; 5] = ["post", "start", "summary", "hash", "serve"];
 
 /// What a function of a component serving a protocol stands for: the handler of an operation,
 /// by its index, or the summary function.
@@ -100,14 +101,20 @@ impl Checker<'_> {
         !sent || encode.is_none_or(|encode| self.implements(ty, encode)) || self.is_handle(ty)
     }
 
-    /// Whether a type is a handle type: a primitive capability or an outbox.
-    fn is_handle(&self, ty: &Ty) -> bool {
-        match ty {
-            Ty::Item(item, _) => {
-                self.is_primitive_capability(*item) || self.db.canonical(*item) == "sys::Outbox"
-            }
-            _ => false,
-        }
+    /// Whether a type is a handle type: one implementing `sys::Capability`, or an outbox.
+    pub fn is_handle(&self, ty: &Ty) -> bool {
+        let capability = self.db.std_item("sys", "Capability");
+        matches!(ty, Ty::Item(..))
+            && (self.is_std(ty, "sys::Outbox")
+                || capability.is_some_and(|capability| self.implements(ty, capability)))
+    }
+
+    /// The hash of a handle type's handle line, which its handles carry.
+    pub fn handle_hash(&self, ty: &Ty) -> Hash {
+        let Ty::Item(item, _) = ty else {
+            unreachable!("a handle type is an item")
+        };
+        Hash::of(self.type_line(ty, self.db.module_of(*item)).as_bytes())
     }
 
     /// The operation an undo clause of a protocol's operation names: another operation of it,
@@ -156,6 +163,43 @@ impl Checker<'_> {
             true => class.compensated(),
             false => class,
         }
+    }
+
+    /// The class of serving a protocol's calls: that of each of its `pub` operations, the
+    /// greatest for a type that is no protocol.
+    pub fn served_class(&self, protocol: Option<&Ty>) -> Class {
+        match protocol {
+            Some(Ty::Item(protocol, _)) if self.is_protocol(*protocol) => {
+                (self.hashed_operations(*protocol).into_iter())
+                    .map(|index| self.operation_class(*protocol, index))
+                    .fold(Class::Traceless, Class::join)
+            }
+            _ => Class::WORST,
+        }
+    }
+
+    /// The results and failures of a protocol's `pub` requests.
+    pub fn reply_types(&self, protocol: ItemId) -> Vec<Ty> {
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            return Vec::new();
+        };
+        (self.hashed_operations(protocol).into_iter())
+            .filter(|index| self.is_request(protocol, *index))
+            .flat_map(|index| {
+                let head = &operations[index].sig;
+                std::iter::once(head.result.clone()).chain(head.fails.clone())
+            })
+            .collect()
+    }
+
+    /// The requires clauses an operation's handler relies on, by their index in its protocol's
+    /// unit.
+    pub fn operation_requires(&self, protocol: ItemId, index: usize) -> Vec<u32> {
+        self.typed(protocol);
+        (self.method_requires(protocol, index).into_iter())
+            .filter(|(_, disputed)| !disputed)
+            .map(|(clause, _)| clause)
+            .collect()
     }
 
     /// Whether an operation has an undo clause.
@@ -403,6 +447,66 @@ impl Checker<'_> {
         Some(bare(params, operation.result.clone(), fails, true))
     }
 
+    /// The protocol of a `sys::Wire` type encoding its operations.
+    pub fn wire_protocol(&self, ty: &Ty) -> Option<ItemId> {
+        if !self.is_std(ty, "sys::Wire") {
+            return None;
+        }
+        match ty.type_arg(0) {
+            Some(Ty::Item(protocol, _)) if self.is_protocol(*protocol) => Some(*protocol),
+            _ => None,
+        }
+    }
+
+    /// Whether a function reference calls an operation as a member of `sys::Wire`, encoding its
+    /// call.
+    pub fn encodes(&self, fn_ref: &FnRef) -> bool {
+        matches!(fn_ref.callable, Callable::Method { interface, .. } if self.is_protocol(interface))
+            && (fn_ref.args.first().and_then(Arg::ty))
+                .is_some_and(|ty| self.wire_protocol(ty).is_some())
+    }
+
+    /// The `pub` operation of a protocol of that name, which `sys::Wire` encodes calls of.
+    pub fn wire_method(&self, protocol: ItemId, name: &str) -> Option<usize> {
+        let ItemKind::Protocol(declared) = &self.db.ast(protocol).kind else {
+            return None;
+        };
+        declared.operations.iter().position(|operation| {
+            operation.method.name.text == name && operation.visibility == Visibility::Pub
+        })
+    }
+
+    /// The head of an operation called as a member of `sys::Wire` of its protocol: the encoded
+    /// call its encoding is appended to, then the operation's parameters, giving a request's
+    /// `sys::Reply`.
+    pub fn wire_head(&self, protocol: ItemId, method: usize) -> Option<FnSig> {
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            return None;
+        };
+        let operation = &operations.get(method)?.sig;
+        let encoded = self.db.std_item("sys", "Encoded")?;
+        let mut params = vec![ParamSig {
+            name: "out".to_owned(),
+            mode: Mode::Mut,
+            ty: Ty::item(encoded, Vec::new()),
+            token: 0,
+            is_self: false,
+        }];
+        params.extend(operation.params.iter().cloned());
+        let result = match self.is_request(protocol, method) {
+            true => {
+                let reply = self.db.std_item("sys", "Reply")?;
+                let failure = operation.fails.clone().unwrap_or(Ty::Never);
+                Ty::item(
+                    reply,
+                    vec![Arg::Ty(operation.result.clone()), Arg::Ty(failure)],
+                )
+            }
+            false => Ty::Unit,
+        };
+        Some(bare(params, result, None, false))
+    }
+
     /// Whether a method an outbox of a protocol calls is one of its operations, rather than
     /// `summary`.
     pub fn is_operation(&self, protocol: ItemId, method: usize) -> bool {
@@ -451,8 +555,8 @@ impl Checker<'_> {
         }
     }
 
-    /// The operations of a protocol that enter its hash: its `pub` ones.
-    fn hashed_operations(&self, protocol: ItemId) -> Vec<usize> {
+    /// The operations of a protocol that enter its hash and travel encoded: its `pub` ones.
+    pub fn hashed_operations(&self, protocol: ItemId) -> Vec<usize> {
         let ItemKind::Protocol(declared) = &self.db.ast(protocol).kind else {
             return Vec::new();
         };

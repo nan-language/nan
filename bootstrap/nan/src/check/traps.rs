@@ -167,6 +167,9 @@ impl Checker<'_> {
                         {
                             sources.push(Source::Declared(span));
                         }
+                        Callable::Method { .. } if self.encodes(fn_ref) => {
+                            sources.push(Source::Declared(span));
+                        }
                         _ => {}
                     },
                     Callee::Value(value) => {

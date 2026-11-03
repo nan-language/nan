@@ -260,17 +260,22 @@ impl Checker<'_> {
         }
     }
 
-    /// An impl line naming `sys::Capability`, which only std writes.
+    /// An impl line naming `sys::Capability` or `sys::Protocol`, which only std writes and the
+    /// toolchain supplies.
     pub fn check_capability_impl(&self, item: ItemId) {
-        if !self.db.is_std(item)
-            && let super::sig::SigKind::Impl {
-                interface: Some(bound),
-                ..
-            } = &self.sig(item).kind
-            && self.db.canonical(bound.interface) == "sys::Capability"
-        {
-            self.report(item, self.db.ast(item).token, Code::AuthorityCapabilityImpl);
-        }
+        let super::sig::SigKind::Impl {
+            interface: Some(bound),
+            ..
+        } = &self.sig(item).kind
+        else {
+            return;
+        };
+        let code = match self.db.canonical(bound.interface).as_str() {
+            "sys::Capability" if !self.db.is_std(item) => Code::AuthorityCapabilityImpl,
+            "sys::Protocol" => Code::ComponentProtocolImpl,
+            _ => return,
+        };
+        self.report(item, self.db.ast(item).token, code);
     }
 }
 

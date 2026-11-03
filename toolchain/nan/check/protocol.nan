@@ -95,10 +95,10 @@ fn Checker.check_operation_clause(self, item: ty::ItemId, index: usize, clause: 
     }
 } Checker.check_operation_clause
 
-/// Whether a name is one no operation takes: the outbox's own method, the component's `start`
-/// or the summary read.
+/// Whether a name is one no operation takes: the outbox's own method, the component's `start`,
+/// the summary read or a member of `sys::Wire`.
 fn reserved_name(name: Str) -> bool {
-    return name == "post" or name == "start" or name == "summary"
+    return name == "post" or name == "start" or name == "summary" or name == "hash" or name == "serve"
 } reserved_name
 
 /// Whether a type may be one of an operation's: Send and not linear, and, for an operation
@@ -116,13 +116,29 @@ fn Checker.operation_type(self, ty: ty::Ty, sent: bool) -> bool {
     }
 } Checker.operation_type
 
-/// Whether a type is a handle type: a primitive capability or an outbox.
-fn Checker.is_handle(self, ty: ty::Ty) -> bool {
-    let ty::TyKind.Item(item: item, args: _) = self.types().kind(ty) else {
+/// Whether a type is a handle type: one implementing `sys::Capability`, or an outbox.
+pkg fn Checker.is_handle(self, ty: ty::Ty) -> bool {
+    let ty::TyKind.Item(item: _, args: _) = self.types().kind(ty) else {
         return false
     }
-    return self.is_primitive_capability(item) or self.db().canonical_text(item) == "sys::Outbox"
+    if self.is_std(ty, path: "sys::Outbox") {
+        return true
+    }
+    return match self.db().std_item("sys", name: "Capability") {
+        Some(capability) => self.implements(ty, interface_item: capability)
+        None => false
+    }
 } Checker.is_handle
+
+/// The hash of a handle type's handle line, which its handles carry.
+pkg fn Checker.handle_hash(self, ty: ty::Ty) -> hashing::HashValue {
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(ty) else {
+        expect false
+        return hashing::HashValue.of(b"")
+    }
+    let line = self.type_line(ty, module: self.db().module_of(item))
+    return hashing::HashValue.of(line.as_bytes())
+} Checker.handle_hash
 
 /// The operation an undo clause of a protocol's operation names: another operation of it,
 /// named by a path of one segment.
@@ -168,6 +184,60 @@ pkg fn Checker.operation_class(self, protocol: ty::ItemId, index: usize) -> ty::
     }
     return class
 } Checker.operation_class
+
+/// The class of serving a protocol's calls: that of each of its `pub` operations, the greatest
+/// for a type that is no protocol.
+pkg fn Checker.served_class(self, protocol: Option[ty::Ty]) -> ty::Class {
+    let Some(served) = protocol else {
+        return ty::Class.worst()
+    }
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(served) else {
+        return ty::Class.worst()
+    }
+    if not self.is_protocol(item) {
+        return ty::Class.worst()
+    }
+    var class = ty::Class.Traceless
+    for index in self.hashed_operations(item) {
+        class = class.join(self.operation_class(item, index))
+    }
+    return class
+} Checker.served_class
+
+/// The results and failures of a protocol's `pub` requests.
+pkg fn Checker.reply_types(self, protocol: ty::ItemId) -> mem::List[ty::Ty] {
+    let alloc = self.alloc()
+    var types = mem::List[ty::Ty].empty(alloc)
+    let held = self.sig(protocol)
+    let SigKind.Protocol(operations: operations, variants: _, summary: _) = held.contents().kind else {
+        return types
+    }
+    for index in self.hashed_operations(protocol) {
+        if not self.is_request(protocol, index) {
+            continue
+        }
+        mut types.push(operations[index].sig.result)
+        match operations[index].sig.failure {
+            Some(failure) => mut types.push(failure)
+            None => {}
+        }
+    }
+    return types
+} Checker.reply_types
+
+/// The requires clauses an operation's handler relies on, by their index in its protocol's
+/// unit.
+pkg fn Checker.operation_requires(self, protocol: ty::ItemId, index: usize) -> mem::List[u32] {
+    let alloc = self.alloc()
+    discard self.typed(protocol)
+    var indexes = mem::List[u32].empty(alloc)
+    for clause in self.method_requires(protocol, method: index) {
+        if not clause.disputed {
+            mut indexes.push(clause.index)
+        }
+    }
+    return indexes
+} Checker.operation_requires
 
 /// Whether an operation has an undo clause.
 pkg fn Checker.operation_undoes(self, protocol: ty::ItemId, index: usize) -> bool {
@@ -463,6 +533,93 @@ pkg fn Checker.outbox_head(self, protocol: ty::ItemId, method: usize, outbox: ty
     return Some(simple_head(take params, result: operation.result, failure: failure, wait: true, alloc))
 } Checker.outbox_head
 
+/// The protocol of a `sys::Wire` type encoding its operations.
+pkg fn Checker.wire_protocol(self, ty: ty::Ty) -> Option[ty::ItemId] {
+    let types = self.types()
+    if not self.is_std(ty, path: "sys::Wire") {
+        return None
+    }
+    let Some(protocol_ty) = types.type_arg(ty, index: 0) else {
+        return None
+    }
+    let ty::TyKind.Item(item: protocol, args: _) = types.kind(protocol_ty) else {
+        return None
+    }
+    if self.is_protocol(protocol) {
+        return Some(protocol)
+    }
+    return None
+} Checker.wire_protocol
+
+/// Whether a function reference calls an operation as a member of `sys::Wire`, encoding its
+/// call.
+pkg fn Checker.encodes(self, fn_ref: nir::FnRef) -> bool {
+    let nir::Callable.Method(item: interface_item, method: _) = fn_ref.callable else {
+        return false
+    }
+    if not self.is_protocol(interface_item) {
+        return false
+    }
+    let args = self.types().arg_list(fn_ref.args)
+    if args.len() == 0 {
+        return false
+    }
+    let Some(self_ty) = args[0].ty() else {
+        return false
+    }
+    return self.wire_protocol(self_ty).is_some()
+} Checker.encodes
+
+/// The `pub` operation of a protocol of that name, which `sys::Wire` encodes calls of.
+pkg fn Checker.wire_method(self, protocol: ty::ItemId, name: Str) -> Option[usize] {
+    let ast::ItemKind.Protocol(declared) = self.db().ast(protocol).kind else {
+        return None
+    }
+    for index in 0..<declared.operations.len() {
+        let operation = declared.operations[index]
+        if operation.method.name.text.as_str() == name and operation.visibility == ast::Visibility.Pub {
+            return Some(index)
+        }
+    }
+    return None
+} Checker.wire_method
+
+/// The head of an operation called as a member of `sys::Wire` of its protocol: the encoded call its
+/// encoding is appended to, then the operation's parameters, giving a request's
+/// `sys::Reply`.
+pkg fn Checker.wire_head(self, protocol: ty::ItemId, method: usize) -> Option[FnSig] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let db = self.db()
+    let held = self.sig(protocol)
+    let SigKind.Protocol(operations: operations, variants: _, summary: _) = held.contents().kind else {
+        return None
+    }
+    if method >= operations.len() {
+        return None
+    }
+    let operation = operations[method].sig
+    let Some(encoded) = db.std_item("sys", name: "Encoded") else {
+        return None
+    }
+    var params = mem::List[ParamSig].empty(alloc)
+    mut params.push(ParamSig(name: text::String.of("out", alloc), mode: ast::Mode.Mut, ty: types.item(encoded, args: mem::List[ty::Arg].empty(alloc)), token: 0, is_self: false))
+    for param in operation.params {
+        mut params.push(ParamSig(name: text::String.of(param.name.as_str(), alloc), mode: param.mode, ty: param.ty, token: param.token, is_self: param.is_self))
+    }
+    var result = ty::Ty.unit()
+    if self.is_request(protocol, index: method) {
+        let Some(reply) = db.std_item("sys", name: "Reply") else {
+            return None
+        }
+        var args = mem::List[ty::Arg].empty(alloc)
+        mut args.push(ty::Arg.Ty(operation.result))
+        mut args.push(ty::Arg.Ty(operation.failure.value_or(ty::Ty.never())))
+        result = types.item(reply, take args)
+    }
+    return Some(simple_head(take params, result: result, failure: None, wait: false, alloc))
+} Checker.wire_head
+
 /// Whether a method an outbox of a protocol calls is one of its operations, rather than
 /// `summary`.
 pkg fn Checker.is_operation(self, protocol: ty::ItemId, method: usize) -> bool {
@@ -516,6 +673,20 @@ pkg fn Checker.operation_visible(self, from: ty::ModuleId, protocol: ty::ItemId,
     return db.field_visible(from, owner: protocol, visibility: declared.operations[index].visibility)
 } Checker.operation_visible
 
+/// The operations of a protocol that enter its hash and travel encoded: its `pub` ones.
+pkg fn Checker.hashed_operations(self, protocol: ty::ItemId) -> mem::List[usize] {
+    var hashed = mem::List[usize].empty(self.alloc())
+    let ast::ItemKind.Protocol(declared) = self.db().ast(protocol).kind else {
+        return hashed
+    }
+    for index in 0..<declared.operations.len() {
+        if declared.operations[index].visibility == ast::Visibility.Pub {
+            mut hashed.push(index)
+        }
+    }
+    return hashed
+} Checker.hashed_operations
+
 /// The hash of each operation that enters a protocol's hash, by name, and the protocol hash.
 pkg fn Checker.protocol_hashes(self, protocol: ty::ItemId) -> ProtocolHashes {
     let alloc = self.alloc()
@@ -525,15 +696,9 @@ pkg fn Checker.protocol_hashes(self, protocol: ty::ItemId) -> ProtocolHashes {
     let SigKind.Protocol(operations: operations, variants: _, summary: summary) = held.contents().kind else {
         return ProtocolHashes(hash: hashing::HashValue.of(b"protocol\n"), operations: take hashed)
     }
-    let ast::ItemKind.Protocol(declared) = db.ast(protocol).kind else {
-        return ProtocolHashes(hash: hashing::HashValue.of(b"protocol\n"), operations: take hashed)
-    }
     let forms = self.forms(protocol)
     let module = db.module_of(protocol)
-    for index in 0..<operations.len() {
-        if declared.operations[index].visibility != ast::Visibility.Pub {
-            continue
-        }
+    for index in self.hashed_operations(protocol) {
         let operation = operations[index].sig
         var bytes = mem::Bytes.empty(alloc)
         mut bytes.append(b"operation\n")

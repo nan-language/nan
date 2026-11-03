@@ -1,0 +1,374 @@
+//! The wire encoding of protocols: the encodings of calls of operations as members of
+//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.serve` and `sys::Reply.decode`.
+
+use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
+
+use super::super::super::abi::Abi;
+use super::super::super::body::Held;
+use super::super::super::call::Invoked;
+use super::super::super::fx::{Fx, PTR};
+use super::super::super::{Instance, Lowering};
+use super::super::mem::vector;
+use super::super::{Supply, entry as supplied_entry, tasks::address_of};
+use super::{
+    BYTE, DecodeFormat, Format, HANDLE, Kind, encode_case, encoder, failure, kind_of, read_from,
+    same_hash, writer,
+};
+use crate::check::db::ItemId;
+use crate::check::sig::SigKind;
+use crate::check::ty::{Arg, Args, Ty};
+use crate::nir::Role;
+
+/// A `sys::Handle`: the generational handle, then its type's handle hash.
+pub mod handle {
+    pub const HANDLE: u64 = 0;
+    pub const HASH: u64 = 8;
+}
+
+pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
+    match supply.path.as_str() {
+        "sys::Wire.hash" => hash(lo, fx, supply),
+        "sys::Wire.serve" => serve(lo, fx, supply),
+        "sys::Reply.decode" => decode_reply(lo, fx, supply),
+        _ => return false,
+    }
+    true
+}
+
+/// The protocol a `sys::Wire` operation's first type argument names.
+fn protocol_of(supply: &Supply) -> ItemId {
+    match supply.type_arg(0) {
+        Ty::Item(protocol, _) => protocol,
+        other => panic!("a protocol, not {other:?}"),
+    }
+}
+
+/// The address of a protocol's hash, as read-only data.
+fn protocol_hash(lo: &mut Lowering, fx: &mut Fx, protocol: ItemId) -> Value {
+    let (hash, _) = lo.ck.protocol_hashes(protocol);
+    let data = lo.bytes_data(&hash.0);
+    lo.data_address(fx, data)
+}
+
+/// `Wire.hash()`: the protocol hash of P.
+fn hash(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let result = supply.abi.result.clone();
+    let layout = lo.layout(&result);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let hash = protocol_hash(lo, fx, protocol_of(supply));
+    lo.copy(fx, target, hash, 33, 1);
+    let held = lo.held_at(fx, &result, target);
+    supply.ret(lo, fx, held);
+}
+
+/// The addresses of the bytes and the handles of the encoded call or reply at `encoded`.
+fn encoded_parts(lo: &mut Lowering, fx: &mut Fx, encoded: Value) -> (Value, Value) {
+    let ty = lo.std_ty("sys", "Encoded", Vec::new());
+    let bytes = lo.layouts.field(lo.ck, &ty, None, "bytes").offset;
+    let handles = lo.layouts.field(lo.ck, &ty, None, "handles").offset;
+    (fx.offset(encoded, bytes), fx.offset(encoded, handles))
+}
+
+/// Appends what `write` writes through a writer to the bytes at `bytes` and its handles to the
+/// list at `handles`: measured, room made for exactly it, then written there, trapping when
+/// memory is exhausted.
+fn append(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    (bytes, handles): (Value, Value),
+    write: impl Fn(&mut Lowering, &mut Fx, Value),
+) {
+    let first = fx.load(PTR, handles, vector::LEN);
+    let writing = |fx: &mut Fx, buffer: Value| {
+        let state = fx.slot(writer::SIZE, 8);
+        fx.store(buffer, state, writer::BUFFER);
+        let zero = fx.ptr(0);
+        fx.store(zero, state, writer::LEN);
+        fx.store(handles, state, writer::HANDLES);
+        fx.store(first, state, writer::NEXT);
+        state
+    };
+    let zero = fx.ptr(0);
+    let measuring = writing(fx, zero);
+    write(lo, fx, measuring);
+    let size = fx.load(PTR, measuring, writer::LEN);
+    let next = fx.load(PTR, measuring, writer::NEXT);
+    let len = fx.load(PTR, bytes, vector::LEN);
+    let (needed, overflow) = fx.b.ins().uadd_overflow(len, size);
+    let drawn = fx.choose_in(
+        lo,
+        overflow,
+        &[types::I8],
+        |_, fx| vec![fx.int(types::I8, 0)],
+        |lo, fx| {
+            let bytes_drawn = vector::reserve(lo, fx, bytes, needed, BYTE);
+            let handles_drawn = vector::reserve(lo, fx, handles, next, HANDLE);
+            vec![fx.b.ins().band(bytes_drawn, handles_drawn)]
+        },
+    )[0];
+    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
+    fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
+    let data = fx.load(PTR, bytes, vector::DATA);
+    let target = fx.b.ins().iadd(data, len);
+    let state = writing(fx, target);
+    write(lo, fx, state);
+    fx.store(needed, bytes, vector::LEN);
+}
+
+/// `Wire[P].op(mut out, ...)`: the call's message, encoded as its variant, appended to `out`.
+pub fn encode_call(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, protocol: ItemId, method: usize) {
+    let (sret, failure, params) = supplied_entry(fx, abi);
+    let message = Ty::item(protocol, Vec::new());
+    let name = lo.ck.method_name(protocol, method);
+    let supply = Supply {
+        abi,
+        args: Args::from(Vec::new()),
+        path: format!("sys::Wire.{name}"),
+        owner: None,
+        sret,
+        failure,
+        params,
+        wrap: None,
+    };
+    let held = lo.variant_value(fx, &message, &name, &supply.params[1..], None);
+    let value = address_of(lo, fx, &message, held);
+    let Kind::Variant(cases) = kind_of(lo, &message) else {
+        unreachable!("a protocol encodes as a variant")
+    };
+    let case = (cases.into_iter())
+        .find(|case| case.index == method)
+        .expect("a pub operation");
+    let parts = encoded_parts(lo, fx, supply.param(0).address());
+    append(lo, fx, &supply, parts, |lo, fx, state| {
+        encode_case(lo, fx, Format::Wire, &message, &case, value, state)
+    });
+    lo.release(fx, &message, value);
+    supply.done(lo, fx);
+}
+
+/// Fails with `CallError.Malformed` holding the `core::DecodeError` a decoding's code names.
+fn fail_malformed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, code: Value) {
+    let error = super::decode_error(lo, fx, code);
+    fail_with(lo, fx, supply, "Malformed", Some(error));
+}
+
+/// Fails with the variant of the operation's `sys::CallError` of that name holding the value at
+/// `payload`.
+fn fail_with(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    variant: &str,
+    payload: Option<Value>,
+) {
+    let fails = supply.abi.fails.clone().expect("a sys::CallError");
+    let payload_ty = call_error_payload(lo, &fails, variant);
+    let held: Vec<Held> = (payload.into_iter())
+        .map(|address| lo.held_at(fx, &payload_ty, address))
+        .collect();
+    let value = lo.variant_value(fx, &fails, variant, &held, None);
+    let target = supply.failure.expect("a failure address");
+    lo.store_held(fx, target, value, &fails);
+    supply.fail(fx);
+}
+
+/// The payload type of a variant of an instantiation of `sys::CallError`.
+fn call_error_payload(lo: &Lowering, call_error: &Ty, variant: &str) -> Ty {
+    match variant {
+        "Failed" => call_error.type_arg(0).cloned().expect("a failure type"),
+        "Malformed" => Ty::item(
+            lo.ck
+                .db
+                .core_item("DecodeError")
+                .expect("core::DecodeError"),
+            Vec::new(),
+        ),
+        "Closed" => lo.std_ty("task", "SendError", Vec::new()),
+        _ => lo.std_ty("task", "Cancelled", Vec::new()),
+    }
+}
+
+/// Reads one value of `ty` at `target` from the Untrusted bytes of parameter `raw` against the
+/// handles of the parameter after it, drawing through the allocator of the one after that: the
+/// code of its decoding, `Trailing` when bytes or handles are left.
+fn read_handled(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    raw: usize,
+    ty: &Ty,
+    target: Value,
+) -> Value {
+    let handles = supply.param(raw + 1).address();
+    let alloc = supply.param(raw + 2).address();
+    let raw = supply.param(raw).address();
+    read_from(
+        lo,
+        fx,
+        raw,
+        alloc,
+        Some(handles),
+        &DecodeFormat::Wire,
+        ty,
+        target,
+    )
+}
+
+/// `Wire[P].serve(out, hash, raw, handles, alloc)`: the call decoded under P's protocol hash,
+/// its operation's `requires` evaluated, then made through `out`, giving the encoding of its
+/// reply.
+fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let protocol = protocol_of(supply);
+    let message = Ty::item(protocol, Vec::new());
+    let own = protocol_hash(lo, fx, protocol);
+    let same = same_hash(lo, fx, supply.param(1).address(), own);
+    let other = fx.b.ins().bxor_imm_s(same, 1);
+    fx.when(other, |fx| {
+        let code = fx.int(types::I32, failure::UNKNOWN_SCHEMA);
+        fail_malformed(lo, fx, supply, code);
+    });
+    let layout = lo.layout(&message);
+    let slot = fx.slot(layout.size, layout.align);
+    let code = read_handled(lo, fx, supply, 2, &message, slot);
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
+    fx.when(failed, |fx| fail_malformed(lo, fx, supply, code));
+    let sig = lo.ck.sig(protocol);
+    let SigKind::Protocol { operations, .. } = &sig.kind else {
+        unreachable!("a protocol's signature")
+    };
+    for method in lo.ck.hashed_operations(protocol) {
+        let operation = &operations[method];
+        let is = lo.variant_is(fx, slot, &message, &operation.name);
+        fx.when(is, |fx| {
+            let args: Vec<Held> = (operation.sig.params.iter())
+                .map(|param| {
+                    let at = lo.payload_address(fx, &message, &operation.name, &param.name, slot);
+                    Held::Address(at)
+                })
+                .collect();
+            for index in lo.ck.operation_requires(protocol, method) {
+                let instance = Instance::Nir {
+                    item: protocol,
+                    role: Role::Requires,
+                    index,
+                    args: Args::from(Vec::new()),
+                };
+                let abi = lo.abi(&instance);
+                let id = lo.instance(instance);
+                let holds = lo
+                    .invoke(fx, Invoked::Direct(id), &abi, &args)
+                    .result
+                    .scalar();
+                let broken = fx.b.ins().icmp_imm_s(IntCC::Equal, holds, 0);
+                fx.when(broken, |fx| {
+                    lo.release(fx, &message, slot);
+                    let code = fx.int(types::I32, failure::INVALID);
+                    fail_malformed(lo, fx, supply, code);
+                });
+            }
+            let instance = Instance::Operation {
+                protocol,
+                method: method as u32,
+            };
+            let abi = lo.abi(&instance);
+            let id = lo.instance(instance);
+            let mut passed = vec![supply.param(0)];
+            passed.extend(args);
+            let called = lo.invoke(fx, Invoked::Direct(id), &abi, &passed);
+            let request = lo.ck.is_request(protocol, method);
+            let reply = request.then(|| {
+                let fails = operation.sig.fails.clone().unwrap_or(Ty::Never);
+                let result = lo.ck.db.core_item("Result").expect("core::Result");
+                Ty::item(
+                    result,
+                    vec![Arg::Ty(operation.sig.result.clone()), Arg::Ty(fails)],
+                )
+            });
+            let succeeded = |lo: &mut Lowering, fx: &mut Fx| {
+                let value = reply
+                    .as_ref()
+                    .map(|reply| lo.variant_value(fx, reply, "Ok", &[called.result], None));
+                give(lo, fx, supply, reply.as_ref().zip(value));
+            };
+            let (Some(failed), Some(failure)) = (called.failed, called.failure) else {
+                succeeded(lo, fx);
+                return;
+            };
+            let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+            fx.when(failed, |fx| match operation.sig.fails.as_ref() {
+                Some(fails) => {
+                    let call_error = abi.fails.clone().expect("a sys::CallError");
+                    let handled = lo.variant_is(fx, failure, &call_error, "Failed");
+                    fx.when(handled, |fx| {
+                        let payload = lo.payload_address(fx, &call_error, "Failed", "", failure);
+                        let held = lo.held_at(fx, fails, payload);
+                        let reply = reply.clone().expect("a request's reply");
+                        let value = lo.variant_value(fx, &reply, "Err", &[held], None);
+                        give(lo, fx, supply, Some((&reply, value)));
+                    });
+                    for variant in ["Malformed", "Closed", "Cancelled"] {
+                        let this = lo.variant_is(fx, failure, &call_error, variant);
+                        fx.when(this, |fx| {
+                            let payload = lo.payload_address(fx, &call_error, variant, "", failure);
+                            fail_with(lo, fx, supply, variant, Some(payload));
+                        });
+                    }
+                }
+                None => fail_with(lo, fx, supply, "Closed", Some(failure)),
+            });
+            succeeded(lo, fx);
+        });
+    }
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// Returns an encoded reply drawn through the operation's allocator: holding the encoding of a reply
+/// held as given, which is then released, or nothing.
+fn give(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, reply: Option<(&Ty, Held)>) {
+    let result = supply.abi.result.clone();
+    let layout = lo.layout(&result);
+    let encoded = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let alloc = fx.load(PTR, supply.param(4).address(), 0);
+    let (bytes, handles) = encoded_parts(lo, fx, encoded);
+    vector::empty(fx, bytes, alloc, BYTE);
+    vector::empty(fx, handles, alloc, HANDLE);
+    if let Some((reply, held)) = reply {
+        let value = address_of(lo, fx, reply, held);
+        let function = encoder(lo, Format::Wire, reply);
+        append(lo, fx, supply, (bytes, handles), |lo, fx, state| {
+            super::call(lo, fx, function, &[value, state]);
+        });
+        lo.release(fx, reply, value);
+    }
+    let held = lo.held_at(fx, &result, encoded);
+    supply.ret(lo, fx, held);
+}
+
+/// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply, or `CallError.Failed`
+/// holding the failure of an `Err` one.
+fn decode_reply(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let (result, fails) = (supply.type_arg(0), supply.type_arg(1));
+    let core_result = lo.ck.db.core_item("Result").expect("core::Result");
+    let reply = Ty::item(
+        core_result,
+        vec![Arg::Ty(result.clone()), Arg::Ty(fails.clone())],
+    );
+    let layout = lo.layout(&reply);
+    let slot = fx.slot(layout.size, layout.align);
+    let code = read_handled(lo, fx, supply, 1, &reply, slot);
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
+    fx.when(failed, |fx| fail_malformed(lo, fx, supply, code));
+    let refused = lo.variant_is(fx, slot, &reply, "Err");
+    fx.when(refused, |fx| {
+        let payload = lo.payload_address(fx, &reply, "Err", "", slot);
+        fail_with(lo, fx, supply, "Failed", Some(payload));
+    });
+    let payload = lo.payload_address(fx, &reply, "Ok", "", slot);
+    let held = lo.held_at(fx, &result, payload);
+    supply.ret(lo, fx, held);
+}

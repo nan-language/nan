@@ -14,7 +14,7 @@ pub mod uses;
 
 impl Checker<'_> {
     /// Whether a type is a parsing type: a scalar, `Unit`, `Never`, an Untrusted instantiation, a
-    /// layout or a struct or enum other than a base type built only from parsing types.
+    /// layout or a struct, enum or protocol other than a base type built only from parsing types.
     pub fn is_parsing(&self, ty: &Ty) -> bool {
         self.parsing(ty, None, &mut Vec::new())
     }
@@ -35,7 +35,10 @@ impl Checker<'_> {
                 }
                 let kind_parses = matches!(
                     self.sig(*item).kind,
-                    SigKind::Struct { .. } | SigKind::Enum { .. } | SigKind::Layout { .. }
+                    SigKind::Struct { .. }
+                        | SigKind::Enum { .. }
+                        | SigKind::Layout { .. }
+                        | SigKind::Protocol { .. }
                 );
                 kind_parses
                     && args.iter().all(|arg| match arg {

@@ -193,8 +193,11 @@ impl Checker<'_> {
         }
         if let Ty::Item(item, _) = ty
             && self.db.is_std(interface)
-            && self.db.canonical(interface) == "sys::Capability"
-            && self.is_kind(*item)
+            && match self.db.canonical(interface).as_str() {
+                "sys::Capability" => self.is_kind(*item),
+                "sys::Protocol" => self.is_protocol(*item),
+                _ => false,
+            }
         {
             return Some((Conformance::Builtin, no_args()));
         }
@@ -513,9 +516,12 @@ impl Checker<'_> {
                         dynamic: false,
                     });
                 }
-                if let Some(protocol) = self.outbox_protocol(ty)
-                    && let Some(method) = self.outbox_method(protocol, name)
-                {
+                let operation = match (self.outbox_protocol(ty), self.wire_protocol(ty)) {
+                    (Some(protocol), _) => Some(protocol).zip(self.outbox_method(protocol, name)),
+                    (_, Some(protocol)) => Some(protocol).zip(self.wire_method(protocol, name)),
+                    _ => None,
+                };
+                if let Some((protocol, method)) = operation {
                     candidates.push(Candidate::Method {
                         bound: Bound {
                             interface: protocol,
@@ -634,7 +640,10 @@ impl Checker<'_> {
     pub fn method_head(&self, bound: &Bound, method: usize, self_ty: &Ty) -> Option<FnSig> {
         let sig = self.sig(bound.interface);
         if let SigKind::Protocol { .. } = &sig.kind {
-            return self.outbox_head(bound.interface, method, self_ty);
+            return match self.wire_protocol(self_ty) {
+                Some(protocol) => self.wire_head(protocol, method),
+                None => self.outbox_head(bound.interface, method, self_ty),
+            };
         }
         let SigKind::Interface { methods } = &sig.kind else {
             return None;

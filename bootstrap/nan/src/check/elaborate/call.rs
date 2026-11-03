@@ -569,6 +569,9 @@ impl Elab<'_, '_> {
     /// The requires clauses a call meets: a direct callee's own, or the interface method's for
     /// a call through a bound, through `Dyn` or of an implementing function without its own.
     fn requires_of(&self, call: &tir::Call, callee: &FnRef) -> Option<Requires> {
+        if self.ck.encodes(callee) {
+            return None;
+        }
         if let Callable::Item { item, .. } = &callee.callable {
             let clauses = self.ck.requires_clauses(*item);
             if clauses.iter().any(|(_, disputed)| !disputed) {

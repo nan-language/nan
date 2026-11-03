@@ -248,8 +248,10 @@ fn encode_kind(
         Kind::Record(record) => encode_record(lo, fx, encoder_ty, record, value, target),
         Kind::Variant(cases) => {
             let index = lo.variant_index(fx, ty, value);
-            for (position, case) in cases.iter().enumerate() {
-                let this = fx.b.ins().icmp_imm_s(IntCC::Equal, index, position as i64);
+            for case in cases {
+                let this =
+                    fx.b.ins()
+                        .icmp_imm_s(IntCC::Equal, index, case.index as i64);
                 fx.when(this, |fx| {
                     let key = lo.view_literal(fx, case.key.as_bytes());
                     let payload = !matches!(case.payload, CasePayload::None);
@@ -270,6 +272,7 @@ fn encode_kind(
                 });
             }
         }
+        Kind::Handle(_) | Kind::Never => unreachable!("an Encode type holds no handle"),
     }
 }
 

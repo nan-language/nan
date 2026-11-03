@@ -13,7 +13,7 @@ use super::super::super::machine::{A64_ACCESS, A64_TABLE, A64_VALID, LARGE, PRES
 use super::super::super::machine::{FAULT, SYSCALL, Stub};
 use super::super::super::runtime::{Routine, state};
 use super::super::{Supply, sys, tasks as task_ops};
-use super::physical;
+use super::{extended, physical};
 
 /// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
 /// machine target completing one ends the interrupt the running CPU serves unless the dispatcher
@@ -106,9 +106,10 @@ pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// `run_user` and, under the user root its third parameter holds, `run_user_split` give
+/// `run_user` and, under the user root its fourth parameter holds, `run_user_split` give
 /// `Interrupted` at once outside thread context, and otherwise enter user mode through the vector
-/// seam's user path and give the exit it reports.
+/// seam's user path, the running task owning the extended state its third parameter holds, if
+/// any, until the exit, and give the exit it reports.
 fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
     let exit_ty = supply.abi.result.clone();
     let user_state = supply.param(1).address();
@@ -118,15 +119,19 @@ fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
         let exit = lo.variant_value(fx, &exit_ty, "Interrupted", &[], None);
         supply.ret(lo, fx, exit);
     });
+    let extended_ty = supply.abi.params[2].0.ty().clone();
+    let area = extended::optional_area(lo, fx, &extended_ty, supply.param(2).address());
+    let previous = lo.call_routine(fx, Routine::Extended, &[area])[0];
     let fault = fx.slot(24, 8);
     let (user_root, kernel_root) = match split {
         true => {
-            let root = word(fx, supply.param(2));
+            let root = word(fx, supply.param(3));
             lo.split_roots(fx, root)
         }
         false => (fx.ptr(0), fx.ptr(0)),
     };
     let kind = lo.enter_user(fx, user_state, fault, user_root, kernel_root);
+    lo.call_routine(fx, Routine::Extended, &[previous]);
     let syscall = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, SYSCALL);
     fx.when(syscall, |fx| {
         let exit = lo.variant_value(fx, &exit_ty, "Syscall", &[], None);

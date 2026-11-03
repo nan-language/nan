@@ -321,12 +321,12 @@ pub closed struct UserFault derives Copy, Eq {
 ```
 
 - `state.regs` holds the general registers: on x86_64 `rax`, `rcx`, `rdx`, `rbx`, `rbp`, `rsi`, `rdi` and `r8` to `r15` in its first 15 entries, the others unused, and on AArch64 `x0` to `x30`. `sp` is the stack pointer, `ip` the address of the next instruction, and `flags` the flags: `RFLAGS` on x86_64, and on AArch64 the condition flags at their `SPSR_EL1` positions. User code sets them, so they are [untrusted](15-untrusted.md#sources).
-- `cpu.run_user(mut state)` runs the thread on the running CPU, under its root, from `state`, with maskable interrupts enabled and of its flags only the arithmetic and direction flags on x86_64 and the condition flags on AArch64. At the thread's next exit it writes the thread's state into `state` and returns:
+- `cpu.run_user(mut state, mut extended)` runs the thread on the running CPU, under its root, from `state`, with maskable interrupts enabled and of its flags only the arithmetic and direction flags on x86_64 and the condition flags on AArch64. At the thread's next exit it writes the thread's state into `state` and returns:
     - `Syscall` for the system call instruction, `syscall` on x86_64 and `svc` on AArch64. `state.ip` addresses the instruction after it; on x86_64 `rcx` and `r11` hold what `syscall` leaves in them, that address and the flags.
     - `Fault(f)` for an exception the thread raises: `f.vector` is its vector, `f.code` the error code the CPU pushed or 0 on x86_64 and the syndrome on AArch64, and `f.address` the faulting address for a vector of class `PageFault` and 0 for other vectors ([interrupt functions](#interrupt-functions)). On x86_64, vectors 2, 8 and 18 are interrupts for this rule, and an `ip` outside the canonical lower half gives `Fault` with vector 13 and code and address 0 without running the thread.
     - `Interrupted` for an interrupt, once its seam has served it as one interrupting the calling task in the call, with the interrupt state the task called with, where the task may be [preempted](#preemption).
 - `run_user` returns `Interrupted` at once inside an interrupt fn and before the anchor is installed. It restores the caller's interrupt state as it returns.
-- A thread that owns no [extended state](#floating-point) runs with it disabled, so that its first floating-point or vector instruction raises an exception: vector 7 on x86_64, and on AArch64 vector 0 with a syndrome of class `0x07`. On x86_64 a thread runs at I/O privilege level 0 with the CPU tables' privilege-level-3 segments. The seams save a thread's state and serve its interrupts on the kernel stack of the task running it, and no register or flag of kernel code reaches the thread.
+- Until the call returns, the calling task owns the [extended state](#floating-point) `extended` holds, as `hw::ExtendedState.with` makes it, and the thread runs with it: its registers start as the state holds them, and the state holds them as the thread leaves them. With `None` the task owns none, so the thread runs with the extended state disabled and its first floating-point or vector instruction raises an exception: vector 7 on x86_64, and on AArch64 vector 0 with a syndrome of class `0x07`. On x86_64 a thread runs at I/O privilege level 0 with the CPU tables' privilege-level-3 segments. The seams save a thread's state and serve its interrupts on the kernel stack of the task running it, and no register or flag of kernel code reaches the thread.
 
 ```nan
 // file: kernel/package.nan
@@ -339,12 +339,12 @@ package kernel {
 } kernel
 
 // file: kernel/kernel.nan
-//! Runs two user threads in turn until one faults, answering each system call with 0.
+//! Runs two user threads, each with the extended state it may own, in turn until one faults, answering each system call with 0.
 
-pub fn run_pair(cpu: hw::Ring0, mut threads: Array[hw::UserState, 2]) -> hw::UserFault {
+pub fn run_pair(cpu: hw::Ring0, mut threads: Array[hw::UserState, 2], mut extended: Array[Option[hw::ExtendedState], 2]) -> hw::UserFault {
     var next: usize = 0
     loop {
-        match cpu.run_user(mut threads[next]) {
+        match cpu.run_user(mut threads[next], extended: mut extended[next]) {
             hw::UserExit.Syscall => {
                 threads[next].regs[0] = Untrusted.of(0)
             }
@@ -369,8 +369,8 @@ package kernel {
 // file: kernel/kernel.nan
 //! Runs a user thread until it faults.
 
-pub fn run_thread(cpu: hw::Ring0, mut thread: hw::UserState) {
-    while cpu.run_user(mut thread) != hw::UserExit.Fault(hw::UserFault(vector: 6, code: 0, address: 0)) { // error: authority.ungranted
+pub fn run_thread(cpu: hw::Ring0, mut thread: hw::UserState, mut extended: Option[hw::ExtendedState]) {
+    while cpu.run_user(mut thread, mut extended) != hw::UserExit.Fault(hw::UserFault(vector: 6, code: 0, address: 0)) { // error: authority.ungranted
     }
 } run_thread
 ```
@@ -389,7 +389,7 @@ pub closed struct EntryArea derives Copy, Eq {
 ```
 
 - The **entry area** is the memory the seams use before they reinstall the running root: the image and the memory it reserves, which hold the vector seams and their user paths, the CPU records with each CPU's tables and entry stack, the interrupt descriptor table and the stacks of nonzero `ist`. `cpu.entry_area()` gives its first address as `base` and its length in bytes as `len`.
-- `cpu.run_user_split(mut state, root)` runs the thread as `run_user` does, but the user path installs `root` just before the thread runs and reinstalls the running root at the thread's exit before any other kernel code runs. On x86_64 with PCIDs enabled, translations the CPU caches from `root` are tagged with the running root's PCID with bit 11 flipped, and both roots keep their cached translations across the switches; on AArch64, with the running root's ASID with bit 7 flipped, and none are invalidated.
+- `cpu.run_user_split(mut state, mut extended, root)` runs the thread as `run_user` does, but the user path installs `root` just before the thread runs and reinstalls the running root at the thread's exit before any other kernel code runs. On x86_64 with PCIDs enabled, translations the CPU caches from `root` are tagged with the running root's PCID with bit 11 flipped, and both roots keep their cached translations across the switches; on AArch64, with the running root's ASID with bit 7 flipped, and none are invalidated.
 - `run_user_split` is a trusted primitive whose soundness condition is that `root` maps the entry area at the addresses and with the attributes the running root maps it; that no page `root` maps for user mode holds what the soundness condition of `write_cr3` keeps out of such pages ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); and that each translation cached under the user root's tag maps as `root` does. `root` need map nothing else: unlike a root `write_cr3` installs, it need not map the frames, regions and windows of the kernel.
 - A translation that the running root marks global on x86_64, or does not mark non-global on AArch64, stays usable under the user root, so the running root keeps out of the user root's reach only what it maps non-globally.
 
@@ -1448,7 +1448,33 @@ pub closed enum LoadError derives Copy, Eq, Render {
 
 A function, closure or const whose own operations or calls of std functions have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation or call.
 
-Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87, SSE and AVX registers, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. No seam and no thread switch saves extended state, and each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The entry function starts with the extended state enabled ([anchor](#anchor)).
+Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87 and SSE registers and the other state components `XCR0` enables, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. A thread **owns** extended state while it runs the body of `hw::ExtendedState.with` or a user thread through `hw::Ring0.run_user` given one ([user mode](#user-mode)), and owns none otherwise.
+
+```nan-api
+// module: hw
+
+pub open linear struct ExtendedState {
+} ExtendedState
+
+pub fn ExtendedState.of(take frame: PhysFrame[4_096]) -> ExtendedState
+
+pub fn ExtendedState.vector(self, index: u8) -> core::simd::U64x2
+    requires index < 16
+
+pub fn ExtendedState.set_vector(mut self, index: u8, value: core::simd::U64x2)
+    requires index < 16
+
+pub fn ExtendedState.with[T: Any, E](mut self, body: fn() -> T fails E uses wait) -> T fails E uses wait
+
+pub fn ExtendedState.into_frame(take self) -> PhysFrame[4_096]
+```
+
+- `hw::ExtendedState.of(take frame)` makes the frame the save area of extended state in its initial state, every vector register zero, and returns it; `take state.into_frame()` returns the frame. On x86_64 the area holds the state in the form that the first of `xsaves`, `xsavec`, `xsaveopt` and `xsave` the CPU has writes where the anchor enabled XSAVE, and in that of `fxsave` otherwise.
+- `state.vector(index)` gives the 128 bits of vector register `index` that `state` holds, `xmm` on x86_64 and `v` on AArch64, and `set_vector(index, value)` sets them, leaving the rest of the state unchanged.
+- `state.with(body)` runs `body` with the running thread owning `state`, then returns what `body` returns or fails as it fails. The thread's registers start as `state` holds them, `state` holds them as `body` leaves them, and the thread owns again the extended state it owned before the call, as it held it then.
+- Each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, while it runs a thread owning none, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The executor restores a thread's extended state into the CPU, enabling it, before the thread runs, and saves it once the thread switches away. Before a thread owning none runs on a CPU holding another thread's extended state, it puts that state in its initial state, then disables it. A thread owning none pays no save or restore, and no thread runs while its CPU holds another thread's extended state.
+- No seam saves extended state: interrupt fns use none, and a preempted thread switches away as any other. The entry function starts with the extended state enabled ([anchor](#anchor)).
+- A thread's saved state holds the state components the `XCR0` of the CPU that saved it enables, and `write_xcr0` disables none ([privileged intrinsics](23-low-level.md#privileged-intrinsics)). Restoring it on a CPU whose `XCR0` lacks one of them raises a general-protection exception in the executor ([interrupt functions](#interrupt-functions)).
 
 ```nan
 // file: kernel/package.nan
@@ -1484,6 +1510,28 @@ pub fn total(levels: core::simd::F32x4) -> f32 {
 } total
 ```
 
+```nan
+// file: vectors/package.nan
+//! Vector registers a bare kernel's task keeps across switches.
+
+package vectors {
+    language 1
+    targets x86_64-bare
+} vectors
+
+// file: vectors/vectors.nan
+//! Pauses while owning extended state whose first vector register holds a mark.
+
+pub fn pause_owning(take frame: hw::PhysFrame[4_096], clock: sys::Clock) -> hw::PhysFrame[4_096] fails task::Cancelled uses wait {
+    var state = hw::ExtendedState.of(take frame)
+    mut state.set_vector(0, value: core::simd::U64x2.splat(7))
+    discard attempt await mut state.with(fn() fails task::Cancelled uses wait {
+        try await clock.sleep_ns(1_000)
+    })
+    return take state.into_frame()
+} pause_owning
+```
+
 ## Kernel halts
 
 A **kernel halt** ends a kernel domain ([domains](11-errors-domains.md#domains)). The kernel halts on a trap in the kernel domain, and in these other cases, each named by its cause:
@@ -1517,7 +1565,7 @@ The types of this table are [base types](05-properties.md#structural-properties)
 | --- | --- | --- | --- | --- | --- | --- |
 | `hw::IrqContext` | yes | no | no | no | no | no |
 | `hw::TrapFrame[V]` | no | no | no | no | no | no |
-| `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]` | yes | no | no | yes | no | no |
+| `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]`, `hw::ExtendedState` | yes | no | no | yes | no | no |
 | `hw::Signal[T]`, `hw::SpinLock[T]`, `hw::PerCpu[T]`, `sys::load::Loader` | no | no | no | yes | no | no |
 | `boot::Services` | no | yes | no | no | no | no |
 | `hw::Anchor[S]` | no | no | no | no | no | no |

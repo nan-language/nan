@@ -190,6 +190,9 @@ pub enum Routine {
     Draw,
     /// `()`: under the IOMMU's lock, invalidates everything it caches and waits until it has.
     IommuFlush,
+    /// `(area) -> previous`: makes the running task own the extended state saved at an area,
+    /// none for zero, saving the one it owned, and gives the area it owned.
+    Extended,
 }
 
 impl Routine {
@@ -262,6 +265,7 @@ impl Routine {
             Routine::ClockNow => "_NSstack_switch_clock_now",
             Routine::Draw => "_NSreplay_draw",
             Routine::IommuFlush => "_NSiommu_flush",
+            Routine::Extended => "_NSstack_switch_extended",
         }
     }
 
@@ -289,7 +293,8 @@ impl Routine {
             | Routine::TaskEnv
             | Routine::OutboxClaim
             | Routine::RegionOpen
-            | Routine::RecordAlloc => (&[P], &[P]),
+            | Routine::RecordAlloc
+            | Routine::Extended => (&[P], &[P]),
             Routine::RecordResize => (&[P, P], &[P]),
             Routine::Free
             | Routine::RecordFree
@@ -707,6 +712,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
         Routine::IommuFlush => lo.define_iommu_flush(fx),
+        Routine::Extended => lo.define_extended(fx),
         Routine::Init
         | Routine::Exit
         | Routine::RecordAlloc

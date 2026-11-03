@@ -189,6 +189,7 @@ fn aarch64_machine_stubs_use_no_floating_point_register() {
         Stub::SetCpu,
         Stub::Halt,
         Stub::DisableFloats,
+        Stub::EnableFloats,
         Stub::ConstantTime,
         Stub::ReadTtbr0,
         Stub::WriteTtbr0,
@@ -248,6 +249,41 @@ fn disable_floats_sets_task_switched_and_clears_fpen() {
         words(&a64),
         [cpacr(true), clear_fpen, cpacr(false), isb, ret]
     );
+}
+
+#[test]
+fn x64_extended_saves_take_the_first_form_the_cpu_has() {
+    let position = |code: &[u8], bytes: &[u8]| {
+        code.windows(bytes.len())
+            .position(|window| window == bytes)
+            .unwrap_or_else(|| panic!("{bytes:02x?} in the stub"))
+    };
+    let (_, _, save) = Stub::ExtendedSave.code(Arch::Amd64);
+    let tests: Vec<usize> = [0x1000u32, 0x800, 0x400, 0x200]
+        .iter()
+        .map(|bit| {
+            let mut test = vec![0xf7, 0xc1];
+            test.extend_from_slice(&bit.to_le_bytes());
+            position(&save, &test)
+        })
+        .collect();
+    assert!(tests.is_sorted(), "xsaves, xsavec, xsaveopt then xsave");
+    let saves = [
+        [0x48, 0x0f, 0xc7, 0x2f],
+        [0x48, 0x0f, 0xc7, 0x27],
+        [0x48, 0x0f, 0xae, 0x37],
+        [0x48, 0x0f, 0xae, 0x27],
+    ];
+    let fxsave = position(&save, &[0x48, 0x0f, 0xae, 0x07]);
+    let targets: Vec<usize> = saves.iter().map(|bytes| position(&save, bytes)).collect();
+    assert!(
+        targets.is_sorted() && fxsave < targets[0],
+        "each test jumps to its form, fxsave falling through"
+    );
+    let (_, _, restore) = Stub::ExtendedRestore.code(Arch::Amd64);
+    let xrstors = position(&restore, &[0x48, 0x0f, 0xc7, 0x1f]);
+    let xrstor = position(&restore, &[0x48, 0x0f, 0xae, 0x2f]);
+    assert!(position(&restore, &[0x48, 0x0f, 0xae, 0x0f]) < xrstors.min(xrstor));
 }
 
 /// The byte offset an AArch64 `ldr` of a 64-bit literal or a `cbnz` at `at` reaches.

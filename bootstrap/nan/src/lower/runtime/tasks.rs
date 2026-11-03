@@ -101,14 +101,18 @@ pub mod task {
     pub const KEY: u64 = 320;
     pub const CPU: u64 = 328;
     pub const QUEUE: u64 = 336;
-    pub const SIZE: u64 = 344;
+    /// On a machine target, the save area of the extended state it owns, zero for none.
+    pub const EXTENDED: u64 = 344;
+    pub const SIZE: u64 = 352;
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
 /// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
 /// idle in its ring, the operations in flight on it, whether another thread asked to cancel one,
 /// its POSIX thread and the top of the stack its stack overflow reports run on; on a kernel the
-/// flags from before its outermost held lock disabled interrupts.
+/// flags from before its outermost held lock disabled interrupts; and on a machine target
+/// whether its CPU's extended state is enabled, holding the state of the last task owning one
+/// that it ran.
 pub mod thread {
     pub const CONTEXT: u64 = 0;
     pub const CURRENT: u64 = 24;
@@ -124,7 +128,8 @@ pub mod thread {
     pub const TRAP_STACK: u64 = 88;
     pub const HELD: u64 = 96;
     pub const SAVED_IF: u64 = HELD + 8 * super::super::locks::HELD_LOCKS;
-    pub const SIZE: u64 = SAVED_IF + 8;
+    pub const EXTENDED: u64 = SAVED_IF + 8;
+    pub const SIZE: u64 = EXTENDED + 8;
 }
 
 /// The bits of a task record's flags.
@@ -819,8 +824,8 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     );
 }
 
-/// Runs a task on the executor thread until it switches away, charging the time it ran, then
-/// settles its state.
+/// Runs a task on the executor thread until it switches away, on a machine target with the
+/// extended state it owns, charging the time it ran, then settles its state.
 fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
@@ -832,6 +837,9 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let started = (!lo.seeded()).then(|| lo.now_ns(fx));
     if lo.kernel() {
         lo.kernel_switch_in(fx, record, started.expect("the time a kernel task starts"));
+    }
+    if lo.machine() {
+        lo.extended_in(fx, record);
     }
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
@@ -856,6 +864,9 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         );
     }
     lo.switch_stacks(fx, scheduler, context, record);
+    if lo.machine() {
+        lo.extended_out(fx, record);
+    }
     if lo.kernel() {
         lo.kernel_switch_out(fx);
     }

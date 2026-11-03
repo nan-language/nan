@@ -17,7 +17,7 @@ mod grown;
 mod held;
 mod jobs;
 
-pub use jobs::JOB;
+pub use jobs::{COMPONENT, JOB};
 pub(crate) mod host;
 mod layout;
 mod levels;
@@ -263,8 +263,10 @@ pub struct Lowered {
     pub collisions: Vec<(String, String)>,
     /// The entries a bundle adds to loaded registries.
     pub contributed: Vec<load::Contributed>,
-    /// For a nanos program's bundle, the stack its job's task needs.
+    /// For a nanos program's bundle, the stack its job's task needs, and the name of each
+    /// component entry with the stack its task needs.
     pub job: Option<u64>,
+    pub components: Vec<(String, u64)>,
 }
 
 /// What a final build lowers: the program's entry function and its target's entry landing fn,
@@ -286,10 +288,11 @@ pub struct Program {
 }
 
 /// What a bundle's build lowers: the entries its contributions add to loaded registries, or a
-/// nanos program's job entry running its entry function.
+/// nanos program's job entry running its entry function or its component entries, by name.
 pub struct Bundle {
     pub contributions: Vec<(ItemId, ItemId)>,
     pub entry: Option<ItemId>,
+    pub components: Vec<(String, ItemId)>,
     pub roots: Vec<PackageId>,
     pub prefixes: HashMap<String, String>,
     /// The codegen level of the kernel's interface.
@@ -431,8 +434,8 @@ pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
     lowering.finish(None)
 }
 
-/// Lowers a bundle: the entries its contributions add to loaded registries or its job entry, with
-/// every function they reach, importing the load ABI.
+/// Lowers a bundle: the entries its contributions add to loaded registries, its job entry or its
+/// component entries, with every function they reach, importing the load ABI.
 pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
     let linking = load::Linking::Bundle;
     let mut lowering = Lowering::new(
@@ -448,11 +451,24 @@ pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
         lowering.contributed.push(contributed);
     }
     let job = bundle.entry.map(|entry| lowering.job_entry(entry));
+    let components: Vec<(String, FuncId)> = bundle
+        .components
+        .iter()
+        .map(|(name, state)| (name.clone(), lowering.component_entry(name, *state)))
+        .collect();
     lowering.drain();
     let lowered = lowering.finish(None);
     let job = job
         .map(|(entry, stack)| stack.unwrap_or_else(|| stack::grown_start(&lowered.frames, entry)));
-    Lowered { job, ..lowered }
+    let components = components
+        .into_iter()
+        .map(|(name, entry)| (name, stack::grown_start(&lowered.frames, entry)))
+        .collect();
+    Lowered {
+        job,
+        components,
+        ..lowered
+    }
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
@@ -968,6 +984,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             collisions,
             contributed,
             job: None,
+            components: Vec::new(),
         }
     }
 }

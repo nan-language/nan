@@ -342,11 +342,11 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         expect false
         return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc))
     }
-    let job = manifest.entry.is_some()
+    let program = manifest.entry.is_some()
     var target = read.target
     match read.target.arch() {
         Some(arch) => {
-            if job {
+            if program {
                 target = workspace::Target.of(arch, kind: workspace::Kind.Nanos)
             }
         }
@@ -404,24 +404,16 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         mut diagnostics.push(interface_error(source, reason: "an interrupt fn demands more stack than the kernel's interrupt stacks hold", alloc))
     }
     let contributions = bundle_contributions(checker, root, kernel: read.roots.view(), alloc)
-    if job and contributions.len() > 0 {
+    if program and contributions.len() > 0 {
         mut diagnostics.push(interface_error(source, reason: "a nanos program adds no entry to a loaded registry", alloc))
     }
     if errors(diagnostics.view()) {
         return Build.failed(take diagnostics)
     }
     let kernel = lower::Interface(hash: copied_bytes(hashing::HashValue.of(file.view()).bytes.view(), alloc), exports: take read.exports, interrupt_stack: read.interrupt_stack)
-    var entry: Option[ty::ItemId] = None
-    if job {
-        match checker.db().package_data(root).root {
-            Some(module) => {
-                entry = checker.db().lookup(module, name: "main")
-            }
-            None => {}
-        }
-    }
-    let program = lower::BundleProgram(contributions: take contributions, entry: entry, roots: single_root(root, alloc), prefixes: prefixes(artefacts, alloc), level: read.level, dump: false)
-    let lowered = lower::lower_bundle(checker, bundle: program)
+    let entries = bundle_entries(checker, root, manifest, alloc)
+    let bundled = lower::BundleProgram(contributions: take contributions, entry: entries.main, components: take entries.components, roots: single_root(root, alloc), prefixes: prefixes(artefacts, alloc), level: read.level, dump: false)
+    let lowered = lower::lower_bundle(checker, bundle: bundled)
     for reported in take collisions(source, lowered, alloc) {
         mut diagnostics.push(take reported)
     }
@@ -431,7 +423,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     if errors(diagnostics.view()) {
         return Build.failed(take diagnostics)
     }
-    let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), job: lowered.job, hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
+    let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), job: lowered.job, components: lowered.components.view(), hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
         Ok(bytes) => bytes
         Err(missing) => {
             var reason = text::String.of("the kernel exports no ", alloc)
@@ -553,3 +545,35 @@ fn write_file(path: Str, contents: Slice[u8], alloc: mem::Alloc) fails platform:
     try platform::write_file(staged_new.as_str(), contents)
     try platform::rename_path(staged_new.as_str(), to: path)
 } write_file
+
+/// The entries of a nanos program's bundle: its entry function `main`, or its component entries
+/// in byte order of name.
+struct BundleEntries {
+    main: Option[ty::ItemId]
+    components: mem::List[lower::BundleComponent]
+} BundleEntries
+
+/// The entries the `entry` directive of the root's manifest lists.
+fn bundle_entries(checker: check::Checker, root: ty::PackageId, manifest: workspace::Manifest, alloc: mem::Alloc) -> BundleEntries {
+    var entries = BundleEntries(main: None, components: mem::List[lower::BundleComponent].empty(alloc))
+    let Some(entry) = manifest.entry else {
+        return entries
+    }
+    let Some(module) = checker.db().package_data(root).root else {
+        expect false
+        return entries
+    }
+    for name in entry.names {
+        let Some(item) = checker.db().lookup(module, name: name.as_str()) else {
+            expect false
+            continue
+        }
+        if name.as_str() == "main" {
+            entries.main = Some(item)
+        } else {
+            mut entries.components.push(lower::BundleComponent(name: text::String.of(name.as_str(), alloc), state: item))
+        }
+    }
+    mut entries.components.sort_by(fn(left: lower::BundleComponent, right: lower::BundleComponent) => left.name.as_str().cmp(right.name.as_str()))
+    return entries
+} bundle_entries

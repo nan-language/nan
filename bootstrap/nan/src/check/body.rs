@@ -1180,7 +1180,7 @@ impl Checker<'_> {
                 .manifest
                 .as_ref()
                 .and_then(|manifest| manifest.entry.as_ref())
-                .is_some_and(|(name, _)| *name == function.label.name.text)
+                .is_some_and(|(names, _)| names.contains(&function.label.name.text))
     }
 
     /// Whether a function is its package's entry function: the one the `entry` directive names,

@@ -156,8 +156,9 @@ pub fn bundle(
         return unusable("another toolchain built the kernel");
     }
     let manifest = source.manifest.as_ref().expect("a bundle's manifest");
-    let job = manifest.entry.is_some();
-    let target = match (job, read.target.arch()) {
+    let names = manifest.entry.as_ref().map(|(names, _)| names);
+    let program = names.is_some();
+    let target = match (program, read.target.arch()) {
         (true, Some(arch)) => Target::of(arch, Kind::Nanos),
         _ => read.target,
     };
@@ -197,7 +198,7 @@ pub fn bundle(
         diagnostics.push(interface_error(source, reason));
     }
     let contributions = contributions(&checker, root, &read.roots);
-    if job && !contributions.is_empty() {
+    if program && !contributions.is_empty() {
         let reason = "a nanos program adds no entry to a loaded registry";
         diagnostics.push(interface_error(source, reason));
     }
@@ -209,17 +210,24 @@ pub fn bundle(
         exports: read.exports,
         interrupt_stack: read.interrupt_stack,
     });
-    let entry = job.then(|| {
-        checker
-            .db
-            .package(root)
-            .root
-            .and_then(|module| checker.db.lookup(module, "main"))
-            .expect("a checked program's entry function")
-    });
+    let module = checker.db.package(root).root;
+    let mut entries: Vec<(String, ItemId)> = names
+        .into_iter()
+        .flatten()
+        .map(|name| {
+            let item = module.and_then(|module| checker.db.lookup(module, name));
+            (name.clone(), item.expect("a checked program's entry"))
+        })
+        .collect();
+    entries.sort();
+    let (entry, components) = match &entries[..] {
+        [(name, main)] if name == "main" => (Some(*main), Vec::new()),
+        _ => (None, entries),
+    };
     let bundle = lower::Bundle {
         contributions,
         entry,
+        components,
         roots: vec![root],
         prefixes: prefixes(&artefacts),
         level: read.level,
@@ -239,6 +247,7 @@ pub fn bundle(
         &lowered.object,
         contributed,
         lowered.job,
+        &lowered.components,
         &interface,
         seed.as_ref(),
     ) {

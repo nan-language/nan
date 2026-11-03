@@ -1,7 +1,13 @@
-//! Jobs: the entry of a nanos program's bundle, which its kernel calls with the address of a `nanos::World` it gives up, that of the `mem::Bytes` of the job's input it gives up and that of the `nanos::Ended` the job writes. The entry owns extended state of its own for the call, runs the program's entry function through the adapter of its form, and fits the stack its entry function's `limits stack N` states, when it states one.
+//! Jobs and component entries: the entries of a nanos program's bundle, which its kernel calls with the address of a `nanos::World` it gives up, that of the input it gives up, the `mem::Bytes` of a job's or what the task of a component's instance receives, and that of the `nanos::Ended` the entry writes. An entry owns extended state of its own for the call. The job entry runs the program's entry function through the adapter of its form, and fits the stack its entry function's `limits stack N` states, when it states one; a component entry runs the instance's task through `nanos::Hosted.run`.
 
 /// The position among an adapter's parameters of the entry function it runs.
 const JOBS_MAIN: usize = 2
+
+/// What an entry's call of its adapter gives, and the type of the adapter's result.
+struct Entered derives Copy {
+    called: Called
+    ended: ty::Ty
+} Entered
 
 /// The job entry of a bundle, and the stack its entry function's `limits stack N` states.
 struct JobEntry derives Copy {
@@ -37,14 +43,7 @@ fn Lowering.job_entry(mut self, entry: ty::ItemId) -> JobEntry {
     }
     let adapter = Instance.Nir(item: adapter_item, role: nir::Role.Body, index: 0, args: self.ck.types().args(take args))
     let main = nir::FnRef.item(entry, args: ty::Args.none())
-    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
-    for _ in 0usize..<3 {
-        mut signature.params.push(clif::AbiParam(value_type: PTR))
-    }
-    let id = mut self.module.declare_function(image::BUNDLE_JOB, linkage: object::Linkage.Local, signature)
-    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
-        let params = mut fx1.entry()
-        let owned = mut lo1.own_extended(mut fx1)
+    let id = mut self.adapter_entry(image::BUNDLE_JOB, call: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) -> Entered {
         let inner = mut lo1.callable_instance(main, as_value: true)
         var wrapped = mem::List[Instance].empty(lo1.alloc)
         mut wrapped.push(take inner)
@@ -61,9 +60,7 @@ fn Lowering.job_entry(mut self, entry: ty::ItemId) -> JobEntry {
         passed[1] = Held.Address(params[1])
         passed[2] = Held.Address(value)
         let called = mut lo1.invoke(mut fx1, invoked: Invoked.Bound(callee: callee, position: JOBS_MAIN, function: glue), abi, args: passed.view())
-        mut lo1.store_held(mut fx1, address: params[2], held: called.result, ty: abi.result)
-        mut lo1.disown_extended(mut fx1, previous: owned)
-        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+        return Entered(called: called, ended: abi.result)
     })
     match stack {
         Some(bound) => {
@@ -74,3 +71,59 @@ fn Lowering.job_entry(mut self, entry: ty::ItemId) -> JobEntry {
     }
     return JobEntry(id: id, stack: stack)
 } Lowering.job_entry
+
+/// Defines the entry of the component `name`, whose state is `state`, running the task of its
+/// instances.
+fn Lowering.component_entry(mut self, name: Str, state: ty::ItemId) -> object::FuncId {
+    let missing = object::FuncId(index: 0)
+    let alloc = self.alloc
+    let state_ty = self.ck.types().item(state, args: mem::List[ty::Arg].empty(alloc))
+    let Some(served) = self.ck.component_of(state_ty) else {
+        expect false
+        return missing
+    }
+    let Some(hosted) = self.ck.db().std_item("nanos", name: "Hosted") else {
+        expect false
+        return missing
+    }
+    let runs = self.ck.db().members(check::TypeKey.Item(hosted), name: "run")
+    if runs.len() == 0 {
+        expect false
+        return missing
+    }
+    var args = mem::List[ty::Arg].empty(alloc)
+    mut args.push(ty::Arg.Ty(state_ty))
+    mut args.push(ty::Arg.Ty(served.env))
+    mut args.push(ty::Arg.Ty(served.message))
+    let adapter = Instance.Nir(item: runs[0], role: nir::Role.Body, index: 0, args: self.ck.types().args(take args))
+    var symbol = text::String.of(image::BUNDLE_COMPONENT, alloc)
+    mut symbol.append(name)
+    return mut self.adapter_entry(symbol.as_str(), call: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) -> Entered {
+        let abi = mut lo1.abi(adapter)
+        let callee = mut lo1.instance(adapter.copy(lo1.alloc))
+        var passed = Array[Held, 2].filled(Held.Address(params[0]))
+        passed[1] = Held.Address(params[1])
+        let called = mut lo1.invoke(mut fx1, invoked: Invoked.Direct(callee), abi, args: passed.view())
+        return Entered(called: called, ended: abi.result)
+    })
+} Lowering.component_entry
+
+/// Defines an entry of a bundle under `symbol`, taking the addresses of a world, of an input and
+/// of the `nanos::Ended` it writes, which owns extended state while `call` calls an adapter with
+/// them, and writes the adapter's result of the type given.
+fn Lowering.adapter_entry(mut self, symbol: Str, call: fn(mut lo: Lowering, mut fx: Fx, params: Slice[clif::Value]) -> Entered) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for _ in 0usize..<3 {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    let id = mut self.module.declare_function(symbol, linkage: object::Linkage.Local, signature)
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        let owned = mut lo1.own_extended(mut fx1)
+        let entered = call(lo: mut lo1, fx: mut fx1, params: params.view())
+        mut lo1.store_held(mut fx1, address: params[2], held: entered.called.result, ty: entered.ended)
+        mut lo1.disown_extended(mut fx1, previous: owned)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+    return id
+} Lowering.adapter_entry

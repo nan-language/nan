@@ -236,7 +236,7 @@ A rule judging reachable code judges all code of a package declaring its target,
 
 ## Entry
 
-The `entry main` directive names the **entry function**: the function item `main` of the root module, which receives the root grant. A directive naming another identifier, and a root module without a function item `main`, are errors (`target.entry-missing`).
+The `entry main` directive names the **entry function**: the function item `main` of the root module, which receives the root grant. On a nanos target, the `entry` directive may instead list **component entries**: structs or enums of the root module, each the state of a component that a kernel holds ([component instances](14-authority.md#component-instances)). A directive naming another identifier, listing `main` beside another name, or listing component entries for another target, and a root module without a function item `main` that the directive names, are errors (`target.entry-missing`). A component entry that is not the state, without generic parameters, of a component serving a [protocol](26-components.md#protocols) whose Env implements `nanos::Environment` and is not linear is an error (`target.component-entry`).
 
 | Target | Head |
 | --- | --- |
@@ -303,6 +303,79 @@ error target.bundle-interface average/package.nan:3 average
     package average {
     because note - - a nanos program builds only against a kernel's interface file
 failed build average: files 0, errors 1, incomplete 0
+```
+
+```nan
+// file: tally/package.nan
+//! A tally a NaN OS kernel holds.
+
+package tally {
+    language 1
+    targets x86_64-nanos
+    entry Tally
+} tally
+
+// file: tally/tally.nan
+//! A tally served through the Counter protocol.
+
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 limits pure
+} Counter
+
+pub closed struct Env {
+    pub clock: sys::Clock
+} Env
+
+impl Env: nanos::Environment
+
+pub fn Env.build(take world: nanos::World) -> Env = Env(clock: world.clock)
+
+pub closed struct Tally derives Encode {
+    pub total: u64
+} Tally
+
+impl Tally: sys::Component[Env, Counter]
+
+pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0)
+
+pub fn Tally.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 {
+    self.total = self.total.wrapping_add(u64.widen(amount))
+    return self.total
+} Tally.add
+```
+
+```nan
+// file: tally/package.nan
+//! A tally a NaN OS kernel holds.
+
+package tally {
+    language 1
+    targets x86_64-nanos
+    entry Tally // error: target.component-entry
+} tally
+
+// file: tally/tally.nan
+//! A tally whose Env no kernel's world builds.
+
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 limits pure
+} Counter
+
+pub closed struct Env {
+} Env
+
+pub closed struct Tally derives Encode {
+    pub total: u64
+} Tally
+
+impl Tally: sys::Component[Env, Counter]
+
+pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0)
+
+pub fn Tally.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 {
+    self.total = self.total.wrapping_add(u64.widen(amount))
+    return self.total
+} Tally.add
 ```
 
 ```nan
@@ -587,6 +660,7 @@ Every image keeps frame pointers in every function, stubs and support routines i
 | --- | --- | --- |
 | `target.dep-program` | error | [Programs and libraries](#programs-and-libraries) |
 | `target.dependency-uncovered` | error | [Targets](#targets) |
+| `target.component-entry` | error | [Entry](#entry) |
 | `target.entry-head` | error | [Entry](#entry) |
 | `target.entry-missing` | error | [Entry](#entry) |
 | `target.link-failed` | error | [Images](#images) |

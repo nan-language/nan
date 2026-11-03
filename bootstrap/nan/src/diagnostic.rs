@@ -440,6 +440,7 @@ codes! {
     SyntaxUnclosedDelimiter = "syntax.unclosed-delimiter",
     SyntaxUnexpectedToken = "syntax.unexpected-token",
     TargetBundleInterface = "target.bundle-interface",
+    TargetComponentEntry = "target.component-entry",
     TargetDepProgram = "target.dep-program",
     TargetDependencyUncovered = "target.dependency-uncovered",
     TargetEntryHead = "target.entry-head",

@@ -1387,7 +1387,7 @@ pub fn Module.into_region(take self) -> hw::Region
 
 ## Loading
 
-A kernel of a bare target **exports its load ABI** when its final closure declares a [loaded registry](25-registries.md#loaded-registries) or a function of a package outside std calls `boot::Kernel.loader`. Its final build then also writes its [interface file](30-artefacts.md#interface-files), and a [bundle](30-artefacts.md#bundles) built against that file adds entries to its loaded registries, or holds the [job](14-authority.md#jobs) of a nanos program, while it runs.
+A kernel of a bare target **exports its load ABI** when its final closure declares a [loaded registry](25-registries.md#loaded-registries) or a function of a package outside std calls `boot::Kernel.loader`. Its final build then also writes its [interface file](30-artefacts.md#interface-files), and a [bundle](30-artefacts.md#bundles) built against that file adds entries to its loaded registries, or holds the [job](14-authority.md#jobs) or the [component entries](14-authority.md#component-instances) of a nanos program, while it runs.
 
 ```nan-api
 // module: boot
@@ -1423,6 +1423,8 @@ pub fn Bundle.unload(take self)
 
 pub fn Bundle.job(self) -> Option[Job]
 
+pub fn Bundle.component(self, name: Str) -> Option[Job]
+
 pub open struct Job derives Copy {
 } Job
 
@@ -1446,7 +1448,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 - `bundle.domain()` shares the bundle's **domain**, an abandoner ([domain run](11-errors-domains.md#domain-run)) that runs no domain when the bundle is loaded. A kernel contains the calls it makes into a bundle, and what they leave running or installed, by making them in a domain run of that abandoner.
 - `bundle.replace(take next)` publishes in one change versions without the entries of `bundle` and with those of `next`, failing as `load` does and then changing nothing and retiring `next`'s placement. Each gate of `bundle` whose registry, key and field an entry of `next` shares then calls `next`'s function, and every other gate of `bundle` goes stale; `bundle` holds `next` from then on, with the same domain, and retires the placement it held.
 - `take bundle.unload()` triggers the bundle's domain, then publishes versions without the bundle's entries; every gate of the bundle goes stale and its placement is retired.
-- `bundle.job()` gives the job entry of a nanos program's bundle, none for another, and `job.stack()` the stack its task needs: the `stack N` its entry function states, or, for one stating none, the stack use of the job entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs it ([jobs](14-authority.md#jobs)).
+- `bundle.job()` gives the job entry of a nanos program's bundle, none for another, `bundle.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's bundle, none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)).
 - Loads, replacements, unloads and reclamations take one lock of the kernel's, each publishing all its versions before the next starts.
 - A bundle's code runs on the kernel's runtime: its tasks, cells, capabilities and domains are the kernel's.
 - **Retired** memory is reclaimed by `loader.reclaim()`: each version a publication replaced once no [read](25-registries.md#loaded-registries) holds it, and each retired placement once no older retired version is held and no call pins its code. Reclaiming a placement unlinks its line tables, clears its window entries and the window tables they leave empty, invalidates every CPU's translations as `hw::Ring0.invalidate_everywhere(hw::TlbScope.All)` does ([cross-CPU operations](#cross-cpu-operations)), then frees its runtime memory. `reclaim` gives the number of retired placements it leaves, and fails at once, keeping what it had cleared for the next call, when cancelled as its invalidation starts. A gate's function value and the records a gate reads, a few words per function field and load, are never reclaimed, so a value holding a gate stays valid after its bundle is reclaimed.
@@ -1482,7 +1484,7 @@ pub fn ExtendedState.into_frame(take self) -> PhysFrame[4_096]
 - `state.with(body)` runs `body` with the running thread owning `state`, then returns what `body` returns or fails as it fails. The thread's registers start as `state` holds them, `state` holds them as `body` leaves them, and the thread owns again the extended state it owned before the call, as it held it then.
 - Each CPU runs its kernel executor with the extended state disabled, `CR0.TS` set on x86_64 and `CPACR_EL1.FPEN` clear on AArch64, while it runs a thread owning none, so that an instruction using it raises an exception ([interrupt functions](#interrupt-functions)). The executor restores a thread's extended state into the CPU, enabling it, before the thread runs, and saves it once the thread switches away. Before a thread owning none runs on a CPU holding another thread's extended state, it puts that state in its initial state, then disables it. A thread owning none pays no save or restore, and no thread runs while its CPU holds another thread's extended state.
 - No seam saves extended state: interrupt fns use none, and a preempted thread switches away as any other. The entry function starts with the extended state enabled ([anchor](#anchor)).
-- Code of a nanos bundle owns extended state of its own wherever code of another target enters it, at its job entry and at the entry of each task it starts: the entry makes the thread own a save area in its own frame, in its initial state, for as long as it runs, so that its floats and lanes survive preemption and no other thread sees them. That area, 4,160 bytes, is part of the entry's stack use.
+- Code of a nanos bundle owns extended state of its own wherever code of another target enters it, at its job entry, at its component entries and at the entry of each task it starts: the entry makes the thread own a save area in its own frame, in its initial state, for as long as it runs, so that its floats and lanes survive preemption and no other thread sees them. That area, 4,160 bytes, is part of the entry's stack use.
 - A thread's saved state holds the state components the `XCR0` of the CPU that saved it enables, and `write_xcr0` disables none ([privileged intrinsics](23-low-level.md#privileged-intrinsics)). Restoring it on a CPU whose `XCR0` lacks one of them raises a general-protection exception in the executor ([interrupt functions](#interrupt-functions)).
 
 ```nan

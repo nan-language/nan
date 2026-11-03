@@ -127,11 +127,12 @@ pub open struct Table[E: Any] {
 pub open struct Job derives Copy {
 } Job
 
-/// A placed image: its placement, its job entry, the entries it adds, the target records its
-/// gates named, and the allocator of this bookkeeping.
+/// A placed image: its placement, its job entry, its component entries, the entries it adds, the
+/// target records its gates named, and the allocator of this bookkeeping.
 struct Placed {
     placement: Placement
     job: Option[Job]
+    components: mem::List[Exported]
     contributions: mem::List[Contribution]
     targets: mem::List[u64]
     alloc: mem::Alloc
@@ -145,6 +146,12 @@ struct Placement derives Copy {
     pages: u64
     lines: u64
 } Placement
+
+/// A component entry of a bundle: the name of its component, and its entry.
+struct Exported {
+    name: mem::Bytes
+    job: Job
+} Exported
 
 /// An entry a bundle adds to a loaded registry: the registry's table record, the entry's address
 /// in the window and its bytes, its key and unique fields, and its function fields.
@@ -218,6 +225,7 @@ struct Parts derives Copy {
     job: bool
     entry: u64
     stack: u64
+    components: Span
 } Parts
 
 /// A signature section: the public key and the signature.
@@ -310,6 +318,15 @@ pub fn Bundle.job(self) -> Option[Job] {
     return self.current.job
 } Bundle.job
 
+pub fn Bundle.component(self, name: Str) -> Option[Job] {
+    for exported in self.current.components {
+        if exported.name.view() == name.as_bytes() {
+            return Some(exported.job)
+        }
+    }
+    return None
+} Bundle.component
+
 pub fn Job.stack(self) -> usize
 
 pub fn Table.read[T: Any](self, body: fn(entries: Slice[E]) -> T) -> T {
@@ -384,6 +401,13 @@ fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails Loa
             fail error
         }
     }
+    let components = match attempt components_of(bundle, parts, window, alloc) {
+        Ok(found) => found
+        Err(error) => {
+            release(memory)
+            fail error
+        }
+    }
     lock(table)
     for index in 0..<pages {
         var kind = KIND_WRITABLE
@@ -405,7 +429,7 @@ fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails Loa
     if parts.job {
         job = Some(Job.at(window + parts.entry, stack: parts.stack))
     }
-    return Prepared(placed: Placed(placement: placement, job: job, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
+    return Prepared(placed: Placed(placement: placement, job: job, components: take components, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
 } place
 
 /// Relocates and binds the image copied at `base` for its address in the window, giving the
@@ -416,10 +440,37 @@ fn relocated(bundle: Slice[u8], parts: Parts, base: u64, window: u64, table: u64
     return try contributions_of(bundle, parts, window, table, alloc)
 } relocated
 
+/// The component entries of a bundle placed at `window`, each entry lying in its code.
+fn components_of(bundle: Slice[u8], parts: Parts, window: u64, alloc: mem::Alloc) -> mem::List[Exported] fails LoadError {
+    var found = mem::List[Exported].empty(alloc)
+    if parts.components.len == 0 {
+        return found
+    }
+    var reader = Reader(at: parts.components.start, end: parts.components.start + parts.components.len)
+    let count = try mut reader.uvar(bundle)
+    for _ in 0..<count {
+        let name = try mut reader.span(bundle)
+        let entry = try mut reader.uvar(bundle)
+        let stack = try mut reader.uvar(bundle)
+        if entry >= parts.read_only {
+            fail LoadError.Malformed
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        for at in name.start..<(name.start + name.len) {
+            mut bytes.push(bundle[at])
+        }
+        mut found.push(Exported(name: take bytes, job: Job.at(window + entry, stack: stack)))
+    }
+    if reader.at != reader.end {
+        fail LoadError.Malformed
+    }
+    return found
+} components_of
+
 /// The parts a bundle's body records, keyed from 1.
 fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
     let empty = Span(start: 0, len: 0)
-    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0)
+    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0, components: empty)
     var reader = Reader(at: body.start, end: body.start + body.len)
     var last: u64 = 0
     var held: u64 = 0
@@ -474,6 +525,9 @@ fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
                     fail LoadError.Malformed
                 }
                 parts.job = true
+            }
+            10 => {
+                parts.components = content
             }
             else => fail LoadError.Malformed
         }

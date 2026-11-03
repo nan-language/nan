@@ -1,0 +1,85 @@
+//! A tally served through the Counter protocol: it adds amounts, refusing large ones, gives back a clock it receives, counts the ticks of a keyed task it starts whenever resumed, logs memory pressure, is unhealthy over its budget or while suspended, and traps dividing by zero.
+
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
+    pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+    pub fn divide(by: u32) -> u64 limits pure
+    fn tick() limits pure
+} Counter
+
+pub closed struct Env {
+    pub log: sys::Log
+    pub clock: sys::Clock
+} Env
+
+impl Env: nanos::Environment
+
+pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
+    let clock = try nanos::Cap[sys::Clock].get(world.caps, key: "clock")
+    return Env(log: world.log, clock: clock)
+} Env.build
+
+pub closed struct Tally derives Encode {
+    pub total: u64
+    pub ticks: u64
+    pub suspended: bool
+} Tally
+
+impl Tally: sys::Component[Env, Counter]
+
+impl Tally: sys::Resume[Env, Counter]
+
+impl Tally: sys::Pressure[Env, Counter]
+
+impl Tally: sys::Health[Env, Counter]
+
+impl Tally: sys::Suspend[Env, Counter]
+
+pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0, ticks: 0, suspended: false)
+
+pub fn Tally.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 fails refusals::Refused {
+    if amount > 1_000 {
+        fail refusals::Refused.TooLarge
+    }
+    self.total = self.total.wrapping_add(u64.widen(amount))
+    return self.total
+} Tally.add
+
+pub fn Tally.echo(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx[Counter]) -> sys::Clock = clock
+
+pub fn Tally.divide(mut self, take by: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 {
+    return self.total / u64.widen(by)
+} Tally.divide
+
+fn Tally.tick(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.ticks += 1
+} Tally.tick
+
+pub fn Tally.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Counter]) {
+    env.log.info("resumed", value: reason)
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Counter]) fails task::Cancelled uses wait {
+        discard attempt await out.tick()
+    })
+} Tally.resume
+
+pub fn Tally.pressure(mut self, level: u8, mut env: Env, mut cx: sys::Cx[Counter]) {
+    env.log.warn("pressure", value: level)
+} Tally.pressure
+
+pub fn Tally.health(mut self, mut env: Env, mut cx: sys::Cx[Counter]) -> sys::HealthReply {
+    if self.suspended {
+        return sys::HealthReply.Unhealthy(text::Fixed[256].of("suspended"))
+    }
+    if self.total > 100 {
+        return sys::HealthReply.Unhealthy(text::Fixed[256].of("over budget"))
+    }
+    return sys::HealthReply.Healthy
+} Tally.health
+
+pub fn Tally.suspend(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.suspended = true
+} Tally.suspend
+
+pub fn Tally.wake(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.suspended = false
+} Tally.wake

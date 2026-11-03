@@ -903,7 +903,7 @@ fn encode_kind(
                 _ => Scalar::Char,
             };
             let loaded = fx.load(
-                super::super::layout::scalar_type(scalar, lo.machine()),
+                super::super::layout::scalar_type(scalar, lo.float_bits()),
                 value,
                 0,
             );
@@ -935,7 +935,7 @@ fn encode_kind(
         }
         Kind::Float(scalar) => {
             let loaded = fx.load(
-                super::super::layout::scalar_type(*scalar, lo.machine()),
+                super::super::layout::scalar_type(*scalar, lo.float_bits()),
                 value,
                 0,
             );
@@ -1459,12 +1459,12 @@ fn decode_kind(
             let narrowed = super::super::place::resize(
                 fx,
                 value,
-                super::super::layout::scalar_type(*scalar, lo.machine()),
+                super::super::layout::scalar_type(*scalar, lo.float_bits()),
             );
             fx.store(narrowed, target, 0);
         }
         Kind::Float(scalar) => {
-            let float = super::super::layout::scalar_type(Scalar::F64, lo.machine());
+            let float = super::super::layout::scalar_type(Scalar::F64, lo.float_bits());
             let (value, failed) = match &decoding.format {
                 DecodeFormat::Wire => wire::read_float(fx, reader_state, float),
                 DecodeFormat::Json => json::read_float(lo, fx, reader_state, float),

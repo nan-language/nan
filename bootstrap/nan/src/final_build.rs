@@ -52,8 +52,8 @@ pub fn build(
     let source = &workspace.packages[program];
     let target = source.program_target();
     if target.is_nanos() {
-        let unavailable = at_entry(source, Code::TargetImageUnavailable);
-        return Ok(Build::failed(vec![unavailable]));
+        let reason = "a nanos program builds only against a kernel's interface file";
+        return Ok(Build::failed(vec![bundle::interface_error(source, reason)]));
     }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
@@ -206,7 +206,8 @@ struct Kernel {
 }
 
 /// The interface of the program whose package is `root`, built at a codegen level, when it is a
-/// kernel of a bare target whose final closure declares a loaded registry.
+/// kernel of a bare target whose final closure declares a loaded registry or calls
+/// `boot::Kernel.loader` outside std.
 fn kernel_interface(
     checker: &check::Checker,
     root: PackageId,
@@ -222,7 +223,19 @@ fn kernel_interface(
         .filter(|item| is_loaded(checker, *item))
         .map(|item| (checker.db.canonical(item), item))
         .collect();
-    if loaded.is_empty() {
+    let own: Vec<PackageId> = packages
+        .iter()
+        .copied()
+        .filter(|package| !checker.db.package(*package).std)
+        .collect();
+    let takes_loader = items(checker, &own).any(|item| {
+        checker.body_dependencies(item).is_some_and(|called| {
+            called
+                .iter()
+                .any(|callee| checker.db.canonical(*callee) == "boot::Kernel.loader")
+        })
+    });
+    if loaded.is_empty() && !takes_loader {
         return None;
     }
     loaded.sort();

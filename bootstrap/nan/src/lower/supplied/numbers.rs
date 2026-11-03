@@ -91,7 +91,7 @@ pub fn conversion(
     let source = nty.ty().scalar().expect("a scalar converted");
     let repr = body.lo.owned_repr(nty.ty());
     let value = body.adapt(held, &nty, repr).scalar();
-    let ty = scalar_type(target, body.lo.machine());
+    let ty = scalar_type(target, body.lo.float_bits());
     let checked = body.checked(block, position);
     match conversion {
         Conversion::Widen => Held::Scalar(widen(body.fx, value, source, target, ty)),
@@ -479,7 +479,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "wrapping_add" => Held::Scalar(fx.b.ins().iadd(value(0), value(1))),
         "wrapping_sub" => Held::Scalar(fx.b.ins().isub(value(0), value(1))),
         "wrapping_mul" => Held::Scalar(fx.b.ins().imul(value(0), value(1))),
-        "count_ones" if lo.machine() && lo.ck.db.target.arch() == Some(Arch::Aarch64) => {
+        "count_ones" if lo.float_bits() && lo.ck.db.target.arch() == Some(Arch::Aarch64) => {
             Held::Scalar(ones(fx, value(0)))
         }
         "count_ones" => count(fx, value(0), "popcnt"),
@@ -549,7 +549,7 @@ fn ones(fx: &mut Fx, value: Value) -> Value {
 
 fn division(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, scalar: Scalar) -> Held {
     let (a, b) = (supply.param(0).scalar(), supply.param(1).scalar());
-    let ty = scalar_type(scalar, lo.machine());
+    let ty = scalar_type(scalar, lo.float_bits());
     let zero_divisor = fx.b.ins().icmp_imm_s(IntCC::Equal, b, 0);
     fx.when(zero_divisor, |fx| {
         super::super::runtime::report::raise_kind(lo, fx, "trap.division-by-zero")

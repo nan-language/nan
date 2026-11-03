@@ -20,7 +20,9 @@
 //! `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock
 //! that delays count, which a host's wall clock reads from the platform instead, then its
 //! resolution. An entry of a capability kind holds its minter's state record, then the two words
-//! of its record.
+//! of its record. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind
+//! serving it and holds that entry's handle, then the method table of the kind for its service
+//! interface.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -76,6 +78,8 @@ pub mod kind {
     pub const OUTBOX: i64 = 8;
     pub const WALL: i64 = 9;
     pub const KIND: i64 = 10;
+    /// An entry revoked as it is minted.
+    pub const DENIED: i64 = 11;
 }
 
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
@@ -540,6 +544,48 @@ pub fn entry_at(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
     let entries = fx.load(PTR, state_address, state::ENTRIES);
     let offset = fx.b.ins().imul_imm_s(index, ENTRY_RECORD as i64);
     fx.b.ins().iadd(entries, offset)
+}
+
+/// The handle of an entry revoked as it is minted, which every operation finds stale.
+pub fn denied(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let kind = fx.ptr(kind::DENIED as u64);
+    let handle = new_entry(lo, fx, kind);
+    revoke(lo, fx, handle);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    handle
+}
+
+/// The handle of a new entry of a kind deriving from the live entry of `service`, holding that
+/// handle and the address of a method table; -1 when `service` is stale.
+pub fn served(lo: &mut Lowering, fx: &mut Fx, kind: i64, service: Value, table: Value) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let source = live_entry(lo, fx, service);
+    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
+    let handle = fx.choose_in(
+        lo,
+        live,
+        &[PTR],
+        |lo, fx| {
+            let kind = fx.ptr(kind as u64);
+            let handle = new_entry(lo, fx, kind);
+            let record = entry_at(lo, fx, handle);
+            fx.store(service, record, entry::STATE);
+            fx.store(table, record, entry::STATE + 8);
+            let index = fx.b.ins().band_imm_s(service, 0xFFFF_FFFF);
+            let index = fx.b.ins().iadd_imm_s(index, 1);
+            let index = fx.b.ins().ireduce(types::I32, index);
+            fx.store(index, record, entry::SOURCE);
+            vec![handle]
+        },
+        |_, fx| vec![fx.int(PTR, -1)],
+    )[0];
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    handle
 }
 
 /// The record of an entry whose handle is live, zero for a stale one.

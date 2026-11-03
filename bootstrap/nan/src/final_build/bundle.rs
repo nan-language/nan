@@ -19,7 +19,7 @@ use crate::encoding::{Record, bytes, list, uvar};
 use crate::hash::Hash;
 use crate::lower;
 use crate::lower::load::Interface;
-use crate::workspace::{Level, Package, Target, Workspace};
+use crate::workspace::{Kind, Level, Package, Target, Workspace};
 
 /// The magic and format version of an interface file.
 const MAGIC: &[u8; 4] = b"NLIF";
@@ -136,7 +136,8 @@ pub fn interrupt_stack(checker: &Checker, packages: &[PackageId]) -> u64 {
 
 /// Builds the bundle of the package at index `package` of the workspace against the interface
 /// file at `against`, signed with the secret key of `seed` when given, writing it into
-/// `.nan/images/<target>/`.
+/// `.nan/images/<target>/`: a library's for the interface's target, a nanos program's for the
+/// nanos target of its architecture.
 pub fn bundle(
     workspace: &Workspace,
     package: usize,
@@ -154,21 +155,20 @@ pub fn bundle(
     if read.toolchain != crate::toolchain::hash(1) {
         return unusable("another toolchain built the kernel");
     }
-    let declared = source
-        .manifest
-        .as_ref()
-        .is_some_and(|manifest| manifest.targets.contains(&read.target));
-    if !declared {
-        return unusable(&format!(
-            "the package does not declare {}",
-            read.target.name()
-        ));
+    let manifest = source.manifest.as_ref().expect("a bundle's manifest");
+    let job = manifest.entry.is_some();
+    let target = match (job, read.target.arch()) {
+        (true, Some(arch)) => Target::of(arch, Kind::Nanos),
+        _ => read.target,
+    };
+    if !manifest.targets.contains(&target) {
+        return unusable(&format!("the package does not declare {}", target.name()));
     }
     let mut diagnostics = check::reported(workspace, &crate::scope::Scope::Workspace);
     let Some(checked) = workspace.closure_of(source) else {
         return Ok(Build::failed(diagnostics));
     };
-    let checker = check::checked(workspace, checked, crate::stdlib::packages(), read.target);
+    let checker = check::checked(workspace, checked, crate::stdlib::packages(), target);
     let root = package_id(&checker, source);
     let closure = checker.reached(root);
     diagnostics.retain(|diagnostic| {
@@ -196,6 +196,11 @@ pub fn bundle(
         let reason = "an interrupt fn demands more stack than the kernel's interrupt stacks hold";
         diagnostics.push(interface_error(source, reason));
     }
+    let contributions = contributions(&checker, root, &read.roots);
+    if job && !contributions.is_empty() {
+        let reason = "a nanos program adds no entry to a loaded registry";
+        diagnostics.push(interface_error(source, reason));
+    }
     if errors(&diagnostics) {
         return Ok(Build::failed(diagnostics));
     }
@@ -204,8 +209,17 @@ pub fn bundle(
         exports: read.exports,
         interrupt_stack: read.interrupt_stack,
     });
+    let entry = job.then(|| {
+        checker
+            .db
+            .package(root)
+            .root
+            .and_then(|module| checker.db.lookup(module, "main"))
+            .expect("a checked program's entry function")
+    });
     let bundle = lower::Bundle {
-        contributions: contributions(&checker, root, &read.roots),
+        contributions,
+        entry,
         roots: vec![root],
         prefixes: prefixes(&artefacts),
         level: read.level,
@@ -224,6 +238,7 @@ pub fn bundle(
     let written = match crate::image::bundle::write(
         &lowered.object,
         contributed,
+        lowered.job,
         &interface,
         seed.as_ref(),
     ) {
@@ -235,7 +250,7 @@ pub fn bundle(
         }
     };
     let name = &checker.db.package(root).name;
-    let path = format!(".nan/images/{}/{name}.nbun", read.target.name());
+    let path = format!(".nan/images/{}/{name}.nbun", target.name());
     write_file(&workspace.root.join(&path), &written)?;
     Ok(Build {
         diagnostics,
@@ -274,7 +289,7 @@ fn contributions(
 }
 
 /// A `target.bundle-interface` error on a package's `package` line, with its reason.
-fn interface_error(package: &Package, reason: &str) -> Diagnostic {
+pub fn interface_error(package: &Package, reason: &str) -> Diagnostic {
     let mut diagnostic = at_manifest(package, Diagnostic::new(Code::TargetBundleInterface));
     diagnostic.because.push(Reason::note(reason));
     diagnostic

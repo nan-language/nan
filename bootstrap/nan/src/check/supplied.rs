@@ -120,9 +120,11 @@ const TRAPPING: [&str; 35] = [
 /// The supplied operations that change an atomic count without a type with interior mutability.
 const COUNTED: [&str; 2] = ["mem::Shared.share", "mem::Shared.make_mut"];
 
-/// The supplied operations calling a component's handlers on the calling task, whose digests
-/// hold the declared digest of a call through `sys::Component` or a system interface.
-const HANDLING: [&str; 8] = [
+/// The supplied operations calling a component's handlers or a job's entry on the calling task,
+/// whose digests hold the declared digest of a call through `sys::Component`, a system interface
+/// or a function type.
+const HANDLING: [&str; 9] = [
+    "nanos::call",
     "sys::Stepper.start",
     "sys::Stepper.deliver",
     "sys::Stepper.step",

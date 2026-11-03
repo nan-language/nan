@@ -120,7 +120,7 @@ pub fn run(
 }
 
 /// `nan build --against`: builds the bundle of the package the scope names, which declares no
-/// entry, against a kernel's interface file.
+/// entry or a nanos target, against a kernel's interface file.
 fn bundle(
     invocation: &Invocation,
     workspace: &Workspace,
@@ -135,16 +135,18 @@ fn bundle(
             .iter()
             .position(|candidate| std::ptr::eq(&**candidate, package))
     });
-    let library = package.filter(|index| {
+    let buildable = package.filter(|index| {
         workspace.packages[*index]
             .manifest
             .as_ref()
-            .is_some_and(|manifest| manifest.entry.is_none())
+            .is_some_and(|manifest| {
+                manifest.entry.is_none() || manifest.targets.iter().any(|target| target.is_nanos())
+            })
     });
     let usable = invocation.name == Name::Build
         && matches!(scope, Scope::Package(_))
         && invocation.value("--compare-with").is_none();
-    let Some(package) = library.filter(|_| usable) else {
+    let Some(package) = buildable.filter(|_| usable) else {
         return Ok(Outcome::Output(
             invocation.tool_error(Code::ToolUsage, written),
         ));

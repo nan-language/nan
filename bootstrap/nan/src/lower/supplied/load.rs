@@ -1,5 +1,5 @@
-//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, and the
-//! export table, runtime memory, window entries, translation invalidation and instruction
+//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded
+//! bundle's job entry, its code's address and its stack, and the export table, runtime memory, window entries, translation invalidation and instruction
 //! visibility the loader of `sys::load` reads.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC};
@@ -24,6 +24,16 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
                 false => lo.none_value(fx, &option),
             };
             supply.ret(lo, fx, loader);
+        }
+        "sys::load::Job.at" => {
+            let sret = supply.sret.expect("a job's address");
+            fx.store(supply.param(0).scalar(), sret, 0);
+            fx.store(supply.param(1).scalar(), sret, 8);
+            supply.ret(lo, fx, Held::Address(sret));
+        }
+        "sys::load::Job.stack" => {
+            let stack = fx.load(PTR, supply.param(0).address(), 8);
+            supply.ret(lo, fx, Held::Scalar(stack));
         }
         "sys::load::Table.record" => {
             let table = supply.param(0).address();

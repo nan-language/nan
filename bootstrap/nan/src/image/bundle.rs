@@ -9,11 +9,13 @@ use crate::lower::load::{Contributed, Interface};
 const MAGIC: &[u8; 4] = b"NBUN";
 const VERSION: u128 = 1;
 
-/// The bundle of a lowered object, signed by the key of a secret seed when one is given, or the
-/// names of the symbols it imports that the interface does not export.
+/// The bundle of a lowered object, with its job entry and the stack its task needs for a nanos
+/// program's, signed by the key of a secret seed when one is given, or the names of the symbols
+/// it imports that the interface does not export.
 pub fn write(
     object: &[u8],
     contributed: &[Contributed],
+    job: Option<u64>,
     interface: &Interface,
     seed: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, Vec<String>> {
@@ -34,7 +36,10 @@ pub fn write(
     }
     let mut out = MAGIC.to_vec();
     uvar(&mut out, VERSION);
-    bytes(&mut out, &body(&linked, contributed, interface, &index));
+    bytes(
+        &mut out,
+        &body(&linked, contributed, job, interface, &index),
+    );
     let mut sections = Record::default();
     if let Some(seed) = seed {
         let mut signature = Record::default();
@@ -47,11 +52,12 @@ pub fn write(
 }
 
 /// The body of a bundle: its interface hash, its image, the image's size in memory, its base
-/// relocations, its imports, its line tables' offset, its contributions and where its read-only
-/// and writable data start.
+/// relocations, its imports, its line tables' offset, its contributions, where its read-only
+/// and writable data start, and its job entry with its task's stack.
 fn body(
     linked: &Linked,
     contributed: &[Contributed],
+    job: Option<u64>,
     interface: &Interface,
     index: &dyn Fn(&str) -> Option<usize>,
 ) -> Vec<u8> {
@@ -147,6 +153,10 @@ fn body(
         8,
         field(|out| pair(out, (start(Access::Read), start(Access::Write)))),
     );
+    if let Some(stack) = job {
+        let entry = linked.symbol(crate::lower::JOB);
+        record.field(9, field(|out| pair(out, (entry, stack))));
+    }
     record.finish()
 }
 

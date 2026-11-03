@@ -124,10 +124,14 @@ pub open linear struct Bundle {
 pub open struct Table[E: Any] {
 } Table
 
-/// A placed image: its placement, the entries it adds, the target records its gates named, and
-/// the allocator of this bookkeeping.
+pub open struct Job derives Copy {
+} Job
+
+/// A placed image: its placement, its job entry, the entries it adds, the target records its
+/// gates named, and the allocator of this bookkeeping.
 struct Placed {
     placement: Placement
+    job: Option[Job]
     contributions: mem::List[Contribution]
     targets: mem::List[u64]
     alloc: mem::Alloc
@@ -211,6 +215,9 @@ struct Parts derives Copy {
     contributions: Span
     read_only: u64
     writable: u64
+    job: bool
+    entry: u64
+    stack: u64
 } Parts
 
 /// A signature section: the public key and the signature.
@@ -299,12 +306,21 @@ pub fn Bundle.unload(take self) {
     retire_placement(current.placement, targets: current.targets.view())
 } Bundle.unload
 
+pub fn Bundle.job(self) -> Option[Job] {
+    return self.current.job
+} Bundle.job
+
+pub fn Job.stack(self) -> usize
+
 pub fn Table.read[T: Any](self, body: fn(entries: Slice[E]) -> T) -> T {
     let holding = pin(self.record())
     let result = body(self.pinned(holding))
     unpin(holding)
     return result
 } Table.read
+
+/// The job entry whose code lies at an address of the window and whose task needs `stack` bytes.
+fn Job.at(entry: u64, stack: u64) -> Job
 
 /// The address of the kernel's export table, zero in an image that exports none.
 fn exports() -> u64
@@ -349,7 +365,8 @@ fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails Loa
     }
     let image = u64.widen(parts.image.len)
     let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
-    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered {
+    let coded = not parts.job or parts.entry < parts.read_only
+    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered or not coded {
         fail LoadError.Malformed
     }
     let pages = (parts.size + PAGE - 1) / PAGE
@@ -384,7 +401,11 @@ fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails Loa
     unlock(table)
     sync(window, len: pages * PAGE)
     let placement = Placement(memory: memory, window: window, pages: pages, lines: lines)
-    return Prepared(placed: Placed(placement: placement, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
+    var job: Option[Job] = None
+    if parts.job {
+        job = Some(Job.at(window + parts.entry, stack: parts.stack))
+    }
+    return Prepared(placed: Placed(placement: placement, job: job, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
 } place
 
 /// Relocates and binds the image copied at `base` for its address in the window, giving the
@@ -398,7 +419,7 @@ fn relocated(bundle: Slice[u8], parts: Parts, base: u64, window: u64, table: u64
 /// The parts a bundle's body records, keyed from 1.
 fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
     let empty = Span(start: 0, len: 0)
-    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0)
+    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0)
     var reader = Reader(at: body.start, end: body.start + body.len)
     var last: u64 = 0
     var held: u64 = 0
@@ -444,6 +465,15 @@ fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
                     fail LoadError.Malformed
                 }
                 held += 1
+            }
+            9 => {
+                var job = Reader(at: content.start, end: content.start + content.len)
+                parts.entry = try mut job.uvar(bundle)
+                parts.stack = try mut job.uvar(bundle)
+                if job.at != job.end {
+                    fail LoadError.Malformed
+                }
+                parts.job = true
             }
             else => fail LoadError.Malformed
         }

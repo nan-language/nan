@@ -39,6 +39,10 @@ const INITIAL_X87_CONTROL: i64 = 0x037F;
 const INITIAL_MXCSR: i64 = 0x1F80;
 const AREA_HEAD: u64 = 576;
 
+/// The alignment of a save area, and the bytes of a frame's slot holding one of a frame's size.
+const AREA_ALIGN: i64 = 64;
+const OWNED_SLOT: u64 = 4_096 + AREA_ALIGN as u64;
+
 /// The x86_64 area an `xrstor` or `fxrstor` of which puts the extended state in its initial
 /// state: a legacy region and header of zeros.
 const INITIAL: Reserved = Reserved {
@@ -117,6 +121,36 @@ impl Lowering<'_, '_> {
                 Vec::new()
             },
         );
+    }
+
+    /// On a nanos target, whose code holds floats and lanes in the registers of extended state,
+    /// at an entry that code of another target calls: makes the running task own extended state
+    /// of its own, in its initial state and saved in the frame, giving the state it owned before.
+    pub fn own_extended(&mut self, fx: &mut Fx) -> Option<Value> {
+        if !self.ck.db.target.is_nanos() {
+            return None;
+        }
+        let slot = fx.slot(OWNED_SLOT, 16);
+        let area = fx.b.ins().iadd_imm_s(slot, AREA_ALIGN - 1);
+        let area = fx.b.ins().band_imm_s(area, -AREA_ALIGN);
+        self.initial_extended(fx, area);
+        Some(self.call_routine(fx, Routine::Extended, &[area])[0])
+    }
+
+    /// Makes the running task own again the extended state `own_extended` gave.
+    pub fn disown_extended(&mut self, fx: &mut Fx, previous: Option<Value>) {
+        if let Some(previous) = previous {
+            self.call_routine(fx, Routine::Extended, &[previous]);
+        }
+    }
+
+    /// The bytes of the stack an entry of the target's code uses for the extended state it
+    /// owns.
+    pub fn owned_stack(&self) -> u64 {
+        match self.ck.db.target.is_nanos() {
+            true => OWNED_SLOT,
+            false => 0,
+        }
     }
 
     /// Writes the initial extended state into the save area at `base`, in the form the running

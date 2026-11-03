@@ -623,7 +623,7 @@ impl Checker<'_> {
 
     /// The dependencies of a function with a body, in order of occurrence; reading them reads
     /// the function as `typed_body` does.
-    fn body_dependencies(&self, item: ItemId) -> Option<Rc<Vec<ItemId>>> {
+    pub fn body_dependencies(&self, item: ItemId) -> Option<Rc<Vec<ItemId>>> {
         if let Some(known) = self.body_dependencies.borrow().get(&item) {
             self.db.note(item);
             return known.clone();

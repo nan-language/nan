@@ -82,15 +82,17 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             match source.is_signed() {
                 true => {
                     fx.b.ins()
-                        .sextend(scalar_type(scalar, lo.machine()), value(0))
+                        .sextend(scalar_type(scalar, lo.float_bits()), value(0))
                 }
                 false => {
                     fx.b.ins()
-                        .uextend(scalar_type(scalar, lo.machine()), value(0))
+                        .uextend(scalar_type(scalar, lo.float_bits()), value(0))
                 }
             }
         }
-        "truncate" => super::super::place::resize(fx, value(0), scalar_type(scalar, lo.machine())),
+        "truncate" => {
+            super::super::place::resize(fx, value(0), scalar_type(scalar, lo.float_bits()))
+        }
         _ => return false,
     };
     supply.ret(lo, fx, Held::Scalar(held));
@@ -131,7 +133,7 @@ fn lower_lanes(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, lanes: &str) {
         let wide = fx.b.ins().uextend(types::I64, chosen);
         let mask = fx.b.ins().ineg(wide);
         let (a, b) = (supply.param(1).address(), supply.param(2).address());
-        if lo.machine() {
+        if lo.float_bits() {
             for half in [0, 8] {
                 let left = fx.load(types::I64, a, half);
                 let right = fx.load(types::I64, b, half);
@@ -165,7 +167,7 @@ fn lower_lanes(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, lanes: &str) {
     let a = supply.param(0).address();
     let b = (amount.is_none() && member != "bit_not").then(|| supply.param(1).address());
     let lane = ty.lane_type();
-    let (count, width, value_ty) = match lo.machine() {
+    let (count, width, value_ty) = match lo.float_bits() {
         true => (ty.lane_count(), lane.bytes(), lane),
         false => (1, 16, ty),
     };

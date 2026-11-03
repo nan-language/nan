@@ -465,7 +465,8 @@ pub fn record_executor(lo: &mut Lowering, fx: &mut Fx, record: Value, exec: Valu
 
 /// The glue running a task's entry, a function value of a type taking at most the argument the
 /// record holds: it writes the result or failure after the record, records the outcome and
-/// frees the closure's environment.
+/// frees the closure's environment; on a nanos target the task owns extended state of its own
+/// while its entry runs.
 fn entry_glue(lo: &mut Lowering, fn_ty: &FnTy) -> FuncId {
     let fn_ty = fn_ty.clone();
     lo.glue_function(
@@ -474,6 +475,7 @@ fn entry_glue(lo: &mut Lowering, fn_ty: &FnTy) -> FuncId {
         move |lo, fx| {
             let params = fx.entry();
             let record = params[0];
+            let owned = lo.own_extended(fx);
             let abi = lo.fn_abi(&fn_ty);
             let code = fx.load(PTR, record, task::CODE);
             let env = fx.load(PTR, record, task::ENV);
@@ -509,6 +511,7 @@ fn entry_glue(lo: &mut Lowering, fn_ty: &FnTy) -> FuncId {
                 None => returned,
             };
             fx.store(outcome, record, task::OUTCOME);
+            lo.disown_extended(fx, owned);
             lo.call_routine(fx, Routine::TaskEnvFree, &[env]);
             fx.b.ins().return_(&[]);
         },

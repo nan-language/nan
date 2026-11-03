@@ -157,10 +157,11 @@ fn secret_lanes_lower_without_branches_or_divisions() {
     }
 }
 
-/// On a host target each vectorized lane member lowers to one block computing on vector values;
-/// on a machine target, which uses no vector register, every lane member computes lane by lane.
+/// On a host or nanos target each vectorized lane member lowers to one block computing on vector
+/// values; on a machine target, which uses no vector register, every lane member computes lane by
+/// lane.
 #[test]
-fn lanes_lower_to_vectors_on_hosts_alone() {
+fn lanes_lower_to_vectors_off_machine_targets() {
     let scratch = example(
         "//! Lanes.\n\n\
          pub fn mixed(a: core::simd::I8x16, b: core::simd::I8x16, c: core::simd::I32x4) -> u16 {\n\
@@ -171,7 +172,7 @@ fn lanes_lower_to_vectors_on_hosts_alone() {
     );
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    for target in [Target::X64Host, Target::X64Bare] {
+    for target in [Target::X64Host, Target::X64Bare, Target::X64Nanos] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::mixed");
         let mut lowering = Lowering::new(
@@ -198,7 +199,11 @@ fn lanes_lower_to_vectors_on_hosts_alone() {
             let vector = ["i8x16", "i16x8", "i32x4", "f32x4"]
                 .iter()
                 .any(|ty| text.contains(ty));
-            assert_eq!(vector, target.is_host(), "{name} on {target:?}:\n{text}");
+            assert_eq!(
+                vector,
+                !target.is_machine(),
+                "{name} on {target:?}:\n{text}"
+            );
         }
     }
 }

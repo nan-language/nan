@@ -1,0 +1,67 @@
+//! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry, the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry receives.
+
+fn jobs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "nanos::call" => jobs_call(mut lo, mut fx, supply)
+        "nanos::render_into" => {
+            let into = sys_view(mut fx, held: supply.param(1))
+            let renderer = new_renderer(mut fx, buffer: into.start, budget: into.len)
+            let ty = supply.type_arg(lo, index: 0)
+            var args = Array[Held, 2].filled(supply.param(0))
+            args[1] = Held.Address(renderer)
+            discard mut lo.call_method(mut fx, ty, interface_name: "Render", own: mem::List[ty::Arg].empty(lo.alloc), args: args.view())
+            let written = render_finish(mut lo, mut fx, renderer_value: renderer)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(written))
+        }
+        "nanos::host_world" => {
+            let world = supply.abi.result
+            let Some(sret) = supply.sret else {
+                expect false
+                return false
+            }
+            for index in 0usize..<11 {
+                let name = match index {
+                    0 => "fs"
+                    1 => "net"
+                    2 => "clock"
+                    3 => "wall"
+                    4 => "random"
+                    5 => "log"
+                    6 => "stdio"
+                    7 => "alloc"
+                    8 => "exec"
+                    9 => "args"
+                    else => "environment"
+                }
+                let field = mut lo.layouts.field(lo.ck, ty: world, variant: None, label: name)
+                let at = mut fx.offset(sret, offset: field.offset)
+                mut lo.store_held(mut fx, address: at, held: supply.param(index), ty: field.ty)
+            }
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        else => return false
+    }
+    return true
+} jobs_lower
+
+/// `nanos::call(job, world, input)`: calls the job entry's code with the addresses of the world,
+/// of the input and of the slot it writes how the job ended into.
+fn jobs_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let code = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let ended = supply.abi.result
+    let laid = mut lo.layout_of(ended)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    for _ in 0usize..<3 {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    let signature_ref = mut fx.b.import_signature(take signature)
+    let world = supply.param(1).address_value()
+    let input = supply.param(2).address_value()
+    discard mut fx.b.call_indirect(signature_ref, callee: code, args: fx.list3(world, b: input, c: slot).view())
+    let held = mut lo.held_at(mut fx, ty: ended, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} jobs_call

@@ -1,6 +1,6 @@
 # 0109. Loading bundles into a running kernel
 
-Status: accepted
+Status: accepted; exporting the load ABI only for loaded registries superseded by 0116
 
 ## Context
 

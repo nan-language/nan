@@ -1,0 +1,67 @@
+//! Jobs: the entry of a nanos program's bundle, which its kernel calls with the address of a `nanos::World` it gives up, that of the `mem::Bytes` of the job's input it gives up and that of the `nanos::Ended` the job writes. The entry owns extended state of its own for the call, runs the program's entry function through the adapter of its form, and fits the stack its entry function's `limits stack N` states.
+
+/// The position among an adapter's parameters of the entry function it runs.
+const JOBS_MAIN: usize = 2
+
+/// Defines the job entry running the entry function `entry`, giving the stack its task needs.
+fn Lowering.job_entry(mut self, entry: ty::ItemId) -> u64 {
+    let Some(sig) = self.ck.fn_sig(entry) else {
+        expect false
+        return 0
+    }
+    let Some(stack) = sig.limit_set.stack else {
+        expect false
+        return 0
+    }
+    let Some(failure_ty) = sig.failure else {
+        expect false
+        return 0
+    }
+    var args = mem::List[ty::Arg].empty(self.alloc)
+    var adapter_name = "hosted_unit"
+    if sig.params.len() == 2 {
+        adapter_name = "typed"
+        mut args.push(ty::Arg.Ty(sig.params[1].ty))
+        mut args.push(ty::Arg.Ty(sig.result))
+    } else if sig.result == ty::Ty.scalar(ty::Scalar.Unsigned8) {
+        adapter_name = "hosted"
+    }
+    mut args.push(ty::Arg.Ty(failure_ty))
+    let Some(adapter_item) = self.ck.db().std_item("nanos", name: adapter_name) else {
+        expect false
+        return 0
+    }
+    let adapter = Instance.Nir(item: adapter_item, role: nir::Role.Body, index: 0, args: self.ck.types().args(take args))
+    let main = nir::FnRef.item(entry, args: ty::Args.none())
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for _ in 0usize..<3 {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    let id = mut self.module.declare_function(image::BUNDLE_JOB, linkage: object::Linkage.Local, signature)
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        let owned = mut lo1.own_extended(mut fx1)
+        let inner = mut lo1.callable_instance(main, as_value: true)
+        var wrapped = mem::List[Instance].empty(lo1.alloc)
+        mut wrapped.push(take inner)
+        let glue = mut lo1.instance(Instance.Value(take wrapped))
+        let reference = mut lo1.func_ref(mut fx1, id: glue)
+        let code = mut fx1.b.func_addr(PTR, func_ref: reference)
+        let value = mut fx1.slot(16, align: 8)
+        mut fx1.store(code, addr: value, offset: 0)
+        let none = mut fx1.ptr(0)
+        mut fx1.store(none, addr: value, offset: 8)
+        let abi = mut lo1.abi(adapter)
+        let callee = mut lo1.instance(adapter.copy(lo1.alloc))
+        var passed = Array[Held, 3].filled(Held.Address(params[0]))
+        passed[1] = Held.Address(params[1])
+        passed[2] = Held.Address(value)
+        let called = mut lo1.invoke(mut fx1, invoked: Invoked.Bound(callee: callee, position: JOBS_MAIN, function: glue), abi, args: passed.view())
+        mut lo1.store_held(mut fx1, address: params[2], held: called.result, ty: abi.result)
+        mut lo1.disown_extended(mut fx1, previous: owned)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+    let head = nir::Span.at(self.ck.db().ast(entry).token)
+    mut self.demands.push(Demand(judged: Judged.Function(id), stack: stack, report: StackReport.Own(head: At(item: entry, span: head))))
+    return stack
+} Lowering.job_entry

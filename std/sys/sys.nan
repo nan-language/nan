@@ -50,6 +50,8 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 pub open struct Fs {
 } Fs
 
+pub fn Fs.denied() -> Fs
+
 pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
     example match attempt testing::world().fs.subdir("logs/..") {
         Err(fs::FsError.InvalidPath) => true
@@ -70,6 +72,8 @@ pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
 
 pub open struct Net {
 } Net
+
+pub fn Net.denied() -> Net
 
 pub fn Net.only_host(self, host: Str) -> Net fails Revoked
 
@@ -95,6 +99,8 @@ pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
 pub open struct WallClock {
 } WallClock
 
+pub fn WallClock.denied() -> WallClock
+
 pub fn WallClock.now_ns(self) -> u64 fails Revoked
     example attempt testing::world().wall.now_ns() == Ok(0)
 
@@ -102,6 +108,8 @@ pub fn WallClock.coarse(self, ns: u64) -> WallClock fails Revoked
 
 pub open struct Random {
 } Random
+
+pub fn Random.served[S: RandomService and Capability and Copy](service: S) -> Random fails Revoked
 
 pub fn Random.fill(self, mut buf: SliceMut[u8]) fails Revoked
 
@@ -114,6 +122,8 @@ pub fn Random.next_u64(self) -> u64 fails Revoked {
 pub open struct Log {
 } Log
 
+pub fn Log.served[S: LogService and Capability and Copy](service: S) -> Log fails Revoked
+
 pub fn Log.info[T: Render](self, message: Str, value: T)
 
 pub fn Log.warn[T: Render](self, message: Str, value: T)
@@ -122,6 +132,8 @@ pub fn Log.error[T: Render](self, message: Str, value: T)
 
 pub open struct Stdio {
 } Stdio
+
+pub fn Stdio.served[S: StdioService and Capability and Copy](service: S) -> Stdio fails Revoked
 
 pub fn Stdio.read_in(self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails StdioError uses wait
     ensures result <= buf.byte_len()
@@ -135,6 +147,26 @@ pub open enum StdioError derives Render {
     Revoked(Revoked) from
     Cancelled(task::Cancelled) from
 } StdioError
+
+pub closed enum LogLevel derives Copy, Eq, Render {
+    Info
+    Warn
+    Error
+} LogLevel
+
+pub interface LogService {
+    fn log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096
+} LogService
+
+pub interface RandomService {
+    fn fill(self, mut buf: SliceMut[u8]) limits stack 4_096
+} RandomService
+
+pub interface StdioService {
+    fn read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError uses wait limits stack 4_096
+    fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+    fn write_err(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+} StdioService
 
 pub closed enum Revoked derives Copy, Eq, Hash, Render {
     Stale
@@ -367,6 +399,36 @@ fn tallies(start: u64, alloc: mem::Alloc) -> Minter[Tally, core::atomic::AtomicU
 } tallies
 
 fn tally_record(state: core::atomic::AtomicU64, record: u64) -> u64 = record
+
+impl Tally: LogService
+
+impl Tally: RandomService
+
+impl Tally: StdioService
+
+/// Counts the bytes of a value logged through a tally.
+fn Tally.log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096 {
+    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(value.byte_len())))
+} Tally.log
+
+fn Tally.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    for index in 0..<buf.len() {
+        buf[index] = 7
+    }
+} Tally.fill
+
+fn Tally.read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError limits stack 4_096 {
+    fail StdioError.Closed
+} Tally.read_in
+
+/// Counts the bytes written through a tally.
+fn Tally.write_out(self, data: Slice[u8]) limits stack 4_096 {
+    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(data.len())))
+} Tally.write_out
+
+fn Tally.write_err(self, data: Slice[u8]) limits stack 4_096 {
+    self.write_out(data)
+} Tally.write_err
 
 fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
     discard state.fetch_add(record)
@@ -1301,3 +1363,75 @@ test handles_travel_beside_their_encodings for Reply.decode {
         }
     })
 } handles_travel_beside_their_encodings
+
+test denied_files_refuse_every_operation for Fs.denied {
+    let world = testing::world()
+    let read = attempt await Fs.denied().read_all("notes", alloc: world.alloc)
+    let refused = match read {
+        Err(fs::FsError.Revoked(Revoked.Stale)) => true
+        else => false
+    }
+    expect refused
+} denied_files_refuse_every_operation
+
+test denied_networks_refuse_every_operation for Net.denied {
+    let narrowed = attempt Net.denied().only_host("example.org")
+    expect narrowed.is_err()
+} denied_networks_refuse_every_operation
+
+test denied_wall_clocks_refuse_every_read for WallClock.denied {
+    let read = attempt WallClock.denied().now_ns()
+    expect read == Err(Revoked.Stale)
+} denied_wall_clocks_refuse_every_read
+
+test served_logs_call_their_kind for Log.served {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    let counter = minter.mint(0)
+    let Ok(log) = attempt Log.served(minter.mint(0)) else {
+        take minter.close()
+        expect false
+        return
+    }
+    log.info("width", value: 12_345u32)
+    let counted = reach(counter, body: tally_count)
+    take minter.close()
+    log.info("width", value: 1u32)
+    expect counted == Some(5)
+} served_logs_call_their_kind
+
+test served_random_sources_call_their_kind for Random.served {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    let Ok(random) = attempt Random.served(minter.mint(0)) else {
+        take minter.close()
+        expect false
+        return
+    }
+    var bytes = Array[u8, 4].filled(0)
+    let filled = attempt random.fill(mut bytes.view_mut())
+    take minter.close()
+    let revoked = attempt random.fill(mut bytes.view_mut())
+    expect filled.is_ok() and bytes[3] == 7 and revoked == Err(Revoked.Stale)
+} served_random_sources_call_their_kind
+
+test served_streams_call_their_kind for Stdio.served {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    let counter = minter.mint(0)
+    let Ok(stdio) = attempt Stdio.served(minter.mint(0)) else {
+        take minter.close()
+        expect false
+        return
+    }
+    let written = attempt await stdio.write_out(b"abc")
+    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    let read = attempt await stdio.read_in(mut buf.view_mut())
+    let counted = reach(counter, body: tally_count)
+    take minter.close()
+    let closed = match read {
+        Err(StdioError.Closed) => true
+        else => false
+    }
+    expect written.is_ok() and closed and counted == Some(3)
+} served_streams_call_their_kind

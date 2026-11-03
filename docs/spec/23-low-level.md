@@ -789,9 +789,9 @@ pub fn Ring0.signal_cpu(self, cpu: u32)
 
 pub fn Ring0.invalidate_everywhere(self, scope: TlbScope) fails task::Cancelled uses wait
 
-pub fn Ring0.run_user(self, mut state: UserState) -> UserExit
+pub fn Ring0.run_user(self, mut state: UserState, mut extended: Option[ExtendedState]) -> UserExit
 
-pub fn Ring0.run_user_split(self, mut state: UserState, root: PageTableRoot) -> UserExit
+pub fn Ring0.run_user_split(self, mut state: UserState, mut extended: Option[ExtendedState], root: PageTableRoot) -> UserExit
 
 pub fn Ring0.entry_area(self) -> EntryArea
 
@@ -884,7 +884,7 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 - `cpuid` gives the four registers the `cpuid` instruction leaves for `leaf` in `eax` and `subleaf` in `ecx`.
 - `read_tsc` reads the time-stamp counter once every earlier instruction has completed. `read_tscp` reads it as `count` together with `cpu`, the number of the CPU that read it, which the runtime keeps in each CPU's `TSC_AUX` for `rdtscp`; on a CPU without `rdtscp` it reads both with maskable interrupts disabled.
 - `monitor_wait` arms `monitor` on `word` and, when `word` still holds `seen`, waits in `mwait` with `hint` as its C-state hint until `word` may have changed, an interrupt arrives, or for no reason; maskable interrupts stay disabled and an arriving one ends the wait. It returns at once on a CPU whose `mwait` cannot end on an interrupt while they are disabled.
-- `read_xcr0` gives `XCR0`, or 0 while the CPU has XSAVE disabled. `write_xcr0` writes `value` to `XCR0` and returns true, or changes nothing and returns false while the CPU has XSAVE disabled or when `xsetbv` would refuse `value`: it enables a state component the CPU lacks, leaves x87 state disabled, enables AVX state without SSE state, enables the three AVX-512 components other than all together or without AVX state, or enables one of the two MPX components or of the two AMX components without the other.
+- `read_xcr0` gives `XCR0`, or 0 while the CPU has XSAVE disabled. `write_xcr0` writes `value` to `XCR0` and returns true, or changes nothing and returns false while the CPU has XSAVE disabled or when `xsetbv` would refuse `value`: it enables a state component the CPU lacks, leaves x87 state disabled, enables AVX state without SSE state, enables the three AVX-512 components other than all together or without AVX state, or enables one of the two MPX components without the other; or when `value` disables a state component `XCR0` enables or enables one other than the x87, SSE, AVX, MPX, AVX-512 and PKRU components, those whose state an [`hw::ExtendedState`](24-kernel.md#floating-point) holds.
 - `hardware_random` gives a value of `rdrand` and `hardware_seed` one of `rdseed`, trying up to 10 times, or `None` when the CPU lacks the instruction or every try fails.
 - `enable_protection` enables `feature` on the running CPU and returns true, or returns false when the CPU lacks it. `Smep` keeps the CPU from executing pages mapped for user mode, `Smap` from accessing them other than through the copies of `hw::UserAddr`, `Umip` keeps user mode from reading descriptor-table registers, `Pcid` enables the PCIDs that `write_cr3_tagged` tags, and `Tsd` keeps user mode from reading the time-stamp counter. No intrinsic disables one again.
 - `clear_cpu_buffers` overwrites the CPU buffers that microarchitectural data sampling reads, through `verw`.

@@ -1,0 +1,139 @@
+//! Runs two tasks owning extended state and one owning none, each switching away many times, one owner nesting a third state in its own, and checks that each state holds its vector registers' marks once its owner is done.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The times each task switches away.
+const ROUNDS: u64 = 200
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn check(name: Str, held: bool) {
+    say(text: name)
+    if held {
+        say(text: " ok\n")
+    } else {
+        say(text: " failed\n")
+    }
+} check
+
+/// The mark of vector register `index` of the state numbered `id`.
+fn mark(id: u64, index: u8) -> core::simd::U64x2 {
+    let low = (id << 32) | u64.widen(index)
+    return core::simd::U64x2.splat(low).replace_lane(1, value: ~low)
+} mark
+
+/// Extended state in a frame, each vector register holding its mark.
+fn marked(take frame: hw::PhysFrame[4_096], id: u64) -> hw::ExtendedState {
+    var state = hw::ExtendedState.of(take frame)
+    for index in 0..<16u8 {
+        mut state.set_vector(index, value: mark(id, index))
+    }
+    return state
+} marked
+
+/// Whether each vector register of `state` holds its mark.
+fn holds(state: hw::ExtendedState, id: u64) -> bool {
+    var all = true
+    for index in 0..<16u8 {
+        all = all and state.vector(index) == mark(id, index)
+    }
+    return all
+} holds
+
+/// Switches away `ROUNDS` times.
+fn pause(clock: sys::Clock) fails task::Cancelled uses wait {
+    for _ in 0..<ROUNDS {
+        try await clock.sleep_ns(10_000)
+    }
+} pause
+
+/// Gives a frame's memory to a heap that nothing uses.
+fn retire(take frame: hw::PhysFrame[4_096]) {
+    discard mem::Heap.over(take frame.into_region())
+} retire
+
+/// Runs the two owners and the task owning none on the states the frames hold, then checks
+/// each state.
+fn switching(
+    take a: hw::PhysFrame[4_096],
+    take b: hw::PhysFrame[4_096],
+    take c: hw::PhysFrame[4_096],
+    exec: task::Executor,
+    clock: sys::Clock,
+    ) fails task::Cancelled uses wait {
+    var one = marked(take a, id: 1)
+    var two = marked(take b, id: 2)
+    var inner = marked(take c, id: 3)
+    discard attempt await task::scope(exec, body: fn[mut one, mut two, mut inner](s: task::Scope) {
+        discard s.spawn(fn[mut one, mut inner]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await mut one.with(fn[mut inner]() fails task::Cancelled uses wait {
+                try await pause(clock)
+                try await mut inner.with(fn() fails task::Cancelled uses wait {
+                    try await pause(clock)
+                })
+                try await pause(clock)
+            })
+        })
+        discard s.spawn(fn[mut two]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await mut two.with(fn() fails task::Cancelled uses wait {
+                try await pause(clock)
+            })
+        })
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+            try await pause(clock)
+        })
+    })
+    check(name: "one", held: holds(one, id: 1))
+    check(name: "two", held: holds(two, id: 2))
+    check(name: "nested", held: holds(inner, id: 3))
+    retire(take one.into_frame())
+    retire(take two.into_frame())
+    retire(take inner.into_frame())
+} switching
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    var regions = mut k.regions()
+    var large = mem::List[hw::PhysFrame[2_097_152]].empty(alloc)
+    match mut regions.pop() {
+        Some(highest) => take highest.frames(mut large)
+        None => say(text: "no usable memory\n")
+    }
+    var small = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    match mut large.pop() {
+        Some(frame) => take frame.split(mut small)
+        None => say(text: "no 2 MiB frame\n")
+    }
+    for frame in take large {
+        mut regions.push(take frame.into_region())
+    }
+    take k.anchor(take regions, run: fn[take small](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        match mut small.pop() {
+            Some(a) => match mut small.pop() {
+                Some(b) => match mut small.pop() {
+                    Some(c) => {
+                        discard attempt await switching(take a, take b, take c, exec, clock)
+                    }
+                    None => {
+                        retire(take a)
+                        retire(take b)
+                    }
+                }
+                None => retire(take a)
+            }
+            None => say(text: "no 4 KiB frames\n")
+        }
+        for frame in take small {
+            retire(take frame)
+        }
+    })
+} main

@@ -98,7 +98,7 @@ pub const BUNDLE_LINES: &str = lines::BUNDLE_SYMBOL;
 const RECORD: &str = "_NSloaded_";
 
 /// The support routines a kernel exports: every one the lowered code of a kernel calls.
-const ROUTINES: [Routine; 50] = [
+const ROUTINES: [Routine; 51] = [
     Routine::Copy,
     Routine::Fill,
     Routine::Compare,
@@ -149,6 +149,7 @@ const ROUTINES: [Routine; 50] = [
     Routine::Unlock,
     Routine::ClockNow,
     Routine::IommuFlush,
+    Routine::Extended,
 ];
 
 /// The names of the exports of a kernel of a target whose final closure declares the loaded

@@ -1,6 +1,6 @@
 # 0096. Machine code without extended state
 
-Status: accepted
+Status: accepted; saving no extended state and its `write_xcr0` superseded by 0113
 
 ## Context
 

@@ -1,0 +1,177 @@
+//! Extended state owned by threads. A task owning extended state records its save area, from which the scheduler restores the state before the task runs and into which it saves the state once the task switches away, so the state is live only while its owner runs. Each CPU's executor thread records whether the CPU's extended state is enabled and holds an owner's; before it runs a task owning none it puts that state in its initial state and disables it, so no task sees another thread's registers and an instruction using them faults. The `Extended` routine changes what the running task owns.
+
+/// The bits of an x86_64 CPU record's features that the `CpuFeatures` stub sets where the CPU
+/// enables XSAVE, and where it saves in the compacted form, through `xsavec` or `xsaves`.
+const EXTENDED_XSAVE: i64 = 0x200
+
+const EXTENDED_COMPACTED: i64 = 0x1800
+
+/// The offsets in an x86_64 save area of its vector registers, which an AArch64 one begins with,
+/// of the x87 control word, of `MXCSR`, and of the XSAVE header's state and compaction bitmaps;
+/// the bit of the SSE state in those bitmaps and the compaction bitmap's bit marking the
+/// compacted form.
+const EXTENDED_X64_VECTORS: u64 = 160
+
+const EXTENDED_X87_CONTROL: u64 = 0
+
+const EXTENDED_MXCSR: u64 = 24
+
+const EXTENDED_STATE_BITMAP: u64 = 512
+
+const EXTENDED_COMPACTION_BITMAP: u64 = 520
+
+const EXTENDED_SSE_STATE: i64 = 2
+
+const EXTENDED_COMPACTED_FORM: i64 = i64.from_bits(0x8000_0000_0000_0000)
+
+/// The initial x87 control word and `MXCSR`, and the bytes of a save area that its initial
+/// state and the XSAVE header span.
+const EXTENDED_INITIAL_X87_CONTROL: i64 = 0x037F
+
+const EXTENDED_INITIAL_MXCSR: i64 = 0x1F80
+
+const EXTENDED_AREA_HEAD: u64 = 576
+
+/// Before the scheduler runs a task: makes the CPU's extended state the one the task owns.
+fn Lowering.extended_in(mut self, mut fx: Fx, record: clif::Value) {
+    let area = mut fx.load(PTR, addr: record, offset: TASK_EXTENDED)
+    mut self.adopt_extended(mut fx, area)
+} Lowering.extended_in
+
+/// Once a task has switched away: saves the extended state it owns.
+fn Lowering.extended_out(mut self, mut fx: Fx, record: clif::Value) {
+    let area = mut fx.load(PTR, addr: record, offset: TASK_EXTENDED)
+    let owns = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: area, y: 0)
+    mut fx.if_true(owns, then: fn[mut self](mut fx1: Fx) {
+        discard mut self.call_stub(mut fx1, stub: Stub.ExtendedSave, args: fx1.list1(area).view())
+    })
+} Lowering.extended_out
+
+/// `Extended(area) -> previous`: with maskable interrupts disabled, saves the extended state the
+/// running task owns, makes the task own the one saved at `area`, none for zero, and makes it
+/// the CPU's, giving the area the task owned before.
+fn Lowering.define_extended(mut self, mut fx: Fx) {
+    let params = mut fx.entry()
+    let area = params[0]
+    let saved = mut self.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let flags = saved[0]
+    let running = mut self.thread(mut fx)
+    let record = mut fx.load(PTR, addr: running, offset: THREAD_CURRENT)
+    let previous = mut fx.load(PTR, addr: record, offset: TASK_EXTENDED)
+    mut self.extended_out(mut fx, record)
+    mut fx.store(area, addr: record, offset: TASK_EXTENDED)
+    mut self.adopt_extended(mut fx, area)
+    discard mut self.call_stub(mut fx, stub: Stub.IrqRestore, args: fx.list1(flags).view())
+    mut fx.b.ret(fx.list1(previous).view())
+} Lowering.define_extended
+
+/// Makes the running CPU's extended state the one saved at `area`, enabling it first where it is
+/// disabled; for zero, puts an owner's state the CPU holds in its initial state and disables it.
+fn Lowering.adopt_extended(mut self, mut fx: Fx, area: clif::Value) {
+    let own = mut self.thread(mut fx)
+    let live = mut fx.load(PTR, addr: own, offset: THREAD_EXTENDED)
+    let disabled = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: live, y: 0)
+    let owns = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: area, y: 0)
+    discard mut fx.choose_in(mut self, condition: owns, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.if_true(disabled, then: fn[mut lo1](mut fx2: Fx) {
+            discard mut lo1.call_stub(mut fx2, stub: Stub.EnableFloats, args: mem::List[clif::Value].empty(fx2.alloc).view())
+            let one = mut fx2.ptr(1)
+            mut fx2.store(one, addr: own, offset: THREAD_EXTENDED)
+        })
+        discard mut lo1.call_stub(mut fx1, stub: Stub.ExtendedRestore, args: fx1.list1(area).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let enabled = mut fx1.b.bxor_imm_s(disabled, y: 1)
+        mut fx1.if_true(enabled, then: fn[mut lo1](mut fx2: Fx) {
+            if lo1.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                discard mut lo1.call_stub(mut fx2, stub: Stub.ExtendedClear, args: mem::List[clif::Value].empty(fx2.alloc).view())
+            } else {
+                let initial = mut lo1.reserved(mut fx2, data_name: "_NSextended_initial", size: EXTENDED_AREA_HEAD, align: 64)
+                discard mut lo1.call_stub(mut fx2, stub: Stub.ExtendedClear, args: fx2.list1(initial).view())
+            }
+            discard mut lo1.call_stub(mut fx2, stub: Stub.DisableFloats, args: mem::List[clif::Value].empty(fx2.alloc).view())
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: own, offset: THREAD_EXTENDED)
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} Lowering.adopt_extended
+
+/// Writes the initial extended state into the save area at `base`, in the form the running CPU
+/// saves.
+fn Lowering.initial_extended(mut self, mut fx: Fx, base: clif::Value) {
+    let zero = mut fx.ptr(0)
+    let len = mut fx.ptr(EXTENDED_AREA_HEAD)
+    discard mut self.call_routine(mut fx, routine: Routine.Fill, args: fx.list3(base, b: zero, c: len).view())
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        return
+    }
+    let control = mut fx.int(clif::Type.Int16, value: EXTENDED_INITIAL_X87_CONTROL)
+    mut fx.store(control, addr: base, offset: EXTENDED_X87_CONTROL)
+    let mxcsr = mut fx.int(clif::Type.Int32, value: EXTENDED_INITIAL_MXCSR)
+    mut fx.store(mxcsr, addr: base, offset: EXTENDED_MXCSR)
+    let features = mut self.extended_features(mut fx)
+    let compacted_bits = mut fx.b.band_imm_s(features, y: EXTENDED_COMPACTED)
+    let compacted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: compacted_bits, y: 0)
+    let form = mut fx.int(PTR, value: EXTENDED_COMPACTED_FORM)
+    let chosen = mut fx.b.select(compacted, x: form, y: zero)
+    mut fx.store(chosen, addr: base, offset: EXTENDED_COMPACTION_BITMAP)
+} Lowering.initial_extended
+
+/// The address in the save area at `base` of the vector register at `index`, and whether it
+/// holds that register's value rather than its initial zeros, which an x86_64 area in the XSAVE
+/// form with the SSE state initial leaves out.
+fn Lowering.extended_vector(mut self, mut fx: Fx, base: clif::Value, index: clif::Value) -> ExtendedVector {
+    let offset = mut fx.b.imul_imm_s(index, y: 16)
+    let at = mut fx.b.iadd(base, y: offset)
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        let held = mut fx.int(clif::Type.Int8, value: 1)
+        return ExtendedVector(at: at, held: held)
+    }
+    let vector_at = mut fx.offset(at, offset: EXTENDED_X64_VECTORS)
+    let features = mut self.extended_features(mut fx)
+    let xsave = mut fx.b.band_imm_s(features, y: EXTENDED_XSAVE)
+    let legacy = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: xsave, y: 0)
+    let bitmap = mut fx.load(PTR, addr: base, offset: EXTENDED_STATE_BITMAP)
+    let sse_bits = mut fx.b.band_imm_s(bitmap, y: EXTENDED_SSE_STATE)
+    let sse = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: sse_bits, y: 0)
+    let held = mut fx.b.bor(legacy, y: sse)
+    return ExtendedVector(at: vector_at, held: held)
+} Lowering.extended_vector
+
+/// A vector register's address in a save area, and whether the area holds its value.
+struct ExtendedVector derives Copy {
+    at: clif::Value
+    held: clif::Value
+} ExtendedVector
+
+/// Makes the save area at `base` hold every vector register's value: on x86_64, an area in the
+/// XSAVE form whose SSE state is initial gets that state's zeros and marks it saved.
+fn Lowering.hold_extended_vectors(mut self, mut fx: Fx, base: clif::Value) {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        return
+    }
+    let zero = mut fx.ptr(0)
+    let index = mut fx.ptr(0)
+    let first_vector = mut self.extended_vector(mut fx, base, index)
+    let initial = mut fx.b.bxor_imm_s(first_vector.held, y: 1)
+    mut fx.if_true(initial, then: fn[mut self](mut fx1: Fx) {
+        let len = mut fx1.ptr(16 * 16)
+        discard mut self.call_routine(mut fx1, routine: Routine.Fill, args: fx1.list3(first_vector.at, b: zero, c: len).view())
+        let bitmap = mut fx1.load(PTR, addr: base, offset: EXTENDED_STATE_BITMAP)
+        let marked_bitmap = mut fx1.b.bor_imm_s(bitmap, y: EXTENDED_SSE_STATE)
+        mut fx1.store(marked_bitmap, addr: base, offset: EXTENDED_STATE_BITMAP)
+        let compaction = mut fx1.load(PTR, addr: base, offset: EXTENDED_COMPACTION_BITMAP)
+        let form_bit = mut fx1.b.band_imm_s(compaction, y: EXTENDED_COMPACTED_FORM)
+        let compacted = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: form_bit, y: 0)
+        let marked = mut fx1.b.bor_imm_s(compaction, y: EXTENDED_SSE_STATE)
+        let chosen = mut fx1.b.select(compacted, x: marked, y: compaction)
+        mut fx1.store(chosen, addr: base, offset: EXTENDED_COMPACTION_BITMAP)
+    })
+} Lowering.hold_extended_vectors
+
+/// The features the running x86_64 CPU's record holds.
+fn Lowering.extended_features(mut self, mut fx: Fx) -> clif::Value {
+    let own = mut self.running_cpu(mut fx)
+    return mut fx.load(PTR, addr: own, offset: CPU_FEATURES)
+} Lowering.extended_features

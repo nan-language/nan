@@ -1,8 +1,9 @@
 //! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA
-//! buffers, the CPU-facing operations, physical memory, and what the IOMMU and PCI code of std
-//! needs.
+//! buffers, the CPU-facing operations, physical memory, extended-state save areas, and what the
+//! IOMMU and PCI code of std needs.
 
 mod cpu;
+mod extended;
 pub mod iommu;
 mod physical;
 mod sync;
@@ -53,6 +54,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "hw::PhysFrame" => physical::lower_frame(lo, fx, supply),
         "hw::PageTableRoot" => physical::page_table_root(lo, fx, supply),
         "hw::UserFrame" => physical::user_frame(lo, fx, supply),
+        "hw::ExtendedState" => extended::lower(lo, fx, supply),
         _ => return false,
     }
     true
@@ -80,7 +82,7 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
         | "hw::IoDomain" | "hw::PciFunction" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
-        | "hw::PageTableRoot" | "hw::UserFrame" => false,
+        | "hw::PageTableRoot" | "hw::UserFrame" | "hw::ExtendedState" => false,
         _ => return None,
     })
 }
@@ -146,7 +148,7 @@ pub fn needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         "hw::PerCpu" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Idt" | "hw::IdtInstalled"
         | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserFrame"
-        | "hw::IrqShared" => false,
+        | "hw::ExtendedState" | "hw::IrqShared" => false,
         _ => return None,
     })
 }

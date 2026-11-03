@@ -226,6 +226,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("hw::Region", LINEAR_SEND),
     ("hw::PhysFrame", LINEAR_SEND),
     ("hw::UserFrame", LINEAR_SEND),
+    ("hw::ExtendedState", LINEAR_SEND),
     ("hw::IrqShared", LINEAR_SEND),
     ("hw::Signal", AFFINE_SEND),
     ("hw::SpinLock", AFFINE_SEND),

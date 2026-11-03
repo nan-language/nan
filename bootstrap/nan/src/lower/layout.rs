@@ -521,11 +521,11 @@ impl Layouts {
                     ("functions".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],
             ),
-            // A physical frame, a page-table root or user frame owning one, and a user address
-            // are one address; an installed table's token holds the table's box.
-            "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserFrame" | "hw::UserAddr" => {
-                self.record(ck, &[("address".to_owned(), Ty::Scalar(Scalar::U64))])
-            }
+            // A physical frame, a page-table root, user frame or extended-state save area owning
+            // one, and a user address are one address; an installed table's token holds the
+            // table's box.
+            "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserFrame" | "hw::ExtendedState"
+            | "hw::UserAddr" => self.record(ck, &[("address".to_owned(), Ty::Scalar(Scalar::U64))]),
             "hw::IdtInstalled" => pointers(1, Some(0)),
             // An exception's trap frame: the address of the state its seam saved, and a page
             // fault's faulting address.

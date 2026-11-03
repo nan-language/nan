@@ -1,4 +1,4 @@
-//! Runs user threads, switching between two on a system call and on interrupts that let another task run, with copies between user and kernel memory, a data abort, a fault on a floating-point register and an instruction abort.
+//! Runs user threads, switching between two on a system call and on interrupts that let another task run, with copies between user and kernel memory, a data abort, a fault on a floating-point register, two threads keeping their own vector registers across interrupts and an instruction abort.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -32,6 +32,10 @@ const THREAD_E: Slice[u8] = b"\x02\xe4\x00\x10\x40\x00\x40\xf9\xa3\x0a\x80\xd2\x
 
 /// Thread F, at `USER_CODE + 0x400`: reads the word at the address in `x0`.
 const THREAD_F: Slice[u8] = b"\x01\x00\x40\xf9"
+
+/// Thread G, at `USER_CODE + 0x480`: moves `x0` to a vector register, `svc` with `x8` 5, then
+/// spins.
+const THREAD_G: Slice[u8] = b"\x00\x00\x67\x9e\xa8\x00\x80\xd2\x01\x00\x00\xd4\x00\x00\x00\x14"
 
 /// Kernel memory outside the image, which thread F probes.
 const KERNEL_PROBE: u64 = 0x5000_0000
@@ -167,6 +171,7 @@ fn user_window(mut frames: mem::List[hw::PhysFrame[4_096]], doorbell: hw::UserFr
     fill(mut code, at: 0x300, bytes: THREAD_D)
     fill(mut code, at: 0x380, bytes: THREAD_E)
     fill(mut code, at: 0x400, bytes: THREAD_F)
+    fill(mut code, at: 0x480, bytes: THREAD_G)
     let page = VALID | TABLE_OR_PAGE | ACCESSED | SHARED | NORMAL | EL0 | NOT_GLOBAL
     link(pages, index: 0, frame: take code, flags: page | READ_ONLY)
     link(pages, index: 1, frame: next_frame(mut frames), flags: page | NO_EXECUTE)
@@ -239,15 +244,42 @@ fn start(ip: u64, sp: u64) -> hw::UserState {
     return hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(sp), ip: Untrusted.of(ip), flags: Untrusted.of(0))
 } start
 
-/// Runs a thread until an exit other than an interrupt.
-fn run_until_exit(cpu: hw::Ring0, mut state: hw::UserState) -> hw::UserExit {
+/// Gives up the frame of the extended state a thread owned, if any.
+fn settle(take extended: Option[hw::ExtendedState]) {
+    match extended {
+        Some(owned) => {
+            discard page_table(take owned.into_frame())
+        }
+        None => {
+        }
+    }
+} settle
+
+/// Runs a thread with the extended state it owns until an exit other than an interrupt.
+fn run_owning(cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit {
     loop {
-        let exit = cpu.run_user(mut state)
+        let exit = cpu.run_user(mut state, mut extended)
         if exit != hw::UserExit.Interrupted {
             return exit
         }
     }
+} run_owning
+
+/// Runs a thread owning no extended state until an exit other than an interrupt.
+fn run_until_exit(cpu: hw::Ring0, mut state: hw::UserState) -> hw::UserExit {
+    var none: Option[hw::ExtendedState] = None
+    let exit = run_owning(cpu, mut state, extended: mut none)
+    settle(take none)
+    return exit
 } run_until_exit
+
+/// Whether an extended state's first vector register holds `value` in its low lane.
+fn holds(extended: Option[hw::ExtendedState], value: u64) -> bool {
+    return match extended {
+        Some(owned) => owned.vector(0).lane(0) == value
+        None => false
+    }
+} holds
 
 /// Names an exit other than the one a step expects, and gives whether it was a system call with
 /// `number` in `x8`.
@@ -306,16 +338,18 @@ fn run_threads(cpu: hw::Ring0, exec: task::Executor, alloc: mem::Alloc) fails ta
         say(text: "thread b says hello\n")
     }
     let ran = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
-    try await task::scope(exec, body: fn[mut b](s: task::Scope) {
+    var none: Option[hw::ExtendedState] = None
+    discard attempt await task::scope(exec, body: fn[mut b, mut none](s: task::Scope) {
         let flag = ran.share()
         discard s.spawn(fn[take flag]() limits stack 4_096 {
             discard flag.contents().swap(1)
         })
         var interrupts: u32 = 0
-        while ran.contents().load() == 0 and interrupts < 1_000 and cpu.run_user(mut b) == hw::UserExit.Interrupted {
+        while ran.contents().load() == 0 and interrupts < 1_000 and cpu.run_user(mut b, extended: mut none) == hw::UserExit.Interrupted {
             interrupts += 1
         }
     })
+    settle(take none)
     if ran.contents().load() == 1 {
         say(text: "another task ran while thread b spun\n")
     }
@@ -337,6 +371,42 @@ fn run_threads(cpu: hw::Ring0, exec: task::Executor, alloc: mem::Alloc) fails ta
         else => say(text: "thread c did not fault\n")
     }
 } run_threads
+
+/// Thread G owning extended state until its system call, thread H running the same code with
+/// another state, then thread G spinning until another task has run, after which each state holds
+/// its thread's vector register.
+fn vectors(
+    cpu: hw::Ring0,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    take g_frame: hw::PhysFrame[4_096],
+    take h_frame: hw::PhysFrame[4_096],
+    ) fails task::Cancelled uses wait {
+    var g = start(ip: USER_CODE + 0x480, sp: USER_DATA + 0x400)
+    g.regs[0] = Untrusted.of(0x6767)
+    var h = g
+    h.regs[0] = Untrusted.of(0x6868)
+    var g_extended = Some(hw::ExtendedState.of(take g_frame))
+    var h_extended = Some(hw::ExtendedState.of(take h_frame))
+    let g_called = syscall_numbered(exit: run_owning(cpu, state: mut g, extended: mut g_extended), state: g, number: 5)
+    let h_called = syscall_numbered(exit: run_owning(cpu, state: mut h, extended: mut h_extended), state: h, number: 5)
+    let ran = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    discard attempt await task::scope(exec, body: fn[mut g, mut g_extended](s: task::Scope) {
+        let flag = ran.share()
+        discard s.spawn(fn[take flag]() limits stack 4_096 {
+            discard flag.contents().swap(1)
+        })
+        var interrupts: u32 = 0
+        while ran.contents().load() == 0 and interrupts < 1_000 and cpu.run_user(mut g, extended: mut g_extended) == hw::UserExit.Interrupted {
+            interrupts += 1
+        }
+    })
+    if g_called and h_called and ran.contents().load() == 1 and holds(g_extended, value: 0x6767) and holds(h_extended, value: 0x6868) {
+        say(text: "threads g and h kept their vector registers across interrupts\n")
+    }
+    settle(take g_extended)
+    settle(take h_extended)
+} vectors
 
 /// Copies refused for a read-only page and an address outside user memory, and an instruction
 /// abort at an address that maps nothing.
@@ -404,16 +474,21 @@ fn isolation(cpu: hw::Ring0, doorbell: hw::UserFrame, split: hw::PageTableRoot) 
     f.regs[0] = Untrusted.of(KERNEL_PROBE)
     var under_split = f
     let under_root = run_until_exit(cpu, state: mut f)
-    let split_exit = trusted "the user root maps the entry area as the root does and the user window alone, and no translation is cached under its ASID" { cpu.run_user_split(mut under_split, root: split) }
+    var none: Option[hw::ExtendedState] = None
+    var split_exit = hw::UserExit.Interrupted
+    while split_exit == hw::UserExit.Interrupted {
+        split_exit = trusted "the user root maps the entry area as the root does and the user window alone, and no translation is cached under its ASID" { cpu.run_user_split(mut under_split, extended: mut none, root: split) }
+    }
     if permission_fault(under_root) and translation_fault(split_exit) {
         say(text: "the user root leaves kernel memory unmapped\n")
     }
     var b = start(ip: USER_CODE + 0x100, sp: USER_DATA + 0x800)
     var called = hw::UserExit.Interrupted
     while called == hw::UserExit.Interrupted {
-        called = trusted "as for thread F" { cpu.run_user_split(mut b, root: split) }
+        called = trusted "as for thread F" { cpu.run_user_split(mut b, extended: mut none, root: split) }
     }
-    let interrupted = trusted "as for thread F" { cpu.run_user_split(mut b, root: split) }
+    let interrupted = trusted "as for thread F" { cpu.run_user_split(mut b, extended: mut none, root: split) }
+    settle(take none)
     if called == hw::UserExit.Syscall and interrupted == hw::UserExit.Interrupted {
         say(text: "thread b ran under the user root until interrupted\n")
     }
@@ -435,11 +510,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let window = user_window(mut frames, doorbell)
     let root = build_root(mut frames, window)
     let split = build_split(mut frames, area: cpu.entry_area(), window)
+    let g_frame = next_frame(mut frames)
+    let h_frame = next_frame(mut frames)
     let alloc = k.alloc()
     mut k.policy(OneCpu())
-    take k.anchor(take frames, run: fn[take cpu, take root, take doorbell, take split](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+    take k.anchor(take frames, run: fn[take cpu, take root, take doorbell, take split, take g_frame, take h_frame](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         install_root(take root, cpu)
         discard attempt await run_threads(cpu, exec, alloc)
+        discard attempt await vectors(cpu, exec, alloc, take g_frame, take h_frame)
         refusals(cpu)
         isolation(cpu, doorbell, split)
         discard trusted "the read faults, nothing mapping the address" { hw::Ptr[u64].of_addr(usize.widen(UNMAPPED)).read() }

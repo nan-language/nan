@@ -78,6 +78,7 @@ codes! {
     ComponentOperationClause = "component.operation-clause",
     ComponentOperationName = "component.operation-name",
     ComponentOperationType = "component.operation-type",
+    ComponentProtocolImpl = "component.protocol-impl",
     ComponentRequestValue = "component.request-value",
     ComponentStateGeneric = "component.state-generic",
     ComponentStateNotEncode = "component.state-not-encode",

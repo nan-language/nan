@@ -657,6 +657,12 @@ impl Lowering<'_, '_> {
                 method,
                 args: fn_ref.args.clone(),
             },
+            Callable::Method { interface, method } if self.ck.encodes(fn_ref) => {
+                Instance::Encoding {
+                    protocol: *interface,
+                    method: *method,
+                }
+            }
             Callable::Method { interface, method } if self.ck.is_protocol(*interface) => {
                 Instance::Operation {
                     protocol: *interface,
@@ -797,6 +803,10 @@ impl Lowering<'_, '_> {
                     .expect("an operation's head")
                     .fn_ty()
             }
+            Instance::Encoding { protocol, method } => (self.ck)
+                .wire_head(*protocol, *method as usize)
+                .expect("an operation's head")
+                .fn_ty(),
             other => panic!("the head of {other:?}"),
         }
     }

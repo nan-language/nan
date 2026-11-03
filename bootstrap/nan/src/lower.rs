@@ -77,6 +77,8 @@ pub enum Instance {
     Conformance { ty: Ty, method: String, args: Args },
     /// An operation of a protocol, or its summary, called through an outbox.
     Operation { protocol: ItemId, method: u32 },
+    /// An operation of a protocol called as a member of `sys::Wire`, encoding its call.
+    Encoding { protocol: ItemId, method: u32 },
     /// The release of a value of a type.
     Release(Ty),
     /// The code of a function value naming a function: the instance called through the ABI of
@@ -587,6 +589,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
             }
             Instance::Operation { protocol, method } => {
                 supplied::tasks::protocols::call(self, fx, abi, *protocol, *method as usize)
+            }
+            Instance::Encoding { protocol, method } => {
+                supplied::codecs::protocols::encode_call(self, fx, abi, *protocol, *method as usize)
             }
             Instance::Release(ty) => release::define(self, fx, ty),
             Instance::Value(inner) => call::value_glue(self, fx, abi, inner),

@@ -102,7 +102,8 @@ fn Checker.check_uses(self, item: ty::ItemId) {
 
 /// The codec uses of a function: of its body, or for a supplied `Codec` member of `mem::wire`,
 /// `text::json` or `text::construction`, the decoder of `T` for `decode`, `canonical` and
-/// `erased` and its encoder for `encode` and `try_encode`.
+/// `erased` and its encoder for `encode` and `try_encode`; for `sys::Wire.serve` the decoder and
+/// encoder of P, and for `sys::Reply.decode` the decoders of R and E.
 fn Checker.codec_uses(self, function: ty::ItemId) -> mem::List[CodecUse] {
     var found = mem::List[CodecUse].empty(self.alloc())
     let Some(head) = self.fn_sig(function) else {
@@ -122,12 +123,19 @@ fn Checker.codec_uses(self, function: ty::ItemId) -> mem::List[CodecUse] {
     if not db.is_std(function) {
         return found
     }
-    let codec = match db.canonical(function).as_str() {
-        "mem::wire::Codec.decode" or "mem::wire::Codec.canonical" or "mem::wire::Codec.erased" or "mem::wire::Codec.decode_from" or "text::json::Codec.decode" or "text::construction::Codec.decode" => Codec.Decode
-        "mem::wire::Codec.encode" or "mem::wire::Codec.try_encode" or "mem::wire::Codec.encode_as" or "text::json::Codec.encode" or "text::json::Codec.try_encode" => Codec.Encode
-        else => return found
+    match db.canonical(function).as_str() {
+        "mem::wire::Codec.decode" or "mem::wire::Codec.canonical" or "mem::wire::Codec.erased" or "mem::wire::Codec.decode_from" or "text::json::Codec.decode" or "text::construction::Codec.decode" => mut found.push(CodecUse(param: head.generics[0].param, codec: Codec.Decode))
+        "mem::wire::Codec.encode" or "mem::wire::Codec.try_encode" or "mem::wire::Codec.encode_as" or "text::json::Codec.encode" or "text::json::Codec.try_encode" => mut found.push(CodecUse(param: head.generics[0].param, codec: Codec.Encode))
+        "sys::Wire.serve" => {
+            mut found.push(CodecUse(param: head.generics[0].param, codec: Codec.Decode))
+            mut found.push(CodecUse(param: head.generics[0].param, codec: Codec.Encode))
+        }
+        "sys::Reply.decode" => {
+            mut found.push(CodecUse(param: head.generics[0].param, codec: Codec.Decode))
+            mut found.push(CodecUse(param: head.generics[1].param, codec: Codec.Decode))
+        }
+        else => {}
     }
-    mut found.push(CodecUse(param: head.generics[0].param, codec: codec))
     return found
 } Checker.codec_uses
 
@@ -271,6 +279,16 @@ fn UsesWalk.call(mut self, call: Call) {
     match call.callee {
         Callee.Function(item: function) => mut self.named(token, function, args: types.arg_list(call.type_args))
         Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: false) => {
+            if ck.wire_protocol(self_ty).is_some() {
+                match ck.method_head(bound, method, self_ty) {
+                    Some(head) => {
+                        for index in 1..<head.params.len() {
+                            mut self.codec(token, ty: head.params[index].ty, codec: Codec.Encode)
+                        }
+                    }
+                    None => {}
+                }
+            }
             if ck.db().core_item("Encode") == Some(bound.item) {
                 if ck.interface_method(bound.item, name: "decode") == Some(method) {
                     mut self.codec(token, ty: self_ty, codec: Codec.Decode)
@@ -470,7 +488,8 @@ fn UsesWalk.implemented(mut self, token: u32, ty: ty::Ty, line: ty::ItemId, inte
 /// uses; of a type parameter of another item, which no argument substituted, declassifying; of
 /// another type, declassifying when it or a frozen shape its migrations of that direction convert
 /// decodes no parsing type or encodes one holding an Untrusted instantiation, and a use of the
-/// same codec of each type parameter of the body the type holds.
+/// same codec of each type parameter of the body the type holds; the encoder of a protocol
+/// being those of the results and failures of its requests.
 fn UsesWalk.codec(mut self, token: u32, ty: ty::Ty, codec: Codec) {
     let ck = self.ck.share()
     let types = ck.types()
@@ -485,6 +504,14 @@ fn UsesWalk.codec(mut self, token: u32, ty: ty::Ty, codec: Codec) {
                 discard mut self.found.declassifying.insert(token)
             }
             return
+        }
+        ty::TyKind.Item(item: protocol, args: _) => {
+            if ck.is_protocol(protocol) and codec == Codec.Encode {
+                for reply in ck.reply_types(protocol) {
+                    mut self.codec(token, ty: reply, codec: Codec.Encode)
+                }
+                return
+            }
         }
         else => {}
     }

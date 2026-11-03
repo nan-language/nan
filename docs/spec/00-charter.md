@@ -561,6 +561,7 @@ Each term links to its home, whose definition governs.
 | [waiver](06-statements-expressions.md#thresholds) | `waive` clause accepting a threshold excess. |
 | [weakening](31-trust.md#weakening) | Change weakening an accepted spec. |
 | [widening](14-authority.md#authority-summaries) | Gain in an authority summary. |
+| [wire encoding](26-components.md#wire-encoding) | Encoding of a protocol's calls and replies, with their handles. |
 
 ## Chapter map
 

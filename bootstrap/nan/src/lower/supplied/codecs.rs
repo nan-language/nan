@@ -5,14 +5,17 @@
 //! order of their keys, an enum value as a variant, and each std type as its encoding states.
 //! The calls of a decoder are a format too.
 //!
-//! A writer is the buffer bytes go to, zero while measuring, and the count of bytes written. A
-//! reader is the address of the next byte, or the decoder's address, the end of the input and
-//! the nesting depth. A decoding function gives zero, or one plus the index of the
+//! A writer is the buffer bytes go to, zero while measuring, and the count of bytes written,
+//! then for the encoding of a protocol's call or reply the list its handles go to and the index
+//! of the next. A reader is the address of the next byte, or the decoder's address, the end of
+//! the input and the nesting depth, then for such an encoding the first of its handles, their
+//! count and the count read. A decoding function gives zero, or one plus the index of the
 //! `core::DecodeError` variant it fails with, having released what it read.
 
 pub mod calls;
 pub mod construction;
 mod json;
+pub mod protocols;
 mod wire;
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
@@ -30,6 +33,7 @@ use super::mem::vector::{self, Element};
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::{KEPT, Payload, SigKind};
 use crate::check::ty::{Arg, Scalar, Subst, Ty};
+use crate::hash::Hash;
 use crate::nir::{Callable, FnRef, Role};
 
 /// A format values encode in.
@@ -51,14 +55,19 @@ pub enum DecodeFormat {
 pub mod writer {
     pub const BUFFER: u64 = 0;
     pub const LEN: u64 = 8;
-    pub const SIZE: u64 = 16;
+    pub const HANDLES: u64 = 16;
+    pub const NEXT: u64 = 24;
+    pub const SIZE: u64 = 32;
 }
 
 pub mod reader {
     pub const POS: u64 = 0;
     pub const END: u64 = 8;
     pub const DEPTH: u64 = 16;
-    pub const SIZE: u64 = 24;
+    pub const HANDLES: u64 = 24;
+    pub const COUNT: u64 = 32;
+    pub const TAKEN: u64 = 40;
+    pub const SIZE: u64 = 48;
 }
 
 /// The codes of decoding failures: one plus the index of each `core::DecodeError` variant.
@@ -100,7 +109,13 @@ const MOST_DEPTH: i64 = 128;
 
 const BYTE: Element = Element { size: 1, align: 1 };
 
+/// The element storage of a list of `sys::Handle`.
+const HANDLE: Element = Element { size: 48, align: 8 };
+
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
+    if protocols::lower(lo, fx, supply) {
+        return true;
+    }
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
     let (encoding, decoding) = match owner {
         "mem::wire::Codec" => (Some(Format::Wire), DecodeFormat::Wire),
@@ -210,6 +225,24 @@ fn read(
 ) -> Value {
     let alloc = supply.param(raw + 1).address();
     let raw = supply.param(raw).address();
+    read_from(lo, fx, raw, alloc, None, format, ty, target)
+}
+
+/// Reads one value of `ty` at `target` from the bytes of the slice at `raw`, and in the wire
+/// format against the handles of the slice at `handles`, drawing through the allocator at
+/// `alloc`: the code of a decoding function, `Trailing` on bytes or handles left after the value,
+/// which is then released.
+#[allow(clippy::too_many_arguments)]
+fn read_from(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    raw: Value,
+    alloc: Value,
+    handles: Option<Value>,
+    format: &DecodeFormat,
+    ty: &Ty,
+    target: Value,
+) -> Value {
     let start = fx.load(PTR, raw, 0);
     let len = fx.load(PTR, raw, 8);
     let alloc = fx.load(PTR, alloc, 0);
@@ -219,6 +252,14 @@ fn read(
     fx.store(end, state, reader::END);
     let zero = fx.ptr(0);
     fx.store(zero, state, reader::DEPTH);
+    let count = handles.map(|handles| {
+        let first = fx.load(PTR, handles, 0);
+        fx.store(first, state, reader::HANDLES);
+        let count = fx.load(PTR, handles, 8);
+        fx.store(count, state, reader::COUNT);
+        fx.store(zero, state, reader::TAKEN);
+        count
+    });
     let function = decoder(lo, format, ty);
     let code = call(lo, fx, function, &[state, alloc, target])[0];
     let read = fx.b.ins().icmp_imm_s(IntCC::Equal, code, 0);
@@ -231,7 +272,12 @@ fn read(
                 json::space(fx, state);
             }
             let pos = fx.load(PTR, state, reader::POS);
-            let left = fx.b.ins().icmp(IntCC::NotEqual, pos, end);
+            let mut left = fx.b.ins().icmp(IntCC::NotEqual, pos, end);
+            if let Some(count) = count {
+                let taken = fx.load(PTR, state, reader::TAKEN);
+                let unread = fx.b.ins().icmp(IntCC::NotEqual, taken, count);
+                left = fx.b.ins().bor(left, unread);
+            }
             fx.when(left, |fx| lo.release(fx, ty, target));
             let trailing = fx.int(types::I32, failure::TRAILING);
             let none = fx.int(types::I32, 0);
@@ -488,16 +534,7 @@ fn returned(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, ty: &Ty, target: Va
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
     fx.when(failed, |fx| {
         let fails = supply.abi.fails.clone().expect("a decode's failure type");
-        let layout = lo.layout(&fails);
-        let error = fx.slot(layout.size, layout.align);
-        for (index, name) in DECODE_ERRORS.iter().enumerate() {
-            let this = fx.b.ins().icmp_imm_s(IntCC::Equal, code, index as i64 + 1);
-            let fails = fails.clone();
-            fx.when(this, |fx| {
-                let value = lo.variant_value(fx, &fails, name, &[], None);
-                lo.store_held(fx, error, value, &fails);
-            });
-        }
+        let error = decode_error(lo, fx, code);
         let held = lo.held_at(fx, &fails, error);
         let target = supply.failure.expect("a failure address");
         lo.store_held(fx, target, held, &fails);
@@ -505,6 +542,26 @@ fn returned(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, ty: &Ty, target: Va
     });
     let held = lo.held_at(fx, ty, target);
     supply.ret(lo, fx, held);
+}
+
+/// The address of the `core::DecodeError` value a decoding function's nonzero code names.
+fn decode_error(lo: &mut Lowering, fx: &mut Fx, code: Value) -> Value {
+    let item = lo
+        .ck
+        .db
+        .core_item("DecodeError")
+        .expect("core::DecodeError");
+    let ty = Ty::item(item, Vec::new());
+    let layout = lo.layout(&ty);
+    let error = fx.slot(layout.size, layout.align);
+    for (index, name) in DECODE_ERRORS.iter().enumerate() {
+        let this = fx.b.ins().icmp_imm_s(IntCC::Equal, code, index as i64 + 1);
+        fx.when(this, |fx| {
+            let value = lo.variant_value(fx, &ty, name, &[], None);
+            lo.store_held(fx, error, value, &ty);
+        });
+    }
+    error
 }
 
 /// How a type encodes.
@@ -525,6 +582,10 @@ enum Kind {
     Id,
     Record(Record),
     Variant(Vec<Case>),
+    /// A value of a handle type, whose handle carries this handle hash.
+    Handle(Hash),
+    /// `Never`, the failure of a request without a `fails` clause, which no reply holds.
+    Never,
 }
 
 /// The element storage of a sequence.
@@ -550,10 +611,12 @@ struct Record {
     kept: Option<(u64, Ty)>,
 }
 
-/// A variant of an enum: its key and payload.
+/// A variant of an enum or a protocol's message: its key, its index among the type's variants
+/// and its payload.
 #[derive(Clone)]
 struct Case {
     key: String,
+    index: usize,
     payload: CasePayload,
 }
 
@@ -573,6 +636,8 @@ fn kind_of(lo: &mut Lowering, ty: &Ty) -> Kind {
             _ if scalar.is_signed() => Kind::Signed(*scalar),
             _ => Kind::Unsigned(*scalar),
         },
+        Ty::Never => Kind::Never,
+        Ty::Item(..) if lo.ck.is_handle(ty) => Kind::Handle(lo.ck.handle_hash(ty)),
         Ty::Unit => Kind::Record(Record {
             fields: Vec::new(),
             open: false,
@@ -636,11 +701,17 @@ fn declared(lo: &mut Lowering, item: crate::check::db::ItemId, args: &[Arg]) -> 
                 kept,
             })
         }
-        SigKind::Enum { variants } => Kind::Variant(
+        SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => Kind::Variant(
             variants
                 .iter()
-                .map(|variant| Case {
+                .enumerate()
+                .filter(|(index, _)| match &sig.kind {
+                    SigKind::Protocol { .. } => lo.ck.hashed_operations(item).contains(index),
+                    _ => true,
+                })
+                .map(|(index, variant)| Case {
                     key: variant.name.clone(),
+                    index,
                     payload: match &variant.payload {
                         Payload::None => CasePayload::None,
                         Payload::Single(payload) => CasePayload::Single(subst.ty(payload)),
@@ -972,14 +1043,71 @@ fn encode_kind(
         Kind::Record(record) => encode_record(lo, fx, format, record, value, state),
         Kind::Variant(cases) => {
             let index = lo.variant_index(fx, ty, value);
-            for (position, case) in cases.iter().enumerate() {
-                let this = fx.b.ins().icmp_imm_s(IntCC::Equal, index, position as i64);
+            for case in cases {
+                let this =
+                    fx.b.ins()
+                        .icmp_imm_s(IntCC::Equal, index, case.index as i64);
                 fx.when(this, |fx| {
                     encode_case(lo, fx, format, ty, case, value, state)
                 });
             }
         }
+        Kind::Handle(hash) => encode_handle(lo, fx, hash, value, state),
+        Kind::Never => {}
     }
+}
+
+/// Writes a value of a handle type: the index of its handle, which goes to the writer's list
+/// unless measuring.
+fn encode_handle(lo: &mut Lowering, fx: &mut Fx, hash: &Hash, value: Value, state: Value) {
+    let next = fx.load(PTR, state, writer::NEXT);
+    wire::put_uvar(fx, state, next);
+    let buffer = fx.load(PTR, state, writer::BUFFER);
+    let writing = fx.b.ins().icmp_imm_s(IntCC::NotEqual, buffer, 0);
+    fx.when(writing, |fx| {
+        let list = fx.load(PTR, state, writer::HANDLES);
+        let data = fx.load(PTR, list, vector::DATA);
+        let len = fx.load(PTR, list, vector::LEN);
+        let entry = HANDLE.at(fx, data, len);
+        let handle = fx.load(types::I64, value, 0);
+        fx.store(handle, entry, protocols::handle::HANDLE);
+        let hash = lo.bytes_data(&hash.0);
+        let hash = lo.data_address(fx, hash);
+        let at = fx.offset(entry, protocols::handle::HASH);
+        lo.copy(fx, at, hash, 33, 1);
+        let len = fx.b.ins().iadd_imm_s(len, 1);
+        fx.store(len, list, vector::LEN);
+    });
+    let next = fx.b.ins().iadd_imm_s(next, 1);
+    fx.store(next, state, writer::NEXT);
+}
+
+/// A writer measuring what follows in `state`, counting its handles from the next index of
+/// `state` when it writes any.
+fn counting(fx: &mut Fx, state: Value, handles: bool) -> Value {
+    let counting = fx.slot(writer::SIZE, 8);
+    let zero = fx.ptr(0);
+    fx.store(zero, counting, writer::BUFFER);
+    fx.store(zero, counting, writer::LEN);
+    if handles {
+        let next = fx.load(PTR, state, writer::NEXT);
+        fx.store(next, counting, writer::NEXT);
+    }
+    counting
+}
+
+/// The bytes an encoding function writes for a value of `ty` that follows in `state`.
+fn measure_within(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    function: FuncId,
+    ty: &Ty,
+    value: Value,
+    state: Value,
+) -> Value {
+    let counting = counting(fx, state, lo.ck.is_handle(ty));
+    call(lo, fx, function, &[value, counting]);
+    fx.load(PTR, counting, writer::LEN)
 }
 
 /// Writes a record: per field, in ascending byte order of keys, its key and value; in the wire
@@ -1020,7 +1148,7 @@ fn encode_record(
                     wire::put_kept(lo, fx, state, cursor, Some(key.as_bytes()));
                 }
                 wire::put_literal_text(lo, fx, state, key.as_bytes());
-                let size = measure(lo, fx, function, field);
+                let size = measure_within(lo, fx, function, field_ty, field, state);
                 wire::put_uvar(fx, state, size);
             }
             Format::Json => {
@@ -1078,17 +1206,16 @@ fn encode_case(
             let payload = lo.payload_address(fx, ty, &case.key, "", value);
             let function = encoder(lo, format, payload_ty);
             if format == Format::Wire {
-                let size = measure(lo, fx, function, payload);
+                let size = measure_within(lo, fx, function, payload_ty, payload, state);
                 wire::put_uvar(fx, state, size);
             }
             call(lo, fx, function, &[payload, state]);
         }
         CasePayload::Labelled(record) => {
             if format == Format::Wire {
-                let counting = fx.slot(writer::SIZE, 8);
-                let zero = fx.ptr(0);
-                fx.store(zero, counting, writer::BUFFER);
-                fx.store(zero, counting, writer::LEN);
+                let handles =
+                    (record.fields.iter()).any(|(_, field_ty, _)| lo.ck.is_handle(field_ty));
+                let counting = counting(fx, state, handles);
                 encode_record(lo, fx, format, record, value, counting);
                 let size = fx.load(PTR, counting, writer::LEN);
                 wire::put_uvar(fx, state, size);
@@ -1458,7 +1585,39 @@ fn decode_kind(
             }
         }
         Kind::Variant(cases) => decode_variant(lo, fx, decoding, ty, cases, target),
+        Kind::Handle(hash) => decode_handle(lo, fx, decoding, hash, target),
+        Kind::Never => {
+            let always = fx.int(types::I8, 1);
+            fx.when(always, |fx| fail(fx, failure::INVALID));
+        }
     }
+}
+
+/// Reads a value of a handle type: the index of the next handle the reader has not read, whose
+/// handle hash is `hash`.
+fn decode_handle(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, hash: &Hash, target: Value) {
+    let reader_state = decoding.reader;
+    let index = read_integer(lo, fx, decoding, false);
+    let taken = fx.load(PTR, reader_state, reader::TAKEN);
+    let other = fx.b.ins().icmp(IntCC::NotEqual, index, taken);
+    fx.when(other, |fx| fail(fx, failure::MALFORMED));
+    let count = fx.load(PTR, reader_state, reader::COUNT);
+    let past =
+        fx.b.ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, taken, count);
+    fx.when(past, |fx| fail(fx, failure::TRUNCATED));
+    let first = fx.load(PTR, reader_state, reader::HANDLES);
+    let entry = HANDLE.at(fx, first, taken);
+    let wanted = lo.bytes_data(&hash.0);
+    let wanted = lo.data_address(fx, wanted);
+    let carried = fx.offset(entry, protocols::handle::HASH);
+    let same = same_hash(lo, fx, wanted, carried);
+    let mismatched = fx.b.ins().bxor_imm_s(same, 1);
+    fx.when(mismatched, |fx| fail(fx, failure::INVALID));
+    let handle = fx.load(types::I64, entry, protocols::handle::HANDLE);
+    fx.store(handle, target, 0);
+    let taken = fx.b.ins().iadd_imm_s(taken, 1);
+    fx.store(taken, reader_state, reader::TAKEN);
 }
 
 /// An unsigned or signed value in 64 bits, returning from the decoding function on failure.

@@ -28,11 +28,11 @@ A **capability** is a value conferring authority. The [primitive capabilities](0
 | `sys::net::Conn`, `sys::Revoker[C]`, `sys::Minter[C, S, R]` | yes | no | yes |
 | `boot::Machine`, `boot::Kernel` | yes | no | no |
 
-[`mem::Alloc`](12-memory.md#allocators) and [`task::Executor`](16-concurrency.md#executors) are the other Copy capabilities of std, and every [capability kind](#capability-kinds) is Copy and Send. [Standard library 1.0](28-stdlib.md#std-authority) lists every primitive capability.
+[`mem::Alloc`](12-memory.md#allocators), [`task::Executor`](16-concurrency.md#executors) and [`sys::Handle`](26-components.md#wire-encoding) are the other Copy capabilities of std, and every [capability kind](#capability-kinds) is Copy and Send. [Standard library 1.0](28-stdlib.md#std-authority) lists every primitive capability.
 
 ### Capability tables
 
-Every Copy capability other than `mem::Alloc` is a [generational handle](12-memory.md#generational-handles) naming an entry of a **capability table**; `mem::Alloc` names a cell ([budgets](12-memory.md#budgets)). A capability table is owned by its **minter**: the root grant minted with it, a `sys::Revoker`, a `sys::Minter` ([capability kinds](#capability-kinds)), or the test or example run whose [sims](22-testing.md#simulated-capabilities) it holds.
+Every Copy capability other than `mem::Alloc` and [`sys::Handle`](26-components.md#wire-encoding) is a [generational handle](12-memory.md#generational-handles) naming an entry of a **capability table**; `mem::Alloc` names a cell ([budgets](12-memory.md#budgets)), and a `sys::Handle` holds another capability. A capability table is owned by its **minter**: the root grant minted with it, a `sys::Revoker`, a `sys::Minter` ([capability kinds](#capability-kinds)), or the test or example run whose [sims](22-testing.md#simulated-capabilities) it holds.
 
 - An entry records the authority it confers and the entry it derives from, if any. An executor's entry also records a clock: the `sys::Clock` of the root grant that minted it, the virtual clock of the test or example run whose world holds it, or for an executor made by `sys::revocable` the clock of its source; the kernel executor records the kernel's clock ([anchor](24-kernel.md#anchor)). An executor's entry also records its share and serial executor and counts the time its tasks ran ([executors](16-concurrency.md#executors)). Every copy of a handle names the same entry.
 - Revoking an entry advances its slot's generation, so every handle to it is stale. An operation through a handle checks at its start that the handle is live; an operation already past its check completes as if the entry were live.

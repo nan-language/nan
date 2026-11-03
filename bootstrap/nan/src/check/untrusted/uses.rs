@@ -67,7 +67,8 @@ impl Checker<'_> {
     /// The codec uses of a function: of its body, or for a supplied `Codec` member of
     /// `mem::wire`, `text::json` or `text::construction`, the decoder of `T` for `decode`,
     /// `canonical`, `erased` and `decode_from` and its encoder for `encode`, `try_encode` and
-    /// `encode_as`.
+    /// `encode_as`; for `sys::Wire.serve` the decoder and encoder of P, and for
+    /// `sys::Reply.decode` the decoders of R and E.
     pub fn codec_uses(&self, function: ItemId) -> Vec<(Param, Codec)> {
         let Some(head) = self.fn_sig(function) else {
             return Vec::new();
@@ -86,21 +87,23 @@ impl Checker<'_> {
         if !self.db.is_std(function) {
             return Vec::new();
         }
-        let codec = match self.db.canonical(function).as_str() {
+        let param = |index: usize| head.generics[index].param;
+        match self.db.canonical(function).as_str() {
             "mem::wire::Codec.decode"
             | "mem::wire::Codec.canonical"
             | "mem::wire::Codec.erased"
             | "mem::wire::Codec.decode_from"
             | "text::json::Codec.decode"
-            | "text::construction::Codec.decode" => Codec::Decode,
+            | "text::construction::Codec.decode" => vec![(param(0), Codec::Decode)],
             "mem::wire::Codec.encode"
             | "mem::wire::Codec.try_encode"
             | "mem::wire::Codec.encode_as"
             | "text::json::Codec.encode"
-            | "text::json::Codec.try_encode" => Codec::Encode,
-            _ => return Vec::new(),
-        };
-        vec![(head.generics[0].param, codec)]
+            | "text::json::Codec.try_encode" => vec![(param(0), Codec::Encode)],
+            "sys::Wire.serve" => vec![(param(0), Codec::Decode), (param(0), Codec::Encode)],
+            "sys::Reply.decode" => vec![(param(0), Codec::Decode), (param(1), Codec::Decode)],
+            _ => Vec::new(),
+        }
     }
 
     /// The uses of a body, computed once; within a cycle of bodies reaching each other, again
@@ -234,6 +237,13 @@ impl Walk<'_, '_> {
                 self_ty,
                 dynamic: false,
             } => {
+                if ck.wire_protocol(self_ty).is_some()
+                    && let Some(head) = ck.method_head(interface, *method, self_ty)
+                {
+                    for param in &head.params[1..] {
+                        self.codec(token, &param.ty, Codec::Encode);
+                    }
+                }
                 if Some(interface.interface) == ck.db.core_item("Encode") {
                     let named =
                         |name| ck.interface_method(interface.interface, name) == Some(*method);
@@ -423,7 +433,8 @@ impl Walk<'_, '_> {
     /// uses; of a type parameter of another item, which no argument substituted, declassifying;
     /// of another type, declassifying when it decodes no parsing type or encodes one holding an
     /// Untrusted instantiation, a use of the same codec of each type parameter of the body the
-    /// type holds, and of each frozen shape its migrations of that direction convert.
+    /// type holds, and of each frozen shape its migrations of that direction convert; the encoder
+    /// of a protocol being those of the results and failures of its requests.
     fn codec(&mut self, token: Tok, ty: &Ty, codec: Codec) {
         if ty.has_error() {
             return;
@@ -433,6 +444,15 @@ impl Walk<'_, '_> {
                 self.uses.codecs.insert((*param, codec));
             } else {
                 self.uses.declassifying.insert(token);
+            }
+            return;
+        }
+        if let Ty::Item(protocol, _) = ty
+            && self.ck.is_protocol(*protocol)
+            && codec == Codec::Encode
+        {
+            for reply in self.ck.reply_types(*protocol) {
+                self.codec(token, &reply, Codec::Encode);
             }
             return;
         }

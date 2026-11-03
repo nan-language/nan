@@ -1,6 +1,6 @@
 # 0097. Protocol items
 
-Status: accepted
+Status: accepted; its reservation of the wire encoding between closures superseded by 0115
 
 ## Context
 

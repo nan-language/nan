@@ -1,6 +1,6 @@
 # Components
 
-This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, and protocols with their servers, operation calls and hashes.
+This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, and protocols with their servers, operation calls, hashes and wire encoding.
 
 ## Components
 
@@ -938,10 +938,10 @@ operation_param = IDENT ":" type_expr ;
 ```
 
 - An operation with a result or a `fails` clause is a **request**; any other is a **one-way** operation. Its parameter types, result and failure type are its **types**.
-- Operation names are distinct within their protocol (`item.duplicate`). An operation named `post`, `start` or `summary` is an error (`component.operation-name`).
+- Operation names are distinct within their protocol (`item.duplicate`). An operation named `post`, `start`, `summary`, `hash` or `serve` is an error (`component.operation-name`).
 - An operation is visible where both it and its protocol are.
 - Each operation's `limits` clause holds `pure` or a [class](10-effects-digests.md#reversibility), the **class** of the operation, `traceless` for `pure`. An operation without one is an error (`component.operation-class`).
-- Each type of an operation is Send and not linear, and each type of a `pub` operation implements [Encode](13-text-encode.md#encode) or is a **handle type**: a [primitive capability](05-properties.md#capability-types) that is Send and not linear, capability kinds included, or `sys::Outbox[Q]`. Any other type is an error (`component.operation-type`), reported on the operation's line.
+- Each type of an operation is Send and not linear, and each type of a `pub` operation implements [Encode](13-text-encode.md#encode) or is a **handle type**: a type implementing [`sys::Capability`](14-authority.md#revocation), capability kinds included, or `sys::Outbox[Q]`. Any other type is an error (`component.operation-type`), reported on the operation's line.
 - The clause region of an operation holds `requires`, `ensures`, `undo` and `todo` clauses, over the operation's parameters and, in `ensures`, `result`. Any other clause, or a `todo` clause holding an example clause, is an error (`component.operation-clause`).
 - The **summary type**, written after `summary`, implements Encode and is Copy; any other is an error (`component.summary-type`).
 
@@ -1190,6 +1190,7 @@ On a value of `sys::Outbox[P]`, P a protocol, the candidates of [method resoluti
 
 pub closed enum CallError[E: Send] derives Render {
     Failed(E)
+    Malformed(core::DecodeError)
     Closed(task::SendError) from
     Cancelled(task::Cancelled) from
 } CallError
@@ -1283,10 +1284,245 @@ pub fn notify(outbox: sys::Outbox[Mailer]) fails task::SendError uses wait limit
 
 ### Protocol hashes
 
-The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), or `handle ` and the type's normalised text for a handle type, followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
+The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), or for a handle type its **handle line**, `handle ` and the type's normalised text, followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
 
 - The code root of a package records the hashes of each `pub` protocol it declares ([code roots](30-artefacts.md#code-roots)), and `nan show --api` prints a protocol's ([commands](33-toolchain.md#commands)).
-- Operations reach the components of their own closure only: the wire encoding of messages, and of the handle types they hold, between closures is [reserved](37-evolution.md#reservations).
+- Closures agreeing on a protocol hash exchange its operations through their [wire encoding](#wire-encoding).
+
+### Wire encoding
+
+Closures exchange the calls of a protocol's operations and their replies as `sys::Encoded` values: the `mem::wire` bytes of a call or a reply, and beside them the **handles** through which its values of handle types travel. `sys::Wire[P]` encodes the calls of P's `pub` operations and serves the calls it decodes to a component serving P; `sys::Reply` decodes their replies.
+
+```nan-api
+// module: sys
+
+pub interface Protocol {
+} Protocol
+
+pub closed struct ProtocolHash derives Copy, Eq, Ord, Hash, Encode {
+    pub bytes: Array[u8, 33]
+} ProtocolHash
+
+pub open struct Handle {
+} Handle
+
+pub closed struct Encoded {
+    pub bytes: mem::Bytes
+    pub handles: mem::List[Handle]
+} Encoded
+
+pub fn Encoded.empty(alloc: mem::Alloc) -> Encoded
+
+pub open struct Wire[P: Protocol] {
+} Wire
+
+pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
+
+pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+
+pub open struct Reply[R: Send, E: Send] {
+} Reply
+
+pub fn Reply.decode(self, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> R fails CallError[E]
+```
+
+- Every protocol implements `sys::Protocol`, and nothing else does: an impl line naming it is an error (`component.protocol-impl`).
+- A `sys::Handle` holds a value of a handle type and that type's **handle hash**, the hash of its handle line ([protocol hashes](#protocol-hashes)). It is a base type and a primitive capability, Copy and Send. `sys::Reply[R, E]` is a base type holding nothing, Copy and Send.
+- `Wire.hash()` gives P's protocol hash, and `Encoded.empty(alloc)` an encoded call without bytes or handles.
+
+On `sys::Wire[P]`, the candidates of method resolution for a name also hold P's `pub` operation of that name where it is visible. As members of `sys::Wire[P]`, they have these heads, E being `Never` for an operation without a `fails` clause:
+
+| Candidate | Head |
+| --- | --- |
+| a one-way operation | `fn op(mut out: sys::Encoded, take p: T, ...)` |
+| a request | `fn op(mut out: sys::Encoded, take p: T, ...) -> sys::Reply[R, E]` |
+
+The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without payload when the operation has no parameters, and otherwise with the record of its arguments keyed by their parameters' names, as an enum variant with labelled payloads [encodes](13-text-encode.md#derived-encode-and-decode). The encoding of the **reply** to a request is the variant `Ok` holding its handler's result or `Err` holding its failure, as `Result[R, E]` encodes. A value of a handle type encodes as an unsigned integer: the index of its handle among the handles beside the encoding, which hold them in the order the encoding does. Decoding an encoding against its handles reads each value of a handle type T as `mem::wire::Codec.decode` reads one ([wire format](13-text-encode.md#wire-format)), and also fails with `Malformed` when an index it reads is not the count of handles read before it, with `Truncated` when no handle has that index, with `Invalid` when that handle's handle hash is not T's, and with `Trailing` when it leaves handles unread.
+
+- `Wire[P].op(mut out, ...)` appends the encoding of its call to `out.bytes` and the handles of its values of handle types to `out.handles`, each index counting the handles `out` held before, trapping when memory is exhausted (`trap.exhausted`). The operation's `requires` is no obligation there, and its class enters no digest.
+- `Wire[P].serve(out, hash, raw, handles, alloc)` fails with `CallError.Malformed` holding `UnknownSchema` when `hash` is not P's protocol hash. Otherwise it decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`, then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments and gives a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
+- `reply.decode(raw, handles, alloc)` decodes the reply of its request from `raw` against `handles` and gives its result, fails with `CallError.Failed` holding its failure, or, when it does not decode, with `CallError.Malformed` holding the decoding's failure. A call through an outbox never fails with `CallError.Malformed`.
+- The digest of `serve` states waiting and the class of each `pub` operation of P ([operation calls](#operation-calls)).
+- The [codec uses](15-untrusted.md#validate-grants) of `serve` mark P `decode` and `encode`, a use of the encoder of a protocol being a use of the encoders of the results and failures of its `pub` requests, and those of `decode` mark R and E `decode`. A call of `Wire[P].op` uses the encoder of each type of its operation's parameters.
+
+A probe and a tally in separate closures each declare the `Counter` protocol over the types of `refusals`, with one protocol hash, so one encodes calls the other serves. The tally refuses calls under another protocol hash, and those breaking `requires`:
+
+```nan
+// file: refusals/package.nan
+//! The refusals of tallies.
+
+package refusals {
+    language 1
+    targets any
+} refusals
+
+// file: refusals/refusals.nan
+//! Why a tally refuses an amount.
+
+pub closed enum Refused derives Render, Encode {
+    TooLarge
+} Refused
+
+// file: counter/package.nan
+//! A tally other closures call.
+
+package counter {
+    language 1
+    targets x86_64-host
+    dep refusals "../refusals"
+    allow validate in counter
+} counter
+
+// file: counter/counter.nan
+//! A tally served through the Counter protocol.
+
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
+        requires amount > 0
+    pub fn reset() limits pure
+    pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+} Counter
+
+pub closed struct Env {
+} Env
+
+pub closed struct Tally derives Encode {
+    pub total: u64
+} Tally
+
+impl Tally: sys::Component[Env, Counter]
+
+pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0)
+
+pub fn Tally.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 fails refusals::Refused {
+    if amount > 1_000 {
+        fail refusals::Refused.TooLarge
+    }
+    self.total = self.total.wrapping_add(u64.widen(amount))
+    return self.total
+} Tally.add
+
+pub fn Tally.reset(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.total = 0
+} Tally.reset
+
+pub fn Tally.echo(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx[Counter]) -> sys::Clock = clock
+
+/// The reply of the tally behind `inbox` to a call made under the protocol hash `hash`.
+pub fn serve(inbox: sys::Outbox[Counter], hash: sys::ProtocolHash, call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
+    return try await sys::Wire[Counter].serve(inbox, hash, raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
+} serve
+
+// file: probe/package.nan
+//! A client of the tallies other closures run.
+
+package probe {
+    language 1
+    targets x86_64-host
+    dep refusals "../refusals"
+} probe
+
+// file: probe/probe.nan
+//! Its own declarations of the protocols of the tallies it calls.
+
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
+        requires amount > 0
+    pub fn reset() limits pure
+    pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+} Counter
+
+pub protocol Gauge {
+    pub fn add(amount: u64) limits pure
+} Gauge
+
+// file: link/package.nan
+//! Calls carried from the closure of probe to that of counter.
+
+package link {
+    language 1
+    targets x86_64-host
+    dep counter "../counter"
+    dep probe "../probe"
+    dep refusals "../refusals"
+    allow validate in counter, link
+} link
+
+// file: link/link.nan
+//! Calls of a probe served by a tally, each carried encoded.
+
+/// The reply to `call`, made under the protocol hash `hash`, of the tally behind `inbox`.
+fn carry(inbox: sys::Outbox[counter::Counter], hash: sys::ProtocolHash, call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[refusals::Refused] uses wait {
+    return match attempt await counter::serve(inbox, hash, call, alloc) {
+        Ok(reply) => reply
+        Err(sys::CallError.Malformed(error)) => fail sys::CallError.Malformed(error)
+        Err(sys::CallError.Cancelled(cancelled)) => fail sys::CallError.Cancelled(take cancelled)
+        else => fail sys::CallError.Closed(task::SendError.Closed)
+    }
+} carry
+
+test probe_calls_tally for carry {
+    let world = testing::world()
+    let alloc = world.alloc
+    let clock = world.clock
+    let last = try await host::Runner[counter::Tally].run(counter::Env(), exec: world.exec, alloc, body: fn(inbox: sys::Outbox[counter::Counter]) fails sys::CallError[refusals::Refused] uses wait {
+        let hash = sys::Wire[probe::Counter].hash()
+        var call = sys::Encoded.empty(alloc)
+        let added = sys::Wire[probe::Counter].add(mut call, amount: 5)
+        expect call.bytes.view() == b"\x03add\x01\x0a\x01\x06amount\x01\x05"
+        let reply = try await carry(inbox, hash, call, alloc)
+        let total = try added.decode(Untrusted.of(reply.bytes.view()), handles: reply.handles.view(), alloc)
+        expect total == 5
+        var large = sys::Encoded.empty(alloc)
+        let refused = sys::Wire[probe::Counter].add(mut large, amount: 5_000)
+        let answer = try await carry(inbox, hash, call: large, alloc)
+        let outcome = attempt refused.decode(Untrusted.of(answer.bytes.view()), handles: answer.handles.view(), alloc)
+        let Err(sys::CallError.Failed(refusals::Refused.TooLarge)) = outcome else {
+            expect false
+            return
+        }
+        var echo = sys::Encoded.empty(alloc)
+        let echoed = sys::Wire[probe::Counter].echo(mut echo, clock)
+        expect echo.handles.len() == 1
+        let echoed_reply = try await carry(inbox, hash, call: echo, alloc)
+        let returned = attempt echoed.decode(Untrusted.of(echoed_reply.bytes.view()), handles: echoed_reply.handles.view(), alloc)
+        let Ok(returned_clock) = returned else {
+            expect false
+            return
+        }
+        let elapsed = attempt returned_clock.elapsed_ns()
+        expect elapsed.is_ok()
+        var other = sys::Encoded.empty(alloc)
+        sys::Wire[probe::Gauge].add(mut other, amount: 1)
+        let mismatched = attempt await carry(inbox, hash: sys::Wire[probe::Gauge].hash(), call: other, alloc)
+        let Err(sys::CallError.Malformed(core::DecodeError.UnknownSchema)) = mismatched else {
+            expect false
+            return
+        }
+        var zero = sys::Encoded.empty(alloc)
+        discard sys::Wire[probe::Counter].add(mut zero, amount: 0)
+        let broken = attempt await carry(inbox, hash, call: zero, alloc)
+        let Err(sys::CallError.Malformed(core::DecodeError.Invalid)) = broken else {
+            expect false
+            return
+        }
+        var reset = sys::Encoded.empty(alloc)
+        sys::Wire[probe::Counter].reset(mut reset)
+        let reset_reply = try await carry(inbox, hash, call: reset, alloc)
+        expect reset_reply.bytes.len() == 0
+    })
+    expect last.total == 0
+} probe_calls_tally
+```
+
+An impl line naming `sys::Protocol` is an error:
+
+```nan
+pub closed struct Fake {
+} Fake
+
+impl Fake: sys::Protocol // error: component.protocol-impl
+```
 
 ## Diagnostics
 
@@ -1298,6 +1534,7 @@ The **operation hash** of an operation is the hash of the UTF-8 bytes `operation
 | `component.operation-clause` | error | [Protocols](#protocols) |
 | `component.operation-name` | error | [Protocols](#protocols) |
 | `component.operation-type` | error | [Protocols](#protocols) |
+| `component.protocol-impl` | error | [Wire encoding](#wire-encoding) |
 | `component.request-value` | error | [Protocols](#protocols) |
 | `component.state-generic` | error | [Component state](#component-state) |
 | `component.state-not-encode` | error | [Component state](#component-state) |

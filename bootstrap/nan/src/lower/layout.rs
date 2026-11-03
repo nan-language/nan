@@ -497,8 +497,22 @@ impl Layouts {
                     niche: None,
                 }
             }
-            "task::Poisoned" | "sys::Domain" | "host::Runner" | "hw::Anchor" | "hw::IrqContext"
-            | "sys::load::Loader" => empty(),
+            "task::Poisoned" | "sys::Domain" | "sys::Reply" | "host::Runner" | "hw::Anchor"
+            | "hw::IrqContext" | "sys::load::Loader" => empty(),
+            // A handle beside an encoding: the generational handle, then its type's handle hash.
+            "sys::Handle" => {
+                let hash = Ty::item(
+                    ck.db.core_item("Array").expect("core::Array"),
+                    vec![Arg::Ty(Ty::Scalar(Scalar::U8)), Arg::Const(Const::Int(33))],
+                );
+                self.record(
+                    ck,
+                    &[
+                        ("handle".to_owned(), Ty::Scalar(Scalar::U64)),
+                        ("hash".to_owned(), hash),
+                    ],
+                )
+            }
             // A loaded registry's table: the address of its table record.
             "sys::load::Table" => {
                 self.record(ck, &[("record".to_owned(), Ty::Scalar(Scalar::U64))])

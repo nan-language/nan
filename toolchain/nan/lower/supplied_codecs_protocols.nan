@@ -1,0 +1,382 @@
+//! The wire encoding of protocols: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.serve` and `sys::Reply.decode`.
+
+/// A `sys::Handle`: the generational handle, then its type's handle hash.
+const HANDLE_HANDLE: u64 = 0
+
+const HANDLE_HASH: u64 = 8
+
+fn protocols_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "sys::Wire.hash" => protocols_hash(mut lo, mut fx, supply)
+        "sys::Wire.serve" => protocols_serve(mut lo, mut fx, supply)
+        "sys::Reply.decode" => protocols_decode_reply(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} protocols_lower
+
+/// The protocol a `sys::Wire` operation's first_index type argument names.
+fn protocols_of(lo: Lowering, supply: Supply) -> ty::ItemId {
+    let ty::TyKind.Item(item: protocol, args: _) = lo.ck.types().kind(supply.type_arg(lo, index: 0)) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    return protocol
+} protocols_of
+
+/// The address of a protocol's hash, as read-only data.
+fn protocols_hash_address(mut lo: Lowering, mut fx: Fx, protocol: ty::ItemId) -> clif::Value {
+    let hashes = lo.ck.protocol_hashes(protocol)
+    let data = mut lo.bytes_data(hashes.hash.bytes.view())
+    return mut lo.data_address(mut fx, id: data)
+} protocols_hash_address
+
+/// `Wire.hash()`: the protocol hash of P.
+fn protocols_hash(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result = supply.abi.result
+    let target = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
+    let hash = protocols_hash_address(mut lo, mut fx, protocol: protocols_of(lo, supply))
+    mut lo.copy(mut fx, dst: target, src: hash, size: 33, align: 1)
+    let held = mut lo.held_at(mut fx, ty: result, address: target)
+    supply.ret(mut lo, mut fx, held)
+} protocols_hash
+
+/// The addresses of the bytes and the handles of an encoded call or reply.
+struct EncodedParts derives Copy {
+    bytes: clif::Value
+    handles: clif::Value
+} EncodedParts
+
+/// The addresses of the bytes and the handles of the encoded call or reply at `encoded`.
+fn encoded_parts(mut lo: Lowering, mut fx: Fx, encoded: clif::Value) -> EncodedParts {
+    let encoded_ty = lo.std_ty("sys", type_name: "Encoded", args: mem::List[ty::Ty].empty(lo.alloc))
+    let bytes = mut lo.layouts.field(lo.ck, ty: encoded_ty, variant: None, label: "bytes")
+    let handles = mut lo.layouts.field(lo.ck, ty: encoded_ty, variant: None, label: "handles")
+    let bytes_at = mut fx.offset(encoded, offset: bytes.offset)
+    let handles_at = mut fx.offset(encoded, offset: handles.offset)
+    return EncodedParts(bytes: bytes_at, handles: handles_at)
+} encoded_parts
+
+/// A writer of an encoding with handles: the buffer, the list its handles go to and the index of
+/// the first_index.
+fn protocols_writer(mut fx: Fx, buffer: clif::Value, handles: clif::Value, first_index: clif::Value) -> clif::Value {
+    let state = mut fx.slot(WRITER_SIZE, align: 8)
+    mut fx.store(buffer, addr: state, offset: WRITER_BUFFER)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: state, offset: WRITER_LEN)
+    mut fx.store(handles, addr: state, offset: WRITER_HANDLES)
+    mut fx.store(first_index, addr: state, offset: WRITER_NEXT)
+    return state
+} protocols_writer
+
+/// Appends what `write` writes through a writer to the bytes of `parts` and its handles to
+/// their list: measured, room made for exactly it, then written there, trapping when memory is
+/// exhausted.
+fn protocols_append(mut lo: Lowering, mut fx: Fx, supply: Supply, parts: EncodedParts, write: fn(mut lo: Lowering, mut fx: Fx, state: clif::Value)) {
+    let bytes = parts.bytes
+    let handles = parts.handles
+    let first_index = mut fx.load(PTR, addr: handles, offset: VECTOR_LEN)
+    let zero = mut fx.ptr(0)
+    let measuring = protocols_writer(mut fx, buffer: zero, handles, first_index)
+    write(mut lo, mut fx, state: measuring)
+    let size = mut fx.load(PTR, addr: measuring, offset: WRITER_LEN)
+    let next = mut fx.load(PTR, addr: measuring, offset: WRITER_NEXT)
+    let len = mut fx.load(PTR, addr: bytes, offset: VECTOR_LEN)
+    let sum = mut fx.b.uadd_overflow(len, y: size)
+    let needed = sum.value
+    let results = fx.types1(clif::Type.Int8)
+    let drawn = mut fx.choose(sum.flag, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(no)
+    }, otherwise: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let bytes_drawn = vector_reserve(mut lo, fx: mut fx1, address: bytes, needed, element: CODECS_BYTE)
+        let handles_drawn = vector_reserve(mut lo, fx: mut fx1, address: handles, needed: next, element: CODECS_HANDLE)
+        let both = mut fx1.b.band(bytes_drawn, y: handles_drawn)
+        return fx1.list1(both)
+    })
+    expect drawn.len() == 1
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: drawn[0], y: 0)
+    let no_taken = mem::List[Taken].empty(lo.alloc)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        supply.exhausted(mut lo, fx: mut fx1, taken: no_taken.view())
+    })
+    let data = mut fx.load(PTR, addr: bytes, offset: VECTOR_DATA)
+    let target = mut fx.b.iadd(data, y: len)
+    let state = protocols_writer(mut fx, buffer: target, handles, first_index)
+    write(mut lo, mut fx, state)
+    mut fx.store(needed, addr: bytes, offset: VECTOR_LEN)
+} protocols_append
+
+/// `Wire[P].op(mut out, ...)`: the call's message, encoded as its variant, appended to `out`.
+fn protocols_encode_call(mut lo: Lowering, mut fx: Fx, abi: Abi, protocol: ty::ItemId, method: usize) {
+    let entry = supply_entry(mut fx, abi, alloc: lo.alloc)
+    let message = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let name = lo.ck.method_name(protocol, method)
+    var path = text::String.of("sys::Wire.", alloc: lo.alloc)
+    mut path.append(name.as_str())
+    let supply = Supply(abi: abi.copy(lo.alloc), args: ty::Args.none(), path: take path, owner: None, sret: entry.sret, failure: entry.failure, params: take entry.params, wrap: None)
+    var payload = mem::List[Held].empty(lo.alloc)
+    for position in 1..<supply.params.len() {
+        mut payload.push(supply.params[position])
+    }
+    let held = mut lo.variant_value(mut fx, ty: message, variant: name.as_str(), payload_values: payload.view(), wrapped: None)
+    let value = tasks_address_of(mut lo, mut fx, ty: message, held)
+    let CodecsKind.Variant(cases) = kind_of(mut lo, ty: message) else {
+        expect false
+        return
+    }
+    let Some(position) = cases.position(fn(case: Case) => case.index == method) else {
+        expect false
+        return
+    }
+    let case = cases[position]
+    let parts = encoded_parts(mut lo, mut fx, encoded: supply.param(0).address_value())
+    protocols_append(mut lo, mut fx, supply, parts, write: fn(mut lo1: Lowering, mut fx1: Fx, state: clif::Value) {
+        encode_case(mut lo1, fx: mut fx1, format: Format.Wire, ty: message, case, value, state)
+    })
+    mut lo.release(mut fx, ty: message, address: value)
+    supply.done(mut lo, mut fx)
+} protocols_encode_call
+
+/// Fails with `CallError.Malformed` holding the `core::DecodeError` a decoding's code names.
+fn protocols_fail_malformed(mut lo: Lowering, mut fx: Fx, supply: Supply, code: clif::Value) {
+    let error = decode_error(mut lo, mut fx, code)
+    protocols_fail_with(mut lo, mut fx, supply, variant: "Malformed", payload: Some(error))
+} protocols_fail_malformed
+
+/// Fails with the variant of the operation's `sys::CallError` of that name holding the value at
+/// `payload`.
+fn protocols_fail_with(mut lo: Lowering, mut fx: Fx, supply: Supply, variant: Str, payload: Option[clif::Value]) {
+    let Some(call_error) = supply.abi.failure else {
+        expect false
+        return
+    }
+    let payload_ty = call_error_payload(lo, call_error, variant)
+    var held = mem::List[Held].empty(lo.alloc)
+    match payload {
+        Some(address) => mut held.push(mut lo.held_at(mut fx, ty: payload_ty, address))
+        None => {}
+    }
+    let value = mut lo.variant_value(mut fx, ty: call_error, variant, payload_values: held.view(), wrapped: None)
+    let Some(target) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: target, held: value, ty: call_error)
+    supply.raise_failure(mut fx)
+} protocols_fail_with
+
+/// The payload type of a variant of an instantiation of `sys::CallError`.
+fn call_error_payload(lo: Lowering, call_error: ty::Ty, variant: Str) -> ty::Ty {
+    let none = mem::List[ty::Ty].empty(lo.alloc)
+    return match variant {
+        "Failed" => lo.ck.types().type_arg(call_error, index: 0).value_or(ty::Ty.error())
+        "Malformed" => match lo.ck.db().core_item("DecodeError") {
+            Some(item) => lo.ck.types().item(item, args: mem::List[ty::Arg].empty(lo.alloc))
+            None => ty::Ty.error()
+        }
+        "Closed" => lo.std_ty("task", type_name: "SendError", args: take none)
+        else => lo.std_ty("task", type_name: "Cancelled", args: take none)
+    }
+} call_error_payload
+
+/// Reads one value of `ty` at `target` from the Untrusted bytes of parameter `raw` against the
+/// handles of the parameter after it, drawing through the allocator of the one after that: the
+/// code of its decoding, `Trailing` when bytes or handles are left.
+fn protocols_read_handled(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usize, ty: ty::Ty, target: clif::Value) -> clif::Value {
+    let handles = supply.param(raw + 1).address_value()
+    let alloc = supply.param(raw + 2).address_value()
+    let raw_address = supply.param(raw).address_value()
+    return codecs_read_from(mut lo, mut fx, raw: raw_address, alloc, handles: Some(handles), format: DecodeFormat.Wire, ty, target)
+} protocols_read_handled
+
+/// `Wire[P].serve(out, hash, raw, handles, alloc)`: the call decoded under P's protocol hash, its
+/// operation's `requires` evaluated, then made through `out`, giving the encoding of its reply.
+fn protocols_serve(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let protocol = protocols_of(lo, supply)
+    let types = lo.ck.types()
+    let message = types.item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let own = protocols_hash_address(mut lo, mut fx, protocol)
+    let same = same_hash(mut lo, mut fx, wanted: supply.param(1).address_value(), hash: own)
+    let other = mut fx.b.bxor_imm_s(same, y: 1)
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        let code = mut fx1.int(clif::Type.Int32, value: FAILURE_UNKNOWN_SCHEMA)
+        protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
+    })
+    let laid = mut lo.layout_of(message)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let code = protocols_read_handled(mut lo, mut fx, supply, raw: 2, ty: message, target: slot)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: code, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
+    })
+    let sig = lo.ck.sig(protocol)
+    let check::SigKind.Protocol(operations: operations, variants: _, summary: _) = sig.contents().kind else {
+        expect false
+        return
+    }
+    for method in lo.ck.hashed_operations(protocol) {
+        let operation = operations[method]
+        let is = mut lo.variant_is(mut fx, address: slot, ty: message, variant: operation.name.as_str())
+        mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+            protocols_serve_operation(mut lo, fx: mut fx1, supply, protocol, method, operation, slot)
+        })
+    }
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} protocols_serve
+
+/// Serves the call of the operation `method` whose message is at `slot`.
+fn protocols_serve_operation(mut lo: Lowering, mut fx: Fx, supply: Supply, protocol: ty::ItemId, method: usize, operation: check::MethodSig, slot: clif::Value) {
+    let message = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    var args = mem::List[Held].empty(lo.alloc)
+    for param in operation.sig.params {
+        let at = mut lo.payload_address(mut fx, ty: message, variant: operation.name.as_str(), label: param.name.as_str(), address: slot)
+        mut args.push(Held.Address(at))
+    }
+    for index in lo.ck.operation_requires(protocol, index: method) {
+        let instance = Instance.Nir(item: protocol, role: nir::Role.Requires, index: index, args: ty::Args.none())
+        let abi = mut lo.abi(instance)
+        let id = mut lo.instance(take instance)
+        let checked = mut lo.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: args.view())
+        let holds = checked.result.scalar_value()
+        let broken = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: holds, y: 0)
+        mut fx.if_true(broken, then: fn[mut lo](mut fx1: Fx) {
+            mut lo.release(fx: mut fx1, ty: message, address: slot)
+            let code = mut fx1.int(clif::Type.Int32, value: FAILURE_INVALID)
+            protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
+        })
+    }
+    let instance = Instance.Operation(protocol: protocol, method: u32.fit(method))
+    let abi = mut lo.abi(instance)
+    let id = mut lo.instance(take instance)
+    var passed = mem::List[Held].empty(lo.alloc)
+    mut passed.push(supply.param(0))
+    for arg in args {
+        mut passed.push(arg)
+    }
+    let called = mut lo.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: passed.view())
+    var reply: Option[ty::Ty] = None
+    if lo.ck.is_request(protocol, index: method) {
+        let Some(result_item) = lo.ck.db().core_item("Result") else {
+            expect false
+            return
+        }
+        var reply_args = mem::List[ty::Arg].empty(lo.alloc)
+        mut reply_args.push(ty::Arg.Ty(operation.sig.result))
+        mut reply_args.push(ty::Arg.Ty(operation.sig.failure.value_or(ty::Ty.never())))
+        reply = Some(lo.ck.types().item(result_item, args: take reply_args))
+    }
+    match called.failed {
+        Some(failed_flag) => {
+            match called.failure {
+                Some(failure) => {
+                    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed_flag, y: 0)
+                    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                        protocols_served_failure(mut lo, fx: mut fx1, supply, operation, call_error: abi.failure, reply, failure)
+                    })
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    protocols_succeeded(mut lo, mut fx, supply, reply, result: called.result)
+} protocols_serve_operation
+
+/// Gives the reply `Ok` holding a request's result, or nothing for a one-way operation.
+fn protocols_succeeded(mut lo: Lowering, mut fx: Fx, supply: Supply, reply: Option[ty::Ty], result: Held) {
+    let Some(reply_ty) = reply else {
+        protocols_give_encoded(mut lo, mut fx, supply, reply: None, held: result)
+        return
+    }
+    let results = Array[Held, 1].filled(result)
+    let value = mut lo.variant_value(mut fx, ty: reply_ty, variant: "Ok", payload_values: results.view(), wrapped: None)
+    protocols_give_encoded(mut lo, mut fx, supply, reply: Some(reply_ty), held: value)
+} protocols_succeeded
+
+/// Gives the reply `Err` holding the failure of a request's handler at `failure`, or fails as
+/// the call through the outbox failed.
+fn protocols_served_failure(mut lo: Lowering, mut fx: Fx, supply: Supply, operation: check::MethodSig, call_error: Option[ty::Ty], reply: Option[ty::Ty], failure: clif::Value) {
+    let Some(failure_ty) = operation.sig.failure else {
+        protocols_fail_with(mut lo, mut fx, supply, variant: "Closed", payload: Some(failure))
+        return
+    }
+    let Some(error_ty) = call_error else {
+        expect false
+        return
+    }
+    let handled = mut lo.variant_is(mut fx, address: failure, ty: error_ty, variant: "Failed")
+    mut fx.if_true(handled, then: fn[mut lo](mut fx1: Fx) {
+        let payload = mut lo.payload_address(fx: mut fx1, ty: error_ty, variant: "Failed", label: "", address: failure)
+        let held = mut lo.held_at(fx: mut fx1, ty: failure_ty, address: payload)
+        let Some(reply_ty) = reply else {
+            expect false
+            return
+        }
+        let failures = Array[Held, 1].filled(held)
+        let value = mut lo.variant_value(fx: mut fx1, ty: reply_ty, variant: "Err", payload_values: failures.view(), wrapped: None)
+        protocols_give_encoded(mut lo, fx: mut fx1, supply, reply: Some(reply_ty), held: value)
+    })
+    for variant in check::Words(list: "Malformed Closed Cancelled", at: 0) {
+        let this = mut lo.variant_is(mut fx, address: failure, ty: error_ty, variant)
+        mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+            let payload = mut lo.payload_address(fx: mut fx1, ty: error_ty, variant, label: "", address: failure)
+            protocols_fail_with(mut lo, fx: mut fx1, supply, variant, payload: Some(payload))
+        })
+    }
+} protocols_served_failure
+
+/// Returns an encoded reply drawn through the operation's allocator: holding the encoding of a reply
+/// held as given, which is then released, or nothing.
+fn protocols_give_encoded(mut lo: Lowering, mut fx: Fx, supply: Supply, reply: Option[ty::Ty], held: Held) {
+    let result = supply.abi.result
+    let encoded = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
+    let alloc = mut fx.load(PTR, addr: supply.param(4).address_value(), offset: 0)
+    let parts = encoded_parts(mut lo, mut fx, encoded)
+    vector_empty(mut fx, address: parts.bytes, alloc, element: CODECS_BYTE)
+    vector_empty(mut fx, address: parts.handles, alloc, element: CODECS_HANDLE)
+    match reply {
+        Some(reply_ty) => {
+            let value = tasks_address_of(mut lo, mut fx, ty: reply_ty, held)
+            let function = encoder(mut lo, format: Format.Wire, ty: reply_ty)
+            protocols_append(mut lo, mut fx, supply, parts, write: fn(mut lo1: Lowering, mut fx1: Fx, state: clif::Value) {
+                let call_args = fx1.list2(value, b: state)
+                discard codecs_call(mut lo1, fx: mut fx1, function, args: call_args.view())
+            })
+            mut lo.release(mut fx, ty: reply_ty, address: value)
+        }
+        None => {}
+    }
+    let returned = mut lo.held_at(mut fx, ty: result, address: encoded)
+    supply.ret(mut lo, mut fx, held: returned)
+} protocols_give_encoded
+
+/// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply, or `CallError.Failed`
+/// holding the failure of an `Err` one.
+fn protocols_decode_reply(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result = supply.type_arg(lo, index: 0)
+    let failure_ty = supply.type_arg(lo, index: 1)
+    let Some(result_item) = lo.ck.db().core_item("Result") else {
+        expect false
+        return
+    }
+    var reply_args = mem::List[ty::Arg].empty(lo.alloc)
+    mut reply_args.push(ty::Arg.Ty(result))
+    mut reply_args.push(ty::Arg.Ty(failure_ty))
+    let reply = lo.ck.types().item(result_item, args: take reply_args)
+    let laid = mut lo.layout_of(reply)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let code = protocols_read_handled(mut lo, mut fx, supply, raw: 1, ty: reply, target: slot)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: code, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
+    })
+    let refused = mut lo.variant_is(mut fx, address: slot, ty: reply, variant: "Err")
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        let payload = mut lo.payload_address(fx: mut fx1, ty: reply, variant: "Err", label: "", address: slot)
+        protocols_fail_with(mut lo, fx: mut fx1, supply, variant: "Failed", payload: Some(payload))
+    })
+    let payload = mut lo.payload_address(mut fx, ty: reply, variant: "Ok", label: "", address: slot)
+    let held = mut lo.held_at(mut fx, ty: result, address: payload)
+    supply.ret(mut lo, mut fx, held)
+} protocols_decode_reply

@@ -257,7 +257,7 @@ fn part(lo: &mut Lowering, fx: &mut Fx, report: Report, ty: &Ty, at: Value) {
 
 /// Writes the scalar at an address.
 fn scalar_part(lo: &mut Lowering, fx: &mut Fx, report: Report, scalar: Scalar, at: Value) {
-    let value = fx.load(scalar_type(scalar, lo.machine()), at, 0);
+    let value = fx.load(scalar_type(scalar, lo.float_bits()), at, 0);
     let bits = bits(fx, scalar, value);
     let how = fx.ptr(written(&Ty::Scalar(scalar)) as u64);
     lo.call_routine(fx, Routine::ReportScalar, &[report.out, bits, how]);

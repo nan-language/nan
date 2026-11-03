@@ -129,7 +129,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 - On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
 - On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`. Vector `0xFE` is the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), a fixed interrupt of the local APICs.
 - On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, except vector `0xFE`, the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), which software-generated interrupt 1 delivers; vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
-- The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the host target of its architecture: code holds floats and lane types in the floating-point and vector registers. Language 1 builds no image for a nanos target ([final builds](#final-builds)).
+- The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the host target of its architecture: code holds floats and lane types in the floating-point and vector registers. Its images are [bundles](30-artefacts.md#bundles) that a bare kernel of its architecture loads and runs on its runtime ([final builds](#final-builds)).
 - The `any` descriptor fixes only its environment, which restricts nothing.
 
 ```nan
@@ -299,8 +299,9 @@ fn main(take world: nanos::World, take input: Readings) -> f64 fails task::Cance
 ```text
 $ nan build average
 failed build average: files 0, errors 1, incomplete 0
-error target.image-unavailable average/package.nan:6 average
-        entry main
+error target.bundle-interface average/package.nan:3 average
+    package average {
+    because note - - a nanos program builds only against a kernel's interface file
 failed build average: files 0, errors 1, incomplete 0
 ```
 
@@ -457,7 +458,7 @@ A final build proceeds in this order:
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.
 
-Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A final build for a nanos target is an error (`target.image-unavailable`), reported on the root's `entry` directive before step 1.
+Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A nanos program's final build is the [bundle build](30-artefacts.md#bundles) against a bare kernel's interface; without one it is an error (`target.bundle-interface`), reported on the root's `package` line before step 1.
 
 ```nan
 // file: stats/package.nan
@@ -588,6 +589,5 @@ Every image keeps frame pointers in every function, stubs and support routines i
 | `target.dependency-uncovered` | error | [Targets](#targets) |
 | `target.entry-head` | error | [Entry](#entry) |
 | `target.entry-missing` | error | [Entry](#entry) |
-| `target.image-unavailable` | error | [Final builds](#final-builds) |
 | `target.link-failed` | error | [Images](#images) |
 | `target.program-targets` | error | [Programs and libraries](#programs-and-libraries) |

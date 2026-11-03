@@ -20,8 +20,8 @@ struct LoadedRegistry {
 } LoadedRegistry
 
 /// The interface of the program whose package is `root`, built at a codegen level, when it is a
-/// kernel of a bare target whose final closure declares a loaded registry, its interface file
-/// naming `toolchain`.
+/// kernel of a bare target whose final closure declares a loaded registry or calls
+/// `boot::Kernel.loader` outside std, its interface file naming `toolchain`.
 fn kernel_interface(checker: check::Checker, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], level: Option[workspace::Level], toolchain: hashing::HashValue, alloc: mem::Alloc) -> Option[KernelInterface] {
     let target = checker.db().target
     if target.kind() != Some(workspace::Kind.Bare) {
@@ -34,7 +34,24 @@ fn kernel_interface(checker: check::Checker, root: ty::PackageId, artefacts: mem
             mut loaded.push(LoadedRegistry(path: checker.db().canonical(item), item: item))
         }
     }
-    if loaded.len() == 0 {
+    var own = mem::List[ty::PackageId].empty(alloc)
+    for id in packages {
+        if not checker.db().package_data(id).std {
+            mut own.push(id)
+        }
+    }
+    var takes_loader = false
+    for item in closure_items(checker, packages: own.view(), alloc) {
+        let Some(called) = checker.body_dependencies(item) else {
+            continue
+        }
+        for callee in called.contents() {
+            if checker.db().canonical(callee).as_str() == "boot::Kernel.loader" {
+                takes_loader = true
+            }
+        }
+    }
+    if loaded.len() == 0 and not takes_loader {
         return None
     }
     mut loaded.sort_by(fn(left: LoadedRegistry, right: LoadedRegistry) => left.path.as_str().cmp(right.path.as_str()))
@@ -302,7 +319,8 @@ fn interrupt_stack_of(checker: check::Checker, packages: Slice[ty::PackageId]) -
 
 /// Builds the bundle of the package at index `package` of the session's workspace against the
 /// interface file at `against`, signed with `signer` when given, writing it into
-/// `.nan/images/<target>/`.
+/// `.nan/images/<target>/`: a library's for the interface's target, a nanos program's for the
+/// nanos target of its architecture.
 pkg fn bundle(session: check::Session, package_index: usize, against: Str, signer: Option[core::crypto::SecretKey], alloc: mem::Alloc) -> Build fails platform::IoError
     waive length "the steps of a bundle build in order, as the Rust writes them"
 {
@@ -320,13 +338,23 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     if hash_of(read.toolchain.view(), chunk: artefact::Chunk(start: 0, next: read.toolchain.len())) != Some(session.toolchain_hash()) {
         return unusable(source, reason: "another toolchain built the kernel", alloc)
     }
-    let declared = match source.manifest {
-        Some(manifest) => manifest.targets.position(fn(target: workspace::Target) => target == read.target).is_some()
-        None => false
+    let Some(manifest) = source.manifest else {
+        expect false
+        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc))
     }
-    if not declared {
+    let job = manifest.entry.is_some()
+    var target = read.target
+    match read.target.arch() {
+        Some(arch) => {
+            if job {
+                target = workspace::Target.of(arch, kind: workspace::Kind.Nanos)
+            }
+        }
+        None => {}
+    }
+    if manifest.targets.position(fn(declared: workspace::Target) => declared == target).is_none() {
         var reason = text::String.of("the package does not declare ", alloc)
-        mut reason.append(read.target.name())
+        mut reason.append(target.name())
         return unusable(source, reason: reason.as_str(), alloc)
     }
     let closures = session.check_closures_coding(package_index)
@@ -334,11 +362,11 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     let Some(checked) = held.closure_of(package_index) else {
         return Build.failed(take diagnostics)
     }
-    let program_checker = session.checker_in(take closures, package_index: package_index, target: read.target)
-    let coding = program_checker.is_some() and session.codes_in_check(checked, package_index: package_index, target: read.target)
+    let program_checker = session.checker_in(take closures, package_index: package_index, target: target)
+    let coding = program_checker.is_some() and session.codes_in_check(checked, package_index: package_index, target: target)
     let checker = match program_checker {
         Some(found) => found
-        None => session.checked(checked, target: read.target)
+        None => session.checked(checked, target: target)
     }
     let root = package_id(checker, program: package_index)
     let closure = checker.reached(root, alloc)
@@ -375,11 +403,24 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     if interrupt_stack_of(checker, packages: own.view()) > read.interrupt_stack {
         mut diagnostics.push(interface_error(source, reason: "an interrupt fn demands more stack than the kernel's interrupt stacks hold", alloc))
     }
+    let contributions = bundle_contributions(checker, root, kernel: read.roots.view(), alloc)
+    if job and contributions.len() > 0 {
+        mut diagnostics.push(interface_error(source, reason: "a nanos program adds no entry to a loaded registry", alloc))
+    }
     if errors(diagnostics.view()) {
         return Build.failed(take diagnostics)
     }
     let kernel = lower::Interface(hash: copied_bytes(hashing::HashValue.of(file.view()).bytes.view(), alloc), exports: take read.exports, interrupt_stack: read.interrupt_stack)
-    let program = lower::BundleProgram(contributions: bundle_contributions(checker, root, kernel: read.roots.view(), alloc), roots: single_root(root, alloc), prefixes: prefixes(artefacts, alloc), level: read.level, dump: false)
+    var entry: Option[ty::ItemId] = None
+    if job {
+        match checker.db().package_data(root).root {
+            Some(module) => {
+                entry = checker.db().lookup(module, name: "main")
+            }
+            None => {}
+        }
+    }
+    let program = lower::BundleProgram(contributions: take contributions, entry: entry, roots: single_root(root, alloc), prefixes: prefixes(artefacts, alloc), level: read.level, dump: false)
     let lowered = lower::lower_bundle(checker, bundle: program)
     for reported in take collisions(source, lowered, alloc) {
         mut diagnostics.push(take reported)
@@ -390,7 +431,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     if errors(diagnostics.view()) {
         return Build.failed(take diagnostics)
     }
-    let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
+    let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), job: lowered.job, hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
         Ok(bytes) => bytes
         Err(missing) => {
             var reason = text::String.of("the kernel exports no ", alloc)
@@ -405,7 +446,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         }
     }
     var path = text::String.of(".nan/images/", alloc)
-    mut path.append(read.target.name())
+    mut path.append(target.name())
     mut path.push('/')
     mut path.append(checker.db().package_data(root).name.as_str())
     mut path.append(".nbun")
@@ -471,7 +512,7 @@ fn bundle_contributions(checker: check::Checker, root: ty::PackageId, kernel: Sl
 } bundle_contributions
 
 /// A `target.bundle-interface` error on a package's `package` line, with its reason.
-fn interface_error(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+pkg fn interface_error(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
     var reported = at_manifest(source, reported: diagnostic::Diagnostic.new(diagnostic::Code.TargetBundleInterface, alloc), alloc)
     mut reported.because.push(diagnostic::Reason.note(reason, alloc))
     return reported

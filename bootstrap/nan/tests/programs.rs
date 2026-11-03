@@ -7,9 +7,9 @@
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
 //! A host program with a `codegen` file is also built and run at each codegen level it lists, one
 //! per line, writing what it expects where this machine has the level's extensions and refusing
-//! to run otherwise. A kernel's `bundles` directory holds packages that the harness builds against
-//! the kernel's interface, signed by the principal `tester`, and passes to each boot as the fw_cfg
-//! file `opt/nan/<package>`. Each package's dependencies are synced before its build. The builds
+//! to run otherwise. A kernel's `bundles` directory holds libraries and nanos programs that the
+//! harness builds against the kernel's interface, signed by the principal `tester`, and passes to
+//! each boot as the fw_cfg file `opt/nan/<package>`. Each package's dependencies are synced before its build. The builds
 //! use the harnesses' home directory.
 
 use std::fs;
@@ -127,6 +127,7 @@ fn bundles(root: &Path, name: &str, target: &str) -> datatest_stable::Result<Vec
     sign_as_tester()?;
     let images = format!(".nan/images/{target}");
     let interface = format!("{images}/{name}.nlif");
+    let nanos = format!(".nan/images/{}", target.replace("-bare", "-nanos"));
     let mut args = Vec::new();
     for package in packages {
         synced(root, &package)?;
@@ -139,7 +140,11 @@ fn bundles(root: &Path, name: &str, target: &str) -> datatest_stable::Result<Vec
             )
             .into());
         }
-        let bundle = root.join(&images).join(format!("{package}.nbun"));
+        let bundle = [&images, &nanos]
+            .map(|images| root.join(images).join(format!("{package}.nbun")))
+            .into_iter()
+            .find(|bundle| bundle.exists())
+            .ok_or_else(|| format!("building {package} writes no bundle"))?;
         args.push("-fw_cfg".to_owned());
         args.push(format!("name=opt/nan/{package},file={}", bundle.display()));
     }

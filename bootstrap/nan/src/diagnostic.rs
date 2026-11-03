@@ -444,7 +444,6 @@ codes! {
     TargetDependencyUncovered = "target.dependency-uncovered",
     TargetEntryHead = "target.entry-head",
     TargetEntryMissing = "target.entry-missing",
-    TargetImageUnavailable = "target.image-unavailable",
     TargetLinkFailed = "target.link-failed",
     TargetProgramTargets = "target.program-targets",
     TaskCaptureNotSend = "task.capture-not-send",

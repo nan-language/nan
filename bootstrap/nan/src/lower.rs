@@ -14,6 +14,9 @@ mod conform;
 mod data;
 mod fx;
 mod held;
+mod jobs;
+
+pub use jobs::JOB;
 pub(crate) mod host;
 mod layout;
 mod levels;
@@ -255,6 +258,8 @@ pub struct Lowered {
     pub collisions: Vec<(String, String)>,
     /// The entries a bundle adds to loaded registries.
     pub contributed: Vec<load::Contributed>,
+    /// For a nanos program's bundle, the stack its job's task needs.
+    pub job: Option<u64>,
 }
 
 /// What a final build lowers: the program's entry function and its target's entry landing fn,
@@ -275,9 +280,11 @@ pub struct Program {
     pub loaded: Vec<ItemId>,
 }
 
-/// What a bundle's build lowers: the entries its contributions add to loaded registries.
+/// What a bundle's build lowers: the entries its contributions add to loaded registries, or a
+/// nanos program's job entry running its entry function.
 pub struct Bundle {
     pub contributions: Vec<(ItemId, ItemId)>,
+    pub entry: Option<ItemId>,
     pub roots: Vec<PackageId>,
     pub prefixes: HashMap<String, String>,
     /// The codegen level of the kernel's interface.
@@ -417,8 +424,8 @@ pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
     lowering.finish(None)
 }
 
-/// Lowers a bundle: the entries its contributions add to loaded registries, with every function
-/// they reach, importing the load ABI.
+/// Lowers a bundle: the entries its contributions add to loaded registries or its job entry, with
+/// every function they reach, importing the load ABI.
 pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
     let linking = load::Linking::Bundle;
     let mut lowering = Lowering::new(
@@ -433,8 +440,12 @@ pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
         let contributed = lowering.contribute(*contribution, *registry);
         lowering.contributed.push(contributed);
     }
+    let job = bundle.entry.map(|entry| lowering.job_entry(entry));
     lowering.drain();
-    lowering.finish(None)
+    Lowered {
+        job,
+        ..lowering.finish(None)
+    }
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
@@ -492,8 +503,15 @@ impl<'c, 'a> Lowering<'c, 'a> {
         }
     }
 
-    /// Whether the image runs on a machine target, a UEFI or bare one.
+    /// Whether the image's code runs on a machine's runtime: an image of a UEFI or bare target, or
+    /// a bundle of a nanos target, which runs on its kernel's.
     pub fn machine(&self) -> bool {
+        self.ck.db.target.is_machine() || self.ck.db.target.is_nanos()
+    }
+
+    /// Whether the image's code keeps floats and lanes in general registers as bit patterns, as
+    /// code of a machine target does.
+    pub fn float_bits(&self) -> bool {
         self.ck.db.target.is_machine()
     }
 
@@ -566,7 +584,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 role: Role::Body,
                 args,
                 ..
-            } if !self.machine()
+            } if !self.float_bits()
                 && self.ck.db.is_std(*item)
                 && supplied::simd::vectorized(&self.ck.db.canonical(*item)) =>
             {
@@ -913,6 +931,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             tasks,
             collisions,
             contributed,
+            job: None,
         }
     }
 }

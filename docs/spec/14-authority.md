@@ -48,6 +48,8 @@ Every Copy capability other than `mem::Alloc` and [`sys::Handle`](26-components.
 pub open struct Fs {
 } Fs
 
+pub fn Fs.denied() -> Fs
+
 pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
 
 pub fn Fs.read_only(self) -> Fs fails Revoked
@@ -64,6 +66,8 @@ pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
 
 pub open struct Net {
 } Net
+
+pub fn Net.denied() -> Net
 
 pub fn Net.only_host(self, host: Str) -> Net fails Revoked
 
@@ -87,6 +91,8 @@ pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
 pub open struct WallClock {
 } WallClock
 
+pub fn WallClock.denied() -> WallClock
+
 pub fn WallClock.now_ns(self) -> u64 fails Revoked
 
 pub fn WallClock.coarse(self, ns: u64) -> WallClock fails Revoked
@@ -94,12 +100,16 @@ pub fn WallClock.coarse(self, ns: u64) -> WallClock fails Revoked
 pub open struct Random {
 } Random
 
+pub fn Random.served[S: RandomService and Capability and Copy](service: S) -> Random fails Revoked
+
 pub fn Random.fill(self, mut buf: SliceMut[u8]) fails Revoked
 
 pub fn Random.next_u64(self) -> u64 fails Revoked
 
 pub open struct Log {
 } Log
+
+pub fn Log.served[S: LogService and Capability and Copy](service: S) -> Log fails Revoked
 
 pub fn Log.info[T: Render](self, message: Str, value: T)
 
@@ -109,6 +119,8 @@ pub fn Log.error[T: Render](self, message: Str, value: T)
 
 pub open struct Stdio {
 } Stdio
+
+pub fn Stdio.served[S: StdioService and Capability and Copy](service: S) -> Stdio fails Revoked
 
 pub fn Stdio.read_in(self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails StdioError uses wait
 
@@ -185,6 +197,39 @@ pub open enum NetError derives Render {
 - A `sys::Log` call writes one record and never waits or fails. On the host, a record is one line on standard error: the level (`info`, `warn` or `error`), `: `, the message, a space, the rendering of `value` within a [render budget](13-text-encode.md#render) of 1,024 bytes and a line feed, each line feed of the message or rendering written as the two chars `\n`.
 - `read` and `read_in` return the number of bytes written into `buf`, 0 at the end of input. `write` returns the number of bytes written, at least 1 when `data` is not empty. `write_out` and `write_err` write all of `data`. A file keeps one position, starting at 0, that each read and write advances by its count.
 - `sys::StdioError.Closed` reports a closed standard stream.
+- `sys::Fs.denied()`, `sys::Net.denied()` and `sys::WallClock.denied()` give a capability whose handle is stale from the start, so that each operation through it fails as through a revoked one.
+- On a machine target, and in a bundle of a nanos target ([bundles](30-artefacts.md#bundles)), which runs on its kernel's runtime, the operations of `sys::Fs`, `sys::Net` and of the files, listeners and connections they open fail with their error's `Denied` once their handle is found live: no file system or network serves them.
+
+### Served capabilities
+
+A kernel serves `sys::Log`, `sys::Random` and `sys::Stdio` to the code it runs through a [capability kind](#capability-kinds) of its own implementing the service interface of each:
+
+```nan-api
+// module: sys
+
+pub closed enum LogLevel derives Copy, Eq, Render {
+    Info
+    Warn
+    Error
+} LogLevel
+
+pub interface LogService {
+    fn log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096
+} LogService
+
+pub interface RandomService {
+    fn fill(self, mut buf: SliceMut[u8]) limits stack 4_096
+} RandomService
+
+pub interface StdioService {
+    fn read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError uses wait limits stack 4_096
+    fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+    fn write_err(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+} StdioService
+```
+
+- `C.served(service)` of `Log`, `Random` or `Stdio` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
+- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; and `Stdio.read_in`, `write_out` and `write_err` call the method of their name, failing as it fails, a count past `buf`'s length counting as that length. Their digests are those of the served capability's operations, whatever the methods do.
 
 ## Revocation
 
@@ -438,6 +483,36 @@ fn main(take world: host::World) fails GreetError uses wait {
     try await world.stdio.write_out(b"hello\n")
 } main
 ```
+
+### Jobs
+
+A bare kernel runs the program of a nanos bundle it loaded ([loading](24-kernel.md#loading)) as a **job**:
+
+```nan-api
+// module: nanos
+
+pub closed enum Ended {
+    Returned(mem::Bytes)
+    Failed(text::String)
+    Trapped(sys::Trap)
+    Undecodable
+} Ended
+
+pub closed enum RunError derives Render {
+    NoJob
+    Cancelled(task::Cancelled) from
+} RunError
+
+pub closed struct HostInput derives Encode {
+    pub args: mem::List[mem::Bytes]
+    pub environment: mem::Map[mem::Bytes, mem::Bytes]
+} HostInput
+
+pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait
+```
+
+- `nanos::run(bundle, world, input, exec, alloc)` runs the job of `bundle` as the first task of a new [domain run](11-errors-domains.md#domain-run) on `exec` and `alloc`, whose stack holds what the `limits stack N` of the program's entry function states, and returns how the job ended: `Returned` with the `mem::wire` encoding of a typed entry's result, or of a host-compatible entry's `u8` exit status, 0 for an entry returning nothing; `Failed` with the rendering of the entry's failure within a budget of 1,024 bytes; `Trapped` with the trap that abandoned the domain; `Undecodable` when `input` is not the `mem::wire` encoding of a typed entry's input type, or of a `HostInput` for a host-compatible entry. It fails with `RunError.NoJob` when `bundle` holds no job, as the bundle of a library does.
+- The job owns `world` and `input`. A typed entry receives `world`. A host-compatible entry receives a `host::World` holding `world`'s capabilities, the `sys::WallClock` that `world.caps` holds under the key `wall`, or `sys::WallClock.denied()` when it holds none, and the arguments and environment of the `HostInput`.
 
 ## Attenuation
 

@@ -941,6 +941,11 @@ impl Lowering<'_, '_> {
 /// What a call from code lowering writes itself calls.
 pub enum Invoked {
     Direct(FuncId),
+    /// A direct call passing for the callee's function-typed parameter at a position a named
+    /// function, by the lowered function its value calls.
+    Bound(FuncId, usize, FuncId),
+    /// Code at an address taking no environment, with the `stack N` its head demands.
+    Code(IrValue, Option<u64>),
     /// A function value at an address, with the `stack N` its type demands.
     Value(IrValue, Option<u64>),
 }
@@ -978,6 +983,21 @@ impl Lowering<'_, '_> {
             Invoked::Direct(id) => {
                 let reference = self.func_ref(fx, id);
                 fx.b.ins().call(reference, &values)
+            }
+            Invoked::Bound(callee, position, function) => {
+                let reference = self.func_ref(fx, callee);
+                let inst = fx.b.ins().call(reference, &values);
+                let bindings = vec![(position, stack::Binding::Function(function))];
+                let kind = stack::Kind::Direct { callee, bindings };
+                fx.sites.push((inst, stack::Site { kind, at: None }));
+                inst
+            }
+            Invoked::Code(code, bound) => {
+                let signature = fx.b.import_signature(abi.signature());
+                let inst = fx.b.ins().call_indirect(signature, code, &values);
+                let kind = stack::Kind::Bounded(bound);
+                fx.sites.push((inst, stack::Site { kind, at: None }));
+                inst
             }
             Invoked::Value(function, bound) => {
                 let code = fx.load(PTR, function, 0);

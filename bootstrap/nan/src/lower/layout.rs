@@ -541,6 +541,14 @@ impl Layouts {
             "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserFrame" | "hw::ExtendedState"
             | "hw::UserAddr" => self.record(ck, &[("address".to_owned(), Ty::Scalar(Scalar::U64))]),
             "hw::IdtInstalled" => pointers(1, Some(0)),
+            // A loaded bundle's job entry: the address of its code and the stack its task needs.
+            "sys::load::Job" => self.record(
+                ck,
+                &[
+                    ("code".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("stack".to_owned(), Ty::Scalar(Scalar::U64)),
+                ],
+            ),
             // An exception's trap frame: the address of the state its seam saved, and a page
             // fault's faulting address.
             "hw::TrapFrame" => self.record(

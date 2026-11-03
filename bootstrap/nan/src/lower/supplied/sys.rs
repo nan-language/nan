@@ -1,7 +1,8 @@
 //! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`,
-//! `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image
-//! through the sims, files, listeners and connections, revocation, and the submission of
-//! io_uring operations.
+//! `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, in a
+//! test image through the sims, or through the kinds serving `Random`, `Log` and `Stdio`, a
+//! machine's runtime serving no file or network operation, capabilities denying every operation,
+//! files, listeners and connections, revocation, and the submission of io_uring operations.
 //!
 //! Each operation checks its capability's entry first, reading its state words through a
 //! snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor,
@@ -14,15 +15,15 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::body::{Body, Held};
-use super::super::call::Called;
+use super::super::call::{Called, Invoked};
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tables::{self, RESOLUTION, entry, live_entry};
+use super::super::runtime::tables::{self, RESOLUTION, entry, kind, live_entry};
 use super::super::runtime::{Routine, holdings, seeded, timers};
 use super::super::transfer;
 use super::Supply;
 use super::render;
 use super::sims;
-use crate::check::ty::Ty;
+use crate::check::ty::{Ty, no_args};
 
 /// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
 /// which hosts it reaches: every host, `ONLY_HOST` or `NO_HOST`.
@@ -48,6 +49,19 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         .path
         .rsplit_once('.')
         .map_or(supply.path.as_str(), |(owner, _)| owner);
+    match (owner, supply.member()) {
+        ("sys::Fs" | "sys::Net" | "sys::WallClock", "denied") => {
+            let handle = tables::denied(lo, fx);
+            let sret = supply.sret.expect("a capability's address");
+            fx.store(handle, sret, 0);
+            supply.done(lo, fx);
+            return true;
+        }
+        ("sys::Log", "served") => return served(lo, fx, supply, kind::LOG, "LogService"),
+        ("sys::Random", "served") => return served(lo, fx, supply, kind::RANDOM, "RandomService"),
+        ("sys::Stdio", "served") => return served(lo, fx, supply, kind::STDIO, "StdioService"),
+        _ => {}
+    }
     match owner {
         "sys::Fs" => fs(lo, fx, supply),
         "sys::Net" => net(lo, fx, supply),
@@ -228,6 +242,10 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         _ => {}
     }
+    if lo.kernel() {
+        fail_with(lo, fx, supply, "Denied");
+        return;
+    }
     if lo.seeded() {
         match member {
             "open" | "create" => sims::fs::open(lo, fx, supply, directory, member == "create"),
@@ -302,6 +320,10 @@ fn descriptor(fx: &mut Fx, address: Value) -> Value {
 fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let [network, _, _, hosts] = checked(lo, fx, supply, capability);
+    if lo.kernel() && supply.member() != "only_host" {
+        fail_with(lo, fx, supply, "Denied");
+        return;
+    }
     match supply.member() {
         "only_host" => {
             let reached = reaches(lo, fx, supply, capability, hosts, supply.param(1));
@@ -486,12 +508,30 @@ pub fn clock_delay(
 
 fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let [stream, _, _, _] = checked(lo, fx, supply, capability);
-    match lo.seeded() {
-        true => sims::random_fill(lo, fx, stream, supply.param(1)),
-        false => {
-            lo.platform_call(fx, "random_fill", &[supply.param(1)]);
-        }
+    let words = checked(lo, fx, supply, capability);
+    let args = [supply.param(1)];
+    if lo.kernel() {
+        call_service(lo, fx, "RandomService", 0, &words, &args);
+    } else {
+        let served = served_entry(fx, &words);
+        fx.choose_in(
+            lo,
+            served,
+            &[],
+            |lo, fx| {
+                call_service(lo, fx, "RandomService", 0, &words, &args);
+                Vec::new()
+            },
+            |lo, fx| {
+                match lo.seeded() {
+                    true => sims::random_fill(lo, fx, words[0], args[0]),
+                    false => {
+                        lo.platform_call(fx, "random_fill", &args);
+                    }
+                }
+                Vec::new()
+            },
+        );
     }
     supply.done(lo, fx);
 }
@@ -499,29 +539,69 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let handle = fx.load(PTR, capability, 0);
-    let record = live_entry(lo, fx, handle);
-    let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+    let (live, words) = tables::snapshot(lo, fx, handle);
     let value_ty = supply.type_arg(0);
     let level = supply.member().to_owned();
     fx.when(live, |fx| {
-        if lo.seeded() {
-            sims::log_line(lo, fx, &level, supply.param(1), &value_ty, supply.param(2));
+        if lo.kernel() {
+            log_service(lo, fx, supply, &level, &words);
             return;
         }
-        let (buffer, len) = render::render_value(lo, fx, &value_ty, supply.param(2), LOG_BUDGET);
-        let rendering = new_view(fx, buffer, len);
-        let level = lo.view_literal(fx, level.as_bytes());
-        lo.platform_call(fx, "log_line", &[level, supply.param(1), rendering]);
+        let served = served_entry(fx, &words);
+        fx.choose_in(
+            lo,
+            served,
+            &[],
+            |lo, fx| {
+                log_service(lo, fx, supply, &level, &words);
+                Vec::new()
+            },
+            |lo, fx| {
+                if lo.seeded() {
+                    sims::log_line(lo, fx, &level, supply.param(1), &value_ty, supply.param(2));
+                    return Vec::new();
+                }
+                let (buffer, len) =
+                    render::render_value(lo, fx, &value_ty, supply.param(2), LOG_BUDGET);
+                let rendering = new_view(fx, buffer, len);
+                let level = lo.view_literal(fx, level.as_bytes());
+                lo.platform_call(fx, "log_line", &[level, supply.param(1), rendering]);
+                Vec::new()
+            },
+        );
     });
     supply.done(lo, fx);
 }
 
+/// Calls the `log` method of the kind serving a `Log` entry with the operation's level, message
+/// and value rendered within the log's budget.
+fn log_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, level: &str, words: &[Value; 4]) {
+    let value_ty = supply.type_arg(0);
+    let (buffer, len) = render::render_value(lo, fx, &value_ty, supply.param(2), LOG_BUDGET);
+    let rendering = new_view(fx, buffer, len);
+    let level_ty = lo.std_ty("sys", "LogLevel", Vec::new());
+    let variant = match level {
+        "info" => "Info",
+        "warn" => "Warn",
+        _ => "Error",
+    };
+    let level = lo.variant_value(fx, &level_ty, variant, &[], None);
+    let args = [level, supply.param(1), rendering];
+    call_service(lo, fx, "LogService", 0, words, &args);
+}
+
 fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let [input, _, _, _] = checked(lo, fx, supply, capability);
+    let words = checked(lo, fx, supply, capability);
+    if lo.kernel() {
+        stdio_service(lo, fx, supply, &words);
+        return;
+    }
+    let served = served_entry(fx, &words);
+    fx.when(served, |fx| stdio_service(lo, fx, supply, &words));
     if lo.seeded() {
         match supply.member() {
-            "read_in" => sims::stdio_read(lo, fx, supply, input),
+            "read_in" => sims::stdio_read(lo, fx, supply, words[0]),
             _ => sims::stdio_write(lo, fx, supply),
         }
         return;
@@ -543,6 +623,80 @@ fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
 }
 
+/// Calls the method of the kind serving a `Stdio` entry that the operation names, its failure
+/// becoming the operation's, a count read past `buf`'s length counting as that length.
+fn stdio_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, words: &[Value; 4]) {
+    let member = supply.member();
+    let method = match member {
+        "read_in" => 0,
+        "write_out" => 1,
+        _ => 2,
+    };
+    let called = call_service(lo, fx, "StdioService", method, words, &[supply.param(1)]);
+    supply.forward_failure(lo, fx, &called);
+    if member == "read_in" {
+        let (_, len) = view(fx, supply.param(1));
+        let read = fx.b.ins().umin(called.result.scalar(), len);
+        supply.ret(lo, fx, Held::Scalar(read));
+    } else {
+        supply.done(lo, fx);
+    }
+}
+
+/// Whether the state words of a `Log`, `Random` or `Stdio` entry are a served entry's, which
+/// names a method table where others hold zero.
+fn served_entry(fx: &mut Fx, words: &[Value; 4]) -> Value {
+    fx.b.ins().icmp_imm_s(IntCC::NotEqual, words[1], 0)
+}
+
+/// `C.served(service)` of `Log`, `Random` or `Stdio`: an entry of a kind deriving from the entry
+/// of the capability kind `service`, whose operations call its methods for a service interface;
+/// `Revoked.Stale` when `service` is stale.
+fn served(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, kind: i64, interface: &str) -> bool {
+    let service_ty = supply.type_arg(0);
+    let service = fx.load(PTR, supply.param(0).address(), 0);
+    let interface = lo
+        .ck
+        .db
+        .std_item("sys", interface)
+        .expect("a service interface");
+    let table = lo.dyn_table(&service_ty, interface, &no_args());
+    let table = lo.data_ref(fx, table);
+    let table = fx.b.ins().symbol_value(PTR, table);
+    let derived = tables::served(lo, fx, kind, service, table);
+    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
+    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+    let sret = supply.sret.expect("a capability's address");
+    fx.store(derived, sret, 0);
+    supply.done(lo, fx);
+    true
+}
+
+/// Calls a method of a service interface on the kind a served entry's state words name, with
+/// the operation's arguments after the kind's handle.
+fn call_service(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    interface: &str,
+    method: u32,
+    words: &[Value; 4],
+    args: &[Held],
+) -> Called {
+    let interface = lo
+        .ck
+        .db
+        .std_item("sys", interface)
+        .expect("a service interface");
+    let service = fx.slot(8, 8);
+    fx.store(words[0], service, 0);
+    let code = fx.load(PTR, words[1], 8 * (u64::from(method) + 3));
+    let abi = lo.dyn_abi(interface, &no_args(), method);
+    let (head, _) = lo.method_head(&Ty::Unit, interface, &no_args(), method);
+    let mut held = vec![Held::Address(service)];
+    held.extend_from_slice(args);
+    lo.invoke(fx, Invoked::Code(code, head.limits.stack), &abi, &held)
+}
+
 /// The operations of files, listeners and connections, through the entry each was opened by;
 /// a release completes whether or not that entry is revoked.
 fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
@@ -550,15 +704,12 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let member = supply.member();
     let descriptor = Held::Scalar(descriptor(fx, address));
     if member == "abandon" {
-        match lo.seeded() {
-            true => {
-                let holding = fx.offset(address, 8);
-                let payload = holdings::payload(fx, holding);
-                sims::abandon(lo, fx, payload);
-            }
-            false => {
-                lo.platform_call(fx, "conn_abandon", &[descriptor]);
-            }
+        if lo.seeded() {
+            let holding = fx.offset(address, 8);
+            let payload = holdings::payload(fx, holding);
+            sims::abandon(lo, fx, payload);
+        } else if !lo.kernel() {
+            lo.platform_call(fx, "conn_abandon", &[descriptor]);
         }
         let holding = fx.load(PTR, address, 8);
         lo.call_routine(fx, Routine::Unhold, &[holding]);
@@ -567,6 +718,14 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
     if member != "close" {
         check(lo, fx, supply, address);
+    }
+    if lo.kernel() {
+        if member == "close" {
+            let holding = fx.load(PTR, address, 8);
+            lo.call_routine(fx, Routine::Unhold, &[holding]);
+        }
+        fail_with(lo, fx, supply, "Denied");
+        return;
     }
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
     if lo.seeded() {

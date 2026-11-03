@@ -1,4 +1,4 @@
-//! The root grant of the nanos targets and its capability table.
+//! The root grant of the nanos targets, its capability table, and the jobs of nanos bundles.
 
 pub closed struct World {
     pub alloc: mem::Alloc
@@ -50,6 +50,128 @@ pub fn Cap.get(caps: Caps, key: Str) -> C fails CapError {
     fail CapError.Missing
 } Cap.get
 
+/// How a job ended: the encoding of its entry function's result, a host-compatible entry's exit
+/// status encoded as a `u8`, the rendering of its failure, the trap that abandoned its domain, or
+/// an input its entry does not decode.
+pub closed enum Ended {
+    Returned(mem::Bytes)
+    Failed(text::String)
+    Trapped(sys::Trap)
+    Undecodable
+} Ended
+
+pub closed enum RunError derives Render {
+    NoJob
+    Cancelled(task::Cancelled) from
+} RunError
+
+/// The input of a host-compatible entry: its arguments and environment.
+pub closed struct HostInput derives Encode {
+    pub args: mem::List[mem::Bytes]
+    pub environment: mem::Map[mem::Bytes, mem::Bytes]
+} HostInput
+
+pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait {
+    let Some(job) = bundle.job() else {
+        fail RunError.NoJob
+    }
+    let outcome = try await sys::Domain.run_sized(fn[take world, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+        return try await call(job, take world, take input)
+    }, stack: job.stack() + CALL_STACK, exec, alloc)
+    match outcome {
+        Ok(ended) => return ended
+        Err(trap) => return Ended.Trapped(take trap)
+    }
+} run
+
+/// The stack of a job's task beyond the one its entry needs, for the call of the entry.
+const CALL_STACK: usize = 4_096
+
+/// The bytes a job's failure renders into.
+const RENDERED: usize = 1_024
+
+/// Calls a job entry, which owns `world` and `input` from then on.
+fn call(job: sys::load::Job, take world: World, take input: mem::Bytes) -> Ended fails task::Cancelled uses wait
+
+/// Runs a typed entry function on the encoding of its input.
+fn typed[I: Encode, O: Encode, E: Render](take world: World, take input: mem::Bytes, main: fn(take world: World, take input: I) -> O fails E uses wait) -> Ended {
+    let alloc = world.alloc
+    let Ok(decoded) = attempt mem::wire::Codec[I].decode(Untrusted.of(input.view()), alloc) else {
+        return Ended.Undecodable
+    }
+    match attempt await main(take world, input: take decoded) {
+        Ok(output) => return returned(output, alloc)
+        Err(failure) => return failed(failure, alloc)
+    }
+} typed
+
+/// Runs a host entry function returning an exit status on the encoding of a `HostInput`.
+fn hosted[E: Render](take world: World, take input: mem::Bytes, main: fn(take world: host::World) -> u8 fails E uses wait) -> Ended {
+    let alloc = world.alloc
+    let Some(host) = host_of(take world, take input) else {
+        return Ended.Undecodable
+    }
+    match attempt await main(take host) {
+        Ok(status) => return returned(status, alloc)
+        Err(failure) => return failed(failure, alloc)
+    }
+} hosted
+
+/// Runs a host entry function returning nothing on the encoding of a `HostInput`.
+fn hosted_unit[E: Render](take world: World, take input: mem::Bytes, main: fn(take world: host::World) fails E uses wait) -> Ended {
+    let alloc = world.alloc
+    let Some(host) = host_of(take world, take input) else {
+        return Ended.Undecodable
+    }
+    match attempt await main(take host) {
+        Ok(_) => return returned(0u8, alloc)
+        Err(failure) => return failed(failure, alloc)
+    }
+} hosted_unit
+
+/// The `host::World` of a host-compatible entry: the capabilities of `world`, the wall clock its
+/// table holds under `wall` or one denying every read, and the arguments and environment the
+/// encoding of a `HostInput` gives; none when `input` does not decode.
+fn host_of(take world: World, take input: mem::Bytes) -> Option[host::World] {
+    let Ok(given) = attempt mem::wire::Codec[HostInput].decode(Untrusted.of(input.view()), alloc: world.alloc) else {
+        return None
+    }
+    let wall = match attempt Cap[sys::WallClock].get(world.caps, key: "wall") {
+        Ok(clock) => clock
+        Err(_) => sys::WallClock.denied()
+    }
+    let HostInput(args: args, environment: environment) = given
+    return Some(host_world(world.fs, net: world.net, clock: world.clock, wall: wall, random: world.random, log: world.log, stdio: world.stdio, alloc: world.alloc, exec: world.exec, args: Untrusted.of(take args), environment: Untrusted.of(take environment)))
+} host_of
+
+/// The `host::World` holding these capabilities, arguments and environment.
+fn host_world(fs: sys::Fs, net: sys::Net, clock: sys::Clock, wall: sys::WallClock, random: sys::Random, log: sys::Log, stdio: sys::Stdio, alloc: mem::Alloc, exec: task::Executor, take args: Untrusted[mem::List[mem::Bytes]], take environment: Untrusted[mem::Map[mem::Bytes, mem::Bytes]]) -> host::World
+
+fn returned[O: Encode](output: O, alloc: mem::Alloc) -> Ended {
+    return Ended.Returned(encoded(output, alloc))
+} returned
+
+fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[T].encode(value, out: mut bytes)
+    return bytes
+} encoded
+
+fn failed[E: Render](failure: E, alloc: mem::Alloc) -> Ended {
+    var buffer = Array[u8, RENDERED].filled(0)
+    let len = render_into(failure, into: mut buffer.view_mut())
+    let Some(bytes) = buffer.view().prefix(len) else {
+        return Ended.Failed(text::String.empty(alloc))
+    }
+    match attempt text::String.try_from_utf8(bytes, alloc) {
+        Ok(text) => return Ended.Failed(take text)
+        Err(_) => return Ended.Failed(text::String.empty(alloc))
+    }
+} failed
+
+/// Renders a value into `into` within a budget of its length, giving the bytes written.
+fn render_into[T: Render](value: T, mut into: SliceMut[u8]) -> usize
+
 /// A capability a table holds: its key, the tag of its type and its handle.
 struct Held {
     key: text::String
@@ -66,6 +188,79 @@ fn Cap.handle(capability: C) -> u64 limits pure, notrap, terminates
 /// The capability whose handle a table holds under the type's tag.
 fn Cap.of_handle(word: u64) -> C limits pure, notrap, terminates
 
+
+/// The nanos world of a test's world, its table empty.
+fn tested(world: host::World) -> World {
+    return World(alloc: world.alloc, exec: world.exec, clock: world.clock, random: world.random, log: world.log, stdio: world.stdio, fs: world.fs, net: world.net, caps: Caps.empty(world.alloc))
+} tested
+
+enum Odd derives Render {
+    Odd
+    Cancelled(task::Cancelled) from
+} Odd
+
+fn halved(take world: World, take input: u32) -> u32 fails Odd {
+    if input % 2 == 1 {
+        fail Odd.Odd
+    }
+    return input / 2
+} halved
+
+enum Walled derives Render {
+    Revoked(sys::Revoked) from
+    Cancelled(task::Cancelled) from
+} Walled
+
+fn walled(take world: host::World) -> u8 fails Walled {
+    discard try world.wall.now_ns()
+    return 1
+} walled
+
+fn printed(take world: host::World) fails Walled {
+    discard try world.clock.elapsed_ns()
+} printed
+
+test typed_jobs_return_decode_and_fail for typed {
+    let world = testing::world()
+    let even = typed(tested(world), input: encoded(42u32, alloc: world.alloc), main: halved)
+    let odd = typed(tested(world), input: encoded(7u32, alloc: world.alloc), main: halved)
+    let undecodable = typed(tested(world), input: mem::Bytes.empty(world.alloc), main: halved)
+    let half = match even {
+        Ended.Returned(bytes) => attempt mem::wire::Codec[u32].decode(Untrusted.of(bytes.view()), alloc: world.alloc) == Ok(21)
+        else => false
+    }
+    let failure = match odd {
+        Ended.Failed(text) => text.as_str() == "Odd.Odd"
+        else => false
+    }
+    let refused = match undecodable {
+        Ended.Undecodable => true
+        else => false
+    }
+    expect half
+    expect failure
+    expect refused
+} typed_jobs_return_decode_and_fail
+
+test host_jobs_get_a_denied_wall_clock for hosted {
+    let world = testing::world()
+    var args = mem::List[mem::Bytes].empty(world.alloc)
+    mut args.push(mem::Bytes.empty(world.alloc))
+    mut args.push(mem::Bytes.empty(world.alloc))
+    let input = HostInput(args: take args, environment: mem::Map[mem::Bytes, mem::Bytes].empty(world.alloc))
+    let denied = hosted(tested(world), input: encoded(input, alloc: world.alloc), main: walled)
+    let ended = hosted_unit(tested(world), input: encoded(input, alloc: world.alloc), main: printed)
+    let failure = match denied {
+        Ended.Failed(text) => text.as_str() == "Walled.Revoked(Revoked.Stale)"
+        else => false
+    }
+    let status = match ended {
+        Ended.Returned(bytes) => attempt mem::wire::Codec[u8].decode(Untrusted.of(bytes.view()), alloc: world.alloc) == Ok(0)
+        else => false
+    }
+    expect failure
+    expect status
+} host_jobs_get_a_denied_wall_clock
 
 test lookups_match_key_and_type for Cap.get {
     let world = testing::world()

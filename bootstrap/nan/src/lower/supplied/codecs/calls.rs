@@ -124,7 +124,7 @@ fn encode_kind(
         }
         Kind::Unsigned(scalar) | Kind::Signed(scalar) => {
             let loaded = fx.load(
-                super::super::super::layout::scalar_type(*scalar, lo.machine()),
+                super::super::super::layout::scalar_type(*scalar, lo.float_bits()),
                 value,
                 0,
             );
@@ -153,7 +153,7 @@ fn encode_kind(
         }
         Kind::Float(scalar) => {
             let loaded = fx.load(
-                super::super::super::layout::scalar_type(*scalar, lo.machine()),
+                super::super::super::layout::scalar_type(*scalar, lo.float_bits()),
                 value,
                 0,
             );

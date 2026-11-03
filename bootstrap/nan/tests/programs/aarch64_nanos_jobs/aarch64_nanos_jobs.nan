@@ -1,0 +1,349 @@
+//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs and standard streams on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, and jobs that trap, fail and return.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+registers FwCfg {
+    data: u8 at 0x0 read
+    selector: u16 at 0x8 write
+} FwCfg
+
+/// The fw_cfg key of the file directory, and the bytes of a file's name in it.
+const DIRECTORY: u16 = 0x19
+
+const NAME_BYTES: usize = 56
+
+/// The seed of the key the harness signs the bundles with.
+const SEED: Array[u8, 32] = Array[u8, 32].filled(7)
+
+/// The readings the averaging job takes and the summary it gives, as it declares them.
+pub closed struct Readings derives Encode {
+    pub values: mem::List[u32]
+} Readings
+
+pub closed struct Summary derives Encode {
+    pub mean_milli: u64
+    pub lanes: u64
+    pub entropy: u64
+} Summary
+
+/// The serial port serving a job's log and standard streams, its record counting the bytes of
+/// standard input it has given.
+struct Console {
+} Console
+
+impl Console: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Console: sys::LogService
+
+impl Console: sys::StdioService
+
+/// A random source serving the bytes of a counter.
+struct Counter {
+} Counter
+
+impl Counter: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Counter: sys::RandomService
+
+fn Console.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
+    match level {
+        sys::LogLevel.Info => say(text: "log info ")
+        sys::LogLevel.Warn => say(text: "log warn ")
+        sys::LogLevel.Error => say(text: "log error ")
+    }
+    say(text: message)
+    say(text: ": ")
+    say(text: value)
+    say(text: "\n")
+} Console.log
+
+fn Console.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError limits stack 4_096 {
+    let input = b"from the kernel"
+    let given = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(input.len())))
+    let Some(Some(start)) = given else {
+        fail sys::StdioError.Closed
+    }
+    if start > 0 {
+        return 0
+    }
+    var count: usize = 0
+    while count < buf.len() and count < input.len() {
+        buf[count] = input[count]
+        count += 1
+    }
+    return count
+} Console.read_in
+
+fn Console.write_out(self, data: Slice[u8]) limits stack 4_096 {
+    say(text: "out ")
+    say_bytes(data)
+} Console.write_out
+
+fn Console.write_err(self, data: Slice[u8]) limits stack 4_096 {
+    say(text: "err ")
+    say_bytes(data)
+} Console.write_err
+
+fn Counter.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    let given = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(buf.len())))
+    let start = given.value_or(None).value_or(0)
+    for index in 0..<buf.len() {
+        buf[index] = u8.truncate(start + u64.widen(index))
+    }
+} Counter.fill
+
+fn say(text: Str) {
+    say_bytes(text.as_bytes())
+} say
+
+fn say_bytes(bytes: Slice[u8]) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in bytes {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say_bytes
+
+fn say_number(value: u64) {
+    var digits = Array[u8, 20].filled(0)
+    var count: usize = 0
+    var left = value
+    loop {
+        digits[count] = b'0' + u8.truncate(left % 10)
+        count += 1
+        left = left / 10
+        if left == 0 {
+            break
+        }
+    }
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    while count > 0 {
+        count -= 1
+        mut port.write(Pl011.data, value: digits[count])
+    }
+    take port.unmap()
+} say_number
+
+/// Reads a big-endian number of `count` bytes from the fw_cfg data register.
+fn read_be(mut fw_cfg: hw::Mmio[FwCfg], count: u32) -> u64 {
+    var value: u64 = 0
+    for _ in 0..<count {
+        value = (value << 8) | u64.widen(mut fw_cfg.read(FwCfg.data))
+    }
+    return value
+} read_be
+
+/// Selects a fw_cfg item, whose key the selector register takes big-endian.
+fn select(mut fw_cfg: hw::Mmio[FwCfg], key: u16) {
+    mut fw_cfg.write(FwCfg.selector, value: (key << 8) | (key >> 8))
+} select
+
+/// The fw_cfg file of a name: its key and size, a zero key when there is none.
+struct Found derives Copy {
+    key: u16
+    size: u64
+} Found
+
+fn find_file(mut fw_cfg: hw::Mmio[FwCfg], name: Str) -> Found {
+    var found = Found(key: 0, size: 0)
+    for _ in 0..<read_be(mut fw_cfg, count: 4) {
+        let size = read_be(mut fw_cfg, count: 4)
+        let key = u16.truncate(read_be(mut fw_cfg, count: 2))
+        discard read_be(mut fw_cfg, count: 2)
+        var same = true
+        for index in 0..<NAME_BYTES {
+            let byte = mut fw_cfg.read(FwCfg.data)
+            var wanted: u8 = 0
+            if index < name.as_bytes().len() {
+                wanted = name.as_bytes()[index]
+            }
+            same = same and byte == wanted
+        }
+        if same {
+            found = Found(key: key, size: size)
+        }
+    }
+    return found
+} find_file
+
+/// The bytes of the fw_cfg file of a name, empty when there is none.
+fn fw_file(name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var fw_cfg = trusted "the virt board maps fw_cfg at 0x0902_0000 and nothing else maps it" { hw::Mmio[FwCfg].map(0x0902_0000) }
+    select(mut fw_cfg, key: DIRECTORY)
+    let found = find_file(mut fw_cfg, name)
+    var bytes = mem::Bytes.empty(alloc)
+    if found.key != 0 {
+        select(mut fw_cfg, key: found.key)
+        for _ in 0..<found.size {
+            mut bytes.push(mut fw_cfg.read(FwCfg.data))
+        }
+    }
+    take fw_cfg.unmap()
+    return bytes
+} fw_file
+
+fn stop(text: Str) -> Never {
+    say(text)
+    loop {
+    }
+} stop
+
+/// The bundle of a fw_cfg file, verified and loaded.
+fn loaded(loader: sys::load::Loader, name: Str, alloc: mem::Alloc) -> sys::load::Bundle {
+    let bytes = fw_file(name, alloc)
+    let keys = Array[core::crypto::PublicKey, 1].filled(core::crypto::SecretKey.of_seed(SEED).public_key())
+    let Ok(prepared) = attempt loader.prepare(bytes.view(), keys: keys.view(), alloc) else {
+        stop(text: "unverified\n")
+    }
+    let Ok(bundle) = attempt take prepared.load() else {
+        stop(text: "unloadable\n")
+    }
+    return bundle
+} loaded
+
+/// What the kernel gives every job.
+struct Grants derives Copy {
+    clock: sys::Clock
+    wall: Option[sys::WallClock]
+    console: Console
+    counter: Counter
+    exec: task::Executor
+    alloc: mem::Alloc
+} Grants
+
+/// The world of a job: its log, standard streams and random source served, its file system and
+/// network denied, and the wall clock in its table.
+fn granted(grants: Grants) -> nanos::World {
+    var caps = nanos::Caps.empty(grants.alloc)
+    match grants.wall {
+        Some(wall) => mut nanos::Cap[sys::WallClock].put(mut caps, key: "wall", capability: wall)
+        None => {}
+    }
+    let Ok(log) = attempt sys::Log.served(grants.console) else {
+        stop(text: "no log\n")
+    }
+    let Ok(stdio) = attempt sys::Stdio.served(grants.console) else {
+        stop(text: "no stdio\n")
+    }
+    let Ok(random) = attempt sys::Random.served(grants.counter) else {
+        stop(text: "no random\n")
+    }
+    return nanos::World(alloc: grants.alloc, exec: grants.exec, clock: grants.clock, random: random, log: log, stdio: stdio, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: take caps)
+} granted
+
+/// Loads the bundle of a fw_cfg file, runs its job on each input and unloads it, writing a line
+/// naming how each run ended, and gives what each run returned, empty for a run returning
+/// nothing.
+fn ran(loader: sys::load::Loader, name: Str, file: Str, grants: Grants, take inputs: mem::List[mem::Bytes]) -> mem::List[mem::Bytes] fails task::Cancelled uses wait {
+    var left = inputs
+    var results = mem::List[mem::Bytes].empty(grants.alloc)
+    var stopped: Option[task::Cancelled] = None
+    let bundle = loaded(loader, name: file, alloc: grants.alloc)
+    while left.len() > 0 {
+        let input = mut left.remove(0)
+        let outcome = attempt await nanos::run(bundle, world: granted(grants), take input, exec: grants.exec, alloc: grants.alloc)
+        say(text: name)
+        var returned = mem::Bytes.empty(grants.alloc)
+        match outcome {
+            Ok(nanos::Ended.Returned(bytes)) => {
+                say(text: " returned\n")
+                returned = bytes
+            }
+            Ok(nanos::Ended.Failed(rendered)) => {
+                say(text: " failed ")
+                say(text: rendered.as_str())
+                say(text: "\n")
+            }
+            Ok(nanos::Ended.Trapped(trap)) => {
+                match trap.kind() {
+                    sys::TrapKind.DivisionByZero => say(text: " trapped trap.division-by-zero\n")
+                    else => say(text: " trapped otherwise\n")
+                }
+            }
+            Ok(nanos::Ended.Undecodable) => say(text: " undecodable\n")
+            Err(nanos::RunError.NoJob) => say(text: " has no job\n")
+            Err(nanos::RunError.Cancelled(cancelled)) => {
+                stopped = Some(take cancelled)
+                break
+            }
+        }
+        mut results.push(take returned)
+    }
+    take bundle.unload()
+    match stopped {
+        Some(cancelled) => fail cancelled
+        None => return results
+    }
+} ran
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    let wall = k.wall_clock()
+    let Some(loader) = k.loader() else {
+        stop(text: "no loader\n")
+    }
+    take k.anchor(0u8, run: fn[take loader](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
+        let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let grants = Grants(clock: clock, wall: wall, console: consoles.mint(0), counter: counters.mint(0), exec: exec, alloc: alloc)
+        let served = attempt await serve(loader, grants)
+        take consoles.close()
+        take counters.close()
+        discard served
+    })
+} main
+
+fn serve(loader: sys::load::Loader, grants: Grants) fails task::Cancelled uses wait {
+    var values = mem::List[u32].empty(grants.alloc)
+    mut values.push(2)
+    mut values.push(4)
+    mut values.push(9)
+    var averaged = mem::List[mem::Bytes].empty(grants.alloc)
+    mut averaged.push(encoded(Readings(values: take values), alloc: grants.alloc))
+    var garbage = mem::Bytes.empty(grants.alloc)
+    mut garbage.push(0xFF)
+    mut averaged.push(take garbage)
+    let summaries = try await ran(loader, name: "average", file: "opt/nan/average", grants, inputs: take averaged)
+    match attempt mem::wire::Codec[Summary].decode(Untrusted.of(summaries[0].view()), alloc: grants.alloc) {
+        Ok(summary) => {
+            say(text: "mean ")
+            say_number(summary.mean_milli)
+            say(text: " lanes ")
+            say_number(summary.lanes)
+            say(text: " entropy ")
+            say_number(summary.entropy)
+            say(text: "\n")
+        }
+        Err(_) => say(text: "summary undecodable\n")
+    }
+    var args = mem::List[mem::Bytes].empty(grants.alloc)
+    var arg = mem::Bytes.empty(grants.alloc)
+    for byte in b"kernel" {
+        mut arg.push(byte)
+    }
+    mut args.push(take arg)
+    let host = nanos::HostInput(args: take args, environment: mem::Map[mem::Bytes, mem::Bytes].empty(grants.alloc))
+    var greeted = mem::List[mem::Bytes].empty(grants.alloc)
+    mut greeted.push(encoded(host, alloc: grants.alloc))
+    let statuses = try await ran(loader, name: "greet", file: "opt/nan/greet", grants, inputs: take greeted)
+    say(text: "status ")
+    say_number(u64.widen(statuses[0][0]))
+    say(text: "\n")
+    var divisors = mem::List[mem::Bytes].empty(grants.alloc)
+    mut divisors.push(encoded(0u32, alloc: grants.alloc))
+    mut divisors.push(encoded(1u32, alloc: grants.alloc))
+    mut divisors.push(encoded(4u32, alloc: grants.alloc))
+    let quotients = try await ran(loader, name: "crash", file: "opt/nan/crash", grants, inputs: take divisors)
+    say(text: "quotient ")
+    say_number(u64.widen(quotients[2][0]))
+    say(text: "\n")
+} serve
+
+fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[T].encode(value, out: mut bytes)
+    return bytes
+} encoded

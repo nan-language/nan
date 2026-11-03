@@ -90,6 +90,7 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
 | `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
+| `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService` | [Served capabilities](14-authority.md#served-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
 | `sys` | `sys::Domain`, `sys::Abandoner`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
@@ -101,7 +102,7 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
 | `sys` | `sys::Resume`, `sys::ResumeReason`, `sys::Pressure`, `sys::Health`, `sys::HealthReply`, `sys::Suspend` | [System interfaces](26-components.md#system-interfaces) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
-| `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
+| `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Job`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
 | `sys` | `sys::load::Table` | [Loaded registries](25-registries.md#loaded-registries) |
 | `hw` | `hw::Ptr` | [Pointers](23-low-level.md#pointers); atomic members in [Trusted atomics](23-low-level.md#trusted-atomics) |
 | `hw` | `hw::Order`, `hw::fence` | [Trusted atomics](23-low-level.md#trusted-atomics) |
@@ -133,6 +134,7 @@ The table names every pub std type, interface, free function and registry with t
 | `host` | `host::World` | [Root grants](14-authority.md#root-grants) |
 | `host` | `host::Runner` | [Runner](26-components.md#runner) |
 | `nanos` | `nanos::World`, `nanos::Caps`, `nanos::Cap`, `nanos::CapError` | [Root grants](14-authority.md#root-grants) |
+| `nanos` | `nanos::Ended`, `nanos::RunError`, `nanos::HostInput`, `nanos::run` | [Jobs](14-authority.md#jobs) |
 | `testing` | `testing::world`, `testing::same` | [Simulated capabilities](22-testing.md#simulated-capabilities) |
 
 ## Array and slice members
@@ -300,7 +302,7 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::PageTableRoot`, `hw::ExtendedState`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; `sys::load::Table.read`, whose receiver only a loaded registry, which no std package declares, gives; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Job`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::PageTableRoot`, `hw::ExtendedState`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; `sys::load::Table.read`, whose receiver only a loaded registry, which no std package declares, gives; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority

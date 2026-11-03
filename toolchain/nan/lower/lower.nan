@@ -155,6 +155,8 @@ pkg struct Lowered {
     pkg codes: Option[object::CodesEntry]
     /// The entries a bundle adds to loaded registries.
     pkg contributed: mem::List[image::LoadedEntry]
+    /// For a nanos program's bundle, the stack its job's task needs.
+    pkg job: Option[u64]
 } Lowered
 
 /// Two entities lowered with one host symbol name, as diagnostics name them: the one named
@@ -196,6 +198,7 @@ pkg struct Program {
 /// What a bundle's build lowers: the entries its contributions add to loaded registries.
 pkg struct BundleProgram {
     pkg contributions: mem::List[BundleContribution]
+    pkg entry: Option[ty::ItemId]
     pkg roots: mem::List[ty::PackageId]
     pkg prefixes: mem::HashMap[text::String, text::String]
     /// The codegen level of the kernel's interface.
@@ -361,8 +364,17 @@ pkg fn lower_bundle(ck: check::Checker, bundle: BundleProgram) -> Lowered {
         let contributed = mut lowering.contributed_entry(contribution.item, registry_item: contribution.registry_item)
         mut lowering.contributed.push(take contributed)
     }
+    var job: Option[u64] = None
+    match bundle.entry {
+        Some(entry) => {
+            job = Some(mut lowering.job_entry(entry))
+        }
+        None => {}
+    }
     mut lowering.drain()
-    return take lowering.finish(None)
+    var lowered = take lowering.finish(None)
+    lowered.job = job
+    return lowered
 } lower_bundle
 
 /// A copy of the package names of a final closure with the prefix their symbols carry.
@@ -427,10 +439,17 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
     )
 } Lowering.new
 
-/// Whether the image runs on a machine target, a UEFI or bare one.
+/// Whether the image's code runs on a machine's runtime: an image of a UEFI or bare target, or
+/// a bundle of a nanos target, which runs on its kernel's.
 fn Lowering.machine(self) -> bool {
-    return self.ck.db().target.is_machine()
+    return self.ck.db().target.is_machine() or self.ck.db().target.is_nanos()
 } Lowering.machine
+
+/// Whether the image's code keeps floats and lanes in general registers as bit patterns, as
+/// code of a machine target does.
+fn Lowering.float_bits(self) -> bool {
+    return self.ck.db().target.is_machine()
+} Lowering.float_bits
 
 /// Whether the image runs a kernel's executor, under interrupts: a machine image other than
 /// a test image, whose runs keep interrupts disabled.
@@ -523,7 +542,7 @@ fn Lowering.define_instance(mut self, instance: Instance, id: object::FuncId) {
 fn Lowering.lower_instance(mut self, mut fx: Fx, instance: Instance, abi: Abi) {
     match instance {
         Instance.Nir(item: item, role: role, index: index, args: args) => {
-            if role == nir::Role.Body and not self.machine() and self.ck.db().is_std(item) and simd_vectorized(self.ck.db().canonical(item).as_str()) {
+            if role == nir::Role.Body and not self.float_bits() and self.ck.db().is_std(item) and simd_vectorized(self.ck.db().canonical(item).as_str()) {
                 simd_lower_vector(mut self, mut fx, abi, item, args)
             } else {
                 body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
@@ -864,7 +883,7 @@ fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lower
     }
     let codes = self.module.codes_entry()
     let image_bytes = take self.module.finish(closure, alloc: self.alloc)
-    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped, codes: take codes, contributed: take self.contributed)
+    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped, codes: take codes, contributed: take self.contributed, job: None)
 } Lowering.finish
 
 /// The calling convention of every lowered function.

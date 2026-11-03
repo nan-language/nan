@@ -374,10 +374,13 @@ pub fn current_domain(lo: &mut Lowering, fx: &mut Fx) -> Value {
 const ENTRY_STACKS: &str = "_NSentry_stacks";
 
 impl Lowering<'_, '_> {
-    /// Records the code of a task entry with its own `limits stack N`, when N passes the
-    /// default task stack.
+    /// Records the code of a task entry with its own `limits stack N`, and the stack the extended
+    /// state its glue owns takes, when that passes the default task stack.
     pub fn entry_stack(&mut self, code: FuncId, own: Option<u64>) {
-        if let Some(stack) = own.filter(|stack| *stack > STACK)
+        let owned = self.owned_stack();
+        if let Some(stack) = own
+            .map(|stack| stack + owned)
+            .filter(|stack| *stack > STACK)
             && !self.entry_stacks.contains(&(code, stack))
         {
             self.entry_stacks.push((code, stack));

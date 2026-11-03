@@ -13310,7 +13310,7 @@ const TEXT_MEM_WIRE_WIRE: Str =
     \\
 
 const TEXT_NANOS_NANOS: Str =
-    \\//! The root grant of the nanos targets and its capability table.
+    \\//! The root grant of the nanos targets, its capability table, and the jobs of nanos bundles.
     \\
     \\pub closed struct World {
     \\    pub alloc: mem::Alloc
@@ -13362,6 +13362,128 @@ const TEXT_NANOS_NANOS: Str =
     \\    fail CapError.Missing
     \\} Cap.get
     \\
+    \\/// How a job ended: the encoding of its entry function's result, a host-compatible entry's exit
+    \\/// status encoded as a `u8`, the rendering of its failure, the trap that abandoned its domain, or
+    \\/// an input its entry does not decode.
+    \\pub closed enum Ended {
+    \\    Returned(mem::Bytes)
+    \\    Failed(text::String)
+    \\    Trapped(sys::Trap)
+    \\    Undecodable
+    \\} Ended
+    \\
+    \\pub closed enum RunError derives Render {
+    \\    NoJob
+    \\    Cancelled(task::Cancelled) from
+    \\} RunError
+    \\
+    \\/// The input of a host-compatible entry: its arguments and environment.
+    \\pub closed struct HostInput derives Encode {
+    \\    pub args: mem::List[mem::Bytes]
+    \\    pub environment: mem::Map[mem::Bytes, mem::Bytes]
+    \\} HostInput
+    \\
+    \\pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait {
+    \\    let Some(job) = bundle.job() else {
+    \\        fail RunError.NoJob
+    \\    }
+    \\    let outcome = try await sys::Domain.run_sized(fn[take world, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+    \\        return try await call(job, take world, take input)
+    \\    }, stack: job.stack() + CALL_STACK, exec, alloc)
+    \\    match outcome {
+    \\        Ok(ended) => return ended
+    \\        Err(trap) => return Ended.Trapped(take trap)
+    \\    }
+    \\} run
+    \\
+    \\/// The stack of a job's task beyond the one its entry needs, for the call of the entry.
+    \\const CALL_STACK: usize = 4_096
+    \\
+    \\/// The bytes a job's failure renders into.
+    \\const RENDERED: usize = 1_024
+    \\
+    \\/// Calls a job entry, which owns `world` and `input` from then on.
+    \\fn call(job: sys::load::Job, take world: World, take input: mem::Bytes) -> Ended fails task::Cancelled uses wait
+    \\
+    \\/// Runs a typed entry function on the encoding of its input.
+    \\fn typed[I: Encode, O: Encode, E: Render](take world: World, take input: mem::Bytes, main: fn(take world: World, take input: I) -> O fails E uses wait) -> Ended {
+    \\    let alloc = world.alloc
+    \\    let Ok(decoded) = attempt mem::wire::Codec[I].decode(Untrusted.of(input.view()), alloc) else {
+    \\        return Ended.Undecodable
+    \\    }
+    \\    match attempt await main(take world, input: take decoded) {
+    \\        Ok(output) => return returned(output, alloc)
+    \\        Err(failure) => return failed(failure, alloc)
+    \\    }
+    \\} typed
+    \\
+    \\/// Runs a host entry function returning an exit status on the encoding of a `HostInput`.
+    \\fn hosted[E: Render](take world: World, take input: mem::Bytes, main: fn(take world: host::World) -> u8 fails E uses wait) -> Ended {
+    \\    let alloc = world.alloc
+    \\    let Some(host) = host_of(take world, take input) else {
+    \\        return Ended.Undecodable
+    \\    }
+    \\    match attempt await main(take host) {
+    \\        Ok(status) => return returned(status, alloc)
+    \\        Err(failure) => return failed(failure, alloc)
+    \\    }
+    \\} hosted
+    \\
+    \\/// Runs a host entry function returning nothing on the encoding of a `HostInput`.
+    \\fn hosted_unit[E: Render](take world: World, take input: mem::Bytes, main: fn(take world: host::World) fails E uses wait) -> Ended {
+    \\    let alloc = world.alloc
+    \\    let Some(host) = host_of(take world, take input) else {
+    \\        return Ended.Undecodable
+    \\    }
+    \\    match attempt await main(take host) {
+    \\        Ok(_) => return returned(0u8, alloc)
+    \\        Err(failure) => return failed(failure, alloc)
+    \\    }
+    \\} hosted_unit
+    \\
+    \\/// The `host::World` of a host-compatible entry: the capabilities of `world`, the wall clock its
+    \\/// table holds under `wall` or one denying every read, and the arguments and environment the
+    \\/// encoding of a `HostInput` gives; none when `input` does not decode.
+    \\fn host_of(take world: World, take input: mem::Bytes) -> Option[host::World] {
+    \\    let Ok(given) = attempt mem::wire::Codec[HostInput].decode(Untrusted.of(input.view()), alloc: world.alloc) else {
+    \\        return None
+    \\    }
+    \\    let wall = match attempt Cap[sys::WallClock].get(world.caps, key: "wall") {
+    \\        Ok(clock) => clock
+    \\        Err(_) => sys::WallClock.denied()
+    \\    }
+    \\    let HostInput(args: args, environment: environment) = given
+    \\    return Some(host_world(world.fs, net: world.net, clock: world.clock, wall: wall, random: world.random, log: world.log, stdio: world.stdio, alloc: world.alloc, exec: world.exec, args: Untrusted.of(take args), environment: Untrusted.of(take environment)))
+    \\} host_of
+    \\
+    \\/// The `host::World` holding these capabilities, arguments and environment.
+    \\fn host_world(fs: sys::Fs, net: sys::Net, clock: sys::Clock, wall: sys::WallClock, random: sys::Random, log: sys::Log, stdio: sys::Stdio, alloc: mem::Alloc, exec: task::Executor, take args: Untrusted[mem::List[mem::Bytes]], take environment: Untrusted[mem::Map[mem::Bytes, mem::Bytes]]) -> host::World
+    \\
+    \\fn returned[O: Encode](output: O, alloc: mem::Alloc) -> Ended {
+    \\    return Ended.Returned(encoded(output, alloc))
+    \\} returned
+    \\
+    \\fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
+    \\    var bytes = mem::Bytes.empty(alloc)
+    \\    mem::wire::Codec[T].encode(value, out: mut bytes)
+    \\    return bytes
+    \\} encoded
+    \\
+    \\fn failed[E: Render](failure: E, alloc: mem::Alloc) -> Ended {
+    \\    var buffer = Array[u8, RENDERED].filled(0)
+    \\    let len = render_into(failure, into: mut buffer.view_mut())
+    \\    let Some(bytes) = buffer.view().prefix(len) else {
+    \\        return Ended.Failed(text::String.empty(alloc))
+    \\    }
+    \\    match attempt text::String.try_from_utf8(bytes, alloc) {
+    \\        Ok(text) => return Ended.Failed(take text)
+    \\        Err(_) => return Ended.Failed(text::String.empty(alloc))
+    \\    }
+    \\} failed
+    \\
+    \\/// Renders a value into `into` within a budget of its length, giving the bytes written.
+    \\fn render_into[T: Render](value: T, mut into: SliceMut[u8]) -> usize
+    \\
     \\/// A capability a table holds: its key, the tag of its type and its handle.
     \\struct Held {
     \\    key: text::String
@@ -13378,6 +13500,79 @@ const TEXT_NANOS_NANOS: Str =
     \\/// The capability whose handle a table holds under the type's tag.
     \\fn Cap.of_handle(word: u64) -> C limits pure, notrap, terminates
     \\
+    \\
+    \\/// The nanos world of a test's world, its table empty.
+    \\fn tested(world: host::World) -> World {
+    \\    return World(alloc: world.alloc, exec: world.exec, clock: world.clock, random: world.random, log: world.log, stdio: world.stdio, fs: world.fs, net: world.net, caps: Caps.empty(world.alloc))
+    \\} tested
+    \\
+    \\enum Odd derives Render {
+    \\    Odd
+    \\    Cancelled(task::Cancelled) from
+    \\} Odd
+    \\
+    \\fn halved(take world: World, take input: u32) -> u32 fails Odd {
+    \\    if input % 2 == 1 {
+    \\        fail Odd.Odd
+    \\    }
+    \\    return input / 2
+    \\} halved
+    \\
+    \\enum Walled derives Render {
+    \\    Revoked(sys::Revoked) from
+    \\    Cancelled(task::Cancelled) from
+    \\} Walled
+    \\
+    \\fn walled(take world: host::World) -> u8 fails Walled {
+    \\    discard try world.wall.now_ns()
+    \\    return 1
+    \\} walled
+    \\
+    \\fn printed(take world: host::World) fails Walled {
+    \\    discard try world.clock.elapsed_ns()
+    \\} printed
+    \\
+    \\test typed_jobs_return_decode_and_fail for typed {
+    \\    let world = testing::world()
+    \\    let even = typed(tested(world), input: encoded(42u32, alloc: world.alloc), main: halved)
+    \\    let odd = typed(tested(world), input: encoded(7u32, alloc: world.alloc), main: halved)
+    \\    let undecodable = typed(tested(world), input: mem::Bytes.empty(world.alloc), main: halved)
+    \\    let half = match even {
+    \\        Ended.Returned(bytes) => attempt mem::wire::Codec[u32].decode(Untrusted.of(bytes.view()), alloc: world.alloc) == Ok(21)
+    \\        else => false
+    \\    }
+    \\    let failure = match odd {
+    \\        Ended.Failed(text) => text.as_str() == "Odd.Odd"
+    \\        else => false
+    \\    }
+    \\    let refused = match undecodable {
+    \\        Ended.Undecodable => true
+    \\        else => false
+    \\    }
+    \\    expect half
+    \\    expect failure
+    \\    expect refused
+    \\} typed_jobs_return_decode_and_fail
+    \\
+    \\test host_jobs_get_a_denied_wall_clock for hosted {
+    \\    let world = testing::world()
+    \\    var args = mem::List[mem::Bytes].empty(world.alloc)
+    \\    mut args.push(mem::Bytes.empty(world.alloc))
+    \\    mut args.push(mem::Bytes.empty(world.alloc))
+    \\    let input = HostInput(args: take args, environment: mem::Map[mem::Bytes, mem::Bytes].empty(world.alloc))
+    \\    let denied = hosted(tested(world), input: encoded(input, alloc: world.alloc), main: walled)
+    \\    let ended = hosted_unit(tested(world), input: encoded(input, alloc: world.alloc), main: printed)
+    \\    let failure = match denied {
+    \\        Ended.Failed(text) => text.as_str() == "Walled.Revoked(Revoked.Stale)"
+    \\        else => false
+    \\    }
+    \\    let status = match ended {
+    \\        Ended.Returned(bytes) => attempt mem::wire::Codec[u8].decode(Untrusted.of(bytes.view()), alloc: world.alloc) == Ok(0)
+    \\        else => false
+    \\    }
+    \\    expect failure
+    \\    expect status
+    \\} host_jobs_get_a_denied_wall_clock
     \\
     \\test lookups_match_key_and_type for Cap.get {
     \\    let world = testing::world()
@@ -13602,10 +13797,14 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\pub open struct Table[E: Any] {
     \\} Table
     \\
-    \\/// A placed image: its placement, the entries it adds, the target records its gates named, and
-    \\/// the allocator of this bookkeeping.
+    \\pub open struct Job derives Copy {
+    \\} Job
+    \\
+    \\/// A placed image: its placement, its job entry, the entries it adds, the target records its
+    \\/// gates named, and the allocator of this bookkeeping.
     \\struct Placed {
     \\    placement: Placement
+    \\    job: Option[Job]
     \\    contributions: mem::List[Contribution]
     \\    targets: mem::List[u64]
     \\    alloc: mem::Alloc
@@ -13689,6 +13888,9 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    contributions: Span
     \\    read_only: u64
     \\    writable: u64
+    \\    job: bool
+    \\    entry: u64
+    \\    stack: u64
     \\} Parts
     \\
     \\/// A signature section: the public key and the signature.
@@ -13777,12 +13979,21 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    retire_placement(current.placement, targets: current.targets.view())
     \\} Bundle.unload
     \\
+    \\pub fn Bundle.job(self) -> Option[Job] {
+    \\    return self.current.job
+    \\} Bundle.job
+    \\
+    \\pub fn Job.stack(self) -> usize
+    \\
     \\pub fn Table.read[T: Any](self, body: fn(entries: Slice[E]) -> T) -> T {
     \\    let holding = pin(self.record())
     \\    let result = body(self.pinned(holding))
     \\    unpin(holding)
     \\    return result
     \\} Table.read
+    \\
+    \\/// The job entry whose code lies at an address of the window and whose task needs `stack` bytes.
+    \\fn Job.at(entry: u64, stack: u64) -> Job
     \\
     \\/// The address of the kernel's export table, zero in an image that exports none.
     \\fn exports() -> u64
@@ -13827,7 +14038,8 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    }
     \\    let image = u64.widen(parts.image.len)
     \\    let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
-    \\    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered {
+    \\    let coded = not parts.job or parts.entry < parts.read_only
+    \\    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered or not coded {
     \\        fail LoadError.Malformed
     \\    }
     \\    let pages = (parts.size + PAGE - 1) / PAGE
@@ -13862,7 +14074,11 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    unlock(table)
     \\    sync(window, len: pages * PAGE)
     \\    let placement = Placement(memory: memory, window: window, pages: pages, lines: lines)
-    \\    return Prepared(placed: Placed(placement: placement, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
+    \\    var job: Option[Job] = None
+    \\    if parts.job {
+    \\        job = Some(Job.at(window + parts.entry, stack: parts.stack))
+    \\    }
+    \\    return Prepared(placed: Placed(placement: placement, job: job, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
     \\} place
     \\
     \\/// Relocates and binds the image copied at `base` for its address in the window, giving the
@@ -13876,7 +14092,7 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\/// The parts a bundle's body records, keyed from 1.
     \\fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
     \\    let empty = Span(start: 0, len: 0)
-    \\    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0)
+    \\    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0)
     \\    var reader = Reader(at: body.start, end: body.start + body.len)
     \\    var last: u64 = 0
     \\    var held: u64 = 0
@@ -13922,6 +14138,15 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\                    fail LoadError.Malformed
     \\                }
     \\                held += 1
+    \\            }
+    \\            9 => {
+    \\                var job = Reader(at: content.start, end: content.start + content.len)
+    \\                parts.entry = try mut job.uvar(bundle)
+    \\                parts.stack = try mut job.uvar(bundle)
+    \\                if job.at != job.end {
+    \\                    fail LoadError.Malformed
+    \\                }
+    \\                parts.job = true
     \\            }
     \\            else => fail LoadError.Malformed
     \\        }
@@ -15036,6 +15261,8 @@ const TEXT_SYS_SYS: Str =
     \\pub open struct Fs {
     \\} Fs
     \\
+    \\pub fn Fs.denied() -> Fs
+    \\
     \\pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
     \\    example match attempt testing::world().fs.subdir("logs/..") {
     \\        Err(fs::FsError.InvalidPath) => true
@@ -15056,6 +15283,8 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub open struct Net {
     \\} Net
+    \\
+    \\pub fn Net.denied() -> Net
     \\
     \\pub fn Net.only_host(self, host: Str) -> Net fails Revoked
     \\
@@ -15081,6 +15310,8 @@ const TEXT_SYS_SYS: Str =
     \\pub open struct WallClock {
     \\} WallClock
     \\
+    \\pub fn WallClock.denied() -> WallClock
+    \\
     \\pub fn WallClock.now_ns(self) -> u64 fails Revoked
     \\    example attempt testing::world().wall.now_ns() == Ok(0)
     \\
@@ -15088,6 +15319,8 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub open struct Random {
     \\} Random
+    \\
+    \\pub fn Random.served[S: RandomService and Capability and Copy](service: S) -> Random fails Revoked
     \\
     \\pub fn Random.fill(self, mut buf: SliceMut[u8]) fails Revoked
     \\
@@ -15100,6 +15333,8 @@ const TEXT_SYS_SYS: Str =
     \\pub open struct Log {
     \\} Log
     \\
+    \\pub fn Log.served[S: LogService and Capability and Copy](service: S) -> Log fails Revoked
+    \\
     \\pub fn Log.info[T: Render](self, message: Str, value: T)
     \\
     \\pub fn Log.warn[T: Render](self, message: Str, value: T)
@@ -15108,6 +15343,8 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub open struct Stdio {
     \\} Stdio
+    \\
+    \\pub fn Stdio.served[S: StdioService and Capability and Copy](service: S) -> Stdio fails Revoked
     \\
     \\pub fn Stdio.read_in(self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails StdioError uses wait
     \\    ensures result <= buf.byte_len()
@@ -15121,6 +15358,26 @@ const TEXT_SYS_SYS: Str =
     \\    Revoked(Revoked) from
     \\    Cancelled(task::Cancelled) from
     \\} StdioError
+    \\
+    \\pub closed enum LogLevel derives Copy, Eq, Render {
+    \\    Info
+    \\    Warn
+    \\    Error
+    \\} LogLevel
+    \\
+    \\pub interface LogService {
+    \\    fn log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096
+    \\} LogService
+    \\
+    \\pub interface RandomService {
+    \\    fn fill(self, mut buf: SliceMut[u8]) limits stack 4_096
+    \\} RandomService
+    \\
+    \\pub interface StdioService {
+    \\    fn read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError uses wait limits stack 4_096
+    \\    fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+    \\    fn write_err(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
+    \\} StdioService
     \\
     \\pub closed enum Revoked derives Copy, Eq, Hash, Render {
     \\    Stale
@@ -15353,6 +15610,36 @@ const TEXT_SYS_SYS: Str =
     \\} tallies
     \\
     \\fn tally_record(state: core::atomic::AtomicU64, record: u64) -> u64 = record
+    \\
+    \\impl Tally: LogService
+    \\
+    \\impl Tally: RandomService
+    \\
+    \\impl Tally: StdioService
+    \\
+    \\/// Counts the bytes of a value logged through a tally.
+    \\fn Tally.log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096 {
+    \\    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(value.byte_len())))
+    \\} Tally.log
+    \\
+    \\fn Tally.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    \\    for index in 0..<buf.len() {
+    \\        buf[index] = 7
+    \\    }
+    \\} Tally.fill
+    \\
+    \\fn Tally.read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError limits stack 4_096 {
+    \\    fail StdioError.Closed
+    \\} Tally.read_in
+    \\
+    \\/// Counts the bytes written through a tally.
+    \\fn Tally.write_out(self, data: Slice[u8]) limits stack 4_096 {
+    \\    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(data.len())))
+    \\} Tally.write_out
+    \\
+    \\fn Tally.write_err(self, data: Slice[u8]) limits stack 4_096 {
+    \\    self.write_out(data)
+    \\} Tally.write_err
     \\
     \\fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
     \\    discard state.fetch_add(record)
@@ -16287,6 +16574,78 @@ const TEXT_SYS_SYS: Str =
     \\        }
     \\    })
     \\} handles_travel_beside_their_encodings
+    \\
+    \\test denied_files_refuse_every_operation for Fs.denied {
+    \\    let world = testing::world()
+    \\    let read = attempt await Fs.denied().read_all("notes", alloc: world.alloc)
+    \\    let refused = match read {
+    \\        Err(fs::FsError.Revoked(Revoked.Stale)) => true
+    \\        else => false
+    \\    }
+    \\    expect refused
+    \\} denied_files_refuse_every_operation
+    \\
+    \\test denied_networks_refuse_every_operation for Net.denied {
+    \\    let narrowed = attempt Net.denied().only_host("example.org")
+    \\    expect narrowed.is_err()
+    \\} denied_networks_refuse_every_operation
+    \\
+    \\test denied_wall_clocks_refuse_every_read for WallClock.denied {
+    \\    let read = attempt WallClock.denied().now_ns()
+    \\    expect read == Err(Revoked.Stale)
+    \\} denied_wall_clocks_refuse_every_read
+    \\
+    \\test served_logs_call_their_kind for Log.served {
+    \\    let world = testing::world()
+    \\    let minter = tallies(0, alloc: world.alloc)
+    \\    let counter = minter.mint(0)
+    \\    let Ok(log) = attempt Log.served(minter.mint(0)) else {
+    \\        take minter.close()
+    \\        expect false
+    \\        return
+    \\    }
+    \\    log.info("width", value: 12_345u32)
+    \\    let counted = reach(counter, body: tally_count)
+    \\    take minter.close()
+    \\    log.info("width", value: 1u32)
+    \\    expect counted == Some(5)
+    \\} served_logs_call_their_kind
+    \\
+    \\test served_random_sources_call_their_kind for Random.served {
+    \\    let world = testing::world()
+    \\    let minter = tallies(0, alloc: world.alloc)
+    \\    let Ok(random) = attempt Random.served(minter.mint(0)) else {
+    \\        take minter.close()
+    \\        expect false
+    \\        return
+    \\    }
+    \\    var bytes = Array[u8, 4].filled(0)
+    \\    let filled = attempt random.fill(mut bytes.view_mut())
+    \\    take minter.close()
+    \\    let revoked = attempt random.fill(mut bytes.view_mut())
+    \\    expect filled.is_ok() and bytes[3] == 7 and revoked == Err(Revoked.Stale)
+    \\} served_random_sources_call_their_kind
+    \\
+    \\test served_streams_call_their_kind for Stdio.served {
+    \\    let world = testing::world()
+    \\    let minter = tallies(0, alloc: world.alloc)
+    \\    let counter = minter.mint(0)
+    \\    let Ok(stdio) = attempt Stdio.served(minter.mint(0)) else {
+    \\        take minter.close()
+    \\        expect false
+    \\        return
+    \\    }
+    \\    let written = attempt await stdio.write_out(b"abc")
+    \\    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    \\    let read = attempt await stdio.read_in(mut buf.view_mut())
+    \\    let counted = reach(counter, body: tally_count)
+    \\    take minter.close()
+    \\    let closed = match read {
+    \\        Err(StdioError.Closed) => true
+    \\        else => false
+    \\    }
+    \\    expect written.is_ok() and closed and counted == Some(3)
+    \\} served_streams_call_their_kind
     \\
 
 const TEXT_TASK_PACKAGE: Str =

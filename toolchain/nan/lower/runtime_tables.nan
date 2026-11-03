@@ -1,4 +1,4 @@
-//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record.
+//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind serving it and holds that entry's handle, then the method table of the kind for its service interface.
 
 /// The capability table's capacity.
 const TABLES_ENTRIES: u64 = 65_536
@@ -62,6 +62,9 @@ const TABLES_KIND_OUTBOX: i64 = 8
 const TABLES_KIND_WALL: i64 = 9
 
 const TABLES_KIND_KIND: i64 = 10
+
+/// An entry revoked as it is minted.
+const TABLES_KIND_DENIED: i64 = 11
 
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
 /// executor's entry.
@@ -604,6 +607,45 @@ fn entry_at(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> clif::Value {
     let offset = mut fx.b.imul_imm_s(index, y: i64.fit(TABLES_ENTRY_RECORD))
     return mut fx.b.iadd(entries, y: offset)
 } entry_at
+
+/// The handle of an entry revoked as it is minted, which every operation finds stale.
+fn tables_denied(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let kind = mut fx.ptr(u64.fit(TABLES_KIND_DENIED))
+    let handle = tables_new_entry(mut lo, mut fx, kind)
+    revoke(mut lo, mut fx, handle)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return handle
+} tables_denied
+
+/// The handle of a new entry of a kind deriving from the live entry of `service`, holding that
+/// handle and the address of a method table; -1 when `service` is stale.
+fn tables_served(mut lo: Lowering, mut fx: Fx, kind: i64, service: clif::Value, table: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let source = live_entry(mut lo, mut fx, handle: service)
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
+    let handle = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let kind_value = mut fx1.ptr(u64.fit(kind))
+        let served = tables_new_entry(mut lo, fx: mut fx1, kind: kind_value)
+        let record = entry_at(mut lo, fx: mut fx1, handle: served)
+        mut fx1.store(service, addr: record, offset: TABLES_ENTRY_STATE)
+        mut fx1.store(table, addr: record, offset: TABLES_ENTRY_STATE + 8)
+        let low = mut fx1.b.band_imm_s(service, y: 0xFFFF_FFFF)
+        let plus = mut fx1.b.iadd_imm_s(low, y: 1)
+        let index = mut fx1.b.ireduce(clif::Type.Int32, x: plus)
+        mut fx1.store(index, addr: record, offset: TABLES_ENTRY_SOURCE)
+        return fx1.list1(served)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let stale = mut fx1.int(PTR, value: -1)
+        return fx1.list1(stale)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return handle[0]
+} tables_served
 
 /// The record of an entry whose handle is live, zero for a stale one.
 fn live_entry(mut lo: Lowering, mut fx: Fx, handle: clif::Value) -> clif::Value {

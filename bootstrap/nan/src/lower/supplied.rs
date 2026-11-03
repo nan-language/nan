@@ -7,6 +7,7 @@ pub mod codecs;
 pub mod floats;
 pub mod generate;
 pub mod hw;
+pub mod jobs;
 pub mod kinds;
 pub mod load;
 pub mod mem;
@@ -236,6 +237,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         || boot::lower(lo, fx, &supply)
         || sys::lower(lo, fx, &supply)
         || kinds::lower(lo, fx, &supply)
+        || jobs::lower(lo, fx, &supply)
         || tasks::lower(lo, fx, &supply)
         || text::lower(lo, fx, &supply)
         || codecs::lower(lo, fx, &supply);

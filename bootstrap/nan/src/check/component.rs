@@ -13,6 +13,7 @@ use crate::diagnostic::{Code, Fix, Offer};
 use crate::syntax::ast::{ClauseKind, ItemKind};
 use crate::syntax::grammar::Punct;
 use crate::syntax::token::TokenKind;
+use crate::workspace::Authority;
 
 /// The order of the entries of a `derives` clause in canonical format.
 const DERIVES_ORDER: [&str; 11] = [
@@ -68,6 +69,9 @@ impl Checker<'_> {
         {
             Code::ComponentEnvNotAbandonable
         } else {
+            if state.is_some_and(|state| self.serves_encoded(state, bound)) {
+                self.require(item, self.db.ast(item).token, Authority::Validate);
+            }
             return;
         };
         let fixes = match (code, state) {
@@ -78,6 +82,31 @@ impl Checker<'_> {
         };
         let token = self.db.ast(item).token;
         self.report_fixed(item, (token, token), code, fixes, Offer::Each);
+    }
+
+    /// Whether a state is a component entry of its package, on a nanos target, serving a protocol
+    /// whose decoder is declassifying, which the bundle runs on the calls of other closures.
+    fn serves_encoded(&self, state: ItemId, bound: &Bound) -> bool {
+        let module = self.db.module_of(state);
+        let entry = self.db.target.is_nanos()
+            && self.db.module(module).root
+            && self
+                .db
+                .package(self.db.package_of(state))
+                .source
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.entry.as_ref())
+                .is_some_and(|(names, _)| {
+                    names
+                        .iter()
+                        .any(|name| self.db.lookup(module, name) == Some(state))
+                });
+        let protocol = match bound.args.get(1).and_then(Arg::ty) {
+            Some(Ty::Item(protocol, _)) if self.is_protocol(*protocol) => Some(*protocol),
+            _ => None,
+        };
+        entry && protocol.is_some_and(|protocol| self.declassifying_decoder(protocol))
     }
 
     /// The rule an impl line naming a system interface breaks: a target implementing no
@@ -173,6 +202,16 @@ impl Checker<'_> {
             .find(|&at| syntax.tokens[at].kind == TokenKind::Punct(Punct::LBrace))?;
         let before = syntax.previous(opener)?;
         Some(self.fix_appending(item, before as u32, &format!(" derives {entry}")))
+    }
+
+    /// The Env and messages of the component whose state is `state`.
+    pub fn component_of(&self, state: &Ty) -> Option<(Ty, Ty)> {
+        let component = self.db.std_item("sys", "Component")?;
+        let (_, args) = self.conformance(state, component)?;
+        match &args[..] {
+            [Arg::Ty(env), Arg::Ty(message)] => Some((env.clone(), message.clone())),
+            _ => None,
+        }
     }
 
     /// The rule a use of `host::Runner.run`, `sys::Stepper.start` or `sys::Stepper.resume`

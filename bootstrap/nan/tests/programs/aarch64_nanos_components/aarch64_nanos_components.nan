@@ -1,0 +1,452 @@
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a missing component and an Env the kernel's grants cannot build.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+registers FwCfg {
+    data: u8 at 0x0 read
+    selector: u16 at 0x8 write
+} FwCfg
+
+/// The fw_cfg key of the file directory, and the bytes of a file's name in it.
+const DIRECTORY: u16 = 0x19
+
+const NAME_BYTES: usize = 56
+
+/// The public key of the seed of 32 bytes 7, with which the harness signs the bundles.
+const SIGNER: Slice[u8] = b"\xEA\x4A\x6C\x63\xE2\x9C\x52\x0A\xBE\xF5\x50\x7B\x13\x2E\xC5\xF9\x95\x47\x76\xAE\xBE\xBE\x7B\x92\x42\x1E\xEA\x69\x14\x46\xD2\x2C"
+
+/// The tally's protocol as the kernel declares it, and another protocol, whose hash the tally refuses.
+pub protocol Counter {
+    pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
+    pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+    pub fn divide(by: u32) -> u64 limits pure
+} Counter
+
+pub protocol Gauge {
+    pub fn add(amount: u32) limits pure
+} Gauge
+
+/// The tally's state, as the kernel declares it.
+pub closed struct Tally derives Encode {
+    pub total: u64
+    pub ticks: u64
+    pub suspended: bool
+} Tally
+
+/// The serial port serving a component's log, random source and standard streams.
+struct Console {
+} Console
+
+impl Console: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Console: sys::LogService
+
+impl Console: sys::RandomService
+
+impl Console: sys::StdioService
+
+fn Console.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
+    match level {
+        sys::LogLevel.Info => say(text: "log info ")
+        sys::LogLevel.Warn => say(text: "log warn ")
+        sys::LogLevel.Error => say(text: "log error ")
+    }
+    say(text: message)
+    say(text: ": ")
+    say(text: value)
+    say(text: "\n")
+} Console.log
+
+fn Console.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    for index in 0..<buf.len() {
+        buf[index] = 0
+    }
+} Console.fill
+
+fn Console.read_in(self, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    return 0
+} Console.read_in
+
+fn Console.write_out(self, data: Slice[u8]) limits stack 4_096 {
+    say_bytes(data)
+} Console.write_out
+
+fn Console.write_err(self, data: Slice[u8]) limits stack 4_096 {
+    say_bytes(data)
+} Console.write_err
+
+fn say(text: Str) {
+    say_bytes(text.as_bytes())
+} say
+
+fn say_bytes(bytes: Slice[u8]) {
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in bytes {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say_bytes
+
+fn say_number(value: u64) {
+    var digits = Array[u8, 20].filled(0)
+    var count: usize = 0
+    var left = value
+    loop {
+        digits[count] = b'0' + u8.truncate(left % 10)
+        count += 1
+        left = left / 10
+        if left == 0 {
+            break
+        }
+    }
+    var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    while count > 0 {
+        count -= 1
+        mut port.write(Pl011.data, value: digits[count])
+    }
+    take port.unmap()
+} say_number
+
+/// Reads a big-endian number of `count` bytes from the fw_cfg data register.
+fn read_be(mut fw_cfg: hw::Mmio[FwCfg], count: u32) -> u64 {
+    var value: u64 = 0
+    for _ in 0..<count {
+        value = (value << 8) | u64.widen(mut fw_cfg.read(FwCfg.data))
+    }
+    return value
+} read_be
+
+/// Selects a fw_cfg item, whose key the selector register takes big-endian.
+fn select(mut fw_cfg: hw::Mmio[FwCfg], key: u16) {
+    mut fw_cfg.write(FwCfg.selector, value: (key << 8) | (key >> 8))
+} select
+
+/// The fw_cfg file of a name: its key and size, a zero key when there is none.
+struct Found derives Copy {
+    key: u16
+    size: u64
+} Found
+
+fn find_file(mut fw_cfg: hw::Mmio[FwCfg], name: Str) -> Found {
+    var found = Found(key: 0, size: 0)
+    for _ in 0..<read_be(mut fw_cfg, count: 4) {
+        let size = read_be(mut fw_cfg, count: 4)
+        let key = u16.truncate(read_be(mut fw_cfg, count: 2))
+        discard read_be(mut fw_cfg, count: 2)
+        var same = true
+        for index in 0..<NAME_BYTES {
+            let byte = mut fw_cfg.read(FwCfg.data)
+            var wanted: u8 = 0
+            if index < name.as_bytes().len() {
+                wanted = name.as_bytes()[index]
+            }
+            same = same and byte == wanted
+        }
+        if same {
+            found = Found(key: key, size: size)
+        }
+    }
+    return found
+} find_file
+
+/// The bytes of the fw_cfg file of a name, empty when there is none.
+fn fw_file(name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var fw_cfg = trusted "the virt board maps fw_cfg at 0x0902_0000 and nothing else maps it" { hw::Mmio[FwCfg].map(0x0902_0000) }
+    select(mut fw_cfg, key: DIRECTORY)
+    let found = find_file(mut fw_cfg, name)
+    var bytes = mem::Bytes.empty(alloc)
+    if found.key != 0 {
+        select(mut fw_cfg, key: found.key)
+        for _ in 0..<found.size {
+            mut bytes.push(mut fw_cfg.read(FwCfg.data))
+        }
+    }
+    take fw_cfg.unmap()
+    return bytes
+} fw_file
+
+fn stop(text: Str) -> Never {
+    say(text)
+    loop {
+    }
+} stop
+
+/// The bundle of a fw_cfg file, verified and loaded.
+fn loaded(loader: sys::load::Loader, name: Str, alloc: mem::Alloc) -> sys::load::Bundle {
+    let bytes = fw_file(name, alloc)
+    let keys = Array[core::crypto::PublicKey, 1].filled(bundle_key())
+    let Ok(prepared) = attempt loader.prepare(bytes.view(), keys: keys.view(), alloc) else {
+        stop(text: "unverified\n")
+    }
+    let Ok(bundle) = attempt take prepared.load() else {
+        stop(text: "unloadable\n")
+    }
+    return bundle
+} loaded
+
+/// What the kernel gives every instance.
+struct Grants derives Copy {
+    clock: sys::Clock
+    console: Console
+    exec: task::Executor
+    alloc: mem::Alloc
+} Grants
+
+/// The world of an instance: its log, random source and standard streams served by the serial
+/// port, its clock in its table under `clock` when `clocked`, and its file system and network
+/// denied.
+fn granted(grants: Grants, clocked: bool) -> nanos::World {
+    var caps = nanos::Caps.empty(grants.alloc)
+    if clocked {
+        mut nanos::Cap[sys::Clock].put(mut caps, key: "clock", capability: grants.clock)
+    }
+    let Ok(log) = attempt sys::Log.served(grants.console) else {
+        stop(text: "no log\n")
+    }
+    let Ok(random) = attempt sys::Random.served(grants.console) else {
+        stop(text: "no random\n")
+    }
+    let Ok(stdio) = attempt sys::Stdio.served(grants.console) else {
+        stop(text: "no stdio\n")
+    }
+    return nanos::World(alloc: grants.alloc, exec: grants.exec, clock: grants.clock, random: random, log: log, stdio: stdio, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: take caps)
+} granted
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    let Some(loader) = k.loader() else {
+        stop(text: "no loader\n")
+    }
+    take k.anchor(0u8, run: fn[take loader](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
+        let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let grants = Grants(clock: clock, console: consoles.mint(0), exec: exec, alloc: alloc)
+        let bundle = loaded(loader, name: "opt/nan/counter", alloc)
+        let served = attempt await serve(bundle, grants)
+        take bundle.unload()
+        take consoles.close()
+        discard served
+    })
+} main
+
+fn serve(bundle: sys::load::Bundle, grants: Grants) fails nanos::InstanceError uses wait {
+    let Some(checkpoint) = try await nanos::hold(bundle, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
+        return try await started(take instance, grants)
+    }) else {
+        stop(text: "no tally\n")
+    }
+    discard try await nanos::hold(bundle, component: "Tally", world: granted(grants, clocked: true), checkpoint: Some(take checkpoint), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        try await restored(take instance, grants)
+    })
+    discard try await nanos::hold(bundle, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        try await trapped(take instance, grants)
+    })
+    discard try await nanos::hold(bundle, component: "Tally", world: granted(grants, clocked: false), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        say(text: "unbuilt ")
+        report(try await take instance.end(), alloc: grants.alloc)
+    })
+    let missing = try await nanos::hold(bundle, component: "Gauge", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard try await take instance.end()
+    })
+    say(text: "gauge held ")
+    say_flag(missing.is_some())
+} serve
+
+/// Starts the tally, calls it, asks after its health through the system interfaces and gives a
+/// checkpoint of it once idle.
+fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails nanos::InstanceError uses wait {
+    var held = instance
+    defer take held.abandon()
+    try await ticked(mut held, reason: sys::ResumeReason.Started)
+    var five = sys::Encoded.empty(grants.alloc)
+    let first_add = sys::Wire[Counter].add(mut five, amount: 5)
+    let reply = try await called(mut held, hash: sys::Wire[Counter].hash(), request: take five, grants)
+    say(text: "added ")
+    say_number(added(first_add, given: reply, grants))
+    say(text: "\n")
+    var seven = sys::Encoded.empty(grants.alloc)
+    let second_add = sys::Wire[Counter].add(mut seven, amount: 7)
+    let total = try await called(mut held, hash: sys::Wire[Counter].hash(), request: take seven, grants)
+    say(text: "added ")
+    say_number(added(second_add, given: total, grants))
+    say(text: "\n")
+    var large = sys::Encoded.empty(grants.alloc)
+    let refused = sys::Wire[Counter].add(mut large, amount: 5_000)
+    let answer = try await called(mut held, hash: sys::Wire[Counter].hash(), request: take large, grants)
+    say(text: "refused ")
+    let Ok(encoded) = answer else {
+        stop(text: "unserved\n")
+    }
+    let outcome = attempt refused.decode(Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc: grants.alloc)
+    match outcome {
+        Err(sys::CallError.Failed(refusals::Refused.TooLarge)) => say(text: "too large\n")
+        else => say(text: "otherwise\n")
+    }
+    var echo = sys::Encoded.empty(grants.alloc)
+    let echoed = sys::Wire[Counter].echo(mut echo, clock: grants.clock)
+    let handed = try await called(mut held, hash: sys::Wire[Counter].hash(), request: take echo, grants)
+    say(text: "echoed clock ")
+    let Ok(handles) = handed else {
+        stop(text: "unserved\n")
+    }
+    let Ok(clock) = attempt echoed.decode(Untrusted.of(handles.bytes.view()), handles: handles.handles.view(), alloc: grants.alloc) else {
+        stop(text: "undecodable\n")
+    }
+    let reading = attempt clock.elapsed_ns()
+    say_flag(reading.is_ok())
+    var gauge = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Gauge].add(mut gauge, amount: 1)
+    say(text: "mismatched ")
+    match attempt await held.inbox().call(sys::Wire[Gauge].hash(), request: take gauge, alloc: grants.alloc) {
+        Err(sys::CallError.Malformed(core::DecodeError.UnknownSchema)) => say(text: "refused\n")
+        else => say(text: "served\n")
+    }
+    say_health(try await mut held.health())
+    try await mut held.pressure(2)
+    try await mut held.suspend()
+    say_health(try await mut held.health())
+    try await mut held.wake()
+    say_health(try await mut held.health())
+    say(text: "idle ")
+    say_flag(try await held.idle())
+    let checkpoint = try await held.checkpoint()
+    undefer held
+    say(text: "started ")
+    report(try await take held.end(), alloc: grants.alloc)
+    return checkpoint
+} started
+
+/// Restores the tally from a checkpoint into a fresh instance and calls it.
+fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var held = instance
+    defer take held.abandon()
+    try await ticked(mut held, reason: sys::ResumeReason.Restored)
+    var one = sys::Encoded.empty(grants.alloc)
+    let add = sys::Wire[Counter].add(mut one, amount: 1)
+    let reply = try await called(mut held, hash: sys::Wire[Counter].hash(), request: take one, grants)
+    say(text: "added ")
+    say_number(added(add, given: reply, grants))
+    say(text: "\n")
+    say_health(try await mut held.health())
+    undefer held
+    say(text: "restored ")
+    report(try await take held.end(), alloc: grants.alloc)
+} restored
+
+/// Calls a handler of the tally that traps, which abandons the instance's domain.
+fn trapped(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var held = instance
+    defer take held.abandon()
+    var zero = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Counter].divide(mut zero, by: 0)
+    say(text: "divided ")
+    match attempt await called(mut held, hash: sys::Wire[Counter].hash(), request: take zero, grants) {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    say(text: "stepped ")
+    match attempt await mut held.step() {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    undefer held
+    say(text: "divider ")
+    report(try await take held.end(), alloc: grants.alloc)
+} trapped
+
+/// Resumes the tally for a reason, then starts the keyed task its resume spawns and steps the tick
+/// that task posts.
+fn ticked(mut instance: nanos::Instance, reason: sys::ResumeReason) fails nanos::InstanceError uses wait {
+    try await mut instance.resumed(reason)
+    say(text: "keyed ")
+    say_number(u64.widen(try await mut instance.start_keyed()))
+    say(text: "\n")
+    try await instance.incoming()
+    say(text: "ticked ")
+    say_flag(try await mut instance.step())
+} ticked
+
+/// The reply of the held tally to a call made under the protocol hash `hash`, which the instance
+/// handles in the next step its holder takes.
+fn called(mut instance: nanos::Instance, hash: sys::ProtocolHash, take request: sys::Encoded, grants: Grants) -> Result[sys::Encoded, sys::CallError[Never]] fails nanos::InstanceError uses wait {
+    var pending = Some(take request)
+    var reply: Result[sys::Encoded, sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
+    try await task::scope(grants.exec, body: fn[mut instance, mut pending, mut reply](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(call) = mut pending.extract() else {
+            return
+        }
+        let inbox = instance.inbox()
+        let answered = s.spawn(fn[take inbox, take call]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
+            return attempt await inbox.call(hash, request: take call, alloc: grants.alloc)
+        })
+        try await instance.incoming()
+        discard try await mut instance.step()
+        reply = try await take answered.join()
+    })
+    return reply
+} called
+
+/// The total an addition's reply gives, zero when it gives none.
+fn added(reply: sys::Reply[u64, refusals::Refused], given: Result[sys::Encoded, sys::CallError[Never]], grants: Grants) -> u64 {
+    let Ok(encoded) = given else {
+        return 0
+    }
+    let Ok(total) = attempt reply.decode(Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc: grants.alloc) else {
+        return 0
+    }
+    return total
+} added
+
+fn say_flag(flag: bool) {
+    if flag {
+        say(text: "true\n")
+    } else {
+        say(text: "false\n")
+    }
+} say_flag
+
+fn say_health(reply: sys::HealthReply) {
+    match reply {
+        sys::HealthReply.Healthy => say(text: "healthy\n")
+        sys::HealthReply.Unhealthy(reason) => {
+            say(text: "unhealthy ")
+            say(text: reason.as_str())
+            say(text: "\n")
+        }
+    }
+} say_health
+
+/// Writes how an instance ended: its last state's total and ticks, the kind of the trap that
+/// abandoned it, or the failure building its Env.
+fn report(take ended: nanos::Ended, alloc: mem::Alloc) {
+    match ended {
+        nanos::Ended.Returned(bytes) => match attempt mem::wire::Codec[Tally].decode(Untrusted.of(bytes.view()), alloc) {
+            Ok(state) => {
+                say(text: "total ")
+                say_number(state.total)
+                say(text: " ticks ")
+                say_number(state.ticks)
+                say(text: "\n")
+            }
+            Err(_) => say(text: "undecodable\n")
+        }
+        nanos::Ended.Failed(rendered) => {
+            say(text: "failed ")
+            say(text: rendered.as_str())
+            say(text: "\n")
+        }
+        nanos::Ended.Trapped(trap) => match trap.kind() {
+            sys::TrapKind.DivisionByZero => say(text: "trapped trap.division-by-zero\n")
+            else => say(text: "trapped otherwise\n")
+        }
+        nanos::Ended.Undecodable => say(text: "undecodable\n")
+    }
+} report
+
+fn bundle_key() -> core::crypto::PublicKey {
+    var bytes = Array[u8, 32].filled(0)
+    mut bytes.view_mut().copy_from(SIGNER)
+    return core::crypto::PublicKey(bytes: bytes)
+} bundle_key

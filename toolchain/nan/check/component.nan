@@ -44,6 +44,7 @@ fn Checker.check_component_impl(self, item: ty::ItemId) {
                     return
                 }
                 if self.env_abandonable(item, env) {
+                    self.check_served_calls(item, state_item, bound)
                     return
                 }
                 code = diagnostic::Code.ComponentEnvNotAbandonable
@@ -64,6 +65,76 @@ fn Checker.check_component_impl(self, item: ty::ItemId) {
     }
     self.report_fixed(item, construct: nir::Span.at(db.ast(item).token), code, take fixes, offer: diagnostic::Offer.Each)
 } Checker.check_component_impl
+
+/// The Env and messages of a component.
+pkg struct ComponentTypes derives Copy {
+    pkg env: ty::Ty
+    pkg message: ty::Ty
+} ComponentTypes
+
+/// The Env and messages of the component whose state is `state`.
+pkg fn Checker.component_of(self, state: ty::Ty) -> Option[ComponentTypes] {
+    let Some(component) = self.db().std_item("sys", name: "Component") else {
+        return None
+    }
+    let Some(conforming) = self.conformance(state, interface_item: component) else {
+        return None
+    }
+    let args = self.types().arg_list(conforming.args)
+    if args.len() != 2 {
+        return None
+    }
+    let Some(env) = args[0].ty() else {
+        return None
+    }
+    let Some(message) = args[1].ty() else {
+        return None
+    }
+    return Some(ComponentTypes(env: env, message: message))
+} Checker.component_of
+
+/// The `validate` grant an impl line naming `sys::Component` needs when it declares a component
+/// entry serving a protocol whose decoder is declassifying, which the bundle runs on the calls of
+/// other closures.
+fn Checker.check_served_calls(self, item: ty::ItemId, state_item: Option[ty::ItemId], bound: ty::Bound) {
+    if self.serves_encoded(state_item, bound) {
+        self.require(item, token: self.db().ast(item).token, authority: workspace::Authority.Validate)
+    }
+} Checker.check_served_calls
+
+/// Whether a state is a component entry of its package, on a nanos target, serving a protocol
+/// whose decoder is declassifying.
+fn Checker.serves_encoded(self, state_item: Option[ty::ItemId], bound: ty::Bound) -> bool {
+    let db = self.db()
+    let Some(state) = state_item else {
+        return false
+    }
+    let module = db.module_of(state)
+    if not db.target.is_nanos() or not db.module(module).root {
+        return false
+    }
+    let Some(manifest) = db.source(db.package_of(state)).manifest else {
+        return false
+    }
+    let Some(entry) = manifest.entry else {
+        return false
+    }
+    var listed = false
+    for name in entry.names {
+        listed = listed or db.lookup(module, name: name.as_str()) == Some(state)
+    }
+    let args = self.types().arg_list(bound.args)
+    if not listed or args.len() != 2 {
+        return false
+    }
+    let Some(message) = args[1].ty() else {
+        return false
+    }
+    return match self.types().kind(message) {
+        ty::TyKind.Item(item: protocol, args: _) => self.is_protocol(protocol) and self.declassifying_decoder(protocol)
+        else => false
+    }
+} Checker.serves_encoded
 
 /// The rule an impl line naming a system interface breaks: a target implementing no
 /// `sys::Component` for the same Env and messages, whose stepper would never call it.

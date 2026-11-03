@@ -25,7 +25,7 @@ fn Checker.check_program(self, package_id: ty::PackageId) {
 } Checker.check_program
 
 /// The `entry` directive of a program: one concrete target declared, and `main` naming a
-/// function of its root module.
+/// function of its root module or component entries.
 fn Checker.check_program_entry(self, package_id: ty::PackageId, manifest: workspace::Manifest, entry: workspace::ProgramEntry, path: Str) {
     let db = self.db()
     let concrete = manifest.targets.len() == 1 and manifest.targets[0] != workspace::Target.Any
@@ -38,14 +38,65 @@ fn Checker.check_program_entry(self, package_id: ty::PackageId, manifest: worksp
     if db.module(module).abandoned {
         return
     }
-    let main = match db.lookup(module, name: "main") {
-        Some(main_item) => is_fn_item(db.ast(main_item))
-        None => false
-    }
-    if entry.name.as_str() != "main" or not main {
-        self.report_file(path, line: entry.line, code: diagnostic::Code.TargetEntryMissing)
+    match self.entry_problem(module, names: entry.names.view()) {
+        Some(code) => self.report_file(path, line: entry.line, code)
+        None => {}
     }
 } Checker.check_program_entry
+
+/// The rule an `entry` directive listing `names` of a root module breaks: `main` alone names
+/// a function item `main`, and other names, on a nanos target, each name a component entry.
+fn Checker.entry_problem(self, module: ty::ModuleId, names: Slice[text::String]) -> Option[diagnostic::Code] {
+    let db = self.db()
+    if names.len() == 1 and names[0].as_str() == "main" {
+        let found = match db.lookup(module, name: "main") {
+            Some(main_item) => is_fn_item(db.ast(main_item))
+            None => false
+        }
+        if found {
+            return None
+        }
+        return Some(diagnostic::Code.TargetEntryMissing)
+    }
+    var problem: Option[diagnostic::Code] = None
+    for name in names {
+        let Some(state) = db.lookup(module, name: name.as_str()) else {
+            return Some(diagnostic::Code.TargetEntryMissing)
+        }
+        let typed = match db.ast(state).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
+            else => false
+        }
+        if not typed or not db.target.is_nanos() {
+            return Some(diagnostic::Code.TargetEntryMissing)
+        }
+        if not self.is_component_entry(state) {
+            problem = Some(diagnostic::Code.TargetComponentEntry)
+        }
+    }
+    return problem
+} Checker.entry_problem
+
+/// Whether a type item is a component entry: a state without generic parameters of a
+/// component serving a protocol, whose Env is not linear and implements `nanos::Environment`.
+fn Checker.is_component_entry(self, state: ty::ItemId) -> bool {
+    if self.sig(state).contents().generics.len() > 0 {
+        return false
+    }
+    let state_ty = self.types().item(state, args: mem::List[ty::Arg].empty(self.alloc()))
+    let Some(served) = self.component_of(state_ty) else {
+        return false
+    }
+    let protocol = match self.types().kind(served.message) {
+        ty::TyKind.Item(item: item, args: _) => self.is_protocol(item)
+        else => false
+    }
+    let built = match self.db().std_item("nanos", name: "Environment") {
+        Some(environment) => self.implements(served.env, interface_item: environment)
+        None => false
+    }
+    return protocol and built and not self.has(served.env, property: Property.Linear)
+} Checker.is_component_entry
 
 /// A `dep` directive naming a workspace package: the dependency covers every target the
 /// package declares and is no program, unless the directive lacks a grant its package needs.

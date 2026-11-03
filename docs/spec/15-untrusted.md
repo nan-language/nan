@@ -285,6 +285,7 @@ The **codec uses** of a function are the type parameters whose decoders and enco
 - the declaration of a validator, on its head;
 - the declaration of a type item whose decoder is declassifying, on the line of its `derives` clause;
 - an impl line naming `core::Decoder`;
+- an impl line naming `sys::Component` for a [component entry](27-program-model.md#entry) serving a protocol that is no parsing type, whose bundle decodes the calls of other closures, on that line;
 - a use of a validator, or a declassifying use of a decoder or encoder, on the line holding the call, function value or instantiation.
 
 `Untrusted.of`, `inspect`, the content-blind operations and the other uses of decoders and encoders need no grant.

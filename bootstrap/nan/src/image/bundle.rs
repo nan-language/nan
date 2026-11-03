@@ -10,12 +10,14 @@ const MAGIC: &[u8; 4] = b"NBUN";
 const VERSION: u128 = 1;
 
 /// The bundle of a lowered object, with its job entry and the stack its task needs for a nanos
-/// program's, signed by the key of a secret seed when one is given, or the names of the symbols
-/// it imports that the interface does not export.
+/// program's, or each component entry by name with the stack its tasks need, signed by the key
+/// of a secret seed when one is given, or the names of the symbols it imports that the interface
+/// does not export.
 pub fn write(
     object: &[u8],
     contributed: &[Contributed],
     job: Option<u64>,
+    components: &[(String, u64)],
     interface: &Interface,
     seed: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, Vec<String>> {
@@ -38,7 +40,7 @@ pub fn write(
     uvar(&mut out, VERSION);
     bytes(
         &mut out,
-        &body(&linked, contributed, job, interface, &index),
+        &body(&linked, contributed, job, components, interface, &index),
     );
     let mut sections = Record::default();
     if let Some(seed) = seed {
@@ -53,11 +55,12 @@ pub fn write(
 
 /// The body of a bundle: its interface hash, its image, the image's size in memory, its base
 /// relocations, its imports, its line tables' offset, its contributions, where its read-only
-/// and writable data start, and its job entry with its task's stack.
+/// and writable data start, its job entry with its task's stack and its component entries.
 fn body(
     linked: &Linked,
     contributed: &[Contributed],
     job: Option<u64>,
+    components: &[(String, u64)],
     interface: &Interface,
     index: &dyn Fn(&str) -> Option<usize>,
 ) -> Vec<u8> {
@@ -156,6 +159,18 @@ fn body(
     if let Some(stack) = job {
         let entry = linked.symbol(crate::lower::JOB);
         record.field(9, field(|out| pair(out, (entry, stack))));
+    }
+    if !components.is_empty() {
+        record.field(
+            10,
+            field(|out| {
+                list(out, components.iter(), |out, (name, stack)| {
+                    bytes(out, name.as_bytes());
+                    let entry = linked.symbol(&format!("{}{name}", crate::lower::COMPONENT));
+                    pair(out, (entry, *stack));
+                })
+            }),
+        );
     }
     record.finish()
 }

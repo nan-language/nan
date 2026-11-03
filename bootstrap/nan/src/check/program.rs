@@ -3,7 +3,8 @@
 
 use super::Checker;
 use super::body::Clauses;
-use super::db::{ItemId, PackageId};
+use super::db::{ItemId, ModuleId, PackageId};
+use super::props::Property;
 use super::ty::{Scalar, Ty};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{ItemKind, Mode, Visibility};
@@ -29,17 +30,12 @@ impl Checker<'_> {
         {
             self.report_file(path, *line, Code::TargetProgramTargets);
         }
-        if let Some((name, line)) = &manifest.entry
+        if let Some((names, line)) = &manifest.entry
             && let Some(module) = data.root
             && !self.db.module(module).abandoned
+            && let Some(code) = self.entry_problem(module, names)
         {
-            let main = self
-                .db
-                .lookup(module, "main")
-                .is_some_and(|item| matches!(self.db.ast(item).kind, ItemKind::Fn(_)));
-            if name != "main" || !main {
-                self.report_file(path, *line, Code::TargetEntryMissing);
-            }
+            self.report_file(path, *line, code);
         }
         for dep in &manifest.deps {
             let Some(Some(dependency)) = data.deps.get(&dep.alias) else {
@@ -61,6 +57,54 @@ impl Checker<'_> {
                 self.report_file(path, dep.line, Code::TargetDepProgram);
             }
         }
+    }
+
+    /// The rule an `entry` directive listing `names` of a root module breaks: `main` alone names
+    /// a function item `main`, and other names, on a nanos target, each name a component entry.
+    fn entry_problem(&self, module: ModuleId, names: &[String]) -> Option<Code> {
+        let item = |name: &str| self.db.lookup(module, name);
+        if let [main] = names
+            && main == "main"
+        {
+            let found =
+                item(main).is_some_and(|item| matches!(self.db.ast(item).kind, ItemKind::Fn(_)));
+            return (!found).then_some(Code::TargetEntryMissing);
+        }
+        let mut problem = None;
+        for name in names {
+            let state = item(name).filter(|state| {
+                matches!(
+                    self.db.ast(*state).kind,
+                    ItemKind::Struct(_) | ItemKind::Enum(_)
+                )
+            });
+            match state {
+                Some(state) if self.db.target.is_nanos() => {
+                    if !self.is_component_entry(state) {
+                        problem = Some(Code::TargetComponentEntry);
+                    }
+                }
+                _ => return Some(Code::TargetEntryMissing),
+            }
+        }
+        problem
+    }
+
+    /// Whether a type item is a component entry: a state without generic parameters of a
+    /// component serving a protocol, whose Env is not linear and implements `nanos::Environment`.
+    fn is_component_entry(&self, state: ItemId) -> bool {
+        if !self.sig(state).generics.is_empty() {
+            return false;
+        }
+        let Some((env, message)) = self.component_of(&Ty::item(state, Vec::new())) else {
+            return false;
+        };
+        let served = matches!(message, Ty::Item(protocol, _) if self.is_protocol(protocol));
+        let built = self
+            .db
+            .std_item("nanos", "Environment")
+            .is_some_and(|environment| self.implements(&env, environment));
+        served && built && !self.has(&env, Property::Linear)
     }
 
     /// The head of a program's entry function: one of its target's forms, quoted as expected,

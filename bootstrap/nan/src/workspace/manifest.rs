@@ -278,8 +278,8 @@ pub struct Manifest {
     pub supported: bool,
     /// The language version the `language` directive states, and its line.
     pub language: Option<(u128, u32)>,
-    /// The name the `entry` directive gives, and its line.
-    pub entry: Option<(String, u32)>,
+    /// The names the `entry` directive lists, and its line.
+    pub entry: Option<(Vec<String>, u32)>,
     /// The codegen levels the `codegen` directive lists that this implementation knows.
     pub levels: Vec<Level>,
     pub deps: Vec<Dep>,
@@ -510,7 +510,12 @@ impl Reader<'_> {
                         self.report(line, Code::ManifestDuplicate);
                         continue;
                     }
-                    manifest.entry = Some((self.idents(node).swap_remove(1), line));
+                    let names =
+                        self.idents(self.tree.find(node, Rule::NameList).expect("a name list"));
+                    if has_repeat(&names) {
+                        self.report(line, Code::ManifestDuplicate);
+                    }
+                    manifest.entry = Some((names, line));
                 }
                 Rule::CodegenDirective => {
                     if codegen.replace(line).is_some() {

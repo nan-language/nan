@@ -1559,7 +1559,7 @@ impl Body<'_, '_> {
                         if let TKind::FnValue { item: function, .. } = typed.kind
                             && wanted.kind == FnKind::Task
                         {
-                            self.ck.check_stack_bound(function, &found.limits);
+                            self.ck.check_stack_bound(function, &found.limits, true);
                         }
                         callable.infer.unify(&pattern, &typed.ty);
                         let fixed = callable.infer.subst.fn_ty(wanted);

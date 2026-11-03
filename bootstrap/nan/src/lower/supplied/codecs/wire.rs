@@ -117,7 +117,7 @@ pub fn read_uvar(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value)
         let malformed = code(fx, failure::MALFORMED);
         fx.b.ins().return_(&[zero, malformed]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state]);
     let results = fx.b.inst_results(call).to_vec();
     (results[0], results[1])

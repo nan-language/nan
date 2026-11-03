@@ -750,7 +750,7 @@ impl Lowering<'_, '_> {
             let outer = [cpu::VECTOR, cpu::FRAME].map(|field| fx.load(PTR, record, field));
             fx.store(params[0], record, cpu::VECTOR);
             fx.store(params[1], record, cpu::FRAME);
-            let dispatch = lo.func_ref(fx, dispatch);
+            let dispatch = lo.call_ref(fx, dispatch);
             let call = fx.b.ins().call(dispatch, &params);
             let preempt = fx.b.inst_results(call)[0];
             fx.store(outer[0], record, cpu::VECTOR);
@@ -1097,6 +1097,9 @@ impl Lowering<'_, '_> {
                             link: layout.link.map(|link| fx.load(PTR, saved, link)),
                             low: fx.load(PTR, record, task::GUARD),
                             high: fx.b.ins().iadd(base, size),
+                            segment: lo
+                                .keeps_segments()
+                                .then(|| fx.load(PTR, record, task::SEGMENT)),
                         };
                         vec![stops::stoppable(lo, fx, &at)]
                     },

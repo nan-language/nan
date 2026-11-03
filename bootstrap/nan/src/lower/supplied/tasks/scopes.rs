@@ -493,8 +493,7 @@ fn entry_glue(lo: &mut Lowering, fn_ty: &FnTy) -> FuncId {
                 let held = adapt_value(lo, fx, Held::Address(argument), nty, *repr);
                 args.extend(held.values());
             }
-            let signature = fx.b.import_signature(abi.signature());
-            let call = fx.b.ins().call_indirect(signature, code, &args);
+            let call = lo.call_code(fx, abi.signature(), code, &args, fn_ty.limits.stack);
             let returns = fx.b.inst_results(call).to_vec();
             let mut returns = returns.into_iter();
             let failed = abi.flagged.then(|| returns.next().expect("a failure flag"));

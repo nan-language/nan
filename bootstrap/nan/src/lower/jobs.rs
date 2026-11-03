@@ -2,10 +2,10 @@
 //! `nanos::World` it gives up, that of the `mem::Bytes` of the job's input it gives up and that
 //! of the `nanos::Ended` the job writes. The entry owns extended state of its own for the call,
 //! runs the program's entry function through the adapter of its form, and fits the stack its
-//! entry function's `limits stack N` states.
+//! entry function's `limits stack N` states, when it states one.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use super::body::Held;
 use super::call::Invoked;
@@ -23,10 +23,11 @@ pub const JOB: &str = "_NSjob";
 const MAIN: usize = 2;
 
 impl Lowering<'_, '_> {
-    /// Defines the job entry running the entry function `entry`, giving the stack its task needs.
-    pub fn job_entry(&mut self, entry: ItemId) -> u64 {
+    /// Defines the job entry running the entry function `entry`, giving it with the stack that
+    /// entry function's `limits stack N` states.
+    pub fn job_entry(&mut self, entry: ItemId) -> (FuncId, Option<u64>) {
         let sig = self.ck.fn_sig(entry).expect("an entry function's head");
-        let stack = sig.limits.stack.expect("a nanos entry's stack bound");
+        let stack = sig.limits.stack;
         let fails = sig.fails.clone().expect("an entry's failure");
         let (adapter, args) = match &sig.params[..] {
             [_, input] => ("typed", vec![input.ty.clone(), sig.result.clone(), fails]),
@@ -81,15 +82,17 @@ impl Lowering<'_, '_> {
             lo.disown_extended(fx, owned);
             fx.b.ins().return_(&[]);
         });
-        let head = stack::At {
-            item: entry,
-            span: Span::at(self.ck.db.item(entry).ast.token),
-        };
-        self.demands.push(Demand {
-            judged: Judged::Function(id),
-            stack,
-            report: Report::Own { head },
-        });
-        stack
+        if let Some(stack) = stack {
+            let head = stack::At {
+                item: entry,
+                span: Span::at(self.ck.db.item(entry).ast.token),
+            };
+            self.demands.push(Demand {
+                judged: Judged::Function(id),
+                stack,
+                report: Report::Own { head },
+            });
+        }
+        (id, stack)
     }
 }

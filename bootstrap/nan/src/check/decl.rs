@@ -334,13 +334,12 @@ impl Checker<'_> {
                             self.report(item, ast.token, Code::DeferAbandonHead);
                         }
                     }
-                    let entry = self.is_entry(item)
-                        || matches!(
-                            fn_sig.modifier,
-                            Some(FnModifier::Interrupt | FnModifier::Landing)
-                        );
-                    if entry {
-                        self.check_stack_bound(item, &fn_sig.limits);
+                    let fixed = matches!(
+                        fn_sig.modifier,
+                        Some(FnModifier::Interrupt | FnModifier::Landing)
+                    );
+                    if fixed || self.is_entry(item) {
+                        self.check_stack_bound(item, &fn_sig.limits, !fixed);
                     }
                     let block = match &function.body {
                         ast::FnBody::Block(block) => Some(block),
@@ -770,9 +769,12 @@ impl Checker<'_> {
     }
 
     /// The `limits stack N` an entry of a boot, task, interrupt or landing context states when
-    /// checked for a machine or nanos target, reported on the entry's head.
-    pub fn check_stack_bound(&self, item: ItemId, limits: &super::ty::LimitSet) {
-        if self.db.target.bounds_stacks() && limits.stack.is_none() {
+    /// checked for a machine target, or for a nanos target when it runs on a stack that does not
+    /// grow, an interrupt or landing context's; reported on the entry's head.
+    pub fn check_stack_bound(&self, item: ItemId, limits: &super::ty::LimitSet, grows: bool) {
+        let target = self.db.target;
+        let bounded = target.is_machine() || (target.is_nanos() && !grows);
+        if bounded && limits.stack.is_none() {
             self.report(item, self.db.ast(item).token, Code::SuspendStackMissing);
         }
     }

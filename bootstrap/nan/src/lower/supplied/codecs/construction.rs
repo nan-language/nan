@@ -131,7 +131,7 @@ fn word(
         let none = code(fx, 0);
         fx.b.ins().return_(&[len, none]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, buffer, capacity]);
     let results = fx.b.inst_results(call).to_vec();
     (results[0], results[1])
@@ -251,7 +251,7 @@ fn number(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value, Value,
         fx.b.ins().return_(&[none]);
     });
     let found = fx.slot(24, 8);
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, found]);
     let failed = fx.b.inst_results(call)[0];
     let start = fx.load(PTR, found, 0);
@@ -401,7 +401,7 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value, float: Type) -> 
         fx.b.ins().return_(&[none]);
     });
     let out = fx.slot(8, 8);
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, out]);
     let failed = fx.b.inst_results(call)[0];
     (fx.load(float, out, 0), failed)
@@ -654,7 +654,7 @@ fn literal(
         let truncated = code(fx, failure::TRUNCATED);
         fx.b.ins().return_(&[zero, truncated]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, buffer, capacity]);
     let results = fx.b.inst_results(call).to_vec();
     (results[0], results[1])
@@ -895,7 +895,7 @@ pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
         let (_, _, _, failed) = number(lo, fx, state);
         fx.b.ins().return_(&[failed]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state]);
     fx.b.inst_results(call)[0]
 }

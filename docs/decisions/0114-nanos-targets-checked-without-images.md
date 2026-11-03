@@ -1,6 +1,6 @@
 # 0114. Nanos targets checked without images
 
-Status: accepted; building no image superseded by 0116
+Status: accepted; building no image superseded by 0116, and its stack bounds on every task and entry by 0117
 
 ## Context
 

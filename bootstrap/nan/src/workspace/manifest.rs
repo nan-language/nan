@@ -131,12 +131,6 @@ impl Target {
         self.kind() == Some(Kind::Nanos)
     }
 
-    /// Whether the target's code states the stack bound of every task it starts: a machine or
-    /// nanos target's.
-    pub fn bounds_stacks(self) -> bool {
-        self.is_machine() || self.is_nanos()
-    }
-
     /// Whether a target variant's selector matches the target: its name, its architecture's or
     /// its kind's.
     pub fn selected_by(self, selector: &str) -> bool {

@@ -533,7 +533,7 @@ impl Lowering<'_, '_> {
                     lo.call_stub(fx, Stub::EnableAvx, &[]);
                 }
                 lo.open_window(fx);
-                let prepare = lo.func_ref(fx, prepare);
+                let prepare = lo.call_ref(fx, prepare);
                 fx.b.ins().call(prepare, &[]);
                 lo.call_stub(fx, Stub::DisableFloats, &[]);
                 lo.cpu_started(fx, record);

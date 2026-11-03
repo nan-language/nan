@@ -18,7 +18,7 @@ impl Lowering<'_, '_> {
             return;
         }
         let glue = self.instance(Instance::Release(ty.clone()));
-        let reference = self.func_ref(fx, glue);
+        let reference = self.call_ref(fx, glue);
         fx.b.ins().call(reference, &[address]);
     }
 

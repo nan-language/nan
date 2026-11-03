@@ -20,7 +20,7 @@ use super::super::machine::Stub;
 use super::super::machine::schedule::HOOK_STACK;
 use super::super::{CALL_CONV, Lowering, lines, stack};
 use super::regions::origin;
-use super::{Routine, state, system, tables};
+use super::{Routine, segments, state, system, tables};
 use crate::check::db::ItemId;
 use crate::nir::Span;
 
@@ -103,7 +103,13 @@ pub mod task {
     pub const QUEUE: u64 = 336;
     /// On a machine target, the save area of the extended state it owns, zero for none.
     pub const EXTENDED: u64 = 344;
-    pub const SIZE: u64 = 352;
+    /// In an image keeping segments, the lowest address grown calls leave free on the stack the
+    /// task runs on and the top of that stack, and the newest segment it runs on, zero for its
+    /// own stack.
+    pub const LIMIT: u64 = 352;
+    pub const TOP: u64 = 360;
+    pub const SEGMENT: u64 = 368;
+    pub const SIZE: u64 = 376;
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
@@ -246,6 +252,14 @@ pub const GUARD: u64 = 4_096;
 /// functions that its calls of support routines run, whose use past the stub call bound the
 /// usable size does not count; a kernel task's also holds a call of a policy hook.
 const ROUTINE_RESERVE: u64 = 32_768;
+
+/// The bytes a task's stack, or a segment of it, holds below its usable part for its routines.
+pub fn reserve(lo: &Lowering) -> u64 {
+    match lo.kernel() {
+        true => ROUTINE_RESERVE + HOOK_STACK,
+        false => ROUTINE_RESERVE,
+    }
+}
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation
 /// the task waits on, which the task keeps until the bit clears.
@@ -485,26 +499,11 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.when(failed, |fx| {
         super::report::raise_kind(lo, fx, "trap.exhausted")
     });
-    let reserve = match lo.kernel() {
-        true => ROUTINE_RESERVE + HOOK_STACK,
-        false => ROUTINE_RESERVE,
-    };
-    let length = fx.b.ins().iadd_imm_s(usable, (GUARD + reserve + 15) as i64);
+    let length =
+        fx.b.ins()
+            .iadd_imm_s(usable, (GUARD + reserve(lo) + 15) as i64);
     let length = fx.b.ins().band_imm_s(length, -16);
-    let mapped = fx.b.ins().icmp_imm_s(IntCC::Equal, cell, 0);
-    let stack = fx.choose_in(
-        lo,
-        mapped,
-        &[PTR],
-        |lo, fx| vec![system::map_stack(lo, fx, length)],
-        |lo, fx| {
-            let align = fx.ptr(super::memory::CHUNK);
-            let drawn = lo.call_routine(fx, Routine::AllocIn, &[cell, length, align, domain])[0];
-            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, drawn, 0);
-            fx.when(present, |fx| system::protect_guard(lo, fx, drawn, false));
-            vec![drawn]
-        },
-    )[0];
+    let stack = segments::draw(lo, fx, cell, domain, length, true);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, stack, 0);
     fx.when(missing, |fx| {
         lo.record_free(fx, record);
@@ -516,6 +515,12 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(cell, record, task::STACK_CELL);
     let guard = fx.b.ins().iadd_imm_s(stack, GUARD as i64);
     fx.store(guard, record, task::GUARD);
+    if lo.keeps_segments() {
+        let limit = fx.b.ins().iadd_imm_s(guard, reserve(lo) as i64);
+        fx.store(limit, record, task::LIMIT);
+        let top = fx.b.ins().iadd(stack, length);
+        fx.store(top, record, task::TOP);
+    }
     // The initial stack pointer of the task's first run, which its switch restores: aligned to
     // 16 bytes, which the start routine is entered with on AArch64, and on x86_64 eight below
     // that, over a zeroed return slot, so the start routine is entered as a call leaves the
@@ -1006,26 +1011,16 @@ pub fn stop_running(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
-/// Returns an ended task's stack: unmapped, or freed through its cell.
+/// Returns an ended task's stack, and in an image keeping segments those a trap left it on:
+/// unmapped, or freed through its cell.
 pub fn release_stack(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let stack = fx.load(PTR, record, task::STACK);
     let cell = fx.load(PTR, record, task::STACK_CELL);
-    let mapped = fx.b.ins().icmp_imm_s(IntCC::Equal, cell, 0);
-    fx.choose_in(
-        lo,
-        mapped,
-        &[],
-        |lo, fx| {
-            let length = fx.load(PTR, record, task::STACK_SIZE);
-            system::unmap_stack(lo, fx, stack, length);
-            Vec::new()
-        },
-        |lo, fx| {
-            system::protect_guard(lo, fx, stack, true);
-            lo.call_routine(fx, Routine::Free, &[stack]);
-            Vec::new()
-        },
-    );
+    let length = fx.load(PTR, record, task::STACK_SIZE);
+    segments::give_back(lo, fx, cell, stack, length, true);
+    if lo.keeps_segments() {
+        segments::release(lo, fx, record, cell);
+    }
 }
 
 /// `IoSubmit(entry)`: submits an io_uring entry from the running task and parks until its

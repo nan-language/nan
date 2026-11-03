@@ -192,8 +192,7 @@ pub fn release_box(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value) {
                 signature
                     .params
                     .push(cranelift_codegen::ir::AbiParam::new(PTR));
-                let signature = fx.b.import_signature(signature);
-                fx.b.ins().call_indirect(signature, release, &[contents]);
+                lo.call_code(fx, signature, release, &[contents], None);
             });
         }
         Some(inner) => {

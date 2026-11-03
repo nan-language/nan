@@ -98,7 +98,7 @@ pub const BUNDLE_LINES: &str = lines::BUNDLE_SYMBOL;
 const RECORD: &str = "_NSloaded_";
 
 /// The support routines a kernel exports: every one the lowered code of a kernel calls.
-const ROUTINES: [Routine; 53] = [
+const ROUTINES: [Routine; 54] = [
     Routine::Copy,
     Routine::Fill,
     Routine::Compare,
@@ -152,6 +152,7 @@ const ROUTINES: [Routine; 53] = [
     Routine::Extended,
     Routine::Ready,
     Routine::Enqueue,
+    Routine::Grow,
 ];
 
 /// The names of the exports of a kernel of a target whose final closure declares the loaded
@@ -431,8 +432,7 @@ impl Lowering<'_, '_> {
             let code = fx.load(PTR, found[0], 0);
             let mut args = params.clone();
             args[0] = fx.ptr(0);
-            let signature = fx.b.import_signature(signature);
-            let inst = fx.b.ins().call_indirect(signature, code, &args);
+            let inst = lo.call_code(fx, signature, code, &args, bound);
             fx.sites.push((
                 inst,
                 Site {

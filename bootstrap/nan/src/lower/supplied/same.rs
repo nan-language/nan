@@ -43,7 +43,7 @@ fn address(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, held: super::super::body::He
 /// Whether two values of a type at addresses are structurally equal.
 fn compare(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, left: Value, right: Value) -> Value {
     let glue = glue(lo, ty);
-    let glue = lo.func_ref(fx, glue);
+    let glue = lo.call_ref(fx, glue);
     let call = fx.b.ins().call(glue, &[left, right]);
     fx.b.inst_results(call)[0]
 }

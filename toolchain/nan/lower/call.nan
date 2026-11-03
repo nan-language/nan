@@ -3,12 +3,12 @@
 /// What a call calls.
 enum CallTarget {
     Direct(id: object::FuncId, abi: Abi)
-    /// Through a function value: its code address and environment, and how its stack use is
-    /// bounded.
-    Indirect(code: clif::Value, env: clif::Value, abi: Abi, kind: StackKind)
+    /// Through a function value: its code address and environment, how its stack use is
+    /// bounded, and the `stack N` its type demands.
+    Indirect(code: clif::Value, env: clif::Value, abi: Abi, kind: StackKind, stack: Option[u64])
     /// Through the method table of a `Dyn` value: the method's code address, which takes the
-    /// address of the value as its receiver, and how its stack use is bounded.
-    Dyn(code: clif::Value, data: clif::Value, abi: Abi, kind: StackKind)
+    /// address of the value as its receiver, and the `stack N` the method's head demands.
+    Dyn(code: clif::Value, data: clif::Value, abi: Abi, stack: Option[u64])
     /// An external symbol under the C convention of the host, with the `stack N` its head
     /// demands.
     Foreign(id: object::FuncId, params: mem::List[Repr], returned: Returned, stack: Option[u64])
@@ -104,7 +104,7 @@ fn Body.value_target(mut self, mut lo: Lowering, mut fx: Fx, value: nir::Value) 
         Some(position) => StackKind.Param(position)
         None => StackKind.Bounded(fn_ty.limit_set.stack)
     }
-    return CallTarget.Indirect(code: code, env: env, abi: take abi, kind: take kind)
+    return CallTarget.Indirect(code: code, env: env, abi: take abi, kind: take kind, stack: fn_ty.limit_set.stack)
 } Body.value_target
 
 /// The function type of a function value's type.
@@ -142,7 +142,7 @@ fn Body.dyn_target(
     }
     let abi = mut lo.dyn_abi(interface_item, args, method)
     let head = mut lo.method_head(ty::Ty.unit(), interface_item, args, method)
-    return CallTarget.Dyn(code: code, data: data, abi: take abi, kind: StackKind.Bounded(head.fn_ty.limit_set.stack))
+    return CallTarget.Dyn(code: code, data: data, abi: take abi, stack: head.fn_ty.limit_set.stack)
 } Body.dyn_target
 
 /// Checks the index of an `at` or `at_mut` call of an array, slice, list, bytes or bounded
@@ -260,7 +260,7 @@ fn Body.emit_call(
     }
     var args = mem::List[clif::Value].empty(lo.alloc)
     match target {
-        CallTarget.Indirect(code: _, env: env, abi: _, kind: _) => mut args.push(env)
+        CallTarget.Indirect(code: _, env: env, abi: _, kind: _, stack: _) => mut args.push(env)
         else => {}
     }
     var result_slot: Option[clif::Value] = None
@@ -325,8 +325,8 @@ fn Body.emit_call(
 fn call_abi(target: CallTarget, alloc: mem::Alloc) -> Abi {
     match target {
         CallTarget.Direct(id: _, abi: abi) => return abi.copy(alloc)
-        CallTarget.Indirect(code: _, env: _, abi: abi, kind: _) => return abi.copy(alloc)
-        CallTarget.Dyn(code: _, data: _, abi: abi, kind: _) => return abi.copy(alloc)
+        CallTarget.Indirect(code: _, env: _, abi: abi, kind: _, stack: _) => return abi.copy(alloc)
+        CallTarget.Dyn(code: _, data: _, abi: abi, stack: _) => return abi.copy(alloc)
         CallTarget.Foreign(id: _, params: params, returned: returned, stack: _) => {
             var abi_params = mem::List[ParamRepr].empty(alloc)
             for repr in params {
@@ -348,7 +348,7 @@ fn Body.call_passed(
     abi: Abi,
     foreign_call: bool,
     ) -> mem::List[clif::Value] {
-    let CallTarget.Dyn(code: _, data: data, abi: _, kind: _) = target else {
+    let CallTarget.Dyn(code: _, data: data, abi: _, stack: _) = target else {
         return mut self.passed(mut lo, mut fx, operands, params: abi.params.view(), foreign_call)
     }
     var passed = mem::List[clif::Value].empty(lo.alloc)
@@ -371,13 +371,16 @@ fn Body.call_passed(
 /// The call instruction of a call's target with its arguments.
 fn call_inst(mut lo: Lowering, mut fx: Fx, target: CallTarget, args: Slice[clif::Value]) -> clif::Inst {
     match target {
-        CallTarget.Direct(id: id, abi: _) or CallTarget.Foreign(id: id, params: _, returned: _, stack: _) => {
+        CallTarget.Direct(id: id, abi: _) => {
+            let reference = mut lo.call_ref(mut fx, id)
+            return mut fx.b.call(reference, args)
+        }
+        CallTarget.Foreign(id: id, params: _, returned: _, stack: _) => {
             let reference = mut lo.func_ref(mut fx, id)
             return mut fx.b.call(reference, args)
         }
-        CallTarget.Indirect(code: code, env: _, abi: abi, kind: _) or CallTarget.Dyn(code: code, data: _, abi: abi, kind: _) => {
-            let signature = mut fx.b.import_signature(abi.signature(lo.alloc))
-            return mut fx.b.call_indirect(signature, callee: code, args)
+        CallTarget.Indirect(code: code, env: _, abi: abi, kind: _, stack: stack) or CallTarget.Dyn(code: code, data: _, abi: abi, stack: stack) => {
+            return mut lo.call_code(mut fx, signature: abi.signature(lo.alloc), code, args, stack)
         }
     }
 } call_inst
@@ -412,7 +415,8 @@ fn Body.call_kind(
             return StackKind.Direct(callee: callee, bindings: take bindings)
         }
         CallTarget.Foreign(id: _, params: _, returned: _, stack: stack) => return StackKind.Bounded(stack)
-        CallTarget.Indirect(code: _, env: _, abi: _, kind: kind) or CallTarget.Dyn(code: _, data: _, abi: _, kind: kind) => return kind
+        CallTarget.Indirect(code: _, env: _, abi: _, kind: kind, stack: _) => return kind
+        CallTarget.Dyn(code: _, data: _, abi: _, stack: stack) => return StackKind.Bounded(stack)
     }
 } Body.call_kind
 
@@ -524,7 +528,7 @@ fn Body.call_sides(
     for value in passed {
         mut call_args.push(value)
     }
-    let reference = mut lo.func_ref(mut fx, id)
+    let reference = mut lo.call_ref(mut fx, id)
     discard mut fx.b.call(reference, args: call_args.view())
     return record
 } Body.call_sides
@@ -1263,7 +1267,7 @@ fn Lowering.invoke(
 fn Lowering.invoked_inst(mut self, mut fx: Fx, invoked: Invoked, abi: Abi, values: Slice[clif::Value]) -> clif::Inst {
     match invoked {
         Invoked.Direct(id) => {
-            let reference = mut self.func_ref(mut fx, id)
+            let reference = mut self.call_ref(mut fx, id)
             return mut fx.b.call(reference, args: values)
         }
         Invoked.Bound(callee: callee, position: position, function: function) => {
@@ -1282,8 +1286,7 @@ fn Lowering.invoked_inst(mut self, mut fx: Fx, invoked: Invoked, abi: Abi, value
         }
         Invoked.Value(function: function, bound: bound) => {
             let code = mut fx.load(PTR, addr: function, offset: 0)
-            let signature = mut fx.b.import_signature(abi.signature(self.alloc))
-            let inst = mut fx.b.call_indirect(signature, callee: code, args: values)
+            let inst = mut self.call_code(mut fx, signature: abi.signature(self.alloc), code, args: values, stack: bound)
             let kind = match fx.fn_params.get(function) {
                 Some(position) => StackKind.Param(position)
                 None => StackKind.Bounded(bound)
@@ -1404,7 +1407,7 @@ fn call_forward(
             mut args.push(value)
         }
     }
-    let reference = mut lo.func_ref(mut fx, id: callee)
+    let reference = mut lo.call_ref(mut fx, id: callee)
     let inst = mut fx.b.call(reference, args: args.view())
     var returns = fx.b.inst_results(inst, alloc: lo.alloc)
     if outer.flagged and not inner.flagged {

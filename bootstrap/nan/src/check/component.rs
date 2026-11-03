@@ -204,6 +204,7 @@ impl Checker<'_> {
                 return Some(Code::ComponentNotComponent);
             }
         }
-        (runner && self.db.target.bounds_stacks()).then_some(Code::ComponentUnavailable)
+        let unavailable = self.db.target.is_machine() || self.db.target.is_nanos();
+        (runner && unavailable).then_some(Code::ComponentUnavailable)
     }
 }

@@ -91,7 +91,7 @@ impl Lowering<'_, '_> {
             return;
         }
         let glue = walker(self, ty);
-        let reference = self.func_ref(fx, glue);
+        let reference = self.call_ref(fx, glue);
         fx.b.ins().call(reference, &[address, lift, owner]);
     }
 
@@ -117,22 +117,28 @@ pub fn signature() -> Signature {
 }
 
 /// Calls a walk through its address, which is not zero.
-pub fn call_walker(fx: &mut Fx, walker: Value, args: &[Value]) -> Inst {
-    let signature = fx.b.import_signature(signature());
-    fx.b.ins().call_indirect(signature, walker, args)
+pub fn call_walker(lo: &mut Lowering, fx: &mut Fx, walker: Value, args: &[Value]) -> Inst {
+    lo.call_code(fx, signature(), walker, args, None)
 }
 
 /// Moves the captures of the task closure a function value at an address holds, through the
 /// walk its environment names; as the walk of the calling function's own `task fn` parameter at
 /// `own` when given, for stack limits.
-pub fn move_captures(fx: &mut Fx, function: Value, lift: Value, owner: Value, own: Option<usize>) {
+pub fn move_captures(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    function: Value,
+    lift: Value,
+    owner: Value,
+    own: Option<usize>,
+) {
     let env = fx.load(PTR, function, 8);
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, env, 0);
     fx.when(present, |fx| {
         let walker = fx.load(PTR, env, 0);
         let walks = fx.b.ins().icmp_imm_s(IntCC::NotEqual, walker, 0);
         fx.when(walks, |fx| {
-            let inst = call_walker(fx, walker, &[env, lift, owner]);
+            let inst = call_walker(lo, fx, walker, &[env, lift, owner]);
             if let Some(position) = own {
                 let site = stack::Site {
                     kind: stack::Kind::Param(position),
@@ -237,7 +243,7 @@ fn define(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value, lift: Value, 
         return;
     }
     if let Ty::Fn(_) = ty {
-        move_captures(fx, address, lift, owner, None);
+        move_captures(lo, fx, address, lift, owner, None);
         return;
     }
     let layout = lo.layout(ty);

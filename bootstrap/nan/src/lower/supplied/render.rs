@@ -249,7 +249,7 @@ pub fn rejected(lo: &mut Lowering, fx: &mut Fx, scalar: Value) -> Value {
         }
         fx.b.ins().return_(&[found]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[scalar]);
     fx.b.inst_results(call)[0]
 }
@@ -321,7 +321,7 @@ fn append_literal(
         append_text(lo, fx, renderer_value, &quoted);
         fx.b.ins().return_(&[]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     fx.b.ins().call(reference, &[renderer_value, start, len]);
 }
 
@@ -516,7 +516,7 @@ pub fn render_to(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, value: Held, renderer_
         }
         Ty::Dyn(_) => {
             let address = value.address();
-            render_dyn(fx, address, renderer_value);
+            render_dyn(lo, fx, address, renderer_value);
         }
         other => panic!("a rendering of {other:?}"),
     }
@@ -827,7 +827,7 @@ fn render_composite(
 }
 
 /// Renders a `Dyn[Render]` value through its method table.
-pub fn render_dyn(fx: &mut Fx, address: Value, renderer_value: Value) {
+pub fn render_dyn(lo: &mut Lowering, fx: &mut Fx, address: Value, renderer_value: Value) {
     let data = fx.load(PTR, address, 0);
     let table = fx.load(PTR, address, 8);
     let code = fx.load(PTR, table, 24);
@@ -838,9 +838,7 @@ pub fn render_dyn(fx: &mut Fx, address: Value, renderer_value: Value) {
     signature
         .params
         .push(cranelift_codegen::ir::AbiParam::new(PTR));
-    let signature = fx.b.import_signature(signature);
-    fx.b.ins()
-        .call_indirect(signature, code, &[data, renderer_value]);
+    lo.call_code(fx, signature, code, &[data, renderer_value], None);
 }
 
 /// `text::fmt("template", label: value, ...)`: a `Dyn[Render]` of the template and the

@@ -419,7 +419,7 @@ fn number(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value, Value,
         fx.b.ins().return_(&[none]);
     });
     let found = fx.slot(24, 8);
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, found]);
     let failed = fx.b.inst_results(call)[0];
     let start = fx.load(PTR, found, 0);
@@ -776,7 +776,7 @@ pub fn string(
         let truncated = code(fx, failure::TRUNCATED);
         fx.b.ins().return_(&[none, truncated]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state, buffer, capacity]);
     let results = fx.b.inst_results(call).to_vec();
     (results[0], results[1])
@@ -1010,7 +1010,7 @@ pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
         let (_, _, _, failed) = number(lo, fx, state);
         fx.b.ins().return_(&[failed]);
     });
-    let reference = lo.func_ref(fx, function);
+    let reference = lo.call_ref(fx, function);
     let call = fx.b.ins().call(reference, &[state]);
     fx.b.inst_results(call)[0]
 }
@@ -1046,7 +1046,7 @@ pub fn read_base64(lo: &mut Lowering, fx: &mut Fx, state: Value, target: Value) 
                         let failed = decode_base64(lo, fx, params[0], params[1], params[2]);
                         fx.b.ins().return_(&[failed]);
                     });
-                    let reference = lo.func_ref(fx, function);
+                    let reference = lo.call_ref(fx, function);
                     let call = fx.b.ins().call(reference, &[text, len, target]);
                     let failed = fx.b.inst_results(call)[0];
                     lo.record_free(fx, text);

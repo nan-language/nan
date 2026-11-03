@@ -313,7 +313,7 @@ pub fn run_nested(
     let region = fx.load(PTR, current, task::REGION);
     let none = fx.ptr(0);
     match fx.fn_params.get(&function).copied() {
-        Some(position) => transfer::move_captures(fx, function, none, record, Some(position)),
+        Some(position) => transfer::move_captures(lo, fx, function, none, record, Some(position)),
         None => lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record),
     }
     let end = domain_end(lo);

@@ -153,7 +153,7 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let budget = supply.param(2).scalar();
     let none = fx.ptr(0);
     let measure = render::new_renderer(fx, none, budget);
-    render::render_dyn(fx, value, measure);
+    render::render_dyn(lo, fx, value, measure);
     let written = render::written(fx, measure);
     let elided = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, written, budget);
     let three = fx.ptr(3);
@@ -165,7 +165,7 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         lo,
         elided,
         &[PTR],
-        |_, fx| vec![elided_end(fx, value, budget, room)],
+        |lo, fx| vec![elided_end(lo, fx, value, budget, room)],
         |_, _| vec![written],
     )[0];
     let output = fx.b.ins().iadd(end, marker);
@@ -183,7 +183,7 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let data = fx.load(PTR, address, vector::DATA);
     let target = fx.b.ins().iadd(data, len);
     let keep = render::window_renderer(fx, target, budget, (zero, end));
-    render::render_dyn(fx, value, keep);
+    render::render_dyn(lo, fx, value, keep);
     let marked = fx.b.ins().icmp_imm_s(IntCC::NotEqual, marker, 0);
     fx.when(marked, |fx| {
         let dots = lo.view_literal(fx, b"...").address();
@@ -197,14 +197,14 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// The length of the longest prefix of the elided rendering of a `Dyn[Render]` value within
 /// `budget` that ends at a char boundary within `room` bytes, read from the bytes the rendering
 /// holds around `room`.
-fn elided_end(fx: &mut Fx, value: Value, budget: Value, room: Value) -> Value {
+fn elided_end(lo: &mut Lowering, fx: &mut Fx, value: Value, budget: Value, room: Value) -> Value {
     let three = fx.ptr(3);
     let back = fx.b.ins().umin(room, three);
     let skip = fx.b.ins().isub(room, back);
     let window = fx.slot(4, 1);
     let four = fx.ptr(4);
     let renderer = render::window_renderer(fx, window, budget, (skip, four));
-    render::render_dyn(fx, value, renderer);
+    render::render_dyn(lo, fx, value, renderer);
     fx.repeat(&[room], |fx, state| {
         let end = state[0];
         let inside = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, end, skip);
@@ -272,7 +272,7 @@ fn fixed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let room = fx.b.ins().isub(full, len);
             let budget = fx.b.ins().umin(budget, room);
             let renderer = render::new_renderer(fx, end, budget);
-            render::render_dyn(fx, value, renderer);
+            render::render_dyn(lo, fx, value, renderer);
             let added = render::finish(lo, fx, renderer);
             let len = fx.b.ins().iadd(len, added);
             fx.store(len, address, len_at);

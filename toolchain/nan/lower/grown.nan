@@ -1,0 +1,270 @@
+//! Grown calls: in an image whose task stacks grow, a direct call closing a cycle of the calls emitted so far, and a call of a function value whose type demands no `stack N`, go through a wrapper. The wrapper writes the call's arguments into a record and has the `Grow` support routine run its thunk, which makes the call from the record, on the running stack when it has the room the thunk needs and on a new stack segment otherwise. Each thunk's need is a word of a table the lowering fills once every frame is known.
+
+/// The symbol of the table of grown calls' needs.
+const GROWN_NEEDS: Str = "_NSstack_switch_needs"
+
+/// The bytes each argument and result takes in a grown call's record.
+const GROWN_SLOT: u64 = 16
+
+/// What a grown call calls: a lowered function, or a function value's code of a signature.
+enum GrownCall derives Eq, Hash {
+    Function(object::FuncId)
+    Value(clif::Signature)
+} GrownCall
+
+fn GrownCall.copy(self, alloc: mem::Alloc) -> GrownCall {
+    return match self {
+        GrownCall.Function(callee) => GrownCall.Function(callee)
+        GrownCall.Value(signature) => GrownCall.Value(object::copied(signature, alloc))
+    }
+} GrownCall.copy
+
+/// A function being defined, and whether calls it makes may grow.
+struct Defining derives Copy {
+    id: object::FuncId
+    grows: bool
+} Defining
+
+/// Whether the image's runtime keeps stack segments: a kernel exporting the load ABI, whose tasks
+/// run the grown calls of the nanos bundles it loads.
+fn Lowering.keeps_segments(self) -> bool = self.exports()
+
+/// Starts defining a function: a routine's calls never grow.
+fn Lowering.enter_definition(mut self, id: object::FuncId) {
+    if not self.grows {
+        return
+    }
+    mut self.defining.push(Defining(id: id, grows: not self.is_routine(callee: id)))
+} Lowering.enter_definition
+
+fn Lowering.leave_definition(mut self) {
+    if self.grows {
+        discard mut self.defining.pop()
+    }
+} Lowering.leave_definition
+
+/// Whether `from` reaches `to` through the calls emitted so far.
+fn Lowering.reaches(self, from: object::FuncId, to: object::FuncId) -> bool {
+    var seen = mem::HashMap[object::FuncId, Unit].empty(seed: 0, alloc: self.alloc)
+    discard mut seen.insert(from, value: Unit)
+    var pending = mem::List[object::FuncId].empty(self.alloc)
+    mut pending.push(from)
+    loop {
+        let Some(caller) = mut pending.pop() else {
+            return false
+        }
+        let Some(callees) = self.emitted_calls.get(caller) else {
+            continue
+        }
+        for callee in callees {
+            if callee == to {
+                return true
+            }
+            if not seen.contains(callee) {
+                discard mut seen.insert(callee, value: Unit)
+                mut pending.push(callee)
+            }
+        }
+    }
+} Lowering.reaches
+
+/// The call site a call of a wrapper is, given how lowering classified the call it wraps; none
+/// for a call of another function.
+fn Lowering.grown_site(self, callee: object::FuncId, take recorded: Option[Site]) -> Option[Site] {
+    let Some(wrapped) = self.wrappers.get(callee) else {
+        return None
+    }
+    let Some(found) = recorded else {
+        var inner = StackKind.Bounded(None)
+        match wrapped.callee {
+            Some(function) => {
+                inner = StackKind.Direct(callee: function, bindings: mem::List[ParamBinding].empty(self.alloc))
+            }
+            None => {}
+        }
+        return Some(Site(kind: StackKind.Grown(wrapper: callee, thunk: wrapped.thunk, inner: mem::Heap.of(self.alloc).boxed(take inner)), at: None))
+    }
+    let Site(kind: kind, at: at) = found
+    return Some(Site(kind: StackKind.Grown(wrapper: callee, thunk: wrapped.thunk, inner: mem::Heap.of(self.alloc).boxed(take kind)), at: at))
+} Lowering.grown_site
+
+/// A reference for a direct call of a lowered function from the function being built: its
+/// grown call's wrapper when the callee reaches the caller through the calls emitted so far.
+fn Lowering.call_ref(mut self, mut fx: Fx, id: object::FuncId) -> clif::FuncRef {
+    let grown = mut self.grown_callee(id)
+    return mut self.func_ref(mut fx, id: grown.value_or(id))
+} Lowering.call_ref
+
+fn Lowering.grown_callee(mut self, callee: object::FuncId) -> Option[object::FuncId] {
+    if not self.grows or self.defining.len() == 0 {
+        return None
+    }
+    let caller = self.defining[self.defining.len() - 1]
+    if not caller.grows {
+        return None
+    }
+    let closes = callee == caller.id or self.reaches(from: callee, to: caller.id)
+    if not self.emitted_calls.contains(caller.id) {
+        discard mut self.emitted_calls.insert(caller.id, value: mem::List[object::FuncId].empty(self.alloc))
+    }
+    var callees = mut self.emitted_calls.at_mut(caller.id)
+    mut callees.push(callee)
+    if not closes {
+        return None
+    }
+    return Some(mut self.wrapper(GrownCall.Function(callee)))
+} Lowering.grown_callee
+
+/// Calls code through its address, as a call of a function value whose type demands `stack`
+/// bytes or none: an unbounded one as a grown call when the image's stacks grow.
+fn Lowering.call_code(mut self, mut fx: Fx, take signature: clif::Signature, code: clif::Value, args: Slice[clif::Value], stack: Option[u64]) -> clif::Inst {
+    var grows = false
+    if self.grows and self.defining.len() > 0 {
+        grows = self.defining[self.defining.len() - 1].grows and stack.is_none()
+    }
+    if not grows {
+        let sig_ref = mut fx.b.import_signature(take signature)
+        return mut fx.b.call_indirect(sig_ref, callee: code, args)
+    }
+    let wrapper = mut self.wrapper(GrownCall.Value(take signature))
+    let reference = mut self.func_ref(mut fx, id: wrapper)
+    var values = mem::List[clif::Value].empty(fx.alloc)
+    mut values.push(code)
+    for arg in args {
+        mut values.push(arg)
+    }
+    return mut fx.b.call(reference, args: values.view())
+} Lowering.call_code
+
+/// The wrapper of a grown call, defined after its thunk when first asked for.
+fn Lowering.wrapper(mut self, called: GrownCall) -> object::FuncId {
+    match self.glues.get(Glue.Grown(called.copy(self.alloc))) {
+        Some(known) => return known
+        None => {}
+    }
+    let thunk = mut self.thunk(called)
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    var callee: Option[object::FuncId] = None
+    match called {
+        GrownCall.Function(function) => {
+            signature = self.module.function_signature(function)
+            callee = Some(function)
+        }
+        GrownCall.Value(value_signature) => {
+            signature = object::copied(value_signature, alloc: self.alloc)
+            mut signature.params.insert(0, value: clif::AbiParam(value_type: PTR))
+        }
+    }
+    mut self.grown.push(Grown(thunk: thunk, callee: callee))
+    let index = self.grown.len() - 1
+    let wrapper = mut self.glue_function(Glue.Grown(called.copy(self.alloc)), signature: object::copied(signature, alloc: self.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        let record = mut fx1.slot(GROWN_SLOT * grown_slots(signature), align: GROWN_SLOT)
+        for at in 0..<params.len() {
+            mut fx1.store(params[at], addr: record, offset: GROWN_SLOT * u64.widen(at))
+        }
+        let thunk_ref = mut lo1.func_ref(mut fx1, id: thunk)
+        let thunk_address = mut fx1.b.func_addr(PTR, func_ref: thunk_ref)
+        let table = mut lo1.needs_data()
+        let needs_address = mut lo1.data_address(mut fx1, id: table)
+        let need = mut fx1.load(PTR, addr: needs_address, offset: 8 * u64.widen(index))
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Grow, args: fx1.list3(thunk_address, b: record, c: need).view())
+        var results = mem::List[clif::Value].empty(fx1.alloc)
+        for at in 0..<signature.returns.len() {
+            mut results.push(mut fx1.load(signature.returns[at].value_type, addr: record, offset: GROWN_SLOT * u64.widen(at)))
+        }
+        mut fx1.b.ret(results.view())
+    })
+    discard mut self.wrappers.insert(wrapper, value: Grown(thunk: thunk, callee: callee))
+    return wrapper
+} Lowering.wrapper
+
+/// The thunk of a grown call: makes the call from the record of its arguments, writing its
+/// results over them.
+fn Lowering.thunk(mut self, called: GrownCall) -> object::FuncId {
+    return mut self.glue_function(Glue.GrownThunk(called.copy(self.alloc)), signature: record_signature(self.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let inst = grown_thunk_call(mut lo1, fx: mut fx1, called, record)
+        let results = fx1.b.inst_results(inst, alloc: fx1.alloc)
+        for at in 0..<results.len() {
+            mut fx1.store(results[at], addr: record, offset: GROWN_SLOT * u64.widen(at))
+        }
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} Lowering.thunk
+
+/// The call a grown call's thunk makes from the record of its arguments.
+fn grown_thunk_call(mut lo: Lowering, mut fx: Fx, called: GrownCall, record: clif::Value) -> clif::Inst {
+    match called {
+        GrownCall.Function(callee) => {
+            let signature = lo.module.function_signature(callee)
+            let args = grown_loaded(mut fx, signature, record, from: 0)
+            let reference = mut lo.func_ref(mut fx, id: callee)
+            return mut fx.b.call(reference, args: args.view())
+        }
+        GrownCall.Value(signature) => {
+            let code = mut fx.load(PTR, addr: record, offset: 0)
+            let args = grown_loaded(mut fx, signature, record, from: 1)
+            let sig_ref = mut fx.b.import_signature(object::copied(signature, alloc: fx.alloc))
+            return mut fx.b.call_indirect(sig_ref, callee: code, args: args.view())
+        }
+    }
+} grown_thunk_call
+
+/// The table of grown calls' needs, declared once and defined when lowering finishes.
+fn Lowering.needs_data(mut self) -> object::DataId {
+    match self.needs {
+        Some(id) => return id
+        None => {}
+    }
+    let id = mut self.module.declare_data(GROWN_NEEDS, linkage: object::Linkage.Local, writable: false, tls: false)
+    self.needs = Some(id)
+    return id
+} Lowering.needs_data
+
+/// Defines the table of grown calls' needs from the frames lowered.
+fn Lowering.emit_needs(mut self) {
+    let Some(id) = self.needs else {
+        return
+    }
+    var excluded = mem::HashMap[object::FuncId, Unit].empty(seed: 0, alloc: self.alloc)
+    for entry in self.routines {
+        discard mut excluded.insert(entry.value(), value: Unit)
+    }
+    for entry in self.wrappers {
+        discard mut excluded.insert(entry.key(), value: Unit)
+        discard mut excluded.insert(entry.value().thunk, value: Unit)
+    }
+    let thunk_needs = stack_needs(self.frames.view(), grown: self.grown.view(), excluded, alloc: self.alloc)
+    var bytes = mem::Bytes.empty(self.alloc)
+    for need in thunk_needs {
+        object::append_u64(mut bytes, value: need)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+} Lowering.emit_needs
+
+/// The record slots a call of a signature takes: one per argument or result, whichever are more.
+fn grown_slots(signature: clif::Signature) -> u64 {
+    var slots = signature.params.len()
+    if signature.returns.len() > slots {
+        slots = signature.returns.len()
+    }
+    if slots == 0 {
+        slots = 1
+    }
+    return u64.widen(slots)
+} grown_slots
+
+/// The arguments of a call of a signature, read from a record from slot `from` on.
+fn grown_loaded(mut fx: Fx, signature: clif::Signature, record: clif::Value, from: u64) -> mem::List[clif::Value] {
+    var args = mem::List[clif::Value].empty(fx.alloc)
+    for at in 0..<signature.params.len() {
+        mut args.push(mut fx.load(signature.params[at].value_type, addr: record, offset: GROWN_SLOT * (from + u64.widen(at))))
+    }
+    return args
+} grown_loaded

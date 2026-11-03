@@ -153,7 +153,7 @@ pub fn release_routine(lo: &mut Lowering, fx: &mut Fx) {
             fx.when(pending, |fx| {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let owner = transfer::raised(fx, reach);
-                transfer::call_walker(fx, walk, &[value, reach, owner]);
+                transfer::call_walker(lo, fx, walk, &[value, reach, owner]);
             });
             (pending, vec![reach])
         });
@@ -186,7 +186,7 @@ pub fn poison(lo: &mut Lowering, fx: &mut Fx, held: Value, domain: Value) {
             let value = fx.load(PTR, entry, held::VALUE);
             let none = fx.ptr(0);
             let owner = transfer::raised(fx, reach);
-            transfer::call_walker(fx, walk, &[value, none, owner]);
+            transfer::call_walker(lo, fx, walk, &[value, none, owner]);
         });
         grant_next(lo, fx, record);
     });

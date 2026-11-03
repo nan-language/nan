@@ -76,3 +76,58 @@ fn an_exceeded_bound_names_each_call_of_the_deepest_path_in_source() {
     assert_eq!(found[0].code, Code::LimitStackExceeded);
     assert_eq!(because, [(Role::Called, "app::inner")]);
 }
+
+/// A recursion's thunk needs its callee's frame and the wrapper's frame with the stub call bound
+/// at the grown call, and a function value's thunk the most any other function needs.
+#[test]
+fn a_grown_call_needs_the_stack_up_to_the_next_grown_call() {
+    let [recursive, wrapper, thunk, value_thunk, big] = [0, 1, 2, 3, 4].map(FuncId::from_u32);
+    let frame = |function, size, sites: Vec<Kind>| Frame {
+        function,
+        name: String::new(),
+        size,
+        params: Vec::new(),
+        sites: sites
+            .into_iter()
+            .map(|kind| Site { kind, at: None })
+            .collect(),
+    };
+    let frames = [
+        frame(
+            recursive,
+            48,
+            vec![Kind::Grown {
+                wrapper,
+                thunk,
+                inner: Box::new(Kind::Direct {
+                    callee: recursive,
+                    bindings: Vec::new(),
+                }),
+            }],
+        ),
+        frame(wrapper, 64, vec![Kind::Stub]),
+        frame(
+            thunk,
+            16,
+            vec![Kind::Direct {
+                callee: recursive,
+                bindings: Vec::new(),
+            }],
+        ),
+        frame(value_thunk, 32, vec![Kind::Bounded(None)]),
+        frame(big, 4_096, vec![Kind::Bounded(Some(100))]),
+    ];
+    let grown = [
+        Grown {
+            thunk,
+            callee: Some(recursive),
+        },
+        Grown {
+            thunk: value_thunk,
+            callee: None,
+        },
+    ];
+    let excluded = HashSet::from([wrapper, thunk, value_thunk]);
+    let needs = needs(&frames, &grown, &excluded);
+    assert_eq!(needs, [16 + 48 + 64 + STUB_CALL_BOUND, 32 + 4_096 + 100]);
+}

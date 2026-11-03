@@ -1,4 +1,4 @@
-//! The boot heap, which starts a machine image's boot area and from which its runtime draws its records and the chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a record is a block of a power-of-two size class behind a 16-byte header naming the class, carved from chunks the map hands out. A freed block joins its class's free list, from which a later record of the class takes it. Every record and chunk is cleared once its lock is released.
+//! The boot heap, which starts a machine image's boot area and from which its runtime draws its records and the chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a record is a block of a power-of-two size class behind a 16-byte header naming the class, carved from chunks the map hands out. A freed block smaller than a chunk joins its class's free list, from which a later record of the class takes it, and a freed run of chunks returns to the map. Every record and chunk is cleared once its lock is released.
 
 /// The bytes of the boot heap.
 const BOOT_HEAP: u64 = 16u64 * 1024 * 1024
@@ -370,7 +370,7 @@ fn heap_carve(mut lo: Lowering, mut fx: Fx, state: clif::Value, size: clif::Valu
     return at
 } heap_carve
 
-/// Returns a block to its size class's free list.
+/// Returns a block to its size class's free list, or a run of chunks to the map.
 fn record_free(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
     let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: address, y: 0)
     mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
@@ -378,11 +378,21 @@ fn record_free(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
         let class = mut fx1.load(PTR, addr: block, offset: 0)
         let state = heap_state(mut lo, fx: mut fx1)
         let flags = heap_lock(mut lo, fx: mut fx1, state)
-        let slot_offset = mut fx1.b.imul_imm_s(class, y: 8)
-        let slot = mut fx1.b.iadd(state, y: slot_offset)
-        let head = mut fx1.load(PTR, addr: slot, offset: ALLOCATORS_FREE)
-        mut fx1.store(head, addr: address, offset: 0)
-        mut fx1.store(block, addr: slot, offset: ALLOCATORS_FREE)
+        let large = mut fx1.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: class, y: CHUNK_CLASS)
+        discard mut fx1.choose_in(mut lo, condition: large, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let block_size = block_bytes(mut fx2, class)
+            let count = mut fx2.b.ushr_imm_s(block_size, y: CHUNK_CLASS)
+            let supply = boot_supply(mut lo2, fx: mut fx2, state)
+            give_chunks(mut fx2, supply, base: block, count)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let slot_offset = mut fx2.b.imul_imm_s(class, y: 8)
+            let slot = mut fx2.b.iadd(state, y: slot_offset)
+            let head = mut fx2.load(PTR, addr: slot, offset: ALLOCATORS_FREE)
+            mut fx2.store(head, addr: address, offset: 0)
+            mut fx2.store(block, addr: slot, offset: ALLOCATORS_FREE)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
         unlock(mut lo, fx: mut fx1, state, flags)
     })
 } record_free

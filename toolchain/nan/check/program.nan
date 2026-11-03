@@ -106,28 +106,54 @@ fn Checker.check_entry_head(self, item: ty::ItemId) {
     let Some(kind) = db.target.kind() else {
         return
     }
-    let grant = match kind {
-        workspace::Kind.Host => "host::World"
-        workspace::Kind.Uefi => "boot::Machine"
-        workspace::Kind.Bare => "boot::Kernel"
-    }
+    let host_forms = "fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> u8 fails E uses wait"
     let forms = match kind {
-        workspace::Kind.Host => "fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> u8 fails E uses wait"
+        workspace::Kind.Host => host_forms
         workspace::Kind.Uefi => "fn main(take P: boot::Machine) -> Never"
-        else => "fn main(take P: boot::Kernel) -> Never"
+        workspace::Kind.Bare => "fn main(take P: boot::Kernel) -> Never"
+        workspace::Kind.Nanos => "fn main(take P: nanos::World, take I: In) -> Out fails E uses wait, In and Out implementing Encode, or fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> u8 fails E uses wait"
     }
-    let parameter = sig.params.len() == 1 and sig.params[0].mode == ast::Mode.Take and not sig.params[0].is_self and self.is_std(sig.params[0].ty, path: grant)
+    let waits = self.entry_failure(sig.failure) and sig.wait
+    let host = sig.params.len() == 1 and self.taken(sig, index: 0, grant: "host::World") and (sig.result == ty::Ty.unit() or sig.result == ty::Ty.scalar(ty::Scalar.Unsigned8)) and waits
     let rest = match kind {
-        workspace::Kind.Host => (sig.result == ty::Ty.unit() or sig.result == ty::Ty.scalar(ty::Scalar.Unsigned8)) and self.entry_failure(sig.failure) and sig.wait
-        else => sig.result == ty::Ty.never() and sig.failure.is_none() and not sig.wait
+        workspace::Kind.Host => host
+        workspace::Kind.Nanos => host or self.job_head(sig, waits)
+        workspace::Kind.Uefi => self.machine_head(sig, grant: "boot::Machine")
+        workspace::Kind.Bare => self.machine_head(sig, grant: "boot::Kernel")
     }
-    let shaped = node.visibility == ast::Visibility.Private and function.modifier.is_none() and function.head.generics.len() == 0 and parameter and rest
+    let shaped = node.visibility == ast::Visibility.Private and function.modifier.is_none() and function.head.generics.len() == 0 and rest
     if not shaped {
         let last = Clauses.of(function.head, fixable: false).last
         let found = self.written(item, head: node.token, last)
         self.report_expected(item, token: node.token, code: diagnostic::Code.TargetEntryHead, expected: text::String.of(forms, alloc: self.alloc()), found: take found)
     }
 } Checker.check_entry_head
+
+/// Whether an entry head's parameter at an index exists and takes a std type, not as `self`.
+fn Checker.taken(self, sig: FnSig, index: usize, grant: Str) -> bool {
+    if index >= sig.params.len() {
+        return false
+    }
+    return sig.params[index].mode == ast::Mode.Take and not sig.params[index].is_self and self.is_std(sig.params[index].ty, path: grant)
+} Checker.taken
+
+/// Whether an entry head has a machine target's form: one taken parameter, the root grant, and
+/// the result `Never`, without a `fails` or `uses wait` clause.
+fn Checker.machine_head(self, sig: FnSig, grant: Str) -> bool {
+    return self.taken(sig, index: 0, grant) and sig.params.len() == 1 and sig.result == ty::Ty.never() and sig.failure.is_none() and not sig.wait
+} Checker.machine_head
+
+/// Whether an entry head has the typed job form of the nanos targets: the root grant and a taken
+/// input, each of input and result implementing `Encode`, failing and waiting as a host entry.
+fn Checker.job_head(self, sig: FnSig, waits: bool) -> bool {
+    let Some(encode) = self.db().core_item("Encode") else {
+        return false
+    }
+    if sig.params.len() != 2 or not waits or not self.taken(sig, index: 0, grant: "nanos::World") {
+        return false
+    }
+    return sig.params[1].mode == ast::Mode.Take and self.implements(sig.params[1].ty, interface_item: encode) and self.implements(sig.result, interface_item: encode)
+} Checker.job_head
 
 /// Whether an entry function's failure type is an enum implementing `Render`, or
 /// `task::Cancelled`.

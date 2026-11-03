@@ -124,11 +124,6 @@ fn manifest_directives_are_checked() {
             5,
         ),
         (
-            "    language 1\n    targets x86_64-nanos\n",
-            "manifest.reserved-target",
-            5,
-        ),
-        (
             "    language 1\n    targets x86_64-arm\n",
             "manifest.unknown-target",
             5,

@@ -1,6 +1,6 @@
 # Components
 
-This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints, and protocols with their servers, operation calls and hashes.
+This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, and protocols with their servers, operation calls and hashes.
 
 ## Components
 
@@ -248,7 +248,7 @@ pub fn frame(world: host::World) -> Framer fails task::SendError uses wait {
 
 ## Component context
 
-A **component context** is the `sys::Cx[M]` that `on` receives. Its operations act on the component whose message is being handled.
+A **component context** is the `sys::Cx[M]` that `on` and the methods of the [system interfaces](#system-interfaces) receive. Its operations act on the component whose message is being handled.
 
 ```nan-api
 // module: sys
@@ -263,7 +263,7 @@ pub fn Cx.after(mut self, ms: u64, take send: M)
 pub fn Cx.after_ns(mut self, ns: u64, take send: M)
 ```
 
-- `sys::Cx[M]` is a base type: a [view](05-properties.md#views), and never linear, Copy, Send, Inert or AnyBits. Only a runner creates one, for one call of `on`; `start` receives none.
+- `sys::Cx[M]` is a base type: a [view](05-properties.md#views), and never linear, Copy, Send, Inert or AnyBits. Only a runner creates one, for one call of `on` or of a system interface method; `start` receives none.
 - `mut cx.send(m)` appends `m` to the intake.
 - `mut cx.after_ns(ns: n, send: m)` appends `m` to the intake as soon as at least `n` nanoseconds have elapsed since the call, so at once when `n` is 0, and `mut cx.after(ms: n, send: m)` does so after `n` milliseconds. The nanoseconds are those that `sys::Clock.elapsed_ns` counts for the clock that the runner's executor records, and the delay ends only once they are a multiple of the executor's resolution ([executors](16-concurrency.md#executors)) ([capability tables](14-authority.md#capability-tables)); on the [seeded scheduler](22-testing.md#seeded-scheduler) the end of the delay is a pending deadline of the virtual clock. Messages whose delays end at the same time enter in the order of their `after` and `after_ns` calls.
 - The operations of a component context never wait. `send`, `after` and `after_ns` draw the message's intake entry through the runner's allocator, and trap when it is exhausted (`trap.exhausted`); the entry is released when the message leaves the intake.
@@ -469,7 +469,7 @@ pub fn Runner.run[Env: Any, M: Any, E](take env: Env, exec: task::Executor, allo
 
 - `host::Runner[S]` has no values; it names `run`. The runner's executor and allocator are the `exec` and `alloc` of the call.
 - A use of `host::Runner[S].run` where S does not implement `sys::Component[Env, M]` for the Env and M fixed at that use ([inference](08-generics-interfaces.md#inference)) is an error (`component.not-component`).
-- A use of `host::Runner.run` in code checked for a machine target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`component.unavailable`).
+- A use of `host::Runner.run` in code checked for a machine or nanos target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`component.unavailable`).
 
 A call `host::Runner[S].run(env, exec, alloc, body: b)` runs these steps:
 
@@ -651,10 +651,10 @@ pub fn Stepper.abandon(take self)
 - A keyed task that `spawn` starts on a stepper is **held**: its stack and record are drawn, but it starts only when `mut s.start_keyed()` starts every held keyed task, in the order of their spawns, returning how many it started. Superseding the key of a held task cancels it before it starts.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
 - `s.incoming()` returns once a message waits in the intake. `s.ready()` returns `true` once a message waits in the intake and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.
-- `s.state()` gives the state. Handlers run only within `start`, `deliver` and `step`, so the holder reads the state of a quiescent component, and the [encoding](13-text-encode.md#encode) of it is a **checkpoint** of the component, which `resume` takes back once decoded. A checkpoint holds the state alone: the intake, the delayed messages and the keyed tasks are the holder's to drain first, until the stepper is idle.
+- `s.state()` gives the state. Handlers run only within `start`, `deliver`, `step` and the operations of the [system interfaces](#system-interfaces), so the holder reads the state of a quiescent component, and the [encoding](13-text-encode.md#encode) of it is a **checkpoint** of the component, which `resume` takes back once decoded. A checkpoint holds the state alone: the intake, the delayed messages and the keyed tasks are the holder's to drain first, until the stepper is idle.
 - `take s.end()` stops the intake: the posts waiting in it fail with `task::SendError.Closed`, its other messages and every delayed message are released, and no message enters it afterwards. It then supersedes the key of every keyed task, starts every held one, and waits until every keyed task has ended. It makes the stepper's outbox stale and returns the state and the Env in a `sys::Stopped`. It is an [exempt primitive](17-suspension-io.md#acknowledged-cancellation): no cancellation point, and it never fails.
 - `take s.abandon()` is the stepper's [abandon method](17-suspension-io.md#abandoning-resources): it stops the intake and supersedes and starts keyed tasks as `end` does, without waiting for them, makes the outbox stale, and releases the state and the Env, a linear Env through its type's abandon method.
-- `start`, `deliver` and `step` call handlers on the calling task: the digest of each holds the [declared digest](10-effects-digests.md#indirect-calls) of a call through the methods of `sys::Component`, and a trap in a handler abandons the domain of the calling task. A keyed task belongs to the domain of the task whose handler spawned it.
+- `start`, `deliver`, `step` and the operations of the [system interfaces](#system-interfaces) call handlers on the calling task: the digest of each holds the [declared digest](10-effects-digests.md#indirect-calls) of a call through the methods of `sys::Component` or of a system interface, and a trap in a handler abandons the domain of the calling task. A keyed task belongs to the domain of the task whose handler spawned it.
 - A stepper belongs to the domain of the task that started it. When that domain is abandoned, the stepper ends with it: its intake stops, the posts waiting in it fail with `task::SendError.Closed`, a request whose handler was running fails as closed, its delayed messages are released, and its outboxes become stale.
 
 ```nan
@@ -784,6 +784,146 @@ pub fn level(exec: task::Executor, alloc: mem::Alloc) -> u32 fails task::Cancell
     let last = try await take stepper.end()
     return last.state.level
 } level
+```
+
+### System interfaces
+
+A **system interface** is one of the std interfaces below, which a component state may implement beside `sys::Component` for the same Env and M. Their methods are handlers too: a holder calls them through its stepper as the events of the component's life that they name occur.
+
+```nan-api
+// module: sys
+
+pub interface Resume[Env: Any and Send, M: Send] {
+    fn resume(mut self, reason: ResumeReason, mut env: Env, mut cx: Cx[M])
+} Resume
+
+pub closed enum ResumeReason derives Copy, Eq, Render, Encode {
+    Started
+    Restored
+    Revived
+    Updated
+    Rewired
+} ResumeReason
+
+pub interface Pressure[Env: Any and Send, M: Send] {
+    fn pressure(mut self, level: u8, mut env: Env, mut cx: Cx[M])
+} Pressure
+
+pub interface Health[Env: Any and Send, M: Send] {
+    fn health(mut self, mut env: Env, mut cx: Cx[M]) -> HealthReply
+} Health
+
+pub closed enum HealthReply derives Copy {
+    Healthy
+    Unhealthy(text::Fixed[256])
+} HealthReply
+
+pub interface Suspend[Env: Any and Send, M: Send] {
+    fn suspend(mut self, mut env: Env, mut cx: Cx[M])
+    fn wake(mut self, mut env: Env, mut cx: Cx[M])
+} Suspend
+
+pub fn Stepper.resumed(mut self, reason: ResumeReason)
+
+pub fn Stepper.pressure(mut self, level: u8)
+
+pub fn Stepper.health(mut self) -> HealthReply
+
+pub fn Stepper.suspend(mut self)
+
+pub fn Stepper.wake(mut self)
+```
+
+- An impl line naming a system interface whose target does not implement `sys::Component` for the same Env and M is an error (`component.system-unmatched`), reported on the impl line.
+- `mut s.resumed(reason)` calls `S.resume`, `mut s.pressure(level)` `S.pressure`, `mut s.health()` `S.health`, `mut s.suspend()` `S.suspend` and `mut s.wake()` `S.wake`, each on the calling task as `deliver` calls `on`: with the state and the Env by `mut` and a component context of the stepper, after the operation's argument, publishing the summary afterwards. When S does not implement the interface for the stepper's Env and M, the operation calls nothing, and `health` returns `HealthReply.Healthy`.
+- The holder chooses when to call each and what it passes. `resume` re-arms what a component needs after `start` (`Started`) or after resuming from a checkpoint, a checkpoint holding no keyed task and no delayed message: of a restart (`Restored`), of a hibernation (`Revived`), under new code (`Updated`) or with a new Env (`Rewired`). `pressure` reports memory pressure, a higher level meaning scarcer memory, so that the component releases what it can rebuild; `health` gives a liveness reply; `suspend` comes before the device the component drives leaves its working power state, and `wake` after it returns to it.
+
+A reader that its holder restores from a checkpoint re-arms its poll, which the checkpoint does not hold:
+
+```nan
+// file: reader/package.nan
+//! A polling reader stepped on the host.
+
+package reader {
+    language 1
+    targets x86_64-host
+} reader
+
+// file: reader/reader.nan
+//! Polls once resumed, and reports itself unhealthy while it polls nothing.
+
+pub closed struct Env {
+} Env
+
+pub closed enum Poll {
+    Tick
+} Poll
+
+pub closed struct Reader derives Encode {
+    pub ticks: u32
+    pub polling: bool
+} Reader
+
+impl Reader: sys::Component[Env, Poll]
+
+impl Reader: sys::Resume[Env, Poll]
+
+impl Reader: sys::Health[Env, Poll]
+
+pub fn Reader.start(mut env: Env) -> Reader = Reader(ticks: 0, polling: false)
+
+pub fn Reader.on(mut self, take message: Poll, mut env: Env, mut cx: sys::Cx[Poll]) {
+    self.ticks += 1
+} Reader.on
+
+pub fn Reader.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Poll]) {
+    self.polling = true
+    mut cx.send(Poll.Tick)
+} Reader.resume
+
+pub fn Reader.health(mut self, mut env: Env, mut cx: sys::Cx[Poll]) -> sys::HealthReply {
+    if self.polling {
+        return sys::HealthReply.Healthy
+    }
+    return sys::HealthReply.Unhealthy(text::Fixed[256].of("not polling"))
+} Reader.health
+
+pub fn restore(world: host::World, take checkpoint: Reader) -> Reader fails task::Cancelled uses wait {
+    var stepper = try sys::Stepper[Reader, Env, Poll].resume(take checkpoint, env: Env(), exec: world.exec, alloc: world.alloc)
+    mut stepper.resumed(sys::ResumeReason.Restored)
+    discard mut stepper.step()
+    let last = try await take stepper.end()
+    return last.state
+} restore
+
+test restored_reader_polls_again for restore {
+    let world = testing::world()
+    let reader = try await restore(world, checkpoint: Reader(ticks: 4, polling: false))
+    expect reader.ticks == 5 and reader.polling
+} restored_reader_polls_again
+```
+
+```nan
+pub closed struct Env {
+} Env
+
+pub closed struct Gauge derives Encode {
+    pub level: u32
+} Gauge
+
+impl Gauge: sys::Component[Env, u32]
+
+impl Gauge: sys::Pressure[Env, u64] // error: component.system-unmatched
+
+pub fn Gauge.start(mut env: Env) -> Gauge = Gauge(level: 0)
+
+pub fn Gauge.on(mut self, take message: u32, mut env: Env, mut cx: sys::Cx[u32]) {
+    self.level = message
+} Gauge.on
+
+pub fn Gauge.pressure(mut self, level: u8, mut env: Env, mut cx: sys::Cx[u64]) {
+    self.level = 0
+} Gauge.pressure
 ```
 
 ## Protocols
@@ -1163,4 +1303,5 @@ The **operation hash** of an operation is the hash of the UTF-8 bytes `operation
 | `component.state-not-encode` | error | [Component state](#component-state) |
 | `component.state-not-inert` | error | [Component state](#component-state) |
 | `component.summary-type` | error | [Protocols](#protocols) |
+| `component.system-unmatched` | error | [System interfaces](#system-interfaces) |
 | `component.unavailable` | error | [Runner](#runner) |

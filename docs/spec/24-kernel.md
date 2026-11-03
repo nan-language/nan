@@ -1446,7 +1446,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 
 ## Floating point
 
-A function, closure or const whose own operations or calls of std functions have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation or call.
+A function, closure or const whose own operations or calls of std functions have the float use [digest fact](10-effects-digests.md#digests) is an error (`kernel.float-use`) wherever the environments of the machine targets judge reachable code ([environments](27-program-model.md#environments)), reported at each such operation or call. In code checked for a nanos target, an interrupt fn whose digest has the float use fact is that error, reported on its head.
 
 Code lowered for a machine target uses none of the **extended state**: on x86_64 the x87 and SSE registers and the other state components `XCR0` enables, and on AArch64 the floating-point and Advanced SIMD registers with FPCR and FPSR. A thread **owns** extended state while it runs the body of `hw::ExtendedState.with` or a user thread through `hw::Ring0.run_user` given one ([user mode](#user-mode)), and owns none otherwise.
 
@@ -1530,6 +1530,29 @@ pub fn pause_owning(take frame: hw::PhysFrame[4_096], clock: sys::Clock) -> hw::
     })
     return take state.into_frame()
 } pause_owning
+```
+
+```nan
+// file: sensor/package.nan
+//! A sensor driver for NaN OS.
+
+package sensor {
+    language 1
+    targets x86_64-nanos
+} sensor
+
+// file: sensor/sensor.nan
+//! Scales a reading as its interrupt arrives.
+
+pub interrupt fn on_reading(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 { // error: kernel.float-use
+    discard scaled(3.0)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_reading
+
+pub fn scaled(level: f64) -> f64 {
+    return level * 2.0
+} scaled
 ```
 
 ## Kernel halts

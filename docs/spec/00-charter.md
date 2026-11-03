@@ -510,12 +510,13 @@ Each term links to its home, whose definition governs.
 | [statement](06-statements-expressions.md#statements) | One logical line of a body. |
 | [status](18-contracts.md#statuses) | Proven, checked, assumed or open. |
 | [stepper](26-components.md#steppers) | `sys::Stepper[S, Env, M]`, running a component on the task holding it. |
-| [std](28-stdlib.md#std-layers) | Nine packages the reserved std aliases name, and the three platform packages. |
+| [std](28-stdlib.md#std-layers) | Ten packages the reserved std aliases name, and the three platform packages. |
 | [store](12-memory.md#stores) | Manager of values in memory. |
 | [structural property](05-properties.md#structural-properties) | Property computed from structure. |
 | [summary](26-components.md#servers) | Value a component serving a protocol publishes at quiescence. |
 | [support routine](27-program-model.md#runtime-support) | Fixed runtime routine. |
 | [suspension point](17-suspension-io.md#stackful-tasks) | An `await`, where a task may suspend. |
+| [system interface](26-components.md#system-interfaces) | Std interface whose methods a stepper calls as handlers at events of a component's life. |
 | [table](25-registries.md#tables) | Sequence of a registry's admitted contributions under a target. |
 | [target](27-program-model.md#targets) | Platform for checking and building. |
 | [target variant](03-packages-modules.md#target-variants) | `name@target` module directory. |

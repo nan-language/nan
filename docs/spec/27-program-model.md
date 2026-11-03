@@ -4,10 +4,10 @@ This chapter defines targets and the dependencies they allow, target descriptors
 
 ## Targets
 
-A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets; `x86_64-nanos` and `aarch64-nanos` are reserved there.
+A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets.
 
 - The targets other than `any` are the **concrete targets**, each fixed by its [descriptor](#descriptors). A package declaring `any` is valid on every concrete target and is checked once, under the `any` descriptor.
-- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-host` and `aarch64-host` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**; the UEFI and bare targets are the **machine targets**.
+- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-host` and `aarch64-host` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**, and `x86_64-nanos` and `aarch64-nanos` the **nanos targets**, whose programs and libraries run on a NaN OS kernel; the UEFI and bare targets are the **machine targets**.
 - A package **covers** a target when it declares that target or `any`. A `dep` directive naming a package that does not cover every target the declaring package declares, `any` included, is an error (`target.dependency-uncovered`).
 
 ```nan
@@ -129,6 +129,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 - On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
 - On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`. Vector `0xFE` is the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), a fixed interrupt of the local APICs.
 - On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, except vector `0xFE`, the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), which software-generated interrupt 1 delivers; vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
+- The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the host target of its architecture: code holds floats and lane types in the floating-point and vector registers. Language 1 builds no image for a nanos target ([final builds](#final-builds)).
 - The `any` descriptor fixes only its environment, which restricts nothing.
 
 ```nan
@@ -242,8 +243,9 @@ The `entry main` directive names the **entry function**: the function item `main
 | `x86_64-host`, `aarch64-host` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
 | `x86_64-uefi`, `aarch64-uefi` | `fn main(take P: boot::Machine) -> Never` |
 | `x86_64-bare`, `aarch64-bare` | `fn main(take P: boot::Kernel) -> Never` |
+| `x86_64-nanos`, `aarch64-nanos` | `fn main(take P: nanos::World, take I: In) -> Out fails E uses wait`, In and Out implementing `Encode`, or a form of the host targets |
 
-The head is one of its target's forms, P being any parameter name and E either an enum implementing `Render` or `task::Cancelled`; it may add a `limits` clause and a clause region. Any other head, including one with a visibility, a modifier, a generic parameter or another parameter, is an error (`target.entry-head`), whose diagnostic quotes the expected forms. Whether the body may fail or wait is judged by [heads](02-items.md#heads); `target.entry-head` judges only the head's shape.
+The head is one of its target's forms, P and I being any parameter names, In and Out any types and E either an enum implementing `Render` or `task::Cancelled`; it may add a `limits` clause and a clause region. Any other head, including one with a visibility, a modifier, a generic parameter or another parameter, is an error (`target.entry-head`), whose diagnostic quotes the expected forms. Whether the body may fail or wait is judged by [heads](02-items.md#heads); `target.entry-head` judges only the head's shape.
 
 The entry function of a bare target starts kernel tasks only by ending in `take k.anchor(take state, run: f)` ([anchor](24-kernel.md#anchor)); one whose body diverges otherwise runs no task.
 
@@ -263,6 +265,60 @@ package status {
 fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     world.log.info("exiting", value: 3u8)
     return 3
+} main
+```
+
+```nan
+// file: average/package.nan
+//! A NaN OS job averaging readings.
+
+package average {
+    language 1
+    targets x86_64-nanos
+    entry main
+    allow validate in average
+} average
+
+// file: average/average.nan
+//! Entry of the averaging job.
+
+pub closed struct Readings derives Encode {
+    pub values: mem::List[f64]
+} Readings
+
+fn main(take world: nanos::World, take input: Readings) -> f64 fails task::Cancelled uses wait limits stack 16_384 {
+    var total: f64 = 0.0
+    for value in input.values {
+        total += value
+    }
+    world.log.info("readings", value: input.values.len())
+    return total / f64.fit(input.values.len())
+} main
+```
+
+```text
+$ nan build average
+failed build average: files 0, errors 1, incomplete 0
+error target.image-unavailable average/package.nan:6 average
+        entry main
+failed build average: files 0, errors 1, incomplete 0
+```
+
+```nan
+// file: average/package.nan
+//! A NaN OS job averaging readings.
+
+package average {
+    language 1
+    targets x86_64-nanos
+    entry main
+} average
+
+// file: average/average.nan
+//! Entry of the averaging job.
+
+fn main(take world: nanos::World, input: u32) fails task::Cancelled uses wait limits stack 16_384 { // error: target.entry-head
+    world.log.info("readings", value: input)
 } main
 ```
 
@@ -401,7 +457,7 @@ A final build proceeds in this order:
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.
 
-Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing.
+Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A final build for a nanos target is an error (`target.image-unavailable`), reported on the root's `entry` directive before step 1.
 
 ```nan
 // file: stats/package.nan
@@ -532,5 +588,6 @@ Every image keeps frame pointers in every function, stubs and support routines i
 | `target.dependency-uncovered` | error | [Targets](#targets) |
 | `target.entry-head` | error | [Entry](#entry) |
 | `target.entry-missing` | error | [Entry](#entry) |
+| `target.image-unavailable` | error | [Final builds](#final-builds) |
 | `target.link-failed` | error | [Images](#images) |
 | `target.program-targets` | error | [Programs and libraries](#programs-and-libraries) |

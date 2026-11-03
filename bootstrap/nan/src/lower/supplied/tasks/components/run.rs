@@ -41,7 +41,7 @@ pub fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     settle::enter_wait(lo, fx, withdraw, record, none);
     let env_at = fx.offset(record, shape.env_at);
     lo.store_held(fx, env_at, env, &env_ty);
-    let start = handler(lo, "start", &state_ty, &env_ty, &message_ty);
+    let start = handler(lo, "Component", "start", &state_ty, &env_ty, &message_ty);
     let state = call_handler(lo, fx, start, &[Held::Address(env_at)]);
     let state_at = fx.offset(record, shape.state_at);
     lo.store_held(fx, state_at, state, &state_ty);

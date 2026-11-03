@@ -1837,7 +1837,7 @@ impl Body<'_, '_> {
         if let Some(code) = self.ck.fn_type_problem(&closure_ty) {
             self.report(token, code);
         }
-        if task && self.ck.db.target.is_machine() && closure_ty.limits.stack.is_none() {
+        if task && self.ck.db.target.bounds_stacks() && closure_ty.limits.stack.is_none() {
             self.report(token, Code::SuspendStackMissing);
         }
         if let (Some(fails), Some(written)) = (&closure_ty.fails, &closure.fails)

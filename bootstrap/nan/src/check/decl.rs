@@ -770,9 +770,9 @@ impl Checker<'_> {
     }
 
     /// The `limits stack N` an entry of a boot, task, interrupt or landing context states when
-    /// checked for a machine target, reported on the entry's head.
+    /// checked for a machine or nanos target, reported on the entry's head.
     pub fn check_stack_bound(&self, item: ItemId, limits: &super::ty::LimitSet) {
-        if self.db.target.is_machine() && limits.stack.is_none() {
+        if self.db.target.bounds_stacks() && limits.stack.is_none() {
             self.report(item, self.db.ast(item).token, Code::SuspendStackMissing);
         }
     }

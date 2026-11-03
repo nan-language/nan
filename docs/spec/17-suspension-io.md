@@ -70,7 +70,7 @@ pub fn contained_triangle(n: u64, exec: task::Executor, alloc: mem::Alloc) -> Op
 
 ### Static bounds
 
-On the machine targets, every stack has a static bound. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
+On the machine and nanos targets, every stack has a static bound. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
 
 | Context | Entry | Stack |
 | --- | --- | --- |
@@ -80,7 +80,7 @@ On the machine targets, every stack has a static bound. The code of each context
 | policy | each method of the type a final build's `boot::Kernel.policy` installs, whose interface method states `limits stack 4_096` | the stack of the task, interrupt fn or CPU calling the hook, each of which holds a call of it ([policies](24-kernel.md#policies)) |
 | landing | each [landing fn](23-low-level.md#landing-functions) | the stack its seam switches to ([machine runs](27-program-model.md#machine-runs), [preemption](24-kernel.md#preemption)) |
 
-- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine target or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.
+- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine or nanos target or within the reach of a final build for a machine target ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.
 - A test body states no limits. On these targets, the build of a test image ([emulator runs](22-testing.md#emulator-runs)) computes the body's stack use as [stack limits](10-effects-digests.md#stack-limits) does for a function demanding `stack N`, reporting each unbounded call site of the body (`limit.stack-unbounded`), and the test's task runs on a stack holding that stack use.
 
 ```nan

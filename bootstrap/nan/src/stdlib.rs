@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use crate::workspace::{Package, Workspace};
 
 /// The std packages that std aliases name, in layer order.
-pub const PACKAGES: [&str; 9] = [
-    "core", "mem", "text", "task", "sys", "hw", "boot", "host", "testing",
+pub const PACKAGES: [&str; 10] = [
+    "core", "mem", "text", "task", "sys", "hw", "boot", "host", "nanos", "testing",
 ];
 
 /// The platform packages, which no alias names.

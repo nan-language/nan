@@ -243,6 +243,46 @@ pub fn Stepper.end(take self) -> Stopped[S, Env] fails task::Cancelled uses wait
 
 pub fn Stepper.abandon(take self)
 
+pub fn Stepper.resumed(mut self, reason: ResumeReason)
+
+pub fn Stepper.pressure(mut self, level: u8)
+
+pub fn Stepper.health(mut self) -> HealthReply
+
+pub fn Stepper.suspend(mut self)
+
+pub fn Stepper.wake(mut self)
+
+pub interface Resume[Env: Any and Send, M: Send] {
+    fn resume(mut self, reason: ResumeReason, mut env: Env, mut cx: Cx[M])
+} Resume
+
+pub closed enum ResumeReason derives Copy, Eq, Render, Encode {
+    Started
+    Restored
+    Revived
+    Updated
+    Rewired
+} ResumeReason
+
+pub interface Pressure[Env: Any and Send, M: Send] {
+    fn pressure(mut self, level: u8, mut env: Env, mut cx: Cx[M])
+} Pressure
+
+pub interface Health[Env: Any and Send, M: Send] {
+    fn health(mut self, mut env: Env, mut cx: Cx[M]) -> HealthReply
+} Health
+
+pub closed enum HealthReply derives Copy {
+    Healthy
+    Unhealthy(text::Fixed[256])
+} HealthReply
+
+pub interface Suspend[Env: Any and Send, M: Send] {
+    fn suspend(mut self, mut env: Env, mut cx: Cx[M])
+    fn wake(mut self, mut env: Env, mut cx: Cx[M])
+} Suspend
+
 pub closed enum CallError[E: Send] derives Render {
     Failed(E)
     Closed(task::SendError) from
@@ -251,6 +291,7 @@ pub closed enum CallError[E: Send] derives Render {
 
 struct Probe derives Encode {
     handled: u64
+    suspended: bool
 } Probe
 
 struct ProbeEnv {
@@ -269,6 +310,19 @@ enum ProbeMessage {
 
 impl Probe: Component[ProbeEnv, ProbeMessage]
 
+impl Probe: Resume[ProbeEnv, ProbeMessage]
+
+impl Probe: Pressure[ProbeEnv, ProbeMessage]
+
+impl Probe: Health[ProbeEnv, ProbeMessage]
+
+impl Probe: Suspend[ProbeEnv, ProbeMessage]
+
+struct Plain derives Encode {
+} Plain
+
+impl Plain: Component[ProbeEnv, ProbeMessage]
+
 struct Tally {
 } Tally
 
@@ -285,7 +339,7 @@ fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
     return state.load()
 } tally_count
 
-fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0)
+fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0, suspended: false)
 
 fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
     match message {
@@ -306,6 +360,37 @@ fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[
         ProbeMessage.Stop => mut cx.cancel(key: 1)
     }
 } Probe.on
+
+fn Probe.resume(mut self, reason: ResumeReason, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    if reason == ResumeReason.Restored {
+        mut cx.send(ProbeMessage.Count)
+    }
+} Probe.resume
+
+fn Probe.pressure(mut self, level: u8, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    env.counted += u64.widen(level)
+} Probe.pressure
+
+fn Probe.health(mut self, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) -> HealthReply {
+    if self.suspended {
+        return HealthReply.Unhealthy(text::Fixed[256].of("suspended"))
+    }
+    return HealthReply.Healthy
+} Probe.health
+
+fn Probe.suspend(mut self, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    self.suspended = true
+} Probe.suspend
+
+fn Probe.wake(mut self, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    self.suspended = false
+} Probe.wake
+
+fn Plain.start(mut env: ProbeEnv) -> Plain = Plain()
+
+fn Plain.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    env.counted += 1
+} Plain.on
 
 test trap_stays_inside_its_domain for Domain.run {
     let world = testing::world()
@@ -996,3 +1081,69 @@ test abandoned_stepper_refuses_posts for Stepper.abandon {
     let outcome = attempt await inbox.post(ProbeMessage.Count)
     expect outcome.is_err()
 } abandoned_stepper_refuses_posts
+
+test restored_component_rearms_through_its_context for Stepper.resumed {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.resumed(ResumeReason.Started)
+    let started = mut stepper.step()
+    mut stepper.resumed(ResumeReason.Restored)
+    let rearmed = mut stepper.step()
+    let last = try await take stepper.end()
+    expect not started and rearmed
+    expect last.state.handled == 1
+} restored_component_rearms_through_its_context
+
+test pressure_reaches_the_env for Stepper.pressure {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.pressure(2)
+    mut stepper.pressure(3)
+    let last = try await take stepper.end()
+    expect last.env.counted == 5
+} pressure_reaches_the_env
+
+test suspended_component_replies_unhealthy for Stepper.suspend {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.suspend()
+    let reply = mut stepper.health()
+    let last = try await take stepper.end()
+    let HealthReply.Unhealthy(reason) = reply else {
+        expect false
+        return
+    }
+    expect reason.as_str() == "suspended"
+    expect last.state.suspended
+} suspended_component_replies_unhealthy
+
+test woken_component_replies_healthy for Stepper.wake {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.suspend()
+    mut stepper.wake()
+    let reply = mut stepper.health()
+    let last = try await take stepper.end()
+    expect not last.state.suspended
+    let HealthReply.Healthy = reply else {
+        expect false
+        return
+    }
+} woken_component_replies_healthy
+
+test component_without_system_interfaces_is_healthy for Stepper.health {
+    let world = testing::world()
+    var stepper = try Stepper[Plain, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    mut stepper.resumed(ResumeReason.Restored)
+    mut stepper.pressure(4)
+    mut stepper.suspend()
+    let reply = mut stepper.health()
+    mut stepper.wake()
+    let idle = stepper.idle()
+    let last = try await take stepper.end()
+    expect idle and last.env.counted == 0
+    let HealthReply.Healthy = reply else {
+        expect false
+        return
+    }
+} component_without_system_interfaces_is_healthy

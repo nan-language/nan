@@ -4,7 +4,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 ## Std layers
 
-**Std**, the standard library, is the nine packages that the reserved std aliases name ([aliases](03-packages-modules.md#aliases)) and the three [platform packages](#platform-packages). Each of the nine is named like its alias.
+**Std**, the standard library, is the ten packages that the reserved std aliases name ([aliases](03-packages-modules.md#aliases)) and the three [platform packages](#platform-packages). Each of the ten is named like its alias.
 
 | Package | Holds | Modules below the root |
 | --- | --- | --- |
@@ -16,12 +16,13 @@ This chapter defines std: its packages, modules and layers, the index of every p
 | `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, cross-CPU operations, scheduling, physical memory, platform registries | `hw::sim` |
 | `boot` | the uefi and bare root grants, firmware services | none |
 | `host` | the host root grant, the component runner | none |
+| `nanos` | the nanos root grant and its capability table | none |
 | `testing` | the simulated world, structural comparison | none |
 
 - These are the only std modules. A std path has at most one module segment after the alias, as in `sys::net::Conn`; every other std item is in its package's root module.
-- Each of the nine packages declares `targets any` and has no target variants, so each of its items has one interface and one meaning on every [target](27-program-model.md#targets). Each platform package declares exactly the targets whose descriptors name it.
+- Each of the ten packages declares `targets any` and has no target variants, so each of its items has one interface and one meaning on every [target](27-program-model.md#targets). Each platform package declares exactly the targets whose descriptors name it.
 
-A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
+A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `nanos`, `testing`, the platform packages.
 
 - Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; `sys::load` names `hw::Ptr` and `hw::Order`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
@@ -97,6 +98,7 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
 | `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
+| `sys` | `sys::Resume`, `sys::ResumeReason`, `sys::Pressure`, `sys::Health`, `sys::HealthReply`, `sys::Suspend` | [System interfaces](26-components.md#system-interfaces) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
 | `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
 | `sys` | `sys::load::Table` | [Loaded registries](25-registries.md#loaded-registries) |
@@ -129,6 +131,7 @@ The table names every pub std type, interface, free function and registry with t
 | `boot` | `boot::Services`, `boot::ServiceError` | [Firmware services](24-kernel.md#firmware-services) |
 | `host` | `host::World` | [Root grants](14-authority.md#root-grants) |
 | `host` | `host::Runner` | [Runner](26-components.md#runner) |
+| `nanos` | `nanos::World`, `nanos::Caps`, `nanos::Cap`, `nanos::CapError` | [Root grants](14-authority.md#root-grants) |
 | `testing` | `testing::world`, `testing::same` | [Simulated capabilities](22-testing.md#simulated-capabilities) |
 
 ## Array and slice members
@@ -315,6 +318,7 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock`, `sys::load::Loader` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `host` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
+| `nanos` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
 | `testing` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | trusted code |
 | platform packages | every primitive capability | `alloc`, `device`, `priv` | none | trusted code, foreign fns, landing fns, its `priv` grant |
 

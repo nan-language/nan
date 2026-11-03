@@ -43,9 +43,17 @@ impl Checker<'_> {
             }
     }
 
-    /// Each float operation of a function's or const's text, closures included, under a kernel
-    /// target.
+    /// Each float operation of a function's or const's text, closures included, under a machine
+    /// target; under a nanos target, an interrupt fn whose digest uses floats.
     pub fn check_float_use(&self, item: ItemId, body: &TBody) {
+        if self.db.target.is_nanos() {
+            let interrupt = matches!(&self.db.ast(item).kind, ItemKind::Fn(function)
+                if matches!(function.modifier, Some((FnModifier::Interrupt, _))));
+            if interrupt && self.digest(item).float {
+                self.report(item, self.db.ast(item).token, Code::KernelFloatUse);
+            }
+            return;
+        }
         if !self.db.target.is_machine() {
             return;
         }

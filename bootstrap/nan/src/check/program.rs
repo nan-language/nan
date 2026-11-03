@@ -79,17 +79,22 @@ impl Checker<'_> {
         let Some(kind) = self.db.target.kind() else {
             return;
         };
-        let (grant, forms) = match kind {
-            Kind::Host => (
-                "host::World",
-                "fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> \
-                 u8 fails E uses wait",
+        const HOST_FORMS: &str = "fn main(take P: host::World) fails E uses wait or fn main(take P: \
+                                  host::World) -> u8 fails E uses wait";
+        let forms = match kind {
+            Kind::Host => HOST_FORMS.to_owned(),
+            Kind::Uefi => "fn main(take P: boot::Machine) -> Never".to_owned(),
+            Kind::Bare => "fn main(take P: boot::Kernel) -> Never".to_owned(),
+            Kind::Nanos => format!(
+                "fn main(take P: nanos::World, take I: In) -> Out fails E uses wait, In and Out \
+                 implementing Encode, or {HOST_FORMS}"
             ),
-            Kind::Uefi => ("boot::Machine", "fn main(take P: boot::Machine) -> Never"),
-            Kind::Bare => ("boot::Kernel", "fn main(take P: boot::Kernel) -> Never"),
         };
-        let parameter = matches!(&sig.params[..], [param]
-            if param.mode == Mode::Take && !param.is_self && self.is_std(&param.ty, grant));
+        let taken = |index: usize, grant: &str| {
+            sig.params.get(index).is_some_and(|param| {
+                param.mode == Mode::Take && !param.is_self && self.is_std(&param.ty, grant)
+            })
+        };
         let failure = |fails: &Ty| {
             let rendered_enum = matches!(fails, Ty::Item(failure, _)
                 if matches!(self.db.ast(*failure).kind, ItemKind::Enum(_)))
@@ -99,29 +104,42 @@ impl Checker<'_> {
                     .is_some_and(|render| self.implements(fails, render));
             rendered_enum || self.is_std(fails, "task::Cancelled")
         };
+        let waits = sig.fails.as_ref().is_some_and(failure) && sig.wait;
+        let host = sig.params.len() == 1
+            && taken(0, "host::World")
+            && matches!(sig.result, Ty::Unit | Ty::Scalar(Scalar::U8))
+            && waits;
+        let encode = |ty: &Ty| {
+            self.db
+                .core_item("Encode")
+                .is_some_and(|encode| self.implements(ty, encode))
+        };
+        let job = || {
+            matches!(&sig.params[..], [_, input] if input.mode == Mode::Take && encode(&input.ty))
+                && taken(0, "nanos::World")
+                && encode(&sig.result)
+                && waits
+        };
         let rest = match kind {
-            Kind::Host => {
-                matches!(sig.result, Ty::Unit | Ty::Scalar(Scalar::U8))
-                    && sig.fails.as_ref().is_some_and(failure)
-                    && sig.wait
-            }
-            _ => sig.result == Ty::Never && sig.fails.is_none() && !sig.wait,
+            Kind::Host => host,
+            Kind::Nanos => host || job(),
+            Kind::Uefi => machine(&sig, taken(0, "boot::Machine")),
+            Kind::Bare => machine(&sig, taken(0, "boot::Kernel")),
         };
         let shaped = ast.visibility == Visibility::Private
             && function.modifier.is_none()
             && function.head.generics.is_empty()
-            && parameter
             && rest;
         if !shaped {
             let last = Clauses::of(&function.head, false).last;
             let found = self.written(item, ast.token, last);
-            self.report_expected(
-                item,
-                ast.token,
-                Code::TargetEntryHead,
-                forms.to_owned(),
-                found,
-            );
+            self.report_expected(item, ast.token, Code::TargetEntryHead, forms, found);
         }
     }
+}
+
+/// Whether an entry head has a machine target's form: one taken parameter, the root grant, and
+/// the result `Never`, neither failing nor waiting.
+fn machine(sig: &super::sig::FnSig, grant: bool) -> bool {
+    grant && sig.params.len() == 1 && sig.result == Ty::Never && sig.fails.is_none() && !sig.wait
 }

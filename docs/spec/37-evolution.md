@@ -167,7 +167,6 @@ A **reservation** is a word, syntax, name, format or seam space that language 1 
 | `uses` with a word other than `wait` | syntax | a `uses` clause | `effect.uses-unknown` | [Waiting](10-effects-digests.md#waiting) |
 | `ui` | name | first segment of a path of two or more segments | `name.reserved` | [Aliases](03-packages-modules.md#aliases) |
 | `sys::infer` | name | first two segments of a path | `name.reserved` | [Reserved std names](28-stdlib.md#reserved-std-names) |
-| `x86_64-nanos`, `aarch64-nanos` | name | the `targets` directive | `manifest.reserved-target` | [Manifest](03-packages-modules.md#manifest) |
 | coverage classes other than `sc` | name | the class of a replay token | `test.replay-token` | [Coverage classes](22-testing.md#coverage-classes) |
 | framing of record fields by key in `text::json` and `text::construction` | format | Encode records | skipped fields are discarded | [Decoding rules](13-text-encode.md#decoding-rules) |
 | the wire encoding of protocol messages and of their handle types | format | messages between closures | operations reach the components of their own closure only | [Protocol hashes](26-components.md#protocol-hashes) |

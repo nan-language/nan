@@ -13481,9 +13481,14 @@ const TEXT_MEM_WIRE_WIRE: Str =
 const TEXT_NANOS_ISOLATED: Str =
     \\//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls, and the first task of the space's runtime, which runs the job on a world whose log, standard streams and random source reach the kernel through those calls.
     \\
-    \\/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, reading
-    \\/// that clock, invoking an operation of a capability the kernel serves, and ending the space.
+    \\/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
+    \\/// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
+    \\/// the kernel serves, and ending the space.
     \\const CALL_WAIT: u64 = 1
+    \\
+    \\const CALL_DRAW: u64 = 2
+    \\
+    \\const CALL_RELEASE: u64 = 3
     \\
     \\const CALL_NOW: u64 = 5
     \\
@@ -13533,7 +13538,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const ENDS_CANCELLED: u64 = 4
     \\
-    \\/// The numbers of the trap kinds of an exception and of an abandoned domain.
+    \\/// The numbers of the trap kinds of exhausted memory, of an exception and of an abandoned domain.
+    \\const EXHAUSTED: u64 = 6
+    \\
     \\const EXCEPTION: u64 = 15
     \\
     \\const ABANDONED: u64 = 16
@@ -13605,7 +13612,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
     \\    state.regs[register(0)] = Untrusted.of(start)
     \\    state.regs[register(1)] = Untrusted.of(space.boot_area())
-    \\    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, alloc)
+    \\    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, mut frames, alloc)
     \\    take space.release(mut frames)
     \\    match outcome {
     \\        Ok(how) => return how
@@ -13622,13 +13629,20 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    return bytes
     \\} start_record
     \\
-    \\/// Runs a space's thread until its job ends, serving its system calls; an exception ends the
-    \\/// job as a trap of `trap.exception`.
-    \\fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\/// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
+    \\/// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
+    \\/// another exception ends the job as a trap of `trap.exception`.
+    \\fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     \\    loop {
     \\        match space.run(cpu, mut state, mut extended) {
     \\            hw::UserExit.Interrupted => {}
-    \\            hw::UserExit.Fault(_) => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+    \\            hw::UserExit.Fault(fault) => {
+    \\                match attempt mut space.draw(fault.address, len: 1, mut frames) {
+    \\                    Ok(1) => {}
+    \\                    Err(sys::load::DrawError.Exhausted) => return Ended.Trapped(trap_of(EXHAUSTED, alloc))
+    \\                    else => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+    \\                }
+    \\            }
     \\            hw::UserExit.Syscall => {
     \\                let number = user_word(state.regs[register(ROLE_NUMBER)])
     \\                if number == CALL_END {
@@ -13641,6 +13655,16 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                        return Ended.Trapped(trap_of(ABANDONED, alloc))
     \\                    }
     \\                    answer = try await slept_until(services.clock, deadline)
+    \\                } else if number == CALL_DRAW {
+    \\                    answer = match attempt mut space.draw(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+    \\                        Ok(_) => 0
+    \\                        Err(_) => INVALID
+    \\                    }
+    \\                } else if number == CALL_RELEASE {
+    \\                    answer = match attempt mut space.give_back(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+    \\                        Ok(_) => 0
+    \\                        Err(_) => INVALID
+    \\                    }
     \\                } else if number == CALL_NOW {
     \\                    answer = match attempt services.clock.elapsed_ns() {
     \\                        Ok(ns) => ns
@@ -16410,15 +16434,34 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    runtime: Parts
     \\} Isolated
     \\
-    \\/// An isolated space: its root, its other tables, and the pages it maps from the start of the
-    \\/// user window, laid out as `plan` gives; the tables mapping the entry area follow those of the
-    \\/// window.
+    \\/// An isolated space: its root, its other tables, the pages it maps from the start of the user
+    \\/// window up to its boot area, laid out as `plan` gives, and the pages of its boot area it has
+    \\/// drawn, in order of their index from the window's start; the tables mapping the entry area
+    \\/// follow those of the window.
     \\pub open linear struct Space {
     \\    root: hw::PageTableRoot
     \\    tables: mem::List[hw::PhysFrame[4_096]]
     \\    pages: mem::List[hw::PhysFrame[4_096]]
+    \\    drawn: mem::List[Drawn]
     \\    plan: Plan
     \\} Space
+    \\
+    \\/// A page of a space's boot area it has drawn: its index from the window's start, and its frame.
+    \\linear struct Drawn {
+    \\    index: u64
+    \\    frame: hw::PhysFrame[4_096]
+    \\} Drawn
+    \\
+    \\pub closed enum DrawError derives Copy, Eq, Render {
+    \\    Outside
+    \\    Exhausted
+    \\} DrawError
+    \\
+    \\/// The pages of a range, by index from the window's start: the lowest, and the highest plus one.
+    \\struct Pages derives Copy {
+    \\    low: u64
+    \\    end: u64
+    \\} Pages
     \\
     \\/// The pages of the entry area, from `low` to `high`.
     \\struct Reach derives Copy {
@@ -16485,7 +16528,7 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    let plan = plan_of(self.runtime, image: self.parts, data)
     \\    let area = cpu.entry_area()
     \\    let reach = Reach(low: area.base / PAGE, high: (area.base + area.len - 1) / PAGE)
-    \\    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.end + reach.tables() {
+    \\    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.boot + reach.tables() {
     \\        fail LoadError.Unplaceable
     \\    }
     \\    if reach.low / level_pages(0) <= USER_SLOT and reach.high / level_pages(0) >= USER_SLOT {
@@ -16569,13 +16612,99 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    })
     \\} Space.write
     \\
+    \\pub fn Space.draw(mut self, address: u64, len: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) -> u64 fails DrawError {
+    \\    let range = try self.boot_pages(address, len)
+    \\    var missing: u64 = 0
+    \\    for index in range.low..<range.end {
+    \\        if self.frame_of(index).is_none() {
+    \\            missing += 1
+    \\        }
+    \\    }
+    \\    if u64.widen(frames.len()) < missing {
+    \\        fail DrawError.Exhausted
+    \\    }
+    \\    for index in range.low..<range.end {
+    \\        let at = self.drawn_from(index)
+    \\        if at == self.drawn.len() or self.drawn[at].index != index {
+    \\            let Some(frame) = mut frames.pop() else {
+    \\                fail DrawError.Exhausted
+    \\            }
+    \\            clear(frame.base())
+    \\            write_entry(self.entry_of(index), value: user_entry(frame.base(), kind: USER_WRITABLE))
+    \\            mut self.drawn.insert(at, value: Drawn(index: index, frame: take frame))
+    \\        }
+    \\    }
+    \\    return missing
+    \\} Space.draw
+    \\
+    \\pub fn Space.give_back(mut self, address: u64, len: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) fails DrawError {
+    \\    let range = try self.boot_pages(address, len)
+    \\    for index in range.low..<range.end {
+    \\        let at = self.drawn_from(index)
+    \\        if at < self.drawn.len() and self.drawn[at].index == index {
+    \\            write_entry(self.entry_of(index), value: 0)
+    \\            let Drawn(index: _, frame: frame) = mut self.drawn.remove(at)
+    \\            mut frames.push(take frame)
+    \\        }
+    \\    }
+    \\} Space.give_back
+    \\
     \\/// Gives back every frame the space took.
     \\pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    \\    let Space(root: root, tables: tables, pages: pages, plan: _) = self
+    \\    let Space(root: root, tables: tables, pages: pages, drawn: drawn, plan: _) = self
     \\    mut frames.push(take root.into_frame())
     \\    given_back(take tables, mut frames)
     \\    given_back(take pages, mut frames)
+    \\    for held in take drawn {
+    \\        let Drawn(index: _, frame: frame) = held
+    \\        mut frames.push(take frame)
+    \\    }
     \\} Space.release
+    \\
+    \\/// The pages of the boot area a range of `len` bytes from `address` touches, failing for a range
+    \\/// reaching outside the boot area.
+    \\fn Space.boot_pages(self, address: u64, len: u64) -> Pages fails DrawError {
+    \\    let start = USER_WINDOW + self.plan.boot * PAGE
+    \\    let end = USER_WINDOW + self.plan.end * PAGE
+    \\    if address < start or address > end or end - address < len {
+    \\        fail DrawError.Outside
+    \\    }
+    \\    let offset = address - USER_WINDOW
+    \\    return Pages(low: offset / PAGE, end: pages_of(offset + len))
+    \\} Space.boot_pages
+    \\
+    \\/// The address of the entry of the table of pages mapping the page of an index.
+    \\fn Space.entry_of(self, index: u64) -> u64 {
+    \\    return self.tables[usize.widen(index / TABLE_ENTRIES) + 2].base() + index % TABLE_ENTRIES * 8
+    \\} Space.entry_of
+    \\
+    \\/// The physical address of the frame the space maps at the page of an index, none for a page
+    \\/// it does not map.
+    \\fn Space.frame_of(self, index: u64) -> Option[u64] {
+    \\    if index < self.plan.boot {
+    \\        return Some(self.pages[usize.widen(index)].base())
+    \\    }
+    \\    let at = self.drawn_from(index)
+    \\    if at < self.drawn.len() and self.drawn[at].index == index {
+    \\        return Some(self.drawn[at].frame.base())
+    \\    }
+    \\    return None
+    \\} Space.frame_of
+    \\
+    \\/// The position in `drawn` of the first page drawn whose index is not below `index`.
+    \\fn Space.drawn_from(self, index: u64) -> usize {
+    \\    var low: usize = 0
+    \\    var high = self.drawn.len()
+    \\    while low < high {
+    \\        let middle = low + (high - low) / 2
+    \\        if self.drawn[middle].index < index {
+    \\            low = middle + 1
+    \\        } else {
+    \\            high = middle
+    \\        }
+    \\    }
+    \\    return low
+    \\} Space.drawn_from
     \\
     \\/// The address of the runtime's export of an index, failing for one it does not define.
     \\fn runtime_export(image: Slice[u8], runtime: Parts, index: u64) -> u64 fails LoadError {
@@ -16650,11 +16779,12 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\
     \\/// The space of a plan, its frames taken from `frames` and cleared: a root mapping the window and
     \\/// the pages of the entry area `reach` holds, a table of 1 GiB entries and one of 2 MiB entries
-    \\/// mapping the window, the tables of its pages, its pages, and the tables mapping the entry area.
+    \\/// mapping the window, the tables of its pages, its pages up to the boot area, and the tables
+    \\/// mapping the entry area.
     \\fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
     \\    let count = tables_of(plan)
     \\    var tables = cleared_frames(mut frames, count: count + 2 + reach.tables(), alloc)
-    \\    var pages = cleared_frames(mut frames, count: plan.end, alloc)
+    \\    var pages = cleared_frames(mut frames, count: plan.boot, alloc)
     \\    let Some(root) = mut frames.pop() else {
     \\        given_back(take tables, mut frames)
     \\        given_back(take pages, mut frames)
@@ -16667,10 +16797,9 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    for index in 0u64..<count {
     \\        write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
     \\    }
-    \\    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, plan: plan)
-    \\    for index in 0u64..<plan.end {
-    \\        let table = space.tables[usize.widen(index / TABLE_ENTRIES) + 2].base()
-    \\        write_entry(table + index % TABLE_ENTRIES * 8, value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
+    \\    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), plan: plan)
+    \\    for index in 0u64..<plan.boot {
+    \\        write_entry(space.entry_of(index), value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     \\    }
     \\    space.map_entry_area(root: top, reach, first_table: count + 2)
     \\    return space
@@ -16809,19 +16938,16 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    return USER_WRITABLE
     \\} image_kind
     \\
-    \\/// Whether `len` bytes from `address` lie in the space's pages, each writable for `writing`.
+    \\/// Whether `len` bytes from `address` lie in pages the space maps, each writable for `writing`.
     \\fn Space.covers(self, address: u64, len: u64, writing: bool) -> bool {
     \\    let end = USER_WINDOW + self.plan.end * PAGE
     \\    if address < USER_WINDOW or address > end or end - address < len {
     \\        return false
     \\    }
-    \\    if writing {
-    \\        let offset = address - USER_WINDOW
-    \\        let lowest = offset / PAGE
-    \\        for index in lowest..<pages_of(offset + len) {
-    \\            if self.kind_of(index) != USER_WRITABLE {
-    \\                return false
-    \\            }
+    \\    let offset = address - USER_WINDOW
+    \\    for index in (offset / PAGE)..<pages_of(offset + len) {
+    \\        if self.frame_of(index).is_none() or (writing and self.kind_of(index) != USER_WRITABLE) {
+    \\            return false
     \\        }
     \\    }
     \\    return true
@@ -16838,7 +16964,7 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\        if len - at < count {
     \\            count = len - at
     \\        }
-    \\        body(self.pages[usize.widen(offset / PAGE)].base() + within, at: at, count: count)
+    \\        body(self.frame_of(offset / PAGE).value_or(0) + within, at: at, count: count)
     \\        at += count
     \\    }
     \\} Space.each_part

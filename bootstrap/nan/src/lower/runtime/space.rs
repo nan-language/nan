@@ -1,6 +1,7 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
-//! area its kernel maps, the system calls through which it reads its kernel's clock, waits for
-//! its first timer and ends, and its start, which runs `nanos::isolated` as its first task.
+//! area its kernel maps as it is used, the system calls through which it reads its kernel's
+//! clock, waits for its first timer and ends, and its start, which runs `nanos::isolated` as its
+//! first task.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -18,9 +19,11 @@ use crate::check::ty::no_args;
 use crate::nir::{Role, Span};
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
-/// clock, reading it, invoking a capability its kernel serves, and ending the space with how its
-/// job ended.
+/// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
+/// its kernel serves, and ending the space with how its job ended.
 pub const WAIT: u64 = 1;
+pub const DRAW: u64 = 2;
+pub const RELEASE: u64 = 3;
 pub const NOW: u64 = 5;
 pub const INVOKE: u64 = 6;
 pub const END: u64 = 11;
@@ -33,8 +36,7 @@ const TRAPPED: u64 = 2;
 pub const START: &str = "_NSuser_start";
 const MAIN: &str = "_NSuser_main";
 
-/// The stack the start routine and the scheduler run on, and the boot area, which the kernel
-/// maps.
+/// The stack the start routine and the scheduler run on, and the boot area.
 pub const START_STACK: u64 = BOOT_STACK;
 pub const BOOT_AREA: u64 = super::super::machine::memory::BOOT_AREA;
 

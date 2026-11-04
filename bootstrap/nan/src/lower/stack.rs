@@ -294,14 +294,12 @@ impl Judge<'_> {
                 };
                 for (position, binding) in bindings {
                     let passed = match binding {
-                        Binding::Function(function) => match self.own_use(*function) {
-                            Use::Bounded(bytes, _) => Ok(bytes),
-                            Use::Unbounded(_) => Err(Vec::new()),
-                        },
-                        Binding::Walk(glue) => match self.own_use(*glue) {
-                            Use::Bounded(bytes, _) => Ok(bytes),
-                            Use::Unbounded(path) => Err(path),
-                        },
+                        Binding::Function(function) | Binding::Walk(function) => {
+                            match self.own_use(*function) {
+                                Use::Bounded(bytes, _) => Ok(bytes),
+                                Use::Unbounded(path) => Err(path),
+                            }
+                        }
                         Binding::Param(own) => bound_at(bounds, *own),
                         Binding::Bounded(bytes) => bytes.ok_or_else(Vec::new),
                     };

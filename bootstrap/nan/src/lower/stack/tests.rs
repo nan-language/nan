@@ -6,8 +6,9 @@ use crate::nir::Span;
 use crate::workspace::tests::Scratch;
 use crate::workspace::{Target, Workspace};
 
-#[test]
-fn an_exceeded_bound_names_each_call_of_the_deepest_path_in_source() {
+/// Runs `test` with the checker of a package whose function `app::outer` calls `app::inner`,
+/// and a place in `outer`.
+fn with_outer(test: impl FnOnce(&Checker, At)) {
     let scratch = Scratch::new(&[
         (
             "app/package.nan",
@@ -32,49 +33,106 @@ fn an_exceeded_bound_names_each_call_of_the_deepest_path_in_source() {
             .expect("the function")
     };
     let outer = item("app::outer");
-    let at = At {
-        item: outer,
-        span: Span::at(checker.db.ast(outer).token),
-    };
-    let (outer_fn, inner_fn) = (FuncId::from_u32(0), FuncId::from_u32(1));
-    let frames = [
-        Frame {
-            function: outer_fn,
-            name: "app::outer".to_owned(),
-            size: 64,
-            params: Vec::new(),
-            sites: vec![Site {
-                kind: Kind::Direct {
-                    callee: inner_fn,
-                    bindings: Vec::new(),
-                },
-                at: Some(at),
-            }],
+    test(
+        &checker,
+        At {
+            item: outer,
+            span: Span::at(checker.db.ast(outer).token),
         },
-        Frame {
-            function: inner_fn,
-            name: "app::inner".to_owned(),
-            size: 64,
-            params: Vec::new(),
-            sites: vec![Site {
-                kind: Kind::Stub,
-                at: None,
-            }],
-        },
-    ];
-    let demand = Demand {
-        judged: Judged::Function(outer_fn),
-        stack: 100,
-        report: Report::Own { head: at },
-    };
-    let found = judge(&checker, &frames, &[demand]);
-    let because: Vec<(Role, &str)> = found[0]
-        .because
-        .iter()
+    );
+}
+
+/// The reasons of a diagnostic, by role and subject.
+fn reasons(found: &Diagnostic) -> Vec<(Role, &str)> {
+    (found.because.iter())
         .map(|reason| (reason.role, reason.subject.as_str()))
-        .collect();
-    assert_eq!(found[0].code, Code::LimitStackExceeded);
-    assert_eq!(because, [(Role::Called, "app::inner")]);
+        .collect()
+}
+
+#[test]
+fn an_exceeded_bound_names_each_call_of_the_deepest_path_in_source() {
+    with_outer(|checker, at| {
+        let (outer_fn, inner_fn) = (FuncId::from_u32(0), FuncId::from_u32(1));
+        let frames = [
+            Frame {
+                function: outer_fn,
+                name: "app::outer".to_owned(),
+                size: 64,
+                params: Vec::new(),
+                sites: vec![Site {
+                    kind: Kind::Direct {
+                        callee: inner_fn,
+                        bindings: Vec::new(),
+                    },
+                    at: Some(at),
+                }],
+            },
+            Frame {
+                function: inner_fn,
+                name: "app::inner".to_owned(),
+                size: 64,
+                params: Vec::new(),
+                sites: vec![Site {
+                    kind: Kind::Stub,
+                    at: None,
+                }],
+            },
+        ];
+        let demand = Demand {
+            judged: Judged::Function(outer_fn),
+            stack: 100,
+            report: Report::Own { head: at },
+        };
+        let found = judge(checker, &frames, &[demand]);
+        assert_eq!(found[0].code, Code::LimitStackExceeded);
+        assert_eq!(reasons(&found[0]), [(Role::Called, "app::inner")]);
+    });
+}
+
+#[test]
+fn an_unbounded_closure_argument_names_the_calls_down_to_its_cause() {
+    with_outer(|checker, at| {
+        let (outer_fn, apply_fn, closure_fn) = (
+            FuncId::from_u32(0),
+            FuncId::from_u32(1),
+            FuncId::from_u32(2),
+        );
+        let frame = |function, name: &str, params, kind| Frame {
+            function,
+            name: name.to_owned(),
+            size: 64,
+            params,
+            sites: vec![Site { kind, at: None }],
+        };
+        let frames = [
+            frame(
+                outer_fn,
+                "app::outer",
+                Vec::new(),
+                Kind::Direct {
+                    callee: apply_fn,
+                    bindings: vec![(0, Binding::Function(closure_fn))],
+                },
+            ),
+            frame(apply_fn, "app::apply", vec![(0, None)], Kind::Param(0)),
+            frame(closure_fn, "", Vec::new(), Kind::Bounded(None)),
+        ];
+        let demand = Demand {
+            judged: Judged::Function(outer_fn),
+            stack: 4096,
+            report: Report::Own { head: at },
+        };
+        let found = judge(checker, &frames, &[demand]);
+        assert_eq!(found[0].code, Code::LimitStackUnbounded);
+        assert_eq!(
+            reasons(&found[0]),
+            [
+                (Role::Called, "app::apply"),
+                (Role::Called, "function parameter"),
+                (Role::Raised, "function value"),
+            ]
+        );
+    });
 }
 
 /// A recursion's thunk needs its callee's frame and the wrapper's frame with the stub call bound

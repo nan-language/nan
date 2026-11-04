@@ -277,7 +277,7 @@ fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
 fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let one = fx.ptr(1);
     let asked = fx.offset(record, task::STOP);
-    let first = match lo.kernel() {
+    let first = match lo.on_cpus() {
         true => {
             let before =
                 fx.b.ins()
@@ -356,7 +356,7 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
 /// Takes a ready task out of the run queue that holds it, passing on its serial executor's turn,
 /// or out of its serial executor's waiting tasks; gives whether it was in either.
 fn remove_ready(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
-    let queued = match lo.kernel() {
+    let queued = match lo.on_cpus() {
         true => lo.kernel_withdraw(fx, record),
         false => remove_queued(lo, fx, record),
     };

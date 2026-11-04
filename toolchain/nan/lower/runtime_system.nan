@@ -1,4 +1,4 @@
-//! The system the runtime runs on: the memory of its records and of the chunks cells draw, task stacks, idling, its standard streams, its start and its exit. On a host target the host module provides them over the C library and Linux; on a machine target the machine module does, over the boot heap, the serial and exit ports and the CPUs.
+//! The system the runtime runs on: the memory of its records and of the chunks cells draw, task stacks, idling, its standard streams, its start and its exit. On a host target the host module provides them over the C library and Linux; on a machine target the machine module does, over the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space module does, over the boot heap its kernel maps and the system calls its kernel serves.
 
 /// The text written when the runtime cannot start.
 const RUNTIME_SYSTEM_UNAVAILABLE: Str = "nan: runtime unavailable\n"
@@ -66,7 +66,11 @@ fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     } else if routine == Routine.Exit and lo.machine() {
         let params = mut fx.entry()
         expect params.len() > 0
-        mut lo.exit_machine(mut fx, status: params[0])
+        if lo.user() {
+            space_exit(mut lo, mut fx)
+        } else {
+            mut lo.exit_machine(mut fx, status: params[0])
+        }
     } else if lo.machine() {
         heap_define(mut lo, mut fx, routine)
     } else {
@@ -76,12 +80,19 @@ fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
 
 /// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
 /// which a machine image's boot area holds after its boot heap, then the executors of the
-/// platform; nonzero when the runtime cannot start.
+/// platform; nonzero when the runtime cannot start. An isolated space's runtime starts with the
+/// boot area its kernel mapped, whose tables it clears.
 fn init(mut lo: Lowering, mut fx: Fx) {
     discard mut fx.entry()
     let state_address = mut lo.state(mut fx)
     var area: Option[clif::Value] = None
-    if lo.machine() {
+    if lo.user() {
+        let mapped = mut fx.load(PTR, addr: state_address, offset: STATE_BOOT_AREA)
+        let tables = mut fx.offset(mapped, offset: BOOT_HEAP)
+        let len = mut fx.ptr(RUNTIME_SYSTEM_TABLE_BYTES)
+        heap_clear(mut lo, mut fx, base: tables, len)
+        area = Some(mapped)
+    } else if lo.machine() {
         area = Some(mut lo.boot_area(mut fx))
     }
     var offset = BOOT_HEAP
@@ -104,7 +115,9 @@ fn init(mut lo: Lowering, mut fx: Fx) {
     let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
     mut fx.store(one, addr: root, offset: REGIONS_REGION_ID)
     mut fx.store(one, addr: state_address, offset: STATE_REGIONS)
-    if lo.machine() {
+    if lo.user() {
+        space_init(mut lo, mut fx)
+    } else if lo.machine() {
         mut lo.machine_init(mut fx)
     } else {
         start_threads(mut lo, mut fx)
@@ -156,8 +169,11 @@ fn system_refuse(mut lo: Lowering, mut fx: Fx, why: Str) {
 } system_refuse
 
 /// Writes a byte range to a standard stream: on a host target to its descriptor, on a machine
-/// target to the serial port, which carries both streams.
+/// target to the serial port, which carries both streams; an isolated space has none.
 fn write_stream(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
+    if lo.user() {
+        return
+    }
     if lo.machine() {
         mut lo.serial_write(mut fx, text, len)
     } else {
@@ -211,9 +227,12 @@ fn system_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessi
 } system_protect_guard
 
 /// Waits until a task may be ready: on a host target in the running thread's ring, handling the
-/// completions that arrive; on a machine target the CPU halts until an interrupt.
+/// completions that arrive; on a machine target the CPU halts until an interrupt; in an isolated
+/// space until its first timer is due.
 fn system_idle(mut lo: Lowering, mut fx: Fx) {
-    if lo.machine() {
+    if lo.user() {
+        space_idle(mut lo, mut fx)
+    } else if lo.machine() {
         discard mut lo.call_stub(mut fx, stub: Stub.IdleWait, args: mem::List[clif::Value].empty(fx.alloc).view())
     } else {
         host_idle(mut lo, mut fx)

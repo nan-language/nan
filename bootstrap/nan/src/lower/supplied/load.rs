@@ -1,6 +1,7 @@
 //! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded
 //! bundle's job entry, its code's address and its stack, and the export table, runtime memory, window entries, translation invalidation and instruction
-//! visibility the loader of `sys::load` reads.
+//! visibility the loader of `sys::load` reads, with the user-mode runtime's image, the entries
+//! mapping an isolated space and the running root its tables share.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC};
 
@@ -93,6 +94,20 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::load::release" => {
             lo.record_free(fx, supply.param(0).scalar());
             supply.done(lo, fx);
+        }
+        "sys::load::Loader.runtime" => {
+            let image = lo.runtime_image.clone().unwrap_or_default();
+            let view = lo.view_literal(fx, &image);
+            supply.ret(lo, fx, view);
+        }
+        "sys::load::user_entry" => {
+            let (physical, kind) = (supply.param(0).scalar(), supply.param(1).scalar());
+            let entry = lo.user_entry(fx, physical, kind);
+            supply.ret(lo, fx, Held::Scalar(entry));
+        }
+        "sys::load::running_root" => {
+            let root = lo.running_root(fx);
+            supply.ret(lo, fx, Held::Scalar(root));
         }
         "sys::load::window_entry" => {
             let (physical, kind) = (supply.param(0).scalar(), supply.param(1).scalar());

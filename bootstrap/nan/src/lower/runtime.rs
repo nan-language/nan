@@ -17,6 +17,7 @@ pub mod seeded;
 pub mod segments;
 pub mod serial;
 pub mod settle;
+pub mod space;
 pub mod stops;
 pub mod system;
 pub mod tables;
@@ -193,6 +194,8 @@ pub enum Routine {
     Stream,
     /// `() -> nanoseconds`: a kernel's clock.
     ClockNow,
+    /// `(op, ns)`: arms a timer of a kernel's clock expiring `ns` nanoseconds from now.
+    TimerArm,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
     /// `()`: under the IOMMU's lock, invalidates everything it caches and waits until it has.
@@ -200,6 +203,9 @@ pub enum Routine {
     /// `(area) -> previous`: makes the running task own the extended state saved at an area,
     /// none for zero, saving the one it owned, and gives the area it owned.
     Extended,
+    /// `(area) -> previous`: makes the running task own extended state in its initial state,
+    /// saved at an area, and gives the area it owned.
+    ExtendedOwn,
 }
 
 impl Routine {
@@ -272,9 +278,11 @@ impl Routine {
             Routine::Yield => "_NSreplay_yield",
             Routine::Stream => "_NSreplay_stream",
             Routine::ClockNow => "_NSstack_switch_clock_now",
+            Routine::TimerArm => "_NSstack_switch_timer_arm",
             Routine::Draw => "_NSreplay_draw",
             Routine::IommuFlush => "_NSiommu_flush",
             Routine::Extended => "_NSstack_switch_extended",
+            Routine::ExtendedOwn => "_NSstack_switch_extended_own",
         }
     }
 
@@ -295,7 +303,9 @@ impl Routine {
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
             Routine::Derive => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
-            Routine::Rehome | Routine::KindRevoke | Routine::TrapReport => (&[P, P], &[]),
+            Routine::Rehome | Routine::KindRevoke | Routine::TrapReport | Routine::TimerArm => {
+                (&[P, P], &[])
+            }
             Routine::KindPin => (&[P, P], &[P]),
             Routine::Charged
             | Routine::Limit
@@ -303,7 +313,8 @@ impl Routine {
             | Routine::OutboxClaim
             | Routine::RegionOpen
             | Routine::RecordAlloc
-            | Routine::Extended => (&[P], &[P]),
+            | Routine::Extended
+            | Routine::ExtendedOwn => (&[P], &[P]),
             Routine::RecordResize => (&[P, P], &[P]),
             Routine::Free
             | Routine::RecordFree
@@ -573,9 +584,13 @@ impl Lowering<'_, '_> {
     }
 
     /// The record of the running executor thread, zero outside one: on a machine target the
-    /// running CPU's, which its record holds.
+    /// running CPU's, which its record holds, in an isolated space's runtime its one thread's,
+    /// and through `Thread` in code reaching its executor only through routines.
     pub fn thread(&mut self, fx: &mut Fx) -> Value {
-        match self.machine() {
+        if self.user() {
+            return space::thread(self, fx);
+        }
+        match self.machine() && !self.portable() {
             true => self.call_stub(fx, Stub::Thread, &[])[0],
             false => self.call_routine(fx, Routine::Thread, &[])[0],
         }
@@ -672,6 +687,9 @@ impl Lowering<'_, '_> {
 /// Defines a routine's body.
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     match routine {
+        Routine::ClockNow | Routine::Extended | Routine::ExtendedOwn if lo.user() => {
+            space::define(lo, fx, routine)
+        }
         Routine::Copy | Routine::Fill | Routine::Compare => memory::bytes(lo, fx, routine),
         Routine::Alloc
         | Routine::AllocIn
@@ -721,10 +739,16 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::GrownStart => segments::grown_start(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
+        Routine::TimerArm => {
+            let params = fx.entry();
+            lo.arm_clock(fx, params[0], params[1]);
+            fx.b.ins().return_(&[]);
+        }
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
         Routine::IommuFlush => lo.define_iommu_flush(fx),
         Routine::Extended => lo.define_extended(fx),
+        Routine::ExtendedOwn => lo.define_extended_own(fx),
         Routine::Init
         | Routine::Exit
         | Routine::RecordAlloc

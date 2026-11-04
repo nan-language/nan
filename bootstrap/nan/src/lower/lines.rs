@@ -100,8 +100,8 @@ impl Lines {
     }
 
     /// The data object of the image's line tables, declared once and defined when lowering
-    /// finishes: writable in a kernel, whose next field loading links, and named apart in a
-    /// bundle, which imports the kernel's.
+    /// finishes: writable in a kernel and in a user-mode runtime, whose next field loading
+    /// links, and named apart in a bundle, which imports the kernel's.
     pub fn table(
         &mut self,
         module: &mut cranelift_object::ObjectModule,
@@ -110,7 +110,7 @@ impl Lines {
         *self.table.get_or_insert_with(|| {
             let (name, writable) = match linking {
                 Linking::Image => (SYMBOL, false),
-                Linking::Kernel(_) => (SYMBOL, true),
+                Linking::Kernel(_) | Linking::Runtime => (SYMBOL, true),
                 Linking::Bundle => (BUNDLE_SYMBOL, false),
             };
             module

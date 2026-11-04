@@ -78,10 +78,11 @@ impl Growth {
 }
 
 impl Lowering<'_, '_> {
-    /// Whether the image's runtime keeps stack segments: a kernel exporting the load ABI, whose
-    /// tasks run the grown calls of the nanos bundles it loads.
+    /// Whether the image's runtime keeps stack segments: a kernel exporting the load ABI or the
+    /// user-mode runtime of its isolated spaces, whose tasks run the grown calls of the nanos
+    /// bundles it loads.
     pub fn keeps_segments(&self) -> bool {
-        self.exports()
+        self.exports() || self.user()
     }
 
     /// Starts defining a function: a routine's calls never grow.

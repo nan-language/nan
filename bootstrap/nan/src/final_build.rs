@@ -85,13 +85,15 @@ pub fn build(
             return Ok(Build::failed(diagnostics));
         }
     }
-    let (lowered, interface) = lower_program(&checker, source, root, &artefacts);
+    let (lowered, interface, runtime) = lower_program(&checker, source, root, &artefacts);
     diagnostics.extend(collisions(source, &lowered));
-    diagnostics.extend(lower::stack::judge(
-        &checker,
-        &lowered.frames,
-        &lowered.demands,
-    ));
+    for lowered in std::iter::once(&lowered).chain(&runtime) {
+        diagnostics.extend(lower::stack::judge(
+            &checker,
+            &lowered.frames,
+            &lowered.demands,
+        ));
+    }
     if errors(&diagnostics) {
         return Ok(Build::failed(diagnostics));
     }
@@ -138,13 +140,14 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// The lowering of the program of `source`, whose package is `root`, for the checker's target at
 /// the codegen level its manifest gives for the target's architecture, with the artefacts of its
-/// final closure, and the interface file of a kernel exporting the load ABI.
+/// final closure, the interface file of a kernel exporting the load ABI, and the lowering of the
+/// user-mode runtime of a kernel running nanos jobs in isolated spaces, whose image it holds.
 fn lower_program(
     checker: &check::Checker,
     source: &Package,
     root: PackageId,
     artefacts: &BTreeMap<String, Vec<u8>>,
-) -> (lower::Lowered, Option<Vec<u8>>) {
+) -> (lower::Lowered, Option<Vec<u8>>, Option<lower::Lowered>) {
     let target = checker.db.target;
     let level = source.manifest.as_ref().and_then(|manifest| {
         manifest
@@ -167,7 +170,7 @@ fn lower_program(
         .and_then(|package| checker.db.lookup(package.root?, LANDING))
         .expect("the platform package's entry landing fn");
     let kernel = kernel_interface(checker, root, artefacts, level);
-    let program = lower::Program {
+    let mut program = lower::Program {
         entry,
         landing,
         roots: vec![root],
@@ -179,12 +182,27 @@ fn lower_program(
             .as_ref()
             .map(|kernel| kernel.loaded.clone())
             .unwrap_or_default(),
+        runtime: None,
     };
+    let runtime = kernel
+        .as_ref()
+        .filter(|kernel| kernel.isolates)
+        .map(|kernel| {
+            let runtime = lower::lower_runtime(checker, &program);
+            program.runtime = Some(crate::image::bundle::runtime(
+                &runtime.object,
+                &kernel.interface,
+                lower::SPACE_START,
+                lower::SPACE_STACK,
+                lower::SPACE_BOOT,
+            ));
+            runtime
+        });
     let lowered = match target.is_machine() {
         true => lower::lower_machine(checker, &program),
         false => lower::lower(checker, &program),
     };
-    (lowered, kernel.map(|kernel| kernel.file))
+    (lowered, kernel.map(|kernel| kernel.file), runtime)
 }
 
 /// A diagnostic on a program's `entry` directive.
@@ -198,11 +216,13 @@ fn at_entry(source: &Package, code: Code) -> Diagnostic {
 }
 
 /// The interface of a kernel exporting the load ABI: its interface file, what lowering reads of
-/// it, and the loaded registries of its final closure, in byte order of canonical path.
+/// it, the loaded registries of its final closure, in byte order of canonical path, and whether
+/// its code places nanos jobs in isolated spaces.
 struct Kernel {
     file: Vec<u8>,
     interface: Rc<lower::load::Interface>,
     loaded: Vec<ItemId>,
+    isolates: bool,
 }
 
 /// The interface of the program whose package is `root`, built at a codegen level, when it is a
@@ -228,13 +248,16 @@ fn kernel_interface(
         .copied()
         .filter(|package| !checker.db.package(*package).std)
         .collect();
-    let takes_loader = items(checker, &own).any(|item| {
-        checker.body_dependencies(item).is_some_and(|called| {
-            called
-                .iter()
-                .any(|callee| checker.db.canonical(*callee) == "boot::Kernel.loader")
+    let calls = |path: &str| {
+        items(checker, &own).any(|item| {
+            checker.body_dependencies(item).is_some_and(|called| {
+                called
+                    .iter()
+                    .any(|callee| checker.db.canonical(*callee) == path)
+            })
         })
-    });
+    };
+    let takes_loader = calls("boot::Kernel.loader");
     if loaded.is_empty() && !takes_loader {
         return None;
     }
@@ -252,6 +275,7 @@ fn kernel_interface(
         file,
         interface: Rc::new(interface),
         loaded: loaded.into_iter().map(|(_, item)| item).collect(),
+        isolates: calls("sys::load::Loader.isolate"),
     })
 }
 

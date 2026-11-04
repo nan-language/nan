@@ -802,10 +802,10 @@ fn write(
 /// other CPUs, and on a machine target the serial port is programmed again, as code may have
 /// reprogrammed it.
 fn end_with(lo: &mut Lowering, fx: &mut Fx, report: Report) {
-    if lo.kernel() {
+    if lo.on_cpus() {
         lo.stop_other_cpus(fx);
     }
-    if lo.machine() {
+    if lo.machine() && !lo.user() {
         lo.serial_init(fx);
     }
     let bytes = fx.b.ins().iadd_imm_s(report.out, 8);

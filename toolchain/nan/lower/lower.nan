@@ -199,6 +199,8 @@ pkg struct Program {
     /// final closure.
     pkg kernel: Option[mem::Shared[Interface]]
     pkg loaded: mem::List[ty::ItemId]
+    /// For a kernel running nanos jobs in isolated spaces, the image of their user-mode runtime.
+    pkg runtime: Option[mem::Bytes]
 } Program
 
 /// What a bundle's build lowers: the entries its contributions add to loaded registries, or a
@@ -272,6 +274,8 @@ struct Lowering {
     sims: Option[object::DataId]
     /// For a bundle, the entries it adds to loaded registries.
     contributed: mem::List[image::LoadedEntry]
+    /// For a kernel running nanos jobs in isolated spaces, the image of their user-mode runtime.
+    runtime_image: Option[mem::Bytes]
     /// Whether the symbol name and text of each function defined are kept, and those kept.
     dumping: bool
     dumped: mem::List[LoweredFunction]
@@ -370,6 +374,12 @@ pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None, linking: take linking)
     lowering.dumping = program.dump
     mut lowering.module.hold_codes(program.kept.view())
+    match program.runtime {
+        Some(image) => {
+            lowering.runtime_image = Some(copied_image(image.view(), alloc))
+        }
+        None => {}
+    }
     let boot = mut lowering.boot_glue(program)
     let stack = lowering.boot_stack(program)
     mut lowering.entry_seam(boot, stack_bytes: stack)
@@ -377,6 +387,28 @@ pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     mut lowering.drain()
     return take lowering.finish(None)
 } lower_machine
+
+/// Lowers the user-mode runtime of a kernel's isolated spaces: its start routine, its runtime
+/// state and every support routine a kernel exports, into an object the bundle writer links.
+pkg fn lower_runtime(ck: check::Checker, program: Program) -> Lowered {
+    let alloc = ck.alloc()
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), level: program.level, test_runtime: None, linking: Linking.Runtime)
+    lowering.dumping = program.dump
+    discard mut lowering.state_data()
+    for routine in exported_routines(alloc) {
+        discard mut lowering.routine(routine)
+    }
+    mut lowering.space_start()
+    mut lowering.drain()
+    return take lowering.finish(None)
+} lower_runtime
+
+/// A copy of an image's bytes.
+fn copied_image(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copied_image
 
 /// Lowers a bundle: the entries its contributions add to loaded registries, its job entry or its
 /// component entries, with every function they reach, importing the load ABI.
@@ -468,6 +500,7 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         test_runtime: take test_runtime,
         sims: None,
         contributed: mem::List[image::LoadedEntry].empty(alloc),
+        runtime_image: None,
         dumping: false,
         dumped: mem::List[LoweredFunction].empty(alloc),
         grows: target.is_nanos(),
@@ -498,6 +531,13 @@ fn Lowering.float_bits(self) -> bool {
 fn Lowering.kernel(self) -> bool {
     return self.machine() and not self.seeded()
 } Lowering.kernel
+
+/// Whether the image's executors are a kernel's CPUs, under interrupts: a kernel's, unlike the
+/// one executor of an isolated space's runtime, which runs in user mode and serves capabilities
+/// as its kernel does.
+fn Lowering.on_cpus(self) -> bool {
+    return self.kernel() and not self.user()
+} Lowering.on_cpus
 
 /// The function lowering an instance, declared now and lowered later when new.
 fn Lowering.instance(mut self, take instance: Instance) -> object::FuncId {

@@ -1,0 +1,393 @@
+//! Isolated spaces: bundles verified for them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
+
+/// The user window: its first address, the top-level entry mapping it, and the most pages a space
+/// maps there, those 512 tables of pages map.
+const USER_WINDOW: u64 = 0x80_0000_0000
+
+const USER_SLOT: u64 = 1
+
+const USER_PAGES: u64 = TABLE_ENTRIES * TABLE_ENTRIES
+
+/// The kinds of a user entry: a page of code, of read-only data, of writable data, and a table.
+const USER_CODE: u64 = 0
+
+const USER_READ_ONLY: u64 = 1
+
+const USER_WRITABLE: u64 = 2
+
+const USER_TABLE: u64 = 3
+
+/// The pages of a 64 KiB chunk, to which a space aligns its boot area.
+const CHUNK_PAGES: u64 = 16
+
+/// A bundle verified for isolated spaces: its bytes and their parts, and the image of the
+/// kernel's user-mode runtime and its parts.
+pub open struct Isolated {
+    bundle: mem::Bytes
+    parts: Parts
+    runtime_image: mem::Bytes
+    runtime: Parts
+} Isolated
+
+/// An isolated space: its root, its other tables, and the pages it maps from the start of the
+/// user window, laid out as `plan` gives.
+pub open linear struct Space {
+    root: hw::PageTableRoot
+    tables: mem::List[hw::PhysFrame[4_096]]
+    pages: mem::List[hw::PhysFrame[4_096]]
+    plan: Plan
+} Space
+
+/// Where a space's pages lie, by index from the window's start: the runtime's image and the
+/// bundle's image, each with the first pages of its read-only and of its writable data from its
+/// start, the runtime's stack, the caller's data, the boot area and the end; and the offset of
+/// the runtime's start.
+struct Plan derives Copy {
+    runtime: Sections
+    image: u64
+    image_sections: Sections
+    stack: u64
+    data: u64
+    boot: u64
+    end: u64
+    start: u64
+} Plan
+
+/// The first pages of an image's read-only data and of its writable data.
+struct Sections derives Copy {
+    read_only: u64
+    writable: u64
+} Sections
+
+pub fn Loader.isolate(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicKey], alloc: mem::Alloc) -> Isolated fails LoadError {
+    let body = try body_of(bundle)
+    if not verified(bundle, body, keys) {
+        fail LoadError.Signature
+    }
+    let parts = try placeable_parts(bundle, body)
+    let image = self.runtime()
+    let runtime = try placeable_parts(image, body: try body_of(image))
+    if not runtime.job or runtime.exports.len == 0 {
+        fail LoadError.Interface
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bundle)
+    var runtime_copy = mem::Bytes.empty(alloc)
+    mut runtime_copy.append(image)
+    return Isolated(bundle: take copy, parts: parts, runtime_image: take runtime_copy, runtime: runtime)
+} Loader.isolate
+
+pub fn Isolated.job(self) -> Option[Job] {
+    if not self.parts.job {
+        return None
+    }
+    return Some(Job.at(USER_WINDOW + pages_of(self.runtime.size) * PAGE + self.parts.entry, stack: self.parts.stack))
+} Isolated.job
+
+pub fn Isolated.space(self, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
+    let plan = plan_of(self.runtime, image: self.parts, data)
+    if plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.end or entry_of_running(USER_SLOT) != 0 {
+        fail LoadError.Unplaceable
+    }
+    let image_base = USER_WINDOW + plan.image * PAGE
+    let runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW)
+    set_word(runtime_copy + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
+    let image_copy = match attempt self.bound_copy(window: image_base) {
+        Ok(copy) => copy
+        Err(error) => {
+            release(runtime_copy)
+            fail error
+        }
+    }
+    var space = match attempt mapped(plan, mut frames, alloc) {
+        Ok(space) => space
+        Err(error) => {
+            release(runtime_copy)
+            release(image_copy)
+            fail error
+        }
+    }
+    mut space.fill(at_page: 0, from: runtime_copy, len: self.runtime.size)
+    mut space.fill(at_page: plan.image, from: image_copy, len: self.parts.size)
+    release(runtime_copy)
+    release(image_copy)
+    sync(space.pages[0].base(), len: plan.stack * PAGE)
+    return space
+} Isolated.space
+
+/// The address at which the runtime starts, with the address of a start record and the boot
+/// area's.
+pub fn Space.start(self) -> u64 {
+    return USER_WINDOW + self.plan.start
+} Space.start
+
+/// The top of the stack the runtime starts on.
+pub fn Space.stack(self) -> u64 {
+    return USER_WINDOW + self.plan.data * PAGE
+} Space.stack
+
+/// The first address of the data the caller lays out, the start record among it.
+pub fn Space.data(self) -> u64 {
+    return USER_WINDOW + self.plan.data * PAGE
+} Space.data
+
+/// The first address of the boot area the runtime runs over.
+pub fn Space.boot_area(self) -> u64 {
+    return USER_WINDOW + self.plan.boot * PAGE
+} Space.boot_area
+
+pub fn Space.run(self, cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit {
+    return trusted "the root holds the running root's top-level entries, so it maps the entry area as the running root does, and maps for user mode only the window, whose pages are frames the space owns and holds no value of the kernel in; the user path drops the translations cached under its tag" { cpu.run_user_split(mut state, mut extended, root: self.root) }
+} Space.run
+
+pub fn Space.read(self, address: u64, len: u64, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails hw::UserAddrError {
+    var bytes = mem::Bytes.zeroed(usize.widen(len), alloc)
+    if not self.covers(address, len, writing: false) {
+        fail hw::UserAddrError.Unmapped
+    }
+    let into = hw::Ptr.of_view_mut(mut bytes.view_mut())
+    self.each_part(address, len, body: fn(physical: u64, at: u64, count: u64) {
+        trusted "the frame at `physical` is the space's, and `into` holds `len` bytes" {
+            hw::Ptr[u8].of_addr(usize.widen(physical)).copy(into.offset(isize.fit(at)), count: usize.widen(count))
+        }
+    })
+    return Untrusted.of(take bytes)
+} Space.read
+
+pub fn Space.write(mut self, address: u64, bytes: Slice[u8]) fails hw::UserAddrError {
+    let len = u64.widen(bytes.len())
+    if not self.covers(address, len, writing: true) {
+        fail hw::UserAddrError.Unmapped
+    }
+    let from = hw::Ptr.of_view(bytes)
+    self.each_part(address, len, body: fn(physical: u64, at: u64, count: u64) {
+        trusted "the frame at `physical` is the space's, and `bytes` holds `len` bytes" {
+            from.offset(isize.fit(at)).copy(hw::Ptr[u8].of_addr(usize.widen(physical)), count: usize.widen(count))
+        }
+    })
+} Space.write
+
+/// Gives back every frame the space took.
+pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    let Space(root: root, tables: tables, pages: pages, plan: _) = self
+    mut frames.push(take root.into_frame())
+    given_back(take tables, mut frames)
+    given_back(take pages, mut frames)
+} Space.release
+
+/// The address of the runtime's export of an index, failing for one it does not define.
+fn runtime_export(image: Slice[u8], runtime: Parts, index: u64) -> u64 fails LoadError {
+    var reader = Reader(at: runtime.exports.start, end: runtime.exports.start + runtime.exports.len)
+    let count = try mut reader.uvar(image)
+    if index >= count {
+        fail LoadError.Interface
+    }
+    for _ in 0..<index {
+        discard try mut reader.uvar(image)
+    }
+    let offset = try mut reader.uvar(image)
+    if offset == 0 or offset > runtime.size {
+        fail LoadError.Interface
+    }
+    return USER_WINDOW + offset - 1
+} runtime_export
+
+/// A copy in runtime memory of an image, its whole size, relocated for its address `window`;
+/// `release` frees it.
+fn relocated_copy(bundle: Slice[u8], parts: Parts, window: u64) -> u64 fails LoadError {
+    let copy = reserve(parts.size)
+    copy_in(bundle, from: parts.image, to: copy)
+    match attempt relocate(bundle, parts, base: copy, window) {
+        Ok(_) => return copy
+        Err(error) => {
+            release(copy)
+            fail error
+        }
+    }
+} relocated_copy
+
+/// The pages of `bytes` bytes.
+fn pages_of(bytes: u64) -> u64 {
+    return (bytes + PAGE - 1) / PAGE
+} pages_of
+
+/// The plan of a space for a runtime and a bundle's image, with `data` bytes for the caller.
+fn plan_of(runtime: Parts, image: Parts, data: u64) -> Plan {
+    let at = pages_of(runtime.size)
+    let stack = at + pages_of(image.size)
+    let start = stack + pages_of(runtime.stack)
+    let boot = (start + pages_of(data) + CHUNK_PAGES - 1) / CHUNK_PAGES * CHUNK_PAGES
+    return Plan(runtime: sections_of(runtime), image: at, image_sections: sections_of(image), stack: stack, data: start, boot: boot, end: boot + pages_of(runtime.boot), start: runtime.entry)
+} plan_of
+
+fn sections_of(parts: Parts) -> Sections {
+    return Sections(read_only: parts.read_only / PAGE, writable: parts.writable / PAGE)
+} sections_of
+
+/// The tables of pages a plan needs.
+fn tables_of(plan: Plan) -> u64 {
+    return (plan.end + TABLE_ENTRIES - 1) / TABLE_ENTRIES
+} tables_of
+
+/// A relocated copy of the bundle's image for its address `window`, its imports bound to the
+/// runtime's exports.
+fn Isolated.bound_copy(self, window: u64) -> u64 fails LoadError {
+    let copy = try relocated_copy(self.bundle.view(), parts: self.parts, window)
+    let image = self.runtime_image.view()
+    let bound = attempt bind(self.bundle.view(), parts: self.parts, base: copy, address: fn(index: u64) -> u64 fails LoadError {
+        return try runtime_export(image, runtime: self.runtime, index)
+    })
+    match bound {
+        Ok(_) => return copy
+        Err(error) => {
+            release(copy)
+            fail error
+        }
+    }
+} Isolated.bound_copy
+
+/// The space of a plan, its frames taken from `frames` and cleared: a root holding the running
+/// root's top-level entries but the window's, a table of 1 GiB entries and one of 2 MiB entries
+/// mapping the window, the tables of its pages, and its pages.
+fn mapped(plan: Plan, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
+    let count = tables_of(plan)
+    var tables = cleared_frames(mut frames, count: count + 2, alloc)
+    var pages = cleared_frames(mut frames, count: plan.end, alloc)
+    let Some(root) = mut frames.pop() else {
+        given_back(take tables, mut frames)
+        given_back(take pages, mut frames)
+        fail LoadError.Unplaceable
+    }
+    clear(root.base())
+    for slot in 0u64..<TABLE_ENTRIES {
+        if slot != USER_SLOT {
+            write_entry(root.base() + slot * 8, value: entry_of_running(slot))
+        }
+    }
+    write_entry(root.base() + USER_SLOT * 8, value: user_entry(tables[0].base(), kind: USER_TABLE))
+    write_entry(tables[0].base(), value: user_entry(tables[1].base(), kind: USER_TABLE))
+    for index in 0u64..<count {
+        write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
+    }
+    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, plan: plan)
+    for index in 0u64..<plan.end {
+        let table = space.tables[usize.widen(index / TABLE_ENTRIES) + 2].base()
+        write_entry(table + index % TABLE_ENTRIES * 8, value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
+    }
+    return space
+} mapped
+
+/// Up to `count` frames taken from the end of `frames`, cleared.
+fn cleared_frames(mut frames: mem::List[hw::PhysFrame[4_096]], count: u64, alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] {
+    var cleared = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    for _ in 0u64..<count {
+        match mut frames.pop() {
+            Some(frame) => {
+                clear(frame.base())
+                mut cleared.push(take frame)
+            }
+            None => {}
+        }
+    }
+    return cleared
+} cleared_frames
+
+/// Gives back the frames of a list.
+fn given_back(take from: mem::List[hw::PhysFrame[4_096]], mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    for frame in take from {
+        mut frames.push(take frame)
+    }
+} given_back
+
+/// Clears the frame at a physical address.
+fn clear(base: u64) {
+    let zeros = Array[u8, 4_096].filled(0)
+    trusted "the frame is one the space takes, at its physical address, which the shared space maps" {
+        hw::Ptr.of_view(zeros.view()).copy(hw::Ptr[u8].of_addr(usize.widen(base)), count: 4_096)
+    }
+} clear
+
+/// The kind of the user entry mapping a page of a space, by its index.
+fn Space.kind_of(self, index: u64) -> u64 {
+    let plan = self.plan
+    if index < plan.image {
+        return image_kind(index, sections: plan.runtime)
+    }
+    if index < plan.stack {
+        return image_kind(index - plan.image, sections: plan.image_sections)
+    }
+    return USER_WRITABLE
+} Space.kind_of
+
+/// The kind of a page of an image, by its index there.
+fn image_kind(index: u64, sections: Sections) -> u64 {
+    if index < sections.read_only {
+        return USER_CODE
+    }
+    if index < sections.writable {
+        return USER_READ_ONLY
+    }
+    return USER_WRITABLE
+} image_kind
+
+/// Whether `len` bytes from `address` lie in the space's pages, each writable for `writing`.
+fn Space.covers(self, address: u64, len: u64, writing: bool) -> bool {
+    let end = USER_WINDOW + self.plan.end * PAGE
+    if address < USER_WINDOW or address > end or end - address < len {
+        return false
+    }
+    if writing {
+        let offset = address - USER_WINDOW
+        let lowest = offset / PAGE
+        for index in lowest..<pages_of(offset + len) {
+            if self.kind_of(index) != USER_WRITABLE {
+                return false
+            }
+        }
+    }
+    return true
+} Space.covers
+
+/// Calls `body` on each part of `len` bytes from `address` that one page holds: the part's
+/// physical address, its offset in the bytes and its length.
+fn Space.each_part(self, address: u64, len: u64, body: fn(physical: u64, at: u64, count: u64)) {
+    var at: u64 = 0
+    while at < len {
+        let offset = address - USER_WINDOW + at
+        let within = offset % PAGE
+        var count = PAGE - within
+        if len - at < count {
+            count = len - at
+        }
+        body(self.pages[usize.widen(offset / PAGE)].base() + within, at: at, count: count)
+        at += count
+    }
+} Space.each_part
+
+/// Copies `len` bytes of runtime memory at `from` into the space's pages from `at_page`.
+fn Space.fill(mut self, at_page: u64, from: u64, len: u64) {
+    self.each_part(USER_WINDOW + at_page * PAGE, len, body: fn(physical: u64, at: u64, count: u64) {
+        copy_memory(from + at, to: physical, len: count)
+    })
+} Space.fill
+
+/// Writes an entry of a table the space holds.
+fn write_entry(address: u64, value: u64) {
+    trusted "the address lies in a table frame the space holds" {
+        hw::Ptr[u64].of_addr(usize.widen(address)).write(value)
+    }
+} write_entry
+
+/// The image of the kernel's user-mode runtime, empty in a kernel built without one.
+proj fn Loader.runtime(self) -> Slice[u8]
+
+/// The entry of a kind mapping a page or table at a physical address for user mode.
+fn user_entry(physical: u64, kind: u64) -> u64
+
+/// The physical address of the running root's top-level table.
+fn running_root() -> u64
+
+/// The running root's top-level entry of a slot.
+fn entry_of_running(slot: u64) -> u64 {
+    return trusted "the running root's top-level table lies at its physical address, which the shared space maps" { hw::Ptr[u64].of_addr(usize.widen(running_root() + slot * 8)).read() }
+} entry_of_running

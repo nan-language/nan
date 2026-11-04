@@ -389,8 +389,8 @@ pub closed struct EntryArea derives Copy, Eq {
 ```
 
 - The **entry area** is the memory the seams use before they reinstall the running root: the image and the memory it reserves, which hold the vector seams and their user paths, the CPU records with each CPU's tables and entry stack, the interrupt descriptor table and the stacks of nonzero `ist`. `cpu.entry_area()` gives its first address as `base` and its length in bytes as `len`.
-- `cpu.run_user_split(mut state, mut extended, root)` runs the thread as `run_user` does, but the user path installs `root` just before the thread runs and reinstalls the running root at the thread's exit before any other kernel code runs. On x86_64 with PCIDs enabled, translations the CPU caches from `root` are tagged with the running root's PCID with bit 11 flipped, and both roots keep their cached translations across the switches; on AArch64, with the running root's ASID with bit 7 flipped, and none are invalidated.
-- `run_user_split` is a trusted primitive whose soundness condition is that `root` maps the entry area at the addresses and with the attributes the running root maps it; that no page `root` maps for user mode holds what the soundness condition of `write_cr3` keeps out of such pages ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); and that each translation cached under the user root's tag maps as `root` does. `root` need map nothing else: unlike a root `write_cr3` installs, it need not map the frames, regions and windows of the kernel.
+- `cpu.run_user_split(mut state, mut extended, root)` runs the thread as `run_user` does, but the user path installs `root` just before the thread runs and reinstalls the running root at the thread's exit before any other kernel code runs. On x86_64 with PCIDs enabled, translations the CPU caches from `root` are tagged with the running root's PCID with bit 11 flipped; on AArch64, with the running root's ASID with bit 7 flipped. Installing `root` drops every translation the CPU caches under that tag, and the running root keeps its own across the switches.
+- `run_user_split` is a trusted primitive whose soundness condition is that `root` maps the entry area at the addresses and with the attributes the running root maps it, and that no page `root` maps for user mode holds what the soundness condition of `write_cr3` keeps out of such pages ([privileged intrinsics](23-low-level.md#privileged-intrinsics)). `root` need map nothing else: unlike a root `write_cr3` installs, it need not map the frames, regions and windows of the kernel.
 - A translation that the running root marks global on x86_64, or does not mark non-global on AArch64, stays usable under the user root, so the running root keeps out of the user root's reach only what it maps non-globally.
 
 ### User frames
@@ -1436,6 +1436,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
     Interface
     DuplicateKey
     DuplicateUnique
+    Unplaceable
 } LoadError
 ```
 
@@ -1451,8 +1452,53 @@ pub closed enum LoadError derives Copy, Eq, Render {
 - `bundle.job()` gives the job entry of a nanos program's bundle, none for another, `bundle.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's bundle, none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)).
 - Loads, replacements, unloads and reclamations take one lock of the kernel's, each publishing all its versions before the next starts.
 - A bundle's code runs on the kernel's runtime: its tasks, cells, capabilities and domains are the kernel's.
+- A bundle's code reaches the runtime it runs on only through the kernel's exports, so that an isolated space's runtime can serve it ([isolated spaces](#isolated-spaces)).
 - **Retired** memory is reclaimed by `loader.reclaim()`: each version a publication replaced once no [read](25-registries.md#loaded-registries) holds it, and each retired placement once no older retired version is held and no call pins its code. Reclaiming a placement unlinks its line tables, clears its window entries and the window tables they leave empty, invalidates every CPU's translations as `hw::Ring0.invalidate_everywhere(hw::TlbScope.All)` does ([cross-CPU operations](#cross-cpu-operations)), then frees its runtime memory. `reclaim` gives the number of retired placements it leaves, and fails at once, keeping what it had cleared for the next call, when cancelled as its invalidation starts. A gate's function value and the records a gate reads, a few words per function field and load, are never reclaimed, so a value holding a gate stays valid after its bundle is reclaimed.
 - No value returned from a gate's call refers to its bundle's memory, since the types crossing a gate are [boundary types](25-registries.md#loaded-registries); what a bundle's code leaves running or installed beyond a call belongs to the domain the call runs in.
+
+### Isolated spaces
+
+A kernel runs the job of a nanos bundle in an **isolated space** when it runs it in user mode, under a root of its own, on the kernel's **user-mode runtime**: the support routines and runtime data a bundle imports, lowered for user mode, which the kernel's final build holds when a function of a package outside std calls `sys::load::Loader.isolate` ([bundles](30-artefacts.md#bundles)).
+
+```nan-api
+// module: sys::load
+
+pub fn Loader.isolate(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicKey], alloc: mem::Alloc) -> Isolated fails LoadError
+
+pub open struct Isolated {
+} Isolated
+
+pub fn Isolated.job(self) -> Option[Job]
+
+pub fn Isolated.space(self, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError
+
+pub open linear struct Space {
+} Space
+
+pub fn Space.start(self) -> u64
+
+pub fn Space.stack(self) -> u64
+
+pub fn Space.data(self) -> u64
+
+pub fn Space.boot_area(self) -> u64
+
+pub fn Space.run(self, cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit
+
+pub fn Space.read(self, address: u64, len: u64, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails hw::UserAddrError
+
+pub fn Space.write(mut self, address: u64, bytes: Slice[u8]) fails hw::UserAddrError
+
+pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]])
+```
+
+- `loader.isolate(bundle, keys, alloc)` verifies a bundle as `prepare` does, and fails with `Interface` too when the kernel holds no user-mode runtime. The isolated bundle keeps copies of the bundle and of the runtime, drawn through `alloc`; `isolated.job()` gives its job as it runs in every space.
+- `isolated.space(data, mut frames, alloc)` makes a space of frames taken from the end of `frames`, each cleared: from `0x80_0000_0000`, the **user window**, it maps the runtime's image, then the bundle's, both relocated for their addresses there and the bundle's imports bound to the runtime's exports, their pages mapped as `prepare` maps them but for user mode; then the runtime's stack, `data` bytes the caller lays out, and the boot area the runtime runs over, all readable and writable, never executable. Its root holds the running root's top-level entries but the window's, which maps the window alone. It fails with `Unplaceable` when `frames` holds too few frames or the running root maps the window, and with `Interface` when the bundle imports what the runtime does not export.
+- `space.start()` is the address at which a thread runs the runtime, with the address of the start record `nanos::run_isolated` lays out in its first argument register and that of the boot area, `space.boot_area()`, in its second; its stack pointer starts at `space.stack()`, and the caller's data starts at `space.data()`.
+- `space.run(cpu, mut state, mut extended)` runs a thread of the space through `run_user_split` under its root.
+- `space.read(address, len, alloc)` copies `len` bytes of the space from `address`, and `space.write(address, bytes)` copies `bytes` into pages of the space mapped writable, each failing with `hw::UserAddrError.Unmapped` for a range the space does not map so.
+- `take space.release(mut frames)` gives back to `frames` every frame the space took.
+- The runtime runs the space's tasks on one executor thread over the boot area, switching between them in user mode; its tasks share the extended state the thread runs with, and their stacks, drawn from the boot area, [grow](17-suspension-io.md#grown-stacks) there as a kernel's tasks' do. It reads the kernel clock, waits for its first timer and ends the space through system calls, made by `syscall` on x86_64 and `svc` on AArch64, the number in `rax` or `x8` and the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` or `x0` to `x5`, the result in `rax` or `x0`.
 
 ## Floating point
 

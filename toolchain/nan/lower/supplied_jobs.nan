@@ -1,4 +1,4 @@
-//! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry, the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry receives.
+//! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry, the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry receives; in an isolated space, the runtime's own grants and the system calls through which it reaches its kernel; and for its kernel, the registers of those calls and the traps a space reports.
 
 fn jobs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
@@ -39,10 +39,116 @@ fn jobs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             }
             supply.ret(mut lo, mut fx, held: Held.Address(sret))
         }
-        else => return false
+        else => return jobs_space_lower(mut lo, mut fx, supply)
     }
     return true
 } jobs_lower
+
+/// The operations of an isolated space's runtime and of its kernel.
+fn jobs_space_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "nanos::space_base" => {
+            let base = mint_base(mut lo, mut fx)
+            let base_ty = supply.abi.result
+            let Some(sret) = supply.sret else {
+                expect false
+                return false
+            }
+            for index in 0usize..<3 {
+                let name = match index {
+                    0 => "alloc"
+                    1 => "exec"
+                    else => "clock"
+                }
+                let value = match index {
+                    0 => base.cell
+                    1 => base.exec
+                    else => base.clock
+                }
+                let field = mut lo.layouts.field(lo.ck, ty: base_ty, variant: None, label: name)
+                mut fx.store(value, addr: sret, offset: field.offset)
+            }
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "nanos::invoke" => {
+            let args = sys_view(mut fx, held: supply.param(2))
+            let result = sys_view(mut fx, held: supply.param(3))
+            var call = fx.list4(supply.param(0).scalar_value(), b: supply.param(1).scalar_value(), c: args.start, d: args.len)
+            mut call.push(result.start)
+            mut call.push(result.len)
+            let given = space_call(mut lo, mut fx, number: SPACE_INVOKE, args: call.view())
+            supply.ret(mut lo, mut fx, held: Held.Scalar(given))
+        }
+        "nanos::end" => {
+            let bytes = sys_view(mut fx, held: supply.param(2))
+            let call = fx.list4(supply.param(0).scalar_value(), b: supply.param(1).scalar_value(), c: bytes.start, d: bytes.len)
+            discard space_call(mut lo, mut fx, number: SPACE_END, args: call.view())
+            supply.done(mut lo, mut fx)
+        }
+        "nanos::trap_number" => {
+            let record = trap_record(mut fx, trap: supply.param(0))
+            let kind = mut fx.load(PTR, addr: record, offset: TRAP_RECORD_KIND)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(kind))
+        }
+        "nanos::trap_of" => jobs_trap_of(mut lo, mut fx, supply)
+        "nanos::register" => {
+            var slots = X64_SYSCALL_REGISTERS
+            if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+                slots = A64_SYSCALL_REGISTERS
+            }
+            let role = supply.param(0).scalar_value()
+            var register = mut fx.ptr(slots[0])
+            for index in 1usize..<8 {
+                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: role, y: i64.fit(index))
+                let value = mut fx.ptr(slots[index])
+                register = mut fx.b.select(this, x: value, y: register)
+            }
+            supply.ret(mut lo, mut fx, held: Held.Scalar(register))
+        }
+        else => return false
+    }
+    return true
+} jobs_space_lower
+
+/// The index in an `hw::UserState`'s registers of each argument of a system call, of its number
+/// and of its result: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, then `rax` for both; on
+/// AArch64 `x0` to `x5`, `x8`, then `x0`.
+const X64_SYSCALL_REGISTERS: Array[u64, 8] = syscall_registers(6, rsi: 5, rdx: 2, r10: 9, r8: 7, r9: 8, number: 0, result: 0)
+
+const A64_SYSCALL_REGISTERS: Array[u64, 8] = syscall_registers(0, rsi: 1, rdx: 2, r10: 3, r8: 4, r9: 5, number: 8, result: 0)
+
+fn syscall_registers(rdi: u64, rsi: u64, rdx: u64, r10: u64, r8: u64, r9: u64, number: u64, result: u64) -> Array[u64, 8] {
+    var slots = Array[u64, 8].filled(rdi)
+    slots[1] = rsi
+    slots[2] = rdx
+    slots[3] = r10
+    slots[4] = r8
+    slots[5] = r9
+    slots[6] = number
+    slots[7] = result
+    return slots
+} syscall_registers
+
+/// `nanos::trap_of(kind, alloc)`: a trap of the kind its number names, `trap.abandoned` for a
+/// number naming none, its record drawn through `alloc` and its report locating the call.
+fn jobs_trap_of(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let given = supply.param(0).scalar_value()
+    let abandoned_number = kind_number("trap.abandoned")
+    let known = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: given, y: abandoned_number + 1)
+    let abandoned = mut fx.ptr(u64.fit(abandoned_number))
+    let kind = mut fx.b.select(known, x: given, y: abandoned)
+    let cell = trap_record(mut fx, trap: supply.param(1))
+    let size = mut fx.ptr(TRAP_RECORD_BYTES + REPORT_REPORT)
+    let align = mut fx.ptr(8)
+    let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: fx.list3(cell, b: size, c: align).view())
+    let record = drawn[0]
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.TrapReport, args: fx.list2(kind, b: record).view())
+    word_result(mut lo, mut fx, supply, value: record)
+} jobs_trap_of
 
 /// `nanos::call(job, world, input)`: calls the job entry's code with the addresses of the world,
 /// of the input and of the slot it writes how the job ended into.

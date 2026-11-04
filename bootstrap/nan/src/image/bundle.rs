@@ -1,5 +1,7 @@
 //! The bundle writer: links the object of a bundle's lowering from address zero and writes the
-//! bundle, each import bound to the index of the export its kernel's interface names.
+//! bundle, each import bound to the index of the export its kernel's interface names; and the
+//! image of a kernel's user-mode runtime, a bundle whose job is the runtime's start, recording
+//! where it defines each export.
 
 use super::{Access, Linked, link};
 use crate::encoding::{Record, bytes, list, uvar};
@@ -38,9 +40,15 @@ pub fn write(
     }
     let mut out = MAGIC.to_vec();
     uvar(&mut out, VERSION);
+    let parts = Parts {
+        job: job.map(|stack| (crate::lower::JOB, stack)),
+        components,
+        runtime: None,
+        lines: crate::lower::load::BUNDLE_LINES,
+    };
     bytes(
         &mut out,
-        &body(&linked, contributed, job, components, interface, &index),
+        &body(&linked, contributed, &parts, interface, &index),
     );
     let mut sections = Record::default();
     if let Some(seed) = seed {
@@ -53,14 +61,54 @@ pub fn write(
     Ok(out)
 }
 
+/// The image of a kernel's user-mode runtime, unsigned, from the object of its lowering: a bundle
+/// whose job is its start routine, with the stack that routine runs on, which records, for each
+/// export of the interface, its offset plus one, or zero where the runtime defines none, and the
+/// bytes of the boot area it runs over.
+pub fn runtime(
+    object: &[u8],
+    interface: &Interface,
+    start: &str,
+    stack: u64,
+    boot: u64,
+) -> Vec<u8> {
+    let linked = link(object, 0, false);
+    let exports: Vec<u64> = interface
+        .exports
+        .iter()
+        .map(|name| linked.symbols.get(name).map_or(0, |at| at + 1))
+        .collect();
+    let mut out = MAGIC.to_vec();
+    uvar(&mut out, VERSION);
+    let none = |_: &str| None;
+    let parts = Parts {
+        job: Some((start, stack)),
+        components: &[],
+        runtime: Some((&exports, boot)),
+        lines: crate::lower::LINES,
+    };
+    bytes(&mut out, &body(&linked, &[], &parts, interface, &none));
+    out.extend(Record::default().finish());
+    out
+}
+
+/// The parts of a bundle's body beside its object's and its contributions: its job entry by
+/// symbol with its task's stack, its component entries, for a runtime where it defines each
+/// export and the bytes of its boot area, and the symbol of its line tables.
+struct Parts<'a> {
+    job: Option<(&'a str, u64)>,
+    components: &'a [(String, u64)],
+    runtime: Option<(&'a [u64], u64)>,
+    lines: &'a str,
+}
+
 /// The body of a bundle: its interface hash, its image, the image's size in memory, its base
-/// relocations, its imports, its line tables' offset, its contributions, where its read-only
-/// and writable data start, its job entry with its task's stack and its component entries.
+/// relocations, its imports, the offset of its line tables, its contributions, where its
+/// read-only and writable data start, then its parts.
 fn body(
     linked: &Linked,
     contributed: &[Contributed],
-    job: Option<u64>,
-    components: &[(String, u64)],
+    parts: &Parts,
     interface: &Interface,
     index: &dyn Fn(&str) -> Option<usize>,
 ) -> Vec<u8> {
@@ -107,10 +155,7 @@ fn body(
             }),
         );
     }
-    record.field(
-        6,
-        field(|out| uvar(out, symbol(crate::lower::load::BUNDLE_LINES))),
-    );
+    record.field(6, field(|out| uvar(out, symbol(parts.lines))));
     if !contributed.is_empty() {
         record.field(
             7,
@@ -156,21 +201,28 @@ fn body(
         8,
         field(|out| pair(out, (start(Access::Read), start(Access::Write)))),
     );
-    if let Some(stack) = job {
-        let entry = linked.symbol(crate::lower::JOB);
+    if let Some((symbol, stack)) = parts.job {
+        let entry = linked.symbol(symbol);
         record.field(9, field(|out| pair(out, (entry, stack))));
     }
-    if !components.is_empty() {
+    if !parts.components.is_empty() {
         record.field(
             10,
             field(|out| {
-                list(out, components.iter(), |out, (name, stack)| {
+                list(out, parts.components.iter(), |out, (name, stack)| {
                     bytes(out, name.as_bytes());
                     let entry = linked.symbol(&format!("{}{name}", crate::lower::COMPONENT));
                     pair(out, (entry, *stack));
                 })
             }),
         );
+    }
+    if let Some((exports, boot)) = parts.runtime {
+        record.field(
+            11,
+            field(|out| list(out, exports.iter(), |out, at| uvar(out, u128::from(*at)))),
+        );
+        record.field(12, field(|out| uvar(out, u128::from(boot))));
     }
     record.finish()
 }

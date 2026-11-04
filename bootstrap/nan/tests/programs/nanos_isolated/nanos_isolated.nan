@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -227,6 +227,46 @@ fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw
 /// The frames each space takes, which hold its runtime's boot area.
 const SPACE_FRAMES: usize = 7_000
 
+/// Kernel memory outside the entry area, which a space's root does not map.
+const KERNEL_PROBE: u64 = 0x1000_0000
+
+/// Runs the runtime of a space of a job with its stack in kernel memory outside the entry area,
+/// so that its first store probes that memory, and writes whether the store faulted on a page
+/// the space's root does not map.
+fn probed(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    var held = frames_for_space(mut frames, alloc: grants.alloc)
+    match attempt job.space(cpu, data: 64, frames: mut held, alloc: grants.alloc) {
+        Ok(space) => {
+            var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(KERNEL_PROBE + 4_096), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
+            var none: Option[hw::ExtendedState] = None
+            var exit = hw::UserExit.Interrupted
+            while exit == hw::UserExit.Interrupted {
+                exit = space.run(cpu, mut state, extended: mut none)
+            }
+            match unmapped_fault(exit) {
+                true => say(text: "probe faulted on a page the space does not map\n")
+                false => say(text: "probe faulted otherwise\n")
+            }
+            returned(take none, mut frames)
+            take space.release(frames: mut held)
+        }
+        Err(_) => say(text: "probe unplaced\n")
+    }
+    for frame in take held {
+        mut frames.push(take frame)
+    }
+} probed
+
+/// Whether an exit is a fault of a store to the page below `KERNEL_PROBE + 4_096` that the root
+/// does not map.
+fn unmapped_fault(exit: hw::UserExit) -> bool {
+    let hw::UserExit.Fault(fault) = exit else {
+        return false
+    }
+    // A user-mode write to a page the root does not map: present clear, write and user set.
+    return fault.vector == 14 and fault.code == 6 and fault.address >= KERNEL_PROBE and fault.address < KERNEL_PROBE + 4_096
+} unmapped_fault
+
 /// A bundle verified for isolated spaces.
 fn isolated(loader: sys::load::Loader, bytes: Slice[u8], alloc: mem::Alloc) -> sys::load::Isolated {
     let keys = Array[core::crypto::PublicKey, 1].filled(bundle_key())
@@ -383,8 +423,9 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 
 /// Runs the jobs: a typed job using floats, lanes and the served capabilities and an input it
 /// does not decode, a host program, a job trapping, failing, returning and reading kernel
-/// memory, a job without a stack bound recursing past the stack it starts with, then a job
-/// spinning on floats in a space while the same job, verified once, spins in the shared space.
+/// memory, a job without a stack bound recursing past the stack it starts with, a space's
+/// runtime probing kernel memory, then a job spinning on floats in a space while the same job,
+/// verified once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     var values = mem::List[u32].empty(grants.alloc)
     mut values.push(2)
@@ -428,6 +469,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     mut depths.push(encoded(Ask.Sum(20_000), alloc: grants.alloc))
     var sums = try await ran(cpu, job: typed, name: "deep", grants, inputs: take depths, mut frames)
     say_answer(text: "sum ", bytes: mut sums.remove(0), alloc: grants.alloc)
+    probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve
 

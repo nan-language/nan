@@ -105,6 +105,22 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let entry = lo.user_entry(fx, physical, kind);
             supply.ret(lo, fx, Held::Scalar(entry));
         }
+        "sys::load::linked_table" => {
+            let (entry, level) = (supply.param(0).scalar(), supply.param(1).scalar());
+            let table = lo.linked_table(fx, entry, level);
+            supply.ret(lo, fx, Held::Scalar(table));
+        }
+        "sys::load::page_of" => {
+            let entry = supply.param(0).scalar();
+            let (level, offset) = (supply.param(1).scalar(), supply.param(2).scalar());
+            let page = lo.page_of(fx, entry, level, offset);
+            supply.ret(lo, fx, Held::Scalar(page));
+        }
+        "sys::load::restricted_page" => {
+            let (page, table) = (supply.param(0).scalar(), supply.param(1).scalar());
+            let page = lo.restricted_page(fx, page, table);
+            supply.ret(lo, fx, Held::Scalar(page));
+        }
         "sys::load::running_root" => {
             let root = lo.running_root(fx);
             supply.ret(lo, fx, Held::Scalar(root));

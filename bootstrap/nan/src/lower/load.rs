@@ -115,6 +115,20 @@ const A64_USER_ENTRIES: [u64; 5] = [
 const X64_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000;
 const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000;
 
+/// The address bits of a leaf entry mapping 1 GiB and of one mapping 2 MiB, by architecture.
+const X64_LEAF_ADDRESS: [i64; 2] = [0x000F_FFFF_C000_0000, 0x000F_FFFF_FFE0_0000];
+const A64_LEAF_ADDRESS: [i64; 2] = [0x0000_FFFF_C000_0000, 0x0000_FFFF_FFE0_0000];
+
+/// The bits of an x86_64 leaf entry above 4 KiB that a page entry keeps: every flag but the
+/// large-page bit and the PAT bit, which moves from bit 12 to bit 7.
+const X64_LEAF_KEPT: i64 = 0xFFF0_0000_0000_0F7F_u64 as i64;
+const X64_LARGE: i64 = 0x80;
+
+/// The attributes of an AArch64 block entry that a page entry keeps: every one but the
+/// contiguous hint, which a page split from a block no longer meets.
+const A64_LEAF_KEPT: i64 = 0xFFEC_0000_0000_0FFC_u64 as i64;
+const A64_CONTIGUOUS: i64 = 1 << 52;
+
 /// The entry of the kind at index `kind` of `entries` over a physical address, the last kind for
 /// an index past the others.
 fn entry_of(fx: &mut Fx, entries: &[u64], physical: Value, kind: Value) -> Value {
@@ -635,6 +649,114 @@ impl Lowering<'_, '_> {
             _ => X64_USER_ENTRIES,
         };
         entry_of(fx, &entries, physical, kind)
+    }
+
+    /// The physical address of the table an entry of a page-table level links to, the root's
+    /// level 0, or zero for an entry linking none: one absent, mapping memory, or of level 3.
+    pub fn linked_table(&mut self, fx: &mut Fx, entry: Value, level: Value) -> Value {
+        let links = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => {
+                let kind = fx.b.ins().band_imm_s(entry, 0x3);
+                fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0x3)
+            }
+            _ => {
+                let present = fx.b.ins().band_imm_s(entry, 0x1);
+                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, present, 0);
+                let large = fx.b.ins().band_imm_s(entry, X64_LARGE);
+                let small = fx.b.ins().icmp_imm_s(IntCC::Equal, large, 0);
+                let root = fx.b.ins().icmp_imm_s(IntCC::Equal, level, 0);
+                let table = fx.b.ins().bor(small, root);
+                fx.b.ins().band(present, table)
+            }
+        };
+        let above = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, level, 3);
+        let links = fx.b.ins().band(links, above);
+        let address = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => fx.b.ins().band_imm_s(entry, A64_ADDRESS),
+            _ => fx.b.ins().band_imm_s(entry, X64_ADDRESS),
+        };
+        let zero = fx.ptr(0);
+        fx.b.ins().select(links, address, zero)
+    }
+
+    /// The entry of the 4 KiB page `offset` bytes into what an entry of a page-table level maps,
+    /// with that entry's attributes, or zero for an entry mapping no memory there: one absent,
+    /// linking a table, or of level 0.
+    pub fn page_of(&mut self, fx: &mut Fx, entry: Value, level: Value, offset: Value) -> Value {
+        let aarch64 = self.ck.db.target.arch() == Some(Arch::Aarch64);
+        let (addresses, kept) = match aarch64 {
+            true => (A64_LEAF_ADDRESS, A64_LEAF_KEPT),
+            false => (X64_LEAF_ADDRESS, X64_LEAF_KEPT),
+        };
+        let within = fx.b.ins().band_imm_s(offset, !0xFFF);
+        let attributes = fx.b.ins().band_imm_s(entry, kept);
+        let attributes = match aarch64 {
+            true => fx.b.ins().bor_imm_s(attributes, 0x3),
+            false => {
+                let pat = fx.b.ins().ushr_imm_s(entry, 5);
+                let pat = fx.b.ins().band_imm_s(pat, 0x80);
+                fx.b.ins().bor(attributes, pat)
+            }
+        };
+        let mut split = Vec::new();
+        for address in addresses {
+            let base = fx.b.ins().band_imm_s(entry, address);
+            let base = fx.b.ins().iadd(base, within);
+            split.push(fx.b.ins().bor(base, attributes));
+        }
+        let (page, leaf, block) = match aarch64 {
+            true => {
+                let page = fx.b.ins().band_imm_s(entry, !A64_CONTIGUOUS);
+                let kind = fx.b.ins().band_imm_s(entry, 0x3);
+                let leaf = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0x3);
+                let block = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, 0x1);
+                (page, leaf, block)
+            }
+            false => {
+                let present = fx.b.ins().band_imm_s(entry, 0x1);
+                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, present, 0);
+                let large = fx.b.ins().band_imm_s(entry, X64_LARGE);
+                let large = fx.b.ins().icmp_imm_s(IntCC::NotEqual, large, 0);
+                (entry, present, fx.b.ins().band(present, large))
+            }
+        };
+        let zero = fx.ptr(0);
+        let last = fx.b.ins().icmp_imm_s(IntCC::Equal, level, 3);
+        let mapped = fx.b.ins().select(leaf, page, zero);
+        let mut result = fx.b.ins().select(last, mapped, zero);
+        for (index, split) in split.into_iter().enumerate() {
+            let this = fx.b.ins().icmp_imm_s(IntCC::Equal, level, index as i64 + 1);
+            let this = fx.b.ins().band(this, block);
+            result = fx.b.ins().select(this, split, result);
+        }
+        result
+    }
+
+    /// A page entry with the restrictions a table entry it lies under imposes: on x86_64 no
+    /// write or user access the table entry denies and execution it disables; on AArch64 the
+    /// access and execute-never limits of its table attributes.
+    pub fn restricted_page(&mut self, fx: &mut Fx, page: Value, table: Value) -> Value {
+        if self.ck.db.target.arch() != Some(Arch::Aarch64) {
+            let allowed = fx.b.ins().bor_imm_s(table, !0x6);
+            let page = fx.b.ins().band(page, allowed);
+            let disabled = fx.b.ins().band_imm_s(table, i64::MIN);
+            return fx.b.ins().bor(page, disabled);
+        }
+        let mut page = page;
+        // APTable[0] denies EL0 access, AP[1] grants it; APTable[1] and UXNTable and PXNTable
+        // set AP[2], UXN and PXN.
+        let denied = fx.b.ins().ushr_imm_s(table, 61);
+        let denied = fx.b.ins().band_imm_s(denied, 1);
+        let denied = fx.b.ins().ishl_imm_s(denied, 6);
+        let kept = fx.b.ins().bnot(denied);
+        page = fx.b.ins().band(page, kept);
+        for (from, to) in [(62, 7), (60, 54), (59, 53)] {
+            let bit = fx.b.ins().ushr_imm_s(table, from);
+            let bit = fx.b.ins().band_imm_s(bit, 1);
+            let bit = fx.b.ins().ishl_imm_s(bit, to);
+            page = fx.b.ins().bor(page, bit);
+        }
+        page
     }
 
     /// The physical address of the running root's top-level table.

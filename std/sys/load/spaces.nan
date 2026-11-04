@@ -30,13 +30,20 @@ pub open struct Isolated {
 } Isolated
 
 /// An isolated space: its root, its other tables, and the pages it maps from the start of the
-/// user window, laid out as `plan` gives.
+/// user window, laid out as `plan` gives; the tables mapping the entry area follow those of the
+/// window.
 pub open linear struct Space {
     root: hw::PageTableRoot
     tables: mem::List[hw::PhysFrame[4_096]]
     pages: mem::List[hw::PhysFrame[4_096]]
     plan: Plan
 } Space
+
+/// The pages of the entry area, from `low` to `high`.
+struct Reach derives Copy {
+    low: u64
+    high: u64
+} Reach
 
 /// Where a space's pages lie, by index from the window's start: the runtime's image and the
 /// bundle's image, each with the first pages of its read-only and of its writable data from its
@@ -84,9 +91,14 @@ pub fn Isolated.job(self) -> Option[Job] {
     return Some(Job.at(USER_WINDOW + pages_of(self.runtime.size) * PAGE + self.parts.entry, stack: self.parts.stack))
 } Isolated.job
 
-pub fn Isolated.space(self, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
+pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
     let plan = plan_of(self.runtime, image: self.parts, data)
-    if plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.end or entry_of_running(USER_SLOT) != 0 {
+    let area = cpu.entry_area()
+    let reach = Reach(low: area.base / PAGE, high: (area.base + area.len - 1) / PAGE)
+    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.end + reach.tables() {
+        fail LoadError.Unplaceable
+    }
+    if reach.low / level_pages(0) <= USER_SLOT and reach.high / level_pages(0) >= USER_SLOT {
         fail LoadError.Unplaceable
     }
     let image_base = USER_WINDOW + plan.image * PAGE
@@ -99,7 +111,7 @@ pub fn Isolated.space(self, data: u64, mut frames: mem::List[hw::PhysFrame[4_096
             fail error
         }
     }
-    var space = match attempt mapped(plan, mut frames, alloc) {
+    var space = match attempt mapped(plan, reach, mut frames, alloc) {
         Ok(space) => space
         Err(error) => {
             release(runtime_copy)
@@ -137,7 +149,7 @@ pub fn Space.boot_area(self) -> u64 {
 } Space.boot_area
 
 pub fn Space.run(self, cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit {
-    return trusted "the root holds the running root's top-level entries, so it maps the entry area as the running root does, and maps for user mode only the window, whose pages are frames the space owns and holds no value of the kernel in; the user path drops the translations cached under its tag" { cpu.run_user_split(mut state, mut extended, root: self.root) }
+    return trusted "the root maps the entry area page by page with the attributes the running root's walk gives it, and for user mode only the window, whose pages are frames the space owns and holds no value of the kernel in; the user path drops the translations cached under its tag" { cpu.run_user_split(mut state, mut extended, root: self.root) }
 } Space.run
 
 pub fn Space.read(self, address: u64, len: u64, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails hw::UserAddrError {
@@ -246,25 +258,21 @@ fn Isolated.bound_copy(self, window: u64) -> u64 fails LoadError {
     }
 } Isolated.bound_copy
 
-/// The space of a plan, its frames taken from `frames` and cleared: a root holding the running
-/// root's top-level entries but the window's, a table of 1 GiB entries and one of 2 MiB entries
-/// mapping the window, the tables of its pages, and its pages.
-fn mapped(plan: Plan, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
+/// The space of a plan, its frames taken from `frames` and cleared: a root mapping the window and
+/// the pages of the entry area `reach` holds, a table of 1 GiB entries and one of 2 MiB entries
+/// mapping the window, the tables of its pages, its pages, and the tables mapping the entry area.
+fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
     let count = tables_of(plan)
-    var tables = cleared_frames(mut frames, count: count + 2, alloc)
+    var tables = cleared_frames(mut frames, count: count + 2 + reach.tables(), alloc)
     var pages = cleared_frames(mut frames, count: plan.end, alloc)
     let Some(root) = mut frames.pop() else {
         given_back(take tables, mut frames)
         given_back(take pages, mut frames)
         fail LoadError.Unplaceable
     }
-    clear(root.base())
-    for slot in 0u64..<TABLE_ENTRIES {
-        if slot != USER_SLOT {
-            write_entry(root.base() + slot * 8, value: entry_of_running(slot))
-        }
-    }
-    write_entry(root.base() + USER_SLOT * 8, value: user_entry(tables[0].base(), kind: USER_TABLE))
+    let top = root.base()
+    clear(top)
+    write_entry(top + USER_SLOT * 8, value: user_entry(tables[0].base(), kind: USER_TABLE))
     write_entry(tables[0].base(), value: user_entry(tables[1].base(), kind: USER_TABLE))
     for index in 0u64..<count {
         write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
@@ -274,8 +282,89 @@ fn mapped(plan: Plan, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::A
         let table = space.tables[usize.widen(index / TABLE_ENTRIES) + 2].base()
         write_entry(table + index % TABLE_ENTRIES * 8, value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     }
+    space.map_entry_area(root: top, reach, first_table: count + 2)
     return space
 } mapped
+
+/// The number of tables mapping the pages of the entry area: at each level below the root, one
+/// per range of pages a table of that level maps.
+fn Reach.tables(self) -> u64 {
+    var count: u64 = 0
+    for level in 0usize..<3 {
+        count += self.high / level_pages(level) - self.low / level_pages(level) + 1
+    }
+    return count
+} Reach.tables
+
+/// The physical address of the table of a level below the root mapping the page of an index in
+/// the entry area, the tables of each level following those of the level above from `first_table`.
+fn Space.entry_table(self, reach: Reach, first_table: u64, level: usize, index: u64) -> u64 {
+    var at = first_table
+    for above in 0usize..<level {
+        at += reach.high / level_pages(above) - reach.low / level_pages(above) + 1
+    }
+    let pages = level_pages(level)
+    return self.tables[usize.widen(at + index / pages - reach.low / pages)].base()
+} Space.entry_table
+
+/// Maps each page of the entry area as the running root does, through the tables from
+/// `first_table` linked from the root at the physical address `root`.
+fn Space.map_entry_area(self, root: u64, reach: Reach, first_table: u64) {
+    for level in 0usize..<3 {
+        let pages = level_pages(level)
+        for unit in (reach.low / pages)..<(reach.high / pages + 1) {
+            let table = self.entry_table(reach, first_table, level, index: unit * pages)
+            var above = root
+            if level > 0 {
+                above = self.entry_table(reach, first_table, level: level - 1, index: unit * pages)
+            }
+            write_entry(above + unit % TABLE_ENTRIES * 8, value: user_entry(table, kind: USER_TABLE))
+        }
+    }
+    for index in reach.low..<(reach.high + 1) {
+        let table = self.entry_table(reach, first_table, level: 2, index)
+        write_entry(table + index % TABLE_ENTRIES * 8, value: running_page(index * PAGE))
+    }
+} Space.map_entry_area
+
+/// The entry of the 4 KiB page at `address` with the attributes the running root's walk gives
+/// it, its leaf's restricted by the tables above, zero where the running root maps nothing.
+fn running_page(address: u64) -> u64 {
+    var table = running_root()
+    var passed = Array[u64, 3].filled(0)
+    for level in 0u64..<4 {
+        let span = TABLE_ENTRIES * TABLE_ENTRIES * TABLE_ENTRIES * PAGE / pow_of(level)
+        let entry = table_word(table, index: address / span % TABLE_ENTRIES)
+        var leaf = page_of(entry, level, offset: address % span)
+        if leaf != 0 {
+            for at in 0u64..<level {
+                leaf = restricted_page(leaf, table: passed[usize.widen(at)])
+            }
+            return leaf
+        }
+        table = linked_table(entry, level)
+        if table == 0 {
+            return 0
+        }
+        passed[usize.widen(level)] = entry
+    }
+    return 0
+} running_page
+
+/// The pages a table of a level below the root maps: one of 1 GiB entries, of 2 MiB entries,
+/// and of pages.
+fn level_pages(level: usize) -> u64 {
+    return pow_of(3 - u64.widen(level))
+} level_pages
+
+/// 512 to the power of a level.
+fn pow_of(level: u64) -> u64 {
+    var power: u64 = 1
+    for _ in 0u64..<level {
+        power *= TABLE_ENTRIES
+    }
+    return power
+} pow_of
 
 /// Up to `count` frames taken from the end of `frames`, cleared.
 fn cleared_frames(mut frames: mem::List[hw::PhysFrame[4_096]], count: u64, alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] {
@@ -387,7 +476,18 @@ fn user_entry(physical: u64, kind: u64) -> u64
 /// The physical address of the running root's top-level table.
 fn running_root() -> u64
 
-/// The running root's top-level entry of a slot.
-fn entry_of_running(slot: u64) -> u64 {
-    return trusted "the running root's top-level table lies at its physical address, which the shared space maps" { hw::Ptr[u64].of_addr(usize.widen(running_root() + slot * 8)).read() }
-} entry_of_running
+/// An entry of a table of the running root at its physical address.
+fn table_word(table: u64, index: u64) -> u64 {
+    return trusted "the running root's tables lie at their physical addresses, which the shared space maps" { hw::Ptr[u64].of_addr(usize.widen(table + index * 8)).read() }
+} table_word
+
+/// The physical address of the table an entry of a level links to, the root's level 0, or zero
+/// for an entry linking none.
+fn linked_table(entry: u64, level: u64) -> u64
+
+/// The entry of the 4 KiB page `offset` bytes into what an entry of a level maps, with its
+/// attributes, or zero for an entry mapping no memory there.
+fn page_of(entry: u64, level: u64, offset: u64) -> u64
+
+/// A page entry with the restrictions a table entry above it imposes.
+fn restricted_page(leaf: u64, table: u64) -> u64

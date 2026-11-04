@@ -507,6 +507,7 @@ impl<'a> Checker<'a> {
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = workspace.diagnostics().collect();
+    found.extend(root::missing_releases(workspace, scope));
     found.extend(diagnostics(workspace, scope));
     for (_, file) in workspace.files() {
         found.extend(file.syntax.diagnostics.iter().map(|diagnostic| {

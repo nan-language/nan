@@ -411,6 +411,56 @@ fn a_store_entry_holding_another_release_than_the_lock_names_is_a_root_mismatch(
 }
 
 #[test]
+fn a_path_source_at_its_locked_release_checks_without_the_store_holding_it() {
+    let scratch = Scratch::new(&[
+        (
+            "dial/package.nan",
+            "//! Dials.\n\npackage dial {\n    language 1\n    targets any\n} dial\n",
+        ),
+        (
+            "dial/dial.nan",
+            "//! Dials.\n\n/// The notch.\npub fn notch() -> u32 = 7\n",
+        ),
+        (
+            "app/package.nan",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets any\n    dep dial \"../dial\"\n} app\n",
+        ),
+        (
+            "app/app.nan",
+            "//! Apps.\n\npub fn notch() -> u32 = dial::notch()\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    run_in(&dir.join("app"), "dep sync");
+    let lock = fs::read_to_string(dir.join("app/.nan/lock.nan")).expect("the lock");
+    let root = lock
+        .lines()
+        .find_map(|line| line.strip_prefix("dep dial alias dial \"../dial\" \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("the locked release");
+    let store = std::env::temp_dir().join("nan-test-home/.nan/store");
+    let entry = fs::read_dir(&store)
+        .expect("the store")
+        .map(|entry| entry.expect("a store entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str()?.split_once('-'))
+                .is_some_and(|(_, held)| held == format!("{root}.entry"))
+        })
+        .expect("the path release");
+    fs::remove_file(entry).expect("the path release removed");
+    let output = run_in(dir, "check app").output;
+    assert!(output.starts_with("ok check app:"), "{output}");
+    let changed = "//! Dials.\n\n/// The notch.\npub fn notch() -> u32 = 8\n";
+    fs::write(dir.join("dial/dial.nan"), changed).expect("a changed dial");
+    let output = run_in(dir, "check app").output;
+    assert!(
+        output.contains("\nerror dep.release-missing app/package.nan:6 app\n"),
+        "{output}"
+    );
+}
+
+#[test]
 fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
     let scratch = Scratch::new(&[
         (

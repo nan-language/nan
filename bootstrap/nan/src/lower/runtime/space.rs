@@ -1,19 +1,22 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
 //! area its kernel maps as it is used, the system calls through which it reads its kernel's
-//! clock, waits for its first timer and ends, and its start, which runs `nanos::isolated` as its
-//! first task.
+//! clock, waits for its first timer or its doorbell and ends, and its start, which runs
+//! `nanos::isolated` as its first task.
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC, types,
+};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use super::super::body::Held;
 use super::super::call::Invoked;
+use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
 use super::super::machine::{BOOT_STACK, Stub};
 use super::super::stack::{At, Demand, Judged, Report};
 use super::super::{CALL_CONV, Instance, Lowering, lines};
 use super::system::unavailable_unless;
-use super::tasks::{task, thread};
+use super::tasks::{self, EXPIRED, task, thread};
 use super::{Routine, state};
 use crate::check::ty::no_args;
 use crate::nir::{Role, Span};
@@ -35,6 +38,13 @@ const TRAPPED: u64 = 2;
 /// and of the boot area, and of the glue of the first task.
 pub const START: &str = "_NSuser_start";
 const MAIN: &str = "_NSuser_main";
+
+/// The operation of the task waiting on the doorbell, zero when none waits.
+pub const BELL: Reserved = Reserved {
+    name: "_NSspace_bell",
+    size: 8,
+    align: 8,
+};
 
 /// The stack the start routine and the scheduler run on, and the boot area.
 pub const START_STACK: u64 = BOOT_STACK;
@@ -83,7 +93,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     fx.b.ins().return_(&[result]);
 }
 
-/// Waits until the first timer is due, or for good without one, then expires the timers due.
+/// Waits until the first timer is due, or for good without one, or until the kernel rings the
+/// doorbell, which wakes the task waiting on it; then expires the timers due.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::TIMER_LOCK);
@@ -101,7 +112,22 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
         |fx| vec![fx.ptr(0)],
     )[0];
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    call(lo, fx, WAIT, &[deadline]);
+    let rung = call(lo, fx, WAIT, &[deadline]);
+    let rung = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rung, 0);
+    fx.when(rung, |fx| {
+        let slot = lo.reserved(fx, BELL);
+        let op = fx.load(PTR, slot, 0);
+        let waiting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, op, 0);
+        fx.when(waiting, |fx| {
+            let zero = fx.ptr(0);
+            fx.store(zero, slot, 0);
+            let claimed = lo.kernel_claim(fx, op);
+            fx.when(claimed, |fx| {
+                let expired = fx.int(types::I32, EXPIRED);
+                tasks::deliver(lo, fx, op, expired);
+            });
+        });
+    });
     lo.expire_timers(fx);
 }
 

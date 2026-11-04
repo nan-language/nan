@@ -39,6 +39,7 @@ pkg enum StdFile derives Copy, Eq {
     MemPackage
     MemWireWire
     NanosIsolated
+    NanosLink
     NanosNanos
     NanosPackage
     SysFsFs
@@ -108,6 +109,7 @@ pkg fn StdFile.all(alloc: mem::Alloc) -> mem::List[StdFile] {
     mut files.push(StdFile.MemPackage)
     mut files.push(StdFile.MemWireWire)
     mut files.push(StdFile.NanosIsolated)
+    mut files.push(StdFile.NanosLink)
     mut files.push(StdFile.NanosNanos)
     mut files.push(StdFile.NanosPackage)
     mut files.push(StdFile.SysFsFs)
@@ -178,6 +180,7 @@ pkg proj fn StdFile.path(self) -> Str {
         StdFile.MemPackage => "mem/package.nan"
         StdFile.MemWireWire => "mem/wire/wire.nan"
         StdFile.NanosIsolated => "nanos/isolated.nan"
+        StdFile.NanosLink => "nanos/link.nan"
         StdFile.NanosNanos => "nanos/nanos.nan"
         StdFile.NanosPackage => "nanos/package.nan"
         StdFile.SysFsFs => "sys/fs/fs.nan"
@@ -248,6 +251,7 @@ pkg proj fn StdFile.text(self) -> Str {
         StdFile.MemPackage => TEXT_MEM_PACKAGE
         StdFile.MemWireWire => TEXT_MEM_WIRE_WIRE
         StdFile.NanosIsolated => TEXT_NANOS_ISOLATED
+        StdFile.NanosLink => TEXT_NANOS_LINK
         StdFile.NanosNanos => TEXT_NANOS_NANOS
         StdFile.NanosPackage => TEXT_NANOS_PACKAGE
         StdFile.SysFsFs => TEXT_SYS_FS_FS
@@ -13479,7 +13483,7 @@ const TEXT_MEM_WIRE_WIRE: Str =
     \\
 
 const TEXT_NANOS_ISOLATED: Str =
-    \\//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls, and the first task of the space's runtime, which runs the job on a world whose log, standard streams and random source reach the kernel through those calls.
+    \\//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls through the space's table of handles, and the first task of the space's runtime, which runs the job on a world whose log, standard streams, random source and link's channels reach the kernel through those calls.
     \\
     \\/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
     \\/// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
@@ -13509,13 +13513,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const STALE: u64 = 0xFFFF_FFFF_FFFF_FFFE
     \\
-    \\/// The handles of the capabilities the kernel serves a job's space, and their operations.
-    \\const HANDLE_LOG: u64 = 0
-    \\
-    \\const HANDLE_STDIO: u64 = 1
-    \\
-    \\const HANDLE_RANDOM: u64 = 2
-    \\
+    \\/// The operations of the capabilities the kernel serves a job's space.
     \\const LOG_LINE: u64 = 0
     \\
     \\const READ_IN: u64 = 0
@@ -13548,8 +13546,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// The most bytes the kernel copies out of a space for one call.
     \\const MOST_BYTES: u64 = 1_048_576
     \\
-    \\/// The bytes of a start record.
-    \\const RECORD_BYTES: usize = 32
+    \\/// The bytes of a start record and of the record of a port.
+    \\const START_BYTES: usize = 80
+    \\
+    \\const PORT_BYTES: usize = 40
     \\
     \\pub closed enum IsolatedError derives Render {
     \\    NoJob
@@ -13566,13 +13566,28 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    pub random: sys::Random
     \\} Services
     \\
-    \\/// The record from which a space's runtime starts: the job, and where the job's input lies and its
-    \\/// length.
+    \\/// The record from which a space's runtime starts: the job, where the job's input lies and its
+    \\/// length, the address of the doorbell, the handles of the log, standard streams and random
+    \\/// source, and where the records of the link's channels lie and their count.
     \\struct Start derives Copy {
     \\    job: sys::load::Job
     \\    input: u64
     \\    input_len: u64
+    \\    bell: u64
+    \\    log: u64
+    \\    stdio: u64
+    \\    random: u64
+    \\    ports: u64
+    \\    port_count: u64
     \\} Start
+    \\
+    \\/// A capability a space holds: its handle is the index of its entry in the space's table.
+    \\enum Holding derives Copy {
+    \\    Log(sys::Log)
+    \\    Stdio(sys::Stdio)
+    \\    Random(sys::Random)
+    \\    Channel(usize)
+    \\} Holding
     \\
     \\/// The allocator, executor and clock of a space's runtime.
     \\struct Base {
@@ -13600,39 +13615,101 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    value: text::String
     \\} LogLine
     \\
-    \\pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
+    \\pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
     \\    let Some(entry) = job.job() else {
     \\        fail IsolatedError.NoJob
     \\    }
-    \\    var space = try job.space(cpu, data: u64.widen(RECORD_BYTES + input.len()), mut frames, alloc)
+    \\    var keys: usize = 0
+    \\    for channel in link.channels {
+    \\        keys += channel.key.as_str().as_bytes().len()
+    \\    }
+    \\    let ports_len = PORT_BYTES * link.channels.len()
+    \\    var table = mem::List[Holding].empty(alloc)
+    \\    let log = held_by(mut table, holding: Holding.Log(services.log))
+    \\    let stdio = held_by(mut table, holding: Holding.Stdio(services.stdio))
+    \\    let random = held_by(mut table, holding: Holding.Random(services.random))
+    \\    let channels = u64.widen(table.len())
+    \\    for index in 0..<link.channels.len() {
+    \\        discard held_by(mut table, holding: Holding.Channel(index))
+    \\    }
+    \\    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), mut frames, alloc)
     \\    let start = space.data()
-    \\    let record = Start(job: entry, input: start + u64.widen(RECORD_BYTES), input_len: u64.widen(input.len()))
-    \\    discard attempt mut space.write(start, bytes: start_record(record, alloc).view())
-    \\    discard attempt mut space.write(record.input, bytes: input.view())
-    \\    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
-    \\    state.regs[register(0)] = Untrusted.of(start)
-    \\    state.regs[register(1)] = Untrusted.of(space.boot_area())
-    \\    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, mut frames, alloc)
-    \\    take space.release(mut frames)
-    \\    match outcome {
-    \\        Ok(how) => return how
-    \\        Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
+    \\    match attempt shared(mut space, link, start, channels, alloc) {
+    \\        Ok(ports) => {
+    \\            let input_at = start + u64.widen(START_BYTES + ports_len + keys)
+    \\            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()))
+    \\            discard attempt mut space.write(start, bytes: record_bytes(record, count: START_BYTES, alloc).view())
+    \\            discard attempt mut space.write(record.ports, bytes: ports.records.view())
+    \\            discard attempt mut space.write(input_at, bytes: input.view())
+    \\            var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
+    \\            state.regs[register(0)] = Untrusted.of(start)
+    \\            state.regs[register(1)] = Untrusted.of(space.boot_area())
+    \\            let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, mut frames, alloc)
+    \\            take space.release(mut frames)
+    \\            match outcome {
+    \\                Ok(how) => return how
+    \\                Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
+    \\            }
+    \\        }
+    \\        Err(error) => {
+    \\            take space.release(mut frames)
+    \\            fail IsolatedError.Unplaced(error)
+    \\        }
     \\    }
     \\} run_isolated
     \\
-    \\/// The bytes of a start record.
-    \\fn start_record(record: Start, alloc: mem::Alloc) -> mem::Bytes {
-    \\    var bytes = mem::Bytes.zeroed(RECORD_BYTES, alloc)
-    \\    trusted "a start record is `RECORD_BYTES` bytes, all initialised" {
-    \\        hw::Ptr[u8].cast(hw::Ptr.of(record)).copy(hw::Ptr.of_view_mut(mut bytes.view_mut()), count: RECORD_BYTES)
+    \\/// What a space's kernel serves it: its services, and its table of handles.
+    \\struct Serving {
+    \\    services: Services
+    \\    table: mem::List[Holding]
+    \\} Serving
+    \\
+    \\/// A link's frames as a space maps them: the doorbell's address, and the records of the
+    \\/// channels with their keys after them, which the start record names.
+    \\struct Shared {
+    \\    bell: u64
+    \\    records: mem::Bytes
+    \\} Shared
+    \\
+    \\/// The handle of a capability a space's table holds from now on.
+    \\fn held_by(mut table: mem::List[Holding], holding: Holding) -> u64 {
+    \\    mut table.push(holding)
+    \\    return u64.widen(table.len() - 1)
+    \\} held_by
+    \\
+    \\/// Maps a link's doorbell and channel frames into a space whose start record lies at `start`,
+    \\/// the channels' handles following one another from `channels`.
+    \\fn shared(mut space: sys::load::Space, link: Link, start: u64, channels: u64, alloc: mem::Alloc) -> Shared fails sys::load::LoadError {
+    \\    let bell = try mut space.share(link.bell)
+    \\    var records = mem::Bytes.empty(alloc)
+    \\    var keys = mem::Bytes.empty(alloc)
+    \\    let keys_at = start + u64.widen(START_BYTES + PORT_BYTES * link.channels.len())
+    \\    for channel in link.channels {
+    \\        let inbound = try mut space.share(channel.inbound)
+    \\        let outbound = try mut space.share(channel.outbound)
+    \\        let key = channel.key.as_str().as_bytes()
+    \\        let port = PortRecord(handle: channels + u64.widen(records.len() / PORT_BYTES), inbound: inbound, outbound: outbound, key: keys_at + u64.widen(keys.len()), key_len: u64.widen(key.len()))
+    \\        mut records.append(record_bytes(port, count: PORT_BYTES, alloc).view())
+    \\        mut keys.append(key)
+    \\    }
+    \\    mut records.append(keys.view())
+    \\    return Shared(bell: bell, records: take records)
+    \\} shared
+    \\
+    \\/// The `count` bytes of a record.
+    \\fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Bytes {
+    \\    var bytes = mem::Bytes.zeroed(count, alloc)
+    \\    trusted "the record is `count` bytes, all initialised" {
+    \\        hw::Ptr[u8].cast(hw::Ptr.of(record)).copy(hw::Ptr.of_view_mut(mut bytes.view_mut()), count: count)
     \\    }
     \\    return bytes
-    \\} start_record
+    \\} record_bytes
     \\
     \\/// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
     \\/// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
     \\/// another exception ends the job as a trap of `trap.exception`.
-    \\fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\    let services = served.services
     \\    loop {
     \\        match space.run(cpu, mut state, mut extended) {
     \\            hw::UserExit.Interrupted => {}
@@ -13654,7 +13731,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                    if deadline == 0 {
     \\                        return Ended.Trapped(trap_of(ABANDONED, alloc))
     \\                    }
-    \\                    answer = try await slept_until(services.clock, deadline)
+    \\                    answer = try await slept_until(services.clock, deadline, link)
     \\                } else if number == CALL_DRAW {
     \\                    answer = match attempt mut space.draw(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
     \\                        Ok(_) => 0
@@ -13671,7 +13748,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                        Err(_) => INVALID
     \\                    }
     \\                } else if number == CALL_INVOKE {
-    \\                    answer = try await invoked(mut space, state, services, alloc)
+    \\                    answer = try await invoked(mut space, state, served, link, alloc)
     \\                }
     \\                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
     \\            }
@@ -13679,16 +13756,23 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\} run_space
     \\
-    \\/// Waits until a deadline of the clock, giving 0.
-    \\fn slept_until(clock: sys::Clock, deadline: u64) -> u64 fails task::Cancelled uses wait {
+    \\/// Waits until a deadline of the clock or until the link's doorbell rings, giving 1 when it rang
+    \\/// and 0 otherwise.
+    \\fn slept_until(clock: sys::Clock, deadline: u64, link: Link) -> u64 fails task::Cancelled uses wait {
     \\    let elapsed = match attempt clock.elapsed_ns() {
     \\        Ok(ns) => ns
     \\        Err(_) => deadline
     \\    }
-    \\    if deadline > elapsed {
-    \\        try await clock.sleep_ns(deadline - elapsed)
+    \\    if deadline <= elapsed {
+    \\        return 0
     \\    }
-    \\    return 0
+    \\    let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
+    \\        return try await link.rung.wait()
+    \\    })
+    \\    return match woken {
+    \\        Some(_) => 1
+    \\        None => 0
+    \\    }
     \\} slept_until
     \\
     \\/// How the job of an `CALL_END` call ended.
@@ -13724,9 +13808,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    return try space.read(user_word(state.regs[register(u64.widen(at))]), len, alloc)
     \\} copied
     \\
-    \\/// Serves an `CALL_INVOKE` call: the handle, the operation, the address and length of its arguments
-    \\/// and the address and capacity of its result.
-    \\fn invoked(mut space: sys::load::Space, state: hw::UserState, services: Services, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\/// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
+    \\/// address and length of its arguments and the address and capacity of its result.
+    \\fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let handle = user_word(state.regs[register(0)])
     \\    let operation = user_word(state.regs[register(1)])
     \\    let target = user_word(state.regs[register(4)])
@@ -13737,12 +13821,41 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    if capacity > MOST_BYTES {
     \\        return INVALID
     \\    }
-    \\    if handle == HANDLE_LOG and operation == LOG_LINE {
-    \\        return logged(services.log, args, alloc)
+    \\    if handle >= u64.widen(served.table.len()) {
+    \\        return STALE
     \\    }
-    \\    if handle == HANDLE_STDIO and operation == READ_IN {
+    \\    match served.table[usize.widen(handle)] {
+    \\        Holding.Log(log) => {
+    \\            if operation == LOG_LINE {
+    \\                return logged(log, args, alloc)
+    \\            }
+    \\        }
+    \\        Holding.Stdio(stdio) => return try await streamed(mut space, stdio, operation, args, target, capacity, alloc)
+    \\        Holding.Random(random) => {
+    \\            if operation == FILL {
+    \\                var bytes = mem::Bytes.zeroed(usize.widen(capacity), alloc)
+    \\                let Ok(_) = attempt random.fill(mut bytes.view_mut()) else {
+    \\                    return STALE
+    \\                }
+    \\                return written_back(mut space, address: target, bytes: bytes, count: capacity)
+    \\            }
+    \\        }
+    \\        Holding.Channel(index) => {
+    \\            if operation == NOTIFY {
+    \\                link.heard_from(u64.widen(index))
+    \\                return 0
+    \\            }
+    \\        }
+    \\    }
+    \\    return INVALID
+    \\} invoked
+    \\
+    \\/// Serves an operation of the standard streams a space holds: its result's address and capacity
+    \\/// are `target` and `capacity`.
+    \\fn streamed(mut space: sys::load::Space, stdio: sys::Stdio, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\    if operation == READ_IN {
     \\        var buffer = Untrusted.of(mem::Bytes.zeroed(usize.widen(capacity), alloc))
-    \\        let Ok(count) = attempt await services.stdio.read_in(mut buffer.view_mut()) else {
+    \\        let Ok(count) = attempt await stdio.read_in(mut buffer.view_mut()) else {
     \\            return STALE
     \\        }
     \\        let Some(read) = buffer.view().prefix(count) else {
@@ -13750,28 +13863,21 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\        return written_back(mut space, address: target, bytes: bytes_of(read, alloc), count: u64.widen(count))
     \\    }
-    \\    if handle == HANDLE_STDIO and (operation == WRITE_OUT or operation == WRITE_ERR) {
+    \\    if operation == WRITE_OUT or operation == WRITE_ERR {
     \\        let Ok(data) = attempt mem::wire::Codec[mem::Bytes].decode(args.view(), alloc) else {
     \\            return INVALID
     \\        }
     \\        let sent = match operation == WRITE_OUT {
-    \\            true => attempt await services.stdio.write_out(data.view())
-    \\            false => attempt await services.stdio.write_err(data.view())
+    \\            true => attempt await stdio.write_out(data.view())
+    \\            false => attempt await stdio.write_err(data.view())
     \\        }
     \\        return match sent {
     \\            Ok(_) => 0
     \\            Err(_) => STALE
     \\        }
     \\    }
-    \\    if handle == HANDLE_RANDOM and operation == FILL {
-    \\        var bytes = mem::Bytes.zeroed(usize.widen(capacity), alloc)
-    \\        let Ok(_) = attempt services.random.fill(mut bytes.view_mut()) else {
-    \\            return STALE
-    \\        }
-    \\        return written_back(mut space, address: target, bytes: bytes, count: capacity)
-    \\    }
     \\    return INVALID
-    \\} invoked
+    \\} streamed
     \\
     \\/// Logs a line whose arguments a call encodes, giving 0, or `INVALID` for arguments that do not
     \\/// decode.
@@ -13823,8 +13929,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\fn trap_of(kind: u64, alloc: mem::Alloc) -> sys::Trap
     \\
     \\/// The first task of a space's runtime: runs the job its start record names on a world whose
-    \\/// log, standard streams and random source the kernel serves, its file system and network
-    \\/// denied, and ends the space with how the job ended.
+    \\/// log, standard streams and random source the kernel serves, with its link's channels in its
+    \\/// table, its file system and network denied, and ends the space with how the job ended.
     \\pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 {
     \\    let record = trusted "the kernel writes the start record at `start` before the space starts" { hw::Ptr[Start].of_addr(usize.widen(start)).read() }
     \\    let granted = space_base()
@@ -13833,8 +13939,13 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    trusted "the kernel writes the job's input of `input_len` bytes at `input`" {
     \\        hw::Ptr[u8].of_addr(usize.widen(record.input)).copy(hw::Ptr.of_view_mut(mut input.view_mut()), count: usize.widen(record.input_len))
     \\    }
+    \\    var list = mem::List[PortRecord].empty(alloc)
+    \\    for index in 0u64..<record.port_count {
+    \\        mut list.push(port_at(record, index))
+    \\    }
     \\    let remotes = sys::Minter[Remote, mem::Alloc, u64].of(alloc, alloc)
-    \\    let world = attempt remote_world(granted, remotes)
+    \\    let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
+    \\    let world = attempt remote_world(granted, record, remotes, ports)
     \\    let job = record.job
     \\    match world {
     \\        Ok(given) => {
@@ -13842,6 +13953,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                return try await call(job, world: take given, take input)
     \\            }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
     \\            take remotes.close()
+    \\            take ports.close()
     \\            match outcome {
     \\                Ok(Ok(how)) => end_with(how)
     \\                Ok(Err(trap)) => end(ENDS_TRAPPED, detail: trap_number(trap), bytes: b"")
@@ -13850,20 +13962,41 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\        Err(_) => {
     \\            take remotes.close()
+    \\            take ports.close()
     \\            end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
     \\        }
     \\    }
     \\} isolated
     \\
     \\/// The world of a space: its runtime's allocator, executor and clock, its log, standard streams
-    \\/// and random source served by the kernel, its file system and network denied and its table
-    \\/// empty.
-    \\fn remote_world(granted: Base, remotes: sys::Minter[Remote, mem::Alloc, u64]) -> World fails sys::Revoked {
-    \\    let logs = try sys::Log.served(remotes.mint(HANDLE_LOG))
-    \\    let streams = try sys::Stdio.served(remotes.mint(HANDLE_STDIO))
-    \\    let source = try sys::Random.served(remotes.mint(HANDLE_RANDOM))
-    \\    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: Caps.empty(granted.alloc))
+    \\/// and random source served by the kernel by the handles its start record gives, its file system
+    \\/// and network denied, and its table holding each channel of its link as a standard stream under
+    \\/// the channel's key.
+    \\fn remote_world(granted: Base, record: Start, remotes: sys::Minter[Remote, mem::Alloc, u64], ports: sys::Minter[Port, Ports, u64]) -> World fails sys::Revoked {
+    \\    let logs = try sys::Log.served(remotes.mint(record.log))
+    \\    let streams = try sys::Stdio.served(remotes.mint(record.stdio))
+    \\    let source = try sys::Random.served(remotes.mint(record.random))
+    \\    var caps = Caps.empty(granted.alloc)
+    \\    for index in 0u64..<record.port_count {
+    \\        let port = port_at(record, index)
+    \\        var key = mem::Bytes.zeroed(usize.widen(port.key_len), alloc: granted.alloc)
+    \\        trusted "the kernel writes each channel's key of `key_len` bytes at `key`" {
+    \\            hw::Ptr[u8].of_addr(usize.widen(port.key)).copy(hw::Ptr.of_view_mut(mut key.view_mut()), count: usize.widen(port.key_len))
+    \\        }
+    \\        let channel = try sys::Stdio.served(ports.mint(index))
+    \\        let named = match attempt text::String.try_from_utf8(key.view(), alloc: granted.alloc) {
+    \\            Ok(text) => text
+    \\            Err(_) => text::String.empty(granted.alloc)
+    \\        }
+    \\        Cap[sys::Stdio].put(mut caps, key: named.as_str(), capability: channel)
+    \\    }
+    \\    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: take caps)
     \\} remote_world
+    \\
+    \\/// The record of a channel of the space's link, by its index.
+    \\fn port_at(record: Start, index: u64) -> PortRecord {
+    \\    return trusted "the kernel writes the records of the link's channels at `ports`" { hw::Ptr[PortRecord].of_addr(usize.widen(record.ports + index * u64.widen(PORT_BYTES))).read() }
+    \\} port_at
     \\
     \\/// Ends the space with how its job ended.
     \\fn end_with(how: Ended) {
@@ -13952,6 +14085,321 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// The number of a trap's kind.
     \\fn trap_number(trap: sys::Trap) -> u64 limits pure, notrap, terminates
+    \\
+
+const TEXT_NANOS_LINK: Str =
+    \\//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings and the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream.
+    \\
+    \\/// The offsets in a channel frame of the count of bytes its writer has written, of the count its
+    \\/// reader has read, and of its data, a ring of `RING_BYTES` bytes.
+    \\const RING_WRITTEN: u64 = 0
+    \\
+    \\const RING_READ: u64 = 8
+    \\
+    \\const RING_DATA: u64 = 64
+    \\
+    \\const RING_BYTES: u64 = 4_096 - RING_DATA
+    \\
+    \\/// The offset in the doorbell frame of the word the kernel sets bits of.
+    \\const BELL_WORD: u64 = 0
+    \\
+    \\/// The operation of a channel's handle: telling the kernel the space wrote to or read from it.
+    \\const NOTIFY: u64 = 0
+    \\
+    \\/// How long a space's reader or writer of a channel waits on the doorbell before looking at the
+    \\/// channel again.
+    \\const RECHECK_NS: u64 = 1_000_000_000
+    \\
+    \\pub open linear struct Link {
+    \\    bell: hw::UserFrame
+    \\    channels: mem::List[Channel]
+    \\    rung: hw::Signal[u64]
+    \\    heard: hw::Signal[u64]
+    \\    alloc: mem::Alloc
+    \\} Link
+    \\
+    \\/// A channel of a link: its key, the frame the kernel writes and the space reads, the frame the
+    \\/// space writes and the kernel reads, and the bytes the kernel has written to the first and read
+    \\/// from the second.
+    \\linear struct Channel {
+    \\    key: text::String
+    \\    inbound: hw::UserFrame
+    \\    outbound: hw::UserFrame
+    \\    sent: core::atomic::AtomicU64
+    \\    taken: core::atomic::AtomicU64
+    \\} Channel
+    \\
+    \\pub closed enum LinkError derives Render {
+    \\    NoChannel
+    \\    Cancelled(task::Cancelled) from
+    \\} LinkError
+    \\
+    \\pub fn Link.of(take bell: hw::PhysFrame[4_096], alloc: mem::Alloc) -> Link {
+    \\    return Link(bell: cleared(take bell), channels: mem::List[Channel].empty(alloc), rung: hw::Signal[u64].empty(), heard: hw::Signal[u64].empty(), alloc: alloc)
+    \\} Link.of
+    \\
+    \\pub fn Link.open(mut self, key: Str, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
+    \\    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0)))
+    \\    return self.channels.len() - 1
+    \\} Link.open
+    \\
+    \\pub fn Link.ring(self, bits: u64) {
+    \\    discard self.bell.fetch_or(hw::Offset[u64](bytes: BELL_WORD), bits)
+    \\    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+    \\        self.rung.post(t, value: bits)
+    \\    })
+    \\} Link.ring
+    \\
+    \\pub fn Link.send(self, channel: usize, data: Slice[u8]) -> usize fails LinkError {
+    \\    let Some(held) = self.channels.get(channel) else {
+    \\        fail LinkError.NoChannel
+    \\    }
+    \\    let sent = held.sent.load()
+    \\    let read = word_of(held.inbound.load(hw::Offset[u64](bytes: RING_READ)))
+    \\    if read > sent or sent - read > RING_BYTES {
+    \\        return 0
+    \\    }
+    \\    var count = RING_BYTES - (sent - read)
+    \\    if u64.widen(data.len()) < count {
+    \\        count = u64.widen(data.len())
+    \\    }
+    \\    let ring = held.inbound.base() + RING_DATA
+    \\    each_piece(at: sent, count, body: fn(offset: u64, from: u64, len: u64) {
+    \\        trusted "the inbound frame is the link's, and `data` holds `count` bytes" {
+    \\            hw::Ptr.of_view(data).offset(isize.fit(from)).copy(hw::Ptr[u8].of_addr(usize.widen(ring + offset)), count: usize.widen(len))
+    \\        }
+    \\    })
+    \\    held.inbound.store(hw::Offset[u64](bytes: RING_WRITTEN), value: sent + count)
+    \\    held.sent.store(sent + count)
+    \\    self.ring(channel_bit(channel))
+    \\    return usize.widen(count)
+    \\} Link.send
+    \\
+    \\pub fn Link.receive(self, channel: usize, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails LinkError uses wait {
+    \\    let Some(held) = self.channels.get(channel) else {
+    \\        fail LinkError.NoChannel
+    \\    }
+    \\    loop {
+    \\        let taken = held.taken.load()
+    \\        let written = word_of(held.outbound.load(hw::Offset[u64](bytes: RING_WRITTEN)))
+    \\        if written > taken and written - taken <= RING_BYTES {
+    \\            let count = written - taken
+    \\            var bytes = mem::Bytes.zeroed(usize.widen(count), alloc)
+    \\            let into = hw::Ptr.of_view_mut(mut bytes.view_mut())
+    \\            let ring = held.outbound.base() + RING_DATA
+    \\            each_piece(at: taken, count, body: fn(offset: u64, from: u64, len: u64) {
+    \\                trusted "the outbound frame is the link's, and `into` holds `count` bytes" {
+    \\                    hw::Ptr[u8].of_addr(usize.widen(ring + offset)).copy(into.offset(isize.fit(from)), count: usize.widen(len))
+    \\                }
+    \\            })
+    \\            held.outbound.store(hw::Offset[u64](bytes: RING_READ), value: written)
+    \\            held.taken.store(written)
+    \\            self.ring(channel_bit(channel))
+    \\            return Untrusted.of(take bytes)
+    \\        }
+    \\        discard try await self.heard.wait()
+    \\    }
+    \\} Link.receive
+    \\
+    \\pub fn Link.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    \\    let Link(bell: bell, channels: channels, rung: _, heard: _, alloc: _) = self
+    \\    mut frames.push(freed(take bell))
+    \\    for channel in take channels {
+    \\        let Channel(key: _, inbound: inbound, outbound: outbound, sent: _, taken: _) = channel
+    \\        mut frames.push(freed(take inbound))
+    \\        mut frames.push(freed(take outbound))
+    \\    }
+    \\} Link.release
+    \\
+    \\/// Tells the kernel's side of a link that the space wrote to or read from a channel.
+    \\fn Link.heard_from(self, channel: u64) {
+    \\    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+    \\        self.heard.post(t, value: channel)
+    \\    })
+    \\} Link.heard_from
+    \\
+    \\/// The bit of the doorbell word that a channel's index sets, the last for an index past it.
+    \\fn channel_bit(channel: usize) -> u64 {
+    \\    if channel >= 63 {
+    \\        return 1 << 63
+    \\    }
+    \\    return 1u64 << u32.fit(channel)
+    \\} channel_bit
+    \\
+    \\/// A frame made a user frame, its words cleared.
+    \\fn cleared(take frame: hw::PhysFrame[4_096]) -> hw::UserFrame {
+    \\    let user = hw::UserFrame.of(take frame)
+    \\    for word in 0u64..<512 {
+    \\        user.store(hw::Offset[u64](bytes: word * 8), value: 0)
+    \\    }
+    \\    return user
+    \\} cleared
+    \\
+    \\/// The frame of a user frame of a link the space it served no longer maps.
+    \\fn freed(take frame: hw::UserFrame) -> hw::PhysFrame[4_096] {
+    \\    return trusted "a link outlives the spaces it serves, whose roots are released and whose cached translations their next entry drops" { take frame.into_frame() }
+    \\} freed
+    \\
+    \\/// A word of a frame the space shares, which the kernel reads as it is.
+    \\validator fn word_of(raw: Untrusted[u64]) -> u64 {
+    \\    return raw.inspect()
+    \\} word_of
+    \\
+    \\/// Calls `body` on each part of `count` bytes of a ring from the byte `at` it holds that lies in
+    \\/// the ring without wrapping: the part's offset in the ring, its offset in the bytes and its
+    \\/// length.
+    \\fn each_piece(at: u64, count: u64, body: fn(offset: u64, from: u64, len: u64)) {
+    \\    let offset = at % RING_BYTES
+    \\    var head = RING_BYTES - offset
+    \\    if count < head {
+    \\        head = count
+    \\    }
+    \\    body(offset, from: 0, len: head)
+    \\    if count > head {
+    \\        body(0, from: head, len: count - head)
+    \\    }
+    \\} each_piece
+    \\
+    \\/// A channel of a link as the runtime of a space serves it to its job, a standard stream whose
+    \\/// input the kernel sends and whose output the kernel receives; its record is the channel's index
+    \\/// in the runtime's ports.
+    \\struct Port {
+    \\} Port
+    \\
+    \\impl Port: sys::Kind[Ports, u64]
+    \\
+    \\impl Port: sys::StdioService
+    \\
+    \\/// The channels of a space's link, as its runtime reaches them: the doorbell's address and each
+    \\/// channel's.
+    \\struct Ports {
+    \\    bell: u64
+    \\    list: mem::List[PortRecord]
+    \\} Ports
+    \\
+    \\/// A channel of a space's link: the handle of its entry in the space's table, the addresses of its
+    \\/// inbound and outbound frames, and the address and length of its key.
+    \\struct PortRecord derives Copy {
+    \\    handle: u64
+    \\    inbound: u64
+    \\    outbound: u64
+    \\    key: u64
+    \\    key_len: u64
+    \\} PortRecord
+    \\
+    \\/// The doorbell and the record a port names, none for a stale port.
+    \\struct Reached derives Copy {
+    \\    bell: u64
+    \\    record: PortRecord
+    \\} Reached
+    \\
+    \\fn reached_port(port: Port) -> Option[Reached] {
+    \\    return sys::reach(port, body: fn(ports: Ports, index: u64) => Reached(bell: ports.bell, record: ports.list[usize.widen(index)]))
+    \\} reached_port
+    \\
+    \\fn Port.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError uses wait limits stack 4_096 {
+    \\    let Some(port) = reached_port(self) else {
+    \\        fail sys::StdioError.Closed
+    \\    }
+    \\    loop {
+    \\        let count = read_ring(port.record.inbound, mut buf)
+    \\        if count > 0 {
+    \\            notified(port.record.handle)
+    \\            return count
+    \\        }
+    \\        if buf.len() == 0 {
+    \\            return 0
+    \\        }
+    \\        if bell_taken(port.bell) == 0 {
+    \\            try await rung(RECHECK_NS)
+    \\        }
+    \\    }
+    \\} Port.read_in
+    \\
+    \\fn Port.write_out(self, data: Slice[u8]) fails sys::StdioError uses wait limits stack 4_096 {
+    \\    let Some(port) = reached_port(self) else {
+    \\        fail sys::StdioError.Closed
+    \\    }
+    \\    var at: usize = 0
+    \\    while at < data.len() {
+    \\        let Some(parts) = data.split_at(at) else {
+    \\            return
+    \\        }
+    \\        let count = write_ring(port.record.outbound, data: parts.tail)
+    \\        at += count
+    \\        if count > 0 {
+    \\            notified(port.record.handle)
+    \\        } else if bell_taken(port.bell) == 0 {
+    \\            try await rung(RECHECK_NS)
+    \\        }
+    \\    }
+    \\} Port.write_out
+    \\
+    \\fn Port.write_err(self, data: Slice[u8]) fails sys::StdioError limits stack 4_096 {
+    \\    fail sys::StdioError.Closed
+    \\} Port.write_err
+    \\
+    \\/// Tells the kernel through a channel's handle that the space wrote to or read from it.
+    \\fn notified(handle: u64) {
+    \\    var nothing = Array[u8, 1].filled(0)
+    \\    discard invoke(handle, operation: NOTIFY, args: b"", result: mut nothing.view_mut())
+    \\} notified
+    \\
+    \\/// Reads into `buf` the bytes of the ring of the frame at `frame` that the kernel has written and
+    \\/// the space has not read, as many as fit, giving their count.
+    \\fn read_ring(frame: u64, mut buf: SliceMut[u8]) -> usize {
+    \\    let written = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_load(hw::Order.Acquire) }
+    \\    let read = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_load(hw::Order.Relaxed) }
+    \\    if written < read or written - read > RING_BYTES {
+    \\        return 0
+    \\    }
+    \\    var count = written - read
+    \\    if u64.widen(buf.len()) < count {
+    \\        count = u64.widen(buf.len())
+    \\    }
+    \\    let into = hw::Ptr.of_view_mut(mut buf)
+    \\    each_piece(at: read, count, body: fn(offset: u64, from: u64, len: u64) {
+    \\        trusted "the frame at `frame` is a channel frame the kernel maps for the space, and `buf` holds `count` bytes" {
+    \\            hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)).copy(into.offset(isize.fit(from)), count: usize.widen(len))
+    \\        }
+    \\    })
+    \\    trusted "the frame at `frame` is a channel frame the kernel maps for the space" {
+    \\        hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_store(read + count, order: hw::Order.Release)
+    \\    }
+    \\    return usize.widen(count)
+    \\} read_ring
+    \\
+    \\/// Writes into the ring of the frame at `frame` as many bytes of `data` as it has room for,
+    \\/// giving their count.
+    \\fn write_ring(frame: u64, data: Slice[u8]) -> usize {
+    \\    let written = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_load(hw::Order.Relaxed) }
+    \\    let read = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_load(hw::Order.Acquire) }
+    \\    if read > written or written - read > RING_BYTES {
+    \\        return 0
+    \\    }
+    \\    var count = RING_BYTES - (written - read)
+    \\    if u64.widen(data.len()) < count {
+    \\        count = u64.widen(data.len())
+    \\    }
+    \\    each_piece(at: written, count, body: fn(offset: u64, from: u64, len: u64) {
+    \\        trusted "the frame at `frame` is a channel frame the kernel maps for the space, and `data` holds `count` bytes" {
+    \\            hw::Ptr.of_view(data).offset(isize.fit(from)).copy(hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)), count: usize.widen(len))
+    \\        }
+    \\    })
+    \\    trusted "the frame at `frame` is a channel frame the kernel maps for the space" {
+    \\        hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_store(written + count, order: hw::Order.Release)
+    \\    }
+    \\    return usize.widen(count)
+    \\} write_ring
+    \\
+    \\/// Takes the bits the kernel has set in the doorbell word at `bell`, clearing them.
+    \\fn bell_taken(bell: u64) -> u64 {
+    \\    return trusted "the frame at `bell` is the doorbell frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(bell + BELL_WORD)).atomic_swap(0, order: hw::Order.AcqRel) }
+    \\} bell_taken
+    \\
+    \\/// Waits until the kernel rings the doorbell or `ns` nanoseconds pass; one task waits at a time,
+    \\/// a later wait taking the doorbell from an earlier one, which waits out its time.
+    \\fn rung(ns: u64) fails task::Cancelled uses wait
     \\
 
 const TEXT_NANOS_NANOS: Str =
@@ -16426,6 +16874,10 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\/// The pages of a 64 KiB chunk, to which a space aligns its boot area.
     \\const CHUNK_PAGES: u64 = 16
     \\
+    \\/// The pages a space keeps between its caller's data and its boot area for the user frames it
+    \\/// shares.
+    \\const SHARED_PAGES: u64 = 32
+    \\
     \\/// A bundle verified for isolated spaces: its bytes and their parts, and the image of the
     \\/// kernel's user-mode runtime and its parts.
     \\pub open struct Isolated {
@@ -16436,14 +16888,15 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\} Isolated
     \\
     \\/// An isolated space: its root, its other tables, the pages it maps from the start of the user
-    \\/// window up to its boot area, laid out as `plan` gives, and the pages of its boot area it has
-    \\/// drawn, in order of their index from the window's start; the tables mapping the entry area
-    \\/// follow those of the window.
+    \\/// window up to the user frames it shares, laid out as `plan` gives, the pages of its boot area
+    \\/// it has drawn, in order of their index from the window's start, and how many user frames it
+    \\/// shares; the tables mapping the entry area follow those of the window.
     \\pub open linear struct Space {
     \\    root: hw::PageTableRoot
     \\    tables: mem::List[hw::PhysFrame[4_096]]
     \\    pages: mem::List[hw::PhysFrame[4_096]]
     \\    drawn: mem::List[Drawn]
+    \\    shared: u64
     \\    plan: Plan
     \\} Space
     \\
@@ -16472,14 +16925,15 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\
     \\/// Where a space's pages lie, by index from the window's start: the runtime's image and the
     \\/// bundle's image, each with the first pages of its read-only and of its writable data from its
-    \\/// start, the runtime's stack, the caller's data, the boot area and the end; and the offset of
-    \\/// the runtime's start.
+    \\/// start, the runtime's stack, the caller's data, the user frames it shares, the boot area and
+    \\/// the end; and the offset of the runtime's start.
     \\struct Plan derives Copy {
     \\    runtime: Sections
     \\    image: u64
     \\    image_sections: Sections
     \\    stack: u64
     \\    data: u64
+    \\    shared: u64
     \\    boot: u64
     \\    end: u64
     \\    start: u64
@@ -16529,7 +16983,7 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    let plan = plan_of(self.runtime, image: self.parts, data)
     \\    let area = cpu.entry_area()
     \\    let reach = Reach(low: area.base / PAGE, high: (area.base + area.len - 1) / PAGE)
-    \\    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.boot + reach.tables() {
+    \\    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.shared + reach.tables() {
     \\        fail LoadError.Unplaceable
     \\    }
     \\    if reach.low / level_pages(0) <= USER_SLOT and reach.high / level_pages(0) >= USER_SLOT {
@@ -16582,8 +17036,18 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    return USER_WINDOW + self.plan.boot * PAGE
     \\} Space.boot_area
     \\
+    \\pub fn Space.share(mut self, frame: hw::UserFrame) -> u64 fails LoadError {
+    \\    let index = self.plan.shared + self.shared
+    \\    if index >= self.plan.boot {
+    \\        fail LoadError.Unplaceable
+    \\    }
+    \\    write_entry(self.entry_of(index), value: user_entry(frame.base(), kind: USER_WRITABLE))
+    \\    self.shared += 1
+    \\    return USER_WINDOW + index * PAGE
+    \\} Space.share
+    \\
     \\pub fn Space.run(self, cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit {
-    \\    return trusted "the root maps the entry area page by page with the attributes the running root's walk gives it, and for user mode only the window, whose pages are frames the space owns and holds no value of the kernel in; the user path drops the translations cached under its tag" { cpu.run_user_split(mut state, mut extended, root: self.root) }
+    \\    return trusted "the root maps the entry area page by page with the attributes the running root's walk gives it, and for user mode only the window, whose pages are frames the space owns, holding no value of the kernel, and user frames; the user path drops the translations cached under its tag" { cpu.run_user_split(mut state, mut extended, root: self.root) }
     \\} Space.run
     \\
     \\pub fn Space.read(self, address: u64, len: u64, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails hw::UserAddrError {
@@ -16652,7 +17116,7 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\
     \\/// Gives back every frame the space took.
     \\pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    \\    let Space(root: root, tables: tables, pages: pages, drawn: drawn, plan: _) = self
+    \\    let Space(root: root, tables: tables, pages: pages, drawn: drawn, shared: _, plan: _) = self
     \\    mut frames.push(take root.into_frame())
     \\    given_back(take tables, mut frames)
     \\    given_back(take pages, mut frames)
@@ -16679,11 +17143,14 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    return self.tables[usize.widen(index / TABLE_ENTRIES) + 2].base() + index % TABLE_ENTRIES * 8
     \\} Space.entry_of
     \\
-    \\/// The physical address of the frame the space maps at the page of an index, none for a page
-    \\/// it does not map.
+    \\/// The physical address of the frame the space owns at the page of an index, none for a page
+    \\/// it does not map or maps a user frame at.
     \\fn Space.frame_of(self, index: u64) -> Option[u64] {
-    \\    if index < self.plan.boot {
+    \\    if index < self.plan.shared {
     \\        return Some(self.pages[usize.widen(index)].base())
+    \\    }
+    \\    if index < self.plan.boot {
+    \\        return None
     \\    }
     \\    let at = self.drawn_from(index)
     \\    if at < self.drawn.len() and self.drawn[at].index == index {
@@ -16748,8 +17215,9 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    let at = pages_of(runtime.size)
     \\    let stack = at + pages_of(image.size)
     \\    let start = stack + pages_of(runtime.stack)
-    \\    let boot = (start + pages_of(data) + CHUNK_PAGES - 1) / CHUNK_PAGES * CHUNK_PAGES
-    \\    return Plan(runtime: sections_of(runtime), image: at, image_sections: sections_of(image), stack: stack, data: start, boot: boot, end: boot + pages_of(runtime.boot), start: runtime.entry)
+    \\    let shared = start + pages_of(data)
+    \\    let boot = (shared + SHARED_PAGES + CHUNK_PAGES - 1) / CHUNK_PAGES * CHUNK_PAGES
+    \\    return Plan(runtime: sections_of(runtime), image: at, image_sections: sections_of(image), stack: stack, data: start, shared: shared, boot: boot, end: boot + pages_of(runtime.boot), start: runtime.entry)
     \\} plan_of
     \\
     \\fn sections_of(parts: Parts) -> Sections {
@@ -16780,12 +17248,12 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\
     \\/// The space of a plan, its frames taken from `frames` and cleared: a root mapping the window and
     \\/// the pages of the entry area `reach` holds, a table of 1 GiB entries and one of 2 MiB entries
-    \\/// mapping the window, the tables of its pages, its pages up to the boot area, and the tables
-    \\/// mapping the entry area.
+    \\/// mapping the window, the tables of its pages, its pages up to the user frames it shares, and
+    \\/// the tables mapping the entry area.
     \\fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
     \\    let count = tables_of(plan)
     \\    var tables = cleared_frames(mut frames, count: count + 2 + reach.tables(), alloc)
-    \\    var pages = cleared_frames(mut frames, count: plan.boot, alloc)
+    \\    var pages = cleared_frames(mut frames, count: plan.shared, alloc)
     \\    let Some(root) = mut frames.pop() else {
     \\        given_back(take tables, mut frames)
     \\        given_back(take pages, mut frames)
@@ -16798,8 +17266,8 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    for index in 0u64..<count {
     \\        write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
     \\    }
-    \\    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), plan: plan)
-    \\    for index in 0u64..<plan.boot {
+    \\    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), shared: 0, plan: plan)
+    \\    for index in 0u64..<plan.shared {
     \\        write_entry(space.entry_of(index), value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     \\    }
     \\    space.map_entry_area(root: top, reach, first_table: count + 2)

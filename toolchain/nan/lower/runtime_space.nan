@@ -1,4 +1,4 @@
-//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, waits for its first timer and ends, and its start, which runs `nanos::isolated` as its first task.
+//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, waits for its first timer or its doorbell and ends, and its start, which runs `nanos::isolated` as its first task.
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
@@ -23,6 +23,9 @@ const SPACE_TRAPPED: u64 = 2
 pkg const SPACE_START: Str = "_NSuser_start"
 
 const SPACE_MAIN: Str = "_NSuser_main"
+
+/// The data holding the operation of the task waiting on the doorbell, zero when none waits.
+pkg const SPACE_BELL: Str = "_NSspace_bell"
 
 /// The stack the start routine and the scheduler run on, and the boot area.
 pkg const SPACE_STACK: u64 = MACHINE_BOOT_STACK
@@ -96,7 +99,22 @@ fn space_idle(mut lo: Lowering, mut fx: Fx) {
         return fx1.list1(none)
     })
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
-    discard space_call(mut lo, mut fx, number: SPACE_WAIT, args: fx.list1(deadline[0]).view())
+    let rung = space_call(mut lo, mut fx, number: SPACE_WAIT, args: fx.list1(deadline[0]).view())
+    let woken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rung, y: 0)
+    mut fx.if_true(woken, then: fn[mut lo](mut fx1: Fx) {
+        let slot = mut lo.reserved(mut fx1, data_name: SPACE_BELL, size: 8, align: 8)
+        let op = mut fx1.load(PTR, addr: slot, offset: 0)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: slot, offset: 0)
+            let claimed = mut lo.kernel_claim(mut fx2, op)
+            mut fx2.if_true(claimed, then: fn[mut lo](mut fx3: Fx) {
+                let expired = mut fx3.int(clif::Type.Int32, value: TASKS_EXPIRED)
+                deliver(mut lo, fx: mut fx3, op, result: expired)
+            })
+        })
+    })
     mut lo.expire_timers(mut fx)
 } space_idle
 

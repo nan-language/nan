@@ -20,6 +20,14 @@ const PAGE: u64 = 4_096;
 /// address plus one.
 pub const IMAGE_EXTENT: &str = "_NSimage";
 
+/// The data object of `SEGMENT_TABLE_BYTES` bytes into which the image writer writes the image's
+/// segment count, then for each of its segments, in address order, its absolute address, its size
+/// and its access: bit 0 for writable and bit 1 for executable. An image has at most
+/// `MOST_SEGMENTS` segments.
+pub const SEGMENT_TABLE: &str = "_NSsegments";
+pub const MOST_SEGMENTS: u64 = 4;
+pub const SEGMENT_TABLE_BYTES: u64 = 8 + 24 * MOST_SEGMENTS;
+
 /// The relocation header, a data object of `RELOCATION_HEADER_BYTES` bytes into which the image
 /// writer of a bare image writes five words as linked: the header's address, the image's first
 /// and last address plus one, the address of a table listing the address of each absolute address
@@ -108,6 +116,10 @@ impl Linked {
         if let Some(extent) = self.symbols.get(IMAGE_EXTENT) {
             places.extend([*extent, *extent + 8]);
         }
+        if let Some(table) = self.symbols.get(SEGMENT_TABLE) {
+            let count = self.segments.len() as u64 + 1;
+            places.extend((0..count).map(|index| table + 8 + 24 * index));
+        }
         places.sort();
         let table = self.end().next_multiple_of(PAGE);
         if !places.is_empty() {
@@ -146,6 +158,30 @@ impl Linked {
         let end = self.end();
         self.write_words(at, &[base, end]);
         self.absolute.extend([(at, 8), (at + 8, 8)]);
+    }
+
+    /// Writes the image's segments into the data object `SEGMENT_TABLE` when the object defines
+    /// one, each segment's address being absolute.
+    fn record_segments(&mut self) {
+        let Some(at) = self.symbols.get(SEGMENT_TABLE).copied() else {
+            return;
+        };
+        assert!(
+            self.segments.len() as u64 <= MOST_SEGMENTS,
+            "an image of at most {MOST_SEGMENTS} segments"
+        );
+        let mut words = vec![self.segments.len() as u64];
+        for segment in &self.segments {
+            let access = match segment.access {
+                Access::Execute => 2,
+                Access::Read => 0,
+                Access::Write => 1,
+            };
+            words.extend([segment.address, segment.size, access]);
+        }
+        self.write_words(at, &words);
+        let places = (0..self.segments.len() as u64).map(|index| (at + 8 + 24 * index, 8));
+        self.absolute.extend(places);
     }
 }
 
@@ -349,6 +385,7 @@ fn link(object: &[u8], base: u64, importing: bool) -> Linked {
     };
     linked.record_relocations(base);
     linked.record_extent(base);
+    linked.record_segments();
     linked.absolute.sort();
     linked
 }

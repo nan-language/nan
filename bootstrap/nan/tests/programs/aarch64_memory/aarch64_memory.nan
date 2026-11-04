@@ -1,4 +1,4 @@
-//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle.
+//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information.
 
 /// The memory the entry root maps with the tables the image holds, and the bytes of a frame.
 const MAPPED: u64 = 0x1_0000_0000
@@ -31,6 +31,62 @@ fn written(mut frame: hw::PhysFrame[GIGABYTE]) -> bool {
     return mut frame.contents_mut(low) == ~base and mut frame.contents_mut(high) == base
 } written
 
+/// Whether what the kernel learns of its memory agrees with its regions: each lies inside a
+/// usable range of the memory map, which lists one when `listed` holds, and outside the image's
+/// segments, the boot area, the entry root's tables and the start information's extents; the
+/// segments lie in address order, the first executable and read-only, one writable and not
+/// executable; and the boot area is not empty.
+fn layout_agrees(k: boot::Kernel, regions: mem::List[hw::Region], listed: bool, alloc: mem::Alloc) -> bool {
+    let map = k.memory_map(alloc)
+    let segments = k.image_segments(alloc)
+    var held = k.start_extents(alloc)
+    mut held.push(k.boot_area())
+    mut held.push(k.entry_tables())
+    for segment in segments {
+        mut held.push(boot::Extent(base: segment.base, byte_len: segment.byte_len))
+    }
+    if listed != (map.len() > 0) {
+        return false
+    }
+    for region in regions {
+        let extent = boot::Extent(base: region.base(), byte_len: region.byte_len())
+        if listed and not usable(map, extent) {
+            return false
+        }
+        for other in held {
+            if overlaps(other, right: extent) {
+                return false
+            }
+        }
+    }
+    if segments.len() < 3 or not segments[0].executable or segments[0].writable {
+        return false
+    }
+    var writable = false
+    var previous: u64 = 0
+    for segment in segments {
+        if segment.base < previous {
+            return false
+        }
+        previous = segment.base.saturating_add(segment.byte_len)
+        writable = writable or (segment.writable and not segment.executable)
+    }
+    return writable and k.boot_area().byte_len > 0
+} layout_agrees
+
+/// Whether an extent lies inside a usable range of a memory map.
+fn usable(map: mem::List[boot::MemoryRange], extent: boot::Extent) -> bool {
+    for range in map {
+        if range.kind == 1 and range.base <= extent.base and extent.base.saturating_add(extent.byte_len) <= range.base.saturating_add(range.byte_len) {
+            return true
+        }
+    }
+    return false
+} usable
+
+/// Whether two extents share a byte.
+fn overlaps(left: boot::Extent, right: boot::Extent) -> bool = left.byte_len > 0 and right.byte_len > 0 and left.base < right.base.saturating_add(right.byte_len) and right.base < left.base.saturating_add(left.byte_len)
+
 /// Whether splitting a region at an address gives nothing, keeping any part it gives.
 fn refuses(mut region: hw::Region, at: u64, mut regions: mem::List[hw::Region]) -> bool {
     let Some(part) = mut region.split(at) else {
@@ -60,6 +116,9 @@ fn halved(take region: hw::Region, mut regions: mem::List[hw::Region]) -> bool {
 
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     var regions = mut k.regions()
+    if layout_agrees(k, regions, listed: false, alloc: k.alloc()) {
+        say(text: "layout agrees\n")
+    }
     var frames = mem::List[hw::PhysFrame[GIGABYTE]].empty(k.alloc())
     match mut regions.pop() {
         Some(highest) => take highest.frames(mut frames)

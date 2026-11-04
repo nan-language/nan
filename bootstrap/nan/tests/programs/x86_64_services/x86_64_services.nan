@@ -1,4 +1,4 @@
-//! Calls each firmware service and writes what it gave to the serial port once boot services end.
+//! Calls each firmware service and writes what it gave to the serial port once boot services end, then checks the kernel's final memory map against its image's segments.
 
 /// The vendor of the variable the program writes, and the PCR it extends.
 const VENDOR: boot::Guid = boot::Guid(data1: 0x6E61_6E00, data2: 0x7072, data3: 0x6F62, data4: 0x6500_0000_0000_0001)
@@ -32,10 +32,38 @@ fn main(take m: boot::Machine) -> Never limits stack 32_768 {
     })
     let k = take m.exit_services()
     say(report.view())
+    if loaded_in_map(k, alloc) {
+        say(b"segments lie in loader code and data\n")
+    }
     take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 16_384 {
         say(b"anchored\n")
     })
 } main
+
+/// Whether the kernel's final memory map lists conventional memory and its image's segments, the
+/// first executable, each lying inside a range of loader code or data, as the firmware loaded it.
+fn loaded_in_map(k: boot::Kernel, alloc: mem::Alloc) -> bool {
+    let map = k.memory_map(alloc)
+    let segments = k.image_segments(alloc)
+    var conventional = false
+    for range in map {
+        conventional = conventional or range.kind == 7
+    }
+    if not conventional or segments.len() < 3 or not segments[0].executable or k.boot_area().byte_len == 0 {
+        return false
+    }
+    for segment in segments {
+        var inside = false
+        for range in map {
+            let end = range.base.saturating_add(range.byte_len)
+            inside = inside or ((range.kind == 1 or range.kind == 2) and range.base <= segment.base and segment.base.saturating_add(segment.byte_len) <= end)
+        }
+        if not inside {
+            return false
+        }
+    }
+    return k.start_extents(alloc).len() == 0
+} loaded_in_map
 
 /// Reports a group of services that failed, and the error it failed with.
 fn failed(outcome: Result[Unit, boot::ServiceError], group: Slice[u8], mut report: mem::Bytes) {

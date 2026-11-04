@@ -7,6 +7,16 @@ const PAGE: u64 = 4_096
 /// address plus one.
 pkg const IMAGE_EXTENT: Str = "_NSimage"
 
+/// The data object of `SEGMENT_TABLE_BYTES` bytes into which the image writer writes the image's
+/// segment count, then for each of its segments, in address order, its absolute address, its size
+/// and its access: bit 0 for writable and bit 1 for executable. An image has at most
+/// `MOST_SEGMENTS` segments.
+pkg const SEGMENT_TABLE: Str = "_NSsegments"
+
+pkg const MOST_SEGMENTS: u64 = 4
+
+pkg const SEGMENT_TABLE_BYTES: u64 = 8 + 24 * MOST_SEGMENTS
+
 /// The relocation header, a data object of `RELOCATION_HEADER_BYTES` bytes into which the image
 /// writer of a bare image writes five words as linked: the header's address, the image's first
 /// and last address plus one, the address of a table listing the address of each absolute address
@@ -121,6 +131,14 @@ fn Linked.record_relocations(mut self, base: u64, alloc: mem::Alloc) {
         }
         None => {}
     }
+    match self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(SEGMENT_TABLE)) {
+        Some(table_at) => {
+            for index in 0..<(u64.widen(self.segments.len()) + 1) {
+                mut places.push(table_at + 8 + 24 * index)
+            }
+        }
+        None => {}
+    }
     mut places.sort_by(fn(left: u64, right: u64) => left.cmp(right))
     let table = next_multiple_of(self.end(), multiple: PAGE)
     if places.len() > 0 {
@@ -166,6 +184,31 @@ fn Linked.record_extent(mut self, base: u64) {
     mut self.absolute.push(Absolute(address: at, width: 8))
     mut self.absolute.push(Absolute(address: at + 8, width: 8))
 } Linked.record_extent
+
+/// Writes the image's segments into the data object `SEGMENT_TABLE` when the object defines one,
+/// each segment's address being absolute.
+fn Linked.record_segments(mut self, alloc: mem::Alloc) {
+    let Some(at) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(SEGMENT_TABLE)) else {
+        return
+    }
+    expect u64.widen(self.segments.len()) <= MOST_SEGMENTS
+    var words = mem::List[u64].empty(alloc)
+    mut words.push(u64.widen(self.segments.len()))
+    for segment in self.segments {
+        let access: u64 = match segment.access {
+            Access.Execute => 2
+            Access.Read => 0
+            Access.Write => 1
+        }
+        mut words.push(segment.address)
+        mut words.push(segment.size)
+        mut words.push(access)
+    }
+    mut self.write_words(at, words: words.view())
+    for index in 0..<u64.widen(self.segments.len()) {
+        mut self.absolute.push(Absolute(address: at + 8 + 24 * index, width: 8))
+    }
+} Linked.record_segments
 
 /// The relocation types the objects lowering writes hold: the x86_64 ones, which patch a byte
 /// range with an absolute or program-counter-relative address, and the AArch64 ones, which patch
@@ -276,6 +319,7 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
     var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute, imports: take imports)
     mut linked.record_relocations(base, alloc)
     mut linked.record_extent(base)
+    mut linked.record_segments(alloc)
     mut linked.absolute.sort_by(absolute_order)
     return linked
 } link

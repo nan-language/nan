@@ -40,11 +40,13 @@ pub struct Interface {
 }
 
 /// How an image takes part in loading: as a kernel exporting the load ABI, as a bundle built
-/// against a kernel's interface, or not at all.
+/// against a kernel's interface, as the user-mode runtime of a kernel's isolated spaces, which
+/// defines the exports a bundle running there imports, or not at all.
 pub enum Linking {
     Image,
     Kernel(Rc<Interface>),
     Bundle,
+    Runtime,
 }
 
 /// The symbol of the export table, and the offsets in it of the line tables' address, the load
@@ -87,6 +89,45 @@ const A64_ENTRIES: [u64; 4] = [
     0x3,
 ];
 
+/// The bits of user-mode entries by kind: a page of code, of read-only data and of writable
+/// data, a table and a writable 2 MiB block. On x86_64 present, user and execute-disable, the
+/// pages and the block writable but code, the table writable and the block large; on AArch64 a
+/// page, table or block descriptor, the access flag, inner-shareable normal write-back memory,
+/// non-global and accessible at EL0, read-only but writable data, execute-never at EL1 and, for
+/// data, at EL0.
+const X64_USER_ENTRIES: [u64; 5] = [
+    0x5,
+    0x8000_0000_0000_0005,
+    0x8000_0000_0000_0007,
+    0x7,
+    0x8000_0000_0000_0087,
+];
+const A64_USER_PAGE: u64 = 0x3 | 0x400 | 0x300 | (2 << 2) | 0x800 | 0x40 | 1 << 53;
+const A64_USER_ENTRIES: [u64; 5] = [
+    A64_USER_PAGE | 0x80,
+    A64_USER_PAGE | 0x80 | 1 << 54,
+    A64_USER_PAGE | 1 << 54,
+    0x3,
+    (A64_USER_PAGE & !0x2) | 1 << 54,
+];
+
+/// The address bits of an x86_64 CR3 value and of an AArch64 `TTBR0_EL1` value.
+const X64_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000;
+const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000;
+
+/// The entry of the kind at index `kind` of `entries` over a physical address, the last kind for
+/// an index past the others.
+fn entry_of(fx: &mut Fx, entries: &[u64], physical: Value, kind: Value) -> Value {
+    let (last, others) = entries.split_last().expect("entry kinds");
+    let mut bits = fx.ptr(*last);
+    for (index, entry) in others.iter().enumerate() {
+        let this = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, index as i64);
+        let value = fx.ptr(*entry);
+        bits = fx.b.ins().select(this, value, bits);
+    }
+    fx.b.ins().bor(physical, bits)
+}
+
 /// The bytes of the stack a gate's own frame and calls use within the `stack N` of its function
 /// type; the function it calls fits in the rest.
 pub const GATE_STACK: u64 = 1_024;
@@ -97,8 +138,9 @@ pub const BUNDLE_LINES: &str = lines::BUNDLE_SYMBOL;
 /// The prefix of the symbol of a loaded registry's table record, before its canonical path.
 const RECORD: &str = "_NSloaded_";
 
-/// The support routines a kernel exports: every one the lowered code of a kernel calls.
-const ROUTINES: [Routine; 54] = [
+/// The support routines a kernel exports: every one the lowered code of a kernel or of a nanos
+/// bundle calls.
+pub const ROUTINES: [Routine; 57] = [
     Routine::Copy,
     Routine::Fill,
     Routine::Compare,
@@ -153,6 +195,9 @@ const ROUTINES: [Routine; 54] = [
     Routine::Ready,
     Routine::Enqueue,
     Routine::Grow,
+    Routine::Thread,
+    Routine::TimerArm,
+    Routine::ExtendedOwn,
 ];
 
 /// The names of the exports of a kernel of a target whose final closure declares the loaded
@@ -221,6 +266,17 @@ impl Lowering<'_, '_> {
     /// Whether the image is a kernel exporting the load ABI.
     pub fn exports(&self) -> bool {
         matches!(self.linking, Linking::Kernel(_))
+    }
+
+    /// Whether the image is the user-mode runtime of a kernel's isolated spaces.
+    pub fn user(&self) -> bool {
+        matches!(self.linking, Linking::Runtime)
+    }
+
+    /// Whether the image's code reaches the executor it runs on only through support routines:
+    /// a nanos bundle's, which runs on its kernel's runtime or on an isolated space's.
+    pub fn portable(&self) -> bool {
+        self.imports() && self.ck.db.target.is_nanos()
     }
 
     /// The stack a kernel's interface lets interrupt functions use, zero for another image.
@@ -567,13 +623,32 @@ impl Lowering<'_, '_> {
             Some(Arch::Aarch64) => A64_ENTRIES,
             _ => X64_ENTRIES,
         };
-        let mut bits = fx.ptr(entries[3]);
-        for (index, entry) in entries.iter().enumerate().take(3) {
-            let this = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, index as i64);
-            let value = fx.ptr(*entry);
-            bits = fx.b.ins().select(this, value, bits);
+        entry_of(fx, &entries, physical, kind)
+    }
+
+    /// The entry of a kind mapping a page, table or 2 MiB block at a physical address for user
+    /// mode, `kind` being 0 for code, 1 for read-only data, 2 for writable data, 3 for a table
+    /// and 4 for a writable block; non-global, so that a space's translations end with its tag's.
+    pub fn user_entry(&mut self, fx: &mut Fx, physical: Value, kind: Value) -> Value {
+        let entries = match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => A64_USER_ENTRIES,
+            _ => X64_USER_ENTRIES,
+        };
+        entry_of(fx, &entries, physical, kind)
+    }
+
+    /// The physical address of the running root's top-level table.
+    pub fn running_root(&mut self, fx: &mut Fx) -> Value {
+        match self.ck.db.target.arch() {
+            Some(Arch::Aarch64) => {
+                let root = self.call_stub(fx, Stub::ReadTtbr0, &[])[0];
+                fx.b.ins().band_imm_s(root, A64_ADDRESS)
+            }
+            _ => {
+                let root = self.call_stub(fx, Stub::ReadCr3, &[])[0];
+                fx.b.ins().band_imm_s(root, X64_ADDRESS)
+            }
         }
-        fx.b.ins().bor(physical, bits)
     }
 
     /// The entry-root top-level entry of the load window on x86_64: its table, writable.

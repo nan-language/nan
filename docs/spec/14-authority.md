@@ -514,6 +514,31 @@ pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes,
 - `nanos::run(bundle, world, input, exec, alloc)` runs the job of `bundle` as the first task of a new [domain run](11-errors-domains.md#domain-run) on `exec` and `alloc`, whose stack holds what the `limits stack N` of the program's entry function states, or [grows](17-suspension-io.md#grown-stacks) from what `job.stack()` gives when it states none, and returns how the job ended: `Returned` with the `mem::wire` encoding of a typed entry's result, or of a host-compatible entry's `u8` exit status, 0 for an entry returning nothing; `Failed` with the rendering of the entry's failure within a budget of 1,024 bytes; `Trapped` with the trap that abandoned the domain; `Undecodable` when `input` is not the `mem::wire` encoding of a typed entry's input type, or of a `HostInput` for a host-compatible entry. It fails with `RunError.NoJob` when `bundle` holds no job, as the bundle of a library does.
 - The job owns `world` and `input`. A typed entry receives `world`. A host-compatible entry receives a `host::World` holding `world`'s capabilities, the `sys::WallClock` that `world.caps` holds under the key `wall`, or `sys::WallClock.denied()` when it holds none, and the arguments and environment of the `HostInput`.
 
+A kernel runs the job of a bundle it verified for isolated spaces ([isolated spaces](24-kernel.md#isolated-spaces)) in a space of its own, in user mode:
+
+```nan-api
+// module: nanos
+
+pub closed struct Services derives Copy {
+    pub clock: sys::Clock
+    pub log: sys::Log
+    pub stdio: sys::Stdio
+    pub random: sys::Random
+} Services
+
+pub closed enum IsolatedError derives Render {
+    NoJob
+    Unplaced(sys::load::LoadError) from
+    Cancelled(task::Cancelled) from
+} IsolatedError
+
+pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait
+```
+
+- `nanos::run_isolated(cpu, job, services, input, mut frames, mut extended, alloc)` makes a space of `job` from `frames`, copies `input` into it and runs the space's thread on `cpu` with the extended state `extended` holds, serving its system calls, until the job ends; it then gives the space's frames back to `frames` and returns how the job ended, as `nanos::run` does. It fails with `IsolatedError.NoJob` when the bundle holds no job and with `Unplaced` when the space cannot be made.
+- The job runs as the first task of a domain run of the space's runtime, on a world of that runtime's allocator, executor and clock, whose log, standard streams and random source reach `services` through system calls, whose file system and network are denied, and whose table is empty. A host-compatible entry so receives a denied wall clock.
+- The kernel reads every register and byte the space gives as untrusted: the arguments of a log line or of a write reach `services` only when they are the `mem::wire` encodings the runtime writes, and a call naming bytes the space does not map fails. A trap of the job's domain ends it `Trapped` with a trap of the same kind, an exception of its thread with a trap of `trap.exception`, and a space waiting with no timer armed, which nothing can wake, with a trap of `trap.abandoned`, each located at the call of `run_isolated`.
+
 ### Component instances
 
 A bare kernel holds instances of the components that a nanos bundle it loaded exports ([component entries](27-program-model.md#entry)), each in a domain of its own, as the holder of a [stepper](26-components.md#steppers) holds its component:

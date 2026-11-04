@@ -771,7 +771,7 @@ fn tasks_enqueue(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         seeded_push_ready(mut lo, mut fx, record)
         return
     }
-    if lo.kernel() {
+    if lo.on_cpus() {
         mut lo.kernel_enqueue(mut fx, record)
         return
     }
@@ -823,12 +823,12 @@ fn schedule(mut lo: Lowering, mut fx: Fx) {
     let header = mut fx.block()
     mut fx.b.jump(header, args: mem::List[clif::Value].empty(fx.alloc).view())
     mut fx.b.switch_to_block(header)
-    if lo.kernel() {
+    if lo.on_cpus() {
         discard mut lo.call_stub(mut fx, stub: Stub.Cli, args: mem::List[clif::Value].empty(fx.alloc).view())
     }
     let record = if lo.seeded() {
         seeded_pick(mut lo, mut fx)
-    } else if lo.kernel() {
+    } else if lo.on_cpus() {
         mut lo.kernel_pick(mut fx)
     } else {
         pop_ready(mut lo, mut fx)
@@ -841,7 +841,7 @@ fn schedule(mut lo: Lowering, mut fx: Fx) {
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         if lo1.seeded() {
             seeded_idle(mut lo1, fx: mut fx1)
-        } else if lo1.kernel() {
+        } else if lo1.on_cpus() {
             mut lo1.kernel_idle(mut fx1)
         } else {
             system_idle(mut lo1, fx: mut fx1)
@@ -872,8 +872,9 @@ fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     })
 } run_task
 
-/// Runs a task on the executor thread until it switches away, on a machine target with the
-/// extended state it owns, charging the time it ran, then settles its state.
+/// Runs a task on the executor thread until it switches away, on a machine target other than an
+/// isolated space, whose tasks share its thread's, with the extended state it owns, charging the
+/// time it ran, then settles its state.
 fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     waive length "the switch, the time it charges and the settling of the state the task left, in order, as the Rust does"
 {
@@ -887,19 +888,20 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     if not lo.seeded() {
         started = Some(mut lo.now_ns(mut fx))
     }
-    if lo.kernel() {
+    if lo.on_cpus() {
         let Some(now) = started else {
             expect false
             return
         }
         mut lo.kernel_switch_in(mut fx, record, now)
     }
-    if lo.machine() {
+    let owners = lo.machine() and not lo.user()
+    if owners {
         mut lo.extended_in(mut fx, record)
     }
     let scheduler = mut fx.offset(thread, offset: THREAD_CONTEXT)
     let context = mut fx.offset(record, offset: TASK_CONTEXT)
-    if lo.kernel() {
+    if lo.on_cpus() {
         // A preempted task resumes through the seam that preempted it, whose return restores its
         // interrupt flag; every other task runs with maskable interrupts enabled.
         let preempted = mut fx.load(PTR, addr: record, offset: TASK_PREEMPTED)
@@ -914,10 +916,10 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
         })
     }
     mut lo.switch_stacks(mut fx, store: scheduler, load: context, payload: record)
-    if lo.machine() {
+    if owners {
         mut lo.extended_out(mut fx, record)
     }
-    if lo.kernel() {
+    if lo.on_cpus() {
         mut lo.kernel_switch_out(mut fx)
     }
     match started {
@@ -1192,11 +1194,14 @@ fn Lowering.cancel_operation(mut self, mut fx: Fx, op: clif::Value) {
     }
 } Lowering.cancel_operation
 
-/// Delivers the completions that have arrived: those on the running thread's ring, or those
-/// the seeded scheduler queued; a kernel's waits end by wakes alone.
+/// Delivers the completions that have arrived: those on the running thread's ring, those the
+/// seeded scheduler queued, or the expiries of an isolated space's timers that are due; a
+/// kernel's waits end by wakes alone.
 fn Lowering.reap(mut self, mut fx: Fx) {
     if self.seeded() {
         seeded_reap(mut self, fx: mut fx)
+    } else if self.user() {
+        space_reap(mut self, mut fx)
     } else if not self.kernel() {
         host_reap(mut self, fx: mut fx, wait: None)
     }

@@ -1,0 +1,60 @@
+//! Averages readings with floats and lanes, in its own task and in tasks it starts, and reports through its world's log, random source and standard output, finding its file system denied.
+
+pub closed struct Readings derives Encode {
+    pub values: mem::List[u32]
+} Readings
+
+pub closed struct Summary derives Encode {
+    pub mean_milli: u64
+    pub lanes: u64
+    pub entropy: u64
+} Summary
+
+pub closed enum AverageError derives Render {
+    Empty
+    Revoked(sys::Revoked) from
+    Stdio(sys::StdioError) from
+    Cancelled(task::Cancelled) from
+} AverageError
+
+/// The sum of `count` steps of a float series, pausing between steps so that other tasks run.
+fn series(clock: sys::Clock, step: f64, count: u32) -> f64 fails task::Cancelled uses wait {
+    var total: f64 = 0.0
+    for _ in 0..<count {
+        total += step
+        try await clock.sleep_ns(10_000)
+    }
+    return total
+} series
+
+fn main(take world: nanos::World, take input: Readings) -> Summary fails AverageError uses wait limits stack 65_536 {
+    if input.values.len() == 0 {
+        fail AverageError.Empty
+    }
+    var total: f64 = 0.0
+    for value in input.values {
+        total += f64.widen(value)
+    }
+    let mean = total / f64.fit(input.values.len())
+    let lanes = core::simd::F32x4.splat(1.5).mul(core::simd::F32x4.of(Array[f32, 4].filled(2.0))).sum()
+    let clock = world.clock
+    let log = world.log
+    try await task::scope(world.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
+        let quarters = s.spawn(fn() -> f64 fails task::Cancelled uses wait limits stack 16_384 {
+            return try await series(clock, step: 0.25, count: 20)
+        })
+        let halves = s.spawn(fn() -> f64 fails task::Cancelled uses wait limits stack 16_384 {
+            return try await series(clock, step: 0.5, count: 20)
+        })
+        let quartered = try await take quarters.join()
+        let halved = try await take halves.join()
+        log.info("series", value: u64.saturate((quartered + halved) * 100.0))
+    })
+    var bytes = Array[u8, 8].filled(0)
+    try world.random.fill(mut bytes.view_mut())
+    world.log.info("mean", value: u64.fit(mean))
+    let denied = attempt await world.fs.read_all("readings", alloc: world.alloc)
+    world.log.warn("fs denied", value: denied.is_err())
+    try await world.stdio.write_out(b"averaged\n")
+    return Summary(mean_milli: u64.saturate(mean * 1000.0), lanes: u64.fit(lanes), entropy: bytes.view().u64_le(0))
+} main

@@ -1,6 +1,6 @@
 # 0112. User mode as a call
 
-Status: accepted; user threads owning extended state only from their first use superseded by 0113
+Status: accepted; user threads owning extended state only from their first use superseded by 0113; user roots keeping their translations superseded by 0118
 
 ## Context
 

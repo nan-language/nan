@@ -1,7 +1,8 @@
 //! The system the runtime runs on: the memory of its records and of the chunks cells draw, task
 //! stacks, idling, its standard streams, its start and its exit. On a host target the host module
 //! provides them over the C library and Linux; on a machine target the machine module does, over
-//! the boot heap, the serial and exit ports and the CPUs.
+//! the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space
+//! module does, over the boot heap its kernel maps and the system calls its kernel serves.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC};
 
@@ -11,7 +12,7 @@ use super::super::host;
 use super::super::machine::Stub;
 use super::super::machine::heap;
 use super::regions::region;
-use super::{Routine, memory, state, tables, tasks};
+use super::{Routine, memory, space, state, tables, tasks};
 
 /// The text written when the runtime cannot start.
 const UNAVAILABLE: &str = "nan: runtime unavailable\n";
@@ -46,7 +47,10 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         (Routine::Init, _) => init(lo, fx),
         (Routine::Exit, true) => {
             let status = fx.entry()[0];
-            lo.exit_machine(fx, status);
+            match lo.user() {
+                true => space::exit(lo, fx),
+                false => lo.exit_machine(fx, status),
+            }
         }
         (_, true) => heap::define(lo, fx, routine),
         (_, false) => host::define(lo, fx, routine),
@@ -55,11 +59,21 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 
 /// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
 /// which a machine image's boot area holds after its boot heap, then the executors of the
-/// platform; nonzero when the runtime cannot start.
+/// platform; nonzero when the runtime cannot start. An isolated space's runtime starts with the
+/// boot area its kernel mapped, whose tables it clears.
 fn init(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let state_address = lo.state(fx);
-    let area = lo.machine().then(|| lo.boot_area(fx));
+    let area = lo.machine().then(|| match lo.user() {
+        true => {
+            let area = fx.load(PTR, state_address, state::BOOT_AREA);
+            let tables = fx.offset(area, heap::BOOT_HEAP);
+            let len = fx.ptr(TABLE_BYTES);
+            heap::clear(lo, fx, tables, len);
+            area
+        }
+        false => lo.boot_area(fx),
+    });
     let mut offset = heap::BOOT_HEAP;
     for (field, size) in TABLES {
         let address = match area {
@@ -78,9 +92,10 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
     let root = fx.load(PTR, state_address, state::ROOT);
     fx.store(one, root, region::ID);
     fx.store(one, state_address, state::REGIONS);
-    match lo.machine() {
-        true => lo.machine_init(fx),
-        false => host::start_threads(lo, fx),
+    match (lo.machine(), lo.user()) {
+        (true, true) => space::init(lo, fx),
+        (true, false) => lo.machine_init(fx),
+        (false, _) => host::start_threads(lo, fx),
     }
     let zero = fx.ptr(0);
     fx.b.ins().return_(&[zero]);
@@ -126,11 +141,12 @@ pub fn refuse(lo: &mut Lowering, fx: &mut Fx, why: &str) {
 }
 
 /// Writes a byte range to a standard stream: on a host target to its descriptor, on a machine
-/// target to the serial port, which carries both streams.
+/// target to the serial port, which carries both streams; an isolated space has none.
 pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
-    match lo.machine() {
-        true => lo.serial_write(fx, text, len),
-        false => host::write_all(lo, fx, fd, text, len),
+    match (lo.machine(), lo.user()) {
+        (true, false) => lo.serial_write(fx, text, len),
+        (true, true) => {}
+        (false, _) => host::write_all(lo, fx, fd, text, len),
     }
 }
 
@@ -180,13 +196,15 @@ pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bo
 }
 
 /// Waits until a task may be ready: on a host target in the running thread's ring, handling the
-/// completions that arrive; on a machine target the CPU halts until an interrupt.
+/// completions that arrive; on a machine target the CPU halts until an interrupt; in an isolated
+/// space until its first timer is due.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
-    match lo.machine() {
-        true => {
+    match (lo.machine(), lo.user()) {
+        (true, false) => {
             lo.call_stub(fx, Stub::IdleWait, &[]);
         }
-        false => host::idle(lo, fx),
+        (true, true) => space::idle(lo, fx),
+        (false, _) => host::idle(lo, fx),
     }
 }
 

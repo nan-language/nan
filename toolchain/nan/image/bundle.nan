@@ -1,4 +1,4 @@
-//! The bundle writer: links the object of a bundle's lowering from address zero and writes the bundle, each import bound to the index of the export its kernel's interface names.
+//! The bundle writer: links the object of a bundle's lowering from address zero and writes the bundle, each import bound to the index of the export its kernel's interface names; and the image of a kernel's user-mode runtime, a bundle whose job is the runtime's start, recording where it defines each export.
 
 /// The magic and format version of a bundle.
 const BUNDLE_MAGIC: Slice[u8] = b"NBUN"
@@ -58,7 +58,9 @@ pkg fn write_bundle(object: Slice[u8], contributed: Slice[LoadedEntry], job: Opt
     var out = mem::Bytes.empty(alloc)
     mut out.append(BUNDLE_MAGIC)
     encoding::uvar(mut out, value: BUNDLE_VERSION)
-    encoding::bytes(mut out, value: bundle_body(linked, contributed, job, components, hash, exports, alloc).view())
+    let defined = mem::List[u64].empty(alloc)
+    let parts = BodyParts(job: job, exports: defined.view(), boot: None)
+    encoding::bytes(mut out, value: bundle_body(linked, contributed, parts, components, job_symbol: BUNDLE_JOB, lines: BUNDLE_LINES, hash, exports, alloc).view())
     var sections = encoding::Record.empty(alloc)
     match signer {
         Some(secret) => {
@@ -73,6 +75,39 @@ pkg fn write_bundle(object: Slice[u8], contributed: Slice[LoadedEntry], job: Opt
     mut out.append(trailer.view())
     return Ok(take out)
 } write_bundle
+
+/// The image of a kernel's user-mode runtime, unsigned, from the object of its lowering: a bundle
+/// whose job is its start routine, with the stack that routine runs on, which records, for each
+/// export of the interface, its offset plus one, or zero where the runtime defines none, and the
+/// bytes of the boot area it runs over; its line tables' symbol is `lines`.
+pkg fn write_runtime(object: Slice[u8], hash: Slice[u8], exports: Slice[text::String], start: Str, stack: u64, boot: u64, lines: Str, alloc: mem::Alloc) -> mem::Bytes {
+    let linked = link(object, base: 0, importing: false, alloc)
+    var offsets = mem::List[u64].empty(alloc)
+    for name in exports {
+        let found = linked.symbols.get_by(fn(key: text::String) => key.as_str().cmp(name.as_str()))
+        mut offsets.push(match found {
+            Some(at) => at + 1
+            None => 0
+        })
+    }
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(BUNDLE_MAGIC)
+    encoding::uvar(mut out, value: BUNDLE_VERSION)
+    let parts = BodyParts(job: Some(stack), exports: offsets.view(), boot: Some(boot))
+    encoding::bytes(mut out, value: bundle_body(linked, contributed: mem::List[LoadedEntry].empty(alloc).view(), parts, components: mem::List[ComponentEntry].empty(alloc).view(), job_symbol: start, lines, hash, exports, alloc).view())
+    var sections = encoding::Record.empty(alloc)
+    let trailer = take sections.finish(alloc)
+    mut out.append(trailer.view())
+    return out
+} write_runtime
+
+/// The parts of a bundle's body beside its object's: the stack its job's task needs, and for a
+/// runtime where it defines each export and the bytes of its boot area.
+view struct BodyParts {
+    job: Option[u64]
+    exports: Slice[u64]
+    boot: Option[u64]
+} BodyParts
 
 /// Adds a name the interface does not export to `missing`, once.
 fn missing_export(mut missing: mem::List[text::String], name: Str, exports: Slice[text::String], alloc: mem::Alloc) {
@@ -102,9 +137,11 @@ fn bytes_of(contents: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
 } bytes_of
 
 /// The body of a bundle: its interface hash, its image, the image's size in memory, its base
-/// relocations, its imports, its line tables' offset, its contributions, where its read-only
-/// and writable data start, its job entry with its task's stack and its component entries.
-fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], job: Option[u64], components: Slice[ComponentEntry], hash: Slice[u8], exports: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes {
+/// relocations, its imports, the offset of its line tables, whose symbol `lines` names, its
+/// contributions, where its read-only and writable data start, its job entry, whose symbol
+/// `job_symbol` names, with its task's stack, its component entries, and for a runtime where it
+/// defines each export and the bytes of its boot area.
+fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], parts: BodyParts, components: Slice[ComponentEntry], job_symbol: Str, lines: Str, hash: Slice[u8], exports: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes {
     var image = mem::Bytes.empty(alloc)
     for segment in linked.segments {
         object::resize(mut image, length: usize.widen(segment.address))
@@ -134,9 +171,7 @@ fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], job: Option[u64]
         }
         mut record.field(5, content: take imports)
     }
-    var lines = mem::Bytes.empty(alloc)
-    encoding::uvar(mut lines, value: linked.symbol(BUNDLE_LINES))
-    mut record.field(6, content: take lines)
+    mut record.field(6, content: uvar_of(linked.symbol(lines), alloc))
     if contributed.len() > 0 {
         var entries = mem::Bytes.empty(alloc)
         encoding::uvar(mut entries, value: u64.widen(contributed.len()))
@@ -149,10 +184,10 @@ fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], job: Option[u64]
     encoding::uvar(mut starts, value: segment_start(linked, from: Access.Read))
     encoding::uvar(mut starts, value: segment_start(linked, from: Access.Write))
     mut record.field(8, content: take starts)
-    match job {
+    match parts.job {
         Some(stack) => {
             var entry = mem::Bytes.empty(alloc)
-            encoding::uvar(mut entry, value: linked.symbol(BUNDLE_JOB))
+            encoding::uvar(mut entry, value: linked.symbol(job_symbol))
             encoding::uvar(mut entry, value: stack)
             mut record.field(9, content: take entry)
         }
@@ -160,6 +195,18 @@ fn bundle_body(linked: Linked, contributed: Slice[LoadedEntry], job: Option[u64]
     }
     if components.len() > 0 {
         mut record.field(10, content: bundle_components(linked, components, alloc))
+    }
+    match parts.boot {
+        Some(boot) => {
+            var offsets = mem::Bytes.empty(alloc)
+            encoding::uvar(mut offsets, value: u64.widen(parts.exports.len()))
+            for offset in parts.exports {
+                encoding::uvar(mut offsets, value: offset)
+            }
+            mut record.field(11, content: take offsets)
+            mut record.field(12, content: uvar_of(boot, alloc))
+        }
+        None => {}
     }
     return take record.finish(alloc)
 } bundle_body

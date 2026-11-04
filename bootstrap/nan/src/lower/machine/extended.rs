@@ -133,8 +133,16 @@ impl Lowering<'_, '_> {
         let slot = fx.slot(OWNED_SLOT, 16);
         let area = fx.b.ins().iadd_imm_s(slot, AREA_ALIGN - 1);
         let area = fx.b.ins().band_imm_s(area, -AREA_ALIGN);
+        Some(self.call_routine(fx, Routine::ExtendedOwn, &[area])[0])
+    }
+
+    /// `ExtendedOwn(area) -> previous`: makes the running task own extended state in its initial
+    /// state, saved at `area`, giving the area it owned before.
+    pub(crate) fn define_extended_own(&mut self, fx: &mut Fx) {
+        let area = fx.entry()[0];
         self.initial_extended(fx, area);
-        Some(self.call_routine(fx, Routine::Extended, &[area])[0])
+        let previous = self.call_routine(fx, Routine::Extended, &[area])[0];
+        fx.b.ins().return_(&[previous]);
     }
 
     /// Makes the running task own again the extended state `own_extended` gave.

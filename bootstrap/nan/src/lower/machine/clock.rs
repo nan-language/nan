@@ -254,7 +254,7 @@ impl Lowering<'_, '_> {
 
     /// Takes each timer due out of the timers, one at a time under the timer lock, and delivers
     /// its expiry outside it.
-    fn expire_timers(&mut self, fx: &mut Fx) {
+    pub(crate) fn expire_timers(&mut self, fx: &mut Fx) {
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         fx.repeat(&[], |fx, _| {
             let state_address = self.state(fx);
@@ -284,18 +284,32 @@ impl Lowering<'_, '_> {
         });
     }
 
-    /// Arms a timer of the clock due `ns` nanoseconds from now; when it is the earliest, the
-    /// running CPU's timer is programmed again.
+    /// Arms a timer of the clock due `ns` nanoseconds from now, through `TimerArm` in code that
+    /// reaches its executor only through routines.
     pub fn kernel_arm(&mut self, fx: &mut Fx, op: Value, ns: Value) {
+        match self.portable() {
+            true => {
+                self.call_routine(fx, Routine::TimerArm, &[op, ns]);
+            }
+            false => self.arm_clock(fx, op, ns),
+        }
+    }
+
+    /// Arms a timer of the clock due `ns` nanoseconds from now; when it is the earliest, a
+    /// kernel programs the running CPU's timer again, and an isolated space's runtime waits for
+    /// it as it idles.
+    pub fn arm_clock(&mut self, fx: &mut Fx, op: Value, ns: Value) {
         let state_address = self.state(fx);
         let lock = fx.offset(state_address, state::TIMER_LOCK);
         self.call_routine(fx, Routine::Lock, &[lock]);
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let due = timers::due_after(fx, now, ns);
         timers::arm(self, fx, op, due);
-        let first = fx.load(PTR, state_address, state::TIMERS);
-        let earliest = fx.b.ins().icmp(IntCC::Equal, first, op);
-        fx.when(earliest, |fx| self.program_timer(fx));
+        if !self.user() {
+            let first = fx.load(PTR, state_address, state::TIMERS);
+            let earliest = fx.b.ins().icmp(IntCC::Equal, first, op);
+            fx.when(earliest, |fx| self.program_timer(fx));
+        }
         self.call_routine(fx, Routine::Unlock, &[lock]);
     }
 

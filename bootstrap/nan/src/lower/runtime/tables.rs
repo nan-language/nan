@@ -767,26 +767,17 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
     fx.b.ins().return_(&[]);
 }
 
-/// A machine target's root grant: a root cell without a limit, whose supply is the boot heap,
-/// made the process domain's; an executor drawing through it that records the kernel's clock, a
-/// `Clock` entry minted now; a `WallClock` entry when the target's wall clock source gives a
-/// time, its field all ones otherwise; its regions and `hw::Ring0` are not yet taken.
+/// A machine target's root grant: its base, a `WallClock` entry when the target's wall clock
+/// source gives a time, its field all ones otherwise; its regions and `hw::Ring0` are not yet
+/// taken.
 fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
     let grant_ty = lo.root_grant();
-    let unlimited = fx.int(PTR, -1);
-    let cell = memory::new_cell(lo, fx, unlimited, unlimited);
-    let clock_kind = fx.ptr(kind::CLOCK as u64);
-    let clock = new_entry(lo, fx, clock_kind);
-    let now = lo.now_ns(fx);
-    let record = entry_at(lo, fx, clock);
-    fx.store(now, record, entry::STATE);
-    let executor = fx.ptr(kind::EXECUTOR as u64);
-    let exec = new_entry(lo, fx, executor);
-    let record = entry_at(lo, fx, exec);
-    fx.store(cell, record, entry::STATE);
-    fx.store(clock, record, entry::STATE + 8);
-    let share = fx.ptr(ROOT_SHARE);
-    fx.store(share, record, EXECUTOR_SHARE);
+    let Base {
+        cell,
+        exec,
+        clock,
+        now,
+    } = mint_base(lo, fx);
     let (valid, wall_now) = lo.wall_source(fx);
     let wall = fx.choose_in(
         lo,
@@ -816,8 +807,42 @@ fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
         let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
         fx.store(untaken, grant, at);
     }
-    process_cell(lo, fx, cell);
     fx.b.ins().return_(&[]);
+}
+
+/// What every root grant of a machine's runtime holds: a root cell without a limit, whose supply
+/// is the boot heap, made the process domain's; an executor drawing through it that records the
+/// kernel's clock, a `Clock` entry minted at `now`.
+pub struct Base {
+    pub cell: Value,
+    pub exec: Value,
+    pub clock: Value,
+    now: Value,
+}
+
+/// Mints the root cell, clock and executor of a machine's runtime.
+pub fn mint_base(lo: &mut Lowering, fx: &mut Fx) -> Base {
+    let unlimited = fx.int(PTR, -1);
+    let cell = memory::new_cell(lo, fx, unlimited, unlimited);
+    let clock_kind = fx.ptr(kind::CLOCK as u64);
+    let clock = new_entry(lo, fx, clock_kind);
+    let now = lo.now_ns(fx);
+    let record = entry_at(lo, fx, clock);
+    fx.store(now, record, entry::STATE);
+    let executor = fx.ptr(kind::EXECUTOR as u64);
+    let exec = new_entry(lo, fx, executor);
+    let record = entry_at(lo, fx, exec);
+    fx.store(cell, record, entry::STATE);
+    fx.store(clock, record, entry::STATE + 8);
+    let share = fx.ptr(ROOT_SHARE);
+    fx.store(share, record, EXECUTOR_SHARE);
+    process_cell(lo, fx, cell);
+    Base {
+        cell,
+        exec,
+        clock,
+        now,
+    }
 }
 
 /// Makes a root grant's cell the process domain's.

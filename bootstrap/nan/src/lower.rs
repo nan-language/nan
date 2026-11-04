@@ -18,6 +18,10 @@ mod held;
 mod jobs;
 
 pub use jobs::{COMPONENT, JOB};
+pub use lines::SYMBOL as LINES;
+pub use runtime::space::{
+    BOOT_AREA as SPACE_BOOT, START as SPACE_START, START_STACK as SPACE_STACK,
+};
 pub(crate) mod host;
 mod layout;
 mod levels;
@@ -285,6 +289,8 @@ pub struct Program {
     /// final closure.
     pub interface: Option<Rc<load::Interface>>,
     pub loaded: Vec<ItemId>,
+    /// For a kernel running nanos jobs in isolated spaces, the image of their user-mode runtime.
+    pub runtime: Option<Vec<u8>>,
 }
 
 /// What a bundle's build lowers: the entries its contributions add to loaded registries, or a
@@ -347,6 +353,8 @@ pub struct Lowering<'c, 'a> {
     contributed: Vec<load::Contributed>,
     /// For an image whose task stacks grow, its grown calls.
     growth: Option<grown::Growth>,
+    /// For a kernel running nanos jobs in isolated spaces, the image of their user-mode runtime.
+    pub runtime_image: Option<Vec<u8>>,
 }
 
 /// A function declared and not yet defined.
@@ -426,10 +434,31 @@ pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
         None,
         linking,
     );
+    lowering.runtime_image = program.runtime.clone();
     let boot = lowering.boot_glue(program);
     let stack = lowering.boot_stack(program);
     lowering.entry_seam(boot, stack);
     lowering.export_abi(&program.loaded);
+    lowering.drain();
+    lowering.finish(None)
+}
+
+/// Lowers the user-mode runtime of a kernel's isolated spaces: its start routine, its runtime
+/// state and every support routine a kernel exports, into an object the bundle writer links.
+pub fn lower_runtime(ck: &Checker, program: &Program) -> Lowered {
+    let mut lowering = Lowering::new(
+        ck,
+        program.prefixes.clone(),
+        program.roots.clone(),
+        program.level,
+        None,
+        load::Linking::Runtime,
+    );
+    lowering.state_data();
+    for routine in load::ROUTINES {
+        lowering.routine(routine);
+    }
+    lowering.space_start();
     lowering.drain();
     lowering.finish(None)
 }
@@ -524,6 +553,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             sims: None,
             contributed: Vec::new(),
             growth: ck.db.target.is_nanos().then(grown::Growth::default),
+            runtime_image: None,
         }
     }
 
@@ -543,6 +573,13 @@ impl<'c, 'a> Lowering<'c, 'a> {
     /// a test image, whose runs keep interrupts disabled.
     pub fn kernel(&self) -> bool {
         self.machine() && !self.seeded()
+    }
+
+    /// Whether the image's executors are a kernel's CPUs, under interrupts: a kernel's, unlike
+    /// the one executor of an isolated space's runtime, which runs in user mode and serves
+    /// capabilities as its kernel does.
+    pub fn on_cpus(&self) -> bool {
+        self.kernel() && !self.user()
     }
 
     /// The function lowering an instance, declared now and lowered later when new.

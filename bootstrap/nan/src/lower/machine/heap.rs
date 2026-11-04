@@ -188,7 +188,9 @@ fn heap_state(lo: &mut Lowering, fx: &mut Fx) -> Value {
 /// Takes the allocators' spin lock, which no interrupt fn takes. A kernel's holder disables
 /// maskable interrupts, so no preemption leaves the lock held; gives the flags to restore.
 fn lock(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Option<Value> {
-    let flags = lo.kernel().then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0]);
+    let flags = lo
+        .on_cpus()
+        .then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0]);
     let word = fx.offset(state, allocators::LOCK);
     fx.repeat(&[], |fx, _| {
         let zero = fx.int(types::I32, 0);

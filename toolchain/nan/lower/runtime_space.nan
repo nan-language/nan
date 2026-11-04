@@ -1,0 +1,191 @@
+//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps, the system calls through which it reads its kernel's clock, waits for its first timer and ends, and its start, which runs `nanos::isolated` as its first task.
+
+/// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
+/// clock, reading it, invoking a capability its kernel serves, and ending the space with how its
+/// job ended.
+const SPACE_WAIT: u64 = 1
+
+const SPACE_NOW: u64 = 5
+
+pkg const SPACE_INVOKE: u64 = 6
+
+pkg const SPACE_END: u64 = 11
+
+/// How an `END` call tells a trap.
+const SPACE_TRAPPED: u64 = 2
+
+/// The symbols of the start routine, which the kernel enters with the addresses of the start record
+/// and of the boot area, and of the glue of the first task.
+pkg const SPACE_START: Str = "_NSuser_start"
+
+const SPACE_MAIN: Str = "_NSuser_main"
+
+/// The stack the start routine and the scheduler run on, and the boot area, which the kernel
+/// maps.
+pkg const SPACE_STACK: u64 = MACHINE_BOOT_STACK
+
+pkg const SPACE_BOOT: u64 = BOOT_AREA
+
+/// Makes a system call with up to six arguments, giving its result.
+fn space_call(mut lo: Lowering, mut fx: Fx, number: u64, args: Slice[clif::Value]) -> clif::Value {
+    var words = mem::List[clif::Value].empty(fx.alloc)
+    for arg in args {
+        mut words.push(arg)
+    }
+    while words.len() < 6 {
+        let zero = mut fx.ptr(0)
+        mut words.push(zero)
+    }
+    let call_number = mut fx.ptr(number)
+    mut words.push(call_number)
+    let results = mut lo.call_stub(mut fx, stub: Stub.Syscall, args: words.view())
+    return results[0]
+} space_call
+
+/// The record of the runtime's one executor thread.
+fn space_thread(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let threads = mut fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+    return mut fx.load(PTR, addr: threads, offset: 0)
+} space_thread
+
+/// The executor of `Init`: one thread, whose record it draws.
+fn space_init(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: state_address, offset: STATE_THREAD_COUNT)
+    let word = mut fx.ptr(8)
+    let threads = mut lo.record_alloc(mut fx, size: word)
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let size = mut fx.ptr(THREAD_SIZE)
+    let record = mut lo.record_alloc(mut fx, size)
+    unavailable_unless(mut fx, address: record)
+    mut fx.store(record, addr: threads, offset: 0)
+} space_init
+
+/// `ClockNow` reads the kernel's clock; `Extended` and `ExtendedOwn` give zero, the space's tasks
+/// sharing the extended state its kernel saves for its thread.
+fn space_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    discard mut fx.entry()
+    let result = if routine == Routine.ClockNow {
+        space_call(mut lo, mut fx, number: SPACE_NOW, args: mem::List[clif::Value].empty(fx.alloc).view())
+    } else {
+        mut fx.ptr(0)
+    }
+    mut fx.b.ret(fx.list1(result).view())
+} space_define
+
+/// Waits until the first timer is due, or for good without one, then expires the timers due.
+fn space_idle(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let deadline = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let due = mut fx1.load(PTR, addr: head, offset: OPERATION_DUE)
+        let one = mut fx1.ptr(1)
+        let raised = mut fx1.b.umax(due, y: one)
+        return fx1.list1(raised)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    discard space_call(mut lo, mut fx, number: SPACE_WAIT, args: fx.list1(deadline[0]).view())
+    mut lo.expire_timers(mut fx)
+} space_idle
+
+/// Expires the timers due, when any is armed.
+fn space_reap(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(armed, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.expire_timers(mut fx1)
+    })
+} space_reap
+
+/// `Exit`: ends the space as a trap abandoning it.
+fn space_exit(mut lo: Lowering, mut fx: Fx) {
+    let how = mut fx.ptr(SPACE_TRAPPED)
+    let kind = mut fx.ptr(u64.fit(kind_number("trap.abandoned")))
+    discard space_call(mut lo, mut fx, number: SPACE_END, args: fx.list2(how, b: kind).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} space_exit
+
+/// Defines the start routine: it sets up the runtime over the boot area, starts
+/// `nanos::isolated` on the record as the first task, with the stack its own `limits stack N`
+/// demands, and runs the scheduler.
+fn Lowering.space_start(mut self) {
+    let Some(isolated) = self.ck.db().std_item("nanos", name: "isolated") else {
+        expect false
+        return
+    }
+    let Some(sig) = self.ck.fn_sig(isolated) else {
+        expect false
+        return
+    }
+    let Some(stack) = sig.limit_set.stack else {
+        expect false
+        return
+    }
+    let main = mut self.space_main(isolated, stack)
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for _ in 0usize..<2 {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    let id = mut self.module.declare_function(SPACE_START, linkage: object::Linkage.Local, signature)
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo: Lowering, mut fx: Fx) {
+        let params = mut fx.entry()
+        let start = params[0]
+        let area = params[1]
+        let state_address = mut lo.state(mut fx)
+        mut fx.store(area, addr: state_address, offset: STATE_BOOT_AREA)
+        system_start(mut lo, mut fx)
+        let process = mut fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
+        let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+        let glue_ref = mut lo.func_ref(mut fx, id: main)
+        let glue = mut fx.b.func_addr(PTR, func_ref: glue_ref)
+        let zero = mut fx.ptr(0)
+        let usable = mut fx.ptr(stack)
+        var spawn_args = fx.list4(glue, b: zero, c: zero, d: zero)
+        mut spawn_args.push(usable)
+        mut spawn_args.push(zero)
+        mut spawn_args.push(process)
+        mut spawn_args.push(root)
+        let created = mut lo.call_routine(mut fx, routine: Routine.Spawn, args: spawn_args.view())
+        let record = created[0]
+        let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+        mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+            space_exit(mut lo, fx: mut fx1)
+        })
+        mut fx.store(start, addr: record, offset: TASK_ARGUMENT)
+        mut fx.store(record, addr: state_address, offset: STATE_ENTRY_TASK)
+        discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: fx.list1(record).view())
+        discard mut lo.call_routine(mut fx, routine: Routine.Schedule, args: mem::List[clif::Value].empty(fx.alloc).view())
+        mut fx.b.trap(clif::TrapCode(user: 1))
+    })
+} Lowering.space_start
+
+/// The glue of the first task, which calls `nanos::isolated` on the start record its task record
+/// holds, its stack demanded at the function's head.
+fn Lowering.space_main(mut self, isolated: ty::ItemId, stack: u64) -> object::FuncId {
+    let instance = Instance.Nir(item: isolated, role: nir::Role.Body, index: 0, args: ty::Args.none())
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let id = mut self.module.declare_function(SPACE_MAIN, linkage: object::Linkage.Local, signature)
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo: Lowering, mut fx: Fx) {
+        let params = mut fx.entry()
+        let record = params[0]
+        let start = mut fx.load(PTR, addr: record, offset: TASK_ARGUMENT)
+        let abi = mut lo.abi(instance)
+        let callee = mut lo.instance(instance.copy(lo.alloc))
+        discard mut lo.invoke(mut fx, invoked: Invoked.Direct(callee), abi, args: Array[Held, 1].filled(Held.Scalar(start)).view())
+        mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+    })
+    let head = nir::Span.at(self.ck.db().ast(isolated).token)
+    mut self.demands.push(Demand(judged: Judged.Function(id), stack: stack, report: StackReport.Own(head: At(item: isolated, span: head))))
+    return id
+} Lowering.space_main

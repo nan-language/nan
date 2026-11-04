@@ -216,6 +216,7 @@ A **bundle** is the `.nbun` file that `nan build <package> --against <interface 
 
 - A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, when the bundle's code reaches a support routine or runtime data the kernel does not export, and when a nanos program's closure contributes to a loaded registry.
 - A `stack N` of the type of a loaded registry's function field demands `N` less 1 KiB of each function a contribution names for it, the rest left to its gate, reported at the contribution, and demands `N` of the gate in the kernel's final build, reported at the registry.
+- The [user-mode runtime](24-kernel.md#isolated-spaces) a kernel's final build holds is an unsigned bundle built against the kernel's own interface file, imports none, and whose job entry is the runtime's start, with the stack that start runs on.
 - `nan build --as <principal>` signs the bundle with the principal's secret key, as [publishing](29-identity-versioning.md#publishing) signs an artefact, failing as publishing does when the user directory lacks it.
 
 Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4E`, the format version 1 as a uvar, its **body** as bytes, then its **sections**: a record holding no field, or exactly field 1, the signature, a record of 1 the public key and 2 the [signature](31-trust.md#signatures), as bytes, of every byte of the bundle before its sections. The body is a record with these keys:
@@ -232,6 +233,8 @@ Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4
 | 8 | the offsets in the image of its read-only data and of its writable data, a pair of uvars |
 | 9 | for a nanos program whose entry is `main`, the offset of its job entry and the bytes of stack its task needs, a pair of uvars |
 | 10 | for a nanos program listing component entries, a list of them in byte order of name: each its name as a text, then the offset of its entry and the bytes of stack its task needs as uvars |
+| 11 | for a user-mode runtime, for each export of the interface, the offset of its definition plus one, or 0 where it defines none, a list of uvars |
+| 12 | for a user-mode runtime, the bytes of the boot area it runs over, a uvar |
 
 - Words are 8 bytes, least significant byte first. The encoding of the image's code and line tables belongs to the kernel's ABI.
 

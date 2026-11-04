@@ -312,8 +312,13 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::IoSubmit => io_submit(lo, fx),
         Routine::Thread => {
             fx.entry();
-            let slot = lo.thread_slot(fx);
-            let record = fx.load(PTR, slot, 0);
+            let record = match lo.machine() {
+                true => lo.thread(fx),
+                false => {
+                    let slot = lo.thread_slot(fx);
+                    fx.load(PTR, slot, 0)
+                }
+            };
             fx.b.ins().return_(&[record]);
         }
         _ => unreachable!("a task routine"),
@@ -716,7 +721,7 @@ fn enqueue(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         super::seeded::push_ready(lo, fx, record);
         return;
     }
-    if lo.kernel() {
+    if lo.on_cpus() {
         lo.kernel_enqueue(fx, record);
         return;
     }
@@ -774,10 +779,10 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     let header = fx.block();
     fx.b.ins().jump(header, &[]);
     fx.b.switch_to_block(header);
-    if lo.kernel() {
+    if lo.on_cpus() {
         lo.call_stub(fx, Stub::Cli, &[]);
     }
-    let record = match (lo.seeded(), lo.kernel()) {
+    let record = match (lo.seeded(), lo.on_cpus()) {
         (true, _) => super::seeded::pick(lo, fx),
         (false, true) => lo.kernel_pick(fx),
         (false, false) => pop_ready(lo, fx),
@@ -793,7 +798,7 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
             Vec::new()
         },
         |lo, fx| {
-            match (lo.seeded(), lo.kernel()) {
+            match (lo.seeded(), lo.on_cpus()) {
                 (true, _) => super::seeded::idle(lo, fx),
                 (false, true) => lo.kernel_idle(fx),
                 (false, false) => system::idle(lo, fx),
@@ -832,8 +837,9 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     );
 }
 
-/// Runs a task on the executor thread until it switches away, on a machine target with the
-/// extended state it owns, charging the time it ran, then settles its state.
+/// Runs a task on the executor thread until it switches away, on a machine target other than an
+/// isolated space, whose tasks share its thread's, with the extended state it owns, charging the
+/// time it ran, then settles its state.
 fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
@@ -843,15 +849,16 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     fx.store(record, thread, thread::CURRENT);
     fx.store(thread, record, task::THREAD);
     let started = (!lo.seeded()).then(|| lo.now_ns(fx));
-    if lo.kernel() {
+    if lo.on_cpus() {
         lo.kernel_switch_in(fx, record, started.expect("the time a kernel task starts"));
     }
-    if lo.machine() {
+    let owners = lo.machine() && !lo.user();
+    if owners {
         lo.extended_in(fx, record);
     }
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
-    if lo.kernel() {
+    if lo.on_cpus() {
         // A preempted task resumes through the seam that preempted it, whose return restores its
         // interrupt flag; every other task runs with maskable interrupts enabled.
         let preempted = fx.load(PTR, record, task::PREEMPTED);
@@ -872,10 +879,10 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         );
     }
     lo.switch_stacks(fx, scheduler, context, record);
-    if lo.machine() {
+    if owners {
         lo.extended_out(fx, record);
     }
-    if lo.kernel() {
+    if lo.on_cpus() {
         lo.kernel_switch_out(fx);
     }
     if let Some(started) = started {
@@ -1166,11 +1173,14 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// Delivers the completions that have arrived: those on the running thread's ring, or
-    /// those the seeded scheduler queued; a kernel's waits end by wakes alone.
+    /// Delivers the completions that have arrived: those on the running thread's ring, those
+    /// the seeded scheduler queued, or the expiries of an isolated space's timers that are due;
+    /// a kernel's waits end by wakes alone.
     pub fn reap(&mut self, fx: &mut Fx) {
         if self.seeded() {
             super::seeded::reap(self, fx);
+        } else if self.user() {
+            super::space::reap(self, fx);
         } else if !self.kernel() {
             host::reap(self, fx, None);
         }

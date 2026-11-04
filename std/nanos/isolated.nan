@@ -1,0 +1,442 @@
+//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls, and the first task of the space's runtime, which runs the job on a world whose log, standard streams and random source reach the kernel through those calls.
+
+/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, reading
+/// that clock, invoking an operation of a capability the kernel serves, and ending the space.
+const CALL_WAIT: u64 = 1
+
+const CALL_NOW: u64 = 5
+
+const CALL_INVOKE: u64 = 6
+
+const CALL_END: u64 = 11
+
+/// The roles of an `hw::UserState` register in a system call, as `register` takes them: its
+/// arguments from 0, its number and its result.
+const ROLE_NUMBER: u64 = 6
+
+const ROLE_RESULT: u64 = 7
+
+/// A call's results from `FAILURES` up are failures: an invalid call, and a stale capability.
+const FAILURES: u64 = 0xFFFF_FFFF_FFFF_F000
+
+const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+const STALE: u64 = 0xFFFF_FFFF_FFFF_FFFE
+
+/// The handles of the capabilities the kernel serves a job's space, and their operations.
+const HANDLE_LOG: u64 = 0
+
+const HANDLE_STDIO: u64 = 1
+
+const HANDLE_RANDOM: u64 = 2
+
+const LOG_LINE: u64 = 0
+
+const READ_IN: u64 = 0
+
+const WRITE_OUT: u64 = 1
+
+const WRITE_ERR: u64 = 2
+
+const FILL: u64 = 0
+
+/// How an `CALL_END` call says the job ended: returned, failed, trapped or given an input it does not
+/// decode.
+const ENDS_RETURNED: u64 = 0
+
+const ENDS_FAILED: u64 = 1
+
+const ENDS_TRAPPED: u64 = 2
+
+const ENDS_UNDECODABLE: u64 = 3
+
+/// The numbers of the trap kinds of an exception and of an abandoned domain.
+const EXCEPTION: u64 = 15
+
+const ABANDONED: u64 = 16
+
+/// The most bytes the kernel copies out of a space for one call.
+const MOST_BYTES: u64 = 1_048_576
+
+/// The bytes of a start record.
+const RECORD_BYTES: usize = 32
+
+pub closed enum IsolatedError derives Render {
+    NoJob
+    Unplaced(sys::load::LoadError) from
+    Cancelled(task::Cancelled) from
+} IsolatedError
+
+/// What the kernel serves a job in an isolated space: the clock of its waits, and the capabilities
+/// its world's log, standard streams and random source reach.
+pub closed struct Services derives Copy {
+    pub clock: sys::Clock
+    pub log: sys::Log
+    pub stdio: sys::Stdio
+    pub random: sys::Random
+} Services
+
+/// The record from which a space's runtime starts: the job, and where the job's input lies and its
+/// length.
+struct Start derives Copy {
+    job: sys::load::Job
+    input: u64
+    input_len: u64
+} Start
+
+/// The allocator, executor and clock of a space's runtime.
+struct Base {
+    alloc: mem::Alloc
+    exec: task::Executor
+    clock: sys::Clock
+} Base
+
+/// A capability the kernel serves a space, its record the handle that the space's calls name.
+struct Remote {
+} Remote
+
+impl Remote: sys::Kind[mem::Alloc, u64]
+
+impl Remote: sys::LogService
+
+impl Remote: sys::StdioService
+
+impl Remote: sys::RandomService
+
+/// The arguments of a log line.
+struct LogLine derives Encode {
+    level: u8
+    message: text::String
+    value: text::String
+} LogLine
+
+pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
+    let Some(entry) = job.job() else {
+        fail IsolatedError.NoJob
+    }
+    var space = try job.space(data: u64.widen(RECORD_BYTES + input.len()), mut frames, alloc)
+    let start = space.data()
+    let record = Start(job: entry, input: start + u64.widen(RECORD_BYTES), input_len: u64.widen(input.len()))
+    discard attempt mut space.write(start, bytes: start_record(record, alloc).view())
+    discard attempt mut space.write(record.input, bytes: input.view())
+    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
+    state.regs[register(0)] = Untrusted.of(start)
+    state.regs[register(1)] = Untrusted.of(space.boot_area())
+    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, alloc)
+    take space.release(mut frames)
+    match outcome {
+        Ok(how) => return how
+        Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
+    }
+} run_isolated
+
+/// The bytes of a start record.
+fn start_record(record: Start, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(RECORD_BYTES, alloc)
+    trusted "a start record is `RECORD_BYTES` bytes, all initialised" {
+        hw::Ptr[u8].cast(hw::Ptr.of(record)).copy(hw::Ptr.of_view_mut(mut bytes.view_mut()), count: RECORD_BYTES)
+    }
+    return bytes
+} start_record
+
+/// Runs a space's thread until its job ends, serving its system calls; an exception ends the
+/// job as a trap of `trap.exception`.
+fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    loop {
+        match space.run(cpu, mut state, mut extended) {
+            hw::UserExit.Interrupted => {}
+            hw::UserExit.Fault(_) => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+            hw::UserExit.Syscall => {
+                let number = user_word(state.regs[register(ROLE_NUMBER)])
+                if number == CALL_END {
+                    return ended_by(mut space, state, alloc)
+                }
+                var answer = INVALID
+                if number == CALL_WAIT {
+                    let deadline = user_word(state.regs[register(0)])
+                    if deadline == 0 {
+                        return Ended.Trapped(trap_of(ABANDONED, alloc))
+                    }
+                    answer = try await slept_until(services.clock, deadline)
+                } else if number == CALL_NOW {
+                    answer = match attempt services.clock.elapsed_ns() {
+                        Ok(ns) => ns
+                        Err(_) => INVALID
+                    }
+                } else if number == CALL_INVOKE {
+                    answer = try await invoked(mut space, state, services, alloc)
+                }
+                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
+            }
+        }
+    }
+} run_space
+
+/// Waits until a deadline of the clock, giving 0.
+fn slept_until(clock: sys::Clock, deadline: u64) -> u64 fails task::Cancelled uses wait {
+    let elapsed = match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => deadline
+    }
+    if deadline > elapsed {
+        try await clock.sleep_ns(deadline - elapsed)
+    }
+    return 0
+} slept_until
+
+/// How the job of an `CALL_END` call ended.
+fn ended_by(mut space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc) -> Ended {
+    let how = user_word(state.regs[register(0)])
+    let detail = user_word(state.regs[register(1)])
+    if how == ENDS_TRAPPED {
+        return Ended.Trapped(trap_of(detail, alloc))
+    }
+    if how == ENDS_UNDECODABLE {
+        return Ended.Undecodable
+    }
+    let Ok(bytes) = attempt copied(space, state, at: 2, alloc) else {
+        return Ended.Trapped(trap_of(EXCEPTION, alloc))
+    }
+    match how {
+        ENDS_RETURNED => return Ended.Returned(bytes_of(bytes.view(), alloc))
+        ENDS_FAILED => return Ended.Failed(text_of(bytes.view(), alloc))
+        else => return Ended.Trapped(trap_of(ABANDONED, alloc))
+    }
+} ended_by
+
+/// The bytes the address and length of a call's arguments from `at` name in the space, at most
+/// `MOST_BYTES`.
+fn copied(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails hw::UserAddrError {
+    let len = user_word(state.regs[register(u64.widen(at) + 1)])
+    if len > MOST_BYTES {
+        fail hw::UserAddrError.OutsideUser
+    }
+    return try space.read(user_word(state.regs[register(u64.widen(at))]), len, alloc)
+} copied
+
+/// Serves an `CALL_INVOKE` call: the handle, the operation, the address and length of its arguments
+/// and the address and capacity of its result.
+fn invoked(mut space: sys::load::Space, state: hw::UserState, services: Services, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let handle = user_word(state.regs[register(0)])
+    let operation = user_word(state.regs[register(1)])
+    let target = user_word(state.regs[register(4)])
+    let capacity = user_word(state.regs[register(5)])
+    let Ok(args) = attempt copied(space, state, at: 2, alloc) else {
+        return INVALID
+    }
+    if capacity > MOST_BYTES {
+        return INVALID
+    }
+    if handle == HANDLE_LOG and operation == LOG_LINE {
+        return logged(services.log, args, alloc)
+    }
+    if handle == HANDLE_STDIO and operation == READ_IN {
+        var buffer = Untrusted.of(mem::Bytes.zeroed(usize.widen(capacity), alloc))
+        let Ok(count) = attempt await services.stdio.read_in(mut buffer.view_mut()) else {
+            return STALE
+        }
+        let Some(read) = buffer.view().prefix(count) else {
+            return INVALID
+        }
+        return written_back(mut space, address: target, bytes: bytes_of(read, alloc), count: u64.widen(count))
+    }
+    if handle == HANDLE_STDIO and (operation == WRITE_OUT or operation == WRITE_ERR) {
+        let Ok(data) = attempt mem::wire::Codec[mem::Bytes].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        let sent = match operation == WRITE_OUT {
+            true => attempt await services.stdio.write_out(data.view())
+            false => attempt await services.stdio.write_err(data.view())
+        }
+        return match sent {
+            Ok(_) => 0
+            Err(_) => STALE
+        }
+    }
+    if handle == HANDLE_RANDOM and operation == FILL {
+        var bytes = mem::Bytes.zeroed(usize.widen(capacity), alloc)
+        let Ok(_) = attempt services.random.fill(mut bytes.view_mut()) else {
+            return STALE
+        }
+        return written_back(mut space, address: target, bytes: bytes, count: capacity)
+    }
+    return INVALID
+} invoked
+
+/// Logs a line whose arguments a call encodes, giving 0, or `INVALID` for arguments that do not
+/// decode.
+fn logged(log: sys::Log, args: Untrusted[mem::Bytes], alloc: mem::Alloc) -> u64 {
+    let Ok(line) = attempt mem::wire::Codec[LogLine].decode(args.view(), alloc) else {
+        return INVALID
+    }
+    match line.level {
+        0 => log.info(line.message.as_str(), value: line.value.as_str())
+        1 => log.warn(line.message.as_str(), value: line.value.as_str())
+        else => log.error(line.message.as_str(), value: line.value.as_str())
+    }
+    return 0
+} logged
+
+/// Writes a call's result bytes at its address, giving `count`, or `INVALID` where the space
+/// cannot take them.
+fn written_back(mut space: sys::load::Space, address: u64, bytes: mem::Bytes, count: u64) -> u64 {
+    return match attempt mut space.write(address, bytes: bytes.view()) {
+        Ok(_) => count
+        Err(_) => INVALID
+    }
+} written_back
+
+validator fn user_word(raw: Untrusted[u64]) -> u64 {
+    return raw.inspect()
+} user_word
+
+/// A space's bytes, which the kernel gives on as they are, as it gives a shared job's.
+validator fn bytes_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} bytes_of
+
+/// A space's text, empty when it is not UTF-8.
+validator fn text_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String {
+    return match attempt text::String.try_from_utf8(raw.inspect(), alloc) {
+        Ok(text) => text
+        Err(_) => text::String.empty(alloc)
+    }
+} text_of
+
+/// The index in an `hw::UserState`'s registers of a system call's register of a role.
+fn register(role: u64) -> usize limits pure, notrap, terminates
+
+/// A trap of the kind its number names, `trap.abandoned` for a number naming none, drawn through
+/// `alloc`.
+fn trap_of(kind: u64, alloc: mem::Alloc) -> sys::Trap
+
+/// The first task of a space's runtime: runs the job its start record names on a world whose
+/// log, standard streams and random source the kernel serves, its file system and network
+/// denied, and ends the space with how the job ended.
+pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 {
+    let record = trusted "the kernel writes the start record at `start` before the space starts" { hw::Ptr[Start].of_addr(usize.widen(start)).read() }
+    let granted = space_base()
+    let alloc = granted.alloc
+    var input = mem::Bytes.zeroed(usize.widen(record.input_len), alloc)
+    trusted "the kernel writes the job's input of `input_len` bytes at `input`" {
+        hw::Ptr[u8].of_addr(usize.widen(record.input)).copy(hw::Ptr.of_view_mut(mut input.view_mut()), count: usize.widen(record.input_len))
+    }
+    let remotes = sys::Minter[Remote, mem::Alloc, u64].of(alloc, alloc)
+    let world = attempt remote_world(granted, remotes)
+    let job = record.job
+    match world {
+        Ok(given) => {
+            let outcome = attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+                return try await call(job, world: take given, take input)
+            }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
+            take remotes.close()
+            match outcome {
+                Ok(Ok(how)) => end_with(how)
+                Ok(Err(trap)) => end(ENDS_TRAPPED, detail: trap_number(trap), bytes: b"")
+                Err(_) => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
+            }
+        }
+        Err(_) => {
+            take remotes.close()
+            end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
+        }
+    }
+} isolated
+
+/// The world of a space: its runtime's allocator, executor and clock, its log, standard streams
+/// and random source served by the kernel, its file system and network denied and its table
+/// empty.
+fn remote_world(granted: Base, remotes: sys::Minter[Remote, mem::Alloc, u64]) -> World fails sys::Revoked {
+    let logs = try sys::Log.served(remotes.mint(HANDLE_LOG))
+    let streams = try sys::Stdio.served(remotes.mint(HANDLE_STDIO))
+    let source = try sys::Random.served(remotes.mint(HANDLE_RANDOM))
+    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: Caps.empty(granted.alloc))
+} remote_world
+
+/// Ends the space with how its job ended.
+fn end_with(how: Ended) {
+    match how {
+        Ended.Returned(bytes) => end(ENDS_RETURNED, detail: 0, bytes: bytes.view())
+        Ended.Failed(text) => end(ENDS_FAILED, detail: 0, bytes: text.as_str().as_bytes())
+        Ended.Trapped(trap) => end(ENDS_TRAPPED, detail: trap_number(trap), bytes: b"")
+        Ended.Undecodable => end(ENDS_UNDECODABLE, detail: 0, bytes: b"")
+    }
+} end_with
+
+/// The allocator and handle a remote capability's record names, none for a stale one.
+fn reached(remote: Remote) -> Option[Reach] {
+    return sys::reach(remote, body: fn(alloc: mem::Alloc, handle: u64) => Reach(alloc: alloc, handle: handle))
+} reached
+
+/// What reaching a remote capability gives.
+struct Reach derives Copy {
+    alloc: mem::Alloc
+    handle: u64
+} Reach
+
+fn Remote.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
+    let Some(reach) = reached(self) else {
+        return
+    }
+    let rank: u8 = match level {
+        sys::LogLevel.Info => 0
+        sys::LogLevel.Warn => 1
+        sys::LogLevel.Error => 2
+    }
+    let line = LogLine(level: rank, message: text::String.of(message, alloc: reach.alloc), value: text::String.of(value, alloc: reach.alloc))
+    var nothing = mem::Bytes.empty(reach.alloc)
+    discard invoke(reach.handle, operation: LOG_LINE, args: encoded(line, alloc: reach.alloc).view(), result: mut nothing.view_mut())
+} Remote.log
+
+fn Remote.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError limits stack 4_096 {
+    let Some(reach) = reached(self) else {
+        fail sys::StdioError.Closed
+    }
+    let read = invoke(reach.handle, operation: READ_IN, args: b"", result: mut buf)
+    if read >= FAILURES {
+        fail sys::StdioError.Closed
+    }
+    return usize.widen(read)
+} Remote.read_in
+
+fn Remote.write_out(self, data: Slice[u8]) fails sys::StdioError limits stack 4_096 {
+    try wrote(self, operation: WRITE_OUT, data)
+} Remote.write_out
+
+fn Remote.write_err(self, data: Slice[u8]) fails sys::StdioError limits stack 4_096 {
+    try wrote(self, operation: WRITE_ERR, data)
+} Remote.write_err
+
+/// Writes bytes to a remote standard stream.
+fn wrote(remote: Remote, operation: u64, data: Slice[u8]) fails sys::StdioError {
+    let Some(reach) = reached(remote) else {
+        fail sys::StdioError.Closed
+    }
+    var bytes = mem::Bytes.empty(reach.alloc)
+    mut bytes.append(data)
+    var nothing = mem::Bytes.empty(reach.alloc)
+    if invoke(reach.handle, operation, args: encoded(bytes, alloc: reach.alloc).view(), result: mut nothing.view_mut()) >= FAILURES {
+        fail sys::StdioError.Closed
+    }
+} wrote
+
+fn Remote.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    let Some(reach) = reached(self) else {
+        return
+    }
+    discard invoke(reach.handle, operation: FILL, args: b"", result: mut buf)
+} Remote.fill
+
+/// The allocator, executor and clock of the runtime, minted for its first task.
+fn space_base() -> Base
+
+/// Makes an `CALL_INVOKE` call, giving its result.
+fn invoke(handle: u64, operation: u64, args: Slice[u8], mut result: SliceMut[u8]) -> u64
+
+/// Makes an `CALL_END` call, after which the space runs no more.
+fn end(how: u64, detail: u64, bytes: Slice[u8])
+
+/// The number of a trap's kind.
+fn trap_number(trap: sys::Trap) -> u64 limits pure, notrap, terminates

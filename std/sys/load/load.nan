@@ -109,6 +109,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
     Interface
     DuplicateKey
     DuplicateUnique
+    Unplaceable
 } LoadError
 
 pub open linear struct Prepared {
@@ -226,6 +227,8 @@ struct Parts derives Copy {
     entry: u64
     stack: u64
     components: Span
+    exports: Span
+    boot: u64
 } Parts
 
 /// A signature section: the public key and the signature.
@@ -375,17 +378,8 @@ proj fn Table.pinned(self, holding: u64) -> Slice[E]
 /// its read-only data read and its writable data written, makes its code visible and links its
 /// line tables after the kernel's.
 fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails LoadError {
-    let parts = try parts_of(bundle, body)
+    let parts = try placeable_parts(bundle, body)
     let table = exports()
-    if table == 0 or not same_interface(bundle, hash: parts.hash, table) {
-        fail LoadError.Interface
-    }
-    let image = u64.widen(parts.image.len)
-    let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
-    let coded = not parts.job or parts.entry < parts.read_only
-    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered or not coded {
-        fail LoadError.Malformed
-    }
     let pages = (parts.size + PAGE - 1) / PAGE
     let memory = reserve(pages * PAGE + PAGE)
     let base = aligned(memory)
@@ -432,11 +426,31 @@ fn place(bundle: Slice[u8], body: Span, alloc: mem::Alloc) -> Prepared fails Loa
     return Prepared(placed: Placed(placement: placement, job: job, components: take components, contributions: take contributions, targets: mem::List[u64].empty(alloc), alloc: alloc))
 } place
 
+/// The parts of a bundle's body, which the kernel's interface built and whose image holds its
+/// line tables and job entry where its parts say, its code, read-only data and writable data in
+/// that order.
+fn placeable_parts(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
+    let parts = try parts_of(bundle, body)
+    let table = exports()
+    if table == 0 or not same_interface(bundle, hash: parts.hash, table) {
+        fail LoadError.Interface
+    }
+    let image = u64.widen(parts.image.len)
+    let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
+    let coded = not parts.job or parts.entry < parts.read_only
+    if parts.size < image or parts.lines > parts.size or parts.size - parts.lines < LINES_BYTES or not ordered or not coded {
+        fail LoadError.Malformed
+    }
+    return parts
+} placeable_parts
+
 /// Relocates and binds the image copied at `base` for its address in the window, giving the
 /// entries it adds.
 fn relocated(bundle: Slice[u8], parts: Parts, base: u64, window: u64, table: u64, alloc: mem::Alloc) -> mem::List[Contribution] fails LoadError {
     try relocate(bundle, parts, base, window)
-    try bind(bundle, parts, base, table)
+    try bind(bundle, parts, base, address: fn(index: u64) -> u64 fails LoadError {
+        return try export(table, index)
+    })
     return try contributions_of(bundle, parts, window, table, alloc)
 } relocated
 
@@ -467,10 +481,11 @@ fn components_of(bundle: Slice[u8], parts: Parts, window: u64, alloc: mem::Alloc
     return found
 } components_of
 
-/// The parts a bundle's body records, keyed from 1.
+/// The parts a bundle's body records, keyed from 1: a runtime's image adds where it defines each
+/// export and the bytes of its boot area.
 fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
     let empty = Span(start: 0, len: 0)
-    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0, components: empty)
+    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0, components: empty, exports: empty, boot: 0)
     var reader = Reader(at: body.start, end: body.start + body.len)
     var last: u64 = 0
     var held: u64 = 0
@@ -528,6 +543,12 @@ fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
             }
             10 => {
                 parts.components = content
+            }
+            11 => {
+                parts.exports = content
+            }
+            12 => {
+                parts.boot = try number(bundle, content)
             }
             else => fail LoadError.Malformed
         }
@@ -665,8 +686,8 @@ fn relocate(bundle: Slice[u8], parts: Parts, base: u64, window: u64) fails LoadE
     }
 } relocate
 
-/// Writes the address of the export each import names into the word it names.
-fn bind(bundle: Slice[u8], parts: Parts, base: u64, table: u64) fails LoadError {
+/// Writes the address `address` gives the export each import names into the word it names.
+fn bind(bundle: Slice[u8], parts: Parts, base: u64, address: fn(index: u64) -> u64 fails LoadError) fails LoadError {
     if parts.imports.len == 0 {
         return
     }
@@ -678,7 +699,7 @@ fn bind(bundle: Slice[u8], parts: Parts, base: u64, table: u64) fails LoadError 
         if offset > parts.size or parts.size - offset < 8 {
             fail LoadError.Malformed
         }
-        set_word(base + offset, value: try export(table, index))
+        set_word(base + offset, value: try address(index))
     }
     if reader.at != reader.end {
         fail LoadError.Malformed

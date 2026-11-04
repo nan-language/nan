@@ -79,6 +79,11 @@ use crate::workspace::Arch;
 /// monitor conduit, taking the function identifier and three arguments and giving the result;
 /// and `FiqOn` and `FiqOff`, which unmask and mask fast interrupts,
 /// through which a halting CPU stops the others.
+///
+/// `Syscall`, which code of an isolated space's runtime calls in user mode, takes six arguments
+/// and the number of a system call, makes it and gives its result: on x86_64 by `syscall` with
+/// the number in `rax` and the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9`, on AArch64
+/// by `svc` with the number in `x8` and the arguments in `x0` to `x5`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stub {
     Out1,
@@ -169,6 +174,7 @@ pub enum Stub {
     Smc,
     FiqOn,
     FiqOff,
+    Syscall,
 }
 
 // The x86_64 stubs read the running CPU's features and its executor thread's index at these
@@ -233,6 +239,13 @@ impl Stub {
             ),
             Stub::Pause => (0, 0, &[0xf3, 0x90, 0xc3]),
             Stub::Mfence => (0, 0, &[0x0f, 0xae, 0xf0, 0xc3]),
+            Stub::Syscall => (
+                7,
+                1,
+                &[
+                    0x49, 0x89, 0xca, 0x48, 0x8b, 0x44, 0x24, 0x08, 0x0f, 0x05, 0xc3,
+                ],
+            ),
             Stub::FlushLine => (1, 0, &[0x0f, 0xae, 0x3f, 0xc3]),
             Stub::IdleWait => (0, 0, &[0xfb, 0xf4, 0xfa, 0xc3]),
             Stub::Lidt => (1, 0, &[0x0f, 0x01, 0x1f, 0xc3]),
@@ -669,6 +682,13 @@ impl Stub {
             ),
             Stub::Pause => (0, 0, &[0x3f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::Mfence => (0, 0, &[0xbf, 0x3b, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Syscall => (
+                7,
+                1,
+                &[
+                    0xe8, 0x03, 0x06, 0xaa, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
             Stub::FlushLine => (1, 0, &[0x20, 0x7a, 0x0b, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::IdleWait => (
                 0,

@@ -26,10 +26,12 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 
 /// `Lock(lock)`: spins until the running thread takes the lock, then records it.
 fn acquire(lo: &mut Lowering, fx: &mut Fx, lock: Value) {
-    let flags = lo.kernel().then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0]);
+    let flags = lo
+        .on_cpus()
+        .then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0]);
     let thread = lo.thread(fx);
     let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
-    let holder = match lo.kernel() {
+    let holder = match lo.on_cpus() {
         true => fx.choose(
             inside,
             &[types::I32],
@@ -48,7 +50,7 @@ fn acquire(lo: &mut Lowering, fx: &mut Fx, lock: Value) {
                 .atomic_cas(MemFlagsData::trusted(), lock, free, holder);
         let busy = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
         fx.when(busy, |fx| {
-            if lo.kernel() {
+            if lo.on_cpus() {
                 let again = fx.b.ins().icmp(IntCC::Equal, seen, holder);
                 fx.when(again, |fx| {
                     let location = lo.interrupted_location(fx);
@@ -114,7 +116,7 @@ fn release(lo: &mut Lowering, fx: &mut Fx, lock: Value) {
     )[0];
     let zero = fx.int(types::I32, 0);
     fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, lock);
-    if lo.kernel() {
+    if lo.on_cpus() {
         let outermost = fx.b.ins().icmp_imm_s(IntCC::Equal, held, 0);
         fx.when(outermost, |fx| {
             let flags = fx.load(PTR, thread, thread::SAVED_IF);

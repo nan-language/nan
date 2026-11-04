@@ -33,15 +33,16 @@ pub struct Locked {
     pub line: u32,
 }
 
-/// An entry of an authority summary, as a lock's `approved` record writes it.
+/// An entry of an authority summary, as a lock's `approved` record writes it, declared in byte
+/// order of the words its forms start with, so that entries order as their forms do.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Entry {
-    Capability(String),
     Alloc,
+    Capability(String),
     Device,
+    Escape(&'static str, String),
     Priv,
     Validator(String),
-    Escape(&'static str, String),
 }
 
 /// The ledger kinds of trust escapes, as `escape` entries write them.

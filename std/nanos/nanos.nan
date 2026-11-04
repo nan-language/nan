@@ -100,19 +100,21 @@ pub interface Environment {
 } Environment
 
 /// A component instance a kernel holds: the senders of its holder's requests to the task of its
-/// domain and of the encoded calls of its inboxes, the receiver of how it ended, and the
-/// abandoner running its domain.
+/// domain and of the encoded calls of its inboxes, the receiver of how it ended, the abandoner
+/// running its domain, and the waits for answers of its domain.
 pub open linear struct Instance {
     requests: task::Sender[Asked]
     calls: task::Sender[Called]
     outcome: task::Receiver[Ended]
     domain: mem::Shared[sys::Abandoner]
+    waits: task::Cown[Waits]
     alloc: mem::Alloc
 } Instance
 
 /// The inbox of an instance, carrying encoded calls to it.
 pub open struct Inbox {
     calls: task::Sender[Called]
+    waits: task::Cown[Waits]
 } Inbox
 
 pub closed enum InstanceError derives Render {
@@ -130,13 +132,9 @@ pub fn hold[T, E](bundle: sys::load::Bundle, component: Str, take world: World, 
         let Some(Given(world: granted, checkpoint: from)) = mut given.extract() else {
             return
         }
-        let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
-        let task::Channel(sender: inbox, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
-        let task::Channel(sender: last, receiver: outcome) = task::Channel[Ended].bounded(1, alloc)
-        let domain = mem::Shared.of(sys::Abandoner.new(), alloc)
-        let running = domain.share()
-        let launch = Launch(checkpoint: take from, requests: take asked, calls: take called)
-        discard s.spawn(fn[take granted, take launch, take running, take last]() fails task::Cancelled uses wait limits stack 16_384 {
+        let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: take from, alloc)
+        let running = instance.domain.share()
+        discard s.spawn(fn[take granted, take launch, take running, take ending, take last]() fails task::Cancelled uses wait limits stack 16_384 {
             let ran = attempt await running.contents().run_sized(fn[take granted, take launch]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
                 return try await call(job, world: take granted, input: take launch)
             }, stack: job.stack() + CALL_STACK, exec, alloc)
@@ -145,16 +143,16 @@ pub fn hold[T, E](bundle: sys::load::Bundle, component: Str, take world: World, 
                 Ok(Err(trap)) => Ended.Trapped(take trap)
                 Err(cancelled) => failed(cancelled, alloc)
             }
+            discard attempt await ending.send(Routed.Ended)
             discard attempt await last.send(take ended)
         })
-        let instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, domain: take domain, alloc: alloc)
         result = Some(try await body(take instance))
     })
     return result
 } hold
 
 pub fn Instance.inbox(self) -> Inbox {
-    return Inbox(calls: self.calls.split())
+    return Inbox(calls: self.calls.split(), waits: self.waits.share())
 } Instance.inbox
 
 pub fn Instance.step(mut self) -> bool fails InstanceError uses wait {
@@ -211,7 +209,7 @@ pub fn Instance.wake(mut self) fails InstanceError uses wait {
 } Instance.wake
 
 pub fn Instance.end(take self) -> Ended fails task::Cancelled uses wait {
-    let Instance(requests: requests, calls: calls, outcome: outcome, domain: _, alloc: alloc) = self
+    let Instance(requests: requests, calls: calls, outcome: outcome, domain: _, waits: _, alloc: alloc) = self
     discard requests
     discard calls
     var last: Option[Ended] = None
@@ -225,15 +223,18 @@ pub fn Instance.end(take self) -> Ended fails task::Cancelled uses wait {
 } Instance.end
 
 pub fn Instance.abandon(take self) {
-    let Instance(requests: _, calls: _, outcome: _, domain: domain, alloc: _) = self
+    let Instance(requests: _, calls: _, outcome: _, domain: domain, waits: _, alloc: _) = self
     domain.contents().trigger()
 } Instance.abandon
 
 pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
-    let task::Channel(sender: sender, receiver: receiver) = task::Channel[Result[sys::Encoded, sys::CallError[Never]]].bounded(1, alloc)
-    try await self.calls.send(Called(hash: hash, request: take request, reply: take sender, alloc: alloc))
-    var replies = receiver
-    let Some(served) = try await mut replies.receive() else {
+    let Some(awaited) = try await awaiting(self.waits, alloc) else {
+        fail sys::CallError.Closed(task::SendError.Closed)
+    }
+    let Awaited(id: id, answers: receiver) = awaited
+    try await self.calls.send(Called(id: id, hash: hash, request: take request, alloc: alloc))
+    var answers = receiver
+    let Some(Answer.Served(served)) = try await mut answers.receive() else {
         fail sys::CallError.Closed(task::SendError.Closed)
     }
     match served {
@@ -251,18 +252,47 @@ struct Given {
     checkpoint: Option[mem::Bytes]
 } Given
 
+/// A new instance and what the task of its domain receives, with the senders through which the
+/// kernel's task running that domain tells that the domain has ended and how.
+linear struct Opened {
+    instance: Instance
+    launch: Launch
+    ending: task::Sender[Routed]
+    last: task::Sender[Ended]
+} Opened
+
+/// Opens an instance that resumes from `checkpoint`, routing the answers of its domain on a task
+/// of `s` until the domain has ended.
+fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], alloc: mem::Alloc) -> Opened {
+    let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
+    let task::Channel(sender: inbox, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
+    let task::Channel(sender: answering, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
+    let task::Channel(sender: last, receiver: outcome) = task::Channel[Ended].bounded(1, alloc)
+    let waits = task::Cown.of(Waits(next: 0, open: true, waiting: mem::Map[u64, task::Sender[Answer]].empty(alloc)), alloc)
+    let routing = waits.share()
+    discard s.spawn(fn[take answered, take routing]() fails task::Cancelled uses wait limits stack 16_384 {
+        try await routed(take answered, waits: routing, alloc)
+    })
+    let instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, domain: mem::Shared.of(sys::Abandoner.new(), alloc), waits: take waits, alloc: alloc)
+    let ending = answering.split()
+    let launch = Launch(checkpoint: take checkpoint, requests: take asked, calls: take called, answers: take answering)
+    return Opened(instance: take instance, launch: take launch, ending: take ending, last: take last)
+} opened
+
 /// What the task of an instance's domain receives beside its world: the checkpoint it resumes
-/// from, none to start, its holder's requests and the encoded calls of its inboxes.
+/// from, none to start, its holder's requests, the encoded calls of its inboxes and the sender of
+/// its answers to both.
 struct Launch {
     checkpoint: Option[mem::Bytes]
     requests: task::Receiver[Asked]
     calls: task::Receiver[Called]
+    answers: task::Sender[Routed]
 } Launch
 
-/// A request of an instance's holder, and the sender of its answer.
+/// A request of an instance's holder, and the number of its wait.
 struct Asked {
+    id: u64
     request: Request
-    answer: task::Sender[Answer]
 } Asked
 
 /// A stepper operation an instance's holder asks for, a wait with the receiver whose sender the
@@ -287,21 +317,90 @@ enum Answer {
     Started(usize)
     Checkpointed(mem::Bytes)
     Health(sys::HealthReply)
+    Served(Result[sys::Encoded, sys::CallError[Never]])
 } Answer
 
-/// An encoded call an inbox carries: its protocol hash, its encoding, the sender of its reply and
+/// An encoded call an inbox carries: the number of its wait, its protocol hash, its encoding and
 /// the allocator its reply is drawn through.
 struct Called {
+    id: u64
     hash: sys::ProtocolHash
     request: sys::Encoded
-    reply: task::Sender[Result[sys::Encoded, sys::CallError[Never]]]
     alloc: mem::Alloc
 } Called
 
+/// What an instance's domain sends its kernel: an answer to the wait of a number, or, from the
+/// kernel's task running the domain, that the domain has ended.
+enum Routed {
+    Answered(Replied)
+    Ended
+} Routed
+
+struct Replied {
+    id: u64
+    answer: Answer
+} Replied
+
+/// The waits for answers of an instance's domain: the number of the next, whether the domain can
+/// still answer, and the sender of each wait's answer by its number. A request a domain takes
+/// never carries a sender, since the settlement of an abandoned domain releases none of the
+/// values its channels buffer.
+struct Waits {
+    next: u64
+    open: bool
+    waiting: mem::Map[u64, task::Sender[Answer]]
+} Waits
+
+/// A wait for an answer of an instance's domain: its number and the receiver of the answer.
+struct Awaited {
+    id: u64
+    answers: task::Receiver[Answer]
+} Awaited
+
+/// Registers a wait for an answer of an instance's domain, none once the domain has ended.
+fn awaiting(waits: task::Cown[Waits], alloc: mem::Alloc) -> Option[Awaited] fails task::Cancelled uses wait {
+    let task::Channel(sender: sender, receiver: receiver) = task::Channel[Answer].bounded(1, alloc)
+    var id: Option[u64] = None
+    await when mut waits {
+        if waits.open {
+            id = Some(waits.next)
+            discard mut waits.waiting.insert(waits.next, value: take sender)
+            waits.next += 1
+        }
+    }
+    let Some(number) = id else {
+        return None
+    }
+    return Some(Awaited(id: number, answers: take receiver))
+} awaiting
+
+/// Gives each answer of an instance's domain to its wait until the domain has ended, then ends
+/// every wait left.
+fn routed(take answered: task::Receiver[Routed], waits: task::Cown[Waits], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var receiver = answered
+    loop {
+        let Some(Routed.Answered(Replied(id: id, answer: answer))) = try await mut receiver.receive() else {
+            break
+        }
+        let waiting = await when mut waits => mut waits.waiting.remove(id)
+        let Some(sender) = waiting else {
+            continue
+        }
+        discard attempt await sender.send(take answer)
+    }
+    await when mut waits {
+        waits.open = false
+        waits.waiting = mem::Map[u64, task::Sender[Answer]].empty(alloc)
+    }
+} routed
+
 /// Has the instance's task carry out a request, failing with `Ended` once the instance has ended.
 fn Instance.ask(self, take request: Request) -> Answer fails InstanceError uses wait {
-    let task::Channel(sender: sender, receiver: receiver) = task::Channel[Answer].bounded(1, alloc: self.alloc)
-    match attempt await self.requests.send(Asked(request: take request, answer: take sender)) {
+    let Some(awaited) = try await awaiting(self.waits, alloc: self.alloc) else {
+        fail InstanceError.Ended
+    }
+    let Awaited(id: id, answers: receiver) = awaited
+    match attempt await self.requests.send(Asked(id: id, request: take request)) {
         Ok(_) => {}
         Err(task::SendError.Closed) => fail InstanceError.Ended
         Err(task::SendError.Cancelled(cancelled)) => fail cancelled
@@ -377,7 +476,7 @@ struct Hosted[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P
 fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
-    let Launch(checkpoint: checkpoint, requests: requests, calls: calls) = launch
+    let Launch(checkpoint: checkpoint, requests: requests, calls: calls, answers: answers) = launch
     var restored: Option[S] = None
     match checkpoint {
         Some(bytes) => {
@@ -400,7 +499,7 @@ fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cance
         Ok(stepper) => stepper
         Err(cancelled) => return failed(cancelled, alloc)
     }
-    discard attempt await serving(mut stepper, take requests, take calls, exec, alloc)
+    discard attempt await serving(mut stepper, take requests, take calls, answers, exec, alloc)
     match attempt await take stepper.end() {
         Ok(stopped) => return returned(stopped.state, alloc)
         Err(cancelled) => return failed(cancelled, alloc)
@@ -408,8 +507,9 @@ fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cance
 } Hosted.run
 
 /// Serves the encoded calls `calls` carries, each on a task of its own, while carrying out the
-/// requests `requests` carries, until every sender of `requests` is released.
-fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: sys::Protocol and Send](mut stepper: sys::Stepper[S, Env, P], take requests: task::Receiver[Asked], take calls: task::Receiver[Called], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// requests `requests` carries, until every sender of `requests` is released, sending each answer
+/// through `answers`.
+fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: sys::Protocol and Send](mut stepper: sys::Stepper[S, Env, P], take requests: task::Receiver[Asked], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var asked = requests
     var waiting = Some(take calls)
     let out = stepper.outbox()
@@ -417,36 +517,38 @@ fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
         let Some(inbox) = mut waiting.extract() else {
             return
         }
-        discard s.spawn(fn[take inbox]() fails task::Cancelled uses wait {
-            try await dispatched(out, calls: take inbox, exec)
+        let replies = answers.split()
+        discard s.spawn(fn[take inbox, take replies]() fails task::Cancelled uses wait {
+            try await dispatched(out, calls: take inbox, answers: replies, exec)
         })
         loop {
             let Some(next) = try await mut asked.receive() else {
                 break
             }
-            let Asked(request: request, answer: answer) = next
+            let Asked(id: id, request: request) = next
             let Some(given) = try await carried(mut stepper, take request, exec, alloc) else {
                 continue
             }
-            discard attempt await answer.send(take given)
+            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: take given)))
         }
         s.cancel()
     })
 } serving
 
 /// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply
-/// to its caller, until every sender of `calls` is released.
-fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], exec: task::Executor) fails task::Cancelled uses wait {
+/// through `answers`, until every sender of `calls` is released.
+fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor) fails task::Cancelled uses wait {
     var receiver = calls
     try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
         loop {
             let Some(called) = try await mut receiver.receive() else {
                 return
             }
-            discard s.spawn(fn[take called]() fails task::Cancelled uses wait {
-                let Called(hash: hash, request: request, reply: reply, alloc: alloc) = called
+            let replies = answers.split()
+            discard s.spawn(fn[take called, take replies]() fails task::Cancelled uses wait {
+                let Called(id: id, hash: hash, request: request, alloc: alloc) = called
                 let served = attempt await sys::Wire[P].serve(out, hash, raw: Untrusted.of(request.bytes.view()), handles: request.handles.view(), alloc)
-                discard attempt await reply.send(take served)
+                discard attempt await replies.send(Routed.Answered(Replied(id: id, answer: Answer.Served(take served))))
             })
         }
     })
@@ -701,16 +803,14 @@ test instances_answer_calls_and_end_with_their_state for Hosted.run {
     var total: u64 = 0
     var ended = Ended.Undecodable
     try await task::scope(world.exec, body: fn[mut total, mut ended](s: task::Scope) fails InstanceError uses wait {
-        let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc: world.alloc)
-        let task::Channel(sender: inbox, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc: world.alloc)
-        let task::Channel(sender: last, receiver: outcome) = task::Channel[Ended].bounded(1, alloc: world.alloc)
-        let launch = Launch(checkpoint: None, requests: take asked, calls: take called)
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, alloc: world.alloc)
         let granted = tested(world)
-        discard s.spawn(fn[take granted, take launch, take last]() fails task::Cancelled uses wait {
+        discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
             let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
+            discard attempt await ending.send(Routed.Ended)
             discard attempt await last.send(take given)
         })
-        var instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, domain: mem::Shared.of(sys::Abandoner.new(), alloc: world.alloc), alloc: world.alloc)
+        var instance = opening
         defer take instance.abandon()
         var request = sys::Encoded.empty(world.alloc)
         let added = sys::Wire[Counted].add(mut request, amount: 5)
@@ -744,3 +844,35 @@ test instances_answer_calls_and_end_with_their_state for Hosted.run {
     }
     expect last.total == 5
 } instances_answer_calls_and_end_with_their_state
+
+test requests_a_domain_never_takes_end_with_it for Instance.ask {
+    let world = testing::world()
+    var stepped: Option[Result[bool, InstanceError]] = None
+    var called: Option[Result[sys::Encoded, sys::CallError[Never]]] = None
+    var ended = Ended.Undecodable
+    try await task::scope(world.exec, body: fn[mut stepped, mut called, mut ended](s: task::Scope) fails task::Cancelled uses wait {
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, alloc: world.alloc)
+        discard s.spawn(fn[take ending, take last]() fails task::Cancelled uses wait {
+            discard attempt await ending.send(Routed.Ended)
+            discard attempt await last.send(Ended.Undecodable)
+        })
+        var instance = opening
+        stepped = Some(attempt await mut instance.step())
+        let inbox = instance.inbox()
+        called = Some(attempt await inbox.call(sys::Wire[Counted].hash(), request: sys::Encoded.empty(world.alloc), alloc: world.alloc))
+        ended = try await take instance.end()
+        discard launch
+    })
+    let Some(Err(InstanceError.Ended)) = stepped else {
+        expect false
+        return
+    }
+    let Some(Err(sys::CallError.Closed(task::SendError.Closed))) = called else {
+        expect false
+        return
+    }
+    let Ended.Undecodable = ended else {
+        expect false
+        return
+    }
+} requests_a_domain_never_takes_end_with_it

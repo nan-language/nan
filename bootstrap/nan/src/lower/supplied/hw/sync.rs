@@ -606,7 +606,9 @@ fn wait(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, signal_ty: &Ty, fields:
             supply.ret(lo, fx, held);
         });
         let waiter = fx.load(PTR, address, fields.waiter);
-        let other = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+        let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+        let elsewhere = fx.b.ins().icmp(IntCC::NotEqual, waiter, current);
+        let other = fx.b.ins().band(waits, elsewhere);
         fx.when(other, |fx| {
             release_word(fx, word);
             irq_restore(lo, fx, flags);

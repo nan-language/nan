@@ -1,8 +1,8 @@
 //! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry,
 //! the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry
-//! receives; in an isolated space, the runtime's own grants, its calls of the job entry and the
-//! system calls through which it reaches its kernel; and for its kernel, the registers of those
-//! calls and the traps a space reports.
+//! receives; in an isolated space, the runtime's own grants, its calls of the job entry, the
+//! system calls through which it reaches its kernel and the wait on its doorbell; and for its
+//! kernel, the registers of those calls and the traps a space reports.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC};
 
@@ -14,7 +14,7 @@ use super::super::runtime::tasks::trap_record;
 use super::super::runtime::{Routine, report, space};
 use super::super::trap::{KINDS, kind_number};
 use super::sys::view;
-use super::{Supply, render};
+use super::{Supply, render, sims};
 use crate::check::ty::Ty;
 use crate::workspace::Arch;
 
@@ -82,6 +82,18 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
                 len,
             ];
             space::call(lo, fx, space::END, &call);
+            supply.done(lo, fx);
+        }
+        "nanos::rung" => {
+            let ns = supply.param(0).scalar();
+            let slot = lo.reserved(fx, space::BELL);
+            let cancelled = sims::wait(lo, fx, None, |lo, fx, op| {
+                fx.store(op, slot, 0);
+                lo.kernel_arm(fx, op, ns);
+            });
+            let zero = fx.ptr(0);
+            fx.store(zero, slot, 0);
+            fx.when(cancelled, |fx| sims::fail_cancelled(lo, fx, supply));
             supply.done(lo, fx);
         }
         "nanos::trap_number" => {

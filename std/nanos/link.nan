@@ -1,0 +1,312 @@
+//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings and the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream.
+
+/// The offsets in a channel frame of the count of bytes its writer has written, of the count its
+/// reader has read, and of its data, a ring of `RING_BYTES` bytes.
+const RING_WRITTEN: u64 = 0
+
+const RING_READ: u64 = 8
+
+const RING_DATA: u64 = 64
+
+const RING_BYTES: u64 = 4_096 - RING_DATA
+
+/// The offset in the doorbell frame of the word the kernel sets bits of.
+const BELL_WORD: u64 = 0
+
+/// The operation of a channel's handle: telling the kernel the space wrote to or read from it.
+const NOTIFY: u64 = 0
+
+/// How long a space's reader or writer of a channel waits on the doorbell before looking at the
+/// channel again.
+const RECHECK_NS: u64 = 1_000_000_000
+
+pub open linear struct Link {
+    bell: hw::UserFrame
+    channels: mem::List[Channel]
+    rung: hw::Signal[u64]
+    heard: hw::Signal[u64]
+    alloc: mem::Alloc
+} Link
+
+/// A channel of a link: its key, the frame the kernel writes and the space reads, the frame the
+/// space writes and the kernel reads, and the bytes the kernel has written to the first and read
+/// from the second.
+linear struct Channel {
+    key: text::String
+    inbound: hw::UserFrame
+    outbound: hw::UserFrame
+    sent: core::atomic::AtomicU64
+    taken: core::atomic::AtomicU64
+} Channel
+
+pub closed enum LinkError derives Render {
+    NoChannel
+    Cancelled(task::Cancelled) from
+} LinkError
+
+pub fn Link.of(take bell: hw::PhysFrame[4_096], alloc: mem::Alloc) -> Link {
+    return Link(bell: cleared(take bell), channels: mem::List[Channel].empty(alloc), rung: hw::Signal[u64].empty(), heard: hw::Signal[u64].empty(), alloc: alloc)
+} Link.of
+
+pub fn Link.open(mut self, key: Str, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
+    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0)))
+    return self.channels.len() - 1
+} Link.open
+
+pub fn Link.ring(self, bits: u64) {
+    discard self.bell.fetch_or(hw::Offset[u64](bytes: BELL_WORD), bits)
+    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+        self.rung.post(t, value: bits)
+    })
+} Link.ring
+
+pub fn Link.send(self, channel: usize, data: Slice[u8]) -> usize fails LinkError {
+    let Some(held) = self.channels.get(channel) else {
+        fail LinkError.NoChannel
+    }
+    let sent = held.sent.load()
+    let read = word_of(held.inbound.load(hw::Offset[u64](bytes: RING_READ)))
+    if read > sent or sent - read > RING_BYTES {
+        return 0
+    }
+    var count = RING_BYTES - (sent - read)
+    if u64.widen(data.len()) < count {
+        count = u64.widen(data.len())
+    }
+    let ring = held.inbound.base() + RING_DATA
+    each_piece(at: sent, count, body: fn(offset: u64, from: u64, len: u64) {
+        trusted "the inbound frame is the link's, and `data` holds `count` bytes" {
+            hw::Ptr.of_view(data).offset(isize.fit(from)).copy(hw::Ptr[u8].of_addr(usize.widen(ring + offset)), count: usize.widen(len))
+        }
+    })
+    held.inbound.store(hw::Offset[u64](bytes: RING_WRITTEN), value: sent + count)
+    held.sent.store(sent + count)
+    self.ring(channel_bit(channel))
+    return usize.widen(count)
+} Link.send
+
+pub fn Link.receive(self, channel: usize, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails LinkError uses wait {
+    let Some(held) = self.channels.get(channel) else {
+        fail LinkError.NoChannel
+    }
+    loop {
+        let taken = held.taken.load()
+        let written = word_of(held.outbound.load(hw::Offset[u64](bytes: RING_WRITTEN)))
+        if written > taken and written - taken <= RING_BYTES {
+            let count = written - taken
+            var bytes = mem::Bytes.zeroed(usize.widen(count), alloc)
+            let into = hw::Ptr.of_view_mut(mut bytes.view_mut())
+            let ring = held.outbound.base() + RING_DATA
+            each_piece(at: taken, count, body: fn(offset: u64, from: u64, len: u64) {
+                trusted "the outbound frame is the link's, and `into` holds `count` bytes" {
+                    hw::Ptr[u8].of_addr(usize.widen(ring + offset)).copy(into.offset(isize.fit(from)), count: usize.widen(len))
+                }
+            })
+            held.outbound.store(hw::Offset[u64](bytes: RING_READ), value: written)
+            held.taken.store(written)
+            self.ring(channel_bit(channel))
+            return Untrusted.of(take bytes)
+        }
+        discard try await self.heard.wait()
+    }
+} Link.receive
+
+pub fn Link.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    let Link(bell: bell, channels: channels, rung: _, heard: _, alloc: _) = self
+    mut frames.push(freed(take bell))
+    for channel in take channels {
+        let Channel(key: _, inbound: inbound, outbound: outbound, sent: _, taken: _) = channel
+        mut frames.push(freed(take inbound))
+        mut frames.push(freed(take outbound))
+    }
+} Link.release
+
+/// Tells the kernel's side of a link that the space wrote to or read from a channel.
+fn Link.heard_from(self, channel: u64) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+        self.heard.post(t, value: channel)
+    })
+} Link.heard_from
+
+/// The bit of the doorbell word that a channel's index sets, the last for an index past it.
+fn channel_bit(channel: usize) -> u64 {
+    if channel >= 63 {
+        return 1 << 63
+    }
+    return 1u64 << u32.fit(channel)
+} channel_bit
+
+/// A frame made a user frame, its words cleared.
+fn cleared(take frame: hw::PhysFrame[4_096]) -> hw::UserFrame {
+    let user = hw::UserFrame.of(take frame)
+    for word in 0u64..<512 {
+        user.store(hw::Offset[u64](bytes: word * 8), value: 0)
+    }
+    return user
+} cleared
+
+/// The frame of a user frame of a link the space it served no longer maps.
+fn freed(take frame: hw::UserFrame) -> hw::PhysFrame[4_096] {
+    return trusted "a link outlives the spaces it serves, whose roots are released and whose cached translations their next entry drops" { take frame.into_frame() }
+} freed
+
+/// A word of a frame the space shares, which the kernel reads as it is.
+validator fn word_of(raw: Untrusted[u64]) -> u64 {
+    return raw.inspect()
+} word_of
+
+/// Calls `body` on each part of `count` bytes of a ring from the byte `at` it holds that lies in
+/// the ring without wrapping: the part's offset in the ring, its offset in the bytes and its
+/// length.
+fn each_piece(at: u64, count: u64, body: fn(offset: u64, from: u64, len: u64)) {
+    let offset = at % RING_BYTES
+    var head = RING_BYTES - offset
+    if count < head {
+        head = count
+    }
+    body(offset, from: 0, len: head)
+    if count > head {
+        body(0, from: head, len: count - head)
+    }
+} each_piece
+
+/// A channel of a link as the runtime of a space serves it to its job, a standard stream whose
+/// input the kernel sends and whose output the kernel receives; its record is the channel's index
+/// in the runtime's ports.
+struct Port {
+} Port
+
+impl Port: sys::Kind[Ports, u64]
+
+impl Port: sys::StdioService
+
+/// The channels of a space's link, as its runtime reaches them: the doorbell's address and each
+/// channel's.
+struct Ports {
+    bell: u64
+    list: mem::List[PortRecord]
+} Ports
+
+/// A channel of a space's link: the handle of its entry in the space's table, the addresses of its
+/// inbound and outbound frames, and the address and length of its key.
+struct PortRecord derives Copy {
+    handle: u64
+    inbound: u64
+    outbound: u64
+    key: u64
+    key_len: u64
+} PortRecord
+
+/// The doorbell and the record a port names, none for a stale port.
+struct Reached derives Copy {
+    bell: u64
+    record: PortRecord
+} Reached
+
+fn reached_port(port: Port) -> Option[Reached] {
+    return sys::reach(port, body: fn(ports: Ports, index: u64) => Reached(bell: ports.bell, record: ports.list[usize.widen(index)]))
+} reached_port
+
+fn Port.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError uses wait limits stack 4_096 {
+    let Some(port) = reached_port(self) else {
+        fail sys::StdioError.Closed
+    }
+    loop {
+        let count = read_ring(port.record.inbound, mut buf)
+        if count > 0 {
+            notified(port.record.handle)
+            return count
+        }
+        if buf.len() == 0 {
+            return 0
+        }
+        if bell_taken(port.bell) == 0 {
+            try await rung(RECHECK_NS)
+        }
+    }
+} Port.read_in
+
+fn Port.write_out(self, data: Slice[u8]) fails sys::StdioError uses wait limits stack 4_096 {
+    let Some(port) = reached_port(self) else {
+        fail sys::StdioError.Closed
+    }
+    var at: usize = 0
+    while at < data.len() {
+        let Some(parts) = data.split_at(at) else {
+            return
+        }
+        let count = write_ring(port.record.outbound, data: parts.tail)
+        at += count
+        if count > 0 {
+            notified(port.record.handle)
+        } else if bell_taken(port.bell) == 0 {
+            try await rung(RECHECK_NS)
+        }
+    }
+} Port.write_out
+
+fn Port.write_err(self, data: Slice[u8]) fails sys::StdioError limits stack 4_096 {
+    fail sys::StdioError.Closed
+} Port.write_err
+
+/// Tells the kernel through a channel's handle that the space wrote to or read from it.
+fn notified(handle: u64) {
+    var nothing = Array[u8, 1].filled(0)
+    discard invoke(handle, operation: NOTIFY, args: b"", result: mut nothing.view_mut())
+} notified
+
+/// Reads into `buf` the bytes of the ring of the frame at `frame` that the kernel has written and
+/// the space has not read, as many as fit, giving their count.
+fn read_ring(frame: u64, mut buf: SliceMut[u8]) -> usize {
+    let written = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_load(hw::Order.Acquire) }
+    let read = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_load(hw::Order.Relaxed) }
+    if written < read or written - read > RING_BYTES {
+        return 0
+    }
+    var count = written - read
+    if u64.widen(buf.len()) < count {
+        count = u64.widen(buf.len())
+    }
+    let into = hw::Ptr.of_view_mut(mut buf)
+    each_piece(at: read, count, body: fn(offset: u64, from: u64, len: u64) {
+        trusted "the frame at `frame` is a channel frame the kernel maps for the space, and `buf` holds `count` bytes" {
+            hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)).copy(into.offset(isize.fit(from)), count: usize.widen(len))
+        }
+    })
+    trusted "the frame at `frame` is a channel frame the kernel maps for the space" {
+        hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_store(read + count, order: hw::Order.Release)
+    }
+    return usize.widen(count)
+} read_ring
+
+/// Writes into the ring of the frame at `frame` as many bytes of `data` as it has room for,
+/// giving their count.
+fn write_ring(frame: u64, data: Slice[u8]) -> usize {
+    let written = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_load(hw::Order.Relaxed) }
+    let read = trusted "the frame at `frame` is a channel frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_load(hw::Order.Acquire) }
+    if read > written or written - read > RING_BYTES {
+        return 0
+    }
+    var count = RING_BYTES - (written - read)
+    if u64.widen(data.len()) < count {
+        count = u64.widen(data.len())
+    }
+    each_piece(at: written, count, body: fn(offset: u64, from: u64, len: u64) {
+        trusted "the frame at `frame` is a channel frame the kernel maps for the space, and `data` holds `count` bytes" {
+            hw::Ptr.of_view(data).offset(isize.fit(from)).copy(hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)), count: usize.widen(len))
+        }
+    })
+    trusted "the frame at `frame` is a channel frame the kernel maps for the space" {
+        hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_store(written + count, order: hw::Order.Release)
+    }
+    return usize.widen(count)
+} write_ring
+
+/// Takes the bits the kernel has set in the doorbell word at `bell`, clearing them.
+fn bell_taken(bell: u64) -> u64 {
+    return trusted "the frame at `bell` is the doorbell frame the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(bell + BELL_WORD)).atomic_swap(0, order: hw::Order.AcqRel) }
+} bell_taken
+
+/// Waits until the kernel rings the doorbell or `ns` nanoseconds pass; one task waits at a time,
+/// a later wait taking the doorbell from an earlier one, which waits out its time.
+fn rung(ns: u64) fails task::Cancelled uses wait

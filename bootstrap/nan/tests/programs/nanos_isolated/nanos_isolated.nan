@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -37,6 +37,7 @@ pub closed enum Ask derives Encode {
     Sum(u64)
     Spin(u32)
     Hold(u32)
+    Echo
 } Ask
 
 pub closed enum Answer derives Encode {
@@ -399,16 +400,18 @@ fn ran(cpu: hw::Ring0, job: sys::load::Isolated, name: Str, grants: Grants, take
     var left = inputs
     var results = mem::List[mem::Bytes].empty(grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
+    let link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     while left.len() > 0 {
         let input = mut left.remove(0)
         var held = frames_for_space(mut frames, alloc: grants.alloc)
-        let outcome = attempt await nanos::run_isolated(cpu, job, services: services(grants), take input, frames: mut held, mut extended, alloc: grants.alloc)
+        let outcome = attempt await nanos::run_isolated(cpu, job, services: services(grants), link, take input, frames: mut held, mut extended, alloc: grants.alloc)
         for frame in take held {
             mut frames.push(take frame)
         }
         mut results.push(report(name, take outcome, alloc: grants.alloc))
     }
     returned(take extended, mut frames)
+    take link.release(mut frames)
     return results
 } ran
 
@@ -476,12 +479,12 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
     trusted "the frame holds itself, and no value owns it from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(base)).write(take frame) }
 } given_up
 
-/// Runs the jobs: a typed job using floats, lanes and the served capabilities and an input it
-/// does not decode, a host program, a job trapping, failing, returning and reading kernel
-/// memory, a job without a stack bound recursing past the stack it starts with, a job holding
-/// memory within the frames its space draws from and past them, a space drawing and giving back
-/// pages, a space's runtime probing kernel memory, then a job spinning on floats in a space
-/// while the same job, verified once, spins in the shared space.
+/// Runs the jobs: a typed job using floats, lanes and the served capabilities and an input it does
+/// not decode, a host program, a job trapping, failing, returning and reading kernel memory, a job
+/// without a stack bound recursing past the stack it starts with, a job holding memory within the
+/// frames its space draws from and past them, a space drawing and giving back pages, a job
+/// answering a line over its link, a space's runtime probing kernel memory, then a job spinning on
+/// floats in a space while the same job, verified once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     var values = mem::List[u32].empty(grants.alloc)
     mut values.push(2)
@@ -531,6 +534,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     var holds = try await ran(cpu, job: typed, name: "hold", grants, inputs: take holdings, mut frames)
     say_answer(text: "held pages ", bytes: mut holds.remove(0), alloc: grants.alloc)
     drew(cpu, job: typed, grants, mut frames)
+    try await linked(cpu, job: typed, grants, mut frames)
     probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve
@@ -546,7 +550,7 @@ fn spun(cpu: hw::Ring0, loader: sys::load::Loader, job: sys::load::Isolated, byt
         stop(text: "unloadable\n")
     }
     let load = bundle.share()
-    var given = Some(Spun(result: mem::Bytes.empty(grants.alloc), frames: frames_for_space(mut frames, alloc: grants.alloc), extended: Some(hw::ExtendedState.of(next_frame(mut frames)))))
+    var given = Some(Spun(result: mem::Bytes.empty(grants.alloc), frames: frames_for_space(mut frames, alloc: grants.alloc), extended: Some(hw::ExtendedState.of(next_frame(mut frames))), link: nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)))
     var in_shared = mem::Bytes.empty(grants.alloc)
     var runs = mem::List[Spun].empty(grants.alloc)
     discard attempt await task::scope(grants.exec, body: fn[mut given, mut in_shared, mut runs](s: task::Scope) fails task::Cancelled uses wait {
@@ -554,11 +558,11 @@ fn spun(cpu: hw::Ring0, loader: sys::load::Loader, job: sys::load::Isolated, byt
             return
         }
         let isolated_run = s.spawn(fn[take taken]() -> Spun fails task::Cancelled uses wait limits stack 65_536 {
-            let Spun(result: _, frames: held, extended: owned) = taken
+            let Spun(result: _, frames: held, extended: owned, link: link) = taken
             var pool = held
             var state = owned
-            let outcome = attempt await nanos::run_isolated(cpu, job, services: services(grants), input: encoded(Ask.Spin(500_000), alloc: grants.alloc), frames: mut pool, extended: mut state, alloc: grants.alloc)
-            return Spun(result: result_of(take outcome, alloc: grants.alloc), frames: take pool, extended: take state)
+            let outcome = attempt await nanos::run_isolated(cpu, job, services: services(grants), link, input: encoded(Ask.Spin(500_000), alloc: grants.alloc), frames: mut pool, extended: mut state, alloc: grants.alloc)
+            return Spun(result: result_of(take outcome, alloc: grants.alloc), frames: take pool, extended: take state, link: take link)
         })
         let outcome = attempt await nanos::run(load, world: world_of(grants), input: encoded(Ask.Spin(1), alloc: grants.alloc), domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
         in_shared = shared_result_of(take outcome, alloc: grants.alloc)
@@ -567,31 +571,88 @@ fn spun(cpu: hw::Ring0, loader: sys::load::Loader, job: sys::load::Isolated, byt
     take bundle.unload()
     say_answer(text: "spun ", bytes: take in_shared, alloc: grants.alloc)
     for run in take runs {
-        let Spun(result: result, frames: held, extended: owned) = run
+        let Spun(result: result, frames: held, extended: owned, link: link) = run
         say_answer(text: "spun ", bytes: take result, alloc: grants.alloc)
         for frame in take held {
             mut frames.push(take frame)
         }
         returned(take owned, mut frames)
+        take link.release(mut frames)
     }
     match given {
-        Some(Spun(result: _, frames: held, extended: owned)) => {
+        Some(Spun(result: _, frames: held, extended: owned, link: link)) => {
             for frame in take held {
                 mut frames.push(take frame)
             }
             returned(take owned, mut frames)
+            take link.release(mut frames)
         }
         None => {}
     }
 } spun
 
-/// What the spinning job's run in a space gives back: what it returned, and the frames and the
-/// extended state it took.
+/// What a job's run in a space gives back: what it returned, and the frames, the extended state
+/// and the link it took.
 linear struct Spun {
     result: mem::Bytes
     frames: mem::List[hw::PhysFrame[4_096]]
     extended: Option[hw::ExtendedState]
+    link: nanos::Link
 } Spun
+
+/// Runs the typed job answering a line over a link of two channels, `ask` and `answer`: once
+/// the job says it is ready, waits 100 ms and sends it a line, then writes what the job sent and
+/// whether its read returned before the second its runtime waits at most on the doorbell.
+fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+    let ask = mut link.open("ask", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    let answer = mut link.open("answer", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    var held = frames_for_space(mut frames, alloc: grants.alloc)
+    var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
+    var result = mem::Bytes.empty(grants.alloc)
+    discard attempt await task::scope(grants.exec, body: fn[mut held, mut extended, mut result](s: task::Scope) fails task::Cancelled uses wait {
+        let run = s.spawn(fn[mut held, mut extended, mut result]() fails task::Cancelled uses wait limits stack 65_536 {
+            let outcome = attempt await nanos::run_isolated(cpu, job, services: services(grants), link, input: encoded(Ask.Echo, alloc: grants.alloc), frames: mut held, mut extended, alloc: grants.alloc)
+            result = result_of(take outcome, alloc: grants.alloc)
+        })
+        say_received(text: "link said ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
+        try await grants.clock.sleep_ns(100_000_000)
+        discard attempt link.send(ask, data: b"ping")
+        say_received(text: "link answered ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
+        try await take run.join()
+    })
+    match attempt mem::wire::Codec[Answer].decode(Untrusted.of(result.view()), alloc: grants.alloc) {
+        Ok(Answer.Number(waited)) => {
+            match waited < 900_000_000 {
+                true => say(text: "the doorbell woke the read\n")
+                false => say(text: "the read woke otherwise\n")
+            }
+        }
+        else => say(text: "echo answered nothing\n")
+    }
+    for frame in take held {
+        mut frames.push(take frame)
+    }
+    returned(take extended, mut frames)
+    take link.release(mut frames)
+} linked
+
+/// Writes `text`, then the bytes a link received.
+fn say_received(text: Str, take outcome: Result[Untrusted[mem::Bytes], nanos::LinkError], alloc: mem::Alloc) {
+    say(text)
+    match outcome {
+        Ok(bytes) => say_bytes(shown(bytes.view(), alloc).view())
+        Err(_) => say(text: "nothing")
+    }
+    say(text: "\n")
+} say_received
+
+/// The bytes a space sent, which the kernel writes as they are.
+validator fn shown(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} shown
 
 /// What a run in a space returned, empty for a run ending otherwise.
 fn result_of(take outcome: Result[nanos::Ended, nanos::IsolatedError], alloc: mem::Alloc) -> mem::Bytes {

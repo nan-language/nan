@@ -1470,7 +1470,7 @@ pub open struct Isolated {
 
 pub fn Isolated.job(self) -> Option[Job]
 
-pub fn Isolated.space(self, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError
+pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError
 
 pub open linear struct Space {
 } Space
@@ -1493,7 +1493,7 @@ pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]])
 ```
 
 - `loader.isolate(bundle, keys, alloc)` verifies a bundle as `prepare` does, and fails with `Interface` too when the kernel holds no user-mode runtime. The isolated bundle keeps copies of the bundle and of the runtime, drawn through `alloc`; `isolated.job()` gives its job as it runs in every space.
-- `isolated.space(data, mut frames, alloc)` makes a space of frames taken from the end of `frames`, each cleared: from `0x80_0000_0000`, the **user window**, it maps the runtime's image, then the bundle's, both relocated for their addresses there and the bundle's imports bound to the runtime's exports, their pages mapped as `prepare` maps them but for user mode; then the runtime's stack, `data` bytes the caller lays out, and the boot area the runtime runs over, all readable and writable, never executable. Its root holds the running root's top-level entries but the window's, which maps the window alone. It fails with `Unplaceable` when `frames` holds too few frames or the running root maps the window, and with `Interface` when the bundle imports what the runtime does not export.
+- `isolated.space(cpu, data, mut frames, alloc)` makes a space of frames taken from the end of `frames`, each cleared: from `0x80_0000_0000`, the **user window**, it maps the runtime's image, then the bundle's, both relocated for their addresses there and the bundle's imports bound to the runtime's exports, their pages mapped as `prepare` maps them but for user mode; then the runtime's stack, `data` bytes the caller lays out, and the boot area the runtime runs over, all readable and writable, never executable. Its root maps the window and the entry area `cpu.entry_area()` gives ([split tables](#split-tables)), each page of the entry area with the attributes the running root maps it with then, and nothing else. It fails with `Unplaceable` when `frames` holds too few frames or the entry area reaches the window, and with `Interface` when the bundle imports what the runtime does not export.
 - `space.start()` is the address at which a thread runs the runtime, with the address of the start record `nanos::run_isolated` lays out in its first argument register and that of the boot area, `space.boot_area()`, in its second; its stack pointer starts at `space.stack()`, and the caller's data starts at `space.data()`.
 - `space.run(cpu, mut state, mut extended)` runs a thread of the space through `run_user_split` under its root.
 - `space.read(address, len, alloc)` copies `len` bytes of the space from `address`, and `space.write(address, bytes)` copies `bytes` into pages of the space mapped writable, each failing with `hw::UserAddrError.Unmapped` for a range the space does not map so.

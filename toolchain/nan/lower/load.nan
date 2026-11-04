@@ -678,6 +678,142 @@ fn Lowering.user_entry(mut self, mut fx: Fx, physical: clif::Value, kind: clif::
     return mut fx.b.bor(physical, y: bits)
 } Lowering.user_entry
 
+/// The address bits of a leaf entry mapping 1 GiB and of one mapping 2 MiB, by architecture.
+const X64_GIGABYTE_LEAF: i64 = 0x000F_FFFF_C000_0000
+
+const X64_BLOCK_LEAF: i64 = 0x000F_FFFF_FFE0_0000
+
+const A64_GIGABYTE_LEAF: i64 = 0x0000_FFFF_C000_0000
+
+const A64_BLOCK_LEAF: i64 = 0x0000_FFFF_FFE0_0000
+
+/// The bits of an x86_64 leaf entry above 4 KiB that a page entry keeps: every flag but the
+/// large-page bit and the PAT bit, which moves from bit 12 to bit 7.
+const X64_LEAF_KEPT: i64 = i64.from_bits(0xFFF0_0000_0000_0F7F)
+
+const X64_LARGE: i64 = 0x80
+
+/// The attributes of an AArch64 block entry that a page entry keeps: every one but the
+/// contiguous hint, which a page split from a block no longer meets.
+const A64_LEAF_KEPT: i64 = i64.from_bits(0xFFEC_0000_0000_0FFC)
+
+const A64_CONTIGUOUS: i64 = 1 << 52
+
+/// The physical address of the table an entry of a page-table level links to, the root's level
+/// 0, or zero for an entry linking none: one absent, mapping memory, or of level 3.
+fn Lowering.linked_table(mut self, mut fx: Fx, entry: clif::Value, level: clif::Value) -> clif::Value {
+    let aarch64 = self.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
+    var links = entry
+    if aarch64 {
+        let kind = mut fx.b.band_imm_s(entry, y: 0x3)
+        links = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: 0x3)
+    } else {
+        let present = mut fx.b.band_imm_s(entry, y: 0x1)
+        let is_present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: present, y: 0)
+        let large = mut fx.b.band_imm_s(entry, y: X64_LARGE)
+        let small = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: large, y: 0)
+        let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: 0)
+        let table = mut fx.b.bor(small, y: root)
+        links = mut fx.b.band(is_present, y: table)
+    }
+    let above = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: level, y: 3)
+    let linking = mut fx.b.band(links, y: above)
+    var mask = FRAME_ADDRESS
+    if aarch64 {
+        mask = A64_ADDRESS
+    }
+    let address = mut fx.b.band_imm_s(entry, y: mask)
+    let zero = mut fx.ptr(0)
+    return mut fx.b.select(linking, x: address, y: zero)
+} Lowering.linked_table
+
+/// The entry of the 4 KiB page `offset` bytes into what an entry of a page-table level maps, with
+/// that entry's attributes, or zero for an entry mapping no memory there: one absent, linking a
+/// table, or of level 0.
+fn Lowering.page_of(mut self, mut fx: Fx, entry: clif::Value, level: clif::Value, offset: clif::Value) -> clif::Value {
+    let aarch64 = self.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
+    var addresses = Array[i64, 2].filled(X64_GIGABYTE_LEAF)
+    addresses[1] = X64_BLOCK_LEAF
+    var kept = X64_LEAF_KEPT
+    if aarch64 {
+        addresses[0] = A64_GIGABYTE_LEAF
+        addresses[1] = A64_BLOCK_LEAF
+        kept = A64_LEAF_KEPT
+    }
+    let within = mut fx.b.band_imm_s(offset, y: ~0xFFF)
+    var attributes = mut fx.b.band_imm_s(entry, y: kept)
+    if aarch64 {
+        attributes = mut fx.b.bor_imm_s(attributes, y: 0x3)
+    } else {
+        let shifted = mut fx.b.ushr_imm_s(entry, y: 5)
+        let pat = mut fx.b.band_imm_s(shifted, y: 0x80)
+        attributes = mut fx.b.bor(attributes, y: pat)
+    }
+    var split = mem::List[clif::Value].empty(fx.alloc)
+    for address in addresses {
+        let leaf_base = mut fx.b.band_imm_s(entry, y: address)
+        let base = mut fx.b.iadd(leaf_base, y: within)
+        mut split.push(mut fx.b.bor(base, y: attributes))
+    }
+    var page = entry
+    var leaf = entry
+    var block = entry
+    if aarch64 {
+        page = mut fx.b.band_imm_s(entry, y: ~A64_CONTIGUOUS)
+        let kind = mut fx.b.band_imm_s(entry, y: 0x3)
+        leaf = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: 0x3)
+        block = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: 0x1)
+    } else {
+        let present = mut fx.b.band_imm_s(entry, y: 0x1)
+        leaf = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: present, y: 0)
+        let large = mut fx.b.band_imm_s(entry, y: X64_LARGE)
+        let is_large = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: large, y: 0)
+        block = mut fx.b.band(leaf, y: is_large)
+    }
+    let zero = mut fx.ptr(0)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: 3)
+    let mapped = mut fx.b.select(leaf, x: page, y: zero)
+    var result = mut fx.b.select(last, x: mapped, y: zero)
+    for index in 0usize..<2 {
+        let at_level = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: i64.fit(index) + 1)
+        let this = mut fx.b.band(at_level, y: block)
+        result = mut fx.b.select(this, x: split[index], y: result)
+    }
+    return result
+} Lowering.page_of
+
+/// A page entry with the restrictions a table entry it lies under imposes: on x86_64 no write or
+/// user access the table entry denies and execution it disables; on AArch64 the access and
+/// execute-never limits of its table attributes.
+fn Lowering.restricted_page(mut self, mut fx: Fx, page: clif::Value, table: clif::Value) -> clif::Value {
+    if self.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
+        let allowed = mut fx.b.bor_imm_s(table, y: ~0x6)
+        let limited = mut fx.b.band(page, y: allowed)
+        let disabled = mut fx.b.band_imm_s(table, y: i64.from_bits(0x8000_0000_0000_0000))
+        return mut fx.b.bor(limited, y: disabled)
+    }
+    // APTable[0] denies EL0 access, AP[1] grants it; APTable[1] and UXNTable and PXNTable set
+    // AP[2], UXN and PXN.
+    let shifted = mut fx.b.ushr_imm_s(table, y: 61)
+    let bit = mut fx.b.band_imm_s(shifted, y: 1)
+    let denied = mut fx.b.ishl_imm_s(bit, y: 6)
+    let kept = mut fx.b.bnot(denied)
+    var limited = mut fx.b.band(page, y: kept)
+    var moves = Array[i64, 6].filled(62)
+    moves[1] = 7
+    moves[2] = 60
+    moves[3] = 54
+    moves[4] = 59
+    moves[5] = 53
+    for index in 0usize..<3 {
+        let from = mut fx.b.ushr_imm_s(table, y: moves[index * 2])
+        let set = mut fx.b.band_imm_s(from, y: 1)
+        let moved = mut fx.b.ishl_imm_s(set, y: moves[index * 2 + 1])
+        limited = mut fx.b.bor(limited, y: moved)
+    }
+    return limited
+} Lowering.restricted_page
+
 /// The physical address of the running root's top-level table.
 fn Lowering.running_root(mut self, mut fx: Fx) -> clif::Value {
     let none = mem::List[clif::Value].empty(fx.alloc)

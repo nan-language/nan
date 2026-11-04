@@ -3,7 +3,9 @@
 //! record is a block of a power-of-two size class behind a 16-byte header naming the class,
 //! carved from chunks the map hands out. A freed block smaller than a chunk joins its class's
 //! free list, from which a later record of the class takes it, and a freed run of chunks returns
-//! to the map. Every record and chunk is cleared once its lock is released.
+//! to the map. Every record and chunk is cleared once its lock is released. An isolated space's
+//! runtime draws each run of chunks the map hands out from its kernel and releases each run
+//! returning to the map.
 
 use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
@@ -11,7 +13,7 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::memory::CHUNK;
-use super::super::runtime::{Routine, state};
+use super::super::runtime::{Routine, space, state};
 use super::stubs::Stub;
 
 /// The bytes of the boot heap.
@@ -84,8 +86,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
-    let supply = boot_supply(lo, fx, state);
-    let base = take_chunks(fx, supply, count);
+    let base = take_boot_chunks(lo, fx, state, count);
     unlock(lo, fx, state, flags);
     let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
     fx.when(taken, |fx| {
@@ -99,9 +100,45 @@ pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
 pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
-    let supply = boot_supply(lo, fx, state);
-    give_chunks(fx, supply, base, count);
+    give_boot_chunks(lo, fx, state, base, count);
     unlock(lo, fx, state, flags);
+}
+
+/// Takes the first run of `count` chunks the boot heap has free, or gives zero when none is
+/// free; an isolated space's runtime draws the run from its kernel, returning it to the map when
+/// the kernel refuses. The caller holds the lock and clears the chunks.
+fn take_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, count: Value) -> Value {
+    let supply = boot_supply(lo, fx, state);
+    let base = take_chunks(fx, supply, count);
+    if !lo.user() {
+        return base;
+    }
+    let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
+    let refused = fx.choose_in(
+        lo,
+        taken,
+        &[PTR],
+        |lo, fx| {
+            let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
+            vec![space::call(lo, fx, space::DRAW, &[base, len])]
+        },
+        |_, fx| vec![fx.ptr(0)],
+    )[0];
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, refused, 0);
+    fx.when(failed, |fx| give_chunks(fx, supply, base, count));
+    let zero = fx.ptr(0);
+    fx.b.ins().select(failed, zero, base)
+}
+
+/// Returns `count` chunks from `base` to the boot heap's map; an isolated space's runtime
+/// releases them to its kernel first. The caller holds the lock.
+fn give_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, base: Value, count: Value) {
+    let supply = boot_supply(lo, fx, state);
+    if lo.user() {
+        let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
+        space::call(lo, fx, space::RELEASE, &[base, len]);
+    }
+    give_chunks(fx, supply, base, count);
 }
 
 /// Gives `count` chunks from `base` back to a supply.
@@ -287,8 +324,7 @@ fn record_alloc(lo: &mut Lowering, fx: &mut Fx, size: Value) -> Value {
                 &[PTR],
                 |lo, fx| {
                     let count = fx.b.ins().ushr_imm_s(bytes, CHUNK_CLASS);
-                    let supply = boot_supply(lo, fx, state);
-                    vec![take_chunks(fx, supply, count)]
+                    vec![take_boot_chunks(lo, fx, state, count)]
                 },
                 |lo, fx| vec![carve(lo, fx, state, bytes)],
             )
@@ -328,8 +364,7 @@ fn carve(lo: &mut Lowering, fx: &mut Fx, state: Value, bytes: Value) -> Value {
         |_, _| vec![at],
         |lo, fx| {
             let one = fx.ptr(1);
-            let supply = boot_supply(lo, fx, state);
-            let chunk = take_chunks(fx, supply, one);
+            let chunk = take_boot_chunks(lo, fx, state, one);
             let end = fx.b.ins().iadd_imm_s(chunk, CHUNK as i64);
             let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, chunk, 0);
             fx.when(taken, |fx| fx.store(end, state, allocators::CARVE_END));
@@ -362,8 +397,7 @@ fn record_free(lo: &mut Lowering, fx: &mut Fx, address: Value) {
             |lo, fx| {
                 let bytes = block_bytes(fx, class);
                 let count = fx.b.ins().ushr_imm_s(bytes, CHUNK_CLASS);
-                let supply = boot_supply(lo, fx, state);
-                give_chunks(fx, supply, block, count);
+                give_boot_chunks(lo, fx, state, block, count);
                 Vec::new()
             },
             |_, fx| {

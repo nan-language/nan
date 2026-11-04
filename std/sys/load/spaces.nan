@@ -29,15 +29,34 @@ pub open struct Isolated {
     runtime: Parts
 } Isolated
 
-/// An isolated space: its root, its other tables, and the pages it maps from the start of the
-/// user window, laid out as `plan` gives; the tables mapping the entry area follow those of the
-/// window.
+/// An isolated space: its root, its other tables, the pages it maps from the start of the user
+/// window up to its boot area, laid out as `plan` gives, and the pages of its boot area it has
+/// drawn, in order of their index from the window's start; the tables mapping the entry area
+/// follow those of the window.
 pub open linear struct Space {
     root: hw::PageTableRoot
     tables: mem::List[hw::PhysFrame[4_096]]
     pages: mem::List[hw::PhysFrame[4_096]]
+    drawn: mem::List[Drawn]
     plan: Plan
 } Space
+
+/// A page of a space's boot area it has drawn: its index from the window's start, and its frame.
+linear struct Drawn {
+    index: u64
+    frame: hw::PhysFrame[4_096]
+} Drawn
+
+pub closed enum DrawError derives Copy, Eq, Render {
+    Outside
+    Exhausted
+} DrawError
+
+/// The pages of a range, by index from the window's start: the lowest, and the highest plus one.
+struct Pages derives Copy {
+    low: u64
+    end: u64
+} Pages
 
 /// The pages of the entry area, from `low` to `high`.
 struct Reach derives Copy {
@@ -104,7 +123,7 @@ pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw:
     let plan = plan_of(self.runtime, image: self.parts, data)
     let area = cpu.entry_area()
     let reach = Reach(low: area.base / PAGE, high: (area.base + area.len - 1) / PAGE)
-    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.end + reach.tables() {
+    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.boot + reach.tables() {
         fail LoadError.Unplaceable
     }
     if reach.low / level_pages(0) <= USER_SLOT and reach.high / level_pages(0) >= USER_SLOT {
@@ -188,13 +207,99 @@ pub fn Space.write(mut self, address: u64, bytes: Slice[u8]) fails hw::UserAddrE
     })
 } Space.write
 
+pub fn Space.draw(mut self, address: u64, len: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) -> u64 fails DrawError {
+    let range = try self.boot_pages(address, len)
+    var missing: u64 = 0
+    for index in range.low..<range.end {
+        if self.frame_of(index).is_none() {
+            missing += 1
+        }
+    }
+    if u64.widen(frames.len()) < missing {
+        fail DrawError.Exhausted
+    }
+    for index in range.low..<range.end {
+        let at = self.drawn_from(index)
+        if at == self.drawn.len() or self.drawn[at].index != index {
+            let Some(frame) = mut frames.pop() else {
+                fail DrawError.Exhausted
+            }
+            clear(frame.base())
+            write_entry(self.entry_of(index), value: user_entry(frame.base(), kind: USER_WRITABLE))
+            mut self.drawn.insert(at, value: Drawn(index: index, frame: take frame))
+        }
+    }
+    return missing
+} Space.draw
+
+pub fn Space.give_back(mut self, address: u64, len: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) fails DrawError {
+    let range = try self.boot_pages(address, len)
+    for index in range.low..<range.end {
+        let at = self.drawn_from(index)
+        if at < self.drawn.len() and self.drawn[at].index == index {
+            write_entry(self.entry_of(index), value: 0)
+            let Drawn(index: _, frame: frame) = mut self.drawn.remove(at)
+            mut frames.push(take frame)
+        }
+    }
+} Space.give_back
+
 /// Gives back every frame the space took.
 pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    let Space(root: root, tables: tables, pages: pages, plan: _) = self
+    let Space(root: root, tables: tables, pages: pages, drawn: drawn, plan: _) = self
     mut frames.push(take root.into_frame())
     given_back(take tables, mut frames)
     given_back(take pages, mut frames)
+    for held in take drawn {
+        let Drawn(index: _, frame: frame) = held
+        mut frames.push(take frame)
+    }
 } Space.release
+
+/// The pages of the boot area a range of `len` bytes from `address` touches, failing for a range
+/// reaching outside the boot area.
+fn Space.boot_pages(self, address: u64, len: u64) -> Pages fails DrawError {
+    let start = USER_WINDOW + self.plan.boot * PAGE
+    let end = USER_WINDOW + self.plan.end * PAGE
+    if address < start or address > end or end - address < len {
+        fail DrawError.Outside
+    }
+    let offset = address - USER_WINDOW
+    return Pages(low: offset / PAGE, end: pages_of(offset + len))
+} Space.boot_pages
+
+/// The address of the entry of the table of pages mapping the page of an index.
+fn Space.entry_of(self, index: u64) -> u64 {
+    return self.tables[usize.widen(index / TABLE_ENTRIES) + 2].base() + index % TABLE_ENTRIES * 8
+} Space.entry_of
+
+/// The physical address of the frame the space maps at the page of an index, none for a page
+/// it does not map.
+fn Space.frame_of(self, index: u64) -> Option[u64] {
+    if index < self.plan.boot {
+        return Some(self.pages[usize.widen(index)].base())
+    }
+    let at = self.drawn_from(index)
+    if at < self.drawn.len() and self.drawn[at].index == index {
+        return Some(self.drawn[at].frame.base())
+    }
+    return None
+} Space.frame_of
+
+/// The position in `drawn` of the first page drawn whose index is not below `index`.
+fn Space.drawn_from(self, index: u64) -> usize {
+    var low: usize = 0
+    var high = self.drawn.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if self.drawn[middle].index < index {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+} Space.drawn_from
 
 /// The address of the runtime's export of an index, failing for one it does not define.
 fn runtime_export(image: Slice[u8], runtime: Parts, index: u64) -> u64 fails LoadError {
@@ -269,11 +374,12 @@ fn Isolated.bound_copy(self, window: u64) -> u64 fails LoadError {
 
 /// The space of a plan, its frames taken from `frames` and cleared: a root mapping the window and
 /// the pages of the entry area `reach` holds, a table of 1 GiB entries and one of 2 MiB entries
-/// mapping the window, the tables of its pages, its pages, and the tables mapping the entry area.
+/// mapping the window, the tables of its pages, its pages up to the boot area, and the tables
+/// mapping the entry area.
 fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError {
     let count = tables_of(plan)
     var tables = cleared_frames(mut frames, count: count + 2 + reach.tables(), alloc)
-    var pages = cleared_frames(mut frames, count: plan.end, alloc)
+    var pages = cleared_frames(mut frames, count: plan.boot, alloc)
     let Some(root) = mut frames.pop() else {
         given_back(take tables, mut frames)
         given_back(take pages, mut frames)
@@ -286,10 +392,9 @@ fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]],
     for index in 0u64..<count {
         write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
     }
-    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, plan: plan)
-    for index in 0u64..<plan.end {
-        let table = space.tables[usize.widen(index / TABLE_ENTRIES) + 2].base()
-        write_entry(table + index % TABLE_ENTRIES * 8, value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
+    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), plan: plan)
+    for index in 0u64..<plan.boot {
+        write_entry(space.entry_of(index), value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     }
     space.map_entry_area(root: top, reach, first_table: count + 2)
     return space
@@ -428,19 +533,16 @@ fn image_kind(index: u64, sections: Sections) -> u64 {
     return USER_WRITABLE
 } image_kind
 
-/// Whether `len` bytes from `address` lie in the space's pages, each writable for `writing`.
+/// Whether `len` bytes from `address` lie in pages the space maps, each writable for `writing`.
 fn Space.covers(self, address: u64, len: u64, writing: bool) -> bool {
     let end = USER_WINDOW + self.plan.end * PAGE
     if address < USER_WINDOW or address > end or end - address < len {
         return false
     }
-    if writing {
-        let offset = address - USER_WINDOW
-        let lowest = offset / PAGE
-        for index in lowest..<pages_of(offset + len) {
-            if self.kind_of(index) != USER_WRITABLE {
-                return false
-            }
+    let offset = address - USER_WINDOW
+    for index in (offset / PAGE)..<pages_of(offset + len) {
+        if self.frame_of(index).is_none() or (writing and self.kind_of(index) != USER_WRITABLE) {
+            return false
         }
     }
     return true
@@ -457,7 +559,7 @@ fn Space.each_part(self, address: u64, len: u64, body: fn(physical: u64, at: u64
         if len - at < count {
             count = len - at
         }
-        body(self.pages[usize.widen(offset / PAGE)].base() + within, at: at, count: count)
+        body(self.frame_of(offset / PAGE).value_or(0) + within, at: at, count: count)
         at += count
     }
 } Space.each_part

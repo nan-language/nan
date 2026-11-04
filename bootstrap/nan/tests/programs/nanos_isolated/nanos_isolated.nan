@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -36,6 +36,7 @@ pub closed enum Ask derives Encode {
     Divide(u32)
     Sum(u64)
     Spin(u32)
+    Hold(u32)
 } Ask
 
 pub closed enum Answer derives Encode {
@@ -224,8 +225,8 @@ fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw
     return hw::Idle.Halt
 } OneCpu.idle
 
-/// The frames each space takes, which hold its runtime's boot area.
-const SPACE_FRAMES: usize = 7_000
+/// The frames each space takes and draws from: 16 MiB, less than its runtime's boot area.
+const SPACE_FRAMES: usize = 4_096
 
 /// Kernel memory outside the entry area, which a space's root does not map.
 const KERNEL_PROBE: u64 = 0x1000_0000
@@ -266,6 +267,58 @@ fn unmapped_fault(exit: hw::UserExit) -> bool {
     // A user-mode write to a page the root does not map: present clear, write and user set.
     return fault.vector == 14 and fault.code == 6 and fault.address >= KERNEL_PROBE and fault.address < KERNEL_PROBE + 4_096
 } unmapped_fault
+
+/// Makes a space of a job, draws the first chunk of its boot area, writes there and gives the
+/// chunk back, then draws past the frames left and outside the boot area, writing how many
+/// frames each step takes or gives back.
+fn drew(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    var held = frames_for_space(mut frames, alloc: grants.alloc)
+    match attempt job.space(cpu, data: 64, frames: mut held, alloc: grants.alloc) {
+        Ok(made) => {
+            var space = made
+            let area = space.boot_area()
+            let left = held.len()
+            let Ok(pages) = attempt mut space.draw(area, len: 65_536, frames: mut held) else {
+                stop(text: "chunk undrawn\n")
+            }
+            say(text: "drew ")
+            say_number(pages)
+            say(text: " pages from ")
+            say_number(u64.widen(left - held.len()))
+            say(text: " frames\n")
+            let wrote = attempt mut space.write(area + 4_096, bytes: b"drawn")
+            discard attempt mut space.give_back(area, len: 65_536, frames: mut held)
+            say(text: "gave back ")
+            say_number(u64.widen(held.len() + 16 - left))
+            say(text: " frames, ")
+            let unmapped = match attempt mut space.write(area + 4_096, bytes: b"drawn") {
+                Err(hw::UserAddrError.Unmapped) => true
+                else => false
+            }
+            match wrote.is_ok() and unmapped {
+                true => say(text: "wrote while drawn only\n")
+                false => say(text: "wrote otherwise\n")
+            }
+            let past = match attempt mut space.draw(area, len: u64.widen(held.len() + 1) * 4_096, frames: mut held) {
+                Err(sys::load::DrawError.Exhausted) => true
+                else => false
+            }
+            let outside = match attempt mut space.draw(space.data(), len: 1, frames: mut held) {
+                Err(sys::load::DrawError.Outside) => true
+                else => false
+            }
+            match past and outside {
+                true => say(text: "refused past the frames and outside the boot area\n")
+                false => say(text: "refused otherwise\n")
+            }
+            take space.release(frames: mut held)
+        }
+        Err(_) => say(text: "space unplaced\n")
+    }
+    for frame in take held {
+        mut frames.push(take frame)
+    }
+} drew
 
 /// A bundle verified for isolated spaces.
 fn isolated(loader: sys::load::Loader, bytes: Slice[u8], alloc: mem::Alloc) -> sys::load::Isolated {
@@ -329,6 +382,7 @@ fn report(name: Str, take outcome: Result[nanos::Ended, nanos::IsolatedError], a
             match trap.kind() {
                 sys::TrapKind.DivisionByZero => say(text: " trapped trap.division-by-zero\n")
                 sys::TrapKind.Exception => say(text: " trapped trap.exception\n")
+                sys::TrapKind.Exhausted => say(text: " trapped trap.exhausted\n")
                 else => say(text: " trapped otherwise\n")
             }
         }
@@ -424,9 +478,10 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 
 /// Runs the jobs: a typed job using floats, lanes and the served capabilities and an input it
 /// does not decode, a host program, a job trapping, failing, returning and reading kernel
-/// memory, a job without a stack bound recursing past the stack it starts with, a space's
-/// runtime probing kernel memory, then a job spinning on floats in a space while the same job,
-/// verified once, spins in the shared space.
+/// memory, a job without a stack bound recursing past the stack it starts with, a job holding
+/// memory within the frames its space draws from and past them, a space drawing and giving back
+/// pages, a space's runtime probing kernel memory, then a job spinning on floats in a space
+/// while the same job, verified once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     var values = mem::List[u32].empty(grants.alloc)
     mut values.push(2)
@@ -470,6 +525,12 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     mut depths.push(encoded(Ask.Sum(20_000), alloc: grants.alloc))
     var sums = try await ran(cpu, job: typed, name: "deep", grants, inputs: take depths, mut frames)
     say_answer(text: "sum ", bytes: mut sums.remove(0), alloc: grants.alloc)
+    var holdings = mem::List[mem::Bytes].empty(grants.alloc)
+    mut holdings.push(encoded(Ask.Hold(4), alloc: grants.alloc))
+    mut holdings.push(encoded(Ask.Hold(64), alloc: grants.alloc))
+    var holds = try await ran(cpu, job: typed, name: "hold", grants, inputs: take holdings, mut frames)
+    say_answer(text: "held pages ", bytes: mut holds.remove(0), alloc: grants.alloc)
+    drew(cpu, job: typed, grants, mut frames)
     probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve

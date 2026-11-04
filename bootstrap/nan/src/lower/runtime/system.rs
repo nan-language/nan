@@ -2,7 +2,7 @@
 //! stacks, idling, its standard streams, its start and its exit. On a host target the host module
 //! provides them over the C library and Linux; on a machine target the machine module does, over
 //! the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space
-//! module does, over the boot heap its kernel maps and the system calls its kernel serves.
+//! module does, over the boot heap whose chunks it draws and the system calls its kernel serves.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC};
 
@@ -60,18 +60,12 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 /// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
 /// which a machine image's boot area holds after its boot heap, then the executors of the
 /// platform; nonzero when the runtime cannot start. An isolated space's runtime starts with the
-/// boot area its kernel mapped, whose tables it clears.
+/// boot area its kernel gives, whose pages its kernel maps cleared.
 fn init(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let state_address = lo.state(fx);
     let area = lo.machine().then(|| match lo.user() {
-        true => {
-            let area = fx.load(PTR, state_address, state::BOOT_AREA);
-            let tables = fx.offset(area, heap::BOOT_HEAP);
-            let len = fx.ptr(TABLE_BYTES);
-            heap::clear(lo, fx, tables, len);
-            area
-        }
+        true => fx.load(PTR, state_address, state::BOOT_AREA),
         false => lo.boot_area(fx),
     });
     let mut offset = heap::BOOT_HEAP;

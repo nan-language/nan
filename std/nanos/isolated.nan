@@ -1,8 +1,13 @@
 //! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls, and the first task of the space's runtime, which runs the job on a world whose log, standard streams and random source reach the kernel through those calls.
 
-/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, reading
-/// that clock, invoking an operation of a capability the kernel serves, and ending the space.
+/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
+/// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
+/// the kernel serves, and ending the space.
 const CALL_WAIT: u64 = 1
+
+const CALL_DRAW: u64 = 2
+
+const CALL_RELEASE: u64 = 3
 
 const CALL_NOW: u64 = 5
 
@@ -52,7 +57,9 @@ const ENDS_UNDECODABLE: u64 = 3
 
 const ENDS_CANCELLED: u64 = 4
 
-/// The numbers of the trap kinds of an exception and of an abandoned domain.
+/// The numbers of the trap kinds of exhausted memory, of an exception and of an abandoned domain.
+const EXHAUSTED: u64 = 6
+
 const EXCEPTION: u64 = 15
 
 const ABANDONED: u64 = 16
@@ -124,7 +131,7 @@ pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services
     var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
     state.regs[register(0)] = Untrusted.of(start)
     state.regs[register(1)] = Untrusted.of(space.boot_area())
-    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, alloc)
+    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, services, mut frames, alloc)
     take space.release(mut frames)
     match outcome {
         Ok(how) => return how
@@ -141,13 +148,20 @@ fn start_record(record: Start, alloc: mem::Alloc) -> mem::Bytes {
     return bytes
 } start_record
 
-/// Runs a space's thread until its job ends, serving its system calls; an exception ends the
-/// job as a trap of `trap.exception`.
-fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+/// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
+/// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
+/// another exception ends the job as a trap of `trap.exception`.
+fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     loop {
         match space.run(cpu, mut state, mut extended) {
             hw::UserExit.Interrupted => {}
-            hw::UserExit.Fault(_) => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+            hw::UserExit.Fault(fault) => {
+                match attempt mut space.draw(fault.address, len: 1, mut frames) {
+                    Ok(1) => {}
+                    Err(sys::load::DrawError.Exhausted) => return Ended.Trapped(trap_of(EXHAUSTED, alloc))
+                    else => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+                }
+            }
             hw::UserExit.Syscall => {
                 let number = user_word(state.regs[register(ROLE_NUMBER)])
                 if number == CALL_END {
@@ -160,6 +174,16 @@ fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserSta
                         return Ended.Trapped(trap_of(ABANDONED, alloc))
                     }
                     answer = try await slept_until(services.clock, deadline)
+                } else if number == CALL_DRAW {
+                    answer = match attempt mut space.draw(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+                        Ok(_) => 0
+                        Err(_) => INVALID
+                    }
+                } else if number == CALL_RELEASE {
+                    answer = match attempt mut space.give_back(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+                        Ok(_) => 0
+                        Err(_) => INVALID
+                    }
                 } else if number == CALL_NOW {
                     answer = match attempt services.clock.elapsed_ns() {
                         Ok(ns) => ns

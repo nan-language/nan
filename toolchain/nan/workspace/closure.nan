@@ -1,4 +1,4 @@
-//! Dependency closures: the release through which a workspace package's lock reaches each package of its dependency closure, std aside — a workspace package checked from source while its locked release holds its current source files, else the release the local store holds — and the closures that workspace packages share.
+//! Dependency closures: the release through which a workspace package's lock reaches each package of its dependency closure, std aside — a workspace package checked from source while its locked release holds its current source files or, when the local store lacks that release, while it is the package's current state, else the release the local store holds — and the closures that workspace packages share.
 
 /// Where a package of a closure comes from: a workspace package checked from source, or a
 /// release of the local store, by its index among the workspace's releases.
@@ -123,14 +123,27 @@ pkg struct Release {
 } Release
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
-/// read from the store, the store entries confirming the current states of path sources, and
-/// the diagnostics of their locks.
+/// read from the store, the store entries confirming the current states of path sources, the
+/// path sources read without one, and the diagnostics of their locks.
 struct Read {
     pkg closures: mem::List[Closure]
     pkg releases: mem::List[Release]
     pkg confirmed: mem::List[mem::Shared[store::Entry]]
+    pkg unconfirmed: mem::List[Unconfirmed]
     pkg found: mem::List[diagnostic::Diagnostic]
 } Read
+
+/// A path source read from source for a locked release the local store lacks, which it is only
+/// when its current state's code root is the release's.
+pkg struct Unconfirmed derives Copy {
+    /// The workspace package whose lock names the release, by index.
+    pkg package_index: usize
+    /// The line of the `dep` directive reaching the release.
+    pkg line: u32
+    /// The workspace package at the path source, by index.
+    pkg source: usize
+    pkg root: hashing::HashValue
+} Unconfirmed
 
 /// The closures of the workspace packages, reading releases through `store_entry`: the store
 /// entry holding a release, by its code root, unless `loaded_release` holds it loaded into its
@@ -142,7 +155,7 @@ fn read_closures(
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Read fails platform::IoError {
-    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
+    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), unconfirmed: mem::List[Unconfirmed].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
     var closures = mem::List[Closure].empty(alloc)
     var index: usize = 0
     for held in packages {
@@ -174,8 +187,8 @@ fn read_closures(
         }
         mut closure.checked.push(at)
     }
-    let ClosureReader(releases: releases, confirmed: confirmed, found: found, alloc: _) = reader
-    return Read(closures: take closures, releases: take releases, confirmed: take confirmed, found: take found)
+    let ClosureReader(releases: releases, confirmed: confirmed, unconfirmed: unconfirmed, found: found, alloc: _) = reader
+    return Read(closures: take closures, releases: take releases, confirmed: take confirmed, unconfirmed: take unconfirmed, found: take found)
 } read_closures
 
 /// Whether a package's own closure agrees with a closure: on the members of their package names,
@@ -228,6 +241,7 @@ struct Own {
 struct ClosureReader {
     releases: mem::List[Release]
     confirmed: mem::List[mem::Shared[store::Entry]]
+    unconfirmed: mem::List[Unconfirmed]
     found: mem::List[diagnostic::Diagnostic]
     alloc: mem::Alloc
 } ClosureReader
@@ -341,7 +355,7 @@ fn ClosureReader.own(
     }
     var lines = mem::Map[text::String, Member].empty(alloc)
     for line in lock.deps {
-        let member = try mut self.locked_member(packages, pack, line, store_entry, loaded_release, grammar)
+        let member = try mut self.locked_member(packages, pack, index, line, store_entry, loaded_release, grammar)
         let Some(found) = member else {
             continue
         }
@@ -384,6 +398,7 @@ fn ClosureReader.locked_member(
     mut self,
     packages: Slice[mem::Shared[Package]],
     pack: Package,
+    index: usize,
     line: machine::Locked,
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
     loaded_release: fn(root: hashing::HashValue, dir: Str) -> Option[mem::Shared[Package]],
@@ -421,12 +436,16 @@ fn ClosureReader.locked_member(
         return Some(Member.Release(try mut self.release(take stored, dir: line.package_name.as_str(), loaded_release, grammar)))
     }
     let dir = resolve_source(pack.dir.as_str(), source: line.source.as_str(), alloc)
+    var named: Option[usize] = None
     var source: Option[usize] = None
     match package_at_dir(packages, dir: dir.as_str()) {
         Some(at) => {
             let located = packages[at].contents()
-            if located.name() == Some(line.package_name.as_str()) and entry_holds(entry, pack: located, alloc) {
-                source = Some(at)
+            if located.name() == Some(line.package_name.as_str()) {
+                named = Some(at)
+                if entry_holds(entry, pack: located, alloc) {
+                    source = Some(at)
+                }
             }
         }
         None => {}
@@ -443,7 +462,10 @@ fn ClosureReader.locked_member(
     }
     let Some(stored) = entry else {
         if not refused {
-            mut self.report(diagnostic::Code.DepReleaseMissing, pack, line: reaching)
+            match named {
+                Some(at) => mut self.unconfirmed.push(Unconfirmed(package_index: index, line: reaching, source: at, root: line.root))
+                None => mut self.report(diagnostic::Code.DepReleaseMissing, pack, line: reaching)
+            }
         }
         let Some(at) = package_at_dir(packages, dir: dir.as_str()) else {
             return None

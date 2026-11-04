@@ -1,7 +1,8 @@
 //! Dependency closures: the release through which a workspace package's lock reaches each package
 //! of its dependency closure, std aside — a workspace package checked from source while its
-//! locked release holds its current source files, else the release the local store holds — and
-//! the closures that workspace packages share.
+//! locked release holds its current source files or, when the local store lacks that release,
+//! while it is the package's current state, else the release the local store holds — and the
+//! closures that workspace packages share.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -95,13 +96,27 @@ pub trait Store {
 }
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
-/// read from the store, the store entries confirming the current states of path sources, and
-/// the diagnostics of their locks.
+/// read from the store, the store entries confirming the current states of path sources, the
+/// path sources read without one, and the diagnostics of their locks.
 pub struct Read {
     pub closures: Vec<Closure>,
     pub releases: Vec<Release>,
     pub confirmed: Vec<Entry>,
+    pub unconfirmed: Vec<Unconfirmed>,
     pub found: Vec<Diagnostic>,
+}
+
+/// A path source read from source for a locked release the local store lacks, which it is only
+/// when its current state's code root is the release's.
+#[derive(Clone)]
+pub struct Unconfirmed {
+    /// The workspace package whose lock names the release, by index.
+    pub package: usize,
+    /// The line of the `dep` directive reaching the release.
+    pub line: u32,
+    /// The workspace package at the path source, by index.
+    pub source: usize,
+    pub root: Hash,
 }
 
 pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<Read> {
@@ -110,6 +125,7 @@ pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<
         store,
         releases: Vec::new(),
         confirmed: Vec::new(),
+        unconfirmed: Vec::new(),
         found: Vec::new(),
     };
     let owns: Vec<Option<Own>> = (0..packages.len())
@@ -153,6 +169,7 @@ pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<
         closures,
         releases: reader.releases,
         confirmed: reader.confirmed,
+        unconfirmed: reader.unconfirmed,
         found: reader.found,
     })
 }
@@ -168,6 +185,7 @@ struct Reader<'a> {
     store: &'a mut dyn Store,
     releases: Vec<Release>,
     confirmed: Vec<Entry>,
+    unconfirmed: Vec<Unconfirmed>,
     found: Vec<Diagnostic>,
 }
 
@@ -272,11 +290,13 @@ impl Reader<'_> {
             let entry = held.filter(|_| !refused);
             let member = if line.source.starts_with('.') {
                 let dir = resolve(&package.dir, &line.source);
-                let source = self.at(&dir).filter(|at| {
-                    self.packages[*at].name() == Some(line.package.as_str())
-                        && entry
-                            .as_ref()
-                            .is_some_and(|entry| holds_sources(entry, &self.packages[*at]))
+                let named = self
+                    .at(&dir)
+                    .filter(|at| self.packages[*at].name() == Some(line.package.as_str()));
+                let source = named.filter(|at| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|entry| holds_sources(entry, &self.packages[*at]))
                 });
                 match (source, entry) {
                     (Some(at), entry) => {
@@ -285,7 +305,15 @@ impl Reader<'_> {
                     }
                     (None, Some(entry)) => Some(Member::Release(self.release(entry, &dir)?)),
                     (None, None) => {
-                        missing(self);
+                        match named.filter(|_| !refused) {
+                            Some(at) => self.unconfirmed.push(Unconfirmed {
+                                package: index,
+                                line: reaching,
+                                source: at,
+                                root: line.root,
+                            }),
+                            None => missing(self),
+                        }
                         self.at(&dir).map(Member::Source)
                     }
                 }

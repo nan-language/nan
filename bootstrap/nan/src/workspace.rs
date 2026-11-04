@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 pub use closure::{
-    Closure, Member, Release, Store as ReleaseStore, holds_sources, reaching_directive,
+    Closure, Member, Release, Store as ReleaseStore, Unconfirmed, holds_sources, reaching_directive,
 };
 pub use machine::Machine;
 pub use manifest::{
@@ -37,6 +37,8 @@ pub struct Workspace {
     /// The store entries confirming that path sources' current states are the releases their
     /// locks name.
     confirmed: Vec<crate::store::Entry>,
+    /// The path sources read for locked releases the local store lacks.
+    pub unconfirmed: Vec<Unconfirmed>,
     /// The dependency closures the packages share, each checking some of them.
     pub closures: Vec<Closure>,
     /// The diagnostics of reading the locks.
@@ -335,6 +337,7 @@ impl Workspace {
             packages,
             releases: read.releases,
             confirmed: read.confirmed,
+            unconfirmed: read.unconfirmed,
             closures: read.closures,
             locked: read.found,
             stray,

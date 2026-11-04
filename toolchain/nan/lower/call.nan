@@ -7,8 +7,9 @@ enum CallTarget {
     /// bounded, and the `stack N` its type demands.
     Indirect(code: clif::Value, env: clif::Value, abi: Abi, kind: StackKind, stack: Option[u64])
     /// Through the method table of a `Dyn` value: the method's code address, which takes the
-    /// address of the value as its receiver, and the `stack N` the method's head demands.
-    Dyn(code: clif::Value, data: clif::Value, abi: Abi, stack: Option[u64])
+    /// address of the value as its receiver, how its stack use is bounded, and the `stack N`
+    /// the method's head demands.
+    Dyn(code: clif::Value, data: clif::Value, abi: Abi, kind: StackKind, stack: Option[u64])
     /// An external symbol under the C convention of the host, with the `stack N` its head
     /// demands.
     Foreign(id: object::FuncId, params: mem::List[Repr], returned: Returned, stack: Option[u64])
@@ -142,7 +143,17 @@ fn Body.dyn_target(
     }
     let abi = mut lo.dyn_abi(interface_item, args, method)
     let head = mut lo.method_head(ty::Ty.unit(), interface_item, args, method)
-    return CallTarget.Dyn(code: code, data: data, abi: take abi, stack: head.fn_ty.limit_set.stack)
+    let stack = head.fn_ty.limit_set.stack
+    var kind = StackKind.Bounded(stack)
+    if stack == None and place.steps.len() == 0 {
+        match self.own_param(lo, value: place.root) {
+            Some(position) => {
+                kind = StackKind.Param(position)
+            }
+            None => {}
+        }
+    }
+    return CallTarget.Dyn(code: code, data: data, abi: take abi, kind: take kind, stack: stack)
 } Body.dyn_target
 
 /// Checks the index of an `at` or `at_mut` call of an array, slice, list, bytes or bounded
@@ -326,7 +337,7 @@ fn call_abi(target: CallTarget, alloc: mem::Alloc) -> Abi {
     match target {
         CallTarget.Direct(id: _, abi: abi) => return abi.copy(alloc)
         CallTarget.Indirect(code: _, env: _, abi: abi, kind: _, stack: _) => return abi.copy(alloc)
-        CallTarget.Dyn(code: _, data: _, abi: abi, stack: _) => return abi.copy(alloc)
+        CallTarget.Dyn(code: _, data: _, abi: abi, kind: _, stack: _) => return abi.copy(alloc)
         CallTarget.Foreign(id: _, params: params, returned: returned, stack: _) => {
             var abi_params = mem::List[ParamRepr].empty(alloc)
             for repr in params {
@@ -348,7 +359,7 @@ fn Body.call_passed(
     abi: Abi,
     foreign_call: bool,
     ) -> mem::List[clif::Value] {
-    let CallTarget.Dyn(code: _, data: data, abi: _, stack: _) = target else {
+    let CallTarget.Dyn(code: _, data: data, abi: _, kind: _, stack: _) = target else {
         return mut self.passed(mut lo, mut fx, operands, params: abi.params.view(), foreign_call)
     }
     var passed = mem::List[clif::Value].empty(lo.alloc)
@@ -379,7 +390,7 @@ fn call_inst(mut lo: Lowering, mut fx: Fx, target: CallTarget, args: Slice[clif:
             let reference = mut lo.func_ref(mut fx, id)
             return mut fx.b.call(reference, args)
         }
-        CallTarget.Indirect(code: code, env: _, abi: abi, kind: _, stack: stack) or CallTarget.Dyn(code: code, data: _, abi: abi, stack: stack) => {
+        CallTarget.Indirect(code: code, env: _, abi: abi, kind: _, stack: stack) or CallTarget.Dyn(code: code, data: _, abi: abi, kind: _, stack: stack) => {
             return mut lo.call_code(mut fx, signature: abi.signature(lo.alloc), code, args, stack)
         }
     }
@@ -401,22 +412,24 @@ fn Body.call_kind(
                 if position >= abi.params.len() {
                     break
                 }
-                let ty::TyKind.Fn(param_fn) = lo.ck.types().kind(abi.params[position].nty.ty()) else {
-                    continue
-                }
                 var binding = Binding.Bounded(None)
-                if lo.ck.types().fn_of(param_fn).kind == ast::FnKind.Task {
-                    binding = mut self.walk_binding(mut lo, mut fx, operand: operands[position])
-                } else {
-                    binding = mut self.binding(mut lo, mut fx, operand: operands[position])
+                match lo.ck.types().kind(abi.params[position].nty.ty()) {
+                    ty::TyKind.Fn(param_fn) => if lo.ck.types().fn_of(param_fn).kind == ast::FnKind.Task {
+                        binding = mut self.walk_binding(mut lo, mut fx, operand: operands[position])
+                    } else {
+                        binding = mut self.binding(mut lo, mut fx, operand: operands[position])
+                    }
+                    ty::TyKind.Dyn(_) => {
+                        binding = self.dyn_binding(lo, operand: operands[position])
+                    }
+                    else => continue
                 }
-                mut bindings.push(ParamBinding(position: position, binding: binding))
+                mut bindings.push(ParamBinding(position: position, binding: take binding))
             }
             return StackKind.Direct(callee: callee, bindings: take bindings)
         }
         CallTarget.Foreign(id: _, params: _, returned: _, stack: stack) => return StackKind.Bounded(stack)
-        CallTarget.Indirect(code: _, env: _, abi: _, kind: kind, stack: _) => return kind
-        CallTarget.Dyn(code: _, data: _, abi: _, stack: stack) => return StackKind.Bounded(stack)
+        CallTarget.Indirect(code: _, env: _, abi: _, kind: kind, stack: _) or CallTarget.Dyn(code: _, data: _, abi: _, kind: kind, stack: _) => return kind
     }
 } Body.call_kind
 
@@ -540,7 +553,7 @@ fn Body.record_site(mut self, mut fx: Fx, inst: clif::Inst, take kind: StackKind
 } Body.record_site
 
 /// The position among the function's parameters of a value that is one of its own
-/// function-typed parameters, a closure's captures excluded.
+/// function-typed or `Dyn` parameters, a closure's captures excluded.
 fn Body.own_param(self, lo: Lowering, value: nir::Value) -> Option[usize] {
     let function = self.function()
     var found: Option[usize] = None
@@ -560,10 +573,10 @@ fn Body.own_param(self, lo: Lowering, value: nir::Value) -> Option[usize] {
     let Some(own) = position.checked_sub(captures) else {
         return None
     }
-    let ty::TyKind.Fn(_) = lo.ck.types().kind(self.nty(value).ty()) else {
-        return None
+    return match lo.ck.types().kind(self.nty(value).ty()) {
+        ty::TyKind.Fn(_) or ty::TyKind.Dyn(_) => Some(own)
+        else => None
     }
-    return Some(own)
 } Body.own_param
 
 /// Where the function value an operand passes comes from: a closure or named function
@@ -702,6 +715,56 @@ fn Body.binding(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -
         FnSource.Other(bound) => Binding.Bounded(bound)
     }
 } Body.binding
+
+/// What an operand passes for a `Dyn` parameter of a direct call's callee: the methods of a
+/// `Dyn` value the function makes, through the temporary holding it, or one of the
+/// function's own parameters.
+fn Body.dyn_binding(self, lo: Lowering, operand: nir::Operand) -> Binding {
+    var traced = nir::Value(index: 0)
+    match operand {
+        nir::Operand.Value(operand_value) => {
+            traced = operand_value
+        }
+        nir::Operand.Place(mode: _, place: place) => if place.contents().steps.len() == 0 {
+            traced = place.contents().root
+        } else {
+            return Binding.Bounded(None)
+        }
+        else => return Binding.Bounded(None)
+    }
+    match self.own_param(lo, value: traced) {
+        Some(position) => return Binding.Param(position)
+        None => {}
+    }
+    for _ in 0..<2usize {
+        match self.made_dyns.get(traced) {
+            Some(made) => {
+                var methods = mem::List[object::FuncId].empty(lo.alloc)
+                for method in made {
+                    mut methods.push(method)
+                }
+                return Binding.Methods(take methods)
+            }
+            None => {}
+        }
+        let Some(defining) = self.definition(traced) else {
+            break
+        }
+        match defining {
+            nir::Op.Load(place) or nir::Op.Move(place) => {
+                if place.steps.len() != 0 {
+                    break
+                }
+                let Some(nir::Operand.Value(initial)) = self.initializer(place.root) else {
+                    break
+                }
+                traced = initial
+            }
+            else => break
+        }
+    }
+    return Binding.Bounded(None)
+} Body.dyn_binding
 
 /// What an operand passes for a `task fn` parameter of a direct call's callee: the walk moving
 /// its captures, which a closure without captures that move and a named function do not need.

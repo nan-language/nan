@@ -534,13 +534,13 @@ On a `pub` item, each limit other than `stack N` is a [promise](05-properties.md
 
 ### Stack limits
 
-The **stack use** of a lowered function is its frame size plus the largest stack use among its call sites. Each function-typed parameter of the function has a **stack bound**: when the function is judged on its own, the N of the `stack N` its type demands, or none; inside the stack use of a direct call site, the stack use of the argument that site supplies for it.
+The **stack use** of a lowered function is its frame size plus the largest stack use among its call sites. Each function-typed parameter and each `Dyn` parameter of the function has a **stack bound**: when the function is judged on its own, the N of the `stack N` a function type demands, or none, and none for a `Dyn` parameter; inside the stack use of a direct call site, the stack use of the argument that site supplies for it.
 
-- A direct call site uses the callee's stack use computed with each of the callee's function-typed parameters that receives a function argument at that site bound to that argument's stack use: a closure's own stack use, a named function's stack use through its [checking entry](18-contracts.md#checking-entries), the stack bound of the calling function's own parameter when the argument is that parameter, or the N of the `stack N` that a function value's type demands, none when it demands none. In lowered code, a call to a method of a generic parameter's bound is a direct call to the implementing function that the instantiation selects.
+- A direct call site uses the callee's stack use computed with each of the callee's function-typed parameters that receives a function argument at that site bound to that argument's stack use: a closure's own stack use, a named function's stack use through its [checking entry](18-contracts.md#checking-entries), the stack bound of the calling function's own parameter when the argument is that parameter, or the N of the `stack N` that a function value's type demands, none when it demands none. Each of its `Dyn` parameters is bound likewise: to the largest stack use among the implementing functions of the methods of a `Dyn[I].view(x)` or `text::fmt` call written as the argument, to the stack bound of the calling function's own parameter when the argument is that parameter, and to none for any other `Dyn` value. In lowered code, a call to a method of a generic parameter's bound is a direct call to the implementing function that the instantiation selects.
 - A `task fn` argument runs on a stack of its own, so the stack bound of a `task fn` parameter is instead the stack use of moving the argument's captures into another domain ([domain memory](11-errors-domains.md#domain-memory)): the stack use of the walk over a closure's captures, 0 for a named function or a closure none of whose captures moving reaches, the stack bound of the calling function's own parameter, and none for another function value or for a parameter of a function judged on its own. The walk calls the move of each capture's type, which calls the move of each type the values it holds have, so it reaches itself, and is unbounded, exactly when a capture's type holds itself through what moving it reaches, as an enum holding a `mem::Box` of itself does; the `raised` reason then names that type.
-- A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call.
+- A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call. So does a call of a method of the function's own `Dyn` parameter whose interface method head demands no `stack` limit, `value.render` in a `text::Writer.write` among them.
 - An indirect call site uses the N of the `stack N` that its function type, registry field type or interface method head demands; a call to a foreign fn the N of its `stack N`; a call to a compiler stub or support routine the stub call bound that [descriptors](27-program-model.md#descriptors) give.
-- A call site is **unbounded** when it is a call through the function's own function-typed parameter whose stack bound is none, an indirect call whose type or head demands no `stack` limit, a call to a foreign fn whose head demands none, or a direct call whose callee reaches itself through [dependencies](#propagation) or holds a call site that is unbounded under the bounds that call gives it.
+- A call site is **unbounded** when it is a call through the function's own function-typed or `Dyn` parameter whose stack bound is none, an indirect call whose type or head demands no `stack` limit, a call to a foreign fn whose head demands none, or a direct call whose callee reaches itself through [dependencies](#propagation) or holds a call site that is unbounded under the bounds that call gives it.
 
 At every [final build](27-program-model.md#final-builds), each function, closure and instantiation that the build lowers is judged against each `stack N` demanded of it by its own limits, by the interface method it implements or by a function type it fits:
 
@@ -610,6 +610,36 @@ pub fn bumped_twice(value: u32) -> u32 limits stack 4_096 {
 
 fn main(take world: host::World) fails task::Cancelled uses wait {
     world.log.info("bumped", value: bumped_twice(40))
+} main
+```
+
+```nan
+// file: gauge/package.nan
+//! Gauge label report.
+
+package gauge {
+    language 1
+    targets x86_64-host
+    entry main
+} gauge
+
+// file: gauge/gauge.nan
+//! Reports a gauge reading as a label.
+
+pub fn label(reading: u64) -> text::Fixed[32] limits stack 4_096 {
+    var line = text::Fixed[32].empty()
+    mut line.write(text::fmt("gauge {reading}", reading), budget: 32)
+    return line
+} label
+
+pub fn relabel(reading: Dyn[Render]) -> text::Fixed[32] limits stack 4_096 {
+    var line = text::Fixed[32].empty()
+    mut line.write(reading, budget: 32) // error: limit.stack-unbounded
+    return line
+} relabel
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info(label(7).as_str(), value: relabel(text::fmt("{seven}", seven: 7u8)).byte_len())
 } main
 ```
 

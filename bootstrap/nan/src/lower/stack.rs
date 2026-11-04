@@ -42,7 +42,8 @@ pub enum Kind {
         bindings: Vec<(usize, Binding)>,
     },
     /// A call through the function's own function-typed parameter at a position, or, for a
-    /// `task fn` parameter, the walk moving its captures.
+    /// `task fn` parameter, the walk moving its captures, or of a method of its own `Dyn`
+    /// parameter there whose head demands no `stack N`.
     Param(usize),
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option<u64>),
@@ -57,13 +58,16 @@ pub enum Kind {
     },
 }
 
-/// What a direct call passes for a function-typed parameter of its callee.
+/// What a direct call passes for a function-typed or `Dyn` parameter of its callee.
 #[derive(Clone, Debug)]
 pub enum Binding {
     /// A closure or a named function, by the lowered function its value calls.
     Function(FuncId),
     /// For a `task fn` parameter, the walk moving a closure's captures, by the glue it calls.
     Walk(FuncId),
+    /// For a `Dyn` parameter, a `Dyn` value made there, by the code of each method of its
+    /// table.
+    Methods(Vec<FuncId>),
     /// The calling function's own parameter at a position.
     Param(usize),
     /// Another function value, bounded by the `stack N` its type demands.
@@ -71,7 +75,8 @@ pub enum Binding {
 }
 
 /// A lowered function: its frame size, the `stack N` the type of each of its function-typed
-/// parameters demands, by position, none for a `task fn` one, and its call sites.
+/// and `Dyn` parameters demands, by position, none for a `task fn` or `Dyn` one, and its call
+/// sites.
 pub struct Frame {
     pub function: FuncId,
     /// The canonical path naming it in reasons, or the type a move walks; empty for other code
@@ -300,6 +305,21 @@ impl Judge<'_> {
                                 Use::Unbounded(path) => Err(path),
                             }
                         }
+                        Binding::Methods(methods) => {
+                            let mut most = Ok(0);
+                            for method in methods {
+                                match self.own_use(*method) {
+                                    Use::Bounded(bytes, _) => {
+                                        most = most.map(|most: u64| most.max(bytes));
+                                    }
+                                    Use::Unbounded(path) => {
+                                        most = Err(path);
+                                        break;
+                                    }
+                                }
+                            }
+                            most
+                        }
                         Binding::Param(own) => bound_at(bounds, *own),
                         Binding::Bounded(bytes) => bytes.ok_or_else(Vec::new),
                     };
@@ -350,7 +370,7 @@ impl Judge<'_> {
     fn subject(&self, kind: &Kind) -> String {
         match kind {
             Kind::Direct { callee, .. } => self.name(*callee),
-            Kind::Param(_) => "function parameter".to_owned(),
+            Kind::Param(_) => "parameter".to_owned(),
             Kind::Bounded(_) => "function value".to_owned(),
             Kind::Stub => String::new(),
             Kind::Grown { inner, .. } => self.subject(inner),

@@ -21,7 +21,7 @@ use super::super::{CALL_CONV, Glue, Instance, Lowering};
 use super::Supply;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Args, Scalar, Subst, Ty};
-use crate::nir::{Literal, Operand};
+use crate::nir::{Literal, Operand, Value as NirValue};
 use crate::syntax::grammar::REJECTED;
 
 mod renderer {
@@ -826,8 +826,13 @@ fn render_composite(
     }
 }
 
-/// Renders a `Dyn[Render]` value through its method table.
-pub fn render_dyn(lo: &mut Lowering, fx: &mut Fx, address: Value, renderer_value: Value) {
+/// Renders a `Dyn[Render]` value through its method table, by the call it emits.
+pub fn render_dyn(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    address: Value,
+    renderer_value: Value,
+) -> cranelift_codegen::ir::Inst {
     let data = fx.load(PTR, address, 0);
     let table = fx.load(PTR, address, 8);
     let code = fx.load(PTR, table, 24);
@@ -838,12 +843,17 @@ pub fn render_dyn(lo: &mut Lowering, fx: &mut Fx, address: Value, renderer_value
     signature
         .params
         .push(cranelift_codegen::ir::AbiParam::new(PTR));
-    lo.call_code(fx, signature, code, &[data, renderer_value], None);
+    lo.call_code(fx, signature, code, &[data, renderer_value], None)
 }
 
 /// `text::fmt("template", label: value, ...)`: a `Dyn[Render]` of the template and the
-/// addresses of its arguments.
-pub fn template(body: &mut Body, args: &Args, operands: &[Operand]) -> Held {
+/// addresses of its arguments, defining `result`.
+pub fn template(
+    body: &mut Body,
+    args: &Args,
+    operands: &[Operand],
+    result: Option<NirValue>,
+) -> Held {
     let Operand::Literal(Literal::Text(text)) = &operands[0] else {
         panic!("a template literal");
     };
@@ -867,6 +877,7 @@ pub fn template(body: &mut Body, args: &Args, operands: &[Operand]) -> Held {
     }
     let pieces = parse(text, &names);
     let glue = body.lo.template_glue(pieces, types);
+    body.made_dyn(result, vec![glue]);
     let table = body.lo.method_table(glue, None);
     let global = body.lo.data_ref(body.fx, table);
     let table_address = body.fx.b.ins().symbol_value(PTR, global);
@@ -975,15 +986,17 @@ impl Lowering<'_, '_> {
     }
 }
 
-/// `Dyn[I].view(x)`: the value's address with the method table of its type for `I`.
-pub fn dyn_view(body: &mut Body, args: &Args, operand: &Operand) -> Held {
+/// `Dyn[I].view(x)`: the value's address with the method table of its type for `I`, defining
+/// `result`.
+pub fn dyn_view(body: &mut Body, args: &Args, operand: &Operand, result: Option<NirValue>) -> Held {
     let (Some(Ty::Dyn(bound)), Some(source)) = (args[0].ty().cloned(), args[1].ty().cloned())
     else {
         panic!("a Dyn view's types");
     };
     let (held, nty) = body.operand(operand);
     let address = body.adapt(held, &nty, Repr::Address).address();
-    let table = body.lo.dyn_table(&source, bound.interface, &bound.args);
+    let (table, methods) = body.lo.dyn_table(&source, bound.interface, &bound.args);
+    body.made_dyn(result, methods);
     let global = body.lo.data_ref(body.fx, table);
     let table_address = body.fx.b.ins().symbol_value(PTR, global);
     let value = body.fx.slot(16, 8);
@@ -993,13 +1006,13 @@ pub fn dyn_view(body: &mut Body, args: &Args, operand: &Operand) -> Held {
 }
 
 impl Lowering<'_, '_> {
-    /// The method table of a type for an interface.
+    /// The method table of a type for an interface, and the code of each of its methods.
     pub fn dyn_table(
         &mut self,
         ty: &Ty,
         interface: crate::check::db::ItemId,
         args: &Args,
-    ) -> cranelift_module::DataId {
+    ) -> (cranelift_module::DataId, Vec<cranelift_module::FuncId>) {
         let methods = match &self.ck.sig(interface).kind {
             SigKind::Interface { methods } => methods.len(),
             _ => 0,
@@ -1022,6 +1035,7 @@ impl Lowering<'_, '_> {
             let reference = self.module.declare_func_in_data(release, &mut description);
             description.write_function_addr(0, reference);
         }
+        let mut code = Vec::new();
         for method in 0..methods {
             let glue = self.instance(Instance::Dyn {
                 ty: ty.clone(),
@@ -1031,10 +1045,11 @@ impl Lowering<'_, '_> {
             });
             let reference = self.module.declare_func_in_data(glue, &mut description);
             description.write_function_addr(24 + 8 * method as u32, reference);
+            code.push(glue);
         }
         self.module
             .define_data(id, &description)
             .expect("a method table");
-        id
+        (id, code)
     }
 }

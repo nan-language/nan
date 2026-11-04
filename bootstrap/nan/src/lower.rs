@@ -695,9 +695,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
         }
     }
 
-    /// Names the frame of an instance just defined and the `stack N` its function-typed
-    /// parameters' types demand, and records the demands of its own limits and of the interface
-    /// method it implements.
+    /// Names the frame of an instance just defined and the `stack N` its function-typed and
+    /// `Dyn` parameters' types demand, and records the demands of its own limits and of the
+    /// interface method it implements.
     fn describe_frame(&mut self, instance: &Instance, abi: &Abi, id: FuncId) {
         let frame = self.frames.last_mut().expect("the frame just defined");
         frame.params = abi
@@ -709,6 +709,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
                     Some((position, None))
                 }
                 Ty::Fn(fn_ty) => Some((position, fn_ty.limits.stack)),
+                Ty::Dyn(_) => Some((position, None)),
                 _ => None,
             })
             .collect();

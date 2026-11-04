@@ -90,7 +90,7 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
 | `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
-| `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService` | [Served capabilities](14-authority.md#served-capabilities) |
+| `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService`, `sys::FsService`, `sys::NetService` | [Served capabilities](14-authority.md#served-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
 | `sys` | `sys::Domain`, `sys::Abandoner`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |

@@ -17,6 +17,7 @@ pub mod render;
 pub mod same;
 pub mod secret;
 pub mod sequences;
+pub mod served;
 pub mod simd;
 pub mod sims;
 pub mod sys;

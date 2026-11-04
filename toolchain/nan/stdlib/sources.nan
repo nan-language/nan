@@ -17044,6 +17044,8 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub fn Fs.denied() -> Fs
     \\
+    \\pub fn Fs.served[S: FsService and Capability and Copy](service: S) -> Fs fails Revoked
+    \\
     \\pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
     \\    example match attempt testing::world().fs.subdir("logs/..") {
     \\        Err(fs::FsError.InvalidPath) => true
@@ -17066,6 +17068,8 @@ const TEXT_SYS_SYS: Str =
     \\} Net
     \\
     \\pub fn Net.denied() -> Net
+    \\
+    \\pub fn Net.served[S: NetService and Capability and Copy](service: S) -> Net fails Revoked
     \\
     \\pub fn Net.only_host(self, host: Str) -> Net fails Revoked
     \\
@@ -17159,6 +17163,29 @@ const TEXT_SYS_SYS: Str =
     \\    fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
     \\    fn write_err(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
     \\} StdioService
+    \\
+    \\pub interface FsService {
+    \\    fn open(self, path: Str) -> u64 fails fs::FsError uses wait limits stack 4_096
+    \\    fn create(self, path: Str) -> u64 fails fs::FsError uses wait limits stack 4_096
+    \\    fn read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails fs::FsError uses wait limits stack 4_096
+    \\    fn write_all(self, path: Str, data: Slice[u8]) fails fs::FsError uses wait limits stack 4_096
+    \\    fn remove(self, path: Str) fails fs::FsError uses wait limits stack 4_096
+    \\    fn read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
+    \\    fn write(self, file: u64, data: Slice[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
+    \\    fn byte_len(self, file: u64) -> u64 fails fs::FsError uses wait limits stack 4_096
+    \\    fn release(self, file: u64) limits stack 4_096
+    \\} FsService
+    \\
+    \\pub interface NetService {
+    \\    fn listen(self, port: u16) -> u64 fails net::NetError uses wait limits stack 4_096
+    \\    fn connect(self, host: Str, port: u16) -> u64 fails net::NetError uses wait limits stack 4_096
+    \\    fn accept(self, listener: u64) -> u64 fails net::NetError uses wait limits stack 4_096
+    \\    fn read(self, conn: u64, mut buf: SliceMut[u8]) -> usize fails net::NetError uses wait limits stack 4_096
+    \\    fn write(self, conn: u64, data: Slice[u8]) -> usize fails net::NetError uses wait limits stack 4_096
+    \\    fn close(self, conn: u64) fails net::NetError uses wait limits stack 4_096
+    \\    fn reset(self, conn: u64) limits stack 4_096
+    \\    fn release(self, listener: u64) limits stack 4_096
+    \\} NetService
     \\
     \\pub closed enum Revoked derives Copy, Eq, Hash, Render {
     \\    Stale
@@ -17426,6 +17453,110 @@ const TEXT_SYS_SYS: Str =
     \\    discard state.fetch_add(record)
     \\    return state.load()
     \\} tally_count
+    \\
+    \\/// Files named by the length of their path, whose releases a shelf counts.
+    \\struct Shelf {
+    \\} Shelf
+    \\
+    \\impl Shelf: Kind[core::atomic::AtomicU64, u64]
+    \\
+    \\impl Shelf: FsService
+    \\
+    \\fn shelves(alloc: mem::Alloc) -> Minter[Shelf, core::atomic::AtomicU64, u64] {
+    \\    return Minter.of(core::atomic::AtomicU64.of(0), alloc)
+    \\} shelves
+    \\
+    \\fn Shelf.open(self, path: Str) -> u64 limits stack 4_096 {
+    \\    return u64.widen(path.byte_len())
+    \\} Shelf.open
+    \\
+    \\fn Shelf.create(self, path: Str) -> u64 limits stack 4_096 {
+    \\    return self.open(path)
+    \\} Shelf.create
+    \\
+    \\/// The bytes of the path itself.
+    \\fn Shelf.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes limits stack 4_096 {
+    \\    var bytes = mem::Bytes.empty(alloc)
+    \\    mut bytes.append(path.as_bytes())
+    \\    return bytes
+    \\} Shelf.read_all
+    \\
+    \\fn Shelf.write_all(self, path: Str, data: Slice[u8]) limits stack 4_096 {
+    \\} Shelf.write_all
+    \\
+    \\fn Shelf.remove(self, path: Str) fails fs::FsError limits stack 4_096 {
+    \\    fail fs::FsError.NotFound
+    \\} Shelf.remove
+    \\
+    \\/// Claims more bytes than `buf` holds.
+    \\fn Shelf.read(self, file: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    \\    return 9
+    \\} Shelf.read
+    \\
+    \\fn Shelf.write(self, file: u64, data: Slice[u8]) -> usize limits stack 4_096 {
+    \\    return data.len()
+    \\} Shelf.write
+    \\
+    \\fn Shelf.byte_len(self, file: u64) -> u64 limits stack 4_096 {
+    \\    return file
+    \\} Shelf.byte_len
+    \\
+    \\fn Shelf.release(self, file: u64) limits stack 4_096 {
+    \\    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
+    \\} Shelf.release
+    \\
+    \\/// Connections named by the length of their host or by their port, a line counting every call.
+    \\struct Line {
+    \\} Line
+    \\
+    \\impl Line: Kind[core::atomic::AtomicU64, u64]
+    \\
+    \\impl Line: NetService
+    \\
+    \\fn lines(alloc: mem::Alloc) -> Minter[Line, core::atomic::AtomicU64, u64] {
+    \\    return Minter.of(core::atomic::AtomicU64.of(0), alloc)
+    \\} lines
+    \\
+    \\fn Line.counted(self) {
+    \\    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
+    \\} Line.counted
+    \\
+    \\fn Line.listen(self, port: u16) -> u64 limits stack 4_096 {
+    \\    self.counted()
+    \\    return u64.widen(port)
+    \\} Line.listen
+    \\
+    \\fn Line.connect(self, host: Str, port: u16) -> u64 limits stack 4_096 {
+    \\    self.counted()
+    \\    return u64.widen(host.byte_len())
+    \\} Line.connect
+    \\
+    \\fn Line.accept(self, listener: u64) -> u64 limits stack 4_096 {
+    \\    self.counted()
+    \\    return listener
+    \\} Line.accept
+    \\
+    \\fn Line.read(self, conn: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    \\    self.counted()
+    \\    return 0
+    \\} Line.read
+    \\
+    \\fn Line.write(self, conn: u64, data: Slice[u8]) -> usize limits stack 4_096 {
+    \\    self.counted()
+    \\    return data.len()
+    \\} Line.write
+    \\
+    \\fn Line.close(self, conn: u64) limits stack 4_096 {
+    \\    self.counted()
+    \\} Line.close
+    \\
+    \\fn Line.reset(self, conn: u64) limits stack 4_096 {
+    \\    self.counted()
+    \\} Line.reset
+    \\
+    \\fn Line.release(self, listener: u64) limits stack 4_096 {
+    \\    self.counted()
+    \\} Line.release
     \\
     \\fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0, suspended: false)
     \\
@@ -18427,6 +18558,91 @@ const TEXT_SYS_SYS: Str =
     \\    }
     \\    expect written.is_ok() and closed and counted == Some(3)
     \\} served_streams_call_their_kind
+    \\
+    \\/// Whether a file opened through `fs` reads 4 bytes into 4 and is 10 bytes long, the file
+    \\/// released before it returns.
+    \\fn reads_back(fs: Fs, path: Str) -> bool fails fs::FsError uses wait {
+    \\    var file = try await fs.open(path)
+    \\    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    \\    let read = try await mut file.read(mut buf.view_mut())
+    \\    let len = try await file.byte_len()
+    \\    return read == 4 and len == 10
+    \\} reads_back
+    \\
+    \\test served_files_call_their_kind for Fs.served {
+    \\    let world = testing::world()
+    \\    let minter = shelves(world.alloc)
+    \\    defer take minter.close()
+    \\    let counter = minter.mint(0)
+    \\    let shelf = minter.mint(0)
+    \\    let fs = try Fs.served(shelf)
+    \\    let docs = try fs.subdir("docs")
+    \\    let reader = try docs.read_only()
+    \\    let path = try await docs.read_all("notes", alloc: world.alloc)
+    \\    let read = try await reads_back(reader, path: "notes")
+    \\    let written = attempt await reader.write_all("notes", data: b"x")
+    \\    let removed = attempt await docs.remove("notes")
+    \\    let released = reach(counter, body: tally_count)
+    \\    minter.revoke(shelf)
+    \\    let opened = attempt await docs.open("notes")
+    \\    let refused = match written {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
+    \\    let missing = match removed {
+    \\        Err(fs::FsError.NotFound) => true
+    \\        else => false
+    \\    }
+    \\    let revoked = match opened {
+    \\        Err(fs::FsError.Revoked(Revoked.Stale)) => true
+    \\        else => false
+    \\    }
+    \\    expect path.byte_len() == 10 and read and refused and missing and revoked and released == Some(1)
+    \\} served_files_call_their_kind
+    \\
+    \\/// Whether `net` denies a connection to `host`, abandoning one it opens.
+    \\fn denies_host(net: Net, host: Str) -> bool fails task::Cancelled uses wait {
+    \\    let outcome = attempt await net.connect(host, port: 7)
+    \\    var denied = false
+    \\    match outcome {
+    \\        Ok(conn) => take conn.abandon()
+    \\        Err(failure) => {
+    \\            denied = match failure {
+    \\                net::NetError.Denied => true
+    \\                else => false
+    \\            }
+    \\        }
+    \\    }
+    \\    return denied
+    \\} denies_host
+    \\
+    \\/// Accepts a connection on a listener of `net` and abandons it, the listener released before it
+    \\/// returns.
+    \\fn accepts(net: Net) fails net::NetError uses wait {
+    \\    var listener = try await net.listen(80)
+    \\    let conn = try await mut listener.accept()
+    \\    take conn.abandon()
+    \\} accepts
+    \\
+    \\test served_networks_call_their_kind for Net.served {
+    \\    let world = testing::world()
+    \\    let minter = lines(world.alloc)
+    \\    defer take minter.close()
+    \\    let counter = minter.mint(0)
+    \\    let net = try Net.served(minter.mint(0))
+    \\    let narrow = try net.only_host("10.0.0.2")
+    \\    let elsewhere = try await denies_host(narrow, host: "10.0.0.3")
+    \\    let conn = try await narrow.connect("10.0.0.2", port: 7)
+    \\    try await take conn.close()
+    \\    let listened = attempt await narrow.listen(80)
+    \\    try await accepts(net)
+    \\    let calls = reach(counter, body: tally_count)
+    \\    let refused = match listened {
+    \\        Err(net::NetError.Denied) => true
+    \\        else => false
+    \\    }
+    \\    expect elsewhere and refused and calls == Some(6)
+    \\} served_networks_call_their_kind
     \\
 
 const TEXT_TASK_PACKAGE: Str =

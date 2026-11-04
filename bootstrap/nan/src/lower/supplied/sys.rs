@@ -1,29 +1,31 @@
 //! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`,
 //! `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, in a
-//! test image through the sims, or through the kinds serving `Random`, `Log` and `Stdio`, a
-//! machine's runtime serving no file or network operation, capabilities denying every operation,
-//! files, listeners and connections, revocation, and the submission of io_uring operations.
+//! test image through the sims, or through the kinds serving them, a machine's runtime serving
+//! no other file or network operation, capabilities denying every operation, files, listeners
+//! and connections, revocation, and the submission of io_uring operations.
 //!
 //! Each operation checks its capability's entry first, reading its state words through a
 //! snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor,
 //! the address and length of its path prefix, and whether it is read-only; a `Net` entry's is
 //! the address and length of its host and whether it reaches every host, only that one or
 //! none. A file, listener or connection is the entry it was opened through and the holding of
-//! its descriptor; a revoker is the holding of its entry or cell.
+//! its descriptor, or of a kind's record for a served one; a revoker is the holding of its entry
+//! or cell.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::body::{Body, Held};
-use super::super::call::{Called, Invoked};
+use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tables::{self, RESOLUTION, entry, kind, live_entry};
 use super::super::runtime::{Routine, holdings, seeded, timers};
 use super::super::transfer;
 use super::Supply;
 use super::render;
+use super::served;
 use super::sims;
-use crate::check::ty::{Ty, no_args};
+use crate::check::ty::Ty;
 
 /// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
 /// which hosts it reaches: every host, `ONLY_HOST` or `NO_HOST`.
@@ -57,9 +59,15 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             supply.done(lo, fx);
             return true;
         }
-        ("sys::Log", "served") => return served(lo, fx, supply, kind::LOG, "LogService"),
-        ("sys::Random", "served") => return served(lo, fx, supply, kind::RANDOM, "RandomService"),
-        ("sys::Stdio", "served") => return served(lo, fx, supply, kind::STDIO, "StdioService"),
+        ("sys::Fs", "served") => return served::served(lo, fx, supply, kind::FS, "FsService"),
+        ("sys::Net", "served") => return served::served(lo, fx, supply, kind::NET, "NetService"),
+        ("sys::Log", "served") => return served::served(lo, fx, supply, kind::LOG, "LogService"),
+        ("sys::Random", "served") => {
+            return served::served(lo, fx, supply, kind::RANDOM, "RandomService");
+        }
+        ("sys::Stdio", "served") => {
+            return served::served(lo, fx, supply, kind::STDIO, "StdioService");
+        }
         _ => {}
     }
     match owner {
@@ -95,6 +103,21 @@ fn checked(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) -
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
     words
+}
+
+/// The state words and the method table of the entry of the `Fs` or `Net` held at an address,
+/// failing the operation with `Revoked.Stale` when its handle is stale.
+fn checked_served(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    capability: Value,
+) -> ([Value; 4], Value) {
+    let handle = fx.load(PTR, capability, 0);
+    let (live, words, table) = tables::served_snapshot(lo, fx, handle);
+    let stale = fx.b.ins().bxor_imm_s(live, 1);
+    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+    (words, table)
 }
 
 /// A copy of the text of the entry of the capability held at an address, which the caller
@@ -152,7 +175,7 @@ pub fn view(fx: &mut Fx, held: Held) -> (Value, Value) {
 }
 
 /// A new view value of `len` bytes from `start`.
-fn new_view(fx: &mut Fx, start: Value, len: Value) -> Held {
+pub fn new_view(fx: &mut Fx, start: Value, len: Value) -> Held {
     let slot = fx.slot(16, 8);
     fx.store(start, slot, 0);
     fx.store(len, slot, 8);
@@ -213,7 +236,7 @@ fn valid_path(fx: &mut Fx, start: Value, len: Value) -> Value {
 
 fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let [directory, _, _, flags] = checked(lo, fx, supply, capability);
+    let ([directory, _, _, flags], table) = checked_served(lo, fx, supply, capability);
     let member = supply.member();
     if matches!(member, "create" | "write_all" | "remove") {
         let read_only = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flags, 0);
@@ -242,10 +265,16 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         _ => {}
     }
+    let served = fx.b.ins().icmp_imm_s(IntCC::NotEqual, table, 0);
     if lo.kernel() {
-        fail_with(lo, fx, supply, "Denied");
+        let unserved = fx.b.ins().bxor_imm_s(served, 1);
+        fx.when(unserved, |fx| fail_with(lo, fx, supply, "Denied"));
+        served::fs(lo, fx, supply, capability, (directory, table));
         return;
     }
+    fx.when(served, |fx| {
+        served::fs(lo, fx, supply, capability, (directory, table))
+    });
     if lo.seeded() {
         match member {
             "open" | "create" => sims::fs::open(lo, fx, supply, directory, member == "create"),
@@ -319,11 +348,13 @@ fn descriptor(fx: &mut Fx, address: Value) -> Value {
 
 fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    let [network, _, _, hosts] = checked(lo, fx, supply, capability);
+    let ([network, _, _, hosts], table) = checked_served(lo, fx, supply, capability);
+    let served = fx.b.ins().icmp_imm_s(IntCC::NotEqual, table, 0);
     if lo.kernel() && supply.member() != "only_host" {
-        fail_with(lo, fx, supply, "Denied");
-        return;
+        let unserved = fx.b.ins().bxor_imm_s(served, 1);
+        fx.when(unserved, |fx| fail_with(lo, fx, supply, "Denied"));
     }
+    let kind = (network, table);
     match supply.member() {
         "only_host" => {
             let reached = reaches(lo, fx, supply, capability, hosts, supply.param(1));
@@ -336,6 +367,11 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "listen" => {
             let restricted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, hosts, 0);
             fx.when(restricted, |fx| fail_with(lo, fx, supply, "Denied"));
+            if lo.kernel() {
+                served::net(lo, fx, supply, capability, kind);
+                return;
+            }
+            fx.when(served, |fx| served::net(lo, fx, supply, capability, kind));
             if lo.seeded() {
                 sims::net::listen(lo, fx, supply, network);
                 return;
@@ -352,6 +388,11 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let reached = reaches(lo, fx, supply, capability, hosts, host);
             let denied = fx.b.ins().bxor_imm_s(reached, 1);
             fx.when(denied, |fx| fail_with(lo, fx, supply, "Denied"));
+            if lo.kernel() {
+                served::net(lo, fx, supply, capability, kind);
+                return;
+            }
+            fx.when(served, |fx| served::net(lo, fx, supply, capability, kind));
             if lo.seeded() {
                 sims::net::connect(lo, fx, supply, network);
                 return;
@@ -510,8 +551,9 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let words = checked(lo, fx, supply, capability);
     let args = [supply.param(1)];
+    let kind = (words[0], words[1]);
     if lo.kernel() {
-        call_service(lo, fx, "RandomService", 0, &words, &args);
+        served::call(lo, fx, "RandomService", "fill", kind, &args);
     } else {
         let served = served_entry(fx, &words);
         fx.choose_in(
@@ -519,7 +561,7 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             served,
             &[],
             |lo, fx| {
-                call_service(lo, fx, "RandomService", 0, &words, &args);
+                served::call(lo, fx, "RandomService", "fill", kind, &args);
                 Vec::new()
             },
             |lo, fx| {
@@ -587,7 +629,7 @@ fn log_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, level: &str, wor
     };
     let level = lo.variant_value(fx, &level_ty, variant, &[], None);
     let args = [level, supply.param(1), rendering];
-    call_service(lo, fx, "LogService", 0, words, &args);
+    served::call(lo, fx, "LogService", "log", (words[0], words[1]), &args);
 }
 
 fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
@@ -627,12 +669,8 @@ fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// becoming the operation's, a count read past `buf`'s length counting as that length.
 fn stdio_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, words: &[Value; 4]) {
     let member = supply.member();
-    let method = match member {
-        "read_in" => 0,
-        "write_out" => 1,
-        _ => 2,
-    };
-    let called = call_service(lo, fx, "StdioService", method, words, &[supply.param(1)]);
+    let kind = (words[0], words[1]);
+    let called = served::call(lo, fx, "StdioService", member, kind, &[supply.param(1)]);
     supply.forward_failure(lo, fx, &called);
     if member == "read_in" {
         let (_, len) = view(fx, supply.param(1));
@@ -649,82 +687,33 @@ fn served_entry(fx: &mut Fx, words: &[Value; 4]) -> Value {
     fx.b.ins().icmp_imm_s(IntCC::NotEqual, words[1], 0)
 }
 
-/// `C.served(service)` of `Log`, `Random` or `Stdio`: an entry of a kind deriving from the entry
-/// of the capability kind `service`, whose operations call its methods for a service interface;
-/// `Revoked.Stale` when `service` is stale.
-fn served(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, kind: i64, interface: &str) -> bool {
-    let service_ty = supply.type_arg(0);
-    let service = fx.load(PTR, supply.param(0).address(), 0);
-    let interface = lo
-        .ck
-        .db
-        .std_item("sys", interface)
-        .expect("a service interface");
-    let (table, _) = lo.dyn_table(&service_ty, interface, &no_args());
-    let table = lo.data_ref(fx, table);
-    let table = fx.b.ins().symbol_value(PTR, table);
-    let derived = tables::served(lo, fx, kind, service, table);
-    let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
-    fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
-    let sret = supply.sret.expect("a capability's address");
-    fx.store(derived, sret, 0);
-    supply.done(lo, fx);
-    true
-}
-
-/// Calls a method of a service interface on the kind a served entry's state words name, with
-/// the operation's arguments after the kind's handle.
-fn call_service(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    interface: &str,
-    method: u32,
-    words: &[Value; 4],
-    args: &[Held],
-) -> Called {
-    let interface = lo
-        .ck
-        .db
-        .std_item("sys", interface)
-        .expect("a service interface");
-    let service = fx.slot(8, 8);
-    fx.store(words[0], service, 0);
-    let code = fx.load(PTR, words[1], 8 * (u64::from(method) + 3));
-    let abi = lo.dyn_abi(interface, &no_args(), method);
-    let (head, _) = lo.method_head(&Ty::Unit, interface, &no_args(), method);
-    let mut held = vec![Held::Address(service)];
-    held.extend_from_slice(args);
-    lo.invoke(fx, Invoked::Code(code, head.limits.stack), &abi, &held)
-}
-
 /// The operations of files, listeners and connections, through the entry each was opened by;
-/// a release completes whether or not that entry is revoked.
+/// a release completes whether or not that entry is revoked. A machine's runtime has only those
+/// a kind serves.
 fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let address = supply.param(0).address();
     let member = supply.member();
+    if !matches!(member, "abandon" | "close") {
+        check(lo, fx, supply, address);
+    }
+    if lo.kernel() {
+        served::resource(lo, fx, supply, address);
+        return;
+    }
+    let served = is_served(fx, address);
+    fx.when(served, |fx| served::resource(lo, fx, supply, address));
     let descriptor = Held::Scalar(descriptor(fx, address));
     if member == "abandon" {
         if lo.seeded() {
             let holding = fx.offset(address, 8);
             let payload = holdings::payload(fx, holding);
             sims::abandon(lo, fx, payload);
-        } else if !lo.kernel() {
+        } else {
             lo.platform_call(fx, "conn_abandon", &[descriptor]);
         }
         let holding = fx.load(PTR, address, 8);
         lo.call_routine(fx, Routine::Unhold, &[holding]);
         supply.done(lo, fx);
-        return;
-    }
-    if member != "close" {
-        check(lo, fx, supply, address);
-    }
-    if lo.kernel() {
-        if member == "close" {
-            let holding = fx.load(PTR, address, 8);
-            lo.call_routine(fx, Routine::Unhold, &[holding]);
-        }
-        fail_with(lo, fx, supply, "Denied");
         return;
     }
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
@@ -788,20 +777,43 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
 }
 
-/// Releases a file or listener: its descriptor closes.
+/// Whether the resource at an address is one a kind serves.
+fn is_served(fx: &mut Fx, address: Value) -> Value {
+    let holding = fx.load(PTR, address, 8);
+    let kind = fx.load(PTR, holding, holdings::holding::KIND);
+    fx.b.ins()
+        .icmp_imm_s(IntCC::Equal, kind, holdings::kind::SERVED)
+}
+
+/// Releases a file or listener: its descriptor closes, or the kind serving it releases it.
 pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, _ty: &Ty, address: Value) -> bool {
     match path {
         "sys::fs::File" | "sys::net::Listener" => {
-            match lo.seeded() {
-                true => {
-                    let holding = fx.offset(address, 8);
-                    let payload = holdings::payload(fx, holding);
-                    sims::release(lo, fx, payload);
-                }
-                false => {
-                    let descriptor = descriptor(fx, address);
-                    lo.platform_call(fx, "release", &[Held::Scalar(descriptor)]);
-                }
+            let holding = fx.offset(address, 8);
+            let payload = holdings::payload(fx, holding);
+            if lo.kernel() {
+                served::release(lo, fx, payload);
+            } else {
+                let served = is_served(fx, address);
+                fx.choose_in(
+                    lo,
+                    served,
+                    &[],
+                    |lo, fx| {
+                        served::release(lo, fx, payload);
+                        Vec::new()
+                    },
+                    |lo, fx| {
+                        match lo.seeded() {
+                            true => sims::release(lo, fx, payload),
+                            false => {
+                                let descriptor = fx.b.ins().ireduce(types::I32, payload);
+                                lo.platform_call(fx, "release", &[Held::Scalar(descriptor)]);
+                            }
+                        }
+                        Vec::new()
+                    },
+                );
             }
             let holding = fx.load(PTR, address, 8);
             lo.call_routine(fx, Routine::Unhold, &[holding]);

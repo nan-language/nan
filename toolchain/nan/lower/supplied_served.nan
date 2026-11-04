@@ -1,0 +1,235 @@
+//! Capabilities kinds serve: `C.served(service)` of `Fs`, `Net`, `Random`, `Log` and `Stdio`, the calls of a service interface's methods on a kind, and the operations of a served `Fs` or `Net` and of the files, listeners and connections opened through one. A served resource's holding holds a record of the handle of the kind serving it, the kind's method table, the number the kind gave the resource and the code of the method releasing it: `FsService.release`, `NetService.release` or `NetService.reset`, which share a signature.
+
+const SERVED_RECORD_SERVICE: u64 = 0
+
+const SERVED_RECORD_TABLE: u64 = 8
+
+const SERVED_RECORD_NUMBER: u64 = 16
+
+const SERVED_RECORD_RELEASE: u64 = 24
+
+const SERVED_RECORD_SIZE: u64 = 32
+
+/// The handle of a kind serving a capability and the kind's method table for its service
+/// interface.
+struct ServingKind derives Copy {
+    service: clif::Value
+    table: clif::Value
+} ServingKind
+
+/// `C.served(service)`: an entry of a kind deriving from the entry of the capability kind
+/// `service`, whose operations call its methods for a service interface; `Revoked.Stale` when
+/// `service` is stale.
+fn served_capability(mut lo: Lowering, mut fx: Fx, supply: Supply, kind: i64, interface_name: Str) -> bool {
+    let service_ty = supply.type_arg(lo, index: 0)
+    let service = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let interface_item = served_interface(lo, name: interface_name)
+    let DynTable(id: table_id, methods: _) = mut lo.dyn_table(service_ty, interface_item, args: ty::Args.none())
+    let table_global = mut lo.data_ref(mut fx, id: table_id)
+    let table = mut fx.b.symbol_value(PTR, global_value: table_global)
+    let derived = tables_served(mut lo, mut fx, kind, service, table)
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return false
+    }
+    mut fx.store(derived, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+    return true
+} served_capability
+
+fn served_interface(lo: Lowering, name: Str) -> ty::ItemId {
+    let Some(interface_item) = lo.ck.db().std_item("sys", name) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    return interface_item
+} served_interface
+
+/// The index of a service interface's method in its method table.
+fn served_method(lo: Lowering, interface_item: ty::ItemId, name: Str) -> u32 {
+    let sig = lo.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        return 0
+    }
+    var index: u32 = 0
+    for method in methods {
+        if method.name.as_str() == name {
+            return index
+        }
+        index += 1
+    }
+    expect false
+    return 0
+} served_method
+
+/// Calls the method of a service interface named `method` on the kind serving a capability
+/// through the kind's method table, with `args` after the kind's handle.
+fn served_call(mut lo: Lowering, mut fx: Fx, interface_name: Str, method: Str, kind: ServingKind, args: Slice[Held]) -> Called {
+    let interface_item = served_interface(lo, name: interface_name)
+    let index = served_method(lo, interface_item, name: method)
+    let slot = served_kind_slot(mut fx, service: kind.service)
+    let code = mut fx.load(PTR, addr: kind.table, offset: 8 * (u64.widen(index) + 3))
+    return served_invoke(mut lo, mut fx, interface_item, method: index, code, slot, args)
+} served_call
+
+/// A slot holding the handle of a kind, which its methods take as `self`.
+fn served_kind_slot(mut fx: Fx, service: clif::Value) -> clif::Value {
+    let slot = mut fx.slot(8, align: 8)
+    mut fx.store(service, addr: slot, offset: 0)
+    return slot
+} served_kind_slot
+
+fn served_invoke(mut lo: Lowering, mut fx: Fx, interface_item: ty::ItemId, method: u32, code: clif::Value, slot: clif::Value, args: Slice[Held]) -> Called {
+    let abi = mut lo.dyn_abi(interface_item, args: ty::Args.none(), method)
+    let head = mut lo.method_head(ty::Ty.unit(), interface_item, args: ty::Args.none(), method)
+    var held = mem::List[Held].empty(lo.alloc)
+    mut held.push(Held.Address(slot))
+    for arg in args {
+        mut held.push(arg)
+    }
+    return mut lo.invoke(mut fx, invoked: Invoked.Code(code: code, bound: head.fn_ty.limit_set.stack), abi, args: held.view())
+} served_invoke
+
+/// An operation of a served `Fs` opening, reading, writing or removing a file: the kind's method
+/// of its name with its path joined to the entry's, a file it opens holding the number the kind
+/// gave it.
+fn served_fs(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, kind: ServingKind) {
+    let member = supply.member()
+    let prefix = sys_checked_text(mut lo, mut fx, supply, capability)
+    let separated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: prefix.len, y: 0)
+    let path = sys_view(mut fx, held: supply.param(1))
+    let joined = tables_join(mut lo, mut fx, head: prefix, tail: path, separated)
+    mut lo.record_free(mut fx, address: prefix.start)
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(new_view(mut fx, start: joined.start, len: joined.len))
+    if member == "read_all" or member == "write_all" {
+        mut args.push(supply.param(2))
+    }
+    let called = served_call(mut lo, mut fx, interface_name: "FsService", method: member, kind, args: args.view())
+    mut lo.record_free(mut fx, address: joined.start)
+    supply.forward_failure(mut lo, mut fx, called)
+    if member == "open" or member == "create" {
+        let handle = mut fx.load(PTR, addr: capability, offset: 0)
+        served_ret_resource(mut lo, mut fx, supply, handle, kind, number: called.result.scalar_value(), interface_name: "FsService", release: "release")
+    } else if member == "read_all" {
+        supply.ret(mut lo, mut fx, held: called.result)
+    } else {
+        supply.done(mut lo, mut fx)
+    }
+} served_fs
+
+/// `listen` or `connect` of a served `Net`: the kind's method of its name, the listener or
+/// connection it opens holding the number the kind gave it.
+fn served_net(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, kind: ServingKind) {
+    var args = mem::List[Held].empty(fx.alloc)
+    mut args.push(supply.param(1))
+    var release = "release"
+    if supply.member() != "listen" {
+        mut args.push(supply.param(2))
+        release = "reset"
+    }
+    let called = served_call(mut lo, mut fx, interface_name: "NetService", method: supply.member(), kind, args: args.view())
+    supply.forward_failure(mut lo, mut fx, called)
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    served_ret_resource(mut lo, mut fx, supply, handle, kind, number: called.result.scalar_value(), interface_name: "NetService", release)
+} served_net
+
+/// Returns a file, listener or connection a kind serves: the entry it was opened through and the
+/// holding of its record, whose releasing method is the method `release` of an interface.
+fn served_ret_resource(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: clif::Value, kind: ServingKind, number: clif::Value, interface_name: Str, release: Str) {
+    let size = mut fx.ptr(SERVED_RECORD_SIZE)
+    let served = mut lo.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: served, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let interface_item = served_interface(lo, name: interface_name)
+    let index = served_method(lo, interface_item, name: release)
+    let code = mut fx.load(PTR, addr: kind.table, offset: 8 * (u64.widen(index) + 3))
+    mut fx.store(kind.service, addr: served, offset: SERVED_RECORD_SERVICE)
+    mut fx.store(kind.table, addr: served, offset: SERVED_RECORD_TABLE)
+    mut fx.store(number, addr: served, offset: SERVED_RECORD_NUMBER)
+    mut fx.store(code, addr: served, offset: SERVED_RECORD_RELEASE)
+    let kind_value = mut fx.ptr(u64.fit(HOLDINGS_KIND_SERVED))
+    let holding_values = mut lo.call_routine(mut fx, routine: Routine.Hold, args: fx.list2(kind_value, b: served).view())
+    expect holding_values.len() == 1
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(handle, addr: sret, offset: 0)
+    mut fx.store(holding_values[0], addr: sret, offset: 8)
+    supply.done(mut lo, mut fx)
+} served_ret_resource
+
+/// An operation of a file, listener or connection a kind serves, through the record its holding
+/// holds; `close` and `abandon` release the record, whether or not the kind's call fails.
+fn served_resource(mut lo: Lowering, mut fx: Fx, supply: Supply, address: clif::Value) {
+    let holding = mut fx.load(PTR, addr: address, offset: 8)
+    let served = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
+    let service = mut fx.load(PTR, addr: served, offset: SERVED_RECORD_SERVICE)
+    let table = mut fx.load(PTR, addr: served, offset: SERVED_RECORD_TABLE)
+    let kind = ServingKind(service: service, table: table)
+    let number = Held.Scalar(mut fx.load(PTR, addr: served, offset: SERVED_RECORD_NUMBER))
+    let path = supply.path.as_str()
+    let Some(owner) = path.slice_bytes(0, end: check::last_dot(path).value_or(0)) else {
+        expect false
+        return
+    }
+    var interface_name = "NetService"
+    if owner == "sys::fs::File" {
+        interface_name = "FsService"
+    }
+    let member = supply.member()
+    if member == "abandon" {
+        served_release(mut lo, mut fx, record: served)
+        discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(holding).view())
+        supply.done(mut lo, mut fx)
+    } else if member == "close" {
+        let called = served_call(mut lo, mut fx, interface_name, method: member, kind, args: Array[Held, 1].filled(number).view())
+        mut lo.record_free(mut fx, address: served)
+        discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: fx.list1(holding).view())
+        supply.forward_failure(mut lo, mut fx, called)
+        supply.done(mut lo, mut fx)
+    } else if member == "accept" {
+        let called = served_call(mut lo, mut fx, interface_name, method: member, kind, args: Array[Held, 1].filled(number).view())
+        supply.forward_failure(mut lo, mut fx, called)
+        let handle = mut fx.load(PTR, addr: address, offset: 0)
+        served_ret_resource(mut lo, mut fx, supply, handle, kind, number: called.result.scalar_value(), interface_name, release: "reset")
+    } else if member == "byte_len" {
+        let called = served_call(mut lo, mut fx, interface_name, method: member, kind, args: Array[Held, 1].filled(number).view())
+        supply.forward_failure(mut lo, mut fx, called)
+        supply.ret(mut lo, mut fx, held: called.result)
+    } else {
+        let data = supply.param(1)
+        var call_args = Array[Held, 2].filled(number)
+        call_args[1] = data
+        let called = served_call(mut lo, mut fx, interface_name, method: member, kind, args: call_args.view())
+        supply.forward_failure(mut lo, mut fx, called)
+        let span = sys_view(mut fx, held: data)
+        var count = mut fx.b.umin(called.result.scalar_value(), y: span.len)
+        if member == "write" {
+            let one = mut fx.ptr(1)
+            let least = mut fx.b.umin(span.len, y: one)
+            count = mut fx.b.umax(count, y: least)
+        }
+        supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+    }
+} served_resource
+
+/// Releases a served resource's record: calls its releasing method, then frees it.
+fn served_release(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let service = mut fx.load(PTR, addr: record, offset: SERVED_RECORD_SERVICE)
+    let number = mut fx.load(PTR, addr: record, offset: SERVED_RECORD_NUMBER)
+    let code = mut fx.load(PTR, addr: record, offset: SERVED_RECORD_RELEASE)
+    let interface_item = served_interface(lo, name: "FsService")
+    let index = served_method(lo, interface_item, name: "release")
+    let slot = served_kind_slot(mut fx, service)
+    discard served_invoke(mut lo, mut fx, interface_item, method: index, code, slot, args: Array[Held, 1].filled(Held.Scalar(number)).view())
+    mut lo.record_free(mut fx, address: record)
+} served_release

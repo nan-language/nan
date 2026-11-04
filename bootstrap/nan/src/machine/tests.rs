@@ -108,6 +108,25 @@ fn records_out_of_order_are_invalid() {
 }
 
 #[test]
+fn approvals_in_entry_order_are_in_record_order() {
+    let mut written = lock();
+    let entries: std::collections::BTreeSet<Approved> = [
+        Approved::Validator("meter::read".to_owned()),
+        Approved::Priv,
+        Approved::Escape("validator", "meter::read".to_owned()),
+        Approved::Device,
+        Approved::Capability("sys::Fs".to_owned()),
+        Approved::Alloc,
+    ]
+    .into_iter()
+    .collect();
+    written.approved = (entries.into_iter())
+        .map(|entry| ("meter".to_owned(), entry))
+        .collect();
+    assert!(Lock::read(&written.bytes().unwrap()).is_ok());
+}
+
+#[test]
 fn a_history_reads_back_as_written() {
     let history = History {
         name: "meter".to_owned(),

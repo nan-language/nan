@@ -1365,6 +1365,9 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                     None => Err(End::Missing),
                 }
             }
+            Callable::Method { interface, method } if self.ck.encodes(fn_ref) => {
+                native::encode_call(self, *interface, *method as usize, &args, at)
+            }
             Callable::Method { interface, method } => {
                 let self_ty = fn_ref
                     .args

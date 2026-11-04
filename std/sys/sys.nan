@@ -375,12 +375,108 @@ pub open struct Wire[P: Protocol] {
 
 pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
 
-pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+pub fn Wire.schema(alloc: mem::Alloc) -> ProtocolSchema
+    example Wire[MeterSpare].schema(testing::world().alloc).operations.len() == 1
+
+pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+
+pub closed struct ProtocolSchema derives Encode {
+    pub hash: ProtocolHash
+    pub operations: mem::List[OperationSchema]
+} ProtocolSchema
+
+pub closed struct OperationSchema derives Encode {
+    pub name: text::String
+    pub parameters: mem::List[ParameterSchema]
+    pub result: Option[TypeSchema]
+    pub failure: Option[TypeSchema]
+} OperationSchema
+
+pub closed struct ParameterSchema derives Encode {
+    pub name: text::String
+    pub value: TypeSchema
+} ParameterSchema
+
+pub closed enum TypeSchema derives Encode {
+    Encoded(mem::wire::Schema)
+    Handle(Array[u8, 33])
+} TypeSchema
+
+pub fn ProtocolSchema.serves(self, client: ProtocolSchema, operation: Str) -> bool
+    example Wire[Meter].schema(testing::world().alloc).serves(Wire[MeterSpare].schema(testing::world().alloc), operation: "clear")
+{
+    let Some(offered) = self.operations.position(fn(held: OperationSchema) => held.name.as_str() == operation) else {
+        return false
+    }
+    if self.hash == client.hash {
+        return true
+    }
+    let Some(called) = client.operations.position(fn(held: OperationSchema) => held.name.as_str() == operation) else {
+        return false
+    }
+    return self.operations[offered].serves(client.operations[called])
+} ProtocolSchema.serves
+
+pub fn ProtocolSchema.serves_call(self, hash: ProtocolHash, peers: Slice[ProtocolSchema], operation: Str) -> bool {
+    if hash == self.hash {
+        return self.serves(self, operation)
+    }
+    for peer in peers {
+        if peer.hash == hash {
+            return self.serves(peer, operation)
+        }
+    }
+    return false
+} ProtocolSchema.serves_call
+
+/// Whether this operation reads each call `call` makes and `call` reads each reply it gives.
+fn OperationSchema.serves(self, call: OperationSchema) -> bool {
+    if self.parameters.len() != call.parameters.len() {
+        return false
+    }
+    for parameter in self.parameters {
+        let Some(at) = call.parameters.position(fn(sent: ParameterSchema) => sent.name == parameter.name) else {
+            return false
+        }
+        if not parameter.value.accepts(call.parameters[at].value) {
+            return false
+        }
+    }
+    let replied = match self.result {
+        None => call.result.is_none()
+        Some(result) => match call.result {
+            Some(read) => read.accepts(result)
+            None => false
+        }
+    }
+    return replied and match self.failure {
+        None => true
+        Some(failure) => match call.failure {
+            Some(read) => read.accepts(failure)
+            None => false
+        }
+    }
+} OperationSchema.serves
+
+/// Whether values of this type schema decode from the encodings of `old`'s.
+fn TypeSchema.accepts(self, old: TypeSchema) -> bool {
+    return match self {
+        TypeSchema.Encoded(tree) => match old {
+            TypeSchema.Encoded(held) => tree.accepts(held)
+            TypeSchema.Handle(_) => false
+        }
+        TypeSchema.Handle(hash) => match old {
+            TypeSchema.Handle(held) => hash == held
+            TypeSchema.Encoded(_) => false
+        }
+    }
+} TypeSchema.accepts
 
 pub open struct Reply[R: Send, E: Send] {
 } Reply
 
 pub fn Reply.decode(self, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> R fails CallError[E]
+    example keeps_clock(testing::world().clock, alloc: testing::world().alloc)
 
 struct Probe derives Encode {
     handled: u64
@@ -1413,7 +1509,8 @@ fn Gauge.keep(mut self, take clock: Clock, mut env: MeterEnv, mut cx: Cx[Meter])
 
 /// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it.
 fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait {
-    return try await Wire[Meter].serve(inbox, hash: Wire[Meter].hash(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
+    let peers = mem::List[ProtocolSchema].empty(alloc)
+    return try await Wire[Meter].serve(inbox, hash: Wire[Meter].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
 } served
 
 test hashes_differ_by_protocol for Wire.hash {
@@ -1424,6 +1521,75 @@ test hashes_differ_by_protocol for Wire.hash {
 protocol MeterSpare {
     pub fn clear() limits pure
 } MeterSpare
+
+enum Shortfall derives Render, Encode {
+    Over
+    Under
+} Shortfall
+
+protocol MeterClient {
+    pub fn add(amount: u32) -> u64 fails Shortfall limits pure
+} MeterClient
+
+protocol MeterOneWay {
+    pub fn add(amount: u32) limits pure
+} MeterOneWay
+
+test operations_serve_the_calls_they_read_and_answer_readably for ProtocolSchema.serves {
+    let alloc = testing::world().alloc
+    let meter = Wire[Meter].schema(alloc)
+    let client = Wire[MeterClient].schema(alloc)
+    let spare = Wire[MeterSpare].schema(alloc)
+    let one_way = Wire[MeterOneWay].schema(alloc)
+    expect meter.serves(meter, operation: "keep")
+    expect meter.serves(client, operation: "add")
+    expect meter.serves(spare, operation: "clear")
+    expect not meter.serves(spare, operation: "add")
+    expect not meter.serves(one_way, operation: "add")
+    expect not meter.serves(meter, operation: "remove")
+    expect not client.serves(meter, operation: "add")
+    var peers = mem::List[ProtocolSchema].empty(alloc)
+    mut peers.push(Wire[MeterSpare].schema(alloc))
+    mut peers.push(Wire[MeterClient].schema(alloc))
+    expect meter.serves_call(Wire[Meter].hash(), peers: peers.view(), operation: "keep")
+    expect meter.serves_call(Wire[MeterClient].hash(), peers: peers.view(), operation: "add")
+    expect not meter.serves_call(Wire[MeterClient].hash(), peers: peers.view(), operation: "clear")
+    expect not meter.serves_call(Wire[MeterOneWay].hash(), peers: peers.view(), operation: "add")
+} operations_serve_the_calls_they_read_and_answer_readably
+
+test compatible_clients_are_served for Wire.serve {
+    let world = testing::world()
+    let alloc = world.alloc
+    let last = try await host::Runner[Gauge].run(MeterEnv(), exec: world.exec, alloc, body: fn(inbox: Outbox[Meter]) fails CallError[Never] uses wait {
+        var peers = mem::List[ProtocolSchema].empty(alloc)
+        mut peers.push(Wire[MeterClient].schema(alloc))
+        mut peers.push(Wire[MeterOneWay].schema(alloc))
+        var call = Encoded.empty(alloc)
+        let reply = Wire[MeterClient].add(mut call, amount: 7)
+        let Ok(answer) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterClient].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+            expect false
+            return
+        }
+        let Ok(total) = attempt reply.decode(Untrusted.of(answer.bytes.view()), handles: answer.handles.view(), alloc) else {
+            expect false
+            return
+        }
+        expect total == 7
+        var posted = Encoded.empty(alloc)
+        Wire[MeterOneWay].add(mut posted, amount: 1)
+        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterOneWay].hash(), peers: peers.view(), raw: Untrusted.of(posted.bytes.view()), handles: posted.handles.view(), alloc) else {
+            expect false
+            return
+        }
+        var cleared = Encoded.empty(alloc)
+        Wire[MeterSpare].clear(mut cleared)
+        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterSpare].hash(), peers: peers.view(), raw: Untrusted.of(cleared.bytes.view()), handles: cleared.handles.view(), alloc) else {
+            expect false
+            return
+        }
+    })
+    expect last.total == 7
+} compatible_clients_are_served
 
 test calls_are_served_from_their_encodings for Wire.serve {
     let world = testing::world()
@@ -1456,6 +1622,16 @@ test calls_are_served_from_their_encodings for Wire.serve {
     })
     expect last.total == 0
 } calls_are_served_from_their_encodings
+
+/// Whether a call keeping `clock` carries its handle, which the reply to it gives back.
+fn keeps_clock(clock: Clock, alloc: mem::Alloc) -> bool {
+    var call = Encoded.empty(alloc)
+    let reply = Wire[Meter].keep(mut call, clock)
+    let kept = attempt reply.decode(Untrusted.of(b"\x02Ok\x01\x01\x00"), handles: call.handles.view(), alloc)
+    let none = mem::List[Handle].empty(alloc)
+    let missing = attempt reply.decode(Untrusted.of(b"\x02Ok\x01\x01\x00"), handles: none.view(), alloc)
+    return call.bytes.view() == b"\x04keep\x01\x09\x01\x05clock\x01\x00" and kept.is_ok() and missing.is_err()
+} keeps_clock
 
 test handles_travel_beside_their_encodings for Reply.decode {
     let world = testing::world()

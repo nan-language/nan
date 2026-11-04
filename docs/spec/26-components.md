@@ -1287,7 +1287,48 @@ pub fn notify(outbox: sys::Outbox[Mailer]) fails task::SendError uses wait limit
 The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), or for a handle type its **handle line**, `handle ` and the type's normalised text, followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
 
 - The code root of a package records the hashes of each `pub` protocol it declares ([code roots](30-artefacts.md#code-roots)), and `nan show --api` prints a protocol's ([commands](33-toolchain.md#commands)).
-- Closures agreeing on a protocol hash exchange its operations through their [wire encoding](#wire-encoding).
+- Closures exchange a protocol's operations through their [wire encoding](#wire-encoding): all of them when they agree on its protocol hash, and otherwise each operation that the server's [protocol schema](#protocol-schemas) serves for the client's.
+
+### Protocol schemas
+
+The **protocol schema** of a protocol describes what its `pub` operations exchange, so that closures declaring a protocol differently judge, operation by operation, which calls they can still exchange.
+
+```nan-api
+// module: sys
+
+pub closed struct ProtocolSchema derives Encode {
+    pub hash: ProtocolHash
+    pub operations: mem::List[OperationSchema]
+} ProtocolSchema
+
+pub closed struct OperationSchema derives Encode {
+    pub name: text::String
+    pub parameters: mem::List[ParameterSchema]
+    pub result: Option[TypeSchema]
+    pub failure: Option[TypeSchema]
+} OperationSchema
+
+pub closed struct ParameterSchema derives Encode {
+    pub name: text::String
+    pub value: TypeSchema
+} ParameterSchema
+
+pub closed enum TypeSchema derives Encode {
+    Encoded(mem::wire::Schema)
+    Handle(Array[u8, 33])
+} TypeSchema
+
+pub fn Wire.schema(alloc: mem::Alloc) -> ProtocolSchema
+
+pub fn ProtocolSchema.serves(self, client: ProtocolSchema, operation: Str) -> bool
+
+pub fn ProtocolSchema.serves_call(self, hash: ProtocolHash, peers: Slice[ProtocolSchema], operation: Str) -> bool
+```
+
+- `Wire[P].schema(alloc)` gives P's protocol schema drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`): P's protocol hash and, in byte order of name, each `pub` operation of P with its parameters in byte order of name, the type schema of its result when it is a request, and that of its failure when it has a `fails` clause. The **type schema** of a handle type is `Handle` holding its [handle hash](#wire-encoding); that of another type is `Encoded` holding its [schema tree](13-text-encode.md#schema-hashes).
+- A type schema **accepts** another when both are `Encoded` and its tree [accepts](29-identity-versioning.md#encode-class) the other's, or both are `Handle` holding one hash.
+- A server's protocol schema S **serves** an operation for a client's protocol schema C when S has an operation of that name and, unless S and C hold one protocol hash, C has one too, such that: they have parameters of the same names, each of S's accepting C's of its name; C's has a result exactly when S's has one, accepting it; and C's has a failure when S's has one, accepting it. S's decoders then read every call of it C encodes, and C's every reply S gives. `server.serves(client, operation)` decides it.
+- S serves a call of an operation made under a protocol hash `hash`, knowing the schemas `peers`, when it serves the operation for itself if `hash` is its own, and otherwise for the first schema of `peers` holding `hash`, none serving it when no schema does. `server.serves_call(hash, peers, operation)` decides it.
 
 ### Wire encoding
 
@@ -1318,7 +1359,7 @@ pub open struct Wire[P: Protocol] {
 
 pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
 
-pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
 
 pub open struct Reply[R: Send, E: Send] {
 } Reply
@@ -1340,12 +1381,12 @@ On `sys::Wire[P]`, the candidates of method resolution for a name also hold P's 
 The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without payload when the operation has no parameters, and otherwise with the record of its arguments keyed by their parameters' names, as an enum variant with labelled payloads [encodes](13-text-encode.md#derived-encode-and-decode). The encoding of the **reply** to a request is the variant `Ok` holding its handler's result or `Err` holding its failure, as `Result[R, E]` encodes. A value of a handle type encodes as an unsigned integer: the index of its handle among the handles beside the encoding, which hold them in the order the encoding does. Decoding an encoding against its handles reads each value of a handle type T as `mem::wire::Codec.decode` reads one ([wire format](13-text-encode.md#wire-format)), and also fails with `Malformed` when an index it reads is not the count of handles read before it, with `Truncated` when no handle has that index, with `Invalid` when that handle's handle hash is not T's, and with `Trailing` when it leaves handles unread.
 
 - `Wire[P].op(mut out, ...)` appends the encoding of its call to `out.bytes` and the handles of its values of handle types to `out.handles`, each index counting the handles `out` held before, trapping when memory is exhausted (`trap.exhausted`). The operation's `requires` is no obligation there, and its class enters no digest.
-- `Wire[P].serve(out, hash, raw, handles, alloc)` fails with `CallError.Malformed` holding `UnknownSchema` when `hash` is not P's protocol hash. Otherwise it decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`, then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments and gives a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
+- `Wire[P].serve(out, hash, peers, raw, handles, alloc)` serves a call made under the protocol hash `hash`, `peers` holding the protocol schemas of the clients the server knows. It decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`. When `hash` is not P's protocol hash, it then fails with `UnknownSchema` unless P's protocol schema, drawn through `alloc`, [serves the call](#protocol-schemas) under `hash` knowing `peers`. It then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments and gives a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
 - `reply.decode(raw, handles, alloc)` decodes the reply of its request from `raw` against `handles` and gives its result, fails with `CallError.Failed` holding its failure, or, when it does not decode, with `CallError.Malformed` holding the decoding's failure. A call through an outbox never fails with `CallError.Malformed`.
 - The digest of `serve` states waiting and the class of each `pub` operation of P ([operation calls](#operation-calls)).
 - The [codec uses](15-untrusted.md#validate-grants) of `serve` mark P `decode` and `encode`, a use of the encoder of a protocol being a use of the encoders of the results and failures of its `pub` requests, and those of `decode` mark R and E `decode`. A call of `Wire[P].op` uses the encoder of each type of its operation's parameters.
 
-A probe and a tally in separate closures each declare the `Counter` protocol over the types of `refusals`, with one protocol hash, so one encodes calls the other serves. The tally refuses calls under another protocol hash, and those breaking `requires`:
+A probe and a tally in separate closures each declare the `Counter` protocol over the types of `refusals`, with one protocol hash, so one encodes calls the other serves. The probe's `Adder`, declaring refusals of its own, has another protocol hash, yet the tally serves its `add`, whose schemas are compatible. The tally refuses the one-way `add` of the probe's `Gauge`, and calls breaking `requires`:
 
 ```nan
 // file: refusals/package.nan
@@ -1408,9 +1449,16 @@ pub fn Tally.reset(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
 
 pub fn Tally.echo(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx[Counter]) -> sys::Clock = clock
 
-/// The reply of the tally behind `inbox` to a call made under the protocol hash `hash`.
-pub fn serve(inbox: sys::Outbox[Counter], hash: sys::ProtocolHash, call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
-    return try await sys::Wire[Counter].serve(inbox, hash, raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
+/// The reply of the tally behind `inbox` to a call made under the protocol hash `hash`, knowing
+/// the clients whose protocol schemas `peers` holds.
+pub fn serve(
+    inbox: sys::Outbox[Counter],
+    hash: sys::ProtocolHash,
+    peers: Slice[sys::ProtocolSchema],
+    call: sys::Encoded,
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::CallError[Never] uses wait {
+    return try await sys::Wire[Counter].serve(inbox, hash, peers, raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
 } serve
 
 // file: probe/package.nan
@@ -1436,6 +1484,15 @@ pub protocol Gauge {
     pub fn add(amount: u64) limits pure
 } Gauge
 
+pub closed enum Refusal derives Render, Encode {
+    Busy
+    TooLarge
+} Refusal
+
+pub protocol Adder {
+    pub fn add(amount: u32) -> u64 fails Refusal limits pure
+} Adder
+
 // file: link/package.nan
 //! Calls carried from the closure of probe to that of counter.
 
@@ -1451,15 +1508,40 @@ package link {
 // file: link/link.nan
 //! Calls of a probe served by a tally, each carried encoded.
 
-/// The reply to `call`, made under the protocol hash `hash`, of the tally behind `inbox`.
+/// The reply to `call`, made under the protocol hash `hash`, of the tally behind `inbox`, which
+/// knows the probe's adders and gauges.
 fn carry(inbox: sys::Outbox[counter::Counter], hash: sys::ProtocolHash, call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[refusals::Refused] uses wait {
-    return match attempt await counter::serve(inbox, hash, call, alloc) {
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    mut peers.push(sys::Wire[probe::Adder].schema(alloc))
+    mut peers.push(sys::Wire[probe::Gauge].schema(alloc))
+    return match attempt await counter::serve(inbox, hash, peers: peers.view(), call, alloc) {
         Ok(reply) => reply
         Err(sys::CallError.Malformed(error)) => fail sys::CallError.Malformed(error)
         Err(sys::CallError.Cancelled(cancelled)) => fail sys::CallError.Cancelled(take cancelled)
         else => fail sys::CallError.Closed(task::SendError.Closed)
     }
 } carry
+
+/// Whether a tally serves the additions of an adder.
+pub fn serves_adder(alloc: mem::Alloc) -> bool
+    example serves_adder(testing::world().alloc)
+{
+    let tally = sys::Wire[counter::Counter].schema(alloc)
+    return tally.serves(sys::Wire[probe::Adder].schema(alloc), operation: "add") and not tally.serves(sys::Wire[probe::Gauge].schema(alloc), operation: "add")
+} serves_adder
+
+/// The sum an adder reads from a tally's reply `reply` to its addition, zero when it reads none.
+pub fn read_sum(reply: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u64
+    example read_sum(Untrusted.of(b"\x02Ok\x01\x01\x05"), alloc: testing::world().alloc) == 5
+    example read_sum(Untrusted.of(b"\x03Err\x01\x0a\x08TooLarge\x00"), alloc: testing::world().alloc) == 0
+{
+    var call = sys::Encoded.empty(alloc)
+    let added = sys::Wire[probe::Adder].add(mut call, amount: 5)
+    let Ok(sum) = attempt added.decode(reply, handles: call.handles.view(), alloc) else {
+        return 0
+    }
+    return sum
+} read_sum
 
 test probe_calls_tally for carry {
     let world = testing::world()
@@ -1492,6 +1574,14 @@ test probe_calls_tally for carry {
         }
         let elapsed = attempt returned_clock.elapsed_ns()
         expect elapsed.is_ok()
+        var adding = sys::Encoded.empty(alloc)
+        let summed = sys::Wire[probe::Adder].add(mut adding, amount: 2)
+        let summed_reply = try await carry(inbox, hash: sys::Wire[probe::Adder].hash(), call: adding, alloc)
+        let sum = attempt summed.decode(Untrusted.of(summed_reply.bytes.view()), handles: summed_reply.handles.view(), alloc)
+        let Ok(7) = sum else {
+            expect false
+            return
+        }
         var other = sys::Encoded.empty(alloc)
         sys::Wire[probe::Gauge].add(mut other, amount: 1)
         let mismatched = attempt await carry(inbox, hash: sys::Wire[probe::Gauge].hash(), call: other, alloc)

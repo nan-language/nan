@@ -1,0 +1,159 @@
+//! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema` and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle hash.
+
+/// A member of `sys::Wire` or `sys::Reply`; none for another.
+fn Interpreter.protocol_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if owner == "sys::Reply" and member == "decode" {
+        return Some(try mut self.decode_reply(type_args, args, at, site))
+    }
+    if owner != "sys::Wire" or (member != "hash" and member != "schema") {
+        return None
+    }
+    let ty::TyKind.Item(item: protocol, args: _) = self.ck.types().kind(type_arg_or_unit(type_args, index: 0)) else {
+        expect false
+        return None
+    }
+    if member == "hash" {
+        let hashes = self.ck.protocol_hashes(protocol)
+        let fields = Val.single(Val.Array(mem::Shared.of(byte_values(hashes.hash.bytes.view(), alloc), alloc)), alloc)
+        return Some(InterpFlow.Return(Val.Struct(item: self.ty_item("sys", name: "ProtocolHash"), fields: mem::Shared.of(take fields, alloc))))
+    }
+    expect args.len() > 0
+    let schema = self.ck.types().item(self.ty_item("sys", name: "ProtocolSchema"), args: mem::List[ty::Arg].empty(alloc))
+    let encoding = self.ck.protocol_schema(protocol)
+    return Some(try mut self.constant_value(take encoding, ty: schema, alloc_value: args[0], at, site))
+} Interpreter.protocol_member
+
+/// The position of a field of a std struct.
+fn Interpreter.field_position(self, item: ty::ItemId, name: Str) -> u32 {
+    let held = self.ck.sig(item)
+    let SigKind.Struct(fields: fields) = held.contents().kind else {
+        expect false
+        return 0
+    }
+    let Some(position) = fields.position(fn(field: FieldSig) => field.name.as_str() == name) else {
+        expect false
+        return 0
+    }
+    return u32.fit(position)
+} Interpreter.field_position
+
+/// `Wire[P].op(mut out, ...)`: the encoding of the call appended to `out.bytes`, each value of a
+/// handle type taken as the index of its handle, which goes to `out.handles`, trapping when memory
+/// is exhausted; a request's `sys::Reply`.
+fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take args: mem::List[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let held = ck.sig(protocol)
+    let SigKind.Protocol(operations: operations, variants: _, summary: _) = held.contents().kind else {
+        expect false
+        fail End.Missing
+    }
+    let operation = operations[method]
+    let encoded_item = self.ty_item("sys", name: "Encoded")
+    let handle_item = self.ty_item("sys", name: "Handle")
+    let out = args[0].place()
+    let bytes_at = out.with(self.field_position(encoded_item, name: "bytes"), alloc)
+    let handles_at = out.with(self.field_position(encoded_item, name: "handles"), alloc)
+    let first_index = self.entries(self.memory.get(handles_at)).len()
+    var named = mem::List[usize].empty(alloc)
+    for position in 0..<operation.sig.params.len() {
+        mut named.push(position)
+    }
+    mut named.sort_by(fn(left: usize, right: usize) => operation.sig.params[left].name.as_str().cmp(operation.sig.params[right].name.as_str()))
+    var carried = mem::List[Val].empty(alloc)
+    var fields = mem::List[TreeField].empty(alloc)
+    for position in named {
+        let param = operation.sig.params[position]
+        let value = args[position + 1]
+        if ck.is_handle(param.ty) {
+            let hash = ck.handle_hash(param.ty)
+            var parts = Val.single(self.deref(value), alloc)
+            mut parts.push(Val.Array(mem::Shared.of(byte_values(hash.bytes.view(), alloc), alloc)))
+            mut carried.push(Val.Struct(item: handle_item, fields: mem::Shared.of(take parts, alloc)))
+            mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: Tree.Unsigned(u64.widen(first_index + carried.len() - 1))))
+        } else {
+            mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: self.encoded(value, ty: param.ty)))
+        }
+    }
+    var payload: Option[mem::Box[Tree]] = None
+    if fields.len() > 0 {
+        payload = Some(mem::Heap.of(alloc).boxed(Tree.Record(take fields)))
+    }
+    var written = mem::Bytes.empty(alloc)
+    Tree.Variant(key: name_bytes(operation.name.as_str(), alloc), payload: take payload).write_wire(mut written, alloc)
+    let bytes = byte_values(written.view(), alloc)
+    let handle_ty = ck.types().item(handle_item, args: mem::List[ty::Arg].empty(alloc))
+    if not mut self.append(place: bytes_at, values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) or not mut self.append(place: handles_at, values: carried.view(), element: handle_ty) {
+        return try self.exhausted(fallible: false, at)
+    }
+    for position in 1..<args.len() {
+        mut self.release_value(args[position])
+    }
+    if ck.is_request(protocol, index: method) {
+        return InterpFlow.Return(Val.Struct(item: self.ty_item("sys", name: "Reply"), fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+    }
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.encode_call
+
+/// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply decoded from `raw` against
+/// `handles`, failing with `CallError.Failed` holding the failure of an `Err` one and with
+/// `CallError.Malformed` when the reply does not decode or leaves bytes or handles unread.
+fn Interpreter.decode_reply(mut self, type_args: Slice[ty::Arg], args: Slice[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    expect args.len() > 3
+    let result_item = self.ty_item("core", name: "Result")
+    var reply_args = mem::List[ty::Arg].empty(alloc)
+    for arg in type_args {
+        mut reply_args.push(arg)
+    }
+    let reply = self.ck.types().item(result_item, args: take reply_args)
+    let wrapped = self.deref(args[1])
+    expect wrapped.fields().len() > 0
+    let input = mut self.bytes(wrapped.fields()[0].copy(alloc))
+    let view = mut self.view(args[2])
+    let handles = self.view_values(view)
+    let count = handles.len()
+    let cell = self.cell_of(args[3])
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site, carried: Some(take handles), taken: 0)
+    var reader = WireReader.new(take input, alloc)
+    var decoded = attempt mut decoding.whole(mut self, reader: mut reader, ty: reply)
+    if decoded.is_ok() and decoding.taken != count {
+        decoded = Err(Failure.Decode(DecodeKind.Trailing))
+    }
+    let call_error = self.ty_item("sys", name: "CallError")
+    match first decoded {
+        Ok(Val.Variant(item: _, index: index, fields: payload)) => {
+            expect payload.contents().len() > 0
+            let held = payload.contents()[0].copy(alloc)
+            if index == self.variant_index(result_item, name: "Ok") {
+                return InterpFlow.Return(take held)
+            }
+            let failed = self.variant_index(call_error, name: "Failed")
+            return InterpFlow.Fail(Val.Variant(item: call_error, index: failed, fields: mem::Shared.of(Val.single(take held, alloc), alloc)))
+        }
+        Ok(_) => {
+            expect false
+            fail End.Missing
+        }
+        Err(Failure.Decode(kind)) => {
+            let error = self.ty_item("core", name: "DecodeError")
+            let malformed = Val.Variant(item: error, index: self.variant_index(error, name: kind.name()), fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))
+            let index = self.variant_index(call_error, name: "Malformed")
+            return InterpFlow.Fail(Val.Variant(item: call_error, index: index, fields: mem::Shared.of(Val.single(take malformed, alloc), alloc)))
+        }
+        Err(Failure.Raised(_)) => {
+            expect false
+            fail End.Missing
+        }
+        Err(Failure.Run(end)) => fail end
+    }
+} Interpreter.decode_reply

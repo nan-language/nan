@@ -1,5 +1,5 @@
 //! The wire encoding of protocols: the encodings of calls of operations as members of
-//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.serve` and `sys::Reply.decode`.
+//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve` and `sys::Reply.decode`.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
@@ -11,10 +11,10 @@ use super::super::super::{Instance, Lowering};
 use super::super::mem::vector;
 use super::super::{Supply, entry as supplied_entry, tasks::address_of};
 use super::{
-    BYTE, DecodeFormat, Format, HANDLE, Kind, encode_case, encoder, failure, kind_of, read_from,
-    same_hash, writer,
+    BYTE, DecodeFormat, Format, HANDLE, Kind, constant, decode_constant, encode_case, encoder,
+    failure, kind_of, read_from, same_hash, writer,
 };
-use crate::check::db::ItemId;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Args, Ty};
 use crate::nir::Role;
@@ -28,6 +28,10 @@ pub mod handle {
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     match supply.path.as_str() {
         "sys::Wire.hash" => hash(lo, fx, supply),
+        "sys::Wire.schema" => {
+            let schema = lo.ck.protocol_schema(protocol_of(supply));
+            constant(lo, fx, supply, &schema);
+        }
         "sys::Wire.serve" => serve(lo, fx, supply),
         "sys::Reply.decode" => decode_reply(lo, fx, supply),
         _ => return false,
@@ -217,22 +221,18 @@ fn read_handled(
     )
 }
 
-/// `Wire[P].serve(out, hash, raw, handles, alloc)`: the call decoded under P's protocol hash,
-/// its operation's `requires` evaluated, then made through `out`, giving the encoding of its
-/// reply.
+/// `Wire[P].serve(out, hash, peers, raw, handles, alloc)`: the call decoded, refused under
+/// another protocol hash unless P serves its operation for the peer of `peers` holding `hash`, its
+/// operation's `requires` evaluated, then made through `out`, giving the encoding of its reply.
 fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let protocol = protocol_of(supply);
     let message = Ty::item(protocol, Vec::new());
     let own = protocol_hash(lo, fx, protocol);
     let same = same_hash(lo, fx, supply.param(1).address(), own);
     let other = fx.b.ins().bxor_imm_s(same, 1);
-    fx.when(other, |fx| {
-        let code = fx.int(types::I32, failure::UNKNOWN_SCHEMA);
-        fail_malformed(lo, fx, supply, code);
-    });
     let layout = lo.layout(&message);
     let slot = fx.slot(layout.size, layout.align);
-    let code = read_handled(lo, fx, supply, 2, &message, slot);
+    let code = read_handled(lo, fx, supply, 3, &message, slot);
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
     fx.when(failed, |fx| fail_malformed(lo, fx, supply, code));
     let sig = lo.ck.sig(protocol);
@@ -249,6 +249,15 @@ fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     Held::Address(at)
                 })
                 .collect();
+            fx.when(other, |fx| {
+                let served = serves(lo, fx, supply, protocol, &operation.name);
+                let refused = fx.b.ins().icmp_imm_s(IntCC::Equal, served, 0);
+                fx.when(refused, |fx| {
+                    lo.release(fx, &message, slot);
+                    let code = fx.int(types::I32, failure::UNKNOWN_SCHEMA);
+                    fail_malformed(lo, fx, supply, code);
+                });
+            });
             for index in lo.ck.operation_requires(protocol, method) {
                 let instance = Instance::Nir {
                     item: protocol,
@@ -325,6 +334,45 @@ fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
+/// Whether P's protocol schema, drawn through `serve`'s allocator and then released, serves a call
+/// of the operation `name` under the hash and the peer schemas `serve` was given, as
+/// `sys::ProtocolSchema.serves_call` decides.
+fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, name: &str) -> Value {
+    let ty = lo.std_ty("sys", "ProtocolSchema", Vec::new());
+    let layout = lo.layout(&ty);
+    let own = fx.slot(layout.size, layout.align);
+    let alloc = fx.load(PTR, supply.param(5).address(), 0);
+    let encoding = lo.ck.protocol_schema(protocol);
+    let code = decode_constant(lo, fx, &encoding, &ty, alloc, own);
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
+    fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
+    let Ty::Item(item, _) = &ty else {
+        unreachable!("sys::ProtocolSchema is an item")
+    };
+    let function = lo.ck.db.members(TypeKey::Item(*item), "serves_call")[0];
+    let instance = Instance::Nir {
+        item: function,
+        role: Role::Body,
+        index: 0,
+        args: Args::from(Vec::new()),
+    };
+    let abi = lo.abi(&instance);
+    let id = lo.instance(instance);
+    let operation = lo.view_literal(fx, name.as_bytes());
+    let args = [
+        Held::Address(own),
+        supply.param(1),
+        supply.param(2),
+        operation,
+    ];
+    let served = lo
+        .invoke(fx, Invoked::Direct(id), &abi, &args)
+        .result
+        .scalar();
+    lo.release(fx, &ty, own);
+    served
+}
+
 /// Returns an encoded reply drawn through the operation's allocator: holding the encoding of a reply
 /// held as given, which is then released, or nothing.
 fn give(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, reply: Option<(&Ty, Held)>) {
@@ -333,7 +381,7 @@ fn give(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, reply: Option<(&Ty, Hel
     let encoded = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let alloc = fx.load(PTR, supply.param(4).address(), 0);
+    let alloc = fx.load(PTR, supply.param(5).address(), 0);
     let (bytes, handles) = encoded_parts(lo, fx, encoded);
     vector::empty(fx, bytes, alloc, BYTE);
     vector::empty(fx, handles, alloc, HANDLE);

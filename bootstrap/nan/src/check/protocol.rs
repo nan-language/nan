@@ -10,6 +10,7 @@ use super::interface::narrower;
 use super::props::Property;
 use super::resolve::Named;
 use super::reversibility::Class;
+use super::schema::{option, record, sequence, text, unsigned, variant};
 use super::sig::{FnSig, ParamSig, SigKind};
 use super::ty::{Arg, Const, LimitSet, Ty};
 use crate::diagnostic::Code;
@@ -607,6 +608,59 @@ impl Checker<'_> {
             bytes.extend(format!("{name} {}\n", hash.full()).as_bytes());
         }
         (Hash::of(&bytes), hashed)
+    }
+
+    /// The `mem::wire` encoding of a protocol's `sys::ProtocolSchema`: its protocol hash and, in
+    /// byte order of name, each `pub` operation with its parameters in byte order of name, the
+    /// type schema of its result for a request and of its failure for a `fails` clause.
+    pub fn protocol_schema(&self, protocol: ItemId) -> Vec<u8> {
+        let (hash, _) = self.protocol_hashes(protocol);
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            unreachable!("a protocol's signature")
+        };
+        let mut described: Vec<(&str, Vec<u8>)> = (self.hashed_operations(protocol).into_iter())
+            .map(|index| {
+                let operation = &operations[index];
+                let mut parameters: Vec<&ParamSig> = operation.sig.params.iter().collect();
+                parameters.sort_by(|left, right| left.name.cmp(&right.name));
+                let parameters = parameters.into_iter().map(|param| {
+                    let value = self.type_schema(&param.ty);
+                    record(vec![("name", text(&param.name)), ("value", value)])
+                });
+                let result = (self.is_request(protocol, index))
+                    .then(|| self.type_schema(&operation.sig.result));
+                let failure = operation.sig.fails.as_ref().map(|ty| self.type_schema(ty));
+                let described = record(vec![
+                    ("failure", option(failure)),
+                    ("name", text(&operation.name)),
+                    ("parameters", sequence(parameters)),
+                    ("result", option(result)),
+                ]);
+                (operation.name.as_str(), described)
+            })
+            .collect();
+        described.sort_by(|left, right| left.0.cmp(right.0));
+        let bytes = sequence(hash.0.iter().map(|byte| unsigned(u64::from(*byte))));
+        record(vec![
+            ("hash", record(vec![("bytes", bytes)])),
+            (
+                "operations",
+                sequence(described.into_iter().map(|(_, described)| described)),
+            ),
+        ])
+    }
+
+    /// The `mem::wire` encoding of the `sys::TypeSchema` of one of an operation's types: `Handle`
+    /// holding the handle hash of a handle type, `Encoded` holding the schema tree of another.
+    fn type_schema(&self, ty: &Ty) -> Vec<u8> {
+        match self.is_handle(ty) {
+            true => {
+                let hash = self.handle_hash(ty);
+                let bytes = sequence(hash.0.iter().map(|byte| unsigned(u64::from(*byte))));
+                variant("Handle", Some(bytes))
+            }
+            false => variant("Encoded", Some(self.schema(ty).wire())),
+        }
     }
 
     /// The line of an operation hash naming one of its types: its schema hash, or `handle` and

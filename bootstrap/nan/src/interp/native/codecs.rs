@@ -1,10 +1,14 @@
 //! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas, erased decoders and
-//! migrations, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any
-//! type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then
-//! writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through
-//! the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! migrations, `text::json::Codec` and `text::construction::Codec`, the wire encoding of protocols,
+//! and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the
+//! tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls
+//! replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in
+//! the order the std encodings and derived decoders make them.
 
 mod construction;
+mod protocols;
+
+pub use protocols::encode_call;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -33,6 +37,9 @@ pub fn member(
     at: (ItemId, Span),
     site: Site,
 ) -> Option<Exec<Flow>> {
+    if let Some(flow) = protocols::member(interp, owner, member, type_args, args, at, site) {
+        return Some(flow);
+    }
     let format = match owner {
         "mem::wire::Codec" => Format::Wire,
         "text::json::Codec" => Format::Json,
@@ -121,21 +128,8 @@ pub fn member(
         "schema_hash" => Ok(Flow::Return(schema_hash(interp, &ty))),
         "schema" => {
             let schema = Ty::item(interp.ty_item("mem::wire", "Schema"), Vec::new());
-            let mut reader = WireReader::new(interp.ck.schema(&ty).wire());
-            let cell = cell_of(interp, &args[0]);
-            let mut decoding = Decoding {
-                interp,
-                reader: &mut reader,
-                cell,
-                depth: 0,
-                at,
-                site,
-            };
-            match decoding.value(&schema) {
-                Ok(tree) => Ok(Flow::Return(tree)),
-                Err(Failure::Run(end)) => Err(end),
-                Err(_) => exhausted(interp, false, at),
-            }
+            let tree = interp.ck.schema(&ty).wire();
+            constant(interp, tree, &schema, &args[0], at, site)
         }
         "erased" => {
             let codec = interp.ty_item("mem::wire", "Codec");
@@ -154,6 +148,34 @@ pub fn member(
         }
         _ => return None,
     })
+}
+
+/// The value of `ty` that the `mem::wire` bytes `encoding` encode, drawn through the allocator
+/// `alloc`, trapping when memory is exhausted.
+fn constant(
+    interp: &mut Interpreter,
+    encoding: Vec<u8>,
+    ty: &Ty,
+    alloc: &Val,
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<Flow> {
+    let mut reader = WireReader::new(encoding);
+    let cell = cell_of(interp, alloc);
+    let mut decoding = Decoding {
+        interp,
+        reader: &mut reader,
+        cell,
+        depth: 0,
+        at,
+        site,
+        carried: None,
+    };
+    match decoding.value(ty) {
+        Ok(value) => Ok(Flow::Return(value)),
+        Err(Failure::Run(end)) => Err(end),
+        Err(_) => exhausted(interp, false, at),
+    }
 }
 
 /// One value of a type read from a format's bytes, the Untrusted slice `args[0]`, drawing on
@@ -181,6 +203,7 @@ fn read(
         depth: 0,
         at,
         site,
+        carried: None,
     };
     decoding.value(ty).and_then(|value| {
         decoding.reader.finish(decoding.interp)?;
@@ -324,6 +347,7 @@ pub fn through(
         depth: 0,
         at,
         site,
+        carried: None,
     };
     let decoded = decoding.value(ty);
     outcome(interp, decoded)
@@ -1030,6 +1054,8 @@ struct Decoding<'d, 'i, 'c, 'a> {
     depth: usize,
     at: (ItemId, Span),
     site: Site,
+    /// The handles beside the encoding of a protocol's call or reply, with the count read.
+    carried: Option<(Vec<Val>, usize)>,
 }
 
 impl Decoding<'_, '_, '_, '_> {
@@ -1056,9 +1082,31 @@ impl Decoding<'_, '_, '_, '_> {
                 self.depth -= 1;
                 Ok(Val::Unit)
             }
+            Ty::Item(..) if self.carried.is_some() && self.interp.ck.is_handle(ty) => {
+                self.handle(ty)
+            }
             Ty::Item(item, args) => self.item(*item, args),
             other => panic!("a decoded value of {other:?}"),
         }
+    }
+
+    /// A value of a handle type: the index of the next handle not read, whose handle hash is
+    /// the type's.
+    fn handle(&mut self, ty: &Ty) -> Decoded<Val> {
+        let index = self.reader.read_unsigned(self.interp)?;
+        let (handles, taken) = self.carried.as_mut().expect("handles beside the encoding");
+        if index != *taken as u64 {
+            return fail("Malformed");
+        }
+        let Some(handle) = handles.get(*taken) else {
+            return fail("Truncated");
+        };
+        let handle = self.interp.deref(handle);
+        if bytes_of(handle.fields()[1].fields()) != self.interp.ck.handle_hash(ty).0 {
+            return fail("Invalid");
+        }
+        *taken += 1;
+        Ok(handle.fields()[0].clone())
     }
 
     fn scalar(&mut self, scalar: Scalar) -> Decoded<Val> {

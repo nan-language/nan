@@ -1,4 +1,4 @@
-//! The wire encoding of protocols: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.serve` and `sys::Reply.decode`.
+//! The wire encoding of protocols: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve` and `sys::Reply.decode`.
 
 /// A `sys::Handle`: the generational handle, then its type's handle hash.
 const HANDLE_HANDLE: u64 = 0
@@ -8,6 +8,10 @@ const HANDLE_HASH: u64 = 8
 fn protocols_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
         "sys::Wire.hash" => protocols_hash(mut lo, mut fx, supply)
+        "sys::Wire.schema" => {
+            let schema = lo.ck.protocol_schema(protocols_of(lo, supply))
+            codecs_constant(mut lo, mut fx, supply, encoding: schema.view())
+        }
         "sys::Wire.serve" => protocols_serve(mut lo, mut fx, supply)
         "sys::Reply.decode" => protocols_decode_reply(mut lo, mut fx, supply)
         else => return false
@@ -190,7 +194,8 @@ fn protocols_read_handled(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usi
     return codecs_read_from(mut lo, mut fx, raw: raw_address, alloc, handles: Some(handles), format: DecodeFormat.Wire, ty, target)
 } protocols_read_handled
 
-/// `Wire[P].serve(out, hash, raw, handles, alloc)`: the call decoded under P's protocol hash, its
+/// `Wire[P].serve(out, hash, peers, raw, handles, alloc)`: the call decoded, refused under another
+/// protocol hash unless P serves its operation for the peer of `peers` holding `hash`, its
 /// operation's `requires` evaluated, then made through `out`, giving the encoding of its reply.
 fn protocols_serve(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let protocol = protocols_of(lo, supply)
@@ -199,13 +204,9 @@ fn protocols_serve(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let own = protocols_hash_address(mut lo, mut fx, protocol)
     let same = same_hash(mut lo, mut fx, wanted: supply.param(1).address_value(), hash: own)
     let other = mut fx.b.bxor_imm_s(same, y: 1)
-    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
-        let code = mut fx1.int(clif::Type.Int32, value: FAILURE_UNKNOWN_SCHEMA)
-        protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
-    })
     let laid = mut lo.layout_of(message)
     let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
-    let code = protocols_read_handled(mut lo, mut fx, supply, raw: 2, ty: message, target: slot)
+    let code = protocols_read_handled(mut lo, mut fx, supply, raw: 3, ty: message, target: slot)
     let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: code, y: 0)
     mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
         protocols_fail_malformed(mut lo, fx: mut fx1, supply, code)
@@ -219,20 +220,30 @@ fn protocols_serve(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         let operation = operations[method]
         let is = mut lo.variant_is(mut fx, address: slot, ty: message, variant: operation.name.as_str())
         mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
-            protocols_serve_operation(mut lo, fx: mut fx1, supply, protocol, method, operation, slot)
+            protocols_serve_operation(mut lo, fx: mut fx1, supply, protocol, method, operation, slot, other)
         })
     }
     mut fx.b.trap(clif::TrapCode(user: 1))
 } protocols_serve
 
-/// Serves the call of the operation `method` whose message is at `slot`.
-fn protocols_serve_operation(mut lo: Lowering, mut fx: Fx, supply: Supply, protocol: ty::ItemId, method: usize, operation: check::MethodSig, slot: clif::Value) {
+/// Serves the call of the operation `method` whose message is at `slot`, made under another
+/// protocol hash when `other` holds.
+fn protocols_serve_operation(mut lo: Lowering, mut fx: Fx, supply: Supply, protocol: ty::ItemId, method: usize, operation: check::MethodSig, slot: clif::Value, other: clif::Value) {
     let message = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
     var args = mem::List[Held].empty(lo.alloc)
     for param in operation.sig.params {
         let at = mut lo.payload_address(mut fx, ty: message, variant: operation.name.as_str(), label: param.name.as_str(), address: slot)
         mut args.push(Held.Address(at))
     }
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        let served = protocols_serves(mut lo, fx: mut fx1, supply, protocol, name: operation.name.as_str())
+        let refused = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: served, y: 0)
+        mut fx1.if_true(refused, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.release(fx: mut fx2, ty: message, address: slot)
+            let code = mut fx2.int(clif::Type.Int32, value: FAILURE_UNKNOWN_SCHEMA)
+            protocols_fail_malformed(mut lo, fx: mut fx2, supply, code)
+        })
+    })
     for index in lo.ck.operation_requires(protocol, index: method) {
         let instance = Instance.Nir(item: protocol, role: nir::Role.Requires, index: index, args: ty::Args.none())
         let abi = mut lo.abi(instance)
@@ -283,6 +294,42 @@ fn protocols_serve_operation(mut lo: Lowering, mut fx: Fx, supply: Supply, proto
     protocols_succeeded(mut lo, mut fx, supply, reply, result: called.result)
 } protocols_serve_operation
 
+/// Whether P's protocol schema, drawn through `serve`'s allocator and then released, serves a call
+/// of the operation `name` under the hash and the peer schemas `serve` was given, as
+/// `sys::ProtocolSchema.serves_call` decides.
+fn protocols_serves(mut lo: Lowering, mut fx: Fx, supply: Supply, protocol: ty::ItemId, name: Str) -> clif::Value {
+    let schema = lo.std_ty("sys", type_name: "ProtocolSchema", args: mem::List[ty::Ty].empty(lo.alloc))
+    let laid = mut lo.layout_of(schema)
+    let own = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let alloc = mut fx.load(PTR, addr: supply.param(5).address_value(), offset: 0)
+    let encoding = lo.ck.protocol_schema(protocol)
+    let code = codecs_decode_constant(mut lo, mut fx, encoding: encoding.view(), ty: schema, alloc, target: own)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: code, y: 0)
+    let no_taken = mem::List[Taken].empty(lo.alloc)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        supply.exhausted(mut lo, fx: mut fx1, taken: no_taken.view())
+    })
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(schema) else {
+        expect false
+        return own
+    }
+    let functions = lo.ck.db().members(check::TypeKey.Item(item), name: "serves_call")
+    expect functions.len() > 0
+    let instance = Instance.Nir(item: functions[0], role: nir::Role.Body, index: 0, args: ty::Args.none())
+    let abi = mut lo.abi(instance)
+    let id = mut lo.instance(take instance)
+    let operation = mut lo.view_literal(mut fx, contents: name.as_bytes())
+    var args = mem::List[Held].empty(lo.alloc)
+    mut args.push(Held.Address(own))
+    mut args.push(supply.param(1))
+    mut args.push(supply.param(2))
+    mut args.push(operation)
+    let called = mut lo.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: args.view())
+    let served = called.result.scalar_value()
+    mut lo.release(mut fx, ty: schema, address: own)
+    return served
+} protocols_serves
+
 /// Gives the reply `Ok` holding a request's result, or nothing for a one-way operation.
 fn protocols_succeeded(mut lo: Lowering, mut fx: Fx, supply: Supply, reply: Option[ty::Ty], result: Held) {
     let Some(reply_ty) = reply else {
@@ -331,7 +378,7 @@ fn protocols_served_failure(mut lo: Lowering, mut fx: Fx, supply: Supply, operat
 fn protocols_give_encoded(mut lo: Lowering, mut fx: Fx, supply: Supply, reply: Option[ty::Ty], held: Held) {
     let result = supply.abi.result
     let encoded = codecs_result_at(mut lo, mut fx, sret: supply.sret, ty: result)
-    let alloc = mut fx.load(PTR, addr: supply.param(4).address_value(), offset: 0)
+    let alloc = mut fx.load(PTR, addr: supply.param(5).address_value(), offset: 0)
     let parts = encoded_parts(mut lo, mut fx, encoded)
     vector_empty(mut fx, address: parts.bytes, alloc, element: CODECS_BYTE)
     vector_empty(mut fx, address: parts.handles, alloc, element: CODECS_HANDLE)

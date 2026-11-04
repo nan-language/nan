@@ -1,4 +1,4 @@
-//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas, erased decoders and migrations, `text::json::Codec` and `text::construction::Codec`, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+//! The codecs the interpreter supplies, `mem::wire::Codec` with its schemas, erased decoders and migrations, `text::json::Codec` and `text::construction::Codec`, the wire encoding of protocols, and `encode` and `decode` through an encoder or decoder of any type. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out and an encoder's calls replay; decoding reads a format or a decoder's calls through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const DECODE_DEPTH_LIMIT: usize = 128
@@ -85,13 +85,16 @@ enum DecodeKind derives Copy, Eq {
     UnknownVariant
 } DecodeKind
 
-/// The decoding of one value: the cell containers draw through, and the nesting. The
-/// interpreter and the reader go beside it.
-struct Decoding derives Copy {
+/// The decoding of one value: the cell containers draw through, the nesting, and the handles
+/// beside the encoding of a protocol's call or reply with the count read. The interpreter and the
+/// reader go beside it.
+struct Decoding {
     cell: u32
     depth: usize
     at: ItemSpan
     site: RunSite
+    carried: Option[mem::List[Val]]
+    taken: usize
 } Decoding
 
 /// A position in the input with the bytes before it read, and the allocator the bytes it reads
@@ -223,6 +226,10 @@ fn Interpreter.codec_member(
     at: ItemSpan,
     site: RunSite,
     ) -> Option[InterpFlow] fails End {
+    match try mut self.protocol_member(owner, member, type_args, args, at, site) {
+        Some(flow) => return Some(take flow)
+        None => {}
+    }
     let alloc = self.alloc
     var format = CodecFormat.Wire
     match owner {
@@ -243,12 +250,7 @@ fn Interpreter.codec_member(
         expect args.len() > 0
         let schema = self.ck.types().item(self.ty_item("mem::wire", name: "Schema"), args: mem::List[ty::Arg].empty(alloc))
         let tree = schema_wire(self.ck.schema(ty), alloc)
-        let cell = self.cell_of(args[0])
-        match attempt mut self.decode_value(CodecFormat.Wire, input: take tree, cell, ty: schema, at, site) {
-            Ok(value) => return Some(InterpFlow.Return(take value))
-            Err(Failure.Run(end)) => fail end
-            else => return Some(try self.exhausted(fallible: false, at))
-        }
+        return Some(try mut self.constant_value(take tree, ty: schema, alloc_value: args[0], at, site))
     }
     if member == "erased" {
         let codec = self.ty_item("mem::wire", name: "Codec")
@@ -345,6 +347,17 @@ fn Interpreter.codec_encode_as(mut self, format: CodecFormat, args: Slice[Val], 
     }
     return try self.exhausted(fallible: false, at)
 } Interpreter.codec_encode_as
+
+/// The value of `ty` that the `mem::wire` bytes `encoding` encode, drawn through the allocator
+/// `alloc_value`, trapping when memory is exhausted.
+fn Interpreter.constant_value(mut self, take encoding: mem::Bytes, ty: ty::Ty, alloc_value: Val, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let cell = self.cell_of(alloc_value)
+    match attempt mut self.decode_value(CodecFormat.Wire, input: take encoding, cell, ty, at, site) {
+        Ok(value) => return InterpFlow.Return(take value)
+        Err(Failure.Run(end)) => fail end
+        else => return try self.exhausted(fallible: false, at)
+    }
+} Interpreter.constant_value
 
 /// Appends a value's encoding in a format to the bytes at the place `out` holds; false on
 /// exhaustion, which leaves them unchanged.
@@ -473,7 +486,7 @@ fn Interpreter.codec_through(
     }
     let cell = self.cell_of(args[1])
     var calls = CodecCalls(target: args[0].copy(alloc), ty: through, interface_item: self.ty_item("core", name: "Decoder"), cell: cell, at: at, site: site)
-    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site)
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site, carried: None, taken: 0)
     let decoded = attempt mut decoding.value(mut self, reader: mut calls, ty)
     return try self.decode_outcome(take decoded)
 } Interpreter.codec_through
@@ -748,7 +761,7 @@ fn Interpreter.decode_value(
     at: ItemSpan,
     site: RunSite,
     ) -> Val fails Failure {
-    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site)
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site, carried: None, taken: 0)
     if format == CodecFormat.Json {
         var json_reader = JsonReader.new(take input, alloc: self.alloc)
         return try mut decoding.whole(mut self, reader: mut json_reader, ty)
@@ -1372,12 +1385,40 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
             self.depth = outer
             return Val.Unit
         }
-        ty::TyKind.Item(item: item, args: args) => return try mut self.item(mut interp, mut reader, item, args: ck.types().arg_list(args))
+        ty::TyKind.Item(item: item, args: args) => {
+            if self.carried.is_some() and ck.is_handle(ty) {
+                return try mut self.handle(mut interp, mut reader, ty)
+            }
+            return try mut self.item(mut interp, mut reader, item, args: ck.types().arg_list(args))
+        }
         else => {}
     }
     expect false
     fail Failure.Decode(DecodeKind.Malformed)
 } Decoding.value
+
+/// A value of a handle type: the index of the next handle not read, whose handle hash is the
+/// type's.
+fn Decoding.handle[R: Reader](mut self, mut interp: Interpreter, mut reader: R, ty: ty::Ty) -> Val fails Failure {
+    let index = try mut reader.read_unsigned(mut interp)
+    let Some(handles) = self.carried else {
+        expect false
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    if index != u64.widen(self.taken) {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    if self.taken >= handles.len() {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    let handle = interp.deref(handles[self.taken])
+    let hash = interp.ck.handle_hash(ty)
+    if value_bytes(handle.fields()[1].fields(), alloc: interp.alloc).view() != hash.bytes.view() {
+        fail Failure.Decode(DecodeKind.Invalid)
+    }
+    self.taken += 1
+    return handle.fields()[0].copy(interp.alloc)
+} Decoding.handle
 
 fn Decoding.scalar[R: Reader](mut self, mut interp: Interpreter, mut reader: R, scalar: ty::Scalar) -> Val fails Failure {
     match scalar {

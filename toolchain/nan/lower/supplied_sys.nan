@@ -1,4 +1,4 @@
-//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, in a test image through the sims, or through the kinds serving `Random`, `Log` and `Stdio`, a machine's runtime serving no file or network operation, capabilities denying every operation, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first, reading its state words through a snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of its host and whether it reaches every host, only that one or none. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
+//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, in a test image through the sims, or through the kinds serving them, a machine's runtime serving no other file or network operation, capabilities denying every operation, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first, reading its state words through a snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of its host and whether it reaches every host, only that one or none. A file, listener or connection is the entry it was opened through and the holding of its descriptor, or of a kind's record for a served one; a revoker is the holding of its entry or cell.
 
 /// The state word of an `Fs` entry holding whether it is read-only, and of a `Net` entry
 /// which hosts it reaches: every host, `SYS_ONLY_HOST` or `SYS_NO_HOST`.
@@ -38,9 +38,11 @@ fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     }
     if member == "served" {
         match owner {
-            "sys::Log" => return sys_served(mut lo, mut fx, supply, kind: TABLES_KIND_LOG, interface_name: "LogService")
-            "sys::Random" => return sys_served(mut lo, mut fx, supply, kind: TABLES_KIND_RANDOM, interface_name: "RandomService")
-            "sys::Stdio" => return sys_served(mut lo, mut fx, supply, kind: TABLES_KIND_STDIO, interface_name: "StdioService")
+            "sys::Fs" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_FS, interface_name: "FsService")
+            "sys::Net" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_NET, interface_name: "NetService")
+            "sys::Log" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_LOG, interface_name: "LogService")
+            "sys::Random" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_RANDOM, interface_name: "RandomService")
+            "sys::Stdio" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_STDIO, interface_name: "StdioService")
             else => {}
         }
     }
@@ -82,6 +84,18 @@ fn sys_checked(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::V
     })
     return taken.words
 } sys_checked
+
+/// The snapshot of the entry of the `Fs` or `Net` held at an address, with its method table,
+/// failing the operation with `Revoked.Stale` when its handle is stale.
+fn sys_checked_served(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> Snapshot {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let taken = served_snapshot(mut lo, mut fx, handle)
+    let stale = mut fx.b.bxor_imm_s(taken.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    return taken
+} sys_checked_served
 
 /// A copy of the text of the entry of the capability held at an address, which the caller
 /// frees, failing the operation with `Revoked.Stale` when its handle is stale.
@@ -216,7 +230,8 @@ fn valid_path(mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
 
 fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let words = sys_checked(mut lo, mut fx, supply, capability)
+    let taken = sys_checked_served(mut lo, mut fx, supply, capability)
+    let words = taken.words
     let directory = words[0]
     let member = supply.member()
     if member == "create" or member == "write_all" or member == "remove" {
@@ -244,10 +259,23 @@ fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         attenuate(mut lo, mut fx, supply, word: SYS_FLAGS, floor, text: None)
         return
     }
-    if lo.kernel() {
-        fail_with(mut lo, mut fx, supply, variant: "Denied")
+    let Some(table) = taken.table else {
+        expect false
         return
     }
+    let kind = ServingKind(service: directory, table: table)
+    let served = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: kind.table, y: 0)
+    if lo.kernel() {
+        let unserved = mut fx.b.bxor_imm_s(served, y: 1)
+        mut fx.if_true(unserved, then: fn[mut lo](mut fx1: Fx) {
+            fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+        })
+        served_fs(mut lo, mut fx, supply, capability, kind)
+        return
+    }
+    mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+        served_fs(mut lo, fx: mut fx1, supply, capability, kind)
+    })
     if lo.seeded() {
         match member {
             "open" or "create" => fs_open(mut lo, mut fx, supply, index: directory, creates: member == "create")
@@ -260,6 +288,13 @@ fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         return
     }
+    sys_fs_platform(mut lo, mut fx, supply, capability, directory)
+} sys_fs
+
+/// An operation of an `Fs` opening, reading, writing or removing a file through the host
+/// platform, in the directory whose descriptor is `directory`.
+fn sys_fs_platform(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, directory: clif::Value) {
+    let member = supply.member()
     let prefix = sys_checked_text(mut lo, mut fx, supply, capability)
     let directory_fd = mut fx.b.ireduce(clif::Type.Int32, x: directory)
     let directory_held = Held.Scalar(directory_fd)
@@ -293,7 +328,7 @@ fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             supply.done(mut lo1, fx: mut fx1)
         }
     })
-} sys_fs
+} sys_fs_platform
 
 /// Returns a file, listener or connection: the entry it was opened through and the holding of
 /// a descriptor or sim, which settlement closes, or abandons for a connection.
@@ -327,12 +362,20 @@ fn sys_descriptor(mut fx: Fx, address: clif::Value) -> clif::Value {
 
 fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
-    let words = sys_checked(mut lo, mut fx, supply, capability)
-    let network = words[0]
-    let hosts = words[3]
-    if lo.kernel() and supply.member() != "only_host" {
-        fail_with(mut lo, mut fx, supply, variant: "Denied")
+    let taken = sys_checked_served(mut lo, mut fx, supply, capability)
+    let network = taken.words[0]
+    let hosts = taken.words[3]
+    let Some(table) = taken.table else {
+        expect false
         return
+    }
+    let kind = ServingKind(service: network, table: table)
+    let served = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: kind.table, y: 0)
+    if lo.kernel() and supply.member() != "only_host" {
+        let unserved = mut fx.b.bxor_imm_s(served, y: 1)
+        mut fx.if_true(unserved, then: fn[mut lo](mut fx1: Fx) {
+            fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+        })
     }
     match supply.member() {
         "only_host" => {
@@ -347,6 +390,13 @@ fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let restricted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: hosts, y: 0)
             mut fx.if_true(restricted, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+            })
+            if lo.kernel() {
+                served_net(mut lo, mut fx, supply, capability, kind)
+                return
+            }
+            mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+                served_net(mut lo, fx: mut fx1, supply, capability, kind)
             })
             if lo.seeded() {
                 listen(mut lo, mut fx, supply, network)
@@ -365,6 +415,13 @@ fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let denied = mut fx.b.bxor_imm_s(reached, y: 1)
             mut fx.if_true(denied, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+            })
+            if lo.kernel() {
+                served_net(mut lo, mut fx, supply, capability, kind)
+                return
+            }
+            mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+                served_net(mut lo, fx: mut fx1, supply, capability, kind)
             })
             if lo.seeded() {
                 connect(mut lo, mut fx, supply, network)
@@ -541,12 +598,13 @@ fn sys_random(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let capability = supply.param(0).address_value()
     let words = sys_checked(mut lo, mut fx, supply, capability)
     let args = Array[Held, 1].filled(supply.param(1))
+    let kind = ServingKind(service: words[0], table: words[1])
     if lo.kernel() {
-        discard sys_call_service(mut lo, mut fx, interface_name: "RandomService", method: 0, words, args: args.view())
+        discard served_call(mut lo, mut fx, interface_name: "RandomService", method: "fill", kind, args: args.view())
     } else {
         let served = sys_served_entry(mut fx, words)
         discard mut fx.choose_in(mut lo, condition: served, results: mem::List[clif::Type].empty(lo.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-            discard sys_call_service(mut lo1, fx: mut fx1, interface_name: "RandomService", method: 0, words, args: args.view())
+            discard served_call(mut lo1, fx: mut fx1, interface_name: "RandomService", method: "fill", kind, args: args.view())
             return mem::List[clif::Value].empty(fx1.alloc)
         }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
             if lo1.seeded() {
@@ -615,7 +673,7 @@ fn sys_log_service(mut lo: Lowering, mut fx: Fx, supply: Supply, level: Str, wor
     var service_args = Array[Held, 3].filled(level_value)
     service_args[1] = supply.param(1)
     service_args[2] = rendering
-    discard sys_call_service(mut lo, mut fx, interface_name: "LogService", method: 0, words, args: service_args.view())
+    discard served_call(mut lo, mut fx, interface_name: "LogService", method: "log", kind: ServingKind(service: words[0], table: words[1]), args: service_args.view())
 } sys_log_service
 
 fn sys_stdio(mut lo: Lowering, mut fx: Fx, supply: Supply) {
@@ -664,13 +722,8 @@ fn sys_stdio(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 /// becoming the operation's, a count read past `buf`'s length counting as that length.
 fn sys_stdio_service(mut lo: Lowering, mut fx: Fx, supply: Supply, words: Array[clif::Value, 4]) {
     let member = supply.member()
-    var method: u32 = 2
-    if member == "read_in" {
-        method = 0
-    } else if member == "write_out" {
-        method = 1
-    }
-    let called = sys_call_service(mut lo, mut fx, interface_name: "StdioService", method, words, args: Array[Held, 1].filled(supply.param(1)).view())
+    let kind = ServingKind(service: words[0], table: words[1])
+    let called = served_call(mut lo, mut fx, interface_name: "StdioService", method: member, kind, args: Array[Held, 1].filled(supply.param(1)).view())
     supply.forward_failure(mut lo, mut fx, called)
     if member == "read_in" {
         let buf = sys_view(mut fx, held: supply.param(1))
@@ -687,81 +740,35 @@ fn sys_served_entry(mut fx: Fx, words: Array[clif::Value, 4]) -> clif::Value {
     return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: words[1], y: 0)
 } sys_served_entry
 
-/// `C.served(service)` of `Log`, `Random` or `Stdio`: an entry of a kind deriving from the entry
-/// of the capability kind `service`, whose operations call its methods for a service interface;
-/// `Revoked.Stale` when `service` is stale.
-fn sys_served(mut lo: Lowering, mut fx: Fx, supply: Supply, kind: i64, interface_name: Str) -> bool {
-    let service_ty = supply.type_arg(lo, index: 0)
-    let service = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let Some(interface_item) = lo.ck.db().std_item("sys", name: interface_name) else {
-        expect false
-        return false
-    }
-    let DynTable(id: table_id, methods: _) = mut lo.dyn_table(service_ty, interface_item, args: ty::Args.none())
-    let table_global = mut lo.data_ref(mut fx, id: table_id)
-    let table = mut fx.b.symbol_value(PTR, global_value: table_global)
-    let derived = tables_served(mut lo, mut fx, kind, service, table)
-    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
-    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
-        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
-    })
-    let Some(sret) = supply.sret else {
-        expect false
-        return false
-    }
-    mut fx.store(derived, addr: sret, offset: 0)
-    supply.done(mut lo, mut fx)
-    return true
-} sys_served
-
-/// Calls a method of a service interface on the kind a served entry's state words name, with the
-/// operation's arguments after the kind's handle.
-fn sys_call_service(mut lo: Lowering, mut fx: Fx, interface_name: Str, method: u32, words: Array[clif::Value, 4], args: Slice[Held]) -> Called {
-    let Some(interface_item) = lo.ck.db().std_item("sys", name: interface_name) else {
-        expect false
-        return Called(failed: None, failure: None, result: Held.Empty)
-    }
-    let service = mut fx.slot(8, align: 8)
-    mut fx.store(words[0], addr: service, offset: 0)
-    let code = mut fx.load(PTR, addr: words[1], offset: 8 * (u64.widen(method) + 3))
-    let abi = mut lo.dyn_abi(interface_item, args: ty::Args.none(), method)
-    let head = mut lo.method_head(ty::Ty.unit(), interface_item, args: ty::Args.none(), method)
-    var held = mem::List[Held].empty(lo.alloc)
-    mut held.push(Held.Address(service))
-    for arg in args {
-        mut held.push(arg)
-    }
-    return mut lo.invoke(mut fx, invoked: Invoked.Code(code: code, bound: head.fn_ty.limit_set.stack), abi, args: held.view())
-} sys_call_service
-
 /// The operations of files, listeners and connections, through the entry each was opened by;
-/// a release completes whether or not that entry is revoked.
+/// a release completes whether or not that entry is revoked. A machine's runtime has only those
+/// a kind serves.
 fn resource(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let address = supply.param(0).address_value()
     let member = supply.member()
+    if member != "abandon" and member != "close" {
+        sys_check(mut lo, mut fx, supply, capability: address)
+    }
+    if lo.kernel() {
+        served_resource(mut lo, mut fx, supply, address)
+        return
+    }
+    let served = sys_is_served(mut fx, address)
+    mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+        served_resource(mut lo, fx: mut fx1, supply, address)
+    })
     let descriptor = Held.Scalar(sys_descriptor(mut fx, address))
     if member == "abandon" {
         if lo.seeded() {
             let held_at = mut fx.offset(address, offset: 8)
             let payload = holdings_payload(mut fx, address: held_at)
             sims_abandon(mut lo, mut fx, index: payload)
-        } else if not lo.kernel() {
+        } else {
             discard mut lo.platform_call(mut fx, name: "conn_abandon", args: Array[Held, 1].filled(descriptor).view())
         }
         let holding = mut fx.load(PTR, addr: address, offset: 8)
         discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
         supply.done(mut lo, mut fx)
-        return
-    }
-    if member != "close" {
-        sys_check(mut lo, mut fx, supply, capability: address)
-    }
-    if lo.kernel() {
-        if member == "close" {
-            let holding = mut fx.load(PTR, addr: address, offset: 8)
-            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
-        }
-        fail_with(mut lo, mut fx, supply, variant: "Denied")
         return
     }
     let path = supply.path.as_str()
@@ -840,18 +847,36 @@ fn resource_sim(mut lo: Lowering, mut fx: Fx, supply: Supply, owner: Str, member
     }
 } resource_sim
 
-/// Releases a file or listener: its descriptor closes.
+/// Whether the resource at an address is one a kind serves.
+fn sys_is_served(mut fx: Fx, address: clif::Value) -> clif::Value {
+    let holding = mut fx.load(PTR, addr: address, offset: 8)
+    let kind = mut fx.load(PTR, addr: holding, offset: HOLDING_KIND)
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: HOLDINGS_KIND_SERVED)
+} sys_is_served
+
+/// Releases a file or listener: its descriptor closes, or the kind serving it releases it.
 fn sys_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) -> bool {
     if owner_path != "sys::fs::File" and owner_path != "sys::net::Listener" {
         return false
     }
-    if lo.seeded() {
-        let held_at = mut fx.offset(address, offset: 8)
-        let payload = holdings_payload(mut fx, address: held_at)
-        sims_release(mut lo, mut fx, index: payload)
+    let held_at = mut fx.offset(address, offset: 8)
+    let payload = holdings_payload(mut fx, address: held_at)
+    if lo.kernel() {
+        served_release(mut lo, mut fx, record: payload)
     } else {
-        let descriptor = sys_descriptor(mut fx, address)
-        discard mut lo.platform_call(mut fx, name: "release", args: Array[Held, 1].filled(Held.Scalar(descriptor)).view())
+        let served = sys_is_served(mut fx, address)
+        discard mut fx.choose_in(mut lo, condition: served, results: mem::List[clif::Type].empty(lo.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            served_release(mut lo1, fx: mut fx1, record: payload)
+            return mem::List[clif::Value].empty(fx1.alloc)
+        }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            if lo1.seeded() {
+                sims_release(mut lo1, fx: mut fx1, index: payload)
+            } else {
+                let descriptor = mut fx1.b.ireduce(clif::Type.Int32, x: payload)
+                discard mut lo1.platform_call(mut fx1, name: "release", args: Array[Held, 1].filled(Held.Scalar(descriptor)).view())
+            }
+            return mem::List[clif::Value].empty(fx1.alloc)
+        })
     }
     let holding = mut fx.load(PTR, addr: address, offset: 8)
     discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())

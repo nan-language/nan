@@ -22,7 +22,8 @@
 //! resolution. An entry of a capability kind holds its minter's state record, then the two words
 //! of its record. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind
 //! serving it and holds that entry's handle, then the method table of the kind for its service
-//! interface.
+//! interface. A served `Fs` or `Net` entry holds that handle in place of its directory or
+//! network, and the method table after its state words, zero for an entry no kind serves.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -45,6 +46,7 @@ pub mod entry {
     pub const KIND: u64 = 8;
     pub const SOURCE: u64 = 12;
     pub const STATE: u64 = 16;
+    pub const TABLE: u64 = 48;
     pub const DEADLINES: u64 = 48;
     pub const USED: u64 = 48;
     pub const SERIAL: u64 = 56;
@@ -127,7 +129,11 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let value = fx.b.ins().umax(value, params[2]);
                     fx.store(value, raised, 0);
                     let owns = owns_text(fx, record);
-                    fx.when(owns, |fx| derive_text(lo, fx, record, params[3], params[4]));
+                    fx.when(owns, |fx| {
+                        let table = fx.load(PTR, source, entry::TABLE);
+                        fx.store(table, record, entry::TABLE);
+                        derive_text(lo, fx, record, params[3], params[4]);
+                    });
                     vec![handle]
                 },
                 |fx| vec![fx.int(PTR, -1)],
@@ -323,27 +329,41 @@ fn derive_text(lo: &mut Lowering, fx: &mut Fx, record: Value, text: Value, len: 
     let joined = fx.b.ins().band(given, fs);
     let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source_len, 0);
     let separated = fx.b.ins().band(joined, has_head);
-    let separator = fx.b.ins().uextend(PTR, separated);
     let tail_len = fx.b.ins().select(given, len, zero);
-    let total = fx.b.ins().iadd(head_len, separator);
-    let total = fx.b.ins().iadd(total, tail_len);
+    let (copy, total) = join(lo, fx, (source, head_len), (text, tail_len), separated);
+    fx.store(copy, record, entry::STATE + 8);
+    fx.store(total, record, entry::STATE + 16);
+}
+
+/// A new text in runtime memory, which the caller frees, and its length: `head`, then a `/` when
+/// `separated`, then `tail`, each given by its address and length; traps when that memory is
+/// exhausted.
+pub fn join(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    head: (Value, Value),
+    tail: (Value, Value),
+    separated: Value,
+) -> (Value, Value) {
+    let separator = fx.b.ins().uextend(PTR, separated);
+    let total = fx.b.ins().iadd(head.1, separator);
+    let total = fx.b.ins().iadd(total, tail.1);
     let size = fx.b.ins().iadd_imm_s(total, 1);
     let copy = lo.record_alloc(fx, size);
     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
     fx.when(failed, |fx| {
         super::report::raise_kind(lo, fx, "trap.exhausted")
     });
-    lo.call_routine(fx, Routine::Copy, &[copy, source, head_len]);
+    lo.call_routine(fx, Routine::Copy, &[copy, head.0, head.1]);
     fx.when(separated, |fx| {
-        let at = fx.b.ins().iadd(copy, head_len);
+        let at = fx.b.ins().iadd(copy, head.1);
         let slash = fx.int(types::I8, i64::from(b'/'));
         fx.store(slash, at, 0);
     });
-    let tail = fx.b.ins().iadd(copy, head_len);
-    let tail = fx.b.ins().iadd(tail, separator);
-    lo.call_routine(fx, Routine::Copy, &[tail, text, tail_len]);
-    fx.store(copy, record, entry::STATE + 8);
-    fx.store(total, record, entry::STATE + 16);
+    let at = fx.b.ins().iadd(copy, head.1);
+    let at = fx.b.ins().iadd(at, separator);
+    lo.call_routine(fx, Routine::Copy, &[at, tail.0, tail.1]);
+    (copy, total)
 }
 
 /// Revokes the live entry a handle names and every entry deriving from it, transitively: each
@@ -561,6 +581,10 @@ pub fn denied(lo: &mut Lowering, fx: &mut Fx) -> Value {
 /// The handle of a new entry of a kind deriving from the live entry of `service`, holding that
 /// handle and the address of a method table; -1 when `service` is stale.
 pub fn served(lo: &mut Lowering, fx: &mut Fx, kind: i64, service: Value, table: Value) -> Value {
+    let table_at = match kind {
+        kind::FS | kind::NET => entry::TABLE,
+        _ => entry::STATE + 8,
+    };
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -575,7 +599,7 @@ pub fn served(lo: &mut Lowering, fx: &mut Fx, kind: i64, service: Value, table: 
             let handle = new_entry(lo, fx, kind);
             let record = entry_at(lo, fx, handle);
             fx.store(service, record, entry::STATE);
-            fx.store(table, record, entry::STATE + 8);
+            fx.store(table, record, table_at);
             let index = fx.b.ins().band_imm_s(service, 0xFFFF_FFFF);
             let index = fx.b.ins().iadd_imm_s(index, 1);
             let index = fx.b.ins().ireduce(types::I32, index);
@@ -605,10 +629,37 @@ pub fn live_entry(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
 /// The state words of the entry a handle names, read without the lock, and whether the handle
 /// was still live once they were read, which makes them that entry's.
 pub fn snapshot(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value; 4]) {
+    let (live, words, _) = read_live(lo, fx, handle, false);
+    (live, words)
+}
+
+/// The state words and the method table of the `Fs` or `Net` entry a handle names, read as
+/// `snapshot` reads them.
+pub fn served_snapshot(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    handle: Value,
+) -> (Value, [Value; 4], Value) {
+    let (live, words, table) = read_live(lo, fx, handle, true);
+    (live, words, table.expect("a method table"))
+}
+
+/// The state words of the entry a handle names, and its method table when `table`, read without
+/// the lock, and whether the handle was still live once they were read.
+fn read_live(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    handle: Value,
+    table: bool,
+) -> (Value, [Value; 4], Option<Value>) {
     let record = entry_at(lo, fx, handle);
     let flags = MemFlagsData::trusted();
     let words = [0, 1, 2, 3].map(|word| {
         let at = fx.offset(record, entry::STATE + 8 * word);
+        fx.b.ins().atomic_load(PTR, flags, at)
+    });
+    let table = table.then(|| {
+        let at = fx.offset(record, entry::TABLE);
         fx.b.ins().atomic_load(PTR, flags, at)
     });
     let generation = fx.b.ins().atomic_load(types::I32, flags, record);
@@ -618,7 +669,7 @@ pub fn snapshot(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, [Value
     let wanted = fx.b.ins().ireduce(types::I32, wanted);
     let same = fx.b.ins().icmp(IntCC::Equal, generation, wanted);
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, live, 0);
-    (fx.b.ins().band(same, live), words)
+    (fx.b.ins().band(same, live), words, table)
 }
 
 /// The share and the serial executor's handle of the executor's entry a handle names, read

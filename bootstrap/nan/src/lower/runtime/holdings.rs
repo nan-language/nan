@@ -1,6 +1,7 @@
 //! Holdings: what a domain owns that settlement releases once the domain is abandoned, each a
 //! record linked in its owner's list: a file or listener, whose descriptor closes; a
-//! connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker,
+//! connection, which is abandoned; a file, listener or connection a kind serves, which the kind
+//! releases or resets; a revoker, which revokes; a budget or an allocator's revoker,
 //! whose cell closes; a channel's sender or receiver, which counts as released; a minter of a
 //! capability kind, which revokes its entries and keeps its state; a device installed behind an
 //! IRQ-safe lock, which is uninstalled and whose record is freed, the device left as it is; a
@@ -9,9 +10,9 @@
 //! function, which std's `hw` unmaps, closes or cuts off.
 //!
 //! A holding's record is its links, its owner, zero while no domain owns it, its kind and what
-//! it holds: a descriptor, a capability or cell handle, a channel's record, a minter's state
-//! record, a device's record, a stepper's record, the address of a pin count, zero while it pins
-//! nothing, or the record `hw` keeps. The lock of the cell
+//! it holds: a descriptor, a kind's record of a served resource, a capability or cell handle, a
+//! channel's record, a minter's state record, a device's record, a stepper's record, the address
+//! of a pin count, zero while it pins nothing, or the record `hw` keeps. The lock of the cell
 //! and capability tables guards the lists.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
@@ -20,8 +21,8 @@ use super::super::Lowering;
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
 use super::super::supplied::hw::iommu;
-use super::super::supplied::sims;
 use super::super::supplied::tasks::{channels, components};
+use super::super::supplied::{served, sims};
 use super::super::transfer;
 use super::{Routine, state, tasks};
 
@@ -47,6 +48,7 @@ pub mod kind {
     pub const UNMAP: i64 = 9;
     pub const DETACH: i64 = 10;
     pub const PIN: i64 = 11;
+    pub const SERVED: i64 = 12;
 }
 
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
@@ -199,6 +201,8 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
                 lo.platform_call(fx, platform, &[Held::Scalar(descriptor)]);
             });
         }
+        let served = is(fx, kind::SERVED);
+        fx.when(served, |fx| served::release(lo, fx, payload));
         for (wanted, routine) in [
             (kind::REVOKE, Routine::Revoke),
             (kind::CLOSE_CELL, Routine::Close),

@@ -1,4 +1,4 @@
-//! Averages readings with floats and lanes, in its own task and in tasks it starts, and reports through its world's log, random source and standard output, finding its file system denied.
+//! Averages readings with floats and lanes, in its own task and in tasks it starts, and reports through its world's log, random source, standard output, file system and network, finding the hosts its network does not reach denied.
 
 pub closed struct Readings derives Encode {
     pub values: mem::List[u32]
@@ -14,6 +14,8 @@ pub closed enum AverageError derives Render {
     Empty
     Revoked(sys::Revoked) from
     Stdio(sys::StdioError) from
+    Fs(sys::fs::FsError) from
+    Net(sys::net::NetError) from
     Cancelled(task::Cancelled) from
 } AverageError
 
@@ -26,6 +28,31 @@ fn series(clock: sys::Clock, step: f64, count: u32) -> f64 fails task::Cancelled
     }
     return total
 } series
+
+/// Whether `net` denies a connection to `host`, abandoning one it opens.
+fn denies(net: sys::Net, host: Str) -> bool fails task::Cancelled uses wait {
+    let outcome = attempt await net.connect(host, port: 7)
+    var denied = false
+    match outcome {
+        Ok(conn) => take conn.abandon()
+        Err(failure) => {
+            denied = match failure {
+                sys::net::NetError.Denied => true
+                else => false
+            }
+        }
+    }
+    return denied
+} denies
+
+/// Sends `data` to `host` and closes the connection.
+fn send(net: sys::Net, host: Str, data: Slice[u8]) fails sys::net::NetError uses wait {
+    var conn = try await net.connect(host, port: 7)
+    defer take conn.abandon()
+    discard try await mut conn.write(data)
+    undefer conn
+    try await take conn.close()
+} send
 
 fn main(take world: nanos::World, take input: Readings) -> Summary fails AverageError uses wait limits stack 65_536 {
     if input.values.len() == 0 {
@@ -53,8 +80,13 @@ fn main(take world: nanos::World, take input: Readings) -> Summary fails Average
     var bytes = Array[u8, 8].filled(0)
     try world.random.fill(mut bytes.view_mut())
     world.log.info("mean", value: u64.fit(mean))
-    let denied = attempt await world.fs.read_all("readings", alloc: world.alloc)
-    world.log.warn("fs denied", value: denied.is_err())
+    let readings = try await world.fs.read_all("readings", alloc: world.alloc)
+    world.log.info("fs read", value: readings.byte_len())
+    var summary = try await world.fs.create("summary")
+    discard try await mut summary.write(b"mean")
+    let elsewhere = try await denies(world.net, host: "10.0.0.3")
+    world.log.warn("net denied", value: elsewhere)
+    try await send(world.net, host: "10.0.0.2", data: b"ping")
     try await world.stdio.write_out(b"averaged\n")
     return Summary(mean_milli: u64.saturate(mean * 1000.0), lanes: u64.fit(lanes), entropy: bytes.view().u64_le(0))
 } main

@@ -50,6 +50,8 @@ pub open struct Fs {
 
 pub fn Fs.denied() -> Fs
 
+pub fn Fs.served[S: FsService and Capability and Copy](service: S) -> Fs fails Revoked
+
 pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
 
 pub fn Fs.read_only(self) -> Fs fails Revoked
@@ -68,6 +70,8 @@ pub open struct Net {
 } Net
 
 pub fn Net.denied() -> Net
+
+pub fn Net.served[S: NetService and Capability and Copy](service: S) -> Net fails Revoked
 
 pub fn Net.only_host(self, host: Str) -> Net fails Revoked
 
@@ -198,11 +202,11 @@ pub open enum NetError derives Render {
 - `read` and `read_in` return the number of bytes written into `buf`, 0 at the end of input. `write` returns the number of bytes written, at least 1 when `data` is not empty. `write_out` and `write_err` write all of `data`. A file keeps one position, starting at 0, that each read and write advances by its count.
 - `sys::StdioError.Closed` reports a closed standard stream.
 - `sys::Fs.denied()`, `sys::Net.denied()` and `sys::WallClock.denied()` give a capability whose handle is stale from the start, so that each operation through it fails as through a revoked one.
-- On a machine target, and in a bundle of a nanos target ([bundles](30-artefacts.md#bundles)), which runs on its kernel's runtime, the operations of `sys::Fs`, `sys::Net` and of the files, listeners and connections they open fail with their error's `Denied` once their handle is found live: no file system or network serves them.
+- On a machine target, and in a bundle of a nanos target ([bundles](30-artefacts.md#bundles)), which runs on its kernel's runtime, the operations of a `sys::Fs` or `sys::Net` that no kind [serves](#served-capabilities) fail with their error's `Denied` once their handle is found live: no file system or network of the platform serves them.
 
 ### Served capabilities
 
-A kernel serves `sys::Log`, `sys::Random` and `sys::Stdio` to the code it runs through a [capability kind](#capability-kinds) of its own implementing the service interface of each:
+A kernel serves `sys::Fs`, `sys::Net`, `sys::Log`, `sys::Random` and `sys::Stdio` to the code it runs through a [capability kind](#capability-kinds) of its own implementing the service interface of each:
 
 ```nan-api
 // module: sys
@@ -226,10 +230,35 @@ pub interface StdioService {
     fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
     fn write_err(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
 } StdioService
+
+pub interface FsService {
+    fn open(self, path: Str) -> u64 fails fs::FsError uses wait limits stack 4_096
+    fn create(self, path: Str) -> u64 fails fs::FsError uses wait limits stack 4_096
+    fn read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails fs::FsError uses wait limits stack 4_096
+    fn write_all(self, path: Str, data: Slice[u8]) fails fs::FsError uses wait limits stack 4_096
+    fn remove(self, path: Str) fails fs::FsError uses wait limits stack 4_096
+    fn read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
+    fn write(self, file: u64, data: Slice[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
+    fn byte_len(self, file: u64) -> u64 fails fs::FsError uses wait limits stack 4_096
+    fn release(self, file: u64) limits stack 4_096
+} FsService
+
+pub interface NetService {
+    fn listen(self, port: u16) -> u64 fails net::NetError uses wait limits stack 4_096
+    fn connect(self, host: Str, port: u16) -> u64 fails net::NetError uses wait limits stack 4_096
+    fn accept(self, listener: u64) -> u64 fails net::NetError uses wait limits stack 4_096
+    fn read(self, conn: u64, mut buf: SliceMut[u8]) -> usize fails net::NetError uses wait limits stack 4_096
+    fn write(self, conn: u64, data: Slice[u8]) -> usize fails net::NetError uses wait limits stack 4_096
+    fn close(self, conn: u64) fails net::NetError uses wait limits stack 4_096
+    fn reset(self, conn: u64) limits stack 4_096
+    fn release(self, listener: u64) limits stack 4_096
+} NetService
 ```
 
-- `C.served(service)` of `Log`, `Random` or `Stdio` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
-- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; and `Stdio.read_in`, `write_out` and `write_err` call the method of their name, failing as it fails, a count past `buf`'s length counting as that length. Their digests are those of the served capability's operations, whatever the methods do.
+- `C.served(service)` of `Fs`, `Net`, `Log`, `Random` or `Stdio` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
+- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
+- A file, listener or connection opened through a served capability holds the number its method returned, and its operations call the method of their name with that number, except `sys::net::Conn.abandon`, which calls `reset`. Releasing a file or listener calls `release`, and [settlement](11-errors-domains.md#settlement) releasing a connection calls `reset`. `release`, `reset` and `close` are called whether or not the resource's entry is revoked.
+- Their digests are those of the served capability's operations, whatever the methods do.
 
 ## Revocation
 
@@ -344,7 +373,7 @@ impl Meter: sys::Capability // error: authority.capability-impl
 A **resource** is an affine or linear value opened through a capability, such as a file or a connection; every resource is a primitive capability.
 
 - A resource records the entry of the capability that opened it or, when another resource opened it, the entry that resource records. Once that entry is revoked, each operation on the resource fails with `sys::Revoked.Stale` through its error enum, except its releases, which complete.
-- An affine resource reaching its [end of scope](07-ownership.md#ownership) is released by the runtime: its platform object is closed without waiting and without running user code.
+- An affine resource reaching its [end of scope](07-ownership.md#ownership) is released by the runtime without waiting: its platform object is closed without running user code, or the kind serving it releases it ([served capabilities](#served-capabilities)).
 - A resource whose graceful release waits is linear. Its graceful release, such as `sys::net::Conn.close`, and its [abandon method](17-suspension-io.md#abandoning-resources) consume it.
 - Every primitive capability giving access to hardware is linear, so a type holding one is [linear](05-properties.md#linear-types).
 

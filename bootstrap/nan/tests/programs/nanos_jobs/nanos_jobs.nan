@@ -1,4 +1,4 @@
-//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs and standard streams on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, and jobs that trap, fail and return.
+//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs, standard streams, files and network on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, and jobs that trap, fail and return holding a file.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -89,6 +89,103 @@ fn Console.write_err(self, data: Slice[u8]) limits stack 4_096 {
     say_bytes(data)
 } Console.write_err
 
+/// A store directory serving a job's files on the serial port, each file numbered by the length
+/// of its path.
+struct Store {
+} Store
+
+impl Store: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Store: sys::FsService
+
+/// An egress gate serving a job's connections on the serial port, each connection numbered by
+/// the length of its host.
+struct Egress {
+} Egress
+
+impl Egress: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Egress: sys::NetService
+
+fn Store.open(self, path: Str) -> u64 limits stack 4_096 {
+    say_line(text: "fs open ", detail: path)
+    return u64.widen(path.byte_len())
+} Store.open
+
+fn Store.create(self, path: Str) -> u64 limits stack 4_096 {
+    say_line(text: "fs create ", detail: path)
+    return u64.widen(path.byte_len())
+} Store.create
+
+fn Store.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes limits stack 4_096 {
+    say_line(text: "fs read_all ", detail: path)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(b"2 4 9")
+    return bytes
+} Store.read_all
+
+fn Store.write_all(self, path: Str, data: Slice[u8]) limits stack 4_096 {
+    say(text: "fs write_all ")
+    say(text: path)
+    say(text: ": ")
+    say_bytes(data)
+    say(text: "\n")
+} Store.write_all
+
+fn Store.remove(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.NotFound
+} Store.remove
+
+fn Store.read(self, file: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    return 0
+} Store.read
+
+fn Store.write(self, file: u64, data: Slice[u8]) -> usize limits stack 4_096 {
+    say_numbered(text: "fs write ", number: file, data)
+    return data.len()
+} Store.write
+
+fn Store.byte_len(self, file: u64) -> u64 limits stack 4_096 {
+    return file
+} Store.byte_len
+
+fn Store.release(self, file: u64) limits stack 4_096 {
+    say_numbered(text: "fs release ", number: file, data: b"")
+} Store.release
+
+fn Egress.listen(self, port: u16) -> u64 fails sys::net::NetError limits stack 4_096 {
+    fail sys::net::NetError.Denied
+} Egress.listen
+
+fn Egress.connect(self, host: Str, port: u16) -> u64 limits stack 4_096 {
+    say_line(text: "net connect ", detail: host)
+    return u64.widen(host.byte_len())
+} Egress.connect
+
+fn Egress.accept(self, listener: u64) -> u64 fails sys::net::NetError limits stack 4_096 {
+    fail sys::net::NetError.Denied
+} Egress.accept
+
+fn Egress.read(self, conn: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    return 0
+} Egress.read
+
+fn Egress.write(self, conn: u64, data: Slice[u8]) -> usize limits stack 4_096 {
+    say_numbered(text: "net write ", number: conn, data)
+    return data.len()
+} Egress.write
+
+fn Egress.close(self, conn: u64) limits stack 4_096 {
+    say_numbered(text: "net close ", number: conn, data: b"")
+} Egress.close
+
+fn Egress.reset(self, conn: u64) limits stack 4_096 {
+    say_numbered(text: "net reset ", number: conn, data: b"")
+} Egress.reset
+
+fn Egress.release(self, listener: u64) limits stack 4_096 {
+} Egress.release
+
 fn Counter.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
     let given = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(buf.len())))
     let start = given.value_or(None).value_or(0)
@@ -108,6 +205,23 @@ fn say_bytes(bytes: Slice[u8]) {
     }
     take uart.unmap()
 } say_bytes
+
+fn say_line(text: Str, detail: Str) {
+    say(text)
+    say(text: detail)
+    say(text: "\n")
+} say_line
+
+/// A line of `text`, `number` and, when there are any, `data`'s bytes.
+fn say_numbered(text: Str, number: u64, data: Slice[u8]) {
+    say(text)
+    say_number(number)
+    if data.len() > 0 {
+        say(text: ": ")
+        say_bytes(data)
+    }
+    say(text: "\n")
+} say_numbered
 
 fn say_number(value: u64) {
     var digits = Array[u8, 20].filled(0)
@@ -206,12 +320,15 @@ struct Grants derives Copy {
     wall: Option[sys::WallClock]
     console: Console
     counter: Counter
+    store: Store
+    egress: Egress
     exec: task::Executor
     alloc: mem::Alloc
 } Grants
 
-/// The world of a job: its log, standard streams and random source served, its file system and
-/// network denied, and the wall clock in its table.
+/// The world of a job: its log, standard streams and random source served, its file system
+/// served under `jobs`, its network served only towards 10.0.0.2, and the wall clock in its
+/// table.
 fn granted(grants: Grants) -> nanos::World {
     var caps = nanos::Caps.empty(grants.alloc)
     match grants.wall {
@@ -227,7 +344,19 @@ fn granted(grants: Grants) -> nanos::World {
     let Ok(random) = attempt sys::Random.served(grants.counter) else {
         stop(text: "no random\n")
     }
-    return nanos::World(alloc: grants.alloc, exec: grants.exec, clock: grants.clock, random: random, log: log, stdio: stdio, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: take caps)
+    let Ok(store) = attempt sys::Fs.served(grants.store) else {
+        stop(text: "no store\n")
+    }
+    let Ok(fs) = attempt store.subdir("jobs") else {
+        stop(text: "no jobs directory\n")
+    }
+    let Ok(egress) = attempt sys::Net.served(grants.egress) else {
+        stop(text: "no egress\n")
+    }
+    let Ok(net) = attempt egress.only_host("10.0.0.2") else {
+        stop(text: "no host\n")
+    }
+    return nanos::World(alloc: grants.alloc, exec: grants.exec, clock: grants.clock, random: random, log: log, stdio: stdio, fs: fs, net: net, caps: take caps)
 } granted
 
 /// Loads the bundle of a fw_cfg file, runs its job on each input and unloads it, writing a line
@@ -285,10 +414,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     take k.anchor(0u8, run: fn[take loader](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
         let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
         let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
-        let grants = Grants(clock: clock, wall: wall, console: consoles.mint(0), counter: counters.mint(0), exec: exec, alloc: alloc)
+        let stores = sys::Minter[Store, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let gates = sys::Minter[Egress, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let grants = Grants(clock: clock, wall: wall, console: consoles.mint(0), counter: counters.mint(0), store: stores.mint(0), egress: gates.mint(0), exec: exec, alloc: alloc)
         let served = attempt await serve(loader, grants)
         take consoles.close()
         take counters.close()
+        take stores.close()
+        take gates.close()
         discard served
     })
 } main

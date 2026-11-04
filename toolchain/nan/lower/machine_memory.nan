@@ -400,10 +400,25 @@ fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(m
 
 /// Visits the memory the AArch64 entry root maps as normal memory, whole: the ranges of the
 /// device tree's memory nodes, or the usable, ACPI reclaimable and ACPI NVS entries of the start
-/// information's memory map, or the entries of the firmware's final memory map that are neither
-/// reserved, unusable nor memory-mapped I/O; and the image.
+/// information's memory map with the start information, what it holds and the device tree, or
+/// the entries of the firmware's final memory map that are neither reserved, unusable nor
+/// memory-mapped I/O; and the image.
 fn Lowering.mapped_memory(mut self, mut fx: Fx, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     mut self.listed_memory(mut fx, listed: Listed.Mapped, held: mem::List[Extent].empty(self.alloc).view(), visit)
+    if self.ck.db().target == workspace::Target.Aarch64Bare {
+        let info = mut self.start_info(mut fx)
+        let given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: info, y: 0)
+        mut fx.if_true(given, then: fn[mut self](mut fx1: Fx) {
+            start_ranges(mut self, fx: mut fx1, start: info, visit)
+            let state_address = mut self.state(mut fx1)
+            let tree = mut fx1.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+            let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: tree, y: 0)
+            mut fx1.if_true(present, then: fn[mut self](mut fx2: Fx) {
+                let end = tree_address(mut fx2, tree, field: DEVICE_TREE_SIZE)
+                visit(mut self, fx: mut fx2, base: tree, end: end)
+            })
+        })
+    }
     let image = mut self.image_extent(mut fx)
     visit(mut self, mut fx, base: image.start, end: image.end)
 } Lowering.mapped_memory
@@ -583,6 +598,38 @@ fn visit_unheld(mut lo: Lowering, mut fx: Fx, held: Slice[Extent], holds: Holds,
         return Pass(again: more, next: fx1.list1(after))
     })
 } visit_unheld
+
+/// Visits a start information and the ranges it holds: its module list, its memory map, its
+/// command line, and each module with its name.
+fn start_ranges(mut lo: Lowering, mut fx: Fx, start: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
+    let info_end = mut fx.b.iadd_imm_s(start, y: START_INFO_BYTES)
+    visit(mut lo, mut fx, base: start, end: info_end)
+    let modules = mut fx.load(PTR, addr: start, offset: START_INFO_MODULES)
+    let count = start_count(mut fx, info: start, offset: START_INFO_MODULE_COUNT)
+    let list_bytes = mut fx.b.imul_imm_s(count, y: START_MODULE_BYTES)
+    let list_end = mut fx.b.iadd(modules, y: list_bytes)
+    visit(mut lo, mut fx, base: modules, end: list_end)
+    let map = mut fx.load(PTR, addr: start, offset: START_INFO_MAP)
+    let entries = start_count(mut fx, info: start, offset: START_INFO_MAP_COUNT)
+    let map_bytes = mut fx.b.imul_imm_s(entries, y: START_MAP_BYTES)
+    let map_end = mut fx.b.iadd(map, y: map_bytes)
+    visit(mut lo, mut fx, base: map, end: map_end)
+    let line = mut fx.load(PTR, addr: start, offset: START_INFO_COMMAND_LINE)
+    let line_end = start_text_end(mut fx, text: line)
+    visit(mut lo, mut fx, base: line, end: line_end)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.imul_imm_s(index, y: START_MODULE_BYTES)
+        let entry = mut fx1.b.iadd(modules, y: offset)
+        let address = mut fx1.load(PTR, addr: entry, offset: START_MODULE_ADDRESS)
+        let size = mut fx1.load(PTR, addr: entry, offset: START_MODULE_SIZE)
+        let module_end = mut fx1.b.iadd(address, y: size)
+        visit(mut lo, fx: mut fx1, base: address, end: module_end)
+        let name = mut fx1.load(PTR, addr: entry, offset: START_MODULE_NAME)
+        let label_end = start_text_end(mut fx1, text: name)
+        visit(mut lo, fx: mut fx1, base: name, end: label_end)
+    })
+} start_ranges
 
 /// Whichever of `lowest` and the ranges a start information holds starts lowest, each only
 /// where it overlaps `rest`: the start information, its module list, its memory map, its command

@@ -55,8 +55,10 @@ use crate::workspace::Arch;
 /// control-register bit of the `hw::Protection` variant at an index and gives 1, or
 /// gives 0 where the CPU lacks it, a variant of no feature bit being on every CPU;
 /// `ClearBuffers` runs `verw`; `UserOpen` and `UserClose` allow and forbid access to user
-/// pages where SMAP is enabled; and `WriteProtect` sets `CR0.WP` and `EFER.NXE`, so that kernel
-/// writes honour read-only pages and execute-disable bits take effect. The AArch64 stubs are
+/// pages where SMAP is enabled; `WriteProtect` sets `CR0.WP` and `EFER.NXE`, so that kernel
+/// writes honour read-only pages and execute-disable bits take effect; and `IdleMwait` waits as
+/// `IdleWait` does, in `mwait` with a hint where the CPU has `monitor` and `mwait` with
+/// interrupts breaking the wait, and halts otherwise. The AArch64 stubs are
 /// `ReadSysReg` and `WriteSysReg`, each naming a system register by its 15-bit encoding, which
 /// the instruction holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base
 /// register, and `WriteTtbr0Tagged`, which writes it without invalidating; `TlbiPage`, which
@@ -148,6 +150,7 @@ pub enum Stub {
     UserOpen,
     UserClose,
     WriteProtect,
+    IdleMwait,
     ReadSysReg(u16),
     WriteSysReg(u16),
     ReadTtbr0,
@@ -517,6 +520,15 @@ impl Stub {
                     0x0f, 0x20, 0xc0, 0x48, 0x0d, 0x00, 0x00, 0x01, 0x00, 0x0f, 0x22, 0xc0, 0xb9,
                     0x80, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x0d, 0x00, 0x08, 0x00, 0x00, 0x0f, 0x30,
                     0xc3,
+                ],
+            ),
+            Stub::IdleMwait => (
+                1,
+                0,
+                &[
+                    0x65, 0xf6, 0x04, 0x25, 0xf8, 0x00, 0x00, 0x00, 0x10, 0x74, 0x13, 0x48, 0x89,
+                    0xe0, 0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xc8, 0x89, 0xf8, 0xfb, 0x0f, 0x01,
+                    0xc9, 0x90, 0xfa, 0xc3, 0xfb, 0xf4, 0xfa, 0xc3,
                 ],
             ),
             Stub::Halt => (0, 0, &[0xfa, 0xf4, 0xeb, 0xfd]),
@@ -1038,7 +1050,8 @@ impl Stub {
             | Stub::ClearBuffers
             | Stub::UserOpen
             | Stub::UserClose
-            | Stub::WriteProtect => panic!("no AArch64 code for the x86_64 stub {self:?}"),
+            | Stub::WriteProtect
+            | Stub::IdleMwait => panic!("no AArch64 code for the x86_64 stub {self:?}"),
             Stub::ReadSysReg(_) | Stub::WriteSysReg(_) => unreachable!("handled before the match"),
         }
     }

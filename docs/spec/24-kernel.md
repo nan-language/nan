@@ -875,6 +875,7 @@ pub closed struct Placement derives Copy, Eq {
 pub closed enum Idle derives Copy, Eq {
     Halt
     Poll
+    Mwait(u8)
 } Idle
 ```
 
@@ -884,7 +885,7 @@ pub closed enum Idle derives Copy, Eq {
 - When a task becomes ready, as it starts, as an event wakes it, as it is preempted and as a [serial executor](16-concurrency.md#executors)'s turn passes to it, `place(t, task)` gives its placement: the task joins the queue of the CPU `cpu` names, of the running CPU when `cpu` is not below `hw::cpu_count()`, with the key `key`. The CPU signal ([cross-CPU operations](#cross-cpu-operations)) then goes to the CPU it names when that is another CPU that idles or runs a task placed with a greater key, or when it is the running CPU, outside an interrupt fn, running a task placed with a greater key.
 - A CPU runs the first task of its queue. When its queue is empty it calls `steal(t, cpu, round)` for rounds 0, 1 and on, at most `hw::cpu_count()` − 1 of them, until a round gives `None` or names another CPU whose queue holds a task, the first of which it then runs.
 - As a CPU switches to a task, `slice(t, cpu, task)` gives the task's **slice**: it is preempted once that many nanoseconds of the kernel clock have passed since, unless it suspends before; 0 gives no slice.
-- A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest deadline of the kernel clock, `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once. Either way the CPU then looks for a task again.
+- A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest deadline of the kernel clock, `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once; `Mwait(hint)` waits as `Halt` does, in `mwait` with `hint` as its C-state hint on an x86_64 CPU with `monitor` and `mwait` whose wait an interrupt ends, and halts otherwise. Either way the CPU then looks for a task again.
 - The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready; steals in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice; and halts.
 - Every method of a policy type is judged against the `stack 4_096` its interface method demands ([stack limits](10-effects-digests.md#stack-limits)), and every stack a hook runs on holds a call of it ([static bounds](17-suspension-io.md#static-bounds)).
 

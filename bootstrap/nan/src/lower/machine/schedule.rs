@@ -25,6 +25,7 @@ use super::cpus::cpu;
 use super::stubs::Stub;
 use crate::check::ty::{Arg, Ty};
 use crate::nir::{Callable, FnRef};
+use crate::workspace::Arch;
 
 /// A hook of a kernel policy, which the glue the policy record holds at its offset calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,7 +36,8 @@ pub enum Hook {
     Steal,
     /// `(policy, cpu, task) -> nanoseconds`.
     Slice,
-    /// `(policy, cpu, timed, until) -> polls`.
+    /// `(policy, cpu, timed, until) -> way`, the way being 0 to halt, 1 to poll, and
+    /// `MWAIT` plus a hint to wait in `mwait`.
     Idle,
 }
 
@@ -75,6 +77,9 @@ impl Hook {
 
 /// The offset in a policy record of the address of the policy's value, which follows it.
 const VALUE: u64 = 32;
+
+/// The way of idling an `Idle` hook gives for `hw::Idle.Mwait`, plus its hint.
+const MWAIT: i64 = 0x100;
 
 /// The most stack a call of a policy hook uses: the 4 KiB its interface method demands, its glue
 /// and the routines placing a task.
@@ -174,7 +179,7 @@ impl Lowering<'_, '_> {
                     }
                     Hook::Steal => {
                         let found = lo.variant_is(fx, result, &result_ty, "Some");
-                        let payload = some_payload(lo, &result_ty);
+                        let payload = variant_payload(lo, &result_ty, "Some");
                         let victim = fx.load(types::I32, result, payload);
                         vec![
                             fx.b.ins().uextend(PTR, found),
@@ -184,7 +189,13 @@ impl Lowering<'_, '_> {
                     Hook::Slice => vec![fx.load(PTR, result, 0)],
                     Hook::Idle => {
                         let polls = lo.variant_is(fx, result, &result_ty, "Poll");
-                        vec![fx.b.ins().uextend(PTR, polls)]
+                        let polls = fx.b.ins().uextend(PTR, polls);
+                        let waits = lo.variant_is(fx, result, &result_ty, "Mwait");
+                        let payload = variant_payload(lo, &result_ty, "Mwait");
+                        let hint = fx.load(types::I8, result, payload);
+                        let hint = fx.b.ins().uextend(PTR, hint);
+                        let hinted = fx.b.ins().bor_imm_s(hint, MWAIT);
+                        vec![fx.b.ins().select(waits, hinted, polls)]
                     }
                 };
                 fx.b.ins().return_(&results);
@@ -491,7 +502,8 @@ impl Lowering<'_, '_> {
     }
 
     /// Idles the running CPU as its policy says, given the earliest deadline of the kernel
-    /// clock: halts it until an interrupt, or returns at once to look for tasks again.
+    /// clock: halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at
+    /// once to look for tasks again.
     pub fn kernel_idle(&mut self, fx: &mut Fx) {
         let own = self.running_index(fx);
         let own_record = self.cpu_record(fx, own);
@@ -509,7 +521,7 @@ impl Lowering<'_, '_> {
         self.call_routine(fx, Routine::Unlock, &[lock]);
         let policy = self.policy(fx);
         let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, policy, 0);
-        let polls = fx.choose_in(
+        let way = fx.choose_in(
             self,
             installed,
             &[PTR],
@@ -519,7 +531,22 @@ impl Lowering<'_, '_> {
             },
             |_, fx| vec![fx.ptr(0)],
         )[0];
-        let halts = fx.b.ins().icmp_imm_s(IntCC::Equal, polls, 0);
+        let waits =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, way, MWAIT);
+        let halts = match self.ck.db.target.arch() {
+            Some(Arch::Amd64) => {
+                fx.when(waits, |fx| {
+                    let hint = fx.b.ins().band_imm_s(way, 0xFF);
+                    self.call_stub(fx, Stub::IdleMwait, &[hint]);
+                });
+                fx.b.ins().icmp_imm_s(IntCC::Equal, way, 0)
+            }
+            _ => {
+                let halts = fx.b.ins().icmp_imm_s(IntCC::Equal, way, 0);
+                fx.b.ins().bor(halts, waits)
+            }
+        };
         fx.when(halts, |fx| {
             self.call_stub(fx, Stub::IdleWait, &[]);
         });
@@ -649,13 +676,13 @@ fn word32(fx: &mut Fx, word: Value) -> Held {
     Held::Scalar(fx.b.ins().ireduce(types::I32, word))
 }
 
-/// The offset of the payload of an option's `Some`.
-fn some_payload(lo: &mut Lowering, option: &Ty) -> u64 {
-    match &lo.layout(option).shape {
+/// The offset of the first payload field of an enum type's variant, by name.
+fn variant_payload(lo: &mut Lowering, ty: &Ty, name: &str) -> u64 {
+    match &lo.layout(ty).shape {
         Shape::Enum(shape) => shape
             .variants
             .iter()
-            .find(|variant| variant.name == "Some")
+            .find(|variant| variant.name == name)
             .and_then(|variant| variant.fields.first())
             .map_or(0, |field| field.offset),
         _ => 0,

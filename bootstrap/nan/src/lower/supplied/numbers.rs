@@ -362,15 +362,18 @@ pub fn bits(
                 _ => value,
             }
         }
-        BitConversion::CheckedFrom => {
-            let target = match body.lo.owned_repr(&owner_ty) {
-                Repr::Scalar(ty) => ty,
-                _ => panic!("a checked bit conversion to a value in memory"),
-            };
-            let converted = from_bits(body.fx, value.scalar(), target);
-            let valid = valid_bits(body, &owner_ty, value.scalar());
-            option_of(body, &result_ty, valid, Held::Scalar(converted))
-        }
+        BitConversion::CheckedFrom => match body.lo.owned_repr(&owner_ty) {
+            Repr::Scalar(target) => {
+                let converted = from_bits(body.fx, value.scalar(), target);
+                let valid = valid_bits(body, &owner_ty, value.scalar());
+                option_of(body, &result_ty, valid, Held::Scalar(converted))
+            }
+            _ => {
+                let address = value.address();
+                let valid = valid_bytes(body, &owner_ty, address);
+                option_of(body, &result_ty, valid, Held::Address(address))
+            }
+        },
     }
 }
 
@@ -463,6 +466,39 @@ fn valid_bits(body: &mut Body, ty: &Ty, bits: Value) -> Value {
         },
         _ => body.fx.int(types::I8, 1),
     }
+}
+
+/// Whether the bytes at an address form a value of a bytes layout: each of its fields of a
+/// layout type holds no niche of that layout, read in the byte order its layouts give.
+fn valid_bytes(body: &mut Body, ty: &Ty, address: Value) -> Value {
+    let layout = body.lo.layout(ty);
+    let Shape::Bytes { fields, big } = &layout.shape else {
+        return body.fx.int(types::I8, 1);
+    };
+    let mut valid = body.fx.int(types::I8, 1);
+    for field in fields {
+        if !matches!(field.ty, Ty::Item(..)) {
+            continue;
+        }
+        let held = match body.lo.layout(&field.ty).shape {
+            Shape::Scalar {
+                ty: scalar,
+                big: own,
+            } => {
+                let bits = body
+                    .fx
+                    .load_ordered(scalar, address, field.offset, true, *big || own);
+                valid_bits(body, &field.ty, bits)
+            }
+            Shape::Bytes { .. } => {
+                let at = body.fx.offset(address, field.offset);
+                valid_bytes(body, &field.ty, at)
+            }
+            _ => continue,
+        };
+        valid = body.fx.b.ins().band(valid, held);
+    }
+    valid
 }
 
 /// Defines a scalar member std supplies.

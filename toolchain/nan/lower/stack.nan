@@ -21,7 +21,8 @@ enum StackKind {
     /// position.
     Direct(callee: object::FuncId, bindings: mem::List[ParamBinding])
     /// A call through the function's own function-typed parameter at a position, or, for a
-    /// `task fn` parameter, the walk moving its captures.
+    /// `task fn` parameter, the walk moving its captures, or of a method of its own `Dyn`
+    /// parameter there whose head demands no `stack N`.
     Param(usize)
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option[u64])
@@ -38,18 +39,22 @@ struct Grown derives Copy {
     callee: Option[object::FuncId]
 } Grown
 
-/// What a direct call passes for the function-typed parameter of its callee at a position.
-struct ParamBinding derives Copy {
+/// What a direct call passes for the function-typed or `Dyn` parameter of its callee at a
+/// position.
+struct ParamBinding {
     position: usize
     binding: Binding
 } ParamBinding
 
-/// What a direct call passes for a function-typed parameter of its callee.
-enum Binding derives Copy {
+/// What a direct call passes for a function-typed or `Dyn` parameter of its callee.
+enum Binding {
     /// A closure or a named function, by the lowered function its value calls.
     Function(object::FuncId)
     /// For a `task fn` parameter, the walk moving a closure's captures, by the glue it calls.
     Walk(object::FuncId)
+    /// For a `Dyn` parameter, a `Dyn` value made there, by the code of each method of its
+    /// table.
+    Methods(mem::List[object::FuncId])
     /// The calling function's own parameter at a position.
     Param(usize)
     /// Another function value, bounded by the `stack N` its type demands.
@@ -57,7 +62,8 @@ enum Binding derives Copy {
 } Binding
 
 /// A lowered function: its frame size, the `stack N` the type of each of its function-typed
-/// parameters demands, by position, none for a `task fn` one, and its call sites.
+/// and `Dyn` parameters demands, by position, none for a `task fn` or `Dyn` one, and its call
+/// sites.
 pkg struct Frame {
     function: object::FuncId
     /// The canonical path naming it in reasons, or the type a move walks; empty for other code
@@ -68,7 +74,8 @@ pkg struct Frame {
     sites: mem::List[Site]
 } Frame
 
-/// The `stack N` the type of a function-typed parameter at a position demands, if any.
+/// The `stack N` the type of a function-typed parameter at a position demands, if any, none
+/// for a `Dyn` parameter.
 struct ParamStack derives Copy {
     position: usize
     stack: Option[u64]
@@ -389,6 +396,18 @@ fn Judge.passed_bound(mut self, all_frames: Slice[Frame], binding: Binding, boun
                 Use.Unbounded(calls) => ParamBound(bytes: None, path: take calls)
             }
         }
+        Binding.Methods(methods) => {
+            var most: u64 = 0
+            for method in methods {
+                match mut self.own_use(all_frames, function: method) {
+                    Use.Bounded(bytes: used_bytes, path: _) => if used_bytes > most {
+                        most = used_bytes
+                    }
+                    Use.Unbounded(calls) => return ParamBound(bytes: None, path: take calls)
+                }
+            }
+            return param_bytes(Some(most), alloc: self.alloc)
+        }
         Binding.Param(own_position) => return param_bound(bounds, position: own_position, alloc: self.alloc)
         Binding.Bounded(stack_bound) => return param_bytes(stack_bound, alloc: self.alloc)
     }
@@ -434,7 +453,7 @@ fn Judge.because(self, ck: check::Checker, all_frames: Slice[Frame], call_path: 
 fn Judge.subject(self, all_frames: Slice[Frame], kind: StackKind) -> text::String {
     return match kind {
         StackKind.Direct(callee: callee, bindings: _) => self.name(all_frames, function: callee)
-        StackKind.Param(_) => text::String.of("function parameter", alloc: self.alloc)
+        StackKind.Param(_) => text::String.of("parameter", alloc: self.alloc)
         StackKind.Bounded(_) => text::String.of("function value", alloc: self.alloc)
         StackKind.Stub => text::String.empty(self.alloc)
         StackKind.Grown(wrapper: _, thunk: _, inner: inner) => self.subject(all_frames, kind: inner.contents())

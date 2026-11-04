@@ -128,7 +128,7 @@ fn an_unbounded_closure_argument_names_the_calls_down_to_its_cause() {
             reasons(&found[0]),
             [
                 (Role::Called, "app::apply"),
-                (Role::Called, "function parameter"),
+                (Role::Called, "parameter"),
                 (Role::Raised, "function value"),
             ]
         );

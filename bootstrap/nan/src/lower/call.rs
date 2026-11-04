@@ -30,11 +30,13 @@ enum Target {
         stack: Option<u64>,
     },
     /// Through the method table of a `Dyn` value: the method's code address, which takes the
-    /// address of the value as its receiver, and the `stack N` the method's head demands.
+    /// address of the value as its receiver, how its stack use is bounded, and the `stack N`
+    /// the method's head demands.
     Dyn {
         code: IrValue,
         data: IrValue,
         abi: Abi,
+        kind: stack::Kind,
         stack: Option<u64>,
     },
     /// An external symbol under the C convention of the host, with the `stack N` its head
@@ -132,10 +134,20 @@ impl Body<'_, '_, '_, '_> {
                 };
                 let abi = self.lo.dyn_abi(*interface, &args, *method);
                 let (head, _) = self.lo.method_head(&Ty::Unit, *interface, &args, *method);
+                let own = place
+                    .steps
+                    .is_empty()
+                    .then(|| self.own_param(place.root))
+                    .flatten();
+                let kind = match (head.limits.stack, own) {
+                    (None, Some(position)) => stack::Kind::Param(position),
+                    (bound, _) => stack::Kind::Bounded(bound),
+                };
                 Target::Dyn {
                     code,
                     data,
                     abi,
+                    kind,
                     stack: head.limits.stack,
                 }
             }
@@ -294,6 +306,7 @@ impl Body<'_, '_, '_, '_> {
                             Some((position, self.walk_binding(operand)))
                         }
                         Ty::Fn(_) => Some((position, self.binding(operand))),
+                        Ty::Dyn(_) => Some((position, self.dyn_binding(operand))),
                         _ => None,
                     })
                     .collect();
@@ -303,8 +316,7 @@ impl Body<'_, '_, '_, '_> {
                 }
             }
             Target::Foreign(.., stack) => stack::Kind::Bounded(*stack),
-            Target::Indirect { kind, .. } => kind.clone(),
-            Target::Dyn { stack: bound, .. } => stack::Kind::Bounded(*bound),
+            Target::Indirect { kind, .. } | Target::Dyn { kind, .. } => kind.clone(),
         };
         self.record_site(inst, kind);
         let returns = self.fx.b.inst_results(inst).to_vec();
@@ -416,7 +428,7 @@ impl Body<'_, '_, '_, '_> {
     }
 
     /// The position among the function's parameters of a value that is one of its own
-    /// function-typed parameters, a closure's captures excluded.
+    /// function-typed or `Dyn` parameters, a closure's captures excluded.
     fn own_param(&self, value: Value) -> Option<usize> {
         let function = self.function();
         let position = function
@@ -428,7 +440,7 @@ impl Body<'_, '_, '_, '_> {
             _ => 0,
         };
         let own = position.checked_sub(captures)?;
-        matches!(self.nty(value).ty(), Ty::Fn(_)).then_some(own)
+        matches!(self.nty(value).ty(), Ty::Fn(_) | Ty::Dyn(_)).then_some(own)
     }
 
     /// Where the function value an operand passes comes from: a closure or named function
@@ -504,6 +516,35 @@ impl Body<'_, '_, '_, '_> {
             FnSource::Param(position) => stack::Binding::Param(position),
             FnSource::Other(bound) => stack::Binding::Bounded(bound),
         }
+    }
+
+    /// What an operand passes for a `Dyn` parameter of a direct call's callee: the methods of a
+    /// `Dyn` value the function makes, through the temporary holding it, or one of the
+    /// function's own parameters.
+    fn dyn_binding(&self, operand: &Operand) -> stack::Binding {
+        let mut value = match operand {
+            Operand::Value(value) => *value,
+            Operand::Place(_, place) if place.steps.is_empty() => place.root,
+            _ => return stack::Binding::Bounded(None),
+        };
+        if let Some(position) = self.own_param(value) {
+            return stack::Binding::Param(position);
+        }
+        for _ in 0..2 {
+            if let Some(methods) = self.dyn_methods(value) {
+                return stack::Binding::Methods(methods.to_vec());
+            }
+            match self.definition(value) {
+                Some(Op::Load(place) | Op::Move(place)) if place.steps.is_empty() => {
+                    match self.initializer(place.root) {
+                        Some(Operand::Value(initial)) => value = *initial,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        stack::Binding::Bounded(None)
     }
 
     /// What an operand passes for a `task fn` parameter of a direct call's callee: the walk

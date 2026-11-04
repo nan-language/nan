@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{self, InstBuilder, Type, Value as IrValue, types};
+use cranelift_module::FuncId;
 
 use super::abi::{Abi, Given, Repr, Returned, substituted};
 use super::fx::{Fx, PTR};
@@ -95,6 +96,8 @@ pub struct Body<'b, 'c, 'a, 'f> {
     /// Whether the function's returns write the bits of the two sides of the comparison it
     /// returns at the result address, as its `Sides` instance.
     sides: bool,
+    /// The code of each method of the table of each `Dyn` value the function makes, by value.
+    made_dyns: HashMap<Value, Vec<FuncId>>,
 }
 
 /// Lowers a NIR function of an item's unit, instantiated with `args`.
@@ -133,6 +136,7 @@ pub fn lower(
         statuses,
         current: function.span,
         sides,
+        made_dyns: HashMap::new(),
         unit: unit.clone(),
         lo,
         fx,
@@ -378,6 +382,18 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         }
         let nty = self.types[value.0 as usize].clone();
         self.lo.repr(&nty)
+    }
+
+    /// Records the code of the methods of the table of a `Dyn` value the function makes.
+    pub fn made_dyn(&mut self, value: Option<Value>, methods: Vec<FuncId>) {
+        if let Some(value) = value {
+            self.made_dyns.insert(value, methods);
+        }
+    }
+
+    /// The code of the methods of the table of a `Dyn` value the function makes.
+    pub fn dyn_methods(&self, value: Value) -> Option<&[FuncId]> {
+        self.made_dyns.get(&value).map(Vec::as_slice)
     }
 
     pub fn nty(&self, value: Value) -> &NTy {

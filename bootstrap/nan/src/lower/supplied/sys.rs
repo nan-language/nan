@@ -660,7 +660,7 @@ fn served(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, kind: i64, interface:
         .db
         .std_item("sys", interface)
         .expect("a service interface");
-    let table = lo.dyn_table(&service_ty, interface, &no_args());
+    let (table, _) = lo.dyn_table(&service_ty, interface, &no_args());
     let table = lo.data_ref(fx, table);
     let table = fx.b.ins().symbol_value(PTR, table);
     let derived = tables::served(lo, fx, kind, service, table);

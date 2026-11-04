@@ -264,8 +264,8 @@ pub fn builtin(
         Builtin::Intrinsic(path) => match path {
             "hw::mint_root" => sys::mint_root(body),
             "hw::Dma.access" => hw::dma_access(body, args, operands),
-            "text::fmt" => render::template(body, args, operands),
-            "Dyn.view" => render::dyn_view(body, args, &operands[0]),
+            "text::fmt" => render::template(body, args, operands, result),
+            "Dyn.view" => render::dyn_view(body, args, &operands[0], result),
             other => panic!("the intrinsic {other} has no lowering on this target"),
         },
     }

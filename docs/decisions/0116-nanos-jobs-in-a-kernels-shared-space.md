@@ -1,6 +1,6 @@
 # 0116. Nanos jobs in a kernel's shared space
 
-Status: accepted; `Fs` and `Net` denied on a kernel's runtime superseded by 0126
+Status: accepted; `Fs` and `Net` denied on a kernel's runtime superseded by 0126; the job's plain domain run superseded by 0128
 
 ## Context
 

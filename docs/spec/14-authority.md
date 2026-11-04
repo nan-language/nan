@@ -523,6 +523,8 @@ A bare kernel runs the program of a nanos bundle it loaded ([loading](24-kernel.
 pub closed enum Ended {
     Returned(mem::Bytes)
     Failed(text::String)
+    Cancelled
+    Abandoned
     Trapped(sys::Trap)
     Undecodable
 } Ended
@@ -537,10 +539,10 @@ pub closed struct HostInput derives Encode {
     pub environment: mem::Map[mem::Bytes, mem::Bytes]
 } HostInput
 
-pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait
+pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, domain: sys::Abandoner, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait
 ```
 
-- `nanos::run(bundle, world, input, exec, alloc)` runs the job of `bundle` as the first task of a new [domain run](11-errors-domains.md#domain-run) on `exec` and `alloc`, whose stack holds what the `limits stack N` of the program's entry function states, or [grows](17-suspension-io.md#grown-stacks) from what `job.stack()` gives when it states none, and returns how the job ended: `Returned` with the `mem::wire` encoding of a typed entry's result, or of a host-compatible entry's `u8` exit status, 0 for an entry returning nothing; `Failed` with the rendering of the entry's failure within a budget of 1,024 bytes; `Trapped` with the trap that abandoned the domain; `Undecodable` when `input` is not the `mem::wire` encoding of a typed entry's input type, or of a `HostInput` for a host-compatible entry. It fails with `RunError.NoJob` when `bundle` holds no job, as the bundle of a library does.
+- `nanos::run(bundle, world, input, domain, exec, alloc)` runs the job of `bundle` as the first task of a [domain run](11-errors-domains.md#domain-run) of the abandoner `domain` on `exec` and `alloc`, whose stack holds what the `limits stack N` of the program's entry function states, or [grows](17-suspension-io.md#grown-stacks) from what `job.stack()` gives when it states none, and returns how the job ended: `Returned` with the `mem::wire` encoding of a typed entry's result, or of a host-compatible entry's `u8` exit status, 0 for an entry returning nothing; `Failed` with the rendering of the entry's failure within a budget of 1,024 bytes, or `Cancelled` when that failure is a [cancellation](11-errors-domains.md#cancellation), such as one of a `task::within` deadline whose region holds the call; `Abandoned` when `domain.trigger()` abandoned the domain; `Trapped` with the trap that abandoned the domain otherwise; `Undecodable` when `input` is not the `mem::wire` encoding of a typed entry's input type, or of a `HostInput` for a host-compatible entry. It fails with `RunError.NoJob` when `bundle` holds no job, as the bundle of a library does.
 - The job owns `world` and `input`. A typed entry receives `world`. A host-compatible entry receives a `host::World` holding `world`'s capabilities, the `sys::WallClock` that `world.caps` holds under the key `wall`, or `sys::WallClock.denied()` when it holds none, and the arguments and environment of the `HostInput`.
 
 A kernel runs the job of a bundle it verified for isolated spaces ([isolated spaces](24-kernel.md#isolated-spaces)) in a space of its own, in user mode:
@@ -592,6 +594,8 @@ pub closed enum InstanceError derives Render {
 
 pub fn hold[T, E](bundle: sys::load::Bundle, component: Str, take world: World, take checkpoint: Option[mem::Bytes], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
 
+pub fn Instance.domain(self) -> mem::Shared[sys::Abandoner]
+
 pub fn Instance.inbox(self) -> Inbox
 
 pub fn Instance.step(mut self) -> bool fails InstanceError uses wait
@@ -624,11 +628,12 @@ pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, all
 ```
 
 - The Env of a component entry implements `nanos::Environment`: `Env.build(world)` makes it from the world its kernel grants an instance, failing with `CapError.Missing` when `world.caps` lacks a capability the Env needs.
-- `nanos::hold(bundle, component, world, checkpoint, exec, alloc, body: b)` runs the **instance task** of a new instance of the component entry `component` of `bundle` as the first task of a new [domain run](11-errors-domains.md#domain-run) on `exec` and `alloc`, whose stack holds what `job.stack()` gives for that entry and [grows](17-suspension-io.md#grown-stacks) beyond it, calls `b` with the instance on the calling task, and returns `Some` of what `b` returns once the instance's domain has ended. It returns `None`, running nothing, when `bundle` has no component entry of that name. The bundle is borrowed for the call, so it cannot be unloaded under the instance.
+- `nanos::hold(bundle, component, world, checkpoint, exec, alloc, body: b)` runs the **instance task** of a new instance of the component entry `component` of `bundle` as the first task of a [domain run](11-errors-domains.md#domain-run) of a new abandoner on `exec` and `alloc`, whose stack holds what `job.stack()` gives for that entry and [grows](17-suspension-io.md#grown-stacks) beyond it, calls `b` with the instance on the calling task, and returns `Some` of what `b` returns once the instance's domain has ended. It returns `None`, running nothing, when `bundle` has no component entry of that name. The bundle is borrowed for the call, so it cannot be unloaded under the instance.
+- `instance.domain()` shares the abandoner running the instance's domain, through which another task abandons an instance whose handler never returns.
 - The instance task owns `world` and `checkpoint`. It decodes `checkpoint`, builds the Env from `world`, then calls `sys::Stepper.start`, or `sys::Stepper.resume` with the decoded state when `checkpoint` is `Some`, and holds the stepper until the instance ends.
 - Each operation of an instance named after a `sys::Stepper` operation has the instance task perform that operation, `checkpoint` giving the `mem::wire` encoding of the state, so a handler runs in the instance's domain and a trap in it abandons that domain alone. Each waits for the instance task to carry it out, and fails with `InstanceError.Ended` once the instance's domain has ended. A cancelled `incoming` or `ready` also ends the wait of the instance task.
 - `instance.inbox()` gives an inbox of the instance. `inbox.call(hash, request, alloc)` has a task of the instance's domain serve the encoded call `request` as `sys::Wire[P].serve` does ([wire encoding](26-components.md#wire-encoding)) through the stepper's outbox, P being the protocol the component serves, and gives its reply drawn through `alloc`, once a step of the instance's holder has handled the call. It fails as `serve` does, and as closed once the instance has ended.
-- `take instance.end()` has the instance task stop serving its inboxes and end the stepper, and returns once the instance's domain has ended, with how the instance ended: `Returned` with the `mem::wire` encoding of its last state; `Failed` with the rendering of the failure building its Env, or of the cancellation its stepper's start met; `Trapped` with the trap that abandoned the domain; `Undecodable` when `checkpoint` is not the `mem::wire` encoding of a state of the component. It is no cancellation point. `take instance.abandon()` abandons the instance's domain without waiting.
+- `take instance.end()` has the instance task stop serving its inboxes and end the stepper, and returns once the instance's domain has ended, with how the instance ended: `Returned` with the `mem::wire` encoding of its last state; `Failed` with the rendering of the failure building its Env; `Cancelled` when its stepper's start or end met a cancellation; `Abandoned` when the abandoner `instance.domain()` shares abandoned the domain; `Trapped` with the trap that abandoned the domain otherwise; `Undecodable` when `checkpoint` is not the `mem::wire` encoding of a state of the component. It is no cancellation point. `take instance.abandon()` abandons the instance's domain without waiting.
 - Only std types and `mem::wire` encodings pass between a kernel and an instance task, which runs the code of the bundle: the state, the Env and the messages of the component never leave the bundle's code.
 
 ## Attenuation

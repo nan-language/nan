@@ -310,9 +310,10 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         }
     }
     text.push_str(&format!(
-        "\n## Time of a machine seam and of a thread switch\n\nA seam's round trip, a self-interrupt sent through the local APIC and taken, and a thread switch, half of a round trip between two tasks each waking the other with a signal, are timed under the emulator.\n\n| Milestone | Seam round trip | Thread switch |\n| --- | ---: | ---: |\n| M4 | {} | {} |\n",
+        "\n## Time of a machine seam and of thread switches\n\nA seam's round trip, a self-interrupt sent through the local APIC and taken, a thread switch, half of a round trip between two tasks each waking the other with a signal, and a switch between owners of extended state, the same between two tasks each owning extended state, are timed under the emulator.\n\n| Milestone | Seam round trip | Thread switch | Switch between owners |\n| --- | ---: | ---: | ---: |\n| M4 | {} | {} | {} |\n",
         nanoseconds(times.kernel.get("seam")),
-        nanoseconds(times.kernel.get("switch"))
+        nanoseconds(times.kernel.get("switch")),
+        nanoseconds(times.kernel.get("owner-switch"))
     ));
     text.push_str(&format!(
         "\n## Time of a generation check in a capability table\n\nAn operation failing at a stale capability's generation check: on `x86_64-host` for M2, on `x86_64-bare` under the emulator for M4.\n\n| Milestone | Time |\n| --- | ---: |\n| M2 | {} |\n| M4 | {} |\n",

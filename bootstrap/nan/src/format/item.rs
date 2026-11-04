@@ -903,9 +903,10 @@ impl Contexts {
         }
     }
 
-    /// Moves past a token on a line of `depth`: a separator ends its context's unit, an opener
-    /// opens a context anchored at the unit holding it, and any other token starts a unit when
-    /// none is current.
+    /// Moves past a token on a line of `depth`: a line end, or a comma inside a delimiter, ends
+    /// its context's unit, an opener opens a context anchored at the unit holding it, and any
+    /// other token starts a unit when none is current. A comma outside every delimiter separates
+    /// entries of an item head's clause, which stays one unit.
     fn track(&mut self, tok: &Tok, role: Option<Role>, depth: usize) {
         match tok.kind {
             TokenKind::Punct(Punct::LParen | Punct::LBracket | Punct::LBrace) => {
@@ -923,7 +924,8 @@ impl Contexts {
             TokenKind::Punct(Punct::RParen | Punct::RBracket | Punct::RBrace) => {
                 self.open.pop();
             }
-            TokenKind::Nl | TokenKind::Punct(Punct::Comma) => *self.unit_mut() = None,
+            TokenKind::Nl => *self.unit_mut() = None,
+            TokenKind::Punct(Punct::Comma) if !self.open.is_empty() => *self.unit_mut() = None,
             _ => {
                 self.unit_mut().get_or_insert(depth);
             }

@@ -54,6 +54,10 @@ fn breakable_lists_are_flat_or_broken() {
         "//! L.\n\nfn f( // the only one\n    a: u32) {\n} f\n",
         "//! L.\n\nfn f( // the only one\n    a: u32,\n    ) {\n} f\n",
     );
+    check(
+        "//! L.\n\nfn f(a: u32, b: u32, c: u32, d: u32, e: u32) -> u32 limits notrap, terminates {\n    return a\n} f\n",
+        "//! L.\n\nfn f(\n    a: u32,\n    b: u32,\n    c: u32,\n    d: u32,\n    e: u32,\n    ) -> u32 limits notrap, terminates {\n    return a\n} f\n",
+    );
 }
 
 #[test]

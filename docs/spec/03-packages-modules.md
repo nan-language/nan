@@ -755,6 +755,21 @@ pub fn frame_checksum(frame: Slice[u8]) -> u8 {
 ```
 
 ```nan
+pub closed struct Tally {
+    pub words: Array[u32, 8]
+    pub count: u32
+} Tally
+
+pub fn Tally.is_full(self) -> bool {
+    return self.cuont == 8 // error: name.unknown
+} Tally.is_full
+
+pub fn Tally.is_empty(self) -> bool {
+    return self.count == 0
+} Tally.is_empty
+```
+
+```nan
 pub closed struct Counter {
     pub hits: u32
 } Counter

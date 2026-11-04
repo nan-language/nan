@@ -1463,9 +1463,16 @@ pub fn Bundle.replace(mut self, take next: Prepared) fails LoadError
 
 pub fn Bundle.unload(take self)
 
-pub fn Bundle.job(self) -> Option[Job]
+pub fn Bundle.share(self) -> Load
 
-pub fn Bundle.component(self, name: Str) -> Option[Job]
+pub open struct Load {
+} Load
+
+pub fn Load.share(self) -> Load
+
+pub fn Load.job(self) -> Option[Job]
+
+pub fn Load.component(self, name: Str) -> Option[Job]
 
 pub open struct Job derives Copy {
 } Job
@@ -1491,11 +1498,12 @@ pub closed enum LoadError derives Copy, Eq, Render {
 - `bundle.domain()` shares the bundle's **domain**, an abandoner ([domain run](11-errors-domains.md#domain-run)) that runs no domain when the bundle is loaded. A kernel contains the calls it makes into a bundle, and what they leave running or installed, by making them in a domain run of that abandoner.
 - `bundle.replace(take next)` publishes in one change versions without the entries of `bundle` and with those of `next`, failing as `load` does and then changing nothing and retiring `next`'s placement. Each gate of `bundle` whose registry, key and field an entry of `next` shares then calls `next`'s function, and every other gate of `bundle` goes stale; `bundle` holds `next` from then on, with the same domain, and retires the placement it held.
 - `take bundle.unload()` triggers the bundle's domain, then publishes versions without the bundle's entries; every gate of the bundle goes stale and its placement is retired.
-- `bundle.job()` gives the job entry of a nanos program's bundle, none for another, `bundle.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's bundle, none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)).
-- Loads, replacements, unloads and reclamations take one lock of the kernel's, each publishing all its versions before the next starts.
+- `bundle.share()` gives a **load**, a counted handle on the placement `bundle` holds, and `load.share()` another on the placement of `load`. A load is Send and never Copy. Each load counts on its placement until it is released or the domain owning it is settled, and a retired placement is never reclaimed while a load counts on it, so a load stays valid after its bundle is replaced or unloaded, and the jobs and instances running from it keep running the code they started with.
+- `load.job()` gives the job entry of a nanos program's load, none for another, `load.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's load, none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)).
+- `take prepared.load()`, `bundle.replace(take next)`, `take bundle.unload()` and `loader.reclaim()` take one lock of the kernel's, each publishing all its versions before the next starts.
 - A bundle's code runs on the kernel's runtime: its tasks, cells, capabilities and domains are the kernel's.
 - A bundle's code reaches the runtime it runs on only through the kernel's exports, so that an isolated space's runtime can serve it ([isolated spaces](#isolated-spaces)).
-- **Retired** memory is reclaimed by `loader.reclaim()`: each version a publication replaced once no [read](25-registries.md#loaded-registries) holds it, and each retired placement once no older retired version is held and no call pins its code. Reclaiming a placement unlinks its line tables, clears its window entries and the window tables they leave empty, invalidates every CPU's translations as `hw::Ring0.invalidate_everywhere(hw::TlbScope.All)` does ([cross-CPU operations](#cross-cpu-operations)), then frees its runtime memory. `reclaim` gives the number of retired placements it leaves, and fails at once, keeping what it had cleared for the next call, when cancelled as its invalidation starts. A gate's function value and the records a gate reads, a few words per function field and load, are never reclaimed, so a value holding a gate stays valid after its bundle is reclaimed.
+- **Retired** memory is reclaimed by `loader.reclaim()`: each version a publication replaced once no [read](25-registries.md#loaded-registries) holds it, and each retired placement once no older retired version is held, no call pins its code and no load counts on it. Reclaiming a placement unlinks its line tables, clears its window entries and the window tables they leave empty, invalidates every CPU's translations as `hw::Ring0.invalidate_everywhere(hw::TlbScope.All)` does ([cross-CPU operations](#cross-cpu-operations)), then frees its runtime memory. `reclaim` gives the number of retired placements it leaves, and fails at once, keeping what it had cleared for the next call, when cancelled as its invalidation starts. A gate's function value, the records a gate reads and the count a placement's loads keep, a few words per function field and load, are never reclaimed, so a value holding a gate stays valid after its bundle is reclaimed.
 - No value returned from a gate's call refers to its bundle's memory, since the types crossing a gate are [boundary types](25-registries.md#loaded-registries); what a bundle's code leaves running or installed beyond a call belongs to the domain the call runs in.
 
 ### Isolated spaces

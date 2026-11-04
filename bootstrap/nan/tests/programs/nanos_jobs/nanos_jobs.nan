@@ -1,4 +1,4 @@
-//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs, standard streams, files and network on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return holding a file, and two jobs of one bundle running at once, one cancelled by a deadline and one spinning until abandoned.
+//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs, standard streams, files and network on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return holding a file, and two jobs of one load running while its bundle unloads, one cancelled by a deadline and one spinning until abandoned.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -367,9 +367,10 @@ fn ran(loader: sys::load::Loader, name: Str, file: Str, verified: bool, grants: 
     var results = mem::List[mem::Bytes].empty(grants.alloc)
     var stopped: Option[task::Cancelled] = None
     let bundle = loaded(loader, name: file, verified, alloc: grants.alloc)
+    let load = bundle.share()
     while left.len() > 0 {
         let input = mut left.remove(0)
-        let outcome = attempt await nanos::run(bundle, world: granted(grants), take input, domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
+        let outcome = attempt await nanos::run(load, world: granted(grants), take input, domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
         say(text: name)
         var returned = mem::Bytes.empty(grants.alloc)
         match outcome {
@@ -475,30 +476,41 @@ fn serve(loader: sys::load::Loader, grants: Grants) fails task::Cancelled uses w
     try await interrupted(loader, grants)
 } serve
 
-/// Runs the crash job twice at once from its bundle: sleeping until a deadline cancels it, and
-/// spinning until its abandoner abandons it once the sleeping one has ended, writing how each
-/// ended.
+/// Runs the crash job twice at once from loads of its bundle, which unloads first: sleeping until
+/// a deadline cancels it, and spinning until its abandoner abandons it once the sleeping one has
+/// ended, writing how each ended and the retired placements reclaim leaves while the loads remain
+/// and once they have ended.
 fn interrupted(loader: sys::load::Loader, grants: Grants) fails task::Cancelled uses wait {
     let bundle = loaded(loader, name: "opt/nan/crash", verified: false, alloc: grants.alloc)
-    defer take bundle.unload()
+    var sleeping = Some(bundle.share())
+    var spinning = Some(bundle.share())
+    take bundle.unload()
+    say_left(try await loader.reclaim())
     let domain = mem::Shared.of(sys::Abandoner.new(), alloc: grants.alloc)
     var slept: Option[Result[nanos::Ended, nanos::RunError]] = None
     var spun: Option[Result[nanos::Ended, nanos::RunError]] = None
-    try await task::scope(grants.exec, body: fn[mut slept, mut spun](s: task::Scope) fails task::Cancelled uses wait {
-        let sleeper = s.spawn(fn() -> Option[Result[nanos::Ended, nanos::RunError]] fails task::Cancelled uses wait limits stack 65_536 {
+    try await task::scope(grants.exec, body: fn[mut sleeping, mut spinning, mut slept, mut spun](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(asleep) = mut sleeping.extract() else {
+            return
+        }
+        let Some(spinner_load) = mut spinning.extract() else {
+            return
+        }
+        let sleeper = s.spawn(fn[take asleep]() -> Option[Result[nanos::Ended, nanos::RunError]] fails task::Cancelled uses wait limits stack 65_536 {
             return try await task::within(grants.clock, ms: 10, body: fn() -> Result[nanos::Ended, nanos::RunError] fails task::Cancelled uses wait {
-                return attempt await nanos::run(bundle, world: granted(grants), input: encoded(3u32, alloc: grants.alloc), domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
+                return attempt await nanos::run(asleep, world: granted(grants), input: encoded(3u32, alloc: grants.alloc), domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
             })
         })
         try await grants.clock.sleep(1)
         let running = domain.share()
-        let spinner = s.spawn(fn[take running]() -> Result[nanos::Ended, nanos::RunError] fails task::Cancelled uses wait limits stack 65_536 {
-            return attempt await nanos::run(bundle, world: granted(grants), input: encoded(2u32, alloc: grants.alloc), domain: running.contents(), exec: grants.exec, alloc: grants.alloc)
+        let spinner = s.spawn(fn[take spinner_load, take running]() -> Result[nanos::Ended, nanos::RunError] fails task::Cancelled uses wait limits stack 65_536 {
+            return attempt await nanos::run(spinner_load, world: granted(grants), input: encoded(2u32, alloc: grants.alloc), domain: running.contents(), exec: grants.exec, alloc: grants.alloc)
         })
         slept = try await take sleeper.join()
         domain.contents().trigger()
         spun = Some(try await take spinner.join())
     })
+    say_left(try await loader.reclaim())
     say_stopped(text: "sleeper ", outcome: take slept)
     say_stopped(text: "spinner ", outcome: take spun)
 } interrupted
@@ -513,6 +525,12 @@ fn say_stopped(text: Str, take outcome: Option[Result[nanos::Ended, nanos::RunEr
     }
 } say_stopped
 
+/// A line giving the retired placements reclaim left.
+fn say_left(count: usize) {
+    say(text: "left ")
+    say_number(u64.widen(count))
+    say(text: "\n")
+} say_left
 
 fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
     var bytes = mem::Bytes.empty(alloc)

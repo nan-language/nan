@@ -280,6 +280,7 @@ pub fn base_needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool
         .or_else(|| text::needs_release(path))
         .or_else(|| hw::needs_release(lo, path, ty))
         .or_else(|| boot::needs_release(path))
+        .or_else(|| load::needs_release(path))
 }
 
 /// Whether moving a value of a std base type into another domain's reach does anything; none
@@ -290,6 +291,7 @@ pub fn base_transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         .or_else(|| tasks::transfers(path))
         .or_else(|| text::transfers(path))
         .or_else(|| hw::transfers(lo, path, ty))
+        .or_else(|| load::transfers(path))
 }
 
 /// Moves a value of a std base type into another domain's reach; false for a type std declares
@@ -311,6 +313,7 @@ pub fn transfer_base(
         || tasks::transfer(lo, fx, &path, ty, address, lift, owner)
         || text::transfer(lo, fx, &path, address, lift)
         || hw::transfer(lo, fx, &path, ty, address, lift, owner)
+        || load::transfer(lo, fx, &path, address, owner)
 }
 
 /// Releases a value of a std base type; false for a type std declares in full.
@@ -324,4 +327,5 @@ pub fn release_base(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value) -> 
         || tasks::release(lo, fx, &path, ty, address)
         || text::release(lo, fx, &path, address)
         || hw::release(lo, fx, &path, ty, address)
+        || load::release(lo, fx, &path, address)
 }

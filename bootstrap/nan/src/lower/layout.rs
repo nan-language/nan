@@ -177,7 +177,7 @@ const VIEW_PAIRS: [&str; 6] = [
 ];
 
 /// The base types holding one pointer to state the runtime keeps.
-const POINTERS: [&str; 17] = [
+const POINTERS: [&str; 18] = [
     "core::Renderer",
     "core::Choices",
     "mem::Budget",
@@ -195,6 +195,7 @@ const POINTERS: [&str; 17] = [
     "sys::Cx",
     "sys::Stepper",
     "sys::Trap",
+    "sys::load::Pin",
 ];
 
 /// The base types that are generational handles, as capability kinds are.

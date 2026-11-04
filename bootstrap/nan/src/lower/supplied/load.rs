@@ -1,20 +1,25 @@
 //! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded
-//! bundle's job entry, its code's address and its stack, and the export table, runtime memory, window entries, translation invalidation and instruction
-//! visibility the loader of `sys::load` reads, with the user-mode runtime's image, the entries
-//! mapping an isolated space and the running root its tables share.
+//! bundle's job entry, its code's address and its stack, the pins counting a load's handles on
+//! its target record, and the export table, runtime memory, window entries, translation
+//! invalidation and instruction visibility the loader of `sys::load` reads, with the user-mode
+//! runtime's image, the entries mapping an isolated space and the running root its tables share.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC};
 
 use super::super::Lowering;
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
 use super::super::machine::Stub;
 use super::super::runtime::{Routine, fetch_add, holdings, report};
+use super::super::transfer;
 use super::{Supply, tasks as task_ops};
 use crate::workspace::Arch;
 
 /// The offset in a version of the count of reads holding it.
 const READERS: u64 = 16;
+
+/// The offset in a target record of its count.
+const PINS: u64 = 8;
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     match supply.path.as_str() {
@@ -74,12 +79,16 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             supply.ret(lo, fx, Held::Scalar(holding));
         }
         "sys::load::unpin" => {
-            let holding = supply.param(0).scalar();
-            let readers = fx.load(PTR, holding, holdings::holding::PAYLOAD);
-            lo.call_routine(fx, Routine::Unhold, &[holding]);
-            let less = fx.int(PTR, -1);
-            fetch_add(fx, readers, less);
+            unpin(lo, fx, supply.param(0).scalar());
             supply.done(lo, fx);
+        }
+        "sys::load::Pin.of" => {
+            let count = fx.offset(supply.param(0).scalar(), PINS);
+            counted(lo, fx, supply, count);
+        }
+        "sys::load::Pin.share" => {
+            let count = holdings::payload(fx, supply.param(0).address());
+            counted(lo, fx, supply, count);
         }
         "sys::load::exports" => {
             let table = lo.export_table(fx);
@@ -150,5 +159,54 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         _ => return false,
     }
+    true
+}
+
+/// Gives a pin holding one more of the count at an address, owned by the calling task's domain.
+fn counted(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, count: Value) {
+    let pin = fx.ptr(holdings::kind::PIN as u64);
+    let holding = lo.call_routine(fx, Routine::Hold, &[pin, count])[0];
+    let one = fx.ptr(1);
+    fetch_add(fx, count, one);
+    let sret = supply.sret.expect("a pin's address");
+    fx.store(holding, sret, 0);
+    supply.done(lo, fx);
+}
+
+/// Releases a pin holding: frees it and takes one from the count it holds.
+fn unpin(lo: &mut Lowering, fx: &mut Fx, holding: Value) {
+    let count = fx.load(PTR, holding, holdings::holding::PAYLOAD);
+    lo.call_routine(fx, Routine::Unhold, &[holding]);
+    let less = fx.int(PTR, -1);
+    fetch_add(fx, count, less);
+}
+
+/// Whether releasing a loading type does anything, none for a type std declares in full.
+pub fn needs_release(path: &str) -> Option<bool> {
+    (path == "sys::load::Pin").then_some(true)
+}
+
+/// Whether moving a loading type into another domain's reach does anything, none for a type std
+/// declares in full.
+pub fn transfers(path: &str) -> Option<bool> {
+    (path == "sys::load::Pin").then_some(true)
+}
+
+/// Moves a pin into another domain's reach: its holding passes to `owner`.
+pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, owner: Value) -> bool {
+    if path != "sys::load::Pin" {
+        return false;
+    }
+    transfer::rehome(lo, fx, address, owner);
+    true
+}
+
+/// Releases a pin.
+pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value) -> bool {
+    if path != "sys::load::Pin" {
+        return false;
+    }
+    let holding = fx.load(PTR, address, 0);
+    unpin(lo, fx, holding);
     true
 }

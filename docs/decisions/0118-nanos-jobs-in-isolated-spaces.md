@@ -1,6 +1,6 @@
 # 0118. Nanos jobs in isolated spaces
 
-Status: accepted
+Status: accepted; the boot area mapped whole before the space runs superseded by 0130
 
 ## Context
 

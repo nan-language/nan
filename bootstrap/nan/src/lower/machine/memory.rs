@@ -393,10 +393,25 @@ impl Lowering<'_, '_> {
 
     /// Visits the memory the AArch64 entry root maps as normal memory, whole: the ranges of the
     /// device tree's memory nodes, or the usable, ACPI reclaimable and ACPI NVS entries of the
-    /// start information's memory map, or the entries of the firmware's final memory map that are
-    /// neither reserved, unusable nor memory-mapped I/O; and the image.
+    /// start information's memory map with the start information, what it holds and the device
+    /// tree, or the entries of the firmware's final memory map that are neither reserved,
+    /// unusable nor memory-mapped I/O; and the image.
     fn mapped_memory(&mut self, fx: &mut Fx, visit: Visit) {
         self.listed_memory(fx, Listed::Mapped, &[], visit);
+        if self.ck.db.target == Target::Aarch64Bare {
+            let info = self.start_info(fx);
+            let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, info, 0);
+            fx.when(given, |fx| {
+                start_ranges(self, fx, info, visit);
+                let state_address = self.state(fx);
+                let tree = fx.load(PTR, state_address, state::PLATFORM);
+                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, tree, 0);
+                fx.when(present, |fx| {
+                    let end = tree_address(fx, tree, device_tree::SIZE);
+                    visit(self, fx, tree, end);
+                });
+            });
+        }
         let (start, end) = self.image_extent(fx);
         visit(self, fx, start, end);
     }
@@ -600,6 +615,38 @@ fn visit_unheld(
         let after = fx.b.ins().umax(rest.0, lowest.1);
         let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, after, end);
         (more, vec![after])
+    });
+}
+
+/// Visits a start information and the ranges it holds: its module list, its memory map, its
+/// command line, and each module with its name.
+fn start_ranges(lo: &mut Lowering, fx: &mut Fx, start: Value, visit: Visit) {
+    let end = fx.b.ins().iadd_imm_s(start, info::BYTES);
+    visit(lo, fx, start, end);
+    let modules = fx.load(PTR, start, info::MODULES);
+    let count = start::count(fx, start, info::MODULE_COUNT);
+    let bytes = fx.b.ins().imul_imm_s(count, module::BYTES);
+    let end = fx.b.ins().iadd(modules, bytes);
+    visit(lo, fx, modules, end);
+    let map = fx.load(PTR, start, info::MAP);
+    let entries = start::count(fx, start, info::MAP_COUNT);
+    let bytes = fx.b.ins().imul_imm_s(entries, map_entry::BYTES);
+    let end = fx.b.ins().iadd(map, bytes);
+    visit(lo, fx, map, end);
+    let line = fx.load(PTR, start, info::COMMAND_LINE);
+    let end = start::text_end(fx, line);
+    visit(lo, fx, line, end);
+    let zero = fx.ptr(0);
+    fx.each(zero, count, |fx, index| {
+        let offset = fx.b.ins().imul_imm_s(index, module::BYTES);
+        let entry = fx.b.ins().iadd(modules, offset);
+        let address = fx.load(PTR, entry, module::ADDRESS);
+        let size = fx.load(PTR, entry, module::SIZE);
+        let end = fx.b.ins().iadd(address, size);
+        visit(lo, fx, address, end);
+        let name = fx.load(PTR, entry, module::NAME);
+        let end = start::text_end(fx, name);
+        visit(lo, fx, name, end);
     });
 }
 

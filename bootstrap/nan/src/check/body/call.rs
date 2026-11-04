@@ -2149,7 +2149,9 @@ impl Body<'_, '_> {
             }
         };
         let written = marker.map(|(mode, _)| mode);
-        if written == required {
+        if written == required
+            || written.is_none() && required == Some(Mode::Take) && self.is_unowned(arg)
+        {
             return;
         }
         let construct = (marker.map_or(token, |(_, marker)| marker), last);
@@ -2171,6 +2173,25 @@ impl Body<'_, '_> {
             _ => Code::ModeMismatch,
         };
         self.report_fixed(construct, code, vec![fix]);
+    }
+
+    /// Whether a typed place does not own its value, which ownership forbids moving: a part, a
+    /// read or `mut` parameter, a view binding, a name a `for` pattern binds by read or `mut`, or
+    /// a field path from one.
+    fn is_unowned(&self, expr: &TExpr) -> bool {
+        match &expr.kind {
+            TKind::Local(local) => {
+                self.part_bindings.contains(local)
+                    || self.wrapped_bindings.contains(local)
+                    || self.read_views.contains(local)
+                    || matches!(
+                        self.local(*local).kind,
+                        LocalKind::Param(mode) | LocalKind::Element(mode) if mode != Mode::Take
+                    )
+            }
+            TKind::Field { base, .. } => self.is_unowned(base),
+            _ => self.is_part(expr) || self.is_wrapped_part(expr),
+        }
     }
 
     /// Whether a typed expression is a part: the result of a projection call of that form, an

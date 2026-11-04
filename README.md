@@ -1,6 +1,6 @@
 # NaN
 
-NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It compiles itself and will build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64 and AArch64, stays frozen and serves only to verify the self-hosted compiler.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It compiles itself and will build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64 and AArch64, implements language 1 with it until the NaN toolchain 1.0 is released, then freezes and serves only to verify the self-hosted compiler.
 
 ## Installation
 
@@ -57,7 +57,7 @@ The NaN toolchain is the workspace in `toolchain/`, written in NaN; `nan build n
 
 ## Bootstrap
 
-`bootstrap/` holds the bootstrap compiler, written in Rust with Cranelift. It implements the same commands, built the first NaN toolchain, and checks every change to the NaN toolchain against its own output; it is frozen. Working on it, or running the test suite, requires [rustup](https://rustup.rs) and a C compiler available as `cc`. From `bootstrap/`:
+`bootstrap/` holds the bootstrap compiler, written in Rust with Cranelift. It implements the same commands, built the first NaN toolchain, and checks every change to the NaN toolchain against its own output; it changes with language 1 until the NaN toolchain 1.0 is released, and freezes then. Working on it, or running the test suite, requires [rustup](https://rustup.rs) and a C compiler available as `cc`. From `bootstrap/`:
 
 ```bash
 rustup toolchain install

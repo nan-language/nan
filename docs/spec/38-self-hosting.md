@@ -1,13 +1,13 @@
 # Self-hosting and milestones
 
-This chapter defines the bootstrap, the NaN toolchain and the check of its first self-built toolchain, the milestones on which language 1 freezes, and the measurements the freeze requires.
+This chapter defines the bootstrap, the NaN toolchain and the check of its first self-built toolchain, the freeze of language 1 and the bootstrap, the milestones and the measurements the freeze requires.
 
 ## Bootstrap
 
 The **bootstrap** is the [implementation](00-charter.md#conformance) written in Rust. It elaborates source to [NIR](19-nir.md#nir) and [lowers](30-artefacts.md#lowering) NIR to machine code through Cranelift.
 
 - The bootstrap implements all of language 1: every rule on every [target](27-program-model.md#targets), every [command](33-toolchain.md#commands), the [prover](20-prover.md#procedure) and the [interpreter](21-interpreter.md#interpreter). It passes every conformance test.
-- The bootstrap implements language 1 only; no later language version applies to it. It is the independent compiler against which the first toolchain built by itself is checked by [stage comparison](36-builds.md#stage-comparison).
+- The bootstrap implements language 1 only; no later language version applies to it. Until the [freeze](#milestones), each change to language 1 lands in the bootstrap and the NaN toolchain together; after it, the bootstrap does not change. It is the independent compiler against which the first toolchain built by itself is checked by [stage comparison](36-builds.md#stage-comparison).
 - Cranelift emits the objects of lowering, freestanding for the machine targets, each function in its [calling convention](23-low-level.md#calling-conventions). The [linker](27-program-model.md#images) of each host target links its images from them, and the bootstrap's own image writer links the others.
 - The bootstrap's `stack_switch` [support routine](27-program-model.md#runtime-support) switches task stacks with Cranelift's stack switching on x86_64 and with a compiler stub of its own on AArch64.
 - Cranelift is the backend whose reported frame sizes the [stack limits](10-effects-digests.md#stack-limits) check reads.
@@ -36,7 +36,7 @@ Each later NaN toolchain is built by its checked predecessor.
 
 ## Milestones
 
-A **milestone** is one of M1 to M6, each a set of checks run on the bootstrap. Language 1 **freezes**, becoming the fixed definition of NaN that version 1 names ([language versions](37-evolution.md#language-versions)), when all six milestones pass on one build of the bootstrap and every [measurement](#measurements) with a bound meets it on that build.
+A **milestone** is one of M1 to M6, each a set of checks run on the bootstrap. Language 1 **freezes**, becoming the fixed definition of NaN that version 1 names ([language versions](37-evolution.md#language-versions)), and the bootstrap with it, when the NaN toolchain 1.0 is released. That release requires all six milestones to pass on one build of the bootstrap and every [measurement](#measurements) with a bound to meet it on that build.
 
 A **kernel conformance test** is one whose `nan` block, or for a `text` block the nearest earlier `nan` block of its section, has a package declaring a machine target; the others are **host conformance tests**. A conformance test passes when every run of the [harness](00-charter.md#marker-comments) gives what its marker comments state.
 

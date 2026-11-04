@@ -1,6 +1,6 @@
 # 0050. Host support routines of the NaN lowering
 
-Status: accepted
+Status: accepted; its bootstrap being frozen superseded by 0120
 
 ## Context
 

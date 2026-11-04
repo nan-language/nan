@@ -1,6 +1,6 @@
 # 0013. Language cost and scope
 
-Status: accepted
+Status: accepted; its freeze when the milestones pass superseded by 0120
 
 ## Context
 

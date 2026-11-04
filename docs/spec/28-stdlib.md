@@ -125,7 +125,7 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::PciFunction`, `hw::PciAddress`, `hw::PciError` | [PCI functions](24-kernel.md#pci-functions) |
 | `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |
 | `hw` | `hw::PerCpu` | [Scheduling](24-kernel.md#scheduling) |
-| `hw` | `hw::Policy`, `hw::TaskView`, `hw::Placement`, `hw::Idle` | [Policies](24-kernel.md#policies) |
+| `hw` | `hw::Policy`, `hw::TaskView`, `hw::Placement`, `hw::Steal`, `hw::Idle` | [Policies](24-kernel.md#policies) |
 | `hw` | `hw::Region`, `hw::PhysFrame`, `hw::Offset` | [Physical memory](24-kernel.md#physical-memory) |
 | `hw` | `hw::ExtendedState` | [Floating point](24-kernel.md#floating-point) |
 | `hw` | `hw::vectors`, `hw::Vector`, `hw::VectorHandler`, `hw::preempt`, `hw::PreemptEntry` | [Platform registries](25-registries.md#platform-registries) |

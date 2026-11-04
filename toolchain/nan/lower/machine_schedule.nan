@@ -8,7 +8,8 @@ enum Hook derives Copy, Eq, Hash {
     Steal
     /// `(policy, cpu, task) -> nanoseconds`.
     Slice
-    /// `(policy, cpu, timed, until) -> polls`.
+    /// `(policy, cpu, timed, until) -> way`, the way being 0 to halt, 1 to poll, and
+    /// `MWAIT` plus a hint to wait in `mwait`.
     Idle
 } Hook
 
@@ -65,6 +66,9 @@ fn hook_counts(params: usize, returns: usize) -> Array[usize, 2] {
 
 /// The offset in a policy record of the address of the policy's value, which follows it.
 const POLICY_VALUE: u64 = 32
+
+/// The way of idling an `Idle` hook gives for `hw::Idle.Mwait`, plus its hint.
+const MWAIT: i64 = 0x100
 
 /// The most stack a call of a policy hook uses: the 4 KiB its interface method demands, its glue
 /// and the routines placing a task.
@@ -166,7 +170,7 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
             }
             Hook.Steal => {
                 let found = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Some")
-                let payload = some_payload(mut lo, option: result_ty)
+                let payload = enum_payload(mut lo, ty: result_ty, name: "Some")
                 let victim = mut fx.load(clif::Type.Int32, addr: result, offset: payload)
                 mut results.push(mut fx.b.uextend(PTR, x: found))
                 mut results.push(mut fx.b.uextend(PTR, x: victim))
@@ -174,7 +178,13 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
             Hook.Slice => mut results.push(mut fx.load(PTR, addr: result, offset: 0))
             Hook.Idle => {
                 let polls = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Poll")
-                mut results.push(mut fx.b.uextend(PTR, x: polls))
+                let polls_word = mut fx.b.uextend(PTR, x: polls)
+                let waits = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Mwait")
+                let payload = enum_payload(mut lo, ty: result_ty, name: "Mwait")
+                let hint = mut fx.load(clif::Type.Int8, addr: result, offset: payload)
+                let hint_word = mut fx.b.uextend(PTR, x: hint)
+                let hinted = mut fx.b.bor_imm_s(hint_word, y: MWAIT)
+                mut results.push(mut fx.b.select(waits, x: hinted, y: polls_word))
             }
         }
         mut fx.b.ret(results.view())
@@ -468,7 +478,8 @@ fn Lowering.steal(mut self, mut fx: Fx, own: clif::Value, own_record: clif::Valu
 } Lowering.steal
 
 /// Idles the running CPU as its policy says, given the earliest deadline of the kernel clock:
-/// halts it until an interrupt, or returns at once to look for tasks again.
+/// halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at once to look
+/// for tasks again.
 fn Lowering.kernel_idle(mut self, mut fx: Fx) {
     let own = mut self.running_index(mut fx)
     let own_record = mut self.cpu_record(mut fx, index: own)
@@ -495,7 +506,19 @@ fn Lowering.kernel_idle(mut self, mut fx: Fx) {
         let none = mut fx1.ptr(0)
         return fx1.list1(none)
     })
-    let halts = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: asked[0], y: 0)
+    let way = asked[0]
+    let waits = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: way, y: MWAIT)
+    var halts = waits
+    if self.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
+        mut fx.if_true(waits, then: fn[mut self](mut fx1: Fx) {
+            let hint = mut fx1.b.band_imm_s(way, y: 0xFF)
+            discard mut self.call_stub(mut fx1, stub: Stub.IdleMwait, args: fx1.list1(hint).view())
+        })
+        halts = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: way, y: 0)
+    } else {
+        let stops = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: way, y: 0)
+        halts = mut fx.b.bor(stops, y: waits)
+    }
     mut fx.if_true(halts, then: fn[mut self](mut fx1: Fx) {
         discard mut self.call_stub(mut fx1, stub: Stub.IdleWait, args: mem::List[clif::Value].empty(fx1.alloc).view())
     })
@@ -618,14 +641,14 @@ fn word32(mut fx: Fx, word: clif::Value) -> Held {
     return Held.Scalar(mut fx.b.ireduce(clif::Type.Int32, x: word))
 } word32
 
-/// The offset of the payload of an option's `Some`.
-fn some_payload(mut lo: Lowering, option: ty::Ty) -> u64 {
-    let laid = mut lo.layout_of(option)
+/// The offset of the first payload field of an enum type's variant, by name.
+fn enum_payload(mut lo: Lowering, ty: ty::Ty, name: Str) -> u64 {
+    let laid = mut lo.layout_of(ty)
     let LayoutShape.Enum(shape) = laid.contents().shape else {
         return 0
     }
     for variant in shape.variants {
-        if variant.name.as_str() == "Some" {
+        if variant.name.as_str() == name {
             if variant.fields.len() > 0 {
                 return variant.fields[0].offset
             }
@@ -633,7 +656,7 @@ fn some_payload(mut lo: Lowering, option: ty::Ty) -> u64 {
         }
     }
     return 0
-} some_payload
+} enum_payload
 
 /// Inserts a task of a key into a CPU's queue after every task of a key no greater. The caller
 /// holds the queue's lock.

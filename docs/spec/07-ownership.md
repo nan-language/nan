@@ -95,7 +95,7 @@ The [markers](06-statements-expressions.md#markers) `mut` and `take` are the mod
 - An argument or receiver passed to a read parameter is unmarked.
 - An argument or receiver that is not a [place](#places), such as a call result, construction, literal, operator result, closure or path naming an item, is unmarked whatever the parameter's mode. Passed by `mut`, a [part](#projection-results) is the place it names, and any other such value is a temporary.
 - A marker before a chain of projection calls states the access to the place at the chain's root: `mut` when a call of the chain takes `mut self` of that place or of a part of it, and no marker otherwise.
-- A missing marker is an error (`mode.unmarked`), whose exact fix inserts it. Any other marker that these rules do not require is an error (`mode.mismatch`), whose exact fix replaces or deletes it.
+- A missing marker is an error (`mode.unmarked`), whose exact fix inserts it, except a missing `take` before a place that does not own its value, which [ownership](#ownership) forbids moving. Any other marker that these rules do not require is an error (`mode.mismatch`), whose exact fix replaces or deletes it.
 - Construction values and payloads are marked like `take` arguments ([construction](04-types.md#construction)), except the values that [projection results](#projection-results) and [view bindings](#view-bindings) leave unmarked.
 
 ```nan
@@ -145,6 +145,16 @@ pub fn Gauge.set(mut self, level: u32) {
 pub fn reset(mut gauge: Gauge) {
     gauge.set(0) // error: mode.unmarked
 } reset
+```
+
+```nan
+pub fn labelled(take label: text::String) -> text::String {
+    return label
+} labelled
+
+pub fn relabelled(label: text::String) -> text::String {
+    return labelled(label) // error: own.move-not-owned
+} relabelled
 ```
 
 ```nan

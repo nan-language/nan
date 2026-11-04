@@ -1,6 +1,7 @@
 //! The times the freeze measures, taken by the benchmark programs of `bootstrap/nanbench/bench/` on the
 //! reference machine's 8 hardware threads: the host runtime's allocation and generation check,
-//! and the kernel runtime's generation check, seam and thread switch under the emulator.
+//! and the kernel runtime's generation check, seam, thread switch and switch between owners of
+//! extended state under the emulator.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -114,14 +115,17 @@ fn kernel(source: &Path, root: &Path) -> Result<BTreeMap<String, u64>, String> {
     while let Ok(line) = received.recv_timeout(KERNEL_WAIT) {
         written.push_str(&line);
         written.push('\n');
-        if line.starts_with("switch ") || line.starts_with("halt ") || line.starts_with("trap.") {
+        if line.starts_with("owner-switch ")
+            || line.starts_with("halt ")
+            || line.starts_with("trap.")
+        {
             break;
         }
     }
     drop(emulator.kill());
     drop(emulator.wait());
     let found = times(&written);
-    match found.contains_key("switch") {
+    match found.contains_key("owner-switch") {
         true => Ok(found),
         false => Err(format!("the kernel benchmark writes\n{written}")),
     }

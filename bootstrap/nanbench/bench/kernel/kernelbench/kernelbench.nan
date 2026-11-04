@@ -1,4 +1,4 @@
-//! Times a generation check, a seam and a thread switch with the HPET, writing them in picoseconds.
+//! Times a generation check, a seam, a thread switch and a switch between owners of extended state with the HPET, writing them in picoseconds.
 
 /// The vector of the benchmark's self-interrupts.
 const SELF_VECTOR: u32 = 0x40
@@ -29,10 +29,6 @@ registers Apic {
     command: u32 at 0x300 read write
 } Apic
 
-/// The anchor, which the benchmark leaves empty.
-struct State {
-} State
-
 pub interrupt fn on_self(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
     take irq.complete()
     return hw::IrqExit.Resume
@@ -42,14 +38,47 @@ contribute hw::vectors bench = hw::Vector(vector: 0x40, ist: 0, handler: hw::Vec
 
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let alloc = k.alloc()
-    let state = State()
-    take k.anchor(take state, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
-        try await run(exec, alloc)
+    var regions = mut k.regions()
+    var large = mem::List[hw::PhysFrame[2_097_152]].empty(alloc)
+    match mut regions.pop() {
+        Some(highest) => take highest.frames(mut large)
+        None => {}
+    }
+    var small = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    match mut large.pop() {
+        Some(frame) => take frame.split(mut small)
+        None => {}
+    }
+    for frame in take large {
+        mut regions.push(take frame.into_region())
+    }
+    take k.anchor(take regions, run: fn[take small](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+        match mut small.pop() {
+            Some(one) => match mut small.pop() {
+                Some(two) => {
+                    var leading = hw::ExtendedState.of(take one)
+                    var trailing = hw::ExtendedState.of(take two)
+                    discard attempt await run(exec, one: mut leading, two: mut trailing, alloc)
+                    retire(take leading.into_frame())
+                    retire(take trailing.into_frame())
+                }
+                None => retire(take one)
+            }
+            None => {}
+        }
+        for frame in take small {
+            retire(take frame)
+        }
     })
 } main
 
+/// Gives a frame's memory to a heap that nothing uses.
+fn retire(take frame: hw::PhysFrame[4_096]) {
+    discard mem::Heap.over(take frame.into_region())
+} retire
+
 /// Times each operation and writes the results, then stops the emulator.
-fn run(exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait limits stack 24_576 {
+fn run(exec: task::Executor, mut one: hw::ExtendedState, mut two: hw::ExtendedState, alloc: mem::Alloc) fails task::Cancelled uses wait limits stack 24_576 {
     var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
     defer take uart.unmap()
     var hpet = trusted "the board's HPET lies at 0xFED0_0000, which the entry root maps uncached, and nothing else maps it" { hw::Mmio[Hpet].map(0xFED0_0000) }
@@ -62,9 +91,11 @@ fn run(exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait 
     let checks = time_checks(exec, mut hpet)
     let seams = time_seams(mut hpet, mut apic)
     let switches = try await time_switches(exec, mut hpet, alloc)
+    let owner_switches = try await time_owner_switches(exec, mut hpet, mut one, mut two, alloc)
     report(mut uart, label: b"generation", value: picoseconds(checks, period))
     report(mut uart, label: b"seam", value: picoseconds(seams, period))
     report(mut uart, label: b"switch", value: picoseconds(switches, period) / 2)
+    report(mut uart, label: b"owner-switch", value: picoseconds(owner_switches, period) / 2)
 } run
 
 /// The HPET ticks of `ROUNDS` operations failing at a stale executor's generation check.
@@ -118,6 +149,35 @@ fn time_switches(exec: task::Executor, mut hpet: hw::Mmio[Hpet], alloc: mem::All
     })
     return mut hpet.read(Hpet.counter) - start
 } time_switches
+
+/// The HPET ticks of `ROUNDS` round trips between a task owning the extended state `one` and a
+/// task owning `two`, each waking the other with a signal.
+fn time_owner_switches(exec: task::Executor, mut hpet: hw::Mmio[Hpet], mut one: hw::ExtendedState, mut two: hw::ExtendedState, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let ping = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let pong = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let start = mut hpet.read(Hpet.counter)
+    try await task::scope(exec, body: fn[mut one, mut two](s: task::Scope) fails task::Cancelled uses wait limits stack 16_384 {
+        discard s.spawn(fn[mut two]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await mut two.with(fn() fails task::Cancelled uses wait {
+                for _ in 0..<ROUNDS {
+                    let value = try await ping.contents().wait()
+                    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+                        pong.contents().post(t, value: value)
+                    })
+                }
+            })
+        })
+        try await mut one.with(fn() fails task::Cancelled uses wait {
+            for round in 0..<ROUNDS {
+                hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+                    ping.contents().post(t, value: round)
+                })
+                discard try await pong.contents().wait()
+            }
+        })
+    })
+    return mut hpet.read(Hpet.counter) - start
+} time_owner_switches
 
 /// The picoseconds of each of `ROUNDS` operations taking `ticks` HPET ticks of `period`
 /// femtoseconds in all.

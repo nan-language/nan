@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a missing component and an Env the kernel's grants cannot build.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component and an Env the kernel's grants cannot build.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -25,6 +25,7 @@ pub protocol Counter {
     pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn divide(by: u32) -> u64 limits pure
+    pub fn spin() -> u64 limits pure
 } Counter
 
 pub protocol Gauge {
@@ -252,7 +253,42 @@ fn serve(bundle: sys::load::Bundle, grants: Grants) fails nanos::InstanceError u
     })
     say(text: "gauge held ")
     say_flag(missing.is_some())
+    discard try await nanos::hold(bundle, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        try await spun(take instance, grants)
+    })
 } serve
+
+/// Calls a handler of the tally that never returns, abandoning the instance's domain from a task
+/// of its own while its holder steps the call.
+fn spun(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var held = instance
+    defer take held.abandon()
+    var spin = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Counter].spin(mut spin)
+    var pending = Some(take spin)
+    var watching = Some(held.domain())
+    say(text: "spun ")
+    let outcome = attempt await task::scope(grants.exec, body: fn[mut held, mut pending, mut watching](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(request) = mut pending.extract() else {
+            return
+        }
+        let Some(watched) = mut watching.extract() else {
+            return
+        }
+        discard s.spawn(fn[take watched]() fails task::Cancelled uses wait limits stack 16_384 {
+            try await grants.clock.sleep(10)
+            watched.contents().trigger()
+        })
+        discard try await called(mut held, hash: sys::Wire[Counter].hash(), take request, grants)
+    })
+    match outcome {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    undefer held
+    say(text: "spinner ")
+    report(try await take held.end(), alloc: grants.alloc)
+} spun
 
 /// Starts the tally, calls it, asks after its health through the system interfaces and gives a
 /// checkpoint of it once idle.
@@ -441,6 +477,8 @@ fn report(take ended: nanos::Ended, alloc: mem::Alloc) {
             sys::TrapKind.DivisionByZero => say(text: "trapped trap.division-by-zero\n")
             else => say(text: "trapped otherwise\n")
         }
+        nanos::Ended.Cancelled => say(text: "cancelled\n")
+        nanos::Ended.Abandoned => say(text: "abandoned\n")
         nanos::Ended.Undecodable => say(text: "undecodable\n")
     }
 } report

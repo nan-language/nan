@@ -52,11 +52,14 @@ pub fn Cap.get(caps: Caps, key: Str) -> C fails CapError {
 
 /// How a job or a component instance ended: the encoding of a job's result, of a host-compatible
 /// entry's exit status as a `u8` or of an instance's last state, the rendering of a job's failure
-/// or of the failure building an instance's Env, the trap that abandoned its domain, or an input
-/// or checkpoint its entry does not decode.
+/// or of the failure building an instance's Env, a cancellation it failed with, the abandoner of
+/// its domain abandoning it, another trap abandoning its domain, or an input or checkpoint its
+/// entry does not decode.
 pub closed enum Ended {
     Returned(mem::Bytes)
     Failed(text::String)
+    Cancelled
+    Abandoned
     Trapped(sys::Trap)
     Undecodable
 } Ended
@@ -72,17 +75,14 @@ pub closed struct HostInput derives Encode {
     pub environment: mem::Map[mem::Bytes, mem::Bytes]
 } HostInput
 
-pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait {
+pub fn run(bundle: sys::load::Bundle, take world: World, take input: mem::Bytes, domain: sys::Abandoner, exec: task::Executor, alloc: mem::Alloc) -> Ended fails RunError uses wait {
     let Some(job) = bundle.job() else {
         fail RunError.NoJob
     }
-    let outcome = try await sys::Domain.run_sized(fn[take world, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+    let outcome = try await domain.run_sized(fn[take world, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
         return try await call(job, take world, take input)
     }, stack: job.stack() + CALL_STACK, exec, alloc)
-    match outcome {
-        Ok(ended) => return ended
-        Err(trap) => return Ended.Trapped(take trap)
-    }
+    return settled(take outcome)
 } run
 
 /// The stack of a job's task beyond the one its entry needs, for the call of the entry.
@@ -93,6 +93,20 @@ const RENDERED: usize = 1_024
 
 /// Calls a job or component entry, which owns `world` and `input` from then on.
 fn call[I: Send](job: sys::load::Job, take world: World, take input: I) -> Ended fails task::Cancelled uses wait
+
+/// How a job or an instance ended once the domain run of its task returned: as that task gave,
+/// abandoned when the abandoner running its domain abandoned it, or trapped.
+fn settled(take outcome: Result[Ended, sys::Trap]) -> Ended {
+    match outcome {
+        Ok(ended) => return ended
+        Err(trap) => {
+            if trap.kind() == sys::TrapKind.Abandoned {
+                return Ended.Abandoned
+            }
+            return Ended.Trapped(take trap)
+        }
+    }
+} settled
 
 /// The Env of a component a kernel holds, built from the world the kernel grants its instance.
 pub interface Environment {
@@ -106,7 +120,7 @@ pub open linear struct Instance {
     requests: task::Sender[Asked]
     calls: task::Sender[Called]
     outcome: task::Receiver[Ended]
-    domain: mem::Shared[sys::Abandoner]
+    abandoner: mem::Shared[sys::Abandoner]
     waits: task::Cown[Waits]
     alloc: mem::Alloc
 } Instance
@@ -133,15 +147,14 @@ pub fn hold[T, E](bundle: sys::load::Bundle, component: Str, take world: World, 
             return
         }
         let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: take from, alloc)
-        let running = instance.domain.share()
+        let running = instance.abandoner.share()
         discard s.spawn(fn[take granted, take launch, take running, take ending, take last]() fails task::Cancelled uses wait limits stack 16_384 {
             let ran = attempt await running.contents().run_sized(fn[take granted, take launch]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
                 return try await call(job, world: take granted, input: take launch)
             }, stack: job.stack() + CALL_STACK, exec, alloc)
             let ended = match ran {
-                Ok(Ok(given_back)) => given_back
-                Ok(Err(trap)) => Ended.Trapped(take trap)
-                Err(cancelled) => failed(cancelled, alloc)
+                Ok(outcome) => settled(take outcome)
+                Err(cancelled) => failed(take cancelled, alloc)
             }
             discard attempt await ending.send(Routed.Ended)
             discard attempt await last.send(take ended)
@@ -150,6 +163,10 @@ pub fn hold[T, E](bundle: sys::load::Bundle, component: Str, take world: World, 
     })
     return result
 } hold
+
+pub fn Instance.domain(self) -> mem::Shared[sys::Abandoner] {
+    return self.abandoner.share()
+} Instance.domain
 
 pub fn Instance.inbox(self) -> Inbox {
     return Inbox(calls: self.calls.split(), waits: self.waits.share())
@@ -209,7 +226,7 @@ pub fn Instance.wake(mut self) fails InstanceError uses wait {
 } Instance.wake
 
 pub fn Instance.end(take self) -> Ended fails task::Cancelled uses wait {
-    let Instance(requests: requests, calls: calls, outcome: outcome, domain: _, waits: _, alloc: alloc) = self
+    let Instance(requests: requests, calls: calls, outcome: outcome, abandoner: _, waits: _, alloc: alloc) = self
     discard requests
     discard calls
     var last: Option[Ended] = None
@@ -223,8 +240,8 @@ pub fn Instance.end(take self) -> Ended fails task::Cancelled uses wait {
 } Instance.end
 
 pub fn Instance.abandon(take self) {
-    let Instance(requests: _, calls: _, outcome: _, domain: domain, waits: _, alloc: _) = self
-    domain.contents().trigger()
+    let Instance(requests: _, calls: _, outcome: _, abandoner: abandoner, waits: _, alloc: _) = self
+    abandoner.contents().trigger()
 } Instance.abandon
 
 pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
@@ -273,7 +290,7 @@ fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], alloc: mem::Alloc
     discard s.spawn(fn[take answered, take routing]() fails task::Cancelled uses wait limits stack 16_384 {
         try await routed(take answered, waits: routing, alloc)
     })
-    let instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, domain: mem::Shared.of(sys::Abandoner.new(), alloc), waits: take waits, alloc: alloc)
+    let instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, abandoner: mem::Shared.of(sys::Abandoner.new(), alloc), waits: take waits, alloc: alloc)
     let ending = answering.split()
     let launch = Launch(checkpoint: take checkpoint, requests: take asked, calls: take called, answers: take answering)
     return Opened(instance: take instance, launch: take launch, ending: take ending, last: take last)
@@ -437,7 +454,7 @@ fn typed[I: Encode, O: Encode, E: Render](take world: World, take input: mem::By
     }
     match attempt await main(take world, input: take decoded) {
         Ok(output) => return returned(output, alloc)
-        Err(failure) => return failed(failure, alloc)
+        Err(failure) => return failed(take failure, alloc)
     }
 } typed
 
@@ -449,7 +466,7 @@ fn hosted[E: Render](take world: World, take input: mem::Bytes, main: fn(take wo
     }
     match attempt await main(take host) {
         Ok(status) => return returned(status, alloc)
-        Err(failure) => return failed(failure, alloc)
+        Err(failure) => return failed(take failure, alloc)
     }
 } hosted
 
@@ -461,7 +478,7 @@ fn hosted_unit[E: Render](take world: World, take input: mem::Bytes, main: fn(ta
     }
     match attempt await main(take host) {
         Ok(_) => return returned(0u8, alloc)
-        Err(failure) => return failed(failure, alloc)
+        Err(failure) => return failed(take failure, alloc)
     }
 } hosted_unit
 
@@ -497,12 +514,12 @@ fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cance
     }
     var stepper = match started {
         Ok(stepper) => stepper
-        Err(cancelled) => return failed(cancelled, alloc)
+        Err(cancelled) => return failed(take cancelled, alloc)
     }
     discard attempt await serving(mut stepper, take requests, take calls, answers, exec, alloc)
     match attempt await take stepper.end() {
         Ok(stopped) => return returned(stopped.state, alloc)
-        Err(cancelled) => return failed(cancelled, alloc)
+        Err(cancelled) => return failed(take cancelled, alloc)
     }
 } Hosted.run
 
@@ -634,9 +651,25 @@ fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
     return bytes
 } encoded
 
-fn failed[E: Render](failure: E, alloc: mem::Alloc) -> Ended {
+/// A failure, or the cancellation it is.
+enum Failure[E] {
+    Failed(E) from
+    Cancelled(task::Cancelled) from
+} Failure
+
+/// Fails with `failure`, which arrives as `Failure.Cancelled` when it is a cancellation.
+fn raised[E](take failure: E) fails Failure[E] {
+    fail failure
+} raised
+
+/// How an entry failing with `failure` ended: cancelled when it is a cancellation, otherwise
+/// failed with its rendering.
+fn failed[E: Render](take failure: E, alloc: mem::Alloc) -> Ended {
+    let Err(Failure.Failed(other)) = attempt raised(take failure) else {
+        return Ended.Cancelled
+    }
     var buffer = Array[u8, RENDERED].filled(0)
-    let len = render_into(failure, into: mut buffer.view_mut())
+    let len = render_into(other, into: mut buffer.view_mut())
     let Some(bytes) = buffer.view().prefix(len) else {
         return Ended.Failed(text::String.empty(alloc))
     }
@@ -718,6 +751,23 @@ test typed_jobs_return_decode_and_fail for typed {
     expect failure
     expect refused
 } typed_jobs_return_decode_and_fail
+
+fn slept(take world: World, take input: u32) -> u32 fails Odd uses wait {
+    try await world.clock.sleep(1_000)
+    return input
+} slept
+
+test cancelled_jobs_end_cancelled for failed {
+    let world = testing::world()
+    let ended = try await task::within(world.clock, ms: 1, body: fn() -> Ended fails task::Cancelled uses wait {
+        return await typed(tested(world), input: encoded(2u32, alloc: world.alloc), main: slept)
+    })
+    let cancelled = match ended {
+        Some(Ended.Cancelled) => true
+        else => false
+    }
+    expect cancelled
+} cancelled_jobs_end_cancelled
 
 test host_jobs_get_a_denied_wall_clock for hosted {
     let world = testing::world()

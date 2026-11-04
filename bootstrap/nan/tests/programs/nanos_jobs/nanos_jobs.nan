@@ -1,4 +1,4 @@
-//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs, standard streams, files and network on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, and jobs that trap, fail and return holding a file.
+//! Loads nanos bundles and runs their jobs in domains of their own, serving their logs, standard streams, files and network on the serial port and their random source from a counter: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return holding a file, and two jobs of one bundle running at once, one cancelled by a deadline and one spinning until abandoned.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -369,7 +369,7 @@ fn ran(loader: sys::load::Loader, name: Str, file: Str, verified: bool, grants: 
     let bundle = loaded(loader, name: file, verified, alloc: grants.alloc)
     while left.len() > 0 {
         let input = mut left.remove(0)
-        let outcome = attempt await nanos::run(bundle, world: granted(grants), take input, exec: grants.exec, alloc: grants.alloc)
+        let outcome = attempt await nanos::run(bundle, world: granted(grants), take input, domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
         say(text: name)
         var returned = mem::Bytes.empty(grants.alloc)
         match outcome {
@@ -388,6 +388,8 @@ fn ran(loader: sys::load::Loader, name: Str, file: Str, verified: bool, grants: 
                     else => say(text: " trapped otherwise\n")
                 }
             }
+            Ok(nanos::Ended.Cancelled) => say(text: " cancelled\n")
+            Ok(nanos::Ended.Abandoned) => say(text: " abandoned\n")
             Ok(nanos::Ended.Undecodable) => say(text: " undecodable\n")
             Err(nanos::RunError.NoJob) => say(text: " has no job\n")
             Err(nanos::RunError.Cancelled(cancelled)) => {
@@ -470,7 +472,47 @@ fn serve(loader: sys::load::Loader, grants: Grants) fails task::Cancelled uses w
     say(text: "quotient ")
     say_number(u64.widen(quotients[2][0]))
     say(text: "\n")
+    try await interrupted(loader, grants)
 } serve
+
+/// Runs the crash job twice at once from its bundle: sleeping until a deadline cancels it, and
+/// spinning until its abandoner abandons it once the sleeping one has ended, writing how each
+/// ended.
+fn interrupted(loader: sys::load::Loader, grants: Grants) fails task::Cancelled uses wait {
+    let bundle = loaded(loader, name: "opt/nan/crash", verified: false, alloc: grants.alloc)
+    defer take bundle.unload()
+    let domain = mem::Shared.of(sys::Abandoner.new(), alloc: grants.alloc)
+    var slept: Option[Result[nanos::Ended, nanos::RunError]] = None
+    var spun: Option[Result[nanos::Ended, nanos::RunError]] = None
+    try await task::scope(grants.exec, body: fn[mut slept, mut spun](s: task::Scope) fails task::Cancelled uses wait {
+        let sleeper = s.spawn(fn() -> Option[Result[nanos::Ended, nanos::RunError]] fails task::Cancelled uses wait limits stack 65_536 {
+            return try await task::within(grants.clock, ms: 10, body: fn() -> Result[nanos::Ended, nanos::RunError] fails task::Cancelled uses wait {
+                return attempt await nanos::run(bundle, world: granted(grants), input: encoded(3u32, alloc: grants.alloc), domain: sys::Abandoner.new(), exec: grants.exec, alloc: grants.alloc)
+            })
+        })
+        try await grants.clock.sleep(1)
+        let running = domain.share()
+        let spinner = s.spawn(fn[take running]() -> Result[nanos::Ended, nanos::RunError] fails task::Cancelled uses wait limits stack 65_536 {
+            return attempt await nanos::run(bundle, world: granted(grants), input: encoded(2u32, alloc: grants.alloc), domain: running.contents(), exec: grants.exec, alloc: grants.alloc)
+        })
+        slept = try await take sleeper.join()
+        domain.contents().trigger()
+        spun = Some(try await take spinner.join())
+    })
+    say_stopped(text: "sleeper ", outcome: take slept)
+    say_stopped(text: "spinner ", outcome: take spun)
+} interrupted
+
+/// A line naming how a stopped job ended.
+fn say_stopped(text: Str, take outcome: Option[Result[nanos::Ended, nanos::RunError]]) {
+    say(text)
+    match outcome {
+        Some(Ok(nanos::Ended.Cancelled)) => say(text: "cancelled\n")
+        Some(Ok(nanos::Ended.Abandoned)) => say(text: "abandoned\n")
+        else => say(text: "otherwise\n")
+    }
+} say_stopped
+
 
 fn encoded[T: Encode](value: T, alloc: mem::Alloc) -> mem::Bytes {
     var bytes = mem::Bytes.empty(alloc)

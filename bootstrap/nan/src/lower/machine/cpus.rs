@@ -140,8 +140,9 @@ impl Lowering<'_, '_> {
     /// register addresses from now on; the boot CPU's data-independent timing mode; on AArch64,
     /// the machine discovered; on a kernel, its clock started, on x86_64 the local APICs' mode
     /// chosen, and a CPU for each processor the platform reports; an executor thread record for
-    /// each CPU; on x86_64, the boot CPU's features recorded; and, on `x86_64-bare`,
-    /// the boot CPU's descriptor tables loaded and AVX enabled when it has it.
+    /// each CPU; on x86_64, the boot CPU's features recorded; on `x86_64-bare`, the boot CPU's
+    /// descriptor tables loaded and AVX enabled when it has it; and, on x86_64, `CR0.WP` and
+    /// `EFER.NXE` set.
     pub fn machine_init(&mut self, fx: &mut Fx) {
         let boot = self.cpu_records(fx);
         self.set_cpu_base(fx, boot);
@@ -184,6 +185,9 @@ impl Lowering<'_, '_> {
         if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
             self.call_stub(fx, Stub::EnableAvx, &[]);
+        }
+        if self.ck.db.target.arch() == Some(Arch::Amd64) {
+            self.call_stub(fx, Stub::WriteProtect, &[]);
         }
         self.open_window(fx);
     }
@@ -508,7 +512,8 @@ impl Lowering<'_, '_> {
 
     /// The glue a started CPU calls with its record: it points its base register at the record,
     /// sets its data-independent timing mode, on x86_64 records its features, loads its
-    /// descriptor tables and enables AVX when it has it, prepares its interrupt delivery through
+    /// descriptor tables, enables AVX when it has it and sets `CR0.WP` and `EFER.NXE`, opens the
+    /// load window on AArch64, prepares its interrupt delivery through
     /// `prepare`, disables floating point, records that it started and runs the executor's
     /// scheduler.
     fn cpu_glue(&mut self, prepare: FuncId) -> FuncId {
@@ -531,6 +536,7 @@ impl Lowering<'_, '_> {
                     lo.call_stub(fx, Stub::CpuFeatures, &[index]);
                     lo.load_cpu_tables(fx, record);
                     lo.call_stub(fx, Stub::EnableAvx, &[]);
+                    lo.call_stub(fx, Stub::WriteProtect, &[]);
                 }
                 lo.open_window(fx);
                 let prepare = lo.call_ref(fx, prepare);

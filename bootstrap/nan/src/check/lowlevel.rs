@@ -11,7 +11,7 @@ use crate::syntax::ast::{self, Access, ItemKind, LayoutFieldKind, LayoutRepr, Mo
 use crate::workspace::Target;
 
 /// The trusted primitives: std functions callable only inside trusted code.
-const PRIMITIVES: [&str; 12] = [
+const PRIMITIVES: [&str; 13] = [
     "hw::Ptr.read",
     "hw::Ptr.write",
     "hw::Ptr.offset",
@@ -23,6 +23,7 @@ const PRIMITIVES: [&str; 12] = [
     "hw::TrapFrame.set_ip",
     "boot::Machine.enter",
     "sys::load::Loader.prepare_unverified",
+    "sys::load::Loader.isolate_unverified",
     "hw::UserFrame.into_frame",
 ];
 

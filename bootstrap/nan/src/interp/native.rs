@@ -22,6 +22,7 @@ mod text;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+pub use codecs::encode_call;
 pub use numbers::{builtin, canonical};
 
 use super::value::{DynVal, Loc, Val, View};

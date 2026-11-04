@@ -99,6 +99,7 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
 | `sys` | `sys::Protocol`, `sys::ProtocolHash`, `sys::Handle`, `sys::Encoded`, `sys::Wire`, `sys::Reply` | [Wire encoding](26-components.md#wire-encoding) |
+| `sys` | `sys::ProtocolSchema`, `sys::OperationSchema`, `sys::ParameterSchema`, `sys::TypeSchema` | [Protocol schemas](26-components.md#protocol-schemas) |
 | `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
 | `sys` | `sys::Resume`, `sys::ResumeReason`, `sys::Pressure`, `sys::Health`, `sys::HealthReply`, `sys::Suspend` | [System interfaces](26-components.md#system-interfaces) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |

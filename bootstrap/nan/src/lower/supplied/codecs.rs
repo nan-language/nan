@@ -473,26 +473,46 @@ fn encode_as(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// `Codec.schema(alloc)`: the type's schema tree, decoded from its `mem::wire` encoding.
 fn schema(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let tree = lo.ck.schema(&supply.type_arg(0)).wire();
-    let data = lo.bytes_data(&tree);
-    let start = lo.data_address(fx, data);
+    constant(lo, fx, supply, &tree);
+}
+
+/// Returns the value of the operation's result type that the `mem::wire` bytes `encoding`
+/// encode, drawn through the allocator of its first parameter, trapping when memory is
+/// exhausted.
+fn constant(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, encoding: &[u8]) {
     let alloc = fx.load(PTR, supply.param(0).address(), 0);
-    let state = fx.slot(reader::SIZE, 8);
-    fx.store(start, state, reader::POS);
-    let end = fx.b.ins().iadd_imm_s(start, tree.len() as i64);
-    fx.store(end, state, reader::END);
-    let zero = fx.ptr(0);
-    fx.store(zero, state, reader::DEPTH);
     let result = supply.abi.result.clone();
     let layout = lo.layout(&result);
     let target = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let function = decoder(lo, &DecodeFormat::Wire, &result);
-    let code = call(lo, fx, function, &[state, alloc, target])[0];
+    let code = decode_constant(lo, fx, encoding, &result, alloc, target);
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
     fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
     let held = lo.held_at(fx, &result, target);
     supply.ret(lo, fx, held);
+}
+
+/// Decodes the value of `ty` that the `mem::wire` bytes `encoding` encode at `target`, drawing
+/// through the allocator handle `alloc`: the code of its decoding.
+fn decode_constant(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    encoding: &[u8],
+    ty: &Ty,
+    alloc: Value,
+    target: Value,
+) -> Value {
+    let data = lo.bytes_data(encoding);
+    let start = lo.data_address(fx, data);
+    let state = fx.slot(reader::SIZE, 8);
+    fx.store(start, state, reader::POS);
+    let end = fx.b.ins().iadd_imm_s(start, encoding.len() as i64);
+    fx.store(end, state, reader::END);
+    let zero = fx.ptr(0);
+    fx.store(zero, state, reader::DEPTH);
+    let function = decoder(lo, &DecodeFormat::Wire, ty);
+    call(lo, fx, function, &[state, alloc, target])[0]
 }
 
 /// `Codec.erased()`: the type's schema hash and `Codec.canonical` of it as a function value.

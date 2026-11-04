@@ -203,17 +203,7 @@ impl Node {
             }
             Node::Back(depth) => ("Back", vec![("depth", unsigned(*depth))]),
         };
-        let mut out = text(name);
-        match fields.is_empty() {
-            true => out.push(0),
-            false => {
-                let payload = record(fields);
-                out.push(1);
-                uvar(&mut out, payload.len() as u128);
-                out.extend(payload);
-            }
-        }
-        out
+        variant(name, (!fields.is_empty()).then(|| record(fields)))
     }
 
     pub fn hash(&self) -> Hash {
@@ -221,19 +211,19 @@ impl Node {
     }
 }
 
-fn unsigned(value: u64) -> Vec<u8> {
+pub(super) fn unsigned(value: u64) -> Vec<u8> {
     let mut out = Vec::new();
     uvar(&mut out, u128::from(value));
     out
 }
 
-fn text(value: &str) -> Vec<u8> {
+pub(super) fn text(value: &str) -> Vec<u8> {
     let mut out = unsigned(value.len() as u64);
     out.extend(value.as_bytes());
     out
 }
 
-fn sequence(elements: impl Iterator<Item = Vec<u8>>) -> Vec<u8> {
+pub(super) fn sequence(elements: impl Iterator<Item = Vec<u8>>) -> Vec<u8> {
     let elements: Vec<Vec<u8>> = elements.collect();
     let mut out = unsigned(elements.len() as u64);
     for element in elements {
@@ -244,7 +234,7 @@ fn sequence(elements: impl Iterator<Item = Vec<u8>>) -> Vec<u8> {
 
 /// A record: its field count, then per field its key, its value's length and its value; the
 /// fields given in ascending byte order of keys.
-fn record(fields: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+pub(super) fn record(fields: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
     let mut out = unsigned(fields.len() as u64);
     for (key, value) in fields {
         out.extend(text(key));
@@ -254,21 +244,25 @@ fn record(fields: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
     out
 }
 
-/// An `Option` value as `mem::wire` encodes it: the variant `None`, or `Some` with its payload.
-fn option(value: Option<Vec<u8>>) -> Vec<u8> {
-    match value {
-        None => {
-            let mut out = text("None");
-            out.push(0);
-            out
-        }
+/// A variant: its key, then `0x00`, or `0x01`, its payload's length and its payload.
+pub(super) fn variant(key: &str, payload: Option<Vec<u8>>) -> Vec<u8> {
+    let mut out = text(key);
+    match payload {
+        None => out.push(0),
         Some(payload) => {
-            let mut out = text("Some");
             out.push(1);
             uvar(&mut out, payload.len() as u128);
             out.extend(payload);
-            out
         }
+    }
+    out
+}
+
+/// An `Option` value as `mem::wire` encodes it: the variant `None`, or `Some` with its payload.
+pub(super) fn option(value: Option<Vec<u8>>) -> Vec<u8> {
+    match value {
+        None => variant("None", None),
+        Some(payload) => variant("Some", Some(payload)),
     }
 }
 

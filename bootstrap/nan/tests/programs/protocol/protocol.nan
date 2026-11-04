@@ -23,6 +23,16 @@ pub protocol Counter summary Tally {
     fn tick() limits pure
 } Counter
 
+/// The counter's additions as a client declares them, with refusals of its own.
+pub protocol Adder {
+    pub fn add(amount: u32) -> u64 fails Rejection limits traceless
+} Adder
+
+pub closed enum Rejection derives Render, Encode {
+    Busy
+    TooLarge(u32)
+} Rejection
+
 pub closed struct Env {
     pub alloc: mem::Alloc
 } Env
@@ -84,6 +94,24 @@ fn sum(values: mem::List[u64]) -> u64 {
     return total
 } sum
 
+/// The total a call adding 3 under the Adder protocol gives, the counter knowing the Adder's
+/// schema when `known` holds, zero when the call is refused.
+fn carried(inbox: sys::Outbox[Counter], known: bool, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    if known {
+        mut peers.push(sys::Wire[Adder].schema(alloc))
+    }
+    var call = sys::Encoded.empty(alloc)
+    let added = sys::Wire[Adder].add(mut call, amount: 3)
+    let Ok(reply) = attempt await sys::Wire[Counter].serve(inbox, hash: sys::Wire[Adder].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+        return 0
+    }
+    let Ok(total) = attempt added.decode(Untrusted.of(reply.bytes.view()), handles: reply.handles.view(), alloc) else {
+        return 0
+    }
+    return total
+} carried
+
 fn exchange(world: host::World) fails sys::CallError[Refusal] uses wait {
     let exec = world.exec
     let alloc = world.alloc
@@ -105,6 +133,8 @@ fn exchange(world: host::World) fails sys::CallError[Refusal] uses wait {
             let totals = try await inbox.history()
             log.info("history sum", value: sum(totals))
         }, exec, alloc)
+        log.info("wire total", value: try await carried(inbox, known: true, alloc))
+        log.info("unknown total", value: try await carried(inbox, known: false, alloc))
         try await pause.sleep(50)
         let tally = try inbox.summary()
         log.info("adds", value: tally.adds)

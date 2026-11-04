@@ -79,9 +79,10 @@ const TCR_HIGH: i64 = 0xB510_0000;
 /// The bits of the window's entries the loader writes, by kind: a table, a page of code, of
 /// read-only data and of writable data. On x86_64 present, writable and execute-disable; on
 /// AArch64 a table or page descriptor, the access flag, inner-shareable normal write-back memory,
-/// read-only and execute-never for EL1 and for EL0.
+/// non-global, so that a user root's ASID finds none of its translations, read-only and
+/// execute-never for EL1 and for EL0.
 const X64_ENTRIES: [u64; 4] = [0x1, 0x8000_0000_0000_0001, 0x8000_0000_0000_0003, 0x3];
-const A64_PAGE: u64 = 0x3 | 0x400 | 0x300 | (2 << 2) | 1 << 54;
+const A64_PAGE: u64 = 0x3 | 0x800 | 0x400 | 0x300 | (2 << 2) | 1 << 54;
 const A64_ENTRIES: [u64; 4] = [
     A64_PAGE | 0x80,
     A64_PAGE | 0x80 | 1 << 53,

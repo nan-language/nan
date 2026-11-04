@@ -23,8 +23,9 @@ pub mod region {
     pub const LEN: u64 = 8;
 }
 
-/// `hw::Region`: its base and length, and `frames`, which appends each frame of a size lying
-/// wholly inside it.
+/// `hw::Region`: its base and length; `frames`, which appends each frame of a size lying wholly
+/// inside it; and `split`, which keeps the part below a 4 KiB-aligned address strictly inside it
+/// and gives the part from that address.
 pub fn lower_region(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let held = supply.param(0).address();
     let base = fx.load(PTR, held, region::BASE);
@@ -51,6 +52,29 @@ pub fn lower_region(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 (inside, vec![past])
             });
             supply.done(lo, fx);
+        }
+        "split" => {
+            let at = supply.param(1).scalar();
+            let result_ty = supply.abi.result.clone();
+            let end = fx.b.ins().iadd(base, len);
+            let above = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, at, base);
+            let below = fx.b.ins().icmp(IntCC::UnsignedLessThan, at, end);
+            let offset = fx.b.ins().band_imm_s(at, 4_095);
+            let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, offset, 0);
+            let inside = fx.b.ins().band(above, below);
+            let inside = fx.b.ins().band(inside, aligned);
+            fx.when(inside, |fx| {
+                let kept = fx.b.ins().isub(at, base);
+                fx.store(kept, held, region::LEN);
+                let part = fx.slot(16, 8);
+                fx.store(at, part, region::BASE);
+                let rest = fx.b.ins().isub(end, at);
+                fx.store(rest, part, region::LEN);
+                let some = lo.variant_value(fx, &result_ty, "Some", &[Held::Address(part)], None);
+                supply.ret(lo, fx, some);
+            });
+            let none = lo.none_value(fx, &result_ty);
+            supply.ret(lo, fx, none);
         }
         member => panic!("no lowering of hw::Region.{member}"),
     }

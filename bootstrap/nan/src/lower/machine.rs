@@ -625,25 +625,37 @@ impl Lowering<'_, '_> {
 
     /// The image's first address and last address plus one, which the image writer records.
     pub fn image_extent(&mut self, fx: &mut Fx) -> (Value, Value) {
-        let id = match self.reserved.get(crate::image::IMAGE_EXTENT) {
+        let extent = self.written_record(fx, crate::image::IMAGE_EXTENT, 16);
+        (fx.load(PTR, extent, 0), fx.load(PTR, extent, 8))
+    }
+
+    /// The address of the image's segment table, which the image writer fills.
+    pub fn segment_table(&mut self, fx: &mut Fx) -> Value {
+        let bytes = crate::image::SEGMENT_TABLE_BYTES as usize;
+        self.written_record(fx, crate::image::SEGMENT_TABLE, bytes)
+    }
+
+    /// The address of a zeroed writable data object of a size the image writer fills, defined
+    /// once.
+    fn written_record(&mut self, fx: &mut Fx, name: &'static str, size: usize) -> Value {
+        let id = match self.reserved.get(name) {
             Some(id) => *id,
             None => {
                 let id = self
                     .module
-                    .declare_data(crate::image::IMAGE_EXTENT, Linkage::Local, true, false)
-                    .expect("the image extent");
+                    .declare_data(name, Linkage::Local, true, false)
+                    .expect("a record the image writer fills");
                 let mut description = DataDescription::new();
-                description.define(vec![0; 16].into_boxed_slice());
+                description.define(vec![0; size].into_boxed_slice());
                 description.set_align(8);
                 self.module
                     .define_data(id, &description)
-                    .expect("the image extent");
-                self.reserved.insert(crate::image::IMAGE_EXTENT, id);
+                    .expect("a record the image writer fills");
+                self.reserved.insert(name, id);
                 id
             }
         };
-        let extent = self.data_address(fx, id);
-        (fx.load(PTR, extent, 0), fx.load(PTR, extent, 8))
+        self.data_address(fx, id)
     }
 
     /// The descriptor table's pseudo-descriptor, which `lgdt` loads: a null descriptor, a 64-bit

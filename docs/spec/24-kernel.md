@@ -1380,6 +1380,16 @@ pub fn Kernel.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Op
 
 pub fn Kernel.device_tree(self, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]]
 
+pub fn Kernel.memory_map(self, alloc: mem::Alloc) -> mem::List[MemoryRange]
+
+pub fn Kernel.image_segments(self, alloc: mem::Alloc) -> mem::List[Segment]
+
+pub fn Kernel.boot_area(self) -> Extent
+
+pub fn Kernel.entry_tables(self) -> Extent
+
+pub fn Kernel.start_extents(self, alloc: mem::Alloc) -> mem::List[Extent]
+
 pub open linear struct Module {
 } Module
 
@@ -1388,12 +1398,28 @@ pub fn Module.name(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes]
 pub proj fn Module.contents(self) -> Untrusted[Slice[u8]]
 
 pub fn Module.into_region(take self) -> hw::Region
+
+pub closed struct Segment derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+    pub writable: bool
+    pub executable: bool
+} Segment
+
+pub closed struct Extent derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+} Extent
 ```
 
 - A bare image's **start information** is a structure in the layout of the PVH boot protocol's naming its modules, command line, RSDP and memory map: on `x86_64-bare` the one the PVH protocol passes, and on `aarch64-bare` the one whose address `x1` holds when it is not zero ([descriptors](27-program-model.md#descriptors)). A UEFI image has none.
 - The first call of `k.modules()` returns a module for each entry of the start information's module list, in its order, drawn through `k.alloc()`; later calls, and calls without a start information, return an empty list. A module owns its memory: `name` copies the NUL-terminated text its entry names, `contents` views its bytes, and `into_region` returns its memory as a region.
 - `k.command_line(alloc)` copies the start information's command line, or on `aarch64-bare` without one the `bootargs` property of the device tree's `/chosen` node; it is empty when neither gives one.
 - `k.acpi_table(signature, alloc)` copies the ACPI table with a signature as `Services.acpi_table` finds it, from the RSDP that the start information names, on `x86_64-bare` otherwise the one in the BIOS area, and on a UEFI target the one the configuration table lists; it is `None` when there is none. `k.device_tree(alloc)` copies the device tree the image entered with on `aarch64-bare`, and is `None` on the other targets.
+- `k.memory_map(alloc)` lists the memory map of the start information, each entry's type as `kind` and `attributes` 0, on a bare target with one, and on a UEFI target the firmware's final memory map that `exit_services` read, `kind` being the UEFI memory type and `attributes` the descriptor's attributes; it is empty otherwise.
+- `k.image_segments(alloc)` lists the image's loadable segments in address order, each with its extent and whether its memory is writable and executable; its code segment is first.
+- `k.boot_area()` gives the extent of the [boot area](#physical-memory), and `k.entry_tables()` that of the tables the runtime added to the [entry root](#physical-memory), empty when it added none.
+- `k.start_extents(alloc)` lists the extents of the start information, its module list, memory map and command line with its NUL, then of each module and of its name with its NUL, in that order, followed on `aarch64-bare` by that of the device tree; it is empty without either.
 - Each draw traps on exhaustion (`trap.exhausted`).
 
 ## Loading

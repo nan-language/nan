@@ -58,6 +58,41 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let rsdp = lo.rsdp(fx);
             supply.ret(lo, fx, Held::Scalar(rsdp));
         }
+        "boot::final_map_address" | "boot::final_map_bytes" | "boot::final_map_stride" => {
+            let word = match lo.ck.db.target.kind() {
+                Some(Kind::Uefi) => {
+                    let at = match supply.path.as_str() {
+                        "boot::final_map_address" => state::MEMORY_MAP,
+                        "boot::final_map_bytes" => state::MAP_SIZE,
+                        _ => state::MAP_STRIDE,
+                    };
+                    let state_address = lo.state(fx);
+                    fx.load(PTR, state_address, at)
+                }
+                _ => fx.ptr(0),
+            };
+            supply.ret(lo, fx, Held::Scalar(word));
+        }
+        "boot::segment_table" => {
+            let table = lo.segment_table(fx);
+            supply.ret(lo, fx, Held::Scalar(table));
+        }
+        "boot::boot_area_start" | "boot::boot_area_end" => {
+            let (start, end) = lo.boot_area_extent(fx);
+            let word = match supply.path.as_str() {
+                "boot::boot_area_start" => start,
+                _ => end,
+            };
+            supply.ret(lo, fx, Held::Scalar(word));
+        }
+        "boot::entry_tables_start" | "boot::entry_tables_end" => {
+            let (start, end) = lo.entry_tables_extent(fx);
+            let word = match supply.path.as_str() {
+                "boot::entry_tables_start" => start,
+                _ => end,
+            };
+            supply.ret(lo, fx, Held::Scalar(word));
+        }
         "boot::system_table_address" => {
             let table = match lo.ck.db.target.kind() {
                 Some(Kind::Uefi) => {

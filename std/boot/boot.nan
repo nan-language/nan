@@ -1,7 +1,41 @@
 //! The UEFI and bare root grants, firmware services and the start information.
 
-/// The offset in a start information of its command line's address.
+/// The offsets in a start information of its version, module count, module list's address,
+/// command line's address, memory map's address and memory map's entry count, and its size; the
+/// size of a module list entry and the offset of its name's address; the size of a memory map
+/// entry and the offset of its type.
+const INFO_VERSION: u64 = 4
+
+const INFO_MODULE_COUNT: u64 = 12
+
+const INFO_MODULES: u64 = 16
+
 const INFO_COMMAND_LINE: u64 = 24
+
+const INFO_MAP: u64 = 40
+
+const INFO_MAP_COUNT: u64 = 48
+
+const INFO_BYTES: u64 = 56
+
+const MODULE_BYTES: u64 = 32
+
+const MODULE_NAME: u64 = 16
+
+const MAP_ENTRY_BYTES: u64 = 24
+
+const MAP_ENTRY_KIND: u64 = 16
+
+/// The offsets in a UEFI memory descriptor of its physical start, page count and attributes.
+const DESCRIPTOR_BASE: u64 = 8
+
+const DESCRIPTOR_PAGES: u64 = 24
+
+const DESCRIPTOR_ATTRIBUTES: u64 = 32
+
+/// The size of an entry of the image's segment table, which follows its count: the segment's
+/// address, size and access, bit 0 for writable and bit 1 for executable.
+const SEGMENT_BYTES: u64 = 24
 
 /// The header of an ACPI table: its size; the offsets in the RSDP of its revision, its RSDT's
 /// address and its XSDT's address; and the offsets in the FADT of the 32-bit and 64-bit
@@ -120,6 +154,76 @@ pub fn Kernel.device_tree(self, alloc: mem::Alloc) -> Option[Untrusted[mem::Byte
     }
     return Some(Untrusted.of(copied(tree, len: u64.widen(u32_be_at(tree + TREE_SIZE)), alloc)))
 } Kernel.device_tree
+
+pub fn Kernel.memory_map(self, alloc: mem::Alloc) -> mem::List[MemoryRange] {
+    var ranges = mem::List[MemoryRange].empty(alloc)
+    let info = start_info()
+    if info != 0 {
+        if u32_at(info + INFO_VERSION) == 0 {
+            return ranges
+        }
+        let map = u64_at(info + INFO_MAP)
+        for index in 0..<u64.widen(u32_at(info + INFO_MAP_COUNT)) {
+            let entry = map + index * MAP_ENTRY_BYTES
+            mut ranges.push(MemoryRange(base: u64_at(entry), byte_len: u64_at(entry + 8), kind: u32_at(entry + MAP_ENTRY_KIND), attributes: 0))
+        }
+        return ranges
+    }
+    let stride = final_map_stride()
+    if stride == 0 {
+        return ranges
+    }
+    let map = final_map_address()
+    for index in 0..<(final_map_bytes() / stride) {
+        let entry = map + index * stride
+        mut ranges.push(MemoryRange(base: u64_at(entry + DESCRIPTOR_BASE), byte_len: u64_at(entry + DESCRIPTOR_PAGES) * 4_096, kind: u32_at(entry), attributes: u64_at(entry + DESCRIPTOR_ATTRIBUTES)))
+    }
+    return ranges
+} Kernel.memory_map
+
+pub fn Kernel.image_segments(self, alloc: mem::Alloc) -> mem::List[Segment] {
+    var segments = mem::List[Segment].empty(alloc)
+    let table = segment_table()
+    for index in 0..<u64_at(table) {
+        let entry = table + 8 + index * SEGMENT_BYTES
+        let access = u64_at(entry + 16)
+        mut segments.push(Segment(base: u64_at(entry), byte_len: u64_at(entry + 8), writable: (access & 1) != 0, executable: (access & 2) != 0))
+    }
+    return segments
+} Kernel.image_segments
+
+pub fn Kernel.boot_area(self) -> Extent {
+    let start = boot_area_start()
+    return Extent(base: start, byte_len: boot_area_end() - start)
+} Kernel.boot_area
+
+pub fn Kernel.entry_tables(self) -> Extent {
+    let start = entry_tables_start()
+    return Extent(base: start, byte_len: entry_tables_end() - start)
+} Kernel.entry_tables
+
+pub fn Kernel.start_extents(self, alloc: mem::Alloc) -> mem::List[Extent] {
+    var extents = mem::List[Extent].empty(alloc)
+    let info = start_info()
+    if info != 0 {
+        mut extents.push(Extent(base: info, byte_len: INFO_BYTES))
+        let modules = u64_at(info + INFO_MODULES)
+        let count = u64.widen(u32_at(info + INFO_MODULE_COUNT))
+        mut extents.push(Extent(base: modules, byte_len: count * MODULE_BYTES))
+        mut extents.push(Extent(base: u64_at(info + INFO_MAP), byte_len: u64.widen(u32_at(info + INFO_MAP_COUNT)) * MAP_ENTRY_BYTES))
+        mut extents.push(text_extent(u64_at(info + INFO_COMMAND_LINE)))
+        for index in 0..<count {
+            let entry = modules + index * MODULE_BYTES
+            mut extents.push(Extent(base: u64_at(entry), byte_len: u64_at(entry + 8)))
+            mut extents.push(text_extent(u64_at(entry + MODULE_NAME)))
+        }
+    }
+    let tree = tree_address()
+    if tree != 0 {
+        mut extents.push(Extent(base: tree, byte_len: u64.widen(u32_be_at(tree + TREE_SIZE))))
+    }
+    return extents
+} Kernel.start_extents
 
 pub open linear struct Module {
     region: hw::Region
@@ -287,6 +391,17 @@ pub closed enum PartitionSignature derives Copy, Eq {
     Mbr(u32)
     Unsigned
 } PartitionSignature
+pub closed struct Segment derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+    pub writable: bool
+    pub executable: bool
+} Segment
+
+pub closed struct Extent derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+} Extent
 
 pub closed struct MemoryRange derives Copy, Eq {
     pub base: u64
@@ -308,6 +423,40 @@ pkg fn rsdp_address() -> u64
 /// The address of the system table the firmware entered the image with, zero when it has no
 /// firmware.
 pkg fn system_table_address() -> u64
+
+/// The address of the firmware's final memory map that `exit_services` read, its size and the
+/// size of each of its descriptors; zero before it and without firmware.
+pkg fn final_map_address() -> u64
+
+pkg fn final_map_bytes() -> u64
+
+pkg fn final_map_stride() -> u64
+
+/// The address of the image's segment table, which the image writer fills: their count, then
+/// each segment's entry.
+pkg fn segment_table() -> u64
+
+/// The first address and the last address plus one of the boot area and of the tables extending
+/// the entry root.
+pkg fn boot_area_start() -> u64
+
+pkg fn boot_area_end() -> u64
+
+pkg fn entry_tables_start() -> u64
+
+pkg fn entry_tables_end() -> u64
+
+/// The extent of the NUL-terminated text at an address, its NUL included; empty at address zero.
+fn text_extent(address: u64) -> Extent {
+    if address == 0 {
+        return Extent(base: 0, byte_len: 0)
+    }
+    var at = address
+    while byte_at(at) != 0 {
+        at += 1
+    }
+    return Extent(base: address, byte_len: at + 1 - address)
+} text_extent
 
 /// The address of the table the firmware's configuration table lists under a GUID, zero when
 /// it lists none or the image has no firmware.

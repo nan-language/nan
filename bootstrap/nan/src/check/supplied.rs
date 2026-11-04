@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 50] = [
+const DRAWING: [&str; 52] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -46,6 +46,8 @@ const DRAWING: [&str; 50] = [
     "sys::Reply.decode",
     "sys::load::pin",
     "sys::load::reserve",
+    "sys::load::Pin.of",
+    "sys::load::Pin.share",
     "nanos::space_base",
     "nanos::trap_of",
     "sys::sim::fs",
@@ -120,7 +122,12 @@ const TRAPPING: [&str; 35] = [
 ];
 
 /// The supplied operations that change an atomic count without a type with interior mutability.
-const COUNTED: [&str; 2] = ["mem::Shared.share", "mem::Shared.make_mut"];
+const COUNTED: [&str; 4] = [
+    "mem::Shared.share",
+    "mem::Shared.make_mut",
+    "sys::load::Pin.of",
+    "sys::load::Pin.share",
+];
 
 /// The supplied operations calling a component's handlers or a job's entry on the calling task,
 /// whose digests hold the declared digest of a call through `sys::Component`, a system interface

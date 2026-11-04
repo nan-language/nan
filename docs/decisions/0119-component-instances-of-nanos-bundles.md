@@ -1,6 +1,6 @@
 # 0119. Component instances of nanos bundles
 
-Status: accepted
+Status: accepted; the bundle borrowed for the instance's life superseded by 0129
 
 ## Context
 

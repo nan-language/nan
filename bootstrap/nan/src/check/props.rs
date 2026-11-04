@@ -211,6 +211,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Abandoner", AFFINE_SEND),
     ("sys::Stepper", LINEAR_ONLY),
     ("sys::load::Loader", AFFINE_SEND),
+    ("sys::load::Pin", AFFINE_SEND),
     ("sys::load::Table", COPY_SEND),
     ("hw::Ptr", [No, No, Yes, Yes, Yes, Yes]),
     ("hw::UserAddr", [No, No, Yes, Yes, Yes, Yes]),

@@ -1,7 +1,10 @@
-//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded bundle's job entry, its code's address and its stack, and the export table, runtime memory, window entries, translation invalidation and instruction visibility the loader of `sys::load` reads, with the user-mode runtime's image, the entries mapping an isolated space and the running root its tables share.
+//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded bundle's job entry, its code's address and its stack, the pins counting a load's handles on its target record, and the export table, runtime memory, window entries, translation invalidation and instruction visibility the loader of `sys::load` reads, with the user-mode runtime's image, the entries mapping an isolated space and the running root its tables share.
 
 /// The offset in a version of the count of reads holding it.
 const VERSION_READERS: u64 = 16
+
+/// The offset in a target record of its count.
+const TARGET_PINS: u64 = 8
 
 fn load_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
@@ -50,12 +53,16 @@ fn load_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             supply.ret(mut lo, mut fx, held: Held.Scalar(holding))
         }
         "sys::load::unpin" => {
-            let holding = supply.param(0).scalar_value()
-            let readers = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
-            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
-            let less = mut fx.int(PTR, value: -1)
-            discard fetch_add(mut fx, address: readers, amount: less)
+            load_unpin(mut lo, mut fx, holding: supply.param(0).scalar_value())
             supply.done(mut lo, mut fx)
+        }
+        "sys::load::Pin.of" => {
+            let count = mut fx.offset(supply.param(0).scalar_value(), offset: TARGET_PINS)
+            load_counted(mut lo, mut fx, supply, count)
+        }
+        "sys::load::Pin.share" => {
+            let count = holdings_payload(mut fx, address: supply.param(0).address_value())
+            load_counted(mut lo, mut fx, supply, count)
         }
         else => return memory_lower(mut lo, mut fx, supply)
     }
@@ -139,6 +146,65 @@ fn memory_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
 
 /// Pins the current version of the table record at `record` for a read, giving the holding that
 /// keeps the pin.
+/// Gives a pin holding one more of the count at an address, owned by the calling task's domain.
+fn load_counted(mut lo: Lowering, mut fx: Fx, supply: Supply, count: clif::Value) {
+    let pin = mut fx.ptr(u64.fit(HOLDINGS_KIND_PIN))
+    let held_args = fx.list2(pin, b: count)
+    let held = mut lo.call_routine(mut fx, routine: Routine.Hold, args: held_args.view())
+    let one = mut fx.ptr(1)
+    discard fetch_add(mut fx, address: count, amount: one)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(held[0], addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} load_counted
+
+/// Releases a pin holding: frees it and takes one from the count it holds.
+fn load_unpin(mut lo: Lowering, mut fx: Fx, holding: clif::Value) {
+    let count = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+    let less = mut fx.int(PTR, value: -1)
+    discard fetch_add(mut fx, address: count, amount: less)
+} load_unpin
+
+/// Whether releasing a loading type does anything, none for a type std declares in full.
+fn load_needs_release(owner_path: Str) -> Option[bool] {
+    if owner_path == "sys::load::Pin" {
+        return Some(true)
+    }
+    return None
+} load_needs_release
+
+/// Whether moving a loading type into another domain's reach does anything, none for a type std
+/// declares in full.
+fn load_transfers(owner_path: Str) -> Option[bool] {
+    if owner_path == "sys::load::Pin" {
+        return Some(true)
+    }
+    return None
+} load_transfers
+
+/// Moves a pin into another domain's reach: its holding passes to `owner`.
+fn load_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::Value, owner: clif::Value) -> bool {
+    if owner_path != "sys::load::Pin" {
+        return false
+    }
+    rehome(mut lo, mut fx, address, owner)
+    return true
+} load_transfer
+
+/// Releases a pin.
+fn load_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::Value) -> bool {
+    if owner_path != "sys::load::Pin" {
+        return false
+    }
+    let holding = mut fx.load(PTR, addr: address, offset: 0)
+    load_unpin(mut lo, mut fx, holding)
+    return true
+} load_release
+
 fn pin_version(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
     let pin = mut fx.ptr(u64.fit(HOLDINGS_KIND_PIN))
     let zero = mut fx.ptr(0)

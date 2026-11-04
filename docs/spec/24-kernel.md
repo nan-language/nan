@@ -1054,6 +1054,8 @@ pub fn Region.byte_len(self) -> u64 limits pure, notrap, terminates
 
 pub fn Region.frames[S: u64 where S == 4_096 or S == 2_097_152 or S == 1_073_741_824](take self, mut frames: mem::List[PhysFrame[S]])
 
+pub fn Region.split(mut self, at: u64) -> Option[Region] limits notrap, terminates, noalloc
+
 pub open linear struct PhysFrame[S: u64 where S == 4_096 or S == 2_097_152 or S == 1_073_741_824] {
 } PhysFrame
 
@@ -1076,6 +1078,7 @@ pub closed struct Offset[T: AnyBits] derives Copy, Eq {
 - On the machine targets, the **boot area** holds the boot heap and the runtime's tables, then on a bare target the entry root's other tables. On a UEFI target it is memory the image reserves. On a bare target it lies outside the image's loadable segments: before the entry landing fn, the runtime places it at the lowest 64 KiB-aligned address of usable memory outside the image from which it lies wholly in that usable memory below 4 GiB on x86_64 and below 512 GiB on AArch64, leaving out the first MiB on x86_64, the [start information](#start-information) and what it holds, and on `aarch64-bare` the device tree and the ranges its memory reservation block lists ([anchor](#anchor)). When no usable memory holds it, the run writes `nan: runtime unavailable` and a line feed to the serial port and writes the byte 71 to the [exit port](27-program-model.md#descriptors).
 - By the soundness condition of `write_cr3` and `write_ttbr0`, no value that safe code reaches holds a frame of a page table that a CPU's root reaches: the trusted code linking a frame into such a table consumes it, such as by storing it through `hw::Ptr.write`.
 - `take region.frames(mut frames)` appends, in address order, every S-aligned frame lying wholly inside the region. Memory of the region outside those frames is never used again.
+- `mut region.split(at)` returns `Some` of the region from `at` to the end of `region`, which keeps the memory below `at`, when `at` is a multiple of 4 096 lying strictly between the region's base and its end; otherwise it returns `None` and leaves `region` unchanged.
 - `take frame.split(mut parts)` appends the S ÷ T frames of size T that make up `frame`, in address order. `PhysFrame[S].merge(take parts)` returns `Ok` of the frame they make up when `parts` holds exactly S ÷ T contiguous frames in address order whose first is S-aligned, and otherwise returns `Err(parts)` unchanged. `split` and `frames` grow their list as `push` does ([growth](12-memory.md#growth)).
 - `frame.contents_mut(at)` projects the T stored `at.bytes` bytes into the frame. It traps (`trap.bounds`) when T does not fit inside the frame from that offset or the offset is not aligned for T. Being AnyBits, T is valid whatever the frame holds. Its T, like that of `hw::Offset[T]`, has a fixed layout ([DMA](23-low-level.md#dma)).
 - `take frame.into_region()` returns the frame's memory as a region, over which a store is created with `over` ([regions](12-memory.md#regions)).

@@ -1,4 +1,4 @@
-//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back.
+//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle.
 
 /// The memory the entry root maps with the tables the image holds, and the bytes of a frame.
 const MAPPED: u64 = 0x1_0000_0000
@@ -31,6 +31,33 @@ fn written(mut frame: hw::PhysFrame[GIGABYTE]) -> bool {
     return mut frame.contents_mut(low) == ~base and mut frame.contents_mut(high) == base
 } written
 
+/// Whether splitting a region at an address gives nothing, keeping any part it gives.
+fn refuses(mut region: hw::Region, at: u64, mut regions: mem::List[hw::Region]) -> bool {
+    let Some(part) = mut region.split(at) else {
+        return true
+    }
+    mut regions.push(take part)
+    return false
+} refuses
+
+/// Splits a region at the 4 KiB boundary at or below its middle, keeping both parts, and gives
+/// whether they cover it and its base or an unaligned address split nothing.
+fn halved(take region: hw::Region, mut regions: mem::List[hw::Region]) -> bool {
+    var lower = region
+    let base = lower.base()
+    let end = base + lower.byte_len()
+    let at = (base + lower.byte_len() / 2) & ~0xFFF
+    let refused = refuses(mut lower, at: base, mut regions) and refuses(mut lower, at: at + 8, mut regions)
+    let Some(upper) = mut lower.split(at) else {
+        mut regions.push(take lower)
+        return false
+    }
+    let covered = lower.base() == base and lower.byte_len() == at - base and upper.base() == at and upper.byte_len() == end - at
+    mut regions.push(take lower)
+    mut regions.push(take upper)
+    return refused and covered
+} halved
+
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     var regions = mut k.regions()
     var frames = mem::List[hw::PhysFrame[GIGABYTE]].empty(k.alloc())
@@ -49,6 +76,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     }
     if high > 0 and same {
         say(text: "frames above 4 GiB written and read back\n")
+    }
+    match mut regions.pop() {
+        Some(next) => {
+            if halved(take next, mut regions) {
+                say(text: "region split at its middle\n")
+            }
+        }
+        None => say(text: "one region of usable memory\n")
     }
     take k.anchor(take regions, run: fn(exec: task::Executor) limits stack 16_384 {
         say(text: "anchored\n")

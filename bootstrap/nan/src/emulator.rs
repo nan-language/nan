@@ -401,21 +401,16 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
             let (code, template) = firmware(arch);
             let format = flash_format(code);
             let volume = boot_volume(arch, image, files)?.display().to_string();
-            let (vars, volume) = match kept {
+            let volume = format!("if=none,id=boot,format=raw,file=fat:{volume},snapshot=on");
+            let vars = match kept {
                 Some(_) => {
                     let vars = dir.join(VARS);
                     if !vars.exists() {
                         fs::copy(template, vars)?;
                     }
-                    (
-                        format!("if=pflash,format={format},unit=1,file={VARS}"),
-                        format!("if=none,id=boot,format=raw,file=fat:rw:{volume}"),
-                    )
+                    format!("if=pflash,format={format},unit=1,file={VARS}")
                 }
-                None => (
-                    format!("if=pflash,format={format},unit=1,file={template},snapshot=on"),
-                    format!("if=none,id=boot,format=raw,file=fat:{volume},snapshot=on"),
-                ),
+                None => format!("if=pflash,format={format},unit=1,file={template},snapshot=on"),
             };
             if arch == Arch::Amd64 {
                 args.push("-fw_cfg".to_owned());

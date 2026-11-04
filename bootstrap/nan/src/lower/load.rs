@@ -606,16 +606,11 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// Opens the load window to the running CPU of a kernel exporting the load ABI: on x86_64
-    /// kernel writes honour read-only pages and execute-disable bits are enabled; on AArch64
-    /// `TTBR1_EL1` walks the window's tables.
+    /// Opens the load window to the running CPU of an AArch64 kernel exporting the load ABI:
+    /// `TTBR1_EL1` walks the window's tables. The entry root's top-level entry maps it on x86_64.
     pub fn open_window(&mut self, fx: &mut Fx) {
-        if !self.exports() {
-            return;
-        }
         let arch = self.ck.db.target.arch().expect("a machine target");
-        if arch == Arch::Amd64 {
-            self.call_stub(fx, Stub::WriteProtect, &[]);
+        if !self.exports() || arch != Arch::Aarch64 {
             return;
         }
         let window = self.reserved(fx, window_tables(arch));

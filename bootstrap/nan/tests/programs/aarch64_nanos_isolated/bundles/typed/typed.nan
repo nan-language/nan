@@ -1,0 +1,110 @@
+//! Answers what its typed input asks: an average of readings with floats and lanes, in its own task and in tasks it starts, reported through its world's log, random source and standard output, its file system found denied; a hundred divided by a number, failing for one and reading kernel memory for two; the sum of the numbers up to a depth, one call deeper per number, on a stack without a bound; or the integer part of a float series stepped three million times from a start.
+
+pub closed struct Readings derives Encode {
+    pub values: mem::List[u32]
+} Readings
+
+pub closed struct Summary derives Encode {
+    pub mean_milli: u64
+    pub lanes: u64
+    pub entropy: u64
+} Summary
+
+pub closed enum Ask derives Encode {
+    Average(Readings)
+    Divide(u32)
+    Sum(u64)
+    Spin(u32)
+} Ask
+
+pub closed enum Answer derives Encode {
+    Summary(Summary)
+    Number(u64)
+} Answer
+
+pub closed enum TypedError derives Render {
+    One
+    Empty
+    Revoked(sys::Revoked) from
+    Stdio(sys::StdioError) from
+    Cancelled(task::Cancelled) from
+} TypedError
+
+/// Kernel memory outside the image, which an isolated space does not map.
+const KERNEL_PROBE: usize = 0x5000_0000
+
+fn main(take world: nanos::World, take input: Ask) -> Answer fails TypedError uses wait {
+    match input {
+        Ask.Average(readings) => return try await averaged(take world, input: take readings)
+        Ask.Divide(divisor) => return Answer.Number(try divided(divisor))
+        Ask.Sum(depth) => return Answer.Number(sum(depth))
+        Ask.Spin(start) => return Answer.Number(spun(start))
+    }
+} main
+
+fn averaged(take world: nanos::World, take input: Readings) -> Answer fails TypedError uses wait {
+    if input.values.len() == 0 {
+        fail TypedError.Empty
+    }
+    var total: f64 = 0.0
+    for value in input.values {
+        total += f64.widen(value)
+    }
+    let mean = total / f64.fit(input.values.len())
+    let lanes = core::simd::F32x4.splat(1.5).mul(core::simd::F32x4.of(Array[f32, 4].filled(2.0))).sum()
+    let clock = world.clock
+    let log = world.log
+    try await task::scope(world.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
+        let quarters = s.spawn(fn() -> f64 fails task::Cancelled uses wait limits stack 16_384 {
+            return try await series(clock, step: 0.25, count: 20)
+        })
+        let halves = s.spawn(fn() -> f64 fails task::Cancelled uses wait limits stack 16_384 {
+            return try await series(clock, step: 0.5, count: 20)
+        })
+        let quartered = try await take quarters.join()
+        let halved = try await take halves.join()
+        log.info("series", value: u64.saturate((quartered + halved) * 100.0))
+    })
+    var bytes = Array[u8, 8].filled(0)
+    try world.random.fill(mut bytes.view_mut())
+    world.log.info("mean", value: u64.fit(mean))
+    let denied = attempt await world.fs.read_all("readings", alloc: world.alloc)
+    world.log.warn("fs denied", value: denied.is_err())
+    try await world.stdio.write_out(b"averaged\n")
+    return Answer.Summary(Summary(mean_milli: u64.saturate(mean * 1000.0), lanes: u64.fit(lanes), entropy: bytes.view().u64_le(0)))
+} averaged
+
+/// The sum of `count` steps of a float series, pausing between steps so that other tasks run.
+fn series(clock: sys::Clock, step: f64, count: u32) -> f64 fails task::Cancelled uses wait {
+    var total: f64 = 0.0
+    for _ in 0..<count {
+        total += step
+        try await clock.sleep_ns(10_000)
+    }
+    return total
+} series
+
+fn divided(divisor: u32) -> u64 fails TypedError {
+    if divisor == 1 {
+        fail TypedError.One
+    }
+    if divisor == 2 {
+        return trusted "the read faults, an isolated space mapping no kernel memory" { hw::Ptr[u64].of_addr(KERNEL_PROBE).read() }
+    }
+    return u64.widen(100 / divisor)
+} divided
+
+fn sum(n: u64) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    return n.wrapping_add(sum(n - 1))
+} sum
+
+fn spun(start: u32) -> u64 {
+    var value = f64.widen(start)
+    for _ in 0u32..<3_000_000 {
+        value = value * 0.999_999 + 1.0
+    }
+    return u64.saturate(value)
+} spun

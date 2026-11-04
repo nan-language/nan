@@ -30,9 +30,11 @@ use crate::workspace::Arch;
 /// A hook of a kernel policy, which the glue the policy record holds at its offset calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hook {
-    /// `(policy, task) -> (cpu, key)`.
+    /// `(policy, task) -> (cpu, key)`, the CPU plus `task::BOUND` when the placement binds the
+    /// task to it.
     Place,
-    /// `(policy, cpu, attempt) -> (found, victim)`.
+    /// `(policy, cpu, attempt) -> (found, victim)`, the victim plus its tasks to take times
+    /// 2^32.
     Steal,
     /// `(policy, cpu, task) -> nanoseconds`.
     Slice,
@@ -171,19 +173,31 @@ impl Lowering<'_, '_> {
                     Hook::Place => {
                         let cpu_at = lo.layouts.field(lo.ck, &result_ty, None, "cpu").offset;
                         let key_at = lo.layouts.field(lo.ck, &result_ty, None, "key").offset;
+                        let bound_at = lo.layouts.field(lo.ck, &result_ty, None, "bound").offset;
                         let target = fx.load(types::I32, result, cpu_at);
+                        let target = fx.b.ins().uextend(PTR, target);
+                        let bound = fx.load(types::I8, result, bound_at);
+                        let bound = fx.b.ins().uextend(PTR, bound);
+                        let binding = fx.b.ins().imul_imm_s(bound, task::BOUND);
                         vec![
-                            fx.b.ins().uextend(PTR, target),
+                            fx.b.ins().bor(target, binding),
                             fx.load(PTR, result, key_at),
                         ]
                     }
                     Hook::Steal => {
                         let found = lo.variant_is(fx, result, &result_ty, "Some");
                         let payload = variant_payload(lo, &result_ty, "Some");
-                        let victim = fx.load(types::I32, result, payload);
+                        let steal_ty = result_ty.type_arg(0).cloned().expect("hw::Steal");
+                        let cpu_at = lo.layouts.field(lo.ck, &steal_ty, None, "cpu").offset;
+                        let tasks_at = lo.layouts.field(lo.ck, &steal_ty, None, "tasks").offset;
+                        let victim = fx.load(types::I32, result, payload + cpu_at);
+                        let victim = fx.b.ins().uextend(PTR, victim);
+                        let tasks = fx.load(types::I32, result, payload + tasks_at);
+                        let tasks = fx.b.ins().uextend(PTR, tasks);
+                        let tasks = fx.b.ins().ishl_imm_s(tasks, 32);
                         vec![
                             fx.b.ins().uextend(PTR, found),
-                            fx.b.ins().uextend(PTR, victim),
+                            fx.b.ins().bor(victim, tasks),
                         ]
                     }
                     Hook::Slice => vec![fx.load(PTR, result, 0)],
@@ -302,7 +316,8 @@ impl Lowering<'_, '_> {
     }
 
     /// Places a ready task on the queue of the CPU its policy names, the running CPU for a CPU
-    /// past the last or while a hook runs on it, with maskable interrupts disabled; then sends the
+    /// past the last or while a hook runs on it, bound to it when the policy says so, with
+    /// maskable interrupts disabled; then sends the
     /// CPU signal to another CPU that idles or runs a task of a greater key, or to the running CPU
     /// outside an interrupt when its task's key is greater.
     pub fn kernel_enqueue(&mut self, fx: &mut Fx, record: Value) {
@@ -328,7 +343,9 @@ impl Lowering<'_, '_> {
                 )
             },
         );
-        let (target, key) = (placed[0], placed[1]);
+        let (place, key) = (placed[0], placed[1]);
+        let target = fx.b.ins().band_imm_s(place, task::BOUND - 1);
+        let binding = fx.b.ins().band_imm_s(place, task::BOUND);
         let state_address = self.state(fx);
         let count = fx.load(PTR, state_address, state::THREAD_COUNT);
         let beyond =
@@ -337,6 +354,7 @@ impl Lowering<'_, '_> {
         let target = fx.b.ins().select(beyond, own, target);
         fx.store(key, record, task::KEY);
         let queue = fx.b.ins().iadd_imm_s(target, 1);
+        let queue = fx.b.ins().bor(queue, binding);
         fx.store(queue, record, task::QUEUE);
         let target_record = self.cpu_record(fx, target);
         let lock = fx.offset(target_record, cpu::QUEUE_LOCK);
@@ -363,7 +381,7 @@ impl Lowering<'_, '_> {
 
     /// The default placement of a ready task: the CPU it last ran on when that CPU idles, else
     /// the first CPU idling, else the running one; its key the next of the order in which tasks
-    /// become ready.
+    /// become ready; unbound.
     fn default_place(&mut self, fx: &mut Fx, record: Value) -> Vec<Value> {
         let own = self.running_index(fx);
         let state_address = self.state(fx);
@@ -462,10 +480,13 @@ impl Lowering<'_, '_> {
                         |lo, fx| lo.hook(fx, policy, Hook::Steal, &[own, attempt]),
                         |_, fx| {
                             let after = fx.b.ins().iadd(own, next);
-                            vec![fx.ptr(1), fx.b.ins().urem(after, count)]
+                            let victim = fx.b.ins().urem(after, count);
+                            vec![fx.ptr(1), fx.b.ins().bor_imm_s(victim, 1 << 32)]
                         },
                     );
-                    let (found, victim) = (named[0], named[1]);
+                    let found = named[0];
+                    let victim = fx.b.ins().band_imm_s(named[1], 0xFFFF_FFFF);
+                    let tasks = fx.b.ins().ushr_imm_s(named[1], 32);
                     let found = fx.b.ins().icmp_imm_s(IntCC::NotEqual, found, 0);
                     let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, victim, count);
                     let other = fx.b.ins().icmp(IntCC::NotEqual, victim, own);
@@ -475,14 +496,7 @@ impl Lowering<'_, '_> {
                         lo,
                         valid,
                         &[PTR],
-                        |lo, fx| {
-                            let victim_record = lo.cpu_record(fx, victim);
-                            let lock = fx.offset(victim_record, cpu::QUEUE_LOCK);
-                            lo.call_routine(fx, Routine::Lock, &[lock]);
-                            let got = take(fx, victim_record);
-                            lo.call_routine(fx, Routine::Unlock, &[lock]);
-                            vec![got]
-                        },
+                        |lo, fx| vec![lo.steal_from(fx, own, own_record, victim, tasks)],
                         |_, fx| vec![fx.ptr(0)],
                     )[0];
                     let missed = fx.b.ins().icmp_imm_s(IntCC::Equal, got, 0);
@@ -499,6 +513,117 @@ impl Lowering<'_, '_> {
             fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, idle);
         });
         stolen
+    }
+
+    /// Takes, in queue order, `tasks` of the n tasks of a victim CPU's queue not bound to it, at
+    /// least one and at most n ÷ 2 rounded up, holding both CPUs' queue locks, taken in address
+    /// order: gives the first, zero when none, the others joining the running CPU's queue with
+    /// their keys.
+    fn steal_from(
+        &mut self,
+        fx: &mut Fx,
+        own: Value,
+        own_record: Value,
+        victim: Value,
+        tasks: Value,
+    ) -> Value {
+        let victim_record = self.cpu_record(fx, victim);
+        let own_lock = fx.offset(own_record, cpu::QUEUE_LOCK);
+        let victim_lock = fx.offset(victim_record, cpu::QUEUE_LOCK);
+        let lower =
+            fx.b.ins()
+                .icmp(IntCC::UnsignedLessThan, own_lock, victim_lock);
+        let first_lock = fx.b.ins().select(lower, own_lock, victim_lock);
+        let second_lock = fx.b.ins().select(lower, victim_lock, own_lock);
+        self.call_routine(fx, Routine::Lock, &[first_lock]);
+        self.call_routine(fx, Routine::Lock, &[second_lock]);
+        let head = fx.load(PTR, victim_record, cpu::QUEUE);
+        let zero = fx.ptr(0);
+        let free = fx.repeat(&[head, zero], |fx, state| {
+            let (current, counted) = (state[0], state[1]);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+            let next = fx.choose(
+                present,
+                &[PTR, PTR],
+                |fx| {
+                    let queue = fx.load(PTR, current, task::QUEUE);
+                    let bound = fx.b.ins().band_imm_s(queue, task::BOUND);
+                    let unbound = fx.b.ins().icmp_imm_s(IntCC::Equal, bound, 0);
+                    let unbound = fx.b.ins().uextend(PTR, unbound);
+                    vec![
+                        fx.load(PTR, current, task::NEXT),
+                        fx.b.ins().iadd(counted, unbound),
+                    ]
+                },
+                |_| vec![current, counted],
+            );
+            (present, next)
+        })[1];
+        let half = fx.b.ins().iadd_imm_s(free, 1);
+        let half = fx.b.ins().ushr_imm_s(half, 1);
+        let one = fx.ptr(1);
+        let asked = fx.b.ins().umax(tasks, one);
+        let wanted = fx.b.ins().umin(asked, half);
+        let own_queue = fx.b.ins().iadd_imm_s(own, 1);
+        let got = fx.repeat(&[head, zero, zero, zero], |fx, state| {
+            let (current, previous, taken, got) = (state[0], state[1], state[2], state[3]);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+            let short = fx.b.ins().icmp(IntCC::UnsignedLessThan, taken, wanted);
+            let more = fx.b.ins().band(present, short);
+            let next = fx.choose(
+                more,
+                &[PTR, PTR, PTR, PTR],
+                |fx| {
+                    let after = fx.load(PTR, current, task::NEXT);
+                    let queue = fx.load(PTR, current, task::QUEUE);
+                    let bound = fx.b.ins().band_imm_s(queue, task::BOUND);
+                    let bound = fx.b.ins().icmp_imm_s(IntCC::NotEqual, bound, 0);
+                    fx.choose(
+                        bound,
+                        &[PTR, PTR, PTR, PTR],
+                        |_| vec![after, current, taken, got],
+                        |fx| {
+                            let first = fx.b.ins().icmp_imm_s(IntCC::Equal, previous, 0);
+                            fx.choose(
+                                first,
+                                &[],
+                                |fx| {
+                                    fx.store(after, victim_record, cpu::QUEUE);
+                                    Vec::new()
+                                },
+                                |fx| {
+                                    fx.store(after, previous, task::NEXT);
+                                    Vec::new()
+                                },
+                            );
+                            let none = fx.b.ins().icmp_imm_s(IntCC::Equal, got, 0);
+                            let got = fx.choose(
+                                none,
+                                &[PTR],
+                                |fx| {
+                                    fx.store(zero, current, task::QUEUE);
+                                    vec![current]
+                                },
+                                |fx| {
+                                    fx.store(own_queue, current, task::QUEUE);
+                                    let key = fx.load(PTR, current, task::KEY);
+                                    insert(fx, own_record, current, key);
+                                    vec![got]
+                                },
+                            )[0];
+                            vec![after, previous, fx.b.ins().iadd_imm_s(taken, 1), got]
+                        },
+                    )
+                },
+                |_| vec![current, previous, taken, got],
+            );
+            (more, next)
+        })[3];
+        let rest = fx.load(PTR, victim_record, cpu::QUEUE);
+        head_key(fx, victim_record, rest);
+        self.call_routine(fx, Routine::Unlock, &[second_lock]);
+        self.call_routine(fx, Routine::Unlock, &[first_lock]);
+        got
     }
 
     /// Idles the running CPU as its policy says, given the earliest deadline of the kernel
@@ -624,7 +749,8 @@ impl Lowering<'_, '_> {
             queued,
             &[types::I8],
             |lo, fx| {
-                let index = fx.b.ins().iadd_imm_s(queue, -1);
+                let index = fx.b.ins().band_imm_s(queue, task::BOUND - 1);
+                let index = fx.b.ins().iadd_imm_s(index, -1);
                 let holder = lo.cpu_record(fx, index);
                 let lock = fx.offset(holder, cpu::QUEUE_LOCK);
                 lo.call_routine(fx, Routine::Lock, &[lock]);

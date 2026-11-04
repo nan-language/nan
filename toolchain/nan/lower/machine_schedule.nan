@@ -2,9 +2,10 @@
 
 /// A hook of a kernel policy, which the glue the policy record holds at its offset calls.
 enum Hook derives Copy, Eq, Hash {
-    /// `(policy, task) -> (cpu, key)`.
+    /// `(policy, task) -> (cpu, key)`, the CPU plus `TASK_BOUND` when the placement binds the task
+    /// to it.
     Place
-    /// `(policy, cpu, attempt) -> (found, victim)`.
+    /// `(policy, cpu, attempt) -> (found, victim)`, the victim plus its tasks to take times 2^32.
     Steal
     /// `(policy, cpu, task) -> nanoseconds`.
     Slice
@@ -164,17 +165,16 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
             Hook.Place => {
                 let cpu_field = mut lo.layouts.field(lo.ck, ty: result_ty, variant: None, label: "cpu")
                 let key_field = mut lo.layouts.field(lo.ck, ty: result_ty, variant: None, label: "key")
+                let bound_field = mut lo.layouts.field(lo.ck, ty: result_ty, variant: None, label: "bound")
                 let target = mut fx.load(clif::Type.Int32, addr: result, offset: cpu_field.offset)
-                mut results.push(mut fx.b.uextend(PTR, x: target))
+                let target_word = mut fx.b.uextend(PTR, x: target)
+                let bound = mut fx.load(clif::Type.Int8, addr: result, offset: bound_field.offset)
+                let bound_word = mut fx.b.uextend(PTR, x: bound)
+                let binding = mut fx.b.imul_imm_s(bound_word, y: TASK_BOUND)
+                mut results.push(mut fx.b.bor(target_word, y: binding))
                 mut results.push(mut fx.load(PTR, addr: result, offset: key_field.offset))
             }
-            Hook.Steal => {
-                let found = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Some")
-                let payload = enum_payload(mut lo, ty: result_ty, name: "Some")
-                let victim = mut fx.load(clif::Type.Int32, addr: result, offset: payload)
-                mut results.push(mut fx.b.uextend(PTR, x: found))
-                mut results.push(mut fx.b.uextend(PTR, x: victim))
-            }
+            Hook.Steal => steal_words(mut lo, mut fx, result, result_ty, mut results)
             Hook.Slice => mut results.push(mut fx.load(PTR, addr: result, offset: 0))
             Hook.Idle => {
                 let polls = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Poll")
@@ -190,6 +190,26 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
         mut fx.b.ret(results.view())
     })
 } Lowering.policy_glue
+
+/// The words a `Steal` hook gives of an `Option[hw::Steal]` at an address: whether it is `Some`,
+/// and the victim plus its tasks to take times 2^32.
+fn steal_words(mut lo: Lowering, mut fx: Fx, result: clif::Value, result_ty: ty::Ty, mut results: mem::List[clif::Value]) {
+    let found = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Some")
+    let payload = enum_payload(mut lo, ty: result_ty, name: "Some")
+    let Some(steal_ty) = lo.ck.types().type_arg(result_ty, index: 0) else {
+        expect false
+        return
+    }
+    let cpu_field = mut lo.layouts.field(lo.ck, ty: steal_ty, variant: None, label: "cpu")
+    let tasks_field = mut lo.layouts.field(lo.ck, ty: steal_ty, variant: None, label: "tasks")
+    let victim = mut fx.load(clif::Type.Int32, addr: result, offset: payload + cpu_field.offset)
+    let victim_word = mut fx.b.uextend(PTR, x: victim)
+    let tasks = mut fx.load(clif::Type.Int32, addr: result, offset: payload + tasks_field.offset)
+    let tasks_word = mut fx.b.uextend(PTR, x: tasks)
+    let shifted = mut fx.b.ishl_imm_s(tasks_word, y: 32)
+    mut results.push(mut fx.b.uextend(PTR, x: found))
+    mut results.push(mut fx.b.bor(victim_word, y: shifted))
+} steal_words
 
 /// The address of a value held as its type is, stored in a slot when it is held otherwise.
 fn Lowering.held_address(mut self, mut fx: Fx, held: Held, ty: ty::Ty) -> clif::Value {
@@ -283,7 +303,8 @@ fn Lowering.policy(mut self, mut fx: Fx) -> clif::Value {
 } Lowering.policy
 
 /// Places a ready task on the queue of the CPU its policy names, the running CPU for a CPU past
-/// the last or while a hook runs on it, with maskable interrupts disabled; then sends the CPU
+/// the last or while a hook runs on it, bound to it when the policy says so, with maskable
+/// interrupts disabled; then sends the CPU
 /// signal to another CPU that idles or runs a task of a greater key, or to the running CPU
 /// outside an interrupt when its task's key is greater.
 fn Lowering.kernel_enqueue(mut self, mut fx: Fx, record: clif::Value) {
@@ -305,14 +326,17 @@ fn Lowering.kernel_enqueue(mut self, mut fx: Fx, record: clif::Value) {
             return mut lo2.default_place(mut fx2, record)
         })
     })
-    let named = placed[0]
+    let place = placed[0]
     let key = placed[1]
+    let named = mut fx.b.band_imm_s(place, y: TASK_BOUND - 1)
+    let binding = mut fx.b.band_imm_s(place, y: TASK_BOUND)
     let state_address = mut self.state(mut fx)
     let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
     let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: named, y: count)
     let target = mut fx.b.select(beyond, x: own, y: named)
     mut fx.store(key, addr: record, offset: TASK_KEY)
-    let queue = mut fx.b.iadd_imm_s(target, y: 1)
+    let queue_index = mut fx.b.iadd_imm_s(target, y: 1)
+    let queue = mut fx.b.bor(queue_index, y: binding)
     mut fx.store(queue, addr: record, offset: TASK_QUEUE)
     let target_record = mut self.cpu_record(mut fx, index: target)
     let lock = mut fx.offset(target_record, offset: CPU_QUEUE_LOCK)
@@ -341,7 +365,7 @@ fn Lowering.kernel_enqueue(mut self, mut fx: Fx, record: clif::Value) {
 
 /// The default placement of a ready task: the CPU it last ran on when that CPU idles, else the
 /// first CPU idling, else the running one; its key the next of the order in which tasks become
-/// ready.
+/// ready; unbound.
 fn Lowering.default_place(mut self, mut fx: Fx, record: clif::Value) -> mem::List[clif::Value] {
     let own = mut self.running_index(mut fx)
     let state_address = mut self.state(mut fx)
@@ -434,23 +458,21 @@ fn Lowering.steal(mut self, mut fx: Fx, own: clif::Value, own_record: clif::Valu
                 return mut lo3.hook(mut fx3, policy, hook: Hook.Steal, args: fx3.list2(own, b: tries).view())
             }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
                 let after = mut fx3.b.iadd(own, y: next)
-                let yes = mut fx3.ptr(1)
                 let victim = mut fx3.b.urem(after, y: count)
-                return fx3.list2(yes, b: victim)
+                let yes = mut fx3.ptr(1)
+                let one_task = mut fx3.b.bor_imm_s(victim, y: 1 << 32)
+                return fx3.list2(yes, b: one_task)
             })
             let found_word = named[0]
-            let victim = named[1]
+            let victim = mut fx2.b.band_imm_s(named[1], y: 0xFFFF_FFFF)
+            let tasks = mut fx2.b.ushr_imm_s(named[1], y: 32)
             let found = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: found_word, y: 0)
             let inside = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: victim, y: count)
             let other = mut fx2.b.icmp(clif::IntCC.NotEqual, x: victim, y: own)
             let found_inside = mut fx2.b.band(found, y: inside)
             let valid = mut fx2.b.band(found_inside, y: other)
             let taken = mut fx2.choose_in(mut lo2, condition: valid, results: fx2.types1(PTR).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
-                let victim_record = mut lo3.cpu_record(mut fx3, index: victim)
-                let lock = mut fx3.offset(victim_record, offset: CPU_QUEUE_LOCK)
-                discard mut lo3.call_routine(mut fx3, routine: Routine.Lock, args: fx3.list1(lock).view())
-                let got = queue_take(mut fx3, holder: victim_record)
-                discard mut lo3.call_routine(mut fx3, routine: Routine.Unlock, args: fx3.list1(lock).view())
+                let got = mut lo3.steal_from(mut fx3, own, own_record, victim, tasks)
                 return fx3.list1(got)
             }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
                 let none = mut fx3.ptr(0)
@@ -476,6 +498,101 @@ fn Lowering.steal(mut self, mut fx: Fx, own: clif::Value, own_record: clif::Valu
     })
     return stolen
 } Lowering.steal
+
+/// Takes, in queue order, `tasks` of the n tasks of a victim CPU's queue not bound to it, at least
+/// one and at most n ÷ 2 rounded up, holding both CPUs' queue locks, taken in address order:
+/// gives the first, zero when none, the others joining the running CPU's queue with their keys.
+fn Lowering.steal_from(mut self, mut fx: Fx, own: clif::Value, own_record: clif::Value, victim: clif::Value, tasks: clif::Value) -> clif::Value {
+    let victim_record = mut self.cpu_record(mut fx, index: victim)
+    let own_lock = mut fx.offset(own_record, offset: CPU_QUEUE_LOCK)
+    let victim_lock = mut fx.offset(victim_record, offset: CPU_QUEUE_LOCK)
+    let lower = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: own_lock, y: victim_lock)
+    let first_lock = mut fx.b.select(lower, x: own_lock, y: victim_lock)
+    let second_lock = mut fx.b.select(lower, x: victim_lock, y: own_lock)
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(first_lock).view())
+    discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(second_lock).view())
+    let head = mut fx.load(PTR, addr: victim_record, offset: CPU_QUEUE)
+    let zero = mut fx.ptr(0)
+    let free = unbound_count(mut fx, head, zero)
+    let rounded = mut fx.b.iadd_imm_s(free, y: 1)
+    let half = mut fx.b.ushr_imm_s(rounded, y: 1)
+    let one = mut fx.ptr(1)
+    let asked = mut fx.b.umax(tasks, y: one)
+    let wanted = mut fx.b.umin(asked, y: half)
+    let own_queue = mut fx.b.iadd_imm_s(own, y: 1)
+    let walked = mut fx.repeat(fx.list4(head, b: zero, c: zero, d: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 3
+        let current = state[0]
+        let previous = state[1]
+        let taken = state[2]
+        let got = state[3]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let short = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: taken, y: wanted)
+        let more = mut fx1.b.band(present, y: short)
+        let next = mut fx1.choose(more, results: fx1.types4(PTR, b: PTR, c: PTR, d: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let after = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            let queue = mut fx2.load(PTR, addr: current, offset: TASK_QUEUE)
+            let binding = mut fx2.b.band_imm_s(queue, y: TASK_BOUND)
+            let bound = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: binding, y: 0)
+            return mut fx2.choose(bound, results: fx2.types4(PTR, b: PTR, c: PTR, d: PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list4(after, b: current, c: taken, d: got)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let at_head = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+                discard mut fx3.choose(at_head, results: mem::List[clif::Type].empty(fx3.alloc).view(), then: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    mut fx4.store(after, addr: victim_record, offset: CPU_QUEUE)
+                    return mem::List[clif::Value].empty(fx4.alloc)
+                }, otherwise: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    mut fx4.store(after, addr: previous, offset: TASK_NEXT)
+                    return mem::List[clif::Value].empty(fx4.alloc)
+                })
+                let none = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: got, y: 0)
+                let kept = mut fx3.choose(none, results: fx3.types1(PTR).view(), then: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    mut fx4.store(zero, addr: current, offset: TASK_QUEUE)
+                    return fx4.list1(current)
+                }, otherwise: fn(mut fx4: Fx) -> mem::List[clif::Value] {
+                    mut fx4.store(own_queue, addr: current, offset: TASK_QUEUE)
+                    let key = mut fx4.load(PTR, addr: current, offset: TASK_KEY)
+                    queue_insert(mut fx4, holder: own_record, record: current, key)
+                    return fx4.list1(got)
+                })
+                let counted_taken = mut fx3.b.iadd_imm_s(taken, y: 1)
+                return fx3.list4(after, b: previous, c: counted_taken, d: kept[0])
+            })
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list4(current, b: previous, c: taken, d: got)
+        })
+        return Pass(again: more, next: take next)
+    })
+    let rest = mut fx.load(PTR, addr: victim_record, offset: CPU_QUEUE)
+    queue_head_key(mut fx, holder: victim_record, head: rest)
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(second_lock).view())
+    discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(first_lock).view())
+    return walked[3]
+} Lowering.steal_from
+
+/// The number of tasks not bound to their CPU in a queue from its first task, counting from
+/// `zero`.
+fn unbound_count(mut fx: Fx, head: clif::Value, zero: clif::Value) -> clif::Value {
+    let counted = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let so_far = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let queue = mut fx2.load(PTR, addr: current, offset: TASK_QUEUE)
+            let binding = mut fx2.b.band_imm_s(queue, y: TASK_BOUND)
+            let unbound = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: binding, y: 0)
+            let unbound_word = mut fx2.b.uextend(PTR, x: unbound)
+            let following = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            let more = mut fx2.b.iadd(so_far, y: unbound_word)
+            return fx2.list2(following, b: more)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: so_far)
+        })
+        return Pass(again: present, next: take next)
+    })
+    return counted[1]
+} unbound_count
 
 /// Idles the running CPU as its policy says, given the earliest deadline of the kernel clock:
 /// halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at once to look
@@ -591,7 +708,8 @@ fn Lowering.kernel_withdraw(mut self, mut fx: Fx, record: clif::Value) -> clif::
     let queue = mut fx.load(PTR, addr: record, offset: TASK_QUEUE)
     let queued = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: queue, y: 0)
     let withdrawn = mut fx.choose_in(mut self, condition: queued, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let index = mut fx1.b.iadd_imm_s(queue, y: -1)
+        let queue_index = mut fx1.b.band_imm_s(queue, y: TASK_BOUND - 1)
+        let index = mut fx1.b.iadd_imm_s(queue_index, y: -1)
         let holder = mut lo1.cpu_record(mut fx1, index)
         let lock = mut fx1.offset(holder, offset: CPU_QUEUE_LOCK)
         discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())

@@ -1,4 +1,4 @@
-//! Runs every task on CPU 0 in 1 ms slices keyed by deadline or weighted time, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed and running tasks of class 1 in slices of 1 ns, which end before they run.
+//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed and running tasks of class 1 in slices of 1 ns, which end before they run.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -10,7 +10,20 @@ const SPINS: u64 = 4_000_000
 /// The nanoseconds the weighted accounts share the CPU.
 const SHARING_NS: u64 = 300_000_000
 
+/// The nanoseconds each task of the steal run spins.
+const STEAL_SPIN_NS: u64 = 20_000_000
+
+/// What the policy records of the steal run: whether it is armed and CPU 0 has stolen, up to three
+/// tasks of class 3 that ran on CPU 0, and the switches of other tasks onto another CPU.
+struct Probe {
+    armed: core::atomic::AtomicBool
+    stole: core::atomic::AtomicBool
+    seen: mem::List[core::atomic::AtomicU64]
+    strays: core::atomic::AtomicU64
+} Probe
+
 struct Paced {
+    probe: mem::Shared[Probe]
 } Paced
 
 impl Paced: hw::Policy
@@ -20,14 +33,34 @@ fn Paced.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement l
         Some(deadline) => deadline
         None => task.ran_ns / u64.widen(task.share.weight)
     }
-    return hw::Placement(cpu: 0, key: key)
+    if task.share.class == 3 {
+        return hw::Placement(cpu: 1, key: key, bound: false)
+    }
+    return hw::Placement(cpu: 0, key: key, bound: true)
 } Paced.place
 
-fn Paced.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096 {
-    return None
+fn Paced.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
+    let probe = self.probe.contents()
+    if not probe.armed.load() {
+        if cpu == 1 {
+            return Some(hw::Steal(cpu: 0, tasks: 4_294_967_295))
+        }
+        return None
+    }
+    if cpu != 0 or probe.stole.swap(true) {
+        return None
+    }
+    return Some(hw::Steal(cpu: 1, tasks: 4_294_967_295))
 } Paced.steal
 
 fn Paced.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    let probe = self.probe.contents()
+    if task.share.class != 3 and cpu != 0 {
+        discard probe.strays.fetch_add(1)
+    }
+    if task.share.class == 3 and cpu == 0 {
+        note_seen(probe, id: task.task)
+    }
     if task.share.class == 1 {
         return 1
     }
@@ -37,6 +70,20 @@ fn Paced.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 l
 fn Paced.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
     return hw::Idle.Mwait(0)
 } Paced.idle
+
+/// Records a task id among those seen, unless seen or three are.
+fn note_seen(probe: Probe, id: u64) limits notrap, terminates, noalloc {
+    for slot in probe.seen {
+        match slot.compare_swap(expected: 0, replacement: id) {
+            Ok(_) => return
+            Err(held) => {
+                if held == id {
+                    return
+                }
+            }
+        }
+    }
+} note_seen
 
 fn say(text: Str) {
     var port = trusted "the virt board maps the PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
@@ -87,8 +134,9 @@ fn slots(count: u64, alloc: mem::Alloc) -> mem::List[core::atomic::AtomicU64] {
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let alloc = k.alloc()
     let clock = k.clock()
-    mut k.policy(Paced())
-    take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+    let probe = mem::Shared.of(Probe(armed: core::atomic::AtomicBool.of(false), stole: core::atomic::AtomicBool.of(false), seen: slots(count: 3, alloc), strays: core::atomic::AtomicU64.of(0)), alloc)
+    mut k.policy(Paced(probe: probe.share()))
+    take k.anchor(0u8, run: fn[take probe](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         try await clock.sleep_ns(1_000_000)
         say(text: "slept\n")
         let edf = slots(count: 3, alloc)
@@ -164,23 +212,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         say(text: "brief")
         say_digit(value: brief_done.load())
         say(text: "\n")
+        try await steal_run(exec, clock, probe: probe.contents())
     })
 } main
 
 /// Spins for `EDF_SPIN_NS` of the clock without awaiting, longer than any slice lasts before its
 /// task is preempted, then records `id` at the next place of `order`.
 fn spin_for_then_record(clock: sys::Clock, id: u64, order: mem::List[core::atomic::AtomicU64], done: core::atomic::AtomicU64) {
-    let Ok(start) = attempt clock.elapsed_ns() else {
-        return
-    }
-    loop {
-        let Ok(now) = attempt clock.elapsed_ns() else {
-            return
-        }
-        if now - start >= EDF_SPIN_NS {
-            break
-        }
-    }
+    spin_for(clock, ns: EDF_SPIN_NS)
     let Some(place) = done.fetch_add(1) else {
         return
     }
@@ -189,3 +228,45 @@ fn spin_for_then_record(clock: sys::Clock, id: u64, order: mem::List[core::atomi
 
 /// The nanoseconds each deadline task spins.
 const EDF_SPIN_NS: u64 = 100_000_000
+
+/// Spins for `ns` nanoseconds of the clock without awaiting.
+fn spin_for(clock: sys::Clock, ns: u64) {
+    let Ok(start) = attempt clock.elapsed_ns() else {
+        return
+    }
+    loop {
+        let Ok(now) = attempt clock.elapsed_ns() else {
+            return
+        }
+        if now - start >= ns {
+            break
+        }
+    }
+} spin_for
+
+/// Runs four tasks of class 3 spinning on CPU 1, from which CPU 0 steals once, then writes how
+/// many of them ran on CPU 0 and whether every other task stayed bound to it.
+fn steal_run(exec: task::Executor, clock: sys::Clock, probe: Probe) fails task::Cancelled uses wait {
+    let spread = exec.split(task::Share(weight: 1, class: 3, reserve_ppm: 0))
+    defer take spread.close()
+    discard probe.armed.swap(true)
+    try await task::scope(spread.executor(), body: fn(s: task::Scope) {
+        for _ in 0..<4u64 {
+            discard s.spawn(fn() limits stack 4_096 {
+                spin_for(clock, ns: STEAL_SPIN_NS)
+            })
+        }
+    })
+    var stolen: u64 = 0
+    for slot in probe.seen {
+        if slot.load() != 0 {
+            stolen += 1
+        }
+    }
+    say(text: "stolen")
+    say_digit(value: stolen)
+    say(text: "\n")
+    if probe.strays.load() == 0 {
+        say(text: "bound kept\n")
+    }
+} steal_run

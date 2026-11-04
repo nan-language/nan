@@ -853,7 +853,7 @@ pub fn Kernel.policy[P: hw::Policy and Send](mut self, take policy: P)
 
 pub interface Policy {
     fn place(self, t: IrqsDisabled, task: TaskView) -> Placement limits notrap, terminates, noalloc, stack 4_096
-    fn steal(self, t: IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096
+    fn steal(self, t: IrqsDisabled, cpu: u32, round: u32) -> Option[Steal] limits notrap, terminates, noalloc, stack 4_096
     fn slice(self, t: IrqsDisabled, cpu: u32, task: TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096
     fn idle(self, t: IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> Idle limits notrap, terminates, noalloc, stack 4_096
 } Policy
@@ -870,7 +870,13 @@ pub closed struct TaskView derives Copy, Eq {
 pub closed struct Placement derives Copy, Eq {
     pub cpu: u32
     pub key: u64
+    pub bound: bool
 } Placement
+
+pub closed struct Steal derives Copy, Eq {
+    pub cpu: u32
+    pub tasks: u32
+} Steal
 
 pub closed enum Idle derives Copy, Eq {
     Halt
@@ -882,11 +888,11 @@ pub closed enum Idle derives Copy, Eq {
 - `k.policy(take p)` makes p the kernel's policy for the rest of the run, keeping p in memory of the support routines; a second call traps (`trap.duplicate-access`), and so does a call when that memory is exhausted (`trap.exhausted`). Without a call the **default policy** applies.
 - The executor calls each method of the policy, a **hook**, on the CPU it concerns, with maskable interrupts disabled and its `t` witnessing that. A task made ready while a hook runs on its CPU joins that CPU's queue last, without a call of `place`. Neither the host targets nor the seeded scheduler call hooks.
 - An `hw::TaskView` shows a hook a task: `task` distinguishes it from every other live task; `executor` distinguishes the executor it was started on from every other live executor; `share` is that executor's [share](16-concurrency.md#executors); `last_cpu` is the CPU it last ran on, `None` before it first runs; `ran_ns` is the nanoseconds of the kernel clock it has run; and `deadline_ns` is the earliest end, in nanoseconds of the kernel clock, of the deadlines of the `task::within` and `task::within_ns` constructs it runs, `None` without one.
-- When a task becomes ready, as it starts, as an event wakes it, as it is preempted and as a [serial executor](16-concurrency.md#executors)'s turn passes to it, `place(t, task)` gives its placement: the task joins the queue of the CPU `cpu` names, of the running CPU when `cpu` is not below `hw::cpu_count()`, with the key `key`. The CPU signal ([cross-CPU operations](#cross-cpu-operations)) then goes to the CPU it names when that is another CPU that idles or runs a task placed with a greater key, or when it is the running CPU, outside an interrupt fn, running a task placed with a greater key.
-- A CPU runs the first task of its queue. When its queue is empty it calls `steal(t, cpu, round)` for rounds 0, 1 and on, at most `hw::cpu_count()` − 1 of them, until a round gives `None` or names another CPU whose queue holds a task, the first of which it then runs.
+- When a task becomes ready, as it starts, as an event wakes it, as it is preempted and as a [serial executor](16-concurrency.md#executors)'s turn passes to it, `place(t, task)` gives its placement: the task joins the queue of the CPU `cpu` names, of the running CPU when `cpu` is not below `hw::cpu_count()`, with the key `key`, **bound** to that CPU when `bound` holds. The CPU signal ([cross-CPU operations](#cross-cpu-operations)) then goes to the CPU it names when that is another CPU that idles or runs a task placed with a greater key, or when it is the running CPU, outside an interrupt fn, running a task placed with a greater key.
+- A CPU runs the first task of its queue. When its queue is empty it calls `steal(t, cpu, round)` for rounds 0, 1 and on, at most `hw::cpu_count()` − 1 of them, until a round gives `None` or a steal whose `cpu` names another CPU whose queue holds a task not bound to it. Of the n such tasks it then takes, in queue order, `tasks` of them, but at least one and at most n ÷ 2 rounded up; it runs the first and the others join its own queue with their keys. No steal takes a bound task.
 - As a CPU switches to a task, `slice(t, cpu, task)` gives the task's **slice**: it is preempted once that many nanoseconds of the kernel clock have passed since, unless it suspends before; 0 gives no slice.
 - A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest deadline of the kernel clock, `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once; `Mwait(hint)` waits as `Halt` does, in `mwait` with `hint` as its C-state hint on an x86_64 CPU with `monitor` and `mwait` whose wait an interrupt ends, and halts otherwise. Either way the CPU then looks for a task again.
-- The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready; steals in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice; and halts.
+- The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready, unbound; steals one task in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice; and halts.
 - Every method of a policy type is judged against the `stack 4_096` its interface method demands ([stack limits](10-effects-digests.md#stack-limits)), and every stack a hook runs on holds a call of it ([static bounds](17-suspension-io.md#static-bounds)).
 
 ```nan
@@ -908,10 +914,10 @@ struct Earliest {
 impl Earliest: hw::Policy
 
 fn Earliest.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement {
-    return hw::Placement(cpu: 0, key: task.deadline_ns.value_or(0))
+    return hw::Placement(cpu: 0, key: task.deadline_ns.value_or(0), bound: false)
 } Earliest.place
 
-fn Earliest.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] {
+fn Earliest.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] {
     return None
 } Earliest.steal
 
@@ -955,10 +961,10 @@ struct Weighted {
 impl Weighted: hw::Policy
 
 fn Weighted.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement {
-    return hw::Placement(cpu: 0, key: task.ran_ns / u64.widen(task.share.weight))
+    return hw::Placement(cpu: 0, key: task.ran_ns / u64.widen(task.share.weight), bound: false)
 } Weighted.place
 
-fn Weighted.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] {
+fn Weighted.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] {
     return None
 } Weighted.steal
 

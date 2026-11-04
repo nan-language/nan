@@ -97,10 +97,12 @@ pub mod task {
     /// The nanoseconds it has run.
     pub const RAN: u64 = 312;
     /// On a kernel, the key its placement gave, the index plus one of the CPU it last ran on and
-    /// that of the CPU whose queue holds it, zero for none.
+    /// that of the CPU whose queue holds it, zero for none, plus `BOUND` when its placement binds
+    /// it to that CPU.
     pub const KEY: u64 = 320;
     pub const CPU: u64 = 328;
     pub const QUEUE: u64 = 336;
+    pub const BOUND: i64 = 1 << 32;
     /// On a machine target, the save area of the extended state it owns, zero for none.
     pub const EXTENDED: u64 = 344;
     /// In an image keeping segments, the lowest address grown calls leave free on the stack the

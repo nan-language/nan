@@ -68,17 +68,15 @@ fn protocols_dispatch(mut lo: Lowering, mut fx: Fx, record: clif::Value, protoco
 } protocols_dispatch
 
 /// Gives a request's handler's result or failure to its poster, unless the poster has stopped,
-/// in which case it is released.
+/// withdrawing the entry the runner's record held as current, in which case it is released.
 fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::Value, head: check::FnSig, called: Called) {
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let current = mut fx.load(PTR, addr: record, offset: RUNNER_CURRENT)
+    let live = mut fx.b.icmp(clif::IntCC.Equal, x: current, y: node)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: record, offset: RUNNER_CURRENT)
-    let current = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_STATUS)
-    let live = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_TAKEN)
-    let reply = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_REPLY)
-    let poster = mut fx.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
-    let reached = ReplyAt(node: node, reply: reply, poster: poster, live: live)
+    let reached = ReplyAt(node: node, live: live)
     var failure_ty: Option[ty::Ty] = None
     match head.failure {
         Some(written) => {
@@ -119,12 +117,9 @@ fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
 } protocols_reply
 
-/// Where a request's reply goes: its entry, its reply slot, its poster, and whether the poster
-/// still waits for it.
+/// Where a request's reply goes: its entry, and whether its poster still waits for it.
 struct ReplyAt derives Copy {
     node: clif::Value
-    reply: clif::Value
-    poster: clif::Value
     live: clif::Value
 } ReplyAt
 
@@ -132,11 +127,13 @@ struct ReplyAt derives Copy {
 /// and wakes it; releases the reply otherwise. The caller holds the runner's lock.
 fn protocols_give(mut lo: Lowering, mut fx: Fx, reached: ReplyAt, ty: ty::Ty, held: Held, word: i64) {
     discard mut fx.choose_in(mut lo, condition: reached.live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        mut lo1.store_held(mut fx1, address: reached.reply, held, ty)
-        give_posted(mut lo1, fx: mut fx1, ty, address: reached.reply, poster: reached.poster)
+        let reply = mut fx1.load(PTR, addr: reached.node, offset: COMPONENTS_ENTRY_REPLY)
+        let poster = mut fx1.load(PTR, addr: reached.node, offset: COMPONENTS_ENTRY_POSTER)
+        mut lo1.store_held(mut fx1, address: reply, held, ty)
+        give_posted(mut lo1, fx: mut fx1, ty, address: reply, poster)
         let status = mut fx1.ptr(u64.fit(word))
         mut fx1.store(status, addr: reached.node, offset: COMPONENTS_ENTRY_STATUS)
-        discard mut lo1.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(reached.poster).view())
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         match held {

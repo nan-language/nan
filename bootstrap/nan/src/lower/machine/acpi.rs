@@ -19,10 +19,12 @@ const ACPI_10_TABLE: (u64, u64) = (0x11D3_2D88_EB9D_2D30, 0x4DC1_3F27_9000_169A)
 const ACPI_20_TABLE: (u64, u64) = (0x11D3_E4F1_8868_E871, 0x8188_3CC7_8000_22BC);
 pub(super) const DEVICE_TREE_TABLE: (u64, u64) = (0x41A5_F19C_B1B6_21D5, 0xE0AA_692C_15D9_0B83);
 
-/// The size of an ACPI table's header, the MADT's signature, and the offset of its first entry.
+/// The size of an ACPI table's header, the MADT's signature, and the offset of its first entry;
+/// and the FADT's signature.
 const SDT_HEADER: u64 = 36;
 const MADT_SIGNATURE: i64 = 0x4349_5041;
 const MADT_ENTRIES: u64 = 44;
+pub(super) const FADT_SIGNATURE: i64 = 0x5043_4146;
 
 /// The BIOS area the RSDP may lie in, on a 16-byte boundary, and its signature.
 const BIOS_AREA: (u64, u64) = (0xE_0000, 0x10_0000);

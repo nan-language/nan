@@ -155,7 +155,13 @@ impl Lowering<'_, '_> {
 
     /// Runs CPUID for a leaf and subleaf into the four words at `registers`, giving `eax`
     /// widened.
-    fn cpuid(&mut self, fx: &mut Fx, registers: Value, leaf: u32, subleaf: u32) -> Value {
+    pub(super) fn cpuid(
+        &mut self,
+        fx: &mut Fx,
+        registers: Value,
+        leaf: u32,
+        subleaf: u32,
+    ) -> Value {
         let leaf = fx.ptr(u64::from(leaf));
         let subleaf = fx.ptr(u64::from(subleaf));
         self.call_stub(fx, Stub::Cpuid, &[leaf, subleaf, registers]);

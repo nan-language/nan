@@ -479,7 +479,15 @@ pub mod state {
     /// an x86_64 kernel, the lock of the PCI configuration ports.
     pub const IOMMU: u64 = 480;
     pub const PCI_LOCK: u64 = 488;
-    pub const SIZE: u64 = 496;
+    /// On an x86_64 kernel, the clock's source: zero for the time-stamp counter, one for the
+    /// HPET and two for the PM timer; the HPET's counter address or the PM timer's port; the mask
+    /// of the bits that counter counts; and the latest count a CPU read from it, extended to 64
+    /// bits.
+    pub const CLOCK_SOURCE: u64 = 496;
+    pub const CLOCK_COUNTER: u64 = 504;
+    pub const CLOCK_MASK: u64 = 512;
+    pub const CLOCK_TICKS: u64 = 520;
+    pub const SIZE: u64 = 528;
 }
 
 impl Lowering<'_, '_> {

@@ -5,9 +5,11 @@
 //! it has while it runs a task or the final build binds the timer's vector; and the wall clock
 //! source a machine root grant reads once.
 //!
-//! On x86_64 the time-stamp counter's rate is measured against the 10 ms the legacy PIT's channel
-//! 2 counts down from `PIT_LATCH`, and each CPU measures its local APIC timer's rate against the
-//! clock as it starts taking interrupts. The wall clock source is the CMOS clock on
+//! On x86_64 the counter is the time-stamp counter where it is invariant, its rate measured against
+//! the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is the HPET or
+//! else the PM timer the ACPI tables name, its count extended to 64 bits from the latest any CPU
+//! read. Each CPU measures its local APIC timer's rate against the clock as it starts taking
+//! interrupts. The wall clock source is the CMOS clock on
 //! `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's
 //! `GetTime` on the UEFI targets, its time read as UTC.
 
@@ -18,6 +20,7 @@ use super::super::fx::{Fx, PTR};
 use super::super::runtime::tasks::{self, CANCELED, EXPIRED, operation};
 use super::super::runtime::{Routine, state, timers};
 use super::super::supplied::boot::firmware;
+use super::acpi::{FADT_SIGNATURE, load_u32, load_u64};
 use super::cpus::cpu;
 use super::discovery::machine;
 use super::stubs::Stub;
@@ -47,6 +50,38 @@ const GATE: i64 = 0x01;
 const SPEAKER: i64 = 0x02;
 const CHANNEL_2_OUT: i64 = 0x20;
 
+/// The clock's sources on x86_64: the time-stamp counter, the HPET and the PM timer.
+const TSC_SOURCE: i64 = 0;
+const HPET_SOURCE: i64 = 1;
+const PM_TIMER_SOURCE: i64 = 2;
+
+/// The CPUID leaves giving the highest extended leaf and, in bit 8 of EDX, an invariant
+/// time-stamp counter.
+const EXTENDED_LEAVES: u32 = 0x8000_0000;
+const POWER_LEAF: u32 = 0x8000_0007;
+const INVARIANT_TSC: i64 = 0x100;
+
+/// The signature of the ACPI table naming the HPET; the offset of the HPET's registers in it,
+/// and those in the FADT of the PM timer's port and of the flags whose bit 8 marks a 32-bit PM
+/// timer.
+const HPET_SIGNATURE: i64 = 0x5445_5048;
+const HPET_ADDRESS: u64 = 44;
+const FADT_PM_TIMER: u64 = 76;
+const FADT_FLAGS: u64 = 112;
+const PM_TIMER_32: i64 = 0x100;
+
+/// The HPET's registers past its capabilities at its base, whose bits 32 to 63 give its period in
+/// femtoseconds and bit 13 a 64-bit counter: its configuration, whose bit 0 starts the counter,
+/// and the counter; and the femtoseconds of a nanosecond.
+const HPET_CONFIGURATION: u64 = 0x10;
+const HPET_COUNTER: u64 = 0xF0;
+const HPET_WIDE: i64 = 0x2000;
+const HPET_ENABLE: i64 = 0x1;
+const FS_PER_NS: u64 = 1_000_000;
+
+/// The PM timer's rate.
+const PM_TIMER_HZ: u64 = 3_579_545;
+
 /// The CMOS clock's index and data ports, its registers of seconds, minutes, hours, day of the
 /// month, month and year, and its status registers A, whose bit 7 is set during an update, and
 /// B, whose bit 1 selects 24-hour hours and bit 2 binary values over BCD; and the bit of a
@@ -65,39 +100,12 @@ const CMOS_AFTERNOON: i64 = 0x80;
 const NS_PER_SECOND: u64 = 1_000_000_000;
 
 impl Lowering<'_, '_> {
-    /// Starts the clock in `Init`: its counter now is its base, and on x86_64 the time-stamp
-    /// counter's rate is measured against the PIT.
+    /// Starts the clock in `Init`: its counter now is its base, and on x86_64 its source is
+    /// chosen.
     pub(super) fn start_clock(&mut self, fx: &mut Fx) {
         let state_address = self.state(fx);
         let (base, scale) = match self.machine_arch() {
-            Arch::Amd64 => {
-                let port = fx.ptr(SYSTEM_CONTROL);
-                let control = self.port_in(fx, 1, port);
-                let control = fx.b.ins().band_imm_s(control, !SPEAKER);
-                let control = fx.b.ins().bor_imm_s(control, GATE);
-                self.port_out(fx, 1, port, control);
-                let port = fx.ptr(PIT_MODE);
-                let mode = fx.ptr(CHANNEL_2_ONE_SHOT);
-                self.port_out(fx, 1, port, mode);
-                for byte in [PIT_LATCH & 0xFF, PIT_LATCH >> 8] {
-                    let port = fx.ptr(PIT_CHANNEL_2);
-                    let byte = fx.ptr(byte);
-                    self.port_out(fx, 1, port, byte);
-                }
-                let start = self.call_stub(fx, Stub::ReadTsc, &[])[0];
-                fx.repeat(&[], |fx, _| {
-                    let port = fx.ptr(SYSTEM_CONTROL);
-                    let control = self.port_in(fx, 1, port);
-                    let out = fx.b.ins().band_imm_s(control, CHANNEL_2_OUT);
-                    (fx.b.ins().icmp_imm_s(IntCC::Equal, out, 0), Vec::new())
-                });
-                let end = self.call_stub(fx, Stub::ReadTsc, &[])[0];
-                let ticks = fx.b.ins().isub(end, start);
-                let one = fx.ptr(1);
-                let ticks = fx.b.ins().umax(ticks, one);
-                let window = fx.ptr(PIT_WINDOW << 32);
-                (end, fx.b.ins().udiv(window, ticks))
-            }
+            Arch::Amd64 => self.start_x64_clock(fx),
             Arch::Aarch64 => {
                 let frequency = self.read_sysreg(fx, super::aarch64::CNTFRQ_EL0);
                 let second = fx.ptr(NS_PER_SECOND << 32);
@@ -109,14 +117,163 @@ impl Lowering<'_, '_> {
         fx.store(scale, state_address, state::CLOCK_SCALE);
     }
 
+    /// Chooses the x86_64 clock's source, recording it: the time-stamp counter where it is
+    /// invariant, otherwise the HPET, else the PM timer, else the time-stamp counter. Gives the
+    /// source's count now and its scale, the time-stamp counter's rate measured against the PIT.
+    fn start_x64_clock(&mut self, fx: &mut Fx) -> (Value, Value) {
+        let registers = fx.slot(16, 4);
+        let highest = self.cpuid(fx, registers, EXTENDED_LEAVES, 0);
+        self.cpuid(fx, registers, POWER_LEAF, 0);
+        let edx = fx.load(types::I32, registers, 12);
+        let invariant = fx.b.ins().band_imm_s(edx, INVARIANT_TSC);
+        let invariant = fx.b.ins().icmp_imm_s(IntCC::NotEqual, invariant, 0);
+        let leaves = fx.b.ins().icmp_imm_s(
+            IntCC::UnsignedGreaterThanOrEqual,
+            highest,
+            POWER_LEAF as i64,
+        );
+        let invariant = fx.b.ins().band(invariant, leaves);
+        let source = fx.choose_in(
+            self,
+            invariant,
+            &[PTR, PTR, PTR, PTR],
+            |_, fx| {
+                let tsc = fx.int(PTR, TSC_SOURCE);
+                let zero = fx.ptr(0);
+                vec![tsc, zero, zero, zero]
+            },
+            |lo, fx| lo.counter_source(fx),
+        );
+        let state_address = self.state(fx);
+        fx.store(source[0], state_address, state::CLOCK_SOURCE);
+        fx.store(source[1], state_address, state::CLOCK_COUNTER);
+        fx.store(source[2], state_address, state::CLOCK_MASK);
+        let tsc = fx.b.ins().icmp_imm_s(IntCC::Equal, source[0], TSC_SOURCE);
+        let started = fx.choose_in(
+            self,
+            tsc,
+            &[PTR, PTR],
+            |lo, fx| lo.pit_tsc_rate(fx),
+            |lo, fx| {
+                let count = lo.counter_reading(fx, source[0], source[1]);
+                let state_address = lo.state(fx);
+                fx.store(count, state_address, state::CLOCK_TICKS);
+                vec![count, source[3]]
+            },
+        );
+        (started[0], started[1])
+    }
+
+    /// The HPET the ACPI `HPET` table names, its counter started, or else the PM timer the
+    /// FADT names, or else the time-stamp counter: the source, its counter's address or port,
+    /// the mask of the bits it counts and its scale.
+    fn counter_source(&mut self, fx: &mut Fx) -> Vec<Value> {
+        let rsdp = self.rsdp(fx);
+        let hpet = self.acpi_table(fx, rsdp, HPET_SIGNATURE);
+        let found = fx.b.ins().icmp_imm_s(IntCC::NotEqual, hpet, 0);
+        fx.choose_in(
+            self,
+            found,
+            &[PTR, PTR, PTR, PTR],
+            |lo, fx| {
+                let base = load_u64(fx, hpet, HPET_ADDRESS);
+                let capabilities = lo.mmio_read(fx, 8, base);
+                let at = fx.b.ins().iadd_imm_s(base, HPET_CONFIGURATION as i64);
+                let configuration = lo.mmio_read(fx, 8, at);
+                let enabled = fx.b.ins().bor_imm_s(configuration, HPET_ENABLE);
+                lo.mmio_write(fx, 8, at, enabled);
+                let period = fx.b.ins().ushr_imm_s(capabilities, 32);
+                let period = fx.b.ins().ishl_imm_s(period, 32);
+                let femtoseconds = fx.ptr(FS_PER_NS);
+                let scale = fx.b.ins().udiv(period, femtoseconds);
+                let wide = fx.b.ins().band_imm_s(capabilities, HPET_WIDE);
+                let wide = fx.b.ins().icmp_imm_s(IntCC::NotEqual, wide, 0);
+                let all = fx.int(PTR, -1);
+                let low = fx.ptr(0xFFFF_FFFF);
+                let mask = fx.b.ins().select(wide, all, low);
+                let counter = fx.b.ins().iadd_imm_s(base, HPET_COUNTER as i64);
+                let source = fx.int(PTR, HPET_SOURCE);
+                vec![source, counter, mask, scale]
+            },
+            |lo, fx| {
+                let fadt = lo.acpi_table(fx, rsdp, FADT_SIGNATURE);
+                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, fadt, 0);
+                let timer = fx.choose(
+                    present,
+                    &[PTR, PTR],
+                    |fx| {
+                        let port = load_u32(fx, fadt, FADT_PM_TIMER);
+                        let flags = load_u32(fx, fadt, FADT_FLAGS);
+                        vec![port, flags]
+                    },
+                    |fx| {
+                        let zero = fx.ptr(0);
+                        vec![zero, zero]
+                    },
+                );
+                let timed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, timer[0], 0);
+                let pm_timer = fx.int(PTR, PM_TIMER_SOURCE);
+                let tsc = fx.int(PTR, TSC_SOURCE);
+                let source = fx.b.ins().select(timed, pm_timer, tsc);
+                let wide = fx.b.ins().band_imm_s(timer[1], PM_TIMER_32);
+                let wide = fx.b.ins().icmp_imm_s(IntCC::NotEqual, wide, 0);
+                let all = fx.ptr(0xFFFF_FFFF);
+                let low = fx.ptr(0xFF_FFFF);
+                let mask = fx.b.ins().select(wide, all, low);
+                let scale = fx.ptr((NS_PER_SECOND << 32) / PM_TIMER_HZ);
+                vec![source, timer[0], mask, scale]
+            },
+        )
+    }
+
+    /// The time-stamp counter at the end of the 10 ms the PIT's channel 2 counts down, and its
+    /// scale over those 10 ms.
+    fn pit_tsc_rate(&mut self, fx: &mut Fx) -> Vec<Value> {
+        let port = fx.ptr(SYSTEM_CONTROL);
+        let control = self.port_in(fx, 1, port);
+        let control = fx.b.ins().band_imm_s(control, !SPEAKER);
+        let control = fx.b.ins().bor_imm_s(control, GATE);
+        self.port_out(fx, 1, port, control);
+        let port = fx.ptr(PIT_MODE);
+        let mode = fx.ptr(CHANNEL_2_ONE_SHOT);
+        self.port_out(fx, 1, port, mode);
+        for byte in [PIT_LATCH & 0xFF, PIT_LATCH >> 8] {
+            let port = fx.ptr(PIT_CHANNEL_2);
+            let byte = fx.ptr(byte);
+            self.port_out(fx, 1, port, byte);
+        }
+        let start = self.call_stub(fx, Stub::ReadTsc, &[])[0];
+        fx.repeat(&[], |fx, _| {
+            let port = fx.ptr(SYSTEM_CONTROL);
+            let control = self.port_in(fx, 1, port);
+            let out = fx.b.ins().band_imm_s(control, CHANNEL_2_OUT);
+            (fx.b.ins().icmp_imm_s(IntCC::Equal, out, 0), Vec::new())
+        });
+        let end = self.call_stub(fx, Stub::ReadTsc, &[])[0];
+        let ticks = fx.b.ins().isub(end, start);
+        let one = fx.ptr(1);
+        let ticks = fx.b.ins().umax(ticks, one);
+        let window = fx.ptr(PIT_WINDOW << 32);
+        vec![end, fx.b.ins().udiv(window, ticks)]
+    }
+
+    /// A reading of the HPET's counter or the PM timer's, as `source` is one or the other.
+    fn counter_reading(&mut self, fx: &mut Fx, source: Value, counter: Value) -> Value {
+        let hpet = fx.b.ins().icmp_imm_s(IntCC::Equal, source, HPET_SOURCE);
+        fx.choose_in(
+            self,
+            hpet,
+            &[PTR],
+            |lo, fx| vec![lo.mmio_read(fx, 8, counter)],
+            |lo, fx| vec![lo.port_in(fx, 4, counter)],
+        )[0]
+    }
+
     /// `ClockNow() -> nanoseconds`: the counter's ticks since the base, as nanoseconds, raised to
     /// the latest reading of any CPU when they are fewer.
     pub fn define_clock_now(&mut self, fx: &mut Fx) {
         fx.entry();
-        let count = match self.machine_arch() {
-            Arch::Amd64 => self.call_stub(fx, Stub::ReadTsc, &[])[0],
-            Arch::Aarch64 => self.read_sysreg(fx, super::aarch64::CNTVCT_EL0),
-        };
+        let count = self.clock_count(fx);
         let state_address = self.state(fx);
         let base = fx.load(PTR, state_address, state::CLOCK_BASE);
         let scale = fx.load(PTR, state_address, state::CLOCK_SCALE);
@@ -150,6 +307,56 @@ impl Lowering<'_, '_> {
             (result[0], vec![result[1]])
         })[0];
         fx.b.ins().return_(&[now]);
+    }
+
+    /// The clock's counter: on x86_64 the time-stamp counter, or the HPET's or PM timer's count
+    /// extended; on AArch64 the virtual counter.
+    fn clock_count(&mut self, fx: &mut Fx) -> Value {
+        if self.machine_arch() == Arch::Aarch64 {
+            return self.read_sysreg(fx, super::aarch64::CNTVCT_EL0);
+        }
+        let state_address = self.state(fx);
+        let source = fx.load(PTR, state_address, state::CLOCK_SOURCE);
+        let tsc = fx.b.ins().icmp_imm_s(IntCC::Equal, source, TSC_SOURCE);
+        fx.choose_in(
+            self,
+            tsc,
+            &[PTR],
+            |lo, fx| lo.call_stub(fx, Stub::ReadTsc, &[]),
+            |lo, fx| vec![lo.extended_count(fx, source)],
+        )[0]
+    }
+
+    /// The HPET's or PM timer's count extended to 64 bits from the latest count any CPU read,
+    /// which a reading less than half the counter's range behind it gives instead.
+    fn extended_count(&mut self, fx: &mut Fx, source: Value) -> Value {
+        let state_address = self.state(fx);
+        let counter = fx.load(PTR, state_address, state::CLOCK_COUNTER);
+        let mask = fx.load(PTR, state_address, state::CLOCK_MASK);
+        let half = fx.b.ins().ushr_imm_s(mask, 1);
+        let ticks = fx.offset(state_address, state::CLOCK_TICKS);
+        let zero = fx.ptr(0);
+        fx.repeat(&[zero], |fx, _| {
+            let latest = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), ticks);
+            let reading = self.counter_reading(fx, source, counter);
+            let passed = fx.b.ins().isub(reading, latest);
+            let passed = fx.b.ins().band(passed, mask);
+            let behind = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, passed, half);
+            let result = fx.choose(
+                behind,
+                &[types::I8, PTR],
+                |fx| vec![fx.int(types::I8, 0), latest],
+                |fx| {
+                    let count = fx.b.ins().iadd(latest, passed);
+                    let seen =
+                        fx.b.ins()
+                            .atomic_cas(MemFlagsData::trusted(), ticks, latest, count);
+                    let raced = fx.b.ins().icmp(IntCC::NotEqual, seen, latest);
+                    vec![raced, count]
+                },
+            );
+            (result[0], vec![result[1]])
+        })[0]
     }
 
     /// Starts the running CPU's timer as it starts taking interrupts: its rate measured on

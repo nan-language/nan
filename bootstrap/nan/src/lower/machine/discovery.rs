@@ -13,7 +13,7 @@ use super::super::Lowering;
 use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::{state, system};
-use super::acpi::{DEVICE_TREE_TABLE, load_u32, load_u64};
+use super::acpi::{DEVICE_TREE_TABLE, FADT_SIGNATURE, load_u32, load_u64};
 use super::cpus::{MAX_CPUS, cpu};
 use super::its::GICR_TYPER;
 use super::memory::{device_tree, name_end, starts_with, tree_address, tree_cell, tree_number};
@@ -129,9 +129,8 @@ mod madt {
     pub const ENABLED: i64 = 1;
 }
 
-/// The FADT's signature, its length that holds the boot architecture flags, their offset, and
-/// their flags saying PSCI is implemented and is reached by `hvc`.
-const FADT_SIGNATURE: i64 = 0x5043_4146;
+/// The FADT's length that holds the boot architecture flags, their offset, and their flags
+/// saying PSCI is implemented and is reached by `hvc`.
 const FADT_ARM_LENGTH: i64 = 131;
 const FADT_ARM_BOOT: u64 = 129;
 const PSCI_COMPLIANT: i64 = 1;

@@ -91,7 +91,8 @@ pub fn needs_release(path: &str) -> Option<bool> {
 pub fn transfers(path: &str) -> Option<bool> {
     match path {
         "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
-        "task::Account" | "task::Cancelled" | "task::Poisoned" | "sys::Abandoner" => Some(false),
+        "task::Scope" | "task::Account" | "task::Cancelled" | "task::Poisoned"
+        | "sys::Abandoner" => Some(false),
         _ => None,
     }
 }

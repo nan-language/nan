@@ -87,6 +87,9 @@ const HPET_WIDE: i64 = 0x2000;
 const HPET_ENABLE: i64 = 0x1;
 const FS_PER_NS: u64 = 1_000_000;
 
+/// The bytes of the HPET's registers.
+const HPET_BYTES: u64 = 0x400;
+
 /// The PM timer's rate.
 const PM_TIMER_HZ: u64 = 3_579_545;
 
@@ -388,6 +391,24 @@ impl Lowering<'_, '_> {
         let state_address = self.state(fx);
         let source = fx.load(PTR, state_address, state::CLOCK_SOURCE);
         fx.b.ins().icmp_imm_s(IntCC::Equal, source, TSC_SOURCE)
+    }
+
+    /// The first address and last address plus one of the registers the clock reads through
+    /// memory: the HPET's where it is the x86_64 clock's source, none otherwise.
+    pub fn clock_registers_extent(&mut self, fx: &mut Fx) -> (Value, Value) {
+        let zero = fx.ptr(0);
+        if self.machine_arch() == Arch::Aarch64 {
+            return (zero, zero);
+        }
+        let state_address = self.state(fx);
+        let source = fx.load(PTR, state_address, state::CLOCK_SOURCE);
+        let counter = fx.load(PTR, state_address, state::CLOCK_COUNTER);
+        let hpet = fx.b.ins().icmp_imm_s(IntCC::Equal, source, HPET_SOURCE);
+        let base = fx.b.ins().iadd_imm_s(counter, -(HPET_COUNTER as i64));
+        let end = fx.offset(base, HPET_BYTES);
+        let start = fx.b.ins().select(hpet, base, zero);
+        let end = fx.b.ins().select(hpet, end, zero);
+        (start, end)
     }
 
     /// The clock's counter: on x86_64 the time-stamp counter, or the HPET's or PM timer's count

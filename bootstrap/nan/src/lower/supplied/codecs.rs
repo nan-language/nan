@@ -1116,18 +1116,24 @@ fn counting(fx: &mut Fx, state: Value, handles: bool) -> Value {
     counting
 }
 
-/// The bytes an encoding function writes for a value of `ty` that follows in `state`.
-fn measure_within(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    function: FuncId,
-    ty: &Ty,
-    value: Value,
-    state: Value,
-) -> Value {
-    let counting = counting(fx, state, lo.ck.is_handle(ty));
-    call(lo, fx, function, &[value, counting]);
-    fx.load(PTR, counting, writer::LEN)
+/// Writes to `state` the byte length `counting` measured, and gives whether `state` writes. A
+/// measuring `state` counts the measured bytes, and its handles when `handles`, at once, so that
+/// each framed value is measured once however deeply framed values nest.
+fn framed(fx: &mut Fx, state: Value, counting: Value, handles: bool) -> Value {
+    let size = fx.load(PTR, counting, writer::LEN);
+    wire::put_uvar(fx, state, size);
+    let buffer = fx.load(PTR, state, writer::BUFFER);
+    let measuring = fx.b.ins().icmp_imm_s(IntCC::Equal, buffer, 0);
+    fx.when(measuring, |fx| {
+        let len = fx.load(PTR, state, writer::LEN);
+        let len = fx.b.ins().iadd(len, size);
+        fx.store(len, state, writer::LEN);
+        if handles {
+            let next = fx.load(PTR, counting, writer::NEXT);
+            fx.store(next, state, writer::NEXT);
+        }
+    });
+    fx.b.ins().icmp_imm_s(IntCC::NotEqual, buffer, 0)
 }
 
 /// Writes a record: per field, in ascending byte order of keys, its key and value; in the wire
@@ -1168,8 +1174,13 @@ fn encode_record(
                     wire::put_kept(lo, fx, state, cursor, Some(key.as_bytes()));
                 }
                 wire::put_literal_text(lo, fx, state, key.as_bytes());
-                let size = measure_within(lo, fx, function, field_ty, field, state);
-                wire::put_uvar(fx, state, size);
+                let handles = lo.ck.is_handle(field_ty);
+                let counting = counting(fx, state, handles);
+                call(lo, fx, function, &[field, counting]);
+                let writing = framed(fx, state, counting, handles);
+                fx.when(writing, |fx| {
+                    call(lo, fx, function, &[field, state]);
+                });
             }
             Format::Json => {
                 if position > 0 {
@@ -1177,9 +1188,9 @@ fn encode_record(
                 }
                 json::put_literal_string(lo, fx, state, key.as_bytes());
                 put_literal(lo, fx, state, b":");
+                call(lo, fx, function, &[field, state]);
             }
         }
-        call(lo, fx, function, &[field, state]);
     }
     if let Some(cursor) = kept {
         wire::put_kept(lo, fx, state, cursor, None);
@@ -1225,23 +1236,34 @@ fn encode_case(
         CasePayload::Single(payload_ty) => {
             let payload = lo.payload_address(fx, ty, &case.key, "", value);
             let function = encoder(lo, format, payload_ty);
-            if format == Format::Wire {
-                let size = measure_within(lo, fx, function, payload_ty, payload, state);
-                wire::put_uvar(fx, state, size);
+            match format {
+                Format::Wire => {
+                    let handles = lo.ck.is_handle(payload_ty);
+                    let counting = counting(fx, state, handles);
+                    call(lo, fx, function, &[payload, counting]);
+                    let writing = framed(fx, state, counting, handles);
+                    fx.when(writing, |fx| {
+                        call(lo, fx, function, &[payload, state]);
+                    });
+                }
+                Format::Json => {
+                    call(lo, fx, function, &[payload, state]);
+                }
             }
-            call(lo, fx, function, &[payload, state]);
         }
-        CasePayload::Labelled(record) => {
-            if format == Format::Wire {
+        CasePayload::Labelled(record) => match format {
+            Format::Wire => {
                 let handles =
                     (record.fields.iter()).any(|(_, field_ty, _)| lo.ck.is_handle(field_ty));
                 let counting = counting(fx, state, handles);
                 encode_record(lo, fx, format, record, value, counting);
-                let size = fx.load(PTR, counting, writer::LEN);
-                wire::put_uvar(fx, state, size);
+                let writing = framed(fx, state, counting, handles);
+                fx.when(writing, |fx| {
+                    encode_record(lo, fx, format, record, value, state)
+                });
             }
-            encode_record(lo, fx, format, record, value, state);
-        }
+            Format::Json => encode_record(lo, fx, format, record, value, state),
+        },
         CasePayload::None => unreachable!("a payload"),
     }
     if format == Format::Json {

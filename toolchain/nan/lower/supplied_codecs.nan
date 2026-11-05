@@ -1081,13 +1081,25 @@ fn codecs_counting(mut fx: Fx, state: clif::Value, handles: bool) -> clif::Value
     return counting
 } codecs_counting
 
-/// The bytes an encoding function writes for a value of `ty` that follows in `state`.
-fn codecs_measure_within(mut lo: Lowering, mut fx: Fx, function: object::FuncId, ty: ty::Ty, value: clif::Value, state: clif::Value) -> clif::Value {
-    let counting = codecs_counting(mut fx, state, handles: lo.ck.is_handle(ty))
-    let call_args = fx.list2(value, b: counting)
-    discard codecs_call(mut lo, mut fx, function, args: call_args.view())
-    return mut fx.load(PTR, addr: counting, offset: WRITER_LEN)
-} codecs_measure_within
+/// Writes to `state` the byte length `counting` measured, and gives whether `state` writes. A
+/// measuring `state` counts the measured bytes, and its handles when `handles`, at once, so that
+/// each framed value is measured once however deeply framed values nest.
+fn codecs_framed(mut fx: Fx, state: clif::Value, counting: clif::Value, handles: bool) -> clif::Value {
+    let size = mut fx.load(PTR, addr: counting, offset: WRITER_LEN)
+    put_uvar(mut fx, state, value: size)
+    let buffer = mut fx.load(PTR, addr: state, offset: WRITER_BUFFER)
+    let measuring = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: buffer, y: 0)
+    mut fx.if_true(measuring, then: fn(mut fx1: Fx) {
+        let len = mut fx1.load(PTR, addr: state, offset: WRITER_LEN)
+        let grown = mut fx1.b.iadd(len, y: size)
+        mut fx1.store(grown, addr: state, offset: WRITER_LEN)
+        if handles {
+            let next = mut fx1.load(PTR, addr: counting, offset: WRITER_NEXT)
+            mut fx1.store(next, addr: state, offset: WRITER_NEXT)
+        }
+    })
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: buffer, y: 0)
+} codecs_framed
 
 /// Writes an unsigned or signed integer or a char of a scalar type at `value`.
 fn encode_number(mut lo: Lowering, mut fx: Fx, format: Format, scalar: ty::Scalar, signed: bool, value: clif::Value, state: clif::Value) {
@@ -1244,17 +1256,24 @@ fn encode_record(mut lo: Lowering, mut fx: Fx, format: Format, record: Record, v
                 None => {}
             }
             put_literal_text(mut lo, mut fx, state, bytes: field.key.as_bytes())
-            let size = codecs_measure_within(mut lo, mut fx, function, ty: field.ty, value: field_at, state)
-            put_uvar(mut fx, state, value: size)
+            let handles = lo.ck.is_handle(field.ty)
+            let counting = codecs_counting(mut fx, state, handles)
+            let measure_args = fx.list2(field_at, b: counting)
+            discard codecs_call(mut lo, mut fx, function, args: measure_args.view())
+            let writing = codecs_framed(mut fx, state, counting, handles)
+            mut fx.if_true(writing, then: fn[mut lo](mut fx1: Fx) {
+                let call_args = fx1.list2(field_at, b: state)
+                discard codecs_call(mut lo, fx: mut fx1, function, args: call_args.view())
+            })
         } else {
             if position > 0 {
                 put_literal(mut lo, mut fx, state, bytes: b",")
             }
             put_literal_string(mut lo, mut fx, state, bytes: field.key.as_bytes())
             put_literal(mut lo, mut fx, state, bytes: b":")
+            let call_args = fx.list2(field_at, b: state)
+            discard codecs_call(mut lo, mut fx, function, args: call_args.view())
         }
-        let call_args = fx.list2(field_at, b: state)
-        discard codecs_call(mut lo, mut fx, function, args: call_args.view())
     }
     match kept {
         Some(cursor) => put_kept(mut lo, mut fx, state, cursor, before: None)
@@ -1293,11 +1312,19 @@ fn encode_case(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, case: C
             let payload = mut lo.payload_address(mut fx, ty, variant: case.key.as_str(), label: "", address: value)
             let function = encoder(mut lo, format, ty: payload_ty)
             if format == Format.Wire {
-                let size = codecs_measure_within(mut lo, mut fx, function, ty: payload_ty, value: payload, state)
-                put_uvar(mut fx, state, value: size)
+                let handles = lo.ck.is_handle(payload_ty)
+                let counting = codecs_counting(mut fx, state, handles)
+                let measure_args = fx.list2(payload, b: counting)
+                discard codecs_call(mut lo, mut fx, function, args: measure_args.view())
+                let writing = codecs_framed(mut fx, state, counting, handles)
+                mut fx.if_true(writing, then: fn[mut lo](mut fx1: Fx) {
+                    let call_args = fx1.list2(payload, b: state)
+                    discard codecs_call(mut lo, fx: mut fx1, function, args: call_args.view())
+                })
+            } else {
+                let call_args = fx.list2(payload, b: state)
+                discard codecs_call(mut lo, mut fx, function, args: call_args.view())
             }
-            let call_args = fx.list2(payload, b: state)
-            discard codecs_call(mut lo, mut fx, function, args: call_args.view())
         }
         CasePayload.Labelled(record) => {
             if format == Format.Wire {
@@ -1307,10 +1334,13 @@ fn encode_case(mut lo: Lowering, mut fx: Fx, format: Format, ty: ty::Ty, case: C
                 }
                 let counting = codecs_counting(mut fx, state, handles)
                 encode_record(mut lo, mut fx, format, record, value, state: counting)
-                let size = mut fx.load(PTR, addr: counting, offset: WRITER_LEN)
-                put_uvar(mut fx, state, value: size)
+                let writing = codecs_framed(mut fx, state, counting, handles)
+                mut fx.if_true(writing, then: fn[mut lo](mut fx1: Fx) {
+                    encode_record(mut lo, fx: mut fx1, format, record, value, state)
+                })
+            } else {
+                encode_record(mut lo, mut fx, format, record, value, state)
             }
-            encode_record(mut lo, mut fx, format, record, value, state)
         }
         CasePayload.None => {
             expect false

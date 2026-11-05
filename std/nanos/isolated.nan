@@ -62,12 +62,13 @@ const ABANDONED: u64 = 16
 const MOST_BYTES: u64 = 1_048_576
 
 /// The bytes of a start record and of the record of a port.
-const START_BYTES: usize = 80
+const START_BYTES: usize = 88
 
 const PORT_BYTES: usize = 40
 
 pub closed enum IsolatedError derives Render {
     NoJob
+    NoChannel
     Unplaced(sys::load::LoadError) from
     Cancelled(task::Cancelled) from
 } IsolatedError
@@ -81,9 +82,10 @@ pub closed struct Services derives Copy {
     pub random: sys::Random
 } Services
 
-/// The record from which a space's runtime starts: the job, where the job's input lies and its
+/// The record from which a space's runtime starts: the entry, where its input lies and its
 /// length, the address of the doorbell, the handles of the log, standard streams and random
-/// source, and where the records of the link's channels lie and their count.
+/// source, where the records of the link's channels lie and their count, and 1 when the entry is
+/// a component entry whose instance the link's first channel carries, 0 for a job.
 struct Start derives Copy {
     job: sys::load::Job
     input: u64
@@ -94,6 +96,7 @@ struct Start derives Copy {
     random: u64
     ports: u64
     port_count: u64
+    held: u64
 } Start
 
 /// A capability a space holds: its handle is the index of its entry in the space's table.
@@ -134,6 +137,28 @@ pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services
     let Some(entry) = job.job() else {
         fail IsolatedError.NoJob
     }
+    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, services, link, held: false, take input, mut frames, alloc)
+    var space = made
+    var state = started
+    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, halted: fn() => false, mut frames, alloc)
+    take space.release(mut frames)
+    match outcome {
+        Ok(how) => return how
+        Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
+    }
+} run_isolated
+
+/// A space made to run an entry: the space, the thread state starting its runtime, and its table
+/// of handles.
+linear struct Placed {
+    space: sys::load::Space
+    state: hw::UserState
+    table: mem::List[Holding]
+} Placed
+
+/// Makes a space of `job` from `frames` that runs `entry` on `input`, the instance of a component
+/// entry when `held`, sharing `link`'s frames with it and laying out its start record.
+fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
     var keys: usize = 0
     for channel in link.channels {
         keys += channel.key.as_str().as_bytes().len()
@@ -152,26 +177,25 @@ pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services
     match attempt shared(mut space, link, start, channels, alloc) {
         Ok(ports) => {
             let input_at = start + u64.widen(START_BYTES + ports_len + keys)
-            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()))
+            let instance: u64 = match held {
+                true => 1
+                false => 0
+            }
+            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance)
             discard attempt mut space.write(start, bytes: record_bytes(record, count: START_BYTES, alloc).view())
             discard attempt mut space.write(record.ports, bytes: ports.records.view())
             discard attempt mut space.write(input_at, bytes: input.view())
             var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
             state.regs[register(0)] = Untrusted.of(start)
             state.regs[register(1)] = Untrusted.of(space.boot_area())
-            let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, mut frames, alloc)
-            take space.release(mut frames)
-            match outcome {
-                Ok(how) => return how
-                Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
-            }
+            return Placed(space: take space, state: state, table: take table)
         }
         Err(error) => {
             take space.release(mut frames)
-            fail IsolatedError.Unplaced(error)
+            fail error
         }
     }
-} run_isolated
+} placed
 
 /// What a space's kernel serves it: its services, and its table of handles.
 struct Serving {
@@ -222,10 +246,14 @@ fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Byt
 
 /// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
 /// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
-/// another exception ends the job as a trap of `trap.exception`.
-fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+/// another exception ends the job as a trap of `trap.exception`. Once `halted` gives true, the
+/// space runs no more and its job ends abandoned.
+fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     let services = served.services
     loop {
+        if halted() {
+            return Ended.Abandoned
+        }
         match space.run(cpu, mut state, mut extended) {
             hw::UserExit.Interrupted => {}
             hw::UserExit.Fault(fault) => {
@@ -357,7 +385,7 @@ fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, l
         }
         Holding.Channel(index) => {
             if operation == NOTIFY {
-                link.heard_from(u64.widen(index))
+                link.heard_from(index)
                 return 0
             }
         }
@@ -443,9 +471,11 @@ fn register(role: u64) -> usize limits pure, notrap, terminates
 /// `alloc`.
 fn trap_of(kind: u64, alloc: mem::Alloc) -> sys::Trap
 
-/// The first task of a space's runtime: runs the job its start record names on a world whose
-/// log, standard streams and random source the kernel serves, with its link's channels in its
-/// table, its file system and network denied, and ends the space with how the job ended.
+/// The first task of a space's runtime: runs the job its start record names, or holds the
+/// instance of the component entry it names for the kernel over its link's first channel, on a
+/// world whose log, standard streams and random source the kernel serves, with its link's other
+/// channels in its table, its file system and network denied, and ends the space with how the job
+/// or instance ended.
 pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 {
     let record = trusted "the kernel writes the start record at `start` before the space starts" { hw::Ptr[Start].of_addr(usize.widen(start)).read() }
     let granted = space_base()
@@ -460,13 +490,16 @@ pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 
     }
     let remotes = sys::Minter[Remote, mem::Alloc, u64].of(alloc, alloc)
     let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
-    let world = attempt remote_world(granted, record, remotes, ports)
+    let world = attempt remote_world(granted, record, remotes, ports, channels_from: record.held)
     let job = record.job
     match world {
         Ok(given) => {
-            let outcome = attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
-                return try await call(job, world: take given, take input)
-            }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
+            let outcome = match record.held {
+                0 => attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+                    return try await call(job, world: take given, take input)
+                }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
+                else => attempt await served_instance(job, port: ports.mint(0), world: take given, take input)
+            }
             take remotes.close()
             take ports.close()
             match outcome {
@@ -485,14 +518,14 @@ pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 
 
 /// The world of a space: its runtime's allocator, executor and clock, its log, standard streams
 /// and random source served by the kernel by the handles its start record gives, its file system
-/// and network denied, and its table holding each channel of its link as a standard stream under
-/// the channel's key.
-fn remote_world(granted: Base, record: Start, remotes: sys::Minter[Remote, mem::Alloc, u64], ports: sys::Minter[Port, Ports, u64]) -> World fails sys::Revoked {
+/// and network denied, and its table holding each channel of its link from the index
+/// `channels_from` as a standard stream under the channel's key.
+fn remote_world(granted: Base, record: Start, remotes: sys::Minter[Remote, mem::Alloc, u64], ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
     let logs = try sys::Log.served(remotes.mint(record.log))
     let streams = try sys::Stdio.served(remotes.mint(record.stdio))
     let source = try sys::Random.served(remotes.mint(record.random))
     var caps = Caps.empty(granted.alloc)
-    for index in 0u64..<record.port_count {
+    for index in channels_from..<record.port_count {
         let port = port_at(record, index)
         var key = mem::Bytes.zeroed(usize.widen(port.key_len), alloc: granted.alloc)
         trusted "the kernel writes each channel's key of `key_len` bytes at `key`" {

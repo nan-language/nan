@@ -139,7 +139,7 @@ The table names every pub std type, interface, free function and registry with t
 | `nanos` | `nanos::World`, `nanos::Caps`, `nanos::Cap`, `nanos::CapError` | [Root grants](14-authority.md#root-grants) |
 | `nanos` | `nanos::Ended`, `nanos::RunError`, `nanos::HostInput`, `nanos::run` | [Jobs](14-authority.md#jobs) |
 | `nanos` | `nanos::Services`, `nanos::IsolatedError`, `nanos::Link`, `nanos::LinkError`, `nanos::run_isolated` | [Jobs](14-authority.md#jobs) |
-| `nanos` | `nanos::Environment`, `nanos::Instance`, `nanos::Inbox`, `nanos::InstanceError`, `nanos::hold` | [Component instances](14-authority.md#component-instances) |
+| `nanos` | `nanos::Environment`, `nanos::Instance`, `nanos::Inbox`, `nanos::InstanceError`, `nanos::hold`, `nanos::hold_isolated` | [Component instances](14-authority.md#component-instances) |
 | `testing` | `testing::world`, `testing::same` | [Simulated capabilities](22-testing.md#simulated-capabilities) |
 
 ## Array and slice members

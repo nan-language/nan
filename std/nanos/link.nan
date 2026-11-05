@@ -24,19 +24,21 @@ pub open linear struct Link {
     bell: hw::UserFrame
     channels: mem::List[Channel]
     rung: hw::Signal[u64]
-    heard: hw::Signal[u64]
     alloc: mem::Alloc
 } Link
 
 /// A channel of a link: its key, the frame the kernel writes and the space reads, the frame the
-/// space writes and the kernel reads, and the bytes the kernel has written to the first and read
-/// from the second.
+/// space writes and the kernel reads, the bytes the kernel has written to the first and read
+/// from the second, and the signals waking the kernel's receiver and its sender once the space
+/// tells it moved bytes.
 linear struct Channel {
     key: text::String
     inbound: hw::UserFrame
     outbound: hw::UserFrame
     sent: core::atomic::AtomicU64
     taken: core::atomic::AtomicU64
+    heard: hw::Signal[u64]
+    room: hw::Signal[u64]
 } Channel
 
 pub closed enum LinkError derives Render {
@@ -45,11 +47,11 @@ pub closed enum LinkError derives Render {
 } LinkError
 
 pub fn Link.of(take bell: hw::PhysFrame[4_096], alloc: mem::Alloc) -> Link {
-    return Link(bell: cleared(take bell), channels: mem::List[Channel].empty(alloc), rung: hw::Signal[u64].empty(), heard: hw::Signal[u64].empty(), alloc: alloc)
+    return Link(bell: cleared(take bell), channels: mem::List[Channel].empty(alloc), rung: hw::Signal[u64].empty(), alloc: alloc)
 } Link.of
 
 pub fn Link.open(mut self, key: Str, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
-    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0)))
+    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0), heard: hw::Signal[u64].empty(), room: hw::Signal[u64].empty()))
     return self.channels.len() - 1
 } Link.open
 
@@ -107,24 +109,46 @@ pub fn Link.receive(self, channel: usize, alloc: mem::Alloc) -> Untrusted[mem::B
             self.ring(channel_bit(channel))
             return Untrusted.of(take bytes)
         }
-        discard try await self.heard.wait()
+        discard try await held.heard.wait()
     }
 } Link.receive
 
 pub fn Link.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    let Link(bell: bell, channels: channels, rung: _, heard: _, alloc: _) = self
+    let Link(bell: bell, channels: channels, rung: _, alloc: _) = self
     mut frames.push(freed(take bell))
     for channel in take channels {
-        let Channel(key: _, inbound: inbound, outbound: outbound, sent: _, taken: _) = channel
+        let Channel(key: _, inbound: inbound, outbound: outbound, sent: _, taken: _, heard: _, room: _) = channel
         mut frames.push(freed(take inbound))
         mut frames.push(freed(take outbound))
     }
 } Link.release
 
+/// Sends the whole of `data` over a channel, waiting while its inbound ring has no room.
+fn Link.sent(self, channel: usize, data: Slice[u8]) fails LinkError uses wait {
+    let Some(held) = self.channels.get(channel) else {
+        fail LinkError.NoChannel
+    }
+    var at: usize = 0
+    while at < data.len() {
+        let Some(parts) = data.split_at(at) else {
+            return
+        }
+        let count = try self.send(channel, data: parts.tail)
+        at += count
+        if count == 0 {
+            discard try await held.room.wait()
+        }
+    }
+} Link.sent
+
 /// Tells the kernel's side of a link that the space wrote to or read from a channel.
-fn Link.heard_from(self, channel: u64) {
+fn Link.heard_from(self, channel: usize) {
+    let Some(held) = self.channels.get(channel) else {
+        return
+    }
     hw::without_irqs(fn(t: hw::IrqsDisabled) {
-        self.heard.post(t, value: channel)
+        held.heard.post(t, value: 1)
+        held.room.post(t, value: 1)
     })
 } Link.heard_from
 

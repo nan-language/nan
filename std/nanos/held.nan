@@ -52,14 +52,13 @@ fn held_in(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, serv
 
 /// What the kernel's relays of an instance hold: the receivers of its holder's requests, of its
 /// inboxes' calls and of the frames to send down, the receiver whose sender stays held while the
-/// instance runs, the abandoner of its domain and the space's services and table of handles.
+/// instance runs, and the abandoner of its domain.
 struct Relays {
     requests: task::Receiver[Asked]
     calls: task::Receiver[Called]
     outgoing: task::Receiver[mem::Bytes]
     parked: task::Receiver[u8]
     abandoner: mem::Shared[sys::Abandoner]
-    served: Serving
 } Relays
 
 /// Runs an instance's space until it ends, sending its holder's requests and its inboxes' calls
@@ -71,10 +70,10 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
     let task::Channel(sender: parking, receiver: parked) = task::Channel[u8].bounded(1, alloc)
     let allocs = task::Cown.of(mem::Map[u64, mem::Alloc].empty(alloc), alloc)
     let halted = core::atomic::AtomicBool.of(false)
-    var relays = Some(Relays(requests: take requests, calls: take calls, outgoing: take outgoing, parked: take parked, abandoner: take abandoner, served: take served))
+    var relays = Some(Relays(requests: take requests, calls: take calls, outgoing: take outgoing, parked: take parked, abandoner: take abandoner))
     var ended = Ended.Cancelled
     try await task::scope(exec, body: fn[mut space, mut state, mut extended, mut frames, mut relays, mut ended](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain, served: table)) = mut relays.extract() else {
+        let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain)) = mut relays.extract() else {
             return
         }
         let requests_down = down.split()
@@ -90,10 +89,10 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
             try await asked_down(take asked, out: requests_down, exec, alloc)
         })
         discard s.spawn(fn[take called, take calls_down, take replies, take drawing]() fails task::Cancelled uses wait {
-            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, alloc)
+            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table: served.table, alloc)
         })
         discard s.spawn(fn[take answered, take routing]() fails task::Cancelled uses wait {
-            try await answered_up(link, answers: answered, allocs: routing, alloc)
+            try await answered_up(link, answers: answered, allocs: routing, table: served.table, alloc)
         })
         discard s.spawn(fn[take waiting, take domain]() fails task::Cancelled uses wait {
             let watched = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -106,7 +105,7 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
             halted.store(true)
             link.ring(0)
         })
-        ended = try await run_space(cpu, mut space, mut state, mut extended, served: table, link, halted: fn() => halted.load(), mut frames, alloc)
+        ended = try await run_space(cpu, mut space, mut state, mut extended, served, link, halted: fn() => halted.load(), mut frames, alloc)
         s.cancel()
     })
     discard parking
@@ -178,17 +177,17 @@ fn asked_down(take requests: task::Receiver[Asked], out: task::Sender[mem::Bytes
     })
 } asked_down
 
-/// Sends `out` the frame of each call of an instance's inboxes, keeping in `allocs` the allocator
-/// its reply is drawn through; a call carrying handles is answered at once as malformed, since no
-/// handle crosses into a space.
-fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Sends `out` the frame of each call of an instance's inboxes, its handles added to the space's
+/// `table`, keeping in `allocs` the allocator its reply is drawn through; a call carrying a handle
+/// the space cannot hold is answered at once as malformed.
+fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var receiver = calls
     loop {
         let Some(called) = try await mut receiver.receive() else {
             return
         }
         let Called(id: id, hash: hash, request: request, alloc: drawn) = called
-        if request.handles.len() > 0 {
+        let Some(crossing) = table.admitted(request.handles.view(), alloc) else {
             discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
             continue
         }
@@ -196,14 +195,15 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
             discard mut allocs.insert(id, value: drawn)
         }
         let sys::Encoded(bytes: bytes, handles: _) = request
-        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes)), alloc))
+        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes, handles: take crossing)), alloc))
     }
 } called_down
 
 /// Routes through `answers` each answer the space sends up the first channel of `link`, a call's
-/// reply drawn through the allocator `allocs` keeps for it; it stops hearing a space that frames an
-/// answer it cannot decode or longer than `MOST_BYTES`.
-fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
+/// the space's `table` it names; it stops hearing a space that frames an answer it cannot decode or
+/// longer than `MOST_BYTES`.
+fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var pending = mem::Bytes.empty(alloc)
     loop {
         let received = match attempt await link.receive(0, alloc) {
@@ -226,13 +226,15 @@ fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem
                 return
             }
             let drawn = await when mut allocs => mut allocs.remove(id)
-            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, alloc: drawn.value_or(alloc)))))
+            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
         }
     }
 } answered_up
 
-/// The answer of what an instance's space gave, a reply's bytes drawn through `alloc`.
-fn answer_of(take sent: Sent, alloc: mem::Alloc) -> Answer {
+/// The answer of what an instance's space gave, a reply's bytes drawn through `alloc` and its
+/// handles those of the entries of the space's `table` it names, a reply naming another refused as
+/// malformed.
+fn answer_of(take sent: Sent, table: Table, alloc: mem::Alloc) -> Answer {
     match sent {
         Sent.Done => return Answer.Done
         Sent.Flag(flag) => return Answer.Flag(flag)
@@ -246,8 +248,11 @@ fn answer_of(take sent: Sent, alloc: mem::Alloc) -> Answer {
             }
             return Answer.Health(sys::HealthReply.Unhealthy(reason))
         }
-        Sent.Served(bytes) => {
-            var reply = sys::Encoded.empty(alloc)
+        Sent.Served(Naming(bytes: bytes, handles: handles)) => {
+            let Some(handed) = table.handed(handles, alloc) else {
+                return Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid)))
+            }
+            var reply = sys::Encoded(bytes: mem::Bytes.empty(alloc), handles: take handed)
             mut reply.bytes.append(bytes.view())
             return Answer.Served(Ok(take reply))
         }
@@ -287,11 +292,13 @@ enum Order derives Copy, Encode {
     Wake
 } Order
 
-/// A call of an instance's inbox: the number of its wait, its protocol hash and its bytes.
+/// A call of an instance's inbox: the number of its wait, its protocol hash, its bytes and what the
+/// space receives of its handles.
 struct Calling derives Encode {
     id: u64
     hash: sys::ProtocolHash
     bytes: mem::Bytes
+    handles: mem::List[Carried]
 } Calling
 
 /// What the space of an instance sends its kernel: an answer and the number of the wait it ends.
@@ -308,9 +315,16 @@ enum Sent derives Encode {
     Checkpointed(mem::Bytes)
     Healthy
     Unhealthy(text::String)
-    Served(mem::Bytes)
+    Served(Naming)
     Refused(Refusal)
 } Sent
+
+/// An encoding a space sends its kernel: its bytes, and the handle of the entry of the space's table
+/// for each of its handles.
+struct Naming derives Encode {
+    bytes: mem::Bytes
+    handles: mem::List[u64]
+} Naming
 
 /// How a call an instance's space served failed: malformed, with the number `decode_code` gives
 /// its decoding failure, or closed.
@@ -410,8 +424,9 @@ struct Relaying {
 /// Holds the instance of the component entry `job` in a space for its kernel: runs the instance
 /// task in a domain of the space's runtime on `world`, resuming from the checkpoint whose
 /// `mem::wire` encoding `input` is, while relaying the requests and calls the kernel sends over
-/// the channel `port` serves to the instance and its answers back, and gives how the domain ended.
-fn served_instance(job: sys::load::Job, port: Port, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+/// the channel `port` serves to the instance and its answers back, their handles those the runtime
+/// holds through `base` for the entries of the space's table, and gives how the domain ended.
+fn served_instance(job: sys::load::Job, port: Port, base: Remote, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
     let Ok(checkpoint) = attempt mem::wire::Codec[Option[mem::Bytes]].decode(Untrusted.of(input.view()), alloc) else {
@@ -432,10 +447,10 @@ fn served_instance(job: sys::load::Job, port: Port, take world: World, take inpu
             return
         }
         discard s.spawn(fn[take down, take inbox]() fails task::Cancelled uses wait {
-            try await relayed_in(port, requests: take down, calls: take inbox, exec, alloc)
+            try await relayed_in(port, requests: take down, calls: take inbox, base, exec, alloc)
         })
         discard s.spawn(fn[take up]() fails task::Cancelled uses wait {
-            try await relayed_out(port, answered: take up, alloc)
+            try await relayed_out(port, answered: take up, base, alloc)
         })
         outcome = try await sys::Domain.run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
             return try await call(job, world: take granted, input: take launched)
@@ -446,9 +461,11 @@ fn served_instance(job: sys::load::Job, port: Port, take world: World, take inpu
 } served_instance
 
 /// Gives the instance each request and call the kernel sends over `port`, each request through a
-/// task of its own so that the end of a wait sent after it is never held up behind it, ends each
-/// wait whose end the kernel sends, and returns once the kernel releases the instance.
-fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// task of its own so that the end of a wait sent after it is never held up behind it, and each
+/// call with the handles the runtime holds through `base` for what the kernel carried into the
+/// space's table; ends each wait whose end the kernel sends, and returns once the kernel releases
+/// the instance.
+fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], base: Remote, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var buffer = mem::Bytes.zeroed(usize.widen(RING_BYTES), alloc)
     var pending = mem::Bytes.empty(alloc)
     var stops = mem::Map[u64, task::Sender[u8]].empty(alloc)
@@ -482,10 +499,8 @@ fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::
                     Down.Stop(id) => {
                         discard mut stops.remove(id)
                     }
-                    Down.Call(Calling(id: id, hash: hash, bytes: bytes)) => {
-                        var request = sys::Encoded.empty(alloc)
-                        mut request.bytes.append(bytes.view())
-                        discard attempt await calls.send(Called(id: id, hash: hash, request: take request, alloc: alloc))
+                    Down.Call(calling) => {
+                        discard attempt await calls.send(called_in(take calling, base, alloc))
                     }
                     Down.Release => return
                 }
@@ -493,6 +508,21 @@ fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::
         }
     })
 } relayed_in
+
+/// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
+/// the kernel carried into the space's table, a handle it cannot hold left out.
+fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
+    let Calling(id: id, hash: hash, bytes: bytes, handles: crossing) = calling
+    var request = sys::Encoded.empty(alloc)
+    mut request.bytes.append(bytes.view())
+    for crossed in crossing {
+        match minted_for(base, crossed) {
+            Some(handle) => mut request.handles.push(handle)
+            None => {}
+        }
+    }
+    return Called(id: id, hash: hash, request: take request, alloc: alloc)
+} called_in
 
 /// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
 /// number of its wait.
@@ -519,24 +549,25 @@ fn stopped_by(id: u64, mut stops: mem::Map[u64, task::Sender[u8]], alloc: mem::A
     return receiver
 } stopped_by
 
-/// Sends the kernel over `port` each answer of the instance, until every sender of `answered` is
-/// released.
-fn relayed_out(port: Port, take answered: task::Receiver[Routed], alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Sends the kernel over `port` each answer of the instance, its handles named through `base`,
+/// until every sender of `answered` is released.
+fn relayed_out(port: Port, take answered: task::Receiver[Routed], base: Remote, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var receiver = answered
     loop {
         let Some(Routed.Answered(Replied(id: id, answer: answer))) = try await mut receiver.receive() else {
             return
         }
-        let frame = framed(Answering(id: id, answer: sent_of(take answer, alloc)), alloc)
+        let frame = framed(Answering(id: id, answer: sent_of(take answer, base, alloc)), alloc)
         let Ok(_) = attempt await port.write_out(frame.view()) else {
             return
         }
     }
 } relayed_out
 
-/// What a space sends its kernel of an answer of its instance; a reply carrying handles is refused
-/// as malformed, since no handle crosses out of a space.
-fn sent_of(take answer: Answer, alloc: mem::Alloc) -> Sent {
+/// What a space sends its kernel of an answer of its instance, a reply's handles named through
+/// `base`; a reply carrying a handle the runtime minted for no entry of the space's table is refused
+/// as malformed.
+fn sent_of(take answer: Answer, base: Remote, alloc: mem::Alloc) -> Sent {
     match answer {
         Answer.Done => return Sent.Done
         Answer.Flag(flag) => return Sent.Flag(flag)
@@ -545,10 +576,10 @@ fn sent_of(take answer: Answer, alloc: mem::Alloc) -> Sent {
         Answer.Health(sys::HealthReply.Healthy) => return Sent.Healthy
         Answer.Health(sys::HealthReply.Unhealthy(why)) => return Sent.Unhealthy(text::String.of(why.as_str(), alloc))
         Answer.Served(Ok(reply)) => {
-            if reply.handles.len() > 0 {
+            let Some(handles) = handles_named(base, minted: reply.handles.view(), alloc) else {
                 return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
             }
-            return Sent.Served(take reply.bytes)
+            return Sent.Served(Naming(bytes: take reply.bytes, handles: take handles))
         }
         Answer.Served(Err(failure)) => {
             let sys::CallError.Malformed(error) = failure else {

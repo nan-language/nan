@@ -46,6 +46,7 @@ pub closed enum Answer derives Encode {
 pub protocol Ledger {
     pub fn add(amount: u32) -> u64 limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+    pub fn note(log: sys::Log) -> sys::Log limits recorded
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
 } Ledger
@@ -55,8 +56,8 @@ pub closed struct Book derives Encode {
     pub ticks: u64
 } Book
 
-/// The serial port serving a job's log and standard streams, its record counting the bytes of
-/// standard input it has given.
+/// The serial port serving a job's log and standard streams, its state counting the bytes of
+/// standard input it has given and its record 1 for the log the book notes through.
 struct Console {
 } Console
 
@@ -75,10 +76,14 @@ impl Counter: sys::Kind[core::atomic::AtomicU64, u64]
 impl Counter: sys::RandomService
 
 fn Console.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
+    match sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => record) {
+        Some(1) => say(text: "note ")
+        else => say(text: "log ")
+    }
     match level {
-        sys::LogLevel.Info => say(text: "log info ")
-        sys::LogLevel.Warn => say(text: "log warn ")
-        sys::LogLevel.Error => say(text: "log error ")
+        sys::LogLevel.Info => say(text: "info ")
+        sys::LogLevel.Warn => say(text: "warn ")
+        sys::LogLevel.Error => say(text: "error ")
     }
     say(text: message)
     say(text: ": ")
@@ -358,10 +363,11 @@ fn isolated(loader: sys::load::Loader, bytes: Slice[u8], alloc: mem::Alloc) -> s
     return job
 } isolated
 
-/// What the kernel serves every job.
+/// What the kernel serves every job, and the console the book notes through.
 struct Grants derives Copy {
     clock: sys::Clock
     console: Console
+    noter: Console
     counter: Counter
     exec: task::Executor
     alloc: mem::Alloc
@@ -478,7 +484,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     take k.anchor(0u8, run: fn[take loader, take cpu, take frames](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
         let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
         let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
-        let grants = Grants(clock: clock, console: consoles.mint(0), counter: counters.mint(0), exec: exec, alloc: alloc)
+        let grants = Grants(clock: clock, console: consoles.mint(0), noter: consoles.mint(1), counter: counters.mint(0), exec: exec, alloc: alloc)
         var pool = frames
         let served = attempt await serve(cpu, loader, grants, frames: mut pool)
         take consoles.close()
@@ -669,9 +675,9 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 } linked
 
 /// Holds instances of the ledger's book in spaces over the first channel of a link: started,
-/// called, refused a call carrying a handle, checkpointed and ended, then restored from that
-/// checkpoint, a handler that traps and a handler that never returns until the instance is
-/// abandoned.
+/// called, given a log it notes through and gives back, refused a call carrying a clock,
+/// checkpointed and ended, then restored from that checkpoint, a handler that traps and a handler
+/// that never returns until the instance is abandoned.
 fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     discard mut link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
@@ -707,11 +713,12 @@ fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails n
     defer take book.abandon()
     try await ticked(mut book, reason: sys::ResumeReason.Started)
     try await added(mut book, amount: 5, grants)
+    try await noted(mut book, grants)
     var echo = sys::Encoded.empty(grants.alloc)
     discard sys::Wire[Ledger].echo(mut echo, clock: grants.clock)
     match attempt await book.inbox().call(sys::Wire[Ledger].hash(), request: take echo, alloc: grants.alloc) {
-        Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "book refused a handle\n")
-        else => say(text: "book took a handle\n")
+        Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "book refused a clock\n")
+        else => say(text: "book took a clock\n")
     }
     let checkpoint = try await book.checkpoint()
     say(text: "book checkpoint ")
@@ -721,6 +728,24 @@ fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails n
     say_ended(try await take book.end(), alloc: grants.alloc)
     return checkpoint
 } started
+
+/// Gives the book the log of the noting console, which it notes its total through and gives back,
+/// and logs through the log it gives back.
+fn noted(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    let Ok(log) = attempt sys::Log.served(grants.noter) else {
+        stop(text: "no note log\n")
+    }
+    var request = sys::Encoded.empty(grants.alloc)
+    let note = sys::Wire[Ledger].note(mut request, log)
+    let Ok(reply) = try await called(mut book, take request, grants) else {
+        say(text: "book note refused\n")
+        return
+    }
+    match attempt note.decode(Untrusted.of(reply.bytes.view()), handles: reply.handles.view(), alloc: grants.alloc) {
+        Ok(given) => given.info("given back", value: true)
+        Err(_) => say(text: "book note undecodable\n")
+    }
+} noted
 
 /// Restores the book from a checkpoint into a fresh instance and calls it.
 fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {

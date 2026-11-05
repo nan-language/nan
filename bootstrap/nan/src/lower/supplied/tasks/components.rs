@@ -10,8 +10,9 @@
 //! of what references the record, its allocator and executor cells, the number of `after` calls
 //! so far, whether the component task has ended, the outbox of the run's body or of the stepper,
 //! the nanosecond at which the executor's clock was minted with the executor's resolution, on
-//! whose grid delays end, the request whose handler runs, and the stepper's holding, zero for a
-//! run; the state, the Env and, for a protocol declaring one, the summary follow. An intake entry
+//! whose grid delays end, the request whose handler runs, the stepper's holding, zero for a run,
+//! the executor's handle and the attached runner's handle, zero for none; the state, the Env and,
+//! for a protocol declaring one, the summary follow. An intake entry
 //! holds its links, the task posting it (zero for a message the component sends itself), its
 //! status, its deadline and order while delayed, whether a keyed outbox posted it and that
 //! outbox's key, where a request's reply goes (zero for any other message), and the message; a
@@ -66,7 +67,9 @@ pub mod runner {
     pub const HOLDING: u64 = 168;
     /// The handle of the executor its tasks run on.
     pub const HANDLE: u64 = 176;
-    pub const HEADER: u64 = 184;
+    /// The handle of the runner a stepper's holder attached, zero for none.
+    pub const RUNNER: u64 = 184;
+    pub const HEADER: u64 = 192;
 }
 
 pub mod entry {
@@ -109,6 +112,21 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_routine(fx, Routine::Lock, &[lock]);
             keyed::supersede_key(lo, fx, runner, supply.param(1).scalar());
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            supply.done(lo, fx);
+        }
+        "sys::Cx.runner" => {
+            let record = fx.load(PTR, supply.param(0).address(), 0);
+            let attached = fx.load(PTR, record, runner::RUNNER);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, attached, 0);
+            let handle = fx.choose_in(
+                lo,
+                present,
+                &[PTR],
+                |_, _| vec![attached],
+                |lo, fx| vec![tables::denied(lo, fx)],
+            )[0];
+            let sret = supply.sret.expect("a runner's address");
+            fx.store(handle, sret, 0);
             supply.done(lo, fx);
         }
         "sys::Outbox.post" => {

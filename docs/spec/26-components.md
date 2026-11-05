@@ -1,6 +1,6 @@
 # Components
 
-This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, and protocols with their servers, operation calls, hashes and wire encoding.
+This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, protocols with their servers, operation calls, hashes and wire encoding, and the runner capabilities a stepper's holder attaches, with their ports.
 
 ## Components
 
@@ -1612,6 +1612,90 @@ pub closed struct Fake {
 } Fake
 
 impl Fake: sys::Protocol // error: component.protocol-impl
+```
+
+## Runner capabilities
+
+A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary and its checkpoints. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
+
+```nan-api
+// module: sys
+
+pub fn Stepper.attach(mut self, runner: Runner)
+
+pub fn Cx.send_to[Q: Protocol](mut self, port: Port[Q], call: Encoded) fails RunnerError
+
+pub fn Cx.reply(mut self, request: u64, reply: Encoded) fails RunnerError
+
+pub fn Cx.publish(mut self, summary: Slice[u8]) fails RunnerError
+
+pub fn Cx.sync(mut self) fails RunnerError
+
+pub open struct Port[Q: Protocol] derives Copy, Send {
+} Port
+
+pub fn Port.of[M: Any and Send](cx: Cx[M], id: u64) -> Port[Q]
+
+pub fn Port.call[R: Send, E: Send](self, reply: Reply[R, E], call: Encoded, alloc: mem::Alloc) -> R fails CallError[E] uses wait
+```
+
+- A stepper starts without a runner capability, and a run of `host::Runner` never has one. `mut s.attach(runner)` attaches `runner` to the stepper in place of the one attached before. The operations of this section act through the runner capability attached to the stepper whose component context they receive, or through one whose handle is stale when none is.
+- `sys::Port[Q].of(cx, id)` gives the port numbered `id` of the runner capability of `cx`, through which a component calls Q's operations on whatever the holder wires to that number. A port holds its runner capability, so a keyed task's closure captures it.
+- `mut cx.send_to(port, call)` hands the holder a call of one of Q's operations, encoded as `sys::Wire[Q]` encodes it ([wire encoding](#wire-encoding)): it calls the `send_to` of the port's runner capability with the port's number, Q's protocol hash and the bytes and handles of `call`.
+- `mut cx.reply(request, reply)` answers the request the holder numbers `request`, calling `reply` with the bytes and handles of `reply`, the encoding of the request's reply. A holder gives the numbers of the requests it keeps pending through operations of the component's own protocol.
+- `mut cx.publish(summary)` gives the holder the encoding of the component's summary, calling `publish`, and `mut cx.sync()` asks the holder to keep a checkpoint of the component once it is quiescent, calling `sync`.
+- Each of these operations of a component context calls its method on the calling task, the handler's, and fails with the method's failure.
+- `port.call(reply, call, alloc)` calls the `call` of the port's runner capability with the port's number, Q's protocol hash, the bytes and handles of `call` and `alloc`, then decodes the encoding it gives as `reply.decode` does ([wire encoding](#wire-encoding)), drawing through `alloc`: it gives the request's result, or fails with `CallError.Failed` holding its failure or `CallError.Malformed` when the encoding does not decode. When the method fails, it fails with `CallError.Cancelled` holding a cancellation and with `CallError.Closed` holding `task::SendError.Closed` otherwise. It is a cancellation point, so a component calls it from a keyed task, posting what it gives to its intake.
+
+A mirror hands a store the values it is sent and fetches the store's value from a keyed task, both through port 1 of its runner capability:
+
+```nan
+pub protocol Store {
+    pub fn put(value: u32) limits pure
+    pub fn get() -> u32 limits pure
+} Store
+
+pub protocol Front {
+    pub fn copy(value: u32) limits traceless
+    pub fn fetch() limits traceless
+    fn fetched(value: u32) limits traceless
+} Front
+
+pub closed struct Env {
+    pub alloc: mem::Alloc
+} Env
+
+pub closed struct Mirror derives Encode {
+    pub last: u32
+} Mirror
+
+impl Mirror: sys::Component[Env, Front]
+
+pub fn Mirror.start(mut env: Env) -> Mirror = Mirror(last: 0)
+
+pub fn Mirror.copy(mut self, take value: u32, mut env: Env, mut cx: sys::Cx[Front]) {
+    var call = sys::Encoded.empty(env.alloc)
+    sys::Wire[Store].put(mut call, value)
+    let store = sys::Port[Store].of(cx, id: 1)
+    discard attempt mut cx.send_to(store, call)
+} Mirror.copy
+
+pub fn Mirror.fetch(mut self, mut env: Env, mut cx: sys::Cx[Front]) {
+    let store = sys::Port[Store].of(cx, id: 1)
+    let alloc = env.alloc
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Front]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let got = sys::Wire[Store].get(mut call)
+        let Ok(value) = attempt await store.call(got, call, alloc) else {
+            return
+        }
+        discard attempt await out.fetched(value)
+    })
+} Mirror.fetch
+
+fn Mirror.fetched(mut self, take value: u32, mut env: Env, mut cx: sys::Cx[Front]) {
+    self.last = value
+} Mirror.fetched
 ```
 
 ## Diagnostics

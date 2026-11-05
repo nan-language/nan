@@ -1,8 +1,9 @@
 //! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`,
 //! `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, in a
 //! test image through the sims, or through the kinds serving them, a machine's runtime serving
-//! no other file or network operation, capabilities denying every operation, files, listeners
-//! and connections, revocation, and the submission of io_uring operations.
+//! no other file or network operation, the operations of `sys::Runner` through the kinds
+//! serving it, capabilities denying every operation, files, listeners and connections,
+//! revocation, and the submission of io_uring operations.
 //!
 //! Each operation checks its capability's entry first, reading its state words through a
 //! snapshot and its text through a copy. An `Fs` entry's state is its directory's descriptor,
@@ -52,7 +53,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         .rsplit_once('.')
         .map_or(supply.path.as_str(), |(owner, _)| owner);
     match (owner, supply.member()) {
-        ("sys::Fs" | "sys::Net" | "sys::WallClock", "denied") => {
+        ("sys::Fs" | "sys::Net" | "sys::WallClock" | "sys::Runner", "denied") => {
             let handle = tables::denied(lo, fx);
             let sret = supply.sret.expect("a capability's address");
             fx.store(handle, sret, 0);
@@ -68,6 +69,9 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         ("sys::Stdio", "served") => {
             return served::served(lo, fx, supply, kind::STDIO, "StdioService");
         }
+        ("sys::Runner", "served") => {
+            return served::served(lo, fx, supply, kind::RUNNER, "RunnerService");
+        }
         _ => {}
     }
     match owner {
@@ -78,6 +82,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::Random" => random(lo, fx, supply),
         "sys::Log" => log(lo, fx, supply),
         "sys::Stdio" => stdio(lo, fx, supply),
+        "sys::Runner" => runner(lo, fx, supply),
         "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" => resource(lo, fx, supply),
         "sys::revocable" | "sys::Revoker" => revocation(lo, fx, supply),
         "host_platform::submit" => submit(lo, fx, supply),
@@ -679,6 +684,23 @@ fn stdio_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, words: &[Value
     } else {
         supply.done(lo, fx);
     }
+}
+
+/// An operation of a `Runner`: the method of its name of the kind serving it, its failure
+/// becoming the operation's.
+fn runner(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let words = checked(lo, fx, supply, supply.param(0).address());
+    let kind = (words[0], words[1]);
+    let called = served::call(
+        lo,
+        fx,
+        "RunnerService",
+        supply.member(),
+        kind,
+        &supply.params[1..],
+    );
+    supply.forward_failure(lo, fx, &called);
+    supply.ret(lo, fx, called.result);
 }
 
 /// Whether the state words of a `Log`, `Random` or `Stdio` entry are a served entry's, which

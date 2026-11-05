@@ -444,6 +444,7 @@ Each term links to its home, whose definition governs.
 | [platform registry](25-registries.md#platform-registries) | Registry binding stubs to handlers. |
 | [poisoning](11-errors-domains.md#poisoning) | State of a cown held by a domain that trapped. |
 | [policy](24-kernel.md#policies) | `hw::Policy` deciding where, in which order and how long a kernel's tasks run. |
+| [port](26-components.md#runner-capabilities) | `sys::Port[Q]` calling a protocol through a runner capability. |
 | [predicate](04-types.md#predicates) | `where` or `invariant` condition. |
 | [prefix viability](#guarantees) | Written text fixes all meaning: the first dead token is defined, and every prefix before it closes with typed holes and closers into a file the grammar derives. |
 | [premise](23-low-level.md#trusted-code) | What trusted code relies on. |
@@ -488,6 +489,7 @@ Each term links to its home, whose definition governs.
 | [run report](21-interpreter.md#run-reports) | Description of how an interpreter run ended. |
 | [run-time check](18-contracts.md#run-time-checks) | Trapping test of an obligation. |
 | [runner](26-components.md#runner) | `host::Runner[S]`, running a component. |
+| [runner capability](26-components.md#runner-capabilities) | `sys::Runner` a stepper's holder serves its component through. |
 | [safe code](23-low-level.md#safe-code) | Code outside trusted code. |
 | [scalar](04-types.md#scalars) | One of 14 built-in types. |
 | [schema hash](13-text-encode.md#schema-hashes) | Hash of an encoded structure. |

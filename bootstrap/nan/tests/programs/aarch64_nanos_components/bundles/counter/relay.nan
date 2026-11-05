@@ -1,0 +1,69 @@
+//! A relay calling the tally through the ports its runner wires: an addition through port 1, whose reply it awaits in a keyed task, the tally's current total through port 2, whose reply its runner holds pending, and a settlement it hands its runner for port 1 while handling a message.
+
+pub protocol Front {
+    pub fn relay(amount: u32) limits recorded
+    pub fn await_total() limits recorded
+    pub fn settle() limits traceless
+    fn relayed(total: u64) limits recorded
+    fn awaited(total: u64) limits recorded
+} Front
+
+pub closed struct RelayEnv {
+    pub log: sys::Log
+    pub alloc: mem::Alloc
+} RelayEnv
+
+impl RelayEnv: nanos::Environment
+
+pub fn RelayEnv.build(take world: nanos::World) -> RelayEnv = RelayEnv(log: world.log, alloc: world.alloc)
+
+pub closed struct Relay derives Encode {
+    pub last: u64
+} Relay
+
+impl Relay: sys::Component[RelayEnv, Front]
+
+pub fn Relay.start(mut env: RelayEnv) -> Relay = Relay(last: 0)
+
+pub fn Relay.relay(mut self, take amount: u32, mut env: RelayEnv, mut cx: sys::Cx[Front]) {
+    let counter = sys::Port[Counter].of(cx, id: 1)
+    let alloc = env.alloc
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Front]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let added = sys::Wire[Counter].add(mut call, amount)
+        let Ok(total) = attempt await counter.call(added, call, alloc) else {
+            return
+        }
+        discard attempt await out.relayed(total)
+    })
+} Relay.relay
+
+pub fn Relay.await_total(mut self, mut env: RelayEnv, mut cx: sys::Cx[Front]) {
+    let deferred = sys::Port[Counter].of(cx, id: 2)
+    let alloc = env.alloc
+    mut cx.spawn(key: 2, run: fn(out: sys::Outbox[Front]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let asked = sys::Wire[Counter].current(mut call)
+        let Ok(total) = attempt await deferred.call(asked, call, alloc) else {
+            return
+        }
+        discard attempt await out.awaited(total)
+    })
+} Relay.await_total
+
+pub fn Relay.settle(mut self, mut env: RelayEnv, mut cx: sys::Cx[Front]) {
+    var call = sys::Encoded.empty(env.alloc)
+    sys::Wire[Counter].settle(mut call)
+    let counter = sys::Port[Counter].of(cx, id: 1)
+    discard attempt mut cx.send_to(counter, call)
+} Relay.settle
+
+fn Relay.relayed(mut self, take total: u64, mut env: RelayEnv, mut cx: sys::Cx[Front]) {
+    self.last = total
+    env.log.info("relayed", value: total)
+} Relay.relayed
+
+fn Relay.awaited(mut self, take total: u64, mut env: RelayEnv, mut cx: sys::Cx[Front]) {
+    self.last = total
+    env.log.info("awaited", value: total)
+} Relay.awaited

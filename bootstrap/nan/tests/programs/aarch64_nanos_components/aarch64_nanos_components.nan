@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a missing component and an Env the kernel's grants cannot build.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a missing component and an Env the kernel's grants cannot build, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes and a sync it asks for.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -17,22 +17,33 @@ const NAME_BYTES: usize = 56
 /// The public key of the seed of 32 bytes 7, with which the harness signs the bundles.
 const SIGNER: Slice[u8] = b"\xEA\x4A\x6C\x63\xE2\x9C\x52\x0A\xBE\xF5\x50\x7B\x13\x2E\xC5\xF9\x95\x47\x76\xAE\xBE\xBE\x7B\x92\x42\x1E\xEA\x69\x14\x46\xD2\x2C"
 
-/// The tally's protocol as the kernel declares it, and another protocol, whose hash the tally refuses.
+/// The tally's protocol as the kernel declares it, another protocol, whose hash the tally refuses,
+/// and the relay's protocol as the kernel declares it.
 pub protocol Counter {
     pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn divide(by: u32) -> u64 limits pure
+    pub fn current() -> u64 fails refusals::Refused limits pure
+    pub fn later(request: u64) limits pure
+    pub fn settle() limits traceless
 } Counter
 
 pub protocol Gauge {
     pub fn add(amount: u32) limits pure
 } Gauge
 
+pub protocol Front {
+    pub fn relay(amount: u32) limits recorded
+    pub fn await_total() limits recorded
+    pub fn settle() limits traceless
+} Front
+
 /// The tally's state, as the kernel declares it.
 pub closed struct Tally derives Encode {
     pub total: u64
     pub ticks: u64
     pub suspended: bool
+    pub pending: u64
 } Tally
 
 /// The serial port serving a component's log, random source and standard streams.
@@ -233,26 +244,27 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
 
 fn serve(bundle: sys::load::Bundle, grants: Grants) fails nanos::InstanceError uses wait {
     let load = bundle.share()
-    let Some(checkpoint) = try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
+    let Some(checkpoint) = try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
         return try await started(take instance, grants)
     }) else {
         stop(text: "no tally\n")
     }
-    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: Some(take checkpoint), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await restored(take instance, grants)
     })
-    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await trapped(take instance, grants)
     })
-    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: false), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: false), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         say(text: "unbuilt ")
         report(try await take instance.end(), alloc: grants.alloc)
     })
-    let missing = try await nanos::hold(load, component: "Gauge", world: granted(grants, clocked: true), checkpoint: None, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    let missing = try await nanos::hold(load, component: "Gauge", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         discard try await take instance.end()
     })
     say(text: "gauge held ")
     say_flag(missing.is_some())
+    try await ported(load, grants)
 } serve
 
 /// Starts the tally, calls it, asks after its health through the system interfaces and gives a
@@ -388,6 +400,233 @@ fn called(mut instance: nanos::Instance, hash: sys::ProtocolHash, take request: 
     })
     return reply
 } called
+
+/// The runner the kernel serves its instances, recording 0 for the tally and 1 for the relay: it
+/// carries each call made through a port to the kernel task holding the instances, keeps each
+/// call sent through a port and each reply given, writes each published total and counts syncs.
+struct Wired {
+} Wired
+
+impl Wired: sys::Kind[Wiring, u64]
+
+impl Wired: sys::RunnerService
+
+struct Wiring {
+    alloc: mem::Alloc
+    forwarding: task::Sender[Forwarded]
+    sent: mem::OnceMap[u64, mem::Bytes]
+    sends: core::atomic::AtomicU64
+    replies: mem::OnceMap[u64, mem::Bytes]
+    syncs: core::atomic::AtomicU64
+} Wiring
+
+/// A call made through a port, with the sender of its reply.
+struct Forwarded {
+    port: u64
+    hash: sys::ProtocolHash
+    request: sys::Encoded
+    answer: task::Sender[sys::Encoded]
+} Forwarded
+
+fn Wired.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: Wiring, record: u64) {
+        let Some(at) = state.sends.fetch_add(1) else {
+            return
+        }
+        discard state.sent.insert(at, value: copied(bytes, alloc: state.alloc))
+    })
+} Wired.send_to
+
+fn Wired.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
+    let Some(forwarding) = sys::reach(self, body: fn(state: Wiring, record: u64) => state.forwarding.split()) else {
+        fail sys::RunnerError.Unknown
+    }
+    var request = sys::Encoded(bytes: copied(bytes, alloc), handles: mem::List[sys::Handle].empty(alloc))
+    for handle in handles {
+        mut request.handles.push(handle)
+    }
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[sys::Encoded].bounded(1, alloc)
+    match attempt await forwarding.send(Forwarded(port: port, hash: hash, request: take request, answer: take answer)) {
+        Ok(_) => {}
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => fail sys::RunnerError.Unknown
+    }
+    var receiver = answers
+    let Some(reply) = try await mut receiver.receive() else {
+        fail sys::RunnerError.Unknown
+    }
+    return reply
+} Wired.call
+
+fn Wired.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: Wiring, record: u64) {
+        discard state.replies.insert(request, value: copied(bytes, alloc: state.alloc))
+    })
+} Wired.reply
+
+fn Wired.publish(self, summary: Slice[u8]) limits stack 4_096 {
+    let decoded = sys::reach(self, body: fn(state: Wiring, record: u64) -> Result[u64, core::DecodeError] {
+        let copy = copied(summary, alloc: state.alloc)
+        return attempt mem::wire::Codec[u64].decode(Untrusted.of(copy.view()), alloc: state.alloc)
+    })
+    let Some(Ok(total)) = decoded else {
+        say(text: "published otherwise\n")
+        return
+    }
+    say(text: "published total ")
+    say_number(total)
+    say(text: "\n")
+} Wired.publish
+
+fn Wired.sync(self) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: Wiring, record: u64) => state.syncs.fetch_add(1))
+} Wired.sync
+
+fn copied(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copied
+
+/// The copy of the bytes the runner the kernel serves keeps under `key`, among the replies given
+/// when `replies` and among the calls sent otherwise, none when it keeps none.
+fn kept(runner: Wired, key: u64, replies: bool) -> Option[mem::Bytes] {
+    let found = sys::reach(runner, body: fn(state: Wiring, record: u64) -> Option[mem::Bytes] {
+        if replies {
+            return copy_of(state.replies.get(key), alloc: state.alloc)
+        }
+        return copy_of(state.sent.get(key), alloc: state.alloc)
+    })
+    let Some(Some(bytes)) = found else {
+        return None
+    }
+    return Some(take bytes)
+} kept
+
+fn copy_of(held: Option[mem::Bytes], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Some(bytes) = held else {
+        return None
+    }
+    return Some(copied(bytes.view(), alloc))
+} copy_of
+
+/// Holds the tally and, from a task of its own, a relay calling it through the ports of a runner
+/// the kernel serves both, writing what they exchange through it, then ends both.
+fn ported(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses wait {
+    let task::Channel(sender: forwarding, receiver: forwarded) = task::Channel[Forwarded].bounded(1, alloc: grants.alloc)
+    let wiring = sys::Minter[Wired, Wiring, u64].of(Wiring(alloc: grants.alloc, forwarding: take forwarding, sent: mem::OnceMap[u64, mem::Bytes].empty(1, alloc: grants.alloc), sends: core::atomic::AtomicU64.of(0), replies: mem::OnceMap[u64, mem::Bytes].empty(2, alloc: grants.alloc), syncs: core::atomic::AtomicU64.of(0)), alloc: grants.alloc)
+    defer take wiring.close()
+    let wired = wiring.mint(0)
+    let Ok(tallied) = attempt sys::Runner.served(wiring.mint(0)) else {
+        stop(text: "unserved\n")
+    }
+    let Ok(relaying) = attempt sys::Runner.served(wiring.mint(1)) else {
+        stop(text: "unserved\n")
+    }
+    var calls = Some(take forwarded)
+    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: tallied, exec: grants.exec, alloc: grants.alloc, body: fn[mut calls](take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        var tally = instance
+        defer take tally.abandon()
+        try await task::scope(grants.exec, body: fn[mut tally, mut calls](s: task::Scope) fails nanos::InstanceError uses wait {
+            let Some(receiver) = mut calls.extract() else {
+                return
+            }
+            let task::Channel(sender: cues, receiver: cued) = task::Channel[u8].bounded(1, alloc: grants.alloc)
+            let shared = load.share()
+            let relay = s.spawn(fn[take shared, take cues]() fails nanos::InstanceError uses wait limits stack 131_072 {
+                discard try await nanos::hold(shared, component: "Relay", world: granted(grants, clocked: false), checkpoint: None, runner: relaying, exec: grants.exec, alloc: grants.alloc, body: fn(take relay: nanos::Instance) fails nanos::InstanceError uses wait {
+                    try await relays(take relay, cues, grants)
+                })
+                discard shared
+            })
+            try await tallies(mut tally, forwarded: take receiver, take cued, wired, grants)
+            try await take relay.join()
+        })
+        undefer tally
+        say(text: "tally ")
+        report(try await take tally.end(), alloc: grants.alloc)
+    })
+} ported
+
+/// Has the relay call the tally through port 1, answered at once, then through port 2, whose call
+/// the tally's holder holds pending, then send the settlement that has the tally reply to it,
+/// cueing the tally's holder once it is sent, and ends the relay once it has the reply.
+fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) fails nanos::InstanceError uses wait {
+    var relaying = relay
+    defer take relaying.abandon()
+    var relayed = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Front].relay(mut relayed, amount: 2)
+    discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take relayed, grants)
+    say(text: "relay keyed ")
+    say_number(u64.widen(try await mut relaying.start_keyed()))
+    say(text: "\n")
+    try await relaying.incoming()
+    discard try await mut relaying.step()
+    var awaiting = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Front].await_total(mut awaiting)
+    discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take awaiting, grants)
+    discard try await mut relaying.start_keyed()
+    var settling = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Front].settle(mut settling)
+    discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take settling, grants)
+    discard attempt await cues.send(1)
+    try await relaying.incoming()
+    discard try await mut relaying.step()
+    undefer relaying
+    say(text: "relay ")
+    match try await take relaying.end() {
+        nanos::Ended.Returned(_) => say(text: "returned\n")
+        else => say(text: "otherwise\n")
+    }
+} relays
+
+/// Serves the relay's calls through ports on the tally: the first at once, the second held
+/// pending as the tally's request 1 until the relay's cue says the settlement it sent through
+/// port 1 waits, which the tally then handles, replying to the request, publishing its total and
+/// asking to sync, which writes its state.
+fn tallies(mut tally: nanos::Instance, take forwarded: task::Receiver[Forwarded], take cued: task::Receiver[u8], wired: Wired, grants: Grants) fails nanos::InstanceError uses wait {
+    var receiver = forwarded
+    var cues = cued
+    let Some(addition) = try await mut receiver.receive() else {
+        stop(text: "unforwarded\n")
+    }
+    try await carried(mut tally, forwarded: take addition, grants)
+    let Some(pending) = try await mut receiver.receive() else {
+        stop(text: "unforwarded\n")
+    }
+    let Forwarded(port: port, hash: _, request: _, answer: waiting) = pending
+    say(text: "pending port ")
+    say_number(port)
+    say(text: "\n")
+    var later = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Counter].later(mut later, request: 1)
+    discard try await called(mut tally, hash: sys::Wire[Counter].hash(), request: take later, grants)
+    discard try await mut cues.receive()
+    let Some(sent) = kept(wired, key: 0, replies: false) else {
+        stop(text: "unsent\n")
+    }
+    discard try await called(mut tally, hash: sys::Wire[Counter].hash(), request: sys::Encoded(bytes: take sent, handles: mem::List[sys::Handle].empty(grants.alloc)), grants)
+    let synced = sys::reach(wired, body: fn(state: Wiring, record: u64) => state.syncs.load())
+    if synced == Some(1) {
+        let checkpoint = try await tally.checkpoint()
+        say(text: "synced ")
+        report(nanos::Ended.Returned(take checkpoint), alloc: grants.alloc)
+    }
+    let Some(replied) = kept(wired, key: 1, replies: true) else {
+        stop(text: "unreplied\n")
+    }
+    discard attempt await waiting.send(sys::Encoded(bytes: take replied, handles: mem::List[sys::Handle].empty(grants.alloc)))
+} tallies
+
+/// Serves a call the relay made through a port by calling the tally with it, giving the tally's
+/// reply to the relay's wait, which ends without one when the tally gives none.
+fn carried(mut tally: nanos::Instance, take forwarded: Forwarded, grants: Grants) fails nanos::InstanceError uses wait {
+    let Forwarded(port: _, hash: hash, request: request, answer: answer) = forwarded
+    let Ok(reply) = try await called(mut tally, hash, take request, grants) else {
+        return
+    }
+    discard attempt await answer.send(take reply)
+} carried
 
 /// The total an addition's reply gives, zero when it gives none.
 fn added(reply: sys::Reply[u64, refusals::Refused], given: Result[sys::Encoded, sys::CallError[Never]], grants: Grants) -> u64 {

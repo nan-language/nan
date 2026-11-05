@@ -24,6 +24,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "start" => open(lo, fx, supply, false),
         "resume" => open(lo, fx, supply, true),
+        "attach" => {
+            let record = record(fx);
+            let handle = fx.load(PTR, supply.param(1).address(), 0);
+            fx.store(handle, record, runner::RUNNER);
+            supply.done(lo, fx);
+        }
         "outbox" => {
             let record = record(fx);
             let inbox = fx.load(PTR, record, runner::INBOX);

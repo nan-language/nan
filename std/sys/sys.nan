@@ -195,6 +195,37 @@ pub interface NetService {
     fn release(self, listener: u64) limits stack 4_096
 } NetService
 
+pub open struct Runner {
+} Runner
+
+pub fn Runner.denied() -> Runner
+
+pub fn Runner.served[S: RunnerService and Capability and Copy](service: S) -> Runner fails Revoked
+
+pub closed enum RunnerError derives Render {
+    Unknown
+    Revoked(Revoked) from
+    Cancelled(task::Cancelled) from
+} RunnerError
+
+pub interface RunnerService {
+    fn send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
+    fn call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails RunnerError uses wait limits stack 4_096
+    fn reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
+    fn publish(self, summary: Slice[u8]) fails RunnerError limits stack 4_096
+    fn sync(self) fails RunnerError limits stack 4_096
+} RunnerService
+
+fn Runner.send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
+
+fn Runner.call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails RunnerError uses wait
+
+fn Runner.reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
+
+fn Runner.publish(self, summary: Slice[u8]) fails RunnerError
+
+fn Runner.sync(self) fails RunnerError
+
 pub closed enum Revoked derives Copy, Eq, Hash, Render {
     Stale
 } Revoked
@@ -215,6 +246,8 @@ impl Random: Capability
 impl Log: Capability
 
 impl Stdio: Capability
+
+impl Runner: Capability
 
 impl mem::Alloc: Capability
 
@@ -265,6 +298,44 @@ pub fn Cx.spawn(mut self, key: u64, take run: task fn(out: Outbox[M]) fails task
 
 pub fn Cx.cancel(mut self, key: u64)
 
+pub fn Cx.send_to[Q: Protocol](mut self, port: Port[Q], call: Encoded) fails RunnerError {
+    try port.runner.send_to(port.id, hash: Wire[Q].hash(), bytes: call.bytes.view(), handles: call.handles.view())
+} Cx.send_to
+
+pub fn Cx.reply(mut self, request: u64, reply: Encoded) fails RunnerError {
+    try self.runner().reply(request, bytes: reply.bytes.view(), handles: reply.handles.view())
+} Cx.reply
+
+pub fn Cx.publish(mut self, summary: Slice[u8]) fails RunnerError {
+    try self.runner().publish(summary)
+} Cx.publish
+
+pub fn Cx.sync(mut self) fails RunnerError {
+    try self.runner().sync()
+} Cx.sync
+
+/// The runner capability attached to the stepper whose component context this is, a stale one
+/// when none is.
+fn Cx.runner(self) -> Runner
+
+pub open struct Port[Q: Protocol] derives Copy, Send {
+    runner: Runner
+    id: u64
+} Port
+
+pub fn Port.of[M: Any and Send](cx: Cx[M], id: u64) -> Port[Q] {
+    return Port(runner: cx.runner(), id: id)
+} Port.of
+
+pub fn Port.call[R: Send, E: Send](self, reply: Reply[R, E], call: Encoded, alloc: mem::Alloc) -> R fails CallError[E] uses wait {
+    let answer = match attempt await self.runner.call(self.id, hash: Wire[Q].hash(), bytes: call.bytes.view(), handles: call.handles.view(), alloc) {
+        Ok(encoded) => encoded
+        Err(RunnerError.Cancelled(cancelled)) => fail CallError.Cancelled(take cancelled)
+        else => fail CallError.Closed(task::SendError.Closed)
+    }
+    return try reply.decode(Untrusted.of(answer.bytes.view()), handles: answer.handles.view(), alloc)
+} Port.call
+
 pub open struct Outbox[M: Any] {
 } Outbox
 
@@ -281,6 +352,8 @@ pub closed struct Stopped[S, Env: Any] {
 pub fn Stepper.start(take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
 
 pub fn Stepper.resume(take state: S, take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
+
+pub fn Stepper.attach(mut self, runner: Runner)
 
 pub fn Stepper.outbox(self) -> Outbox[M]
 
@@ -661,6 +734,139 @@ fn Line.reset(self, conn: u64) limits stack 4_096 {
 fn Line.release(self, listener: u64) limits stack 4_096 {
     self.counted()
 } Line.release
+
+/// A runner counting what reaches it: the port of each send, a thousand per number of a reply, a
+/// hundred per byte of a summary and ten thousand per sync, answering each call with its port.
+struct Board {
+} Board
+
+impl Board: Kind[core::atomic::AtomicU64, u64]
+
+impl Board: RunnerService
+
+fn Board.counted(self, amount: u64) {
+    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(amount))
+} Board.counted
+
+fn Board.send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) limits stack 4_096 {
+    self.counted(port)
+} Board.send_to
+
+fn Board.call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded limits stack 4_096 {
+    var reply = Encoded.empty(alloc)
+    let answer: Result[u64, Full] = Ok(port)
+    mem::wire::Codec[Result[u64, Full]].encode(answer, out: mut reply.bytes)
+    return reply
+} Board.call
+
+fn Board.reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) limits stack 4_096 {
+    self.counted(request * 1_000)
+} Board.reply
+
+fn Board.publish(self, summary: Slice[u8]) limits stack 4_096 {
+    self.counted(u64.widen(summary.len()) * 100)
+} Board.publish
+
+fn Board.sync(self) limits stack 4_096 {
+    self.counted(10_000)
+} Board.sync
+
+/// What a relayer asks of its runner.
+protocol Relay {
+    pub fn send(port: u64) limits traceless
+    pub fn answer(request: u64) limits traceless
+    pub fn publish() limits traceless
+    pub fn sync() limits traceless
+    pub fn ask(port: u64) limits traceless
+    fn answered(total: u64) limits traceless
+} Relay
+
+struct RelayEnv {
+    alloc: mem::Alloc
+} RelayEnv
+
+/// A component acting through its runner, counting the operations its runner refused and keeping
+/// the last total a call through a port answered.
+struct Relayer derives Encode {
+    refused: u64
+    total: u64
+} Relayer
+
+impl Relayer: Component[RelayEnv, Relay]
+
+fn Relayer.start(mut env: RelayEnv) -> Relayer = Relayer(refused: 0, total: 0)
+
+fn Relayer.send(mut self, take port: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    var call = Encoded.empty(env.alloc)
+    Wire[Meter].clear(mut call)
+    let meter = Port[Meter].of(cx, id: port)
+    mut self.counted(attempt mut cx.send_to(meter, call))
+} Relayer.send
+
+fn Relayer.answer(mut self, take request: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    mut self.counted(attempt mut cx.reply(request, reply: Encoded.empty(env.alloc)))
+} Relayer.answer
+
+fn Relayer.publish(mut self, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    mut self.counted(attempt mut cx.publish(b"ab"))
+} Relayer.publish
+
+fn Relayer.sync(mut self, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    mut self.counted(attempt mut cx.sync())
+} Relayer.sync
+
+fn Relayer.ask(mut self, take port: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    let meter = Port[Meter].of(cx, id: port)
+    let alloc = env.alloc
+    mut cx.spawn(key: 1, run: fn(out: Outbox[Relay]) fails task::Cancelled uses wait {
+        var call = Encoded.empty(alloc)
+        let added = Wire[Meter].add(mut call, amount: 1)
+        let Ok(total) = attempt await meter.call(added, call, alloc) else {
+            return
+        }
+        discard attempt await out.answered(total)
+    })
+} Relayer.ask
+
+fn Relayer.answered(mut self, take total: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    self.total = total
+} Relayer.answered
+
+fn Relayer.counted(mut self, outcome: Result[Unit, RunnerError]) {
+    if outcome.is_err() {
+        self.refused += 1
+    }
+} Relayer.counted
+
+/// The count a board reaches, or the refusals of a relayer whose runner it does not serve, once a
+/// relayer handles `message` and its keyed tasks end, and the relayer's last state.
+struct Relayed {
+    count: u64
+    last: Relayer
+} Relayed
+
+fn relayed(world: host::World, take message: Relay, attached: bool) -> Relayed fails task::Cancelled uses wait {
+    let minter = Minter[Board, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc: world.alloc)
+    defer take minter.close()
+    let counter = minter.mint(0)
+    var stepper = try Stepper[Relayer, RelayEnv, Relay].start(RelayEnv(alloc: world.alloc), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    if attached {
+        let Ok(runner) = attempt Runner.served(minter.mint(0)) else {
+            return Relayed(count: 0, last: Relayer(refused: 0, total: 0))
+        }
+        mut stepper.attach(runner)
+    }
+    mut stepper.deliver(take message)
+    discard mut stepper.start_keyed()
+    while try await stepper.ready() {
+        discard mut stepper.step()
+    }
+    undefer stepper
+    let Stopped(state: last, env: _) = try await take stepper.end()
+    let count = reach(counter, body: tally_count).value_or(0)
+    return Relayed(count: count, last: take last)
+} relayed
 
 fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0, suspended: false)
 
@@ -1827,3 +2033,65 @@ test served_networks_call_their_kind for Net.served {
     }
     expect elsewhere and refused and calls == Some(6)
 } served_networks_call_their_kind
+
+test denied_runners_refuse_every_operation for Runner.denied {
+    let world = testing::world()
+    var stepper = try Stepper[Relayer, RelayEnv, Relay].start(RelayEnv(alloc: world.alloc), exec: world.exec, alloc: world.alloc)
+    mut stepper.attach(Runner.denied())
+    mut stepper.deliver(Relay.sync())
+    mut stepper.deliver(Relay.publish())
+    let last = try await take stepper.end()
+    expect last.state.refused == 2
+} denied_runners_refuse_every_operation
+
+test runners_of_stale_kinds_are_not_served for Runner.served {
+    let world = testing::world()
+    let minter = Minter[Board, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc: world.alloc)
+    let board = minter.mint(0)
+    take minter.close()
+    let Err(Revoked.Stale) = attempt Runner.served(board) else {
+        expect false
+        return
+    }
+} runners_of_stale_kinds_are_not_served
+
+test unattached_steppers_refuse_runner_operations for Stepper.attach {
+    let world = testing::world()
+    let attached = try await relayed(world, message: Relay.sync(), attached: true)
+    let unattached = try await relayed(world, message: Relay.sync(), attached: false)
+    expect attached.count == 10_000 and attached.last.refused == 0
+    expect unattached.count == 0 and unattached.last.refused == 1
+} unattached_steppers_refuse_runner_operations
+
+test sends_reach_the_runner_with_their_port for Cx.send_to {
+    let sent = try await relayed(testing::world(), message: Relay.send(port: 3), attached: true)
+    expect sent.count == 3 and sent.last.refused == 0
+} sends_reach_the_runner_with_their_port
+
+test ports_keep_their_number for Port.of {
+    let sent = try await relayed(testing::world(), message: Relay.send(port: 7), attached: true)
+    expect sent.count == 7
+} ports_keep_their_number
+
+test replies_reach_the_runner_with_their_request for Cx.reply {
+    let answered = try await relayed(testing::world(), message: Relay.answer(request: 5), attached: true)
+    expect answered.count == 5_000
+} replies_reach_the_runner_with_their_request
+
+test summaries_reach_the_runner for Cx.publish {
+    let published = try await relayed(testing::world(), message: Relay.publish(), attached: true)
+    expect published.count == 200
+} summaries_reach_the_runner
+
+test syncs_reach_the_runner for Cx.sync {
+    let synced = try await relayed(testing::world(), message: Relay.sync(), attached: true)
+    expect synced.count == 10_000
+} syncs_reach_the_runner
+
+test calls_through_ports_decode_the_runners_reply for Port.call {
+    let world = testing::world()
+    let asked = try await relayed(world, message: Relay.ask(port: 4), attached: true)
+    let unattached = try await relayed(world, message: Relay.ask(port: 4), attached: false)
+    expect asked.last.total == 4
+    expect unattached.last.total == 0
+} calls_through_ports_decode_the_runners_reply

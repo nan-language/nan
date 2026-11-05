@@ -199,7 +199,7 @@ const POINTERS: [&str; 18] = [
 ];
 
 /// The base types that are generational handles, as capability kinds are.
-const HANDLES: [&str; 13] = [
+const HANDLES: [&str; 14] = [
     "mem::Alloc",
     "mem::Heap",
     "mem::Handle",
@@ -212,6 +212,7 @@ const HANDLES: [&str; 13] = [
     "sys::Random",
     "sys::Log",
     "sys::Stdio",
+    "sys::Runner",
     "sys::Outbox",
 ];
 

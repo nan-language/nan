@@ -15261,7 +15261,8 @@ const TEXT_NANOS_NANOS: Str =
     \\    discard attempt mut cx.sync()
     \\} Count.sync
     \\
-    \\/// A runner counting the syncs of the instances it serves and refusing every call.
+    \\/// A runner counting the syncs of the instances it serves, refusing every call and holding no
+    \\/// capability.
     \\struct Syncs {
     \\} Syncs
     \\
@@ -15285,6 +15286,13 @@ const TEXT_NANOS_NANOS: Str =
     \\fn Syncs.sync(self) limits stack 4_096 {
     \\    discard sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
     \\} Syncs.sync
+    \\
+    \\fn Syncs.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    \\    fail sys::RunnerError.Unknown
+    \\} Syncs.capability
+    \\
+    \\fn Syncs.drop_capability(self, id: u64) limits stack 4_096 {
+    \\} Syncs.drop_capability
     \\
     \\test instances_answer_calls_and_end_with_their_state for Hosted.run {
     \\    let world = testing::world()
@@ -17952,6 +17960,8 @@ const TEXT_SYS_SYS: Str =
     \\    fn reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
     \\    fn publish(self, summary: Slice[u8]) fails RunnerError limits stack 4_096
     \\    fn sync(self) fails RunnerError limits stack 4_096
+    \\    fn capability(self, id: u64) -> Handle fails RunnerError limits stack 4_096
+    \\    fn drop_capability(self, id: u64) fails RunnerError limits stack 4_096
     \\} RunnerService
     \\
     \\fn Runner.send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
@@ -17963,6 +17973,10 @@ const TEXT_SYS_SYS: Str =
     \\fn Runner.publish(self, summary: Slice[u8]) fails RunnerError
     \\
     \\fn Runner.sync(self) fails RunnerError
+    \\
+    \\fn Runner.capability(self, id: u64) -> Handle fails RunnerError
+    \\
+    \\fn Runner.drop_capability(self, id: u64) fails RunnerError
     \\
     \\pub closed enum Revoked derives Copy, Eq, Hash, Render {
     \\    Stale
@@ -18052,9 +18066,28 @@ const TEXT_SYS_SYS: Str =
     \\    try self.runner().sync()
     \\} Cx.sync
     \\
+    \\pub fn Cx.capability[C: Capability and Copy](mut self, id: CapabilityId[C]) -> C fails RunnerError {
+    \\    let handle = try self.runner().capability(id.id)
+    \\    let Some(capability) = id.of_handle(handle) else {
+    \\        fail RunnerError.Unknown
+    \\    }
+    \\    return capability
+    \\} Cx.capability
+    \\
+    \\pub fn Cx.drop_capability[C: Capability and Copy](mut self, id: CapabilityId[C]) fails RunnerError {
+    \\    try self.runner().drop_capability(id.id)
+    \\} Cx.drop_capability
+    \\
     \\/// The runner capability attached to the stepper whose component context this is, a stale one
     \\/// when none is.
     \\fn Cx.runner(self) -> Runner
+    \\
+    \\pub closed struct CapabilityId[C: Capability and Copy] derives Copy, Eq, Encode {
+    \\    pub id: u64
+    \\} CapabilityId
+    \\
+    \\/// The capability `handle` holds, none when its handle hash is not C's.
+    \\fn CapabilityId.of_handle(self, handle: Handle) -> Option[C]
     \\
     \\pub open struct Port[Q: Protocol] derives Copy, Send {
     \\    runner: Runner
@@ -18169,6 +18202,8 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub open struct Handle {
     \\} Handle
+    \\
+    \\pub fn Handle.of[C: Capability and Copy](capability: C) -> Handle
     \\
     \\pub closed struct Encoded {
     \\    pub bytes: mem::Bytes
@@ -18474,7 +18509,9 @@ const TEXT_SYS_SYS: Str =
     \\} Line.release
     \\
     \\/// A runner counting what reaches it: the port of each send, a thousand per number of a reply, a
-    \\/// hundred per byte of a summary and ten thousand per sync, answering each call with its port.
+    \\/// hundred per byte of a summary, ten thousand per sync and a hundred thousand per number of a
+    \\/// dropped capability, answering each call with its port and holding itself as each capability
+    \\/// but the one numbered 0.
     \\struct Board {
     \\} Board
     \\
@@ -18509,6 +18546,17 @@ const TEXT_SYS_SYS: Str =
     \\    self.counted(10_000)
     \\} Board.sync
     \\
+    \\fn Board.capability(self, id: u64) -> Handle fails RunnerError limits stack 4_096 {
+    \\    if id == 0 {
+    \\        fail RunnerError.Unknown
+    \\    }
+    \\    return Handle.of(self)
+    \\} Board.capability
+    \\
+    \\fn Board.drop_capability(self, id: u64) limits stack 4_096 {
+    \\    self.counted(id * 100_000)
+    \\} Board.drop_capability
+    \\
     \\/// What a relayer asks of its runner.
     \\protocol Relay {
     \\    pub fn send(port: u64) limits traceless
@@ -18516,6 +18564,8 @@ const TEXT_SYS_SYS: Str =
     \\    pub fn publish() limits traceless
     \\    pub fn sync() limits traceless
     \\    pub fn ask(port: u64) limits traceless
+    \\    pub fn hold(id: u64, typed: bool) limits traceless
+    \\    pub fn release(id: u64) limits traceless
     \\    fn answered(total: u64) limits traceless
     \\} Relay
     \\
@@ -18565,6 +18615,27 @@ const TEXT_SYS_SYS: Str =
     \\        discard attempt await out.answered(total)
     \\    })
     \\} Relayer.ask
+    \\
+    \\/// Takes the capability numbered `id` as a board when `typed`, as a clock otherwise, counting 7
+    \\/// through a board it takes.
+    \\fn Relayer.hold(mut self, take id: u64, take typed: bool, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    \\    if typed {
+    \\        let Ok(board) = attempt mut cx.capability(CapabilityId[Board](id: id)) else {
+    \\            self.refused += 1
+    \\            return
+    \\        }
+    \\        board.counted(7)
+    \\        return
+    \\    }
+    \\    let Ok(_) = attempt mut cx.capability(CapabilityId[Clock](id: id)) else {
+    \\        self.refused += 1
+    \\        return
+    \\    }
+    \\} Relayer.hold
+    \\
+    \\fn Relayer.release(mut self, take id: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    \\    mut self.counted(attempt mut cx.drop_capability(CapabilityId[Board](id: id)))
+    \\} Relayer.release
     \\
     \\fn Relayer.answered(mut self, take total: u64, mut env: RelayEnv, mut cx: Cx[Relay]) {
     \\    self.total = total
@@ -19833,6 +19904,29 @@ const TEXT_SYS_SYS: Str =
     \\    expect asked.last.total == 4
     \\    expect unattached.last.total == 0
     \\} calls_through_ports_decode_the_runners_reply
+    \\
+    \\test capabilities_come_back_as_their_type for Cx.capability {
+    \\    let world = testing::world()
+    \\    let held = try await relayed(world, message: Relay.hold(id: 1, typed: true), attached: true)
+    \\    let unknown = try await relayed(world, message: Relay.hold(id: 0, typed: true), attached: true)
+    \\    let mistyped = try await relayed(world, message: Relay.hold(id: 1, typed: false), attached: true)
+    \\    expect held.count == 7 and held.last.refused == 0
+    \\    expect unknown.count == 0 and unknown.last.refused == 1
+    \\    expect mistyped.count == 0 and mistyped.last.refused == 1
+    \\} capabilities_come_back_as_their_type
+    \\
+    \\test dropped_capabilities_reach_the_runner for Cx.drop_capability {
+    \\    let dropped = try await relayed(testing::world(), message: Relay.release(id: 2), attached: true)
+    \\    expect dropped.count == 200_000 and dropped.last.refused == 0
+    \\} dropped_capabilities_reach_the_runner
+    \\
+    \\test handles_hold_their_capability_and_its_type for Handle.of {
+    \\    let world = testing::world()
+    \\    let handle = Handle.of(world.clock)
+    \\    let clock = CapabilityId[Clock](id: 0).of_handle(handle)
+    \\    let log = CapabilityId[Log](id: 0).of_handle(handle)
+    \\    expect clock.is_some() and log.is_none()
+    \\} handles_hold_their_capability_and_its_type
     \\
 
 const TEXT_TASK_PACKAGE: Str =

@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes and a sync it asks for.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes, a sync it asks for, and a clock the runner holds for the relay as a capability by number until the relay drops it.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -40,6 +40,7 @@ pub protocol Front {
     pub fn relay(amount: u32) limits recorded
     pub fn await_total() limits recorded
     pub fn settle() limits traceless
+    pub fn clocked() limits recorded
 } Front
 
 /// The tally's state, as the kernel declares it.
@@ -486,7 +487,8 @@ fn called(mut instance: nanos::Instance, hash: sys::ProtocolHash, take request: 
 
 /// The runner the kernel serves its instances, recording 0 for the tally and 1 for the relay: it
 /// carries each call made through a port to the kernel task holding the instances, keeps each
-/// call sent through a port and each reply given, writes each published total and counts syncs.
+/// call sent through a port and each reply given, writes each published total, counts syncs, and
+/// holds the kernel's clock as capability 7 until it is dropped.
 struct Wired {
 } Wired
 
@@ -501,6 +503,8 @@ struct Wiring {
     sends: core::atomic::AtomicU64
     replies: mem::OnceMap[u64, mem::Bytes]
     syncs: core::atomic::AtomicU64
+    clock: sys::Clock
+    dropped: core::atomic::AtomicU64
 } Wiring
 
 /// A call made through a port, with the sender of its reply.
@@ -565,6 +569,26 @@ fn Wired.sync(self) limits stack 4_096 {
     discard sys::reach(self, body: fn(state: Wiring, record: u64) => state.syncs.fetch_add(1))
 } Wired.sync
 
+fn Wired.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    let held = sys::reach(self, body: fn(state: Wiring, record: u64) -> Option[sys::Clock] {
+        if id != 7 or state.dropped.load() != 0 {
+            return None
+        }
+        return Some(state.clock)
+    })
+    let Some(Some(clock)) = held else {
+        fail sys::RunnerError.Unknown
+    }
+    return sys::Handle.of(clock)
+} Wired.capability
+
+fn Wired.drop_capability(self, id: u64) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: Wiring, record: u64) => state.dropped.fetch_add(1))
+    say(text: "dropped capability ")
+    say_number(id)
+    say(text: "\n")
+} Wired.drop_capability
+
 fn copied(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     var copy = mem::Bytes.empty(alloc)
     mut copy.append(bytes)
@@ -597,7 +621,7 @@ fn copy_of(held: Option[mem::Bytes], alloc: mem::Alloc) -> Option[mem::Bytes] {
 /// the kernel serves both, writing what they exchange through it, then ends both.
 fn ported(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses wait {
     let task::Channel(sender: forwarding, receiver: forwarded) = task::Channel[Forwarded].bounded(1, alloc: grants.alloc)
-    let wiring = sys::Minter[Wired, Wiring, u64].of(Wiring(alloc: grants.alloc, forwarding: take forwarding, sent: mem::OnceMap[u64, mem::Bytes].empty(1, alloc: grants.alloc), sends: core::atomic::AtomicU64.of(0), replies: mem::OnceMap[u64, mem::Bytes].empty(2, alloc: grants.alloc), syncs: core::atomic::AtomicU64.of(0)), alloc: grants.alloc)
+    let wiring = sys::Minter[Wired, Wiring, u64].of(Wiring(alloc: grants.alloc, forwarding: take forwarding, sent: mem::OnceMap[u64, mem::Bytes].empty(1, alloc: grants.alloc), sends: core::atomic::AtomicU64.of(0), replies: mem::OnceMap[u64, mem::Bytes].empty(2, alloc: grants.alloc), syncs: core::atomic::AtomicU64.of(0), clock: grants.clock, dropped: core::atomic::AtomicU64.of(0)), alloc: grants.alloc)
     defer take wiring.close()
     let wired = wiring.mint(0)
     let Ok(tallied) = attempt sys::Runner.served(wiring.mint(0)) else {
@@ -633,7 +657,8 @@ fn ported(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses
 
 /// Has the relay call the tally through port 1, answered at once, then through port 2, whose call
 /// the tally's holder holds pending, then send the settlement that has the tally reply to it,
-/// cueing the tally's holder once it is sent, and ends the relay once it has the reply.
+/// cueing the tally's holder once it is sent, then, once it has the reply, has it read and drop
+/// the clock its runner holds for it, and ends it.
 fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) fails nanos::InstanceError uses wait {
     var relaying = relay
     defer take relaying.abandon()
@@ -655,6 +680,9 @@ fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) f
     discard attempt await cues.send(1)
     try await relaying.incoming()
     discard try await mut relaying.step()
+    var clocking = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Front].clocked(mut clocking)
+    discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take clocking, grants)
     undefer relaying
     say(text: "relay ")
     match try await take relaying.end() {

@@ -273,6 +273,8 @@ pub interface RunnerService {
     fn reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
     fn publish(self, summary: Slice[u8]) fails RunnerError limits stack 4_096
     fn sync(self) fails RunnerError limits stack 4_096
+    fn capability(self, id: u64) -> Handle fails RunnerError limits stack 4_096
+    fn drop_capability(self, id: u64) fails RunnerError limits stack 4_096
 } RunnerService
 ```
 
@@ -280,7 +282,7 @@ pub interface RunnerService {
 - `C.served(service)` of `Fs`, `Net`, `Log`, `Random`, `Stdio` or `Runner` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
 - The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
 - A file, listener or connection opened through a served capability holds the number its method returned, and its operations call the method of their name with that number, except `sys::net::Conn.abandon`, which calls `reset`. Releasing a file or listener calls `release`, and [settlement](11-errors-domains.md#settlement) releasing a connection calls `reset`. `release`, `reset` and `close` are called whether or not the resource's entry is revoked.
-- The operations of [component contexts and ports](26-components.md#runner-capabilities) acting through a served `Runner` call `service`'s method of their name on the calling task, with the arguments that section gives, and fail as it fails. `RunnerError.Unknown` is how a kind refuses a port or request it does not know.
+- The operations of [component contexts and ports](26-components.md#runner-capabilities) acting through a served `Runner` call `service`'s method of their name on the calling task, with the arguments that section gives, and fail as it fails. `RunnerError.Unknown` is how a kind refuses a port, request or capability it does not know.
 - Their digests are those of the served capability's operations, whatever the methods do.
 
 ## Revocation

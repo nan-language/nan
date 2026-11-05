@@ -1,5 +1,6 @@
 //! The wire encoding of protocols: the encodings of calls of operations as members of
-//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve` and `sys::Reply.decode`.
+//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`, `sys::Reply.decode`, and
+//! the handles `sys::Handle.of` makes and capability ids read.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
@@ -34,9 +35,45 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "sys::Wire.serve" => serve(lo, fx, supply),
         "sys::Reply.decode" => decode_reply(lo, fx, supply),
+        "sys::Handle.of" => handle_of(lo, fx, supply),
+        "sys::CapabilityId.of_handle" => capability_of(lo, fx, supply),
         _ => return false,
     }
     true
+}
+
+/// `Handle.of(capability)`: the handle holding `capability` with the handle hash of its type.
+fn handle_of(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let hash = lo.ck.handle_hash(&supply.type_arg(0));
+    let sret = supply.sret.expect("a handle's address");
+    let word = fx.load(types::I64, supply.param(0).address(), 0);
+    fx.store(word, sret, handle::HANDLE);
+    let data = lo.bytes_data(&hash.0);
+    let data = lo.data_address(fx, data);
+    let at = fx.offset(sret, handle::HASH);
+    lo.copy(fx, at, data, 33, 1);
+    supply.done(lo, fx);
+}
+
+/// `id.of_handle(handle)`: `Some` of the capability `handle` holds when its handle hash is that
+/// of the id's capability type, `None` otherwise.
+fn capability_of(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let hash = lo.ck.handle_hash(&supply.type_arg(0));
+    let handle = supply.param(1).address();
+    let wanted = lo.bytes_data(&hash.0);
+    let wanted = lo.data_address(fx, wanted);
+    let carried = fx.offset(handle, handle::HASH);
+    let same = same_hash(lo, fx, wanted, carried);
+    let option = supply.abi.result.clone();
+    fx.when(same, |fx| {
+        let word = fx.load(types::I64, handle, handle::HANDLE);
+        let slot = fx.slot(8, 8);
+        fx.store(word, slot, 0);
+        let some = lo.variant_value(fx, &option, "Some", &[Held::Address(slot)], None);
+        supply.ret(lo, fx, some);
+    });
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
 }
 
 /// The protocol a `sys::Wire` operation's first type argument names.

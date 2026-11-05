@@ -1,6 +1,6 @@
 # 0132. Runner capabilities of components
 
-Status: accepted
+Status: accepted; the capabilities held by id it leaves to do superseded by 0133
 
 ## Context
 

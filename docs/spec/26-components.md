@@ -1,6 +1,6 @@
 # Components
 
-This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, protocols with their servers, operation calls, hashes and wire encoding, and the runner capabilities a stepper's holder attaches, with their ports.
+This chapter defines components, their handlers and quiescence, component state and its state schema, Env and messages, the component context with its `send` and `after` operations, keyed tasks and outboxes, the runner `host::Runner`, steppers with their checkpoints and system interfaces, protocols with their servers, operation calls, hashes and wire encoding, and the runner capabilities a stepper's holder attaches, with their ports and the resources they hold.
 
 ## Components
 
@@ -1618,7 +1618,7 @@ impl Fake: sys::Protocol // error: component.protocol-impl
 
 ## Runner capabilities
 
-A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary, its checkpoints and the capabilities the holder keeps for it by number. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
+A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary, its checkpoints and the capabilities and resources the holder keeps for it by number. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
 
 ```nan-api
 // module: sys
@@ -1649,6 +1649,35 @@ pub open struct Port[Q: Protocol] derives Copy, Send {
 pub fn Port.of[M: Any and Send](cx: Cx[M], id: u64) -> Port[Q]
 
 pub fn Port.call[R: Send, E: Send](self, reply: Reply[R, E], call: Encoded, alloc: mem::Alloc) -> R fails CallError[E] uses wait
+
+pub interface Resource {
+    fn held(take self) -> Held limits pure, notrap, terminates
+    fn of_held(take held: Held) -> Result[Self, Held] limits pure, notrap, terminates
+} Resource
+
+pub closed enum Held {
+    File(fs::File)
+    Listener(net::Listener)
+} Held
+
+impl fs::File: Resource
+
+impl net::Listener: Resource
+
+pub closed struct ResourceId[R: Resource] derives Copy, Eq, Encode {
+    pub id: u64
+} ResourceId
+
+pub open struct Resources derives Copy, Send {
+} Resources
+
+pub fn Resources.of[M: Any and Send](cx: Cx[M]) -> Resources
+
+pub fn Resources.resource[R: Resource](self, id: ResourceId[R]) -> R fails RunnerError uses wait
+
+pub fn Resources.take_resource[R: Resource](self, id: ResourceId[R]) -> R fails RunnerError uses wait
+
+pub fn Resources.put_resource[R: Resource](self, id: ResourceId[R], take resource: R) fails RunnerError uses wait
 ```
 
 - A stepper starts without a runner capability, and a run of `host::Runner` never has one. `mut s.attach(runner)` attaches `runner` to the stepper in place of the one attached before. The operations of this section act through the runner capability attached to the stepper whose component context they receive, or through one whose handle is stale when none is.
@@ -1659,6 +1688,10 @@ pub fn Port.call[R: Send, E: Send](self, reply: Reply[R, E], call: Encoded, allo
 - A holder keeps capabilities for its component by number, so the component's state, which a checkpoint holds, names each by a `sys::CapabilityId[C]`. `id.of_handle(handle)` gives the capability `handle` holds, none when its handle hash is not C's ([wire encoding](#wire-encoding)), whatever `id.id` is. `mut cx.capability(id)` calls `capability` with `id.id` and gives the capability `id.of_handle` gives of the `sys::Handle` it returns, failing with `RunnerError.Unknown` when that gives none. `mut cx.drop_capability(id)` calls `drop_capability` with `id.id`, telling the holder the component no longer needs that capability.
 - Each of these operations of a component context calls its method on the calling task, the handler's, and fails with the method's failure.
 - `port.call(reply, call, alloc)` calls the `call` of the port's runner capability with the port's number, Q's protocol hash, the bytes and handles of `call` and `alloc`, then decodes the encoding it gives as `reply.decode` does ([wire encoding](#wire-encoding)), drawing through `alloc`: it gives the request's result, or fails with `CallError.Failed` holding its failure or `CallError.Malformed` when the encoding does not decode. When the method fails, it fails with `CallError.Cancelled` holding a cancellation and with `CallError.Closed` holding `task::SendError.Closed` otherwise. It is a cancellation point, so a component calls it from a keyed task, posting what it gives to its intake.
+- A holder keeps files and listeners for its component by number too, each in a `sys::Held` of its type, and the component's state names each by a `sys::ResourceId[R]`. `sys::Resource` is implemented by `sys::fs::File` and `sys::net::Listener` alone: `take r.held()` gives the `Held` holding `r`, and `R.of_held(held)` gives `Ok` of what `held` holds when it is an R and `Err` of `held` otherwise. A connection is held by no number, as an id of a linear type would be linear.
+- `sys::Resources.of(cx)` gives the resources of the runner capability of `cx`, which hold that capability as a port does, so a keyed task's closure captures them. Their operations wait, as those of the resources they give do, so a component calls them from a keyed task.
+- `resources.resource(id)` lends the component the resource the holder keeps under `id.id`, calling `resource`, and `resources.take_resource(id)` gives it the resource, calling `take_resource`, after which the holder keeps nothing under that number. Each gives what the `Held` the method returns holds when it is an R; otherwise it hands that `Held` back through `put_resource` under `id.id` and fails with `RunnerError.Unknown`. `resources.put_resource(id, resource)` hands the holder `resource` under `id.id`, a lent one back, calling `put_resource` with `take resource.held()`.
+- A resource `resource` or `take_resource` gives belongs to the calling task's [domain](11-errors-domains.md#domain-memory), so settlement releases it with that domain and never with the holder's, and one `put_resource` hands over belongs to whatever the holder's kind moves it into.
 
 A mirror hands a store the values it is sent and fetches the store's value from a keyed task, both through port 1 of its runner capability:
 

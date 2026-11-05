@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, keyed tasks and checkpoints run in their spaces, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -50,6 +50,7 @@ pub protocol Ledger {
     pub fn add(amount: u32) -> u64 limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn note(log: sys::Log) -> sys::Log limits recorded
+    pub fn borrow() limits recorded
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
 } Ledger
@@ -658,30 +659,36 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     take link.release(mut frames)
 } linked
 
-/// Holds instances of the ledger's book in spaces over the first channel of a link: started,
-/// called, given a log it notes through and gives back, refused a call carrying a clock,
-/// checkpointed and ended, then restored from that checkpoint, a handler that traps and a handler
-/// that never returns until the instance is abandoned.
+/// Holds instances of the ledger's book in spaces over the first channel of a link, acting through
+/// a runner the kernel serves: started, called, given a log it notes through, publishing its total,
+/// and gives back, lent logs through its runner, refused a call carrying a clock, checkpointed and
+/// ended, then restored from that checkpoint, a handler that traps and a handler that never returns
+/// until the instance is abandoned.
 fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let lending = sys::Minter[Lending, Lent, u64].of(Lent(noter: grants.noter, alloc: grants.alloc), alloc: grants.alloc)
+    defer take lending.close()
+    let Ok(runner) = attempt sys::Runner.served(lending.mint(0)) else {
+        stop(text: "no runner\n")
+    }
     var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     discard mut link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
-    let opened = attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
+    let opened = attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, runner, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
         return try await started(take instance, grants)
     })
     match opened {
         Ok(Some(checkpoint)) => {
-            discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: Some(take checkpoint), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+            discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: Some(take checkpoint), runner, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                 try await restored(take instance, grants)
             })
         }
         else => say(text: "book unheld\n")
     }
-    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, runner, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await trapped(take instance, grants)
     })
-    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, runner, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await abandoned(take instance, grants)
     })
     for frame in take pool {
@@ -698,6 +705,7 @@ fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails n
     try await ticked(mut book, reason: sys::ResumeReason.Started)
     try await added(mut book, amount: 5, grants)
     try await noted(mut book, grants)
+    try await borrowed(mut book, grants)
     var echo = sys::Encoded.empty(grants.alloc)
     discard sys::Wire[Ledger].echo(mut echo, clock: grants.clock)
     match attempt await book.inbox().call(sys::Wire[Ledger].hash(), request: take echo, alloc: grants.alloc) {
@@ -730,6 +738,101 @@ fn noted(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError u
         Err(_) => say(text: "book note undecodable\n")
     }
 } noted
+
+/// Has the book read the log its runner holds as capability 7, then borrow the log its runner lends
+/// through port 1 from the keyed task it starts, which sends a tick once it has logged through it.
+fn borrowed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var request = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Ledger].borrow(mut request)
+    discard try await called(mut book, take request, grants)
+    discard try await mut book.start_keyed()
+    try await book.incoming()
+    discard try await mut book.step()
+    say(text: "book borrowed\n")
+} borrowed
+
+/// The runner the kernel serves the book: it writes each total the book publishes, holds the
+/// noting console's log as capability 7 and lends it through port 1, refusing every other
+/// operation.
+struct Lending {
+} Lending
+
+impl Lending: sys::Kind[Lent, u64]
+
+/// What the runner the kernel serves the book holds: the noting console, and the allocator it
+/// decodes through.
+struct Lent derives Copy {
+    noter: Console
+    alloc: mem::Alloc
+} Lent
+
+impl Lending: sys::RunnerService
+
+fn Lending.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Lending.send_to
+
+fn Lending.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError limits stack 4_096 {
+    let Some(log) = lent(self) else {
+        fail sys::RunnerError.Unknown
+    }
+    if port != 1 {
+        fail sys::RunnerError.Unknown
+    }
+    var reply = sys::Encoded.empty(alloc)
+    let lending: Result[u64, u8] = Ok(0)
+    mem::wire::Codec[Result[u64, u8]].encode(lending, out: mut reply.bytes)
+    mut reply.handles.push(sys::Handle.of(log))
+    return reply
+} Lending.call
+
+fn Lending.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Lending.reply
+
+fn Lending.publish(self, summary: Slice[u8]) limits stack 4_096 {
+    let Some(alloc) = sys::reach(self, body: fn(state: Lent, record: u64) => state.alloc) else {
+        return
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(summary)
+    let Ok(total) = attempt mem::wire::Codec[u64].decode(Untrusted.of(bytes.view()), alloc) else {
+        say(text: "published otherwise\n")
+        return
+    }
+    say(text: "published total ")
+    say_number(total)
+    say(text: "\n")
+} Lending.publish
+
+fn Lending.sync(self) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Lending.sync
+
+fn Lending.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    let Some(log) = lent(self) else {
+        fail sys::RunnerError.Unknown
+    }
+    if id != 7 {
+        fail sys::RunnerError.Unknown
+    }
+    return sys::Handle.of(log)
+} Lending.capability
+
+fn Lending.drop_capability(self, id: u64) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Lending.drop_capability
+
+/// The log of the noting console a runner holds, none for a stale runner.
+fn lent(runner: Lending) -> Option[sys::Log] {
+    let Some(noter) = sys::reach(runner, body: fn(state: Lent, record: u64) => state.noter) else {
+        return None
+    }
+    match attempt sys::Log.served(noter) {
+        Ok(log) => return Some(log)
+        Err(_) => return None
+    }
+} lent
 
 /// Restores the book from a checkpoint into a fresh instance and calls it.
 fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {

@@ -13487,12 +13487,12 @@ const TEXT_MEM_WIRE_WIRE: Str =
     \\
 
 const TEXT_NANOS_HELD: Str =
-    \\//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in a space, sending its holder's requests and its inboxes' calls down the first channel of the space's link and routing the answers the space sends back, and the space's side, which runs the instance task and relays between that channel and the instance.
+    \\//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in a space, sending its holder's requests and its inboxes' calls down the first channel of the space's link, routing the answers the space sends back and calling its holder's runner for it, and the space's side, which runs the instance task, relays between that channel and the instance and forwards the operations of the instance's runner capability to the kernel.
     \\
     \\/// The bytes of a frame's head, which holds the length of the encoding following it.
     \\const FRAME_HEAD: usize = 4
     \\
-    \\pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: Str, services: Services, link: Link, take checkpoint: Option[mem::Bytes], mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+    \\pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: Str, services: Services, link: Link, take checkpoint: Option[mem::Bytes], runner: sys::Runner, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
     \\    let Some(entry) = job.component(component) else {
     \\        return None
     \\    }
@@ -13505,7 +13505,7 @@ const TEXT_NANOS_HELD: Str =
     \\        let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc)
     \\        let watched = instance.abandoner.share()
     \\        discard s.spawn(fn[take from, take launch, take ending, take last, take watched, mut frames, mut extended]() fails task::Cancelled uses wait {
-    \\            let ended = match attempt await held_in(cpu, job, entry, services, link, checkpoint: take from, take launch, abandoner: take watched, mut frames, mut extended, exec, alloc) {
+    \\            let ended = match attempt await held_in(cpu, job, entry, services, runner, link, checkpoint: take from, take launch, abandoner: take watched, mut frames, mut extended, exec, alloc) {
     \\                Ok(how) => how
     \\                Err(cancelled) => failed(take cancelled, alloc)
     \\            }
@@ -13518,17 +13518,18 @@ const TEXT_NANOS_HELD: Str =
     \\} hold_isolated
     \\
     \\/// Runs the instance of the component entry `entry` in a space of `job` made from `frames`,
-    \\/// resuming from `checkpoint`, until it ends, and gives how it ended: failed with the rendering of
-    \\/// an `IsolatedError` when `link` has no channel or no space can be made.
-    \\fn held_in(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, link: Link, take checkpoint: Option[mem::Bytes], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\/// resuming from `checkpoint` and acting through `runner`, until it ends, and gives how it ended:
+    \\/// failed with the rendering of an `IsolatedError` when `link` has no channel or no space can be
+    \\/// made.
+    \\fn held_in(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, runner: sys::Runner, link: Link, take checkpoint: Option[mem::Bytes], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     \\    if link.channels.len() == 0 {
     \\        return failed(IsolatedError.NoChannel, alloc)
     \\    }
-    \\    match attempt placed(cpu, job, entry, services, link, held: true, input: encoded(checkpoint, alloc), mut frames, alloc) {
+    \\    match attempt placed(cpu, job, entry, services, runner, link, held: true, input: encoded(checkpoint, alloc), mut frames, alloc) {
     \\        Ok(Placed(space: made, state: started, table: table)) => {
     \\            var space = made
     \\            var state = started
-    \\            let outcome = attempt await relayed(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, take launch, take abandoner, mut frames, exec, alloc)
+    \\            let outcome = attempt await relayed(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), runner, link, take launch, take abandoner, mut frames, exec, alloc)
     \\            take space.release(mut frames)
     \\            match outcome {
     \\                Ok(how) => return how
@@ -13551,9 +13552,10 @@ const TEXT_NANOS_HELD: Str =
     \\} Relays
     \\
     \\/// Runs an instance's space until it ends, sending its holder's requests and its inboxes' calls
-    \\/// down the first channel of `link` and routing the answers the space sends up it, and gives how
-    \\/// it ended; once `abandoner` abandons, the space runs no more and the instance ends abandoned.
-    \\fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], take served: Serving, link: Link, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\/// down the first channel of `link` and routing the answers the space sends up it, calling through
+    \\/// `runner` the ports the instance calls, and gives how it ended; once `abandoner` abandons, the
+    \\/// space runs no more and the instance ends abandoned.
+    \\fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], take served: Serving, runner: sys::Runner, link: Link, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     \\    let Launch(checkpoint: _, runner: _, requests: requests, calls: calls, answers: answers) = launch
     \\    let task::Channel(sender: down, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
     \\    let task::Channel(sender: parking, receiver: parked) = task::Channel[u8].bounded(1, alloc)
@@ -13567,6 +13569,7 @@ const TEXT_NANOS_HELD: Str =
     \\        }
     \\        let requests_down = down.split()
     \\        let calls_down = down.split()
+    \\        let ports_down = down.split()
     \\        let replies = answers.split()
     \\        let answered = answers.split()
     \\        let routing = allocs.share()
@@ -13580,8 +13583,8 @@ const TEXT_NANOS_HELD: Str =
     \\        discard s.spawn(fn[take called, take calls_down, take replies, take drawing]() fails task::Cancelled uses wait {
     \\            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table: served.table, alloc)
     \\        })
-    \\        discard s.spawn(fn[take answered, take routing]() fails task::Cancelled uses wait {
-    \\            try await answered_up(link, answers: answered, allocs: routing, table: served.table, alloc)
+    \\        discard s.spawn(fn[take answered, take routing, take ports_down]() fails task::Cancelled uses wait {
+    \\            try await answered_up(link, answers: answered, allocs: routing, table: served.table, runner, out: ports_down, exec, alloc)
     \\        })
     \\        discard s.spawn(fn[take waiting, take domain]() fails task::Cancelled uses wait {
     \\            let watched = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -13690,35 +13693,91 @@ const TEXT_NANOS_HELD: Str =
     \\
     \\/// Routes through `answers` each answer the space sends up the first channel of `link`, a call's
     \\/// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
-    \\/// the space's `table` it names; it stops hearing a space that frames an answer it cannot decode or
-    \\/// longer than `MOST_BYTES`.
-    \\fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// the space's `table` it names, and calls through `runner` each port the instance calls, on a task
+    \\/// of its own sending `out` the frame of the reply; it stops hearing a space that frames a message
+    \\/// it cannot decode or longer than `MOST_BYTES`.
+    \\fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var pending = mem::Bytes.empty(alloc)
+    \\    try await task::scope(exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
+    \\        loop {
+    \\            let Some(up) = try await next_up(link, mut pending, alloc) else {
+    \\                return
+    \\            }
+    \\            match up {
+    \\                Up.Answered(Answering(id: id, answer: sent)) => {
+    \\                    let drawn = await when mut allocs => mut allocs.remove(id)
+    \\                    discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
+    \\                }
+    \\                Up.Called(called) => {
+    \\                    let replying = out.split()
+    \\                    discard s.spawn(fn[take called, take replying]() fails task::Cancelled uses wait {
+    \\                        try await ported(take called, runner, table, out: replying, alloc)
+    \\                    })
+    \\                }
+    \\            }
+    \\        }
+    \\    })
+    \\} answered_up
+    \\
+    \\/// The next message the space sends up the first channel of `link`, after what `pending` holds of
+    \\/// it; none once the space frames one it cannot decode or longer than `MOST_BYTES`.
+    \\fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Option[Up] fails task::Cancelled uses wait {
     \\    loop {
+    \\        match frame_len(pending) {
+    \\            Some(len) => {
+    \\                if u64.widen(len) > MOST_BYTES {
+    \\                    return None
+    \\                }
+    \\                match frame_off(mut pending, len, alloc) {
+    \\                    Some(frame) => return up_of(frame, alloc)
+    \\                    None => {}
+    \\                }
+    \\            }
+    \\            None => {}
+    \\        }
     \\        let received = match attempt await link.receive(0, alloc) {
     \\            Ok(bytes) => bytes
     \\            Err(LinkError.Cancelled(cancelled)) => fail cancelled
-    \\            Err(LinkError.NoChannel) => return
+    \\            Err(LinkError.NoChannel) => return None
     \\        }
     \\        mut pending.append(bytes_of(received.view(), alloc).view())
-    \\        loop {
-    \\            let Some(len) = frame_len(pending) else {
-    \\                break
-    \\            }
-    \\            if u64.widen(len) > MOST_BYTES {
-    \\                return
-    \\            }
-    \\            let Some(frame) = frame_off(mut pending, len, alloc) else {
-    \\                break
-    \\            }
-    \\            let Ok(Answering(id: id, answer: sent)) = attempt mem::wire::Codec[Answering].decode(Untrusted.of(frame.view()), alloc) else {
-    \\                return
-    \\            }
-    \\            let drawn = await when mut allocs => mut allocs.remove(id)
-    \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
-    \\        }
     \\    }
-    \\} answered_up
+    \\} next_up
+    \\
+    \\/// The message a frame holds, none when it does not decode.
+    \\fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Option[Up] {
+    \\    match attempt mem::wire::Codec[Up].decode(Untrusted.of(frame.view()), alloc) {
+    \\        Ok(up) => return Some(take up)
+    \\        Err(_) => return None
+    \\    }
+    \\} up_of
+    \\
+    \\/// Calls through `runner` the port an instance's space calls, its handles those of the entries of
+    \\/// the space's `table` it names, and sends `out` the frame of the reply, its handles added to
+    \\/// `table`.
+    \\fn ported(take called: PortCall, runner: sys::Runner, table: Table, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\    let PortCall(id: id, port: port, hash: hash, call: request) = called
+    \\    let answer = try await port_answer(port, hash, take request, runner, table, alloc)
+    \\    discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
+    \\} ported
+    \\
+    \\/// What crosses down of the reply to a call through the port `port` of `runner`.
+    \\fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner: sys::Runner, table: Table, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+    \\    let Naming(bytes: bytes, handles: handles) = request
+    \\    let Some(handed) = table.handed(handles, alloc) else {
+    \\        return PortAnswer.Unknown
+    \\    }
+    \\    let reply = match attempt await runner.call(port, hash, bytes: bytes.view(), handles: handed.view(), alloc) {
+    \\        Ok(given) => given
+    \\        Err(sys::RunnerError.Cancelled(cancelled)) => fail cancelled
+    \\        Err(sys::RunnerError.Revoked(_)) => return PortAnswer.Revoked
+    \\        Err(sys::RunnerError.Unknown) => return PortAnswer.Unknown
+    \\    }
+    \\    let Some(crossing) = table.admitted(reply.handles.view(), alloc) else {
+    \\        return PortAnswer.Unknown
+    \\    }
+    \\    return PortAnswer.Replied(Carrying(bytes: take reply.bytes, handles: take crossing))
+    \\} port_answer
     \\
     \\/// The answer of what an instance's space gave, a reply's bytes drawn through `alloc` and its
     \\/// handles those of the entries of the space's `table` it names, a reply naming another refused as
@@ -13758,6 +13817,7 @@ const TEXT_NANOS_HELD: Str =
     \\    Stop(u64)
     \\    Call(Calling)
     \\    Release
+    \\    Ported(PortReply)
     \\} Down
     \\
     \\/// A request of an instance's holder and the number of its wait.
@@ -13790,11 +13850,47 @@ const TEXT_NANOS_HELD: Str =
     \\    handles: mem::List[Carried]
     \\} Calling
     \\
-    \\/// What the space of an instance sends its kernel: an answer and the number of the wait it ends.
+    \\/// What the space of an instance sends its kernel: an answer of its instance, or a call its
+    \\/// instance makes through a port of its runner capability.
+    \\enum Up derives Encode {
+    \\    Answered(Answering)
+    \\    Called(PortCall)
+    \\} Up
+    \\
+    \\/// An answer of an instance and the number of the wait it ends.
     \\struct Answering derives Encode {
     \\    id: u64
     \\    answer: Sent
     \\} Answering
+    \\
+    \\/// A call an instance makes through a port: the number of its wait, the port, the protocol hash and
+    \\/// the call.
+    \\struct PortCall derives Encode {
+    \\    id: u64
+    \\    port: u64
+    \\    hash: sys::ProtocolHash
+    \\    call: Naming
+    \\} PortCall
+    \\
+    \\/// The reply to a call an instance made through a port, and the number of its wait.
+    \\struct PortReply derives Encode {
+    \\    id: u64
+    \\    answer: PortAnswer
+    \\} PortReply
+    \\
+    \\/// The reply to a call through a port as it crosses into a space, or how the call failed.
+    \\enum PortAnswer derives Encode {
+    \\    Replied(Carrying)
+    \\    Unknown
+    \\    Revoked
+    \\} PortAnswer
+    \\
+    \\/// An encoding a kernel sends a space: its bytes, and what crossed into the space's table for each
+    \\/// of its handles.
+    \\struct Carrying derives Encode {
+    \\    bytes: mem::Bytes
+    \\    handles: mem::List[Carried]
+    \\} Carrying
     \\
     \\/// An answer of an instance as its space sends it.
     \\enum Sent derives Encode {
@@ -13903,19 +13999,23 @@ const TEXT_NANOS_HELD: Str =
     \\} Entered
     \\
     \\/// The ends of an instance's channels that the relays of its space hold: the senders of its
-    \\/// holder's requests and of its inboxes' calls, and the receiver of its answers.
+    \\/// holder's requests and of its inboxes' calls, the receiver of its answers and the receiver of the
+    \\/// frames to send up.
     \\struct Relaying {
     \\    requests: task::Sender[Asked]
     \\    calls: task::Sender[Called]
     \\    answered: task::Receiver[Routed]
+    \\    outgoing: task::Receiver[mem::Bytes]
     \\} Relaying
     \\
     \\/// Holds the instance of the component entry `job` in a space for its kernel: runs the instance
     \\/// task in a domain of the space's runtime on `world`, resuming from the checkpoint whose
-    \\/// `mem::wire` encoding `input` is, while relaying the requests and calls the kernel sends over
-    \\/// the channel `port` serves to the instance and its answers back, their handles those the runtime
-    \\/// holds through `base` for the entries of the space's table, and gives how the domain ended.
-    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\/// `mem::wire` encoding `input` is and acting through the runner capability of the space's table
+    \\/// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
+    \\/// channel `port` serves to the instance and its answers and calls through ports back, their
+    \\/// handles those the runtime holds through `base` for the entries of the space's table, and gives
+    \\/// how the domain ended.
+    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     \\    let alloc = world.alloc
     \\    let exec = world.exec
     \\    let Ok(checkpoint) = attempt mem::wire::Codec[Option[mem::Bytes]].decode(Untrusted.of(input.view()), alloc) else {
@@ -13924,22 +14024,35 @@ const TEXT_NANOS_HELD: Str =
     \\    let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     \\    let task::Channel(sender: calls, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     \\    let task::Channel(sender: answers, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
-    \\    let launch = Launch(checkpoint: take checkpoint, runner: sys::Runner.denied(), requests: take asked, calls: take called, answers: take answers)
+    \\    let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
+    \\    let waits = task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc)
+    \\    let forwarders = sys::Minter[Forwarder, Forwarding, u64].of(Forwarding(base: base, up: up.split(), waits: waits.share(), alloc: alloc), alloc)
+    \\    defer take forwarders.close()
+    \\    let acting = match attempt sys::Runner.served(forwarders.mint(runner)) {
+    \\        Ok(served) => served
+    \\        Err(_) => sys::Runner.denied()
+    \\    }
+    \\    let launch = Launch(checkpoint: take checkpoint, runner: acting, requests: take asked, calls: take called, answers: take answers)
     \\    var entered = Some(Entered(world: take world, launch: take launch))
-    \\    var relaying = Some(Relaying(requests: take requests, calls: take calls, answered: take answered))
+    \\    var relaying = Some(Relaying(requests: take requests, calls: take calls, answered: take answered, outgoing: take outgoing))
     \\    var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
     \\    try await task::scope(exec, body: fn[mut entered, mut relaying, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
     \\        let Some(Entered(world: granted, launch: launched)) = mut entered.extract() else {
     \\            return
     \\        }
-    \\        let Some(Relaying(requests: down, calls: inbox, answered: up)) = mut relaying.extract() else {
+    \\        let Some(Relaying(requests: down, calls: inbox, answered: answering, outgoing: sending)) = mut relaying.extract() else {
     \\            return
     \\        }
-    \\        discard s.spawn(fn[take down, take inbox]() fails task::Cancelled uses wait {
-    \\            try await relayed_in(port, requests: take down, calls: take inbox, base, exec, alloc)
+    \\        let replies = waits.share()
+    \\        let framing = up.split()
+    \\        discard s.spawn(fn[take down, take inbox, take replies]() fails task::Cancelled uses wait {
+    \\            try await relayed_in(port, requests: take down, calls: take inbox, base, waits: replies, exec, alloc)
     \\        })
-    \\        discard s.spawn(fn[take up]() fails task::Cancelled uses wait {
-    \\            try await relayed_out(port, answered: take up, base, alloc)
+    \\        discard s.spawn(fn[take answering, take framing]() fails task::Cancelled uses wait {
+    \\            try await relayed_out(answered: take answering, up: framing, base, alloc)
+    \\        })
+    \\        discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
+    \\            try await written_up(port, outgoing: take sending)
     \\        })
     \\        outcome = try await sys::Domain.run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
     \\            return try await call(job, world: take granted, input: take launched)
@@ -13952,9 +14065,9 @@ const TEXT_NANOS_HELD: Str =
     \\/// Gives the instance each request and call the kernel sends over `port`, each request through a
     \\/// task of its own so that the end of a wait sent after it is never held up behind it, and each
     \\/// call with the handles the runtime holds through `base` for what the kernel carried into the
-    \\/// space's table; ends each wait whose end the kernel sends, and returns once the kernel releases
-    \\/// the instance.
-    \\fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], base: Remote, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// space's table; ends each wait whose end the kernel sends, gives each reply to a call through a
+    \\/// port to its wait in `waits`, and returns once the kernel releases the instance.
+    \\fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], base: Remote, waits: task::Cown[PortWaits], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var buffer = mem::Bytes.zeroed(usize.widen(RING_BYTES), alloc)
     \\    var pending = mem::Bytes.empty(alloc)
     \\    var stops = mem::Map[u64, task::Sender[u8]].empty(alloc)
@@ -13992,11 +14105,22 @@ const TEXT_NANOS_HELD: Str =
     \\                        discard attempt await calls.send(called_in(take calling, base, alloc))
     \\                    }
     \\                    Down.Release => return
+    \\                    Down.Ported(reply) => try await port_replied(take reply, waits)
     \\                }
     \\            }
     \\        }
     \\    })
     \\} relayed_in
+    \\
+    \\/// Gives the reply to a call through a port to the wait of its number in `waits`.
+    \\fn port_replied(take reply: PortReply, waits: task::Cown[PortWaits]) fails task::Cancelled uses wait {
+    \\    let PortReply(id: id, answer: answer) = reply
+    \\    let waiting = await when mut waits => mut waits.waiting.remove(id)
+    \\    let Some(sender) = waiting else {
+    \\        return
+    \\    }
+    \\    discard attempt await sender.send(take answer)
+    \\} port_replied
     \\
     \\/// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
     \\/// the kernel carried into the space's table, a handle it cannot hold left out.
@@ -14038,20 +14162,195 @@ const TEXT_NANOS_HELD: Str =
     \\    return receiver
     \\} stopped_by
     \\
-    \\/// Sends the kernel over `port` each answer of the instance, its handles named through `base`,
-    \\/// until every sender of `answered` is released.
-    \\fn relayed_out(port: Port, take answered: task::Receiver[Routed], base: Remote, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// Sends `up` the frame of each answer of the instance, its handles named through `base`, until
+    \\/// every sender of `answered` is released.
+    \\fn relayed_out(take answered: task::Receiver[Routed], up: task::Sender[mem::Bytes], base: Remote, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var receiver = answered
     \\    loop {
     \\        let Some(Routed.Answered(Replied(id: id, answer: answer))) = try await mut receiver.receive() else {
     \\            return
     \\        }
-    \\        let frame = framed(Answering(id: id, answer: sent_of(take answer, base, alloc)), alloc)
-    \\        let Ok(_) = attempt await port.write_out(frame.view()) else {
+    \\        let frame = framed(Up.Answered(Answering(id: id, answer: sent_of(take answer, base, alloc))), alloc)
+    \\        let Ok(_) = attempt await up.send(take frame) else {
     \\            return
     \\        }
     \\    }
     \\} relayed_out
+    \\
+    \\/// Sends the kernel over `port` each frame `outgoing` carries.
+    \\fn written_up(port: Port, take outgoing: task::Receiver[mem::Bytes]) fails task::Cancelled uses wait {
+    \\    var receiver = outgoing
+    \\    loop {
+    \\        let Some(frame) = try await mut receiver.receive() else {
+    \\            return
+    \\        }
+    \\        let Ok(_) = attempt await port.write_out(frame.view()) else {
+    \\            return
+    \\        }
+    \\    }
+    \\} written_up
+    \\
+    \\/// The runner capability of an instance's space, its record the handle of the runner capability in
+    \\/// the space's table: it acts through the kernel by `invoke`, and calls a port over the link's
+    \\/// first channel, so that the space runs on while the call waits.
+    \\struct Forwarder {
+    \\} Forwarder
+    \\
+    \\impl Forwarder: sys::Kind[Forwarding, u64]
+    \\
+    \\impl Forwarder: sys::RunnerService
+    \\
+    \\/// What the runner capability of an instance's space shares: the remote capability its handles are
+    \\/// minted through, the sender of the frames the space sends up, the waits of the calls through
+    \\/// ports and the runtime's allocator.
+    \\struct Forwarding {
+    \\    base: Remote
+    \\    up: task::Sender[mem::Bytes]
+    \\    waits: task::Cown[PortWaits]
+    \\    alloc: mem::Alloc
+    \\} Forwarding
+    \\
+    \\/// The calls through ports of an instance's space that wait for their replies: the number of the
+    \\/// next, and the sender of each one's reply by its number.
+    \\struct PortWaits {
+    \\    next: u64
+    \\    waiting: mem::Map[u64, task::Sender[PortAnswer]]
+    \\} PortWaits
+    \\
+    \\/// What reaching the runner capability of an instance's space gives for an operation by `invoke`.
+    \\struct Forward derives Copy {
+    \\    base: Remote
+    \\    handle: u64
+    \\    alloc: mem::Alloc
+    \\} Forward
+    \\
+    \\/// What reaching the runner capability of an instance's space gives for a call through a port.
+    \\struct Calls {
+    \\    base: Remote
+    \\    up: task::Sender[mem::Bytes]
+    \\    waits: task::Cown[PortWaits]
+    \\} Calls
+    \\
+    \\fn forwarded(runner: Forwarder) -> Forward fails sys::RunnerError {
+    \\    let Some(forward) = sys::reach(runner, body: fn(state: Forwarding, handle: u64) => Forward(base: state.base, handle: handle, alloc: state.alloc)) else {
+    \\        fail sys::RunnerError.Revoked(sys::Revoked.Stale)
+    \\    }
+    \\    return forward
+    \\} forwarded
+    \\
+    \\/// Makes an `invoke` of an operation of the runner capability of the space's table, giving its
+    \\/// result written into `result`.
+    \\fn acted_through(forward: Forward, operation: u64, args: Slice[u8], mut result: SliceMut[u8]) -> u64 fails sys::RunnerError {
+    \\    let given = invoke(forward.handle, operation, args, result: mut result)
+    \\    if given == STALE {
+    \\        fail sys::RunnerError.Revoked(sys::Revoked.Stale)
+    \\    }
+    \\    if given >= FAILURES {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    return given
+    \\} acted_through
+    \\
+    \\/// Makes an `invoke` of an operation of the runner capability of the space's table that gives no
+    \\/// bytes.
+    \\fn acted(forward: Forward, operation: u64, args: Slice[u8]) fails sys::RunnerError {
+    \\    var nothing = Array[u8, 1].filled(0)
+    \\    discard try acted_through(forward, operation, args, result: mut nothing.view_mut())
+    \\} acted
+    \\
+    \\/// `bytes` and the handles of the space's table for which the runtime minted the capabilities
+    \\/// `handles` holds, failing with `RunnerError.Unknown` when it minted none of one.
+    \\fn naming(base: Remote, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> Naming fails sys::RunnerError {
+    \\    let Some(named) = handles_named(base, minted: handles, alloc) else {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    var copy = mem::Bytes.empty(alloc)
+    \\    mut copy.append(bytes)
+    \\    return Naming(bytes: take copy, handles: take named)
+    \\} naming
+    \\
+    \\fn Forwarder.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
+    \\    let forward = try forwarded(self)
+    \\    let sent = try naming(forward.base, bytes, handles, alloc: forward.alloc)
+    \\    try acted(forward, operation: RUN_SEND_TO, args: encoded(Sending(port: port, hash: hash, call: take sent), alloc: forward.alloc).view())
+    \\} Forwarder.send_to
+    \\
+    \\fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
+    \\    let Some(calls) = sys::reach(self, body: fn(state: Forwarding, handle: u64) => Calls(base: state.base, up: state.up.split(), waits: state.waits.share())) else {
+    \\        fail sys::RunnerError.Revoked(sys::Revoked.Stale)
+    \\    }
+    \\    let Calls(base: base, up: up, waits: waits) = calls
+    \\    let sent = try naming(base, bytes, handles, alloc)
+    \\    let task::Channel(sender: answer, receiver: answers) = task::Channel[PortAnswer].bounded(1, alloc)
+    \\    var id: u64 = 0
+    \\    await when mut waits {
+    \\        id = waits.next
+    \\        waits.next += 1
+    \\        discard mut waits.waiting.insert(id, value: take answer)
+    \\    }
+    \\    match attempt await up.send(framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)) {
+    \\        Ok(_) => {}
+    \\        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    \\        Err(task::SendError.Closed) => fail sys::RunnerError.Unknown
+    \\    }
+    \\    var receiver = answers
+    \\    let Some(answered) = try await mut receiver.receive() else {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    let PortAnswer.Replied(Carrying(bytes: replied, handles: crossing)) = answered else {
+    \\        let PortAnswer.Revoked = answered else {
+    \\            fail sys::RunnerError.Unknown
+    \\        }
+    \\        fail sys::RunnerError.Revoked(sys::Revoked.Stale)
+    \\    }
+    \\    var reply = sys::Encoded.empty(alloc)
+    \\    mut reply.bytes.append(replied.view())
+    \\    for crossed in crossing {
+    \\        let Some(handle) = minted_for(base, crossed) else {
+    \\            fail sys::RunnerError.Unknown
+    \\        }
+    \\        mut reply.handles.push(handle)
+    \\    }
+    \\    return reply
+    \\} Forwarder.call
+    \\
+    \\fn Forwarder.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
+    \\    let forward = try forwarded(self)
+    \\    let reply = try naming(forward.base, bytes, handles, alloc: forward.alloc)
+    \\    try acted(forward, operation: RUN_REPLY, args: encoded(Replying(request: request, reply: take reply), alloc: forward.alloc).view())
+    \\} Forwarder.reply
+    \\
+    \\fn Forwarder.publish(self, summary: Slice[u8]) fails sys::RunnerError limits stack 4_096 {
+    \\    let forward = try forwarded(self)
+    \\    var bytes = mem::Bytes.empty(forward.alloc)
+    \\    mut bytes.append(summary)
+    \\    try acted(forward, operation: RUN_PUBLISH, args: encoded(bytes, alloc: forward.alloc).view())
+    \\} Forwarder.publish
+    \\
+    \\fn Forwarder.sync(self) fails sys::RunnerError limits stack 4_096 {
+    \\    try acted(try forwarded(self), operation: RUN_SYNC, args: b"")
+    \\} Forwarder.sync
+    \\
+    \\fn Forwarder.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    \\    let forward = try forwarded(self)
+    \\    var result = Array[u8, CARRIED_BYTES].filled(0)
+    \\    let count = try acted_through(forward, operation: RUN_CAPABILITY, args: encoded(id, alloc: forward.alloc).view(), result: mut result.view_mut())
+    \\    let Some(bytes) = result.view().prefix(usize.widen(count)) else {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    let Ok(crossed) = attempt mem::wire::Codec[Carried].decode(Untrusted.of(take bytes), alloc: forward.alloc) else {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    let Some(handle) = minted_for(forward.base, crossed) else {
+    \\        fail sys::RunnerError.Unknown
+    \\    }
+    \\    return handle
+    \\} Forwarder.capability
+    \\
+    \\fn Forwarder.drop_capability(self, id: u64) fails sys::RunnerError limits stack 4_096 {
+    \\    let forward = try forwarded(self)
+    \\    try acted(forward, operation: RUN_DROP, args: encoded(id, alloc: forward.alloc).view())
+    \\} Forwarder.drop_capability
     \\
     \\/// What a space sends its kernel of an answer of its instance, a reply's handles named through
     \\/// `base`; a reply carrying a handle the runtime minted for no entry of the space's table is refused
@@ -14122,6 +14421,23 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const FILL: u64 = 0
     \\
+    \\/// The operations of the runner capability the kernel serves an instance's space; a call through a
+    \\/// port, which waits for its reply, crosses the link instead.
+    \\const RUN_SEND_TO: u64 = 0
+    \\
+    \\const RUN_REPLY: u64 = 1
+    \\
+    \\const RUN_PUBLISH: u64 = 2
+    \\
+    \\const RUN_SYNC: u64 = 3
+    \\
+    \\const RUN_CAPABILITY: u64 = 4
+    \\
+    \\const RUN_DROP: u64 = 5
+    \\
+    \\/// The most bytes the encoding of what crosses into a space's table takes.
+    \\const CARRIED_BYTES: usize = 16
+    \\
     \\/// How an `CALL_END` call says the job ended: returned, failed, trapped, given an input it does not
     \\/// decode or cancelled.
     \\const ENDS_RETURNED: u64 = 0
@@ -14145,7 +14461,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\const MOST_BYTES: u64 = 1_048_576
     \\
     \\/// The bytes of a start record and of the record of a port.
-    \\const START_BYTES: usize = 88
+    \\const START_BYTES: usize = 96
     \\
     \\const PORT_BYTES: usize = 40
     \\
@@ -14170,8 +14486,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// The record from which a space's runtime starts: the entry, where its input lies and its
     \\/// length, the address of the doorbell, the handles of the log, standard streams and random
-    \\/// source, where the records of the link's channels lie and their count, and 1 when the entry is
-    \\/// a component entry whose instance the link's first channel carries, 0 for a job.
+    \\/// source, where the records of the link's channels lie and their count, 1 when the entry is a
+    \\/// component entry whose instance the link's first channel carries, 0 for a job, and the handle of
+    \\/// the runner capability.
     \\struct Start derives Copy {
     \\    job: sys::load::Job
     \\    input: u64
@@ -14183,6 +14500,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    ports: u64
     \\    port_count: u64
     \\    held: u64
+    \\    runner: u64
     \\} Start
     \\
     \\/// A capability a space holds: its handle is the index of its entry in the space's table.
@@ -14191,6 +14509,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Stdio(sys::Stdio)
     \\    Random(sys::Random)
     \\    Channel(usize)
+    \\    Runner(sys::Runner)
     \\} Holding
     \\
     \\/// A space's table of handles: the capability each handle names, and the count of handles given.
@@ -14233,11 +14552,24 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    value: text::String
     \\} LogLine
     \\
+    \\/// The arguments of a call handed to the runner capability through a port.
+    \\struct Sending derives Encode {
+    \\    port: u64
+    \\    hash: sys::ProtocolHash
+    \\    call: Naming
+    \\} Sending
+    \\
+    \\/// The arguments of a reply to a request the runner capability holds pending.
+    \\struct Replying derives Encode {
+    \\    request: u64
+    \\    reply: Naming
+    \\} Replying
+    \\
     \\pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
     \\    let Some(entry) = job.job() else {
     \\        fail IsolatedError.NoJob
     \\    }
-    \\    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, services, link, held: false, take input, mut frames, alloc)
+    \\    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, services, runner: sys::Runner.denied(), link, held: false, take input, mut frames, alloc)
     \\    var space = made
     \\    var state = started
     \\    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, halted: fn() => false, mut frames, alloc)
@@ -14257,8 +14589,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Placed
     \\
     \\/// Makes a space of `job` from `frames` that runs `entry` on `input`, the instance of a component
-    \\/// entry when `held`, sharing `link`'s frames with it and laying out its start record.
-    \\fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
+    \\/// entry acting through `runner` when `held`, sharing `link`'s frames with it and laying out its
+    \\/// start record.
+    \\fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, runner: sys::Runner, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
     \\    var keys: usize = 0
     \\    for channel in link.channels {
     \\        keys += channel.key.as_str().as_bytes().len()
@@ -14272,6 +14605,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    for index in 0..<link.channels.len() {
     \\        discard held_by(table, holding: Holding.Channel(index))
     \\    }
+    \\    let acting = held_by(table, holding: Holding.Runner(runner))
     \\    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), mut frames, alloc)
     \\    let start = space.data()
     \\    match attempt shared(mut space, link, start, channels, alloc) {
@@ -14281,7 +14615,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                true => 1
     \\                false => 0
     \\            }
-    \\            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance)
+    \\            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance, runner: acting)
     \\            discard attempt mut space.write(start, bytes: record_bytes(record, count: START_BYTES, alloc).view())
     \\            discard attempt mut space.write(record.ports, bytes: ports.records.view())
     \\            discard attempt mut space.write(input_at, bytes: input.view())
@@ -14347,7 +14681,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            Holding.Log(_) => mut crossing.push(Carried.Log(handle))
     \\            Holding.Stdio(_) => mut crossing.push(Carried.Stdio(handle))
     \\            Holding.Random(_) => mut crossing.push(Carried.Random(handle))
-    \\            Holding.Channel(_) => return None
+    \\            else => return None
     \\        }
     \\    }
     \\    return Some(take crossing)
@@ -14383,7 +14717,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            Holding.Log(log) => mut given.push(sys::Handle.of(log))
     \\            Holding.Stdio(stdio) => mut given.push(sys::Handle.of(stdio))
     \\            Holding.Random(random) => mut given.push(sys::Handle.of(random))
-    \\            Holding.Channel(_) => return None
+    \\            else => return None
     \\        }
     \\    }
     \\    return Some(take given)
@@ -14423,6 +14757,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// space runs no more and its job ends abandoned.
     \\fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     \\    let services = served.services
+    \\    var ids = mem::Map[u64, Carried].empty(alloc)
     \\    loop {
     \\        if halted() {
     \\            return Ended.Abandoned
@@ -14464,7 +14799,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                        Err(_) => INVALID
     \\                    }
     \\                } else if number == CALL_INVOKE {
-    \\                    answer = try await invoked(mut space, state, served, link, alloc)
+    \\                    answer = try await invoked(mut space, state, served, link, mut ids, alloc)
     \\                }
     \\                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
     \\            }
@@ -14525,8 +14860,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} copied
     \\
     \\/// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
-    \\/// address and length of its arguments and the address and capacity of its result.
-    \\fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\/// address and length of its arguments and the address and capacity of its result; `ids` keeps
+    \\/// what crossed into the table for each capability the runner capability holds by number.
+    \\fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let handle = user_word(state.regs[register(0)])
     \\    let operation = user_word(state.regs[register(1)])
     \\    let target = user_word(state.regs[register(4)])
@@ -14562,9 +14898,91 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                return 0
     \\            }
     \\        }
+    \\        Holding.Runner(runner) => return runner_served(mut space, runner, operation, args, target, capacity, table: served.table, mut ids, alloc)
     \\    }
     \\    return INVALID
     \\} invoked
+    \\
+    \\/// Serves an operation of the runner capability of an instance's space through `runner`, the
+    \\/// handles crossing through `table`; `ids` keeps what crossed into the table for each capability
+    \\/// `runner` holds by number until it is dropped.
+    \\fn runner_served(mut space: sys::load::Space, runner: sys::Runner, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
+    \\    if operation == RUN_SEND_TO {
+    \\        let Ok(Sending(port: port, hash: hash, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        let Some(handed) = table.handed(handles, alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        return outcome_of(attempt runner.send_to(port, hash, bytes: bytes.view(), handles: handed.view()))
+    \\    }
+    \\    if operation == RUN_REPLY {
+    \\        let Ok(Replying(request: request, reply: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Replying].decode(args.view(), alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        let Some(handed) = table.handed(handles, alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        return outcome_of(attempt runner.reply(request, bytes: bytes.view(), handles: handed.view()))
+    \\    }
+    \\    if operation == RUN_PUBLISH {
+    \\        let Ok(summary) = attempt mem::wire::Codec[mem::Bytes].decode(args.view(), alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        return outcome_of(attempt runner.publish(summary.view()))
+    \\    }
+    \\    if operation == RUN_SYNC {
+    \\        return outcome_of(attempt runner.sync())
+    \\    }
+    \\    let Ok(id) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    if operation == RUN_DROP {
+    \\        discard mut ids.remove(id)
+    \\        return outcome_of(attempt runner.drop_capability(id))
+    \\    }
+    \\    if operation != RUN_CAPABILITY {
+    \\        return INVALID
+    \\    }
+    \\    let handle = match attempt runner.capability(id) {
+    \\        Ok(given) => given
+    \\        Err(failure) => return outcome_of(Err(take failure))
+    \\    }
+    \\    let Some(crossed) = kept_for(id, handle, table, mut ids, alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    let bytes = encoded(crossed, alloc)
+    \\    if u64.widen(bytes.len()) > capacity {
+    \\        return INVALID
+    \\    }
+    \\    return written_back(mut space, address: target, bytes, count: u64.widen(bytes.len()))
+    \\} runner_served
+    \\
+    \\/// What crossed into the table for the capability a runner holds by the number `id`: what `ids`
+    \\/// keeps for `id`, or, added to `ids`, the capability `handle` holds crossing; none when it cannot
+    \\/// cross.
+    \\fn kept_for(id: u64, handle: sys::Handle, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> Option[Carried] {
+    \\    match ids.get(id) {
+    \\        Some(kept) => return Some(kept)
+    \\        None => {}
+    \\    }
+    \\    let held = Array[sys::Handle, 1].filled(handle)
+    \\    let Some(crossing) = table.admitted(held.view(), alloc) else {
+    \\        return None
+    \\    }
+    \\    discard mut ids.insert(id, value: crossing[0])
+    \\    return Some(crossing[0])
+    \\} kept_for
+    \\
+    \\/// The result of a call of the runner capability: 0, or `STALE` for a stale runner and `INVALID`
+    \\/// for another failure.
+    \\fn outcome_of(outcome: Result[Unit, sys::RunnerError]) -> u64 {
+    \\    match outcome {
+    \\        Ok(_) => return 0
+    \\        Err(sys::RunnerError.Revoked(_)) => return STALE
+    \\        Err(sys::RunnerError.Unknown) or Err(sys::RunnerError.Cancelled(_)) => return INVALID
+    \\    }
+    \\} outcome_of
     \\
     \\/// Serves an operation of the standard streams a space holds: its result's address and capacity
     \\/// are `target` and `capacity`.
@@ -14672,7 +15090,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                0 => attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
     \\                    return try await call(job, world: take given, take input)
     \\                }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
-    \\                else => attempt await served_instance(job, port: ports.mint(0), base, world: take given, take input)
+    \\                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, world: take given, take input)
     \\            }
     \\            take remotes.close()
     \\            take ports.close()
@@ -18842,19 +19260,19 @@ const TEXT_SYS_SYS: Str =
     \\    fn drop_capability(self, id: u64) fails RunnerError limits stack 4_096
     \\} RunnerService
     \\
-    \\fn Runner.send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
+    \\pub fn Runner.send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
     \\
-    \\fn Runner.call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails RunnerError uses wait
+    \\pub fn Runner.call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails RunnerError uses wait
     \\
-    \\fn Runner.reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
+    \\pub fn Runner.reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError
     \\
-    \\fn Runner.publish(self, summary: Slice[u8]) fails RunnerError
+    \\pub fn Runner.publish(self, summary: Slice[u8]) fails RunnerError
     \\
-    \\fn Runner.sync(self) fails RunnerError
+    \\pub fn Runner.sync(self) fails RunnerError
     \\
-    \\fn Runner.capability(self, id: u64) -> Handle fails RunnerError
+    \\pub fn Runner.capability(self, id: u64) -> Handle fails RunnerError
     \\
-    \\fn Runner.drop_capability(self, id: u64) fails RunnerError
+    \\pub fn Runner.drop_capability(self, id: u64) fails RunnerError
     \\
     \\pub closed enum Revoked derives Copy, Eq, Hash, Render {
     \\    Stale

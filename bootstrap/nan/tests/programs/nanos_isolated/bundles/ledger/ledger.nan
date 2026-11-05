@@ -1,21 +1,28 @@
-//! A book served through the Ledger protocol: it adds amounts, gives back a clock it receives, notes its total through a log it receives and gives that log back, counts the ticks of a keyed task it starts whenever resumed, traps dividing by zero and spins without end when asked.
+//! A book served through the Ledger protocol: it adds amounts, gives back a clock it receives, notes its total through a log it receives, publishing it, and gives that log back, logs through the log its runner holds as capability 7 and the one it lends through port 1, counts the ticks of a keyed task it starts whenever resumed, traps dividing by zero and spins without end when asked.
 
 pub protocol Ledger {
     pub fn add(amount: u32) -> u64 limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn note(log: sys::Log) -> sys::Log limits recorded
+    pub fn borrow() limits recorded
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
     fn tick() limits pure
 } Ledger
 
+/// What the runner of a book lends through port 1.
+pub protocol Lender {
+    pub fn lend() -> sys::Log limits pure
+} Lender
+
 pub closed struct Env {
     pub log: sys::Log
+    pub alloc: mem::Alloc
 } Env
 
 impl Env: nanos::Environment
 
-pub fn Env.build(take world: nanos::World) -> Env = Env(log: world.log)
+pub fn Env.build(take world: nanos::World) -> Env = Env(log: world.log, alloc: world.alloc)
 
 pub closed struct Book derives Encode {
     pub total: u64
@@ -37,8 +44,30 @@ pub fn Book.echo(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx
 
 pub fn Book.note(mut self, take log: sys::Log, mut env: Env, mut cx: sys::Cx[Ledger]) -> sys::Log {
     log.info("noted", value: self.total)
+    var summary = mem::Bytes.empty(env.alloc)
+    mem::wire::Codec[u64].encode(self.total, out: mut summary)
+    discard attempt mut cx.publish(summary.view())
     return log
 } Book.note
+
+pub fn Book.borrow(mut self, mut env: Env, mut cx: sys::Cx[Ledger]) {
+    match attempt mut cx.capability(sys::CapabilityId[sys::Log](id: 7)) {
+        Ok(held) => held.info("held", value: true)
+        Err(_) => env.log.info("held", value: false)
+    }
+    let lender = sys::Port[Lender].of(cx, id: 1)
+    let log = env.log
+    let alloc = env.alloc
+    mut cx.spawn(key: 2, run: fn(out: sys::Outbox[Ledger]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let lent = sys::Wire[Lender].lend(mut call)
+        match attempt await lender.call(lent, call, alloc) {
+            Ok(borrowed) => borrowed.info("lent", value: true)
+            Err(_) => log.info("lent", value: false)
+        }
+        discard attempt await out.tick()
+    })
+} Book.borrow
 
 pub fn Book.divide(mut self, take by: u32, mut env: Env, mut cx: sys::Cx[Ledger]) -> u64 {
     return self.total / u64.widen(by)

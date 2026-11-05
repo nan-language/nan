@@ -1,29 +1,34 @@
-//! A tally served through the Counter protocol: it adds amounts, refusing large ones, gives back a clock it receives, counts the ticks of a keyed task it starts whenever resumed, logs memory pressure, is unhealthy over its budget or while suspended, traps dividing by zero and spins without end when asked.
+//! A tally served through the Counter protocol: it adds amounts, refusing large ones, gives back a clock it receives, counts the ticks of a keyed task it starts whenever resumed, logs memory pressure, is unhealthy over its budget or while suspended, answers the request its runner holds pending once settled, then publishes its total and asks its runner to sync, traps dividing by zero and spins without end when asked.
 
 pub protocol Counter {
     pub fn add(amount: u32) -> u64 fails refusals::Refused limits pure
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
+    pub fn current() -> u64 fails refusals::Refused limits pure
+    pub fn later(request: u64) limits pure
+    pub fn settle() limits traceless
     fn tick() limits pure
 } Counter
 
 pub closed struct Env {
     pub log: sys::Log
     pub clock: sys::Clock
+    pub alloc: mem::Alloc
 } Env
 
 impl Env: nanos::Environment
 
 pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
     let clock = try nanos::Cap[sys::Clock].get(world.caps, key: "clock")
-    return Env(log: world.log, clock: clock)
+    return Env(log: world.log, clock: clock, alloc: world.alloc)
 } Env.build
 
 pub closed struct Tally derives Encode {
     pub total: u64
     pub ticks: u64
     pub suspended: bool
+    pub pending: u64
 } Tally
 
 impl Tally: sys::Component[Env, Counter]
@@ -36,7 +41,7 @@ impl Tally: sys::Health[Env, Counter]
 
 impl Tally: sys::Suspend[Env, Counter]
 
-pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0, ticks: 0, suspended: false)
+pub fn Tally.start(mut env: Env) -> Tally = Tally(total: 0, ticks: 0, suspended: false, pending: 0)
 
 pub fn Tally.add(mut self, take amount: u32, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 fails refusals::Refused {
     if amount > 1_000 {
@@ -56,6 +61,24 @@ pub fn Tally.spin(mut self, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 {
     loop {
     }
 } Tally.spin
+
+pub fn Tally.current(mut self, mut env: Env, mut cx: sys::Cx[Counter]) -> u64 = self.total
+
+pub fn Tally.later(mut self, take request: u64, mut env: Env, mut cx: sys::Cx[Counter]) {
+    self.pending = request
+} Tally.later
+
+pub fn Tally.settle(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
+    var reply = sys::Encoded.empty(env.alloc)
+    let answer: Result[u64, refusals::Refused] = Ok(self.total)
+    mem::wire::Codec[Result[u64, refusals::Refused]].encode(answer, out: mut reply.bytes)
+    discard attempt mut cx.reply(self.pending, reply)
+    self.pending = 0
+    var summary = mem::Bytes.empty(env.alloc)
+    mem::wire::Codec[u64].encode(self.total, out: mut summary)
+    discard attempt mut cx.publish(summary.view())
+    discard attempt mut cx.sync()
+} Tally.settle
 
 fn Tally.tick(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
     self.ticks += 1

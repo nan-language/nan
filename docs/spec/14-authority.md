@@ -23,7 +23,7 @@ A **capability** is a value conferring authority. The [primitive capabilities](0
 
 | Type | Linear | Copy | Send |
 | --- | --- | --- | --- |
-| `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio` | no | yes | yes |
+| `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::Runner` | no | yes | yes |
 | `sys::fs::File`, `sys::net::Listener` | no | no | yes |
 | `sys::net::Conn`, `sys::Revoker[C]`, `sys::Minter[C, S, R]` | yes | no | yes |
 | `boot::Machine`, `boot::Kernel` | yes | no | no |
@@ -206,7 +206,7 @@ pub open enum NetError derives Render {
 
 ### Served capabilities
 
-A kernel serves `sys::Fs`, `sys::Net`, `sys::Log`, `sys::Random` and `sys::Stdio` to the code it runs through a [capability kind](#capability-kinds) of its own implementing the service interface of each:
+A kernel serves `sys::Fs`, `sys::Net`, `sys::Log`, `sys::Random` and `sys::Stdio` to the code it runs, and the [runner capabilities](26-components.md#runner-capabilities) of the components it holds, through a [capability kind](#capability-kinds) of its own implementing the service interface of each:
 
 ```nan-api
 // module: sys
@@ -253,11 +253,34 @@ pub interface NetService {
     fn reset(self, conn: u64) limits stack 4_096
     fn release(self, listener: u64) limits stack 4_096
 } NetService
+
+pub open struct Runner {
+} Runner
+
+pub fn Runner.denied() -> Runner
+
+pub fn Runner.served[S: RunnerService and Capability and Copy](service: S) -> Runner fails Revoked
+
+pub closed enum RunnerError derives Render {
+    Unknown
+    Revoked(Revoked) from
+    Cancelled(task::Cancelled) from
+} RunnerError
+
+pub interface RunnerService {
+    fn send_to(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
+    fn call(self, port: u64, hash: ProtocolHash, bytes: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails RunnerError uses wait limits stack 4_096
+    fn reply(self, request: u64, bytes: Slice[u8], handles: Slice[Handle]) fails RunnerError limits stack 4_096
+    fn publish(self, summary: Slice[u8]) fails RunnerError limits stack 4_096
+    fn sync(self) fails RunnerError limits stack 4_096
+} RunnerService
 ```
 
-- `C.served(service)` of `Fs`, `Net`, `Log`, `Random` or `Stdio` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
+- `sys::Runner.denied()` gives a runner whose handle is stale from the start.
+- `C.served(service)` of `Fs`, `Net`, `Log`, `Random`, `Stdio` or `Runner` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
 - The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
 - A file, listener or connection opened through a served capability holds the number its method returned, and its operations call the method of their name with that number, except `sys::net::Conn.abandon`, which calls `reset`. Releasing a file or listener calls `release`, and [settlement](11-errors-domains.md#settlement) releasing a connection calls `reset`. `release`, `reset` and `close` are called whether or not the resource's entry is revoked.
+- The operations of [component contexts and ports](26-components.md#runner-capabilities) acting through a served `Runner` call `service`'s method of their name on the calling task, with the arguments that section gives, and fail as it fails. `RunnerError.Unknown` is how a kind refuses a port or request it does not know.
 - Their digests are those of the served capability's operations, whatever the methods do.
 
 ## Revocation
@@ -288,6 +311,8 @@ impl Log: Capability
 
 impl Stdio: Capability
 
+impl Runner: Capability
+
 impl mem::Alloc: Capability
 
 impl task::Executor: Capability
@@ -316,6 +341,7 @@ An operation through a stale handle behaves as follows:
 | `sys::Clock` | `elapsed_ms`, `elapsed_ns` and `coarse` fail with `sys::Revoked.Stale`; `sleep` and `sleep_ns` return at once |
 | `sys::WallClock` | `now_ns` and `coarse` fail with `sys::Revoked.Stale` |
 | `sys::Log` | the record is discarded |
+| `sys::Runner` | the operations of [component contexts](26-components.md#runner-capabilities) acting through it fail with `sys::RunnerError.Revoked` holding `sys::Revoked.Stale`, and `sys::Port.call` fails as closed |
 | a [capability kind](#capability-kinds) | `sys::reach` returns `None` and `sys::derive` fails with `sys::Revoked.Stale` |
 | `mem::Alloc` | draws through it are exhaustion ([budgets](12-memory.md#budgets)) |
 | `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains), `host::Runner.run` and the [stepper](26-components.md#steppers) constructors `start` and `resume` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). `coarse` fails with `sys::Revoked.Stale`, and `split` and `serial` return an account of the stale executor. |
@@ -617,7 +643,7 @@ pub closed enum InstanceError derives Render {
     Cancelled(task::Cancelled) from
 } InstanceError
 
-pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
+pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
 
 pub fn Instance.domain(self) -> mem::Shared[sys::Abandoner]
 
@@ -653,9 +679,9 @@ pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, all
 ```
 
 - The Env of a component entry implements `nanos::Environment`: `Env.build(world)` makes it from the world its kernel grants an instance, failing with `CapError.Missing` when `world.caps` lacks a capability the Env needs.
-- `nanos::hold(load, component, world, checkpoint, exec, alloc, body: b)` runs the **instance task** of a new instance of the component entry `component` of `load` as the first task of a [domain run](11-errors-domains.md#domain-run) of a new abandoner on `exec` and `alloc`, whose stack holds what `job.stack()` gives for that entry and [grows](17-suspension-io.md#grown-stacks) beyond it, calls `b` with the instance on the calling task, and returns `Some` of what `b` returns once the instance's domain has ended. It returns `None`, running nothing, when `load` has no component entry of that name. The load is borrowed for the call, so its placement is never reclaimed under the instance.
+- `nanos::hold(load, component, world, checkpoint, runner, exec, alloc, body: b)` runs the **instance task** of a new instance of the component entry `component` of `load` as the first task of a [domain run](11-errors-domains.md#domain-run) of a new abandoner on `exec` and `alloc`, whose stack holds what `job.stack()` gives for that entry and [grows](17-suspension-io.md#grown-stacks) beyond it, calls `b` with the instance on the calling task, and returns `Some` of what `b` returns once the instance's domain has ended. It returns `None`, running nothing, when `load` has no component entry of that name. The load is borrowed for the call, so its placement is never reclaimed under the instance.
 - `instance.domain()` shares the abandoner running the instance's domain, through which another task abandons an instance whose handler never returns.
-- The instance task owns `world` and `checkpoint`. It decodes `checkpoint`, builds the Env from `world`, then calls `sys::Stepper.start`, or `sys::Stepper.resume` with the decoded state when `checkpoint` is `Some`, and holds the stepper until the instance ends.
+- The instance task owns `world` and `checkpoint`. It decodes `checkpoint`, builds the Env from `world`, then calls `sys::Stepper.start`, or `sys::Stepper.resume` with the decoded state when `checkpoint` is `Some`, attaches the runner capability `runner` to the stepper ([runner capabilities](26-components.md#runner-capabilities)), and holds the stepper until the instance ends. The component's handlers thus call the kind serving `runner` on the instance task, its calls through ports and its replies crossing as wire encodings.
 - Each operation of an instance named after a `sys::Stepper` operation has the instance task perform that operation, `checkpoint` giving the `mem::wire` encoding of the state, so a handler runs in the instance's domain and a trap in it abandons that domain alone. Each waits for the instance task to carry it out, and fails with `InstanceError.Ended` once the instance's domain has ended. A cancelled `incoming` or `ready` also ends the wait of the instance task.
 - `instance.inbox()` gives an inbox of the instance. `inbox.call(hash, request, alloc)` has a task of the instance's domain serve the encoded call `request` as `sys::Wire[P].serve` does ([wire encoding](26-components.md#wire-encoding)) through the stepper's outbox, knowing no peer schemas, P being the protocol the component serves, and gives its reply drawn through `alloc`, once a step of the instance's holder has handled the call. It fails as `serve` does, and as closed once the instance has ended.
 - `take instance.end()` has the instance task stop serving its inboxes and end the stepper, and returns once the instance's domain has ended, with how the instance ended: `Returned` with the `mem::wire` encoding of its last state; `Failed` with the rendering of the failure building its Env; `Cancelled` when its stepper's start or end met a cancellation; `Abandoned` when the abandoner `instance.domain()` shares abandoned the domain; `Trapped` with the trap that abandoned the domain otherwise; `Undecodable` when `checkpoint` is not the `mem::wire` encoding of a state of the component. It is no cancellation point. `take instance.abandon()` abandons the instance's domain without waiting.

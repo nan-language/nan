@@ -1,6 +1,6 @@
-//! Capabilities kinds serve: `C.served(service)` of `Fs`, `Net`, `Random`, `Log` and `Stdio`, the
-//! calls of a service interface's methods on a kind, and the operations of a served `Fs` or `Net`
-//! and of the files, listeners and connections opened through one.
+//! Capabilities kinds serve: `C.served(service)` of `Fs`, `Net`, `Random`, `Log`, `Stdio` and
+//! `Runner`, the calls of a service interface's methods on a kind, and the operations of a served
+//! `Fs` or `Net` and of the files, listeners and connections opened through one.
 //!
 //! A served resource's holding holds a record of the handle of the kind serving it, the kind's
 //! method table, the number the kind gave the resource and the code of the method releasing it:

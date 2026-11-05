@@ -82,6 +82,7 @@ pub mod kind {
     pub const KIND: i64 = 10;
     /// An entry revoked as it is minted.
     pub const DENIED: i64 = 11;
+    pub const RUNNER: i64 = 12;
 }
 
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an

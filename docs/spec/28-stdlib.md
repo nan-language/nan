@@ -90,17 +90,18 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
 | `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
-| `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService`, `sys::FsService`, `sys::NetService` | [Served capabilities](14-authority.md#served-capabilities) |
+| `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService`, `sys::FsService`, `sys::NetService`, `sys::Runner`, `sys::RunnerError`, `sys::RunnerService` | [Served capabilities](14-authority.md#served-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
 | `sys` | `sys::Domain`, `sys::Abandoner`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
 | `sys` | `sys::Component` | [Components](26-components.md#components) |
-| `sys` | `sys::Cx` | [Component context](26-components.md#component-context); `spawn` and `cancel` in [Keyed tasks](26-components.md#keyed-tasks) |
+| `sys` | `sys::Cx` | [Component context](26-components.md#component-context); `spawn` and `cancel` in [Keyed tasks](26-components.md#keyed-tasks); `send_to`, `reply`, `publish` and `sync` in [Runner capabilities](26-components.md#runner-capabilities) |
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
 | `sys` | `sys::Protocol`, `sys::ProtocolHash`, `sys::Handle`, `sys::Encoded`, `sys::Wire`, `sys::Reply` | [Wire encoding](26-components.md#wire-encoding) |
 | `sys` | `sys::ProtocolSchema`, `sys::OperationSchema`, `sys::ParameterSchema`, `sys::TypeSchema` | [Protocol schemas](26-components.md#protocol-schemas) |
-| `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers) |
+| `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers); `attach` in [Runner capabilities](26-components.md#runner-capabilities) |
+| `sys` | `sys::Port` | [Runner capabilities](26-components.md#runner-capabilities) |
 | `sys` | `sys::Resume`, `sys::ResumeReason`, `sys::Pressure`, `sys::Health`, `sys::HealthReply`, `sys::Suspend` | [System interfaces](26-components.md#system-interfaces) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
 | `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Load`, `sys::load::Job`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
@@ -311,7 +312,7 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 ## Std authority
 
-The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `sys::Handle`; `sys::load::Loader`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]`, `hw::Iommu`, `hw::IoDomain` and `hw::PciFunction` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
+The primitive capabilities ([capability types](05-properties.md#capability-types)) are exactly `mem::Alloc`, `mem::Budget` and `mem::Heap`; `task::Executor` and `task::Account`; `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::fs::File`, `sys::net::Listener`, `sys::net::Conn`, `sys::Revoker[C]` and `sys::Minter[C, S, R]`; `sys::Runner`; `sys::Handle`; `sys::load::Loader`; `boot::Machine`, `boot::Kernel` and `boot::Services` ([kernel types](24-kernel.md#kernel-types)); and the hardware capabilities `hw::Mmio[R]`, `hw::Ports[R]`, `hw::Dma[T]`, `hw::DmaShared[T]`, `hw::Ring0`, `hw::PageTableRoot`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::IrqShared[T]`, `hw::Iommu`, `hw::IoDomain` and `hw::PciFunction` ([kernel types](24-kernel.md#kernel-types)); and every [capability kind](14-authority.md#capability-kinds) a package outside std declares. The **sys capabilities** are `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log` and `sys::Stdio`.
 
 The [authority summary](14-authority.md#authority-summaries) of each std package, published in its artefact, holds only entries of its row. "Trusted code" covers trusted blocks and expressions and `assume`; "decoders" are the decoders that the package's types derive.
 
@@ -321,11 +322,11 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
 | `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction` | trusted code, declassifying decoders and validators |
 | `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
-| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `sys::Handle`, `sys::load::Loader`, `task::Executor` | `alloc` | none | trusted code |
+| `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `sys::Runner`, `sys::Handle`, `sys::load::Loader`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `boot` | `boot::Machine`, `boot::Kernel`, `boot::Services`, the hardware capabilities, `task::Executor`, `sys::Clock`, `sys::WallClock`, `sys::load::Loader` | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |
 | `host` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
-| `nanos` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | none |
+| `nanos` | the sys capabilities and the resources they open, `sys::Runner`, `task::Executor` | `alloc` | none | none |
 | `testing` | the sys capabilities and the resources they open, `task::Executor` | `alloc` | none | trusted code |
 | platform packages | every primitive capability | `alloc`, `device`, `priv` | none | trusted code, foreign fns, landing fns, its `priv` grant |
 

@@ -136,7 +136,7 @@ pub closed enum InstanceError derives Render {
     Cancelled(task::Cancelled) from
 } InstanceError
 
-pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
     let Some(job) = load.component(component) else {
         return None
     }
@@ -146,7 +146,7 @@ pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take
         let Some(Given(world: granted, checkpoint: from)) = mut given.extract() else {
             return
         }
-        let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: take from, alloc)
+        let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: take from, runner, alloc)
         let running = instance.abandoner.share()
         discard s.spawn(fn[take granted, take launch, take running, take ending, take last]() fails task::Cancelled uses wait limits stack 16_384 {
             let ran = attempt await running.contents().run_sized(fn[take granted, take launch]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
@@ -280,7 +280,7 @@ linear struct Opened {
 
 /// Opens an instance that resumes from `checkpoint`, routing the answers of its domain on a task
 /// of `s` until the domain has ended.
-fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], alloc: mem::Alloc) -> Opened {
+fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], runner: sys::Runner, alloc: mem::Alloc) -> Opened {
     let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     let task::Channel(sender: inbox, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: answering, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
@@ -292,15 +292,16 @@ fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], alloc: mem::Alloc
     })
     let instance = Instance(requests: take requests, calls: take inbox, outcome: take outcome, abandoner: mem::Shared.of(sys::Abandoner.new(), alloc), waits: take waits, alloc: alloc)
     let ending = answering.split()
-    let launch = Launch(checkpoint: take checkpoint, requests: take asked, calls: take called, answers: take answering)
+    let launch = Launch(checkpoint: take checkpoint, runner: runner, requests: take asked, calls: take called, answers: take answering)
     return Opened(instance: take instance, launch: take launch, ending: take ending, last: take last)
 } opened
 
 /// What the task of an instance's domain receives beside its world: the checkpoint it resumes
-/// from, none to start, its holder's requests, the encoded calls of its inboxes and the sender of
-/// its answers to both.
+/// from, none to start, the runner its component contexts act through, its holder's requests,
+/// the encoded calls of its inboxes and the sender of its answers to both.
 struct Launch {
     checkpoint: Option[mem::Bytes]
+    runner: sys::Runner
     requests: task::Receiver[Asked]
     calls: task::Receiver[Called]
     answers: task::Sender[Routed]
@@ -487,13 +488,13 @@ struct Hosted[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P
 } Hosted
 
 /// Runs a component instance for the kernel holding it: decodes its checkpoint, builds its Env from
-/// `world`, starts it or resumes it from the checkpoint, serves its inboxes and carries out its
-/// holder's requests until the holder releases it, then ends it, giving the encoding of its last
-/// state. It never fails.
+/// `world`, starts it or resumes it from the checkpoint, attaches its runner, serves its inboxes
+/// and carries out its holder's requests until the holder releases it, then ends it, giving the
+/// encoding of its last state. It never fails.
 fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
-    let Launch(checkpoint: checkpoint, requests: requests, calls: calls, answers: answers) = launch
+    let Launch(checkpoint: checkpoint, runner: runner, requests: requests, calls: calls, answers: answers) = launch
     var restored: Option[S] = None
     match checkpoint {
         Some(bytes) => {
@@ -516,6 +517,7 @@ fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cance
         Ok(stepper) => stepper
         Err(cancelled) => return failed(take cancelled, alloc)
     }
+    mut stepper.attach(runner)
     discard attempt await serving(mut stepper, take requests, take calls, answers, exec, alloc)
     match attempt await take stepper.end() {
         Ok(stopped) => return returned(stopped.state, alloc)
@@ -824,6 +826,7 @@ enum Over derives Render, Encode {
 
 protocol Counted {
     pub fn add(amount: u32) -> u64 fails Over limits pure
+    pub fn sync() limits traceless
 } Counted
 
 struct CountedEnv {
@@ -849,12 +852,41 @@ fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Co
     return self.total
 } Count.add
 
+fn Count.sync(mut self, mut env: CountedEnv, mut cx: sys::Cx[Counted]) {
+    discard attempt mut cx.sync()
+} Count.sync
+
+/// A runner counting the syncs of the instances it serves and refusing every call.
+struct Syncs {
+} Syncs
+
+impl Syncs: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Syncs: sys::RunnerService
+
+fn Syncs.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+} Syncs.send_to
+
+fn Syncs.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Syncs.call
+
+fn Syncs.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+} Syncs.reply
+
+fn Syncs.publish(self, summary: Slice[u8]) limits stack 4_096 {
+} Syncs.publish
+
+fn Syncs.sync(self) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
+} Syncs.sync
+
 test instances_answer_calls_and_end_with_their_state for Hosted.run {
     let world = testing::world()
     var total: u64 = 0
     var ended = Ended.Undecodable
     try await task::scope(world.exec, body: fn[mut total, mut ended](s: task::Scope) fails InstanceError uses wait {
-        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, alloc: world.alloc)
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc: world.alloc)
         let granted = tested(world)
         discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
             let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
@@ -902,7 +934,7 @@ test requests_a_domain_never_takes_end_with_it for Instance.ask {
     var called: Option[Result[sys::Encoded, sys::CallError[Never]]] = None
     var ended = Ended.Undecodable
     try await task::scope(world.exec, body: fn[mut stepped, mut called, mut ended](s: task::Scope) fails task::Cancelled uses wait {
-        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, alloc: world.alloc)
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc: world.alloc)
         discard s.spawn(fn[take ending, take last]() fails task::Cancelled uses wait {
             discard attempt await ending.send(Routed.Ended)
             discard attempt await last.send(Ended.Undecodable)
@@ -927,3 +959,35 @@ test requests_a_domain_never_takes_end_with_it for Instance.ask {
         return
     }
 } requests_a_domain_never_takes_end_with_it
+
+test instances_act_through_the_runner_they_are_held_with for Hosted.run {
+    let world = testing::world()
+    let minter = sys::Minter[Syncs, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc: world.alloc)
+    defer take minter.close()
+    let counter = minter.mint(0)
+    let runner = try sys::Runner.served(minter.mint(0))
+    try await task::scope(world.exec, body: fn(s: task::Scope) fails InstanceError uses wait {
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner, alloc: world.alloc)
+        let granted = tested(world)
+        discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
+            let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
+            discard attempt await ending.send(Routed.Ended)
+            discard attempt await last.send(take given)
+        })
+        var instance = opening
+        defer take instance.abandon()
+        var request = sys::Encoded.empty(world.alloc)
+        sys::Wire[Counted].sync(mut request)
+        let caller = instance.inbox()
+        let answered = s.spawn(fn[take caller, take request]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait {
+            return attempt await caller.call(sys::Wire[Counted].hash(), take request, alloc: world.alloc)
+        })
+        try await instance.incoming()
+        discard try await mut instance.step()
+        discard try await take answered.join()
+        undefer instance
+        discard try await take instance.end()
+    })
+    let synced = sys::reach(counter, body: fn(state: core::atomic::AtomicU64, record: u64) => state.load())
+    expect synced == Some(1)
+} instances_act_through_the_runner_they_are_held_with

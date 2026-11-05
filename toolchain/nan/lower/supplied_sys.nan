@@ -737,18 +737,44 @@ fn sys_stdio_service(mut lo: Lowering, mut fx: Fx, supply: Supply, words: Array[
 } sys_stdio_service
 
 /// An operation of a `Runner`: the method of its name of the kind serving it, its failure
-/// becoming the operation's.
+/// becoming the operation's. The resource `put_resource` takes is released when the runner is
+/// stale, and the one `resource` or `take_resource` gives passes to the calling task's domain.
 fn sys_runner(mut lo: Lowering, mut fx: Fx, supply: Supply) {
-    let words = sys_checked(mut lo, mut fx, supply, capability: supply.param(0).address_value())
+    let member = supply.member()
+    let capability = supply.param(0).address_value()
+    let words = if member == "put_resource" {
+        sys_checked_releasing(mut lo, mut fx, supply, capability)
+    } else {
+        sys_checked(mut lo, mut fx, supply, capability)
+    }
     let kind = ServingKind(service: words[0], table: words[1])
     var args = mem::List[Held].empty(lo.alloc)
     for position in 1..<supply.params.len() {
         mut args.push(supply.params[position])
     }
-    let called = served_call(mut lo, mut fx, interface_name: "RunnerService", method: supply.member(), kind, args: args.view())
+    let called = served_call(mut lo, mut fx, interface_name: "RunnerService", method: member, kind, args: args.view())
     supply.forward_failure(mut lo, mut fx, called)
+    if member == "resource" or member == "take_resource" {
+        let none = mut fx.ptr(0)
+        let domain = current_domain(mut lo, mut fx)
+        mut lo.transfer(mut fx, ty: supply.abi.result, address: called.result.address_value(), lift: none, owner: domain)
+    }
     supply.ret(mut lo, mut fx, held: called.result)
 } sys_runner
+
+/// The state words of the entry of the `Runner` held at an address, failing `put_resource` with
+/// `Revoked.Stale` once it releases the `sys::Held` it takes when its handle is stale.
+fn sys_checked_releasing(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> Array[clif::Value, 4] {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let taken = snapshot(mut lo, mut fx, handle)
+    let stale = mut fx.b.bxor_imm_s(taken.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        let held = lo.std_ty("sys", type_name: "Held", args: mem::List[ty::Ty].empty(lo.alloc))
+        mut lo.release(mut fx1, ty: held, address: supply.param(2).address_value())
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    return taken.words
+} sys_checked_releasing
 
 /// Whether the state words of a `Log`, `Random` or `Stdio` entry are a served entry's, which
 /// names a method table where others hold zero.

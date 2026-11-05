@@ -20,7 +20,7 @@ use super::super::body::{Body, Held};
 use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tables::{self, RESOLUTION, entry, kind, live_entry};
-use super::super::runtime::{Routine, holdings, seeded, timers};
+use super::super::runtime::{Routine, holdings, seeded, tasks, timers};
 use super::super::transfer;
 use super::Supply;
 use super::render;
@@ -687,20 +687,45 @@ fn stdio_service(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, words: &[Value
 }
 
 /// An operation of a `Runner`: the method of its name of the kind serving it, its failure
-/// becoming the operation's.
+/// becoming the operation's. The resource `put_resource` takes is released when the runner is
+/// stale, and the one `resource` or `take_resource` gives passes to the calling task's domain.
 fn runner(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
-    let words = checked(lo, fx, supply, supply.param(0).address());
+    let member = supply.member();
+    let capability = supply.param(0).address();
+    let words = if member == "put_resource" {
+        checked_releasing(lo, fx, supply, capability)
+    } else {
+        checked(lo, fx, supply, capability)
+    };
     let kind = (words[0], words[1]);
-    let called = served::call(
-        lo,
-        fx,
-        "RunnerService",
-        supply.member(),
-        kind,
-        &supply.params[1..],
-    );
+    let called = served::call(lo, fx, "RunnerService", member, kind, &supply.params[1..]);
     supply.forward_failure(lo, fx, &called);
+    if matches!(member, "resource" | "take_resource") {
+        let none = fx.ptr(0);
+        let domain = tasks::current_domain(lo, fx);
+        let result = supply.abi.result.clone();
+        lo.transfer(fx, &result, called.result.address(), none, domain);
+    }
     supply.ret(lo, fx, called.result);
+}
+
+/// The state words of the entry of the `Runner` held at an address, failing `put_resource` with
+/// `Revoked.Stale` once it releases the `sys::Held` it takes when its handle is stale.
+fn checked_releasing(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    capability: Value,
+) -> [Value; 4] {
+    let handle = fx.load(PTR, capability, 0);
+    let (live, words) = tables::snapshot(lo, fx, handle);
+    let stale = fx.b.ins().bxor_imm_s(live, 1);
+    fx.when(stale, |fx| {
+        let held = lo.std_ty("sys", "Held", Vec::new());
+        lo.release(fx, &held, supply.param(2).address());
+        fail_with(lo, fx, supply, "Revoked");
+    });
+    words
 }
 
 /// Whether the state words of a `Log`, `Random` or `Stdio` entry are a served entry's, which

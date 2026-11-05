@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes, a sync it asks for, and a clock the runner holds for the relay as a capability by number until the relay drops it.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes, a sync it asks for, a clock the runner holds for the relay as a capability by number until the relay drops it, and a file the runner holds for the relay as a resource by number, which the relay borrows, puts back, then takes and drops, after the runner refuses it a resource it does not hold.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -41,6 +41,7 @@ pub protocol Front {
     pub fn await_total() limits recorded
     pub fn settle() limits traceless
     pub fn clocked() limits recorded
+    pub fn noted() limits recorded
 } Front
 
 /// The tally's state, as the kernel declares it.
@@ -485,10 +486,57 @@ fn called(mut instance: nanos::Instance, hash: sys::ProtocolHash, take request: 
     return reply
 } called
 
+/// A store serving the file `note`, numbered by the length of its path, writing each release.
+struct Notes {
+} Notes
+
+impl Notes: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Notes: sys::FsService
+
+fn Notes.open(self, path: Str) -> u64 limits stack 4_096 {
+    return u64.widen(path.byte_len())
+} Notes.open
+
+fn Notes.create(self, path: Str) -> u64 fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.Denied
+} Notes.create
+
+fn Notes.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.Denied
+} Notes.read_all
+
+fn Notes.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.Denied
+} Notes.write_all
+
+fn Notes.remove(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.Denied
+} Notes.remove
+
+fn Notes.read(self, file: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    return 0
+} Notes.read
+
+fn Notes.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError limits stack 4_096 {
+    fail sys::fs::FsError.Denied
+} Notes.write
+
+fn Notes.byte_len(self, file: u64) -> u64 limits stack 4_096 {
+    return file
+} Notes.byte_len
+
+fn Notes.release(self, file: u64) limits stack 4_096 {
+    say(text: "fs release ")
+    say_number(file)
+    say(text: "\n")
+} Notes.release
+
 /// The runner the kernel serves its instances, recording 0 for the tally and 1 for the relay: it
 /// carries each call made through a port to the kernel task holding the instances, keeps each
-/// call sent through a port and each reply given, writes each published total, counts syncs, and
-/// holds the kernel's clock as capability 7 until it is dropped.
+/// call sent through a port and each reply given, writes each published total, counts syncs,
+/// holds the kernel's clock as capability 7 until it is dropped, and holds resources by number,
+/// writing each it lends, takes back or gives away.
 struct Wired {
 } Wired
 
@@ -505,7 +553,15 @@ struct Wiring {
     syncs: core::atomic::AtomicU64
     clock: sys::Clock
     dropped: core::atomic::AtomicU64
+    keeper: Keeper
 } Wiring
+
+/// What keeps the resources the runner holds by number, apart from its state, which every
+/// operation of the runner reaches.
+struct Keeper {
+} Keeper
+
+impl Keeper: sys::Kind[task::Cown[mem::Map[u64, sys::Held]], u64]
 
 /// A call made through a port, with the sender of its reply.
 struct Forwarded {
@@ -589,6 +645,53 @@ fn Wired.drop_capability(self, id: u64) limits stack 4_096 {
     say(text: "\n")
 } Wired.drop_capability
 
+fn Wired.resource(self, id: u64) -> sys::Held fails sys::RunnerError uses wait limits stack 8_192 {
+    let resource = try await self.removed(id)
+    say(text: "lent resource ")
+    say_number(id)
+    say(text: "\n")
+    return resource
+} Wired.resource
+
+fn Wired.take_resource(self, id: u64) -> sys::Held fails sys::RunnerError uses wait limits stack 8_192 {
+    let resource = try await self.removed(id)
+    say(text: "gave resource ")
+    say_number(id)
+    say(text: "\n")
+    return resource
+} Wired.take_resource
+
+fn Wired.put_resource(self, id: u64, take resource: sys::Held) fails sys::RunnerError uses wait limits stack 8_192 {
+    let Some(held) = self.kept() else {
+        fail sys::RunnerError.Unknown
+    }
+    await when mut held {
+        discard mut held.insert(id, value: take resource)
+    }
+    say(text: "put resource ")
+    say_number(id)
+    say(text: "\n")
+} Wired.put_resource
+
+/// The resources the runner holds by number, none once its keeper is closed.
+fn Wired.kept(self) -> Option[task::Cown[mem::Map[u64, sys::Held]]] {
+    let Some(keeper) = sys::reach(self, body: fn(state: Wiring, record: u64) => state.keeper) else {
+        return None
+    }
+    return sys::reach(keeper, body: fn(state: task::Cown[mem::Map[u64, sys::Held]], record: u64) => state.share())
+} Wired.kept
+
+/// The resource the runner holds under `id`, which it no longer holds.
+fn Wired.removed(self, id: u64) -> sys::Held fails sys::RunnerError uses wait {
+    let Some(held) = self.kept() else {
+        fail sys::RunnerError.Unknown
+    }
+    let Some(resource) = await when mut held => mut held.remove(id) else {
+        fail sys::RunnerError.Unknown
+    }
+    return resource
+} Wired.removed
+
 fn copied(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     var copy = mem::Bytes.empty(alloc)
     mut copy.append(bytes)
@@ -620,8 +723,20 @@ fn copy_of(held: Option[mem::Bytes], alloc: mem::Alloc) -> Option[mem::Bytes] {
 /// Holds the tally and, from a task of its own, a relay calling it through the ports of a runner
 /// the kernel serves both, writing what they exchange through it, then ends both.
 fn ported(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses wait {
+    let notes = sys::Minter[Notes, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc: grants.alloc)
+    defer take notes.close()
+    let Ok(noting) = attempt sys::Fs.served(notes.mint(0)) else {
+        stop(text: "unserved\n")
+    }
+    let Ok(note) = attempt await noting.open("note") else {
+        stop(text: "unopened\n")
+    }
+    var held = mem::Map[u64, sys::Held].empty(grants.alloc)
+    discard mut held.insert(3, value: take note.held())
+    let keeping = sys::Minter[Keeper, task::Cown[mem::Map[u64, sys::Held]], u64].of(task::Cown.of(take held, alloc: grants.alloc), alloc: grants.alloc)
+    defer take keeping.close()
     let task::Channel(sender: forwarding, receiver: forwarded) = task::Channel[Forwarded].bounded(1, alloc: grants.alloc)
-    let wiring = sys::Minter[Wired, Wiring, u64].of(Wiring(alloc: grants.alloc, forwarding: take forwarding, sent: mem::OnceMap[u64, mem::Bytes].empty(1, alloc: grants.alloc), sends: core::atomic::AtomicU64.of(0), replies: mem::OnceMap[u64, mem::Bytes].empty(2, alloc: grants.alloc), syncs: core::atomic::AtomicU64.of(0), clock: grants.clock, dropped: core::atomic::AtomicU64.of(0)), alloc: grants.alloc)
+    let wiring = sys::Minter[Wired, Wiring, u64].of(Wiring(alloc: grants.alloc, forwarding: take forwarding, sent: mem::OnceMap[u64, mem::Bytes].empty(1, alloc: grants.alloc), sends: core::atomic::AtomicU64.of(0), replies: mem::OnceMap[u64, mem::Bytes].empty(2, alloc: grants.alloc), syncs: core::atomic::AtomicU64.of(0), clock: grants.clock, dropped: core::atomic::AtomicU64.of(0), keeper: keeping.mint(0)), alloc: grants.alloc)
     defer take wiring.close()
     let wired = wiring.mint(0)
     let Ok(tallied) = attempt sys::Runner.served(wiring.mint(0)) else {
@@ -658,7 +773,8 @@ fn ported(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses
 /// Has the relay call the tally through port 1, answered at once, then through port 2, whose call
 /// the tally's holder holds pending, then send the settlement that has the tally reply to it,
 /// cueing the tally's holder once it is sent, then, once it has the reply, has it read and drop
-/// the clock its runner holds for it, and ends it.
+/// the clock its runner holds for it, then borrow, put back, take and drop the file its runner
+/// holds for it, and ends it.
 fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) fails nanos::InstanceError uses wait {
     var relaying = relay
     defer take relaying.abandon()
@@ -683,6 +799,12 @@ fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) f
     var clocking = sys::Encoded.empty(grants.alloc)
     sys::Wire[Front].clocked(mut clocking)
     discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take clocking, grants)
+    var noting = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Front].noted(mut noting)
+    discard try await called(mut relaying, hash: sys::Wire[Front].hash(), request: take noting, grants)
+    discard try await mut relaying.start_keyed()
+    try await relaying.incoming()
+    discard try await mut relaying.step()
     undefer relaying
     say(text: "relay ")
     match try await take relaying.end() {

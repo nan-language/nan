@@ -1,6 +1,6 @@
 # 0133. Capabilities held by id
 
-Status: accepted
+Status: accepted; the resources held by id it leaves to do superseded by 0137
 
 ## Context
 

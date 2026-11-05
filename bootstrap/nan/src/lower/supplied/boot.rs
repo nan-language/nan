@@ -93,6 +93,14 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             };
             supply.ret(lo, fx, Held::Scalar(word));
         }
+        "boot::clock_registers_start" | "boot::clock_registers_end" => {
+            let (start, end) = lo.clock_registers_extent(fx);
+            let word = match supply.path.as_str() {
+                "boot::clock_registers_start" => start,
+                _ => end,
+            };
+            supply.ret(lo, fx, Held::Scalar(word));
+        }
         "boot::system_table_address" => {
             let table = match lo.ck.db.target.kind() {
                 Some(Kind::Uefi) => {

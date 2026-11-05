@@ -75,3 +75,32 @@ fn bare_image_segments_leave_the_boot_area_out() {
         }
     }
 }
+
+#[test]
+fn a_locked_release_reaches_the_methods_its_tests_call() {
+    let scratch = Scratch::new(&[
+        (
+            "count/package.nan",
+            "//! Counts.\n\npackage count {\n    language 1\n    targets any\n} count\n",
+        ),
+        (
+            "count/count.nan",
+            "//! Counts.\n\n/// A count.\npub closed struct Count {\n    pub value: u32\n} Count\n\n/// The next count.\npub fn Count.next(self) -> u32 {\n    return self.value + 1\n} Count.next\n\ntest next_follows_the_value for Count.next {\n    expect Count(value: 1).next() == 2\n} next_follows_the_value\n",
+        ),
+        (
+            "exits/package.nan",
+            "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-host\n    entry main\n    dep count \"../count\"\n} exits\n",
+        ),
+        (
+            "exits/exits.nan",
+            "//! Exits.\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    world.log.info(\"next\", value: count::Count(value: 2).next())\n} main\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    run_in(&dir.join("exits"), "dep sync");
+    let source = fs::read_to_string(dir.join("count/count.nan")).expect("the count source");
+    fs::write(dir.join("count/count.nan"), source.replace("+ 1", "+ 2 - 1"))
+        .expect("a changed count");
+    let built = run_in(dir, "build exits");
+    assert_eq!(built.status, 0, "{}", built.output);
+}

@@ -16,7 +16,7 @@ use super::super::body::Held;
 use super::super::call::Invoked;
 use super::super::fx::{Fx, PTR};
 use super::super::layout::Shape;
-use super::super::runtime::tasks::{operation, task};
+use super::super::runtime::tasks::{operation, task, thread};
 use super::super::runtime::{Routine, fetch_add, report, state, timers};
 use super::super::supplied::Supply;
 use super::super::supplied::tasks::accounts;
@@ -41,10 +41,18 @@ pub enum Hook {
     /// `(policy, cpu, timed, until) -> way`, the way being 0 to halt, 1 to poll, and
     /// `MWAIT` plus a hint to wait in `mwait`.
     Idle,
+    /// `(policy, task, delay) -> nanoseconds`.
+    Slack,
 }
 
 impl Hook {
-    const ALL: [Hook; 4] = [Hook::Place, Hook::Steal, Hook::Slice, Hook::Idle];
+    const ALL: [Hook; 5] = [
+        Hook::Place,
+        Hook::Steal,
+        Hook::Slice,
+        Hook::Idle,
+        Hook::Slack,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -52,6 +60,7 @@ impl Hook {
             Hook::Steal => "steal",
             Hook::Slice => "slice",
             Hook::Idle => "idle",
+            Hook::Slack => "slack",
         }
     }
 
@@ -65,6 +74,7 @@ impl Hook {
             Hook::Steal => (3, 2),
             Hook::Slice => (3, 1),
             Hook::Idle => (4, 1),
+            Hook::Slack => (3, 1),
         };
         let mut signature = Signature::new(CALL_CONV);
         signature
@@ -78,7 +88,7 @@ impl Hook {
 }
 
 /// The offset in a policy record of the address of the policy's value, which follows it.
-const VALUE: u64 = 32;
+const VALUE: u64 = 40;
 
 /// The way of idling an `Idle` hook gives for `hw::Idle.Mwait`, plus its hint.
 const MWAIT: i64 = 0x100;
@@ -165,6 +175,10 @@ impl Lowering<'_, '_> {
                         lo.write_option(fx, &option, slot, timed, Held::Scalar(params[3]));
                         args.push(Held::Address(slot));
                     }
+                    Hook::Slack => {
+                        args.push(lo.task_view(fx, &param_ty(2), params[1]));
+                        args.push(Held::Scalar(params[2]));
+                    }
                 }
                 let called = lo.invoke(fx, Invoked::Direct(id), &abi, &args);
                 let result_ty = abi.result.clone();
@@ -200,7 +214,7 @@ impl Lowering<'_, '_> {
                             fx.b.ins().bor(victim, tasks),
                         ]
                     }
-                    Hook::Slice => vec![fx.load(PTR, result, 0)],
+                    Hook::Slice | Hook::Slack => vec![fx.load(PTR, result, 0)],
                     Hook::Idle => {
                         let polls = lo.variant_is(fx, result, &result_ty, "Poll");
                         let polls = fx.b.ins().uextend(PTR, polls);
@@ -305,6 +319,36 @@ impl Lowering<'_, '_> {
         let zero = fx.ptr(0);
         fx.store(zero, own, cpu::HOOK);
         results
+    }
+
+    /// The slack the kernel's policy gives a timer the running task arms `delay` nanoseconds
+    /// ahead, its hook called with maskable interrupts disabled; zero under the default policy
+    /// and outside a task.
+    pub(super) fn timer_slack(&mut self, fx: &mut Fx, delay: Value) -> Value {
+        let policy = self.policy(fx);
+        let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, policy, 0);
+        fx.choose_in(
+            self,
+            installed,
+            &[PTR],
+            |lo, fx| {
+                let flags = lo.call_stub(fx, Stub::IrqSave, &[])[0];
+                let own = lo.running_cpu(fx);
+                let thread = fx.load(PTR, own, cpu::THREAD);
+                let record = fx.load(PTR, thread, thread::CURRENT);
+                let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+                let slack = fx.choose_in(
+                    lo,
+                    running,
+                    &[PTR],
+                    |lo, fx| lo.hook(fx, policy, Hook::Slack, &[record, delay]),
+                    |_, fx| vec![fx.ptr(0)],
+                )[0];
+                lo.call_stub(fx, Stub::IrqRestore, &[flags]);
+                vec![slack]
+            },
+            |_, fx| vec![fx.ptr(0)],
+        )[0]
     }
 
     /// The installed policy's record, zero for the default policy.
@@ -626,9 +670,9 @@ impl Lowering<'_, '_> {
         got
     }
 
-    /// Idles the running CPU as its policy says, given the earliest deadline of the kernel
-    /// clock: halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at
-    /// once to look for tasks again.
+    /// Idles the running CPU as its policy says, given the earliest end of a timer's window:
+    /// halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at once to
+    /// look for tasks again.
     pub fn kernel_idle(&mut self, fx: &mut Fx) {
         let own = self.running_index(fx);
         let own_record = self.cpu_record(fx, own);
@@ -637,12 +681,10 @@ impl Lowering<'_, '_> {
         self.call_routine(fx, Routine::Lock, &[lock]);
         let first = fx.load(PTR, state_address, state::TIMERS);
         let timed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
-        let until = fx.choose(
-            timed,
-            &[PTR],
-            |fx| vec![fx.load(PTR, first, operation::DUE)],
-            |fx| vec![fx.ptr(0)],
-        )[0];
+        let all = fx.int(PTR, -1);
+        let end = self.windows_end(fx, all);
+        let zero = fx.ptr(0);
+        let until = fx.b.ins().select(timed, end, zero);
         self.call_routine(fx, Routine::Unlock, &[lock]);
         let policy = self.policy(fx);
         let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, policy, 0);

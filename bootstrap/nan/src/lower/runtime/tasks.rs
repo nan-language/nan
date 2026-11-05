@@ -213,7 +213,9 @@ pub mod operation {
     pub const DUE: u64 = 80;
     pub const ORDER: u64 = 88;
     pub const WITHDRAW: u64 = 96;
-    pub const SIZE: u64 = 104;
+    /// On a kernel, the end of a timer's window: when it is due plus its slack.
+    pub const WINDOW_END: u64 = 104;
+    pub const SIZE: u64 = 112;
     pub const COMPLETED: i64 = 1;
     pub const DELIVERED: i64 = 2;
     pub const REQUESTED: i64 = 1;

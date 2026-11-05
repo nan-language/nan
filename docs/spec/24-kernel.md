@@ -840,7 +840,7 @@ pub fn count_switch(switches: hw::PerCpu[Switches]) {
 
 ### Policies
 
-Each CPU has a **run queue** of ready tasks, ordered by key, tasks of equal keys in the order they joined it. A kernel's **policy** decides on which CPU's queue and with which key a task that becomes ready is placed, from which CPUs a CPU with an empty queue takes a task, how long a task runs before it is preempted, and how a CPU idles.
+Each CPU has a **run queue** of ready tasks, ordered by key, tasks of equal keys in the order they joined it. A kernel's **policy** decides on which CPU's queue and with which key a task that becomes ready is placed, from which CPUs a CPU with an empty queue takes a task, how long a task runs before it is preempted, how a CPU idles, and how late a deadline may pass.
 
 ```nan-api
 // module: boot
@@ -856,6 +856,9 @@ pub interface Policy {
     fn steal(self, t: IrqsDisabled, cpu: u32, round: u32) -> Option[Steal] limits notrap, terminates, noalloc, stack 4_096
     fn slice(self, t: IrqsDisabled, cpu: u32, task: TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096
     fn idle(self, t: IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> Idle limits notrap, terminates, noalloc, stack 4_096
+    fn slack(self, t: IrqsDisabled, task: TaskView, delay_ns: u64) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+        return 0
+    } slack
 } Policy
 
 pub closed struct TaskView derives Copy, Eq {
@@ -891,8 +894,9 @@ pub closed enum Idle derives Copy, Eq {
 - When a task becomes ready, as it starts, as an event wakes it, as it is preempted and as a [serial executor](16-concurrency.md#executors)'s turn passes to it, `place(t, task)` gives its placement: the task joins the queue of the CPU `cpu` names, of the running CPU when `cpu` is not below `hw::cpu_count()`, with the key `key`, **bound** to that CPU when `bound` holds. The CPU signal ([cross-CPU operations](#cross-cpu-operations)) then goes to the CPU it names when that is another CPU that idles or runs a task placed with a greater key, or when it is the running CPU, outside an interrupt fn, running a task placed with a greater key.
 - A CPU runs the first task of its queue. When its queue is empty it calls `steal(t, cpu, round)` for rounds 0, 1 and on, at most `hw::cpu_count()` − 1 of them, until a round gives `None` or a steal whose `cpu` names another CPU whose queue holds a task not bound to it. Of the n such tasks it then takes, in queue order, `tasks` of them, but at least one and at most n ÷ 2 rounded up; it runs the first and the others join its own queue with their keys. No steal takes a bound task.
 - As a CPU switches to a task, `slice(t, cpu, task)` gives the task's **slice**: it is preempted once that many nanoseconds of the kernel clock have passed since, unless it suspends before; 0 gives no slice.
-- A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest deadline of the kernel clock, `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once; `Mwait(hint)` waits as `Halt` does, in `mwait` with `hint` as its C-state hint on an x86_64 CPU with `monitor` and `mwait` whose wait an interrupt ends, and halts otherwise. Either way the CPU then looks for a task again.
-- The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready, unbound; steals one task in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice; and halts.
+- A CPU finding no task calls `idle(t, cpu, until_ns)`, `until_ns` being the earliest end of the window of a deadline of the kernel clock ([kernel time](#kernel-time)), `None` when none is armed. `Halt` halts the CPU until an interrupt arrives, which the CPU signal and its timer bring; `Poll` returns at once; `Mwait(hint)` waits as `Halt` does, in `mwait` with `hint` as its C-state hint on an x86_64 CPU with `monitor` and `mwait` whose wait an interrupt ends, and halts otherwise. Either way the CPU then looks for a task again.
+- As a kernel task arms a deadline of the kernel clock `delay_ns` nanoseconds ahead, `slack(t, task, delay_ns)` gives its **slack** ([kernel time](#kernel-time)); the default body gives 0.
+- The default policy places a task on the CPU it last ran on when that CPU idles, otherwise on the lowest-numbered CPU that idles, otherwise on the running CPU, with a key that grows with the order in which tasks become ready, unbound; steals one task in round r from CPU `(cpu + 1 + r) % hw::cpu_count()`; gives no slice and no slack; and halts.
 - Every method of a policy type is judged against the `stack 4_096` its interface method demands ([stack limits](10-effects-digests.md#stack-limits)), and every stack a hook runs on holds a call of it ([static bounds](17-suspension-io.md#static-bounds)).
 
 ```nan
@@ -1015,10 +1019,10 @@ A kernel task's stack is drawn through the executor's allocator as the task star
 
 ### Kernel time
 
-The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. On x86_64 that counter is the time-stamp counter where it is invariant and otherwise the HPET or the ACPI PM timer, whose narrower count the clock extends to 64 bits; on AArch64 it is the virtual counter. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline.
+The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. On x86_64 that counter is the time-stamp counter where it is invariant and otherwise the HPET or the ACPI PM timer, whose narrower count the clock extends to 64 bits; on AArch64 it is the virtual counter. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline. Its **window** runs from it to it plus its slack ([policies](#policies)), and it passes at a moment of its window, together with every other deadline whose window holds that moment.
 
-- Each CPU's timer fires at the earliest deadline, at the end of the slice of the task it runs and at its **pacing ticks**, 10 ms apart, whichever comes first. A CPU has pacing ticks while it runs a task, and when idle only if a contribution binds the timer's vector, so an idle CPU of another kernel sleeps until a deadline or the CPU signal. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
-- A deadline armed on a CPU ahead of every other deadline programs that CPU's timer to fire at it.
+- Each CPU's timer fires at the earliest end of a deadline's window, at the end of the slice of the task it runs and at its **pacing ticks**, 10 ms apart, whichever comes first. A CPU has pacing ticks while it runs a task, and when idle only if a contribution binds the timer's vector, so an idle CPU of another kernel sleeps until a deadline or the CPU signal. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
+- A deadline armed on a CPU whose window ends before every other deadline's programs that CPU's timer to fire at that end.
 - Cancelling a task that sleeps ends its sleep at once, and a deadline that its construct no longer needs leaves the deadlines at once.
 
 ```nan

@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, keyed tasks and checkpoints run in their spaces, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -44,6 +44,19 @@ pub closed enum Answer derives Encode {
     Summary(Summary)
     Number(u64)
 } Answer
+
+/// The book's protocol and state, as the kernel declares them.
+pub protocol Ledger {
+    pub fn add(amount: u32) -> u64 limits pure
+    pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
+    pub fn divide(by: u32) -> u64 limits pure
+    pub fn spin() -> u64 limits pure
+} Ledger
+
+pub closed struct Book derives Encode {
+    pub total: u64
+    pub ticks: u64
+} Book
 
 /// The serial port serving a job's log and standard streams, its record counting the bytes of
 /// standard input it has given.
@@ -483,8 +496,9 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 /// not decode, a host program, a job trapping, failing, returning and reading kernel memory, a job
 /// without a stack bound recursing past the stack it starts with, a job holding memory within the
 /// frames its space draws from and past them, a space drawing and giving back pages, a job
-/// answering a line over its link, a space's runtime probing kernel memory, then a job spinning on
-/// floats in a space while the same job, verified once, spins in the shared space.
+/// answering a line over its link, instances of a component held in spaces, a space's runtime
+/// probing kernel memory, then a job spinning on floats in a space while the same job, verified
+/// once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     var values = mem::List[u32].empty(grants.alloc)
     mut values.push(2)
@@ -535,6 +549,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     say_answer(text: "held pages ", bytes: mut holds.remove(0), alloc: grants.alloc)
     drew(cpu, job: typed, grants, mut frames)
     try await linked(cpu, job: typed, grants, mut frames)
+    try await booked(cpu, job: isolated(loader, bytes: fw_file(name: "opt/nan/ledger", alloc: grants.alloc).view(), alloc: grants.alloc), grants, mut frames)
     probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve
@@ -636,6 +651,207 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     returned(take extended, mut frames)
     take link.release(mut frames)
 } linked
+
+/// Holds instances of the ledger's book in spaces over the first channel of a link: started,
+/// called, refused a call carrying a handle, checkpointed and ended, then restored from that
+/// checkpoint, a handler that traps and a handler that never returns until the instance is
+/// abandoned.
+fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+    discard mut link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    var pool = frames_for_space(mut frames, alloc: grants.alloc)
+    var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
+    let opened = attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
+        return try await started(take instance, grants)
+    })
+    match opened {
+        Ok(Some(checkpoint)) => {
+            discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: Some(take checkpoint), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+                try await restored(take instance, grants)
+            })
+        }
+        else => say(text: "book unheld\n")
+    }
+    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        try await trapped(take instance, grants)
+    })
+    discard attempt await nanos::hold_isolated(cpu, job, component: "Book", services: services(grants), link, checkpoint: None, frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        try await abandoned(take instance, grants)
+    })
+    for frame in take pool {
+        mut frames.push(take frame)
+    }
+    returned(take extended, mut frames)
+    take link.release(mut frames)
+} booked
+
+/// Starts the book, calls it and gives a checkpoint of it.
+fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    try await ticked(mut book, reason: sys::ResumeReason.Started)
+    try await added(mut book, amount: 5, grants)
+    var echo = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].echo(mut echo, clock: grants.clock)
+    match attempt await book.inbox().call(sys::Wire[Ledger].hash(), request: take echo, alloc: grants.alloc) {
+        Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "book refused a handle\n")
+        else => say(text: "book took a handle\n")
+    }
+    let checkpoint = try await book.checkpoint()
+    say(text: "book checkpoint ")
+    say_book(checkpoint, alloc: grants.alloc)
+    undefer book
+    say(text: "book ")
+    say_ended(try await take book.end(), alloc: grants.alloc)
+    return checkpoint
+} started
+
+/// Restores the book from a checkpoint into a fresh instance and calls it.
+fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    try await ticked(mut book, reason: sys::ResumeReason.Restored)
+    try await added(mut book, amount: 7, grants)
+    undefer book
+    say(text: "book ")
+    say_ended(try await take book.end(), alloc: grants.alloc)
+} restored
+
+/// Calls a handler of the book that traps, which ends the instance.
+fn trapped(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    var zero = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].divide(mut zero, by: 0)
+    say(text: "book divided ")
+    match attempt await called(mut book, request: take zero, grants) {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    say(text: "book stepped ")
+    match attempt await mut book.step() {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    undefer book
+    say(text: "book divider ")
+    say_ended(try await take book.end(), alloc: grants.alloc)
+} trapped
+
+/// Calls a handler of the book that never returns, abandoning the instance from a task of its own
+/// while its holder steps the call.
+fn abandoned(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    var spin = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].spin(mut spin)
+    var pending = Some(take spin)
+    var watching = Some(book.domain())
+    say(text: "book spun ")
+    let outcome = attempt await task::scope(grants.exec, body: fn[mut book, mut pending, mut watching](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(request) = mut pending.extract() else {
+            return
+        }
+        let Some(watched) = mut watching.extract() else {
+            return
+        }
+        discard s.spawn(fn[take watched]() fails task::Cancelled uses wait limits stack 16_384 {
+            try await grants.clock.sleep(10)
+            watched.contents().trigger()
+        })
+        discard try await called(mut book, take request, grants)
+    })
+    match outcome {
+        Err(nanos::InstanceError.Ended) => say(text: "ended\n")
+        else => say(text: "otherwise\n")
+    }
+    undefer book
+    say(text: "book spinner ")
+    say_ended(try await take book.end(), alloc: grants.alloc)
+} abandoned
+
+/// Resumes the book for a reason, then starts the keyed task its resume spawns and steps the tick
+/// that task posts.
+fn ticked(mut book: nanos::Instance, reason: sys::ResumeReason) fails nanos::InstanceError uses wait {
+    try await mut book.resumed(reason)
+    say(text: "book keyed ")
+    say_number(u64.widen(try await mut book.start_keyed()))
+    say(text: "\n")
+    try await book.incoming()
+    say(text: "book ticked ")
+    match try await mut book.step() {
+        true => say(text: "true\n")
+        false => say(text: "false\n")
+    }
+} ticked
+
+/// Adds `amount` to the book and writes the total it answers.
+fn added(mut book: nanos::Instance, amount: u32, grants: Grants) fails nanos::InstanceError uses wait {
+    var request = sys::Encoded.empty(grants.alloc)
+    let add = sys::Wire[Ledger].add(mut request, amount)
+    let reply = try await called(mut book, take request, grants)
+    say(text: "book added ")
+    let Ok(given) = reply else {
+        say(text: "nothing\n")
+        return
+    }
+    match attempt add.decode(Untrusted.of(given.bytes.view()), handles: given.handles.view(), alloc: grants.alloc) {
+        Ok(total) => {
+            say_number(total)
+            say(text: "\n")
+        }
+        Err(_) => say(text: "nothing\n")
+    }
+} added
+
+/// The reply of the book to a call, which the instance handles in the next step its holder takes.
+fn called(mut book: nanos::Instance, take request: sys::Encoded, grants: Grants) -> Result[sys::Encoded, sys::CallError[Never]] fails nanos::InstanceError uses wait {
+    var pending = Some(take request)
+    var reply: Result[sys::Encoded, sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
+    try await task::scope(grants.exec, body: fn[mut book, mut pending, mut reply](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(call) = mut pending.extract() else {
+            return
+        }
+        let inbox = book.inbox()
+        let answered = s.spawn(fn[take inbox, take call]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
+            return attempt await inbox.call(sys::Wire[Ledger].hash(), request: take call, alloc: grants.alloc)
+        })
+        try await book.incoming()
+        discard try await mut book.step()
+        reply = try await take answered.join()
+    })
+    return reply
+} called
+
+/// Writes the total and ticks of the book whose state `bytes` encodes.
+fn say_book(bytes: mem::Bytes, alloc: mem::Alloc) {
+    match attempt mem::wire::Codec[Book].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(state) => {
+            say(text: "total ")
+            say_number(state.total)
+            say(text: " ticks ")
+            say_number(state.ticks)
+            say(text: "\n")
+        }
+        Err(_) => say(text: "undecodable\n")
+    }
+} say_book
+
+/// Writes how an instance of the book ended.
+fn say_ended(take ended: nanos::Ended, alloc: mem::Alloc) {
+    match ended {
+        nanos::Ended.Returned(bytes) => {
+            say(text: "returned ")
+            say_book(bytes, alloc)
+        }
+        nanos::Ended.Trapped(trap) => match trap.kind() {
+            sys::TrapKind.DivisionByZero => say(text: "trapped trap.division-by-zero\n")
+            else => say(text: "trapped otherwise\n")
+        }
+        nanos::Ended.Abandoned => say(text: "abandoned\n")
+        else => say(text: "ended otherwise\n")
+    }
+} say_ended
 
 /// Writes `text`, then the bytes a link received.
 fn say_received(text: Str, take outcome: Result[Untrusted[mem::Bytes], nanos::LinkError], alloc: mem::Alloc) {

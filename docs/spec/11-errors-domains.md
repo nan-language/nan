@@ -470,7 +470,7 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 } TrapKind
 ```
 
-`sys::Domain.run` runs `body` on `exec` as the first task of a new domain D. The calling task waits until D ends: when its first task ends, or once D, abandoned, is settled and freed.
+`sys::Domain.run` runs `body` on `exec` as the first task of a new domain D. The calling task waits until D ends: once its first task and every other task of D have ended, or once D, abandoned, is settled and freed.
 
 - A [task closure](16-concurrency.md#task-closures) passed as `body` captures by `take` and Copy only ([lending](16-concurrency.md#lending)).
 - Before D starts, the calling task draws through `alloc`, which names D's [cell](#domain-memory), the first task's stack, which belongs to D, and the storage of D's trap report, which belongs to the caller's domain; when `alloc` cannot supply them, the call traps (`trap.exhausted`) in the caller's domain. Other tasks of D draw their stacks as [joins](16-concurrency.md#joins) states. When `run` returns `Ok` or fails, it frees that storage before it returns; on `Err` the storage belongs to the returned `sys::Trap` and is freed when that value is released.

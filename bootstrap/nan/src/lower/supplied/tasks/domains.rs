@@ -271,7 +271,8 @@ pub struct Nested {
 /// Runs the `task fn` value of a type held at `function` on an executor as the first task of a
 /// new domain nested in the running task's, its stack, of `stack` usable bytes or else of the
 /// size its type gives, and its trap record drawn through a cell, the domain's cell, and waits until that task
-/// ends or a trap abandons the domain; the spawn is a scheduling point when `point` holds.
+/// and every other task of the domain have ended or a trap abandons the domain; the spawn is a
+/// scheduling point when `point` holds.
 /// Through a claimed abandoner, the domain is the one it runs until the wait ends, and an
 /// abandoner triggered already abandons it before its first task starts, which then never does,
 /// its trap report locating the run's call.
@@ -373,6 +374,9 @@ pub fn run_nested(
             let flags = fx.load(PTR, first, task::FLAGS);
             let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
             let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
+            let tasks = fx.load(PTR, record, domain::TASKS);
+            let none = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
+            let ended = fx.b.ins().band(ended, none);
             let abandoned = fx.load(PTR, record, domain::ABANDONED);
             let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
             let over = fx.b.ins().bor(ended, abandoned);

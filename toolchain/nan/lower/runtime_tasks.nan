@@ -205,7 +205,7 @@ const DOMAIN_CHUNKS: u64 = 16
 /// ended first.
 const DOMAIN_ABANDONED: u64 = 24
 
-/// The task waiting for the domain's first task to end, and the lock of that wait.
+/// The task waiting for the domain's tasks to end, and the lock of that wait.
 const DOMAIN_WAITER: u64 = 32
 
 const DOMAIN_LOCK: u64 = 40
@@ -225,7 +225,10 @@ const DOMAIN_HOLDINGS: u64 = 72
 /// The handle of its cell, which the chunks passing to it are charged to.
 const DOMAIN_CELL: u64 = 80
 
-const DOMAIN_SIZE: u64 = 88
+/// The count of its tasks that have not ended.
+const DOMAIN_TASKS: u64 = 88
+
+const DOMAIN_SIZE: u64 = 96
 
 const DOMAIN_CLOSED: i64 = 2
 
@@ -623,6 +626,9 @@ fn tasks_spawn(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(storage, addr: record, offset: TASK_RESULT)
     mut fx.store(storage, addr: record, offset: TASK_FAILURE)
     mut fx.store(domain, addr: record, offset: TASK_DOMAIN)
+    let tasks = mut fx.offset(domain, offset: DOMAIN_TASKS)
+    let one = mut fx.ptr(1)
+    discard fetch_add(mut fx, address: tasks, amount: one)
     mut fx.store(region, addr: record, offset: TASKS_TASK_REGION)
     let new = mut fx.int(clif::Type.Int32, value: RUN_NEW)
     mut fx.store(new, addr: record, offset: TASK_STATE)
@@ -869,6 +875,7 @@ fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let asked = stop_asked(mut fx, record)
     discard mut fx.choose_in(mut lo, condition: asked, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
+        count_out(mut lo1, fx: mut fx1, record)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -948,6 +955,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     let stops = mut fx.b.bor(trapped, y: asked)
     discard mut fx.choose_in(mut lo, condition: stops, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
+        count_out(mut lo1, fx: mut fx1, record)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -975,6 +983,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
         })
         mut fx1.if_true(ended, then: fn[mut lo1](mut fx2: Fx) {
             release_stack(mut lo1, fx: mut fx2, record)
+            count_out(mut lo1, fx: mut fx2, record)
             let done = mut fx2.load(PTR, addr: record, offset: TASK_DONE)
             let has_done = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
             mut fx2.if_true(has_done, then: fn(mut fx3: Fx) {
@@ -987,6 +996,25 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
         return mem::List[clif::Value].empty(fx1.alloc)
     })
 } switch_in
+
+/// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the
+/// domain to end once none remains.
+fn count_out(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let domain = mut fx.load(PTR, addr: record, offset: TASK_DOMAIN)
+    let lock = mut fx.offset(domain, offset: DOMAIN_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let tasks = mut fx.offset(domain, offset: DOMAIN_TASKS)
+    let less = mut fx.int(PTR, value: -1)
+    let before = fetch_add(mut fx, address: tasks, amount: less)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 1)
+    let waiter = mut fx.load(PTR, addr: domain, offset: DOMAIN_WAITER)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+    let wakes = mut fx.b.band(last, y: waits)
+    mut fx.if_true(wakes, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: fx1.list1(waiter).view())
+    })
+} count_out
 
 /// Adds `ns` to the time a task ran and to the time its executor's entry and each entry that
 /// entry derives from account, while the executor's handle is live; a task started outside any

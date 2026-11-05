@@ -1347,6 +1347,8 @@ pub closed struct ProtocolHash derives Copy, Eq, Ord, Hash, Encode {
 pub open struct Handle {
 } Handle
 
+pub fn Handle.of[C: Capability and Copy](capability: C) -> Handle
+
 pub closed struct Encoded {
     pub bytes: mem::Bytes
     pub handles: mem::List[Handle]
@@ -1369,7 +1371,7 @@ pub fn Reply.decode(self, raw: Untrusted[Slice[u8]], handles: Slice[Handle], all
 
 - Every protocol implements `sys::Protocol`, and nothing else does: an impl line naming it is an error (`component.protocol-impl`).
 - A `sys::Handle` holds a value of a handle type and that type's **handle hash**, the hash of its handle line ([protocol hashes](#protocol-hashes)). It is a base type and a primitive capability, Copy and Send. `sys::Reply[R, E]` is a base type holding nothing, Copy and Send.
-- `Wire.hash()` gives P's protocol hash, and `Encoded.empty(alloc)` an encoded call without bytes or handles.
+- `Wire.hash()` gives P's protocol hash, `Encoded.empty(alloc)` an encoded call without bytes or handles, and `sys::Handle.of(capability)` the handle holding `capability` with C's handle hash, as the handles beside an encoding hold it.
 
 On `sys::Wire[P]`, the candidates of method resolution for a name also hold P's `pub` operation of that name where it is visible. As members of `sys::Wire[P]`, they have these heads, E being `Never` for an operation without a `fails` clause:
 
@@ -1616,7 +1618,7 @@ impl Fake: sys::Protocol // error: component.protocol-impl
 
 ## Runner capabilities
 
-A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary and its checkpoints. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
+A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary, its checkpoints and the capabilities the holder keeps for it by number. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
 
 ```nan-api
 // module: sys
@@ -1631,6 +1633,14 @@ pub fn Cx.publish(mut self, summary: Slice[u8]) fails RunnerError
 
 pub fn Cx.sync(mut self) fails RunnerError
 
+pub fn Cx.capability[C: Capability and Copy](mut self, id: CapabilityId[C]) -> C fails RunnerError
+
+pub fn Cx.drop_capability[C: Capability and Copy](mut self, id: CapabilityId[C]) fails RunnerError
+
+pub closed struct CapabilityId[C: Capability and Copy] derives Copy, Eq, Encode {
+    pub id: u64
+} CapabilityId
+
 pub open struct Port[Q: Protocol] derives Copy, Send {
 } Port
 
@@ -1644,6 +1654,7 @@ pub fn Port.call[R: Send, E: Send](self, reply: Reply[R, E], call: Encoded, allo
 - `mut cx.send_to(port, call)` hands the holder a call of one of Q's operations, encoded as `sys::Wire[Q]` encodes it ([wire encoding](#wire-encoding)): it calls the `send_to` of the port's runner capability with the port's number, Q's protocol hash and the bytes and handles of `call`.
 - `mut cx.reply(request, reply)` answers the request the holder numbers `request`, calling `reply` with the bytes and handles of `reply`, the encoding of the request's reply. A holder gives the numbers of the requests it keeps pending through operations of the component's own protocol.
 - `mut cx.publish(summary)` gives the holder the encoding of the component's summary, calling `publish`, and `mut cx.sync()` asks the holder to keep a checkpoint of the component once it is quiescent, calling `sync`.
+- A holder keeps capabilities for its component by number, so the component's state, which a checkpoint holds, names each by a `sys::CapabilityId[C]`. `mut cx.capability(id)` calls `capability` with `id.id` and gives the capability the `sys::Handle` it returns holds, failing with `RunnerError.Unknown` when that handle's handle hash is not C's ([wire encoding](#wire-encoding)). `mut cx.drop_capability(id)` calls `drop_capability` with `id.id`, telling the holder the component no longer needs that capability.
 - Each of these operations of a component context calls its method on the calling task, the handler's, and fails with the method's failure.
 - `port.call(reply, call, alloc)` calls the `call` of the port's runner capability with the port's number, Q's protocol hash, the bytes and handles of `call` and `alloc`, then decodes the encoding it gives as `reply.decode` does ([wire encoding](#wire-encoding)), drawing through `alloc`: it gives the request's result, or fails with `CallError.Failed` holding its failure or `CallError.Malformed` when the encoding does not decode. When the method fails, it fails with `CallError.Cancelled` holding a cancellation and with `CallError.Closed` holding `task::SendError.Closed` otherwise. It is a cancellation point, so a component calls it from a keyed task, posting what it gives to its intake.
 

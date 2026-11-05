@@ -1,6 +1,6 @@
 # 0081. The kernel clock
 
-Status: accepted; its pacing of idle CPUs superseded by 0107, its x86_64 counter by 0121, its measurement of the time-stamp counter by 0122
+Status: accepted; its pacing of idle CPUs superseded by 0107, its x86_64 counter by 0121, its measurement of the time-stamp counter by 0122, its one-shot x86_64 timers by 0123
 
 ## Context
 

@@ -247,12 +247,18 @@ const APIC_ENABLED: u64 = 0x100;
 const DIVIDE_BY_16: u64 = 0x3;
 const MASKED: u64 = 0x1_0000;
 
-/// The interrupt vector each CPU's local APIC timer fires, one-shot, the nanoseconds of the
-/// clock over which a CPU counts its timer's ticks, and the vector of the local APIC's spurious
+/// The interrupt vector each CPU's local APIC timer fires, the nanoseconds of the clock over
+/// which a CPU counts its one-shot timer's ticks, and the vector of the local APIC's spurious
 /// interrupts.
 const TIMER_VECTOR: i64 = 0x20;
 const TIMER_MEASURE: u64 = 1_000_000;
 const SPURIOUS_VECTOR: i64 = 0xFF;
+
+/// The local vector table's timer mode arming the timer through `IA32_TSC_DEADLINE`, that
+/// register, and the bit of CPUID leaf 1's ECX saying a CPU has the mode.
+const TSC_DEADLINE_MODE: u64 = 0x4_0000;
+const TSC_DEADLINE_MSR: u32 = 0x6E0;
+const TSC_DEADLINE_FEATURE: i64 = 1 << 24;
 
 /// The vector of non-maskable interrupts, and those whose interrupt fn's return halts the
 /// kernel.
@@ -1225,9 +1231,41 @@ impl Lowering<'_, '_> {
         )[0]
     }
 
+    /// Sets the running CPU's local APIC timer firing `TIMER_VECTOR`, recording its mode, and
+    /// gives the ticks it counts in a millisecond: in TSC-deadline mode, where the CPU has it
+    /// and the clock is the time-stamp counter, the time-stamp counter's; one-shot otherwise,
+    /// the local APIC timer's own.
+    pub(super) fn x64_timer_rate(&mut self, fx: &mut Fx) -> Value {
+        let registers = fx.slot(16, 4);
+        self.cpuid(fx, registers, 1, 0);
+        let ecx = fx.load(types::I32, registers, 8);
+        let feature = fx.b.ins().band_imm_s(ecx, TSC_DEADLINE_FEATURE);
+        let feature = fx.b.ins().icmp_imm_s(IntCC::NotEqual, feature, 0);
+        let clocked = self.tsc_clocked(fx);
+        let deadline = fx.b.ins().band(feature, clocked);
+        let record = self.running_cpu(fx);
+        let mode = fx.b.ins().uextend(PTR, deadline);
+        fx.store(mode, record, cpu::TSC_DEADLINE);
+        fx.choose_in(
+            self,
+            deadline,
+            &[PTR],
+            |lo, fx| {
+                let mode = fx.ptr(TIMER_VECTOR as u64 | TSC_DEADLINE_MODE);
+                lo.apic_write(fx, APIC_LVT_TIMER, mode);
+                fx.b.ins().fence();
+                let state_address = lo.state(fx);
+                let scale = fx.load(PTR, state_address, state::CLOCK_SCALE);
+                let millisecond = fx.ptr(super::super::runtime::timers::NS_PER_MS << 32);
+                vec![fx.b.ins().udiv(millisecond, scale)]
+            },
+            |lo, fx| vec![lo.apic_timer_rate(fx)],
+        )[0]
+    }
+
     /// The ticks the running CPU's local APIC timer counts in a millisecond, measured with its
     /// interrupt masked, after which the timer fires `TIMER_VECTOR` one-shot.
-    pub(super) fn x64_timer_rate(&mut self, fx: &mut Fx) -> Value {
+    fn apic_timer_rate(&mut self, fx: &mut Fx) -> Value {
         let divide = fx.ptr(DIVIDE_BY_16);
         self.apic_write(fx, APIC_TIMER_DIVIDE, divide);
         let masked = fx.ptr(TIMER_VECTOR as u64 | MASKED);
@@ -1254,9 +1292,27 @@ impl Lowering<'_, '_> {
         fx.b.ins().udiv(ticks, elapsed)
     }
 
-    /// Starts the running CPU's local APIC timer counting down `ticks`.
+    /// Arms the running CPU's timer to fire in `ticks` of its rate: in TSC-deadline mode at the
+    /// time-stamp counter that many ticks ahead, and otherwise counting them down.
     pub(super) fn x64_set_timer(&mut self, fx: &mut Fx, ticks: Value) {
-        self.apic_write(fx, APIC_TIMER_COUNT, ticks);
+        let record = self.running_cpu(fx);
+        let mode = fx.load(PTR, record, cpu::TSC_DEADLINE);
+        let deadline = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mode, 0);
+        fx.choose_in(
+            self,
+            deadline,
+            &[],
+            |lo, fx| {
+                let now = lo.call_stub(fx, Stub::ReadTsc, &[])[0];
+                let at = fx.b.ins().iadd(now, ticks);
+                lo.write_msr(fx, TSC_DEADLINE_MSR, at);
+                Vec::new()
+            },
+            |lo, fx| {
+                lo.apic_write(fx, APIC_TIMER_COUNT, ticks);
+                Vec::new()
+            },
+        );
     }
 
     /// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the

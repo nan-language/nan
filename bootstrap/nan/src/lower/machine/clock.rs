@@ -1,17 +1,19 @@
-//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in
-//! nanoseconds since the runtime started and never below what any CPU read before; the timers
-//! of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the
-//! earliest of the timer first due, the end of its task's slice and its next pacing tick, which
-//! it has while it runs a task or the final build binds the timer's vector; and the wall clock
-//! source a machine root grant reads once.
+//! A kernel's clock: its counter, on x86_64 the time-stamp counter, the HPET or the PM timer and
+//! on AArch64 the virtual counter, in nanoseconds since the runtime started and never below what
+//! any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its
+//! timer programmed for the earliest of the timer first due, the end of its task's slice and its
+//! next pacing tick, which it has while it runs a task or the final build binds the timer's
+//! vector; and the wall clock source a machine root grant reads once.
 //!
 //! On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf
 //! `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name,
 //! else over the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is
-//! that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU measures its local APIC timer's rate against the clock as it starts taking
-//! interrupts. The wall clock source is the CMOS clock on
-//! `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's
-//! `GetTime` on the UEFI targets, its time read as UTC.
+//! that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU's
+//! timer runs in TSC-deadline mode where it has that mode and the clock is the time-stamp
+//! counter, and otherwise one-shot, its local APIC timer's rate measured against the clock as it
+//! starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031
+//! the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI
+//! targets, its time read as UTC.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -379,6 +381,13 @@ impl Lowering<'_, '_> {
             (result[0], vec![result[1]])
         })[0];
         fx.b.ins().return_(&[now]);
+    }
+
+    /// Whether the x86_64 clock's source is the time-stamp counter.
+    pub(super) fn tsc_clocked(&mut self, fx: &mut Fx) -> Value {
+        let state_address = self.state(fx);
+        let source = fx.load(PTR, state_address, state::CLOCK_SOURCE);
+        fx.b.ins().icmp_imm_s(IntCC::Equal, source, TSC_SOURCE)
     }
 
     /// The clock's counter: on x86_64 the time-stamp counter, or the HPET's or PM timer's count

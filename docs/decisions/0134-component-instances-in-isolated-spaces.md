@@ -1,6 +1,6 @@
 # 0134. Component instances in isolated spaces
 
-Status: accepted; no handle crossing into or out of a space superseded by 0135
+Status: accepted; no handle crossing into or out of a space superseded by 0135, and the instance acting through no runner by 0136
 
 ## Context
 

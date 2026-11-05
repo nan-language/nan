@@ -586,8 +586,8 @@ pub fn leave_untaken(
 }
 
 /// Withdraws a stopped poster's entry from a runner's intake unless the runner has taken or
-/// removed it, marks a taken one so that no reply reaches it, and drops the poster's reference
-/// to the runner.
+/// removed it, marks a taken one and stops the runner's record holding it as current so that no
+/// reply reaches it, and drops the poster's reference to the runner.
 fn withdraw_post(lo: &mut Lowering) -> FuncId {
     lo.glue_function(
         Glue::WithdrawPost,
@@ -605,6 +605,12 @@ fn withdraw_post(lo: &mut Lowering) -> FuncId {
             fx.when(taken, |fx| {
                 let withdrawn = fx.ptr(status::WITHDRAWN as u64);
                 fx.store(withdrawn, node, entry::STATUS);
+                let current = fx.load(PTR, record, runner::CURRENT);
+                let held = fx.b.ins().icmp(IntCC::Equal, current, node);
+                fx.when(held, |fx| {
+                    let zero = fx.ptr(0);
+                    fx.store(zero, record, runner::CURRENT);
+                });
             });
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             unreference(lo, fx, record);

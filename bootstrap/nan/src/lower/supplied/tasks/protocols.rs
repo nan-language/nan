@@ -87,22 +87,22 @@ pub fn dispatch(
 }
 
 /// Gives a request's handler's result or failure to its poster, unless the poster has stopped,
-/// in which case it is released.
+/// withdrawing the entry the runner's record held as current, in which case it is released.
 fn reply(lo: &mut Lowering, fx: &mut Fx, record: Value, node: Value, head: &FnSig, called: Called) {
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
+    let current = fx.load(PTR, record, runner::CURRENT);
+    let live = fx.b.ins().icmp(IntCC::Equal, current, node);
     let zero = fx.ptr(0);
     fx.store(zero, record, runner::CURRENT);
-    let current = fx.load(PTR, node, entry::STATUS);
-    let live = fx.b.ins().icmp_imm_s(IntCC::Equal, current, status::TAKEN);
-    let reply = fx.load(PTR, node, entry::REPLY);
-    let poster = fx.load(PTR, node, entry::POSTER);
     let give = |lo: &mut Lowering, fx: &mut Fx, ty: &Ty, held: Held, word: i64| {
         fx.choose_in(
             lo,
             live,
             &[],
             |lo, fx| {
+                let reply = fx.load(PTR, node, entry::REPLY);
+                let poster = fx.load(PTR, node, entry::POSTER);
                 lo.store_held(fx, reply, held, ty);
                 components::give_posted(lo, fx, ty, reply, poster);
                 let word = fx.ptr(word as u64);

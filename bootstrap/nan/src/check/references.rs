@@ -206,7 +206,7 @@ impl Checker<'_> {
                     functions.entry(name.clone()).or_default().extend(
                         named
                             .iter()
-                            .filter(|function| self.db.is_reported(**function)),
+                            .filter(|function| !self.db.is_carried(**function)),
                     );
                 }
             }

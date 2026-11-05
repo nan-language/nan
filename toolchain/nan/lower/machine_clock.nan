@@ -1,4 +1,4 @@
-//! A kernel's clock: its counter, on x86_64 the time-stamp counter, the HPET or the PM timer and on AArch64 the virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name, else over the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU's timer runs in TSC-deadline mode where it has that mode and the clock is the time-stamp counter, and otherwise one-shot, its local APIC timer's rate measured against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
+//! A kernel's clock: its counter, on x86_64 the time-stamp counter, the HPET or the PM timer and on AArch64 the virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires once due, its timer programmed for the earliest of the end of a timer's window, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name, else over the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU's timer runs in TSC-deadline mode where it has that mode and the clock is the time-stamp counter, and otherwise one-shot, its local APIC timer's rate measured against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
 
 /// The nanoseconds between a CPU's pacing ticks.
 const PACING_PERIOD: u64 = 10_000_000
@@ -476,10 +476,10 @@ fn Lowering.reprogram_timer(mut self, mut fx: Fx) {
     discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
 } Lowering.reprogram_timer
 
-/// Programs the running CPU's timer to fire at the earliest of the timer first due, the end of
-/// its task's slice while that is ahead and, while it runs a task or the final build binds the
-/// timer's vector, its next pacing tick; at once when that has passed. The caller holds the
-/// timer lock.
+/// Programs the running CPU's timer to fire at the earliest of the end of a timer's window, the end
+/// of its task's slice while that is ahead and, while it runs a task or the final build binds the
+/// timer's vector, its next pacing tick; at once when that has passed. The caller holds the timer
+/// lock.
 fn Lowering.program_timer(mut self, mut fx: Fx) {
     let record = mut self.running_cpu(mut fx)
     let latest = mut fx.int(PTR, value: -1)
@@ -506,17 +506,7 @@ fn Lowering.program_timer(mut self, mut fx: Fx) {
     let sliced = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: slice_end, y: now)
     let end = mut fx.b.select(sliced, x: slice_end, y: latest)
     let due_first = mut fx.b.umin(pace, y: end)
-    let state_address = mut self.state(mut fx)
-    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
-    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
-    let targets = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let due = mut fx1.load(PTR, addr: head, offset: OPERATION_DUE)
-        let earlier = mut fx1.b.umin(due, y: due_first)
-        return fx1.list1(earlier)
-    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        return fx1.list1(due_first)
-    })
-    let target = targets[0]
+    let target = mut self.windows_end(mut fx, bound: due_first)
     let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: target, y: now)
     let remaining = mut fx.b.isub(target, y: now)
     let zero = mut fx.ptr(0)
@@ -536,6 +526,35 @@ fn Lowering.program_timer(mut self, mut fx: Fx) {
         workspace::Arch.Aarch64 => mut self.aarch64_set_timer(mut fx, ticks)
     }
 } Lowering.program_timer
+
+/// The earliest end of a timer's window, or `bound` when it is earlier. The timers are in the order
+/// they are due and a window ends no sooner than its timer is due, so the walk stops at the first
+/// timer due after the earliest end so far. The caller holds the timer lock.
+fn Lowering.windows_end(mut self, mut fx: Fx, bound: clif::Value) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let walked = mut fx.repeat(fx.list2(head, b: bound).view(), body: fn(mut fx1: Fx, walk: Slice[clif::Value]) -> Pass {
+        expect walk.len() > 1
+        let current = walk[0]
+        let end = walk[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types3(PTR, b: PTR, c: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let due = mut fx2.load(PTR, addr: current, offset: OPERATION_DUE)
+            let within = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: due, y: end)
+            let window = mut fx2.load(PTR, addr: current, offset: OPERATION_WINDOW_END)
+            let following = mut fx2.load(PTR, addr: current, offset: OPERATION_NEXT)
+            let earliest = mut fx2.b.umin(end, y: window)
+            return fx2.list3(following, b: earliest, c: within)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list3(current, b: end, c: stop)
+        })
+        expect next.len() > 2
+        return Pass(again: next[2], next: fx1.list2(next[0], b: next[1]))
+    })
+    expect walked.len() > 1
+    return walked[1]
+} Lowering.windows_end
 
 /// What the running CPU's timer interrupt does before any interrupt fn runs: the timers due
 /// expire, a pacing tick that has come moves the next a period on, and the timer is programmed
@@ -593,20 +612,21 @@ fn Lowering.expire_timers(mut self, mut fx: Fx) {
     })
 } Lowering.expire_timers
 
-/// Arms a timer of the clock due `ns` nanoseconds from now, through `TimerArm` in code that
-/// reaches its executor only through routines.
+/// Arms a timer of the clock due `ns` nanoseconds from now through `TimerArm`, on whose stack the
+/// policy's slack hook runs.
 fn Lowering.kernel_arm(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value) {
-    if self.portable() {
-        discard mut self.call_routine(mut fx, routine: Routine.TimerArm, args: fx.list2(op, b: ns).view())
-        return
-    }
-    mut self.arm_clock(mut fx, op, ns)
+    discard mut self.call_routine(mut fx, routine: Routine.TimerArm, args: fx.list2(op, b: ns).view())
 } Lowering.kernel_arm
 
-/// Arms a timer of the clock due `ns` nanoseconds from now; when it is the earliest, a kernel
-/// programs the running CPU's timer again, and an isolated space's runtime waits for it as it
-/// idles.
+/// Arms a timer of the clock due `ns` nanoseconds from now. On a kernel its window ends after the
+/// slack the kernel's policy gives it, and when that window ends first the running CPU's timer is
+/// programmed again; an isolated space's runtime waits for it as it idles.
 fn Lowering.arm_clock(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value) {
+    let kernel_side = not self.user()
+    var slack = op
+    if kernel_side {
+        slack = mut self.timer_slack(mut fx, delay: ns)
+    }
     let state_address = mut self.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
     discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
@@ -614,9 +634,12 @@ fn Lowering.arm_clock(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value) {
     expect read.len() > 0
     let due = due_after(mut fx, now: read[0], delay: ns)
     arm(mut self, mut fx, op, due)
-    if not self.user() {
-        let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
-        let earliest = mut fx.b.icmp(clif::IntCC.Equal, x: head, y: op)
+    if kernel_side {
+        let window = due_after(mut fx, now: due, delay: slack)
+        mut fx.store(window, addr: op, offset: OPERATION_WINDOW_END)
+        let all = mut fx.int(PTR, value: -1)
+        let end = mut self.windows_end(mut fx, bound: all)
+        let earliest = mut fx.b.icmp(clif::IntCC.Equal, x: end, y: window)
         mut fx.if_true(earliest, then: fn[mut self](mut fx1: Fx) {
             mut self.program_timer(mut fx1)
         })

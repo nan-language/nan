@@ -1,9 +1,9 @@
 //! A kernel's clock: its counter, on x86_64 the time-stamp counter, the HPET or the PM timer and
 //! on AArch64 the virtual counter, in nanoseconds since the runtime started and never below what
-//! any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its
-//! timer programmed for the earliest of the timer first due, the end of its task's slice and its
-//! next pacing tick, which it has while it runs a task or the final build binds the timer's
-//! vector; and the wall clock source a machine root grant reads once.
+//! any CPU read before; the timers of the clock, which each CPU's timer interrupt expires once
+//! due, its timer programmed for the earliest of the end of a timer's window, the end of its
+//! task's slice and its next pacing tick, which it has while it runs a task or the final build
+//! binds the timer's vector; and the wall clock source a machine root grant reads once.
 //!
 //! On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf
 //! `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name,
@@ -464,10 +464,10 @@ impl Lowering<'_, '_> {
         self.call_routine(fx, Routine::Unlock, &[lock]);
     }
 
-    /// Programs the running CPU's timer to fire at the earliest of the timer first due, the end
-    /// of its task's slice while that is ahead and, while it runs a task or the final build
-    /// binds the timer's vector, its next pacing tick; at once when that has passed. The caller
-    /// holds the timer lock.
+    /// Programs the running CPU's timer to fire at the earliest of the end of a timer's window,
+    /// the end of its task's slice while that is ahead and, while it runs a task or the final
+    /// build binds the timer's vector, its next pacing tick; at once when that has passed. The
+    /// caller holds the timer lock.
     fn program_timer(&mut self, fx: &mut Fx) {
         let record = self.running_cpu(fx);
         let latest = fx.int(PTR, -1);
@@ -486,18 +486,7 @@ impl Lowering<'_, '_> {
         let sliced = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, end, now);
         let end = fx.b.ins().select(sliced, end, latest);
         let target = fx.b.ins().umin(pace, end);
-        let state_address = self.state(fx);
-        let first = fx.load(PTR, state_address, state::TIMERS);
-        let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
-        let target = fx.choose(
-            armed,
-            &[PTR],
-            |fx| {
-                let due = fx.load(PTR, first, operation::DUE);
-                vec![fx.b.ins().umin(due, target)]
-            },
-            |_| vec![target],
-        )[0];
+        let target = self.windows_end(fx, target);
         let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, target, now);
         let delay = fx.b.ins().isub(target, now);
         let zero = fx.ptr(0);
@@ -516,6 +505,34 @@ impl Lowering<'_, '_> {
             Arch::Amd64 => self.x64_set_timer(fx, ticks),
             Arch::Aarch64 => self.aarch64_set_timer(fx, ticks),
         }
+    }
+
+    /// The earliest end of a timer's window, or `bound` when it is earlier. The timers are in the
+    /// order they are due and a window ends no sooner than its timer is due, so the walk stops
+    /// at the first timer due after the earliest end so far. The caller holds the timer lock.
+    pub(super) fn windows_end(&mut self, fx: &mut Fx, bound: Value) -> Value {
+        let state_address = self.state(fx);
+        let first = fx.load(PTR, state_address, state::TIMERS);
+        fx.repeat(&[first, bound], |fx, walk| {
+            let (current, end) = (walk[0], walk[1]);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+            let next = fx.choose(
+                present,
+                &[PTR, PTR, types::I8],
+                |fx| {
+                    let due = fx.load(PTR, current, operation::DUE);
+                    let within = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, due, end);
+                    let window = fx.load(PTR, current, operation::WINDOW_END);
+                    vec![
+                        fx.load(PTR, current, operation::NEXT),
+                        fx.b.ins().umin(end, window),
+                        within,
+                    ]
+                },
+                |fx| vec![current, end, fx.int(types::I8, 0)],
+            );
+            (next[2], vec![next[0], next[1]])
+        })[1]
     }
 
     /// What the running CPU's timer interrupt does before any interrupt fn runs: the timers due
@@ -572,30 +589,29 @@ impl Lowering<'_, '_> {
         });
     }
 
-    /// Arms a timer of the clock due `ns` nanoseconds from now, through `TimerArm` in code that
-    /// reaches its executor only through routines.
+    /// Arms a timer of the clock due `ns` nanoseconds from now through `TimerArm`, on whose stack
+    /// the policy's slack hook runs.
     pub fn kernel_arm(&mut self, fx: &mut Fx, op: Value, ns: Value) {
-        match self.portable() {
-            true => {
-                self.call_routine(fx, Routine::TimerArm, &[op, ns]);
-            }
-            false => self.arm_clock(fx, op, ns),
-        }
+        self.call_routine(fx, Routine::TimerArm, &[op, ns]);
     }
 
-    /// Arms a timer of the clock due `ns` nanoseconds from now; when it is the earliest, a
-    /// kernel programs the running CPU's timer again, and an isolated space's runtime waits for
-    /// it as it idles.
+    /// Arms a timer of the clock due `ns` nanoseconds from now. On a kernel its window ends
+    /// after the slack the kernel's policy gives it, and when that window ends first the running
+    /// CPU's timer is programmed again; an isolated space's runtime waits for it as it idles.
     pub fn arm_clock(&mut self, fx: &mut Fx, op: Value, ns: Value) {
+        let slack = (!self.user()).then(|| self.timer_slack(fx, ns));
         let state_address = self.state(fx);
         let lock = fx.offset(state_address, state::TIMER_LOCK);
         self.call_routine(fx, Routine::Lock, &[lock]);
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
         let due = timers::due_after(fx, now, ns);
         timers::arm(self, fx, op, due);
-        if !self.user() {
-            let first = fx.load(PTR, state_address, state::TIMERS);
-            let earliest = fx.b.ins().icmp(IntCC::Equal, first, op);
+        if let Some(slack) = slack {
+            let window = timers::due_after(fx, due, slack);
+            fx.store(window, op, operation::WINDOW_END);
+            let all = fx.int(PTR, -1);
+            let end = self.windows_end(fx, all);
+            let earliest = fx.b.ins().icmp(IntCC::Equal, end, window);
             fx.when(earliest, |fx| self.program_timer(fx));
         }
         self.call_routine(fx, Routine::Unlock, &[lock]);

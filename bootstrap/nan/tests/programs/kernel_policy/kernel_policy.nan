@@ -1,4 +1,4 @@
-//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed and running tasks of class 1 in slices of 1 ns, which end before they run.
+//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed, running tasks of class 1 in slices of 1 ns, which end before they run, and giving the sleeps of class 2 a slack.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -13,13 +13,21 @@ const SHARING_NS: u64 = 300_000_000
 /// The nanoseconds each task of the steal run spins.
 const STEAL_SPIN_NS: u64 = 20_000_000
 
-/// What the policy records of the steal run: whether it is armed and CPU 0 has stolen, up to three
-/// tasks of class 3 that ran on CPU 0, and the switches of other tasks onto another CPU.
+/// The nanoseconds each sleep of the slack run lasts, and the slack the policy gives such a sleep of
+/// class 2.
+const LAX_NS: u64 = 10_000_000
+
+const LAX_SLACK_NS: u64 = 2_000_000_000
+
+/// What the policy records: of the steal run, whether it is armed and CPU 0 has stolen, up to three
+/// tasks of class 3 that ran on CPU 0, and the switches of other tasks onto another CPU; and the
+/// end of the earliest window of a deadline a CPU last idled until.
 struct Probe {
     armed: core::atomic::AtomicBool
     stole: core::atomic::AtomicBool
     seen: mem::List[core::atomic::AtomicU64]
     strays: core::atomic::AtomicU64
+    until: core::atomic::AtomicU64
 } Probe
 
 struct Paced {
@@ -68,8 +76,19 @@ fn Paced.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 l
 } Paced.slice
 
 fn Paced.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    let Some(until) = until_ns else {
+        return hw::Idle.Mwait(0)
+    }
+    discard self.probe.contents().until.swap(until)
     return hw::Idle.Mwait(0)
 } Paced.idle
+
+fn Paced.slack(self, t: hw::IrqsDisabled, task: hw::TaskView, delay_ns: u64) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    if task.share.class == 2 and delay_ns == LAX_NS {
+        return LAX_SLACK_NS
+    }
+    return 0
+} Paced.slack
 
 /// Records a task id among those seen, unless seen or three are.
 fn note_seen(probe: Probe, id: u64) limits notrap, terminates, noalloc {
@@ -134,7 +153,7 @@ fn slots(count: u64, alloc: mem::Alloc) -> mem::List[core::atomic::AtomicU64] {
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let alloc = k.alloc()
     let clock = k.clock()
-    let probe = mem::Shared.of(Probe(armed: core::atomic::AtomicBool.of(false), stole: core::atomic::AtomicBool.of(false), seen: slots(count: 3, alloc), strays: core::atomic::AtomicU64.of(0)), alloc)
+    let probe = mem::Shared.of(Probe(armed: core::atomic::AtomicBool.of(false), stole: core::atomic::AtomicBool.of(false), seen: slots(count: 3, alloc), strays: core::atomic::AtomicU64.of(0), until: core::atomic::AtomicU64.of(0)), alloc)
     mut k.policy(Paced(probe: probe.share()))
     take k.anchor(0u8, run: fn[take probe](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         try await clock.sleep_ns(1_000_000)
@@ -213,6 +232,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         say_digit(value: brief_done.load())
         say(text: "\n")
         try await steal_run(exec, clock, probe: probe.contents())
+        try await slack_run(exec, clock, probe: probe.contents())
     })
 } main
 
@@ -270,3 +290,20 @@ fn steal_run(exec: task::Executor, clock: sys::Clock, probe: Probe) fails task::
         say(text: "bound kept\n")
     }
 } steal_run
+
+/// Sleeps `LAX_NS` on `exec`, then on an executor of class 2, and writes whether the window of the
+/// second sleep, as the CPUs idling saw it end, ended at least its slack after the first's.
+fn slack_run(exec: task::Executor, clock: sys::Clock, probe: Probe) fails task::Cancelled uses wait {
+    try await clock.sleep_ns(LAX_NS)
+    let strict = probe.until.load()
+    let lax = exec.split(task::Share(weight: 1, class: 2, reserve_ppm: 0))
+    defer take lax.close()
+    try await task::scope(lax.executor(), body: fn(s: task::Scope) {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 4_096 {
+            try await clock.sleep_ns(LAX_NS)
+        })
+    })
+    if probe.until.load() >= strict + LAX_SLACK_NS {
+        say(text: "slack kept\n")
+    }
+} slack_run

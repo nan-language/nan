@@ -12,15 +12,18 @@ enum Hook derives Copy, Eq, Hash {
     /// `(policy, cpu, timed, until) -> way`, the way being 0 to halt, 1 to poll, and
     /// `MWAIT` plus a hint to wait in `mwait`.
     Idle
+    /// `(policy, task, delay) -> nanoseconds`.
+    Slack
 } Hook
 
-const HOOKS: Array[Hook, 4] = listed_hooks()
+const HOOKS: Array[Hook, 5] = listed_hooks()
 
-fn listed_hooks() -> Array[Hook, 4] {
-    var listed = Array[Hook, 4].filled(Hook.Place)
+fn listed_hooks() -> Array[Hook, 5] {
+    var listed = Array[Hook, 5].filled(Hook.Place)
     listed[1] = Hook.Steal
     listed[2] = Hook.Slice
     listed[3] = Hook.Idle
+    listed[4] = Hook.Slack
     return listed
 } listed_hooks
 
@@ -30,6 +33,7 @@ proj fn Hook.name(self) -> Str {
         Hook.Steal => "steal"
         Hook.Slice => "slice"
         Hook.Idle => "idle"
+        Hook.Slack => "slack"
     }
 } Hook.name
 
@@ -39,6 +43,7 @@ fn Hook.offset(self) -> u64 {
         Hook.Steal => 8
         Hook.Slice => 16
         Hook.Idle => 24
+        Hook.Slack => 32
     }
 } Hook.offset
 
@@ -48,6 +53,7 @@ fn Hook.signature(self, alloc: mem::Alloc) -> clif::Signature {
         Hook.Steal => hook_counts(3, returns: 2)
         Hook.Slice => hook_counts(3, returns: 1)
         Hook.Idle => hook_counts(4, returns: 1)
+        Hook.Slack => hook_counts(3, returns: 1)
     }
     var signature = clif::Signature.new(CALL_CONV, alloc)
     for _ in 0..<counts[0] {
@@ -66,7 +72,7 @@ fn hook_counts(params: usize, returns: usize) -> Array[usize, 2] {
 } hook_counts
 
 /// The offset in a policy record of the address of the policy's value, which follows it.
-const POLICY_VALUE: u64 = 32
+const POLICY_VALUE: u64 = 40
 
 /// The way of idling an `Idle` hook gives for `hw::Idle.Mwait`, plus its hint.
 const MWAIT: i64 = 0x100
@@ -128,35 +134,7 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
         let instance = mut lo.callable_instance(fn_ref, as_value: false)
         let abi = mut lo.abi(instance)
         let id = mut lo.instance(take instance)
-        var args = mem::List[Held].empty(lo.alloc)
-        mut args.push(Held.Address(params[0]))
-        mut args.push(Held.Empty)
-        match hook {
-            Hook.Place => {
-                expect abi.params.len() > 2
-                mut args.push(mut lo.task_view(mut fx, view_ty: abi.params[2].nty.ty(), record: params[1]))
-            }
-            Hook.Steal => {
-                expect params.len() > 2
-                mut args.push(word32(mut fx, word: params[1]))
-                mut args.push(word32(mut fx, word: params[2]))
-            }
-            Hook.Slice => {
-                expect params.len() > 2 and abi.params.len() > 3
-                mut args.push(word32(mut fx, word: params[1]))
-                mut args.push(mut lo.task_view(mut fx, view_ty: abi.params[3].nty.ty(), record: params[2]))
-            }
-            Hook.Idle => {
-                expect params.len() > 3 and abi.params.len() > 3
-                mut args.push(word32(mut fx, word: params[1]))
-                let option = abi.params[3].nty.ty()
-                let laid = mut lo.layout_of(option)
-                let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
-                let timed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: params[2], y: 0)
-                mut lo.write_option(mut fx, option, address: slot, presence: timed, value: Held.Scalar(params[3]))
-                mut args.push(Held.Address(slot))
-            }
-        }
+        let args = hook_args(mut lo, mut fx, hook, params: params.view(), abi)
         let called = mut lo.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: args.view())
         let result_ty = abi.result
         let result = mut lo.held_address(mut fx, held: called.result, ty: result_ty)
@@ -176,6 +154,7 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
             }
             Hook.Steal => steal_words(mut lo, mut fx, result, result_ty, mut results)
             Hook.Slice => mut results.push(mut fx.load(PTR, addr: result, offset: 0))
+            Hook.Slack => mut results.push(mut fx.load(PTR, addr: result, offset: 0))
             Hook.Idle => {
                 let polls = mut lo.variant_is(mut fx, address: result, ty: result_ty, variant: "Poll")
                 let polls_word = mut fx.b.uextend(PTR, x: polls)
@@ -190,6 +169,47 @@ fn Lowering.policy_glue(mut self, hook: Hook, policy_ty: ty::Ty) -> object::Func
         mut fx.b.ret(results.view())
     })
 } Lowering.policy_glue
+
+/// The arguments a hook's glue passes the hook's implementing function: the policy's value, the
+/// witness of disabled interrupts, and the hook's own from the words the runtime gives.
+fn hook_args(mut lo: Lowering, mut fx: Fx, hook: Hook, params: Slice[clif::Value], abi: Abi) -> mem::List[Held] {
+    expect params.len() > 1
+    var args = mem::List[Held].empty(lo.alloc)
+    mut args.push(Held.Address(params[0]))
+    mut args.push(Held.Empty)
+    match hook {
+        Hook.Place => {
+            expect abi.params.len() > 2
+            mut args.push(mut lo.task_view(mut fx, view_ty: abi.params[2].nty.ty(), record: params[1]))
+        }
+        Hook.Steal => {
+            expect params.len() > 2
+            mut args.push(word32(mut fx, word: params[1]))
+            mut args.push(word32(mut fx, word: params[2]))
+        }
+        Hook.Slice => {
+            expect params.len() > 2 and abi.params.len() > 3
+            mut args.push(word32(mut fx, word: params[1]))
+            mut args.push(mut lo.task_view(mut fx, view_ty: abi.params[3].nty.ty(), record: params[2]))
+        }
+        Hook.Idle => {
+            expect params.len() > 3 and abi.params.len() > 3
+            mut args.push(word32(mut fx, word: params[1]))
+            let option = abi.params[3].nty.ty()
+            let laid = mut lo.layout_of(option)
+            let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            let timed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: params[2], y: 0)
+            mut lo.write_option(mut fx, option, address: slot, presence: timed, value: Held.Scalar(params[3]))
+            mut args.push(Held.Address(slot))
+        }
+        Hook.Slack => {
+            expect params.len() > 2 and abi.params.len() > 2
+            mut args.push(mut lo.task_view(mut fx, view_ty: abi.params[2].nty.ty(), record: params[1]))
+            mut args.push(Held.Scalar(params[2]))
+        }
+    }
+    return args
+} hook_args
 
 /// The words a `Steal` hook gives of an `Option[hw::Steal]` at an address: whether it is `Some`,
 /// and the victim plus its tasks to take times 2^32.
@@ -294,6 +314,33 @@ fn Lowering.hook(mut self, mut fx: Fx, policy: clif::Value, hook: Hook, args: Sl
     mut fx.store(zero, addr: own, offset: CPU_HOOK)
     return results
 } Lowering.hook
+
+/// The slack the kernel's policy gives a timer the running task arms `delay` nanoseconds ahead, its
+/// hook called with maskable interrupts disabled; zero under the default policy and outside a task.
+fn Lowering.timer_slack(mut self, mut fx: Fx, delay: clif::Value) -> clif::Value {
+    let policy = mut self.policy(mut fx)
+    let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: policy, y: 0)
+    let given = mut fx.choose_in(mut self, condition: installed, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let saved = mut lo1.call_stub(mut fx1, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        expect saved.len() > 0
+        let flags = saved[0]
+        let own = mut lo1.running_cpu(mut fx1)
+        let thread = mut fx1.load(PTR, addr: own, offset: CPU_THREAD)
+        let record = mut fx1.load(PTR, addr: thread, offset: THREAD_CURRENT)
+        let running = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+        let slack = mut fx1.choose_in(mut lo1, condition: running, results: fx1.types1(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return mut lo2.hook(mut fx2, policy, hook: Hook.Slack, args: fx2.list2(record, b: delay).view())
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(mut fx2.ptr(0))
+        })
+        discard mut lo1.call_stub(mut fx1, stub: Stub.IrqRestore, args: fx1.list1(flags).view())
+        return slack
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.ptr(0))
+    })
+    expect given.len() > 0
+    return given[0]
+} Lowering.timer_slack
 
 /// The installed policy's record, zero for the default policy.
 fn Lowering.policy(mut self, mut fx: Fx) -> clif::Value {
@@ -594,9 +641,9 @@ fn unbound_count(mut fx: Fx, head: clif::Value, zero: clif::Value) -> clif::Valu
     return counted[1]
 } unbound_count
 
-/// Idles the running CPU as its policy says, given the earliest deadline of the kernel clock:
-/// halts it until an interrupt, waits in `mwait` until one on x86_64, or returns at once to look
-/// for tasks again.
+/// Idles the running CPU as its policy says, given the earliest end of a timer's window: halts it
+/// until an interrupt, waits in `mwait` until one on x86_64, or returns at once to look for tasks
+/// again.
 fn Lowering.kernel_idle(mut self, mut fx: Fx) {
     let own = mut self.running_index(mut fx)
     let own_record = mut self.cpu_record(mut fx, index: own)
@@ -605,14 +652,10 @@ fn Lowering.kernel_idle(mut self, mut fx: Fx) {
     discard mut self.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
     let timers = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
     let timed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: timers, y: 0)
-    let due = mut fx.choose(timed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let at = mut fx1.load(PTR, addr: timers, offset: OPERATION_DUE)
-        return fx1.list1(at)
-    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let none = mut fx1.ptr(0)
-        return fx1.list1(none)
-    })
-    let until = due[0]
+    let all = mut fx.int(PTR, value: -1)
+    let end = mut self.windows_end(mut fx, bound: all)
+    let zero_until = mut fx.ptr(0)
+    let until = mut fx.b.select(timed, x: end, y: zero_until)
     discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
     let policy = mut self.policy(mut fx)
     let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: policy, y: 0)

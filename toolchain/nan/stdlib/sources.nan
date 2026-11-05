@@ -13541,14 +13541,13 @@ const TEXT_NANOS_HELD: Str =
     \\
     \\/// What the kernel's relays of an instance hold: the receivers of its holder's requests, of its
     \\/// inboxes' calls and of the frames to send down, the receiver whose sender stays held while the
-    \\/// instance runs, the abandoner of its domain and the space's services and table of handles.
+    \\/// instance runs, and the abandoner of its domain.
     \\struct Relays {
     \\    requests: task::Receiver[Asked]
     \\    calls: task::Receiver[Called]
     \\    outgoing: task::Receiver[mem::Bytes]
     \\    parked: task::Receiver[u8]
     \\    abandoner: mem::Shared[sys::Abandoner]
-    \\    served: Serving
     \\} Relays
     \\
     \\/// Runs an instance's space until it ends, sending its holder's requests and its inboxes' calls
@@ -13560,10 +13559,10 @@ const TEXT_NANOS_HELD: Str =
     \\    let task::Channel(sender: parking, receiver: parked) = task::Channel[u8].bounded(1, alloc)
     \\    let allocs = task::Cown.of(mem::Map[u64, mem::Alloc].empty(alloc), alloc)
     \\    let halted = core::atomic::AtomicBool.of(false)
-    \\    var relays = Some(Relays(requests: take requests, calls: take calls, outgoing: take outgoing, parked: take parked, abandoner: take abandoner, served: take served))
+    \\    var relays = Some(Relays(requests: take requests, calls: take calls, outgoing: take outgoing, parked: take parked, abandoner: take abandoner))
     \\    var ended = Ended.Cancelled
     \\    try await task::scope(exec, body: fn[mut space, mut state, mut extended, mut frames, mut relays, mut ended](s: task::Scope) fails task::Cancelled uses wait {
-    \\        let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain, served: table)) = mut relays.extract() else {
+    \\        let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain)) = mut relays.extract() else {
     \\            return
     \\        }
     \\        let requests_down = down.split()
@@ -13579,10 +13578,10 @@ const TEXT_NANOS_HELD: Str =
     \\            try await asked_down(take asked, out: requests_down, exec, alloc)
     \\        })
     \\        discard s.spawn(fn[take called, take calls_down, take replies, take drawing]() fails task::Cancelled uses wait {
-    \\            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, alloc)
+    \\            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table: served.table, alloc)
     \\        })
     \\        discard s.spawn(fn[take answered, take routing]() fails task::Cancelled uses wait {
-    \\            try await answered_up(link, answers: answered, allocs: routing, alloc)
+    \\            try await answered_up(link, answers: answered, allocs: routing, table: served.table, alloc)
     \\        })
     \\        discard s.spawn(fn[take waiting, take domain]() fails task::Cancelled uses wait {
     \\            let watched = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -13595,7 +13594,7 @@ const TEXT_NANOS_HELD: Str =
     \\            halted.store(true)
     \\            link.ring(0)
     \\        })
-    \\        ended = try await run_space(cpu, mut space, mut state, mut extended, served: table, link, halted: fn() => halted.load(), mut frames, alloc)
+    \\        ended = try await run_space(cpu, mut space, mut state, mut extended, served, link, halted: fn() => halted.load(), mut frames, alloc)
     \\        s.cancel()
     \\    })
     \\    discard parking
@@ -13667,17 +13666,17 @@ const TEXT_NANOS_HELD: Str =
     \\    })
     \\} asked_down
     \\
-    \\/// Sends `out` the frame of each call of an instance's inboxes, keeping in `allocs` the allocator
-    \\/// its reply is drawn through; a call carrying handles is answered at once as malformed, since no
-    \\/// handle crosses into a space.
-    \\fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// Sends `out` the frame of each call of an instance's inboxes, its handles added to the space's
+    \\/// `table`, keeping in `allocs` the allocator its reply is drawn through; a call carrying a handle
+    \\/// the space cannot hold is answered at once as malformed.
+    \\fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var receiver = calls
     \\    loop {
     \\        let Some(called) = try await mut receiver.receive() else {
     \\            return
     \\        }
     \\        let Called(id: id, hash: hash, request: request, alloc: drawn) = called
-    \\        if request.handles.len() > 0 {
+    \\        let Some(crossing) = table.admitted(request.handles.view(), alloc) else {
     \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
     \\            continue
     \\        }
@@ -13685,14 +13684,15 @@ const TEXT_NANOS_HELD: Str =
     \\            discard mut allocs.insert(id, value: drawn)
     \\        }
     \\        let sys::Encoded(bytes: bytes, handles: _) = request
-    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes)), alloc))
+    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes, handles: take crossing)), alloc))
     \\    }
     \\} called_down
     \\
     \\/// Routes through `answers` each answer the space sends up the first channel of `link`, a call's
-    \\/// reply drawn through the allocator `allocs` keeps for it; it stops hearing a space that frames an
-    \\/// answer it cannot decode or longer than `MOST_BYTES`.
-    \\fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
+    \\/// the space's `table` it names; it stops hearing a space that frames an answer it cannot decode or
+    \\/// longer than `MOST_BYTES`.
+    \\fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var pending = mem::Bytes.empty(alloc)
     \\    loop {
     \\        let received = match attempt await link.receive(0, alloc) {
@@ -13715,13 +13715,15 @@ const TEXT_NANOS_HELD: Str =
     \\                return
     \\            }
     \\            let drawn = await when mut allocs => mut allocs.remove(id)
-    \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, alloc: drawn.value_or(alloc)))))
+    \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
     \\        }
     \\    }
     \\} answered_up
     \\
-    \\/// The answer of what an instance's space gave, a reply's bytes drawn through `alloc`.
-    \\fn answer_of(take sent: Sent, alloc: mem::Alloc) -> Answer {
+    \\/// The answer of what an instance's space gave, a reply's bytes drawn through `alloc` and its
+    \\/// handles those of the entries of the space's `table` it names, a reply naming another refused as
+    \\/// malformed.
+    \\fn answer_of(take sent: Sent, table: Table, alloc: mem::Alloc) -> Answer {
     \\    match sent {
     \\        Sent.Done => return Answer.Done
     \\        Sent.Flag(flag) => return Answer.Flag(flag)
@@ -13735,8 +13737,11 @@ const TEXT_NANOS_HELD: Str =
     \\            }
     \\            return Answer.Health(sys::HealthReply.Unhealthy(reason))
     \\        }
-    \\        Sent.Served(bytes) => {
-    \\            var reply = sys::Encoded.empty(alloc)
+    \\        Sent.Served(Naming(bytes: bytes, handles: handles)) => {
+    \\            let Some(handed) = table.handed(handles, alloc) else {
+    \\                return Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid)))
+    \\            }
+    \\            var reply = sys::Encoded(bytes: mem::Bytes.empty(alloc), handles: take handed)
     \\            mut reply.bytes.append(bytes.view())
     \\            return Answer.Served(Ok(take reply))
     \\        }
@@ -13776,11 +13781,13 @@ const TEXT_NANOS_HELD: Str =
     \\    Wake
     \\} Order
     \\
-    \\/// A call of an instance's inbox: the number of its wait, its protocol hash and its bytes.
+    \\/// A call of an instance's inbox: the number of its wait, its protocol hash, its bytes and what the
+    \\/// space receives of its handles.
     \\struct Calling derives Encode {
     \\    id: u64
     \\    hash: sys::ProtocolHash
     \\    bytes: mem::Bytes
+    \\    handles: mem::List[Carried]
     \\} Calling
     \\
     \\/// What the space of an instance sends its kernel: an answer and the number of the wait it ends.
@@ -13797,9 +13804,16 @@ const TEXT_NANOS_HELD: Str =
     \\    Checkpointed(mem::Bytes)
     \\    Healthy
     \\    Unhealthy(text::String)
-    \\    Served(mem::Bytes)
+    \\    Served(Naming)
     \\    Refused(Refusal)
     \\} Sent
+    \\
+    \\/// An encoding a space sends its kernel: its bytes, and the handle of the entry of the space's table
+    \\/// for each of its handles.
+    \\struct Naming derives Encode {
+    \\    bytes: mem::Bytes
+    \\    handles: mem::List[u64]
+    \\} Naming
     \\
     \\/// How a call an instance's space served failed: malformed, with the number `decode_code` gives
     \\/// its decoding failure, or closed.
@@ -13899,8 +13913,9 @@ const TEXT_NANOS_HELD: Str =
     \\/// Holds the instance of the component entry `job` in a space for its kernel: runs the instance
     \\/// task in a domain of the space's runtime on `world`, resuming from the checkpoint whose
     \\/// `mem::wire` encoding `input` is, while relaying the requests and calls the kernel sends over
-    \\/// the channel `port` serves to the instance and its answers back, and gives how the domain ended.
-    \\fn served_instance(job: sys::load::Job, port: Port, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\/// the channel `port` serves to the instance and its answers back, their handles those the runtime
+    \\/// holds through `base` for the entries of the space's table, and gives how the domain ended.
+    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     \\    let alloc = world.alloc
     \\    let exec = world.exec
     \\    let Ok(checkpoint) = attempt mem::wire::Codec[Option[mem::Bytes]].decode(Untrusted.of(input.view()), alloc) else {
@@ -13921,10 +13936,10 @@ const TEXT_NANOS_HELD: Str =
     \\            return
     \\        }
     \\        discard s.spawn(fn[take down, take inbox]() fails task::Cancelled uses wait {
-    \\            try await relayed_in(port, requests: take down, calls: take inbox, exec, alloc)
+    \\            try await relayed_in(port, requests: take down, calls: take inbox, base, exec, alloc)
     \\        })
     \\        discard s.spawn(fn[take up]() fails task::Cancelled uses wait {
-    \\            try await relayed_out(port, answered: take up, alloc)
+    \\            try await relayed_out(port, answered: take up, base, alloc)
     \\        })
     \\        outcome = try await sys::Domain.run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
     \\            return try await call(job, world: take granted, input: take launched)
@@ -13935,9 +13950,11 @@ const TEXT_NANOS_HELD: Str =
     \\} served_instance
     \\
     \\/// Gives the instance each request and call the kernel sends over `port`, each request through a
-    \\/// task of its own so that the end of a wait sent after it is never held up behind it, ends each
-    \\/// wait whose end the kernel sends, and returns once the kernel releases the instance.
-    \\fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// task of its own so that the end of a wait sent after it is never held up behind it, and each
+    \\/// call with the handles the runtime holds through `base` for what the kernel carried into the
+    \\/// space's table; ends each wait whose end the kernel sends, and returns once the kernel releases
+    \\/// the instance.
+    \\fn relayed_in(port: Port, take requests: task::Sender[Asked], take calls: task::Sender[Called], base: Remote, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var buffer = mem::Bytes.zeroed(usize.widen(RING_BYTES), alloc)
     \\    var pending = mem::Bytes.empty(alloc)
     \\    var stops = mem::Map[u64, task::Sender[u8]].empty(alloc)
@@ -13971,10 +13988,8 @@ const TEXT_NANOS_HELD: Str =
     \\                    Down.Stop(id) => {
     \\                        discard mut stops.remove(id)
     \\                    }
-    \\                    Down.Call(Calling(id: id, hash: hash, bytes: bytes)) => {
-    \\                        var request = sys::Encoded.empty(alloc)
-    \\                        mut request.bytes.append(bytes.view())
-    \\                        discard attempt await calls.send(Called(id: id, hash: hash, request: take request, alloc: alloc))
+    \\                    Down.Call(calling) => {
+    \\                        discard attempt await calls.send(called_in(take calling, base, alloc))
     \\                    }
     \\                    Down.Release => return
     \\                }
@@ -13982,6 +13997,21 @@ const TEXT_NANOS_HELD: Str =
     \\        }
     \\    })
     \\} relayed_in
+    \\
+    \\/// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
+    \\/// the kernel carried into the space's table, a handle it cannot hold left out.
+    \\fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
+    \\    let Calling(id: id, hash: hash, bytes: bytes, handles: crossing) = calling
+    \\    var request = sys::Encoded.empty(alloc)
+    \\    mut request.bytes.append(bytes.view())
+    \\    for crossed in crossing {
+    \\        match minted_for(base, crossed) {
+    \\            Some(handle) => mut request.handles.push(handle)
+    \\            None => {}
+    \\        }
+    \\    }
+    \\    return Called(id: id, hash: hash, request: take request, alloc: alloc)
+    \\} called_in
     \\
     \\/// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
     \\/// number of its wait.
@@ -14008,24 +14038,25 @@ const TEXT_NANOS_HELD: Str =
     \\    return receiver
     \\} stopped_by
     \\
-    \\/// Sends the kernel over `port` each answer of the instance, until every sender of `answered` is
-    \\/// released.
-    \\fn relayed_out(port: Port, take answered: task::Receiver[Routed], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// Sends the kernel over `port` each answer of the instance, its handles named through `base`,
+    \\/// until every sender of `answered` is released.
+    \\fn relayed_out(port: Port, take answered: task::Receiver[Routed], base: Remote, alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var receiver = answered
     \\    loop {
     \\        let Some(Routed.Answered(Replied(id: id, answer: answer))) = try await mut receiver.receive() else {
     \\            return
     \\        }
-    \\        let frame = framed(Answering(id: id, answer: sent_of(take answer, alloc)), alloc)
+    \\        let frame = framed(Answering(id: id, answer: sent_of(take answer, base, alloc)), alloc)
     \\        let Ok(_) = attempt await port.write_out(frame.view()) else {
     \\            return
     \\        }
     \\    }
     \\} relayed_out
     \\
-    \\/// What a space sends its kernel of an answer of its instance; a reply carrying handles is refused
-    \\/// as malformed, since no handle crosses out of a space.
-    \\fn sent_of(take answer: Answer, alloc: mem::Alloc) -> Sent {
+    \\/// What a space sends its kernel of an answer of its instance, a reply's handles named through
+    \\/// `base`; a reply carrying a handle the runtime minted for no entry of the space's table is refused
+    \\/// as malformed.
+    \\fn sent_of(take answer: Answer, base: Remote, alloc: mem::Alloc) -> Sent {
     \\    match answer {
     \\        Answer.Done => return Sent.Done
     \\        Answer.Flag(flag) => return Sent.Flag(flag)
@@ -14034,10 +14065,10 @@ const TEXT_NANOS_HELD: Str =
     \\        Answer.Health(sys::HealthReply.Healthy) => return Sent.Healthy
     \\        Answer.Health(sys::HealthReply.Unhealthy(why)) => return Sent.Unhealthy(text::String.of(why.as_str(), alloc))
     \\        Answer.Served(Ok(reply)) => {
-    \\            if reply.handles.len() > 0 {
+    \\            let Some(handles) = handles_named(base, minted: reply.handles.view(), alloc) else {
     \\                return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
     \\            }
-    \\            return Sent.Served(take reply.bytes)
+    \\            return Sent.Served(Naming(bytes: take reply.bytes, handles: take handles))
     \\        }
     \\        Answer.Served(Err(failure)) => {
     \\            let sys::CallError.Malformed(error) = failure else {
@@ -14118,6 +14149,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const PORT_BYTES: usize = 40
     \\
+    \\/// The most handles a space's table holds.
+    \\const MOST_HELD: u64 = 256
+    \\
     \\pub closed enum IsolatedError derives Render {
     \\    NoJob
     \\    NoChannel
@@ -14159,6 +14193,20 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Channel(usize)
     \\} Holding
     \\
+    \\/// A space's table of handles: the capability each handle names, and the count of handles given.
+    \\struct Table {
+    \\    held: mem::OnceMap[u64, Holding]
+    \\    count: core::atomic::AtomicU64
+    \\} Table
+    \\
+    \\/// A capability the kernel adds to a space's table for its runtime to receive: its type, and its
+    \\/// handle.
+    \\enum Carried derives Copy, Encode {
+    \\    Log(u64)
+    \\    Stdio(u64)
+    \\    Random(u64)
+    \\} Carried
+    \\
     \\/// The allocator, executor and clock of a space's runtime.
     \\struct Base {
     \\    alloc: mem::Alloc
@@ -14170,7 +14218,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\struct Remote {
     \\} Remote
     \\
-    \\impl Remote: sys::Kind[mem::Alloc, u64]
+    \\impl Remote: sys::Kind[Spaced, u64]
     \\
     \\impl Remote: sys::LogService
     \\
@@ -14205,7 +14253,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\linear struct Placed {
     \\    space: sys::load::Space
     \\    state: hw::UserState
-    \\    table: mem::List[Holding]
+    \\    table: Table
     \\} Placed
     \\
     \\/// Makes a space of `job` from `frames` that runs `entry` on `input`, the instance of a component
@@ -14216,13 +14264,13 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        keys += channel.key.as_str().as_bytes().len()
     \\    }
     \\    let ports_len = PORT_BYTES * link.channels.len()
-    \\    var table = mem::List[Holding].empty(alloc)
-    \\    let log = held_by(mut table, holding: Holding.Log(services.log))
-    \\    let stdio = held_by(mut table, holding: Holding.Stdio(services.stdio))
-    \\    let random = held_by(mut table, holding: Holding.Random(services.random))
-    \\    let channels = u64.widen(table.len())
+    \\    let table = Table(held: mem::OnceMap[u64, Holding].empty(0, alloc), count: core::atomic::AtomicU64.of(0))
+    \\    let log = held_by(table, holding: Holding.Log(services.log))
+    \\    let stdio = held_by(table, holding: Holding.Stdio(services.stdio))
+    \\    let random = held_by(table, holding: Holding.Random(services.random))
+    \\    let channels = table.count.load()
     \\    for index in 0..<link.channels.len() {
-    \\        discard held_by(mut table, holding: Holding.Channel(index))
+    \\        discard held_by(table, holding: Holding.Channel(index))
     \\    }
     \\    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), mut frames, alloc)
     \\    let start = space.data()
@@ -14252,7 +14300,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// What a space's kernel serves it: its services, and its table of handles.
     \\struct Serving {
     \\    services: Services
-    \\    table: mem::List[Holding]
+    \\    table: Table
     \\} Serving
     \\
     \\/// A link's frames as a space maps them: the doorbell's address, and the records of the
@@ -14262,11 +14310,84 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    records: mem::Bytes
     \\} Shared
     \\
-    \\/// The handle of a capability a space's table holds from now on.
-    \\fn held_by(mut table: mem::List[Holding], holding: Holding) -> u64 {
-    \\    mut table.push(holding)
-    \\    return u64.widen(table.len() - 1)
+    \\/// The handle of a capability a space's table holds from now on, `MOST_HELD`, which names none,
+    \\/// once it is full.
+    \\fn held_by(table: Table, holding: Holding) -> u64 {
+    \\    return table.add(holding).value_or(MOST_HELD)
     \\} held_by
+    \\
+    \\/// The handle of a capability the table holds from now on, none once it holds `MOST_HELD`.
+    \\fn Table.add(self, holding: Holding) -> Option[u64] {
+    \\    let Some(handle) = self.count.fetch_add(1) else {
+    \\        return None
+    \\    }
+    \\    if handle >= MOST_HELD {
+    \\        return None
+    \\    }
+    \\    discard self.held.insert(handle, value: holding)
+    \\    return Some(handle)
+    \\} Table.add
+    \\
+    \\/// What a space receives of the capabilities `handles` hold, each added to the table, none when no
+    \\/// space holds one's type or the table is full.
+    \\fn Table.admitted(self, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
+    \\    var holdings = mem::List[Holding].empty(alloc)
+    \\    for handle in handles {
+    \\        let Some(holding) = holding_of(handle) else {
+    \\            return None
+    \\        }
+    \\        mut holdings.push(holding)
+    \\    }
+    \\    var crossing = mem::List[Carried].empty(alloc)
+    \\    for holding in holdings {
+    \\        let Some(handle) = self.add(holding) else {
+    \\            return None
+    \\        }
+    \\        match holding {
+    \\            Holding.Log(_) => mut crossing.push(Carried.Log(handle))
+    \\            Holding.Stdio(_) => mut crossing.push(Carried.Stdio(handle))
+    \\            Holding.Random(_) => mut crossing.push(Carried.Random(handle))
+    \\            Holding.Channel(_) => return None
+    \\        }
+    \\    }
+    \\    return Some(take crossing)
+    \\} Table.admitted
+    \\
+    \\/// The entry of a space's table holding the capability `handle` holds, none for a type no space
+    \\/// holds.
+    \\fn holding_of(handle: sys::Handle) -> Option[Holding] {
+    \\    match sys::CapabilityId[sys::Log](id: 0).of_handle(handle) {
+    \\        Some(log) => return Some(Holding.Log(log))
+    \\        None => {}
+    \\    }
+    \\    match sys::CapabilityId[sys::Stdio](id: 0).of_handle(handle) {
+    \\        Some(stdio) => return Some(Holding.Stdio(stdio))
+    \\        None => {}
+    \\    }
+    \\    match sys::CapabilityId[sys::Random](id: 0).of_handle(handle) {
+    \\        Some(random) => return Some(Holding.Random(random))
+    \\        None => {}
+    \\    }
+    \\    return None
+    \\} holding_of
+    \\
+    \\/// The handles of the capabilities of the entries of the table that `handles`, which a space sends,
+    \\/// name; none when one names no entry or a channel's.
+    \\fn Table.handed(self, handles: mem::List[u64], alloc: mem::Alloc) -> Option[mem::List[sys::Handle]] {
+    \\    var given = mem::List[sys::Handle].empty(alloc)
+    \\    for handle in handles {
+    \\        let Some(holding) = self.held.get(handle) else {
+    \\            return None
+    \\        }
+    \\        match holding {
+    \\            Holding.Log(log) => mut given.push(sys::Handle.of(log))
+    \\            Holding.Stdio(stdio) => mut given.push(sys::Handle.of(stdio))
+    \\            Holding.Random(random) => mut given.push(sys::Handle.of(random))
+    \\            Holding.Channel(_) => return None
+    \\        }
+    \\    }
+    \\    return Some(take given)
+    \\} Table.handed
     \\
     \\/// Maps a link's doorbell and channel frames into a space whose start record lies at `start`,
     \\/// the channels' handles following one another from `channels`.
@@ -14416,10 +14537,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    if capacity > MOST_BYTES {
     \\        return INVALID
     \\    }
-    \\    if handle >= u64.widen(served.table.len()) {
+    \\    let Some(holding) = served.table.held.get(handle) else {
     \\        return STALE
     \\    }
-    \\    match served.table[usize.widen(handle)] {
+    \\    match holding {
     \\        Holding.Log(log) => {
     \\            if operation == LOG_LINE {
     \\                return logged(log, args, alloc)
@@ -14540,9 +14661,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    for index in 0u64..<record.port_count {
     \\        mut list.push(port_at(record, index))
     \\    }
-    \\    let remotes = sys::Minter[Remote, mem::Alloc, u64].of(alloc, alloc)
+    \\    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[Minted, u64].empty(0, alloc)), alloc)
+    \\    let base = remotes.mint(MOST_HELD)
     \\    let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
-    \\    let world = attempt remote_world(granted, record, remotes, ports, channels_from: record.held)
+    \\    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held)
     \\    let job = record.job
     \\    match world {
     \\        Ok(given) => {
@@ -14550,7 +14672,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                0 => attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
     \\                    return try await call(job, world: take given, take input)
     \\                }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
-    \\                else => attempt await served_instance(job, port: ports.mint(0), world: take given, take input)
+    \\                else => attempt await served_instance(job, port: ports.mint(0), base, world: take given, take input)
     \\            }
     \\            take remotes.close()
     \\            take ports.close()
@@ -14572,10 +14694,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// and random source served by the kernel by the handles its start record gives, its file system
     \\/// and network denied, and its table holding each channel of its link from the index
     \\/// `channels_from` as a standard stream under the channel's key.
-    \\fn remote_world(granted: Base, record: Start, remotes: sys::Minter[Remote, mem::Alloc, u64], ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
-    \\    let logs = try sys::Log.served(remotes.mint(record.log))
-    \\    let streams = try sys::Stdio.served(remotes.mint(record.stdio))
-    \\    let source = try sys::Random.served(remotes.mint(record.random))
+    \\fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
+    \\    let logs = try Cap[sys::Log].held(base, handle: record.log, serve: served_log)
+    \\    let streams = try Cap[sys::Stdio].held(base, handle: record.stdio, serve: served_stdio)
+    \\    let source = try Cap[sys::Random].held(base, handle: record.random, serve: served_random)
     \\    var caps = Caps.empty(granted.alloc)
     \\    for index in channels_from..<record.port_count {
     \\        let port = port_at(record, index)
@@ -14610,9 +14732,125 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\} end_with
     \\
+    \\/// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
+    \\/// allocator, the handle of the capability minted for each handle of the space's table, and that
+    \\/// handle by the capability's type tag and word.
+    \\struct Spaced {
+    \\    alloc: mem::Alloc
+    \\    minted: mem::OnceMap[u64, sys::Handle]
+    \\    handles: mem::OnceMap[Minted, u64]
+    \\} Spaced
+    \\
+    \\/// A capability a space's runtime minted: the tag of its type and its word.
+    \\struct Minted derives Copy, Eq, Hash {
+    \\    tag: u64
+    \\    word: u64
+    \\} Minted
+    \\
+    \\/// The capability the runtime holds for the handle `handle` of the space's table, served through
+    \\/// `serve` on a remote capability deriving from `base` the first time.
+    \\fn Cap.held(base: Remote, handle: u64, serve: fn(remote: Remote) -> C fails sys::Revoked) -> C fails sys::Revoked {
+    \\    match sys::reach(base, body: fn(state: Spaced, record: u64) => state.minted.get(handle)) {
+    \\        Some(Some(minted)) => {
+    \\            let Some(capability) = sys::CapabilityId[C](id: 0).of_handle(minted) else {
+    \\                fail sys::Revoked.Stale
+    \\            }
+    \\            return capability
+    \\        }
+    \\        Some(None) => {}
+    \\        None => fail sys::Revoked.Stale
+    \\    }
+    \\    let capability = try serve(try sys::derive(base, narrow: fn(state: Spaced, record: u64) => handle))
+    \\    let kept = sys::reach(base, body: fn(state: Spaced, record: u64) -> sys::Handle {
+    \\        discard state.handles.insert(Minted(tag: Cap[C].tag(), word: Cap[C].handle(capability)), value: handle)
+    \\        return state.minted.insert(handle, value: sys::Handle.of(capability))
+    \\    })
+    \\    let Some(stored) = kept else {
+    \\        fail sys::Revoked.Stale
+    \\    }
+    \\    let Some(held) = sys::CapabilityId[C](id: 0).of_handle(stored) else {
+    \\        fail sys::Revoked.Stale
+    \\    }
+    \\    return held
+    \\} Cap.held
+    \\
+    \\/// The handle of the space's table for which the runtime minted the capability of type C that
+    \\/// `minted` holds, none for another.
+    \\fn Cap.handle_in(base: Remote, minted: sys::Handle) -> Option[u64] {
+    \\    let Some(capability) = sys::CapabilityId[C](id: 0).of_handle(minted) else {
+    \\        return None
+    \\    }
+    \\    let key = Minted(tag: Cap[C].tag(), word: Cap[C].handle(capability))
+    \\    return sys::reach(base, body: fn(state: Spaced, record: u64) => state.handles.get(key)).value_or(None)
+    \\} Cap.handle_in
+    \\
+    \\fn served_log(remote: Remote) -> sys::Log fails sys::Revoked {
+    \\    return try sys::Log.served(remote)
+    \\} served_log
+    \\
+    \\fn served_stdio(remote: Remote) -> sys::Stdio fails sys::Revoked {
+    \\    return try sys::Stdio.served(remote)
+    \\} served_stdio
+    \\
+    \\fn served_random(remote: Remote) -> sys::Random fails sys::Revoked {
+    \\    return try sys::Random.served(remote)
+    \\} served_random
+    \\
+    \\/// The handle of the capability the runtime holds for what the kernel carried into the space's
+    \\/// table, none once `base` is stale.
+    \\fn minted_for(base: Remote, crossed: Carried) -> Option[sys::Handle] {
+    \\    match crossed {
+    \\        Carried.Log(handle) => {
+    \\            let Ok(log) = attempt Cap[sys::Log].held(base, handle, serve: served_log) else {
+    \\                return None
+    \\            }
+    \\            return Some(sys::Handle.of(log))
+    \\        }
+    \\        Carried.Stdio(handle) => {
+    \\            let Ok(stdio) = attempt Cap[sys::Stdio].held(base, handle, serve: served_stdio) else {
+    \\                return None
+    \\            }
+    \\            return Some(sys::Handle.of(stdio))
+    \\        }
+    \\        Carried.Random(handle) => {
+    \\            let Ok(random) = attempt Cap[sys::Random].held(base, handle, serve: served_random) else {
+    \\                return None
+    \\            }
+    \\            return Some(sys::Handle.of(random))
+    \\        }
+    \\    }
+    \\} minted_for
+    \\
+    \\/// The handles of the space's table for which the runtime minted the capabilities `minted` holds,
+    \\/// none when it minted none of one.
+    \\fn handles_named(base: Remote, minted: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[u64]] {
+    \\    var indices = mem::List[u64].empty(alloc)
+    \\    for handle in minted {
+    \\        let Some(index) = handle_named(base, minted: handle) else {
+    \\            return None
+    \\        }
+    \\        mut indices.push(index)
+    \\    }
+    \\    return Some(take indices)
+    \\} handles_named
+    \\
+    \\/// The handle of the space's table for which the runtime minted the capability `minted` holds,
+    \\/// none when it minted none.
+    \\fn handle_named(base: Remote, minted: sys::Handle) -> Option[u64] {
+    \\    match Cap[sys::Log].handle_in(base, minted) {
+    \\        Some(index) => return Some(index)
+    \\        None => {}
+    \\    }
+    \\    match Cap[sys::Stdio].handle_in(base, minted) {
+    \\        Some(index) => return Some(index)
+    \\        None => {}
+    \\    }
+    \\    return Cap[sys::Random].handle_in(base, minted)
+    \\} handle_named
+    \\
     \\/// The allocator and handle a remote capability's record names, none for a stale one.
     \\fn reached(remote: Remote) -> Option[Reach] {
-    \\    return sys::reach(remote, body: fn(alloc: mem::Alloc, handle: u64) => Reach(alloc: alloc, handle: handle))
+    \\    return sys::reach(remote, body: fn(state: Spaced, handle: u64) => Reach(alloc: state.alloc, handle: handle))
     \\} reached
     \\
     \\/// What reaching a remote capability gives.
@@ -18726,8 +18964,7 @@ const TEXT_SYS_SYS: Str =
     \\    pub id: u64
     \\} CapabilityId
     \\
-    \\/// The capability `handle` holds, none when its handle hash is not C's.
-    \\fn CapabilityId.of_handle(self, handle: Handle) -> Option[C]
+    \\pub fn CapabilityId.of_handle(self, handle: Handle) -> Option[C]
     \\
     \\pub open struct Port[Q: Protocol] derives Copy, Send {
     \\    runner: Runner

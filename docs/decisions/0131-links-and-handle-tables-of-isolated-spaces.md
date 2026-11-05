@@ -1,6 +1,6 @@
 # 0131. Links and handle tables of isolated spaces
 
-Status: accepted
+Status: accepted; the handles never transferred into a space superseded by 0135
 
 ## Context
 

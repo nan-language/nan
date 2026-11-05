@@ -1015,7 +1015,7 @@ A kernel task's stack is drawn through the executor's allocator as the task star
 
 ### Kernel time
 
-The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline.
+The **kernel clock** is the counter the clock field of the target's [descriptor](27-program-model.md#descriptors) names, in nanoseconds since the runtime started; a reading on any CPU is never below one any CPU made before. On x86_64 that counter is the time-stamp counter where it is invariant and otherwise the HPET or the ACPI PM timer, whose narrower count the clock extends to 64 bits; on AArch64 it is the virtual counter. A **deadline** of the kernel clock is the end of a `sys::Clock` sleep or of a `task::within` or `task::within_ns` deadline; every CPU sees every deadline.
 
 - Each CPU's timer fires at the earliest deadline, at the end of the slice of the task it runs and at its **pacing ticks**, 10 ms apart, whichever comes first. A CPU has pacing ticks while it runs a task, and when idle only if a contribution binds the timer's vector, so an idle CPU of another kernel sleeps until a deadline or the CPU signal. Each firing passes the deadlines due, then calls the interrupt fn bound to the timer's vector, if any, at a pacing tick alone.
 - A deadline armed on a CPU ahead of every other deadline programs that CPU's timer to fire at it.

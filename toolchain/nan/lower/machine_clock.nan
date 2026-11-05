@@ -1,4 +1,4 @@
-//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the counter is the time-stamp counter where it is invariant, its rate measured against the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is the HPET or else the PM timer the ACPI tables name, its count extended to 64 bits from the latest any CPU read. Each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
+//! A kernel's clock: its counter, x86_64's time-stamp counter or AArch64's virtual counter, in nanoseconds since the runtime started and never below what any CPU read before; the timers of the clock, which each CPU's timer interrupt expires, its timer programmed one-shot for the earliest of the timer first due, the end of its task's slice and its next pacing tick, which it has while it runs a task or the final build binds the timer's vector; and the wall clock source a machine root grant reads once. On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name, else over the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU measures its local APIC timer's rate against the clock as it starts taking interrupts. The wall clock source is the CMOS clock on `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's `GetTime` on the UEFI targets, its time read as UTC.
 
 /// The nanoseconds between a CPU's pacing ticks.
 const PACING_PERIOD: u64 = 10_000_000
@@ -42,12 +42,20 @@ const HPET_SOURCE: i64 = 1
 const PM_TIMER_SOURCE: i64 = 2
 
 /// The CPUID leaves giving the highest extended leaf and, in bit 8 of EDX, an invariant
-/// time-stamp counter.
+/// time-stamp counter; and those giving the highest basic leaf and the time-stamp counter's
+/// ratio to the core crystal, as EBX over EAX, with the crystal's frequency in ECX.
 const EXTENDED_LEAVES: u32 = 0x8000_0000
 
 const POWER_LEAF: u32 = 0x8000_0007
 
 const INVARIANT_TSC: i64 = 0x100
+
+const BASIC_LEAVES: u32 = 0
+
+const TSC_LEAF: u32 = 0x15
+
+/// The nanoseconds of the HPET or PM timer the time-stamp counter's rate is measured over.
+const TSC_WINDOW: u64 = 10_000_000
 
 /// The signature of the ACPI table naming the HPET; the offset of the HPET's registers in it,
 /// and those in the FADT of the PM timer's port and of the flags whose bit 8 marks a 32-bit PM
@@ -144,8 +152,8 @@ fn Lowering.start_clock(mut self, mut fx: Fx) {
 } Lowering.start_clock
 
 /// Chooses the x86_64 clock's source, recording it: the time-stamp counter where it is invariant,
-/// otherwise the HPET, else the PM timer, else the time-stamp counter. Gives the source's count now
-/// and its scale, the time-stamp counter's rate measured against the PIT.
+/// otherwise the HPET, else the PM timer, else the time-stamp counter. Gives the source's count
+/// now and its scale.
 fn Lowering.start_x64_clock(mut self, mut fx: Fx) -> mem::List[clif::Value] {
     let words = mut fx.slot(16, align: 4)
     let highest = mut self.cpuid(mut fx, words, leaf: EXTENDED_LEAVES)
@@ -155,24 +163,22 @@ fn Lowering.start_x64_clock(mut self, mut fx: Fx) -> mem::List[clif::Value] {
     let steady = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
     let leaves = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: highest, y: i64.widen(POWER_LEAF))
     let stable = mut fx.b.band(steady, y: leaves)
-    let source = mut fx.choose_in(mut self, condition: stable, results: fx.types4(PTR, b: PTR, c: PTR, d: PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let tsc = mut fx1.int(PTR, value: TSC_SOURCE)
-        let zero = mut fx1.ptr(0)
-        return fx1.list4(tsc, b: zero, c: zero, d: zero)
-    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        return mut lo1.counter_source(mut fx1)
-    })
-    expect source.len() > 3
-    let kind = source[0]
-    let counter = source[1]
-    let counter_scale = source[3]
+    let platform = mut self.counter_source(mut fx)
+    expect platform.len() > 3
+    let kind = platform[0]
+    let counter = platform[1]
+    let counter_scale = platform[3]
+    let counted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: kind, y: TSC_SOURCE)
+    let uncounted = mut fx.b.bxor_imm_s(counted, y: 1)
+    let tsc = mut fx.b.bor(stable, y: uncounted)
+    let tsc_kind = mut fx.int(PTR, value: TSC_SOURCE)
+    let source = mut fx.b.select(tsc, x: tsc_kind, y: kind)
     let state_address = mut self.state(mut fx)
-    mut fx.store(kind, addr: state_address, offset: STATE_CLOCK_SOURCE)
+    mut fx.store(source, addr: state_address, offset: STATE_CLOCK_SOURCE)
     mut fx.store(counter, addr: state_address, offset: STATE_CLOCK_COUNTER)
-    mut fx.store(source[2], addr: state_address, offset: STATE_CLOCK_MASK)
-    let tsc = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TSC_SOURCE)
+    mut fx.store(platform[2], addr: state_address, offset: STATE_CLOCK_MASK)
     return mut fx.choose_in(mut self, condition: tsc, results: fx.types2(PTR, b: PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        return mut lo1.pit_tsc_rate(mut fx1)
+        return mut lo1.tsc_rate(mut fx1, counted, platform: platform.view())
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let count = mut lo1.counter_reading(mut fx1, source: kind, counter)
         let ticks_state = mut lo1.state(mut fx1)
@@ -180,6 +186,77 @@ fn Lowering.start_x64_clock(mut self, mut fx: Fx) -> mem::List[clif::Value] {
         return fx1.list2(count, b: counter_scale)
     })
 } Lowering.start_x64_clock
+
+/// The time-stamp counter now and its scale: from the rate CPUID leaf `0x15` reports where it
+/// gives both the ratio and the crystal's frequency, else measured against `platform`, the
+/// source, counter, mask and scale of the HPET or PM timer, when `counted` holds, and against the
+/// PIT otherwise.
+fn Lowering.tsc_rate(mut self, mut fx: Fx, counted: clif::Value, platform: Slice[clif::Value]) -> mem::List[clif::Value] {
+    let words = mut fx.slot(16, align: 4)
+    let highest = mut self.cpuid(mut fx, words, leaf: BASIC_LEAVES)
+    let denominator = mut self.cpuid(mut fx, words, leaf: TSC_LEAF)
+    let ratio_word = mut fx.load(clif::Type.Int32, addr: words, offset: 4)
+    let ratio = mut fx.b.uextend(PTR, x: ratio_word)
+    let crystal_word = mut fx.load(clif::Type.Int32, addr: words, offset: 8)
+    let crystal = mut fx.b.uextend(PTR, x: crystal_word)
+    let listed = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: highest, y: i64.widen(TSC_LEAF))
+    let ratio_given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: ratio, y: 0)
+    let ratio_listed = mut fx.b.band(listed, y: ratio_given)
+    let crystal_given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: crystal, y: 0)
+    let reported = mut fx.b.band(ratio_listed, y: crystal_given)
+    return mut fx.choose_in(mut self, condition: reported, results: fx.types2(PTR, b: PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let product = mut fx1.b.imul(crystal, y: ratio)
+        let one = mut fx1.ptr(1)
+        let divisor = mut fx1.b.umax(denominator, y: one)
+        let quotient = mut fx1.b.udiv(product, y: divisor)
+        let hz = mut fx1.b.umax(quotient, y: one)
+        let second = mut fx1.ptr(NS_PER_SECOND << 32)
+        let scale = mut fx1.b.udiv(second, y: hz)
+        let read = mut lo1.call_stub(mut fx1, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        expect read.len() > 0
+        return fx1.list2(read[0], b: scale)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return mut fx1.choose_in(mut lo1, condition: counted, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return mut lo2.counter_tsc_rate(mut fx2, platform)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return mut lo2.pit_tsc_rate(mut fx2)
+        })
+    })
+} Lowering.tsc_rate
+
+/// The time-stamp counter at the end of `TSC_WINDOW` of a platform counter, given as its source,
+/// counter, mask and scale, and its scale over that window.
+fn Lowering.counter_tsc_rate(mut self, mut fx: Fx, platform: Slice[clif::Value]) -> mem::List[clif::Value] {
+    expect platform.len() > 3
+    let source = platform[0]
+    let counter = platform[1]
+    let mask = platform[2]
+    let scale = platform[3]
+    let span = mut fx.ptr(TSC_WINDOW << 32)
+    let window = mut fx.b.udiv(span, y: scale)
+    let initial = mut self.counter_reading(mut fx, source, counter)
+    let started = mut self.call_stub(mut fx, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect started.len() > 0
+    let start = started[0]
+    let zero = mut fx.ptr(0)
+    let counted = mut fx.repeat(fx.list1(zero).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let reading = mut self.counter_reading(mut fx1, source, counter)
+        let difference = mut fx1.b.isub(reading, y: initial)
+        let passed = mut fx1.b.band(difference, y: mask)
+        let short = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: passed, y: window)
+        return Pass(again: short, next: fx1.list1(passed))
+    })
+    expect counted.len() > 0
+    let ended = mut self.call_stub(mut fx, stub: Stub.ReadTsc, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect ended.len() > 0
+    let end = ended[0]
+    let elapsed_ticks = mut fx.b.isub(end, y: start)
+    let one = mut fx.ptr(1)
+    let ticks = mut fx.b.umax(elapsed_ticks, y: one)
+    let elapsed = mut fx.b.imul(counted[0], y: scale)
+    let tsc_scale = mut fx.b.udiv(elapsed, y: ticks)
+    return fx.list2(end, b: tsc_scale)
+} Lowering.counter_tsc_rate
 
 /// The HPET the ACPI `HPET` table names, its counter started, or else the PM timer the FADT
 /// names, or else the time-stamp counter: the source, its counter's address or port, the mask of

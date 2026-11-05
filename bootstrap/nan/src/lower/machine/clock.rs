@@ -5,10 +5,10 @@
 //! it has while it runs a task or the final build binds the timer's vector; and the wall clock
 //! source a machine root grant reads once.
 //!
-//! On x86_64 the counter is the time-stamp counter where it is invariant, its rate measured against
-//! the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is the HPET or
-//! else the PM timer the ACPI tables name, its count extended to 64 bits from the latest any CPU
-//! read. Each CPU measures its local APIC timer's rate against the clock as it starts taking
+//! On x86_64 the counter is the time-stamp counter where it is invariant, at the rate CPUID leaf
+//! `0x15` reports, else measured over 10 ms of the HPET or else the PM timer the ACPI tables name,
+//! else over the 10 ms the legacy PIT's channel 2 counts down from `PIT_LATCH`; elsewhere it is
+//! that HPET or PM timer, its count extended to 64 bits from the latest any CPU read. Each CPU measures its local APIC timer's rate against the clock as it starts taking
 //! interrupts. The wall clock source is the CMOS clock on
 //! `x86_64-bare`, the PL031 the machine's discovery finds on `aarch64-bare` and the firmware's
 //! `GetTime` on the UEFI targets, its time read as UTC.
@@ -56,10 +56,16 @@ const HPET_SOURCE: i64 = 1;
 const PM_TIMER_SOURCE: i64 = 2;
 
 /// The CPUID leaves giving the highest extended leaf and, in bit 8 of EDX, an invariant
-/// time-stamp counter.
+/// time-stamp counter; and those giving the highest basic leaf and the time-stamp counter's
+/// ratio to the core crystal, as EBX over EAX, with the crystal's frequency in ECX.
 const EXTENDED_LEAVES: u32 = 0x8000_0000;
 const POWER_LEAF: u32 = 0x8000_0007;
 const INVARIANT_TSC: i64 = 0x100;
+const BASIC_LEAVES: u32 = 0;
+const TSC_LEAF: u32 = 0x15;
+
+/// The nanoseconds of the HPET or PM timer the time-stamp counter's rate is measured over.
+const TSC_WINDOW: u64 = 10_000_000;
 
 /// The signature of the ACPI table naming the HPET; the offset of the HPET's registers in it,
 /// and those in the FADT of the PM timer's port and of the flags whose bit 8 marks a 32-bit PM
@@ -119,7 +125,7 @@ impl Lowering<'_, '_> {
 
     /// Chooses the x86_64 clock's source, recording it: the time-stamp counter where it is
     /// invariant, otherwise the HPET, else the PM timer, else the time-stamp counter. Gives the
-    /// source's count now and its scale, the time-stamp counter's rate measured against the PIT.
+    /// source's count now and its scale.
     fn start_x64_clock(&mut self, fx: &mut Fx) -> (Value, Value) {
         let registers = fx.slot(16, 4);
         let highest = self.cpuid(fx, registers, EXTENDED_LEAVES, 0);
@@ -133,35 +139,101 @@ impl Lowering<'_, '_> {
             POWER_LEAF as i64,
         );
         let invariant = fx.b.ins().band(invariant, leaves);
-        let source = fx.choose_in(
-            self,
-            invariant,
-            &[PTR, PTR, PTR, PTR],
-            |_, fx| {
-                let tsc = fx.int(PTR, TSC_SOURCE);
-                let zero = fx.ptr(0);
-                vec![tsc, zero, zero, zero]
-            },
-            |lo, fx| lo.counter_source(fx),
-        );
+        let platform = self.counter_source(fx);
+        let counted =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::NotEqual, platform[0], TSC_SOURCE);
+        let uncounted = fx.b.ins().bxor_imm_s(counted, 1);
+        let tsc = fx.b.ins().bor(invariant, uncounted);
+        let tsc_source = fx.int(PTR, TSC_SOURCE);
+        let source = fx.b.ins().select(tsc, tsc_source, platform[0]);
         let state_address = self.state(fx);
-        fx.store(source[0], state_address, state::CLOCK_SOURCE);
-        fx.store(source[1], state_address, state::CLOCK_COUNTER);
-        fx.store(source[2], state_address, state::CLOCK_MASK);
-        let tsc = fx.b.ins().icmp_imm_s(IntCC::Equal, source[0], TSC_SOURCE);
+        fx.store(source, state_address, state::CLOCK_SOURCE);
+        fx.store(platform[1], state_address, state::CLOCK_COUNTER);
+        fx.store(platform[2], state_address, state::CLOCK_MASK);
         let started = fx.choose_in(
             self,
             tsc,
             &[PTR, PTR],
-            |lo, fx| lo.pit_tsc_rate(fx),
+            |lo, fx| lo.tsc_rate(fx, counted, &platform),
             |lo, fx| {
-                let count = lo.counter_reading(fx, source[0], source[1]);
+                let count = lo.counter_reading(fx, platform[0], platform[1]);
                 let state_address = lo.state(fx);
                 fx.store(count, state_address, state::CLOCK_TICKS);
-                vec![count, source[3]]
+                vec![count, platform[3]]
             },
         );
         (started[0], started[1])
+    }
+
+    /// The time-stamp counter now and its scale: from the rate CPUID leaf `0x15` reports where
+    /// it gives both the ratio and the crystal's frequency, else measured against `platform`,
+    /// the source, counter, mask and scale of the HPET or PM timer, when `counted` holds, and
+    /// against the PIT otherwise.
+    fn tsc_rate(&mut self, fx: &mut Fx, counted: Value, platform: &[Value]) -> Vec<Value> {
+        let registers = fx.slot(16, 4);
+        let highest = self.cpuid(fx, registers, BASIC_LEAVES, 0);
+        let denominator = self.cpuid(fx, registers, TSC_LEAF, 0);
+        let ratio = fx.load(types::I32, registers, 4);
+        let ratio = fx.b.ins().uextend(PTR, ratio);
+        let crystal = fx.load(types::I32, registers, 8);
+        let crystal = fx.b.ins().uextend(PTR, crystal);
+        let listed =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, highest, TSC_LEAF as i64);
+        let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ratio, 0);
+        let reported = fx.b.ins().band(listed, given);
+        let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, crystal, 0);
+        let reported = fx.b.ins().band(reported, given);
+        fx.choose_in(
+            self,
+            reported,
+            &[PTR, PTR],
+            |lo, fx| {
+                let hz = fx.b.ins().imul(crystal, ratio);
+                let one = fx.ptr(1);
+                let denominator = fx.b.ins().umax(denominator, one);
+                let hz = fx.b.ins().udiv(hz, denominator);
+                let hz = fx.b.ins().umax(hz, one);
+                let second = fx.ptr(NS_PER_SECOND << 32);
+                let scale = fx.b.ins().udiv(second, hz);
+                let now = lo.call_stub(fx, Stub::ReadTsc, &[])[0];
+                vec![now, scale]
+            },
+            |lo, fx| {
+                fx.choose_in(
+                    lo,
+                    counted,
+                    &[PTR, PTR],
+                    |lo, fx| lo.counter_tsc_rate(fx, platform),
+                    |lo, fx| lo.pit_tsc_rate(fx),
+                )
+            },
+        )
+    }
+
+    /// The time-stamp counter at the end of `TSC_WINDOW` of a platform counter, given as its
+    /// source, counter, mask and scale, and its scale over that window.
+    fn counter_tsc_rate(&mut self, fx: &mut Fx, platform: &[Value]) -> Vec<Value> {
+        let (source, counter, mask, scale) = (platform[0], platform[1], platform[2], platform[3]);
+        let window = fx.ptr(TSC_WINDOW << 32);
+        let window = fx.b.ins().udiv(window, scale);
+        let first = self.counter_reading(fx, source, counter);
+        let start = self.call_stub(fx, Stub::ReadTsc, &[])[0];
+        let zero = fx.ptr(0);
+        let passed = fx.repeat(&[zero], |fx, _| {
+            let reading = self.counter_reading(fx, source, counter);
+            let passed = fx.b.ins().isub(reading, first);
+            let passed = fx.b.ins().band(passed, mask);
+            let short = fx.b.ins().icmp(IntCC::UnsignedLessThan, passed, window);
+            (short, vec![passed])
+        })[0];
+        let end = self.call_stub(fx, Stub::ReadTsc, &[])[0];
+        let ticks = fx.b.ins().isub(end, start);
+        let one = fx.ptr(1);
+        let ticks = fx.b.ins().umax(ticks, one);
+        let elapsed = fx.b.ins().imul(passed, scale);
+        vec![end, fx.b.ins().udiv(elapsed, ticks)]
     }
 
     /// The HPET the ACPI `HPET` table names, its counter started, or else the PM timer the

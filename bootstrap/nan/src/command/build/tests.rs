@@ -99,8 +99,11 @@ fn a_locked_release_reaches_the_methods_its_tests_call() {
     let dir = &scratch.0;
     run_in(&dir.join("exits"), "dep sync");
     let source = fs::read_to_string(dir.join("count/count.nan")).expect("the count source");
-    fs::write(dir.join("count/count.nan"), source.replace("+ 1", "+ 2 - 1"))
-        .expect("a changed count");
+    fs::write(
+        dir.join("count/count.nan"),
+        source.replace("+ 1", "+ 2 - 1"),
+    )
+    .expect("a changed count");
     let built = run_in(dir, "build exits");
     assert_eq!(built.status, 0, "{}", built.output);
 }

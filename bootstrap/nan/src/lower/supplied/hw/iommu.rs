@@ -210,7 +210,7 @@ fn config(
                         None => lo.port_in(fx, 4, port),
                     };
                     let free = fx.ptr(0);
-                    fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
+                    fx.release_store(free, lock);
                     lo.call_stub(fx, Stub::IrqRestore, &[flags]);
                     vec![read]
                 },

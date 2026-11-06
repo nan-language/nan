@@ -353,8 +353,7 @@ fn claim(_lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
 fn settle_kept(lo: &mut Lowering, fx: &mut Fx, record: Value, state: i64) {
     let word = fx.offset(record, scope::FAILED);
     let state = fx.ptr(state as u64);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), state, word);
+    fx.atomic_store(state, word);
     lo.call_routine(fx, Routine::Cancel, &[record]);
 }
 
@@ -860,8 +859,7 @@ fn arm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value, ns: Value) {
 fn disarm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value) {
     let current = tasks::current_task(lo, fx);
     let waiter = fx.offset(timer, operation::WAITER);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), current, waiter);
+    fx.atomic_store(current, waiter);
     lo.cancel_operation(fx, timer);
     tasks::wait_delivered(lo, fx, timer);
     let current = tasks::current_task(lo, fx);

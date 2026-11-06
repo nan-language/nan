@@ -124,8 +124,7 @@ impl Lowering<'_, '_> {
         fx.store(value, record, VALUE);
         self.store_held(fx, value, supply.param(1), &policy_ty);
         let installed = fx.offset(state_address, state::POLICY);
-        fx.b.ins()
-            .atomic_store(MemFlagsData::trusted(), record, installed);
+        fx.atomic_store(record, installed);
         supply.done(self, fx);
     }
 
@@ -488,7 +487,7 @@ impl Lowering<'_, '_> {
         fx.when(empty, |fx| {
             let idle = fx.offset(own_record, cpu::IDLE);
             let one = fx.ptr(1);
-            fx.b.ins().atomic_store(MemFlagsData::trusted(), one, idle);
+            fx.atomic_store(one, idle);
         });
         self.call_routine(fx, Routine::Unlock, &[lock]);
         fx.choose_in(
@@ -554,7 +553,7 @@ impl Lowering<'_, '_> {
         fx.when(got, |fx| {
             let idle = fx.offset(own_record, cpu::IDLE);
             let zero = fx.ptr(0);
-            fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, idle);
+            fx.atomic_store(zero, idle);
         });
         stolen
     }
@@ -719,12 +718,12 @@ impl Lowering<'_, '_> {
         });
         let idle = fx.offset(own_record, cpu::IDLE);
         let zero = fx.ptr(0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, idle);
+        fx.atomic_store(zero, idle);
     }
 
     /// What the running CPU records as it switches a task in at nanosecond `now`: the task ran
     /// on it, its key, and the end of the slice its policy gives it; its timer is programmed
-    /// again for that slice and its pacing.
+    /// again when that slice and its pacing need it at another time than they last did.
     pub fn kernel_switch_in(&mut self, fx: &mut Fx, record: Value, now: Value) {
         let own = self.running_index(fx);
         let own_record = self.cpu_record(fx, own);
@@ -746,7 +745,11 @@ impl Lowering<'_, '_> {
         let zero = fx.ptr(0);
         let end = fx.b.ins().select(sliced, end, zero);
         fx.store(end, own_record, cpu::SLICE_END);
-        self.reprogram_timer(fx);
+        let need = self.timer_need(fx, own_record, now);
+        let thread = fx.load(PTR, own_record, cpu::THREAD);
+        let programmed = fx.load(PTR, thread, thread::TIMER_NEED);
+        let changed = fx.b.ins().icmp(IntCC::NotEqual, need, programmed);
+        fx.when(changed, |fx| self.reprogram_timer(fx));
     }
 
     /// What the running CPU records once a task has switched away: it runs no task.

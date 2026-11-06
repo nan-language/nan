@@ -12,6 +12,9 @@ struct Fx {
     /// In a test image, the bytes recording which targets ran and the slot of the target this
     /// function's calls run, which its entry marks.
     mark: Option[TargetMark]
+    /// Whether the target orders memory as x86_64 does: its stores keep their order, and only a
+    /// load may pass an earlier store.
+    total_store_order: bool
     alloc: mem::Alloc
 } Fx
 
@@ -42,8 +45,8 @@ fn fx_access(unaligned_access: bool) -> clif::MemFlags {
     return clif::MemFlags.owned()
 } fx_access
 
-fn Fx.new(take b: clif::Builder, alloc: mem::Alloc) -> Fx {
-    return Fx(b: take b, sites: mem::List[CallSite].empty(alloc), fn_params: mem::HashMap[clif::Value, usize].empty(seed: 0, alloc), mark: None, alloc: alloc)
+fn Fx.new(take b: clif::Builder, total_store_order: bool, alloc: mem::Alloc) -> Fx {
+    return Fx(b: take b, sites: mem::List[CallSite].empty(alloc), fn_params: mem::HashMap[clif::Value, usize].empty(seed: 0, alloc), mark: None, total_store_order: total_store_order, alloc: alloc)
 } Fx.new
 
 /// Starts the function: its entry block holding its parameters, current and sealed, which
@@ -96,6 +99,27 @@ fn Fx.load_device(mut self, ty: clif::Type, addr: clif::Value, big: bool) -> cli
     let value = mut self.b.load(ty, flags: clif::MemFlags(aligned: true, notrap: false), p: addr, offset: 0)
     return mut self.ordered(value, big)
 } Fx.load_device
+
+/// Stores a scalar at `addr`, sequentially consistent: under total store order by `xchg`, which
+/// orders as a store followed by `mfence` does in a fraction of its time.
+fn Fx.atomic_store(mut self, value: clif::Value, addr: clif::Value) {
+    if self.total_store_order {
+        let ty = self.b.value_type(value)
+        discard mut self.b.atomic_rmw(ty, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Xchg, p: addr, x: value)
+    } else {
+        mut self.b.atomic_store(clif::MemFlags.owned(), x: value, p: addr)
+    }
+} Fx.atomic_store
+
+/// Stores a scalar at `addr` after every earlier access, as freeing a lock word needs: a plain
+/// store under total store order, and sequentially consistent otherwise.
+fn Fx.release_store(mut self, value: clif::Value, addr: clif::Value) {
+    if self.total_store_order {
+        mut self.b.store(clif::MemFlags.owned(), x: value, p: addr, offset: 0)
+    } else {
+        mut self.b.atomic_store(clif::MemFlags.owned(), x: value, p: addr)
+    }
+} Fx.release_store
 
 /// Stores a scalar at `offset` past `addr`, possibly unaligned, in big-endian byte order
 /// when `big` holds.

@@ -9,7 +9,7 @@
 //! ordered by when they are due and then by when they were armed. A completion, of a timer or of
 //! a wait in a sim, is queued and delivered when the scheduler next reaps, as a ring's would be.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
@@ -329,8 +329,7 @@ fn yield_point(lo: &mut Lowering, fx: &mut Fx) {
             |lo, fx| {
                 let ready = fx.int(types::I32, run::READY);
                 let word = fx.offset(record, task::STATE);
-                fx.b.ins()
-                    .atomic_store(MemFlagsData::trusted(), ready, word);
+                fx.atomic_store(ready, word);
                 requeue(lo, fx, record);
                 let thread = lo.thread(fx);
                 let scheduler = fx.offset(thread, thread::CONTEXT);

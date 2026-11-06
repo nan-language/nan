@@ -23,6 +23,9 @@ pub struct Fx<'f> {
     /// In a test image, the bytes recording which targets ran and the slot of the target this
     /// function's calls run, which its entry marks.
     pub mark: Option<(ir::GlobalValue, u32)>,
+    /// Whether the target orders memory as x86_64 does: its stores keep their order, and only a
+    /// load may pass an earlier store.
+    total_store_order: bool,
 }
 
 /// Flags of an access to memory lowered code owns: aligned and never trapping.
@@ -51,12 +54,13 @@ fn access(unaligned_access: bool) -> MemFlagsData {
 }
 
 impl<'f> Fx<'f> {
-    pub fn new(b: FunctionBuilder<'f>) -> Fx<'f> {
+    pub fn new(b: FunctionBuilder<'f>, total_store_order: bool) -> Fx<'f> {
         Fx {
             b,
             sites: Vec::new(),
             fn_params: HashMap::new(),
             mark: None,
+            total_store_order,
         }
     }
 
@@ -115,6 +119,29 @@ impl<'f> Fx<'f> {
     pub fn load_device(&mut self, ty: Type, addr: Value, big: bool) -> Value {
         let value = self.b.ins().load(ty, device(), addr, 0);
         self.ordered(value, big)
+    }
+
+    /// Stores a scalar at `addr`, sequentially consistent: under total store order by `xchg`,
+    /// which orders as a store followed by `mfence` does in a fraction of its time.
+    pub fn atomic_store(&mut self, value: Value, addr: Value) {
+        if self.total_store_order {
+            let ty = self.b.func.dfg.value_type(value);
+            self.b
+                .ins()
+                .atomic_rmw(ty, trusted(), ir::AtomicRmwOp::Xchg, addr, value);
+        } else {
+            self.b.ins().atomic_store(trusted(), value, addr);
+        }
+    }
+
+    /// Stores a scalar at `addr` after every earlier access, as freeing a lock word needs: a plain
+    /// store under total store order, and sequentially consistent otherwise.
+    pub fn release_store(&mut self, value: Value, addr: Value) {
+        if self.total_store_order {
+            self.b.ins().store(trusted(), value, addr, 0);
+        } else {
+            self.b.ins().atomic_store(trusted(), value, addr);
+        }
     }
 
     /// Stores a scalar at `offset` past `addr`, possibly unaligned, in big-endian byte order

@@ -176,7 +176,7 @@ pub fn poison(lo: &mut Lowering, fx: &mut Fx, held: Value, domain: Value) {
         let record = fx.load(PTR, entry, held::RECORD);
         let one = fx.ptr(1);
         let flag = fx.offset(record, cown::POISONED);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), one, flag);
+        fx.atomic_store(one, flag);
         let reach = fx.load(PTR, record, cown::REACH);
         let walk = fx.load(PTR, entry, held::WALK);
         let walks = fx.b.ins().icmp_imm_s(IntCC::NotEqual, walk, 0);
@@ -334,8 +334,7 @@ fn grant_next_locked(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             let task = fx.load(PTR, head, request::TASK);
             let granted = fx.offset(head, request::GRANTED);
             let one = fx.ptr(1);
-            fx.b.ins()
-                .atomic_store(MemFlagsData::trusted(), one, granted);
+            fx.atomic_store(one, granted);
             vec![task]
         },
         |fx| vec![fx.ptr(0)],

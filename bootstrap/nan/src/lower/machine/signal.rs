@@ -80,8 +80,7 @@ impl Lowering<'_, '_> {
         });
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let posted = fx.offset(state_address, state::SHOOTDOWN_SCOPE);
-        fx.b.ins()
-            .atomic_store(MemFlagsData::trusted(), scope, posted);
+        fx.atomic_store(scope, posted);
         let own = self.running_index(fx);
         let count = fx.load(PTR, state_address, state::THREAD_COUNT);
         let zero = fx.ptr(0);
@@ -98,8 +97,7 @@ impl Lowering<'_, '_> {
                 let one = fx.ptr(1);
                 fetch_add(fx, left, one);
                 let pending = fx.offset(record, cpu::SHOOTDOWN);
-                fx.b.ins()
-                    .atomic_store(MemFlagsData::trusted(), one, pending);
+                fx.atomic_store(one, pending);
                 let id = fx.load(PTR, record, cpu::HARDWARE_ID);
                 self.send_ipi(fx, id, IPI_SIGNAL);
             });
@@ -115,7 +113,7 @@ impl Lowering<'_, '_> {
             (waiting, Vec::new())
         });
         let free = fx.ptr(0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
+        fx.release_store(free, lock);
     }
 
     /// Serves the shootdown posted to the running CPU, if any, when the CPU signal arrives on

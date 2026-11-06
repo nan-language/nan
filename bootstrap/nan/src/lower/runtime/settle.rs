@@ -285,7 +285,7 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
             Some(fx.b.ins().icmp_imm_s(IntCC::Equal, before, 0))
         }
         false => {
-            fx.b.ins().atomic_store(MemFlagsData::trusted(), one, asked);
+            fx.atomic_store(one, asked);
             None
         }
     };
@@ -317,8 +317,7 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                 |lo, fx| {
                     let removed = remove_ready(lo, fx, record);
                     fx.when(removed, |fx| {
-                        fx.b.ins()
-                            .atomic_store(MemFlagsData::trusted(), stopped, word);
+                        fx.atomic_store(stopped, word);
                     });
                     vec![fx.b.ins().bxor_imm_s(removed, 1)]
                 },

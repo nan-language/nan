@@ -245,7 +245,7 @@ fn lock(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Option<Value> {
 fn unlock(lo: &mut Lowering, fx: &mut Fx, state: Value, flags: Option<Value>) {
     let word = fx.offset(state, allocators::LOCK);
     let zero = fx.int(types::I32, 0);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, word);
+    fx.release_store(zero, word);
     if let Some(flags) = flags {
         lo.call_stub(fx, Stub::IrqRestore, &[flags]);
     }

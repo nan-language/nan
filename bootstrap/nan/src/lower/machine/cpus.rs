@@ -485,7 +485,7 @@ impl Lowering<'_, '_> {
         let one = fx.ptr(1);
         super::super::runtime::fetch_add(fx, started, one);
         let flag = fx.offset(record, cpu::STARTED);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), one, flag);
+        fx.atomic_store(one, flag);
     }
 
     /// Spins for `pauses` pauses.

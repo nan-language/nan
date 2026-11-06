@@ -802,10 +802,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
         let mut builder_context = FunctionBuilderContext::new();
         self.enter_definition(id);
         let recorded = {
-            let mut fx = Fx::new(FunctionBuilder::new(
-                &mut context.func,
-                &mut builder_context,
-            ));
+            let mut fx = Fx::new(
+                FunctionBuilder::new(&mut context.func, &mut builder_context),
+                self.ck.db.target.arch() == Some(Arch::Amd64),
+            );
             build(self, &mut fx);
             fx.b.seal_all_blocks();
             let recorded = std::mem::take(&mut fx.sites);

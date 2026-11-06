@@ -106,7 +106,7 @@ impl Lowering<'_, '_> {
     pub(crate) fn spin_unlock(&mut self, fx: &mut Fx, base: Value, offset: u64, flags: Value) {
         let lock = fx.offset(base, offset);
         let free = fx.ptr(0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
+        fx.release_store(free, lock);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);
     }
 

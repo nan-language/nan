@@ -135,9 +135,9 @@ const TASK_SIZE: u64 = 376
 /// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
 /// idle in its ring, the operations in flight on it, whether another thread asked to cancel
 /// one, its POSIX thread and the top of the stack its stack overflow reports run on; on a
-/// kernel the flags from before its outermost held lock disabled interrupts; and on a machine
-/// target whether its CPU's extended state is enabled, holding the state of the last task
-/// owning one that it ran.
+/// kernel the flags from before its outermost held lock disabled interrupts and the time its
+/// CPU's timer was last programmed to need; and on a machine target whether its CPU's extended
+/// state is enabled, holding the state of the last task owning one that it ran.
 const THREAD_CONTEXT: u64 = 0
 
 const THREAD_CURRENT: u64 = 24
@@ -166,7 +166,9 @@ const THREAD_SAVED_IF: u64 = THREAD_HELD + 8 * HELD_LOCKS
 
 const THREAD_EXTENDED: u64 = THREAD_SAVED_IF + 8
 
-const THREAD_SIZE: u64 = THREAD_EXTENDED + 8
+const THREAD_TIMER_NEED: u64 = THREAD_EXTENDED + 8
+
+const THREAD_SIZE: u64 = THREAD_TIMER_NEED + 8
 
 /// The bits of a task record's flags. Its join handle has reaped it.
 const FLAG_REAPED: i64 = 1
@@ -406,7 +408,7 @@ fn waiting_on(mut lo: Lowering, mut fx: Fx, what: i64) {
     let current = current_task(mut lo, mut fx)
     let word = mut fx.offset(current, offset: TASK_IO)
     let marker = mut fx.ptr(what.to_bits())
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: marker, p: word)
+    mut fx.atomic_store(marker, addr: word)
 } waiting_on
 
 /// The task the running executor thread runs, zero outside a task.
@@ -682,7 +684,7 @@ fn task_start(mut lo: Lowering, mut fx: Fx) {
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
     let ended = mut fx.int(clif::Type.Int32, value: RUN_ENDED)
     let word = mut fx.offset(record, offset: TASK_STATE)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: ended, p: word)
+    mut fx.atomic_store(ended, addr: word)
     switch_out(mut lo, mut fx, record)
     mut fx.b.trap(clif::TrapCode(user: 1))
 } task_start
@@ -727,7 +729,7 @@ fn park(mut lo: Lowering, mut fx: Fx) {
         switch_out(mut lo1, fx: mut fx1, record)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: running, p: word)
+        mut fx1.atomic_store(running, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
     })
 } park
@@ -877,7 +879,7 @@ fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
         count_out(mut lo1, fx: mut fx1, record)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
-        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
+        mut fx1.atomic_store(stopped, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         switch_in(mut lo1, fx: mut fx1, record)
@@ -894,7 +896,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     let word = mut fx.offset(record, offset: TASK_STATE)
     let thread = mut lo.thread(mut fx)
     let running = mut fx.int(clif::Type.Int32, value: RUN_RUNNING)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: running, p: word)
+    mut fx.atomic_store(running, addr: word)
     mut fx.store(record, addr: thread, offset: THREAD_CURRENT)
     mut fx.store(thread, addr: record, offset: TASK_THREAD)
     var started: Option[clif::Value] = None
@@ -957,7 +959,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
         count_out(mut lo1, fx: mut fx1, record)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
-        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
+        mut fx1.atomic_store(stopped, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         // A task switching away notified was woken after it parked, or was preempted, and keeps
@@ -977,7 +979,7 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
             let notified = mut fx2.b.icmp(clif::IntCC.NotEqual, x: seen, y: parking_state)
             mut fx2.if_true(notified, then: fn[mut lo1](mut fx3: Fx) {
                 let ready = mut fx3.int(clif::Type.Int32, value: RUN_READY)
-                mut fx3.b.atomic_store(clif::MemFlags.owned(), x: ready, p: word)
+                mut fx3.atomic_store(ready, addr: word)
                 tasks_push_ready(mut lo1, fx: mut fx3, record)
             })
         })
@@ -1067,7 +1069,7 @@ fn stop_asked(mut fx: Fx, record: clif::Value) -> clif::Value {
 fn stop_running(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let stopping = mut fx.int(clif::Type.Int32, value: RUN_STOPPING)
     let word = mut fx.offset(record, offset: TASK_STATE)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: stopping, p: word)
+    mut fx.atomic_store(stopping, addr: word)
     switch_out(mut lo, mut fx, record)
     mut fx.b.trap(clif::TrapCode(user: 1))
 } stop_running
@@ -1107,7 +1109,7 @@ fn io_submit(mut lo: Lowering, mut fx: Fx) {
     discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fx.list3(op, b: zero, c: size).view())
     mut fx.store(record, addr: op, offset: OPERATION_TASK)
     let word = mut fx.offset(record, offset: TASK_IO)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: op, p: word)
+    mut fx.atomic_store(op, addr: word)
     host_submit(mut lo, mut fx, prepared: entry, op: Some(op))
     let origin_submitted = regions_origin(mut fx, region)
     let cancelled_submitted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_submitted, y: 0)
@@ -1170,7 +1172,7 @@ fn deliver(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
 fn set_done(mut fx: Fx, op: clif::Value, done: i64) {
     let word = mut fx.offset(op, offset: OPERATION_DONE)
     let value = mut fx.ptr(done.to_bits())
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: value, p: word)
+    mut fx.atomic_store(value, addr: word)
 } set_done
 
 /// Waits until an operation's completion has been delivered, the running task parking while it

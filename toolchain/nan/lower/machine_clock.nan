@@ -496,37 +496,18 @@ fn Lowering.reprogram_timer(mut self, mut fx: Fx) {
     discard mut self.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
 } Lowering.reprogram_timer
 
-/// Programs the running CPU's timer to fire at the earliest of the end of a timer's window, the end
-/// of its task's slice while that is ahead and, while it runs a task or the final build binds the
-/// timer's vector, its next pacing tick; at once when that has passed. The caller holds the timer
-/// lock.
+/// Programs the running CPU's timer to fire at the earliest of the end of a timer's window and the
+/// time its task needs it, which its executor thread records; at once when that has passed. The
+/// caller holds the timer lock.
 fn Lowering.program_timer(mut self, mut fx: Fx) {
     let record = mut self.running_cpu(mut fx)
-    let latest = mut fx.int(PTR, value: -1)
-    let next_pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
-    let timer = self.vectors().timer
-    let statically = mut self.statically_bound()
-    var bound = false
-    for vector in statically {
-        if vector == timer {
-            bound = true
-        }
-    }
-    var pace = next_pace
-    if not bound {
-        let thread = mut fx.load(PTR, addr: record, offset: CPU_THREAD)
-        let current = mut fx.load(PTR, addr: thread, offset: THREAD_CURRENT)
-        let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
-        pace = mut fx.b.select(running, x: next_pace, y: latest)
-    }
     let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
     expect read.len() > 0
     let now = read[0]
-    let slice_end = mut fx.load(PTR, addr: record, offset: CPU_SLICE_END)
-    let sliced = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: slice_end, y: now)
-    let end = mut fx.b.select(sliced, x: slice_end, y: latest)
-    let due_first = mut fx.b.umin(pace, y: end)
-    let target = mut self.windows_end(mut fx, bound: due_first)
+    let need = mut self.timer_need(mut fx, record, now)
+    let thread = mut fx.load(PTR, addr: record, offset: CPU_THREAD)
+    mut fx.store(need, addr: thread, offset: THREAD_TIMER_NEED)
+    let target = mut self.windows_end(mut fx, bound: need)
     let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: target, y: now)
     let remaining = mut fx.b.isub(target, y: now)
     let zero = mut fx.ptr(0)
@@ -546,6 +527,33 @@ fn Lowering.program_timer(mut self, mut fx: Fx) {
         workspace::Arch.Aarch64 => mut self.aarch64_set_timer(mut fx, ticks)
     }
 } Lowering.program_timer
+
+/// The earliest time the task a CPU, whose record is `record`, runs at `now` needs its timer: the
+/// end of its slice while that is ahead and, while it runs a task or the final build binds the
+/// timer's vector, the CPU's next pacing tick; the latest time for none.
+fn Lowering.timer_need(mut self, mut fx: Fx, record: clif::Value, now: clif::Value) -> clif::Value {
+    let latest = mut fx.int(PTR, value: -1)
+    let next_pace = mut fx.load(PTR, addr: record, offset: CPU_NEXT_PACE)
+    let timer = self.vectors().timer
+    let statically = mut self.statically_bound()
+    var bound = false
+    for vector in statically {
+        if vector == timer {
+            bound = true
+        }
+    }
+    var pace = next_pace
+    if not bound {
+        let thread = mut fx.load(PTR, addr: record, offset: CPU_THREAD)
+        let current = mut fx.load(PTR, addr: thread, offset: THREAD_CURRENT)
+        let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        pace = mut fx.b.select(running, x: next_pace, y: latest)
+    }
+    let slice_end = mut fx.load(PTR, addr: record, offset: CPU_SLICE_END)
+    let sliced = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: slice_end, y: now)
+    let end = mut fx.b.select(sliced, x: slice_end, y: latest)
+    return mut fx.b.umin(pace, y: end)
+} Lowering.timer_need
 
 /// The earliest end of a timer's window, or `bound` when it is earlier. The timers are in the order
 /// they are due and a window ends no sooner than its timer is due, so the walk stops at the first

@@ -122,7 +122,7 @@ fn atomic_op(
     match member {
         "load" => Held::Scalar(fx.b.ins().atomic_load(ty, flags, address)),
         "store" => {
-            fx.b.ins().atomic_store(flags, operand(1), address);
+            fx.atomic_store(operand(1), address);
             Held::Empty
         }
         "swap" => {

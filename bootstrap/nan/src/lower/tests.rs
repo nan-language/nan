@@ -272,3 +272,23 @@ fn machine_code_holds_no_float_or_vector_value() {
         }
     }
 }
+
+/// A kernel's support routines store sequentially consistent by exchanges on x86_64, which takes
+/// no `mfence`, and by store-releases on AArch64.
+#[test]
+fn x64_stores_exchange_rather_than_fence() {
+    let source = "//! Anchors.\n\n\
+        fn main(take k: boot::Kernel) -> Never limits stack 16_384 {\n\
+        \x20   take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 32_768 {\n    })\n\
+        } main\n";
+    for (target, fenced) in [("x86_64-bare", false), ("aarch64-bare", true)] {
+        let manifest = format!(
+            "//! A kernel.\n\npackage st {{\n    language 1\n    targets {target}\n    entry main\n}} st\n"
+        );
+        let scratch = Scratch::new(&[("st/package.nan", &manifest), ("st/st.nan", source)]);
+        let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+        let texts = crate::final_build::lowered_functions(&workspace, 0);
+        let stores = texts.iter().any(|(_, text)| text.contains("atomic_store"));
+        assert_eq!(stores, fenced, "{target}");
+    }
+}

@@ -894,8 +894,7 @@ pub fn submit(lo: &mut Lowering, fx: &mut Fx, entry: Value, op: Option<Value>) {
     let index32 = fx.b.ins().ireduce(types::I32, index);
     fx.store(index32, slot, 0);
     let next = fx.b.ins().iadd_imm_s(tail, 1);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), next, tail_address);
+    fx.atomic_store(next, tail_address);
     enter(lo, fx, ring, 1, 0, 0);
 }
 
@@ -949,14 +948,14 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     let current = lo.thread(fx);
     let idle = fx.offset(current, thread::IDLE);
     let one = fx.ptr(1);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), one, idle);
+    fx.atomic_store(one, idle);
     let state_address = lo.state(fx);
     let head = fx.offset(state_address, state::READY_HEAD);
     let head = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), head);
     let empty = fx.b.ins().icmp_imm_s(IntCC::Equal, head, 0);
     reap(lo, fx, Some(empty));
     let zero = fx.ptr(0);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, idle);
+    fx.atomic_store(zero, idle);
 }
 
 /// Handles the completions on the running thread's ring, first submitting the cancellations
@@ -989,8 +988,7 @@ pub fn reap(lo: &mut Lowering, fx: &mut Fx, wait: Option<Value>) {
             let user = fx.load(PTR, cqe, 0);
             let result = fx.load(types::I32, cqe, 8);
             let next = fx.b.ins().iadd_imm_s(head, 1);
-            fx.b.ins()
-                .atomic_store(MemFlagsData::trusted(), next, head_address);
+            fx.atomic_store(next, head_address);
             let is_operation = fx.b.ins().icmp_imm_s(IntCC::NotEqual, user, 0);
             fx.when(is_operation, |fx| complete(lo, fx, user, result));
             let more = fx.b.ins().icmp(IntCC::NotEqual, next, tail);
@@ -1089,8 +1087,7 @@ fn submit_cancel(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     submit_built(lo, fx, uring::ASYNC_CANCEL, fd, op, len, zero, flags, None);
     let submitted = fx.ptr(operation::SUBMITTED as u64);
     let word = fx.offset(op, operation::CANCEL);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), submitted, word);
+    fx.atomic_store(submitted, word);
 }
 
 /// Asks once for the cancellation of an operation whose record stays valid during the call:
@@ -1122,7 +1119,7 @@ pub fn cancel_operation(lo: &mut Lowering, fx: &mut Fx, op: Value) {
             |lo, fx| {
                 let flag = fx.offset(owner, thread::REQUESTS);
                 let one = fx.ptr(1);
-                fx.b.ins().atomic_store(MemFlagsData::trusted(), one, flag);
+                fx.atomic_store(one, flag);
                 send_wake(lo, fx, owner);
                 Vec::new()
             },

@@ -176,7 +176,7 @@ impl Lowering<'_, '_> {
         let state_address = self.state(fx);
         let lock = fx.offset(state_address, state::IRQ_LOCK);
         let free = fx.ptr(0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
+        fx.release_store(free, lock);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);
     }
 
@@ -256,8 +256,7 @@ impl Lowering<'_, '_> {
             let following = fx.b.ins().iadd_imm_s(next, device::NEXT as i64);
             (more, vec![fx.b.ins().select(more, following, at[0])])
         })[0];
-        fx.b.ins()
-            .atomic_store(MemFlagsData::trusted(), record, link);
+        fx.atomic_store(record, link);
     }
 
     /// Installs a device record on a new message-signalled interrupt of CPU `cpu`, from the
@@ -371,7 +370,7 @@ impl Lowering<'_, '_> {
             (other, vec![fx.b.ins().select(other, following, at[0])])
         })[0];
         let next = fx.load(PTR, record, device::NEXT);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), next, link);
+        fx.atomic_store(next, link);
         if self.machine_arch() == Arch::Amd64 {
             let message = fx.load(PTR, record, device::MESSAGE);
             let remapped = self.is_remapped(fx, message);

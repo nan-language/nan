@@ -71,7 +71,7 @@ fn acquire(lo: &mut Lowering, fx: &mut Fx, word: Value, located: bool) {
 
 fn release_word(fx: &mut Fx, word: Value) {
     let free = fx.ptr(0);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), free, word);
+    fx.release_store(free, word);
 }
 
 /// The number of the CPU, or executor thread, running the caller.

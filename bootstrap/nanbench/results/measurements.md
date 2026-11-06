@@ -84,13 +84,13 @@ Each item's radius is in `radii.tsv`.
 | M2 | settle/settle.nan:15 |  |
 | M6 | tally/tally.nan:29 | listener |
 
-## Time of the extended-state save of a machine seam and of a thread switch
+## Time of a machine seam and of thread switches
 
-Both save every state component with `xsave64` and restore it with `xrstor64`, which a guest under KVM runs natively: their native times are their times under the emulator. A seam's round trip, a self-interrupt sent through the local APIC and taken, and a thread switch, half of a round trip between two tasks each waking the other with a signal, are timed under the emulator.
+A seam's round trip, a self-interrupt sent through the local APIC and taken, a thread switch, half of a round trip between two tasks on one CPU each waking the other with a signal, and a switch between owners of extended state, the same between two tasks each owning extended state that holds values in its vector registers, are timed under the emulator.
 
-| Milestone | Save | Restore | Seam round trip | Thread switch |
-| --- | ---: | ---: | ---: | ---: |
-| M4 | 52.9 ns | 95.8 ns | 4622.7 ns | 346.2 ns |
+| Milestone | Seam round trip | Thread switch | Switch between owners |
+| --- | ---: | ---: | ---: |
+| M4 | 1635.8 ns | 249.1 ns | 402.1 ns |
 
 ## Time of a generation check in a capability table
 

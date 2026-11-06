@@ -115,7 +115,7 @@ fn release(lo: &mut Lowering, fx: &mut Fx, lock: Value) {
         |fx| vec![fx.ptr(1)],
     )[0];
     let zero = fx.int(types::I32, 0);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, lock);
+    fx.release_store(zero, lock);
     if lo.on_cpus() {
         let outermost = fx.b.ins().icmp_imm_s(IntCC::Equal, held, 0);
         fx.when(outermost, |fx| {
@@ -137,7 +137,7 @@ pub fn release_held(lo: &mut Lowering, fx: &mut Fx) {
         let slot = fx.b.ins().iadd(thread, slot);
         let lock = fx.load(PTR, slot, thread::HELD);
         let free = fx.int(types::I32, 0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
+        fx.release_store(free, lock);
     });
     fx.store(zero, thread, thread::LOCKS);
 }

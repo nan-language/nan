@@ -118,9 +118,9 @@ pub mod task {
 /// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
 /// idle in its ring, the operations in flight on it, whether another thread asked to cancel one,
 /// its POSIX thread and the top of the stack its stack overflow reports run on; on a kernel the
-/// flags from before its outermost held lock disabled interrupts; and on a machine target
-/// whether its CPU's extended state is enabled, holding the state of the last task owning one
-/// that it ran.
+/// flags from before its outermost held lock disabled interrupts and the time its CPU's timer was
+/// last programmed to need; and on a machine target whether its CPU's extended state is enabled,
+/// holding the state of the last task owning one that it ran.
 pub mod thread {
     pub const CONTEXT: u64 = 0;
     pub const CURRENT: u64 = 24;
@@ -137,7 +137,8 @@ pub mod thread {
     pub const HELD: u64 = 96;
     pub const SAVED_IF: u64 = HELD + 8 * super::super::locks::HELD_LOCKS;
     pub const EXTENDED: u64 = SAVED_IF + 8;
-    pub const SIZE: u64 = EXTENDED + 8;
+    pub const TIMER_NEED: u64 = EXTENDED + 8;
+    pub const SIZE: u64 = TIMER_NEED + 8;
 }
 
 /// The bits of a task record's flags.
@@ -337,7 +338,7 @@ pub fn waiting_on(lo: &mut Lowering, fx: &mut Fx, what: i64) {
     let current = current_task(lo, fx);
     let word = fx.offset(current, task::IO);
     let what = fx.ptr(what as u64);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), what, word);
+    fx.atomic_store(what, word);
 }
 
 /// The task the running executor thread runs, zero outside a task.
@@ -614,8 +615,7 @@ fn task_start(lo: &mut Lowering, fx: &mut Fx) {
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     let ended = fx.int(types::I32, run::ENDED);
     let word = fx.offset(record, task::STATE);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), ended, word);
+    fx.atomic_store(ended, word);
     switch_out(lo, fx, record);
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
@@ -668,8 +668,7 @@ fn park(lo: &mut Lowering, fx: &mut Fx) {
             Vec::new()
         },
         |_, fx| {
-            fx.b.ins()
-                .atomic_store(MemFlagsData::trusted(), running, word);
+            fx.atomic_store(running, word);
             Vec::new()
         },
     );
@@ -836,8 +835,7 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             lo.call_routine(fx, Routine::Turn, &[record]);
             count_out(lo, fx, record);
             let stopped = fx.int(types::I32, run::STOPPED);
-            fx.b.ins()
-                .atomic_store(MemFlagsData::trusted(), stopped, word);
+            fx.atomic_store(stopped, word);
             Vec::new()
         },
         |lo, fx| {
@@ -854,8 +852,7 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
     let running = fx.int(types::I32, run::RUNNING);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), running, word);
+    fx.atomic_store(running, word);
     fx.store(record, thread, thread::CURRENT);
     fx.store(thread, record, task::THREAD);
     let started = (!lo.seeded()).then(|| lo.now_ns(fx));
@@ -922,8 +919,7 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             lo.call_routine(fx, Routine::Turn, &[record]);
             count_out(lo, fx, record);
             let stopped = fx.int(types::I32, run::STOPPED);
-            fx.b.ins()
-                .atomic_store(MemFlagsData::trusted(), stopped, word);
+            fx.atomic_store(stopped, word);
             Vec::new()
         },
         |lo, fx| {
@@ -948,8 +944,7 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
                 let notified = fx.b.ins().icmp(IntCC::NotEqual, seen, parking);
                 fx.when(notified, |fx| {
                     let ready = fx.int(types::I32, run::READY);
-                    fx.b.ins()
-                        .atomic_store(MemFlagsData::trusted(), ready, word);
+                    fx.atomic_store(ready, word);
                     push_ready(lo, fx, record);
                 });
             });
@@ -1043,8 +1038,7 @@ pub fn stop_asked(fx: &mut Fx, record: Value) -> Value {
 pub fn stop_running(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let stopping = fx.int(types::I32, run::STOPPING);
     let word = fx.offset(record, task::STATE);
-    fx.b.ins()
-        .atomic_store(MemFlagsData::trusted(), stopping, word);
+    fx.atomic_store(stopping, word);
     switch_out(lo, fx, record);
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
@@ -1083,7 +1077,7 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
     lo.call_routine(fx, Routine::Fill, &[op, zero, size]);
     fx.store(record, op, operation::TASK);
     let word = fx.offset(record, task::IO);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), op, word);
+    fx.atomic_store(op, word);
     host::submit(lo, fx, entry, Some(op));
     let cancelled = origin(fx, region);
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
@@ -1144,7 +1138,7 @@ pub fn deliver(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
 fn set_done(fx: &mut Fx, op: Value, done: i64) {
     let word = fx.offset(op, operation::DONE);
     let done = fx.ptr(done as u64);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), done, word);
+    fx.atomic_store(done, word);
 }
 
 /// Waits until an operation's completion has been delivered, the running task parking while it

@@ -227,7 +227,7 @@ pub fn user_frame(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "store" => {
             let value = supply.param(2).scalar();
-            fx.b.ins().atomic_store(flags, value, address);
+            fx.atomic_store(value, address);
             supply.done(lo, fx);
         }
         "fetch_or" => {

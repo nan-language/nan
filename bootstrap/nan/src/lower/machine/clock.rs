@@ -485,29 +485,16 @@ impl Lowering<'_, '_> {
         self.call_routine(fx, Routine::Unlock, &[lock]);
     }
 
-    /// Programs the running CPU's timer to fire at the earliest of the end of a timer's window,
-    /// the end of its task's slice while that is ahead and, while it runs a task or the final
-    /// build binds the timer's vector, its next pacing tick; at once when that has passed. The
-    /// caller holds the timer lock.
+    /// Programs the running CPU's timer to fire at the earliest of the end of a timer's window
+    /// and the time its task needs it, which its executor thread records; at once when that has
+    /// passed. The caller holds the timer lock.
     fn program_timer(&mut self, fx: &mut Fx) {
         let record = self.running_cpu(fx);
-        let latest = fx.int(PTR, -1);
-        let pace = fx.load(PTR, record, cpu::NEXT_PACE);
-        let pace = match self.statically_bound().contains(&self.vectors().timer) {
-            true => pace,
-            false => {
-                let thread = fx.load(PTR, record, cpu::THREAD);
-                let running = fx.load(PTR, thread, tasks::thread::CURRENT);
-                let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, running, 0);
-                fx.b.ins().select(running, pace, latest)
-            }
-        };
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
-        let end = fx.load(PTR, record, cpu::SLICE_END);
-        let sliced = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, end, now);
-        let end = fx.b.ins().select(sliced, end, latest);
-        let target = fx.b.ins().umin(pace, end);
-        let target = self.windows_end(fx, target);
+        let need = self.timer_need(fx, record, now);
+        let thread = fx.load(PTR, record, cpu::THREAD);
+        fx.store(need, thread, tasks::thread::TIMER_NEED);
+        let target = self.windows_end(fx, need);
         let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, target, now);
         let delay = fx.b.ins().isub(target, now);
         let zero = fx.ptr(0);
@@ -526,6 +513,27 @@ impl Lowering<'_, '_> {
             Arch::Amd64 => self.x64_set_timer(fx, ticks),
             Arch::Aarch64 => self.aarch64_set_timer(fx, ticks),
         }
+    }
+
+    /// The earliest time the task a CPU, whose record is `record`, runs at `now` needs its timer:
+    /// the end of its slice while that is ahead and, while it runs a task or the final build binds
+    /// the timer's vector, the CPU's next pacing tick; the latest time for none.
+    pub(super) fn timer_need(&mut self, fx: &mut Fx, record: Value, now: Value) -> Value {
+        let latest = fx.int(PTR, -1);
+        let pace = fx.load(PTR, record, cpu::NEXT_PACE);
+        let pace = match self.statically_bound().contains(&self.vectors().timer) {
+            true => pace,
+            false => {
+                let thread = fx.load(PTR, record, cpu::THREAD);
+                let running = fx.load(PTR, thread, tasks::thread::CURRENT);
+                let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, running, 0);
+                fx.b.ins().select(running, pace, latest)
+            }
+        };
+        let end = fx.load(PTR, record, cpu::SLICE_END);
+        let sliced = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, end, now);
+        let end = fx.b.ins().select(sliced, end, latest);
+        fx.b.ins().umin(pace, end)
     }
 
     /// The earliest end of a timer's window, or `bound` when it is earlier. The timers are in the

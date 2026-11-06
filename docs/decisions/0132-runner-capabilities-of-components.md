@@ -1,6 +1,6 @@
 # 0132. Runner capabilities of components
 
-Status: accepted; the capabilities held by id it leaves to do superseded by 0133, the resources by 0137, and the operations of `Runner` private to `sys` by 0136
+Status: accepted; the capabilities held by id it leaves to do superseded by 0133, the resources by 0137, the operations of `Runner` private to `sys` by 0136, and the numbers of pending requests told through the component's own operations by 0144
 
 ## Context
 

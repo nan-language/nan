@@ -10,6 +10,7 @@ use super::super::super::call::Invoked;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::{Instance, Lowering};
 use super::super::mem::vector;
+use super::super::tasks::protocols::{Answer, await_reply};
 use super::super::{Supply, entry as supplied_entry, tasks::address_of};
 use super::{
     BYTE, DecodeFormat, Format, HANDLE, Kind, constant, decode_constant, encode_case, encoder,
@@ -258,18 +259,19 @@ fn read_handled(
     )
 }
 
-/// `Wire[P].serve(out, hash, peers, raw, handles, alloc)`: the call decoded, refused under
-/// another protocol hash unless P serves its operation for the peer of `peers` holding `hash`, its
-/// operation's `requires` evaluated, then made through `out`, giving the encoding of its reply.
+/// `Wire[P].serve(out, request, hash, peers, raw, handles, alloc)`: the call decoded, refused
+/// under another protocol hash unless P serves its operation for the peer of `peers` holding
+/// `hash`, its operation's `requires` evaluated, then made through `out`, a request numbered
+/// `request`, giving the encoding of its reply, none when its handler postponed it.
 fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let protocol = protocol_of(supply);
     let message = Ty::item(protocol, Vec::new());
     let own = protocol_hash(lo, fx, protocol);
-    let same = same_hash(lo, fx, supply.param(1).address(), own);
+    let same = same_hash(lo, fx, supply.param(2).address(), own);
     let other = fx.b.ins().bxor_imm_s(same, 1);
     let layout = lo.layout(&message);
     let slot = fx.slot(layout.size, layout.align);
-    let code = read_handled(lo, fx, supply, 3, &message, slot);
+    let code = read_handled(lo, fx, supply, 4, &message, slot);
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
     fx.when(failed, |fx| fail_malformed(lo, fx, supply, code));
     let sig = lo.ck.sig(protocol);
@@ -315,6 +317,42 @@ fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     fail_malformed(lo, fx, supply, code);
                 });
             }
+            if lo.ck.is_request(protocol, method) {
+                let fails = operation.sig.fails.clone().unwrap_or(Ty::Never);
+                let result = lo.ck.db.core_item("Result").expect("core::Result");
+                let reply = Ty::item(
+                    result,
+                    vec![Arg::Ty(operation.sig.result.clone()), Arg::Ty(fails)],
+                );
+                let number = supply.param(1).scalar();
+                let held = Held::Address(slot);
+                await_reply(
+                    lo,
+                    fx,
+                    supply,
+                    &message,
+                    held,
+                    &operation.sig,
+                    Some(number),
+                    &|lo, fx, answer| {
+                        let value = match answer {
+                            Answer::Replied(result) => {
+                                lo.variant_value(fx, &reply, "Ok", &[result], None)
+                            }
+                            Answer::Failed(failure) => {
+                                lo.variant_value(fx, &reply, "Err", &[failure], None)
+                            }
+                            Answer::Postponed => {
+                                let none = lo.none_value(fx, &supply.abi.result);
+                                supply.ret(lo, fx, none);
+                                return;
+                            }
+                        };
+                        give(lo, fx, supply, Some((&reply, value)));
+                    },
+                );
+                return;
+            }
             let instance = Instance::Operation {
                 protocol,
                 method: method as u32,
@@ -324,48 +362,13 @@ fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let mut passed = vec![supply.param(0)];
             passed.extend(args);
             let called = lo.invoke(fx, Invoked::Direct(id), &abi, &passed);
-            let request = lo.ck.is_request(protocol, method);
-            let reply = request.then(|| {
-                let fails = operation.sig.fails.clone().unwrap_or(Ty::Never);
-                let result = lo.ck.db.core_item("Result").expect("core::Result");
-                Ty::item(
-                    result,
-                    vec![Arg::Ty(operation.sig.result.clone()), Arg::Ty(fails)],
-                )
-            });
-            let succeeded = |lo: &mut Lowering, fx: &mut Fx| {
-                let value = reply
-                    .as_ref()
-                    .map(|reply| lo.variant_value(fx, reply, "Ok", &[called.result], None));
-                give(lo, fx, supply, reply.as_ref().zip(value));
-            };
-            let (Some(failed), Some(failure)) = (called.failed, called.failure) else {
-                succeeded(lo, fx);
-                return;
-            };
-            let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-            fx.when(failed, |fx| match operation.sig.fails.as_ref() {
-                Some(fails) => {
-                    let call_error = abi.fails.clone().expect("a sys::CallError");
-                    let handled = lo.variant_is(fx, failure, &call_error, "Failed");
-                    fx.when(handled, |fx| {
-                        let payload = lo.payload_address(fx, &call_error, "Failed", "", failure);
-                        let held = lo.held_at(fx, fails, payload);
-                        let reply = reply.clone().expect("a request's reply");
-                        let value = lo.variant_value(fx, &reply, "Err", &[held], None);
-                        give(lo, fx, supply, Some((&reply, value)));
-                    });
-                    for variant in ["Malformed", "Closed", "Cancelled"] {
-                        let this = lo.variant_is(fx, failure, &call_error, variant);
-                        fx.when(this, |fx| {
-                            let payload = lo.payload_address(fx, &call_error, variant, "", failure);
-                            fail_with(lo, fx, supply, variant, Some(payload));
-                        });
-                    }
-                }
-                None => fail_with(lo, fx, supply, "Closed", Some(failure)),
-            });
-            succeeded(lo, fx);
+            if let (Some(failed), Some(failure)) = (called.failed, called.failure) {
+                let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+                fx.when(failed, |fx| {
+                    fail_with(lo, fx, supply, "Closed", Some(failure))
+                });
+            }
+            give(lo, fx, supply, None);
         });
     }
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
@@ -378,7 +381,7 @@ fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, nam
     let ty = lo.std_ty("sys", "ProtocolSchema", Vec::new());
     let layout = lo.layout(&ty);
     let own = fx.slot(layout.size, layout.align);
-    let alloc = fx.load(PTR, supply.param(5).address(), 0);
+    let alloc = fx.load(PTR, supply.param(6).address(), 0);
     let encoding = lo.ck.protocol_schema(protocol);
     let code = decode_constant(lo, fx, &encoding, &ty, alloc, own);
     let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
@@ -398,10 +401,10 @@ fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, nam
     let operation = lo.view_literal(fx, name.as_bytes());
     let args = [
         Held::Address(own),
-        supply.param(1),
         supply.param(2),
+        supply.param(3),
         operation,
-        supply.param(5),
+        supply.param(6),
     ];
     let served = lo
         .invoke(fx, Invoked::Direct(id), &abi, &args)
@@ -411,15 +414,13 @@ fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, nam
     served
 }
 
-/// Returns an encoded reply drawn through the operation's allocator: holding the encoding of a reply
-/// held as given, which is then released, or nothing.
+/// Returns `Some` of an encoded reply drawn through the operation's allocator: holding the
+/// encoding of a reply held as given, which is then released, or nothing.
 fn give(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, reply: Option<(&Ty, Held)>) {
-    let result = supply.abi.result.clone();
-    let layout = lo.layout(&result);
-    let encoded = supply
-        .sret
-        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let alloc = fx.load(PTR, supply.param(5).address(), 0);
+    let ty = lo.std_ty("sys", "Encoded", Vec::new());
+    let layout = lo.layout(&ty);
+    let encoded = fx.slot(layout.size, layout.align);
+    let alloc = fx.load(PTR, supply.param(6).address(), 0);
     let (bytes, handles) = encoded_parts(lo, fx, encoded);
     vector::empty(fx, bytes, alloc, BYTE);
     vector::empty(fx, handles, alloc, HANDLE);
@@ -431,8 +432,9 @@ fn give(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, reply: Option<(&Ty, Hel
         });
         lo.release(fx, reply, value);
     }
-    let held = lo.held_at(fx, &result, encoded);
-    supply.ret(lo, fx, held);
+    let held = lo.held_at(fx, &ty, encoded);
+    let some = lo.variant_value(fx, &supply.abi.result, "Some", &[held], None);
+    supply.ret(lo, fx, some);
 }
 
 /// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply, or `CallError.Failed`

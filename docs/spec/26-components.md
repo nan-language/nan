@@ -1048,7 +1048,7 @@ The parameters `p: T` are the operation's in order, R is its result and E its fa
 - The operation's limits apply to its handler as an interface method's apply to its implementing function, and the code of the summary function meets `limits pure`.
 - The operation's `requires` and `ensures` clauses bind its handler as an interface method's bind its implementing function ([interface contracts](18-contracts.md#interface-contracts)), over the parameters they share.
 - An operation's `undo` clause names another operation of P by its name; anything else is an error (`effect.undo-target`), and so is an undoer whose class is not at most `restorable` (`effect.undo-irreversible`). The handler's digest is compensated as if the handler had the clause ([compensation](10-effects-digests.md#compensation)), and the ledger records an `undo` entry on P.
-- The runner of a component serving P passes each message it removes from the intake to its operation's handler with the message's arguments, in place of `on`. When a request's handler returns or fails, its result or failure goes to the task that posted the request ([operation calls](#operation-calls)).
+- The runner of a component serving P passes each message it removes from the intake to its operation's handler with the message's arguments, in place of `on`. When a request's handler returns or fails, its result or failure goes to the task that posted the request ([operation calls](#operation-calls)), unless the handler [postponed](#runner-capabilities) the request.
 - When P declares a summary type, the runner **publishes** the component's summary: after `start` returns and after each handler returns or fails, it calls the summary function on the state and keeps the value it gives, in place of the one kept before.
 
 ```nan
@@ -1361,7 +1361,7 @@ pub open struct Wire[P: Protocol] {
 
 pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
 
-pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+pub fn Wire.serve(out: Outbox[P], request: u64, hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait
 
 pub open struct Reply[R: Send, E: Send] {
 } Reply
@@ -1383,7 +1383,7 @@ On `sys::Wire[P]`, the candidates of method resolution for a name also hold P's 
 The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without payload when the operation has no parameters, and otherwise with the record of its arguments keyed by their parameters' names, as an enum variant with labelled payloads [encodes](13-text-encode.md#derived-encode-and-decode). The encoding of the **reply** to a request is the variant `Ok` holding its handler's result or `Err` holding its failure, as `Result[R, E]` encodes. A value of a handle type encodes as an unsigned integer: the index of its handle among the handles beside the encoding, which hold them in the order the encoding does. Decoding an encoding against its handles reads each value of a handle type T as `mem::wire::Codec.decode` reads one ([wire format](13-text-encode.md#wire-format)), and also fails with `Malformed` when an index it reads is not the count of handles read before it, with `Truncated` when no handle has that index, with `Invalid` when that handle's handle hash is not T's, and with `Trailing` when it leaves handles unread.
 
 - `Wire[P].op(mut out, ...)` appends the encoding of its call to `out.bytes` and the handles of its values of handle types to `out.handles`, each index counting the handles `out` held before, trapping when memory is exhausted (`trap.exhausted`). The operation's `requires` is no obligation there, and its class enters no digest.
-- `Wire[P].serve(out, hash, peers, raw, handles, alloc)` serves a call made under the protocol hash `hash`, `peers` holding the protocol schemas of the clients the server knows. It decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`. When `hash` is not P's protocol hash, it then fails with `UnknownSchema` unless P's protocol schema [serves the call](#protocol-schemas) under `hash` knowing `peers`, the schema drawn and the call judged through `alloc`. It then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments and gives a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
+- `Wire[P].serve(out, request, hash, peers, raw, handles, alloc)` serves a call made under the protocol hash `hash`, which the holder serving it numbers `request`, `peers` holding the protocol schemas of the clients the server knows. It decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`. When `hash` is not P's protocol hash, it then fails with `UnknownSchema` unless P's protocol schema [serves the call](#protocol-schemas) under `hash` knowing `peers`, the schema drawn and the call judged through `alloc`. It then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments, a request carrying its number, and gives `Some` of a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. It gives `None` when the handler [postponed](#runner-capabilities) the request. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
 - `reply.decode(raw, handles, alloc)` decodes the reply of its request from `raw` against `handles` and gives its result, fails with `CallError.Failed` holding its failure, or, when it does not decode, with `CallError.Malformed` holding the decoding's failure. A call through an outbox never fails with `CallError.Malformed`.
 - The digest of `serve` states waiting and the class of each `pub` operation of P ([operation calls](#operation-calls)).
 - The [codec uses](15-untrusted.md#validate-grants) of `serve` mark P `decode` and `encode`, a use of the encoder of a protocol being a use of the encoders of the results and failures of its `pub` requests, and those of `decode` mark R and E `decode`. A call of `Wire[P].op` uses the encoder of each type of its operation's parameters.
@@ -1452,7 +1452,7 @@ pub fn Tally.reset(mut self, mut env: Env, mut cx: sys::Cx[Counter]) {
 pub fn Tally.echo(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx[Counter]) -> sys::Clock = clock
 
 /// The reply of the tally behind `inbox` to a call made under the protocol hash `hash`, knowing
-/// the clients whose protocol schemas `peers` holds.
+/// the clients whose protocol schemas `peers` holds; the tally postpones no request.
 pub fn serve(
     inbox: sys::Outbox[Counter],
     hash: sys::ProtocolHash,
@@ -1460,7 +1460,10 @@ pub fn serve(
     call: sys::Encoded,
     alloc: mem::Alloc,
     ) -> sys::Encoded fails sys::CallError[Never] uses wait {
-    return try await sys::Wire[Counter].serve(inbox, hash, peers, raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
+    let Some(reply) = try await sys::Wire[Counter].serve(inbox, request: 0, hash, peers, raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+        fail sys::CallError.Closed(task::SendError.Closed)
+    }
+    return reply
 } serve
 
 // file: probe/package.nan
@@ -1618,7 +1621,7 @@ impl Fake: sys::Protocol // error: component.protocol-impl
 
 ## Runner capabilities
 
-A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests the holder keeps pending for it, its published summary, its checkpoints and the capabilities and resources the holder keeps for it by number. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
+A component reaches what lies beyond its own intake through the **runner capability** its stepper's holder attaches, a `sys::Runner` that a kernel serves through a capability kind of its own ([served capabilities](14-authority.md#served-capabilities)): the components of other closures through numbered **ports**, the requests it postpones, which the holder keeps pending for it, its published summary, its checkpoints and the capabilities and resources the holder keeps for it by number. Calls, replies and summaries reach the runner capability as wire encodings, so the holder and the component may be separate closures.
 
 ```nan-api
 // module: sys
@@ -1626,6 +1629,8 @@ A component reaches what lies beyond its own intake through the **runner capabil
 pub fn Stepper.attach(mut self, runner: Runner)
 
 pub fn Cx.send_to[Q: Protocol](mut self, port: Port[Q], call: Encoded) fails RunnerError
+
+pub fn Cx.postpone(mut self) -> Option[u64]
 
 pub fn Cx.reply(mut self, request: u64, reply: Encoded) fails RunnerError
 
@@ -1683,10 +1688,12 @@ pub fn Resources.put_resource[R: Resource](self, id: ResourceId[R], take resourc
 - A stepper starts without a runner capability, and a run of `host::Runner` never has one. `mut s.attach(runner)` attaches `runner` to the stepper in place of the one attached before. The operations of this section act through the runner capability attached to the stepper whose component context they receive, or through one whose handle is stale when none is.
 - `sys::Port[Q].of(cx, id)` gives the port numbered `id` of the runner capability of `cx`, through which a component calls Q's operations on whatever the holder wires to that number. A port holds its runner capability, so a keyed task's closure captures it.
 - `mut cx.send_to(port, call)` hands the holder a call of one of Q's operations, encoded as `sys::Wire[Q]` encodes it ([wire encoding](#wire-encoding)): it calls the `send_to` of the port's runner capability with the port's number, Q's protocol hash and the bytes and handles of `call`.
-- `mut cx.reply(request, reply)` answers the request the holder numbers `request`, calling `reply` with the bytes and handles of `reply`, the encoding of the request's reply. A holder gives the numbers of the requests it keeps pending through operations of the component's own protocol.
+- `mut cx.postpone()` **postpones** the request whose handler receives `cx`, and gives the number its holder gave it through [`sys::Wire.serve`](#wire-encoding): when the handler returns or fails, its result or failure is released, and `serve` gives `None` in place of the reply. A later call within the same handler gives the same number. It gives `None` and postpones nothing in a handler of a one-way operation, of a request that no `serve` numbered or of a system interface, and when no runner capability is attached to the stepper.
+- `mut cx.reply(request, reply)` answers the request the holder numbers `request`, calling `reply` with the bytes and handles of `reply`, the encoding of the request's reply ([wire encoding](#wire-encoding)).
+- A holder keeps a postponed request pending under its number from the call of `serve` on, as `reply` may reach it before `serve` returns, until `reply` answers it or the holder ends it. The component's state holds the numbers of the requests it postponed, so a later handler answers them, after a checkpoint is resumed too. Meanwhile the client's call waits, a call through a port as a cancellation point.
 - `mut cx.publish(summary)` gives the holder the encoding of the component's summary, calling `publish`, and `mut cx.sync()` asks the holder to keep a checkpoint of the component once it is quiescent, calling `sync`.
 - A holder keeps capabilities for its component by number, so the component's state, which a checkpoint holds, names each by a `sys::CapabilityId[C]`. `id.of_handle(handle)` gives the capability `handle` holds, none when its handle hash is not C's ([wire encoding](#wire-encoding)), whatever `id.id` is. `mut cx.capability(id)` calls `capability` with `id.id` and gives the capability `id.of_handle` gives of the `sys::Handle` it returns, failing with `RunnerError.Unknown` when that gives none. `mut cx.drop_capability(id)` calls `drop_capability` with `id.id`, telling the holder the component no longer needs that capability.
-- Each of these operations of a component context calls its method on the calling task, the handler's, and fails with the method's failure.
+- Each of these operations of a component context but `postpone` calls its method on the calling task, the handler's, and fails with the method's failure.
 - `port.call(reply, call, alloc)` calls the `call` of the port's runner capability with the port's number, Q's protocol hash, the bytes and handles of `call` and `alloc`, then decodes the encoding it gives as `reply.decode` does ([wire encoding](#wire-encoding)), drawing through `alloc`: it gives the request's result, or fails with `CallError.Failed` holding its failure or `CallError.Malformed` when the encoding does not decode. When the method fails, it fails with `CallError.Cancelled` holding a cancellation and with `CallError.Closed` holding `task::SendError.Closed` otherwise. It is a cancellation point, so a component calls it from a keyed task, posting what it gives to its intake.
 - A holder keeps files and listeners for its component by number too, each in a `sys::Held` of its type, and the component's state names each by a `sys::ResourceId[R]`. `sys::Resource` is implemented by `sys::fs::File` and `sys::net::Listener` alone: `take r.held()` gives the `Held` holding `r`, and `R.of_held(held)` gives `Ok` of what `held` holds when it is an R and `Err` of `held` otherwise. A connection is held by no number, as an id of a linear type would be linear.
 - `sys::Resources.of(cx)` gives the resources of the runner capability of `cx`, which hold that capability as a port does, so a keyed task's closure captures them. Their operations wait, as those of the resources they give do, so a component calls them from a keyed task.
@@ -1742,6 +1749,51 @@ pub fn Mirror.fetch(mut self, mut env: Env, mut cx: sys::Cx[Front]) {
 fn Mirror.fetched(mut self, take value: u32, mut env: Env, mut cx: sys::Cx[Front]) {
     self.last = value
 } Mirror.fetched
+```
+
+A console postpones a read until a byte arrives, then answers it with that byte, and answers 0 at once when a read waits already or its holder numbered none:
+
+```nan
+pub protocol Console {
+    pub fn read() -> u8 limits traceless
+    pub fn arrived(byte: u8) limits traceless
+} Console
+
+pub closed struct Env {
+    pub alloc: mem::Alloc
+} Env
+
+pub closed struct Uart derives Encode {
+    pub waiting: bool
+    pub request: u64
+} Uart
+
+impl Uart: sys::Component[Env, Console]
+
+pub fn Uart.start(mut env: Env) -> Uart = Uart(waiting: false, request: 0)
+
+pub fn Uart.read(mut self, mut env: Env, mut cx: sys::Cx[Console]) -> u8 {
+    if self.waiting {
+        return 0
+    }
+    let Some(request) = mut cx.postpone() else {
+        return 0
+    }
+    self.waiting = true
+    self.request = request
+    return 0
+} Uart.read
+
+pub fn Uart.arrived(mut self, take byte: u8, mut env: Env, mut cx: sys::Cx[Console]) {
+    if not self.waiting {
+        return
+    }
+    var reply = sys::Encoded.empty(env.alloc)
+    let answer: Result[u8, Never] = Ok(byte)
+    mem::wire::Codec[Result[u8, Never]].encode(answer, out: mut reply.bytes)
+    discard attempt mut cx.reply(self.request, reply)
+    self.waiting = false
+} Uart.arrived
 ```
 
 ## Diagnostics

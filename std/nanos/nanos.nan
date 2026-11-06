@@ -244,12 +244,12 @@ pub fn Instance.abandon(take self) {
     abandoner.contents().trigger()
 } Instance.abandon
 
-pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
+pub fn Inbox.call(self, hash: sys::ProtocolHash, request: u64, take encoding: sys::Encoded, alloc: mem::Alloc) -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
     let Some(awaited) = try await awaiting(self.waits, alloc) else {
         fail sys::CallError.Closed(task::SendError.Closed)
     }
     let Awaited(id: id, answers: receiver) = awaited
-    try await self.calls.send(Called(id: id, hash: hash, request: take request, alloc: alloc))
+    try await self.calls.send(Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc))
     var answers = receiver
     let Some(Answer.Served(served)) = try await mut answers.receive() else {
         fail sys::CallError.Closed(task::SendError.Closed)
@@ -335,15 +335,16 @@ enum Answer {
     Started(usize)
     Checkpointed(mem::Bytes)
     Health(sys::HealthReply)
-    Served(Result[sys::Encoded, sys::CallError[Never]])
+    Served(Result[Option[sys::Encoded], sys::CallError[Never]])
 } Answer
 
-/// An encoded call an inbox carries: the number of its wait, its protocol hash, its encoding and
-/// the allocator its reply is drawn through.
+/// An encoded call an inbox carries: the number of its wait, its protocol hash, the number its
+/// holder gives it, its encoding and the allocator its reply is drawn through.
 struct Called {
     id: u64
     hash: sys::ProtocolHash
-    request: sys::Encoded
+    request: u64
+    encoding: sys::Encoded
     alloc: mem::Alloc
 } Called
 
@@ -554,8 +555,9 @@ fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
     })
 } serving
 
-/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply
-/// through `answers`, until every sender of `calls` is released.
+/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply,
+/// none when its handler postponed it, through `answers`, until every sender of `calls` is
+/// released.
 fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor) fails task::Cancelled uses wait {
     var receiver = calls
     try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
@@ -565,9 +567,9 @@ fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::
             }
             let replies = answers.split()
             discard s.spawn(fn[take called, take replies]() fails task::Cancelled uses wait {
-                let Called(id: id, hash: hash, request: request, alloc: alloc) = called
+                let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: alloc) = called
                 let peers = mem::List[sys::ProtocolSchema].empty(alloc)
-                let served = attempt await sys::Wire[P].serve(out, hash, peers: peers.view(), raw: Untrusted.of(request.bytes.view()), handles: request.handles.view(), alloc)
+                let served = attempt await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
                 discard attempt await replies.send(Routed.Answered(Replied(id: id, answer: Answer.Served(take served))))
             })
         }
@@ -826,23 +828,27 @@ enum Over derives Render, Encode {
 
 protocol Counted {
     pub fn add(amount: u32) -> u64 fails Over limits pure
+    pub fn later() -> u64 limits pure
     pub fn sync() limits traceless
 } Counted
 
 struct CountedEnv {
+    alloc: mem::Alloc
 } CountedEnv
 
 impl CountedEnv: Environment
 
-fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv()
+fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv(alloc: world.alloc)
 
+/// A count that answers the request it postpones once asked to sync.
 struct Count derives Encode {
     total: u64
+    pending: Option[u64]
 } Count
 
 impl Count: sys::Component[CountedEnv, Counted]
 
-fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0)
+fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None)
 
 fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 fails Over {
     if amount > 100 {
@@ -852,12 +858,24 @@ fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Co
     return self.total
 } Count.add
 
+fn Count.later(mut self, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 {
+    self.pending = mut cx.postpone()
+    return self.total
+} Count.later
+
 fn Count.sync(mut self, mut env: CountedEnv, mut cx: sys::Cx[Counted]) {
+    match self.pending {
+        Some(request) => {
+            discard attempt mut cx.reply(request, reply: sys::Encoded.empty(env.alloc))
+        }
+        None => {}
+    }
+    self.pending = None
     discard attempt mut cx.sync()
 } Count.sync
 
-/// A runner counting the syncs of the instances it serves, refusing every call and holding no
-/// capability or resource.
+/// A runner counting the syncs of the instances it serves and ten per number of a reply, refusing
+/// every call and holding no capability or resource.
 struct Syncs {
 } Syncs
 
@@ -873,6 +891,7 @@ fn Syncs.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handle
 } Syncs.call
 
 fn Syncs.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+    discard sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(request * 10))
 } Syncs.reply
 
 fn Syncs.publish(self, summary: Slice[u8]) limits stack 4_096 {
@@ -918,13 +937,13 @@ test instances_answer_calls_and_end_with_their_state for Hosted.run {
         var request = sys::Encoded.empty(world.alloc)
         let added = sys::Wire[Counted].add(mut request, amount: 5)
         let caller = instance.inbox()
-        let answered = s.spawn(fn[take caller, take request]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait {
-            return attempt await caller.call(sys::Wire[Counted].hash(), take request, alloc: world.alloc)
+        let answered = s.spawn(fn[take caller, take request]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+            return attempt await caller.call(sys::Wire[Counted].hash(), request: 1, encoding: take request, alloc: world.alloc)
         })
         try await instance.incoming()
         let stepped = try await mut instance.step()
         expect stepped
-        let Ok(reply) = try await take answered.join() else {
+        let Ok(Some(reply)) = try await take answered.join() else {
             expect false
             return
         }
@@ -951,7 +970,7 @@ test instances_answer_calls_and_end_with_their_state for Hosted.run {
 test requests_a_domain_never_takes_end_with_it for Instance.ask {
     let world = testing::world()
     var stepped: Option[Result[bool, InstanceError]] = None
-    var called: Option[Result[sys::Encoded, sys::CallError[Never]]] = None
+    var called: Option[Result[Option[sys::Encoded], sys::CallError[Never]]] = None
     var ended = Ended.Undecodable
     try await task::scope(world.exec, body: fn[mut stepped, mut called, mut ended](s: task::Scope) fails task::Cancelled uses wait {
         let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc: world.alloc)
@@ -962,7 +981,7 @@ test requests_a_domain_never_takes_end_with_it for Instance.ask {
         var instance = opening
         stepped = Some(attempt await mut instance.step())
         let inbox = instance.inbox()
-        called = Some(attempt await inbox.call(sys::Wire[Counted].hash(), request: sys::Encoded.empty(world.alloc), alloc: world.alloc))
+        called = Some(attempt await inbox.call(sys::Wire[Counted].hash(), request: 1, encoding: sys::Encoded.empty(world.alloc), alloc: world.alloc))
         ended = try await take instance.end()
         discard launch
     })
@@ -996,11 +1015,23 @@ test instances_act_through_the_runner_they_are_held_with for Hosted.run {
         })
         var instance = opening
         defer take instance.abandon()
+        var asking = sys::Encoded.empty(world.alloc)
+        discard sys::Wire[Counted].later(mut asking)
+        let asker = instance.inbox()
+        let asked = s.spawn(fn[take asker, take asking]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+            return attempt await asker.call(sys::Wire[Counted].hash(), request: 3, encoding: take asking, alloc: world.alloc)
+        })
+        try await instance.incoming()
+        discard try await mut instance.step()
+        let Ok(None) = try await take asked.join() else {
+            expect false
+            return
+        }
         var request = sys::Encoded.empty(world.alloc)
         sys::Wire[Counted].sync(mut request)
         let caller = instance.inbox()
-        let answered = s.spawn(fn[take caller, take request]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait {
-            return attempt await caller.call(sys::Wire[Counted].hash(), take request, alloc: world.alloc)
+        let answered = s.spawn(fn[take caller, take request]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+            return attempt await caller.call(sys::Wire[Counted].hash(), request: 4, encoding: take request, alloc: world.alloc)
         })
         try await instance.incoming()
         discard try await mut instance.step()
@@ -1009,5 +1040,5 @@ test instances_act_through_the_runner_they_are_held_with for Hosted.run {
         discard try await take instance.end()
     })
     let synced = sys::reach(counter, body: fn(state: core::atomic::AtomicU64, record: u64) => state.load())
-    expect synced == Some(1)
+    expect synced == Some(31)
 } instances_act_through_the_runner_they_are_held_with

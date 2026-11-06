@@ -12,7 +12,7 @@ use super::super::super::super::runtime::tasks::{self, kind, operation, task};
 use super::super::super::super::runtime::{Routine, report, settle, timers};
 use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
-use super::{entry, reference, runner, status, unreference, wake_waiter};
+use super::{entry, numbering, reference, runner, status, unreference, wake_waiter};
 use crate::check::ty::Ty;
 
 /// The fields of a delayed message's timer after its operation record: its links in its
@@ -450,8 +450,9 @@ pub fn fail_closed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 /// The steps of a post before it waits: a cancellation point, failing when the call is
 /// cancelled at its start or `out` is stale or the intake has stopped; otherwise `m` enters the
-/// intake in an entry on the posting task's stack, which a request's reply follows. Gives the
-/// runner's record, which the post references, and the entry.
+/// intake in an entry on the posting task's stack, which a request's reply follows, with the
+/// number its holder gave a request it serves. Gives the runner's record, which the post
+/// references, and the entry.
 pub fn enqueue(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -459,6 +460,7 @@ pub fn enqueue(
     message: &Ty,
     held: Held,
     reply: Option<Value>,
+    number: Option<Value>,
 ) -> (Value, Value) {
     let handle = fx.load(PTR, supply.param(0).address(), 0);
     let release_held = |lo: &mut Lowering, fx: &mut Fx| {
@@ -502,6 +504,11 @@ pub fn enqueue(
     fx.store(keyed_post, node, entry::KEYED);
     if let Some(reply) = reply {
         fx.store(reply, node, entry::REPLY);
+    }
+    if let Some(number) = number {
+        fx.store(number, node, entry::NUMBER);
+        let marked = fx.ptr(numbering::NUMBERED as u64);
+        fx.store(marked, node, entry::NUMBERING);
     }
     let at = fx.offset(node, entry::MESSAGE);
     lo.store_held(fx, at, held, message);

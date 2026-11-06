@@ -1,4 +1,4 @@
-//! Protocols: the calls of an outbox's operations and of its summary, the dispatch of a component serving a protocol to its handlers with the replies of requests, and the publication of its summary. A request's entry holds the address of its reply, a slot of the posting task's stack fitting the operation's result and failure; the component task writes the one the handler gives there before it marks the entry replied or failed and wakes the poster.
+//! Protocols: the calls of an outbox's operations and of its summary, the dispatch of a component serving a protocol to its handlers with the replies of requests, and the publication of its summary. A request's entry holds the address of its reply, a slot of the posting task's stack fitting the operation's result and failure; the component task writes the one the handler gives there before it marks the entry replied or failed and wakes the poster, or, once the handler postponed the request, releases it and marks the entry postponed.
 
 /// The protocol a message type is, when it is one.
 fn protocols_served(lo: Lowering, message: ty::Ty) -> Option[ty::ItemId] {
@@ -68,7 +68,8 @@ fn protocols_dispatch(mut lo: Lowering, mut fx: Fx, record: clif::Value, protoco
 } protocols_dispatch
 
 /// Gives a request's handler's result or failure to its poster, unless the poster has stopped,
-/// withdrawing the entry the runner's record held as current, in which case it is released.
+/// withdrawing the entry the runner's record held as current, or the handler postponed the
+/// request, in which case it is released and the poster told it was postponed.
 fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::Value, head: check::FnSig, called: Called) {
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
@@ -76,7 +77,18 @@ fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif
     let live = mut fx.b.icmp(clif::IntCC.Equal, x: current, y: node)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: record, offset: RUNNER_CURRENT)
-    let reached = ReplyAt(node: node, live: live)
+    let marked = mut fx.choose(live, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let numbering = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NUMBERING)
+        let is_postponed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: numbering, y: NUMBERING_POSTPONED)
+        return fx1.list1(is_postponed)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let unmarked = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(unmarked)
+    })
+    let postponed = marked[0]
+    let unpostponed = mut fx.b.bxor_imm_s(postponed, y: 1)
+    let answered = mut fx.b.band(live, y: unpostponed)
+    let reached = ReplyAt(node: node, answered: answered)
     var failure_ty: Option[ty::Ty] = None
     match head.failure {
         Some(written) => {
@@ -102,6 +114,7 @@ fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif
                                 protocols_give(mut lo1, fx: mut fx1, reached, ty: head.result, held: called.result, word: STATUS_REPLIED)
                                 return mem::List[clif::Value].empty(fx1.alloc)
                             })
+                            protocols_tell_postponed(mut lo, mut fx, node, postponed)
                             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
                             return
                         }
@@ -114,19 +127,67 @@ fn protocols_reply(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif
         None => {}
     }
     protocols_give(mut lo, mut fx, reached, ty: head.result, held: called.result, word: STATUS_REPLIED)
+    protocols_tell_postponed(mut lo, mut fx, node, postponed)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
 } protocols_reply
 
-/// Where a request's reply goes: its entry, and whether its poster still waits for it.
+/// Marks the entry `node` postponed and wakes its poster when `postponed` holds. The caller holds
+/// the runner's lock.
+fn protocols_tell_postponed(mut lo: Lowering, mut fx: Fx, node: clif::Value, postponed: clif::Value) {
+    mut fx.if_true(postponed, then: fn[mut lo](mut fx1: Fx) {
+        let word = mut fx1.ptr(u64.fit(STATUS_POSTPONED))
+        mut fx1.store(word, addr: node, offset: COMPONENTS_ENTRY_STATUS)
+        let poster = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(poster).view())
+    })
+} protocols_tell_postponed
+
+/// `mut cx.postpone()`: the number of the request whose handler runs, which it marks postponed,
+/// none when the handler runs for no request its holder numbered or no runner is attached.
+fn protocols_postpone(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let current = mut fx.load(PTR, addr: record, offset: RUNNER_CURRENT)
+    let handling = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+    let attached_word = mut fx.load(PTR, addr: record, offset: RUNNER_RUNNER)
+    let attached = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: attached_word, y: 0)
+    let postponable = mut fx.b.band(handling, y: attached)
+    let numbered_values = mut fx.choose(postponable, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let numbering = mut fx1.load(PTR, addr: current, offset: COMPONENTS_ENTRY_NUMBERING)
+        let is_numbered = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: numbering, y: 0)
+        return fx1.list1(is_numbered)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let unnumbered = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(unnumbered)
+    })
+    let numbered_request = numbered_values[0]
+    let option = supply.abi.result
+    mut fx.if_true(numbered_request, then: fn[mut lo](mut fx1: Fx) {
+        let postponed = mut fx1.ptr(u64.fit(NUMBERING_POSTPONED))
+        mut fx1.store(postponed, addr: current, offset: COMPONENTS_ENTRY_NUMBERING)
+        let number = mut fx1.load(clif::Type.Int64, addr: current, offset: COMPONENTS_ENTRY_NUMBER)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let slot = mut fx1.slot(8, align: 8)
+        mut fx1.store(number, addr: slot, offset: 0)
+        let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(slot)).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: some)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} protocols_postpone
+
+/// Where a request's reply goes: its entry, and whether its poster takes it.
 struct ReplyAt derives Copy {
     node: clif::Value
-    live: clif::Value
+    answered: clif::Value
 } ReplyAt
 
-/// Writes a reply of a type to a poster that still waits for it, marked by the status `word`,
-/// and wakes it; releases the reply otherwise. The caller holds the runner's lock.
+/// Writes a reply of a type to a poster that takes it, marked by the status `word`, and wakes it;
+/// releases the reply otherwise. The caller holds the runner's lock.
 fn protocols_give(mut lo: Lowering, mut fx: Fx, reached: ReplyAt, ty: ty::Ty, held: Held, word: i64) {
-    discard mut fx.choose_in(mut lo, condition: reached.live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+    discard mut fx.choose_in(mut lo, condition: reached.answered, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let reply = mut fx1.load(PTR, addr: reached.node, offset: COMPONENTS_ENTRY_REPLY)
         let poster = mut fx1.load(PTR, addr: reached.node, offset: COMPONENTS_ENTRY_POSTER)
         mut lo1.store_held(mut fx1, address: reply, held, ty)
@@ -190,7 +251,7 @@ fn protocols_call(mut lo: Lowering, mut fx: Fx, abi: Abi, protocol: ty::ItemId, 
     }
     let held = mut lo.variant_value(mut fx, ty: message, variant: name.as_str(), payload_values: payload.view(), wrapped: None)
     if not lo.ck.is_request(protocol, index: method) {
-        let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: None)
+        let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: None, number: None)
         await_taken(mut lo, mut fx, supply, message, record: posted.record, node: posted.node)
         return
     }
@@ -198,13 +259,28 @@ fn protocols_call(mut lo: Lowering, mut fx: Fx, abi: Abi, protocol: ty::ItemId, 
     let check::SigKind.Protocol(operations: operations, variants: _, summary: _) = sig.contents().kind else {
         return
     }
-    protocols_request(mut lo, mut fx, supply, message, held, head: operations[method].sig)
+    protocols_await_reply(mut lo, mut fx, supply, message, held, head: operations[method].sig, number: None, awaiting: Awaiting.Returned)
 } protocols_call
 
-/// `out.op(...)` for a request: posts its message with a reply slot, then waits until the
-/// handler has given its result or failure there, the component task has stopped, or the
-/// message left the intake untaken.
-fn protocols_request(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, held: Held, head: check::FnSig) {
+/// How a request's handler answered its poster: with its result, with its failure, or by
+/// postponing it.
+enum Answer {
+    Replied(Held)
+    Failed(Held)
+    Postponed
+} Answer
+
+/// Where a request's answer goes: the return of its call through an outbox, or the reply of
+/// `sys::Wire.serve`, encoded as the type it holds.
+enum Awaiting derives Copy {
+    Returned
+    Served(ty::Ty)
+} Awaiting
+
+/// Posts a request's message with a reply slot, numbered `number` when its holder serves it, then
+/// waits until the handler has given its result or failure there or postponed it, answering as
+/// `awaiting` says, until the component task has stopped or the message left the intake untaken.
+fn protocols_await_reply(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::Ty, held: Held, head: check::FnSig, number: Option[clif::Value], awaiting: Awaiting) {
     var failure_ty: Option[ty::Ty] = None
     match head.failure {
         Some(written) => {
@@ -230,7 +306,7 @@ fn protocols_request(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::
         None => {}
     }
     let reply = mut fx.slot(at_least_one(size), align: at_least_one(align))
-    let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: Some(reply))
+    let posted = components_enqueue(mut lo, mut fx, supply, message, held, reply: Some(reply), number)
     let record = posted.record
     let node = posted.node
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
@@ -243,17 +319,25 @@ fn protocols_request(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::
         mut fx1.if_true(replied, then: fn[mut lo](mut fx2: Fx) {
             leave_post(mut lo, fx: mut fx2, record)
             let result = mut lo.held_at(mut fx2, ty: head.result, address: reply)
-            supply.ret(mut lo, fx: mut fx2, held: result)
+            protocols_answer(mut lo, fx: mut fx2, supply, awaiting, answer: Answer.Replied(result))
         })
         match failure_ty {
             Some(written_failure) => {
                 let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_FAILED)
                 mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
                     leave_post(mut lo, fx: mut fx2, record)
-                    protocols_fail_failed(mut lo, fx: mut fx2, supply, failure_ty: written_failure, reply)
+                    let failure = mut lo.held_at(mut fx2, ty: written_failure, address: reply)
+                    protocols_answer(mut lo, fx: mut fx2, supply, awaiting, answer: Answer.Failed(failure))
                 })
             }
             None => {}
+        }
+        if number.is_some() {
+            let postponed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_POSTPONED)
+            mut fx1.if_true(postponed, then: fn[mut lo](mut fx2: Fx) {
+                leave_post(mut lo, fx: mut fx2, record)
+                protocols_answer(mut lo, fx: mut fx2, supply, awaiting, answer: Answer.Postponed)
+            })
         }
         let abandoned = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: STATUS_ABANDONED)
         mut fx1.if_true(abandoned, then: fn[mut lo](mut fx2: Fx) {
@@ -265,16 +349,41 @@ fn protocols_request(mut lo: Lowering, mut fx: Fx, supply: Supply, message: ty::
         return Pass(again: mut fx1.int(clif::Type.Int8, value: 1), next: mem::List[clif::Value].empty(fx1.alloc))
     })
     mut fx.b.trap(clif::TrapCode(user: 1))
-} protocols_request
+} protocols_await_reply
 
-/// Fails a request with `CallError.Failed` holding the failure its handler gave in the reply
-/// slot.
-fn protocols_fail_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::Ty, reply: clif::Value) {
+/// Answers a request's poster as `awaiting` says: returning its result or failing with
+/// `CallError.Failed` holding its failure, or giving the encoding of its reply, none when its
+/// handler postponed it.
+fn protocols_answer(mut lo: Lowering, mut fx: Fx, supply: Supply, awaiting: Awaiting, take answer: Answer) {
+    match awaiting {
+        Awaiting.Returned => match answer {
+            Answer.Replied(result) => supply.ret(mut lo, mut fx, held: result)
+            Answer.Failed(failure) => protocols_fail_failed(mut lo, mut fx, supply, failure)
+            Answer.Postponed => {
+                expect false
+            }
+        }
+        Awaiting.Served(reply_ty) => {
+            let value = match answer {
+                Answer.Replied(result) => mut lo.variant_value(mut fx, ty: reply_ty, variant: "Ok", payload_values: Array[Held, 1].filled(result).view(), wrapped: None)
+                Answer.Failed(failure) => mut lo.variant_value(mut fx, ty: reply_ty, variant: "Err", payload_values: Array[Held, 1].filled(failure).view(), wrapped: None)
+                Answer.Postponed => {
+                    let none = mut lo.none_value(mut fx, option: supply.abi.result)
+                    supply.ret(mut lo, mut fx, held: none)
+                    return
+                }
+            }
+            protocols_give_encoded(mut lo, mut fx, supply, reply: Some(reply_ty), held: value)
+        }
+    }
+} protocols_answer
+
+/// Fails a request with `CallError.Failed` holding the failure its handler gave.
+fn protocols_fail_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure: Held) {
     let Some(call_error) = supply.abi.failure else {
         expect false
         return
     }
-    let failure = mut lo.held_at(mut fx, ty: failure_ty, address: reply)
     let value = mut lo.variant_value(mut fx, ty: call_error, variant: "Failed", payload_values: Array[Held, 1].filled(failure).view(), wrapped: None)
     let Some(target) = supply.failure else {
         expect false

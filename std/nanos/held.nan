@@ -189,16 +189,16 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
         let Some(called) = try await mut receiver.receive() else {
             return
         }
-        let Called(id: id, hash: hash, request: request, alloc: drawn) = called
-        let Some(crossing) = table.admitted(request.handles.view(), alloc) else {
+        let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: drawn) = called
+        let Some(crossing) = table.admitted(encoding.handles.view(), alloc) else {
             discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
             continue
         }
         await when mut allocs {
             discard mut allocs.insert(id, value: drawn)
         }
-        let sys::Encoded(bytes: bytes, handles: _) = request
-        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes, handles: take crossing)), alloc))
+        let sys::Encoded(bytes: bytes, handles: _) = encoding
+        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, bytes: take bytes, handles: take crossing)), alloc))
     }
 } called_down
 
@@ -313,8 +313,9 @@ fn answer_of(take sent: Sent, table: Table, alloc: mem::Alloc) -> Answer {
             }
             var reply = sys::Encoded(bytes: mem::Bytes.empty(alloc), handles: take handed)
             mut reply.bytes.append(bytes.view())
-            return Answer.Served(Ok(take reply))
+            return Answer.Served(Ok(Some(take reply)))
         }
+        Sent.Postponed => return Answer.Served(Ok(None))
         Sent.Refused(Refusal.Malformed(code)) => return Answer.Served(Err(sys::CallError.Malformed(decode_error(code))))
         Sent.Refused(Refusal.Closed) => return Answer.Served(Err(sys::CallError.Closed(task::SendError.Closed)))
     }
@@ -352,11 +353,12 @@ enum Order derives Copy, Encode {
     Wake
 } Order
 
-/// A call of an instance's inbox: the number of its wait, its protocol hash, its bytes and what the
-/// space receives of its handles.
+/// A call of an instance's inbox: the number of its wait, its protocol hash, the number its holder
+/// gives it, its bytes and what the space receives of its handles.
 struct Calling derives Encode {
     id: u64
     hash: sys::ProtocolHash
+    request: u64
     bytes: mem::Bytes
     handles: mem::List[Carried]
 } Calling
@@ -412,6 +414,7 @@ enum Sent derives Encode {
     Healthy
     Unhealthy(text::String)
     Served(Naming)
+    Postponed
     Refused(Refusal)
 } Sent
 
@@ -636,16 +639,16 @@ fn port_replied(take reply: PortReply, waits: task::Cown[PortWaits]) fails task:
 /// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
 /// the kernel carried into the space's table, a handle it cannot hold left out.
 fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
-    let Calling(id: id, hash: hash, bytes: bytes, handles: crossing) = calling
-    var request = sys::Encoded.empty(alloc)
-    mut request.bytes.append(bytes.view())
+    let Calling(id: id, hash: hash, request: request, bytes: bytes, handles: crossing) = calling
+    var encoding = sys::Encoded.empty(alloc)
+    mut encoding.bytes.append(bytes.view())
     for crossed in crossing {
         match minted_for(base, crossed) {
-            Some(handle) => mut request.handles.push(handle)
+            Some(handle) => mut encoding.handles.push(handle)
             None => {}
         }
     }
-    return Called(id: id, hash: hash, request: take request, alloc: alloc)
+    return Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc)
 } called_in
 
 /// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
@@ -889,12 +892,13 @@ fn sent_of(take answer: Answer, base: Remote, alloc: mem::Alloc) -> Sent {
         Answer.Checkpointed(bytes) => return Sent.Checkpointed(take bytes)
         Answer.Health(sys::HealthReply.Healthy) => return Sent.Healthy
         Answer.Health(sys::HealthReply.Unhealthy(why)) => return Sent.Unhealthy(text::String.of(why.as_str(), alloc))
-        Answer.Served(Ok(reply)) => {
+        Answer.Served(Ok(Some(reply))) => {
             let Some(handles) = handles_named(base, minted: reply.handles.view(), alloc) else {
                 return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
             }
             return Sent.Served(Naming(bytes: take reply.bytes, handles: take handles))
         }
+        Answer.Served(Ok(None)) => return Sent.Postponed
         Answer.Served(Err(failure)) => {
             let sys::CallError.Malformed(error) = failure else {
                 return Sent.Refused(Refusal.Closed)

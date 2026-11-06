@@ -13831,16 +13831,16 @@ const TEXT_NANOS_HELD: Str =
     \\        let Some(called) = try await mut receiver.receive() else {
     \\            return
     \\        }
-    \\        let Called(id: id, hash: hash, request: request, alloc: drawn) = called
-    \\        let Some(crossing) = table.admitted(request.handles.view(), alloc) else {
+    \\        let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: drawn) = called
+    \\        let Some(crossing) = table.admitted(encoding.handles.view(), alloc) else {
     \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
     \\            continue
     \\        }
     \\        await when mut allocs {
     \\            discard mut allocs.insert(id, value: drawn)
     \\        }
-    \\        let sys::Encoded(bytes: bytes, handles: _) = request
-    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, bytes: take bytes, handles: take crossing)), alloc))
+    \\        let sys::Encoded(bytes: bytes, handles: _) = encoding
+    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, bytes: take bytes, handles: take crossing)), alloc))
     \\    }
     \\} called_down
     \\
@@ -13955,8 +13955,9 @@ const TEXT_NANOS_HELD: Str =
     \\            }
     \\            var reply = sys::Encoded(bytes: mem::Bytes.empty(alloc), handles: take handed)
     \\            mut reply.bytes.append(bytes.view())
-    \\            return Answer.Served(Ok(take reply))
+    \\            return Answer.Served(Ok(Some(take reply)))
     \\        }
+    \\        Sent.Postponed => return Answer.Served(Ok(None))
     \\        Sent.Refused(Refusal.Malformed(code)) => return Answer.Served(Err(sys::CallError.Malformed(decode_error(code))))
     \\        Sent.Refused(Refusal.Closed) => return Answer.Served(Err(sys::CallError.Closed(task::SendError.Closed)))
     \\    }
@@ -13994,11 +13995,12 @@ const TEXT_NANOS_HELD: Str =
     \\    Wake
     \\} Order
     \\
-    \\/// A call of an instance's inbox: the number of its wait, its protocol hash, its bytes and what the
-    \\/// space receives of its handles.
+    \\/// A call of an instance's inbox: the number of its wait, its protocol hash, the number its holder
+    \\/// gives it, its bytes and what the space receives of its handles.
     \\struct Calling derives Encode {
     \\    id: u64
     \\    hash: sys::ProtocolHash
+    \\    request: u64
     \\    bytes: mem::Bytes
     \\    handles: mem::List[Carried]
     \\} Calling
@@ -14054,6 +14056,7 @@ const TEXT_NANOS_HELD: Str =
     \\    Healthy
     \\    Unhealthy(text::String)
     \\    Served(Naming)
+    \\    Postponed
     \\    Refused(Refusal)
     \\} Sent
     \\
@@ -14278,16 +14281,16 @@ const TEXT_NANOS_HELD: Str =
     \\/// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
     \\/// the kernel carried into the space's table, a handle it cannot hold left out.
     \\fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
-    \\    let Calling(id: id, hash: hash, bytes: bytes, handles: crossing) = calling
-    \\    var request = sys::Encoded.empty(alloc)
-    \\    mut request.bytes.append(bytes.view())
+    \\    let Calling(id: id, hash: hash, request: request, bytes: bytes, handles: crossing) = calling
+    \\    var encoding = sys::Encoded.empty(alloc)
+    \\    mut encoding.bytes.append(bytes.view())
     \\    for crossed in crossing {
     \\        match minted_for(base, crossed) {
-    \\            Some(handle) => mut request.handles.push(handle)
+    \\            Some(handle) => mut encoding.handles.push(handle)
     \\            None => {}
     \\        }
     \\    }
-    \\    return Called(id: id, hash: hash, request: take request, alloc: alloc)
+    \\    return Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc)
     \\} called_in
     \\
     \\/// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
@@ -14531,12 +14534,13 @@ const TEXT_NANOS_HELD: Str =
     \\        Answer.Checkpointed(bytes) => return Sent.Checkpointed(take bytes)
     \\        Answer.Health(sys::HealthReply.Healthy) => return Sent.Healthy
     \\        Answer.Health(sys::HealthReply.Unhealthy(why)) => return Sent.Unhealthy(text::String.of(why.as_str(), alloc))
-    \\        Answer.Served(Ok(reply)) => {
+    \\        Answer.Served(Ok(Some(reply))) => {
     \\            let Some(handles) = handles_named(base, minted: reply.handles.view(), alloc) else {
     \\                return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
     \\            }
     \\            return Sent.Served(Naming(bytes: take reply.bytes, handles: take handles))
     \\        }
+    \\        Answer.Served(Ok(None)) => return Sent.Postponed
     \\        Answer.Served(Err(failure)) => {
     \\            let sys::CallError.Malformed(error) = failure else {
     \\                return Sent.Refused(Refusal.Closed)
@@ -16097,12 +16101,12 @@ const TEXT_NANOS_NANOS: Str =
     \\    abandoner.contents().trigger()
     \\} Instance.abandon
     \\
-    \\pub fn Inbox.call(self, hash: sys::ProtocolHash, take request: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails sys::CallError[Never] uses wait {
+    \\pub fn Inbox.call(self, hash: sys::ProtocolHash, request: u64, take encoding: sys::Encoded, alloc: mem::Alloc) -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
     \\    let Some(awaited) = try await awaiting(self.waits, alloc) else {
     \\        fail sys::CallError.Closed(task::SendError.Closed)
     \\    }
     \\    let Awaited(id: id, answers: receiver) = awaited
-    \\    try await self.calls.send(Called(id: id, hash: hash, request: take request, alloc: alloc))
+    \\    try await self.calls.send(Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc))
     \\    var answers = receiver
     \\    let Some(Answer.Served(served)) = try await mut answers.receive() else {
     \\        fail sys::CallError.Closed(task::SendError.Closed)
@@ -16188,15 +16192,16 @@ const TEXT_NANOS_NANOS: Str =
     \\    Started(usize)
     \\    Checkpointed(mem::Bytes)
     \\    Health(sys::HealthReply)
-    \\    Served(Result[sys::Encoded, sys::CallError[Never]])
+    \\    Served(Result[Option[sys::Encoded], sys::CallError[Never]])
     \\} Answer
     \\
-    \\/// An encoded call an inbox carries: the number of its wait, its protocol hash, its encoding and
-    \\/// the allocator its reply is drawn through.
+    \\/// An encoded call an inbox carries: the number of its wait, its protocol hash, the number its
+    \\/// holder gives it, its encoding and the allocator its reply is drawn through.
     \\struct Called {
     \\    id: u64
     \\    hash: sys::ProtocolHash
-    \\    request: sys::Encoded
+    \\    request: u64
+    \\    encoding: sys::Encoded
     \\    alloc: mem::Alloc
     \\} Called
     \\
@@ -16407,8 +16412,9 @@ const TEXT_NANOS_NANOS: Str =
     \\    })
     \\} serving
     \\
-    \\/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply
-    \\/// through `answers`, until every sender of `calls` is released.
+    \\/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply,
+    \\/// none when its handler postponed it, through `answers`, until every sender of `calls` is
+    \\/// released.
     \\fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor) fails task::Cancelled uses wait {
     \\    var receiver = calls
     \\    try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
@@ -16418,9 +16424,9 @@ const TEXT_NANOS_NANOS: Str =
     \\            }
     \\            let replies = answers.split()
     \\            discard s.spawn(fn[take called, take replies]() fails task::Cancelled uses wait {
-    \\                let Called(id: id, hash: hash, request: request, alloc: alloc) = called
+    \\                let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: alloc) = called
     \\                let peers = mem::List[sys::ProtocolSchema].empty(alloc)
-    \\                let served = attempt await sys::Wire[P].serve(out, hash, peers: peers.view(), raw: Untrusted.of(request.bytes.view()), handles: request.handles.view(), alloc)
+    \\                let served = attempt await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
     \\                discard attempt await replies.send(Routed.Answered(Replied(id: id, answer: Answer.Served(take served))))
     \\            })
     \\        }
@@ -16679,23 +16685,27 @@ const TEXT_NANOS_NANOS: Str =
     \\
     \\protocol Counted {
     \\    pub fn add(amount: u32) -> u64 fails Over limits pure
+    \\    pub fn later() -> u64 limits pure
     \\    pub fn sync() limits traceless
     \\} Counted
     \\
     \\struct CountedEnv {
+    \\    alloc: mem::Alloc
     \\} CountedEnv
     \\
     \\impl CountedEnv: Environment
     \\
-    \\fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv()
+    \\fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv(alloc: world.alloc)
     \\
+    \\/// A count that answers the request it postpones once asked to sync.
     \\struct Count derives Encode {
     \\    total: u64
+    \\    pending: Option[u64]
     \\} Count
     \\
     \\impl Count: sys::Component[CountedEnv, Counted]
     \\
-    \\fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0)
+    \\fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None)
     \\
     \\fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 fails Over {
     \\    if amount > 100 {
@@ -16705,12 +16715,24 @@ const TEXT_NANOS_NANOS: Str =
     \\    return self.total
     \\} Count.add
     \\
+    \\fn Count.later(mut self, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 {
+    \\    self.pending = mut cx.postpone()
+    \\    return self.total
+    \\} Count.later
+    \\
     \\fn Count.sync(mut self, mut env: CountedEnv, mut cx: sys::Cx[Counted]) {
+    \\    match self.pending {
+    \\        Some(request) => {
+    \\            discard attempt mut cx.reply(request, reply: sys::Encoded.empty(env.alloc))
+    \\        }
+    \\        None => {}
+    \\    }
+    \\    self.pending = None
     \\    discard attempt mut cx.sync()
     \\} Count.sync
     \\
-    \\/// A runner counting the syncs of the instances it serves, refusing every call and holding no
-    \\/// capability or resource.
+    \\/// A runner counting the syncs of the instances it serves and ten per number of a reply, refusing
+    \\/// every call and holding no capability or resource.
     \\struct Syncs {
     \\} Syncs
     \\
@@ -16726,6 +16748,7 @@ const TEXT_NANOS_NANOS: Str =
     \\} Syncs.call
     \\
     \\fn Syncs.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+    \\    discard sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(request * 10))
     \\} Syncs.reply
     \\
     \\fn Syncs.publish(self, summary: Slice[u8]) limits stack 4_096 {
@@ -16771,13 +16794,13 @@ const TEXT_NANOS_NANOS: Str =
     \\        var request = sys::Encoded.empty(world.alloc)
     \\        let added = sys::Wire[Counted].add(mut request, amount: 5)
     \\        let caller = instance.inbox()
-    \\        let answered = s.spawn(fn[take caller, take request]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait {
-    \\            return attempt await caller.call(sys::Wire[Counted].hash(), take request, alloc: world.alloc)
+    \\        let answered = s.spawn(fn[take caller, take request]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+    \\            return attempt await caller.call(sys::Wire[Counted].hash(), request: 1, encoding: take request, alloc: world.alloc)
     \\        })
     \\        try await instance.incoming()
     \\        let stepped = try await mut instance.step()
     \\        expect stepped
-    \\        let Ok(reply) = try await take answered.join() else {
+    \\        let Ok(Some(reply)) = try await take answered.join() else {
     \\            expect false
     \\            return
     \\        }
@@ -16804,7 +16827,7 @@ const TEXT_NANOS_NANOS: Str =
     \\test requests_a_domain_never_takes_end_with_it for Instance.ask {
     \\    let world = testing::world()
     \\    var stepped: Option[Result[bool, InstanceError]] = None
-    \\    var called: Option[Result[sys::Encoded, sys::CallError[Never]]] = None
+    \\    var called: Option[Result[Option[sys::Encoded], sys::CallError[Never]]] = None
     \\    var ended = Ended.Undecodable
     \\    try await task::scope(world.exec, body: fn[mut stepped, mut called, mut ended](s: task::Scope) fails task::Cancelled uses wait {
     \\        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc: world.alloc)
@@ -16815,7 +16838,7 @@ const TEXT_NANOS_NANOS: Str =
     \\        var instance = opening
     \\        stepped = Some(attempt await mut instance.step())
     \\        let inbox = instance.inbox()
-    \\        called = Some(attempt await inbox.call(sys::Wire[Counted].hash(), request: sys::Encoded.empty(world.alloc), alloc: world.alloc))
+    \\        called = Some(attempt await inbox.call(sys::Wire[Counted].hash(), request: 1, encoding: sys::Encoded.empty(world.alloc), alloc: world.alloc))
     \\        ended = try await take instance.end()
     \\        discard launch
     \\    })
@@ -16849,11 +16872,23 @@ const TEXT_NANOS_NANOS: Str =
     \\        })
     \\        var instance = opening
     \\        defer take instance.abandon()
+    \\        var asking = sys::Encoded.empty(world.alloc)
+    \\        discard sys::Wire[Counted].later(mut asking)
+    \\        let asker = instance.inbox()
+    \\        let asked = s.spawn(fn[take asker, take asking]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+    \\            return attempt await asker.call(sys::Wire[Counted].hash(), request: 3, encoding: take asking, alloc: world.alloc)
+    \\        })
+    \\        try await instance.incoming()
+    \\        discard try await mut instance.step()
+    \\        let Ok(None) = try await take asked.join() else {
+    \\            expect false
+    \\            return
+    \\        }
     \\        var request = sys::Encoded.empty(world.alloc)
     \\        sys::Wire[Counted].sync(mut request)
     \\        let caller = instance.inbox()
-    \\        let answered = s.spawn(fn[take caller, take request]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait {
-    \\            return attempt await caller.call(sys::Wire[Counted].hash(), take request, alloc: world.alloc)
+    \\        let answered = s.spawn(fn[take caller, take request]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait {
+    \\            return attempt await caller.call(sys::Wire[Counted].hash(), request: 4, encoding: take request, alloc: world.alloc)
     \\        })
     \\        try await instance.incoming()
     \\        discard try await mut instance.step()
@@ -16862,7 +16897,7 @@ const TEXT_NANOS_NANOS: Str =
     \\        discard try await take instance.end()
     \\    })
     \\    let synced = sys::reach(counter, body: fn(state: core::atomic::AtomicU64, record: u64) => state.load())
-    \\    expect synced == Some(1)
+    \\    expect synced == Some(31)
     \\} instances_act_through_the_runner_they_are_held_with
     \\
 
@@ -19539,6 +19574,8 @@ const TEXT_SYS_SYS: Str =
     \\    try port.runner.send_to(port.id, hash: Wire[Q].hash(), bytes: call.bytes.view(), handles: call.handles.view())
     \\} Cx.send_to
     \\
+    \\pub fn Cx.postpone(mut self) -> Option[u64]
+    \\
     \\pub fn Cx.reply(mut self, request: u64, reply: Encoded) fails RunnerError {
     \\    try self.runner().reply(request, bytes: reply.bytes.view(), handles: reply.handles.view())
     \\} Cx.reply
@@ -19776,7 +19813,7 @@ const TEXT_SYS_SYS: Str =
     \\pub fn Wire.schema(alloc: mem::Alloc) -> ProtocolSchema
     \\    example Wire[MeterSpare].schema(testing::world().alloc).operations.len() == 1
     \\
-    \\pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+    \\pub fn Wire.serve(out: Outbox[P], request: u64, hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait
     \\
     \\pub closed struct ProtocolSchema derives Encode {
     \\    pub hash: ProtocolHash
@@ -21228,10 +21265,11 @@ const TEXT_SYS_SYS: Str =
     \\
     \\fn Gauge.keep(mut self, take clock: Clock, mut env: MeterEnv, mut cx: Cx[Meter]) -> Clock = clock
     \\
-    \\/// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it.
-    \\fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait {
+    \\/// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it, none when
+    \\/// its handler postponed it.
+    \\fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait {
     \\    let peers = mem::List[ProtocolSchema].empty(alloc)
-    \\    return try await Wire[Meter].serve(inbox, hash: Wire[Meter].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
+    \\    return try await Wire[Meter].serve(inbox, request: 1, hash: Wire[Meter].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
     \\} served
     \\
     \\test hashes_differ_by_protocol for Wire.hash {
@@ -21296,7 +21334,7 @@ const TEXT_SYS_SYS: Str =
     \\        mut peers.push(Wire[MeterOneWay].schema(alloc))
     \\        var call = Encoded.empty(alloc)
     \\        let reply = Wire[MeterClient].add(mut call, amount: 7)
-    \\        let Ok(answer) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterClient].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+    \\        let Ok(Some(answer)) = attempt await Wire[Meter].serve(inbox, request: 1, hash: Wire[MeterClient].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }
@@ -21307,13 +21345,13 @@ const TEXT_SYS_SYS: Str =
     \\        expect total == 7
     \\        var posted = Encoded.empty(alloc)
     \\        Wire[MeterOneWay].add(mut posted, amount: 1)
-    \\        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterOneWay].hash(), peers: peers.view(), raw: Untrusted.of(posted.bytes.view()), handles: posted.handles.view(), alloc) else {
+    \\        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, request: 2, hash: Wire[MeterOneWay].hash(), peers: peers.view(), raw: Untrusted.of(posted.bytes.view()), handles: posted.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }
     \\        var cleared = Encoded.empty(alloc)
     \\        Wire[MeterSpare].clear(mut cleared)
-    \\        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterSpare].hash(), peers: peers.view(), raw: Untrusted.of(cleared.bytes.view()), handles: cleared.handles.view(), alloc) else {
+    \\        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, request: 3, hash: Wire[MeterSpare].hash(), peers: peers.view(), raw: Untrusted.of(cleared.bytes.view()), handles: cleared.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }
@@ -21328,7 +21366,7 @@ const TEXT_SYS_SYS: Str =
     \\        var call = Encoded.empty(alloc)
     \\        let reply = Wire[Meter].add(mut call, amount: 7)
     \\        expect call.bytes.view() == b"\\x03add\\x01\\x0A\\x01\\x06amount\\x01\\x07"
-    \\        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+    \\        let Ok(Some(answer)) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }
@@ -21344,7 +21382,7 @@ const TEXT_SYS_SYS: Str =
     \\        var cleared = Encoded.empty(alloc)
     \\        Wire[Meter].clear(mut cleared)
     \\        expect cleared.bytes.view() == b"\\x05clear\\x00"
-    \\        let Ok(none) = attempt await served(inbox, call: cleared, handles: cleared.handles.view(), alloc) else {
+    \\        let Ok(Some(none)) = attempt await served(inbox, call: cleared, handles: cleared.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }
@@ -21352,6 +21390,97 @@ const TEXT_SYS_SYS: Str =
     \\    })
     \\    expect last.total == 0
     \\} calls_are_served_from_their_encodings
+    \\
+    \\protocol Awaited {
+    \\    pub fn read() -> u64 limits traceless
+    \\    pub fn arrive(value: u64) limits traceless
+    \\} Awaited
+    \\
+    \\/// A component postponing each read until a value arrives, which answers every read it
+    \\/// postponed, and counting the reads it answered at once.
+    \\struct Waiter derives Encode {
+    \\    reads: mem::List[u64]
+    \\    prompt: u64
+    \\} Waiter
+    \\
+    \\impl Waiter: Component[RelayEnv, Awaited]
+    \\
+    \\fn Waiter.start(mut env: RelayEnv) -> Waiter = Waiter(reads: mem::List.empty(env.alloc), prompt: 0)
+    \\
+    \\fn Waiter.read(mut self, mut env: RelayEnv, mut cx: Cx[Awaited]) -> u64 {
+    \\    let Some(request) = mut cx.postpone() else {
+    \\        self.prompt += 1
+    \\        return 7
+    \\    }
+    \\    if mut cx.postpone() == Some(request) {
+    \\        mut self.reads.push(request)
+    \\    }
+    \\    return 0
+    \\} Waiter.read
+    \\
+    \\fn Waiter.arrive(mut self, take value: u64, mut env: RelayEnv, mut cx: Cx[Awaited]) {
+    \\    let one_way = mut cx.postpone()
+    \\    if one_way.is_some() {
+    \\        return
+    \\    }
+    \\    for request in self.reads {
+    \\        var reply = Encoded.empty(env.alloc)
+    \\        let answer: Result[u64, Never] = Ok(value)
+    \\        mem::wire::Codec[Result[u64, Never]].encode(answer, out: mut reply.bytes)
+    \\        discard attempt mut cx.reply(request, reply)
+    \\    }
+    \\    mut self.reads.truncate(0)
+    \\} Waiter.arrive
+    \\
+    \\test postponed_requests_are_answered_by_number for Cx.postpone {
+    \\    let world = testing::world()
+    \\    let alloc = world.alloc
+    \\    let minter = boards(mem::Map[u64, Held].empty(alloc), alloc)
+    \\    defer take minter.close()
+    \\    let counter = minter.mint(0)
+    \\    var stepper = try Stepper[Waiter, RelayEnv, Awaited].start(RelayEnv(alloc: alloc), exec: world.exec, alloc)
+    \\    defer take stepper.abandon()
+    \\    let Ok(runner) = attempt Runner.served(minter.mint(0)) else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    mut stepper.attach(runner)
+    \\    let inbox = stepper.outbox()
+    \\    var numbered_reply: Option[Result[Option[Encoded], CallError[Never]]] = None
+    \\    var direct: Option[Result[u64, task::SendError]] = None
+    \\    try await task::scope(world.exec, body: fn[mut stepper, mut numbered_reply, mut direct](s: task::Scope) fails task::Cancelled uses wait {
+    \\        let numbered = s.spawn(fn() -> Result[Option[Encoded], CallError[Never]] fails task::Cancelled uses wait {
+    \\            var call = Encoded.empty(alloc)
+    \\            discard Wire[Awaited].read(mut call)
+    \\            let peers = mem::List[ProtocolSchema].empty(alloc)
+    \\            return attempt await Wire[Awaited].serve(inbox, request: 4, hash: Wire[Awaited].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
+    \\        })
+    \\        try await stepper.incoming()
+    \\        discard mut stepper.step()
+    \\        numbered_reply = Some(try await take numbered.join())
+    \\        let posted = s.spawn(fn() -> Result[u64, task::SendError] fails task::Cancelled uses wait {
+    \\            return attempt await inbox.read()
+    \\        })
+    \\        try await stepper.incoming()
+    \\        discard mut stepper.step()
+    \\        direct = Some(try await take posted.join())
+    \\    })
+    \\    let Some(Ok(None)) = numbered_reply else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    let Some(Ok(7)) = direct else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    let before = reach(counter, body: board_count)
+    \\    mut stepper.deliver(Awaited.arrive(value: 9))
+    \\    let after = reach(counter, body: board_count)
+    \\    expect before == Some(0) and after == Some(4_000)
+    \\    undefer stepper
+    \\    let last = try await take stepper.end()
+    \\    expect last.state.reads.len() == 0 and last.state.prompt == 1
+    \\} postponed_requests_are_answered_by_number
     \\
     \\/// Whether a call keeping `clock` carries its handle, which the reply to it gives back.
     \\fn keeps_clock(clock: Clock, alloc: mem::Alloc) -> bool {
@@ -21384,7 +21513,7 @@ const TEXT_SYS_SYS: Str =
     \\            expect false
     \\            return
     \\        }
-    \\        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+    \\        let Ok(Some(answer)) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
     \\            expect false
     \\            return
     \\        }

@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -53,11 +53,14 @@ pub protocol Ledger {
     pub fn borrow() limits recorded
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
+    pub fn wait() -> u64 limits pure
+    pub fn settle() limits traceless
 } Ledger
 
 pub closed struct Book derives Encode {
     pub total: u64
     pub ticks: u64
+    pub pending: u64
 } Book
 
 /// The serial port serving a job's log and standard streams, its state counting the bytes of
@@ -706,9 +709,10 @@ fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails n
     try await added(mut book, amount: 5, grants)
     try await noted(mut book, grants)
     try await borrowed(mut book, grants)
+    try await postponed(mut book, grants)
     var echo = sys::Encoded.empty(grants.alloc)
     discard sys::Wire[Ledger].echo(mut echo, clock: grants.clock)
-    match attempt await book.inbox().call(sys::Wire[Ledger].hash(), request: take echo, alloc: grants.alloc) {
+    match attempt await book.inbox().call(sys::Wire[Ledger].hash(), request: 0, encoding: take echo, alloc: grants.alloc) {
         Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "book refused a clock\n")
         else => say(text: "book took a clock\n")
     }
@@ -751,9 +755,23 @@ fn borrowed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceErro
     say(text: "book borrowed\n")
 } borrowed
 
-/// The runner the kernel serves the book: it writes each total the book publishes, holds the
-/// noting console's log as capability 7 and lends it through port 1, refusing every other
-/// operation.
+/// Has the book postpone a wait the kernel numbers 4, then settle it, which has the book reply to
+/// the wait through its runner.
+fn postponed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var waiting = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].wait(mut waiting)
+    match try await answered(mut book, number: 4, request: take waiting, grants) {
+        Ok(None) => say(text: "book postponed a wait\n")
+        else => say(text: "book answered a wait\n")
+    }
+    var settling = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Ledger].settle(mut settling)
+    discard try await called(mut book, request: take settling, grants)
+} postponed
+
+/// The runner the kernel serves the book: it writes each total the book publishes and each reply
+/// it gives, holds the noting console's log as capability 7 and lends it through port 1, refusing
+/// every other operation.
 struct Lending {
 } Lending
 
@@ -786,8 +804,22 @@ fn Lending.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], hand
     return reply
 } Lending.call
 
-fn Lending.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
-    fail sys::RunnerError.Unknown
+fn Lending.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) limits stack 4_096 {
+    let Some(alloc) = sys::reach(self, body: fn(state: Lent, record: u64) => state.alloc) else {
+        return
+    }
+    var reply = mem::Bytes.empty(alloc)
+    mut reply.append(bytes)
+    say(text: "replied request ")
+    say_number(request)
+    match attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc) {
+        Ok(Ok(total)) => {
+            say(text: " total ")
+            say_number(total)
+            say(text: "\n")
+        }
+        else => say(text: " otherwise\n")
+    }
 } Lending.reply
 
 fn Lending.publish(self, summary: Slice[u8]) limits stack 4_096 {
@@ -944,24 +976,35 @@ fn added(mut book: nanos::Instance, amount: u32, grants: Grants) fails nanos::In
     }
 } added
 
-/// The reply of the book to a call, which the instance handles in the next step its holder takes.
+/// The reply of the book to a call, which the instance handles in the next step its holder takes,
+/// closed when the book postpones it.
 fn called(mut book: nanos::Instance, take request: sys::Encoded, grants: Grants) -> Result[sys::Encoded, sys::CallError[Never]] fails nanos::InstanceError uses wait {
+    match try await answered(mut book, number: 0, take request, grants) {
+        Ok(Some(reply)) => return Ok(take reply)
+        Ok(None) => return Err(sys::CallError.Closed(task::SendError.Closed))
+        Err(failure) => return Err(take failure)
+    }
+} called
+
+/// The reply of the book to a call numbered `number`, which the instance handles in the next step
+/// its holder takes, none when the book postpones it.
+fn answered(mut book: nanos::Instance, number: u64, take request: sys::Encoded, grants: Grants) -> Result[Option[sys::Encoded], sys::CallError[Never]] fails nanos::InstanceError uses wait {
     var pending = Some(take request)
-    var reply: Result[sys::Encoded, sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
+    var reply: Result[Option[sys::Encoded], sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
     try await task::scope(grants.exec, body: fn[mut book, mut pending, mut reply](s: task::Scope) fails nanos::InstanceError uses wait {
         let Some(call) = mut pending.extract() else {
             return
         }
         let inbox = book.inbox()
-        let answered = s.spawn(fn[take inbox, take call]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
-            return attempt await inbox.call(sys::Wire[Ledger].hash(), request: take call, alloc: grants.alloc)
+        let replied = s.spawn(fn[take inbox, take call]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
+            return attempt await inbox.call(sys::Wire[Ledger].hash(), request: number, encoding: take call, alloc: grants.alloc)
         })
         try await book.incoming()
         discard try await mut book.step()
-        reply = try await take answered.join()
+        reply = try await take replied.join()
     })
     return reply
-} called
+} answered
 
 /// Writes the total and ticks of the book whose state `bytes` encodes.
 fn say_book(bytes: mem::Bytes, alloc: mem::Alloc) {

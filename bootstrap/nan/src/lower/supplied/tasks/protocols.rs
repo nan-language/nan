@@ -4,7 +4,8 @@
 //!
 //! A request's entry holds the address of its reply, a slot of the posting task's stack fitting
 //! the operation's result and failure; the component task writes the one the handler gives there
-//! before it marks the entry replied or failed and wakes the poster.
+//! before it marks the entry replied or failed and wakes the poster, or, once the handler
+//! postponed the request, releases it and marks the entry postponed.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -15,7 +16,7 @@ use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::Routine;
 use super::super::super::{Instance, Lowering};
 use super::super::{Supply, entry as supplied_entry};
-use super::components::{self, Shape, entry, runner, status};
+use super::components::{self, Shape, entry, numbering, runner, status};
 use crate::check::db::ItemId;
 use crate::check::sig::{FnSig, SigKind};
 use crate::check::ty::{Arg, Args, Ty};
@@ -87,7 +88,8 @@ pub fn dispatch(
 }
 
 /// Gives a request's handler's result or failure to its poster, unless the poster has stopped,
-/// withdrawing the entry the runner's record held as current, in which case it is released.
+/// withdrawing the entry the runner's record held as current, or the handler postponed the
+/// request, in which case it is released and the poster told it was postponed.
 fn reply(lo: &mut Lowering, fx: &mut Fx, record: Value, node: Value, head: &FnSig, called: Called) {
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -95,10 +97,24 @@ fn reply(lo: &mut Lowering, fx: &mut Fx, record: Value, node: Value, head: &FnSi
     let live = fx.b.ins().icmp(IntCC::Equal, current, node);
     let zero = fx.ptr(0);
     fx.store(zero, record, runner::CURRENT);
+    let postponed = fx.choose(
+        live,
+        &[types::I8],
+        |fx| {
+            let numbering = fx.load(PTR, node, entry::NUMBERING);
+            vec![
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, numbering, numbering::POSTPONED),
+            ]
+        },
+        |fx| vec![fx.int(types::I8, 0)],
+    )[0];
+    let answered = fx.b.ins().bxor_imm_s(postponed, 1);
+    let answered = fx.b.ins().band(live, answered);
     let give = |lo: &mut Lowering, fx: &mut Fx, ty: &Ty, held: Held, word: i64| {
         fx.choose_in(
             lo,
-            live,
+            answered,
             &[],
             |lo, fx| {
                 let reply = fx.load(PTR, node, entry::REPLY);
@@ -138,7 +154,49 @@ fn reply(lo: &mut Lowering, fx: &mut Fx, record: Value, node: Value, head: &FnSi
         }
         _ => give(lo, fx, &head.result, called.result, status::REPLIED),
     }
+    fx.when(postponed, |fx| {
+        let word = fx.ptr(status::POSTPONED as u64);
+        fx.store(word, node, entry::STATUS);
+        let poster = fx.load(PTR, node, entry::POSTER);
+        lo.call_routine(fx, Routine::Wake, &[poster]);
+    });
     lo.call_routine(fx, Routine::Unlock, &[lock]);
+}
+
+/// `mut cx.postpone()`: the number of the request whose handler runs, which it marks postponed,
+/// none when the handler runs for no request its holder numbered or no runner is attached.
+pub fn postpone(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let record = fx.load(PTR, supply.param(0).address(), 0);
+    let lock = fx.offset(record, runner::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let current = fx.load(PTR, record, runner::CURRENT);
+    let handling = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+    let attached = fx.load(PTR, record, runner::RUNNER);
+    let attached = fx.b.ins().icmp_imm_s(IntCC::NotEqual, attached, 0);
+    let postponable = fx.b.ins().band(handling, attached);
+    let numbered_request = fx.choose(
+        postponable,
+        &[types::I8],
+        |fx| {
+            let numbering = fx.load(PTR, current, entry::NUMBERING);
+            vec![fx.b.ins().icmp_imm_s(IntCC::NotEqual, numbering, 0)]
+        },
+        |fx| vec![fx.int(types::I8, 0)],
+    )[0];
+    let option = supply.abi.result.clone();
+    fx.when(numbered_request, |fx| {
+        let postponed = fx.ptr(numbering::POSTPONED as u64);
+        fx.store(postponed, current, entry::NUMBERING);
+        let number = fx.load(types::I64, current, entry::NUMBER);
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
+        let slot = fx.slot(8, 8);
+        fx.store(number, slot, 0);
+        let some = lo.variant_value(fx, &option, "Some", &[Held::Address(slot)], None);
+        supply.ret(lo, fx, some);
+    });
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
 }
 
 /// Publishes the summary of a component whose protocol declares one: the value its summary
@@ -184,7 +242,7 @@ pub fn call(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, protocol: ItemId, method:
     }
     let held = lo.variant_value(fx, &message, &name, &supply.params[1..], None);
     if !lo.ck.is_request(protocol, method) {
-        let (record, node) = components::enqueue(lo, fx, &supply, &message, held, None);
+        let (record, node) = components::enqueue(lo, fx, &supply, &message, held, None, None);
         components::await_taken(lo, fx, &supply, &message, record, node);
         return;
     }
@@ -192,19 +250,51 @@ pub fn call(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, protocol: ItemId, method:
     let SigKind::Protocol { operations, .. } = &sig.kind else {
         return;
     };
-    request(lo, fx, &supply, &message, held, &operations[method].sig);
+    let head = &operations[method].sig;
+    await_reply(
+        lo,
+        fx,
+        &supply,
+        &message,
+        held,
+        head,
+        None,
+        &|lo, fx, answer| match answer {
+            Answer::Replied(result) => supply.ret(lo, fx, result),
+            Answer::Failed(failure) => {
+                let call_error = supply.abi.fails.clone().expect("a request's failure type");
+                let value = lo.variant_value(fx, &call_error, "Failed", &[failure], None);
+                let target = supply.failure.expect("a failure address");
+                lo.store_held(fx, target, value, &call_error);
+                supply.fail(fx);
+            }
+            Answer::Postponed => unreachable!("an unnumbered request is never postponed"),
+        },
+    );
 }
 
-/// `out.op(...)` for a request: posts its message with a reply slot, then waits until the
-/// handler has given its result or failure there, the component task has stopped, or the
-/// message left the intake untaken.
-fn request(
+/// How a request's handler answered its poster: with its result, with its failure, or by
+/// postponing it.
+pub enum Answer {
+    Replied(Held),
+    Failed(Held),
+    Postponed,
+}
+
+/// Posts a request's message with a reply slot, numbered `number` when its holder serves it, then
+/// waits until the handler has given its result or failure there or postponed it, passing
+/// `answer` how it answered, until the component task has stopped or the message left the intake
+/// untaken.
+#[allow(clippy::too_many_arguments)]
+pub fn await_reply(
     lo: &mut Lowering,
     fx: &mut Fx,
     supply: &Supply,
     message: &Ty,
     held: Held,
     head: &FnSig,
+    number: Option<Value>,
+    answer: &dyn Fn(&mut Lowering, &mut Fx, Answer),
 ) {
     let fails = head.fails.clone().filter(|ty| *ty != Ty::Never);
     let result_layout = lo.layout(&head.result);
@@ -219,7 +309,7 @@ fn request(
         None => (result_layout.size, result_layout.align),
     };
     let reply = fx.slot(size.max(1), align.max(1));
-    let (record, node) = components::enqueue(lo, fx, supply, message, held, Some(reply));
+    let (record, node) = components::enqueue(lo, fx, supply, message, held, Some(reply), number);
     let lock = fx.offset(record, runner::LOCK);
     let at = fx.offset(node, entry::MESSAGE);
     fx.repeat(&[], |fx, _| {
@@ -232,18 +322,23 @@ fn request(
         fx.when(replied, |fx| {
             components::leave_post(lo, fx, record);
             let result = lo.held_at(fx, &head.result, reply);
-            supply.ret(lo, fx, result);
+            answer(lo, fx, Answer::Replied(result));
         });
         if let Some(fails) = &fails {
             let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, current, status::FAILED);
             fx.when(failed, |fx| {
                 components::leave_post(lo, fx, record);
-                let call_error = supply.abi.fails.clone().expect("a request's failure type");
                 let failure = lo.held_at(fx, fails, reply);
-                let value = lo.variant_value(fx, &call_error, "Failed", &[failure], None);
-                let target = supply.failure.expect("a failure address");
-                lo.store_held(fx, target, value, &call_error);
-                supply.fail(fx);
+                answer(lo, fx, Answer::Failed(failure));
+            });
+        }
+        if number.is_some() {
+            let postponed =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, current, status::POSTPONED);
+            fx.when(postponed, |fx| {
+                components::leave_post(lo, fx, record);
+                answer(lo, fx, Answer::Postponed);
             });
         }
         let abandoned =

@@ -15,7 +15,8 @@
 //! for a protocol declaring one, the summary follow. An intake entry
 //! holds its links, the task posting it (zero for a message the component sends itself), its
 //! status, its deadline and order while delayed, whether a keyed outbox posted it and that
-//! outbox's key, where a request's reply goes (zero for any other message), and the message; a
+//! outbox's key, where a request's reply goes (zero for any other message), the number a holder
+//! serving the request gave it and its numbering, and the message; a
 //! posted entry lies on the posting task's stack, any other is drawn through the runner's
 //! allocator.
 
@@ -82,12 +83,21 @@ pub mod entry {
     pub const KEY: u64 = 48;
     pub const KEYED: u64 = 56;
     pub const REPLY: u64 = 64;
-    pub const MESSAGE: u64 = 72;
+    pub const NUMBER: u64 = 72;
+    pub const NUMBERING: u64 = 80;
+    pub const MESSAGE: u64 = 88;
+}
+
+/// The numberings of a request's entry: none, numbered by the holder serving it, or numbered and
+/// postponed by its handler.
+pub mod numbering {
+    pub const NUMBERED: i64 = 1;
+    pub const POSTPONED: i64 = 2;
 }
 
 /// The statuses of a posted entry: taken by the component task, removed from the intake untaken,
-/// a request's handler having returned or failed, its poster stopped, or the component task
-/// stopped while its handler ran.
+/// a request's handler having returned or failed, its poster stopped, the component task
+/// stopped while its handler ran, or its handler having postponed it.
 pub mod status {
     pub const TAKEN: i64 = 1;
     pub const REMOVED: i64 = 2;
@@ -95,6 +105,7 @@ pub mod status {
     pub const FAILED: i64 = 4;
     pub const WITHDRAWN: i64 = 5;
     pub const ABANDONED: i64 = 6;
+    pub const POSTPONED: i64 = 7;
 }
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
@@ -114,6 +125,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             supply.done(lo, fx);
         }
+        "sys::Cx.postpone" => super::protocols::postpone(lo, fx, supply),
         "sys::Cx.runner" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
             let attached = fx.load(PTR, record, runner::RUNNER);
@@ -131,7 +143,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "sys::Outbox.post" => {
             let message = supply.type_arg(0);
-            let (record, node) = enqueue(lo, fx, supply, &message, supply.param(1), None);
+            let (record, node) = enqueue(lo, fx, supply, &message, supply.param(1), None, None);
             await_taken(lo, fx, supply, &message, record, node);
         }
         _ => stepper::lower(lo, fx, supply),

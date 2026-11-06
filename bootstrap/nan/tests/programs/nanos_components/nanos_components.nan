@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total held pending until a settlement the relay sends has the tally reply, a summary the tally publishes, a sync it asks for, a clock the runner holds for the relay as a capability by number until the relay drops it, and a file the runner holds for the relay as a resource by number, which the relay borrows, puts back, then takes and drops, after the runner refuses it a resource it does not hold.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total the tally postpones until a settlement the relay sends has it reply, a summary the tally publishes, a sync it asks for, a clock the runner holds for the relay as a capability by number until the relay drops it, and a file the runner holds for the relay as a resource by number, which the relay borrows, puts back, then takes and drops, after the runner refuses it a resource it does not hold.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -28,7 +28,6 @@ pub protocol Counter {
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
     pub fn current() -> u64 fails refusals::Refused limits pure
-    pub fn later(request: u64) limits pure
     pub fn settle() limits traceless
 } Counter
 
@@ -397,7 +396,7 @@ fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails n
     var gauge = sys::Encoded.empty(grants.alloc)
     sys::Wire[Gauge].add(mut gauge, amount: 1)
     say(text: "mismatched ")
-    match attempt await held.inbox().call(sys::Wire[Gauge].hash(), request: take gauge, alloc: grants.alloc) {
+    match attempt await held.inbox().call(sys::Wire[Gauge].hash(), request: 0, encoding: take gauge, alloc: grants.alloc) {
         Err(sys::CallError.Malformed(core::DecodeError.UnknownSchema)) => say(text: "refused\n")
         else => say(text: "served\n")
     }
@@ -466,25 +465,36 @@ fn ticked(mut instance: nanos::Instance, reason: sys::ResumeReason) fails nanos:
     say_flag(try await mut instance.step())
 } ticked
 
-/// The reply of the held tally to a call made under the protocol hash `hash`, which the instance
-/// handles in the next step its holder takes.
+/// The reply of the held instance to a call made under the protocol hash `hash`, which the
+/// instance handles in the next step its holder takes, closed when the instance postpones it.
 fn called(mut instance: nanos::Instance, hash: sys::ProtocolHash, take request: sys::Encoded, grants: Grants) -> Result[sys::Encoded, sys::CallError[Never]] fails nanos::InstanceError uses wait {
+    match try await answered(mut instance, hash, number: 0, take request, grants) {
+        Ok(Some(reply)) => return Ok(take reply)
+        Ok(None) => return Err(sys::CallError.Closed(task::SendError.Closed))
+        Err(failure) => return Err(take failure)
+    }
+} called
+
+/// The reply of the held instance to a call made under the protocol hash `hash` and numbered
+/// `number`, which the instance handles in the next step its holder takes, none when the instance
+/// postpones it.
+fn answered(mut instance: nanos::Instance, hash: sys::ProtocolHash, number: u64, take request: sys::Encoded, grants: Grants) -> Result[Option[sys::Encoded], sys::CallError[Never]] fails nanos::InstanceError uses wait {
     var pending = Some(take request)
-    var reply: Result[sys::Encoded, sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
+    var reply: Result[Option[sys::Encoded], sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
     try await task::scope(grants.exec, body: fn[mut instance, mut pending, mut reply](s: task::Scope) fails nanos::InstanceError uses wait {
         let Some(call) = mut pending.extract() else {
             return
         }
         let inbox = instance.inbox()
-        let answered = s.spawn(fn[take inbox, take call]() -> Result[sys::Encoded, sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
-            return attempt await inbox.call(hash, request: take call, alloc: grants.alloc)
+        let replied = s.spawn(fn[take inbox, take call]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
+            return attempt await inbox.call(hash, request: number, encoding: take call, alloc: grants.alloc)
         })
         try await instance.incoming()
         discard try await mut instance.step()
-        reply = try await take answered.join()
+        reply = try await take replied.join()
     })
     return reply
-} called
+} answered
 
 /// A store serving the file `note`, numbered by the length of its path, writing each release.
 struct Notes {
@@ -813,10 +823,10 @@ fn relays(take relay: nanos::Instance, cues: task::Sender[u8], grants: Grants) f
     }
 } relays
 
-/// Serves the relay's calls through ports on the tally: the first at once, the second held
-/// pending as the tally's request 1 until the relay's cue says the settlement it sent through
-/// port 1 waits, which the tally then handles, replying to the request, publishing its total and
-/// asking to sync, which writes its state.
+/// Serves the relay's calls through ports on the tally: the first at once, the second as the
+/// tally's request 1, which the tally postpones until the relay's cue says the settlement it sent
+/// through port 1 waits, which the tally then handles, replying to the request, publishing its
+/// total and asking to sync, which writes its state.
 fn tallies(mut tally: nanos::Instance, take forwarded: task::Receiver[Forwarded], take cued: task::Receiver[u8], wired: Wired, grants: Grants) fails nanos::InstanceError uses wait {
     var receiver = forwarded
     var cues = cued
@@ -827,13 +837,13 @@ fn tallies(mut tally: nanos::Instance, take forwarded: task::Receiver[Forwarded]
     let Some(pending) = try await mut receiver.receive() else {
         stop(text: "unforwarded\n")
     }
-    let Forwarded(port: port, hash: _, request: _, answer: waiting) = pending
+    let Forwarded(port: port, hash: hash, request: request, answer: waiting) = pending
     say(text: "pending port ")
     say_number(port)
     say(text: "\n")
-    var later = sys::Encoded.empty(grants.alloc)
-    sys::Wire[Counter].later(mut later, request: 1)
-    discard try await called(mut tally, hash: sys::Wire[Counter].hash(), request: take later, grants)
+    let Ok(None) = try await answered(mut tally, hash, number: 1, take request, grants) else {
+        stop(text: "unpostponed\n")
+    }
     discard try await mut cues.receive()
     let Some(sent) = kept(wired, key: 0, replies: false) else {
         stop(text: "unsent\n")

@@ -445,6 +445,7 @@ Each term links to its home, whose definition governs.
 | [poisoning](11-errors-domains.md#poisoning) | State of a cown held by a domain that trapped. |
 | [policy](24-kernel.md#policies) | `hw::Policy` deciding where, in which order and how long a kernel's tasks run. |
 | [port](26-components.md#runner-capabilities) | `sys::Port[Q]` calling a protocol through a runner capability. |
+| [postpone](26-components.md#runner-capabilities) | Leave a request a holder numbered for a later `Cx.reply` to answer. |
 | [predicate](04-types.md#predicates) | `where` or `invariant` condition. |
 | [prefix viability](#guarantees) | Written text fixes all meaning: the first dead token is defined, and every prefix before it closes with typed holes and closers into a file the grammar derives. |
 | [premise](23-low-level.md#trusted-code) | What trusted code relies on. |

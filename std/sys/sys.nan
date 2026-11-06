@@ -317,6 +317,8 @@ pub fn Cx.send_to[Q: Protocol](mut self, port: Port[Q], call: Encoded) fails Run
     try port.runner.send_to(port.id, hash: Wire[Q].hash(), bytes: call.bytes.view(), handles: call.handles.view())
 } Cx.send_to
 
+pub fn Cx.postpone(mut self) -> Option[u64]
+
 pub fn Cx.reply(mut self, request: u64, reply: Encoded) fails RunnerError {
     try self.runner().reply(request, bytes: reply.bytes.view(), handles: reply.handles.view())
 } Cx.reply
@@ -554,7 +556,7 @@ pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
 pub fn Wire.schema(alloc: mem::Alloc) -> ProtocolSchema
     example Wire[MeterSpare].schema(testing::world().alloc).operations.len() == 1
 
-pub fn Wire.serve(out: Outbox[P], hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait
+pub fn Wire.serve(out: Outbox[P], request: u64, hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait
 
 pub closed struct ProtocolSchema derives Encode {
     pub hash: ProtocolHash
@@ -2006,10 +2008,11 @@ fn Gauge.clear(mut self, mut env: MeterEnv, mut cx: Cx[Meter]) {
 
 fn Gauge.keep(mut self, take clock: Clock, mut env: MeterEnv, mut cx: Cx[Meter]) -> Clock = clock
 
-/// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it.
-fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CallError[Never] uses wait {
+/// The reply of the gauge behind `inbox` to the call `call`, with `handles` beside it, none when
+/// its handler postponed it.
+fn served(inbox: Outbox[Meter], call: Encoded, handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait {
     let peers = mem::List[ProtocolSchema].empty(alloc)
-    return try await Wire[Meter].serve(inbox, hash: Wire[Meter].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
+    return try await Wire[Meter].serve(inbox, request: 1, hash: Wire[Meter].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles, alloc)
 } served
 
 test hashes_differ_by_protocol for Wire.hash {
@@ -2074,7 +2077,7 @@ test compatible_clients_are_served for Wire.serve {
         mut peers.push(Wire[MeterOneWay].schema(alloc))
         var call = Encoded.empty(alloc)
         let reply = Wire[MeterClient].add(mut call, amount: 7)
-        let Ok(answer) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterClient].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+        let Ok(Some(answer)) = attempt await Wire[Meter].serve(inbox, request: 1, hash: Wire[MeterClient].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
             expect false
             return
         }
@@ -2085,13 +2088,13 @@ test compatible_clients_are_served for Wire.serve {
         expect total == 7
         var posted = Encoded.empty(alloc)
         Wire[MeterOneWay].add(mut posted, amount: 1)
-        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterOneWay].hash(), peers: peers.view(), raw: Untrusted.of(posted.bytes.view()), handles: posted.handles.view(), alloc) else {
+        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, request: 2, hash: Wire[MeterOneWay].hash(), peers: peers.view(), raw: Untrusted.of(posted.bytes.view()), handles: posted.handles.view(), alloc) else {
             expect false
             return
         }
         var cleared = Encoded.empty(alloc)
         Wire[MeterSpare].clear(mut cleared)
-        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, hash: Wire[MeterSpare].hash(), peers: peers.view(), raw: Untrusted.of(cleared.bytes.view()), handles: cleared.handles.view(), alloc) else {
+        let Err(CallError.Malformed(core::DecodeError.UnknownSchema)) = attempt await Wire[Meter].serve(inbox, request: 3, hash: Wire[MeterSpare].hash(), peers: peers.view(), raw: Untrusted.of(cleared.bytes.view()), handles: cleared.handles.view(), alloc) else {
             expect false
             return
         }
@@ -2106,7 +2109,7 @@ test calls_are_served_from_their_encodings for Wire.serve {
         var call = Encoded.empty(alloc)
         let reply = Wire[Meter].add(mut call, amount: 7)
         expect call.bytes.view() == b"\x03add\x01\x0A\x01\x06amount\x01\x07"
-        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+        let Ok(Some(answer)) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
             expect false
             return
         }
@@ -2122,7 +2125,7 @@ test calls_are_served_from_their_encodings for Wire.serve {
         var cleared = Encoded.empty(alloc)
         Wire[Meter].clear(mut cleared)
         expect cleared.bytes.view() == b"\x05clear\x00"
-        let Ok(none) = attempt await served(inbox, call: cleared, handles: cleared.handles.view(), alloc) else {
+        let Ok(Some(none)) = attempt await served(inbox, call: cleared, handles: cleared.handles.view(), alloc) else {
             expect false
             return
         }
@@ -2130,6 +2133,97 @@ test calls_are_served_from_their_encodings for Wire.serve {
     })
     expect last.total == 0
 } calls_are_served_from_their_encodings
+
+protocol Awaited {
+    pub fn read() -> u64 limits traceless
+    pub fn arrive(value: u64) limits traceless
+} Awaited
+
+/// A component postponing each read until a value arrives, which answers every read it
+/// postponed, and counting the reads it answered at once.
+struct Waiter derives Encode {
+    reads: mem::List[u64]
+    prompt: u64
+} Waiter
+
+impl Waiter: Component[RelayEnv, Awaited]
+
+fn Waiter.start(mut env: RelayEnv) -> Waiter = Waiter(reads: mem::List.empty(env.alloc), prompt: 0)
+
+fn Waiter.read(mut self, mut env: RelayEnv, mut cx: Cx[Awaited]) -> u64 {
+    let Some(request) = mut cx.postpone() else {
+        self.prompt += 1
+        return 7
+    }
+    if mut cx.postpone() == Some(request) {
+        mut self.reads.push(request)
+    }
+    return 0
+} Waiter.read
+
+fn Waiter.arrive(mut self, take value: u64, mut env: RelayEnv, mut cx: Cx[Awaited]) {
+    let one_way = mut cx.postpone()
+    if one_way.is_some() {
+        return
+    }
+    for request in self.reads {
+        var reply = Encoded.empty(env.alloc)
+        let answer: Result[u64, Never] = Ok(value)
+        mem::wire::Codec[Result[u64, Never]].encode(answer, out: mut reply.bytes)
+        discard attempt mut cx.reply(request, reply)
+    }
+    mut self.reads.truncate(0)
+} Waiter.arrive
+
+test postponed_requests_are_answered_by_number for Cx.postpone {
+    let world = testing::world()
+    let alloc = world.alloc
+    let minter = boards(mem::Map[u64, Held].empty(alloc), alloc)
+    defer take minter.close()
+    let counter = minter.mint(0)
+    var stepper = try Stepper[Waiter, RelayEnv, Awaited].start(RelayEnv(alloc: alloc), exec: world.exec, alloc)
+    defer take stepper.abandon()
+    let Ok(runner) = attempt Runner.served(minter.mint(0)) else {
+        expect false
+        return
+    }
+    mut stepper.attach(runner)
+    let inbox = stepper.outbox()
+    var numbered_reply: Option[Result[Option[Encoded], CallError[Never]]] = None
+    var direct: Option[Result[u64, task::SendError]] = None
+    try await task::scope(world.exec, body: fn[mut stepper, mut numbered_reply, mut direct](s: task::Scope) fails task::Cancelled uses wait {
+        let numbered = s.spawn(fn() -> Result[Option[Encoded], CallError[Never]] fails task::Cancelled uses wait {
+            var call = Encoded.empty(alloc)
+            discard Wire[Awaited].read(mut call)
+            let peers = mem::List[ProtocolSchema].empty(alloc)
+            return attempt await Wire[Awaited].serve(inbox, request: 4, hash: Wire[Awaited].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc)
+        })
+        try await stepper.incoming()
+        discard mut stepper.step()
+        numbered_reply = Some(try await take numbered.join())
+        let posted = s.spawn(fn() -> Result[u64, task::SendError] fails task::Cancelled uses wait {
+            return attempt await inbox.read()
+        })
+        try await stepper.incoming()
+        discard mut stepper.step()
+        direct = Some(try await take posted.join())
+    })
+    let Some(Ok(None)) = numbered_reply else {
+        expect false
+        return
+    }
+    let Some(Ok(7)) = direct else {
+        expect false
+        return
+    }
+    let before = reach(counter, body: board_count)
+    mut stepper.deliver(Awaited.arrive(value: 9))
+    let after = reach(counter, body: board_count)
+    expect before == Some(0) and after == Some(4_000)
+    undefer stepper
+    let last = try await take stepper.end()
+    expect last.state.reads.len() == 0 and last.state.prompt == 1
+} postponed_requests_are_answered_by_number
 
 /// Whether a call keeping `clock` carries its handle, which the reply to it gives back.
 fn keeps_clock(clock: Clock, alloc: mem::Alloc) -> bool {
@@ -2162,7 +2256,7 @@ test handles_travel_beside_their_encodings for Reply.decode {
             expect false
             return
         }
-        let Ok(answer) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
+        let Ok(Some(answer)) = attempt await served(inbox, call, handles: call.handles.view(), alloc) else {
             expect false
             return
         }

@@ -1,6 +1,6 @@
 # 0155. Releases walking types that hold each other
 
-Status: accepted
+Status: superseded by 0161
 
 ## Context
 

@@ -7,7 +7,7 @@
 //! list, set, map or hash map it holds, inline, of a group type. Entering a frame releases its
 //! other parts and frees the storage of its empty vectors. The frame then enters, in turn, what
 //! each holder still holds, a vector's last element first, after storing in the holder the
-//! **link** naming the frame's own parent: its address in the low 48 bits, its type's index in
+//! **link** naming the frame's own parent: its address in the low 49 bits, its type's index in
 //! the group above. Once a frame holds nothing more, its parent finds the first holder still
 //! holding something, which is the one it entered the frame from, reads the link back from it,
 //! takes the frame out, freeing a box's or shared value's storage or a vector's once empty, and
@@ -33,7 +33,7 @@ use crate::check::ty::Ty;
 const DONE: i64 = 1;
 
 /// The bits of a link holding the frame's address.
-const ADDRESS_BITS: i64 = 48;
+const ADDRESS_BITS: i64 = 49;
 
 /// How a holder holds values of a group type.
 enum Holder {

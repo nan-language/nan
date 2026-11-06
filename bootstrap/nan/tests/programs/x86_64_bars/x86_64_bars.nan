@@ -1,0 +1,78 @@
+//! Leaves the firmware, then maps the common configuration of each modern virtio function through its BAR and reads whether the device offers virtio 1.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The common configuration of a modern virtio device, which QEMU's devices lay out at the
+/// start of BAR 4, and the feature bit, in the second feature word, of virtio 1.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+} Common
+
+const COMMON_BAR: u8 = 4
+
+const VERSION_1: u32 = 1
+
+/// The vendor id of virtio devices and the first device id of a modern one.
+const VIRTIO_VENDOR: u32 = 0x1AF4
+
+const MODERN: u32 = 0x1040
+
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take m: boot::Machine) -> Never limits stack 32_768 {
+    var k = take m.exit_services()
+    let alloc = k.alloc()
+    let functions = mut k.pci_functions()
+    for function in take functions {
+        var mapped = function
+        let ids = mapped.config_read(0)
+        if (ids & 0xFFFF) == VIRTIO_VENDOR and (ids >> 16) >= MODERN {
+            var line = mem::Bytes.empty(alloc)
+            mut line.append(b"virtio device ")
+            hex(mut line, value: ids >> 16)
+            match attempt hw::Mmio[Common].of_bar(mut mapped, index: COMMON_BAR) {
+                Ok(common) => offered(take common, mut line)
+                Err(hw::PciError.NotMemory) => mut line.append(b": not memory\n")
+                Err(hw::PciError.TooSmall) => mut line.append(b": too small\n")
+                Err(hw::PciError.Taken) => mut line.append(b": taken\n")
+                Err(hw::PciError.Unmapped) => mut line.append(b": unmapped\n")
+            }
+            say(line.view())
+        }
+        take mapped.release()
+    }
+    take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 16_384 {
+        say(b"anchored\n")
+    })
+} main
+
+/// Appends whether the device the window reaches offers virtio 1, the window then unmapped.
+fn offered(take common: hw::Mmio[Common], mut line: mem::Bytes) {
+    var regs = common
+    mut regs.write(Common.device_feature_select, value: 1)
+    let offers = (mut regs.read(Common.device_feature) & VERSION_1) != 0
+    take regs.unmap()
+    if offers {
+        mut line.append(b": virtio 1 through its BAR\n")
+    } else {
+        mut line.append(b": no virtio 1 through its BAR\n")
+    }
+} offered
+
+/// Appends a device id in four hexadecimal digits.
+fn hex(mut line: mem::Bytes, value: u32) {
+    var shift: u32 = 16
+    while shift > 0 {
+        shift -= 4
+        mut line.push(b"0123456789abcdef"[usize.widen((value >> shift) & 0xF)])
+    }
+} hex

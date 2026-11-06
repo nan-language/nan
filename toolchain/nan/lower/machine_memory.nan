@@ -1,10 +1,10 @@
-//! The physical memory of a machine image: the usable memory its platform lists, the boot area, which holds the boot heap and then the runtime tables `Init` sets up, and the tables extending the entry root over usable memory above 4 GiB. A bare target carves the boot area, with those tables at its end, from usable memory as it starts; a UEFI target's image reserves the boot area, and `exit_services` carves the tables alone.
+//! The physical memory of a machine image: the usable memory its platform lists, the boot area, which holds the boot heap and then the runtime tables `Init` sets up, the memory types of the entry root, and the tables extending it over usable memory above 4 GiB. A bare target carves the boot area, with those tables at its end, from usable memory as it starts; a UEFI target's image reserves the boot area, and `exit_services` carves the tables alone.
 
 /// The bytes of the boot area: the boot heap, then the runtime tables, to a whole page.
 const BOOT_AREA: u64 = next_multiple_of(BOOT_HEAP + RUNTIME_SYSTEM_TABLE_BYTES, multiple: PAGE_TABLE)
 
 /// The bytes of a page table, the bytes an entry of its upper tables maps, a gigabyte, and the
-/// bytes an AArch64 level-2 block maps.
+/// bytes a 2 MiB page or an AArch64 level-2 block maps.
 const PAGE_TABLE: u64 = 4_096
 
 const ONE_GIGABYTE: u64 = 1 << 30
@@ -20,9 +20,9 @@ const LOW_MEMORY: i64 = 0x10_0000
 
 /// The entries of a UEFI memory map: in a descriptor the offsets of its type, physical start and
 /// page count; the types of conventional memory and of boot services' code and data, which
-/// `exit_services` frees; and the types of memory the AArch64 entry root maps as normal memory:
-/// the loader's code and data, boot and runtime services' code and data, conventional memory,
-/// ACPI reclaimable memory, ACPI NVS and persistent memory.
+/// `exit_services` frees; and the types of memory the entry root maps cached: the loader's code
+/// and data, boot and runtime services' code and data, conventional memory, ACPI reclaimable
+/// memory, ACPI NVS and persistent memory.
 const FIRMWARE_MAP_KIND: u64 = 0
 
 const FIRMWARE_MAP_BASE: u64 = 8
@@ -128,10 +128,11 @@ fn Lowering.entry_tables_extent(mut self, mut fx: Fx) -> Extent {
 } Lowering.entry_tables_extent
 
 /// The boot area with the entry root's tables at its end, carved outside the image, its runtime
-/// tables zero-filled; `Init` returns 1 when no usable memory holds it. On x86_64 it extends the
-/// entry root, which the entry seam installed; on AArch64 it fills the entry root, drops any cache
-/// line holding the tables it wrote through the boot root's device mapping, and installs it in
-/// place of the boot root before filling the runtime tables.
+/// tables zero-filled; `Init` returns 1 when no usable memory holds it. On x86_64 it sets the
+/// memory types of the entry root, which the entry seam installed, and extends it, then installs
+/// it again to drop the translations cached from the types it replaced; on AArch64 it fills the
+/// entry root, drops any cache line holding the tables it wrote through the boot root's device
+/// mapping, and installs it in place of the boot root before filling the runtime tables.
 fn Lowering.carve_boot_area(mut self, mut fx: Fx) -> clif::Value {
     let extension = mut self.root_extension(mut fx)
     let image = mut self.image_extent(mut fx)
@@ -153,12 +154,16 @@ fn Lowering.carve_boot_area(mut self, mut fx: Fx) -> clif::Value {
         heap_clear(mut self, mut fx, base: tables, len)
         let root_tables = mut fx.offset(area, offset: BOOT_AREA)
         mut self.write_root_extension(mut fx, extension, tables: root_tables)
+        let root_data = mut self.entry_root()
+        let root = mut self.data_address(mut fx, id: root_data)
+        discard mut self.call_stub(mut fx, stub: Stub.WriteCr3, args: Array[clif::Value, 1].filled(root).view())
     }
     return area
 } Lowering.carve_boot_area
 
-/// `exit_services`'s extension of the entry root before installing it, with its tables carved
-/// from usable memory outside the image, trapping (`trap.exhausted`) when none holds them.
+/// `exit_services`'s memory types and extension of the entry root before installing it, with its
+/// tables carved from usable memory outside the image, trapping (`trap.exhausted`) when none
+/// holds them.
 fn Lowering.extend_entry_root(mut self, mut fx: Fx) {
     let extension = mut self.root_extension(mut fx)
     let image = mut self.image_extent(mut fx)
@@ -253,11 +258,11 @@ fn raise_top(mut fx: Fx, top: clif::Variable, base: clif::Value, end: clif::Valu
 } raise_top
 
 /// Writes the entry root's tables at `tables`, zero-filled first, whose extent it records in the
-/// runtime state. On x86_64 it extends the root in place over the gigabytes past the first 4 that
-/// `extension` maps: each gets an entry in its upper table, the root's own for the first 512 GiB,
-/// a 1 GiB page or, when the CPU maps none, a page directory of 2 MiB pages, the directories
-/// following the upper tables. On AArch64 it fills the root, its level-2 tables following the
-/// upper tables.
+/// runtime state. On x86_64 it sets the memory types of the root's own tables and extends the
+/// root in place over the gigabytes past the first 4 that `extension` maps: each gets an entry in
+/// its upper table, the root's own for the first 512 GiB, a 1 GiB page or, when the CPU maps none,
+/// a page directory of 2 MiB pages, the directories following the upper tables. On AArch64 it
+/// fills the root, its level-2 tables following the upper tables.
 fn Lowering.write_root_extension(mut self, mut fx: Fx, extension: RootExtension, tables: clif::Value) {
     let state_address = mut self.state(mut fx)
     mut fx.store(tables, addr: state_address, offset: STATE_ENTRY_TABLES)
@@ -273,6 +278,7 @@ fn Lowering.write_root_extension(mut self, mut fx: Fx, extension: RootExtension,
         mut self.write_aarch64_root(mut fx, extension, root, own, tables, leaves: directories)
         return
     }
+    mut self.write_memory_types(mut fx, root)
     let link = MACHINE_WRITABLE | MACHINE_PRESENT
     let block = MACHINE_LARGE | MACHINE_WRITABLE | MACHINE_PRESENT
     let start = mut fx.ptr(MACHINE_MAPPED / ONE_GIGABYTE)
@@ -318,6 +324,36 @@ fn Lowering.write_root_extension(mut self, mut fx: Fx, extension: RootExtension,
         mut fx1.store(entry, addr: entry_slot, offset: 0)
     })
 } Lowering.write_root_extension
+
+/// Sets the memory types of the 2 MiB pages of the first 4 GiB in the x86_64 entry root at `root`,
+/// whose page directories follow its top-level and page-directory-pointer tables: each page that
+/// holds memory `mapped_memory` visits cached, every other uncached.
+fn Lowering.write_memory_types(mut self, mut fx: Fx, root: clif::Value) {
+    let directories = mut fx.offset(root, offset: 2 * PAGE_TABLE)
+    let page = MACHINE_LARGE | MACHINE_WRITABLE | MACHINE_PRESENT
+    let pages = mut fx.ptr(MACHINE_MAPPED / LEVEL_2_BLOCK)
+    let zero_value = mut fx.ptr(0)
+    write_pages(mut fx, directories, start: zero_value, end: pages, bits: page | UNCACHED)
+    mut self.mapped_memory(mut fx, visit: fn(mut lo1: Lowering, mut fx1: Fx, base: clif::Value, end: clif::Value) {
+        let starting = mut fx1.b.ushr_imm_s(base, y: 21)
+        let bumped = mut fx1.b.iadd_imm_s(end, y: i64.fit(LEVEL_2_BLOCK) - 1)
+        let rounded = mut fx1.b.ushr_imm_s(bumped, y: 21)
+        let last = mut fx1.b.umin(rounded, y: pages)
+        write_pages(mut fx1, directories, start: starting, end: last, bits: page)
+    })
+} Lowering.write_memory_types
+
+/// Writes the entries of the 2 MiB pages from `start` to before `end` in the page directories at
+/// `directories`, each with `bits`.
+fn write_pages(mut fx: Fx, directories: clif::Value, start: clif::Value, end: clif::Value, bits: u64) {
+    mut fx.each(start, end, body: fn(mut fx1: Fx, index: clif::Value) {
+        let at = mut fx1.b.ishl_imm_s(index, y: 21)
+        let entry = mut fx1.b.bor_imm_s(at, y: i64.fit(bits))
+        let slot_offset = mut fx1.b.ishl_imm_s(index, y: 3)
+        let slot = mut fx1.b.iadd(directories, y: slot_offset)
+        mut fx1.store(entry, addr: slot, offset: 0)
+    })
+} write_pages
 
 /// Fills the AArch64 entry root, its level-0 table at `root` and level-1 table at `own`, with the
 /// upper tables of `extension` at `tables` and its level-2 tables at `leaves`, a table per
@@ -398,25 +434,27 @@ fn Lowering.usable_memory(mut self, mut fx: Fx, held: Slice[Extent], visit: fn(m
     mut self.listed_memory(mut fx, listed: Listed.Usable, held, visit)
 } Lowering.usable_memory
 
-/// Visits the memory the AArch64 entry root maps as normal memory, whole: the ranges of the
-/// device tree's memory nodes, or the usable, ACPI reclaimable and ACPI NVS entries of the start
-/// information's memory map with the start information, what it holds and the device tree, or
-/// the entries of the firmware's final memory map that are neither reserved, unusable nor
-/// memory-mapped I/O; and the image.
+/// Visits the memory the entry root maps cached, as normal memory on AArch64, whole: the ranges
+/// of the device tree's memory nodes, or the usable, ACPI reclaimable and ACPI NVS entries of the
+/// start information's memory map with the start information, what it holds and on
+/// `aarch64-bare` the device tree, or the entries of the firmware's final memory map that are
+/// neither reserved, unusable nor memory-mapped I/O; and the image.
 fn Lowering.mapped_memory(mut self, mut fx: Fx, visit: fn(mut lo: Lowering, mut fx: Fx, base: clif::Value, end: clif::Value)) {
     mut self.listed_memory(mut fx, listed: Listed.Mapped, held: mem::List[Extent].empty(self.alloc).view(), visit)
-    if self.ck.db().target == workspace::Target.Aarch64Bare {
+    if self.ck.db().target.kind() == Some(workspace::Kind.Bare) {
         let info = mut self.start_info(mut fx)
         let given = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: info, y: 0)
         mut fx.if_true(given, then: fn[mut self](mut fx1: Fx) {
             start_ranges(mut self, fx: mut fx1, start: info, visit)
-            let state_address = mut self.state(mut fx1)
-            let tree = mut fx1.load(PTR, addr: state_address, offset: STATE_PLATFORM)
-            let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: tree, y: 0)
-            mut fx1.if_true(present, then: fn[mut self](mut fx2: Fx) {
-                let end = tree_address(mut fx2, tree, field: DEVICE_TREE_SIZE)
-                visit(mut self, fx: mut fx2, base: tree, end: end)
-            })
+            if self.ck.db().target == workspace::Target.Aarch64Bare {
+                let state_address = mut self.state(mut fx1)
+                let tree = mut fx1.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+                let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: tree, y: 0)
+                mut fx1.if_true(present, then: fn[mut self](mut fx2: Fx) {
+                    let end = tree_address(mut fx2, tree, field: DEVICE_TREE_SIZE)
+                    visit(mut self, fx: mut fx2, base: tree, end: end)
+                })
+            }
         })
     }
     let image = mut self.image_extent(mut fx)
@@ -486,7 +524,7 @@ fn Lowering.listed_memory(mut self, mut fx: Fx, listed: Listed, held: Slice[Exte
 } Lowering.listed_memory
 
 /// Which memory a walk of the platform's memory visits: the usable memory outside the ranges it
-/// holds, or the memory the AArch64 entry root maps as normal memory.
+/// holds, or the memory the entry root maps cached.
 enum Listed derives Copy {
     Usable
     Mapped
@@ -531,7 +569,7 @@ fn start_memory(mut lo: Lowering, mut fx: Fx, start: clif::Value, listed: Listed
     })
 } start_memory
 
-/// Whether a start information's memory type is one the AArch64 entry root maps as normal memory.
+/// Whether a start information's memory type is one the entry root maps cached.
 fn mapped_start_kind(mut fx: Fx, kind: clif::Value) -> clif::Value {
     var any = mut fx.int(clif::Type.Int8, value: 0)
     for mapped_kind in START_MAP_MAPPED {

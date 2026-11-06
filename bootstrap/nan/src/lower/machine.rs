@@ -80,10 +80,10 @@ pub const MAPPED: u64 = 1 << 32;
 pub const PRESENT: u64 = 0x1;
 pub const WRITABLE: u64 = 0x2;
 pub const LARGE: u64 = 0x80;
-const UNCACHED: u64 = 0x18;
+pub const UNCACHED: u64 = 0x18;
 
-/// The bytes a 2 MiB page maps, and the first address the entry root maps uncached: the last
-/// gigabyte below 4 GiB, where the memory-mapped devices lie.
+/// The bytes a 2 MiB page maps, and the first address the image's tables map uncached until the
+/// runtime sets their memory types: the last gigabyte below 4 GiB.
 const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 const DEVICES: u64 = 3 << 30;
 

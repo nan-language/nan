@@ -9958,6 +9958,9 @@ const TEXT_HW_IOMMU: Str =
     \\/// Whether the image runs on AArch64.
     \\pkg fn on_aarch64() -> bool
     \\
+    \\/// The address of the entry root's top-level table.
+    \\pkg fn entry_root() -> u64
+    \\
     \\/// What `boot::Kernel.iommu` enables: the machine's IOMMU, with interrupt remapping on VT-d.
     \\pkg fn started() -> Option[Iommu] {
     \\    if on_aarch64() {
@@ -10572,15 +10575,29 @@ const TEXT_HW_PCI: Str =
     \\
     \\const MSIX_MASKED: u32 = 0x4000_0000
     \\
-    \\/// The configuration space of a bus in an ECAM, and the memory the entry root maps as device
-    \\/// memory: the last gigabyte below 4 GiB on x86_64, the first gigabyte on AArch64.
+    \\/// The configuration space of a bus in an ECAM.
     \\const BUS_BYTES: u64 = 0x10_0000
     \\
-    \\const X86_DEVICES: u64 = 0xC000_0000
+    \\/// The entry root's tables: the bytes of a 2 MiB page or block, the memory the root maps at its
+    \\/// physical addresses, below 128 TiB, and an entry's address bits; the bits of an entry that is
+    \\/// present, of an x86_64 one that maps a page and of an AArch64 one that names a table; the bits
+    \\/// of an x86_64 page making it uncached, and those of an AArch64 block's memory attribute index,
+    \\/// which is zero for device memory.
+    \\const ROOT_PAGE: u64 = 0x20_0000
     \\
-    \\const X86_DEVICES_END: u64 = 0x1_0000_0000
+    \\const ROOT_REACHABLE: u64 = 0x8000_0000_0000
     \\
-    \\const AARCH64_DEVICES_END: u64 = 0x4000_0000
+    \\const ROOT_ADDRESS: u64 = 0x000F_FFFF_FFFF_F000
+    \\
+    \\const ROOT_PRESENT: u64 = 0x1
+    \\
+    \\const ROOT_X86_PAGE: u64 = 0x80
+    \\
+    \\const ROOT_AARCH64_TABLE: u64 = 0x2
+    \\
+    \\const ROOT_X86_UNCACHED: u64 = 0x18
+    \\
+    \\const ROOT_AARCH64_ATTRIBUTES: u64 = 0x1C
     \\
     \\/// The bus address window of 32-bit memory a device tree's `ranges` names, by the space code of
     \\/// its first cell, and an entry's bytes.
@@ -10753,7 +10770,7 @@ const TEXT_HW_PCI: Str =
     \\            return functions
     \\        }
     \\        ecam = u64_be_at(node.reg)
-    \\        if ecam + BUS_BYTES > AARCH64_DEVICES_END {
+    \\        if not device_memory(base: ecam, size: BUS_BYTES) {
     \\            return functions
     \\        }
     \\        window = memory_window(node)
@@ -10914,16 +10931,43 @@ const TEXT_HW_PCI: Str =
     \\    return aligned + size
     \\} assign_bar
     \\
-    \\/// Whether the entry root maps a range as device memory.
+    \\/// Whether the entry root maps a range uncached, as device memory on AArch64.
     \\fn device_memory(base: u64, size: u64) -> bool {
     \\    let Some(end) = base.checked_add(size) else {
     \\        return false
     \\    }
-    \\    if on_aarch64() {
-    \\        return end <= AARCH64_DEVICES_END
+    \\    if end > ROOT_REACHABLE {
+    \\        return false
     \\    }
-    \\    return base >= X86_DEVICES and end <= X86_DEVICES_END
+    \\    var page = base & ~(ROOT_PAGE - 1)
+    \\    while page < end {
+    \\        if not device_page(page) {
+    \\            return false
+    \\        }
+    \\        page += ROOT_PAGE
+    \\    }
+    \\    return true
     \\} device_memory
+    \\
+    \\/// Whether the entry root maps the 2 MiB page or block at an address uncached, walking its
+    \\/// tables from the top-level one down to the entry mapping it.
+    \\fn device_page(address: u64) -> bool {
+    \\    var table = entry_root()
+    \\    for level in 0u32..<3 {
+    \\        let entry = peek(table + ((address >> (39 - 9 * level)) & 0x1FF) * 8)
+    \\        if (entry & ROOT_PRESENT) == 0 {
+    \\            return false
+    \\        }
+    \\        if level > 0 and on_aarch64() and (entry & ROOT_AARCH64_TABLE) == 0 {
+    \\            return (entry & ROOT_AARCH64_ATTRIBUTES) == 0
+    \\        }
+    \\        if level > 0 and not on_aarch64() and (entry & ROOT_X86_PAGE) != 0 {
+    \\            return (entry & ROOT_X86_UNCACHED) == ROOT_X86_UNCACHED
+    \\        }
+    \\        table = entry & ROOT_ADDRESS
+    \\    }
+    \\    return false
+    \\} device_page
     \\
     \\/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function is not
     \\/// attached, has no such entry or its table lies outside device memory.

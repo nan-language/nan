@@ -834,7 +834,7 @@ pub flexible enum Mode derives Encode { // error: encode.flexible
 
 ## Schema hashes
 
-The **schema tree** of a type implementing `Encode` is the `mem::wire::Schema` describing its encoded structure, and its **schema hash** is the [hash](29-identity-versioning.md#hash-values) of the tree's `mem::wire` encoding.
+The **schema tree** of a type implementing `Encode` is the `mem::wire::Schema` describing its encoded structure, and its **schema hash** is the [hash](29-identity-versioning.md#hash-values) of the tree's `mem::wire` encoding. A tree lists its nodes in `nodes`, each naming its children by their positions there.
 
 ```nan-api
 // module: mem::wire
@@ -843,7 +843,11 @@ pub closed struct SchemaHash derives Copy, Eq, Ord, Hash, Encode {
     pub bytes: Array[u8, 33]
 } SchemaHash
 
-pub closed enum Schema derives Encode {
+pub closed struct Schema derives Encode {
+    pub nodes: mem::List[SchemaNode]
+} Schema
+
+pub closed enum SchemaNode derives Encode {
     Bool
     Char
     Text
@@ -852,24 +856,24 @@ pub closed enum Schema derives Encode {
     Signed(width: u8)
     Float(width: u8)
     BoundedText(capacity: u64)
-    Sequence(element: mem::Box[Schema], length: Option[u64], capacity: Option[u64], unique: bool)
-    Map(key: mem::Box[Schema], value: mem::Box[Schema])
+    Sequence(element: usize, length: Option[u64], capacity: Option[u64], unique: bool)
+    Map(key: usize, value: usize)
     Record(open: bool, fields: mem::List[SchemaField])
     Variant(open: bool, variants: mem::List[SchemaVariant])
     Back(depth: u64)
-} Schema
+} SchemaNode
 
 pub closed struct SchemaField derives Encode {
     pub key: text::String
     pub aliases: mem::List[text::String]
     pub defaulted: bool
-    pub value: Schema
+    pub value: usize
 } SchemaField
 
 pub closed struct SchemaVariant derives Encode {
     pub key: text::String
     pub aliases: mem::List[text::String]
-    pub payload: Option[Schema]
+    pub payload: Option[usize]
 } SchemaVariant
 
 pub fn Codec.schema_hash() -> SchemaHash limits pure, notrap, terminates
@@ -888,7 +892,8 @@ pub fn Codec.schema(alloc: mem::Alloc) -> Schema
 | `Variant` | enums, `Option`, `Result` |
 | `Back` | recursion |
 
-- A `Record` or `Variant` node is `open` when its type is declared `open`. Its fields, one per field of the struct or label of the payload, and its variants, one per variant of the enum, appear in ascending byte order of keys, each with the aliases of its key in byte order. A field is `defaulted` when it takes a default when missing; a variant's `payload` is the node of its payload.
+- A `Record` or `Variant` node is `open` when its type is declared `open`. Its fields, one per field of the struct or label of the payload, and its variants, one per variant of the enum, appear in ascending byte order of keys, each with the aliases of its key in byte order. A field is `defaulted` when it takes a default when missing; a field's `value` is the node of its value and a variant's `payload` the node of its payload.
+- The children of a node are the `element` of a `Sequence` node, the `key` and `value` of a `Map` node, the values of a `Record` node's fields and the payloads of a `Variant` node's variants, in that order. `nodes` holds the root first, each node followed by the nodes under each of its children in turn.
 - `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
 - Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
 - `schema_hash` gives the schema hash of `T`, and `schema` its schema tree drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`).
@@ -905,10 +910,11 @@ pub fn hop_width(alloc: mem::Alloc) -> u8
     example hop_width(testing::world().alloc) == 8
     example PROBE_SCHEMA != mem::wire::Codec[u32].schema_hash()
 {
-    let mem::wire::Schema.Record(open: _, fields: fields) = mem::wire::Codec[Probe].schema(alloc) else {
+    let tree = mem::wire::Codec[Probe].schema(alloc)
+    let mem::wire::SchemaNode.Record(open: _, fields: fields) = tree.nodes[0] else {
         return 0
     }
-    let mem::wire::Schema.Unsigned(width: width) = fields[0].value else {
+    let mem::wire::SchemaNode.Unsigned(width: width) = tree.nodes[fields[0].value] else {
         return 0
     }
     return width
@@ -1064,8 +1070,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "ahp37ganadyzqu6xs3ebh5st5xa5x4g56uumirr2tiglvgkifvyyi43"
-check "afih66hobkrodcs6u7hsifjemt3242epjbzeciviyckgq7j5stdv2x5"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
+check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.

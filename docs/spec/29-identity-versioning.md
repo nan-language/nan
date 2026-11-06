@@ -371,16 +371,16 @@ The **encode class** of a release is the worst class of the exported types imple
 - `Unsigned`, `Signed` and `Float` nodes have equal widths, a `BoundedText` node has a capacity at least O's, and a `Back` node has O's depth;
 - a `Sequence` node accepts O's element, has O's length, has no capacity or one at least O's, and is unique only when O is;
 - a `Map` node accepts O's key and value;
-- in a `Record` node, a field of N whose key or aliases include the key of a field of O has a value accepting that field's; a field of O that no field of N matches exists only when N is open; and a field of N matching no field of O is defaulted;
-- in a `Variant` node, each variant of O is matched by a variant of N whose key or aliases include its key, without a payload when O's has none and with a payload accepting O's otherwise;
+- in a `Record` node, the first field of N whose key or aliases include the key of a field of O has a value accepting that field's; a field of O that no field of N matches exists only when N is open; and a field of N matching no field of O is defaulted;
+- in a `Variant` node, each variant of O is matched by a first variant of N whose key or aliases include its key, without a payload when O's has none and with a payload accepting O's otherwise;
 - nodes of the other kinds always.
 
-`mem::wire::Schema.accepts` decides it, so code holding two trees, such as those of [code roots](30-artefacts.md#code-roots), compares them without the toolchain.
+`new.accepts(old, alloc)` decides it, so code holding two trees, such as those of [code roots](30-artefacts.md#code-roots), compares them without the toolchain. It draws the pairs of nodes left to compare through `alloc`, trapping when memory is exhausted (`trap.exhausted`), and is false when the `nodes` of either tree are empty or hold a node after the first that is not the child of exactly one node before it.
 
 ```nan-api
 // module: mem::wire
 
-pub fn Schema.accepts(self, old: Schema) -> bool
+pub fn Schema.accepts(self, old: Schema, alloc: mem::Alloc) -> bool
 ```
 
 ```nan
@@ -397,7 +397,7 @@ pub fn reads_settings(alloc: mem::Alloc) -> bool
     example reads_settings(testing::world().alloc)
 {
     let config = mem::wire::Codec[Config].schema(alloc)
-    return config.accepts(mem::wire::Codec[Settings].schema(alloc))
+    return config.accepts(mem::wire::Codec[Settings].schema(alloc), alloc)
 } reads_settings
 ```
 

@@ -1,5 +1,5 @@
 //! Schema trees: the description of a type's encoded structure, and the schema hash, the hash of
-//! the `mem::wire` encoding of a tree's root node.
+//! a tree's `mem::wire` encoding.
 
 use std::collections::BTreeMap;
 
@@ -61,7 +61,8 @@ pub struct Variant {
 impl Node {
     /// Whether this tree, a type's new one, accepts an old one: nodes of one kind whose parts
     /// accept the old parts, a record matching each old field by key or alias, keeping one only
-    /// when open and defaulting each new one, and a variant node matching each old variant.
+    /// when open and defaulting each new one, and a variant node matching each old variant, each
+    /// matched by the first variant whose key or aliases hold its key.
     pub fn accepts(&self, old: &Node) -> bool {
         match (self, old) {
             (Node::Unsigned(new), Node::Unsigned(old))
@@ -123,23 +124,33 @@ impl Node {
                     ..
                 },
             ) => old_variants.iter().all(|old| {
-                variants.iter().any(|variant| {
-                    let matched = variant.key == old.key || variant.aliases.contains(&old.key);
-                    matched
-                        && match (&variant.payload, &old.payload) {
-                            (None, None) => true,
-                            (Some(new), Some(old)) => new.accepts(old),
-                            _ => false,
-                        }
+                let matched = variants
+                    .iter()
+                    .find(|variant| variant.key == old.key || variant.aliases.contains(&old.key));
+                matched.is_some_and(|variant| match (&variant.payload, &old.payload) {
+                    (None, None) => true,
+                    (Some(new), Some(old)) => new.accepts(old),
+                    _ => false,
                 })
             }),
             (new, old) => std::mem::discriminant(new) == std::mem::discriminant(old),
         }
     }
 
-    /// The node's `mem::wire` encoding: a variant keyed by its name, with a record of its fields
-    /// as payload when it has fields.
+    /// The tree's `mem::wire` encoding as a `mem::wire::Schema`: its nodes in preorder, each
+    /// naming its children by position.
     pub fn wire(&self) -> Vec<u8> {
+        let mut nodes = Vec::new();
+        self.lay(&mut nodes);
+        record(vec![("nodes", sequence(nodes.into_iter()))])
+    }
+
+    /// Lays out this node's encoding and then its children's, its fields and variants in byte
+    /// order of keys, giving its position: a variant keyed by its name, with a record of its
+    /// fields as payload when it has fields.
+    fn lay(&self, nodes: &mut Vec<Vec<u8>>) -> u64 {
+        let at = nodes.len();
+        nodes.push(Vec::new());
         let (name, fields): (&str, Vec<(&str, Vec<u8>)>) = match self {
             Node::Bool => ("Bool", Vec::new()),
             Node::Char => ("Char", Vec::new()),
@@ -158,52 +169,73 @@ impl Node {
                 "Sequence",
                 vec![
                     ("capacity", option(capacity.map(unsigned))),
-                    ("element", element.wire()),
+                    ("element", unsigned(element.lay(nodes))),
                     ("length", option(length.map(unsigned))),
                     ("unique", vec![u8::from(*unique)]),
                 ],
             ),
-            Node::Map { key, value } => ("Map", vec![("key", key.wire()), ("value", value.wire())]),
+            Node::Map { key, value } => {
+                let key = unsigned(key.lay(nodes));
+                let value = unsigned(value.lay(nodes));
+                ("Map", vec![("key", key), ("value", value)])
+            }
             Node::Record { open, fields } => {
                 let mut sorted: Vec<&Field> = fields.iter().collect();
                 sorted.sort_by(|left, right| left.key.cmp(&right.key));
-                let fields = sequence(sorted.iter().map(|field| {
-                    record(vec![
-                        (
-                            "aliases",
-                            sequence(field.aliases.iter().map(|alias| text(alias))),
-                        ),
-                        ("defaulted", vec![u8::from(field.defaulted)]),
-                        ("key", text(&field.key)),
-                        ("value", field.value.wire()),
-                    ])
-                }));
+                let fields: Vec<Vec<u8>> = sorted
+                    .iter()
+                    .map(|field| {
+                        record(vec![
+                            (
+                                "aliases",
+                                sequence(field.aliases.iter().map(|alias| text(alias))),
+                            ),
+                            ("defaulted", vec![u8::from(field.defaulted)]),
+                            ("key", text(&field.key)),
+                            ("value", unsigned(field.value.lay(nodes))),
+                        ])
+                    })
+                    .collect();
                 (
                     "Record",
-                    vec![("fields", fields), ("open", vec![u8::from(*open)])],
+                    vec![
+                        ("fields", sequence(fields.into_iter())),
+                        ("open", vec![u8::from(*open)]),
+                    ],
                 )
             }
             Node::Variant { open, variants } => {
                 let mut sorted: Vec<&Variant> = variants.iter().collect();
                 sorted.sort_by(|left, right| left.key.cmp(&right.key));
-                let variants = sequence(sorted.iter().map(|variant| {
-                    record(vec![
-                        (
-                            "aliases",
-                            sequence(variant.aliases.iter().map(|alias| text(alias))),
-                        ),
-                        ("key", text(&variant.key)),
-                        ("payload", option(variant.payload.as_ref().map(Node::wire))),
-                    ])
-                }));
+                let variants: Vec<Vec<u8>> = sorted
+                    .iter()
+                    .map(|variant| {
+                        let payload = variant
+                            .payload
+                            .as_ref()
+                            .map(|payload| unsigned(payload.lay(nodes)));
+                        record(vec![
+                            (
+                                "aliases",
+                                sequence(variant.aliases.iter().map(|alias| text(alias))),
+                            ),
+                            ("key", text(&variant.key)),
+                            ("payload", option(payload)),
+                        ])
+                    })
+                    .collect();
                 (
                     "Variant",
-                    vec![("open", vec![u8::from(*open)]), ("variants", variants)],
+                    vec![
+                        ("open", vec![u8::from(*open)]),
+                        ("variants", sequence(variants.into_iter())),
+                    ],
                 )
             }
             Node::Back(depth) => ("Back", vec![("depth", unsigned(*depth))]),
         };
-        variant(name, (!fields.is_empty()).then(|| record(fields)))
+        nodes[at] = variant(name, (!fields.is_empty()).then(|| record(fields)));
+        at as u64
     }
 
     pub fn hash(&self) -> Hash {

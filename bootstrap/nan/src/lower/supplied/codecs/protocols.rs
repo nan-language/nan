@@ -373,7 +373,7 @@ fn serve(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 /// Whether P's protocol schema, drawn through `serve`'s allocator and then released, serves a call
 /// of the operation `name` under the hash and the peer schemas `serve` was given, as
-/// `sys::ProtocolSchema.serves_call` decides.
+/// `sys::ProtocolSchema.serves_call` decides through that allocator.
 fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, name: &str) -> Value {
     let ty = lo.std_ty("sys", "ProtocolSchema", Vec::new());
     let layout = lo.layout(&ty);
@@ -401,6 +401,7 @@ fn serves(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, protocol: ItemId, nam
         supply.param(1),
         supply.param(2),
         operation,
+        supply.param(5),
     ];
     let served = lo
         .invoke(fx, Invoked::Direct(id), &abi, &args)

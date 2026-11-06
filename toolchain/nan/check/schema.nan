@@ -100,21 +100,21 @@ fn Checker.schema_within(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::S
     let alloc = self.alloc()
     let types = self.types()
     match types.kind(ty) {
-        ty::TyKind.Scalar(scalar) => return schema_scalar_node(scalar)
-        ty::TyKind.Unit => return mem::wire::Schema.Record(open: false, fields: mem::List[mem::wire::SchemaField].empty(alloc))
+        ty::TyKind.Scalar(scalar) => return schema_leaf(schema_scalar_node(scalar), alloc)
+        ty::TyKind.Unit => return schema_record(open: false, members: mem::List[SchemaMember].empty(alloc), alloc)
         else => {}
     }
     let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
-        return mem::wire::Schema.Record(open: false, fields: mem::List[mem::wire::SchemaField].empty(alloc))
+        return schema_record(open: false, members: mem::List[SchemaMember].empty(alloc), alloc)
     }
     let held_args = types.arg_list(args)
     let path = self.db().canonical(item)
     match path.as_str() {
-        "text::String" => return mem::wire::Schema.Text
-        "mem::Bytes" => return mem::wire::Schema.Bytes
-        "text::Fixed" => return mem::wire::Schema.BoundedText(capacity: schema_arg_count(held_args, index: 0).value_or(0))
+        "text::String" => return schema_leaf(mem::wire::SchemaNode.Text, alloc)
+        "mem::Bytes" => return schema_leaf(mem::wire::SchemaNode.Bytes, alloc)
+        "text::Fixed" => return schema_leaf(mem::wire::SchemaNode.BoundedText(capacity: schema_arg_count(held_args, index: 0).value_or(0)), alloc)
         "mem::Box" or "mem::Shared" or "core::Untrusted" => return self.schema_within(schema_arg_ty(held_args, index: 0), walk: mut walk)
-        "mem::Id" => return mem::wire::Schema.Unsigned(width: 32)
+        "mem::Id" => return schema_leaf(mem::wire::SchemaNode.Unsigned(width: 32), alloc)
         "core::Array" or "mem::Bounded" or "mem::Set" or "mem::List" => {
             let element = self.schema_within(schema_arg_ty(held_args, index: 0), walk: mut walk)
             var length: Option[u64] = None
@@ -125,12 +125,12 @@ fn Checker.schema_within(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::S
             if path.as_str() == "mem::Bounded" {
                 capacity = schema_arg_count(held_args, index: 1)
             }
-            return mem::wire::Schema.Sequence(element: mem::Heap.of(alloc).boxed(take element), length: length, capacity: capacity, unique: path.as_str() == "mem::Set")
+            return schema_sequence(take element, length, capacity, unique: path.as_str() == "mem::Set", alloc)
         }
         "mem::Map" => {
             let key = self.schema_within(schema_arg_ty(held_args, index: 0), walk: mut walk)
             let value = self.schema_within(schema_arg_ty(held_args, index: 1), walk: mut walk)
-            return mem::wire::Schema.Map(key: mem::Heap.of(alloc).boxed(take key), value: mem::Heap.of(alloc).boxed(take value))
+            return schema_map(take key, take value, alloc)
         }
         else => {}
     }
@@ -142,7 +142,7 @@ fn Checker.schema_within(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::S
                 expect depth <= ~0u64 - made
                 depth += made
             }
-            return mem::wire::Schema.Back(depth: depth)
+            return schema_leaf(mem::wire::SchemaNode.Back(depth: depth), alloc)
         }
         None => {}
     }
@@ -167,9 +167,9 @@ fn Checker.schema_within(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::S
     let open = self.db().ast(item).is_open()
     mut walk.enclosing.push(SchemaEnclosing(ty: ty, made: 1))
     let node = match sig.contents().kind {
-        SigKind.Struct(fields: fields) => mem::wire::Schema.Record(open: open, fields: self.field_nodes(item, fields: fields.view(), subst, open, walk: mut walk))
-        SigKind.Enum(variants: variants) => mem::wire::Schema.Variant(open: open, variants: self.variant_nodes(item, variants: variants.view(), subst, walk: mut walk))
-        else => mem::wire::Schema.Record(open: open, fields: mem::List[mem::wire::SchemaField].empty(alloc))
+        SigKind.Struct(fields: fields) => schema_record(open, members: self.field_nodes(item, fields: fields.view(), subst, open, walk: mut walk), alloc)
+        SigKind.Enum(variants: variants) => schema_variant(open, alternatives: self.variant_nodes(item, variants: variants.view(), subst, walk: mut walk), alloc)
+        else => schema_record(open, members: mem::List[SchemaMember].empty(alloc), alloc)
     }
     discard mut walk.enclosing.pop()
     walk.outside = outside
@@ -177,22 +177,150 @@ fn Checker.schema_within(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::S
 } Checker.schema_within
 
 /// The node of a scalar type.
-fn schema_scalar_node(scalar: ty::Scalar) -> mem::wire::Schema {
+fn schema_scalar_node(scalar: ty::Scalar) -> mem::wire::SchemaNode {
     let width = u8.truncate(scalar.bits())
     if scalar == ty::Scalar.Bool {
-        return mem::wire::Schema.Bool
+        return mem::wire::SchemaNode.Bool
     }
     if scalar == ty::Scalar.Char {
-        return mem::wire::Schema.Char
+        return mem::wire::SchemaNode.Char
     }
     if scalar.is_float() {
-        return mem::wire::Schema.Float(width: width)
+        return mem::wire::SchemaNode.Float(width: width)
     }
     if scalar.is_signed() {
-        return mem::wire::Schema.Signed(width: width)
+        return mem::wire::SchemaNode.Signed(width: width)
     }
-    return mem::wire::Schema.Unsigned(width: width)
+    return mem::wire::SchemaNode.Unsigned(width: width)
 } schema_scalar_node
+
+/// A field of a record node with the tree of its value, which its position does not name yet.
+struct SchemaMember {
+    field: mem::wire::SchemaField
+    tree: mem::wire::Schema
+} SchemaMember
+
+/// A variant of a variant node with the tree of its payload, which its position does not name
+/// yet.
+struct SchemaAlternative {
+    variant: mem::wire::SchemaVariant
+    tree: Option[mem::wire::Schema]
+} SchemaAlternative
+
+/// A tree of one node.
+fn schema_leaf(take node: mem::wire::SchemaNode, alloc: mem::Alloc) -> mem::wire::Schema {
+    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    mut nodes.push(take node)
+    return mem::wire::Schema(nodes: take nodes)
+} schema_leaf
+
+/// The nodes of a tree holding a placeholder for its root, which its children's trees follow
+/// once grafted.
+fn schema_root(alloc: mem::Alloc) -> mem::List[mem::wire::SchemaNode] {
+    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    mut nodes.push(mem::wire::SchemaNode.Bool)
+    return nodes
+} schema_root
+
+/// A sequence node with its element's tree grafted after it.
+fn schema_sequence(take element: mem::wire::Schema, length: Option[u64], capacity: Option[u64], unique: bool, alloc: mem::Alloc) -> mem::wire::Schema {
+    var nodes = schema_root(alloc)
+    let at = schema_graft(mut nodes, tree: take element)
+    nodes[0] = mem::wire::SchemaNode.Sequence(element: at, length: length, capacity: capacity, unique: unique)
+    return mem::wire::Schema(nodes: take nodes)
+} schema_sequence
+
+/// A map node with its key's and its value's trees grafted after it.
+fn schema_map(take key: mem::wire::Schema, take value: mem::wire::Schema, alloc: mem::Alloc) -> mem::wire::Schema {
+    var nodes = schema_root(alloc)
+    let key_at = schema_graft(mut nodes, tree: take key)
+    let value_at = schema_graft(mut nodes, tree: take value)
+    nodes[0] = mem::wire::SchemaNode.Map(key: key_at, value: value_at)
+    return mem::wire::Schema(nodes: take nodes)
+} schema_map
+
+/// A record node with its fields' trees grafted after it in order.
+fn schema_record(open: bool, take members: mem::List[SchemaMember], alloc: mem::Alloc) -> mem::wire::Schema {
+    var nodes = schema_root(alloc)
+    var fields = mem::List[mem::wire::SchemaField].empty(alloc)
+    var members_left = take members.into_cursor()
+    loop {
+        let Some(member) = mut members_left.next() else {
+            break
+        }
+        let SchemaMember(field: field, tree: tree) = member
+        var placed = field
+        placed.value = schema_graft(mut nodes, tree: take tree)
+        mut fields.push(take placed)
+    }
+    nodes[0] = mem::wire::SchemaNode.Record(open: open, fields: take fields)
+    return mem::wire::Schema(nodes: take nodes)
+} schema_record
+
+/// A variant node with its payloads' trees grafted after it in order.
+fn schema_variant(open: bool, take alternatives: mem::List[SchemaAlternative], alloc: mem::Alloc) -> mem::wire::Schema {
+    var nodes = schema_root(alloc)
+    var variants = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    var alternatives_left = take alternatives.into_cursor()
+    loop {
+        let Some(alternative) = mut alternatives_left.next() else {
+            break
+        }
+        let SchemaAlternative(variant: variant, tree: tree) = alternative
+        var placed = variant
+        match tree {
+            Some(payload) => {
+                placed.payload = Some(schema_graft(mut nodes, tree: take payload))
+            }
+            None => {}
+        }
+        mut variants.push(take placed)
+    }
+    nodes[0] = mem::wire::SchemaNode.Variant(open: open, variants: take variants)
+    return mem::wire::Schema(nodes: take nodes)
+} schema_variant
+
+/// Appends a tree's nodes to `nodes`, each naming its children by their positions there, giving
+/// the position of the tree's root.
+fn schema_graft(mut nodes: mem::List[mem::wire::SchemaNode], take tree: mem::wire::Schema) -> usize {
+    let base = nodes.len()
+    let mem::wire::Schema(nodes: grafted) = tree
+    var grafted_left = take grafted.into_cursor()
+    loop {
+        let Some(node) = mut grafted_left.next() else {
+            return base
+        }
+        mut nodes.push(schema_shifted(take node, by: base))
+    }
+} schema_graft
+
+/// A node naming each of its children `by` positions further.
+fn schema_shifted(take node: mem::wire::SchemaNode, by: usize) -> mem::wire::SchemaNode {
+    match node {
+        mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: unique) => return mem::wire::SchemaNode.Sequence(element: element + by, length: length, capacity: capacity, unique: unique)
+        mem::wire::SchemaNode.Map(key: key, value: value) => return mem::wire::SchemaNode.Map(key: key + by, value: value + by)
+        mem::wire::SchemaNode.Record(open: open, fields: fields) => {
+            var shifted = fields
+            for field in mut shifted {
+                field.value += by
+            }
+            return mem::wire::SchemaNode.Record(open: open, fields: take shifted)
+        }
+        mem::wire::SchemaNode.Variant(open: open, variants: variants) => {
+            var shifted = variants
+            for variant in mut shifted {
+                match variant.payload {
+                    Some(payload) => {
+                        variant.payload = Some(payload + by)
+                    }
+                    None => {}
+                }
+            }
+            return mem::wire::SchemaNode.Variant(open: open, variants: take shifted)
+        }
+        else => return node
+    }
+} schema_shifted
 
 /// The type argument at an index, `Unit` without one.
 fn schema_arg_ty(args: Slice[ty::Arg], index: usize) -> ty::Ty {
@@ -217,9 +345,9 @@ fn schema_arg_count(args: Slice[ty::Arg], index: usize) -> Option[u64] {
 } schema_arg_count
 
 /// The fields of a struct's record node, in byte order of keys.
-fn Checker.field_nodes(self, item: ty::ItemId, fields: Slice[FieldSig], subst: ty::Subst, open: bool, mut walk: SchemaWalk) -> mem::List[mem::wire::SchemaField] {
+fn Checker.field_nodes(self, item: ty::ItemId, fields: Slice[FieldSig], subst: ty::Subst, open: bool, mut walk: SchemaWalk) -> mem::List[SchemaMember] {
     let alloc = self.alloc()
-    var nodes = mem::List[mem::wire::SchemaField].empty(alloc)
+    var nodes = mem::List[SchemaMember].empty(alloc)
     for field in fields {
         if field.is_kept() {
             continue
@@ -228,16 +356,16 @@ fn Checker.field_nodes(self, item: ty::ItemId, fields: Slice[FieldSig], subst: t
         let defaulted = open and self.implements_default(value_ty)
         let aliases = self.key_aliases_of(item, member: field.name.as_str())
         let value = self.nested(value_ty, walk: mut walk)
-        mut nodes.push(mem::wire::SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: take aliases, defaulted: defaulted, value: take value))
+        mut nodes.push(SchemaMember(field: mem::wire::SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: take aliases, defaulted: defaulted, value: 0), tree: take value))
     }
-    mut nodes.sort_by(fn(left: mem::wire::SchemaField, right: mem::wire::SchemaField) => left.key.as_str().cmp(right.key.as_str()))
+    mut nodes.sort_by(fn(left: SchemaMember, right: SchemaMember) => left.field.key.as_str().cmp(right.field.key.as_str()))
     return nodes
 } Checker.field_nodes
 
 /// The variants of an enum's variant node, in byte order of keys.
-fn Checker.variant_nodes(self, item: ty::ItemId, variants: Slice[VariantSig], subst: ty::Subst, mut walk: SchemaWalk) -> mem::List[mem::wire::SchemaVariant] {
+fn Checker.variant_nodes(self, item: ty::ItemId, variants: Slice[VariantSig], subst: ty::Subst, mut walk: SchemaWalk) -> mem::List[SchemaAlternative] {
     let alloc = self.alloc()
-    var nodes = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    var nodes = mem::List[SchemaAlternative].empty(alloc)
     for variant in variants {
         let aliases = self.key_aliases_of(item, member: variant.name.as_str())
         var payload: Option[mem::wire::Schema] = None
@@ -247,32 +375,32 @@ fn Checker.variant_nodes(self, item: ty::ItemId, variants: Slice[VariantSig], su
                 payload = Some(self.nested(subst.ty(self.types(), ty: payload_ty), walk: mut walk))
             }
             Payload.Labelled(labelled_fields) => {
-                payload = Some(mem::wire::Schema.Record(open: false, fields: self.labelled_nodes(labelled_fields.view(), subst, walk: mut walk)))
+                payload = Some(schema_record(open: false, members: self.labelled_nodes(labelled_fields.view(), subst, walk: mut walk), alloc))
             }
         }
-        mut nodes.push(mem::wire::SchemaVariant(key: text::String.of(variant.name.as_str(), alloc), aliases: take aliases, payload: take payload))
+        mut nodes.push(SchemaAlternative(variant: mem::wire::SchemaVariant(key: text::String.of(variant.name.as_str(), alloc), aliases: take aliases, payload: None), tree: take payload))
     }
-    mut nodes.sort_by(fn(left: mem::wire::SchemaVariant, right: mem::wire::SchemaVariant) => left.key.as_str().cmp(right.key.as_str()))
+    mut nodes.sort_by(fn(left: SchemaAlternative, right: SchemaAlternative) => left.variant.key.as_str().cmp(right.variant.key.as_str()))
     return nodes
 } Checker.variant_nodes
 
 /// The fields of a labelled payload's record node, in byte order of keys.
-fn Checker.labelled_nodes(self, fields: Slice[LabelledTy], subst: ty::Subst, mut walk: SchemaWalk) -> mem::List[mem::wire::SchemaField] {
+fn Checker.labelled_nodes(self, fields: Slice[LabelledTy], subst: ty::Subst, mut walk: SchemaWalk) -> mem::List[SchemaMember] {
     let alloc = self.alloc()
-    var nodes = mem::List[mem::wire::SchemaField].empty(alloc)
+    var nodes = mem::List[SchemaMember].empty(alloc)
     for field in fields {
         let value = self.nested(subst.ty(self.types(), ty: field.ty), walk: mut walk)
-        mut nodes.push(mem::wire::SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: mem::List[text::String].empty(alloc), defaulted: false, value: take value))
+        mut nodes.push(SchemaMember(field: mem::wire::SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: mem::List[text::String].empty(alloc), defaulted: false, value: 0), tree: take value))
     }
-    mut nodes.sort_by(fn(left: mem::wire::SchemaField, right: mem::wire::SchemaField) => left.key.as_str().cmp(right.key.as_str()))
+    mut nodes.sort_by(fn(left: SchemaMember, right: SchemaMember) => left.field.key.as_str().cmp(right.field.key.as_str()))
     return nodes
 } Checker.labelled_nodes
 
 /// The node of a constituent, counting the node made for each enclosing instantiation.
 fn Checker.nested(self, ty: ty::Ty, mut walk: SchemaWalk) -> mem::wire::Schema {
     let node = self.schema_within(ty, walk: mut walk)
-    let made = match node {
-        mem::wire::Schema.Record(open: _, fields: _) or mem::wire::Schema.Variant(open: _, variants: _) => true
+    let made = match node.nodes[0] {
+        mem::wire::SchemaNode.Record(open: _, fields: _) or mem::wire::SchemaNode.Variant(open: _, variants: _) => true
         else => false
     }
     let count = walk.enclosing.len()

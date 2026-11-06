@@ -24,10 +24,10 @@ struct Markers derives Copy {
     failure: Option[ast::Word[ast::FailureMarker]]
     awaited: Option[u32]
     mode: Option[ast::Word[ast::Mode]]
-    /// Whether a call further out of a projection chain takes `mut self` of this call's result.
-    chain_mut: bool
-    /// Whether the mode marks the root of the projection chain that is the receiver, which it
-    /// covers, rather than the receiver.
+    /// Whether the call is a link of a projection chain, whose root the chain checks once.
+    link: bool
+    /// Whether the receiver is a projection chain whose root the mode marks, which this call
+    /// checks once its own receiver mode is known.
     chained: bool
     /// The last token of the receiver a method call passes for `self`.
     receiver: Option[u32]
@@ -37,7 +37,7 @@ struct Markers derives Copy {
 } Markers
 
 /// No marker.
-fn Markers.none() -> Markers = Markers(failure: None, awaited: None, mode: None, chain_mut: false, chained: false, receiver: None, start: None, last: None)
+fn Markers.none() -> Markers = Markers(failure: None, awaited: None, mode: None, link: false, chained: false, receiver: None, start: None, last: None)
 
 /// A head being called with what is known of its generic arguments.
 struct Callable {
@@ -1619,30 +1619,13 @@ fn Body.method_call(
     expected: Option[ty::Ty],
     markers: Markers,
     ) -> TExpr {
-    var chained = false
-    match base.kind {
-        ast::ExprKind.Call(callee: callee, args: _) => {
-            if markers.mode.is_some() {
-                match callee.contents().kind {
-                    ast::ExprKind.Field(base: _, name: _) => {
-                        let construction = mut self.is_construction(callee.contents())
-                        chained = not construction
-                    }
-                    else => {}
-                }
-            }
-        }
-        else => {}
-    }
-    var chain = Markers.none()
-    chain.mode = markers.mode
-    chain.chain_mut = true
+    let chained = markers.mode.is_some() and mut self.is_chain(base)
     let mutable = match markers.mode {
         Some(word) => word.kind == ast::Mode.Mut
         None => false
     }
     let receiver = if chained {
-        mut self.call(base, expected: None, markers: Some(chain))
+        mut self.link(base, mode: markers.mode)
     } else if mutable {
         mut self.mut_operand(base, expected: None)
     } else {
@@ -1652,8 +1635,106 @@ fn Body.method_call(
         mut self.skim_args(args)
         return TExpr.failed(token)
     }
-    return mut self.method_on(token, take receiver, name, args, expected, markers)
+    var marks = markers
+    marks.chained = chained
+    let typed = mut self.method_on(token, take receiver, name, args, expected, markers: marks)
+    if chained and not markers.link {
+        self.check_chained_receiver(base, call: typed, marker: markers.mode)
+    }
+    return typed
 } Body.method_call
+
+/// The marking rule of the projection chain that is the receiver of a typed method call.
+fn Body.check_chained_receiver(self, base: ast::Expr, call: TExpr, marker: Option[ast::Word[ast::Mode]]) {
+    match first call.kind {
+        TKind.Call(held) if held.contents().args.len() > 0 => {
+            let receiver = held.contents().args[0]
+            self.check_chain(base, typed: receiver.expr.contents(), marker, takes_mut: receiver.mode == ast::Mode.Mut)
+        }
+        else => {}
+    }
+} Body.check_chained_receiver
+
+/// Whether an expression is a projection chain that a mode before it marks at its root: a
+/// method call, or a field or index of a chain.
+fn Body.is_chain(mut self, expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Field(base: base, name: _) or ast::ExprKind.Index(base: base, index: _) => mut self.is_chain(base.contents())
+        ast::ExprKind.Call(callee: callee, args: _) => match callee.contents().kind {
+            ast::ExprKind.Field(base: _, name: _) => not mut self.is_construction(callee.contents())
+            else => false
+        }
+        else => false
+    }
+} Body.is_chain
+
+/// A projection chain under `mode`: its calls typed as links, which leave the marking of its
+/// root to the chain, and an index writing through `at_mut` under `mut`.
+fn Body.link(mut self, chain: ast::Expr, mode: Option[ast::Word[ast::Mode]]) -> TExpr {
+    match chain.kind {
+        ast::ExprKind.Field(base: base, name: name) => {
+            let typed = mut self.link(base.contents(), mode)
+            return mut self.field_of(chain.token, base: take typed, name, read: true)
+        }
+        ast::ExprKind.Index(base: base, index: index) => {
+            let typed = mut self.link(base.contents(), mode)
+            let write = match mode {
+                Some(word) => word.kind == ast::Mode.Mut
+                None => false
+            }
+            return mut self.index_on(chain.token, base: base.contents(), base_typed: take typed, index: index.contents(), write)
+        }
+        else => {
+            var markers = Markers.none()
+            markers.mode = mode
+            markers.link = true
+            return mut self.call(chain, expected: None, markers: Some(markers))
+        }
+    }
+} Body.link
+
+/// The marking rule of a projection chain: the mode before it states the access to the place
+/// at its root, `mut` when `takes_mut` or a call of the chain takes `mut self`, and no marker
+/// otherwise.
+fn Body.check_chain(self, chain: ast::Expr, typed: TExpr, marker: Option[ast::Word[ast::Mode]], takes_mut: bool) {
+    if not typed.is_place() {
+        match chain.kind {
+            ast::ExprKind.Field(base: base, name: _) => match typed.kind {
+                TKind.Field(base: inner, name: _) => {
+                    self.check_chain(base.contents(), typed: inner.contents(), marker, takes_mut)
+                    return
+                }
+                else => {}
+            }
+            ast::ExprKind.Index(base: base, index: _) => match first typed.kind {
+                TKind.Index(held) if held.contents().args.len() > 0 => {
+                    let receiver = held.contents().args[0]
+                    self.check_chain(base.contents(), typed: receiver.expr.contents(), marker, takes_mut: takes_mut or receiver.mode == ast::Mode.Mut)
+                    return
+                }
+                else => {}
+            }
+            ast::ExprKind.Call(callee: callee, args: _) => match callee.contents().kind {
+                ast::ExprKind.Field(base: base, name: _) => match first typed.kind {
+                    TKind.Call(held) if held.contents().projection and held.contents().args.len() > 0 => {
+                        let receiver = held.contents().args[0]
+                        self.check_chain(base.contents(), typed: receiver.expr.contents(), marker, takes_mut: takes_mut or receiver.mode == ast::Mode.Mut)
+                        return
+                    }
+                    else => {}
+                }
+                else => {}
+            }
+            else => {}
+        }
+    }
+    let mode = if takes_mut {
+        ast::Mode.Mut
+    } else {
+        ast::Mode.Read
+    }
+    self.check_mode(construct: nir::Span(head: chain.token, last: chain.last), arg: typed, mode, marker, receiver: false)
+} Body.check_chain
 
 /// A method call on a typed receiver.
 fn Body.method_on(
@@ -1826,7 +1907,7 @@ fn Body.resolved_method(
     if projected {
         marks.mode = None
     }
-    marks.chained = projected and markers.mode.is_some()
+    marks.chained = markers.chained or (projected and markers.mode.is_some())
     match form {
         Some(written) => {
             let Some(whole) = args.prefix(args.len()) else {
@@ -2001,9 +2082,7 @@ fn Body.apply_with(
             if not unified and not types.has_error(given.ty) {
                 self.report_mismatch(given.token, expected: callable.infer.subst.ty(types, ty: param.ty), found: given.ty)
             }
-            if not markers.chained {
-                self.check_mode(construct: nir::Span(head: given.token, last: markers.receiver.value_or(given.token)), arg: given, mode: param.mode, marker: markers.mode, chain_mut: markers.chain_mut, receiver: true)
-            }
+            self.check_receiver(given, mode: param.mode, markers)
             mut typed_args.push(TArg.of(take given, mode: param.mode, alloc))
         }
         None => {}
@@ -2036,6 +2115,7 @@ fn Body.typed_arg(
         ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
         else => written
     }
+    let chain = marker.is_some() and mut self.is_chain(value)
     var typed = TExpr.failed(value.token)
     match value.kind {
         ast::ExprKind.Closure(closure) => {
@@ -2047,10 +2127,14 @@ fn Body.typed_arg(
             }
         }
         else => {
-            typed = mut self.value_arg(value, marker, param, pattern, mut infer, mut waits)
+            typed = mut self.value_arg(value, marker, chain, param, pattern, mut infer, mut waits)
         }
     }
-    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: param.mode, marker, chain_mut: false, receiver: false)
+    if chain {
+        self.check_chain(value, typed, marker, takes_mut: false)
+    } else {
+        self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: param.mode, marker, receiver: false)
+    }
     return typed
 } Body.typed_arg
 
@@ -2086,11 +2170,12 @@ fn Body.closure_arg(
 } Body.closure_arg
 
 /// An argument other than a closure, typed with its parameter's type as the hint once no
-/// parameter it holds is left to fix.
+/// parameter it holds is left to fix, or as a projection chain's links when `chain`.
 fn Body.value_arg(
     mut self,
     value: ast::Expr,
     marker: Option[ast::Word[ast::Mode]],
+    chain: bool,
     param: ParamSig,
     pattern: ty::Ty,
     mut infer: Infer,
@@ -2106,7 +2191,9 @@ fn Body.value_arg(
         Some(word) => word.kind == ast::Mode.Mut
         None => false
     }
-    let typed = if mutable {
+    let typed = if chain {
+        mut self.link(value, mode: marker)
+    } else if mutable {
         mut self.mut_operand(value, expected: hint)
     } else {
         mut self.operand(value, expected: hint)
@@ -2875,7 +2962,6 @@ fn Body.check_mode(
     arg: TExpr,
     mode: ast::Mode,
     marker: Option[ast::Word[ast::Mode]],
-    chain_mut: bool,
     receiver: bool,
     ) {
     let ck = self.ck
@@ -2888,9 +2974,7 @@ fn Body.check_mode(
         required = match first mode {
             ast::Mode.Mut => Some(ast::Mode.Mut)
             ast::Mode.Take if not ck.has(arg.ty, property: Property.Copy) => Some(ast::Mode.Take)
-            ast::Mode.Take => None
-            ast::Mode.Read if chain_mut => Some(ast::Mode.Mut)
-            ast::Mode.Read => None
+            ast::Mode.Take or ast::Mode.Read => None
         }
     }
     let written = match marker {
@@ -2927,6 +3011,15 @@ fn Body.check_mode(
     }
     self.report_fixed(construct: nir::Span(head: head, last: construct.last), code, take fixes)
 } Body.check_mode
+
+/// The marking rules for a call's receiver, except one that a projection chain's root stands
+/// for in its marking: the receiver of a link, or a chain itself.
+fn Body.check_receiver(self, receiver: TExpr, mode: ast::Mode, markers: Markers) {
+    if markers.link or markers.chained {
+        return
+    }
+    self.check_mode(construct: nir::Span(head: receiver.token, last: markers.receiver.value_or(receiver.token)), arg: receiver, mode, marker: markers.mode, receiver: true)
+} Body.check_receiver
 
 /// Whether a typed place does not own its value, which ownership forbids moving: a part, a
 /// read or `mut` parameter, a view binding, a name a `for` pattern binds by read or `mut`, or
@@ -3309,12 +3402,17 @@ fn Body.construction_value(mut self, item: ty::ItemId, arg: ast::Arg, field_ty: 
         ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
         else => written
     }
+    let chain = marker.is_some() and mut self.is_chain(value)
     let pattern = infer.subst.ty(types, ty: field_ty)
     var hint: Option[ty::Ty] = None
     if not infer.open(pattern, types) {
         hint = Some(pattern)
     }
-    let typed = mut self.expr(value, expected: hint)
+    let typed = if chain {
+        mut self.link(value, mode: marker)
+    } else {
+        mut self.expr(value, expected: hint)
+    }
     let unified = mut infer.unify(pattern, found: typed.ty, types)
     if not unified {
         self.expect_type(typed, expected: infer.subst.ty(types, ty: field_ty), token: value.token)
@@ -3338,7 +3436,11 @@ fn Body.construction_value(mut self, item: ty::ItemId, arg: ast::Arg, field_ty: 
     if wraps_part {
         mode = ast::Mode.Read
     }
-    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: mode, marker, chain_mut: false, receiver: false)
+    if chain {
+        self.check_chain(value, typed, marker, takes_mut: false)
+    } else {
+        self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: mode, marker, receiver: false)
+    }
     if wraps_part {
         wrapped = true
     }
@@ -3348,9 +3450,6 @@ fn Body.construction_value(mut self, item: ty::ItemId, arg: ast::Arg, field_ty: 
 /// `x[i]`: a call of the `at`, or `at_mut` where the element is written, that method
 /// resolution finds on the type of `x`.
 fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bool) -> TExpr {
-    let ck = self.ck.share()
-    let types = ck.types()
-    let alloc = ck.alloc()
     var base_typed = TExpr.failed(token)
     if write {
         match mut self.place(base, assigned: false) {
@@ -3364,6 +3463,14 @@ fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bo
     } else {
         base_typed = mut self.expr(base, expected: None)
     }
+    return mut self.index_on(token, base, take base_typed, index, write)
+} Body.index
+
+/// `x[i]` of a typed `x`.
+fn Body.index_on(mut self, token: u32, base: ast::Expr, take base_typed: TExpr, index: ast::Expr, write: bool) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
     if types.has_error(base_typed.ty) {
         discard mut self.skim(index)
         return TExpr.failed(token)
@@ -3409,7 +3516,7 @@ fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bo
     mut call_args.push(TArg.of(take index_typed, mode: ast::Mode.Read, alloc))
     let made = Call(token: token, callee: take found.callee, type_args: type_args, args: take call_args, head: take head, projection: true, failure: None, awaited: false)
     return TExpr(token: token, last: token, ty: result, kind: TKind.Index(mem::Heap.of(alloc).boxed(take made)))
-} Body.index
+} Body.index_on
 
 /// Whether a callable indexes: a projection taking `self` and an index.
 fn is_indexing_head(callable: Option[Callable]) -> bool {
@@ -3620,7 +3727,7 @@ fn Body.bits_call(
         Some(marker) => self.unneeded_await(marker)
         None => {}
     }
-    self.check_mode(construct: nir::Span(head: receiver.token, last: markers.receiver.value_or(receiver.token)), arg: receiver, mode: ast::Mode.Read, marker: markers.mode, chain_mut: markers.chain_mut, receiver: true)
+    self.check_receiver(receiver, mode: ast::Mode.Read, markers)
     if args.len() > 0 {
         self.report(token, code: diagnostic::Code.ExprArgumentCount)
         mut self.skim_args(args)
@@ -3699,7 +3806,7 @@ fn Body.dyn_view(
     if name == "view_mut" {
         mode = ast::Mode.Mut
     }
-    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode, marker, chain_mut: false, receiver: false)
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode, marker, receiver: false)
     let ty = types.intern(ty::TyKind.Dyn(bound))
     var call_args = mem::List[TArg].empty(alloc)
     mut call_args.push(TArg.of(take typed, mode: mode, alloc))
@@ -3759,7 +3866,7 @@ fn Body.boxed_dyn_call(
         }
         else => {}
     }
-    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: ast::Mode.Take, marker, chain_mut: false, receiver: false)
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: ast::Mode.Take, marker, receiver: false)
     var call_args = mem::List[TArg].empty(alloc)
     mut call_args.push(TArg.of(take typed, mode: ast::Mode.Take, alloc))
     let made = Call(token: token, callee: Callee.Builtin(Builtin.DynView), type_args: ty::Args.none(), args: take call_args, head: plain_head(boxed, alloc), projection: false, failure: None, awaited: false)
@@ -3922,7 +4029,7 @@ fn Body.apply_dma(
     let Some(operands) = mut self.dma_operands(token, args, indexed, write, element) else {
         return TExpr.failed(token)
     }
-    self.check_mode(construct: nir::Span(head: receiver.token, last: markers.receiver.value_or(receiver.token)), arg: receiver, mode: ast::Mode.Mut, marker: markers.mode, chain_mut: false, receiver: true)
+    self.check_receiver(receiver, mode: ast::Mode.Mut, markers)
     var result = element
     if write {
         result = ty::Ty.unit()

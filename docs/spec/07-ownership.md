@@ -108,7 +108,7 @@ The [markers](06-statements-expressions.md#markers) `mut` and `take` are the mod
 - An argument or receiver passed to a `take` parameter is marked `take` when its type is not Copy. A Copy value passed to a `take` parameter is copied and unmarked; marking it is an error (`mode.copy-taken`), whose exact fix deletes the marker. A generic parameter's type is Copy only when bounded by `Copy`.
 - An argument or receiver passed to a read parameter is unmarked.
 - An argument or receiver that is not a [place](#places), such as a call result, construction, literal, operator result, closure or path naming an item, is unmarked whatever the parameter's mode. Passed by `mut`, a [part](#projection-results) is the place it names, and any other such value is a temporary.
-- A marker before a chain of projection calls states the access to the place at the chain's root: `mut` when a call of the chain takes `mut self` of that place or of a part of it, and no marker otherwise.
+- A marker before a chain of projection calls, which may also step through fields and indexes, states the access to the place at the chain's root: `mut` when a call of the chain takes `mut self` of that place or of a part of it, and no marker otherwise.
 - A missing marker is an error (`mode.unmarked`), whose exact fix inserts it, except a missing `take` before a place that does not own its value, which [ownership](#ownership) forbids moving. Any other marker that these rules do not require is an error (`mode.mismatch`), whose exact fix replaces or deletes it.
 - Construction values and payloads are marked like `take` arguments ([construction](04-types.md#construction)), except the values that [projection results](#projection-results) and [view bindings](#view-bindings) leave unmarked.
 
@@ -145,6 +145,77 @@ pub fn Frame.clear(mut self) {
 pub fn clear_first(mut frames: mem::List[Frame]) {
     mut frames.at_mut(0).clear()
 } clear_first
+```
+
+```nan
+pub closed struct Frame {
+    pub slots: mem::List[u64]
+} Frame
+
+pub closed struct Stack {
+    pub frames: mem::List[Frame]
+} Stack
+
+pub proj fn Stack.top(mut self) -> Frame {
+    return mut self.frames.at_mut(0)
+} Stack.top
+
+pub fn clear(mut slots: mem::List[u64]) {
+    mut slots.truncate(0)
+} clear
+
+pub fn Stack.reset(mut self) {
+    clear(mut self.top().slots)
+    mut self.top().slots.push(0)
+    for slot in mut self.top().slots {
+        slot += 1
+    }
+} Stack.reset
+```
+
+```nan
+pub closed struct Frame {
+    pub slots: mem::List[u64]
+} Frame
+
+pub closed struct Stack {
+    pub frames: mem::List[Frame]
+} Stack
+
+pub proj fn Stack.top(mut self) -> Frame {
+    return mut self.frames.at_mut(0)
+} Stack.top
+
+pub fn depth(mut stack: Stack) -> usize {
+    return stack.top().slots.len() // error: mode.unmarked
+} depth
+```
+
+The fix marks the root of the chain:
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error mode.unmarked example/example.nan:15 example::depth
+        return stack.top().slots.len() // error: mode.unmarked
+    expected: mut stack
+    found: stack
+    fix 1 example/example.nan
+    -     return stack.top().slots.len() // error: mode.unmarked
+    +     return mut stack.top().slots.len() // error: mode.unmarked
+failed check example: errors 1, incomplete 0
+```
+
+```nan
+pub closed struct Frame {
+    pub seq: u32
+} Frame
+
+pub fn Frame.seq_of(self) -> u32 = self.seq
+
+pub fn first_seq(frames: mem::List[Frame]) -> u32 {
+    return mut frames.at(0).seq_of() // error: mode.mismatch
+} first_seq
 ```
 
 ```nan

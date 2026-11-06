@@ -187,10 +187,10 @@ pub struct Markers {
     pub failure: Option<(FailureMarker, Tok)>,
     pub awaited: Option<Tok>,
     pub mode: Option<(Mode, Tok)>,
-    /// Whether a call further out of a projection chain takes `mut self` of this call's result.
-    pub chain_mut: bool,
-    /// Whether the mode marks the root of the projection chain that is the receiver, which it
-    /// covers, rather than the receiver.
+    /// Whether the call is a link of a projection chain, whose root the chain checks once.
+    pub link: bool,
+    /// Whether the receiver is a projection chain whose root the mode marks, which this call
+    /// checks once its own receiver mode is known.
     pub chained: bool,
     /// The last token of the receiver a method call passes for `self`.
     pub receiver: Option<Tok>,
@@ -1225,31 +1225,106 @@ impl Body<'_, '_> {
         expected: Option<&Ty>,
         markers: Markers,
     ) -> TExpr {
-        let receiver_markers = Markers {
-            mode: markers.mode,
-            chain_mut: false,
-            ..Markers::default()
-        };
-        let receiver = match &base.kind {
-            ExprKind::Call { callee, .. }
-                if markers.mode.is_some()
-                    && matches!(callee.kind, ExprKind::Field { .. })
-                    && !self.is_construction(callee) =>
-            {
-                let chain = Markers {
-                    chain_mut: true,
-                    ..receiver_markers
-                };
-                self.call(base, None, Some(chain))
-            }
-            _ if matches!(markers.mode, Some((Mode::Mut, _))) => self.mut_operand(base, None),
+        let chained = markers.mode.is_some() && self.is_chain(base);
+        let receiver = match markers.mode {
+            _ if chained => self.link(base, markers.mode),
+            Some((Mode::Mut, _)) => self.mut_operand(base, None),
             _ => self.operand(base, None),
         };
         if receiver.ty.has_error() {
             self.skim_args(args);
             return TExpr::failed(token);
         }
-        self.method_on(token, receiver, name, args, expected, markers)
+        let markers = Markers { chained, ..markers };
+        let typed = self.method_on(token, receiver, name, args, expected, markers);
+        if chained
+            && !markers.link
+            && let TKind::Call(call) = &typed.kind
+            && let Some(receiver) = call.args.first()
+        {
+            let takes_mut = receiver.mode == Mode::Mut;
+            self.check_chain(base, &receiver.expr, markers.mode, takes_mut);
+        }
+        typed
+    }
+
+    /// Whether an expression is a projection chain that a mode before it marks at its root: a
+    /// method call, or a field or index of a chain.
+    pub fn is_chain(&mut self, expr: &ast::Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => self.is_chain(base),
+            ExprKind::Call { callee, .. } => {
+                matches!(callee.kind, ExprKind::Field { .. }) && !self.is_construction(callee)
+            }
+            _ => false,
+        }
+    }
+
+    /// A projection chain under `mode`: its calls typed as links, which leave the marking of its
+    /// root to the chain, and an index writing through `at_mut` under `mut`.
+    pub fn link(&mut self, chain: &ast::Expr, mode: Option<(Mode, Tok)>) -> TExpr {
+        match &chain.kind {
+            ExprKind::Field { base, name } => {
+                let typed = self.link(base, mode);
+                self.field_of(chain.token, typed, name, true)
+            }
+            ExprKind::Index { base, index } => {
+                let typed = self.link(base, mode);
+                let write = matches!(mode, Some((Mode::Mut, _)));
+                self.index_on(chain.token, base, typed, index, write)
+            }
+            _ => {
+                let markers = Markers {
+                    mode,
+                    link: true,
+                    ..Markers::default()
+                };
+                self.call(chain, None, Some(markers))
+            }
+        }
+    }
+
+    /// The marking rule of a projection chain: the mode before it states the access to the place
+    /// at its root, `mut` when `takes_mut` or a call of the chain takes `mut self`, and no marker
+    /// otherwise.
+    fn check_chain(
+        &self,
+        chain: &ast::Expr,
+        typed: &TExpr,
+        marker: Option<(Mode, Tok)>,
+        takes_mut: bool,
+    ) {
+        let step = match (&chain.kind, &typed.kind) {
+            _ if is_place(typed) => None,
+            (ExprKind::Field { base, .. }, TKind::Field { base: inner, .. }) => {
+                Some((base, &**inner, takes_mut))
+            }
+            (ExprKind::Index { base, .. }, TKind::Index(call)) => {
+                call.args.first().map(|receiver| {
+                    (
+                        base,
+                        &receiver.expr,
+                        takes_mut || receiver.mode == Mode::Mut,
+                    )
+                })
+            }
+            (ExprKind::Call { callee, .. }, TKind::Call(call)) if call.proj => {
+                match (&callee.kind, call.args.first()) {
+                    (ExprKind::Field { base, .. }, Some(receiver)) => Some((
+                        base,
+                        &receiver.expr,
+                        takes_mut || receiver.mode == Mode::Mut,
+                    )),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((base, inner, takes_mut)) = step {
+            return self.check_chain(base, inner, marker, takes_mut);
+        }
+        let mode = if takes_mut { Mode::Mut } else { Mode::Read };
+        self.check_mode((chain.token, chain.last), typed, mode, marker, false);
     }
 
     /// A method call on a typed receiver.
@@ -1369,7 +1444,7 @@ impl Body<'_, '_> {
         let projected = matches!(&receiver.kind, TKind::Call(call) if call.proj);
         let markers = Markers {
             mode: markers.mode.filter(|_| !projected),
-            chained: projected && markers.mode.is_some(),
+            chained: markers.chained || (projected && markers.mode.is_some()),
             ..markers
         };
         if let Some(form) = &form {
@@ -1511,16 +1586,7 @@ impl Body<'_, '_> {
                     &receiver.ty,
                 );
             }
-            if !markers.chained {
-                self.check_mode(
-                    (receiver.token, markers.receiver.unwrap_or(receiver.token)),
-                    &receiver,
-                    param.mode,
-                    markers.mode,
-                    markers.chain_mut,
-                    true,
-                );
-            }
+            self.check_receiver(&receiver, param.mode, markers);
             typed_args.push(TArg {
                 expr: receiver,
                 mode: param.mode,
@@ -1529,6 +1595,7 @@ impl Body<'_, '_> {
         for (arg, param) in args.iter().zip(&params[offset..]) {
             let pattern = callable.infer.subst.ty(&param.ty);
             let (marker, value) = self.marked_value(&arg.value);
+            let chain = marker.is_some() && self.is_chain(value);
             let typed = match (&value.kind, &pattern) {
                 (ExprKind::Closure(closure), Ty::Fn(wanted)) => {
                     let wanted = (**wanted).clone();
@@ -1552,6 +1619,7 @@ impl Body<'_, '_> {
                 _ => {
                     let hint = (!callable.infer.open(&pattern)).then_some(&pattern);
                     let typed = match marker {
+                        _ if chain => self.link(value, marker),
                         Some((Mode::Mut, _)) => self.mut_operand(value, hint),
                         _ => self.operand(value, hint),
                     };
@@ -1577,14 +1645,11 @@ impl Body<'_, '_> {
                     typed
                 }
             };
-            self.check_mode(
-                (value.token, value.last),
-                &typed,
-                param.mode,
-                marker,
-                false,
-                false,
-            );
+            if chain {
+                self.check_chain(value, &typed, marker, false);
+            } else {
+                self.check_mode((value.token, value.last), &typed, param.mode, marker, false);
+            }
             typed_args.push(TArg {
                 expr: typed,
                 mode: param.mode,
@@ -2130,7 +2195,6 @@ impl Body<'_, '_> {
         arg: &TExpr,
         mode: Mode,
         marker: Option<(Mode, Tok)>,
-        chain_mut: bool,
         receiver: bool,
     ) {
         if arg.ty.has_error() {
@@ -2143,9 +2207,7 @@ impl Body<'_, '_> {
             match mode {
                 Mode::Mut => Some(Mode::Mut),
                 Mode::Take if !self.ck.has(&arg.ty, Property::Copy) => Some(Mode::Take),
-                Mode::Take => None,
-                Mode::Read if chain_mut => Some(Mode::Mut),
-                Mode::Read => None,
+                Mode::Take | Mode::Read => None,
             }
         };
         let written = marker.map(|(mode, _)| mode);
@@ -2173,6 +2235,16 @@ impl Body<'_, '_> {
             _ => Code::ModeMismatch,
         };
         self.report_fixed(construct, code, vec![fix]);
+    }
+
+    /// The marking rules for a call's receiver, except one that a projection chain's root
+    /// stands for in its marking: the receiver of a link, or a chain itself.
+    fn check_receiver(&self, receiver: &TExpr, mode: Mode, markers: Markers) {
+        if markers.link || markers.chained {
+            return;
+        }
+        let construct = (receiver.token, markers.receiver.unwrap_or(receiver.token));
+        self.check_mode(construct, receiver, mode, markers.mode, true);
     }
 
     /// Whether a typed place does not own its value, which ownership forbids moving: a part, a
@@ -2405,9 +2477,14 @@ impl Body<'_, '_> {
                 fields[0].clone()
             };
             let (marker, value) = self.marked_value(&arg.value);
+            let chain = marker.is_some() && self.is_chain(value);
             let pattern = infer.subst.ty(&ty);
             let hint = (!infer.open(&pattern)).then_some(&pattern);
-            let typed = self.expr(value, hint);
+            let typed = if chain {
+                self.link(value, marker)
+            } else {
+                self.expr(value, hint)
+            };
             if !infer.unify(&pattern, &typed.ty) {
                 let shown = infer.subst.ty(&ty);
                 self.expect(&typed, &shown, value.token);
@@ -2421,14 +2498,11 @@ impl Body<'_, '_> {
                 && (self.is_part(&typed) || self.is_read_view(&typed))
                 && !self.ck.has(&typed.ty, Property::Copy);
             let mode = if wraps_part { Mode::Read } else { Mode::Take };
-            self.check_mode(
-                (value.token, value.last),
-                &typed,
-                mode,
-                marker,
-                false,
-                false,
-            );
+            if chain {
+                self.check_chain(value, &typed, marker, false);
+            } else {
+                self.check_mode((value.token, value.last), &typed, mode, marker, false);
+            }
             wrapped |= wraps_part;
             values.push((name, typed));
         }
@@ -2480,6 +2554,18 @@ impl Body<'_, '_> {
         } else {
             self.expr(base, None)
         };
+        self.index_on(token, base, base_typed, index, write)
+    }
+
+    /// `x[i]` of a typed `x`.
+    fn index_on(
+        &mut self,
+        token: Tok,
+        base: &ast::Expr,
+        base_typed: TExpr,
+        index: &ast::Expr,
+        write: bool,
+    ) -> TExpr {
         if base_typed.ty.has_error() {
             self.skim(index);
             return TExpr::failed(token);
@@ -2720,14 +2806,7 @@ impl Body<'_, '_> {
         if let Some(marker) = markers.awaited {
             self.unneeded_await(marker);
         }
-        self.check_mode(
-            (receiver.token, markers.receiver.unwrap_or(receiver.token)),
-            &receiver,
-            Mode::Read,
-            markers.mode,
-            markers.chain_mut,
-            true,
-        );
+        self.check_receiver(&receiver, Mode::Read, markers);
         if !args.is_empty() {
             self.report(token, Code::ExprArgumentCount);
             self.skim_args(args);
@@ -2811,14 +2890,7 @@ impl Body<'_, '_> {
         } else {
             Mode::Read
         };
-        self.check_mode(
-            (value.token, value.last),
-            &typed,
-            mode,
-            marker,
-            false,
-            false,
-        );
+        self.check_mode((value.token, value.last), &typed, mode, marker, false);
         let ty = Ty::Dyn(Rc::new(bound));
         TExpr {
             token,
@@ -2858,14 +2930,7 @@ impl Body<'_, '_> {
         {
             self.report(token, Code::InterfaceNotImplemented);
         }
-        self.check_mode(
-            (value.token, value.last),
-            &typed,
-            Mode::Take,
-            marker,
-            false,
-            false,
-        );
+        self.check_mode((value.token, value.last), &typed, Mode::Take, marker, false);
         TExpr {
             token,
             last: token,
@@ -3075,14 +3140,7 @@ impl Body<'_, '_> {
             self.report(token, Code::HwDmaOperand);
             return TExpr::failed(token);
         }
-        self.check_mode(
-            (receiver.token, markers.receiver.unwrap_or(receiver.token)),
-            &receiver,
-            Mode::Mut,
-            markers.mode,
-            false,
-            true,
-        );
+        self.check_receiver(&receiver, Mode::Mut, markers);
         let result = if write { Ty::Unit } else { element };
         // The access carries, as type arguments, its field's bytes layout, the field's index in
         // it and whether the access writes and is indexed; its operands are the buffer, then the

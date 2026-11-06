@@ -1433,17 +1433,19 @@ impl Body<'_, '_> {
         iterated: &ast::Expr,
         body: &ast::LoopBlock,
     ) -> TStmtKind {
-        let (mode, inner) = match &iterated.kind {
+        let (marker, inner) = match &iterated.kind {
             ast::ExprKind::Marked {
                 failure: None,
                 awaited: None,
-                mode: Some((mode, _)),
+                mode: Some(marker),
                 inner,
-            } => (*mode, &**inner),
-            _ => (Mode::Read, iterated),
+            } => (Some(*marker), &**inner),
+            _ => (None, iterated),
         };
-        let typed = match mode {
-            Mode::Mut => self.mut_operand(inner, None),
+        let mode = marker.map_or(Mode::Read, |(mode, _)| mode);
+        let typed = match marker {
+            Some(_) if self.is_chain(inner) => self.link(inner, marker),
+            Some((Mode::Mut, _)) => self.mut_operand(inner, None),
             _ => self.expr(inner, None),
         };
         let (cursor, element) = self.cursor_of(&typed, mode, iterated.token);

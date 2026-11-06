@@ -166,10 +166,16 @@ fn an_internal_error_writes_a_reproducer() {
         scope: Some("app".to_owned()),
         read: vec!["app/package.nan".to_owned()],
     };
-    let output = internal_error(&invocation, &line, &trace).render(&invocation.format);
+    let output = internal_error(
+        &invocation,
+        &line,
+        &trace,
+        "panic at nan/src/check.rs:7\nno type",
+    )
+    .render(&invocation.format);
     assert_eq!(
         output,
-        "internal-error check app: records 1\ninternal internal.invariant - -\n    reproducer .nan/repro/2\ninternal-error check app: records 1\n"
+        "internal-error check app: records 1\ninternal internal.invariant - -\n    invariant panic at nan/src/check.rs:7\n        no type\n    reproducer .nan/repro/2\ninternal-error check app: records 1\n"
     );
     let reproducer = scratch.0.join(".nan/repro/2");
     assert_eq!(
@@ -183,6 +189,20 @@ fn an_internal_error_writes_a_reproducer() {
     assert_eq!(
         fs::read_to_string(reproducer.join("app/package.nan")).expect("read the copy"),
         MANIFEST
+    );
+}
+
+#[test]
+fn a_panic_is_described_by_its_location_and_message() {
+    let line = line!() + 1;
+    let panicked = caught(|| panic!("an item {} has no type", 3)).expect_err("a panic");
+    assert_eq!(
+        panicked,
+        format!("panic at nan/src/command/tests.rs:{line}\nan item 3 has no type")
+    );
+    assert_eq!(
+        shown_path("/home/u/.cargo/registry/src/index/cranelift-codegen-1.0/src/isa/x64.rs"),
+        "cranelift-codegen-1.0/src/isa/x64.rs"
     );
 }
 

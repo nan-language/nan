@@ -52,9 +52,10 @@ A diagnostic prints as a [record](33-toolchain.md#records) whose lines are, in o
 4. the line `expected: ` and the expected text, then the line `found: ` and the found text;
 5. for each reason, `because`, its role, its location, its item and its subject, separated by single spaces, `-` standing for an absent location or item, followed by the quote of its line;
 6. for each edit of each fix, `fix`, the fix's number counting the offered fixes from 1, and the edit's path, separated by single spaces, followed by each line of the edit's old text prefixed `- ` and each line of its new text prefixed `+ `, an empty line printing as `-` or `+` alone;
-7. for an internal error, `reproducer ` and the reproducer's path.
+7. for `internal.invariant`, `invariant ` and the first line of the invariant's description, followed by each of its other lines indented 4 spaces;
+8. for an internal error, `reproducer ` and the reproducer's path.
 
-Absent parts print nothing. A quote is the single line after the header or `because` line it belongs to; every other continuation line starts with `targets: `, `expected: `, `found: `, `because `, `fix `, `reproducer `, `-` or `+`. A quote or edit line copied from source prints in an [envelope](33-toolchain.md#envelopes) where that section requires one.
+Absent parts print nothing. A quote is the single line after the header or `because` line it belongs to; every other continuation line starts with `targets: `, `expected: `, `found: `, `because `, `fix `, `invariant `, `reproducer `, `-` or `+`, or belongs to an invariant's description. A quote or edit line copied from source prints in an [envelope](33-toolchain.md#envelopes) where that section requires one.
 
 ```nan
 pub closed linear struct Lease {
@@ -107,7 +108,7 @@ ok check example: errors 0, incomplete 1
 
 An **internal error** is a diagnostic reporting that the implementation failed, as [Toolchain](33-toolchain.md#internal-errors) defines; it is no verdict on the source, which the command neither accepts nor rejects.
 
-- An implementation finding that one of its own invariants does not hold, including elaboration producing NIR that is not [well formed](19-nir.md#well-formedness) and a trap in its own code, reports `internal.invariant`.
+- An implementation finding that one of its own invariants does not hold, including elaboration producing NIR that is not [well formed](19-nir.md#well-formedness) and a trap in its own code, reports `internal.invariant`, describing the invariant by the [trap report](11-errors-domains.md#trap-reports) of a trap in its own code, and otherwise by lines of its own naming what failed.
 - An implementation that cannot obtain the memory or stack a command needs reports `internal.resource-exhausted`.
 - The location and item of an internal error are those of the line being checked when the fault occurred, or absent.
 - A conforming implementation reports no internal error on a conformance test.

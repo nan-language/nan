@@ -169,7 +169,7 @@ pub fn run(
         }),
         None => Err(io::Error::other(format!(
             "test run {test}/{index} of {} ended with {} without an outcome:\n{}{}",
-            image.path().display(),
+            image.path().file_name().unwrap_or_default().display(),
             output.status,
             String::from_utf8_lossy(&output.stderr),
             match frames {

@@ -671,8 +671,8 @@ fn run(
     }, stack: COMMAND_STACK, exec, alloc)
     let outcome = match attempted {
         Ok(Ok(done)) => done
-        Ok(Err(_)) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: diagnostic::Code.InternalInvariant, alloc))
-        Err(trap) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: trapped_code(trap.kind()), alloc))
+        Ok(Err(error)) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: diagnostic::Code.InternalInvariant, broken: text::fmt("io {error}", error), alloc))
+        Err(trap) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: trapped_code(trap.kind()), broken: text::fmt("{trap}", trap), alloc))
     }
     return match outcome {
         Outcome.Output(written) => Ran(output: written.render(invocation.format, alloc), status: written.verdict.status(), launch: None)
@@ -720,6 +720,9 @@ fn Crew.serve(self, clock: sys::Clock, alloc: mem::Alloc) fails task::Cancelled 
     }
 } Crew.serve
 
+/// The most bytes of the description of an internal error's broken invariant.
+const INVARIANT_BUDGET: usize = 65_536
+
 /// The internal error a trap of a command's implementation is: one of a resource the command
 /// cannot obtain when it exhausted memory or its stack.
 fn trapped_code(kind: sys::TrapKind) -> diagnostic::Code {
@@ -729,9 +732,10 @@ fn trapped_code(kind: sys::TrapKind) -> diagnostic::Code {
     }
 } trapped_code
 
-/// The output of a command whose implementation failed with the internal error `code`, after
-/// writing its reproducer.
-fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trace, code: diagnostic::Code, alloc: mem::Alloc) -> output::Output {
+/// The output of a command whose implementation failed with the internal error `code`, finding
+/// broken, for `internal.invariant`, the invariant `broken` renders the description of: the
+/// trap report of a trap, or `io` and the I/O failure ending the command. Writes its reproducer.
+fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trace, code: diagnostic::Code, broken: Dyn[Render], alloc: mem::Alloc) -> output::Output {
     var scope = text::String.of(".", alloc)
     match latest(trace.scope, alloc) {
         Some(written) => {
@@ -747,6 +751,11 @@ fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trac
         }
     }
     var lines = mem::List[text::String].empty(alloc)
+    if code == diagnostic::Code.InternalInvariant {
+        var described = text::String.empty(alloc)
+        mut described.write(broken, budget: INVARIANT_BUDGET)
+        lines = invariant_lines(described.as_str(), alloc)
+    }
     match latest(trace.root, alloc) {
         Some(root) => {
             match attempt reproducer(root.as_str(), args, read: trace.read, alloc) {
@@ -766,6 +775,21 @@ fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trac
     mut records.push(unlocated(code, lines: take lines, alloc))
     return output::Output(command: invocation.command(scope.as_str(), skip: true, alloc), elision: invocation.command(scope.as_str(), skip: false, alloc), verdict: output::Verdict.InternalError, summary: take summary, records: take records)
 } internal_error
+
+/// The lines of an internal error naming a broken invariant: `invariant ` and the first line of
+/// its description, then each other line indented 4 spaces.
+fn invariant_lines(described: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    for line in final_build::lines_of(described, alloc) {
+        var written = text::String.of("    ", alloc)
+        if lines.len() == 0 {
+            written = text::String.of("invariant ", alloc)
+        }
+        mut written.append(output::printable(line.as_bytes(), alloc).as_str())
+        mut lines.push(take written)
+    }
+    return lines
+} invariant_lines
 
 /// Writes `.nan/repro/<n>` for the least positive `n` naming no directory: the command line, the
 /// toolchain hashes and every workspace file the command read. Returns its path.

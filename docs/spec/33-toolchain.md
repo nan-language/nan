@@ -177,7 +177,7 @@ On an [internal error](34-diagnostics.md#internal-errors) the command:
 
 1. stops;
 2. writes a **reproducer**: the directory `.nan/repro/<n>`, n being the least positive integer naming no existing directory, holding `command`, the command line one argument per line; `toolchain`, the [toolchain hash](36-builds.md#toolchain-hash) of each language version the toolchain implements, one per line in version order; every file the command read in the workspace, at its path; and each version or `--from` file its command line names outside the workspace, under that argument's name (`from`, `old`, `new`, `base`, `ours`, `theirs`) as `command` names it;
-3. prints, between verdict lines whose summary is `records 1`, the internal error's diagnostic naming the reproducer, and exits with status 3.
+3. prints, between verdict lines whose summary is `records 1`, the internal error's diagnostic naming the broken invariant, for `internal.invariant`, and the reproducer, and exits with status 3.
 
 Run in the reproducer directory with the same toolchain hash and [local store](29-identity-versioning.md#local-store), the recorded command line reproduces the internal error.
 

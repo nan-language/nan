@@ -15,10 +15,12 @@ mod test;
 mod upgrade;
 mod verify;
 
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use crate::diagnostic::{Code, Diagnostic, Role};
 use crate::fix;
@@ -417,9 +419,7 @@ pub fn run(args: &[String], current: &Path) -> Run {
         return usage(args);
     };
     let mut trace = Trace::default();
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        execute(&invocation, current, &mut trace)
-    }));
+    let outcome = caught(|| execute(&invocation, current, &mut trace));
     let output = match outcome {
         Ok(Ok(Outcome::Output(output))) => output,
         Ok(Ok(Outcome::Launch(launch))) => {
@@ -436,7 +436,8 @@ pub fn run(args: &[String], current: &Path) -> Run {
                 launch: None,
             };
         }
-        Ok(Err(_)) | Err(_) => internal_error(&invocation, args, &trace),
+        Ok(Err(error)) => internal_error(&invocation, args, &trace, &format!("io {error}")),
+        Err(panicked) => internal_error(&invocation, args, &trace, &panicked),
     };
     Run {
         output: output.render(&invocation.format),
@@ -445,17 +446,62 @@ pub fn run(args: &[String], current: &Path) -> Run {
     }
 }
 
-/// The output of a command whose implementation failed, after writing its reproducer.
-fn internal_error(invocation: &Invocation, args: &[String], trace: &Trace) -> Output {
+thread_local! {
+    /// Whether this thread runs a command, whose panic `caught` describes.
+    static CATCHING: Cell<bool> = const { Cell::new(false) };
+    static PANICKED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Runs a command's body, or describes the panic ending it: `panic at` and the location of the
+/// panic, then its message.
+fn caught<T>(body: impl FnOnce() -> T) -> Result<T, String> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !CATCHING.get() {
+                return previous(info);
+            }
+            let location = info
+                .location()
+                .map(|at| format!(" at {}:{}", shown_path(at.file()), at.line()))
+                .unwrap_or_default();
+            let message = info.payload_as_str().unwrap_or_default();
+            PANICKED.set(Some(format!("panic{location}\n{message}")));
+        }));
+    });
+    let catching = CATCHING.replace(true);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(body));
+    CATCHING.set(catching);
+    outcome.map_err(|_| PANICKED.take().unwrap_or_else(|| "panic".to_owned()))
+}
+
+/// The path of a source file as a panic location prints it: an absolute one from its crate's
+/// directory, the one holding its last `src` directory, or else its file name.
+fn shown_path(file: &str) -> &str {
+    if !file.starts_with('/') {
+        return file;
+    }
+    let crate_end = file.rfind("/src/").unwrap_or(file.len());
+    let crate_start = file[..crate_end].rfind('/').map_or(0, |slash| slash + 1);
+    &file[crate_start..]
+}
+
+/// The output of a command whose implementation failed, finding broken the invariant `invariant`
+/// describes, after writing its reproducer.
+fn internal_error(
+    invocation: &Invocation,
+    args: &[String],
+    trace: &Trace,
+    invariant: &str,
+) -> Output {
     let scope = trace.scope.as_deref().or(invocation.scope()).unwrap_or(".");
     let reproducer = trace
         .root
         .as_deref()
         .and_then(|root| reproducer(root, args, &trace.read).ok());
-    let lines = reproducer
-        .into_iter()
-        .map(|path| format!("reproducer {path}"))
-        .collect();
+    let mut lines = invariant_lines(invariant);
+    lines.extend(reproducer.map(|path| format!("reproducer {path}")));
     Output {
         command: invocation.command(scope, true),
         elision: invocation.command(scope, false),
@@ -463,6 +509,16 @@ fn internal_error(invocation: &Invocation, args: &[String], trace: &Trace) -> Ou
         summary: vec![("records", 1)],
         records: vec![unlocated(Code::InternalInvariant, lines)],
     }
+}
+
+/// The lines of an internal error naming a broken invariant: `invariant ` and the first line of
+/// its description, then each other line indented 4 spaces.
+fn invariant_lines(invariant: &str) -> Vec<String> {
+    let mut described = invariant.lines();
+    let first = described.next().unwrap_or_default();
+    let mut lines = vec![format!("invariant {}", output::printable(first.as_bytes()))];
+    lines.extend(described.map(|line| format!("    {}", output::printable(line.as_bytes()))));
+    lines
 }
 
 /// Writes `.nan/repro/<n>` for the least positive `n` naming no directory: the command line, the

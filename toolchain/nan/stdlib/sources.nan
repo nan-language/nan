@@ -10507,16 +10507,16 @@ const TEXT_HW_PCI: Str =
     \\//! PCI functions: the endpoints of bus 0, their configuration, the register windows of their memory BARs, their attachment to I/O domains, and their MSI-X interrupts.
     \\
     \\/// A function record's offsets: past its holding and tag, its requester id, the ECAM base its
-    \\/// configuration is read through, zero for port I/O, the space it is attached to, its taken
-    \\/// BARs, its MSI-X capability's offset, the offset from its BARs' bus addresses to the CPU's,
-    \\/// then each BAR's base, size and kind.
+    \\/// configuration is read through, zero for port I/O, the space it is attached to, the first
+    \\/// record of the windows given over its BARs, its MSI-X capability's offset, the offset from its
+    \\/// BARs' bus addresses to the CPU's, then each BAR's base, size and kind.
     \\const FUNCTION_REQUESTER: u64 = 16
     \\
     \\const FUNCTION_ECAM: u64 = 24
     \\
     \\const FUNCTION_ATTACHED: u64 = 32
     \\
-    \\const FUNCTION_TAKEN: u64 = 40
+    \\const FUNCTION_WINDOWS: u64 = 40
     \\
     \\const FUNCTION_MSIX: u64 = 48
     \\
@@ -10529,6 +10529,18 @@ const TEXT_HW_PCI: Str =
     \\const BARS: u64 = 6
     \\
     \\const FUNCTION_RECORD: u64 = 208
+    \\
+    \\/// A window record's offsets: the next window record of its function, then its BAR and the
+    \\/// bytes of the BAR it spans, from its start to its end.
+    \\const WINDOW_NEXT: u64 = 0
+    \\
+    \\const WINDOW_BAR: u64 = 8
+    \\
+    \\const WINDOW_START: u64 = 16
+    \\
+    \\const WINDOW_END: u64 = 24
+    \\
+    \\const WINDOW_RECORD: u64 = 32
     \\
     \\/// The attachment of a function attached to physical memory.
     \\const ATTACHED_PHYSICAL: u64 = 0xFFFF_FFFF_FFFF_FFFF
@@ -10626,6 +10638,7 @@ const TEXT_HW_PCI: Str =
     \\
     \\pub closed enum PciError derives Copy, Eq, Render {
     \\    NotMemory
+    \\    Misaligned
     \\    TooSmall
     \\    Taken
     \\    Unmapped
@@ -10650,31 +10663,42 @@ const TEXT_HW_PCI: Str =
     \\    return config(self.record, offset: u32.widen(offset))
     \\} PciFunction.config_read
     \\
-    \\pub fn Mmio.of_bar(mut function: PciFunction, index: u8) -> Mmio[R] fails PciError {
+    \\pub fn Mmio.of_bar(mut function: PciFunction, index: u8, offset: u64) -> Mmio[R] fails PciError {
     \\    let record = function.record
-    \\    if u64.widen(index) >= BARS {
+    \\    let bar_index = u64.widen(index)
+    \\    if bar_index >= BARS {
     \\        fail PciError.NotMemory
     \\    }
-    \\    let bar = record + FUNCTION_BARS + u64.widen(index) * BAR_BYTES
+    \\    let bar = record + FUNCTION_BARS + bar_index * BAR_BYTES
     \\    let kind = peek(bar + 16)
     \\    if kind != MEMORY32 and kind != MEMORY64 {
     \\        fail PciError.NotMemory
     \\    }
-    \\    let bit = 1u64 << u32.widen(index)
-    \\    if (peek(record + FUNCTION_TAKEN) & bit) != 0 {
-    \\        fail PciError.Taken
+    \\    if offset % Mmio[R].alignment() != 0 {
+    \\        fail PciError.Misaligned
     \\    }
     \\    let size = peek(bar + 8)
-    \\    if Mmio[R].extent() > size {
+    \\    let Some(end) = offset.checked_add(Mmio[R].extent()) else {
     \\        fail PciError.TooSmall
+    \\    }
+    \\    if end > size {
+    \\        fail PciError.TooSmall
+    \\    }
+    \\    if taken(record, index: bar_index, start: offset, end) {
+    \\        fail PciError.Taken
     \\    }
     \\    let base = peek(bar).wrapping_add(peek(record + FUNCTION_WINDOW))
     \\    if not device_memory(base, size) {
     \\        fail PciError.Unmapped
     \\    }
-    \\    poke(record + FUNCTION_TAKEN, value: peek(record + FUNCTION_TAKEN) | bit)
+    \\    let window = runtime_record(WINDOW_RECORD)
+    \\    poke(window + WINDOW_NEXT, value: peek(record + FUNCTION_WINDOWS))
+    \\    poke(window + WINDOW_BAR, value: bar_index)
+    \\    poke(window + WINDOW_START, value: offset)
+    \\    poke(window + WINDOW_END, value: end)
+    \\    poke(record + FUNCTION_WINDOWS, value: window)
     \\    set_command(record, set: MEMORY, clear: 0)
-    \\    return trusted "the BAR holds the function's R registers, at an address the entry root maps uncached, and only this window maps it" { Mmio[R].map(base) }
+    \\    return trusted "the BAR holds the function's registers R reaches from the offset, at an address the entry root maps uncached, and no other window maps them" { Mmio[R].map(base + offset) }
     \\} Mmio.of_bar
     \\
     \\pub fn PciFunction.attach(mut self, space: IoSpace) fails IommuError {
@@ -10744,8 +10768,11 @@ const TEXT_HW_PCI: Str =
     \\    cut_off(record)
     \\} PciFunction.release
     \\
-    \\/// The register window extent of R: the bytes from its first register to past its last.
+    \\/// The register window extent of R: the bytes from its offset 0 to past its last register.
     \\pkg fn Mmio.extent() -> u64
+    \\
+    \\/// The bytes of R's widest register or element, to which its window's address is aligned.
+    \\pkg fn Mmio.alignment() -> u64
     \\
     \\/// A double word of a function's configuration through an ECAM, or through the configuration
     \\/// ports for a zero `ecam`, and its write.
@@ -10969,6 +10996,33 @@ const TEXT_HW_PCI: Str =
     \\    return false
     \\} device_page
     \\
+    \\/// Whether the bytes from `start` to `end` of BAR `index` of a function overlap a window given
+    \\/// over the BAR, its MSI-X table or its pending bit array.
+    \\fn taken(record: u64, index: u64, start: u64, end: u64) -> bool {
+    \\    var window = peek(record + FUNCTION_WINDOWS)
+    \\    while window != 0 {
+    \\        if peek(window + WINDOW_BAR) == index and start < peek(window + WINDOW_END) and peek(window + WINDOW_START) < end {
+    \\            return true
+    \\        }
+    \\        window = peek(window + WINDOW_NEXT)
+    \\    }
+    \\    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
+    \\    if capability == 0 {
+    \\        return false
+    \\    }
+    \\    let msix_entries = u64.widen((config(record, offset: capability) >> 16) & 0x7FF) + 1
+    \\    let table = config(record, offset: capability + 4)
+    \\    let pending = config(record, offset: capability + 8)
+    \\    return overlaps(location: table, bytes: msix_entries * 16, index, start, end) or overlaps(location: pending, bytes: (msix_entries + 63) / 64 * 8, index, start, end)
+    \\} taken
+    \\
+    \\/// Whether the `bytes` bytes an MSI-X structure's BAR indicator and offset `location` place
+    \\/// overlap the bytes from `start` to `end` of BAR `index`.
+    \\fn overlaps(location: u32, bytes: u64, index: u64, start: u64, end: u64) -> bool {
+    \\    let offset = u64.widen(location & 0xFFFF_FFF8)
+    \\    return u64.widen(location & 0x7) == index and start < offset + bytes and offset < end
+    \\} overlaps
+    \\
     \\/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function is not
     \\/// attached, has no such entry or its table lies outside device memory.
     \\fn msix_table_entry(record: u64, entry: u64) -> u64 {
@@ -11001,7 +11055,7 @@ const TEXT_HW_PCI: Str =
     \\/// mask.
     \\fn program_entry(record: u64, table: u64, message: MsiMessage) {
     \\    set_command(record, set: MEMORY, clear: 0)
-    \\    var entry = trusted "the MSI-X entry lies in the function's memory BAR, which the entry root maps uncached; a window of the BAR may also write it, and interrupt remapping or the ITS lets only this function's messages through" { Mmio[MsixEntry].map(table) }
+    \\    var entry = trusted "the MSI-X entry lies in the function's memory BAR, which the entry root maps uncached, outside every window of the BAR" { Mmio[MsixEntry].map(table) }
     \\    mut entry.write(MsixEntry.control, value: 1)
     \\    mut entry.write(MsixEntry.address_low, value: u32.truncate(message.address))
     \\    mut entry.write(MsixEntry.address_high, value: u32.truncate(message.address >> 32))
@@ -11014,7 +11068,8 @@ const TEXT_HW_PCI: Str =
     \\} program_entry
     \\
     \\/// Cuts a function off: no longer mastering the bus or decoding memory, its context or stream
-    \\/// reaching nothing once the IOMMU no longer caches it; then frees its record.
+    \\/// reaching nothing once the IOMMU no longer caches it; then frees its record and those of its
+    \\/// windows.
     \\fn cut_off(record: u64) {
     \\    set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
     \\    let unit = iommu_unit()
@@ -11023,6 +11078,12 @@ const TEXT_HW_PCI: Str =
     \\        clear_entry(unit, requester: peek(record + FUNCTION_REQUESTER))
     \\        iommu_flush()
     \\        iommu_unlock(flags)
+    \\    }
+    \\    var window = peek(record + FUNCTION_WINDOWS)
+    \\    while window != 0 {
+    \\        let next = peek(window + WINDOW_NEXT)
+    \\        free_record(window)
+    \\        window = next
     \\    }
     \\    free_record(record)
     \\} cut_off

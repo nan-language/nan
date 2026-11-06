@@ -157,12 +157,17 @@ const SIMULATED: i64 = i64::MIN;
 /// those of a device: on the host every window is simulated, a machine image's other than a test
 /// image's never are, and a machine test image's word says which one is.
 pub fn window(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
-    if supply.member() == "extent" {
+    if let member @ ("extent" | "alignment") = supply.member() {
         let Ty::Registers(block) = supply.type_arg(0) else {
             panic!("a registers block");
         };
-        let extent = fx.ptr(registers_extent(lo, block));
-        supply.ret(lo, fx, Held::Scalar(extent));
+        let span = registers_span(lo, block);
+        let bytes = match member {
+            "extent" => span.extent,
+            _ => span.alignment,
+        };
+        let bytes = fx.ptr(bytes);
+        supply.ret(lo, fx, Held::Scalar(bytes));
         return;
     }
     if supply.member() == "map" {
@@ -614,8 +619,14 @@ fn dma_parts(lo: &mut Lowering, ty: &Ty) -> Vec<(u64, u64)> {
 /// its byte offset, then its stride, each 4 bytes.
 const REGISTER_ENTRY: u64 = 8;
 
-/// The bytes of a registers block from its offset 0 to past its last register or element.
-fn registers_extent(lo: &mut Lowering, block: ItemId) -> u64 {
+/// The bytes a registers block spans: from its offset 0 to past its last register or element,
+/// and those of its widest register or element.
+struct BlockSpan {
+    extent: u64,
+    alignment: u64,
+}
+
+fn registers_span(lo: &mut Lowering, block: ItemId) -> BlockSpan {
     let ItemKind::Registers(declared) = &lo.ck.db.ast(block).kind else {
         panic!("a registers item");
     };
@@ -624,7 +635,10 @@ fn registers_extent(lo: &mut Lowering, block: ItemId) -> u64 {
     let SigKind::Registers { registers } = &lo.ck.sig(block).kind else {
         panic!("a registers block");
     };
-    let mut extent = 0;
+    let mut span = BlockSpan {
+        extent: 0,
+        alignment: 1,
+    };
     for (register, sig) in declared.registers.iter().zip(registers) {
         let (size, last) = match (&sig.ty, register.stride) {
             (Ty::Item(_, args), Some(stride)) => {
@@ -637,9 +651,10 @@ fn registers_extent(lo: &mut Lowering, block: ItemId) -> u64 {
             }
             _ => (lo.layout(&sig.ty).size, 0),
         };
-        extent = extent.max(number(register.at) + last + size);
+        span.extent = span.extent.max(number(register.at) + last + size);
+        span.alignment = span.alignment.max(size);
     }
-    extent
+    span
 }
 
 /// The table of a registers block, an entry per register in order.

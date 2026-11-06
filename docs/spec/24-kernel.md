@@ -678,6 +678,7 @@ pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
 
 pub closed enum PciError derives Copy, Eq, Render {
     NotMemory
+    Misaligned
     TooSmall
     Taken
     Unmapped
@@ -688,7 +689,7 @@ pub fn PciFunction.address(self) -> PciAddress
 pub fn PciFunction.config_read(self, offset: u8) -> u32
     requires offset % 4 == 0
 
-pub fn Mmio.of_bar(mut function: PciFunction, index: u8) -> Mmio[R] fails PciError
+pub fn Mmio.of_bar(mut function: PciFunction, index: u8, offset: u64) -> Mmio[R] fails PciError
 
 pub fn PciFunction.attach(mut self, space: IoSpace) fails IommuError
 
@@ -700,7 +701,7 @@ pub fn PciFunction.release(take self)
 ```
 
 - `function.address()` is its bus, device and function numbers; its **requester id** is `device << 3 | function` on bus 0. `function.config_read(offset)` reads the double word at `offset` of its configuration space. Nothing writes its configuration but the runtime.
-- `hw::Mmio[R].of_bar(mut function, index: i)` enables the function's memory decoding and returns a window over R at the start of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)). It fails with `NotMemory` when BAR i is not a memory BAR, with `TooSmall` when the BAR holds fewer bytes than R spans from offset 0 to past its last register, with `Taken` when an earlier call gave a window over the BAR, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)).
+- `hw::Mmio[R].of_bar(mut function, index: i, offset: o)` enables the function's memory decoding and returns a window over R at offset o of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)); the window's bytes are those R spans from o to past its last register. It fails with `NotMemory` when BAR i is not a memory BAR, with `Misaligned` when o is not a multiple of the size of R's widest register or element, with `TooSmall` when the window's bytes do not lie within the BAR, with `Taken` when they overlap those of a window an earlier call gave over the BAR, or the function's MSI-X table or pending bit array, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)).
 - `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, and with `Unsupported` when the IOMMU does not translate the function. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Unsupported` when the IOMMU translates the function and cannot pass its accesses through. A function attached anew leaves the space it was attached to.
 - `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
 - `take function.release()` cuts the function off: its bus mastering and memory decoding end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
@@ -718,7 +719,7 @@ package driver {
 } driver
 
 // file: driver/driver.nan
-//! Finds a modern virtio entropy device and maps its common configuration.
+//! Finds a modern virtio entropy device and maps its common configuration at the offset in its BAR that its capability gives.
 
 const VIRTIO_ENTROPY: u32 = 0x1044_1AF4
 
@@ -730,8 +731,8 @@ pub fn is_entropy(function: hw::PciFunction) -> bool {
     return function.config_read(0) == VIRTIO_ENTROPY
 } is_entropy
 
-pub fn reset(mut function: hw::PciFunction, bar: u8) fails hw::PciError {
-    var common = try hw::Mmio[Common].of_bar(mut function, index: bar)
+pub fn reset(mut function: hw::PciFunction, bar: u8, offset: u64) fails hw::PciError {
+    var common = try hw::Mmio[Common].of_bar(mut function, index: bar, offset)
     mut common.write(Common.device_status, value: 0)
     take common.unmap()
 } reset

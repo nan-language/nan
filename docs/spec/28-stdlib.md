@@ -77,6 +77,7 @@ The table names every pub std type, interface, free function and registry with t
 | `mem` | `mem::wire::Erased` | [Erased decoders](13-text-encode.md#erased-decoders) |
 | `text` | `text::String`, `text::Fixed` | [Text types](13-text-encode.md#text-types) |
 | `text` | `text::utf8::Utf8Error`, `text::utf8::valid_prefix`, `text::utf8::is_valid`, `text::utf8::char_at`, `text::utf8::write_char` | [UTF-8](13-text-encode.md#utf-8) |
+| `text` | `text::case::fold`, `text::case::eq` | [Case folding](13-text-encode.md#case-folding) |
 | `text` | `text::Symbol`, `text::Interner` | [Interning](13-text-encode.md#interning) |
 | `text` | `text::Writer`, `text::fmt` | [Writers](13-text-encode.md#writers), [Templates](13-text-encode.md#templates) |
 | `text` | `text::json::Codec` | [JSON](13-text-encode.md#json) |

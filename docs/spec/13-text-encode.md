@@ -1,6 +1,6 @@
 # Text, rendering and Encode
 
-This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules and flexible structs, schema trees and hashes, the formats `mem::wire` and `text::json`, erased decoders, migrations, and the construction text that `text::construction` decodes.
+This chapter defines the text types, their lengths and slicing, `text::utf8`, case folding, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules and flexible structs, schema trees and hashes, the formats `mem::wire` and `text::json`, erased decoders, migrations, and the construction text that `text::construction` decodes.
 
 ## Text types
 
@@ -244,6 +244,32 @@ pub fn label_of(bytes: Slice[u8], alloc: mem::Alloc) -> text::String fails Label
     }
     return label
 } label_of
+```
+
+## Case folding
+
+`text::case` compares text without regard to case, by the simple case folding of Unicode 18.0.0.
+
+```nan-api
+// module: text::case
+
+pub fn fold(c: char) -> char limits pure, notrap, terminates
+    example fold('Σ') == 'σ'
+
+pub fn eq(text: Str, other: Str) -> bool limits pure, notrap, terminates
+    example eq("ΣΊΣΥΦΟΣ", other: "σίσυφος")
+```
+
+- `fold(c)` is the mapping of `c` with status C or S in `CaseFolding.txt` of the Unicode Character Database, and `c` itself when it has none. It maps one char to one char, so it folds `ß` to itself and the Kelvin sign to `k`, and has none of the Turkic mappings of status T.
+- `eq(text, other: o)` is true exactly when both texts have the same char count and each char of `text` folds to what the char of `o` at its position folds to.
+
+```nan
+pub fn same_entry_name(name: Str, entry: Str) -> bool
+    example same_entry_name("README.TXT", entry: "readme.txt")
+    example not same_entry_name("ı", entry: "I")
+{
+    return text::case::eq(name, other: entry)
+} same_entry_name
 ```
 
 ## Interning

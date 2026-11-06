@@ -881,7 +881,7 @@ fn Flow.take_value(mut self, value: FlowValue, ty: ty::Ty, token: u32) {
             return
         }
         Some(Form.Part) => {
-            self.report(token, code: diagnostic::Code.OwnMoveNotOwned)
+            self.report_not_owned(value, token)
             return
         }
         else => {}
@@ -897,7 +897,7 @@ fn Flow.take_value(mut self, value: FlowValue, ty: ty::Ty, token: u32) {
         if self.task == Some(true) and self.local_kind(root) == LocalKind.Capture(ast::Mode.Read) {
             self.report_fixed(nir::Span.at(token), code: diagnostic::Code.ClosureCaptureMode, fixes: self.listed(root, mode: ast::Mode.Take))
         } else {
-            self.report(token, code: diagnostic::Code.OwnMoveNotOwned)
+            self.report_not_owned(value, token)
         }
         return
     }
@@ -910,6 +910,54 @@ fn Flow.take_value(mut self, value: FlowValue, ty: ty::Ty, token: u32) {
     discard mut self.moved_locals.insert(root)
     mut self.change_state(fn(mut state: FlowState) => mut state.move_path(path, token, alloc))
 } Flow.take_value
+
+/// Reports a move at `token` of a value that does not own it: where the root of the place it
+/// is was bound, or the latest hold of the projection result it is or derives from; moving
+/// out of a read parameter is fixed by marking it `take`, and the moved value too unless
+/// marked.
+fn Flow.report_not_owned(self, value: FlowValue, token: u32) {
+    let code = diagnostic::Code.OwnMoveNotOwned
+    if not self.newly_reported(token, code) {
+        return
+    }
+    let alloc = self.alloc
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    let root = match first value.place {
+        Some(path) if value.form.is_none() or self.views.contains(path.root) => Some(path.root)
+        else => None
+    }
+    match root {
+        Some(bound) => {
+            let local = self.body.contents().local(bound)
+            let at = self.bound.get(bound).value_or(local.token)
+            mut because.push(self.reason(at, role: diagnostic::Role.Bound, subject: self.name(bound)))
+            if local.kind == LocalKind.Param(ast::Mode.Read) and value.form.is_none() {
+                let source = self.ck.db().syntax(self.item)
+                let unmarked = match source.previous(usize.widen(token)) {
+                    Some(marker) => source.tokens[marker].kind != syntax::TokenKind.Keyword(syntax::Keyword.Take)
+                    None => true
+                }
+                if unmarked {
+                    let param = self.ck.fix_inserting(self.item, before: local.token, text: "take ")
+                    mut fixes.push(take param.joined(self.ck.fix_inserting(self.item, before: token, text: "take ")))
+                }
+                mut fixes.push(self.ck.fix_inserting(self.item, before: local.token, text: "take "))
+            }
+        }
+        None => {
+            if value.holds.len() > 0 {
+                let hold = value.holds[value.holds.len() - 1]
+                var role = diagnostic::Role.Frozen
+                if hold.held {
+                    role = diagnostic::Role.Held
+                }
+                mut because.push(self.reason(hold.token, role, subject: self.written(hold.source)))
+            }
+        }
+    }
+    self.ck.report_fixed_because(self.item, construct: nir::Span.at(token), code, take fixes, offer: diagnostic::Offer.First, take because)
+} Flow.report_not_owned
 
 /// The first place a pending deferred call names that overlaps a path.
 fn Flow.deferred_place(self, path: Path) -> Option[Path] {
@@ -1355,7 +1403,7 @@ fn Flow.branches_value(mut self, take branches: mem::List[FlowBranch], ty: ty::T
     }
     for branch in take branches {
         if not returning and not parts and branch.value.form == Some(Form.Part) and not self.is_copy(ty) {
-            self.report(branch.token, code: diagnostic::Code.OwnMoveNotOwned)
+            self.report_not_owned(branch.value, token: branch.token)
         }
         for hold in take branch.value.holds {
             mut joined.holds.push(take hold)

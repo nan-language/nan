@@ -595,7 +595,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 return;
             }
             Some(Form::Part) => {
-                self.report(token, Code::OwnMoveNotOwned);
+                self.report_not_owned(value, token);
                 return;
             }
             _ => {}
@@ -614,7 +614,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let fixes = self.listed(root, Mode::Take);
                 self.report_fixed((token, token), Code::ClosureCaptureMode, fixes);
             } else {
-                self.report(token, Code::OwnMoveNotOwned);
+                self.report_not_owned(value, token);
             }
             return;
         }
@@ -650,6 +650,55 @@ impl<'c, 'a> Flow<'c, 'a> {
         if let Some(state) = self.state.as_mut() {
             state.moved.insert(path.clone(), (Moved::Every, token));
         }
+    }
+
+    /// Reports a move at `token` of a value that does not own it: where the root of the place it
+    /// is was bound, or the latest hold of the projection result it is or derives from; moving
+    /// out of a read parameter is fixed by marking it `take`, and the moved value too unless
+    /// marked.
+    fn report_not_owned(&mut self, value: &Value, token: Tok) {
+        if !self.reported.insert((token, Code::OwnMoveNotOwned)) {
+            return;
+        }
+        let mut because = Vec::new();
+        let mut fixes = Vec::new();
+        let place = value
+            .place
+            .as_ref()
+            .filter(|path| value.form.is_none() || self.views.contains_key(&path.root));
+        match place {
+            Some(path) => {
+                let local = self.body.local(path.root);
+                let at = self.bound.get(&path.root).copied().unwrap_or(local.token);
+                because.push(self.reason(at, Role::Bound, self.name(path.root)));
+                if local.kind == LocalKind::Param(Mode::Read) && value.form.is_none() {
+                    let param = self.ck.fix_inserting(self.item, local.token, "take ");
+                    let syntax = &self.ck.db.item(self.item).file.syntax;
+                    let unmarked = syntax.previous(token as usize).is_none_or(|marker| {
+                        syntax.tokens[marker].kind != TokenKind::Keyword(Keyword::Take)
+                    });
+                    if unmarked {
+                        let marked = self.ck.fix_inserting(self.item, token, "take ");
+                        fixes.push(param.clone().and(marked));
+                    }
+                    fixes.push(param);
+                }
+            }
+            None => {
+                if let Some(hold) = value.holds.last() {
+                    let role = if hold.held { Role::Held } else { Role::Frozen };
+                    because.push(self.reason(hold.token, role, self.written(&hold.source)));
+                }
+            }
+        }
+        self.ck.report_fixed_because(
+            self.item,
+            (token, token),
+            Code::OwnMoveNotOwned,
+            fixes,
+            Offer::First,
+            because,
+        );
     }
 
     // Linear consumption.
@@ -1048,7 +1097,7 @@ impl<'c, 'a> Flow<'c, 'a> {
         };
         for (value, token) in branches {
             if !returning && !parts && value.form == Some(Form::Part) && !self.is_copy(ty) {
-                self.report(token, Code::OwnMoveNotOwned);
+                self.report_not_owned(&value, token);
             }
             joined.holds.extend(value.holds);
             joined.roots.extend(value.roots);

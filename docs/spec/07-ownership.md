@@ -13,6 +13,7 @@ A **move** transfers a non-Copy value to a new owner. A value moves when it init
 - Assigning a moved place that [modes](#modes) allow to be assigned makes it usable again; that assignment releases nothing.
 - A **partial move** moves a field out of a place whose root is a `let` or `var` binding or a `take` parameter, by field access or by destructuring. The other fields stay usable. A use of the whole value while one of its fields is moved is an error (`own.use-after-move`); assigning every moved field makes the whole usable again.
 - Moving out of a place that does not own its value is an error (`own.move-not-owned`): a read or `mut` parameter, a [view binding](#view-bindings), a [part](#projection-results), a capture as [captures](#captures) states, a name a `for` pattern binds to an element it does not own ([iteration](#iteration)), or a field path from one of these.
+- The [because-chain](34-diagnostics.md#because-chain) of `own.move-not-owned` holds, for a moved place, a `bound` reason, its subject the place's root, at the line binding it, and for a moved part that is not a place, a `frozen` or `held` reason, its subject the source of the latest [hold](#holds) the part keeps, at the line where that hold began, when it keeps one. When the root is a read parameter, the exact fix is the first of these rewrites that passes the [re-check](34-diagnostics.md#exact-fixes): marking the parameter `take` together with the moved value when it is unmarked, and marking the parameter `take` alone.
 
 The **end of scope** of an owner is where the values it still holds are released:
 
@@ -57,6 +58,19 @@ pub closed struct Frame {
 pub fn payload_of(frame: Frame) -> mem::List[u8] {
     return frame.payload // error: own.move-not-owned
 } payload_of
+```
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error own.move-not-owned example/example.nan:8 example::payload_of
+        return frame.payload // error: own.move-not-owned
+    because bound example/example.nan:7 example::payload_of frame
+    pub fn payload_of(frame: Frame) -> mem::List[u8] {
+    fix 1 example/example.nan
+    - pub fn payload_of(frame: Frame) -> mem::List[u8] {
+    + pub fn payload_of(take frame: Frame) -> mem::List[u8] {
+failed check example: errors 1, incomplete 0
 ```
 
 ## Modes
@@ -155,6 +169,26 @@ pub fn labelled(take label: text::String) -> text::String {
 pub fn relabelled(label: text::String) -> text::String {
     return labelled(label) // error: own.move-not-owned
 } relabelled
+```
+
+The fix marks both the parameter and the argument `take`:
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error own.move-not-owned example/example.nan:7 example::relabelled
+        return labelled(label) // error: own.move-not-owned
+    expected: take label
+    found: label
+    because bound example/example.nan:6 example::relabelled label
+    pub fn relabelled(label: text::String) -> text::String {
+    fix 1 example/example.nan
+    - pub fn relabelled(label: text::String) -> text::String {
+    + pub fn relabelled(take label: text::String) -> text::String {
+    fix 1 example/example.nan
+    -     return labelled(label) // error: own.move-not-owned
+    +     return labelled(take label) // error: own.move-not-owned
+failed check example: errors 1, incomplete 0
 ```
 
 ```nan

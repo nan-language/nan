@@ -346,11 +346,26 @@ impl<'a> Checker<'a> {
         fixes: Vec<Fix>,
         offer: Offer,
     ) {
+        self.report_fixed_because(item, construct, code, fixes, offer, Vec::new());
+    }
+
+    /// Reports a diagnostic on the construct of an item's tokens `first..=last`, with the fixes
+    /// its rule names and its because-chain.
+    pub fn report_fixed_because(
+        &self,
+        item: ItemId,
+        construct: (Tok, Tok),
+        code: Code,
+        fixes: Vec<Fix>,
+        offer: Offer,
+        because: Vec<Reason>,
+    ) {
         self.report_diagnostic(
             item,
             Diagnostic {
                 fixes,
                 offer,
+                because,
                 ..self.on(item, construct, code)
             },
         );

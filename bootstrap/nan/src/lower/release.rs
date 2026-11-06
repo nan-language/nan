@@ -7,9 +7,14 @@ use super::Instance;
 use super::Lowering;
 use super::fx::Fx;
 use super::layout::Shape;
+use super::stack;
 use super::supplied;
 use crate::check::props::Property;
+use crate::check::sig::SigKind;
 use crate::check::ty::Ty;
+use crate::nir::Span;
+
+mod walk;
 
 impl Lowering<'_, '_> {
     /// Releases the value of a type at an address.
@@ -20,6 +25,46 @@ impl Lowering<'_, '_> {
         let glue = self.instance(Instance::Release(ty.clone()));
         let reference = self.call_ref(fx, glue);
         fx.b.ins().call(reference, &[address]);
+    }
+
+    /// Releases a part of a value of type `owner` at an address: the field or the payload of
+    /// the variant `name` declares, the call's site lying on that declaration in workspace
+    /// source.
+    pub fn release_part(&mut self, fx: &mut Fx, owner: &Ty, name: &str, ty: &Ty, address: Value) {
+        if !self.needs_release(ty) {
+            return;
+        }
+        let glue = self.instance(Instance::Release(ty.clone()));
+        let reference = self.call_ref(fx, glue);
+        let inst = fx.b.ins().call(reference, &[address]);
+        if let Some(at) = self.declared(owner, name) {
+            let kind = stack::Kind::Direct {
+                callee: glue,
+                bindings: Vec::new(),
+            };
+            fx.sites.push((inst, stack::Site { kind, at: Some(at) }));
+        }
+    }
+
+    /// Where the field or variant `name` of a type the workspace declares is declared.
+    fn declared(&self, owner: &Ty, name: &str) -> Option<stack::At> {
+        let Ty::Item(item, _) = owner else {
+            return None;
+        };
+        if self.ck.db.is_std(*item) {
+            return None;
+        }
+        let token = match &self.ck.sig(*item).kind {
+            SigKind::Struct { fields } => fields.iter().find(|field| field.name == name)?.token,
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
+                variants.iter().find(|variant| variant.name == name)?.token
+            }
+            _ => return None,
+        };
+        Some(stack::At {
+            item: *item,
+            span: Span::at(token),
+        })
     }
 
     /// Whether releasing a value of a type does anything.
@@ -70,6 +115,11 @@ impl Lowering<'_, '_> {
 pub fn define(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) {
     let params = fx.entry();
     let address = params[0];
+    if let Some(group) = lo.release_group(ty) {
+        walk::release(lo, fx, &group, ty, address);
+        fx.b.ins().return_(&[]);
+        return;
+    }
     if let Ty::Item(item, _) = ty
         && lo.ck.db.is_std(*item)
         && supplied::release_base(lo, fx, ty, address)
@@ -88,7 +138,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) {
         Shape::Record(fields) | Shape::Bytes { fields, .. } => {
             for field in fields.clone() {
                 let at = fx.offset(address, field.offset);
-                lo.release(fx, &field.ty, at);
+                lo.release_part(fx, ty, &field.name, &field.ty, at);
             }
         }
         Shape::Array { element, count } => {
@@ -118,7 +168,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) {
                 fx.when(is, |fx| {
                     for field in &fields {
                         let at = fx.offset(address, field.offset);
-                        lo.release(fx, &field.ty, at);
+                        lo.release_part(fx, ty, &variant.name, &field.ty, at);
                     }
                 });
             }

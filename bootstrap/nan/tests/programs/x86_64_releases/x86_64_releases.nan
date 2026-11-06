@@ -1,0 +1,111 @@
+//! Releases values whose types hold themselves, from a task with a bound on its stack: a tree of lists, a chain of boxes a million deep and one of lists half a million deep, and groves of maps, hash maps and shared values, each drawn through a budget whose charge then returns to zero.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+enum Tree {
+    Leaf(u64)
+    Node(mem::List[Tree])
+} Tree
+
+enum Chain {
+    End
+    Link(mem::Box[Chain])
+} Chain
+
+struct Nest {
+    inner: mem::List[Nest]
+} Nest
+
+enum Grove {
+    Seed(text::String)
+    Sorted(mem::Map[u64, Grove])
+    Hashed(mem::HashMap[u64, Grove])
+    Both(left: mem::Shared[Grove], right: mem::Shared[Grove])
+} Grove
+
+fn grow(alloc: mem::Alloc) -> u64 {
+    var leaves = mem::List[Tree].empty(alloc)
+    mut leaves.push(Tree.Leaf(1))
+    let tree = Tree.Node(take leaves)
+    let Tree.Node(items) = tree else {
+        return 0
+    }
+    return u64.widen(items.len())
+} grow
+
+fn chained(depth: u64, alloc: mem::Alloc) {
+    let heap = mem::Heap.of(alloc)
+    var chain = Chain.End
+    for _ in 0..<depth {
+        chain = Chain.Link(heap.boxed(take chain))
+    }
+} chained
+
+fn nested(depth: u64, alloc: mem::Alloc) {
+    var nest = Nest(inner: mem::List[Nest].empty(alloc))
+    for _ in 0..<depth {
+        var outer = mem::List[Nest].empty(alloc)
+        mut outer.push(take nest)
+        nest = Nest(inner: take outer)
+    }
+} nested
+
+fn planted(alloc: mem::Alloc) {
+    var sorted = mem::Map[u64, Grove].empty(alloc)
+    discard mut sorted.insert(1, value: Grove.Seed(text::String.of("oak", alloc)))
+    discard mut sorted.insert(2, value: Grove.Sorted(mem::Map[u64, Grove].empty(alloc)))
+    var hashed = mem::HashMap[u64, Grove].empty(seed: 7, alloc)
+    discard mut hashed.insert(3, value: Grove.Sorted(take sorted))
+    discard mut hashed.insert(4, value: Grove.Seed(text::String.of("elm", alloc)))
+    let shared = mem::Shared[Grove].of(Grove.Hashed(take hashed), alloc)
+    let again = shared.share()
+    let both = Grove.Both(left: take shared, right: take again)
+    let twice = mem::Shared[Grove].of(take both, alloc)
+    discard Grove.Both(left: twice.share(), right: take twice)
+} planted
+
+/// Whether what `release` draws through a budget of its own all returns.
+fn returned(alloc: mem::Alloc, release: fn(alloc: mem::Alloc)) -> bool {
+    let budget = alloc.split(limit: 1_073_741_824)
+    release(budget.alloc())
+    let charged = budget.charged()
+    take budget.close()
+    return charged == 0
+} returned
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    var regions = mut k.regions()
+    var largest: usize = 0
+    for index in 0..<regions.len() {
+        if regions[index].byte_len() > regions[largest].byte_len() {
+            largest = index
+        }
+    }
+    let chosen = mut regions.remove(largest)
+    let drawn = mem::Heap.over(take chosen).alloc()
+    take k.anchor(take regions, run: fn(exec: task::Executor) limits stack 16_384 {
+        if grow(alloc) == 1 {
+            say(text: b"tree of one leaf\n")
+        }
+        if returned(drawn, release: fn(budget: mem::Alloc) => chained(depth: 1_000_000, alloc: budget)) {
+            say(text: b"chain of a million boxes released\n")
+        }
+        if returned(drawn, release: fn(budget: mem::Alloc) => nested(depth: 500_000, alloc: budget)) {
+            say(text: b"nest of half a million lists released\n")
+        }
+        if returned(drawn, release: planted) {
+            say(text: b"groves released\n")
+        }
+    })
+} main

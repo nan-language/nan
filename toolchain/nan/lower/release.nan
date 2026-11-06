@@ -10,6 +10,53 @@ fn Lowering.release(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value) {
     discard mut fx.b.call(reference, args: Array[clif::Value, 1].filled(address).view())
 } Lowering.release
 
+/// Releases a part of a value of type `owner` at an address: the field or the payload of the
+/// variant `name` declares, the call's site lying on that declaration in workspace source.
+fn Lowering.release_part(mut self, mut fx: Fx, owner: ty::Ty, name: Str, ty: ty::Ty, address: clif::Value) {
+    if not mut self.needs_release(ty) {
+        return
+    }
+    let glue = mut self.instance(Instance.Release(ty))
+    let reference = mut self.call_ref(mut fx, id: glue)
+    let inst = mut fx.b.call(reference, args: Array[clif::Value, 1].filled(address).view())
+    match self.declared(owner, name) {
+        Some(at) => {
+            let kind = StackKind.Direct(callee: glue, bindings: mem::List[ParamBinding].empty(fx.alloc))
+            mut fx.sites.push(CallSite(inst: inst, site: Site(kind: take kind, at: Some(at))))
+        }
+        None => {}
+    }
+} Lowering.release_part
+
+/// Where the field or variant `name` of a type the workspace declares is declared.
+fn Lowering.declared(self, owner: ty::Ty, name: Str) -> Option[At] {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(owner) else {
+        return None
+    }
+    if self.ck.db().is_std(item) {
+        return None
+    }
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        check::SigKind.Struct(fields: fields) => {
+            for field in fields {
+                if field.name.as_str() == name {
+                    return Some(At(item: item, span: nir::Span.at(field.token)))
+                }
+            }
+        }
+        check::SigKind.Enum(variants: variants) or check::SigKind.Protocol(operations: _, variants: variants, summary: _) => {
+            for variant in variants {
+                if variant.name.as_str() == name {
+                    return Some(At(item: item, span: nir::Span.at(variant.token)))
+                }
+            }
+        }
+        else => {}
+    }
+    return None
+} Lowering.declared
+
 /// Whether releasing a value of a type does anything.
 fn Lowering.needs_release(mut self, ty: ty::Ty) -> bool {
     match self.releases.get(ty) {
@@ -77,6 +124,14 @@ fn release_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) {
     let incoming = mut fx.entry()
     expect incoming.len() > 0
     let address = incoming[0]
+    match mut lo.release_group(ty) {
+        Some(group) => {
+            walk_release(mut lo, mut fx, group, ty, address)
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+            return
+        }
+        None => {}
+    }
     match lo.ck.types().kind(ty) {
         ty::TyKind.Item(item: item, args: _) => {
             if lo.ck.db().is_std(item) and release_base(mut lo, mut fx, ty, address) {
@@ -97,7 +152,7 @@ fn release_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) {
         LayoutShape.Record(fields) or LayoutShape.Bytes(fields: fields, big: _) => {
             for field in fields {
                 let at = mut fx.offset(address, offset: field.offset)
-                mut lo.release(mut fx, ty: field.ty, address: at)
+                mut lo.release_part(mut fx, owner: ty, name: field.name.as_str(), ty: field.ty, address: at)
             }
         }
         LayoutShape.Array(element: element, count: count) => {
@@ -127,7 +182,7 @@ fn release_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) {
                 mut fx.if_true(is, then: fn[mut lo](mut then_fx: Fx) {
                     for field in fields {
                         let at = mut then_fx.offset(address, offset: field.offset)
-                        mut lo.release(mut then_fx, ty: field.ty, address: at)
+                        mut lo.release_part(mut then_fx, owner: ty, name: variant.name.as_str(), ty: field.ty, address: at)
                     }
                 })
             }

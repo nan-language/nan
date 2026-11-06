@@ -79,8 +79,8 @@ pub enum Binding {
 /// sites.
 pub struct Frame {
     pub function: FuncId,
-    /// The canonical path naming it in reasons, or the type a move walks; empty for other code
-    /// lowering writes itself.
+    /// The canonical path naming it in reasons, or the type a move walks or a release releases;
+    /// empty for other code lowering writes itself.
     pub name: String,
     pub size: u64,
     pub params: Vec<(usize, Option<u64>)>,

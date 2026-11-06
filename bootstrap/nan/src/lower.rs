@@ -194,6 +194,8 @@ pub enum Glue {
     IrqDevice(Ty, ty::FnTy),
     /// Moves a value of a type into another domain's reach.
     Transfer(Ty),
+    /// Releases a value of a type of the release group whose first member is the type.
+    Release(Ty),
     /// Moves the captures of a task closure, the closure function's instance, into another
     /// domain's reach.
     Captures(Instance),
@@ -325,6 +327,8 @@ pub struct Lowering<'c, 'a> {
     /// The instances and routines declared and not yet defined.
     queue: Vec<Pending>,
     releases: HashMap<Ty, bool>,
+    /// The release group of each type asked for, once known.
+    release_groups: HashMap<Ty, Option<Rc<Vec<Ty>>>>,
     transfers: HashMap<Ty, bool>,
     glues: HashMap<Glue, FuncId>,
     /// The number of glue functions and tables named so far.
@@ -534,6 +538,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             routines: HashMap::new(),
             queue: Vec::new(),
             releases: HashMap::new(),
+            release_groups: HashMap::new(),
             transfers: HashMap::new(),
             glues: HashMap::new(),
             glue: 0,
@@ -716,6 +721,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
             .collect();
         let item = match instance {
             Instance::Nir { item, .. } | Instance::Supplied { item, .. } => *item,
+            Instance::Release(released @ Ty::Item(item, _)) => {
+                frame.name = self.ck.show(released, self.ck.db.module_of(*item));
+                return;
+            }
             _ => return,
         };
         frame.name = self.ck.db.canonical(item);

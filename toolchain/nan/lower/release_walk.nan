@@ -1,0 +1,500 @@
+//! Release walks: the release of the types of a **group**, those whose releases reach each other through the values boxes, shared values and vectors hold. One function per group walks the values it releases depth first without calling itself, keeping its place in the values it releases. A **frame** is a value of a group type being released, and a **holder** a box, shared value, list, set, map or hash map it holds, inline, of a group type. Entering a frame releases its other parts and frees the storage of its empty vectors. The frame then enters, in turn, what each holder still holds, a vector's last element first, after storing in the holder the **link** naming the frame's own parent: its address in the low 48 bits, its type's index in the group above. Once a frame holds nothing more, its parent finds the first holder still holding something, which is the one it entered the frame from, reads the link back from it, takes the frame out, freeing a box's or shared value's storage or a vector's once empty, and goes on. A box's or shared value's word is the link while its value is released and `WALK_DONE` once it is.
+
+/// A box's or shared value's word once the value it holds is released.
+const WALK_DONE: i64 = 1
+
+/// The bits of a link holding the frame's address, and their mask.
+const WALK_ADDRESS_BITS: i64 = 48
+
+const WALK_ADDRESS_MASK: i64 = 0xFFFF_FFFF_FFFF
+
+/// How a holder holds values of a group type.
+enum Holder derives Copy {
+    /// The elements of a vector, `indexed` for a hash map's, whose index is freed first.
+    Vector(element: ty::Ty, indexed: bool)
+    /// The contents of a box.
+    Boxed(ty::Ty)
+    /// The contents of a shared value, released by its last holder.
+    Shared(ty::Ty)
+} Holder
+
+fn Holder.of(lo: Lowering, ty: ty::Ty) -> Option[Holder] {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return None
+    }
+    if not lo.ck.db().is_std(item) {
+        return None
+    }
+    let path = lo.ck.db().canonical(item)
+    let named = path.as_str()
+    if named == "mem::List" or named == "mem::Set" {
+        return Some(Holder.Vector(element: mem_arg(lo, ty, index: 0), indexed: false))
+    }
+    if named == "mem::Map" or named == "mem::HashMap" {
+        return Some(Holder.Vector(element: mem_entry(lo, ty), indexed: named == "mem::HashMap"))
+    }
+    if named == "mem::Box" {
+        let contents = mem_arg(lo, ty, index: 0)
+        return match lo.ck.types().kind(contents) {
+            ty::TyKind.Dyn(_) => None
+            else => Some(Holder.Boxed(contents))
+        }
+    }
+    if named == "mem::Shared" {
+        return Some(Holder.Shared(mem_arg(lo, ty, index: 0)))
+    }
+    return None
+} Holder.of
+
+fn Holder.held(self) -> ty::Ty {
+    return match self {
+        Holder.Vector(element: element, indexed: _) => element
+        Holder.Boxed(held) or Holder.Shared(held) => held
+    }
+} Holder.held
+
+/// The group of a type, by its index among the groups, its members in the order a search from
+/// the first member asked for finds them; none for a type whose release does not reach itself.
+fn Lowering.release_group(mut self, ty: ty::Ty) -> Option[usize] {
+    match self.release_groups.get(ty) {
+        Some(known) => return known
+        None => {}
+    }
+    let Some(members) = walk_group_of(mut self, ty) else {
+        discard mut self.release_groups.insert(ty, value: None)
+        return None
+    }
+    let group = self.groups.len()
+    for member in members {
+        discard mut self.release_groups.insert(member, value: Some(group))
+    }
+    mut self.groups.push(take members)
+    return Some(group)
+} Lowering.release_group
+
+/// The types of the values a type's release releases through no other type's release: what a
+/// holder holds, or the fields, payloads and elements of a type laid out in full.
+fn walk_parts(mut lo: Lowering, ty: ty::Ty) -> mem::List[ty::Ty] {
+    var parts = mem::List[ty::Ty].empty(lo.alloc)
+    if not mut lo.needs_release(ty) {
+        return parts
+    }
+    match Holder.of(lo, ty) {
+        Some(holder) => {
+            let held = holder.held()
+            if mut lo.needs_release(held) {
+                mut parts.push(held)
+            }
+            return parts
+        }
+        None => {}
+    }
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return parts
+    }
+    if lo.ck.db().is_std(item) {
+        let owner_path = lo.ck.db().canonical(item)
+        if base_needs_release(mut lo, owner_path: owner_path.as_str(), ty).is_some() {
+            return parts
+        }
+    }
+    let laid = mut lo.layout_of(ty)
+    for part in laid_parts(laid.contents(), alloc: lo.alloc) {
+        if mut lo.needs_release(part) {
+            mut parts.push(part)
+        }
+    }
+    return parts
+} walk_parts
+
+/// The types a search through parts from a type finds and that reach it, in the order found.
+fn walk_group_of(mut lo: Lowering, ty: ty::Ty) -> Option[mem::List[ty::Ty]] {
+    var found = mem::List[ty::Ty].empty(lo.alloc)
+    mut found.push(ty)
+    var indexes = mem::HashMap[ty::Ty, usize].empty(seed: 0, alloc: lo.alloc)
+    discard mut indexes.insert(ty, value: 0)
+    var edges = mem::List[mem::List[usize]].empty(lo.alloc)
+    while edges.len() < found.len() {
+        var targets = mem::List[usize].empty(lo.alloc)
+        for part in walk_parts(mut lo, ty: found[edges.len()]) {
+            match indexes.get(part) {
+                Some(index) => mut targets.push(index)
+                None => {
+                    discard mut indexes.insert(part, value: found.len())
+                    mut targets.push(found.len())
+                    mut found.push(part)
+                }
+            }
+        }
+        mut edges.push(take targets)
+    }
+    var reaches = mem::List[bool].empty(lo.alloc)
+    for _ in 0..<found.len() {
+        mut reaches.push(false)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for index in 0..<edges.len() {
+            if reaches[index] {
+                continue
+            }
+            for target in edges[index] {
+                if target == 0 or reaches[target] {
+                    reaches[index] = true
+                    changed = true
+                    break
+                }
+            }
+        }
+    }
+    if not reaches[0] {
+        return None
+    }
+    var members = mem::List[ty::Ty].empty(lo.alloc)
+    for index in 0..<found.len() {
+        if reaches[index] {
+            mut members.push(found[index])
+        }
+    }
+    return Some(take members)
+} walk_group_of
+
+/// The index of a type among a group's members.
+fn walk_member(members: Slice[ty::Ty], ty: ty::Ty) -> usize {
+    for index in 0..<members.len() {
+        if members[index] == ty {
+            return index
+        }
+    }
+    expect false
+    return 0
+} walk_member
+
+/// Whether a type is a member of a group.
+fn walk_holds(members: Slice[ty::Ty], ty: ty::Ty) -> bool {
+    for member in members {
+        if member == ty {
+            return true
+        }
+    }
+    return false
+} walk_holds
+
+/// Releases the value of a type of a group, by its index, at an address through the group's
+/// walk.
+fn walk_release(mut lo: Lowering, mut fx: Fx, group: usize, ty: ty::Ty, address: clif::Value) {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let head = lo.groups[group][0]
+    let walk = mut lo.glue_function(Glue.Release(head), take signature, build: fn(mut glue_lo: Lowering, mut glue_fx: Fx) {
+        walk_define(mut glue_lo, fx: mut glue_fx, group)
+    })
+    let member = walk_member(lo.groups[group].view(), ty)
+    let reference = mut lo.call_ref(mut fx, id: walk)
+    let index = mut fx.ptr(u64.widen(member))
+    let walk_args = fx.list2(address, b: index)
+    discard mut fx.b.call(reference, args: walk_args.view())
+} walk_release
+
+/// The blocks of a walk, each taking a frame's address, its parent's address and its parent's
+/// index: per member, entering a frame of it and searching a frame of it for a holder still
+/// holding something; and leaving a frame for its parent.
+struct Walk {
+    members: mem::List[ty::Ty]
+    enter: mem::List[clif::Block]
+    search: mem::List[clif::Block]
+} Walk
+
+/// What a walk does at a holder.
+enum WalkStep derives Copy {
+    /// Entering a frame: frees an empty vector's storage and a hash map's index.
+    Enter
+    /// Searching a frame with its parent and its parent's index: enters the next value held.
+    Search(parent: clif::Value, index: clif::Value)
+    /// Leaving a frame for its parent: takes it out of the first holder still holding one.
+    Leave(child: clif::Value)
+} WalkStep
+
+/// The walk releasing a value of a type of a group, by its index, at the address of its first
+/// parameter, the type by its index in the group in the second.
+fn walk_define(mut lo: Lowering, mut fx: Fx, group: usize) {
+    let params = mut fx.entry()
+    expect params.len() > 1
+    let root = params[0]
+    let root_member = params[1]
+    var members = mem::List[ty::Ty].empty(lo.alloc)
+    for member in lo.groups[group] {
+        mut members.push(member)
+    }
+    var entering = mem::List[clif::Block].empty(lo.alloc)
+    var searching = mem::List[clif::Block].empty(lo.alloc)
+    for _ in 0..<members.len() {
+        mut entering.push(walk_block(mut fx))
+        mut searching.push(walk_block(mut fx))
+    }
+    let leaving = walk_block(mut fx)
+    let walk = Walk(members: take members, enter: take entering, search: take searching)
+    let count = walk.members.len()
+    walk_dispatch(mut fx, value: root_member, count, each: fn(mut each_fx: Fx, index: usize) {
+        let entered = each_fx.list3(root, b: root, c: root_member)
+        mut each_fx.b.jump(walk.enter[index], args: entered.view())
+    })
+    for member in 0..<count {
+        let ty = walk.members[member]
+        mut fx.b.switch_to_block(walk.enter[member])
+        let entered = fx.b.block_params(walk.enter[member], alloc: fx.alloc)
+        walk_value(mut lo, mut fx, walk, step: WalkStep.Enter, member, frame: entered[0], ty, address: entered[0])
+        mut fx.b.jump(walk.search[member], args: entered.view())
+        mut fx.b.switch_to_block(walk.search[member])
+        let searched = fx.b.block_params(walk.search[member], alloc: fx.alloc)
+        let step = WalkStep.Search(parent: searched[1], index: searched[2])
+        walk_value(mut lo, mut fx, walk, step, member, frame: searched[0], ty, address: searched[0])
+        mut fx.b.jump(leaving, args: searched.view())
+    }
+    mut fx.b.switch_to_block(leaving)
+    let left = fx.b.block_params(leaving, alloc: fx.alloc)
+    let finished = mut fx.b.icmp(clif::IntCC.Equal, x: left[0], y: root)
+    mut fx.if_true(finished, then: fn(mut done_fx: Fx) {
+        mut done_fx.b.ret(mem::List[clif::Value].empty(done_fx.alloc).view())
+    })
+    walk_dispatch(mut fx, value: left[2], count, each: fn[mut lo](mut each_fx: Fx, index: usize) {
+        let step = WalkStep.Leave(child: left[0])
+        walk_value(mut lo, fx: mut each_fx, walk, step, member: index, frame: left[1], ty: walk.members[index], address: left[1])
+        mut each_fx.b.trap(clif::TrapCode(user: 1))
+    })
+} walk_define
+
+/// A block taking a frame's address, its parent's address and its parent's index.
+fn walk_block(mut fx: Fx) -> clif::Block {
+    let block = mut fx.block()
+    for _ in 0u8..<3 {
+        discard mut fx.b.append_block_param(block, ty: PTR)
+    }
+    return block
+} walk_block
+
+/// Runs `each` for the index below `count` a value equals, the last when it equals no other.
+fn walk_dispatch(mut fx: Fx, value: clif::Value, count: usize, each: fn(mut fx: Fx, index: usize)) {
+    expect count > 0
+    for index in 0..<(count - 1) {
+        let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: i64.fit(index))
+        mut fx.if_true(is, then: fn(mut then_fx: Fx) {
+            each(mut then_fx, index)
+        })
+    }
+    each(mut fx, index: count - 1)
+} walk_dispatch
+
+/// What a step does at the value of a group's type at `address`, in the frame of the group's
+/// `member` at `frame`.
+fn walk_value(mut lo: Lowering, mut fx: Fx, walk: Walk, step: WalkStep, member: usize, frame: clif::Value, ty: ty::Ty, address: clif::Value) {
+    match Holder.of(lo, ty) {
+        Some(holder) => {
+            walk_held(mut lo, mut fx, walk, step, member, frame, holder, address)
+            return
+        }
+        None => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Record(fields) or LayoutShape.Bytes(fields: fields, big: _) => {
+            for field in fields {
+                let at = mut fx.offset(address, offset: field.offset)
+                walk_part(mut lo, mut fx, walk, step, member, frame, owner: ty, name: field.name.as_str(), ty: field.ty, address: at)
+            }
+        }
+        LayoutShape.Enum(shape) => {
+            for variant in shape.variants {
+                var fields = mem::List[Field].empty(lo.alloc)
+                for field in variant.fields {
+                    let walked = match step {
+                        WalkStep.Enter => mut lo.needs_release(field.ty)
+                        else => walk_holds(walk.members.view(), ty: field.ty)
+                    }
+                    if walked {
+                        mut fields.push(field.copy(lo.alloc))
+                    }
+                }
+                if fields.len() == 0 {
+                    continue
+                }
+                let is = mut lo.variant_is(mut fx, address, ty, variant: variant.name.as_str())
+                mut fx.if_true(is, then: fn[mut lo](mut then_fx: Fx) {
+                    for field in fields {
+                        let at = mut then_fx.offset(address, offset: field.offset)
+                        walk_part(mut lo, fx: mut then_fx, walk, step, member, frame, owner: ty, name: variant.name.as_str(), ty: field.ty, address: at)
+                    }
+                })
+            }
+        }
+        LayoutShape.Array(element: element, count: count) => {
+            let walked = match step {
+                WalkStep.Enter => mut lo.needs_release(element)
+                else => walk_holds(walk.members.view(), ty: element)
+            }
+            if walked {
+                let element_laid = mut lo.layout_of(element)
+                let size = element_laid.contents().size
+                let start = mut fx.ptr(0)
+                let end = mut fx.ptr(count)
+                mut fx.each(start, end, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
+                    let offset = mut pass_fx.b.imul_imm_s(index, y: i64.fit(size))
+                    let at = mut pass_fx.b.iadd(address, y: offset)
+                    walk_part(mut lo, fx: mut pass_fx, walk, step, member, frame, owner: ty, name: "", ty: element, address: at)
+                })
+            }
+        }
+        else => {}
+    }
+} walk_value
+
+/// What a step does at a part of a value of type `owner`, declared by its field or variant
+/// `name`: walks a part of a group type, and releases another on entering.
+fn walk_part(mut lo: Lowering, mut fx: Fx, walk: Walk, step: WalkStep, member: usize, frame: clif::Value, owner: ty::Ty, name: Str, ty: ty::Ty, address: clif::Value) {
+    if walk_holds(walk.members.view(), ty) {
+        walk_value(mut lo, mut fx, walk, step, member, frame, ty, address)
+        return
+    }
+    match step {
+        WalkStep.Enter => mut lo.release_part(mut fx, owner, name, ty, address)
+        else => {}
+    }
+} walk_part
+
+/// What a step does at a holder of the frame of the group's `member` at `frame`.
+fn walk_held(mut lo: Lowering, mut fx: Fx, walk: Walk, step: WalkStep, member: usize, frame: clif::Value, holder: Holder, address: clif::Value) {
+    match step {
+        WalkStep.Enter => {
+            let Holder.Vector(element: _, indexed: indexed) = holder else {
+                return
+            }
+            if indexed {
+                free_index(mut lo, mut fx, address)
+            }
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: len, y: 0)
+            mut fx.if_true(empty, then: fn[mut lo](mut empty_fx: Fx) {
+                free_storage(mut lo, fx: mut empty_fx, address)
+            })
+        }
+        WalkStep.Search(parent: parent, index: index) => walk_search(mut lo, mut fx, walk, member, frame, holder, address, parent, index)
+        WalkStep.Leave(child: child) => walk_leave(mut lo, mut fx, walk, member, frame, holder, address, child)
+    }
+} walk_held
+
+/// Enters the next value a holder of the frame of the group's `member` at `frame` holds, the
+/// frame's parent and its index given.
+fn walk_search(mut lo: Lowering, mut fx: Fx, walk: Walk, member: usize, frame: clif::Value, holder: Holder, address: clif::Value, parent: clif::Value, index: clif::Value) {
+    match holder {
+        Holder.Vector(element: element, indexed: _) => {
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let more = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            mut fx.if_true(more, then: fn[mut lo](mut more_fx: Fx) {
+                let data = mut more_fx.load(PTR, addr: address, offset: VECTOR_DATA)
+                let last = mut more_fx.b.iadd_imm_s(len, y: -1)
+                let child = Element.of(mut lo, ty: element).at(mut more_fx, data, index: last)
+                let link = walk_link(mut more_fx, frame: parent, index)
+                mut more_fx.store(link, addr: address, offset: VECTOR_ALLOC)
+                walk_enter(mut more_fx, walk, held: element, child, member, frame)
+            })
+        }
+        Holder.Boxed(contents) => {
+            let word = mut fx.load(PTR, addr: address, offset: 0)
+            let more = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: word, y: WALK_DONE)
+            mut fx.if_true(more, then: fn(mut more_fx: Fx) {
+                let link = walk_link(mut more_fx, frame: parent, index)
+                mut more_fx.store(link, addr: address, offset: 0)
+                walk_enter(mut more_fx, walk, held: contents, child: word, member, frame)
+            })
+        }
+        Holder.Shared(contents) => {
+            let word = mut fx.load(PTR, addr: address, offset: 0)
+            let more = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: word, y: WALK_DONE)
+            mut fx.if_true(more, then: fn[mut lo](mut more_fx: Fx) {
+                let minus = mut more_fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+                let before = mut more_fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Add, p: word, x: minus)
+                let shared = mut more_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: before, y: 1)
+                mut more_fx.if_true(shared, then: fn(mut shared_fx: Fx) {
+                    let done = mut shared_fx.ptr(u64.fit(WALK_DONE))
+                    mut shared_fx.store(done, addr: address, offset: 0)
+                    let searched = shared_fx.list3(frame, b: parent, c: index)
+                    mut shared_fx.b.jump(walk.search[member], args: searched.view())
+                })
+                let at = contents_at(mut lo, value: contents)
+                let child = mut more_fx.offset(word, offset: at)
+                let link = walk_link(mut more_fx, frame: parent, index)
+                mut more_fx.store(link, addr: address, offset: 0)
+                walk_enter(mut more_fx, walk, held: contents, child, member, frame)
+            })
+        }
+    }
+} walk_search
+
+/// Takes the frame at `child` out of the first holder still holding something of the frame
+/// of the group's `member` at `frame`, and goes on searching that frame.
+fn walk_leave(mut lo: Lowering, mut fx: Fx, walk: Walk, member: usize, frame: clif::Value, holder: Holder, address: clif::Value, child: clif::Value) {
+    match holder {
+        Holder.Vector(element: _, indexed: _) => {
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let more = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            mut fx.if_true(more, then: fn[mut lo](mut more_fx: Fx) {
+                let link = mut more_fx.load(PTR, addr: address, offset: VECTOR_ALLOC)
+                let left = mut more_fx.b.iadd_imm_s(len, y: -1)
+                mut more_fx.store(left, addr: address, offset: VECTOR_LEN)
+                let empty = mut more_fx.b.icmp_imm_s(clif::IntCC.Equal, x: left, y: 0)
+                mut more_fx.if_true(empty, then: fn[mut lo](mut empty_fx: Fx) {
+                    let data = mut empty_fx.load(PTR, addr: address, offset: VECTOR_DATA)
+                    let free_args = empty_fx.list1(data)
+                    discard mut lo.call_routine(mut empty_fx, routine: Routine.Free, args: free_args.view())
+                })
+                walk_resume(mut more_fx, walk, member, frame, link)
+            })
+        }
+        else => {
+            let word = mut fx.load(PTR, addr: address, offset: 0)
+            let more = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: word, y: WALK_DONE)
+            mut fx.if_true(more, then: fn[mut lo](mut more_fx: Fx) {
+                var storage = child
+                match holder {
+                    Holder.Shared(contents) => {
+                        let at = contents_at(mut lo, value: contents)
+                        storage = mut more_fx.b.iadd_imm_s(child, y: -i64.fit(at))
+                    }
+                    else => {}
+                }
+                let free_args = more_fx.list1(storage)
+                discard mut lo.call_routine(mut more_fx, routine: Routine.Free, args: free_args.view())
+                let done = mut more_fx.ptr(u64.fit(WALK_DONE))
+                mut more_fx.store(done, addr: address, offset: 0)
+                walk_resume(mut more_fx, walk, member, frame, link: word)
+            })
+        }
+    }
+} walk_leave
+
+/// The link naming a frame by its address and its type's index in the group.
+fn walk_link(mut fx: Fx, frame: clif::Value, index: clif::Value) -> clif::Value {
+    let address = mut fx.b.band_imm_s(frame, y: WALK_ADDRESS_MASK)
+    let shifted = mut fx.b.ishl_imm_s(index, y: WALK_ADDRESS_BITS)
+    return mut fx.b.bor(address, y: shifted)
+} walk_link
+
+/// Enters a value of a group type at `child`, held by the frame of the group's `member` at
+/// `frame`.
+fn walk_enter(mut fx: Fx, walk: Walk, held: ty::Ty, child: clif::Value, member: usize, frame: clif::Value) {
+    let index = walk_member(walk.members.view(), ty: held)
+    let parent = mut fx.ptr(u64.widen(member))
+    let entered = fx.list3(child, b: frame, c: parent)
+    mut fx.b.jump(walk.enter[index], args: entered.view())
+} walk_enter
+
+/// Goes on searching the frame of the group's `member` at `frame`, whose parent a link names.
+fn walk_resume(mut fx: Fx, walk: Walk, member: usize, frame: clif::Value, link: clif::Value) {
+    let shifted = mut fx.b.ishl_imm_s(link, y: 64 - WALK_ADDRESS_BITS)
+    let parent = mut fx.b.sshr_imm_s(shifted, y: 64 - WALK_ADDRESS_BITS)
+    let index = mut fx.b.ushr_imm_s(link, y: WALK_ADDRESS_BITS)
+    let searched = fx.list3(frame, b: parent, c: index)
+    mut fx.b.jump(walk.search[member], args: searched.view())
+} walk_resume

@@ -538,6 +538,7 @@ The **stack use** of a lowered function is its frame size plus the largest stack
 
 - A direct call site uses the callee's stack use computed with each of the callee's function-typed parameters that receives a function argument at that site bound to that argument's stack use: a closure's own stack use, a named function's stack use through its [checking entry](18-contracts.md#checking-entries), the stack bound of the calling function's own parameter when the argument is that parameter, or the N of the `stack N` that a function value's type demands, none when it demands none. Each of its `Dyn` parameters is bound likewise: to the largest stack use among the implementing functions of the methods of a `Dyn[I].view(x)` or `text::fmt` call written as the argument, to the stack bound of the calling function's own parameter when the argument is that parameter, and to none for any other `Dyn` value. In lowered code, a call to a method of a generic parameter's bound is a direct call to the implementing function that the instantiation selects.
 - A `task fn` argument runs on a stack of its own, so the stack bound of a `task fn` parameter is instead the stack use of moving the argument's captures into another domain ([domain memory](11-errors-domains.md#domain-memory)): the stack use of the walk over a closure's captures, 0 for a named function or a closure none of whose captures moving reaches, the stack bound of the calling function's own parameter, and none for another function value or for a parameter of a function judged on its own. The walk calls the move of each capture's type, which calls the move of each type the values it holds have, so it reaches itself, and is unbounded, exactly when a capture's type holds itself through what moving it reaches, as an enum holding a `mem::Box` of itself does; the `raised` reason then names that type.
+- A [release](07-ownership.md#ownership) calls the release of the type of each part it releases, except among the types whose values hold each other through boxes, shared values, lists, sets, maps and hash maps, inline or through the structs, enums and arrays they hold: one walk releases the values of such types that a release reaches, keeping its place in them rather than on the stack, and reaches no release of them again, so its stack use does not grow with their depth. A release therefore reaches itself, and is unbounded, exactly when its type holds itself through another value, as an enum holding a `mem::Arena` of itself does; the `called` reason of the release of a field or payload of a type of the workspace lies on the line declaring that field or variant, and the `raised` reason names the type whose release the path reaches again.
 - A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call. So does a call of a method of the function's own `Dyn` parameter whose interface method head demands no `stack` limit, `value.render` in a `text::Writer.write` among them.
 - An indirect call site uses the N of the `stack N` that its function type, registry field type or interface method head demands; a call to a foreign fn the N of its `stack N`; a call to a compiler stub or support routine the stub call bound that [descriptors](27-program-model.md#descriptors) give.
 - A call site is **unbounded** when it is a call through the function's own function-typed or `Dyn` parameter whose stack bound is none, an indirect call whose type or head demands no `stack` limit, a call to a foreign fn whose head demands none, or a direct call whose callee reaches itself through [dependencies](#propagation) or holds a call site that is unbounded under the bounds that call gives it.
@@ -704,6 +705,44 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     let chain = Chain.Link(heap.boxed(Chain.End))
     world.log.info("linked", value: try await linked(take chain, exec: world.exec, alloc: world.alloc))
 } main
+```
+
+```nan
+// file: forests/package.nan
+//! Forest felling.
+
+package forests {
+    language 1
+    targets x86_64-host
+    entry main
+} forests
+
+// file: forests/forests.nan
+//! Fells a forest whose groves an arena holds.
+
+pub closed enum Forest {
+    Tree(u64)
+    Grove(mem::Arena[Forest])
+} Forest
+
+pub fn felled(take forest: Forest) limits stack 16_384 { // error: limit.stack-unbounded
+} felled
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    felled(Forest.Grove(mem::Arena[Forest].empty(world.alloc)))
+} main
+```
+
+```text
+$ nan build forests
+failed build forests: files 0, errors 1, incomplete 0
+error limit.stack-unbounded forests/forests.nan:8 forests::felled
+    pub fn felled(take forest: Forest) limits stack 16_384 { // error: limit.stack-unbounded
+    because called - - Forest
+    because called forests/forests.nan:5 forests::Forest Arena[forests::Forest]
+        Grove(mem::Arena[Forest])
+    because raised - - Forest
+failed build forests: files 0, errors 1, incomplete 0
 ```
 
 ## Function types

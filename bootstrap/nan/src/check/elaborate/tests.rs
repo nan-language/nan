@@ -396,3 +396,17 @@ fn an_invariant_of_a_loop_in_a_nested_block_is_numbered() {
         "unit example::bounded\n\nfn body (read %0: u32) -> u32\n^0:\n    %1 = slot inner: u32\n    init %1, 0u32\n    %2 = lt %0, 5u32\n    branch %2, ^1, ^5\n^1:\n    jump ^2\n^2:\n    %3 = load %1\n    %4 = lt %3, %0\n    branch %4, ^3, ^4\n^3:\n    %5 = load %1\n    %6 = call example::bounded invariant 0(%5, %0)\n    check invariant, %6\n    %7 = load %1\n    %8 = add %7, 1u32\n    assign %1, %8\n    jump ^2\n^4:\n    jump ^5\n^5:\n    %9 = load %1\n    return %9\n\nfn invariant 0 (read %0: u32, read %1: u32) -> bool\n^0:\n    %2 = le %0, %1\n    return %2\n"
     );
 }
+
+/// An indexed write through a local, a field of a `mut` parameter and an array of arrays, and an
+/// indexed read, pass the array to `at_mut` and `at` in place, never copying it.
+#[test]
+fn an_indexed_place_is_passed_in_place() {
+    let text = unit_text(
+        "pub struct Grid derives Copy {\n    pub rows: Array[Array[u8, 64], 64]\n} Grid\n\npub fn fill(mut grid: Grid, index: usize) -> u8 {\n    var cells = Array[u8, 4096].filled(0)\n    cells[index] = 1\n    grid.rows[index][index] = 2\n    return cells[index]\n} fill\n",
+        "example::fill",
+    );
+    assert_eq!(
+        text,
+        "unit example::fill\n\nfn body (mut %0: ref mut example::Grid, read %1: usize) -> u8\n^0:\n    %2 = slot cells: Array[u8, 4096]\n    %3 = call Array.filled[u8, 4096](0u8)\n    init %2, %3\n    %4 = call Array.at_mut[u8, 4096](mut %2, %1)\n    assign %4, 1u8\n    %5 = call Array.at_mut[Array[u8, 64], 64](mut %0.rows, %1)\n    %6 = call Array.at_mut[u8, 64](mut %5, %1)\n    assign %6, 2u8\n    %7 = call Array.at[u8, 4096](read %2, %1)\n    %8 = load %7\n    return %8\n"
+    );
+}

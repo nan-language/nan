@@ -429,13 +429,14 @@ impl Elab<'_, '_> {
         }
         let requires = self.requires_of(call, callee);
         let decreases = self.decreases_of(callee);
-        if requires
+        if !requires
             .as_ref()
             .is_some_and(|requires| !requires.clauses.is_empty())
-            || decreases.is_some()
+            && decreases.is_none()
         {
-            self.slot_taken_values(call, args);
+            return Ok(());
         }
+        self.slot_taken_values(call, args);
         let read: Vec<Operand> = call
             .args
             .iter()

@@ -1,0 +1,330 @@
+//! Suspends and resets PCI functions, then abandons a confined entropy driver mid-request and hands its function, reset, to a second driver that suspends, resets and draws through it.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The capability ids of PCI power management and of PCIe, and the device capability bit of
+/// function level reset.
+const POWER_ID: u32 = 0x01
+
+const EXPRESS_ID: u32 = 0x10
+
+const FLR_CAPABLE: u32 = 0x1000_0000
+
+/// The power state field's value in D3hot.
+const D3_HOT: u32 = 0x3
+
+/// The vendor and device ids of QEMU's NVMe controller.
+const NVME: u32 = 0x0010_1B36
+
+/// The command bits of memory decoding and bus mastering.
+const DECODES: u32 = 0x6
+
+/// The polls of an interrupt count before the kernel gives up.
+const INTERRUPT_POLLS: u32 = 1_000_000
+
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn rate(level: u32) -> u32 {
+    return 1_000 / level
+} rate
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let functions = mut k.pci_functions()
+    let Some(iommu) = mut k.iommu() else {
+        say(b"iommu: none\n")
+        loop {
+        }
+    }
+    say(b"iommu: enabled\n")
+    let trapping = new_domain(iommu)
+    let restarted = new_domain(iommu)
+    var kept = mem::List[hw::PciFunction].empty(alloc)
+    for function in take functions {
+        let express = capability(function, id: EXPRESS_ID) != 0
+        if rng::is_entropy(function) and express {
+            listed(function, alloc)
+            mut kept.push(take function)
+        } else {
+            var probed = function
+            if probed.config_read(0) == NVME or rng::is_entropy(probed) {
+                listed(probed, alloc)
+                if express {
+                    reset(mut probed, alloc)
+                } else {
+                    refusing(mut probed, alloc)
+                }
+            }
+            take probed.release()
+        }
+    }
+    take k.anchor(take iommu, run: fn[take kept, take trapping, take restarted](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        var express = kept
+        let next = mut express.pop()
+        for function in take express {
+            take function.release()
+        }
+        match next {
+            Some(function) => try await recovered(take function, trapping: take trapping, restarted: take restarted, exec, alloc)
+            None => {
+                say(b"pci: no entropy function behind a port\n")
+                take trapping.close()
+                take restarted.close()
+            }
+        }
+    })
+} main
+
+/// A domain of the IOMMU; the kernel stops here when it has none.
+fn new_domain(iommu: hw::Iommu) -> hw::IoDomain {
+    match attempt iommu.domain() {
+        Ok(created) => return created
+        Err(_) => {
+            say(b"iommu: no domain\n")
+            loop {
+            }
+        }
+    }
+} new_domain
+
+/// Writes a function's address and ids with whether it has power management and function level
+/// reset.
+fn listed(function: hw::PciFunction, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"function ")
+    address(mut line, at: function.address())
+    let ids = function.config_read(0)
+    mut line.append(b" ")
+    hex(mut line, value: ids & 0xFFFF, digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: ids >> 16, digits: 4)
+    if capability(function, id: POWER_ID) != 0 {
+        mut line.append(b" power")
+    }
+    let express = capability(function, id: EXPRESS_ID)
+    if express != 0 and (function.config_read(u8.truncate(express + 4)) & FLR_CAPABLE) != 0 {
+        mut line.append(b" flr")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} listed
+
+/// Writes what suspending and resetting a function without the capabilities give.
+fn refusing(mut function: hw::PciFunction, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"  suspend:")
+    named(mut line, outcome: attempt mut function.set_power(hw::PowerState.Suspended))
+    mut line.append(b"\n  reset:")
+    named(mut line, outcome: attempt mut function.reset())
+    mut line.append(b"\n")
+    say(line.view())
+} refusing
+
+/// Resets a function, writing what the reset gave and whether it then decodes and masters the
+/// bus as before.
+fn reset(mut function: hw::PciFunction, alloc: mem::Alloc) {
+    let command = function.config_read(4) & 0xFFFF
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"  reset:")
+    named(mut line, outcome: attempt mut function.reset())
+    if (function.config_read(4) & 0xFFFF) == command {
+        mut line.append(b", its command kept")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} reset
+
+/// Hands a function to a driver in a domain that traps mid-request, then reclaims it from its
+/// keeper, suspends and resets it, and hands it to a second driver.
+fn recovered(take function: hw::PciFunction, take trapping: hw::IoDomain, take restarted: hw::IoDomain, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var held = function
+    let Some(keeper) = mut held.keeper() else {
+        say(b"keeper: none\n")
+        take held.release()
+        take trapping.close()
+        take restarted.close()
+        return
+    }
+    var keeping = keeper
+    if (mut keeping.reclaim()).is_none() {
+        say(b"keeper: nothing to reclaim while the function is held\n")
+    }
+    let level = hw::cpu_count() / 8
+    let ended = attempt await sys::Domain.run(fn[take held, take trapping]() -> u32 limits stack 16_384 {
+        let space = trapping.space()
+        var device = match rng::start(take held, space, alloc) {
+            Ok(started) => started
+            Err(refused) => {
+                take refused.release()
+                take trapping.close()
+                return 0
+            }
+        }
+        if (attempt mut device.draw(space, alloc)).is_ok() {
+            say(b"first driver: drew 32 bytes\n")
+        }
+        let heap = mem::Heap.of(alloc)
+        let buffer = hw::Dma.of(heap.boxed(rng::Entropy.from_bits(Array[u8, 32].filled(0))), space)
+        mut device.post(buffer.bus_addr().value)
+        let rated = rate(level)
+        discard take buffer.into_box()
+        let stopped = take device.stop()
+        take stopped.release()
+        take trapping.close()
+        return rated
+    }, exec, alloc)
+    match ended {
+        Ok(Ok(_)) => say(b"first driver: the domain returned\n")
+        Ok(Err(_)) => {}
+        Err(cancelled) => {
+            take keeping.release()
+            take restarted.close()
+            fail cancelled
+        }
+    }
+    match mut keeping.reclaim() {
+        Some(given) => incarnated(take given, domain: take restarted, alloc)
+        None => {
+            say(b"keeper: nothing handed back\n")
+            take restarted.close()
+        }
+    }
+    let Some(back) = mut keeping.reclaim() else {
+        say(b"keeper: the second driver's function did not come back\n")
+        take keeping.release()
+        return
+    }
+    say(b"keeper: the released function came back\n")
+    take back.release()
+    take keeping.release()
+} recovered
+
+/// Checks a reclaimed function is cut off, resets it, then drives it from a second domain:
+/// draws, suspends and resumes it, and draws with the queue's MSI-X interrupt after a reset.
+fn incarnated(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: mem::Alloc) {
+    var reclaimed = function
+    if (reclaimed.config_read(4) & DECODES) == 0 {
+        say(b"keeper: the trapped driver's function came back cut off\n")
+    }
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"keeper: reset:")
+    named(mut line, outcome: attempt mut reclaimed.reset())
+    mut line.append(b"\n")
+    say(line.view())
+    let power = capability(reclaimed, id: POWER_ID)
+    if (attempt mut reclaimed.set_power(hw::PowerState.Suspended)).is_ok() and power_state(reclaimed, at: power) == D3_HOT and (attempt mut reclaimed.set_power(hw::PowerState.On)).is_ok() and power_state(reclaimed, at: power) == 0 {
+        say(b"keeper: suspended in D3hot, then on in D0\n")
+    }
+    let space = domain.space()
+    var device = match rng::start(take reclaimed, space, alloc) {
+        Ok(started) => started
+        Err(refused) => {
+            say(b"second driver: did not start\n")
+            take refused.release()
+            take domain.close()
+            return
+        }
+    }
+    if (attempt mut device.draw(space, alloc)).is_ok() {
+        say(b"second driver: drew 32 bytes through its own windows\n")
+    }
+    if (attempt mut device.resume()).is_ok() and (attempt mut device.draw(space, alloc)).is_ok() {
+        say(b"second driver: suspended, on again and drew 32 bytes\n")
+    }
+    let Some(shared) = mut device.count_interrupts() else {
+        say(b"msi-x: refused\n")
+        let stopped = take device.stop()
+        take stopped.release()
+        take domain.close()
+        return
+    }
+    if (attempt mut device.restart()).is_ok() {
+        mut device.signal_used()
+        if (attempt mut device.draw(space, alloc)).is_ok() and interrupted(shared) {
+            say(b"second driver: reset, drew 32 bytes and took the queue's interrupt\n")
+        }
+    }
+    discard take shared.uninstall()
+    let stopped = take device.stop()
+    take stopped.release()
+    take domain.close()
+} incarnated
+
+/// Whether a count of interrupts reaches 1 within `INTERRUPT_POLLS` polls.
+fn interrupted(shared: hw::IrqShared[u64]) -> bool {
+    for _ in 0..<INTERRUPT_POLLS {
+        let counted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut count: u64) -> u64 limits notrap, terminates, noalloc {
+                return count
+            })
+        })
+        if counted > 0 {
+            return true
+        }
+    }
+    return false
+} interrupted
+
+/// The power state of a function whose power management capability lies at `at`.
+fn power_state(function: hw::PciFunction, at: u32) -> u32 {
+    return function.config_read(u8.truncate(at + 4)) & 0x3
+} power_state
+
+/// The offset of a function's capability of an id, zero without one.
+fn capability(function: hw::PciFunction, id: u32) -> u32 {
+    var at = function.config_read(0x34) & 0xFC
+    for _ in 0u32..<48 {
+        invariant at <= 0xFC
+        if at == 0 {
+            return 0
+        }
+        let head = function.config_read(u8.truncate(at))
+        if (head & 0xFF) == id {
+            return at
+        }
+        at = (head >> 8) & 0xFC
+    }
+    return 0
+} capability
+
+fn named(mut line: mem::Bytes, outcome: Result[Unit, hw::PciError]) {
+    match outcome {
+        Ok(_) => mut line.append(b" ok")
+        Err(hw::PciError.Unsupported) => mut line.append(b" unsupported")
+        Err(hw::PciError.Unresponsive) => mut line.append(b" unresponsive")
+        Err(hw::PciError.Removed) => mut line.append(b" removed")
+        Err(hw::PciError.NotMemory) => mut line.append(b" not memory")
+        Err(hw::PciError.Misaligned) => mut line.append(b" misaligned")
+        Err(hw::PciError.TooSmall) => mut line.append(b" too small")
+        Err(hw::PciError.Taken) => mut line.append(b" taken")
+        Err(hw::PciError.Unmapped) => mut line.append(b" unmapped")
+    }
+} named
+
+/// Appends a bus path as `ssss:bb:dd.f`.
+fn address(mut line: mem::Bytes, at: hw::PciAddress) {
+    hex(mut line, value: u32.widen(at.segment), digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.bus), digits: 2)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.device), digits: 2)
+    mut line.append(b".")
+    hex(mut line, value: u32.widen(at.function), digits: 1)
+} address
+
+/// Appends the low `digits` hexadecimal digits of a value.
+fn hex(mut line: mem::Bytes, value: u32, digits: u32) {
+    var shift = digits * 4
+    while shift > 0 {
+        shift -= 4
+        mut line.push(b"0123456789abcdef"[usize.widen((value >> shift) & 0xF)])
+    }
+} hex

@@ -686,7 +686,17 @@ pub closed enum PciError derives Copy, Eq, Render {
     Taken
     Unmapped
     Removed
+    Unsupported
+    Unresponsive
 } PciError
+
+pub closed enum PowerState derives Copy, Eq, Render {
+    On
+    Suspended
+} PowerState
+
+pub open linear struct PciKeeper {
+} PciKeeper
 
 pub fn PciFunction.address(self) -> PciAddress
 
@@ -707,20 +717,35 @@ pub fn PciFunction.msi[T: Any and Send](mut self, cpu: u32, take dev: T, on_irq:
 
 pub fn PciFunction.intx[T: Any and Send](mut self, line: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
 
+pub fn PciFunction.set_power(mut self, state: PowerState) fails PciError
+
+pub fn PciFunction.reset(mut self) fails PciError
+
+pub fn PciFunction.keeper(mut self) -> Option[PciKeeper]
+
 pub fn PciFunction.release(take self)
+
+pub fn PciKeeper.address(self) -> PciAddress
+
+pub fn PciKeeper.reclaim(mut self) -> Option[PciFunction]
+
+pub fn PciKeeper.release(take self)
 ```
 
 - `function.address()` is its **bus path**: its segment and its bus, device and function numbers; its **requester id** is `bus << 8 | device << 3 | function` in its segment. `function.config_read(offset)` reads the double word at `offset` of its configuration space, all ones once the function is removed. Nothing writes its configuration but the runtime.
-- `hw::Mmio[R].of_bar(mut function, index: i, offset: o)` enables the function's memory decoding and returns a window over R at offset o of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)); the window's bytes are those R spans from o to past its last register. It fails with `Removed` when the function is removed, with `NotMemory` when BAR i is not a memory BAR, with `Misaligned` when o is not a multiple of the size of R's widest register or element, with `TooSmall` when the window's bytes do not lie within the BAR, with `Taken` when they overlap those of a window an earlier call gave over the BAR, or the function's MSI-X table or pending bit array, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)).
+- `hw::Mmio[R].of_bar(mut function, index: i, offset: o)` enables the function's memory decoding and returns a window over R at offset o of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)); the window's bytes are those R spans from o to past its last register. It fails with `Removed` when the function is removed, with `NotMemory` when BAR i is not a memory BAR, with `Misaligned` when o is not a multiple of the size of R's widest register or element, with `TooSmall` when the window's bytes do not lie within the BAR, with `Taken` when they overlap those of a window an earlier call gave that has not ended, or the function's MSI-X table or pending bit array, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)). The window ends when it is unmapped, or when settlement ends it.
 - `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, with `Exhausted` when no memory for the IOMMU's tables is left, and with `Unsupported` when the IOMMU does not translate the function, the function is not isolated or it is removed. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Exhausted` as `attach` does, and with `Unsupported` when the function is removed, or the IOMMU translates it and cannot pass its accesses through, as for a function below a bridge other than a PCIe port, whose DMA reaches the IOMMU under another requester id. A function attached anew leaves the space it was attached to.
 - A function is **isolated** when its DMA reaches the IOMMU under its own requester id and no peer receives it otherwise: each bridge above it is a PCIe switch upstream port, or a PCIe root or downstream port whose ACS capability validates the source of the requests from below and redirects their peer requests and completions upstream and forwards them there, which the runtime enables; and a function of a multi-function device has an ACS capability redirecting its peer requests and completions upstream, which the runtime enables. The runtime reads ACS capabilities through an ECAM alone.
 - `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached or is removed, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
 - `mut function.msi(cpu: n, take dev, on_irq: f)` installs `dev` as `msix` does, then writes the interrupt's message to the function's MSI capability, with the 32-bit or 64-bit address the capability takes, unmasks its vector where the capability masks vectors, and enables MSI with that one vector. It refuses with `Unsupported` when the function is not attached or is removed or has no MSI capability, with `Unreachable` when the message's address lies above 4 GiB and the capability takes 32-bit addresses alone, and otherwise as `install_msi` does.
 - `mut function.intx(line: l, take dev, on_irq: f)` installs `dev` with f on the **line** l that the platform routes the function's INTx pin to, the global system interrupt ACPI's `_PRT` gives on x86_64 and the identifier of the shared peripheral interrupt the device tree's `interrupt-map` gives on AArch64, then enables the function's INTx. A line is level-triggered and delivered to the boot CPU, and the devices installed on it share it as devices on one vector do. On x86_64 it is the pin holding l of the MADT's I/O APIC with the greatest first interrupt not above l; the runtime points the pin, active low, at a vector of the boot CPU while a device is installed on the line and masks it once none is, and once the IOMMU remaps interrupts the pin's interrupts reach that vector through a remapping entry accepting the I/O APIC's requester id alone. It refuses with `Unsupported` when the function is removed or has no INTx pin, on x86_64 when no such I/O APIC lies in memory the entry root maps uncached or has the pin, or the IOMMU remaps interrupts and no device scope of its remapping unit names the I/O APIC, and on AArch64 when l is below 32, past 255 or a vector a contribution binds; with `Unreachable` when on x86_64 the pin cannot name the boot CPU's local APIC id, as for `install_msi`, or on AArch64 devices are installed on l for another CPU; and with `Exhausted` when on x86_64 a line no device is installed on finds no vector that no device is installed on for any CPU.
 - A function signals its interrupts through the last of `msix`, `msi` and `intx` that installed an interrupt for it, which disables the other two; the interrupts installed for it before stay installed. Uninstalling an interrupt leaves the function signalling as before until another of these operations or `release`.
-- `take function.release()` cuts the function off: its bus mastering, memory decoding and INTx end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
-- A function is **removed** once the rescan or powering off of a port above it cuts it off ([PCI ports](#pci-ports)): from then on the IOMMU translates the requester ids of that port's buses to no memory until a function found anew there is attached, the operations of this section write no configuration, and `function.removed()` returns true. Its windows reach no function, as no BAR is given an address a window of a removed function reaches; an interrupt `msix`, `msi` or `intx` installed for it stays installed until uninstalled, and a function later found at its requester id or on its line may raise it. Its `release` only frees it.
-- An `hw::PciFunction` is a resource of the domain run holding it, which its [settlement](11-errors-domains.md#settlement) cuts off as `release` does.
+- `mut function.set_power(state)` puts the function in D0 for `On` and in D3hot for `Suspended`, through the power state field of its power management capability. Suspending it saves its MSI-X table and command, ends its memory decoding, bus mastering and INTx, enters D3hot and waits 10 ms: a suspended function decodes no memory, so its windows reach no register, masters no bus, so its DMA reaches no memory, and signals no interrupt. The operations of this section act on a suspended function as on one that is on, the decoding, bus mastering, INTx and MSI-X entries they enable reaching it once it is on. Turning it on enters D0, waits 10 ms and until it answers, as `reset` does, then gives it back the configuration the runtime writes, which the transition may reset: its BARs, cache line size and latency timer, interrupt line, PCIe device control, link control and device control 2, ACS control, MSI and MSI-X capabilities, MSI-X table and, last, its command. A state the function is in changes nothing. It fails with `Removed` when the function is removed, with `Unsupported` when it has no power management capability, and with `Unresponsive` as `reset` does.
+- `mut function.reset()` resets the function by a function level reset, through its PCIe capability's device control, when its device capabilities report one, and otherwise through its power management capability by a transition from D3hot to D0, when the capability's No_Soft_Reset bit is clear. It saves the function's configuration as `set_power` does, ends its memory decoding, bus mastering and INTx, so that it reaches no memory while it is reset, then turns a suspended function on, waits up to 1 s for its transactions to complete and initiates the function level reset, waiting 100 ms after it, or makes the transition, waiting 10 ms after each state. It then waits until the function **answers**, its first double word of configuration being neither all ones nor a vendor id of 1, which asks the read to be retried, and gives it back its configuration as turning it on does: the function is on, attached as before, its windows reach its registers and its interrupts are signalled as before. It fails with `Removed` when the function is removed, with `Unsupported` when it has neither way to reset, and with `Unresponsive` when it does not answer within 1 s; the function is then removed, its decoding, bus mastering and INTx stay ended, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
+- `mut function.keeper()` returns `Some` of a **keeper** for the function, an `hw::PciKeeper`, and `None` when the function has one. From then on its release and settlement hand it, cut off, back to its keeper in place of freeing it. `keeper.address()` is the function's bus path. `mut keeper.reclaim()` returns `Some` of the function once it is handed back, which it then is no longer until it is again, and `None` otherwise. `take keeper.release()` gives the keeper up: a function handed back to it is freed, and a function not handed back has no keeper from then on.
+- `take function.release()` cuts the function off: its bus mastering, memory decoding, INTx, MSI and MSI-X end, it is attached to no space, and its DMA reaches no memory once the IOMMU no longer caches its attachment; a suspended function stays in D3hot.
+- A function is **removed** once the rescan or powering off of a port above it cuts it off ([PCI ports](#pci-ports)), the IOMMU then translating the requester ids of that port's buses to no memory until a function found anew there is attached, or once it does not answer after `set_power` or `reset`. From then on the operations of this section write no configuration, and `function.removed()` returns true. Its windows reach no function, as no BAR is given an address a window of a function a port removed reaches and a function that did not answer decodes no memory; an interrupt `msix`, `msi` or `intx` installed for it stays installed until uninstalled, and a function later found at its requester id or on its line may raise it. Its `release` only frees it or hands it back to its keeper.
+- An `hw::PciFunction`, an `hw::PciKeeper` and a window `of_bar` gives are resources of the domain run holding them, which its [settlement](11-errors-domains.md#settlement) cuts off, releases and ends as `release` and `unmap` do.
 - Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) but `attach_physical`, which is a device operation (`authority.ungranted`). Each has the device fact.
 
 ```nan
@@ -804,6 +829,54 @@ pub fn unconfine(mut function: hw::PciFunction) -> hw::PciAddress fails hw::Iomm
     try mut function.attach_physical() // error: authority.ungranted
     return function.address()
 } unconfine
+```
+
+```nan
+// file: manager/package.nan
+//! A device manager restarting the drivers that trap.
+
+package manager {
+    language 1
+    targets x86_64-bare
+    allow confined in manager
+} manager
+
+// file: manager/manager.nan
+//! Reclaims the function a trapped driver's settlement handed back, then resets it for the driver's next incarnation, or suspends it when it has no reset.
+
+pub fn restarted(mut keeper: hw::PciKeeper) -> Option[hw::PciFunction] {
+    let Some(function) = mut keeper.reclaim() else {
+        return None
+    }
+    var reclaimed = function
+    match attempt mut reclaimed.reset() {
+        Ok(_) => return Some(take reclaimed)
+        Err(error) => {
+            if error == hw::PciError.Unsupported {
+                discard attempt mut reclaimed.set_power(hw::PowerState.Suspended)
+            }
+        }
+    }
+    take reclaimed.release()
+    return None
+} restarted
+```
+
+```nan
+// file: manager/package.nan
+//! A device manager.
+
+package manager {
+    language 1
+    targets x86_64-bare
+} manager
+
+// file: manager/manager.nan
+//! Takes back a function from its keeper outside a confined module.
+
+pub fn reclaimed(mut keeper: hw::PciKeeper) -> Option[hw::PciFunction] {
+    return mut keeper.reclaim() // error: authority.ungranted
+} reclaimed
 ```
 
 ## PCI ports

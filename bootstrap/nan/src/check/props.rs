@@ -242,7 +242,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 37] = [
+const PRIMITIVE_CAPABILITIES: [&str; 38] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -279,6 +279,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 37] = [
     "hw::Iommu",
     "hw::IoDomain",
     "hw::PciFunction",
+    "hw::PciKeeper",
     "hw::PciPort",
 ];
 

@@ -80,9 +80,10 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
             lo.transfers(&value)
         }
         "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
-        | "hw::IoDomain" | "hw::PciFunction" | "hw::PciPort" => true,
-        "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
-        | "hw::PageTableRoot" | "hw::UserFrame" | "hw::ExtendedState" => false,
+        | "hw::IoDomain" | "hw::PciFunction" | "hw::PciKeeper" | "hw::PciPort" => true,
+        "hw::Mmio" => lo.machine(),
+        "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame" | "hw::PageTableRoot"
+        | "hw::UserFrame" | "hw::ExtendedState" => false,
         _ => return None,
     })
 }
@@ -128,9 +129,16 @@ pub fn transfer(
             let contents = fx.load(PTR, address, 0);
             super::super::transfer::lift(lo, fx, contents, lift);
         }
-        "hw::IoDomain" | "hw::PciFunction" | "hw::PciPort" => {
+        "hw::IoDomain" | "hw::PciFunction" | "hw::PciKeeper" | "hw::PciPort" => {
             let record = fx.load(PTR, address, 0);
             super::super::transfer::rehome(lo, fx, record, owner);
+        }
+        "hw::Mmio" => {
+            let window = fx.load(PTR, address, 8);
+            let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, window, 0);
+            fx.when(given, |fx| {
+                super::super::transfer::rehome(lo, fx, window, owner)
+            });
         }
         _ => return false,
     }

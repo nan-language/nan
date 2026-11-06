@@ -1,7 +1,8 @@
 //! The operations std's `hw` supplies to its IOMMU and PCI code: the unit record the runtime
 //! state names, its lock and invalidation, chunks, runtime records and holdings, cache line
-//! write-backs, the platform's tables, the entry root, PCI configuration accesses, and the calls
-//! of that code the runtime makes for the kernel's accessors, DMA buffers and settlement.
+//! write-backs, the platform's tables, the entry root, the kernel clock, PCI configuration
+//! accesses, and the calls of that code the runtime makes for the kernel's accessors, DMA
+//! buffers, register windows over BARs and settlement.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC};
 
@@ -125,6 +126,10 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let flags = supply.param(0).scalar();
             lo.spin_unlock(fx, state_address, state::PCI_REMOVAL_LOCK, flags);
             supply.done(lo, fx);
+        }
+        "clock_ns" => {
+            let now = lo.now_ns(fx);
+            supply.ret(lo, fx, Held::Scalar(now));
         }
         "config_read" => {
             let value = config(lo, fx, supply, None, 4);

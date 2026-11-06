@@ -182,8 +182,28 @@ pub fn window(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         };
         let sret = supply.sret.expect("a window's slot");
         fx.store(base, sret, 0);
+        if !supply.path.starts_with("hw::Ports") {
+            let none = fx.ptr(0);
+            fx.store(none, sret, 8);
+        }
         supply.ret(lo, fx, Held::Address(sret));
         return;
+    }
+    if supply.member() == "windowed" {
+        let place = supply.param(0).address();
+        let word = fx.load(PTR, place, 0);
+        let sret = supply.sret.expect("a window's slot");
+        fx.store(word, sret, 0);
+        fx.store(supply.param(1).scalar(), sret, 8);
+        supply.ret(lo, fx, Held::Address(sret));
+        return;
+    }
+    if supply.member() == "unmap" && lo.machine() && supply.path.starts_with("hw::Mmio") {
+        let window = fx.load(PTR, supply.param(0).address(), 8);
+        let given = fx.b.ins().icmp_imm_s(IntCC::NotEqual, window, 0);
+        fx.when(given, |fx| {
+            iommu::call_hw(lo, fx, "window_unmapped", &[Held::Scalar(window)]);
+        });
     }
     let word = fx.load(PTR, supply.param(0).address(), 0);
     match (lo.machine(), lo.seeded()) {
@@ -358,6 +378,10 @@ pub fn registers(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             };
             let sret = supply.sret.expect("a window's slot");
             fx.store(word, sret, 0);
+            if supply.member() == "mmio" {
+                let none = fx.ptr(0);
+                fx.store(none, sret, 8);
+            }
             supply.ret(lo, fx, Held::Address(sret));
         }
         member => sim_access(lo, fx, supply, member),

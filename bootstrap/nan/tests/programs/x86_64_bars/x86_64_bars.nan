@@ -1,4 +1,4 @@
-//! Leaves the firmware, then maps the common configuration and ISR status of each modern virtio function through windows at the offsets its capabilities give in one BAR, and tries the windows its BARs refuse.
+//! Leaves the firmware, then maps the common configuration and ISR status of each modern virtio function through windows at the offsets its capabilities give in one BAR, tries the windows its BARs refuse while they are mapped, and maps the common configuration again once unmapped.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -75,19 +75,50 @@ fn main(take m: boot::Machine) -> Never limits stack 32_768 {
 } main
 
 /// Appends what the windows over the function's common configuration and ISR status read, then
-/// what windows over them again, across the ISR status, misaligned, past the BAR's end and over
-/// the MSI-X table give.
+/// what windows over them again while they are mapped, across the ISR status, misaligned, past
+/// the BAR's end, over the MSI-X table and over the common configuration once unmapped give.
 fn windows(mut function: hw::PciFunction, places: Places, mut line: mem::Bytes) {
     let common = places.common
-    let isr = places.isr
     match attempt hw::Mmio[Common].of_bar(mut function, index: common.bar, offset: common.offset) {
-        Ok(window) => offered(take window, mut line)
-        Err(error) => named(mut line, error)
+        Ok(window) => {
+            var regs = window
+            offered(mut regs, mut line)
+            while_mapped(mut function, places, mut line)
+            take regs.unmap()
+        }
+        Err(error) => {
+            named(mut line, error)
+            while_mapped(mut function, places, mut line)
+        }
     }
+    mut line.append(b"\n  again once unmapped:")
+    given(attempt hw::Mmio[Common].of_bar(mut function, index: common.bar, offset: common.offset), mut line)
+    mut line.append(b"\n")
+} windows
+
+/// Appends what the window over the ISR status reads, then what the windows `refused` tries
+/// give while it is mapped.
+fn while_mapped(mut function: hw::PciFunction, places: Places, mut line: mem::Bytes) {
+    let isr = places.isr
     match attempt hw::Mmio[Isr].of_bar(mut function, index: isr.bar, offset: isr.offset) {
-        Ok(window) => status(take window, mut line)
-        Err(error) => named(mut line, error)
+        Ok(window) => {
+            var regs = window
+            status(mut regs, mut line)
+            refused(mut function, places, mut line)
+            take regs.unmap()
+        }
+        Err(error) => {
+            named(mut line, error)
+            refused(mut function, places, mut line)
+        }
     }
+} while_mapped
+
+/// Appends what windows over the common configuration again, across the ISR status,
+/// misaligned, past the BAR's end and over the MSI-X table give.
+fn refused(mut function: hw::PciFunction, places: Places, mut line: mem::Bytes) {
+    let common = places.common
+    let isr = places.isr
     mut line.append(b"\n  again:")
     given(attempt hw::Mmio[Common].of_bar(mut function, index: common.bar, offset: common.offset), mut line)
     mut line.append(b"\n  across the ISR status:")
@@ -98,8 +129,7 @@ fn windows(mut function: hw::PciFunction, places: Places, mut line: mem::Bytes) 
     given(attempt hw::Mmio[Common].of_bar(mut function, index: common.bar, offset: 0xFFFF_FFFF_FFFF_FFF8), mut line)
     mut line.append(b"\n  over the MSI-X table:")
     given(attempt hw::Mmio[Common].of_bar(mut function, index: places.msix.bar, offset: places.msix.offset), mut line)
-    mut line.append(b"\n")
-} windows
+} refused
 
 /// The places the function's capabilities give, BAR 6, which none has, where one is missing.
 fn capabilities(function: hw::PciFunction) -> Places {
@@ -131,24 +161,19 @@ fn capabilities(function: hw::PciFunction) -> Places {
     return found
 } capabilities
 
-/// Appends whether the device the window reaches offers virtio 1, the window then unmapped.
-fn offered(take common: hw::Mmio[Common], mut line: mem::Bytes) {
-    var regs = common
+/// Appends whether the device the window reaches offers virtio 1.
+fn offered(mut regs: hw::Mmio[Common], mut line: mem::Bytes) {
     mut regs.write(Common.device_feature_select, value: 1)
-    let offers = (mut regs.read(Common.device_feature) & VERSION_1) != 0
-    take regs.unmap()
-    if offers {
+    if (mut regs.read(Common.device_feature) & VERSION_1) != 0 {
         mut line.append(b": virtio 1")
     } else {
         mut line.append(b": no virtio 1")
     }
 } offered
 
-/// Appends the ISR status the window reads, the window then unmapped.
-fn status(take isr: hw::Mmio[Isr], mut line: mem::Bytes) {
-    var regs = isr
+/// Appends the ISR status the window reads.
+fn status(mut regs: hw::Mmio[Isr], mut line: mem::Bytes) {
     let bits = mut regs.read(Isr.status)
-    take regs.unmap()
     mut line.append(b", ISR status ")
     mut line.push(b"0123456789abcdef"[usize.widen(bits & 0xF)])
 } status
@@ -172,6 +197,8 @@ fn named(mut line: mem::Bytes, error: hw::PciError) {
         hw::PciError.Taken => mut line.append(b" taken")
         hw::PciError.Unmapped => mut line.append(b" unmapped")
         hw::PciError.Removed => mut line.append(b" removed")
+        hw::PciError.Unsupported => mut line.append(b" unsupported")
+        hw::PciError.Unresponsive => mut line.append(b" unresponsive")
     }
 } named
 

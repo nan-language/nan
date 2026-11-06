@@ -581,9 +581,12 @@ impl Layouts {
                     ("len".to_owned(), Ty::Scalar(Scalar::U64)),
                 ],
             ),
-            // A register window and a simulated register block each hold one pointer: the sim
-            // block its window reaches, or on a machine target the mapped address or port.
-            "hw::Mmio" | "hw::Ports" | "hw::sim::Registers" => pointers(1, None),
+            // A port window and a simulated register block each hold one pointer: the sim block
+            // the window reaches, or on a machine target its port. A memory window holds the sim
+            // block or the mapped address, then the record of a window over a PCI function's
+            // BAR, zero for any other window.
+            "hw::Ports" | "hw::sim::Registers" => pointers(1, None),
+            "hw::Mmio" => pointers(2, None),
             // A DMA buffer holds its box, whose contents never move, and the record of its mapping
             // in an I/O domain, zero in the physical space.
             "hw::Dma" | "hw::DmaShared" => pointers(2, Some(0)),

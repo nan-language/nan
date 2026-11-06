@@ -7,6 +7,10 @@ const OVMF_CODE: Str = "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2 /usr/share/edk2/
 
 const OVMF_VARS: Str = "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2 /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/x64/OVMF_VARS.4m.fd"
 
+/// The setting of the q35 machine that leaves the hot plug of its PCIe ports native, to the
+/// ports' slots, rather than to ACPI.
+const NATIVE_HOT_PLUG: Str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
+
 /// The firmware setting that makes OVMF place every PCI device's memory below 4 GiB, where the
 /// entry root maps devices.
 const BARS_BELOW_4_GIB: Str = "name=opt/ovmf/X-PciMmio64Mb,string=0"
@@ -33,18 +37,32 @@ const TPM_PROGRAM: Str = "swtpm"
 
 const TPM_ARGS: Str = "socket --tpm2 --tpmstate dir=tpm --ctrl type=unixio,path=tpm.sock --terminate"
 
-/// The files of a machine directory, which the emulator and the TPM emulator run in: the disk,
-/// the firmware's variables, the TPM's state directory and the TPM's socket.
-const DISK: Str = "disk.raw"
-
+/// The files of a machine directory, which the emulator and the TPM emulator run in: the
+/// firmware's variables, the TPM's state directory and the TPM's socket.
 const VARS: Str = "vars.fd"
 
 const TPM_STATE: Str = "tpm"
 
 const TPM_SOCKET: Str = "tpm.sock"
 
-/// The size of a machine's disk.
-const DISK_BYTES: u64 = 268_435_456
+/// A disk of a machine: the emulator's id of its drive, whose file in the machine directory is
+/// the id followed by `.raw`, made blank when missing, and its size.
+struct Disk {
+    id: text::String
+    bytes: u64
+} Disk
+
+/// The disks of an architecture's machines: the virtio disk of every machine, then on x86_64
+/// the NVMe controller's namespace and the SATA disk on the AHCI controller's first port.
+fn disks(arch: workspace::Arch, alloc: mem::Alloc) -> mem::List[Disk] {
+    var all = mem::List[Disk].empty(alloc)
+    mut all.push(Disk(id: text::String.of("disk", alloc), bytes: 268_435_456))
+    if arch == workspace::Arch.Amd64 {
+        mut all.push(Disk(id: text::String.of("nvme", alloc), bytes: 16_777_216))
+        mut all.push(Disk(id: text::String.of("sata", alloc), bytes: 16_777_216))
+    }
+    return all
+} disks
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pkg const OTHER_END: u8 = 70
@@ -74,9 +92,9 @@ const SYSTEM_TIME: usize = 12
 
 /// How a launch boots a machine.
 pkg enum Boots {
-    /// The boots of a run: the machine's disk, firmware variables and TPM state persist in the
-    /// machine directory `dir`, its console port is the socket there, and a reset reboots the
-    /// machine when `resets` holds and ends the run otherwise.
+    /// The boots of a run: the machine's disks, firmware variables and TPM state persist in the
+    /// machine directory `dir`, its console port and the emulator's monitor are sockets there,
+    /// and a reset reboots the machine when `resets` holds and ends the run otherwise.
     Kept(dir: text::String, resets: bool)
     /// The boots of a test run: each finds the machine as the launch made it, its network
     /// restricted to the machine and its console port unconnected, and a reset ends it.
@@ -84,16 +102,20 @@ pkg enum Boots {
 } Boots
 
 /// The emulator arguments common to every machine run of an architecture: the machine with its
-/// IOMMU first, the AArch64 one without ACPI, on x86_64 accelerated by KVM when `kvm` holds,
-/// processors, memory, entropy device, exit port, TPM, watchdog, disk and network device, each
-/// virtio PCI device modern and behind the IOMMU, no display, the serial port on the standard streams then the console port,
-/// and an end with the process that starts it. `kept` holds whether a run's boots keep resets,
-/// and is none for a test run's.
+/// IOMMU first, the AArch64 one without ACPI and the x86_64 one with native PCIe hot plug, on
+/// x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy device, exit port,
+/// TPM, watchdog, disk and network device, each virtio PCI device modern and behind the IOMMU,
+/// on x86_64 then the NVMe controller, the SATA disk and the empty hot-plug root port, no
+/// display, the serial port on the standard streams then the console port, a run's monitor,
+/// the disks' drives, and an end with the process that starts it. `kept` holds whether a run's
+/// boots keep resets, and is none for a test run's.
 fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Alloc) -> mem::List[text::String] {
     var written = text::String.of("-run-with exit-with-parent=on ", alloc)
     match arch {
         workspace::Arch.Amd64 => {
-            mut written.append("-machine q35 -device intel-iommu,intremap=on,aw-bits=48 ")
+            mut written.append("-machine q35 -device intel-iommu,intremap=on,aw-bits=48 -global ")
+            mut written.append(NATIVE_HOT_PLUG)
+            mut written.append(" ")
             if kvm {
                 mut written.append("-accel kvm,kernel-irqchip=split -cpu host,+invtsc")
             } else {
@@ -103,10 +125,28 @@ fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::A
         }
         workspace::Arch.Aarch64 => mut written.append("-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off -accel tcg -cpu cortex-a72 -smp 4 -m 512M -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native -device tpm-tis-device,tpmdev=tpm")
     }
-    mut written.append(" -chardev socket,id=tpm,path=tpm.sock -tpmdev emulator,id=tpm,chardev=tpm -device i6300esb -device virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on -device virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on -display none -nodefaults -monitor none -serial stdio")
+    mut written.append(" -chardev socket,id=tpm,path=tpm.sock -tpmdev emulator,id=tpm,chardev=tpm -device i6300esb -device virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on -device virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on")
+    if arch == workspace::Arch.Amd64 {
+        mut written.append(" -device nvme,drive=nvme,serial=nan -device ide-hd,bus=ide.0,drive=sata -device pcie-root-port,id=plug,chassis=0,slot=0,mem-reserve=2M")
+    }
+    mut written.append(" -display none -nodefaults -monitor none -serial stdio")
     match kept {
-        Some(_) => mut written.append(" -serial unix:console.sock,server=on,wait=off -drive if=none,id=disk,format=raw,file=disk.raw -netdev user,id=net")
-        None => mut written.append(" -serial null -drive if=none,id=disk,format=raw,file=disk.raw,snapshot=on -netdev user,id=net,restrict=on")
+        Some(_) => mut written.append(" -serial unix:console.sock,server=on,wait=off -chardev socket,id=monitor,path=monitor.sock,server=on,wait=off -mon chardev=monitor,mode=control")
+        None => mut written.append(" -serial null")
+    }
+    for disk in disks(arch, alloc) {
+        mut written.append(" -drive if=none,id=")
+        mut written.append(disk.id.as_str())
+        mut written.append(",format=raw,file=")
+        mut written.append(disk.id.as_str())
+        mut written.append(".raw")
+        if kept.is_none() {
+            mut written.append(",snapshot=on")
+        }
+    }
+    match kept {
+        Some(_) => mut written.append(" -netdev user,id=net")
+        None => mut written.append(" -netdev user,id=net,restrict=on")
     }
     if kept != Some(true) {
         mut written.append(" -no-reboot")
@@ -139,7 +179,7 @@ fn words_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     return parts
 } words_of
 
-/// The machine directory a launch boots in, holding the machine's disk, firmware variables, TPM
+/// The machine directory a launch boots in, holding the machine's disks, firmware variables, TPM
 /// state and sockets, and whether every boot makes its TPM state anew.
 pkg struct Machine {
     pkg dir: text::String
@@ -303,8 +343,8 @@ fn start_tpm(machine: Machine, alloc: mem::Alloc) -> platform::Background fails 
     return tpm
 } start_tpm
 
-/// The emulator invocation that boots a machine image, in a machine directory holding a disk made
-/// blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by loading
+/// The emulator invocation that boots a machine image, in a machine directory holding its disks,
+/// each made blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by loading
 /// its segments on AArch64, and a UEFI image through the firmware from a FAT volume holding it at
 /// the default boot path and each of `files` at `/` followed by its name.
 pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String], take boots: Boots, alloc: mem::Alloc) -> Launch fails platform::IoError {
@@ -322,9 +362,13 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
         Boots.Fresh => {}
     }
     try platform::create_dir_all(dir.as_str(), alloc)
-    let disk_path = platform::join(dir.as_str(), name: DISK, alloc)
-    if not platform::exists(disk_path.as_str()) {
-        try platform::write_sized(disk_path.as_str(), bytes: DISK_BYTES)
+    for disk in disks(arch, alloc) {
+        var file = text::String.of(disk.id.as_str(), alloc)
+        mut file.append(".raw")
+        let path = platform::join(dir.as_str(), name: file.as_str(), alloc)
+        if not platform::exists(path.as_str()) {
+            try platform::write_sized(path.as_str(), bytes: disk.bytes)
+        }
     }
     var args = base_args(arch, kvm: kvm_usable(arch), kept, alloc)
     if target.kind() == Some(workspace::Kind.Uefi) {
@@ -540,11 +584,14 @@ fn joined(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Allo
 test a_machine_keeps_its_iommu_first_and_a_test_run_drops_its_writes for base_args {
     let alloc = testing::world().alloc
     let accelerated = joined(workspace::Arch.Amd64, kvm: true, kept: None, alloc)
-    expect holds(accelerated.as_bytes(), wanted: b"-machine q35 -device intel-iommu,intremap=on,aw-bits=48 -accel kvm,kernel-irqchip=split -cpu host,+invtsc ")
-    expect holds(accelerated.as_bytes(), wanted: b"-serial stdio -serial null -drive if=none,id=disk,format=raw,file=disk.raw,snapshot=on -netdev user,id=net,restrict=on -no-reboot")
+    expect holds(accelerated.as_bytes(), wanted: b"-machine q35 -device intel-iommu,intremap=on,aw-bits=48 -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -accel kvm,kernel-irqchip=split -cpu host,+invtsc ")
+    expect holds(accelerated.as_bytes(), wanted: b"-serial stdio -serial null -drive if=none,id=disk,format=raw,file=disk.raw,snapshot=on ")
+    expect holds(accelerated.as_bytes(), wanted: b" -netdev user,id=net,restrict=on -no-reboot")
+    expect not holds(accelerated.as_bytes(), wanted: b"-mon ")
     let tcg = joined(workspace::Arch.Amd64, kvm: false, kept: Some(false), alloc)
     expect holds(tcg.as_bytes(), wanted: b"-accel tcg -cpu max ")
-    expect holds(tcg.as_bytes(), wanted: b"-serial unix:console.sock,server=on,wait=off -drive if=none,id=disk,format=raw,file=disk.raw -netdev user,id=net -no-reboot")
+    expect holds(tcg.as_bytes(), wanted: b"-serial unix:console.sock,server=on,wait=off -chardev socket,id=monitor,path=monitor.sock,server=on,wait=off -mon chardev=monitor,mode=control -drive if=none,id=disk,format=raw,file=disk.raw ")
+    expect holds(tcg.as_bytes(), wanted: b" -netdev user,id=net -no-reboot")
     let kept = joined(workspace::Arch.Aarch64, kvm: true, kept: Some(true), alloc)
     expect holds(kept.as_bytes(), wanted: b"-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off -accel tcg -cpu cortex-a72 ")
     expect not holds(kept.as_bytes(), wanted: b"-no-reboot")

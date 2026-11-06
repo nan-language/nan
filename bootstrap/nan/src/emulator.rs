@@ -37,6 +37,10 @@ const OVMF: [(&str, &str); 5] = [
     ),
 ];
 
+/// The setting of the q35 machine that leaves the hot plug of its PCIe ports native, to the
+/// ports' slots, rather than to ACPI.
+const NATIVE_HOT_PLUG: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
+
 /// The firmware setting that makes OVMF place every PCI device's memory below 4 GiB, where the
 /// entry root maps devices.
 const BARS_BELOW_4_GIB: &str = "name=opt/ovmf/X-PciMmio64Mb,string=0";
@@ -70,17 +74,25 @@ fn program(arch: Arch) -> &'static str {
 /// The TPM emulator serving each boot's TPM.
 const TPM_PROGRAM: &str = "swtpm";
 
-/// The files of a machine directory, which the emulator and the TPM emulator run in: the disk,
-/// the firmware's variables, the TPM's state directory, and the sockets of the TPM and of the
-/// console port.
-const DISK: &str = "disk.raw";
+/// The files of a machine directory, which the emulator and the TPM emulator run in: the
+/// firmware's variables, the TPM's state directory, and the sockets of the TPM, of the console
+/// port and of the emulator's monitor.
 const VARS: &str = "vars.fd";
 const TPM_STATE: &str = "tpm";
 const TPM_SOCKET: &str = "tpm.sock";
 const CONSOLE_SOCKET: &str = "console.sock";
+const MONITOR_SOCKET: &str = "monitor.sock";
 
-/// The size of a machine's disk.
-const DISK_BYTES: u64 = 256 << 20;
+/// The disks of an architecture's machines, each the emulator's id of its drive, whose file in
+/// the machine directory is the id followed by `.raw`, made blank when missing, and its size:
+/// the virtio disk of every machine, then on x86_64 the NVMe controller's namespace and the SATA
+/// disk on the AHCI controller's first port.
+fn disks(arch: Arch) -> &'static [(&'static str, u64)] {
+    match arch {
+        Arch::Amd64 => &[("disk", 256 << 20), ("nvme", 16 << 20), ("sata", 16 << 20)],
+        Arch::Aarch64 => &[("disk", 256 << 20)],
+    }
+}
 
 /// The status of a run under the emulator that ends other than by a write to the exit port.
 pub const OTHER_END: i32 = 70;
@@ -108,9 +120,9 @@ const SYSTEM_TIME: usize = 12;
 
 /// How a launch boots a machine.
 pub enum Boots {
-    /// The boots of a run: the machine's disk, firmware variables and TPM state persist in the
-    /// machine directory `dir`, its console port is the socket there, and a reset reboots the
-    /// machine when `resets` holds and ends the run otherwise.
+    /// The boots of a run: the machine's disks, firmware variables and TPM state persist in the
+    /// machine directory `dir`, its console port and the emulator's monitor are sockets there,
+    /// and a reset reboots the machine when `resets` holds and ends the run otherwise.
     Kept { dir: PathBuf, resets: bool },
     /// The boots of a test run: each finds the machine as the launch made it, its network
     /// restricted to the machine and its console port unconnected, and a reset ends it.
@@ -118,11 +130,13 @@ pub enum Boots {
 }
 
 /// The emulator arguments common to every machine run of an architecture: the machine with its
-/// IOMMU first, the AArch64 one without ACPI, on x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy
-/// device, exit port, TPM, watchdog, disk and network device, each virtio PCI device modern and
-/// behind the IOMMU, no display, the serial port on the standard streams then the console port,
-/// and an end with the process that starts it. `kept` holds whether a run's boots keep resets,
-/// and is none for a test run's.
+/// IOMMU first, the AArch64 one without ACPI and the x86_64 one with native PCIe hot plug, on
+/// x86_64 accelerated by KVM when `kvm` holds, processors, memory, entropy device, exit port,
+/// TPM, watchdog, disk and network device, each virtio PCI device modern and behind the IOMMU,
+/// on x86_64 then the NVMe controller, the SATA disk and the empty hot-plug root port, no
+/// display, the serial port on the standard streams then the console port, a run's monitor,
+/// the disks' drives, and an end with the process that starts it. `kept` holds whether a run's
+/// boots keep resets, and is none for a test run's.
 fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
     let machine: &[&str] = match (arch, kvm) {
         (Arch::Amd64, true) => &[
@@ -130,6 +144,8 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
             "q35",
             "-device",
             "intel-iommu,intremap=on,aw-bits=48",
+            "-global",
+            NATIVE_HOT_PLUG,
             "-accel",
             "kvm,kernel-irqchip=split",
             "-cpu",
@@ -140,6 +156,8 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
             "q35",
             "-device",
             "intel-iommu,intremap=on,aw-bits=48",
+            "-global",
+            NATIVE_HOT_PLUG,
             "-accel",
             "tcg",
             "-cpu",
@@ -174,17 +192,24 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
             "tpm-tis-device,tpmdev=tpm",
         ],
     };
-    let (disk, network, console) = match kept {
+    let slots: &[&str] = match arch {
+        Arch::Amd64 => &[
+            "-device",
+            "nvme,drive=nvme,serial=nan",
+            "-device",
+            "ide-hd,bus=ide.0,drive=sata",
+            "-device",
+            "pcie-root-port,id=plug,chassis=0,slot=0,mem-reserve=2M",
+        ],
+        Arch::Aarch64 => &[],
+    };
+    let (network, console, snapshot) = match kept {
         Some(_) => (
-            format!("if=none,id=disk,format=raw,file={DISK}"),
-            "user,id=net".to_owned(),
+            "user,id=net",
             format!("unix:{CONSOLE_SOCKET},server=on,wait=off"),
+            "",
         ),
-        None => (
-            format!("if=none,id=disk,format=raw,file={DISK},snapshot=on"),
-            "user,id=net,restrict=on".to_owned(),
-            "null".to_owned(),
-        ),
+        None => ("user,id=net,restrict=on", "null".to_owned(), ",snapshot=on"),
     };
     let mut args: Vec<String> = ["-run-with", "exit-with-parent=on"]
         .iter()
@@ -202,6 +227,9 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
             "virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on",
             "-device",
             "virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on",
+        ])
+        .chain(slots)
+        .chain(&[
             "-display",
             "none",
             "-nodefaults",
@@ -212,10 +240,24 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
         ])
         .map(|argument| (*argument).to_owned())
         .collect();
-    for (option, value) in [("-serial", console), ("-drive", disk), ("-netdev", network)] {
-        args.push(option.to_owned());
-        args.push(value);
+    args.push("-serial".to_owned());
+    args.push(console);
+    if kept.is_some() {
+        args.extend([
+            "-chardev".to_owned(),
+            format!("socket,id=monitor,path={MONITOR_SOCKET},server=on,wait=off"),
+            "-mon".to_owned(),
+            "chardev=monitor,mode=control".to_owned(),
+        ]);
     }
+    for (id, _) in disks(arch) {
+        args.push("-drive".to_owned());
+        args.push(format!(
+            "if=none,id={id},format=raw,file={id}.raw{snapshot}"
+        ));
+    }
+    args.push("-netdev".to_owned());
+    args.push(network.to_owned());
     if kept != Some(true) {
         args.push("-no-reboot".to_owned());
     }
@@ -311,7 +353,7 @@ fn flash_format(path: &str) -> &'static str {
     }
 }
 
-/// The machine directory a launch boots in, holding the machine's disk, firmware variables, TPM
+/// The machine directory a launch boots in, holding the machine's disks, firmware variables, TPM
 /// state and sockets, and whether every boot makes its TPM state anew.
 pub struct Machine {
     pub dir: PathBuf,
@@ -380,8 +422,8 @@ impl Drop for Boot {
     }
 }
 
-/// The emulator invocation that boots a machine image, in a machine directory holding a disk
-/// made blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by
+/// The emulator invocation that boots a machine image, in a machine directory holding its disks,
+/// each made blank when missing: a bare image directly, by the PVH boot protocol on x86_64 and by
 /// loading its segments on AArch64, and a UEFI image through the firmware from a FAT volume
 /// holding it at the default boot path and each of `files` at `/` followed by its name.
 pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> io::Result<Launch> {
@@ -391,9 +433,11 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
         Boots::Fresh => (machine_of(image), None),
     };
     fs::create_dir_all(&dir)?;
-    let disk = dir.join(DISK);
-    if !disk.exists() {
-        fs::File::create(&disk)?.set_len(DISK_BYTES)?;
+    for (id, bytes) in disks(arch) {
+        let file = dir.join(format!("{id}.raw"));
+        if !file.exists() {
+            fs::File::create(&file)?.set_len(*bytes)?;
+        }
     }
     let mut args = base_args(arch, kvm_usable(arch), kept);
     match target.kind() {

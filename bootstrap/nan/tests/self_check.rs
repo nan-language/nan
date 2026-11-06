@@ -894,7 +894,7 @@ fn compare_boots(
     let launch = run
         .launch
         .ok_or_else(|| format!("nan run {program} reports\n{}", run.output))?;
-    let booted = machine::boot(&launch)?;
+    let booted = machine::boot(&launch, Vec::new())?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let mut command = Command::new(&toolchain.image);
     command
@@ -1047,6 +1047,7 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
     fs::remove_file(dir.join(name).join("expected"))?;
     drop(fs::remove_file(dir.join(name).join("emulator")));
+    drop(fs::remove_file(dir.join(name).join("monitor")));
     let bundles = bundle_packages(&dir.join(name))?;
     if !bundles.is_empty() {
         for package in std::iter::once(name).chain(bundles.iter().map(String::as_str)) {
@@ -1149,9 +1150,9 @@ fn compare_bundled(
         .chain(front_bundles)
         .collect();
     launch.args.extend(own);
-    let booted = machine::boot(&launch)?;
+    let booted = machine::boot(&launch, Vec::new())?;
     launch.args = front_args;
-    let front_booted = machine::boot(&launch)?;
+    let front_booted = machine::boot(&launch, Vec::new())?;
     if (front_booted.status, &front_booted.written) != (booted.status, &booted.written) {
         return Err(format!(
             "{program} and its bundles built by the bootstrap write\n{}exiting with {}\nbuilt by the NaN toolchain\n{}exiting with {}",

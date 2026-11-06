@@ -1,0 +1,280 @@
+//! Lists the machine's PCIe ports, reads the NVMe controller's version and the SATA link of the AHCI controller's first port through their BARs, then lists the function the harness plugs into the empty hot-plug slot and cuts it off once the harness unplugs it.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The version of an NVMe controller, and the SATA status of an AHCI controller's first port,
+/// whose low bits read 3 once a device is present and its link up.
+registers Nvme {
+    version: u32 at 0x8 read
+} Nvme
+
+registers Ahci {
+    port_status: u32 at 0x128 read
+} Ahci
+
+/// The common configuration of a modern virtio device, which QEMU's devices lay out at the
+/// start of BAR 4, and the feature bit, in the second feature word, of virtio 1.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+} Common
+
+const COMMON_BAR: u8 = 4
+
+const VERSION_1: u32 = 1
+
+/// The class codes of an NVMe and an AHCI controller, with their BARs of registers.
+const NVME_CLASS: u32 = 0x01_08_02
+
+const NVME_BAR: u8 = 0
+
+const AHCI_CLASS: u32 = 0x01_06_01
+
+const AHCI_BAR: u8 = 5
+
+const LINK_UP: u32 = 3
+
+/// The polls of the slot's interrupt count before the kernel gives up.
+const POLLS: u32 = 100_000_000
+
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take m: boot::Machine) -> Never limits stack 32_768 {
+    var k = take m.exit_services()
+    let alloc = k.alloc()
+    var functions = mut k.pci_functions()
+    var ports = mut k.pci_ports()
+    var empty = mem::List[hw::PciPort].empty(alloc)
+    for port in take ports {
+        var line = mem::Bytes.empty(alloc)
+        mut line.append(b"port ")
+        address(mut line, at: port.address())
+        let buses = port.buses()
+        mut line.append(b" buses ")
+        hex(mut line, value: u32.widen(buses.secondary), digits: 2)
+        mut line.append(b"-")
+        hex(mut line, value: u32.widen(buses.subordinate), digits: 2)
+        let events = mut port.slot_events()
+        let Some(slot) = port.slot() else {
+            mut line.append(b"\n")
+            say(line.view())
+            take port.release()
+            continue
+        }
+        mut line.append(b" slot ")
+        hex(mut line, value: u32.widen(slot.number), digits: 1)
+        if slot.hot_plug and not events.present {
+            mut line.append(b" hot plug, empty")
+        }
+        mut line.append(b"\n")
+        say(line.view())
+        if slot.hot_plug and not events.present {
+            mut empty.push(take port)
+        } else {
+            take port.release()
+        }
+    }
+    for function in take functions {
+        var found = function
+        let class = found.config_read(0x8) >> 8
+        if class == NVME_CLASS {
+            nvme(mut found, alloc)
+        }
+        if class == AHCI_CLASS {
+            ahci(mut found, alloc)
+        }
+        take found.release()
+    }
+    let Some(iommu) = mut k.iommu() else {
+        say(b"iommu: none\n")
+        loop {
+        }
+    }
+    take k.anchor(take iommu, run: fn[take empty](exec: task::Executor) limits stack 65_536 {
+        for port in take empty {
+            plugged(take port, alloc)
+        }
+    })
+} main
+
+/// Writes the NVMe controller's version its registers give.
+fn nvme(mut function: hw::PciFunction, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"nvme ")
+    address(mut line, at: function.address())
+    match attempt hw::Mmio[Nvme].of_bar(mut function, index: NVME_BAR, offset: 0) {
+        Ok(window) => {
+            var regs = window
+            let version = mut regs.read(Nvme.version)
+            take regs.unmap()
+            mut line.append(b": version ")
+            hex(mut line, value: version >> 16, digits: 1)
+            mut line.append(b".")
+            hex(mut line, value: (version >> 8) & 0xFF, digits: 1)
+        }
+        Err(_) => mut line.append(b": no BAR")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} nvme
+
+/// Writes whether the AHCI controller's first port has a device whose link is up.
+fn ahci(mut function: hw::PciFunction, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"ahci ")
+    address(mut line, at: function.address())
+    match attempt hw::Mmio[Ahci].of_bar(mut function, index: AHCI_BAR, offset: 0) {
+        Ok(window) => {
+            var regs = window
+            let status = mut regs.read(Ahci.port_status)
+            take regs.unmap()
+            if (status & 0xF) == LINK_UP {
+                mut line.append(b": a disk on port 0")
+            } else {
+                mut line.append(b": port 0 empty")
+            }
+        }
+        Err(_) => mut line.append(b": no BAR")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} ahci
+
+/// Installs the slot's interrupt, then, once the slot reports a card, powers it and lists the
+/// functions a rescan finds, and once its attention button is pressed, powers it off and checks
+/// that those functions are cut off.
+fn plugged(take port: hw::PciPort, alloc: mem::Alloc) {
+    var slot = port
+    let shared = match mut slot.slot_irq(cpu: 0, dev: 0u64, on_irq: count) {
+        Ok(installed) => installed
+        Err(_) => {
+            say(b"hot plug: no interrupt\n")
+            take slot.release()
+            return
+        }
+    }
+    say(b"hot plug: interrupt installed\n")
+    var seen = interrupted(shared, seen: 0)
+    let arrived = mut slot.slot_events()
+    if arrived.presence_changed and arrived.present {
+        say(b"hot plug: a card arrived\n")
+    }
+    mut slot.power(on: true)
+    var found = mut slot.rescan(alloc)
+    var hot = mem::List[hw::PciFunction].empty(alloc)
+    for function in take found {
+        var added = function
+        virtio(mut added, alloc)
+        mut hot.push(take added)
+    }
+    seen = interrupted(shared, seen)
+    let pressed = mut slot.slot_events()
+    if pressed.attention_pressed {
+        say(b"hot plug: attention button pressed\n")
+    }
+    mut slot.power(on: false)
+    for function in take hot {
+        var left = function
+        var refused = false
+        match attempt hw::Mmio[Common].of_bar(mut left, index: COMMON_BAR, offset: 0) {
+            Ok(window) => take window.unmap()
+            Err(error) => {
+                refused = error == hw::PciError.Removed
+            }
+        }
+        if left.removed() and refused {
+            say(b"power off: the function is cut off\n")
+        }
+        take left.release()
+    }
+    discard interrupted(shared, seen)
+    let left = mut slot.slot_events()
+    if left.presence_changed and not left.present {
+        say(b"hot plug: the card left\n")
+    }
+    let again = mut slot.rescan(alloc)
+    if again.len() == 0 {
+        say(b"rescan: nothing\n")
+    }
+    for function in take again {
+        take function.release()
+    }
+    discard take shared.uninstall()
+    take slot.release()
+} plugged
+
+interrupt fn count(mut counted: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    counted = counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} count
+
+/// The interrupts counted once the count passes `seen`, or after `POLLS` polls.
+fn interrupted(shared: hw::IrqShared[u64], seen: u64) -> u64 {
+    var counted = seen
+    for _ in 0..<POLLS {
+        counted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut total: u64) -> u64 limits notrap, terminates, noalloc {
+                return total
+            })
+        })
+        if counted > seen {
+            return counted
+        }
+    }
+    return counted
+} interrupted
+
+/// Writes a plugged function's bus path and ids and whether a modern virtio device answers
+/// through its BAR.
+fn virtio(mut function: hw::PciFunction, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"plugged ")
+    address(mut line, at: function.address())
+    let ids = function.config_read(0)
+    mut line.append(b" ")
+    hex(mut line, value: ids & 0xFFFF, digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: ids >> 16, digits: 4)
+    match attempt hw::Mmio[Common].of_bar(mut function, index: COMMON_BAR, offset: 0) {
+        Ok(common) => {
+            var regs = common
+            mut regs.write(Common.device_feature_select, value: 1)
+            if (mut regs.read(Common.device_feature) & VERSION_1) != 0 {
+                mut line.append(b": virtio 1 through its BAR")
+            }
+            take regs.unmap()
+        }
+        Err(_) => mut line.append(b": no BAR")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} virtio
+
+/// Appends a bus path as segment:bus:device.function.
+fn address(mut line: mem::Bytes, at: hw::PciAddress) {
+    hex(mut line, value: u32.widen(at.segment), digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.bus), digits: 2)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.device), digits: 2)
+    mut line.append(b".")
+    hex(mut line, value: u32.widen(at.function), digits: 1)
+} address
+
+/// Appends a value in `digits` hexadecimal digits.
+fn hex(mut line: mem::Bytes, value: u32, digits: u32) {
+    var shift = digits * 4
+    while shift > 0 {
+        shift -= 4
+        mut line.push(b"0123456789abcdef"[usize.widen((value >> shift) & 0xF)])
+    }
+} hex

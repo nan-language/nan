@@ -1,4 +1,4 @@
-//! Lists the PCI functions and ports behind root ports and a PCI bridge with their bus paths, attaches them to an I/O domain, then hot-adds and removes a device on an empty root port's slot through QEMU's monitor.
+//! Lists the PCI functions and ports behind root ports and a PCI bridge with their bus paths, attaches them to an I/O domain, then attaches the device the harness plugs into the empty hot-plug slot and cuts it off once the harness unplugs it.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -15,24 +15,15 @@ const COMMON_BAR: u8 = 4
 
 const VERSION_1: u32 = 1
 
-/// The serial port writing the console, and the one QEMU's monitor reads.
-const CONSOLE: u16 = 0x3F8
-
-const MONITOR: u16 = 0x3E8
-
 /// The polls of the slot's interrupt count before the kernel gives up.
 const POLLS: u32 = 100_000_000
 
-fn write(port: u16, text: Slice[u8]) {
-    var uart = trusted "the board decodes the port to a 16550 UART and nothing else maps it" { hw::Ports[Uart].map(port) }
+fn say(text: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
     for byte in text {
         mut uart.write(Uart.data, value: byte)
     }
     take uart.unmap()
-} write
-
-fn say(text: Slice[u8]) {
-    write(port: CONSOLE, text)
 } say
 
 fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
@@ -110,9 +101,8 @@ fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
     })
 } main
 
-/// Installs the slot's interrupt, asks QEMU to add a device to the slot and lists it once the
-/// slot reports it, then asks QEMU to remove it and powers the slot off once its attention
-/// button is pressed.
+/// Installs the slot's interrupt, lists and attaches the device a rescan finds once the slot
+/// reports a card, then powers the slot off once its attention button is pressed.
 fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
     var slot = port
     let shared = match mut slot.slot_irq(cpu: 0, dev: 0u64, on_irq: count) {
@@ -124,7 +114,6 @@ fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
         }
     }
     say(b"hot plug: interrupt installed\n")
-    write(port: MONITOR, text: b"device_add virtio-rng-pci,bus=rp2,id=hot,disable-legacy=on,iommu_platform=on\n")
     var seen = interrupted(shared, seen: 0)
     let arrived = mut slot.slot_events()
     if arrived.presence_changed and arrived.present {
@@ -139,7 +128,6 @@ fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
         attach(mut added, domain, alloc)
         mut hot.push(take added)
     }
-    write(port: MONITOR, text: b"device_del hot\n")
     seen = interrupted(shared, seen)
     let pressed = mut slot.slot_events()
     if pressed.attention_pressed {

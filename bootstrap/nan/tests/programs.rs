@@ -5,6 +5,8 @@
 //! writing the serial port until it ends the emulator through the exit port; on a UEFI target the
 //! firmware writes first, so its output only ends with the expected text. A machine program with an
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
+//! A machine program's `monitor` file holds a line, a tab and a command of QEMU's machine protocol
+//! per line, which each boot makes on the run's monitor once the program writes the line.
 //! A host program with a `codegen` file is also built and run at each codegen level it lists, one
 //! per line, writing what it expects where this machine has the level's extensions and refusing
 //! to run otherwise. A kernel's `bundles` directory holds libraries and nanos programs that the
@@ -35,7 +37,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_dir(&entry.path(), &target)?;
-        } else if !["expected", "emulator", "codegen"]
+        } else if !["expected", "emulator", "monitor", "codegen"]
             .iter()
             .any(|kept| entry.file_name() == *kept)
         {
@@ -228,7 +230,18 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 Ok(lines) => lines.lines().map(str::to_owned).collect(),
                 Err(_) => vec![String::new()],
             };
+            let monitor = fs::read_to_string(source.join("monitor")).unwrap_or_default();
             for extra in boots {
+                let requests = monitor
+                    .lines()
+                    .map(|line| {
+                        let (after, command) = line.split_once('\t').expect("a tab in a request");
+                        machine::Request {
+                            after: after.to_owned(),
+                            command: command.to_owned(),
+                        }
+                    })
+                    .collect();
                 let run = nan::run(&["run".to_owned(), name.to_owned()], &root);
                 let Some(mut launch) = run.launch else {
                     return Err(format!("nan run {name} reports\n{}", run.output).into());
@@ -237,7 +250,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                     .args
                     .extend(extra.split_whitespace().map(str::to_owned));
                 launch.args.extend(bundles.iter().cloned());
-                let booted = machine::boot(&launch)?;
+                let booted = machine::boot(&launch, requests)?;
                 let label = format!(" booted with `{extra}`");
                 runs.push((
                     label,

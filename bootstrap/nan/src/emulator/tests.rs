@@ -21,7 +21,7 @@ fn written(arch: Arch, kvm: bool, kept: Option<bool>) -> String {
 #[test]
 fn the_x86_64_machine_has_its_iommu_first_and_the_host_cpu_under_kvm() {
     let kvm = written(Arch::Amd64, true, None);
-    let iommu = "-machine q35 -device intel-iommu,intremap=on,aw-bits=48 ";
+    let iommu = "-machine q35 -device intel-iommu,intremap=on,aw-bits=48 -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off ";
     assert!(kvm.contains(&format!(
         "{iommu}-accel kvm,kernel-irqchip=split -cpu host,+invtsc "
     )));
@@ -43,7 +43,7 @@ fn the_aarch64_machine_runs_under_tcg_with_an_smmu() {
 }
 
 #[test]
-fn a_test_run_drops_its_writes_and_a_run_keeps_them() {
+fn a_test_run_drops_its_writes_and_a_run_keeps_them_with_its_monitor() {
     let fresh = written(Arch::Amd64, true, None);
     for held in [
         "-serial stdio -serial null ",
@@ -53,10 +53,12 @@ fn a_test_run_drops_its_writes_and_a_run_keeps_them() {
         assert!(fresh.contains(held), "{fresh} holds no {held}");
     }
     assert!(fresh.ends_with(" -no-reboot"));
+    assert!(!fresh.contains("-mon "));
     for resets in [false, true] {
         let kept = written(Arch::Aarch64, false, Some(resets));
         for held in [
             "-serial stdio -serial unix:console.sock,server=on,wait=off ",
+            "-chardev socket,id=monitor,path=monitor.sock,server=on,wait=off -mon chardev=monitor,mode=control ",
             "-drive if=none,id=disk,format=raw,file=disk.raw ",
             "-netdev user,id=net",
         ] {

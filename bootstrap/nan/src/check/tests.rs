@@ -62,3 +62,39 @@ fn a_check_of_one_package_reads_only_what_it_reaches() {
     );
     assert_eq!(scoped, whole);
 }
+
+#[test]
+fn a_package_declaring_any_is_judged_within_the_reach_of_a_final_build() {
+    let domain = |name: &str| {
+        format!(
+            "pub fn {name}(n: u64, exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {{\n    let outcome = try await sys::Domain.run_sized(fn() -> u64 {{\n        return n\n    }}, stack: 65_536, exec, alloc)\n    return outcome.is_ok()\n}} {name}\n"
+        )
+    };
+    let tally = format!(
+        "//! Runs counts in domains.\n\n{}\n{}",
+        domain("reached"),
+        domain("unreached")
+    );
+    let scratch = Scratch::new(&[
+        (
+            "tally/package.nan",
+            "//! Tallies.\n\npackage tally {\n    language 1\n    targets any\n} tally\n",
+        ),
+        ("tally/tally.nan", &tally),
+        (
+            "counter/package.nan",
+            "//! A kernel.\n\npackage counter {\n    language 1\n    targets x86_64-bare\n    entry main\n    dep tally \"../tally\"\n} counter\n",
+        ),
+        (
+            "counter/counter.nan",
+            "//! Counts once.\n\nfn main(take k: boot::Kernel) -> Never limits stack 16_384 {\n    let alloc = k.alloc()\n    take k.anchor(Unit, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {\n        discard try await tally::reached(3, exec, alloc)\n        loop {\n            try await hw::Signal[Unit].empty().wait()\n        }\n    })\n} main\n",
+        ),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let missing: Vec<(Option<String>, Option<u32>)> = reported(&workspace, &Scope::Workspace)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == Code::SuspendStackMissing)
+        .map(|diagnostic| (diagnostic.path, diagnostic.line))
+        .collect();
+    assert_eq!(missing, [(Some("tally/tally.nan".to_owned()), Some(4))]);
+}

@@ -24,6 +24,117 @@ fn Checker.check_program(self, package_id: ty::PackageId) {
     }
 } Checker.check_program
 
+/// Judges under the checker's concrete target each item of a package declaring `any` within
+/// the reach of the final build of each program it checks, from the program's entry items and
+/// the admitted contributions to platform registries.
+fn Checker.judge_build_reaches(self) {
+    let db = self.db()
+    let alloc = self.alloc()
+    if db.target == workspace::Target.Any {
+        return
+    }
+    var sharing = false
+    for index in 0..<db.packages.len() {
+        sharing = sharing or self.is_shared(ty::PackageId(index: u32.fit(index)))
+    }
+    if not sharing {
+        return
+    }
+    for program in self.packages_checked() {
+        let Some(manifest) = db.source(program).manifest else {
+            continue
+        }
+        let Some(entry) = manifest.entry else {
+            continue
+        }
+        let Some(module) = db.package_data(program).root else {
+            continue
+        }
+        var admitted = mem::List[Contribution].empty(alloc)
+        for contribution in self.contributions(program) {
+            if contribution.admitted {
+                mut admitted.push(contribution)
+            }
+        }
+        var roots = mem::List[ty::ItemId].empty(alloc)
+        for name in entry.names {
+            match db.lookup(module, name: name.as_str()) {
+                Some(named) => mut roots.push(named)
+                None => {}
+            }
+        }
+        for contribution in admitted {
+            if self.is_platform_contribution(contribution.item) {
+                mut roots.push(contribution.item)
+            }
+        }
+        self.judge_reach(take roots, admitted: admitted.view())
+    }
+} Checker.judge_build_reaches
+
+/// Judges each item of a package declaring `any` that `roots` reach: each item a reached item's
+/// unit names, the impl lines of each reached type and the `admitted` contributions to each
+/// reached registry, an item of the carried std or of a quiet package adding only itself.
+fn Checker.judge_reach(self, take roots: mem::List[ty::ItemId], admitted: Slice[Contribution]) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var pending = roots
+    var reach = mem::Set[ty::ItemId].empty(alloc)
+    loop {
+        let Some(item) = mut pending.pop() else {
+            return
+        }
+        if not mut reach.insert(item) or not db.is_reported(item) {
+            continue
+        }
+        if self.is_shared(db.package_of(item)) {
+            self.judge_alone(item)
+        }
+        if self.rejected(item) {
+            continue
+        }
+        match db.declaration(item).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+                for line in self.impl_lines(TypeKey.Item(item)) {
+                    mut pending.push(line)
+                }
+            }
+            ast::ItemKind.Impl(_) => {
+                for named in self.names(item).contents() {
+                    mut pending.push(named)
+                }
+            }
+            ast::ItemKind.Registry(_) => {
+                for contribution in admitted {
+                    if contribution.registry_item == item {
+                        mut pending.push(contribution.item)
+                    }
+                }
+            }
+            else => {}
+        }
+        match self.unit(item) {
+            Some(unit) => {
+                for named in named_items(self.types(), unit: unit.contents(), alloc) {
+                    mut pending.push(named)
+                }
+            }
+            None => {}
+        }
+    }
+} Checker.judge_reach
+
+/// Whether a package of the checker's closure that it reports on declares `any`.
+fn Checker.is_shared(self, package_id: ty::PackageId) -> bool {
+    let db = self.db()
+    let data = db.package_data(package_id)
+    if data.carried or data.quiet {
+        return false
+    }
+    let targets = check_targets(db.source(package_id), alloc: self.alloc())
+    return targets.len() == 1 and targets[0] == workspace::Target.Any
+} Checker.is_shared
+
 /// The `entry` directive of a program: one concrete target declared, and `main` naming a
 /// function of its root module or component entries.
 fn Checker.check_program_entry(self, package_id: ty::PackageId, manifest: workspace::Manifest, entry: workspace::ProgramEntry, path: Str) {

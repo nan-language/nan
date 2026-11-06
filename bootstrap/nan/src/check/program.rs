@@ -1,11 +1,14 @@
 //! Targets and programs: the targets each dependency covers, dependencies on programs, the one
 //! concrete target a program declares and the head of its entry function.
 
-use super::Checker;
+use std::collections::HashSet;
+
 use super::body::Clauses;
-use super::db::{ItemId, ModuleId, PackageId};
+use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::props::Property;
+use super::registry::Contribution;
 use super::ty::{Scalar, Ty};
+use super::{Checker, check_targets, checked_packages, seal};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{ItemKind, Mode, Visibility};
 use crate::workspace::{Kind, Target};
@@ -57,6 +60,85 @@ impl Checker<'_> {
                 self.report_file(path, dep.line, Code::TargetDepProgram);
             }
         }
+    }
+
+    /// Judges under the checker's concrete target each item of a package declaring `any` within
+    /// the reach of the final build of each program it checks, from the program's entry items and
+    /// the admitted contributions to platform registries.
+    pub fn judge_build_reaches(&self) {
+        let mut packages = (0..self.db.packages.len()).map(|index| PackageId(index as u32));
+        if self.db.target == Target::Any || !packages.any(|package| self.is_shared(package)) {
+            return;
+        }
+        for (_, program) in checked_packages(self) {
+            let data = self.db.package(program);
+            let entry = data
+                .source
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.entry.as_ref());
+            let (Some((names, _)), Some(module)) = (entry, data.root) else {
+                continue;
+            };
+            let admitted: Vec<Contribution> = self
+                .contributions(program)
+                .into_iter()
+                .filter(|contribution| contribution.admitted)
+                .collect();
+            let roots = names
+                .iter()
+                .filter_map(|name| self.db.lookup(module, name))
+                .chain(
+                    admitted
+                        .iter()
+                        .filter(|contribution| self.is_platform_contribution(contribution.item))
+                        .map(|contribution| contribution.item),
+                )
+                .collect();
+            self.judge_reach(roots, &admitted);
+        }
+    }
+
+    /// Judges each item of a package declaring `any` that `roots` reach: each item a reached
+    /// item's unit names, the impl lines of each reached type and the `admitted` contributions to
+    /// each reached registry, an item of the carried std or of a quiet package adding only
+    /// itself.
+    fn judge_reach(&self, roots: Vec<ItemId>, admitted: &[Contribution]) {
+        let mut pending = roots;
+        let mut reach: HashSet<ItemId> = HashSet::new();
+        while let Some(item) = pending.pop() {
+            if !reach.insert(item) || !self.db.is_reported(item) {
+                continue;
+            }
+            if self.is_shared(self.db.package_of(item)) {
+                self.judge_alone(item);
+            }
+            if self.rejected(item) {
+                continue;
+            }
+            match self.db.declaration(item).kind {
+                ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
+                    pending.extend(self.impl_lines(TypeKey::Item(item)));
+                }
+                ItemKind::Impl(_) => pending.extend(self.names(item).iter().copied()),
+                ItemKind::Registry(_) => pending.extend(
+                    admitted
+                        .iter()
+                        .filter(|contribution| contribution.registry == item)
+                        .map(|contribution| contribution.item),
+                ),
+                _ => {}
+            }
+            if let Some(unit) = self.unit(item) {
+                pending.extend(seal::named_items(&unit));
+            }
+        }
+    }
+
+    /// Whether a package of the checker's closure that it reports on declares `any`.
+    fn is_shared(&self, package: PackageId) -> bool {
+        let data = self.db.package(package);
+        !data.carried && !data.quiet && check_targets(data.source) == [Target::Any]
     }
 
     /// The rule an `entry` directive listing `names` of a root module breaks: `main` alone names

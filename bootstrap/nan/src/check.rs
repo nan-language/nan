@@ -450,11 +450,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Records a diagnostic of unused code on an item, reported once found under every target
-    /// checking its file.
+    /// Records a diagnostic of unused code on an item of a package declaring the checker's
+    /// target, reported once found under every target checking its file.
     fn report_unused(&self, item: ItemId, diagnostic: Diagnostic) {
+        let declared = check_targets(self.db.package(self.db.package_of(item)).source);
         if let Some(diagnostic) = self.on_item(item, diagnostic)
             && self.db.is_reported(item)
+            && declared.contains(&self.db.target)
         {
             self.unused.borrow_mut().push(diagnostic);
         }
@@ -773,6 +775,7 @@ impl Checker<'_> {
             self.check_tables(package);
             self.check_approvals(package);
         }
+        self.judge_build_reaches();
         self.check_wheres();
         self.check_const_cycles();
     }

@@ -480,7 +480,7 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 - The tasks of D lie in the region of every cancelling construct whose region holds the call of `run` ([origin and absorption](#origin-and-absorption)).
 - `sys::Domain` has no values that code obtains; it names the operation.
 
-`sys::Domain.run_sized(body, stack, exec, alloc)` behaves as `run(body, exec, alloc)`, except that the first task's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a body whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run in a domain.
+`sys::Domain.run_sized(body, stack, exec, alloc)` behaves as `run(body, exec, alloc)`, except that the first task's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a body whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run in a domain off the machine targets, whose task entries state [static bounds](17-suspension-io.md#static-bounds).
 
 An **abandoner**, a `sys::Abandoner`, abandons from outside the domain it runs, such as a body that loops without reaching a cancellation point. It is a [base type](05-properties.md#structural-properties), Send and never Copy, linear, a view, Inert or AnyBits, with [interior mutability](12-memory.md#interior-mutability), so tasks share one through a [`mem::Shared`](12-memory.md#shared-values).
 

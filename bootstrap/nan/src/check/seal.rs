@@ -120,7 +120,7 @@ impl Checker<'_> {
 
 /// The items a unit names: its types, function references, constants, registers blocks and
 /// `Dyn` interfaces, each once.
-fn named_items(unit: &Unit) -> Vec<ItemId> {
+pub(super) fn named_items(unit: &Unit) -> Vec<ItemId> {
     let mut found: Vec<ItemId> = Vec::new();
     let mut add = |item: ItemId| {
         if !found.contains(&item) {

@@ -113,12 +113,13 @@ fn device_value(mut lo: Lowering, value_ty: ty::Ty) -> u64 {
 } device_value
 
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
-/// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
-/// target install it on its interrupt, `install_msi` giving the device back in its refusal
-/// otherwise; the running task's domain then owns the record as a holding. `message` reads the
-/// message the record holds; `with` takes the record's lock around its body; `uninstall` ends
-/// the holding, removes the device from its interrupt and waits until no CPU runs its interrupt
-/// fn, then moves it out of the freed record. A CPU number past the CPUs traps.
+/// `install`, `install_on`, `install_msi` and `install_line` move the device into a new record,
+/// and on a machine target install it on its interrupt, `install_msi` and `install_line` giving
+/// the device back in their refusal otherwise; the running task's domain then owns the record as
+/// a holding. `message` reads the message the record holds; `with` takes the record's lock
+/// around its body; `uninstall` ends the holding, removes the device from its interrupt and waits
+/// until no CPU runs its interrupt fn, then moves it out of the freed record. A CPU number past
+/// the CPUs traps.
 fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let value_ty = supply.type_arg(lo, index: 0)
     let value_at = device_value(mut lo, value_ty)
@@ -144,6 +145,7 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "install_msi" => shared_install_msi(mut lo, mut fx, supply, value_ty, validated: false)
         "install_validated" => shared_install_msi(mut lo, mut fx, supply, value_ty, validated: true)
+        "install_line" => shared_install_line(mut lo, mut fx, supply, value_ty)
         "message" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             let option = supply.abi.result
@@ -273,6 +275,32 @@ fn shared_install_msi(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty
     let cpu = cpu_number(mut lo, mut fx, supply)
     let record = device_record(mut lo, mut fx, supply, value_ty, handler: 3)
     let outcome = msi_outcome(mut lo, mut fx, supply, record, cpu, validated)
+    installed_or_refused(mut lo, mut fx, supply, value_ty, record, outcome)
+} shared_install_msi
+
+/// `install_line`: `Ok` of the shared device once installed on a line of a machine target, or
+/// `Err` of a refusal as `install_msi` gives one.
+fn shared_install_line(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty) {
+    let record = device_record(mut lo, mut fx, supply, value_ty, handler: 3)
+    let outcome = line_outcome(mut lo, mut fx, supply, record)
+    installed_or_refused(mut lo, mut fx, supply, value_ty, record, outcome)
+} shared_install_line
+
+/// The outcome of `install_line`: the installation's on a machine target, `Unsupported` on the
+/// host.
+fn line_outcome(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) -> clif::Value {
+    if not lo.machine() {
+        return mut fx.ptr(u64.fit(MSI_UNSUPPORTED))
+    }
+    let line = supply.param(1).scalar_value()
+    let source_word = supply.param(2).scalar_value()
+    let source = mut fx.b.uextend(PTR, x: source_word)
+    return mut lo.install_line(mut fx, record, line, source)
+} line_outcome
+
+/// Returns `Ok` of the shared device a record holds when an install's outcome is `MSI_INSTALLED`,
+/// or else `Err` of a refusal giving back the device with the outcome's `hw::MsiError` variant.
+fn installed_or_refused(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty, record: clif::Value, outcome: clif::Value) {
     let result_ty = supply.abi.result
     let installed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: MSI_INSTALLED)
     mut fx.if_true(installed, then: fn[mut lo](mut fx1: Fx) {
@@ -303,7 +331,7 @@ fn shared_install_msi(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty
         return_refusal(mut lo, fx: mut fx1, supply, refused, variant: "Unreachable")
     })
     return_refusal(mut lo, mut fx, supply, refused, variant: "Unsupported")
-} shared_install_msi
+} installed_or_refused
 
 /// The outcome of installing a device record on a message-signalled interrupt: the machine
 /// target's, `Unsupported` on the host.

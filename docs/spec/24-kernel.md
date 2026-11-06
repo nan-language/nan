@@ -664,7 +664,7 @@ interrupt fn Queue.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit lim
 
 ## PCI functions
 
-A **PCI function** is an `hw::PciFunction`, an endpoint below a host bridge that `boot::Kernel.pci_functions` lists ([anchor](#anchor)) or a port's rescan finds ([PCI ports](#pci-ports)). Its DMA reaches the memory of the space it is attached to, through the IOMMU when one is enabled ([I/O domains](23-low-level.md#io-domains)), and its register windows and message-signalled interrupts derive from it with no trusted premise.
+A **PCI function** is an `hw::PciFunction`, an endpoint below a host bridge that `boot::Kernel.pci_functions` lists ([anchor](#anchor)) or a port's rescan finds ([PCI ports](#pci-ports)). Its DMA reaches the memory of the space it is attached to, through the IOMMU when one is enabled ([I/O domains](23-low-level.md#io-domains)), and its register windows and interrupts derive from it with no trusted premise.
 
 ```nan-api
 // module: hw
@@ -703,6 +703,10 @@ pub fn PciFunction.attach_physical(mut self) fails IommuError
 
 pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
 
+pub fn PciFunction.msi[T: Any and Send](mut self, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+pub fn PciFunction.intx[T: Any and Send](mut self, line: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
 pub fn PciFunction.release(take self)
 ```
 
@@ -711,8 +715,11 @@ pub fn PciFunction.release(take self)
 - `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, with `Exhausted` when no memory for the IOMMU's tables is left, and with `Unsupported` when the IOMMU does not translate the function, the function is not isolated or it is removed. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Exhausted` as `attach` does, and with `Unsupported` when the function is removed, or the IOMMU translates it and cannot pass its accesses through, as for a function below a bridge other than a PCIe port, whose DMA reaches the IOMMU under another requester id. A function attached anew leaves the space it was attached to.
 - A function is **isolated** when its DMA reaches the IOMMU under its own requester id and no peer receives it otherwise: each bridge above it is a PCIe switch upstream port, or a PCIe root or downstream port whose ACS capability validates the source of the requests from below and redirects their peer requests and completions upstream and forwards them there, which the runtime enables; and a function of a multi-function device has an ACS capability redirecting its peer requests and completions upstream, which the runtime enables. The runtime reads ACS capabilities through an ECAM alone.
 - `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached or is removed, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
-- `take function.release()` cuts the function off: its bus mastering and memory decoding end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
-- A function is **removed** once the rescan or powering off of a port above it cuts it off ([PCI ports](#pci-ports)): from then on the IOMMU translates the requester ids of that port's buses to no memory until a function found anew there is attached, the operations of this section write no configuration, and `function.removed()` returns true. Its windows reach no function, as no BAR is given an address a window of a removed function reaches; an interrupt `msix` installed for it stays installed until uninstalled, and a function later found at its requester id may raise it. Its `release` only frees it.
+- `mut function.msi(cpu: n, take dev, on_irq: f)` installs `dev` as `msix` does, then writes the interrupt's message to the function's MSI capability, with the 32-bit or 64-bit address the capability takes, unmasks its vector where the capability masks vectors, and enables MSI with that one vector. It refuses with `Unsupported` when the function is not attached or is removed or has no MSI capability, with `Unreachable` when the message's address lies above 4 GiB and the capability takes 32-bit addresses alone, and otherwise as `install_msi` does.
+- `mut function.intx(line: l, take dev, on_irq: f)` installs `dev` with f on the **line** l that the platform routes the function's INTx pin to, the global system interrupt ACPI's `_PRT` gives on x86_64 and the identifier of the shared peripheral interrupt the device tree's `interrupt-map` gives on AArch64, then enables the function's INTx. A line is level-triggered and delivered to the boot CPU, and the devices installed on it share it as devices on one vector do. On x86_64 it is the pin holding l of the MADT's I/O APIC with the greatest first interrupt not above l; the runtime points the pin, active low, at a vector of the boot CPU while a device is installed on the line and masks it once none is, and once the IOMMU remaps interrupts the pin's interrupts reach that vector through a remapping entry accepting the I/O APIC's requester id alone. It refuses with `Unsupported` when the function is removed or has no INTx pin, on x86_64 when no such I/O APIC lies in memory the entry root maps uncached or has the pin, or the IOMMU remaps interrupts and no device scope of its remapping unit names the I/O APIC, and on AArch64 when l is below 32, past 255 or a vector a contribution binds; with `Unreachable` when on x86_64 the pin cannot name the boot CPU's local APIC id, as for `install_msi`, or on AArch64 devices are installed on l for another CPU; and with `Exhausted` when on x86_64 a line no device is installed on finds no vector that no device is installed on for any CPU.
+- A function signals its interrupts through the last of `msix`, `msi` and `intx` that installed an interrupt for it, which disables the other two; the interrupts installed for it before stay installed. Uninstalling an interrupt leaves the function signalling as before until another of these operations or `release`.
+- `take function.release()` cuts the function off: its bus mastering, memory decoding and INTx end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
+- A function is **removed** once the rescan or powering off of a port above it cuts it off ([PCI ports](#pci-ports)): from then on the IOMMU translates the requester ids of that port's buses to no memory until a function found anew there is attached, the operations of this section write no configuration, and `function.removed()` returns true. Its windows reach no function, as no BAR is given an address a window of a removed function reaches; an interrupt `msix`, `msi` or `intx` installed for it stays installed until uninstalled, and a function later found at its requester id or on its line may raise it. Its `release` only frees it.
 - An `hw::PciFunction` is a resource of the domain run holding it, which its [settlement](11-errors-domains.md#settlement) cuts off as `release` does.
 - Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) but `attach_physical`, which is a device operation (`authority.ungranted`). Each has the device fact.
 
@@ -744,6 +751,40 @@ pub fn reset(mut function: hw::PciFunction, bar: u8, offset: u64) fails hw::PciE
     mut common.write(Common.device_status, value: 0)
     take common.unmap()
 } reset
+```
+
+```nan
+// file: driver/package.nan
+//! A driver confined to an I/O domain.
+
+package driver {
+    language 1
+    targets x86_64-bare
+    allow confined in driver
+} driver
+
+// file: driver/driver.nan
+//! Counts a function's completions on MSI-X entry 0, else on its MSI vector, else on its INTx line.
+
+interrupt fn completed(mut count: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 256 {
+    count = count.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} completed
+
+/// Installs the count on CPU 0, or on `line`, the line the platform routes the function's INTx
+/// pin to.
+pub fn counted(mut function: hw::PciFunction, line: u32) -> Result[hw::IrqShared[u64], hw::MsiRefusal[u64]] {
+    match mut function.msix(entry: 0, cpu: 0, dev: 0u64, on_irq: completed) {
+        Ok(shared) => return Ok(take shared)
+        Err(refusal) => {
+            match mut function.msi(cpu: 0, dev: refusal.dev, on_irq: completed) {
+                Ok(shared) => return Ok(take shared)
+                Err(again) => return mut function.intx(line, dev: again.dev, on_irq: completed)
+            }
+        }
+    }
+} counted
 ```
 
 ```nan
@@ -826,7 +867,7 @@ pub fn PciPort.release(take self)
 - `port.slot()` returns `Some` of its slot's capabilities when it is a root or downstream port with a slot and is not removed, and `None` otherwise: the slot's physical number, and whether it is hot-plug capable, may lose its card without notice, has a power controller and has an attention button.
 - `mut port.slot_events()` returns whether a card is present in the slot and its link is active, and whether, since the last call, the card's presence changed, the attention button was pressed and the link changed; it then clears those events. A port without a slot reports none.
 - `mut port.power(on: b)` turns the slot's power and power indicator on or off, where the slot has them, and waits until the slot completes the command. Turning them off first removes every function below the port.
-- `mut port.slot_irq(cpu: n, take dev, on_irq: f)` installs `dev` on the slot's hot-plug interrupt as `PciFunction.msix` installs it on a function's MSI-X entry, with the entry the port's PCIe capability names, and enables the interrupt on presence changes, on attention button presses where the slot has a button and on link changes where the port reports its link. The interrupt arrives once an event leaves no earlier one that `slot_events` has not cleared. It refuses with `Unsupported` when the slot is not hot-plug capable or the port is removed, has no such MSI-X entry or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does. On AArch64 the port's requests, which are the messages the runtime writes to its MSI-X table alone, then bypass the IOMMU.
+- `mut port.slot_irq(cpu: n, take dev, on_irq: f)` installs `dev` on the slot's hot-plug interrupt as `PciFunction.msix` installs it on a function's MSI-X entry, with the entry the port's PCIe capability names, or for a port without an MSI-X capability as `PciFunction.msi` installs it on a function's MSI capability, and enables the interrupt on presence changes, on attention button presses where the slot has a button and on link changes where the port reports its link. The interrupt arrives once an event leaves no earlier one that `slot_events` has not cleared. It refuses with `Unsupported` when the slot is not hot-plug capable or the port is removed, has no such MSI-X entry or its table lies outside the memory the entry root maps uncached, or has neither an MSI-X nor an MSI capability, and otherwise as `msi` does. On AArch64 the port's requests, which are the messages the runtime programs alone, then bypass the IOMMU.
 - `mut port.rescan(alloc)` removes every function and port below the port, then returns the endpoints its secondary bus holds, found anew as `boot::Kernel.pci_functions` finds them and drawn through `alloc`; it enters no bridge. Every memory BAR of each is given an address of the port's memory window, aligned to its size, above every address that window gave or held before, or none when the window has no room. A function or port is **removed** by the rescan or powering off of a port above it; a removed port has no slot and its rescan returns an empty list.
 - `take port.release()` gives the port up. An `hw::PciPort` is a resource of the domain run holding it, which its settlement releases as `release` does.
 - Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) with the device fact.

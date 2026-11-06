@@ -1,0 +1,196 @@
+//! The x86_64 lines `hw::IrqShared.install_line` installs: pins of an I/O APIC, level-triggered and active low, each delivered to one vector of the boot CPU whose devices sit in the row of every CPU, in the remapped format once the IOMMU remaps interrupts, and masked once no device is left on them. A line names its pin as the I/O APIC's register base shifted left by 8 bits with the pin's number.
+
+/// The I/O APIC's register window after its register select, its version register, whose bits
+/// 16 to 23 hold its last pin's number, and the first of the two registers of pin 0's entry.
+const IOAPIC_WINDOW: i64 = 0x10
+
+const IOAPIC_VERSION: u64 = 0x01
+
+const IOAPIC_ENTRIES: i64 = 0x10
+
+/// An entry's first word level-triggered and active low, or masked; and its second, in the
+/// remapped format with the remapping entry's index from bit 17.
+const IOAPIC_LEVEL_LOW: i64 = 0xA000
+
+const IOAPIC_MASKED: u64 = 0x1_0000
+
+const IOAPIC_REMAPPABLE: i64 = 0x1_0000
+
+/// The x86_64 part of `install_line`, under the bindings lock: the record joins the devices
+/// installed on the line, or else takes a vector of its own.
+fn Lowering.x64_install_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, source: clif::Value) -> clif::Value {
+    let every = mut fx.ptr(0)
+    let start = mut fx.ptr(u64.fit(MSI_FIRST_VECTOR))
+    let searched = mut fx.repeat(fx.list1(start).view(), body: fn[mut self](mut fx1: Fx, at: Slice[clif::Value]) -> Pass {
+        expect at.len() > 0
+        let vector = at[0]
+        let slot = mut self.irq_binding(mut fx1, row: every, vector)
+        let on = mut self.line_chained(mut fx1, slot, line)
+        let off = mut fx1.b.bxor_imm_s(on, y: 1)
+        let next = mut fx1.b.iadd_imm_s(vector, y: 1)
+        let inside = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: MSI_VECTORS_END)
+        let more = mut fx1.b.band(off, y: inside)
+        return Pass(again: more, next: fx1.list1(mut fx1.b.select(off, x: next, y: vector)))
+    })
+    expect searched.len() > 0
+    let vector = searched[0]
+    let shared = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: MSI_VECTORS_END)
+    let chosen = mut fx.choose_in(mut self, condition: shared, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.line_chain(mut fx1, record, line, vector)
+        return fx1.list1(mut fx1.ptr(u64.fit(MSI_INSTALLED)))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut lo1.x64_new_line(mut fx1, record, line, source))
+    })
+    expect chosen.len() > 0
+    return chosen[0]
+} Lowering.x64_install_line
+
+/// Installs a device record on a line no device is installed on: the lowest vector from
+/// `MSI_FIRST_VECTOR` short of `MSI_VECTORS_END` the final build does not bind and no device is
+/// installed on for any CPU, with the boot CPU's remapping entry for it, accepting only requester
+/// `source`, once the IOMMU remaps interrupts. Unsupported when the I/O APIC has no such pin, and
+/// unreachable when the entry cannot name the boot CPU's local APIC id.
+fn Lowering.x64_new_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, source: clif::Value) -> clif::Value {
+    let apic = mut fx.b.ushr_imm_s(line, y: 8)
+    let pin = mut fx.b.band_imm_s(line, y: 0xFF)
+    let version_register = mut fx.ptr(IOAPIC_VERSION)
+    let version = mut self.ioapic_read(mut fx, apic, register: version_register)
+    let shifted = mut fx.b.ushr_imm_s(version, y: 16)
+    let last = mut fx.b.band_imm_s(shifted, y: 0xFF)
+    let held = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: pin, y: last)
+    let unsupported = mut fx.ptr(u64.fit(MSI_UNSUPPORTED))
+    let outcome = mut fx.variable(PTR, initial: unsupported)
+    mut fx.if_true(held, then: fn[mut self](mut fx1: Fx) {
+        let statically = mut self.statically_bound()
+        let start = mut fx1.ptr(u64.fit(MSI_FIRST_VECTOR))
+        let searched = mut fx1.repeat(fx1.list1(start).view(), body: fn[mut self](mut fx2: Fx, at: Slice[clif::Value]) -> Pass {
+            expect at.len() > 0
+            let vector = at[0]
+            var taken = mut self.installed_for(mut fx2, vector, cpu: None)
+            for bound in statically {
+                let same = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound)
+                taken = mut fx2.b.bor(taken, y: same)
+            }
+            let next = mut fx2.b.iadd_imm_s(vector, y: 1)
+            let inside = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: MSI_VECTORS_END)
+            let more = mut fx2.b.band(taken, y: inside)
+            return Pass(again: more, next: fx2.list1(mut fx2.b.select(taken, x: next, y: vector)))
+        })
+        expect searched.len() > 0
+        let vector = searched[0]
+        let free = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: MSI_VECTORS_END)
+        let exhausted = mut fx1.ptr(u64.fit(MSI_EXHAUSTED))
+        mut fx1.b.def_var(outcome, val: exhausted)
+        mut fx1.if_true(free, then: fn[mut self](mut fx2: Fx) {
+            let boot = mut fx2.ptr(0)
+            let id = mut self.hardware_id(mut fx2, index: boot)
+            let unit = mut self.iommu_unit(mut fx2)
+            let remapping = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: unit, y: 0)
+            let upper_word = mut fx2.choose_in(mut self, condition: remapping, results: fx2.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let address = mut lo3.remap(mut fx3, unit, cpu: boot, vector, id, source, validated: true, level: true)
+                let named = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: address, y: 0)
+                let index = mut fx3.b.ishl_imm_s(vector, y: 17)
+                return fx3.list2(mut fx3.b.bor_imm_s(index, y: IOAPIC_REMAPPABLE), b: named)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let near = mut fx3.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: id, y: MSI_ID_MAX)
+                return fx3.list2(mut fx3.b.ishl_imm_s(id, y: 24), b: near)
+            })
+            expect upper_word.len() > 1
+            let high = upper_word[0]
+            let reached = upper_word[1]
+            let installed = mut fx2.ptr(u64.fit(MSI_INSTALLED))
+            let unreachable = mut fx2.ptr(u64.fit(MSI_UNREACHABLE))
+            let chosen = mut fx2.b.select(reached, x: installed, y: unreachable)
+            mut fx2.b.def_var(outcome, val: chosen)
+            mut fx2.if_true(reached, then: fn[mut self](mut fx3: Fx) {
+                mut self.line_chain(mut fx3, record, line, vector)
+                let entry = mut self.ioapic_entry(mut fx3, pin)
+                let masked = mut fx3.ptr(IOAPIC_MASKED)
+                mut self.ioapic_write(mut fx3, apic, register: entry, value: masked)
+                let upper = mut fx3.b.iadd_imm_s(entry, y: 1)
+                mut self.ioapic_write(mut fx3, apic, register: upper, value: high)
+                let low = mut fx3.b.bor_imm_s(vector, y: IOAPIC_LEVEL_LOW)
+                mut self.ioapic_write(mut fx3, apic, register: entry, value: low)
+            })
+        })
+    })
+    return mut fx.b.use_var(outcome)
+} Lowering.x64_new_line
+
+/// After a device record leaves its binding's chain at `slot`, masks the pin of the line it was
+/// installed on, and clears the line's remapping entry, when no other device is left on the line.
+fn Lowering.x64_line_left(mut self, mut fx: Fx, record: clif::Value, slot: clif::Value) {
+    let line = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_LINE)
+    let lined = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: line, y: 0)
+    mut fx.if_true(lined, then: fn[mut self](mut fx1: Fx) {
+        let on = mut self.line_chained(mut fx1, slot, line)
+        let last = mut fx1.b.bxor_imm_s(on, y: 1)
+        mut fx1.if_true(last, then: fn[mut self](mut fx2: Fx) {
+            let apic = mut fx2.b.ushr_imm_s(line, y: 8)
+            let pin = mut fx2.b.band_imm_s(line, y: 0xFF)
+            let entry = mut self.ioapic_entry(mut fx2, pin)
+            let masked = mut fx2.ptr(IOAPIC_MASKED)
+            mut self.ioapic_write(mut fx2, apic, register: entry, value: masked)
+            let unit = mut self.iommu_unit(mut fx2)
+            let remapping = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: unit, y: 0)
+            mut fx2.if_true(remapping, then: fn[mut self](mut fx3: Fx) {
+                let vector = mut fx3.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
+                mut self.clear_remapping(mut fx3, unit, index: vector)
+            })
+        })
+    })
+} Lowering.x64_line_left
+
+/// Whether a device installed on a line is chained in the binding at `slot`.
+fn Lowering.line_chained(mut self, mut fx: Fx, slot: clif::Value, line: clif::Value) -> clif::Value {
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let walked = mut fx.repeat(fx.list2(head, b: none).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let seen = mut fx1.choose(present, results: fx1.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next = mut fx2.load(PTR, addr: current, offset: DEVICE_RECORD_NEXT)
+            let named = mut fx2.load(PTR, addr: current, offset: DEVICE_RECORD_LINE)
+            return fx2.list2(next, b: mut fx2.b.icmp(clif::IntCC.Equal, x: named, y: line))
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(mut fx2.ptr(0), b: mut fx2.int(clif::Type.Int8, value: 0))
+        })
+        expect seen.len() > 1
+        let found = mut fx1.b.bor(state[1], y: seen[1])
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen[0], y: 0)
+        return Pass(again: more, next: fx1.list2(seen[0], b: found))
+    })
+    expect walked.len() > 1
+    return walked[1]
+} Lowering.line_chained
+
+/// Chains a device record installed on a line at the end of the devices of its vector in the
+/// row of every CPU.
+fn Lowering.line_chain(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, vector: clif::Value) {
+    mut fx.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
+    mut fx.store(line, addr: record, offset: DEVICE_RECORD_LINE)
+    let every = mut fx.ptr(0)
+    let slot = mut self.irq_binding(mut fx, row: every, vector)
+    mut self.chain(mut fx, record, slot)
+} Lowering.line_chain
+
+/// The register of the first word of a pin's entry.
+fn Lowering.ioapic_entry(mut self, mut fx: Fx, pin: clif::Value) -> clif::Value {
+    let doubled = mut fx.b.ishl_imm_s(pin, y: 1)
+    return mut fx.b.iadd_imm_s(doubled, y: IOAPIC_ENTRIES)
+} Lowering.ioapic_entry
+
+/// Reads an I/O APIC's register, selecting it first.
+fn Lowering.ioapic_read(mut self, mut fx: Fx, apic: clif::Value, register: clif::Value) -> clif::Value {
+    mut self.mmio_write(mut fx, width: 4, address: apic, value: register)
+    let window = mut fx.b.iadd_imm_s(apic, y: IOAPIC_WINDOW)
+    return mut self.mmio_read(mut fx, width: 4, address: window)
+} Lowering.ioapic_read
+
+/// Writes an I/O APIC's register, selecting it first.
+fn Lowering.ioapic_write(mut self, mut fx: Fx, apic: clif::Value, register: clif::Value, value: clif::Value) {
+    mut self.mmio_write(mut fx, width: 4, address: apic, value: register)
+    let window = mut fx.b.iadd_imm_s(apic, y: IOAPIC_WINDOW)
+    mut self.mmio_write(mut fx, width: 4, address: window, value)
+} Lowering.ioapic_write

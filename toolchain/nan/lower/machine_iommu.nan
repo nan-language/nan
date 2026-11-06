@@ -1,4 +1,4 @@
-//! The machine's IOMMU as the runtime drives it once std's `hw` has enabled it: the unit record `hw` builds and the runtime state names, its lock, the invalidation of everything the unit caches through its command queue, and on VT-d the remapping table entries of the message-signalled interrupts `install_msi` gives, one per CPU and vector.
+//! The machine's IOMMU as the runtime drives it once std's `hw` has enabled it: the unit record `hw` builds and the runtime state names, its lock, the invalidation of everything the unit caches through its command queue, and on VT-d the remapping table entries of the message-signalled interrupts `install_msi` gives and of the lines `install_line` gives, one per CPU and vector.
 
 /// The offsets of the unit record's words the runtime reads: its kind, its register base, its
 /// command queue and the queue's next entry, the remapping table, its flags, its lock and the
@@ -70,11 +70,13 @@ const SMMU_CONSUME: u64 = 0x9C
 
 const SMMU_WRAPPED: i64 = 2 * IOMMU_QUEUE_ENTRIES - 1
 
-/// A remapping table entry's first word: present, its vector and destination; its second, the
+/// A remapping table entry's first word: present, level-triggered, its vector and destination; its second, the
 /// requester id it accepts and the bit validating it. The message naming entry `i` has address
 /// `0xFEE0_0000 | (i & 0x7FFF) << 5 | REMAPPED_FORMAT | (i >> 15) << 2`, which the format bit
 /// marks, and data 0.
 const REMAPPING_PRESENT: i64 = 1
+
+const REMAPPING_LEVEL: i64 = 1i64 << 4
 
 const REMAPPING_VALIDATED: i64 = 1i64 << 18
 
@@ -232,7 +234,7 @@ fn Lowering.queue_command(mut self, mut fx: Fx, unit: clif::Value, low: clif::Va
 /// Writes the remapping table entry of CPU `cpu`'s vector `vector`, whose local APIC has id
 /// `id`, accepting only requester `source` when `validated` holds, and invalidates the unit's
 /// caches; gives the message naming it, or zero when the entry cannot name an id past 255.
-fn Lowering.remap(mut self, mut fx: Fx, unit: clif::Value, cpu: clif::Value, vector: clif::Value, id: clif::Value, source: clif::Value, validated: bool) -> clif::Value {
+fn Lowering.remap(mut self, mut fx: Fx, unit: clif::Value, cpu: clif::Value, vector: clif::Value, id: clif::Value, source: clif::Value, validated: bool, level: bool) -> clif::Value {
     let flags = mut fx.load(PTR, addr: unit, offset: IOMMU_FLAGS)
     let mode = mut fx.b.band_imm_s(flags, y: IOMMU_EXTENDED)
     let extended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mode, y: 0)
@@ -249,7 +251,11 @@ fn Lowering.remap(mut self, mut fx: Fx, unit: clif::Value, cpu: clif::Value, vec
         let destination = mut fx1.b.ishl_imm_s(chosen, y: 32)
         let vector_bits = mut fx1.b.ishl_imm_s(vector, y: 16)
         let routed = mut fx1.b.bor(vector_bits, y: destination)
-        let low = mut fx1.b.bor_imm_s(routed, y: REMAPPING_PRESENT)
+        var present = REMAPPING_PRESENT
+        if level {
+            present |= REMAPPING_LEVEL
+        }
+        let low = mut fx1.b.bor_imm_s(routed, y: present)
         let high = remapping_requester(mut fx1, source, validated)
         mut fx1.store(high, addr: entry, offset: 8)
         discard mut self.call_stub(mut fx1, stub: Stub.Mfence, args: mem::List[clif::Value].empty(fx1.alloc).view())
@@ -285,11 +291,16 @@ fn Lowering.unremap(mut self, mut fx: Fx, unit: clif::Value, message: clif::Valu
     let high_bit = mut fx.b.band_imm_s(high_shifted, y: 1)
     let high = mut fx.b.ishl_imm_s(high_bit, y: 15)
     let index = mut fx.b.bor(low, y: high)
+    mut self.clear_remapping(mut fx, unit, index)
+} Lowering.unremap
+
+/// Clears the remapping table entry of an index, and invalidates the unit's caches.
+fn Lowering.clear_remapping(mut self, mut fx: Fx, unit: clif::Value, index: clif::Value) {
     let entry = mut self.remapping_entry(mut fx, unit, index)
     let none = mut fx.ptr(0)
     mut fx.store(none, addr: entry, offset: 0)
     mut self.publish_entry(mut fx, unit, entry)
-} Lowering.unremap
+} Lowering.clear_remapping
 
 /// Whether a message is in the remapped format.
 fn Lowering.remapped_format(mut self, mut fx: Fx, message: clif::Value) -> clif::Value {

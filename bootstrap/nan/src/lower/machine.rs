@@ -1,8 +1,8 @@
 //! Machine targets: the program entry seams of the UEFI and bare targets, which Cranelift
 //! cannot express, and the boot glue the seams call; its submodules hold the other compiler
 //! stubs, the ports the descriptors name, the CPUs, a kernel's clock and scheduling, the
-//! extended state threads own, interrupt delivery with the devices installed on it and the
-//! AArch64 ITS, the IOMMU's invalidations and interrupt remapping, the CPU signal, and user mode.
+//! extended state threads own, interrupt delivery with the devices installed on it, the x86_64
+//! I/O APIC's lines and the AArch64 ITS, the IOMMU's invalidations and interrupt remapping, the CPU signal, and user mode.
 //! Each seam and stub is fixed machine code the implementation emits, with relocations the image
 //! writer resolves into the image's own addresses.
 
@@ -16,6 +16,7 @@ mod extended;
 mod handoff;
 pub mod heap;
 mod interrupts;
+mod ioapic;
 mod iommu;
 mod its;
 pub mod memory;

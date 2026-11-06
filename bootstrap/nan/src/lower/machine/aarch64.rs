@@ -273,12 +273,15 @@ const GICR_SGI: u64 = 0x1_0000;
 /// The distributor's registers the kernel programs: its control register, set to affinity
 /// routing with both groups enabled; its group, set-enable and clear-enable registers, whose
 /// word `n` covers interrupts `32n` to `32n + 31`, words one to seven the shared peripheral
-/// interrupts a vector names; and its routing registers, a doubleword per interrupt.
+/// interrupts a vector names; its configuration registers, whose word `n` holds two bits for each
+/// of interrupts `16n` to `16n + 15`, the upper one making it edge-triggered; and its routing
+/// registers, a doubleword per interrupt.
 const GICD_CTLR: u64 = 0x0;
 const GICD_ARE_GROUPS: u64 = (1 << 4) | 0x3;
 const GICD_IGROUPR: u64 = 0x080;
 const GICD_ISENABLER: u64 = 0x100;
 const GICD_ICENABLER: u64 = 0x180;
+const GICD_ICFGR: u64 = 0xC00;
 const GICD_IROUTER: u64 = 0x6000;
 const GICD_SPI_WORDS: u64 = 8;
 
@@ -396,6 +399,23 @@ impl Lowering<'_, '_> {
     /// Disables a shared peripheral interrupt, once no installed device is left on it.
     pub fn aarch64_disable(&mut self, fx: &mut Fx, vector: Value) {
         self.gic_spi_bit(fx, GICD_ICENABLER, vector);
+    }
+
+    /// Makes a shared peripheral interrupt level-sensitive, while it is disabled.
+    pub fn aarch64_level(&mut self, fx: &mut Fx, vector: Value) {
+        let gicd = self.distributor(fx);
+        let word = fx.b.ins().ushr_imm_s(vector, 4);
+        let word = fx.b.ins().ishl_imm_s(word, 2);
+        let at = fx.b.ins().iadd(word, gicd);
+        let at = fx.b.ins().iadd_imm_s(at, GICD_ICFGR as i64);
+        let position = fx.b.ins().band_imm_s(vector, 15);
+        let position = fx.b.ins().ishl_imm_s(position, 1);
+        let position = fx.b.ins().iadd_imm_s(position, 1);
+        let one = fx.ptr(1);
+        let edge = fx.b.ins().ishl(one, position);
+        let config = self.mmio_read(fx, 4, at);
+        let config = fx.b.ins().band_not(config, edge);
+        self.mmio_write(fx, 4, at, config);
     }
 
     /// Writes the bit of a shared peripheral interrupt alone to its word of one of the

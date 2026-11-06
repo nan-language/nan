@@ -1,0 +1,172 @@
+//! Raises the software interrupts of two i82557 Ethernet controllers on one INTx line, a shared peripheral interrupt, shared, then disabled once no device is left on it.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// The system control block of an i82557 in its BAR 0: the interrupts it raised, which a write
+/// of their bits acknowledges, and its interrupt control, whose software interrupt bit raises
+/// one.
+registers Scb {
+    acknowledge: u8 at 0x1 read write
+    control: u8 at 0x3 write
+} Scb
+
+/// The ids of an i82557; the slot of each one and the shared peripheral interrupt the virt
+/// board's `interrupt-map` routes the INTx pin of both to; the BAR of the system control block;
+/// the software interrupt bit of its interrupt control and of the interrupts it raised.
+const CONTROLLER: u32 = 0x1229_8086
+
+const FIRST_SLOT: u8 = 5
+
+const SECOND_SLOT: u8 = 9
+
+const LINE: u32 = 36
+
+const SCB_BAR: u8 = 0
+
+const SOFTWARE: u8 = 0x2
+
+const SOFTWARE_RAISED: u8 = 0x4
+
+/// The polls of an interrupt count before the kernel gives up.
+const POLLS: u32 = 10_000_000
+
+fn say(text: Str) {
+    var port = trusted "the virt board maps the PL011 of the serial port at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text.as_bytes() {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+/// An i82557's system control block with the interrupts its interrupt fn counted.
+linear struct Nic {
+    regs: hw::Mmio[Scb]
+    counted: u64
+} Nic
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let functions = mut k.pci_functions()
+    take k.anchor(0u8, run: fn[take functions](exec: task::Executor) limits stack 65_536 {
+        var controllers = mem::List[hw::PciFunction].empty(alloc)
+        for function in take functions {
+            let at = function.address()
+            if function.config_read(0) == CONTROLLER and (at.device == FIRST_SLOT or at.device == SECOND_SLOT) {
+                mut controllers.push(take function)
+            } else {
+                take function.release()
+            }
+        }
+        match mut controllers.pop() {
+            Some(later) => {
+                match mut controllers.pop() {
+                    Some(earlier) => {
+                        var one = earlier
+                        var two = later
+                        lines(mut one, mut two)
+                        take one.release()
+                        take two.release()
+                    }
+                    None => take later.release()
+                }
+            }
+            None => say(text: "pci: no controllers\n")
+        }
+        for left in take controllers {
+            take left.release()
+        }
+    })
+} main
+
+/// Installs both controllers on their shared INTx line, raises the second device's interrupt
+/// with the first installed, then with the first uninstalled, and raises it once more with
+/// neither installed, which the disabled line keeps from any CPU.
+fn lines(mut one: hw::PciFunction, mut two: hw::PciFunction) {
+    let Some(earlier) = on_line(mut one) else {
+        return
+    }
+    let Some(later) = on_line(mut two) else {
+        unmapped(take earlier.uninstall())
+        return
+    }
+    raise(later)
+    if counted(later, seen: 0) == 1 and counted(earlier, seen: 0) == 0 {
+        say(text: "intx: the shared line reached the device that raised it\n")
+    }
+    unmapped(take earlier.uninstall())
+    raise(later)
+    if counted(later, seen: 1) == 2 {
+        say(text: "intx: the line stayed with the device left on it\n")
+    }
+    let Nic(regs: regs, counted: _) = take later.uninstall()
+    var last = regs
+    mut last.write(Scb.control, value: SOFTWARE)
+    for _ in 0..<POLLS {
+    }
+    mut last.write(Scb.acknowledge, value: SOFTWARE_RAISED)
+    say(text: "intx: the line was disabled once no device was left on it\n")
+    take last.unmap()
+} lines
+
+/// Unmaps an controller's registers.
+fn unmapped(take device: Nic) {
+    let Nic(regs: regs, counted: _) = device
+    take regs.unmap()
+} unmapped
+
+/// Installs an controller's registers on its INTx line.
+fn on_line(mut function: hw::PciFunction) -> Option[hw::IrqShared[Nic]] {
+    let regs = match attempt hw::Mmio[Scb].of_bar(mut function, index: SCB_BAR, offset: 0) {
+        Ok(window) => window
+        Err(_) => {
+            say(text: "scb: no window\n")
+            return None
+        }
+    }
+    match mut function.intx(line: LINE, dev: Nic(regs: take regs, counted: 0), on_irq: Nic.on_irq) {
+        Ok(shared) => return Some(take shared)
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "intx: refused\n")
+            unmapped(take refused)
+            return None
+        }
+    }
+} on_line
+
+/// Raises an installed controller's interrupt.
+fn raise(shared: hw::IrqShared[Nic]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Nic) limits notrap, terminates, noalloc {
+            mut device.regs.write(Scb.control, value: SOFTWARE)
+        })
+    })
+} raise
+
+/// The interrupts an controller counted once the count passes `seen`, or after `POLLS` polls.
+fn counted(shared: hw::IrqShared[Nic], seen: u64) -> u64 {
+    var count = seen
+    for _ in 0..<POLLS {
+        count = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut device: Nic) -> u64 limits notrap, terminates, noalloc {
+                return device.counted
+            })
+        })
+        if count > seen {
+            return count
+        }
+    }
+    return count
+} counted
+
+/// Counts and acknowledges the controller's raised interrupts, if it raised any.
+interrupt fn Nic.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let raised = mut self.regs.read(Scb.acknowledge)
+    if raised != 0 {
+        mut self.regs.write(Scb.acknowledge, value: raised)
+        self.counted = self.counted.wrapping_add(1)
+    }
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Nic.on_irq

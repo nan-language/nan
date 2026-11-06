@@ -1,0 +1,372 @@
+//! Raises the interrupts of two QEMU edu devices on one INTx line, shared, then masked once no device is left on it, and through MSI in place of INTx and back; then takes an AHCI port's first D2H FIS through the controller's MSI. With pci-testdev present the IOMMU stays off, so interrupts arrive in compatibility format, and otherwise they arrive remapped.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The registers of QEMU's edu device in its BAR 0: the raised interrupt bits, and the writes
+/// raising and acknowledging them.
+registers EduRegs {
+    status: u32 at 0x24 read
+    raise: u32 at 0x60 write
+    acknowledge: u32 at 0x64 write
+} EduRegs
+
+/// The registers of an AHCI controller in its BAR 5: its global control with the pending ports,
+/// then port 0's received-FIS address, interrupt status and enables, and command.
+registers AhciRegs {
+    control: u32 at 0x04 read write
+    pending: u32 at 0x08 read write
+    received: u32 at 0x108 write
+    received_high: u32 at 0x10C write
+    port_status: u32 at 0x110 read write
+    port_enabled: u32 at 0x114 write
+    command: u32 at 0x118 read write
+} AhciRegs
+
+/// The memory an AHCI port writes the FISes it receives to.
+layout Received: bytes 4096 le {
+    data: Array[u8, 4096] at 0
+} Received
+
+/// The ids of the edu device, of an AHCI controller and of pci-testdev; the slot of each edu
+/// device and the global system interrupt q35's `_PRT` routes the INTx pin of both to; the BARs
+/// of the edu and AHCI registers.
+const EDU: u32 = 0x11E8_1234
+
+const AHCI: u32 = 0x2922_8086
+
+const TESTDEV: u32 = 0x0005_1B36
+
+const FIRST_EDU: u8 = 9
+
+const SECOND_EDU: u8 = 13
+
+const EDU_LINE: u32 = 21
+
+const EDU_BAR: u8 = 0
+
+const AHCI_BAR: u8 = 5
+
+/// The AHCI global control bits resetting the controller, enabling its interrupt and AHCI mode;
+/// the port's interrupt enable of a received D2H FIS; and its command bit receiving FISes.
+const RESET: u32 = 0x1
+
+const INTERRUPTS: u32 = 0x2
+
+const AHCI_MODE: u32 = 0x8000_0000
+
+const D2H: u32 = 0x1
+
+const RECEIVE: u32 = 0x10
+
+/// The polls of an interrupt count before the kernel gives up, and of a cleared condition.
+const POLLS: u32 = 10_000_000
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+/// An edu device's registers with the interrupts its interrupt fn counted.
+linear struct Edu {
+    regs: hw::Mmio[EduRegs]
+    counted: u64
+} Edu
+
+/// An AHCI controller's registers with the interrupts its interrupt fn counted.
+linear struct Ahci {
+    regs: hw::Mmio[AhciRegs]
+    counted: u64
+} Ahci
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    var functions = mut k.pci_functions()
+    var remapped = true
+    for function in functions.view() {
+        if function.config_read(0) == TESTDEV {
+            remapped = false
+        }
+    }
+    let iommu = enabled(mut k, wanted: remapped)
+    let domain = domain_of(iommu)
+    take k.anchor(take iommu, run: fn[take functions, take domain](exec: task::Executor) limits stack 65_536 {
+        var edus = mem::List[hw::PciFunction].empty(alloc)
+        var controllers = mem::List[hw::PciFunction].empty(alloc)
+        for function in take functions {
+            let ids = function.config_read(0)
+            let at = function.address()
+            if ids == EDU and (at.device == FIRST_EDU or at.device == SECOND_EDU) {
+                mut edus.push(take function)
+            } else if ids == AHCI and at.device != 0x1F {
+                mut controllers.push(take function)
+            } else {
+                take function.release()
+            }
+        }
+        match mut edus.pop() {
+            Some(later) => {
+                match mut edus.pop() {
+                    Some(earlier) => {
+                        var one = earlier
+                        var two = later
+                        attached(mut one, domain)
+                        match lines(mut one, mut two) {
+                            Some(device) => messages(mut one, take device)
+                            None => {}
+                        }
+                        take one.release()
+                        take two.release()
+                    }
+                    None => take later.release()
+                }
+            }
+            None => say(text: "pci: no edu devices\n")
+        }
+        for left in take edus {
+            take left.release()
+        }
+        for controller in take controllers {
+            var function = controller
+            attached(mut function, domain)
+            received(mut function, domain, alloc)
+            take function.release()
+        }
+        closed(take domain)
+    })
+} main
+
+/// Closes the domain, if there is one.
+fn closed(take domain: Option[hw::IoDomain]) {
+    match domain {
+        Some(made) => take made.close()
+        None => {}
+    }
+} closed
+
+/// The IOMMU, enabled when `wanted` holds.
+fn enabled(mut k: boot::Kernel, wanted: bool) -> Option[hw::Iommu] {
+    if wanted {
+        return mut k.iommu()
+    }
+    return None
+} enabled
+
+/// A domain of the IOMMU, none without one.
+fn domain_of(iommu: Option[hw::Iommu]) -> Option[hw::IoDomain] {
+    let Some(unit) = iommu else {
+        return None
+    }
+    match attempt unit.domain() {
+        Ok(made) => return Some(take made)
+        Err(_) => return None
+    }
+} domain_of
+
+/// Attaches a function to the domain, or to physical memory without one.
+fn attached(mut function: hw::PciFunction, domain: Option[hw::IoDomain]) {
+    let outcome = match domain {
+        Some(made) => attempt mut function.attach(made.space())
+        None => attempt mut function.attach_physical()
+    }
+    if outcome.is_err() {
+        say(text: "attach: refused\n")
+    }
+} attached
+
+/// Installs both edu devices on their shared INTx line, raises the second device's interrupt
+/// with the first installed, then with the first uninstalled, and raises it once more with
+/// neither installed, which the masked line keeps from any CPU; gives back the first device.
+fn lines(mut one: hw::PciFunction, mut two: hw::PciFunction) -> Option[Edu] {
+    let Some(earlier) = on_line(mut one) else {
+        return None
+    }
+    let Some(later) = on_line(mut two) else {
+        return Some(take earlier.uninstall())
+    }
+    raise(later)
+    if counted(later, seen: 0) == 1 and counted(earlier, seen: 0) == 0 {
+        say(text: "intx: the shared line reached the device that raised it\n")
+    }
+    let left = take earlier.uninstall()
+    raise(later)
+    if counted(later, seen: 1) == 2 {
+        say(text: "intx: the line stayed with the device left on it\n")
+    }
+    let Edu(regs: regs, counted: _) = take later.uninstall()
+    var last = regs
+    mut last.write(EduRegs.raise, value: 1)
+    for _ in 0..<POLLS {
+    }
+    mut last.write(EduRegs.acknowledge, value: 1)
+    say(text: "intx: the line was masked once no device was left on it\n")
+    take last.unmap()
+    return Some(take left)
+} lines
+
+/// Unmaps an edu device's registers.
+fn unmapped(take device: Edu) {
+    let Edu(regs: regs, counted: _) = device
+    take regs.unmap()
+} unmapped
+
+/// Raises an edu device's interrupt through MSI, then through INTx once installed there.
+fn messages(mut one: hw::PciFunction, take device: Edu) {
+    let shared = match mut one.msi(cpu: 0, dev: take device, on_irq: Edu.on_irq) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "msi: refused\n")
+            unmapped(take refused)
+            return
+        }
+    }
+    raise(shared)
+    if counted(shared, seen: 0) == 1 {
+        say(text: "msi: the edu device's interrupt arrived\n")
+    }
+    let back = take shared.uninstall()
+    match mut one.intx(line: EDU_LINE, dev: take back, on_irq: Edu.on_irq) {
+        Ok(line) => {
+            raise(line)
+            if counted(line, seen: 1) == 2 {
+                say(text: "intx: the edu device's interrupt arrived in place of MSI\n")
+            }
+            unmapped(take line.uninstall())
+        }
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "intx: refused\n")
+            unmapped(take refused)
+        }
+    }
+} messages
+
+/// Installs an edu device's registers on its INTx line.
+fn on_line(mut function: hw::PciFunction) -> Option[hw::IrqShared[Edu]] {
+    let regs = match attempt hw::Mmio[EduRegs].of_bar(mut function, index: EDU_BAR, offset: 0) {
+        Ok(window) => window
+        Err(_) => {
+            say(text: "edu: no window\n")
+            return None
+        }
+    }
+    match mut function.intx(line: EDU_LINE, dev: Edu(regs: take regs, counted: 0), on_irq: Edu.on_irq) {
+        Ok(shared) => return Some(take shared)
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "intx: refused\n")
+            unmapped(take refused)
+            return None
+        }
+    }
+} on_line
+
+/// Raises an installed edu device's interrupt.
+fn raise(shared: hw::IrqShared[Edu]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Edu) limits notrap, terminates, noalloc {
+            mut device.regs.write(EduRegs.raise, value: 1)
+        })
+    })
+} raise
+
+/// The interrupts an edu device counted once the count passes `seen`, or after `POLLS` polls.
+fn counted(shared: hw::IrqShared[Edu], seen: u64) -> u64 {
+    var count = seen
+    for _ in 0..<POLLS {
+        count = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut device: Edu) -> u64 limits notrap, terminates, noalloc {
+                return device.counted
+            })
+        })
+        if count > seen {
+            return count
+        }
+    }
+    return count
+} counted
+
+/// Counts and acknowledges the edu device's raised interrupts, if it raised any.
+interrupt fn Edu.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let raised = mut self.regs.read(EduRegs.status)
+    if raised != 0 {
+        mut self.regs.write(EduRegs.acknowledge, value: raised)
+        self.counted = self.counted.wrapping_add(1)
+    }
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Edu.on_irq
+
+/// Resets the AHCI controller, installs it on its MSI vector and has port 0 receive FISes,
+/// whose first one, the D2H FIS of its disk, raises the interrupt.
+fn received(mut function: hw::PciFunction, domain: Option[hw::IoDomain], alloc: mem::Alloc) {
+    var regs = match attempt hw::Mmio[AhciRegs].of_bar(mut function, index: AHCI_BAR, offset: 0) {
+        Ok(window) => window
+        Err(_) => {
+            say(text: "ahci: no window\n")
+            return
+        }
+    }
+    mut regs.write(AhciRegs.control, value: RESET)
+    for _ in 0..<POLLS {
+        if (mut regs.read(AhciRegs.control) & RESET) == 0 {
+            break
+        }
+    }
+    mut regs.write(AhciRegs.control, value: AHCI_MODE | INTERRUPTS)
+    mut regs.write(AhciRegs.port_enabled, value: D2H)
+    let space = match domain {
+        Some(made) => made.space()
+        None => hw::IoSpace.physical()
+    }
+    let heap = mem::Heap.of(alloc)
+    let buffer = hw::Dma.of(heap.boxed(Received.from_bits(Array[u8, 4096].filled(0))), space)
+    let shared = match mut function.msi(cpu: 0, dev: Ahci(regs: take regs, counted: 0), on_irq: Ahci.on_irq) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: Ahci(regs: refused, counted: _), error: _)) => {
+            say(text: "ahci: msi refused\n")
+            take refused.unmap()
+            discard take buffer.into_box()
+            return
+        }
+    }
+    let address = buffer.bus_addr().value
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut controller: Ahci) limits notrap, terminates, noalloc {
+            mut controller.regs.write(AhciRegs.received, value: u32.truncate(address))
+            mut controller.regs.write(AhciRegs.received_high, value: u32.truncate(address >> 32))
+            mut controller.regs.write(AhciRegs.command, value: RECEIVE)
+        })
+    })
+    var count: u64 = 0
+    for _ in 0..<POLLS {
+        count = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut controller: Ahci) -> u64 limits notrap, terminates, noalloc {
+                return controller.counted
+            })
+        })
+        if count > 0 {
+            break
+        }
+    }
+    if count > 0 {
+        say(text: "ahci: the port's D2H FIS arrived through MSI\n")
+    }
+    let Ahci(regs: back, counted: _) = take shared.uninstall()
+    take back.unmap()
+    discard take buffer.into_box()
+} received
+
+/// Counts and clears an AHCI controller's pending port interrupts.
+interrupt fn Ahci.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let port = mut self.regs.read(AhciRegs.port_status)
+    if port != 0 {
+        mut self.regs.write(AhciRegs.port_status, value: port)
+        mut self.regs.write(AhciRegs.pending, value: 1)
+        self.counted = self.counted.wrapping_add(1)
+    }
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Ahci.on_irq

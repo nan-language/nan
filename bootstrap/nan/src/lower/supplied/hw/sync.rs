@@ -126,12 +126,13 @@ pub fn device_value(lo: &mut Lowering, value_ty: &Ty) -> u64 {
 }
 
 /// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
-/// `install`, `install_on` and `install_msi` move the device into a new record, and on a machine
-/// target install it on its interrupt, `install_msi` giving the device back in its refusal
-/// otherwise; the running task's domain then owns the record as a holding. `message` reads the
-/// message the record holds; `with` takes the record's lock around its body; `uninstall` ends
-/// the holding, removes the device from its interrupt and waits until no CPU runs its interrupt
-/// fn, then moves it out of the freed record. A CPU number past the CPUs traps.
+/// `install`, `install_on`, `install_msi` and `install_line` move the device into a new record,
+/// and on a machine target install it on its interrupt, `install_msi` and `install_line` giving
+/// the device back in their refusal otherwise; the running task's domain then owns the record as
+/// a holding. `message` reads the message the record holds; `with` takes the record's lock
+/// around its body; `uninstall` ends the holding, removes the device from its interrupt and waits
+/// until no CPU runs its interrupt fn, then moves it out of the freed record. A CPU number past
+/// the CPUs traps.
 pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let value_at = device_value(lo, &value_ty);
@@ -157,6 +158,7 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "install_msi" => install_msi(lo, fx, supply, &value_ty, false),
         "install_validated" => install_msi(lo, fx, supply, &value_ty, true),
+        "install_line" => install_line(lo, fx, supply, &value_ty),
         "message" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
             let option = supply.abi.result.clone();
@@ -296,6 +298,35 @@ fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, v
         }
         false => fx.ptr(msi::UNSUPPORTED as u64),
     };
+    installed_or_refused(lo, fx, supply, value_ty, record, outcome);
+}
+
+/// `install_line`: `Ok` of the shared device once installed on a line of a machine target, or
+/// `Err` of a refusal as `install_msi` gives one.
+fn install_line(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty) {
+    let record = device_record(lo, fx, supply, value_ty, 3);
+    let outcome = match lo.machine() {
+        true => {
+            let line = supply.param(1).scalar();
+            let source = supply.param(2).scalar();
+            let source = fx.b.ins().uextend(PTR, source);
+            lo.install_line(fx, record, line, source)
+        }
+        false => fx.ptr(msi::UNSUPPORTED as u64),
+    };
+    installed_or_refused(lo, fx, supply, value_ty, record, outcome);
+}
+
+/// Returns `Ok` of the shared device a record holds when an install's outcome is `INSTALLED`,
+/// or else `Err` of a refusal giving back the device with the outcome's `hw::MsiError` variant.
+fn installed_or_refused(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    value_ty: &Ty,
+    record: Value,
+    outcome: Value,
+) {
     let result_ty = supply.abi.result.clone();
     let installed = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, msi::INSTALLED);
     fx.when(installed, |fx| {

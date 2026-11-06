@@ -9751,8 +9751,8 @@ const TEXT_HW_IOMMU: Str =
     \\/// The remapping structures of the DMAR table: where they start, the kinds of a remapping
     \\/// unit and of a reserved memory region, the flag of a unit including every PCI function, and
     \\/// the table flag saying the platform remaps interrupts; where a unit's device scopes start, the
-    \\/// kinds of an endpoint's scope and of a bridge's, and the length of one naming a device of its
-    \\/// start bus.
+    \\/// kinds of an endpoint's scope, of a bridge's and of an I/O APIC's, and the length of one naming
+    \\/// a device of its start bus.
     \\const DMAR_STRUCTURES: u64 = 48
     \\
     \\const DMAR_SCOPES: u64 = 16
@@ -9760,6 +9760,8 @@ const TEXT_HW_IOMMU: Str =
     \\const ENDPOINT_SCOPE: u8 = 1
     \\
     \\const BRIDGE_SCOPE: u8 = 2
+    \\
+    \\const IOAPIC_SCOPE: u8 = 3
     \\
     \\const ONE_HOP: u64 = 8
     \\
@@ -10493,6 +10495,25 @@ const TEXT_HW_IOMMU: Str =
     \\    return false
     \\} covered
     \\
+    \\/// The requester id of the I/O APIC of an id that a device scope of VT-d's remapping unit names
+    \\/// one hop below its start bus.
+    \\fn ioapic_requester(unit: u64, id: u8) -> Option[u32] {
+    \\    let covers = peek(unit + UNIT_COVERS)
+    \\    let end = covers + u64.widen(u32_at(covers) >> 16)
+    \\    var at = covers + DMAR_SCOPES
+    \\    while at + 2 <= end {
+    \\        let length = u64.widen(byte_at(at + 1))
+    \\        if length == 0 {
+    \\            return None
+    \\        }
+    \\        if length == ONE_HOP and byte_at(at) == IOAPIC_SCOPE and byte_at(at + 4) == id {
+    \\            return Some((u32.widen(byte_at(at + 5)) << 8) | (u32.widen(byte_at(at + 6)) << 3) | u32.widen(byte_at(at + 7) & 0x7))
+    \\        }
+    \\        at += length
+    \\    }
+    \\    return None
+    \\} ioapic_requester
+    \\
     \\/// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
     \\/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0, its stream
     \\/// table holding the stream table entries of the PCI host's buses that its stream ids reach,
@@ -10603,13 +10624,13 @@ const TEXT_HW_PACKAGE: Str =
     \\
 
 const TEXT_HW_PCI: Str =
-    \\//! PCI functions and ports: the functions and bridges below each host bridge, their configuration, the register windows of their memory BARs, their attachment to I/O domains, their MSI-X interrupts, and the hot-plug slots of PCIe ports.
+    \\//! PCI functions and ports: the functions and bridges below each host bridge, their configuration, the register windows of their memory BARs, their attachment to I/O domains, their MSI-X, MSI and INTx interrupts, and the hot-plug slots of PCIe ports.
     \\
     \\/// A function record's offsets: past its holding and tag, its requester id, the ECAM base its
     \\/// configuration is read through, zero for port I/O, the space it is attached to, the first
     \\/// record of the windows given over its BARs, its MSI-X capability's offset, the offset from its
     \\/// BARs' bus addresses to the CPU's, then each BAR's base, size and kind; then its host's record, its bus's generation when it was
-    \\/// found, its path flags, and the next record found and not yet listed.
+    \\/// found, its path flags, the next record found and not yet listed, and its MSI capability's offset.
     \\const FUNCTION_REQUESTER: u64 = 16
     \\
     \\const FUNCTION_ECAM: u64 = 24
@@ -10636,20 +10657,22 @@ const TEXT_HW_PCI: Str =
     \\
     \\const FUNCTION_NEXT: u64 = 232
     \\
-    \\const FUNCTION_RECORD: u64 = 240
+    \\const FUNCTION_MSI: u64 = 240
+    \\
+    \\const FUNCTION_RECORD: u64 = 248
     \\
     \\/// A port's record extends a function's, its path flags unused, with its PCIe capability's
     \\/// offset, the flags of the path below it, and the bus address its memory window
     \\/// gives next with that window's end; a bridge has two BARs.
-    \\const PORT_EXPRESS: u64 = 240
+    \\const PORT_EXPRESS: u64 = 248
     \\
-    \\const PORT_BELOW: u64 = 248
+    \\const PORT_BELOW: u64 = 256
     \\
-    \\const PORT_NEXT: u64 = 256
+    \\const PORT_NEXT: u64 = 264
     \\
-    \\const PORT_END: u64 = 264
+    \\const PORT_END: u64 = 272
     \\
-    \\const PORT_RECORD: u64 = 272
+    \\const PORT_RECORD: u64 = 280
     \\
     \\const BRIDGE_BARS: u64 = 2
     \\
@@ -10718,10 +10741,11 @@ const TEXT_HW_PCI: Str =
     \\const MEMORY64: u64 = 3
     \\
     \\/// The configuration offsets the runtime reads and writes: the ids, the command and status,
-    \\/// the class and revision, the header type, the first BAR and the capability list's head; the
-    \\/// command bits decoding memory, mastering the bus and disabling INTx; the status bit
-    \\/// announcing capabilities; the class of bridges; and the MSI-X capability's id with its
-    \\/// enable and function mask bits.
+    \\/// the class and revision, the header type, the first BAR, the capability list's head and the
+    \\/// interrupt line and pin; the command bits decoding memory, mastering the bus and disabling
+    \\/// INTx; the status bit announcing capabilities; the class of bridges; the MSI-X capability's id
+    \\/// with its enable and function mask bits; and the MSI capability's id with its control bits
+    \\/// enabling it, of its enabled messages, of 64-bit addresses and of a vector mask.
     \\const IDS_OFFSET: u32 = 0x00
     \\
     \\const COMMAND_OFFSET: u32 = 0x04
@@ -10733,6 +10757,8 @@ const TEXT_HW_PCI: Str =
     \\const FIRST_BAR: u32 = 0x10
     \\
     \\const CAPABILITIES_OFFSET: u32 = 0x34
+    \\
+    \\const INTERRUPT_OFFSET: u32 = 0x3C
     \\
     \\const MEMORY: u32 = 0x2
     \\
@@ -10749,6 +10775,16 @@ const TEXT_HW_PCI: Str =
     \\const MSIX_ENABLE: u32 = 0x8000_0000
     \\
     \\const MSIX_MASKED: u32 = 0x4000_0000
+    \\
+    \\const MSI_ID: u32 = 0x05
+    \\
+    \\const MSI_ENABLE: u32 = 0x1
+    \\
+    \\const MSI_MESSAGES: u32 = 0x70
+    \\
+    \\const MSI_WIDE: u32 = 0x80
+    \\
+    \\const MSI_MASKABLE: u32 = 0x100
     \\
     \\/// A bridge's header type and its bus numbers, I/O window, memory window, prefetchable window
     \\/// and that window's upper halves; a memory window's granule; the values closing a bridge's
@@ -10899,6 +10935,19 @@ const TEXT_HW_PCI: Str =
     \\const MEMORY_SPACE: u32 = 2
     \\
     \\const RANGE_BYTES: u64 = 28
+    \\
+    \\/// The signature of the ACPI MADT with where its entries start, the kind of an I/O APIC entry,
+    \\/// the bytes of an I/O APIC's registers, and the largest message address a function writing
+    \\/// 32-bit addresses reaches.
+    \\const MADT_SIGNATURE: u32 = 0x4349_5041
+    \\
+    \\const MADT_ENTRIES: u64 = 44
+    \\
+    \\const MADT_IOAPIC: u8 = 1
+    \\
+    \\const IOAPIC_BYTES: u64 = 0x20
+    \\
+    \\const NARROW_ADDRESSES: u64 = 0xFFFF_FFFF
     \\
     \\/// An MSI-X table entry.
     \\registers MsixEntry {
@@ -11069,24 +11118,37 @@ const TEXT_HW_PCI: Str =
     \\    if table == 0 {
     \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
     \\    }
-    \\    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
-    \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
+    \\    return signalled(record, table, slot: 0, cpu, take dev, on_irq)
+    \\} PciFunction.msix
+    \\
+    \\pub fn PciFunction.msi[T: Any and Send](mut self, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    \\    let record = self.record
+    \\    if peek(record + FUNCTION_ATTACHED) == 0 or peek(record + FUNCTION_MSI) == 0 or gone(record) {
+    \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    \\    }
+    \\    return signalled(record, table: 0, slot: 0, cpu, take dev, on_irq)
+    \\} PciFunction.msi
+    \\
+    \\pub fn PciFunction.intx[T: Any and Send](mut self, line: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    \\    let record = self.record
+    \\    let route = routed(line)
+    \\    if route.line == 0 or gone(record) or ((config(record, offset: INTERRUPT_OFFSET) >> 8) & 0xFF) == 0 {
+    \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    \\    }
+    \\    match IrqShared.install_line(take dev, line: route.line, source: route.source, on_irq) {
     \\        Ok(shared) => {
-    \\            match shared.message() {
-    \\                Some(message) => {
-    \\                    let held = pci_lock()
-    \\                    if not gone(record) {
-    \\                        program_entry(record, table, message)
-    \\                    }
-    \\                    pci_unlock(held)
-    \\                }
-    \\                None => {}
+    \\            let held = pci_lock()
+    \\            if not gone(record) {
+    \\                msix_off(record)
+    \\                msi_off(record)
+    \\                set_command(record, set: 0, clear: INTX_DISABLE)
     \\            }
+    \\            pci_unlock(held)
     \\            return Ok(take shared)
     \\        }
     \\        Err(refusal) => return Err(take refusal)
     \\    }
-    \\} PciFunction.msix
+    \\} PciFunction.intx
     \\
     \\pub fn PciFunction.release(take self) {
     \\    let PciFunction(record: record) = self
@@ -11179,30 +11241,19 @@ const TEXT_HW_PCI: Str =
     \\    let record = self.record
     \\    let at = slot_capability(record)
     \\    var table: u64 = 0
+    \\    var signals = false
     \\    if at != 0 and (config(record, offset: at + SLOT_CAPABILITIES) & HOT_PLUG) != 0 {
-    \\        table = msix_table_entry(record, entry: u64.widen((config(record, offset: at) >> 25) & 0x1F))
+    \\        if peek(record + FUNCTION_MSIX) != 0 {
+    \\            table = msix_table_entry(record, entry: u64.widen((config(record, offset: at) >> 25) & 0x1F))
+    \\            signals = table != 0
+    \\        } else {
+    \\            signals = peek(record + FUNCTION_MSI) != 0
+    \\        }
     \\    }
-    \\    if table == 0 or not messages_reach(record) {
+    \\    if not signals or not messages_reach(record) {
     \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
     \\    }
-    \\    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
-    \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
-    \\        Ok(shared) => {
-    \\            match shared.message() {
-    \\                Some(message) => {
-    \\                    let held = pci_lock()
-    \\                    if not gone(record) {
-    \\                        program_entry(record, table, message)
-    \\                        slot_command(record, at, set: slot_events_enabled(record, at), clear: 0)
-    \\                    }
-    \\                    pci_unlock(held)
-    \\                }
-    \\                None => {}
-    \\            }
-    \\            return Ok(take shared)
-    \\        }
-    \\        Err(refusal) => return Err(take refusal)
-    \\    }
+    \\    return signalled(record, table, slot: at, cpu, take dev, on_irq)
     \\} PciPort.slot_irq
     \\
     \\pub fn PciPort.rescan(mut self, alloc: mem::Alloc) -> mem::List[PciFunction] {
@@ -11264,6 +11315,12 @@ const TEXT_HW_PCI: Str =
     \\/// Installs a device on a new message-signalled interrupt of CPU `cpu` from requester `source`,
     \\/// which interrupt remapping lets that requester alone raise.
     \\pkg fn IrqShared.install_validated(take dev: T, cpu: u32, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+    \\
+    \\/// Installs a device on a level-triggered line delivered to the boot CPU, with the devices
+    \\/// installed on it before: on AArch64 the shared peripheral interrupt of identifier `line`; on
+    \\/// x86_64 pin `line & 0xFF`, active low, of the I/O APIC whose registers lie at `line >> 8`,
+    \\/// whose interrupts interrupt remapping accepts from requester `source` alone.
+    \\pkg fn IrqShared.install_line(take dev: T, line: u64, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
     \\
     \\/// What `boot::Kernel.pci_functions` lists: the endpoints below each host bridge, depth first,
     \\/// each with bus mastering and memory decoding off and INTx disabled.
@@ -11699,6 +11756,7 @@ const TEXT_HW_PCI: Str =
     \\        index += size_bar(record, index)
     \\    }
     \\    poke(record + FUNCTION_MSIX, value: u64.widen(find_capability(record, id: MSIX_ID)))
+    \\    poke(record + FUNCTION_MSI, value: u64.widen(find_capability(record, id: MSI_ID)))
     \\    return record
     \\} new_record
     \\
@@ -11926,10 +11984,43 @@ const TEXT_HW_PCI: Str =
     \\    return address
     \\} msix_table_entry
     \\
+    \\/// Installs a device on a message-signalled interrupt of CPU `cpu` validated for a function's
+    \\/// or port's requester id, then, unless the record is removed meanwhile, programs its message
+    \\/// into the MSI-X table entry at `table`, or for a zero one into the MSI capability, and for a
+    \\/// nonzero slot capability `slot` enables the slot's events.
+    \\fn signalled[T: Any and Send](record: u64, table: u64, slot: u32, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    \\    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
+    \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
+    \\        Ok(shared) => {
+    \\            let Some(message) = shared.message() else {
+    \\                return Ok(take shared)
+    \\            }
+    \\            if table == 0 and message.address > NARROW_ADDRESSES and ((config(record, offset: u32.truncate(peek(record + FUNCTION_MSI))) >> 16) & MSI_WIDE) == 0 {
+    \\                return Err(MsiRefusal(dev: take shared.uninstall(), error: MsiError.Unreachable))
+    \\            }
+    \\            let held = pci_lock()
+    \\            if not gone(record) {
+    \\                if table != 0 {
+    \\                    program_entry(record, table, message)
+    \\                } else {
+    \\                    program_msi(record, message)
+    \\                }
+    \\                if slot != 0 {
+    \\                    slot_command(record, at: slot, set: slot_events_enabled(record, at: slot), clear: 0)
+    \\                }
+    \\            }
+    \\            pci_unlock(held)
+    \\            return Ok(take shared)
+    \\        }
+    \\        Err(refusal) => return Err(take refusal)
+    \\    }
+    \\} signalled
+    \\
     \\/// Writes a message to an MSI-X table entry, unmasked, and enables MSI-X without the function
-    \\/// mask.
+    \\/// mask in place of MSI and INTx.
     \\fn program_entry(record: u64, table: u64, message: MsiMessage) {
-    \\    set_command(record, set: MEMORY, clear: 0)
+    \\    msi_off(record)
+    \\    set_command(record, set: MEMORY | INTX_DISABLE, clear: 0)
     \\    var entry = trusted "the MSI-X entry lies in the function's memory BAR, which the entry root maps uncached, outside every window of the BAR" { Mmio[MsixEntry].map(table) }
     \\    mut entry.write(MsixEntry.control, value: 1)
     \\    mut entry.write(MsixEntry.address_low, value: u32.truncate(message.address))
@@ -11941,6 +12032,92 @@ const TEXT_HW_PCI: Str =
     \\    let control = config(record, offset: capability)
     \\    set_config(record, offset: capability, value: (control | MSIX_ENABLE) & ~MSIX_MASKED)
     \\} program_entry
+    \\
+    \\/// Writes a message to a function's MSI capability, its vector unmasked where it masks vectors,
+    \\/// and enables MSI with that one vector in place of MSI-X and INTx.
+    \\fn program_msi(record: u64, message: MsiMessage) {
+    \\    msix_off(record)
+    \\    set_command(record, set: INTX_DISABLE, clear: 0)
+    \\    let at = u32.truncate(peek(record + FUNCTION_MSI))
+    \\    let control = config(record, offset: at) >> 16
+    \\    set_config16(record, offset: at + 2, value: u16.truncate(control & ~(MSI_ENABLE | MSI_MESSAGES)))
+    \\    set_config(record, offset: at + 4, value: u32.truncate(message.address))
+    \\    var data = at + 8
+    \\    if (control & MSI_WIDE) != 0 {
+    \\        set_config(record, offset: data, value: u32.truncate(message.address >> 32))
+    \\        data += 4
+    \\    }
+    \\    set_config(record, offset: data, value: message.data)
+    \\    if (control & MSI_MASKABLE) != 0 {
+    \\        set_config(record, offset: data + 4, value: config(record, offset: data + 4) & ~1)
+    \\    }
+    \\    set_config16(record, offset: at + 2, value: u16.truncate((control & ~MSI_MESSAGES) | MSI_ENABLE))
+    \\} program_msi
+    \\
+    \\/// Disables a function's MSI-X, where it has the capability.
+    \\fn msix_off(record: u64) {
+    \\    let at = u32.truncate(peek(record + FUNCTION_MSIX))
+    \\    if at != 0 {
+    \\        set_config(record, offset: at, value: config(record, offset: at) & ~MSIX_ENABLE)
+    \\    }
+    \\} msix_off
+    \\
+    \\/// Disables a function's MSI, where it has the capability.
+    \\fn msi_off(record: u64) {
+    \\    let at = u32.truncate(peek(record + FUNCTION_MSI))
+    \\    if at != 0 {
+    \\        set_config16(record, offset: at + 2, value: u16.truncate((config(record, offset: at) >> 16) & ~MSI_ENABLE))
+    \\    }
+    \\} msi_off
+    \\
+    \\/// A line as `IrqShared.install_line` takes it, zero for none, with the requester id remapped
+    \\/// interrupts of the line come from.
+    \\struct Route derives Copy {
+    \\    line: u64
+    \\    source: u32
+    \\} Route
+    \\
+    \\/// The line of a platform interrupt: on AArch64 its identifier; on x86_64 the pin holding
+    \\/// global system interrupt `line` of the MADT's I/O APIC with the greatest first interrupt not
+    \\/// above it, whose registers lie in memory the entry root maps uncached and, once VT-d remaps
+    \\/// interrupts, whose requester id the remapping unit's device scopes name.
+    \\fn routed(line: u32) -> Route {
+    \\    let none = Route(line: 0, source: 0)
+    \\    if on_aarch64() {
+    \\        return Route(line: u64.widen(line), source: 0)
+    \\    }
+    \\    let madt = listed_table(MADT_SIGNATURE)
+    \\    if madt == 0 {
+    \\        return none
+    \\    }
+    \\    let end = madt + u64.widen(u32_at(madt + 4))
+    \\    var at = madt + MADT_ENTRIES
+    \\    var found: u64 = 0
+    \\    var start: u32 = 0
+    \\    while at + 2 <= end and byte_at(at + 1) >= 2 {
+    \\        if byte_at(at) == MADT_IOAPIC and at + 12 <= end and u32_at(at + 8) <= line and (found == 0 or u32_at(at + 8) >= start) {
+    \\            found = at
+    \\            start = u32_at(at + 8)
+    \\        }
+    \\        at += u64.widen(byte_at(at + 1))
+    \\    }
+    \\    if found == 0 or line - start > 0xFF {
+    \\        return none
+    \\    }
+    \\    let base = u64.widen(u32_at(found + 4))
+    \\    if not device_memory(base, size: IOAPIC_BYTES) {
+    \\        return none
+    \\    }
+    \\    var source: u32 = 0
+    \\    let unit = iommu_unit()
+    \\    if unit != 0 {
+    \\        let Some(requester) = ioapic_requester(unit, id: byte_at(found + 2)) else {
+    \\            return none
+    \\        }
+    \\        source = requester
+    \\    }
+    \\    return Route(line: (base << 8) | u64.widen(line - start), source: source)
+    \\} routed
     \\
     \\/// Attaches a function to the domain of a space, under the PCI lock.
     \\fn attached_to(record: u64, space: IoSpace) fails IommuError {
@@ -12090,13 +12267,13 @@ const TEXT_HW_PCI: Str =
     \\    return true
     \\} cut_below
     \\
-    \\/// Cuts a function off: unless a port's cut-off reached it first, it no longer masters the bus
-    \\/// or decodes memory, and its context or stream reaches nothing once the IOMMU no longer caches
+    \\/// Cuts a function off: unless a port's cut-off reached it first, it no longer masters the bus,
+    \\/// decodes memory or asserts INTx, and its context or stream reaches nothing once the IOMMU no longer caches
     \\/// it; then frees its record and those of its windows.
     \\fn cut_off(record: u64) {
     \\    let held = pci_lock()
     \\    if not gone(record) {
-    \\        set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
+    \\        set_command(record, set: INTX_DISABLE, clear: BUS_MASTER | MEMORY)
     \\        let unit = iommu_unit()
     \\        if unit != 0 and peek(record + FUNCTION_ATTACHED) != 0 {
     \\            let flags = iommu_lock()

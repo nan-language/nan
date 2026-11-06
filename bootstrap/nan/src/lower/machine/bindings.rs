@@ -3,7 +3,8 @@
 //! which the dispatcher runs and installs and uninstalls change under the bindings lock; and the
 //! vectors of x86_64 message-signalled interrupts, with their remapping entries once the IOMMU
 //! remaps interrupts. On AArch64 a vector from 32 up is a shared peripheral interrupt, routed to
-//! the CPU of its devices.
+//! the CPU of its devices. Level-triggered lines are installed for the boot CPU in the row of
+//! every CPU.
 
 use super::super::data::Reserved;
 use cranelift_codegen::ir::{
@@ -34,7 +35,8 @@ const ROWS: u64 = MAX_CPUS + 1;
 /// record, the interrupt fn as a function value, the next device of its binding, the binding,
 /// the address and data of its message, zero without one, the ITS device id and CPU of an
 /// AArch64 message-signalled interrupt, the holding through which its owner's settlement
-/// uninstalls it, and the device from `VALUE` on, at its alignment.
+/// uninstalls it, the x86_64 line it is installed on, zero for none, and the device from `VALUE`
+/// on, at its alignment.
 pub mod device {
     pub const LOCK: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -47,7 +49,8 @@ pub mod device {
     pub const SOURCE: u64 = 72;
     pub const CPU: u64 = 80;
     pub const HOLDING: u64 = 88;
-    pub const VALUE: u64 = 96;
+    pub const LINE: u64 = 96;
+    pub const VALUE: u64 = 104;
 }
 
 /// What `install_msi` gives: the interrupt installed, or the `hw::MsiError` variant refusing it.
@@ -58,10 +61,10 @@ pub mod msi {
     pub const UNSUPPORTED: i64 = 3;
 }
 
-/// The vectors an x86_64 message-signalled interrupt may take, past the timer's and short of
-/// the CPU signal's, the largest local APIC id a message names, and the base of its address.
-const MSI_VECTORS: (i64, i64) = (0x21, 0xFE);
-const MSI_ID_MAX: i64 = 255;
+/// The vectors an x86_64 message-signalled interrupt or line may take, past the timer's and short
+/// of the CPU signal's, the largest local APIC id a message names, and the base of its address.
+pub(super) const MSI_VECTORS: (i64, i64) = (0x21, 0xFE);
+pub(super) const MSI_ID_MAX: i64 = 255;
 const MSI_ADDRESS: i64 = 0xFEE0_0000;
 
 /// The binding table.
@@ -221,7 +224,12 @@ impl Lowering<'_, '_> {
 
     /// Whether devices are installed on a vector for a CPU other than `cpu`, or for any CPU for
     /// `None`, the devices installed for every CPU counting as the boot CPU's.
-    fn installed_for(&mut self, fx: &mut Fx, vector: Value, cpu: Option<Value>) -> Value {
+    pub(super) fn installed_for(
+        &mut self,
+        fx: &mut Fx,
+        vector: Value,
+        cpu: Option<Value>,
+    ) -> Value {
         let state_address = self.state(fx);
         let count = fx.load(PTR, state_address, state::THREAD_COUNT);
         let rows = fx.b.ins().iadd_imm_s(count, 1);
@@ -279,6 +287,66 @@ impl Lowering<'_, '_> {
         outcome
     }
 
+    /// Installs a device record on a level-triggered line delivered to the boot CPU, which
+    /// `line` names as `hw::IrqShared.install_line` takes it, behind the devices installed on it
+    /// before; on x86_64 the remapping entry of a line no device is installed on accepts only
+    /// requester `source`. Gives one of the `msi` outcomes.
+    pub fn install_line(
+        &mut self,
+        fx: &mut Fx,
+        record: Value,
+        line: Value,
+        source: Value,
+    ) -> Value {
+        let flags = self.lock_bindings(fx);
+        let outcome = match self.machine_arch() {
+            Arch::Amd64 => self.x64_install_line(fx, record, line, source),
+            Arch::Aarch64 => self.aarch64_install_line(fx, record, line),
+        };
+        self.unlock_bindings(fx, flags);
+        outcome
+    }
+
+    /// The AArch64 part of `install_line`: the shared peripheral interrupt `line` takes the record
+    /// for the boot CPU, made level-sensitive while no device is installed on it, unless a row
+    /// has no vector for it, the final build binds it, or devices are installed on it for another
+    /// CPU.
+    fn aarch64_install_line(&mut self, fx: &mut Fx, record: Value, line: Value) -> Value {
+        let above =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, line, 32);
+        let below =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, line, VECTORS as i64);
+        let mut inside = fx.b.ins().band(above, below);
+        for bound in self.statically_bound() {
+            let other = fx.b.ins().icmp_imm_s(IntCC::NotEqual, line, bound);
+            inside = fx.b.ins().band(inside, other);
+        }
+        let unsupported = fx.ptr(msi::UNSUPPORTED as u64);
+        let outcome = fx.var(PTR, unsupported);
+        fx.when(inside, |fx| {
+            let boot = fx.ptr(0);
+            let elsewhere = self.installed_for(fx, line, Some(boot));
+            let unreachable = fx.ptr(msi::UNREACHABLE as u64);
+            fx.b.def_var(outcome, unreachable);
+            let free = fx.b.ins().bxor_imm_s(elsewhere, 1);
+            fx.when(free, |fx| {
+                let installed = self.installed_for(fx, line, None);
+                let fresh = fx.b.ins().bxor_imm_s(installed, 1);
+                fx.when(fresh, |fx| self.aarch64_level(fx, line));
+                fx.store(line, record, device::VECTOR);
+                let every = fx.ptr(0);
+                let slot = self.irq_binding(fx, every, line);
+                self.chain(fx, record, slot);
+                self.aarch64_route(fx, line, boot);
+                let done = fx.ptr(msi::INSTALLED as u64);
+                fx.b.def_var(outcome, done);
+            });
+        });
+        fx.b.use_var(outcome)
+    }
+
     /// The x86_64 part of `install_msi`: the lowest vector of `MSI_VECTORS` the final build does
     /// not bind and no device is installed on for the CPU. Its message names the CPU's local
     /// APIC id, which no message reaches past `MSI_ID_MAX`, or once the IOMMU remaps
@@ -328,7 +396,7 @@ impl Lowering<'_, '_> {
                 remapping,
                 &[PTR, PTR],
                 |lo, fx| {
-                    let address = lo.remap(fx, unit, cpu, vector, id, source, validated);
+                    let address = lo.remap(fx, unit, cpu, vector, id, source, validated, false);
                     vec![address, fx.ptr(0)]
                 },
                 |_, fx| {
@@ -357,9 +425,9 @@ impl Lowering<'_, '_> {
         fx.b.use_var(outcome)
     }
 
-    /// Removes a device record from its binding's chain, and on AArch64 disables a shared
-    /// peripheral interrupt no device is left on or discards an LPI's translation, then spins
-    /// until no CPU runs the binding's devices.
+    /// Removes a device record from its binding's chain, on x86_64 masks a line no device is left
+    /// on, and on AArch64 disables a shared peripheral interrupt no device is left on or discards
+    /// an LPI's translation, then spins until no CPU runs the binding's devices.
     pub fn uninstall_device(&mut self, fx: &mut Fx, record: Value) {
         let flags = self.lock_bindings(fx);
         let slot = fx.load(PTR, record, device::BINDING);
@@ -378,6 +446,7 @@ impl Lowering<'_, '_> {
                 let unit = self.iommu_unit(fx);
                 self.unremap(fx, unit, message);
             });
+            self.x64_line_left(fx, record, slot);
         }
         if self.machine_arch() == Arch::Aarch64 {
             let vector = fx.load(PTR, record, device::VECTOR);

@@ -1,7 +1,8 @@
 //! The machine's IOMMU as the runtime drives it once std's `hw` has enabled it: the unit record
 //! `hw` builds and the runtime state names, its lock, the invalidation of everything the unit
 //! caches through its command queue, and on VT-d the remapping table entries of the
-//! message-signalled interrupts `install_msi` gives, one per CPU and vector.
+//! message-signalled interrupts `install_msi` gives and of the lines `install_line` gives, one
+//! per CPU and vector.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC};
 
@@ -58,11 +59,12 @@ const PRODUCE: u64 = 0x98;
 const CONSUME: u64 = 0x9C;
 const WRAPPED: i64 = 2 * QUEUE_ENTRIES - 1;
 
-/// A remapping table entry's first word: present, its vector and destination; its second, the
-/// requester id it accepts and the bit validating it. The message naming entry `i` has address
+/// A remapping table entry's first word: present, level-triggered, its vector and destination;
+/// its second, the requester id it accepts and the bit validating it. The message naming entry `i` has address
 /// `0xFEE0_0000 | (i & 0x7FFF) << 5 | REMAPPED | (i >> 15) << 2`, which the format bit marks,
 /// and data 0.
 const PRESENT: i64 = 1;
+const LEVEL: i64 = 1 << 4;
 const VALIDATED: i64 = 1 << 18;
 const REMAPPED: i64 = 0x10;
 const MSI_BASE: i64 = 0xFEE0_0000;
@@ -227,8 +229,9 @@ impl Lowering<'_, '_> {
     }
 
     /// Writes the remapping table entry of CPU `cpu`'s vector `vector`, whose local APIC has id
-    /// `id`, accepting only requester `source` when `validated` holds, and invalidates the unit's
-    /// caches; gives the message naming it, or zero when the entry cannot name an id past 255.
+    /// `id`, accepting only requester `source` when `validated` holds and level-triggered when
+    /// `level` does, and invalidates the unit's caches; gives the message naming it, or zero when
+    /// the entry cannot name an id past 255.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn remap(
         &mut self,
@@ -239,6 +242,7 @@ impl Lowering<'_, '_> {
         id: Value,
         source: Value,
         validated: bool,
+        level: bool,
     ) -> Value {
         let flags = fx.load(PTR, unit, unit::FLAGS);
         let extended = fx.b.ins().band_imm_s(flags, EXTENDED);
@@ -258,7 +262,10 @@ impl Lowering<'_, '_> {
             let destination = fx.b.ins().ishl_imm_s(destination, 32);
             let low = fx.b.ins().ishl_imm_s(vector, 16);
             let low = fx.b.ins().bor(low, destination);
-            let low = fx.b.ins().bor_imm_s(low, PRESENT);
+            let low = match level {
+                true => fx.b.ins().bor_imm_s(low, PRESENT | LEVEL),
+                false => fx.b.ins().bor_imm_s(low, PRESENT),
+            };
             let high = match validated {
                 true => {
                     let requester = fx.b.ins().band_imm_s(source, 0xFFFF);
@@ -290,6 +297,11 @@ impl Lowering<'_, '_> {
         let high = fx.b.ins().band_imm_s(high, 1);
         let high = fx.b.ins().ishl_imm_s(high, 15);
         let index = fx.b.ins().bor(low, high);
+        self.clear_remapping(fx, unit, index);
+    }
+
+    /// Clears the remapping table entry of an index, and invalidates the unit's caches.
+    pub(super) fn clear_remapping(&mut self, fx: &mut Fx, unit: Value, index: Value) {
         let entry = self.remapping_entry(fx, unit, index);
         let none = fx.ptr(0);
         fx.store(none, entry, 0);

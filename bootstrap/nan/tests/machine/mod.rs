@@ -151,7 +151,7 @@ impl Monitor {
             let mut line = String::new();
             match self.replies.read_line(&mut line) {
                 Ok(0) => return Err("the monitor closes".to_owned()),
-                Ok(_) if line.starts_with(r#"{"event""#) => {}
+                Ok(_) if line.starts_with(r#"{"timestamp""#) => {}
                 Ok(_) => return Ok(line.trim_end().to_owned()),
                 Err(error) => return Err(error.to_string()),
             }

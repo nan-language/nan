@@ -69,7 +69,7 @@ The **closure set** of a line is exactly:
 - the names of the items its module declares;
 - each item and member it names, each [tombstone](29-identity-versioning.md#forwarding) whose old form one of its uses matches, and the type of each expression in it, with what each exposes at the line's position under the [visibility](03-packages-modules.md#visibility) rules: head and shape, contracts and examples, structural properties, digest, codec uses, a const's value, a transparent body, the impl lines naming it and a type's members;
 - for a line holding a [const context](21-interpreter.md#const-evaluation), an example clause or an obligation whose outcome a [refutation confirmation](21-interpreter.md#refutation-confirmation) decides, the NIR of every function those [interpreter](21-interpreter.md#interpreter) runs execute;
-- the manifest directives naming its module; its package's `language`, `targets` and `entry` directives; and the `dep` directive of each alias it uses, with the release the [lock](29-identity-versioning.md#lock) names for it;
+- the manifest directives naming its module; its package's `language`, `targets` and `entry` directives; and the `dep` directive of each alias it uses, with the release the checker reads for it ([lock](29-identity-versioning.md#lock));
 - the [core vocabulary](03-packages-modules.md#core-vocabulary).
 
 A fact the toolchain computes for an item, such as a structural property, a digest fact or a const's value, is computed from the closure sets of that item's own lines.

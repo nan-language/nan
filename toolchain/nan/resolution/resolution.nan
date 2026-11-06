@@ -12,8 +12,9 @@ pkg struct Change {
 /// What resolution decides.
 pkg enum Outcome {
     /// The lock to write, the packages whose locked release changes, the package's source files
-    /// that forwarding rewrites, and its uses that stay moved.
-    Resolved(lock: machine::Lock, changes: mem::List[Change], sources: mem::Map[text::String, mem::Bytes], moved: mem::List[diagnostic::Diagnostic])
+    /// that forwarding rewrites, and its errors under the lock: its uses that stay moved and,
+    /// when its own errors were ignored, every other.
+    Resolved(lock: machine::Lock, changes: mem::List[Change], sources: mem::Map[text::String, mem::Bytes], errors: mem::List[diagnostic::Diagnostic])
     /// No assignment is acceptable: the diagnostics the newest one fails with.
     Unresolved(mem::List[diagnostic::Diagnostic])
 } Outcome
@@ -75,16 +76,20 @@ fn copied_assignment(assigned: Slice[Assigned], alloc: mem::Alloc) -> mem::List[
     return copy
 } copied_assignment
 
-/// The root a lock line names for the current state of a path source while candidates are
+/// The code root a lock line names for the current state of a path source while candidates are
 /// checked, before that state's code root is computed.
-fn pending_root(dir: Str, alloc: mem::Alloc) -> hashing::HashValue {
+fn pending_code_root(dir: Str, alloc: mem::Alloc) -> text::String {
     var keyed = text::String.of("current\n", alloc)
     mut keyed.append(dir)
-    return hashing::HashValue.of(keyed.as_bytes())
+    return keyed
+} pending_code_root
+
+fn pending_root(dir: Str, alloc: mem::Alloc) -> hashing::HashValue {
+    return hashing::HashValue.of(pending_code_root(dir, alloc).as_bytes())
 } pending_root
 
-/// A store entry with its code root, standing for the current state of a path source's package
-/// while candidates are checked.
+/// A store entry of its pending code root attesting its files, standing for the current state
+/// of a path source's package while candidates are checked.
 struct CurrentEntry {
     root: hashing::HashValue
     entry: mem::Shared[store::Entry]
@@ -151,7 +156,7 @@ pkg fn resolve(session: check::Session, package_index: usize, local: store::Stor
             }
             None => {}
         }
-        return Ok(Outcome.Unresolved(take diagnostics))
+        return Ok(Outcome.Unresolved(check::sorted_diagnostics(take diagnostics, alloc)))
     }
     return try resolver.lock(local, assigned: assignment.view())
 } resolve
@@ -470,7 +475,10 @@ fn Resolver.locked_session(self, lock: machine::Lock, take changed: mem::Map[tex
             Some(name) => name
             None => ""
         }
-        let entry = store::Entry(index: 0, package_name: text::String.of(package_name, alloc), name: None, parent: None, summary: None, artefact: mem::Bytes.empty(alloc), sources: check::package_files(pack, alloc))
+        let sources = check::package_files(pack, alloc)
+        let attested = artefact::attestation(self.session.toolchain_hash(), source_tree: artefact::source_tree_hash(sources.view(), alloc), seals: artefact::seal_list(mem::List[artefact::AttestedSeal].empty(alloc).view(), alloc).view(), alloc)
+        let pending = artefact::artefact(pending_code_root(pack.dir.as_str(), alloc).as_bytes(), attested: attested.view(), alloc)
+        let entry = store::Entry(index: 0, package_name: text::String.of(package_name, alloc), name: None, parent: None, summary: None, artefact: take pending, sources: take sources)
         mut current.push(CurrentEntry(root: pending_root(pack.dir.as_str(), alloc), entry: mem::Shared.of(take entry, alloc)))
     }
     var path = text::String.of(self.root().dir.as_str(), alloc)
@@ -696,16 +704,20 @@ fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result
     let unlocked = self.root().machine.lock_file.is_none()
     let approved = judged.session.approvals(self.package_index, take lock, all: unlocked)
     let changes = self.changes(approved)
-    var moved = mem::List[diagnostic::Diagnostic].empty(alloc)
-    if self.forwarding {
+    var errors = mem::List[diagnostic::Diagnostic].empty(alloc)
+    if self.forwarding or not self.own_errors {
         for reported in take judged.session.reported(scope::Scope.Package(self.package_index)) {
-            if reported.code == diagnostic::Code.NameMoved {
-                mut moved.push(take reported)
+            let kept = match self.own_errors {
+                true => reported.code == diagnostic::Code.NameMoved
+                false => reported.code.class() == diagnostic::Class.Error
+            }
+            if kept {
+                mut errors.push(take reported)
             }
         }
     }
     let Forwarded(session: _, sources: sources) = judged
-    return Ok(Outcome.Resolved(lock: take approved, changes: take changes, sources: take sources, moved: take moved))
+    return Ok(Outcome.Resolved(lock: take approved, changes: take changes, sources: take sources, errors: take errors))
 } Resolver.lock
 
 /// The position of the entry holding a release, by its code root.

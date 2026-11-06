@@ -286,3 +286,41 @@ fn a_test_head_names_a_function_and_takes_generated_values() {
         );
     }
 }
+
+#[test]
+fn a_changed_path_dependency_runs_the_affected_tests_of_a_sync_and_refuses_runs_once_broken() {
+    let dial = |notch: &str| {
+        format!(
+            "//! Dials.\n\n/// The notch.\npub fn notch() -> u32 {{\n    return {notch}\n}} notch\n"
+        )
+    };
+    let scratch = Scratch::new(&[
+        (
+            "dial/package.nan",
+            "//! Dials.\n\npackage dial {\n    language 1\n    targets any\n} dial\n",
+        ),
+        ("dial/dial.nan", &dial("7")),
+        (
+            "app/package.nan",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets any\n    dep dial \"../dial\"\n} app\n",
+        ),
+        (
+            "app/app.nan",
+            "//! Apps.\n\n/// The notch.\npub fn notch() -> u32 {\n    return dial::notch()\n} notch\n\ntest seventh for notch {\n    expect notch() == 7\n} seventh\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    run_in(&dir.join("app"), "dep sync");
+    fs::write(dir.join("dial/dial.nan"), dial("8")).expect("a changed dial");
+    let synced = run_in(&dir.join("app"), "dep sync").output;
+    assert!(
+        synced.contains("\nerror dep.unresolved app/app.nan:8 app::seventh\n"),
+        "{synced}"
+    );
+    fs::write(dir.join("dial/dial.nan"), dial("true")).expect("a broken dial");
+    let tested = run_in(dir, "test app").output;
+    assert!(
+        tested.contains("\nerror type.mismatch dial/dial.nan:5 dial::notch\n"),
+        "{tested}"
+    );
+}

@@ -1,8 +1,7 @@
-//! Dependency closures: the release through which a workspace package's lock reaches each package
-//! of its dependency closure, std aside — a workspace package checked from source while its
-//! locked release holds its current source files or, when the local store lacks that release,
-//! while it is the package's current state, else the release the local store holds — and the
-//! closures that workspace packages share.
+//! Dependency closures: what a workspace package's lock reaches for each package of its
+//! dependency closure, std aside — the current state of a path source holding the package its
+//! lock line names, else the locked release the local store holds — and the closures that
+//! workspace packages share.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -106,8 +105,8 @@ pub struct Read {
     pub found: Vec<Diagnostic>,
 }
 
-/// A path source read from source for a locked release the local store lacks, which it is only
-/// when its current state's code root is the release's.
+/// A path source whose current state no store entry confirms as its locked release, which it is
+/// only when its current state's code root is the release's.
 #[derive(Clone)]
 pub struct Unconfirmed {
     /// The workspace package whose lock names the release, by index.
@@ -293,27 +292,22 @@ impl Reader<'_> {
                 let named = self
                     .at(&dir)
                     .filter(|at| self.packages[*at].name() == Some(line.package.as_str()));
-                let source = named.filter(|at| {
-                    entry
-                        .as_ref()
-                        .is_some_and(|entry| holds_sources(entry, &self.packages[*at]))
-                });
-                match (source, entry) {
+                match (named, entry) {
                     (Some(at), entry) => {
-                        self.confirmed.extend(entry);
-                        Some(Member::Source(at))
-                    }
-                    (None, Some(entry)) => Some(Member::Release(self.release(entry, &dir)?)),
-                    (None, None) => {
-                        match named.filter(|_| !refused) {
-                            Some(at) => self.unconfirmed.push(Unconfirmed {
+                        match entry.filter(|entry| holds_sources(entry, &self.packages[at])) {
+                            Some(entry) => self.confirmed.push(entry),
+                            None => self.unconfirmed.push(Unconfirmed {
                                 package: index,
                                 line: reaching,
                                 source: at,
                                 root: line.root,
                             }),
-                            None => missing(self),
                         }
+                        Some(Member::Source(at))
+                    }
+                    (None, Some(entry)) => Some(Member::Release(self.release(entry, &dir)?)),
+                    (None, None) => {
+                        missing(self);
                         self.at(&dir).map(Member::Source)
                     }
                 }

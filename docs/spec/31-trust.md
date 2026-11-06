@@ -18,6 +18,7 @@ The incompleteness codes are exactly:
 | `threshold.depth` | an unwaived nesting excess | [Depth](06-statements-expressions.md#depth) |
 | `threshold.length` | an unwaived body-length excess | [Length](06-statements-expressions.md#length) |
 | `retired.forwarded-use` | a use of the old form of a `preserves` tombstone | [Forwarding](29-identity-versioning.md#forwarding) |
+| `dep.sync-pending` | a path source changed since its lock | [Lock](29-identity-versioning.md#lock) |
 | `unused.item`, `unused.local`, `unused.field`, `unused.dependency`, `unused.tombstone` | unused code | [Unused code](#unused-code) |
 | `unused.grant` | a manifest grant nothing uses | [Manifest grants](14-authority.md#manifest-grants), [Contributors](25-registries.md#contributors) |
 | `doc.stale` | a stale doc | [Doc binding](32-docs.md#doc-binding) |

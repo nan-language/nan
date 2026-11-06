@@ -63,6 +63,8 @@ A **run** is one execution of a test body on one [run target](#emulator-runs). O
 
 These codes and `test.emulator-unavailable` are the **test-run codes**. `nan test` reports a failing test as [checking commands](33-toolchain.md#checking-commands) state, its cause being its test-run code or trap kind; a test-run code is never a diagnostic. A test passes when every run passes, and reports only its failing run of lowest index. Runs share no state, and their outcomes never depend on how many execute at once.
 
+A package's tests run on a run target only when every other package of the final closure of its test image that is checked from source checks without error and its [release checks](30-artefacts.md#releases) find none; `nan test` reports those errors in place of its runs.
+
 ```nan
 pub fn scale(level: u32) -> u32 {
     return level / 2

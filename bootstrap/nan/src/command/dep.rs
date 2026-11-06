@@ -157,7 +157,7 @@ fn synced(
             lock,
             changes: released,
             sources,
-            moved,
+            errors,
         } => {
             for change in released {
                 let hash = |hash: Option<crate::hash::Hash>| {
@@ -175,7 +175,7 @@ fn synced(
                 });
             }
             records.extend(
-                moved
+                errors
                     .iter()
                     .map(|diagnostic| record(workspace, &Scope::Workspace, diagnostic)),
             );

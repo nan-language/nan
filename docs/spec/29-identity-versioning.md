@@ -513,10 +513,11 @@ The **lock** of a package is its machine file `.nan/lock.nan`, written only by `
 - one checksummed line per package of the [dependency closure](27-program-model.md#final-builds) other than the package itself and std: the package's name and, for a direct dependency, its alias ([lock syntax](35-format.md#lock)), its source as its `dep` directive writes it with a path source rewritten relative to the locking package's directory, the code root hash of its **locked release**, and, for a release whose artefact holds [sections](30-artefacts.md#sections), the public key of its publisher;
 - for a [final-link root](27-program-model.md#final-builds), its [approvals](#approvals).
 
-[Canonical format and machine files](35-format.md#lock) defines the lock's syntax, validity and reserved fields. The checker reads each other package of the closure but std through its locked release: from source when that release is the current state of its path source, and otherwise from the source tree its local store entry holds ([releases](30-artefacts.md#releases)).
+[Canonical format and machine files](35-format.md#lock) defines the lock's syntax, validity and reserved fields. The checker reads each other package of the closure but std from source, as its current state, when it is reached through a path source whose directory holds it, and otherwise through its locked release, from the source tree its local store entry holds ([releases](30-artefacts.md#releases)).
 
 - A `dep` directive without a lock line for its source, a lock line whose source differs from its directive's, and a missing or surplus line for a package reached through others are errors (`dep.lock-stale`), reported on the directive or else on the `package` line.
-- A locked release that is neither the current state of its path source nor in the local store is an error (`dep.release-missing`), reported on the first `dep` directive, in alias order, that reaches it.
+- A locked release read from the local store that the store does not hold is an error (`dep.release-missing`), reported on the first `dep` directive, in alias order, that reaches it.
+- A path source whose current state's code root is not its locked release's is incompleteness (`dep.sync-pending`), reported on the first `dep` directive, in alias order, that reaches it, naming the command `nan dep sync`.
 - A dependency closure holds one release per package name. Two sources or two releases of one package name are an error (`dep.split-package`), reported on each `dep` directive of the checked package that reaches that name, except the first in alias order.
 - A package in its own dependency closure is an error (`dep.cycle`), reported on the first `dep` directive, in alias order, that reaches it.
 
@@ -594,7 +595,25 @@ An **assignment** gives one candidate to each source of P's `dep` directives and
 3. the [release check](30-artefacts.md#releases) of every other assigned release, under each target P is checked for, finds no error;
 4. P's [reliance tests](22-testing.md#reliance-tests) and [affected tests](22-testing.md#affected-tests) pass, and so do the reliance tests recorded in each assigned release whose targets lie in a package assigned another release than the lock names.
 
-`nan dep sync` writes the greatest acceptable assignment, comparing assignments by the publication index of each package's release, 0 for a path release or an absent package, over the union of their package names in byte order, the first difference deciding. When none is acceptable, it searches again ignoring P's own errors in condition 2 and, while P has any, P's tests in condition 4, so that a package whose own source does not check still locks its closure; when none is acceptable then either, it is an error (`dep.unresolved`), reported on P's `package` line with the diagnostics of each condition that the assignment of each source's newest candidate fails. For each package whose locked release changes, `nan dep sync` prints both code roots, the release class of the new one with the old as its parent, and the epoch changes and widenings it brings.
+`nan dep sync` writes the greatest acceptable assignment, comparing assignments by the publication index of each package's release, 0 for a path release or an absent package, over the union of their package names in byte order, the first difference deciding. When none is acceptable, it searches again ignoring P's own errors in condition 2 and, while P has any, P's tests in condition 4, so that a package whose own source does not check still locks its closure, and then reports P's errors under the lock it writes; when none is acceptable then either, it is an error (`dep.unresolved`), reported on P's `package` line with the diagnostics of each condition that the assignment of each source's newest candidate fails. For each package whose locked release changes, `nan dep sync` prints both code roots, the release class of the new one with the old as its parent, and the epoch changes and widenings it brings.
+
+In the next example, `example` does not check, so `nan dep sync` locks its closure ignoring its own error and reports that error.
+
+```nan
+pub fn ratio(part: u32, whole: u32) -> u8 {
+    return part / whole // error: type.mismatch
+} ratio
+```
+
+```text
+$ nan dep sync example
+failed dep sync example: files 0, errors 1, incomplete 0
+error type.mismatch example/example.nan:3 example::ratio
+        return part / whole // error: type.mismatch
+    expected: u8
+    found: u32
+failed dep sync example: files 0, errors 1, incomplete 0
+```
 
 ### Upgrades
 
@@ -617,6 +636,7 @@ The lock of a final-link root records **approvals**: pairs of its [closure summa
 | `dep.lock-stale` | error | [Lock](#lock) |
 | `dep.release-missing` | error | [Lock](#lock) |
 | `dep.split-package` | error | [Lock](#lock) |
+| `dep.sync-pending` | incompleteness | [Lock](#lock) |
 | `dep.unresolved` | error | [Resolution](#resolution) |
 | `retired.ambiguous-use` | error | [Forwarding](#forwarding) |
 | `retired.bad-rewrite` | error | [Tombstones](#tombstones) |

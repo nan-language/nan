@@ -116,6 +116,7 @@ codes! {
     DepLockStale = "dep.lock-stale",
     DepReleaseMissing = "dep.release-missing",
     DepSplitPackage = "dep.split-package",
+    DepSyncPending = "dep.sync-pending",
     DepUnresolved = "dep.unresolved",
     DeriveConstituentMissing = "derive.constituent-missing",
     DeriveDuplicate = "derive.duplicate",
@@ -532,6 +533,7 @@ impl Code {
             Code::InternalInvariant => Class::Internal,
             Code::ApiStale
             | Code::ApiWeakeningPending
+            | Code::DepSyncPending
             | Code::DocStale
             | Code::RetiredForwardedUse
             | Code::SealSameAuthor

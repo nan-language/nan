@@ -14,7 +14,7 @@ use std::io;
 use crate::cache::{Cache, Exposed};
 use crate::check::db::{ItemId, PackageId};
 use crate::check::{self, Checker, testing};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Class, Diagnostic};
 use crate::emulator;
 use crate::encoding::{bytes, uvar};
 use crate::hash::{Hash, blake3, checksummed_base32, read_checksummed_base32};
@@ -23,7 +23,7 @@ use crate::output;
 use crate::scope::Scope;
 use crate::syntax::ast::ItemKind;
 use crate::toolchain;
-use crate::workspace::{Closure, File, Package, Target, Workspace};
+use crate::workspace::{Closure, File, Member, Package, Target, Workspace};
 use outcome::{Ended, Image, Run};
 
 /// The most runs of a test without parameters: schedules 0 to 63.
@@ -149,6 +149,7 @@ pub fn run(
             right.target.name(),
         ))
     });
+    check::sort_diagnostics(&mut report.diagnostics);
     Ok(Ok(report))
 }
 
@@ -480,15 +481,16 @@ fn run_package(
 }
 
 /// Lowers and writes the test image of a package's tests for a checker's target, under
-/// `.nan/tests/`, readied for its runs; or the errors of checking the releases it reaches, or
-/// else the symbol collisions of its lowering.
+/// `.nan/tests/`, readied for its runs; or the errors of the other workspace packages and of the
+/// releases it reaches, or else the symbol collisions of its lowering.
 fn build(
     checker: &Checker,
     workspace: &Workspace,
     package: PackageId,
     tests: &[Selected],
 ) -> io::Result<Result<Image, Vec<Diagnostic>>> {
-    let refused = check::release_errors(checker, package);
+    let mut refused = source_errors(checker, workspace, package);
+    refused.extend(check::release_errors(checker, package));
     if !refused.is_empty() {
         return Ok(Err(refused));
     }
@@ -506,6 +508,24 @@ fn build(
         .join(format!("{}{}", data.name, target.image_suffix()));
     crate::final_build::write_image(target, &lowered.object, &image)?.map_err(io::Error::other)?;
     Ok(Ok(Image::new(target, image)?))
+}
+
+/// The errors that checking reports on the workspace packages other than a package of a checker's
+/// closure that the package reaches.
+fn source_errors(checker: &Checker, workspace: &Workspace, package: PackageId) -> Vec<Diagnostic> {
+    let mut found = Vec::new();
+    for reached in checker.reached(package) {
+        if let (true, Some(Member::Source(index))) =
+            (reached != package, checker.db.package(reached).member)
+        {
+            found.extend(
+                check::reported(workspace, &Scope::Package(index))
+                    .into_iter()
+                    .filter(|diagnostic| diagnostic.code.class() == Class::Error),
+            );
+        }
+    }
+    found
 }
 
 /// The test image of a package's selected tests for a checker's target.
@@ -629,7 +649,7 @@ fn regression(checker: &Checker, workspace: &Workspace, test: ItemId, shrunk: &R
     let erroneous = check::reported(&after, &Scope::Workspace)
         .iter()
         .any(|diagnostic| {
-            diagnostic.code.class() == crate::diagnostic::Class::Error
+            diagnostic.code.class() == Class::Error
                 && diagnostic.path.as_deref() == Some(path.as_str())
                 && diagnostic
                     .line

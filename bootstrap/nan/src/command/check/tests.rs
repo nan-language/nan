@@ -239,11 +239,6 @@ fn a_path_only_a_newer_release_names_reports_that_release() {
         )
     };
     let scratch = Scratch::new(&[
-        ("meter/package.nan", &package("meter", "")),
-        (
-            "meter/meter.nan",
-            "//! Meters.\n\n/// The level.\npub fn level() -> u32 = 1\n",
-        ),
         ("gauge/package.nan", &package("gauge", "")),
         (
             "gauge/gauge.nan",
@@ -255,24 +250,17 @@ fn a_path_only_a_newer_release_names_reports_that_release() {
         "nan-test/{}/gauge",
         dir.file_name().expect("a directory name").to_string_lossy()
     );
-    let deps = format!("    dep meter \"../meter\"\n    dep gauge \"{name}\"\n");
+    let deps = format!("    dep gauge \"{name}\"\n");
     fs::create_dir_all(dir.join("app")).expect("the app directory");
     fs::write(dir.join("app/package.nan"), package("app", &deps)).expect("the app manifest");
-    let app = "//! Apps.\n\npub fn level() -> u32 = meter::level()\n\npub fn reading() -> u32 = gauge::reading()\n";
+    let app = "//! Apps.\n\npub fn reading() -> u32 = gauge::reading()\n";
     fs::write(dir.join("app/app.nan"), app).expect("the app source");
     run_in(dir, "api update gauge");
     run_in(dir, &format!("publish --local gauge --name {name}"));
     run_in(&dir.join("app"), "dep sync");
-    for (path, added) in [
-        (
-            "meter/meter.nan",
-            "\n/// Resets.\npub fn reset() -> u32 = 0\n",
-        ),
-        ("gauge/gauge.nan", "\n/// Zero.\npub fn zero() -> u32 = 0\n"),
-    ] {
-        let text = fs::read_to_string(dir.join(path)).expect("a source");
-        fs::write(dir.join(path), text + added).expect("a newer source");
-    }
+    let text = fs::read_to_string(dir.join("gauge/gauge.nan")).expect("the gauge source");
+    let added = "\n/// Zero.\npub fn zero() -> u32 = 0\n";
+    fs::write(dir.join("gauge/gauge.nan"), text + added).expect("a newer gauge");
     run_in(dir, "api update gauge");
     let published = run_in(dir, "publish --local gauge").output;
     let line = published
@@ -281,20 +269,17 @@ fn a_path_only_a_newer_release_names_reports_that_release() {
     let root = line
         .and_then(|line| line.split(' ').nth(2))
         .expect("a published release");
-    let uses = "\npub fn reset() -> u32 = meter::reset()\n\npub fn zero() -> u32 = gauge::zero()\n";
-    fs::write(dir.join("app/app.nan"), format!("{app}{uses}")).expect("the app's new uses");
+    let uses = "\npub fn zero() -> u32 = gauge::zero()\n";
+    fs::write(dir.join("app/app.nan"), format!("{app}{uses}")).expect("the app's new use");
     let output = run_in(dir, "check app").output;
-    for (line, item, release) in [
-        (7, "reset", "../meter".to_owned()),
-        (9, "zero", format!("{name} {root}")),
-    ] {
-        let reported = format!("\nerror name.newer-release app/app.nan:{line} app::{item}\n");
-        assert!(output.contains(&reported), "{output}");
-        assert!(
-            output.contains(&format!("\n    because note - - {release}\n")),
-            "{output}"
-        );
-    }
+    assert!(
+        output.contains("\nerror name.newer-release app/app.nan:5 app::zero\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("\n    because note - - {name} {root}\n")),
+        "{output}"
+    );
     assert!(
         output.contains("\n    because command - - nan dep sync\n"),
         "{output}"
@@ -411,7 +396,8 @@ fn a_store_entry_holding_another_release_than_the_lock_names_is_a_root_mismatch(
 }
 
 #[test]
-fn a_path_source_at_its_locked_release_checks_without_the_store_holding_it() {
+fn a_path_source_checks_at_its_locked_release_without_the_store_holding_it_and_then_awaits_a_sync()
+{
     let scratch = Scratch::new(&[
         (
             "dial/package.nan",
@@ -455,7 +441,7 @@ fn a_path_source_at_its_locked_release_checks_without_the_store_holding_it() {
     fs::write(dir.join("dial/dial.nan"), changed).expect("a changed dial");
     let output = run_in(dir, "check app").output;
     assert!(
-        output.contains("\nerror dep.release-missing app/package.nan:6 app\n"),
+        output.contains("\nincomplete dep.sync-pending app/package.nan:6 app\n"),
         "{output}"
     );
 }

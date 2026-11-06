@@ -9,7 +9,7 @@ use super::snapshot::Items;
 use super::{Checker, check_targets, unchecked};
 use crate::artefact::{self, AttestedSeal, Parts, ProtocolRoot};
 use crate::cache::Cache;
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, Reason, Role};
 use crate::encoding::{Record, bytes, list, uvar};
 use crate::hash::Hash;
 use crate::scope::Scope;
@@ -62,14 +62,22 @@ pub fn build(workspace: &Workspace, closure: &Closure, member: Member) -> Built 
     assemble(workspace.member(member), &coded)
 }
 
-/// The `dep.release-missing` diagnostics a scope holds of the path sources read for locked
-/// releases the local store lacks: each whose current state's code root is not its release's.
-pub fn missing_releases(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
+/// The `dep.sync-pending` diagnostics a scope holds of the path sources whose current states no
+/// store entry confirms as their locked releases: each whose current state's code root is not its
+/// release's.
+pub fn pending_syncs(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     let mut found = Vec::new();
     for unconfirmed in &workspace.unconfirmed {
         let package = &workspace.packages[unconfirmed.package];
         let path = format!("{}/package.nan", package.dir);
-        let diagnostic = Diagnostic::at(Code::DepReleaseMissing, &path, unconfirmed.line);
+        let diagnostic = Diagnostic {
+            because: vec![Reason {
+                role: Role::Command,
+                subject: "nan dep sync".to_owned(),
+                at: None,
+            }],
+            ..Diagnostic::at(Code::DepSyncPending, &path, unconfirmed.line)
+        };
         if found.contains(&diagnostic) || !scope.holds(workspace, &path, Some(unconfirmed.line)) {
             continue;
         }

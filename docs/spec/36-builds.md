@@ -56,10 +56,10 @@ No command of the toolchain opens a network connection.
 **Fetching** is making available to the toolchain a release that a [lock](29-identity-versioning.md#lock) does not name: taking a [candidate](29-identity-versioning.md#resolution) into resolution, or appending a path release to the local store. Fetching reads only path sources and the local store.
 
 - Only `nan dep add`, `nan dep sync` and `nan upgrade` without `--language`, which resolves as `nan dep sync` does, fetch.
-- Every other command reaches a dependency other than std only through its locked release, read as [Lock](29-identity-versioning.md#lock) states: from source when that release is the current state of its path source, and otherwise from the source tree its local store entry holds.
-- Reading the current state of a path source, or the releases the local store holds, to report `name.newer-release` is not fetching.
+- Every other command reads a dependency other than std as [Lock](29-identity-versioning.md#lock) states: as the current state of a path source whose directory holds it, and otherwise through its locked release, from the source tree its local store entry holds.
+- Reading the current state of a path source, or the releases the local store holds to report `name.newer-release`, is not fetching.
 
-In the next example, `nan dep sync` in `wire` fetches the current state of `ring` as a path release, and `nan check` of `wire` then checks `ring` from source, since its locked release is the current state of `../ring`; after `ring` changes, `nan check` reads the locked release from its source tree in the local store until `nan dep sync` runs again.
+In the next example, `nan dep sync` in `wire` fetches the current state of `ring` as a path release. Once `nan edit rename` changes `ring` and its use in `wire`, `nan check` of `wire` checks the new state of `ring` from source and reports that the lock of `wire` awaits `nan dep sync`.
 
 ```nan
 // file: ring/package.nan
@@ -88,6 +88,20 @@ package wire {
 //! Frame slots sized by queue capacity.
 
 pub const FRAME_SLOTS: usize = ring::DEFAULT_CAPACITY * 2
+```
+
+```text
+$ nan edit rename ring::DEFAULT_CAPACITY QUEUE_CAPACITY
+ok edit rename ring::DEFAULT_CAPACITY QUEUE_CAPACITY: files 2, errors 0, incomplete 0
+wrote ring/ring.nan
+wrote wire/wire.nan
+ok edit rename ring::DEFAULT_CAPACITY QUEUE_CAPACITY: files 2, errors 0, incomplete 0
+$ nan check wire
+ok check wire: errors 0, incomplete 1
+incomplete dep.sync-pending wire/package.nan:6 wire
+        dep ring "../ring"
+    because command - - nan dep sync
+ok check wire: errors 0, incomplete 1
 ```
 
 ## Toolchain hash

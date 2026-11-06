@@ -524,7 +524,7 @@ impl<'a> Checker<'a> {
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = workspace.diagnostics().collect();
-    found.extend(root::missing_releases(workspace, scope));
+    found.extend(root::pending_syncs(workspace, scope));
     found.extend(diagnostics(workspace, scope));
     for (_, file) in workspace.files() {
         found.extend(file.syntax.diagnostics.iter().map(|diagnostic| {
@@ -566,6 +566,12 @@ pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
             diagnostic.span = Some((line.start, line.end));
         }
     }
+    sort_diagnostics(&mut found);
+    found
+}
+
+/// Sorts diagnostics by path, line and code, keeping each once whatever bytes it is located on.
+pub fn sort_diagnostics(found: &mut Vec<Diagnostic>) {
     found.sort_by(|left, right| {
         (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
     });
@@ -575,7 +581,6 @@ pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
             ..later.clone()
         } == *earlier
     });
-    found
 }
 
 impl Checker<'_> {

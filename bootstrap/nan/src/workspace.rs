@@ -37,7 +37,7 @@ pub struct Workspace {
     /// The store entries confirming that path sources' current states are the releases their
     /// locks name.
     confirmed: Vec<crate::store::Entry>,
-    /// The path sources read for locked releases the local store lacks.
+    /// The path sources whose current states no store entry confirms as their locked releases.
     pub unconfirmed: Vec<Unconfirmed>,
     /// The dependency closures the packages share, each checking some of them.
     pub closures: Vec<Closure>,

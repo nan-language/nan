@@ -33,12 +33,13 @@ pub struct Change {
 /// What resolution decides.
 pub enum Outcome {
     /// The lock to write, the packages whose locked release changes, the package's source files
-    /// that forwarding rewrites, and its uses that stay moved.
+    /// that forwarding rewrites, and its errors under the lock: its uses that stay moved and,
+    /// when its own errors were ignored, every other.
     Resolved {
         lock: Lock,
         changes: Vec<Change>,
         sources: HashMap<String, Vec<u8>>,
-        moved: Vec<Diagnostic>,
+        errors: Vec<Diagnostic>,
     },
     /// No assignment is acceptable: the diagnostics the newest one fails with.
     Unresolved(Vec<Diagnostic>),
@@ -71,14 +72,18 @@ impl Candidate {
     }
 }
 
-/// The root a lock line names for the current state of a path source while candidates are
+/// The code root a lock line names for the current state of a path source while candidates are
 /// checked, before that state's code root is computed.
+fn pending_code_root(dir: &str) -> Vec<u8> {
+    format!("current\n{dir}").into_bytes()
+}
+
 fn pending_root(dir: &str) -> Hash {
-    Hash::of(format!("current\n{dir}").as_bytes())
+    Hash::of(&pending_code_root(dir))
 }
 
 /// The store a candidate lock reads: the entries of the local store, and for each path source's
-/// current state an entry holding its files.
+/// current state an entry of its pending code root attesting its files.
 struct Candidates<'a> {
     entries: &'a [Entry],
     current: HashMap<Hash, Entry>,
@@ -149,6 +154,7 @@ pub fn resolve(
             manifest.line,
         )];
         diagnostics.extend(resolver.newest.take().unwrap_or_default());
+        check::sort_diagnostics(&mut diagnostics);
         return Ok(Ok(Outcome::Unresolved(diagnostics)));
     };
     resolver.lock(store, &assignment)
@@ -360,14 +366,20 @@ impl Resolver<'_> {
             .packages
             .iter()
             .map(|package| {
+                let sources = check::package_sources(package);
+                let attestation = artefact::attestation(
+                    crate::toolchain::hash(1),
+                    artefact::source_tree_hash(&sources),
+                    &artefact::seal_list(&[]),
+                );
                 let entry = Entry {
                     index: 0,
                     package: package.name().unwrap_or_default().to_owned(),
                     name: None,
                     parent: None,
                     summary: None,
-                    artefact: Vec::new(),
-                    sources: check::package_sources(package),
+                    artefact: artefact::artefact(&pending_code_root(&package.dir), &attestation),
+                    sources,
                 };
                 (pending_root(&package.dir), entry)
             })
@@ -531,10 +543,13 @@ impl Resolver<'_> {
         let first = self.workspace.packages[self.package].machine.lock.is_none();
         let lock = check::approvals(&workspace, &workspace.packages[self.package], lock, first);
         let changes = self.changes(&lock);
-        let moved = match self.forwarding {
+        let errors = match self.forwarding || !self.own_errors {
             true => check::reported(&workspace, &Scope::Package(self.package))
                 .into_iter()
-                .filter(|diagnostic| diagnostic.code == Code::NameMoved)
+                .filter(|diagnostic| match self.own_errors {
+                    true => diagnostic.code == Code::NameMoved,
+                    false => diagnostic.code.class() == DiagnosticClass::Error,
+                })
                 .collect(),
             false => Vec::new(),
         };
@@ -542,7 +557,7 @@ impl Resolver<'_> {
             lock,
             changes,
             sources,
-            moved,
+            errors,
         }))
     }
 

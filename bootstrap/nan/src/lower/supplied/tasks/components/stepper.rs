@@ -355,16 +355,17 @@ fn end(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
     retire(lo, fx, record);
     let shape = shape(lo, &state_ty, &env_ty, &message_ty);
     let stopped = supply.abi.result.clone();
-    let result = supply.sret.expect("a stopped stepper's address");
-    for (field, ty, at) in [
-        ("state", &state_ty, shape.state_at),
-        ("env", &env_ty, shape.env_at),
-    ] {
-        let offset = lo.layouts.field(lo.ck, &stopped, None, field).offset;
-        let layout = lo.layout(ty);
-        let target = fx.offset(result, offset);
-        let source = fx.offset(record, at);
-        lo.copy(fx, target, source, layout.size, layout.align);
+    if let Some(result) = supply.sret {
+        for (field, ty, at) in [
+            ("state", &state_ty, shape.state_at),
+            ("env", &env_ty, shape.env_at),
+        ] {
+            let offset = lo.layouts.field(lo.ck, &stopped, None, field).offset;
+            let layout = lo.layout(ty);
+            let target = fx.offset(result, offset);
+            let source = fx.offset(record, at);
+            lo.copy(fx, target, source, layout.size, layout.align);
+        }
     }
     unreference(lo, fx, record);
     supply.done(lo, fx);

@@ -212,6 +212,20 @@ impl Body<'_, '_, '_, '_> {
                     big,
                 }
             }
+            (
+                Shape::Empty,
+                Location::Memory {
+                    address,
+                    unaligned,
+                    big,
+                    ..
+                },
+            ) => Location::Memory {
+                address,
+                ty: self.lo.ck.field_type(&ty, name).expect("a struct's field"),
+                unaligned,
+                big,
+            },
             (shape, location) => panic!("a field step {name} into {shape:?} at {location:?}"),
         }
     }

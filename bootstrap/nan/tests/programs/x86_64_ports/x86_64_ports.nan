@@ -1,0 +1,263 @@
+//! Lists the PCI functions and ports behind root ports and a PCI bridge with their bus paths, attaches them to an I/O domain, then hot-adds and removes a device on an empty root port's slot through QEMU's monitor.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The common configuration of a modern virtio device, which QEMU's devices lay out at the
+/// start of BAR 4, and the feature bit, in the second feature word, of virtio 1.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+} Common
+
+const COMMON_BAR: u8 = 4
+
+const VERSION_1: u32 = 1
+
+/// The serial port writing the console, and the one QEMU's monitor reads.
+const CONSOLE: u16 = 0x3F8
+
+const MONITOR: u16 = 0x3E8
+
+/// The polls of the slot's interrupt count before the kernel gives up.
+const POLLS: u32 = 100_000_000
+
+fn write(port: u16, text: Slice[u8]) {
+    var uart = trusted "the board decodes the port to a 16550 UART and nothing else maps it" { hw::Ports[Uart].map(port) }
+    for byte in text {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} write
+
+fn say(text: Slice[u8]) {
+    write(port: CONSOLE, text)
+} say
+
+fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
+    let alloc = k.alloc()
+    var functions = mut k.pci_functions()
+    var ports = mut k.pci_ports()
+    var hot_plug = mem::List[hw::PciPort].empty(alloc)
+    for port in take ports {
+        var line = mem::Bytes.empty(alloc)
+        mut line.append(b"port ")
+        address(mut line, at: port.address())
+        let buses = port.buses()
+        match port.kind() {
+            hw::PortKind.Root => mut line.append(b" root")
+            hw::PortKind.Upstream => mut line.append(b" upstream")
+            hw::PortKind.Downstream => mut line.append(b" downstream")
+            hw::PortKind.Bridge => mut line.append(b" bridge")
+        }
+        mut line.append(b" buses ")
+        hex(mut line, value: u32.widen(buses.secondary), digits: 2)
+        mut line.append(b"-")
+        hex(mut line, value: u32.widen(buses.subordinate), digits: 2)
+        match port.slot() {
+            Some(slot) => {
+                mut line.append(b" slot ")
+                hex(mut line, value: u32.widen(slot.number), digits: 1)
+                if slot.hot_plug {
+                    mut line.append(b" hot plug")
+                }
+            }
+            None => {}
+        }
+        mut line.append(b"\n")
+        say(line.view())
+        let events = mut port.slot_events()
+        if port.slot().is_some() and not events.present {
+            mut hot_plug.push(take port)
+        } else {
+            take port.release()
+        }
+    }
+    var behind = mem::List[hw::PciFunction].empty(alloc)
+    for function in take functions {
+        if function.address().bus != 0 {
+            listed(function, prefix: b"function ", alloc)
+            mut behind.push(take function)
+        } else {
+            take function.release()
+        }
+    }
+    let Some(iommu) = mut k.iommu() else {
+        say(b"iommu: none\n")
+        loop {
+        }
+    }
+    say(b"iommu: enabled\n")
+    let domain = match attempt iommu.domain() {
+        Ok(made) => made
+        Err(_) => {
+            say(b"iommu: no domain\n")
+            loop {
+            }
+        }
+    }
+    for function in take behind {
+        var attached = function
+        attach(mut attached, domain, alloc)
+        take attached.release()
+    }
+    take k.anchor(take iommu, run: fn[take hot_plug, take domain](exec: task::Executor) limits stack 65_536 {
+        for port in take hot_plug {
+            plugged(take port, domain, alloc)
+        }
+        take domain.close()
+    })
+} main
+
+/// Installs the slot's interrupt, asks QEMU to add a device to the slot and lists it once the
+/// slot reports it, then asks QEMU to remove it and powers the slot off once its attention
+/// button is pressed.
+fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
+    var slot = port
+    let shared = match mut slot.slot_irq(cpu: 0, dev: 0u64, on_irq: count) {
+        Ok(installed) => installed
+        Err(_) => {
+            say(b"hot plug: no interrupt\n")
+            take slot.release()
+            return
+        }
+    }
+    say(b"hot plug: interrupt installed\n")
+    write(port: MONITOR, text: b"device_add virtio-rng-pci,bus=rp2,id=hot,disable-legacy=on,iommu_platform=on\n")
+    var seen = interrupted(shared, seen: 0)
+    let arrived = mut slot.slot_events()
+    if arrived.presence_changed and arrived.present {
+        say(b"hot plug: a card arrived\n")
+    }
+    mut slot.power(on: true)
+    var found = mut slot.rescan(alloc)
+    var hot = mem::List[hw::PciFunction].empty(alloc)
+    for function in take found {
+        listed(function, prefix: b"rescan: function ", alloc)
+        var added = function
+        attach(mut added, domain, alloc)
+        mut hot.push(take added)
+    }
+    write(port: MONITOR, text: b"device_del hot\n")
+    seen = interrupted(shared, seen)
+    let pressed = mut slot.slot_events()
+    if pressed.attention_pressed {
+        say(b"hot plug: attention button pressed\n")
+    }
+    mut slot.power(on: false)
+    for function in take hot {
+        var left = function
+        var refused = false
+        match attempt hw::Mmio[Common].of_bar(mut left, index: 1, offset: 0) {
+            Ok(window) => take window.unmap()
+            Err(error) => {
+                refused = error == hw::PciError.Removed
+            }
+        }
+        if left.removed() and refused and (attempt mut left.attach(domain.space())).is_err() {
+            say(b"power off: the function is cut off\n")
+        }
+        take left.release()
+    }
+    discard interrupted(shared, seen)
+    let left = mut slot.slot_events()
+    if left.presence_changed and not left.present {
+        say(b"hot plug: the card left\n")
+    }
+    let again = mut slot.rescan(alloc)
+    if again.len() == 0 {
+        say(b"rescan: nothing\n")
+    }
+    for function in take again {
+        take function.release()
+    }
+    discard take shared.uninstall()
+    take slot.release()
+} plugged
+
+interrupt fn count(mut counted: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    counted = counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} count
+
+/// The interrupts counted once the count passes `seen`, or after `POLLS` polls.
+fn interrupted(shared: hw::IrqShared[u64], seen: u64) -> u64 {
+    var counted = seen
+    for _ in 0..<POLLS {
+        counted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut total: u64) -> u64 limits notrap, terminates, noalloc {
+                return total
+            })
+        })
+        if counted > seen {
+            return counted
+        }
+    }
+    return counted
+} interrupted
+
+/// Attaches a function to the domain and reports whether it attached and, attached, whether
+/// a modern virtio device answers through its BAR.
+fn attach(mut function: hw::PciFunction, domain: hw::IoDomain, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"attach ")
+    address(mut line, at: function.address())
+    match attempt mut function.attach(domain.space()) {
+        Ok(_) => {
+            mut line.append(b": ok")
+            match attempt hw::Mmio[Common].of_bar(mut function, index: COMMON_BAR, offset: 0) {
+                Ok(common) => {
+                    var regs = common
+                    mut regs.write(Common.device_feature_select, value: 1)
+                    if (mut regs.read(Common.device_feature) & VERSION_1) != 0 {
+                        mut line.append(b", virtio 1 through its BAR")
+                    }
+                    take regs.unmap()
+                }
+                Err(_) => mut line.append(b", no BAR")
+            }
+        }
+        Err(hw::IommuError.Unsupported) => mut line.append(b": unsupported")
+        Err(hw::IommuError.Exhausted) => mut line.append(b": exhausted")
+        Err(hw::IommuError.Physical) => mut line.append(b": physical")
+        Err(hw::IommuError.Closed) => mut line.append(b": closed")
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} attach
+
+/// Writes a function's bus path and ids after a prefix.
+fn listed(function: hw::PciFunction, prefix: Slice[u8], alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(prefix)
+    address(mut line, at: function.address())
+    let ids = function.config_read(0)
+    mut line.append(b" ")
+    hex(mut line, value: ids & 0xFFFF, digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: ids >> 16, digits: 4)
+    mut line.append(b"\n")
+    say(line.view())
+} listed
+
+/// Appends a bus path as segment:bus:device.function.
+fn address(mut line: mem::Bytes, at: hw::PciAddress) {
+    hex(mut line, value: u32.widen(at.segment), digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.bus), digits: 2)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.device), digits: 2)
+    mut line.append(b".")
+    hex(mut line, value: u32.widen(at.function), digits: 1)
+} address
+
+/// Appends a value in `digits` hexadecimal digits.
+fn hex(mut line: mem::Bytes, value: u32, digits: u32) {
+    var shift = digits * 4
+    while shift > 0 {
+        shift -= 4
+        mut line.push(b"0123456789abcdef"[usize.widen((value >> shift) & 0xF)])
+    }
+} hex

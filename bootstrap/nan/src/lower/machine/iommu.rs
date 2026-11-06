@@ -76,8 +76,18 @@ impl Lowering<'_, '_> {
 
     /// Takes a unit's lock with maskable interrupts disabled, giving the state to restore.
     pub(crate) fn iommu_lock(&mut self, fx: &mut Fx, unit: Value) -> Value {
+        self.spin_lock(fx, unit, unit::LOCK)
+    }
+
+    pub(crate) fn iommu_unlock(&mut self, fx: &mut Fx, unit: Value, flags: Value) {
+        self.spin_unlock(fx, unit, unit::LOCK, flags);
+    }
+
+    /// Takes the lock whose word is at `offset` from `base` with maskable interrupts disabled,
+    /// giving the state to restore.
+    pub(crate) fn spin_lock(&mut self, fx: &mut Fx, base: Value, offset: u64) -> Value {
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
-        let lock = fx.offset(unit, unit::LOCK);
+        let lock = fx.offset(base, offset);
         fx.repeat(&[], |fx, _| {
             let free = fx.ptr(0);
             let held = fx.ptr(1);
@@ -93,8 +103,8 @@ impl Lowering<'_, '_> {
         flags
     }
 
-    pub(crate) fn iommu_unlock(&mut self, fx: &mut Fx, unit: Value, flags: Value) {
-        let lock = fx.offset(unit, unit::LOCK);
+    pub(crate) fn spin_unlock(&mut self, fx: &mut Fx, base: Value, offset: u64, flags: Value) {
+        let lock = fx.offset(base, offset);
         let free = fx.ptr(0);
         fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
         self.call_stub(fx, Stub::IrqRestore, &[flags]);

@@ -1027,7 +1027,7 @@ A module performs an authority **directly** when one of its items, under a decla
 | Authority | Operations |
 | --- | --- |
 | `device` | the device operations of [register windows](23-low-level.md#register-windows), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions), and every confined operation |
-| `confined` | the confined operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks) and [PCI functions](24-kernel.md#pci-functions) |
+| `confined` | the confined operations of [register windows](23-low-level.md#register-windows), [DMA](23-low-level.md#dma), [I/O domains](23-low-level.md#io-domains), [locks](24-kernel.md#locks), [PCI functions](24-kernel.md#pci-functions) and [PCI ports](24-kernel.md#pci-ports) |
 | `priv` | calls of [privileged intrinsics](23-low-level.md#privileged-intrinsics) and declarations of landing fns |
 | `trusted` | [trusted code](23-low-level.md#trusted-code), `assume` and declarations of [foreign fns](23-low-level.md#foreign-functions) |
 | `validate` | the operations that [validate grants](15-untrusted.md#validate-grants) list |

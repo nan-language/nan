@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 53] = [
+const DRAWING: [&str; 54] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -62,6 +62,7 @@ const DRAWING: [&str; 53] = [
     "boot::Kernel.regions",
     "boot::Kernel.modules",
     "boot::Kernel.pci_functions",
+    "boot::Kernel.pci_ports",
     "boot::Kernel.anchor",
     "boot::Machine.enter",
     "host::Runner.run",

@@ -455,6 +455,8 @@ const TEXT_BOOT_BOOT: Str =
     \\
     \\pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
     \\
+    \\pub fn Kernel.pci_ports(mut self) -> mem::List[hw::PciPort]
+    \\
     \\pub fn Kernel.loader(self) -> Option[sys::load::Loader]
     \\
     \\pub fn Kernel.command_line(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
@@ -9590,9 +9592,10 @@ const TEXT_HW_IOMMU: Str =
     \\
     \\/// The offsets of the unit record, a chunk the runtime's flush and interrupt routines read too:
     \\/// its kind, register base, command queue, the queue's next entry, the interrupt remapping
-    \\/// table, its flags, then past the runtime's lock and wait words, the table of bus 0's contexts
-    \\/// or streams, the free table pages, a bit per function of bus 0 it translates, and the domain
-    \\/// slots, each a domain record and a generation.
+    \\/// table, its flags, then past the runtime's lock and wait words, its root table of contexts or
+    \\/// its stream table, the free table pages, what it translates, the DMAR table's remapping unit
+    \\/// on VT-d and the entries of its stream table on SMMUv3, and the domain slots, each a domain
+    \\/// record and a generation.
     \\const UNIT_KIND: u64 = 0
     \\
     \\const UNIT_REGISTERS: u64 = 8
@@ -9607,9 +9610,7 @@ const TEXT_HW_IOMMU: Str =
     \\
     \\const UNIT_FREE: u64 = 72
     \\
-    \\const UNIT_COVERED: u64 = 80
-    \\
-    \\const COVERED_WORDS: u64 = 4
+    \\const UNIT_COVERS: u64 = 80
     \\
     \\const UNIT_SLOTS: u64 = 128
     \\
@@ -9629,13 +9630,15 @@ const TEXT_HW_IOMMU: Str =
     \\
     \\const PASS_THROUGH: u64 = 16
     \\
-    \\/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function
-    \\/// and a mapping. Every such record holds its holding at offset 0.
+    \\/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function,
+    \\/// a mapping and a PCI port. Every such record holds its holding at offset 0.
     \\const DOMAIN_TAG: u64 = 1
     \\
     \\const FUNCTION_TAG: u64 = 2
     \\
     \\const MAPPING_TAG: u64 = 3
+    \\
+    \\const PORT_TAG: u64 = 4
     \\
     \\const RECORD_HOLDING: u64 = 0
     \\
@@ -9748,12 +9751,15 @@ const TEXT_HW_IOMMU: Str =
     \\/// The remapping structures of the DMAR table: where they start, the kinds of a remapping
     \\/// unit and of a reserved memory region, the flag of a unit including every PCI function, and
     \\/// the table flag saying the platform remaps interrupts; where a unit's device scopes start, the
-    \\/// kind of an endpoint's scope and the length of one naming a device of its start bus.
+    \\/// kinds of an endpoint's scope and of a bridge's, and the length of one naming a device of its
+    \\/// start bus.
     \\const DMAR_STRUCTURES: u64 = 48
     \\
     \\const DMAR_SCOPES: u64 = 16
     \\
     \\const ENDPOINT_SCOPE: u8 = 1
+    \\
+    \\const BRIDGE_SCOPE: u8 = 2
     \\
     \\const ONE_HOP: u64 = 8
     \\
@@ -9782,15 +9788,20 @@ const TEXT_HW_IOMMU: Str =
     \\} SmmuRegisters
     \\
     \\/// The identity bits SMMUv3 needs: stage 1, AArch64 tables, coherent table walks, 4 KiB pages,
-    \\/// and the stream id bits; the control bits enabling it and its command queue; the bypass
-    \\/// register's update and abort bits; the read-allocate hint of a base register; inner
-    \\/// shareable write-back tables and queues; and a stream table and command queue of 2^8
-    \\/// entries.
+    \\/// and the stream id bits; the identity bit of two-level stream tables; the control bits
+    \\/// enabling it and its command queue; the bypass register's update and abort bits; the
+    \\/// read-allocate hint of a base register; inner shareable write-back tables and queues; a
+    \\/// command queue of 2^8 entries; the stream ids of a bus's functions, whose stream table
+    \\/// entries fill a level-2 table of a two-level stream table; its format and split, and the span
+    \\/// of a level-1 descriptor naming such a table; and the buses one chunk of a linear stream table
+    \\/// holds.
     \\const STAGE1: u32 = 0x2
     \\
     \\const AARCH64_TABLES: u32 = 0x8
     \\
     \\const WALKS_COHERENT: u32 = 0x10
+    \\
+    \\const TWO_LEVELS: u32 = 0x800_0000
     \\
     \\const GRANULE_4K: u32 = 0x10
     \\
@@ -9807,6 +9818,18 @@ const TEXT_HW_IOMMU: Str =
     \\const SHARED_CACHED: u32 = 0xD75
     \\
     \\const LOG2_ENTRIES: u64 = 8
+    \\
+    \\const BUS_STREAMS: u64 = 256
+    \\
+    \\const BUS_TABLE: u64 = 16_384
+    \\
+    \\const TWO_LEVEL_FORMAT: u32 = 0x1_0000
+    \\
+    \\const BUS_SPLIT: u32 = 0x200
+    \\
+    \\const BUS_SPAN: u64 = 9
+    \\
+    \\const LINEAR_BUSES: u64 = 4
     \\
     \\/// A stream table entry's words: valid, then translated by stage 1 through one context
     \\/// descriptor or bypassing translation; the inner shareable write-back walks of its second word.
@@ -10003,14 +10026,16 @@ const TEXT_HW_IOMMU: Str =
     \\    end_mapping(mapping)
     \\} unmapped
     \\
-    \\/// Releases what a holding of an abandoned domain holds: a mapping ends, and a domain or
-    \\/// function is cut off from memory.
+    \\/// Releases what a holding of an abandoned domain holds: a mapping ends, a domain or function
+    \\/// is cut off from memory, and a port's record is freed.
     \\pkg fn settled(kind: u64, payload: u64) {
     \\    let tag = peek(payload + RECORD_TAG)
     \\    if kind == UNMAP {
     \\        end_mapping(payload)
     \\    } else if tag == DOMAIN_TAG {
     \\        close_domain(payload)
+    \\    } else if tag == PORT_TAG {
+    \\        free_record(payload)
     \\    } else {
     \\        cut_off(payload)
     \\    }
@@ -10037,9 +10062,15 @@ const TEXT_HW_IOMMU: Str =
     \\    let unit = iommu_unit()
     \\    let flags = iommu_lock()
     \\    let slot = peek(record + DOMAIN_SLOT)
-    \\    for requester in 0..<256u64 {
-    \\        if attached_domain(unit, requester) == slot + FIRST_DOMAIN {
-    \\            clear_entry(unit, requester)
+    \\    for bus in 0..<256u64 {
+    \\        let first_entry = bus_entries(unit, bus, create: false)
+    \\        if first_entry != 0 {
+    \\            for function in 0..<BUS_STREAMS {
+    \\                let entry = first_entry + function * entry_bytes(unit)
+    \\                if attached_domain(unit, entry) == slot + FIRST_DOMAIN {
+    \\                    clear_at(unit, entry)
+    \\                }
+    \\            }
     \\        }
     \\    }
     \\    let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
@@ -10064,10 +10095,9 @@ const TEXT_HW_IOMMU: Str =
     \\    return peek(entry)
     \\} live
     \\
-    \\/// The domain id a requester's context or stream reaches, zero when it reaches none: the
+    \\/// The domain id a context or stream table entry reaches, zero when it reaches none: the
     \\/// pass-through id, or a slot's plus `FIRST_DOMAIN`.
-    \\fn attached_domain(unit: u64, requester: u64) -> u64 {
-    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\fn attached_domain(unit: u64, entry: u64) -> u64 {
     \\    let head = peek(entry)
     \\    if (head & 1) == 0 {
     \\        return 0
@@ -10090,10 +10120,49 @@ const TEXT_HW_IOMMU: Str =
     \\    return STREAM_BYTES
     \\} entry_bytes
     \\
+    \\/// The first context or stream table entry of a bus's requesters, under the unit's lock,
+    \\/// adding the bus's context table on VT-d when `create` holds; zero when the unit has none or
+    \\/// no table page is left.
+    \\fn bus_entries(unit: u64, bus: u64, create: bool) -> u64 {
+    \\    let table = peek(unit + UNIT_STREAMS)
+    \\    if peek(unit + UNIT_KIND) == SMMU {
+    \\        if (bus + 1) * BUS_STREAMS > peek(unit + UNIT_COVERS) {
+    \\            return 0
+    \\        }
+    \\        return table + bus * BUS_STREAMS * STREAM_BYTES
+    \\    }
+    \\    let root = table + bus * 16
+    \\    if (peek(root) & 1) == 0 {
+    \\        if not create {
+    \\            return 0
+    \\        }
+    \\        let contexts = table_page(unit)
+    \\        if contexts == 0 {
+    \\            return 0
+    \\        }
+    \\        poke(root, value: contexts | 0x1)
+    \\        publish(unit, address: root, bytes: 16)
+    \\    }
+    \\    return peek(root) & FRAME_MASK
+    \\} bus_entries
+    \\
+    \\/// A requester's context or stream table entry, as `bus_entries` gives its bus's.
+    \\fn requester_entry(unit: u64, requester: u64, create: bool) -> u64 {
+    \\    let first_entry = bus_entries(unit, bus: requester >> 8, create)
+    \\    if first_entry == 0 {
+    \\        return 0
+    \\    }
+    \\    return first_entry + (requester & 0xFF) * entry_bytes(unit)
+    \\} requester_entry
+    \\
     \\/// Points a requester's context or stream at a domain, or passes it through for zero, under
-    \\/// the unit's lock; the first word, holding the valid bit, is written last.
-    \\fn set_entry(unit: u64, requester: u64, domain: u64) {
-    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\/// the unit's lock, the first word, holding the valid bit, written last; false when no table
+    \\/// page is left.
+    \\fn set_entry(unit: u64, requester: u64, domain: u64) -> bool {
+    \\    let entry = requester_entry(unit, requester, create: true)
+    \\    if entry == 0 {
+    \\        return false
+    \\    }
     \\    if peek(unit + UNIT_KIND) == VTD {
     \\        if domain == 0 {
     \\            poke(entry + 8, value: 0x2 | (PASS_DOMAIN << 8))
@@ -10110,14 +10179,31 @@ const TEXT_HW_IOMMU: Str =
     \\        poke(entry, value: (domain + DOMAIN_CONTEXT) | STREAM_TRANSLATED)
     \\    }
     \\    publish(unit, address: entry, bytes: 16)
+    \\    return true
     \\} set_entry
     \\
     \\/// Makes a requester's DMA reach nothing, under the unit's lock.
     \\fn clear_entry(unit: u64, requester: u64) {
-    \\    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    \\    let entry = requester_entry(unit, requester, create: false)
+    \\    if entry != 0 {
+    \\        clear_at(unit, entry)
+    \\    }
+    \\} clear_entry
+    \\
+    \\/// Makes the DMA of every requester of a bus reach nothing, under the unit's lock.
+    \\fn clear_bus(unit: u64, bus: u64) {
+    \\    let first_entry = bus_entries(unit, bus, create: false)
+    \\    if first_entry != 0 {
+    \\        for function in 0..<BUS_STREAMS {
+    \\            clear_at(unit, entry: first_entry + function * entry_bytes(unit))
+    \\        }
+    \\    }
+    \\} clear_bus
+    \\
+    \\fn clear_at(unit: u64, entry: u64) {
     \\    poke(entry, value: 0)
     \\    publish(unit, address: entry, bytes: 8)
-    \\} clear_entry
+    \\} clear_at
     \\
     \\/// Maps the pages of a range at their own addresses in a domain's tables, as device memory on
     \\/// SMMUv3 when `device` holds, under the unit's lock; false when no table page is left.
@@ -10302,13 +10388,10 @@ const TEXT_HW_IOMMU: Str =
     \\    poke(unit + UNIT_REGISTERS, value: base)
     \\    poke(unit + UNIT_REMAPPING, value: remapping)
     \\    poke(unit + UNIT_FLAGS, value: flags)
-    \\    cover_scopes(unit, drhd)
+    \\    poke(unit + UNIT_COVERS, value: drhd)
     \\    let root = table_page(unit)
-    \\    let contexts = table_page(unit)
     \\    poke(unit + UNIT_QUEUE, value: table_page(unit))
-    \\    poke(unit + UNIT_STREAMS, value: contexts)
-    \\    poke(root, value: contexts | 0x1)
-    \\    publish(unit, address: root, bytes: 16)
+    \\    poke(unit + UNIT_STREAMS, value: root)
     \\    publish(unit, address: remapping, bytes: REMAPPING_CHUNKS * CHUNK)
     \\    mut regs.write(VtdRegisters.root, value: root)
     \\    vtd_command(mut regs, bit: SET_ROOT)
@@ -10371,50 +10454,50 @@ const TEXT_HW_IOMMU: Str =
     \\    return unit
     \\} vtd_unit
     \\
-    \\/// Records in the unit the functions of bus 0 a remapping unit translates: every one when it
-    \\/// includes every PCI function, otherwise the endpoints its device scopes name on bus 0.
-    \\fn cover_scopes(unit: u64, drhd: u64) {
-    \\    if (byte_at(drhd + 4) & ALL_FUNCTIONS) != 0 {
-    \\        cover_all(unit)
-    \\        return
+    \\/// Whether the unit translates a requester of a segment whose configuration an ECAM, or the
+    \\/// configuration ports for zero, reaches: on VT-d one of segment 0 its remapping unit includes,
+    \\/// every one when it includes every PCI function, otherwise each endpoint its device scopes name
+    \\/// one hop below their start bus and each function of the buses below each bridge they name so;
+    \\/// on SMMUv3 one of segment 0 its stream table holds.
+    \\fn covered(unit: u64, segment: u64, ecam: u64, requester: u64) -> bool {
+    \\    let covers = peek(unit + UNIT_COVERS)
+    \\    if segment != 0 {
+    \\        return false
     \\    }
-    \\    let end = drhd + u64.widen(u32_at(drhd) >> 16)
-    \\    var at = drhd + DMAR_SCOPES
+    \\    if peek(unit + UNIT_KIND) == SMMU {
+    \\        return requester < covers
+    \\    }
+    \\    if (byte_at(covers + 4) & ALL_FUNCTIONS) != 0 {
+    \\        return true
+    \\    }
+    \\    let end = covers + u64.widen(u32_at(covers) >> 16)
+    \\    var at = covers + DMAR_SCOPES
     \\    while at + 2 <= end {
     \\        let length = u64.widen(byte_at(at + 1))
     \\        if length == 0 {
-    \\            return
+    \\            return false
     \\        }
-    \\        if byte_at(at) == ENDPOINT_SCOPE and length == ONE_HOP and byte_at(at + 5) == 0 {
-    \\            let requester = (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
-    \\            cover(unit, requester)
+    \\        let named = (u64.widen(byte_at(at + 5)) << 8) | (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
+    \\        if length == ONE_HOP and named == requester and (byte_at(at) == ENDPOINT_SCOPE or byte_at(at) == BRIDGE_SCOPE) {
+    \\            return true
+    \\        }
+    \\        if length == ONE_HOP and byte_at(at) == BRIDGE_SCOPE {
+    \\            let buses = config_read(ecam, requester: u32.truncate(named), offset: BUSES_OFFSET)
+    \\            let bus = u32.truncate(requester >> 8)
+    \\            if bus >= ((buses >> 8) & 0xFF) and bus <= ((buses >> 16) & 0xFF) and ((buses >> 8) & 0xFF) != 0 {
+    \\                return true
+    \\            }
     \\        }
     \\        at += length
     \\    }
-    \\} cover_scopes
-    \\
-    \\/// Records that the unit translates every function of bus 0.
-    \\fn cover_all(unit: u64) {
-    \\    for word in 0..<COVERED_WORDS {
-    \\        poke(unit + UNIT_COVERED + word * 8, value: 0xFFFF_FFFF_FFFF_FFFF)
-    \\    }
-    \\} cover_all
-    \\
-    \\/// Records that the unit translates a requester of bus 0.
-    \\fn cover(unit: u64, requester: u64) {
-    \\    let at = unit + UNIT_COVERED + (requester >> 6) * 8
-    \\    poke(at, value: peek(at) | (1u64 << u32.truncate(requester & 0x3F)))
-    \\} cover
-    \\
-    \\/// Whether the unit translates a requester of bus 0.
-    \\fn covered(unit: u64, requester: u64) -> bool {
-    \\    let bits = peek(unit + UNIT_COVERED + (requester >> 6) * 8)
-    \\    return ((bits >> u32.truncate(requester & 0x3F)) & 1) != 0
+    \\    return false
     \\} covered
     \\
     \\/// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
-    \\/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0. Every
-    \\/// function's DMA then reaches nothing until it is attached.
+    \\/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0, its stream
+    \\/// table holding the stream table entries of the PCI host's buses that its stream ids reach,
+    \\/// in a level-2 table per bus, or of the buses one chunk holds when it walks no two-level
+    \\/// table. Every function's DMA then reaches nothing until it is attached.
     \\fn started_smmu() -> Option[Iommu] {
     \\    let node = tree_node(compatible: "arm,smmu-v3")
     \\    if node.reg == 0 {
@@ -10430,8 +10513,15 @@ const TEXT_HW_IOMMU: Str =
     \\        take regs.unmap()
     \\        return None
     \\    }
+    \\    let walks_two = (identity & TWO_LEVELS) != 0
+    \\    let wanted = tree_buses()
+    \\    var log2 = LOG2_ENTRIES
+    \\    while log2 < stream_bits and (1u64 << u32.fit(log2)) < wanted * BUS_STREAMS and (walks_two or (1u64 << u32.fit(log2)) < LINEAR_BUSES * BUS_STREAMS) {
+    \\        log2 += 1
+    \\    }
+    \\    let buses = (1u64 << u32.fit(log2)) / BUS_STREAMS
     \\    let unit = chunks(1)
-    \\    let streams = chunks(1)
+    \\    let streams = chunks((buses * BUS_TABLE + CHUNK - 1) / CHUNK)
     \\    if unit == 0 or streams == 0 {
     \\        take regs.unmap()
     \\        return None
@@ -10440,7 +10530,16 @@ const TEXT_HW_IOMMU: Str =
     \\    poke(unit + UNIT_REGISTERS, value: base)
     \\    poke(unit + UNIT_FLAGS, value: u64.widen(sizes & 0x7) << 8)
     \\    poke(unit + UNIT_STREAMS, value: streams)
-    \\    cover_all(unit)
+    \\    poke(unit + UNIT_COVERS, value: buses * BUS_STREAMS)
+    \\    var table = streams
+    \\    var format = u32.truncate(log2)
+    \\    if walks_two {
+    \\        table = table_page(unit)
+    \\        for bus in 0..<buses {
+    \\            poke(table + bus * 8, value: (streams + bus * BUS_TABLE) | BUS_SPAN)
+    \\        }
+    \\        format |= TWO_LEVEL_FORMAT | BUS_SPLIT
+    \\    }
     \\    let queue = table_page(unit)
     \\    poke(unit + UNIT_QUEUE, value: queue)
     \\    mut regs.write(SmmuRegisters.control, value: 0)
@@ -10450,8 +10549,8 @@ const TEXT_HW_IOMMU: Str =
     \\    while (mut regs.read(SmmuRegisters.bypass) & UPDATE) != 0 {
     \\    }
     \\    mut regs.write(SmmuRegisters.control1, value: SHARED_CACHED)
-    \\    mut regs.write(SmmuRegisters.streams, value: streams | READ_ALLOCATE)
-    \\    mut regs.write(SmmuRegisters.streams_config, value: u32.truncate(LOG2_ENTRIES))
+    \\    mut regs.write(SmmuRegisters.streams, value: table | READ_ALLOCATE)
+    \\    mut regs.write(SmmuRegisters.streams_config, value: format)
     \\    mut regs.write(SmmuRegisters.queue_base, value: queue | READ_ALLOCATE | LOG2_ENTRIES)
     \\    mut regs.write(SmmuRegisters.queue_produce, value: 0)
     \\    mut regs.write(SmmuRegisters.queue_consume, value: 0)
@@ -10504,12 +10603,13 @@ const TEXT_HW_PACKAGE: Str =
     \\
 
 const TEXT_HW_PCI: Str =
-    \\//! PCI functions: the endpoints of bus 0, their configuration, the register windows of their memory BARs, their attachment to I/O domains, and their MSI-X interrupts.
+    \\//! PCI functions and ports: the functions and bridges below each host bridge, their configuration, the register windows of their memory BARs, their attachment to I/O domains, their MSI-X interrupts, and the hot-plug slots of PCIe ports.
     \\
     \\/// A function record's offsets: past its holding and tag, its requester id, the ECAM base its
     \\/// configuration is read through, zero for port I/O, the space it is attached to, the first
     \\/// record of the windows given over its BARs, its MSI-X capability's offset, the offset from its
-    \\/// BARs' bus addresses to the CPU's, then each BAR's base, size and kind.
+    \\/// BARs' bus addresses to the CPU's, then each BAR's base, size and kind; then its host's record, its bus's generation when it was
+    \\/// found, its path flags, and the next record found and not yet listed.
     \\const FUNCTION_REQUESTER: u64 = 16
     \\
     \\const FUNCTION_ECAM: u64 = 24
@@ -10528,7 +10628,30 @@ const TEXT_HW_PCI: Str =
     \\
     \\const BARS: u64 = 6
     \\
-    \\const FUNCTION_RECORD: u64 = 208
+    \\const FUNCTION_HOST: u64 = 208
+    \\
+    \\const FUNCTION_GENERATION: u64 = 216
+    \\
+    \\const FUNCTION_FLAGS: u64 = 224
+    \\
+    \\const FUNCTION_NEXT: u64 = 232
+    \\
+    \\const FUNCTION_RECORD: u64 = 240
+    \\
+    \\/// A port's record extends a function's, its path flags unused, with its PCIe capability's
+    \\/// offset, the flags of the path below it, and the bus address its memory window
+    \\/// gives next with that window's end; a bridge has two BARs.
+    \\const PORT_EXPRESS: u64 = 240
+    \\
+    \\const PORT_BELOW: u64 = 248
+    \\
+    \\const PORT_NEXT: u64 = 256
+    \\
+    \\const PORT_END: u64 = 264
+    \\
+    \\const PORT_RECORD: u64 = 272
+    \\
+    \\const BRIDGE_BARS: u64 = 2
     \\
     \\/// A window record's offsets: the next window record of its function, then its BAR and the
     \\/// bytes of the BAR it spans, from its start to its end.
@@ -10541,6 +10664,46 @@ const TEXT_HW_PCI: Str =
     \\const WINDOW_END: u64 = 24
     \\
     \\const WINDOW_RECORD: u64 = 32
+    \\
+    \\/// The path flags of a function: its DMA reaches the IOMMU under another requester id, or a
+    \\/// peer may receive it without the IOMMU.
+    \\const ALIASED: u64 = 1
+    \\
+    \\const EXPOSED: u64 = 2
+    \\
+    \\/// A host record's offsets: the next host's record, its segment, the ECAM base of its bus 0,
+    \\/// zero for port I/O, its first and last bus, the bus address window of 32-bit memory its BARs
+    \\/// are given addresses from with the offset to the CPU's, then each bus's generation, which
+    \\/// grows each time the functions found on it are cut off.
+    \\const HOST_NEXT: u64 = 0
+    \\
+    \\const HOST_SEGMENT: u64 = 8
+    \\
+    \\const HOST_ECAM: u64 = 16
+    \\
+    \\const HOST_FIRST: u64 = 24
+    \\
+    \\const HOST_LAST: u64 = 32
+    \\
+    \\const HOST_WINDOW: u64 = 40
+    \\
+    \\const HOST_WINDOW_END: u64 = 48
+    \\
+    \\const HOST_OFFSET: u64 = 56
+    \\
+    \\const HOST_GENERATIONS: u64 = 64
+    \\
+    \\const HOST_RECORD: u64 = 2_112
+    \\
+    \\/// The PCI record's offsets: the first host's record, and the first and last records of the
+    \\/// functions and of the ports found and not yet listed.
+    \\const PCI_HOSTS: u64 = 0
+    \\
+    \\const PCI_FUNCTIONS: u64 = 8
+    \\
+    \\const PCI_PORTS: u64 = 24
+    \\
+    \\const PCI_RECORD: u64 = 40
     \\
     \\/// The attachment of a function attached to physical memory.
     \\const ATTACHED_PHYSICAL: u64 = 0xFFFF_FFFF_FFFF_FFFF
@@ -10587,8 +10750,128 @@ const TEXT_HW_PCI: Str =
     \\
     \\const MSIX_MASKED: u32 = 0x4000_0000
     \\
-    \\/// The configuration space of a bus in an ECAM.
-    \\const BUS_BYTES: u64 = 0x10_0000
+    \\/// A bridge's header type and its bus numbers, I/O window, memory window, prefetchable window
+    \\/// and that window's upper halves; a memory window's granule; the values closing a bridge's
+    \\/// I/O and memory windows; and a header type's bit marking a multi-function device.
+    \\const BRIDGE_HEADER: u32 = 1
+    \\
+    \\const BUSES_OFFSET: u32 = 0x18
+    \\
+    \\const IO_WINDOW: u32 = 0x1C
+    \\
+    \\const BRIDGE_MEMORY: u32 = 0x20
+    \\
+    \\const PREFETCH_WINDOW: u32 = 0x24
+    \\
+    \\const PREFETCH_BASE_HIGH: u32 = 0x28
+    \\
+    \\const PREFETCH_LIMIT_HIGH: u32 = 0x2C
+    \\
+    \\const WINDOW_GRANULE: u64 = 0x10_0000
+    \\
+    \\const CLOSED_IO: u32 = 0xF0
+    \\
+    \\const CLOSED_WINDOW: u32 = 0xFFF0
+    \\
+    \\const MULTI_FUNCTION: u32 = 0x80
+    \\
+    \\/// The PCIe capability's id, its port types, and the offsets from it of its link capabilities,
+    \\/// link status, slot capabilities, slot control and slot status; the bit saying a port has a
+    \\/// slot, and the link capability bit saying it reports an active link.
+    \\const EXPRESS_ID: u32 = 0x10
+    \\
+    \\const ROOT_PORT: u32 = 4
+    \\
+    \\const UPSTREAM_PORT: u32 = 5
+    \\
+    \\const DOWNSTREAM_PORT: u32 = 6
+    \\
+    \\const LINK_CAPABILITIES: u32 = 0x0C
+    \\
+    \\const LINK_CONTROL: u32 = 0x10
+    \\
+    \\const SLOT_CAPABILITIES: u32 = 0x14
+    \\
+    \\const SLOT_CONTROL: u32 = 0x18
+    \\
+    \\const SLOT_STATUS: u32 = 0x1A
+    \\
+    \\const SLOT_IMPLEMENTED: u32 = 0x100
+    \\
+    \\const REPORTS_LINK: u32 = 0x10_0000
+    \\
+    \\/// The slot capability bits: attention button, power controller, power indicator, surprise
+    \\/// removal, hot-plug capable and no command completed; the slot control bits enabling attention
+    \\/// button, presence detect and link change events and hot-plug interrupts, the power indicator
+    \\/// field with its on and off values, and the power controller's off bit; the slot status bits
+    \\/// of an attention button press, a presence change, a completed command and a link change, all
+    \\/// the change bits, and the bit of a card present; and the link status bit of an active link.
+    \\const ATTENTION_BUTTON: u32 = 0x1
+    \\
+    \\const POWER_CONTROLLER: u32 = 0x2
+    \\
+    \\const POWER_INDICATOR: u32 = 0x10
+    \\
+    \\const SURPRISE: u32 = 0x20
+    \\
+    \\const HOT_PLUG: u32 = 0x40
+    \\
+    \\const NO_COMMAND_COMPLETED: u32 = 0x4_0000
+    \\
+    \\const ATTENTION_EVENTS: u32 = 0x1
+    \\
+    \\const PRESENCE_EVENTS: u32 = 0x8
+    \\
+    \\const HOT_PLUG_INTERRUPTS: u32 = 0x20
+    \\
+    \\const LINK_EVENTS: u32 = 0x1000
+    \\
+    \\const INDICATOR: u32 = 0x300
+    \\
+    \\const INDICATOR_ON: u32 = 0x100
+    \\
+    \\const INDICATOR_OFF: u32 = 0x300
+    \\
+    \\const POWER_OFF: u32 = 0x400
+    \\
+    \\const ATTENTION_PRESSED: u32 = 0x1
+    \\
+    \\const PRESENCE_CHANGED: u32 = 0x8
+    \\
+    \\const COMMAND_COMPLETED: u32 = 0x10
+    \\
+    \\const LINK_CHANGED: u32 = 0x100
+    \\
+    \\const SLOT_CHANGES: u32 = 0x11F
+    \\
+    \\const CARD_PRESENT: u32 = 0x40
+    \\
+    \\const LINK_ACTIVE: u32 = 0x2000
+    \\
+    \\/// The polls of a slot's status before a command counts as completed.
+    \\const COMMAND_POLLS: u32 = 100_000
+    \\
+    \\/// Where extended capabilities start, the ACS capability's id, and the ACS bits a port needs to
+    \\/// send every request of the functions below it upstream to the IOMMU: source validation,
+    \\/// request and completion redirection and upstream forwarding; and those a function of a
+    \\/// multi-function device needs, request and completion redirection.
+    \\const EXTENDED_FIRST: u32 = 0x100
+    \\
+    \\const ACS_ID: u32 = 0x000D
+    \\
+    \\const PORT_ACS: u32 = 0x1D
+    \\
+    \\const FUNCTION_ACS: u32 = 0xC
+    \\
+    \\/// The position of the bus in an ECAM address, and the signature of the ACPI MCFG table with
+    \\/// where its entries start and each entry's bytes.
+    \\const BUS_SHIFT: u32 = 20
+    \\
+    \\const MCFG_SIGNATURE: u32 = 0x4746_434D
+    \\
+    \\const MCFG_ENTRIES: u64 = 44
+    \\
+    \\const MCFG_ENTRY: u64 = 16
     \\
     \\/// The entry root's tables: the bytes of a 2 MiB page or block, the memory the root maps at its
     \\/// physical addresses, below 128 TiB, and an entry's address bits; the bits of an entry that is
@@ -10625,12 +10908,13 @@ const TEXT_HW_PCI: Str =
     \\    control: u32 at 0xC write
     \\} MsixEntry
     \\
-    \\/// A function of PCI bus 0.
+    \\/// A function of a PCI bus.
     \\pub open linear struct PciFunction {
     \\    record: u64
     \\} PciFunction
     \\
     \\pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
+    \\    pub segment: u16
     \\    pub bus: u8
     \\    pub device: u8
     \\    pub function: u8
@@ -10642,29 +10926,79 @@ const TEXT_HW_PCI: Str =
     \\    TooSmall
     \\    Taken
     \\    Unmapped
+    \\    Removed
     \\} PciError
+    \\
+    \\/// A bridge of a PCI bus.
+    \\pub open linear struct PciPort {
+    \\    record: u64
+    \\} PciPort
+    \\
+    \\pub closed enum PortKind derives Copy, Eq, Render {
+    \\    Root
+    \\    Upstream
+    \\    Downstream
+    \\    Bridge
+    \\} PortKind
+    \\
+    \\pub closed struct PciBuses derives Copy, Eq, Render {
+    \\    pub secondary: u8
+    \\    pub subordinate: u8
+    \\} PciBuses
+    \\
+    \\pub closed struct PciSlot derives Copy, Eq, Render {
+    \\    pub number: u16
+    \\    pub hot_plug: bool
+    \\    pub surprise: bool
+    \\    pub power_controller: bool
+    \\    pub attention_button: bool
+    \\} PciSlot
+    \\
+    \\pub closed struct SlotEvents derives Copy, Eq, Render {
+    \\    pub present: bool
+    \\    pub link_active: bool
+    \\    pub presence_changed: bool
+    \\    pub attention_pressed: bool
+    \\    pub link_changed: bool
+    \\} SlotEvents
     \\
     \\/// The bus addresses of 32-bit memory BARs are assigned from, with the offset turning a bus
     \\/// address into the CPU's; an empty window assigns none.
-    \\struct BusWindow {
+    \\struct BusWindow derives Copy {
     \\    start: u64
     \\    end: u64
     \\    offset: u64
     \\} BusWindow
     \\
+    \\/// Where a scan leaves off: the next bus number no bridge holds, and the bus address its
+    \\/// window gives next.
+    \\struct Scanned derives Copy {
+    \\    bus: u64
+    \\    address: u64
+    \\} Scanned
+    \\
     \\pub fn PciFunction.address(self) -> PciAddress {
-    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
-    \\    return PciAddress(bus: 0, device: u8.truncate(requester >> 3), function: u8.truncate(requester & 0x7))
+    \\    return address_of(self.record)
     \\} PciFunction.address
     \\
     \\pub fn PciFunction.config_read(self, offset: u8) -> u32
     \\    requires offset % 4 == 0
     \\{
+    \\    if gone(self.record) {
+    \\        return 0xFFFF_FFFF
+    \\    }
     \\    return config(self.record, offset: u32.widen(offset))
     \\} PciFunction.config_read
     \\
+    \\pub fn PciFunction.removed(self) -> bool {
+    \\    return gone(self.record)
+    \\} PciFunction.removed
+    \\
     \\pub fn Mmio.of_bar(mut function: PciFunction, index: u8, offset: u64) -> Mmio[R] fails PciError {
     \\    let record = function.record
+    \\    if gone(record) {
+    \\        fail PciError.Removed
+    \\    }
     \\    let bar_index = u64.widen(index)
     \\    if bar_index >= BARS {
     \\        fail PciError.NotMemory
@@ -10691,13 +11025,15 @@ const TEXT_HW_PCI: Str =
     \\    if not device_memory(base, size) {
     \\        fail PciError.Unmapped
     \\    }
+    \\    if not live_command(record, set: MEMORY, clear: 0) {
+    \\        fail PciError.Removed
+    \\    }
     \\    let window = runtime_record(WINDOW_RECORD)
     \\    poke(window + WINDOW_NEXT, value: peek(record + FUNCTION_WINDOWS))
     \\    poke(window + WINDOW_BAR, value: bar_index)
     \\    poke(window + WINDOW_START, value: offset)
     \\    poke(window + WINDOW_END, value: end)
     \\    poke(record + FUNCTION_WINDOWS, value: window)
-    \\    set_command(record, set: MEMORY, clear: 0)
     \\    return trusted "the BAR holds the function's registers R reaches from the offset, at an address the entry root maps uncached, and no other window maps them" { Mmio[R].map(base + offset) }
     \\} Mmio.of_bar
     \\
@@ -10705,47 +11041,31 @@ const TEXT_HW_PCI: Str =
     \\    if space.key == PHYSICAL_KEY {
     \\        fail IommuError.Physical
     \\    }
-    \\    let unit = iommu_unit()
-    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
-    \\    if not covered(unit, requester) {
-    \\        fail IommuError.Unsupported
+    \\    let held = pci_lock()
+    \\    let attached = attempt attached_to(self.record, space)
+    \\    pci_unlock(held)
+    \\    match attached {
+    \\        Ok(_) => {}
+    \\        Err(error) => fail error
     \\    }
-    \\    let flags = iommu_lock()
-    \\    let domain = live(unit, key: space.key)
-    \\    if domain == 0 {
-    \\        iommu_unlock(flags)
-    \\        fail IommuError.Closed
-    \\    }
-    \\    if on_aarch64() and not map_range(unit, domain, address: ITS_PAGE, bytes: PAGE_BYTES, device: true) {
-    \\        iommu_unlock(flags)
-    \\        fail IommuError.Exhausted
-    \\    }
-    \\    set_entry(unit, requester, domain)
-    \\    iommu_flush()
-    \\    iommu_unlock(flags)
-    \\    poke(self.record + FUNCTION_ATTACHED, value: space.key)
-    \\    set_command(self.record, set: BUS_MASTER, clear: 0)
     \\} PciFunction.attach
     \\
     \\pub fn PciFunction.attach_physical(mut self) fails IommuError {
-    \\    let unit = iommu_unit()
-    \\    let requester = peek(self.record + FUNCTION_REQUESTER)
-    \\    if unit != 0 and covered(unit, requester) {
-    \\        if peek(unit + UNIT_KIND) == VTD and (peek(unit + UNIT_FLAGS) & PASS_THROUGH) == 0 {
-    \\            fail IommuError.Unsupported
-    \\        }
-    \\        let flags = iommu_lock()
-    \\        set_entry(unit, requester, domain: 0)
-    \\        iommu_flush()
-    \\        iommu_unlock(flags)
+    \\    let held = pci_lock()
+    \\    let attached = attempt attached_physically(self.record)
+    \\    pci_unlock(held)
+    \\    match attached {
+    \\        Ok(_) => {}
+    \\        Err(error) => fail error
     \\    }
-    \\    poke(self.record + FUNCTION_ATTACHED, value: ATTACHED_PHYSICAL)
-    \\    set_command(self.record, set: BUS_MASTER, clear: 0)
     \\} PciFunction.attach_physical
     \\
     \\pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
     \\    let record = self.record
-    \\    let table = msix_table_entry(record, entry: u64.widen(entry))
+    \\    var table: u64 = 0
+    \\    if peek(record + FUNCTION_ATTACHED) != 0 and not gone(record) {
+    \\        table = msix_table_entry(record, entry: u64.widen(entry))
+    \\    }
     \\    if table == 0 {
     \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
     \\    }
@@ -10753,7 +11073,13 @@ const TEXT_HW_PCI: Str =
     \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
     \\        Ok(shared) => {
     \\            match shared.message() {
-    \\                Some(message) => program_entry(record, table, message)
+    \\                Some(message) => {
+    \\                    let held = pci_lock()
+    \\                    if not gone(record) {
+    \\                        program_entry(record, table, message)
+    \\                    }
+    \\                    pci_unlock(held)
+    \\                }
     \\                None => {}
     \\            }
     \\            return Ok(take shared)
@@ -10768,6 +11094,147 @@ const TEXT_HW_PCI: Str =
     \\    cut_off(record)
     \\} PciFunction.release
     \\
+    \\pub fn PciPort.address(self) -> PciAddress {
+    \\    return address_of(self.record)
+    \\} PciPort.address
+    \\
+    \\pub fn PciPort.kind(self) -> PortKind {
+    \\    let at = u32.truncate(peek(self.record + PORT_EXPRESS))
+    \\    if at == 0 {
+    \\        return PortKind.Bridge
+    \\    }
+    \\    let kind = (config(self.record, offset: at) >> 20) & 0xF
+    \\    if kind == ROOT_PORT {
+    \\        return PortKind.Root
+    \\    }
+    \\    if kind == UPSTREAM_PORT {
+    \\        return PortKind.Upstream
+    \\    }
+    \\    if kind == DOWNSTREAM_PORT {
+    \\        return PortKind.Downstream
+    \\    }
+    \\    return PortKind.Bridge
+    \\} PciPort.kind
+    \\
+    \\pub fn PciPort.buses(self) -> PciBuses {
+    \\    let buses = config(self.record, offset: BUSES_OFFSET)
+    \\    return PciBuses(secondary: u8.truncate(buses >> 8), subordinate: u8.truncate(buses >> 16))
+    \\} PciPort.buses
+    \\
+    \\pub fn PciPort.slot(self) -> Option[PciSlot] {
+    \\    let at = slot_capability(self.record)
+    \\    if at == 0 {
+    \\        return None
+    \\    }
+    \\    let caps = config(self.record, offset: at + SLOT_CAPABILITIES)
+    \\    return Some(PciSlot(number: u16.truncate(caps >> 19), hot_plug: (caps & HOT_PLUG) != 0, surprise: (caps & SURPRISE) != 0, power_controller: (caps & POWER_CONTROLLER) != 0, attention_button: (caps & ATTENTION_BUTTON) != 0))
+    \\} PciPort.slot
+    \\
+    \\pub fn PciPort.slot_events(mut self) -> SlotEvents {
+    \\    let record = self.record
+    \\    let held = pci_lock()
+    \\    let at = slot_capability(record)
+    \\    var status: u32 = 0
+    \\    var link: u32 = 0
+    \\    if at != 0 {
+    \\        status = config(record, offset: at + SLOT_CONTROL) >> 16
+    \\        link = config(record, offset: at + LINK_CONTROL) >> 16
+    \\        if (status & SLOT_CHANGES) != 0 {
+    \\            set_config16(record, offset: at + SLOT_STATUS, value: u16.truncate(status & SLOT_CHANGES))
+    \\        }
+    \\    }
+    \\    pci_unlock(held)
+    \\    return SlotEvents(present: (status & CARD_PRESENT) != 0, link_active: (link & LINK_ACTIVE) != 0, presence_changed: (status & PRESENCE_CHANGED) != 0, attention_pressed: (status & ATTENTION_PRESSED) != 0, link_changed: (status & LINK_CHANGED) != 0)
+    \\} PciPort.slot_events
+    \\
+    \\pub fn PciPort.power(mut self, on: bool) {
+    \\    let record = self.record
+    \\    if not on and not cut_below(record) {
+    \\        return
+    \\    }
+    \\    let held = pci_lock()
+    \\    let at = slot_capability(record)
+    \\    if at != 0 {
+    \\        let caps = config(record, offset: at + SLOT_CAPABILITIES)
+    \\        var set: u32 = 0
+    \\        var clear: u32 = 0
+    \\        if (caps & POWER_CONTROLLER) != 0 and on {
+    \\            clear |= POWER_OFF
+    \\        } else if (caps & POWER_CONTROLLER) != 0 {
+    \\            set |= POWER_OFF
+    \\        }
+    \\        if (caps & POWER_INDICATOR) != 0 and on {
+    \\            clear |= INDICATOR
+    \\            set |= INDICATOR_ON
+    \\        } else if (caps & POWER_INDICATOR) != 0 {
+    \\            clear |= INDICATOR
+    \\            set |= INDICATOR_OFF
+    \\        }
+    \\        slot_command(record, at, set, clear)
+    \\    }
+    \\    pci_unlock(held)
+    \\} PciPort.power
+    \\
+    \\pub fn PciPort.slot_irq[T: Any and Send](mut self, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    \\    let record = self.record
+    \\    let at = slot_capability(record)
+    \\    var table: u64 = 0
+    \\    if at != 0 and (config(record, offset: at + SLOT_CAPABILITIES) & HOT_PLUG) != 0 {
+    \\        table = msix_table_entry(record, entry: u64.widen((config(record, offset: at) >> 25) & 0x1F))
+    \\    }
+    \\    if table == 0 or not messages_reach(record) {
+    \\        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    \\    }
+    \\    let source = u32.truncate(peek(record + FUNCTION_REQUESTER))
+    \\    match IrqShared.install_validated(take dev, cpu, source, on_irq) {
+    \\        Ok(shared) => {
+    \\            match shared.message() {
+    \\                Some(message) => {
+    \\                    let held = pci_lock()
+    \\                    if not gone(record) {
+    \\                        program_entry(record, table, message)
+    \\                        slot_command(record, at, set: slot_events_enabled(record, at), clear: 0)
+    \\                    }
+    \\                    pci_unlock(held)
+    \\                }
+    \\                None => {}
+    \\            }
+    \\            return Ok(take shared)
+    \\        }
+    \\        Err(refusal) => return Err(take refusal)
+    \\    }
+    \\} PciPort.slot_irq
+    \\
+    \\pub fn PciPort.rescan(mut self, alloc: mem::Alloc) -> mem::List[PciFunction] {
+    \\    var functions = mem::List[PciFunction].empty(alloc)
+    \\    let port = self.record
+    \\    let bus = u64.widen((config(port, offset: BUSES_OFFSET) >> 8) & 0xFF)
+    \\    if not cut_below(port) or bus == 0 {
+    \\        return functions
+    \\    }
+    \\    let host = peek(port + FUNCTION_HOST)
+    \\    let window = BusWindow(start: peek(port + PORT_NEXT), end: peek(port + PORT_END), offset: peek(port + FUNCTION_WINDOW))
+    \\    var next = window.start
+    \\    for present in present_functions(host, bus, alloc).view() {
+    \\        let requester = present & 0xFFFF
+    \\        if endpoint(host, requester) {
+    \\            let record = function_found(host, requester, flags: peek(port + PORT_BELOW), multi: present > 0xFFFF)
+    \\            for index in 0..<BARS {
+    \\                next = assign_bar(record, index, next, window, fresh: true)
+    \\            }
+    \\            mut functions.push(PciFunction(record: record))
+    \\        }
+    \\    }
+    \\    poke(port + PORT_NEXT, value: next)
+    \\    return functions
+    \\} PciPort.rescan
+    \\
+    \\pub fn PciPort.release(take self) {
+    \\    let PciPort(record: record) = self
+    \\    unhold(peek(record + RECORD_HOLDING))
+    \\    free_record(record)
+    \\} PciPort.release
+    \\
     \\/// The register window extent of R: the bytes from its offset 0 to past its last register.
     \\pkg fn Mmio.extent() -> u64
     \\
@@ -10775,70 +11242,465 @@ const TEXT_HW_PCI: Str =
     \\pkg fn Mmio.alignment() -> u64
     \\
     \\/// A double word of a function's configuration through an ECAM, or through the configuration
-    \\/// ports for a zero `ecam`, and its write.
+    \\/// ports for a zero `ecam`, its write, and the write of a word.
     \\pkg fn config_read(ecam: u64, requester: u32, offset: u32) -> u32
     \\
     \\pkg fn config_write(ecam: u64, requester: u32, offset: u32, value: u32)
+    \\
+    \\pkg fn config_write16(ecam: u64, requester: u32, offset: u32, value: u16)
+    \\
+    \\/// The PCI record the runtime keeps, zero before `boot::Kernel` lists the functions or ports,
+    \\/// and its recording.
+    \\pkg fn pci_state() -> u64
+    \\
+    \\pkg fn pci_ready(record: u64)
+    \\
+    \\/// Takes the lock ordering a function's removal with its configuration, with maskable
+    \\/// interrupts disabled, giving the state to restore.
+    \\pkg fn pci_lock() -> u64
+    \\
+    \\pkg fn pci_unlock(flags: u64)
     \\
     \\/// Installs a device on a new message-signalled interrupt of CPU `cpu` from requester `source`,
     \\/// which interrupt remapping lets that requester alone raise.
     \\pkg fn IrqShared.install_validated(take dev: T, cpu: u32, source: u32, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
     \\
-    \\/// What `boot::Kernel.pci_functions` lists: the endpoints of PCI bus 0, segment 0, each with
-    \\/// bus mastering and memory decoding off and INTx disabled, their unassigned memory BARs given
-    \\/// addresses from the device tree's window on AArch64.
+    \\/// What `boot::Kernel.pci_functions` lists: the endpoints below each host bridge, depth first,
+    \\/// each with bus mastering and memory decoding off and INTx disabled.
     \\pkg fn enumerated(alloc: mem::Alloc) -> mem::List[PciFunction] {
+    \\    let pci = found_below(alloc)
     \\    var functions = mem::List[PciFunction].empty(alloc)
-    \\    var ecam: u64 = 0
-    \\    var window = BusWindow(start: 0, end: 0, offset: 0)
-    \\    if on_aarch64() {
-    \\        let node = tree_node(compatible: "pci-host-ecam-generic")
-    \\        if node.reg == 0 {
-    \\            return functions
-    \\        }
-    \\        ecam = u64_be_at(node.reg)
-    \\        if not device_memory(base: ecam, size: BUS_BYTES) {
-    \\            return functions
-    \\        }
-    \\        window = memory_window(node)
+    \\    var record = peek(pci + PCI_FUNCTIONS)
+    \\    poke(pci + PCI_FUNCTIONS, value: 0)
+    \\    while record != 0 {
+    \\        mut functions.push(PciFunction(record: record))
+    \\        record = peek(record + FUNCTION_NEXT)
     \\    }
-    \\    var records = mem::List[u64].empty(alloc)
-    \\    for device in 0u32..<32 {
-    \\        for function in 0u32..<8 {
-    \\            let requester = (device << 3) | function
-    \\            let ids = config_read(ecam, requester, offset: IDS_OFFSET)
-    \\            let header = (config_read(ecam, requester, offset: HEADER_OFFSET) >> 16) & 0xFF
-    \\            if (ids & 0xFFFF) != 0xFFFF and (header & 0x7F) == 0 and (config_read(ecam, requester, offset: CLASS_OFFSET) >> 24) != BRIDGE {
-    \\                let record = found(ecam, requester, window)
-    \\                mut records.push(record)
-    \\                mut functions.push(PciFunction(record: record))
+    \\    return functions
+    \\} enumerated
+    \\
+    \\/// What `boot::Kernel.pci_ports` lists: the bridges below each host bridge, depth first.
+    \\pkg fn ports_enumerated(alloc: mem::Alloc) -> mem::List[PciPort] {
+    \\    let pci = found_below(alloc)
+    \\    var ports = mem::List[PciPort].empty(alloc)
+    \\    var record = peek(pci + PCI_PORTS)
+    \\    poke(pci + PCI_PORTS, value: 0)
+    \\    while record != 0 {
+    \\        mut ports.push(PciPort(record: record))
+    \\        record = peek(record + FUNCTION_NEXT)
+    \\    }
+    \\    return ports
+    \\} ports_enumerated
+    \\
+    \\/// The bus past the last of the device tree's PCI host, bus 0's without one.
+    \\pkg fn tree_buses() -> u64 {
+    \\    let node = tree_node(compatible: "pci-host-ecam-generic")
+    \\    if node.reg == 0 or tree_bus_end(node) == 0 {
+    \\        return 1
+    \\    }
+    \\    return tree_bus_end(node)
+    \\} tree_buses
+    \\
+    \\/// The PCI record, made the first time with the host bridges and every function and bridge
+    \\/// below them, depth first.
+    \\fn found_below(alloc: mem::Alloc) -> u64 {
+    \\    let known = pci_state()
+    \\    if known != 0 {
+    \\        return known
+    \\    }
+    \\    let pci = runtime_record(PCI_RECORD)
+    \\    if on_aarch64() {
+    \\        tree_host(pci)
+    \\    } else {
+    \\        table_hosts(pci)
+    \\    }
+    \\    var host = peek(pci + PCI_HOSTS)
+    \\    while host != 0 {
+    \\        scan_host(pci, host, alloc)
+    \\        host = peek(host + HOST_NEXT)
+    \\    }
+    \\    pci_ready(pci)
+    \\    return pci
+    \\} found_below
+    \\
+    \\/// Records the hosts of the ACPI MCFG table whose ECAM the entry root maps uncached, then
+    \\/// segment 0 through the configuration ports when none of them is in segment 0.
+    \\fn table_hosts(pci: u64) {
+    \\    var last: u64 = 0
+    \\    var zero = false
+    \\    let empty = BusWindow(start: 0, end: 0, offset: 0)
+    \\    let mcfg = listed_table(MCFG_SIGNATURE)
+    \\    if mcfg != 0 {
+    \\        let end = mcfg + u64.widen(u32_at(mcfg + 4))
+    \\        var at = mcfg + MCFG_ENTRIES
+    \\        while at + MCFG_ENTRY <= end {
+    \\            let base = u64_at(at)
+    \\            let segment = u64.widen(u32_at(at + 8) & 0xFFFF)
+    \\            let first_bus = u64.widen(byte_at(at + 10))
+    \\            let final_bus = u64.widen(byte_at(at + 11))
+    \\            if final_bus >= first_bus and device_memory(base: base.wrapping_add(first_bus << BUS_SHIFT), size: (final_bus - first_bus + 1) << BUS_SHIFT) {
+    \\                last = add_host(pci, last, segment, ecam: base, first_bus, final_bus, window: empty)
+    \\                zero = zero or segment == 0
     \\            }
-    \\            if function == 0 and ((ids & 0xFFFF) == 0xFFFF or (header & 0x80) == 0) {
+    \\            at += MCFG_ENTRY
+    \\        }
+    \\    }
+    \\    if not zero {
+    \\        discard add_host(pci, last, segment: 0, ecam: 0, first_bus: 0, final_bus: 255, window: empty)
+    \\    }
+    \\} table_hosts
+    \\
+    \\/// Records the host of the device tree's `pci-host-ecam-generic` node, segment 0, when the
+    \\/// entry root maps its ECAM as device memory.
+    \\fn tree_host(pci: u64) {
+    \\    let node = tree_node(compatible: "pci-host-ecam-generic")
+    \\    if node.reg == 0 {
+    \\        return
+    \\    }
+    \\    let base = u64_be_at(node.reg)
+    \\    let first_bus = tree_first_bus(node)
+    \\    let end = tree_bus_end(node)
+    \\    if end <= first_bus or not device_memory(base, size: (end - first_bus) << BUS_SHIFT) {
+    \\        return
+    \\    }
+    \\    discard add_host(pci, last: 0, segment: 0, ecam: base.wrapping_sub(first_bus << BUS_SHIFT), first_bus, final_bus: end - 1, window: memory_window(node))
+    \\} tree_host
+    \\
+    \\/// The first bus of a PCI host's node: the first of its `bus-range`, or zero.
+    \\fn tree_first_bus(node: NodeValues) -> u64 {
+    \\    if node.bus_range == 0 {
+    \\        return 0
+    \\    }
+    \\    return u64.widen(u32_be_at(node.bus_range) & 0xFF)
+    \\} tree_first_bus
+    \\
+    \\/// The bus past the last of a PCI host's node that its `bus-range` and the ECAM its `reg`
+    \\/// names both hold.
+    \\fn tree_bus_end(node: NodeValues) -> u64 {
+    \\    let first_bus = tree_first_bus(node)
+    \\    var end: u64 = 256
+    \\    let buses = u64_be_at(node.reg + 8) >> BUS_SHIFT
+    \\    if buses < end - first_bus {
+    \\        end = first_bus + buses
+    \\    }
+    \\    if node.bus_range != 0 and u64.widen(u32_be_at(node.bus_range + 4) & 0xFF) + 1 < end {
+    \\        end = u64.widen(u32_be_at(node.bus_range + 4) & 0xFF) + 1
+    \\    }
+    \\    return end
+    \\} tree_bus_end
+    \\
+    \\/// Records a host after the host record `last`, or first for a zero one, giving its record.
+    \\fn add_host(pci: u64, last: u64, segment: u64, ecam: u64, first_bus: u64, final_bus: u64, window: BusWindow) -> u64 {
+    \\    let host = runtime_record(HOST_RECORD)
+    \\    poke(host + HOST_SEGMENT, value: segment)
+    \\    poke(host + HOST_ECAM, value: ecam)
+    \\    poke(host + HOST_FIRST, value: first_bus)
+    \\    poke(host + HOST_LAST, value: final_bus)
+    \\    poke(host + HOST_WINDOW, value: window.start)
+    \\    poke(host + HOST_WINDOW_END, value: window.end)
+    \\    poke(host + HOST_OFFSET, value: window.offset)
+    \\    if last == 0 {
+    \\        poke(pci + PCI_HOSTS, value: host)
+    \\    } else {
+    \\        poke(last + HOST_NEXT, value: host)
+    \\    }
+    \\    return host
+    \\} add_host
+    \\
+    \\/// Scans a host from its first bus, then each later bus of its range that no bridge holds and
+    \\/// a function answers on, as the root bus of another host bridge.
+    \\fn scan_host(pci: u64, host: u64, alloc: mem::Alloc) {
+    \\    let first_bus = peek(host + HOST_FIRST)
+    \\    let last = peek(host + HOST_LAST)
+    \\    var scanned = Scanned(bus: first_bus, address: peek(host + HOST_WINDOW))
+    \\    var bus = first_bus
+    \\    while bus <= last {
+    \\        if bus == first_bus or present_functions(host, bus, alloc).len() > 0 {
+    \\            let window = BusWindow(start: scanned.address, end: peek(host + HOST_WINDOW_END), offset: peek(host + HOST_OFFSET))
+    \\            scanned = scan(pci, host, bus, window, next_bus: bus + 1, alloc)
+    \\            bus = scanned.bus
+    \\        } else {
+    \\            bus += 1
+    \\        }
+    \\    }
+    \\} scan_host
+    \\
+    \\/// The functions that answer on a bus, in the order of their requester ids, each its
+    \\/// requester id plus `0x1_0000` for a function of a multi-function device.
+    \\fn present_functions(host: u64, bus: u64, alloc: mem::Alloc) -> mem::List[u64] {
+    \\    var present = mem::List[u64].empty(alloc)
+    \\    for device in 0u64..<32 {
+    \\        var multi: u64 = 0
+    \\        for function in 0u64..<8 {
+    \\            let requester = (bus << 8) | (device << 3) | function
+    \\            let ids = host_config(host, requester, offset: IDS_OFFSET)
+    \\            if (ids & 0xFFFF) != 0xFFFF {
+    \\                if function == 0 and ((host_config(host, requester, offset: HEADER_OFFSET) >> 16) & MULTI_FUNCTION) != 0 {
+    \\                    multi = 0x1_0000
+    \\                }
+    \\                mut present.push(requester | multi)
+    \\            }
+    \\            if function == 0 and multi == 0 {
     \\                break
     \\            }
     \\        }
     \\    }
-    \\    assign(records.view(), window)
-    \\    return functions
-    \\} enumerated
+    \\    return present
+    \\} present_functions
     \\
-    \\/// A function's record, its BARs sized, its MSI-X capability found and its command cleared.
-    \\fn found(ecam: u64, requester: u32, window: BusWindow) -> u64 {
-    \\    let command = config_read(ecam, requester, offset: COMMAND_OFFSET) & 0xFFFF
-    \\    config_write(ecam, requester, offset: COMMAND_OFFSET, value: (command & ~(BUS_MASTER | MEMORY)) | INTX_DISABLE)
-    \\    let record = runtime_record(FUNCTION_RECORD)
-    \\    poke(record + RECORD_TAG, value: FUNCTION_TAG)
-    \\    poke(record + FUNCTION_REQUESTER, value: u64.widen(requester))
-    \\    poke(record + FUNCTION_ECAM, value: ecam)
-    \\    poke(record + FUNCTION_WINDOW, value: window.offset)
-    \\    var index: u64 = 0
-    \\    while index < BARS {
-    \\        index += size_bar(record, index)
+    \\/// Whether a host's function is an endpoint: of header type 0 and not of the bridge class.
+    \\fn endpoint(host: u64, requester: u64) -> bool {
+    \\    let header = (host_config(host, requester, offset: HEADER_OFFSET) >> 16) & 0x7F
+    \\    return header == 0 and (host_config(host, requester, offset: CLASS_OFFSET) >> 24) != BRIDGE
+    \\} endpoint
+    \\
+    \\/// Records the endpoints and bridges of a bus and those below it, depth first: each memory BAR
+    \\/// without an address is given one of its bus's window above every BAR and bridge window that
+    \\/// window holds, and each bridge is entered in turn. A bridge whose secondary bus is zero is
+    \\/// given the next bus numbers and a memory window of whole MiBs from its bus's window, at least
+    \\/// one, its I/O and prefetchable windows closed; every bridge entered forwards memory and DMA.
+    \\fn scan(pci: u64, host: u64, bus: u64, window: BusWindow, next_bus: u64, alloc: mem::Alloc) -> Scanned {
+    \\    var records = mem::List[u64].empty(alloc)
+    \\    var parents = mem::List[Level].empty(alloc)
+    \\    var free_bus = next_bus
+    \\    var level = bus_level(host, bus, window, port: 0, flags: 0, given: false, mut records, alloc)
+    \\    loop {
+    \\        if level.next == level.end {
+    \\            let Some(parent) = mut parents.pop() else {
+    \\                return Scanned(bus: free_bus, address: level.address)
+    \\            }
+    \\            var above = parent
+    \\            above.address = left(port: level.port, below: level, above: above.window, free_bus, address: above.address)
+    \\            level = above
+    \\        } else {
+    \\            let record = records.view()[level.next]
+    \\            level.next += 1
+    \\            for index in 0..<bar_count(record) {
+    \\                level.address = assign_bar(record, index, next: level.address, window: level.window, fresh: false)
+    \\            }
+    \\            if peek(record + RECORD_TAG) != PORT_TAG {
+    \\                listed(at: pci + PCI_FUNCTIONS, record)
+    \\            } else {
+    \\                listed(at: pci + PCI_PORTS, record)
+    \\                let child = below_port(host, port: record, above: level, free_bus, mut records, alloc)
+    \\                if child.port != 0 {
+    \\                    free_bus = bus_after(port: record, child, free_bus)
+    \\                    mut parents.push(level)
+    \\                    level = child
+    \\                }
+    \\            }
+    \\        }
     \\    }
-    \\    poke(record + FUNCTION_MSIX, value: u64.widen(msix_capability(record)))
+    \\} scan
+    \\
+    \\/// A bus being scanned: the bridge it is the secondary bus of, zero for a root bus, its window,
+    \\/// whether the scan gave the bridge its bus numbers and window, the indexes of the next of its
+    \\/// records to enter and past its last among the records found, and the bus address its window
+    \\/// gives next.
+    \\struct Level derives Copy {
+    \\    port: u64
+    \\    window: BusWindow
+    \\    given: bool
+    \\    next: usize
+    \\    end: usize
+    \\    address: u64
+    \\} Level
+    \\
+    \\/// The level of a bridge's secondary bus, after making the bridge forward memory and DMA and
+    \\/// giving it bus numbers from `free_bus` when its secondary bus is zero; one of port zero when
+    \\/// the bridge has none or no bus number is left for it.
+    \\fn below_port(host: u64, port: u64, above: Level, free_bus: u64, mut records: mem::List[u64], alloc: mem::Alloc) -> Level {
+    \\    let last_bus = peek(host + HOST_LAST)
+    \\    let buses = config(port, offset: BUSES_OFFSET)
+    \\    let secondary = u64.widen((buses >> 8) & 0xFF)
+    \\    let subordinate = u64.widen((buses >> 16) & 0xFF)
+    \\    let on = peek(port + FUNCTION_REQUESTER) >> 8
+    \\    set_command(port, set: MEMORY | BUS_MASTER, clear: 0)
+    \\    if secondary == 0 and free_bus <= last_bus {
+    \\        set_config(port, offset: BUSES_OFFSET, value: (buses & 0xFF00_0000) | u32.truncate((last_bus << 16) | (free_bus << 8) | on))
+    \\        let base = (above.address + WINDOW_GRANULE - 1) & ~(WINDOW_GRANULE - 1)
+    \\        let window = BusWindow(start: base, end: above.window.end, offset: above.window.offset)
+    \\        return bus_level(host, bus: free_bus, window, port, flags: peek(port + PORT_BELOW), given: true, mut records, alloc)
+    \\    }
+    \\    if secondary > on and subordinate >= secondary and subordinate <= last_bus {
+    \\        return bus_level(host, bus: secondary, window: bridge_window(port, offset: above.window.offset), port, flags: peek(port + PORT_BELOW), given: false, mut records, alloc)
+    \\    }
+    \\    return Level(port: 0, window: above.window, given: false, next: 0, end: 0, address: 0)
+    \\} below_port
+    \\
+    \\/// The next bus number no bridge holds once a scan enters a bridge's secondary bus.
+    \\fn bus_after(port: u64, child: Level, free_bus: u64) -> u64 {
+    \\    if child.given {
+    \\        return free_bus + 1
+    \\    }
+    \\    let subordinate = u64.widen((config(port, offset: BUSES_OFFSET) >> 16) & 0xFF)
+    \\    if subordinate + 1 > free_bus {
+    \\        return subordinate + 1
+    \\    }
+    \\    return free_bus
+    \\} bus_after
+    \\
+    \\/// The level of a bus, its functions and bridges appended to `records`, the next address of its
+    \\/// window above every BAR and bridge window it holds.
+    \\fn bus_level(host: u64, bus: u64, window: BusWindow, port: u64, flags: u64, given: bool, mut records: mem::List[u64], alloc: mem::Alloc) -> Level {
+    \\    let start = records.len()
+    \\    var address = window.start
+    \\    for present in present_functions(host, bus, alloc).view() {
+    \\        let requester = present & 0xFFFF
+    \\        var record: u64 = 0
+    \\        if ((host_config(host, requester, offset: HEADER_OFFSET) >> 16) & 0x7F) == BRIDGE_HEADER {
+    \\            record = port_found(host, requester, flags)
+    \\        } else if endpoint(host, requester) {
+    \\            record = function_found(host, requester, flags, multi: present > 0xFFFF)
+    \\        }
+    \\        if record != 0 {
+    \\            address = above_held(record, window, next: address)
+    \\            mut records.push(record)
+    \\        }
+    \\    }
+    \\    return Level(port: port, window: window, given: given, next: start, end: records.len(), address: address)
+    \\} bus_level
+    \\
+    \\/// Ends the scan below a bridge, giving the address its parent bus's window gives next: a
+    \\/// bridge the scan gave bus numbers to takes those up to `free_bus` and a window from
+    \\/// `address`, closed when `above` has no room for it.
+    \\fn left(port: u64, below: Level, above: BusWindow, free_bus: u64, address: u64) -> u64 {
+    \\    poke(port + PORT_NEXT, value: below.address)
+    \\    poke(port + PORT_END, value: below.window.end)
+    \\    if not below.given {
+    \\        return address
+    \\    }
+    \\    let buses = config(port, offset: BUSES_OFFSET)
+    \\    set_config(port, offset: BUSES_OFFSET, value: (buses & 0xFF00_FFFF) | u32.truncate((free_bus - 1) << 16))
+    \\    set_config(port, offset: IO_WINDOW, value: CLOSED_IO)
+    \\    set_config(port, offset: PREFETCH_WINDOW, value: CLOSED_WINDOW)
+    \\    set_config(port, offset: PREFETCH_BASE_HIGH, value: 0)
+    \\    set_config(port, offset: PREFETCH_LIMIT_HIGH, value: 0)
+    \\    let base = below.window.start
+    \\    var end = (below.address + WINDOW_GRANULE - 1) & ~(WINDOW_GRANULE - 1)
+    \\    if end < base + WINDOW_GRANULE {
+    \\        end = base + WINDOW_GRANULE
+    \\    }
+    \\    if end > above.end {
+    \\        set_config(port, offset: BRIDGE_MEMORY, value: CLOSED_WINDOW)
+    \\        poke(port + PORT_NEXT, value: 0)
+    \\        poke(port + PORT_END, value: 0)
+    \\        return address
+    \\    }
+    \\    set_config(port, offset: BRIDGE_MEMORY, value: u32.truncate(((((end - 1) >> 16) & 0xFFF0) << 16) | ((base >> 16) & 0xFFF0)))
+    \\    poke(port + PORT_END, value: end)
+    \\    return end
+    \\} left
+    \\
+    \\/// Appends a record to the records found and not yet listed whose first record is at `at`
+    \\/// and last at the next word.
+    \\fn listed(at: u64, record: u64) {
+    \\    let last = peek(at + 8)
+    \\    if last == 0 {
+    \\        poke(at, value: record)
+    \\    } else {
+    \\        poke(last + FUNCTION_NEXT, value: record)
+    \\    }
+    \\    poke(at + 8, value: record)
+    \\} listed
+    \\
+    \\/// The memory window a bridge forwards, empty when it forwards none.
+    \\fn bridge_window(port: u64, offset: u64) -> BusWindow {
+    \\    let value = config(port, offset: BRIDGE_MEMORY)
+    \\    let base = u64.widen(value & 0xFFF0) << 16
+    \\    let limit = (u64.widen(value >> 16) & 0xFFF0) << 16
+    \\    if base > limit {
+    \\        return BusWindow(start: 0, end: 0, offset: offset)
+    \\    }
+    \\    return BusWindow(start: base, end: limit + WINDOW_GRANULE, offset: offset)
+    \\} bridge_window
+    \\
+    \\/// The next address of a window above `next` and above every memory BAR of a record and, for
+    \\/// a bridge whose bus numbers are assigned, its memory window, that the window holds.
+    \\fn above_held(record: u64, window: BusWindow, next: u64) -> u64 {
+    \\    var mark = next
+    \\    for index in 0..<bar_count(record) {
+    \\        let bar = record + FUNCTION_BARS + index * BAR_BYTES
+    \\        let base = peek(bar)
+    \\        let end = base + peek(bar + 8)
+    \\        if peek(bar + 16) != NO_BAR and base >= window.start and base < window.end and end > mark {
+    \\            mark = end
+    \\        }
+    \\    }
+    \\    if peek(record + RECORD_TAG) == PORT_TAG and ((config(record, offset: BUSES_OFFSET) >> 8) & 0xFF) != 0 {
+    \\        let held = bridge_window(record, offset: window.offset)
+    \\        if held.start >= window.start and held.start < window.end and held.end > mark {
+    \\            mark = held.end
+    \\        }
+    \\    }
+    \\    return mark
+    \\} above_held
+    \\
+    \\/// The BARs of a record: two for a bridge's.
+    \\fn bar_count(record: u64) -> u64 {
+    \\    if peek(record + RECORD_TAG) == PORT_TAG {
+    \\        return BRIDGE_BARS
+    \\    }
+    \\    return BARS
+    \\} bar_count
+    \\
+    \\/// An endpoint's record, its path flags those of the path above it, exposed for a function of
+    \\/// a multi-function device that does not redirect its peers' requests upstream.
+    \\fn function_found(host: u64, requester: u64, flags: u64, multi: bool) -> u64 {
+    \\    let record = new_record(host, requester, bytes: FUNCTION_RECORD, tag: FUNCTION_TAG)
+    \\    var path = flags
+    \\    if multi and not acs_enabled(record, needed: FUNCTION_ACS) {
+    \\        path |= EXPOSED
+    \\    }
+    \\    poke(record + FUNCTION_FLAGS, value: path)
     \\    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
     \\    return record
-    \\} found
+    \\} function_found
+    \\
+    \\/// A bridge's record, its PCIe capability found, and the path flags below it those above it
+    \\/// and what it adds: a PCIe root or downstream port exposes them unless it redirects every peer
+    \\/// request upstream, an upstream port adds nothing and any other bridge aliases them.
+    \\fn port_found(host: u64, requester: u64, flags: u64) -> u64 {
+    \\    let record = new_record(host, requester, bytes: PORT_RECORD, tag: PORT_TAG)
+    \\    let express = find_capability(record, id: EXPRESS_ID)
+    \\    poke(record + PORT_EXPRESS, value: u64.widen(express))
+    \\    var below = flags | ALIASED | EXPOSED
+    \\    if express != 0 {
+    \\        let kind = (config(record, offset: express) >> 20) & 0xF
+    \\        if kind == UPSTREAM_PORT {
+    \\            below = flags
+    \\        } else if (kind == ROOT_PORT or kind == DOWNSTREAM_PORT) and acs_enabled(record, needed: PORT_ACS) {
+    \\            below = flags
+    \\        } else if kind == ROOT_PORT or kind == DOWNSTREAM_PORT {
+    \\            below = flags | EXPOSED
+    \\        }
+    \\    }
+    \\    poke(record + PORT_BELOW, value: below)
+    \\    poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
+    \\    return record
+    \\} port_found
+    \\
+    \\/// A record of `bytes` bytes for a host's function, with bus mastering and memory decoding off
+    \\/// and INTx disabled, its BARs sized and its MSI-X capability found.
+    \\fn new_record(host: u64, requester: u64, bytes: u64, tag: u64) -> u64 {
+    \\    let ecam = peek(host + HOST_ECAM)
+    \\    let id = u32.truncate(requester)
+    \\    let command = config_read(ecam, requester: id, offset: COMMAND_OFFSET) & 0xFFFF
+    \\    config_write(ecam, requester: id, offset: COMMAND_OFFSET, value: (command & ~(BUS_MASTER | MEMORY)) | INTX_DISABLE)
+    \\    let record = runtime_record(bytes)
+    \\    poke(record + RECORD_TAG, value: tag)
+    \\    poke(record + FUNCTION_REQUESTER, value: requester)
+    \\    poke(record + FUNCTION_ECAM, value: ecam)
+    \\    poke(record + FUNCTION_WINDOW, value: peek(host + HOST_OFFSET))
+    \\    poke(record + FUNCTION_HOST, value: host)
+    \\    poke(record + FUNCTION_GENERATION, value: bus_generation(host, bus: requester >> 8))
+    \\    var index: u64 = 0
+    \\    while index < bar_count(record) {
+    \\        index += size_bar(record, index)
+    \\    }
+    \\    poke(record + FUNCTION_MSIX, value: u64.widen(find_capability(record, id: MSIX_ID)))
+    \\    return record
+    \\} new_record
     \\
     \\/// Records BAR `index` of a function, giving the BARs it occupies: two for 64-bit memory.
     \\fn size_bar(record: u64, index: u64) -> u64 {
@@ -10849,7 +11711,7 @@ const TEXT_HW_PCI: Str =
     \\        poke(bar + 16, value: IO_BAR)
     \\        return 1
     \\    }
-    \\    let wide = ((low >> 1) & 0x3) == 2 and index + 1 < BARS
+    \\    let wide = ((low >> 1) & 0x3) == 2 and index + 1 < bar_count(record)
     \\    let low_mask = probe(record, offset: at, value: low) & 0xFFFF_FFF0
     \\    var high: u32 = 0
     \\    var high_mask: u32 = 0xFFFF_FFFF
@@ -10881,8 +11743,8 @@ const TEXT_HW_PCI: Str =
     \\    return kept
     \\} probe
     \\
-    \\/// The offset of a function's MSI-X capability, zero without one.
-    \\fn msix_capability(record: u64) -> u32 {
+    \\/// The offset of a function's capability of an id, zero without one.
+    \\fn find_capability(record: u64, id: u32) -> u32 {
     \\    if ((config(record, offset: COMMAND_OFFSET) >> 16) & HAS_CAPABILITIES) == 0 {
     \\        return 0
     \\    }
@@ -10892,13 +11754,41 @@ const TEXT_HW_PCI: Str =
     \\            return 0
     \\        }
     \\        let head = config(record, offset: at)
-    \\        if (head & 0xFF) == MSIX_ID {
+    \\        if (head & 0xFF) == id {
     \\            return at
     \\        }
     \\        at = (head >> 8) & 0xFC
     \\    }
     \\    return 0
-    \\} msix_capability
+    \\} find_capability
+    \\
+    \\/// Whether a function's ACS capability has the bits `needed`, which it then enables; false
+    \\/// without an ECAM, through which alone extended capabilities are read.
+    \\fn acs_enabled(record: u64, needed: u32) -> bool {
+    \\    if peek(record + FUNCTION_ECAM) == 0 {
+    \\        return false
+    \\    }
+    \\    var at = EXTENDED_FIRST
+    \\    for _ in 0u32..<96 {
+    \\        let head = config(record, offset: at)
+    \\        if head == 0 or head == 0xFFFF_FFFF {
+    \\            return false
+    \\        }
+    \\        if (head & 0xFFFF) == ACS_ID {
+    \\            let acs = config(record, offset: at + 4)
+    \\            if (acs & needed) != needed {
+    \\                return false
+    \\            }
+    \\            set_config16(record, offset: at + 6, value: u16.truncate((acs >> 16) | needed))
+    \\            return true
+    \\        }
+    \\        at = (head >> 20) & 0xFFC
+    \\        if at < EXTENDED_FIRST {
+    \\            return false
+    \\        }
+    \\    }
+    \\    return false
+    \\} acs_enabled
     \\
     \\/// The window of 32-bit memory a PCI host's `ranges` names, empty without one.
     \\fn memory_window(node: NodeValues) -> BusWindow {
@@ -10915,47 +11805,32 @@ const TEXT_HW_PCI: Str =
     \\    return BusWindow(start: 0, end: 0, offset: 0)
     \\} memory_window
     \\
-    \\/// Gives each unassigned memory BAR of the functions an address of the window, aligned to its
-    \\/// size, above every BAR the window already holds.
-    \\fn assign(records: Slice[u64], window: BusWindow) {
-    \\    var next = window.start
-    \\    for record in records {
-    \\        for index in 0..<BARS {
-    \\            let bar = record + FUNCTION_BARS + index * BAR_BYTES
-    \\            let base = peek(bar)
-    \\            let end = base + peek(bar + 8)
-    \\            if peek(bar + 16) != NO_BAR and base >= window.start and base < window.end and end > next {
-    \\                next = end
-    \\            }
-    \\        }
-    \\    }
-    \\    for record in records {
-    \\        for index in 0..<BARS {
-    \\            next = assign_bar(record, index, next, window)
-    \\        }
-    \\    }
-    \\} assign
-    \\
-    \\/// Gives BAR `index` of a function an address from `next` when it is an unassigned memory BAR
-    \\/// the window holds, giving the window's next free address.
-    \\fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow) -> u64 {
+    \\/// Gives BAR `index` of a function an address from `next` when it is a memory BAR and, unless
+    \\/// `fresh` holds, holds no address, giving the window's next free address; a BAR the window has
+    \\/// no room for is given none and no longer counts as memory.
+    \\fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow, fresh: bool) -> u64 {
     \\    let bar = record + FUNCTION_BARS + index * BAR_BYTES
     \\    let kind = peek(bar + 16)
     \\    let size = peek(bar + 8)
-    \\    if peek(bar) != 0 or (kind != MEMORY32 and kind != MEMORY64) or size == 0 {
+    \\    if (kind != MEMORY32 and kind != MEMORY64) or size == 0 or (peek(bar) != 0 and not fresh) {
     \\        return next
     \\    }
+    \\    var given: u64 = 0
     \\    let aligned = (next + size - 1) & ~(size - 1)
-    \\    if aligned + size > window.end {
-    \\        return next
+    \\    if aligned + size <= window.end {
+    \\        given = aligned
     \\    }
     \\    let at = FIRST_BAR + u32.fit(index * 4)
-    \\    set_config(record, offset: at, value: u32.truncate(aligned))
+    \\    set_config(record, offset: at, value: u32.truncate(given))
     \\    if kind == MEMORY64 {
-    \\        set_config(record, offset: at + 4, value: u32.truncate(aligned >> 32))
+    \\        set_config(record, offset: at + 4, value: u32.truncate(given >> 32))
     \\    }
-    \\    poke(bar, value: aligned)
-    \\    return aligned + size
+    \\    poke(bar, value: given)
+    \\    if given == 0 {
+    \\        poke(bar + 16, value: NO_BAR)
+    \\        return next
+    \\    }
+    \\    return given + size
     \\} assign_bar
     \\
     \\/// Whether the entry root maps a range uncached, as device memory on AArch64.
@@ -11023,11 +11898,11 @@ const TEXT_HW_PCI: Str =
     \\    return u64.widen(location & 0x7) == index and start < offset + bytes and offset < end
     \\} overlaps
     \\
-    \\/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function is not
-    \\/// attached, has no such entry or its table lies outside device memory.
+    \\/// The CPU address of entry `entry` of a function's MSI-X table, zero when the function has no
+    \\/// such entry or its table lies outside device memory.
     \\fn msix_table_entry(record: u64, entry: u64) -> u64 {
     \\    let capability = u32.truncate(peek(record + FUNCTION_MSIX))
-    \\    if capability == 0 or peek(record + FUNCTION_ATTACHED) == 0 {
+    \\    if capability == 0 {
     \\        return 0
     \\    }
     \\    if entry > u64.widen((config(record, offset: capability) >> 16) & 0x7FF) {
@@ -11035,7 +11910,7 @@ const TEXT_HW_PCI: Str =
     \\    }
     \\    let location = config(record, offset: capability + 4)
     \\    let index = u64.widen(location & 0x7)
-    \\    if index >= BARS {
+    \\    if index >= bar_count(record) {
     \\        return 0
     \\    }
     \\    let bar = record + FUNCTION_BARS + index * BAR_BYTES
@@ -11067,18 +11942,170 @@ const TEXT_HW_PCI: Str =
     \\    set_config(record, offset: capability, value: (control | MSIX_ENABLE) & ~MSIX_MASKED)
     \\} program_entry
     \\
-    \\/// Cuts a function off: no longer mastering the bus or decoding memory, its context or stream
-    \\/// reaching nothing once the IOMMU no longer caches it; then frees its record and those of its
-    \\/// windows.
-    \\fn cut_off(record: u64) {
-    \\    set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
+    \\/// Attaches a function to the domain of a space, under the PCI lock.
+    \\fn attached_to(record: u64, space: IoSpace) fails IommuError {
     \\    let unit = iommu_unit()
-    \\    if unit != 0 and peek(record + FUNCTION_ATTACHED) != 0 {
-    \\        let flags = iommu_lock()
-    \\        clear_entry(unit, requester: peek(record + FUNCTION_REQUESTER))
-    \\        iommu_flush()
-    \\        iommu_unlock(flags)
+    \\    let requester = peek(record + FUNCTION_REQUESTER)
+    \\    if gone(record) or peek(record + FUNCTION_FLAGS) != 0 or not covered(unit, segment: segment_of(record), ecam: peek(record + FUNCTION_ECAM), requester) {
+    \\        fail IommuError.Unsupported
     \\    }
+    \\    let flags = iommu_lock()
+    \\    let domain = live(unit, key: space.key)
+    \\    if domain == 0 {
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Closed
+    \\    }
+    \\    if on_aarch64() and not map_range(unit, domain, address: ITS_PAGE, bytes: PAGE_BYTES, device: true) {
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Exhausted
+    \\    }
+    \\    if not set_entry(unit, requester, domain) {
+    \\        iommu_unlock(flags)
+    \\        fail IommuError.Exhausted
+    \\    }
+    \\    iommu_flush()
+    \\    iommu_unlock(flags)
+    \\    poke(record + FUNCTION_ATTACHED, value: space.key)
+    \\    set_command(record, set: BUS_MASTER, clear: 0)
+    \\} attached_to
+    \\
+    \\/// Attaches a function to physical memory, under the PCI lock.
+    \\fn attached_physically(record: u64) fails IommuError {
+    \\    if gone(record) {
+    \\        fail IommuError.Unsupported
+    \\    }
+    \\    let unit = iommu_unit()
+    \\    let requester = peek(record + FUNCTION_REQUESTER)
+    \\    if unit != 0 and covered(unit, segment: segment_of(record), ecam: peek(record + FUNCTION_ECAM), requester) {
+    \\        if (peek(record + FUNCTION_FLAGS) & ALIASED) != 0 or (peek(unit + UNIT_KIND) == VTD and (peek(unit + UNIT_FLAGS) & PASS_THROUGH) == 0) {
+    \\            fail IommuError.Unsupported
+    \\        }
+    \\        let flags = iommu_lock()
+    \\        let passed = set_entry(unit, requester, domain: 0)
+    \\        if passed {
+    \\            iommu_flush()
+    \\        }
+    \\        iommu_unlock(flags)
+    \\        if not passed {
+    \\            fail IommuError.Exhausted
+    \\        }
+    \\    }
+    \\    poke(record + FUNCTION_ATTACHED, value: ATTACHED_PHYSICAL)
+    \\    set_command(record, set: BUS_MASTER, clear: 0)
+    \\} attached_physically
+    \\
+    \\/// Whether a port's messages reach the interrupt controller: on SMMUv3 its stream then bypasses
+    \\/// translation, its only requests being the messages the runtime gives it.
+    \\fn messages_reach(record: u64) -> bool {
+    \\    let unit = iommu_unit()
+    \\    if unit == 0 or peek(unit + UNIT_KIND) != SMMU {
+    \\        return true
+    \\    }
+    \\    let requester = peek(record + FUNCTION_REQUESTER)
+    \\    if not covered(unit, segment: segment_of(record), ecam: peek(record + FUNCTION_ECAM), requester) {
+    \\        return false
+    \\    }
+    \\    let flags = iommu_lock()
+    \\    let passed = set_entry(unit, requester, domain: 0)
+    \\    if passed {
+    \\        iommu_flush()
+    \\    }
+    \\    iommu_unlock(flags)
+    \\    return passed
+    \\} messages_reach
+    \\
+    \\/// The PCIe capability of a root or downstream port with a slot that is not cut off, zero
+    \\/// otherwise.
+    \\fn slot_capability(record: u64) -> u32 {
+    \\    let at = u32.truncate(peek(record + PORT_EXPRESS))
+    \\    if at == 0 or gone(record) {
+    \\        return 0
+    \\    }
+    \\    let flags = config(record, offset: at) >> 16
+    \\    let kind = (flags >> 4) & 0xF
+    \\    if (flags & SLOT_IMPLEMENTED) == 0 or (kind != ROOT_PORT and kind != DOWNSTREAM_PORT) {
+    \\        return 0
+    \\    }
+    \\    return at
+    \\} slot_capability
+    \\
+    \\/// The slot control bits raising a slot's hot-plug interrupt on presence changes, attention
+    \\/// button presses and link changes where it has them.
+    \\fn slot_events_enabled(record: u64, at: u32) -> u32 {
+    \\    var events = PRESENCE_EVENTS | HOT_PLUG_INTERRUPTS
+    \\    if (config(record, offset: at + SLOT_CAPABILITIES) & ATTENTION_BUTTON) != 0 {
+    \\        events |= ATTENTION_EVENTS
+    \\    }
+    \\    if (config(record, offset: at + LINK_CAPABILITIES) & REPORTS_LINK) != 0 {
+    \\        events |= LINK_EVENTS
+    \\    }
+    \\    return events
+    \\} slot_events_enabled
+    \\
+    \\/// Sets and clears bits of a slot's control, then waits until the slot completes the command,
+    \\/// under the PCI lock.
+    \\fn slot_command(record: u64, at: u32, set: u32, clear: u32) {
+    \\    let control = config(record, offset: at + SLOT_CONTROL) & 0xFFFF
+    \\    set_config16(record, offset: at + SLOT_CONTROL, value: u16.truncate((control & ~clear) | set))
+    \\    if (config(record, offset: at + SLOT_CAPABILITIES) & NO_COMMAND_COMPLETED) != 0 {
+    \\        return
+    \\    }
+    \\    for _ in 0u32..<COMMAND_POLLS {
+    \\        if ((config(record, offset: at + SLOT_CONTROL) >> 16) & COMMAND_COMPLETED) != 0 {
+    \\            set_config16(record, offset: at + SLOT_STATUS, value: u16.truncate(COMMAND_COMPLETED))
+    \\            return
+    \\        }
+    \\    }
+    \\} slot_command
+    \\
+    \\/// Cuts off every function found below a port that is not cut off itself, giving whether it
+    \\/// is not: the generations of the port's buses grow, so those functions give no window and
+    \\/// reach no memory from then on, and the IOMMU translates none of those buses' requester ids.
+    \\fn cut_below(port: u64) -> bool {
+    \\    let held = pci_lock()
+    \\    if gone(port) {
+    \\        pci_unlock(held)
+    \\        return false
+    \\    }
+    \\    let host = peek(port + FUNCTION_HOST)
+    \\    let buses = config(port, offset: BUSES_OFFSET)
+    \\    let first_bus = u64.widen((buses >> 8) & 0xFF)
+    \\    let end = u64.widen((buses >> 16) & 0xFF) + 1
+    \\    if first_bus != 0 {
+    \\        for bus in first_bus..<end {
+    \\            let at = host + HOST_GENERATIONS + bus * 8
+    \\            poke(at, value: peek(at) + 1)
+    \\        }
+    \\        let unit = iommu_unit()
+    \\        if unit != 0 and peek(host + HOST_SEGMENT) == 0 {
+    \\            let flags = iommu_lock()
+    \\            for bus in first_bus..<end {
+    \\                clear_bus(unit, bus)
+    \\            }
+    \\            iommu_flush()
+    \\            iommu_unlock(flags)
+    \\        }
+    \\    }
+    \\    pci_unlock(held)
+    \\    return true
+    \\} cut_below
+    \\
+    \\/// Cuts a function off: unless a port's cut-off reached it first, it no longer masters the bus
+    \\/// or decodes memory, and its context or stream reaches nothing once the IOMMU no longer caches
+    \\/// it; then frees its record and those of its windows.
+    \\fn cut_off(record: u64) {
+    \\    let held = pci_lock()
+    \\    if not gone(record) {
+    \\        set_command(record, set: 0, clear: BUS_MASTER | MEMORY)
+    \\        let unit = iommu_unit()
+    \\        if unit != 0 and peek(record + FUNCTION_ATTACHED) != 0 {
+    \\            let flags = iommu_lock()
+    \\            clear_entry(unit, requester: peek(record + FUNCTION_REQUESTER))
+    \\            iommu_flush()
+    \\            iommu_unlock(flags)
+    \\        }
+    \\    }
+    \\    pci_unlock(held)
     \\    var window = peek(record + FUNCTION_WINDOWS)
     \\    while window != 0 {
     \\        let next = peek(window + WINDOW_NEXT)
@@ -11088,13 +12115,44 @@ const TEXT_HW_PCI: Str =
     \\    free_record(record)
     \\} cut_off
     \\
+    \\/// Sets and clears bits of a function's command unless it is cut off, under the PCI lock;
+    \\/// false when it is.
+    \\fn live_command(record: u64, set: u32, clear: u32) -> bool {
+    \\    let held = pci_lock()
+    \\    let present = not gone(record)
+    \\    if present {
+    \\        set_command(record, set, clear)
+    \\    }
+    \\    pci_unlock(held)
+    \\    return present
+    \\} live_command
+    \\
+    \\/// Whether a function or port was found before a port above it cut off what lay below it.
+    \\fn gone(record: u64) -> bool {
+    \\    let host = peek(record + FUNCTION_HOST)
+    \\    return bus_generation(host, bus: peek(record + FUNCTION_REQUESTER) >> 8) != peek(record + FUNCTION_GENERATION)
+    \\} gone
+    \\
+    \\fn bus_generation(host: u64, bus: u64) -> u64 {
+    \\    return peek(host + HOST_GENERATIONS + bus * 8)
+    \\} bus_generation
+    \\
+    \\fn segment_of(record: u64) -> u64 {
+    \\    return peek(peek(record + FUNCTION_HOST) + HOST_SEGMENT)
+    \\} segment_of
+    \\
+    \\fn address_of(record: u64) -> PciAddress {
+    \\    let requester = peek(record + FUNCTION_REQUESTER)
+    \\    return PciAddress(segment: u16.truncate(segment_of(record)), bus: u8.truncate(requester >> 8), device: u8.truncate((requester >> 3) & 0x1F), function: u8.truncate(requester & 0x7))
+    \\} address_of
+    \\
     \\/// Sets and clears bits of a function's command register, leaving its status.
     \\fn set_command(record: u64, set: u32, clear: u32) {
     \\    let command = config(record, offset: COMMAND_OFFSET) & 0xFFFF
     \\    set_config(record, offset: COMMAND_OFFSET, value: (command & ~clear) | set)
     \\} set_command
     \\
-    \\/// A double word of a function's configuration, and its write.
+    \\/// A double word of a function's configuration, its write, and the write of a word.
     \\fn config(record: u64, offset: u32) -> u32 {
     \\    return config_read(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset)
     \\} config
@@ -11102,6 +12160,15 @@ const TEXT_HW_PCI: Str =
     \\fn set_config(record: u64, offset: u32, value: u32) {
     \\    config_write(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset, value)
     \\} set_config
+    \\
+    \\fn set_config16(record: u64, offset: u32, value: u16) {
+    \\    config_write16(peek(record + FUNCTION_ECAM), requester: u32.truncate(peek(record + FUNCTION_REQUESTER)), offset, value)
+    \\} set_config16
+    \\
+    \\/// A double word of the configuration of a host's function.
+    \\fn host_config(host: u64, requester: u64, offset: u32) -> u32 {
+    \\    return config_read(peek(host + HOST_ECAM), requester: u32.truncate(requester), offset)
+    \\} host_config
     \\
 
 const TEXT_HW_SIM_SIM: Str =
@@ -11344,12 +12411,13 @@ const TEXT_HW_TABLES: Str =
     \\
     \\const TREE_END: u32 = 9
     \\
-    \\/// The values of a child of the device tree's root node: of its `reg` property and its
-    \\/// `ranges` property with its length in bytes, each zero when missing.
+    \\/// The values of a child of the device tree's root node: of its `reg` property, its `ranges`
+    \\/// property with its length in bytes, and its `bus-range` property, each zero when missing.
     \\struct NodeValues {
     \\    reg: u64
     \\    ranges: u64
     \\    ranges_len: u64
+    \\    bus_range: u64
     \\} NodeValues
     \\
     \\/// The address of the table with a signature that the XSDT, or the RSDT for an RSDP of revision
@@ -11382,7 +12450,7 @@ const TEXT_HW_TABLES: Str =
     \\
     \\/// The first child of the device tree's root node whose `compatible` property lists a name.
     \\fn tree_node(compatible: Str) -> NodeValues {
-    \\    var node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\    var node = NodeValues(reg: 0, ranges: 0, ranges_len: 0, bus_range: 0)
     \\    let tree = tree_address()
     \\    if tree == 0 or u32_be_at(tree) != TREE_MAGIC {
     \\        return node
@@ -11397,7 +12465,7 @@ const TEXT_HW_TABLES: Str =
     \\        if token == BEGIN_NODE {
     \\            depth += 1
     \\            if depth == 2 {
-    \\                node = NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\                node = NodeValues(reg: 0, ranges: 0, ranges_len: 0, bus_range: 0)
     \\                matched = false
     \\            }
     \\            while byte_at(at) != 0 {
@@ -11420,10 +12488,12 @@ const TEXT_HW_TABLES: Str =
     \\            } else if depth == 2 and text_is(name, text: "ranges") {
     \\                node.ranges = value
     \\                node.ranges_len = len
+    \\            } else if depth == 2 and text_is(name, text: "bus-range") {
+    \\                node.bus_range = value
     \\            }
     \\            at = value + (len + 3) / 4 * 4
     \\        } else if token == TREE_END {
-    \\            return NodeValues(reg: 0, ranges: 0, ranges_len: 0)
+    \\            return NodeValues(reg: 0, ranges: 0, ranges_len: 0, bus_range: 0)
     \\        }
     \\    }
     \\} tree_node

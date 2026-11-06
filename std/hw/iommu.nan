@@ -7,9 +7,10 @@ const SMMU: u64 = 2
 
 /// The offsets of the unit record, a chunk the runtime's flush and interrupt routines read too:
 /// its kind, register base, command queue, the queue's next entry, the interrupt remapping
-/// table, its flags, then past the runtime's lock and wait words, the table of bus 0's contexts
-/// or streams, the free table pages, a bit per function of bus 0 it translates, and the domain
-/// slots, each a domain record and a generation.
+/// table, its flags, then past the runtime's lock and wait words, its root table of contexts or
+/// its stream table, the free table pages, what it translates, the DMAR table's remapping unit
+/// on VT-d and the entries of its stream table on SMMUv3, and the domain slots, each a domain
+/// record and a generation.
 const UNIT_KIND: u64 = 0
 
 const UNIT_REGISTERS: u64 = 8
@@ -24,9 +25,7 @@ const UNIT_STREAMS: u64 = 64
 
 const UNIT_FREE: u64 = 72
 
-const UNIT_COVERED: u64 = 80
-
-const COVERED_WORDS: u64 = 4
+const UNIT_COVERS: u64 = 80
 
 const UNIT_SLOTS: u64 = 128
 
@@ -46,13 +45,15 @@ const UNCOHERENT: u64 = 8
 
 const PASS_THROUGH: u64 = 16
 
-/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function
-/// and a mapping. Every such record holds its holding at offset 0.
+/// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function,
+/// a mapping and a PCI port. Every such record holds its holding at offset 0.
 const DOMAIN_TAG: u64 = 1
 
 const FUNCTION_TAG: u64 = 2
 
 const MAPPING_TAG: u64 = 3
+
+const PORT_TAG: u64 = 4
 
 const RECORD_HOLDING: u64 = 0
 
@@ -165,12 +166,15 @@ const REMAPPING_EXTENDED: u64 = 0x800
 /// The remapping structures of the DMAR table: where they start, the kinds of a remapping
 /// unit and of a reserved memory region, the flag of a unit including every PCI function, and
 /// the table flag saying the platform remaps interrupts; where a unit's device scopes start, the
-/// kind of an endpoint's scope and the length of one naming a device of its start bus.
+/// kinds of an endpoint's scope and of a bridge's, and the length of one naming a device of its
+/// start bus.
 const DMAR_STRUCTURES: u64 = 48
 
 const DMAR_SCOPES: u64 = 16
 
 const ENDPOINT_SCOPE: u8 = 1
+
+const BRIDGE_SCOPE: u8 = 2
 
 const ONE_HOP: u64 = 8
 
@@ -199,15 +203,20 @@ registers SmmuRegisters {
 } SmmuRegisters
 
 /// The identity bits SMMUv3 needs: stage 1, AArch64 tables, coherent table walks, 4 KiB pages,
-/// and the stream id bits; the control bits enabling it and its command queue; the bypass
-/// register's update and abort bits; the read-allocate hint of a base register; inner
-/// shareable write-back tables and queues; and a stream table and command queue of 2^8
-/// entries.
+/// and the stream id bits; the identity bit of two-level stream tables; the control bits
+/// enabling it and its command queue; the bypass register's update and abort bits; the
+/// read-allocate hint of a base register; inner shareable write-back tables and queues; a
+/// command queue of 2^8 entries; the stream ids of a bus's functions, whose stream table
+/// entries fill a level-2 table of a two-level stream table; its format and split, and the span
+/// of a level-1 descriptor naming such a table; and the buses one chunk of a linear stream table
+/// holds.
 const STAGE1: u32 = 0x2
 
 const AARCH64_TABLES: u32 = 0x8
 
 const WALKS_COHERENT: u32 = 0x10
+
+const TWO_LEVELS: u32 = 0x800_0000
 
 const GRANULE_4K: u32 = 0x10
 
@@ -224,6 +233,18 @@ const READ_ALLOCATE: u64 = 0x4000_0000_0000_0000
 const SHARED_CACHED: u32 = 0xD75
 
 const LOG2_ENTRIES: u64 = 8
+
+const BUS_STREAMS: u64 = 256
+
+const BUS_TABLE: u64 = 16_384
+
+const TWO_LEVEL_FORMAT: u32 = 0x1_0000
+
+const BUS_SPLIT: u32 = 0x200
+
+const BUS_SPAN: u64 = 9
+
+const LINEAR_BUSES: u64 = 4
 
 /// A stream table entry's words: valid, then translated by stage 1 through one context
 /// descriptor or bypassing translation; the inner shareable write-back walks of its second word.
@@ -420,14 +441,16 @@ pkg fn unmapped(mapping: u64) {
     end_mapping(mapping)
 } unmapped
 
-/// Releases what a holding of an abandoned domain holds: a mapping ends, and a domain or
-/// function is cut off from memory.
+/// Releases what a holding of an abandoned domain holds: a mapping ends, a domain or function
+/// is cut off from memory, and a port's record is freed.
 pkg fn settled(kind: u64, payload: u64) {
     let tag = peek(payload + RECORD_TAG)
     if kind == UNMAP {
         end_mapping(payload)
     } else if tag == DOMAIN_TAG {
         close_domain(payload)
+    } else if tag == PORT_TAG {
+        free_record(payload)
     } else {
         cut_off(payload)
     }
@@ -454,9 +477,15 @@ fn close_domain(record: u64) {
     let unit = iommu_unit()
     let flags = iommu_lock()
     let slot = peek(record + DOMAIN_SLOT)
-    for requester in 0..<256u64 {
-        if attached_domain(unit, requester) == slot + FIRST_DOMAIN {
-            clear_entry(unit, requester)
+    for bus in 0..<256u64 {
+        let first_entry = bus_entries(unit, bus, create: false)
+        if first_entry != 0 {
+            for function in 0..<BUS_STREAMS {
+                let entry = first_entry + function * entry_bytes(unit)
+                if attached_domain(unit, entry) == slot + FIRST_DOMAIN {
+                    clear_at(unit, entry)
+                }
+            }
         }
     }
     let entry = unit + UNIT_SLOTS + slot * SLOT_BYTES
@@ -481,10 +510,9 @@ fn live(unit: u64, key: u64) -> u64 {
     return peek(entry)
 } live
 
-/// The domain id a requester's context or stream reaches, zero when it reaches none: the
+/// The domain id a context or stream table entry reaches, zero when it reaches none: the
 /// pass-through id, or a slot's plus `FIRST_DOMAIN`.
-fn attached_domain(unit: u64, requester: u64) -> u64 {
-    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+fn attached_domain(unit: u64, entry: u64) -> u64 {
     let head = peek(entry)
     if (head & 1) == 0 {
         return 0
@@ -507,10 +535,49 @@ fn entry_bytes(unit: u64) -> u64 {
     return STREAM_BYTES
 } entry_bytes
 
+/// The first context or stream table entry of a bus's requesters, under the unit's lock,
+/// adding the bus's context table on VT-d when `create` holds; zero when the unit has none or
+/// no table page is left.
+fn bus_entries(unit: u64, bus: u64, create: bool) -> u64 {
+    let table = peek(unit + UNIT_STREAMS)
+    if peek(unit + UNIT_KIND) == SMMU {
+        if (bus + 1) * BUS_STREAMS > peek(unit + UNIT_COVERS) {
+            return 0
+        }
+        return table + bus * BUS_STREAMS * STREAM_BYTES
+    }
+    let root = table + bus * 16
+    if (peek(root) & 1) == 0 {
+        if not create {
+            return 0
+        }
+        let contexts = table_page(unit)
+        if contexts == 0 {
+            return 0
+        }
+        poke(root, value: contexts | 0x1)
+        publish(unit, address: root, bytes: 16)
+    }
+    return peek(root) & FRAME_MASK
+} bus_entries
+
+/// A requester's context or stream table entry, as `bus_entries` gives its bus's.
+fn requester_entry(unit: u64, requester: u64, create: bool) -> u64 {
+    let first_entry = bus_entries(unit, bus: requester >> 8, create)
+    if first_entry == 0 {
+        return 0
+    }
+    return first_entry + (requester & 0xFF) * entry_bytes(unit)
+} requester_entry
+
 /// Points a requester's context or stream at a domain, or passes it through for zero, under
-/// the unit's lock; the first word, holding the valid bit, is written last.
-fn set_entry(unit: u64, requester: u64, domain: u64) {
-    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+/// the unit's lock, the first word, holding the valid bit, written last; false when no table
+/// page is left.
+fn set_entry(unit: u64, requester: u64, domain: u64) -> bool {
+    let entry = requester_entry(unit, requester, create: true)
+    if entry == 0 {
+        return false
+    }
     if peek(unit + UNIT_KIND) == VTD {
         if domain == 0 {
             poke(entry + 8, value: 0x2 | (PASS_DOMAIN << 8))
@@ -527,14 +594,31 @@ fn set_entry(unit: u64, requester: u64, domain: u64) {
         poke(entry, value: (domain + DOMAIN_CONTEXT) | STREAM_TRANSLATED)
     }
     publish(unit, address: entry, bytes: 16)
+    return true
 } set_entry
 
 /// Makes a requester's DMA reach nothing, under the unit's lock.
 fn clear_entry(unit: u64, requester: u64) {
-    let entry = peek(unit + UNIT_STREAMS) + requester * entry_bytes(unit)
+    let entry = requester_entry(unit, requester, create: false)
+    if entry != 0 {
+        clear_at(unit, entry)
+    }
+} clear_entry
+
+/// Makes the DMA of every requester of a bus reach nothing, under the unit's lock.
+fn clear_bus(unit: u64, bus: u64) {
+    let first_entry = bus_entries(unit, bus, create: false)
+    if first_entry != 0 {
+        for function in 0..<BUS_STREAMS {
+            clear_at(unit, entry: first_entry + function * entry_bytes(unit))
+        }
+    }
+} clear_bus
+
+fn clear_at(unit: u64, entry: u64) {
     poke(entry, value: 0)
     publish(unit, address: entry, bytes: 8)
-} clear_entry
+} clear_at
 
 /// Maps the pages of a range at their own addresses in a domain's tables, as device memory on
 /// SMMUv3 when `device` holds, under the unit's lock; false when no table page is left.
@@ -719,13 +803,10 @@ fn started_vtd() -> Option[Iommu] {
     poke(unit + UNIT_REGISTERS, value: base)
     poke(unit + UNIT_REMAPPING, value: remapping)
     poke(unit + UNIT_FLAGS, value: flags)
-    cover_scopes(unit, drhd)
+    poke(unit + UNIT_COVERS, value: drhd)
     let root = table_page(unit)
-    let contexts = table_page(unit)
     poke(unit + UNIT_QUEUE, value: table_page(unit))
-    poke(unit + UNIT_STREAMS, value: contexts)
-    poke(root, value: contexts | 0x1)
-    publish(unit, address: root, bytes: 16)
+    poke(unit + UNIT_STREAMS, value: root)
     publish(unit, address: remapping, bytes: REMAPPING_CHUNKS * CHUNK)
     mut regs.write(VtdRegisters.root, value: root)
     vtd_command(mut regs, bit: SET_ROOT)
@@ -788,50 +869,50 @@ fn vtd_unit() -> u64 {
     return unit
 } vtd_unit
 
-/// Records in the unit the functions of bus 0 a remapping unit translates: every one when it
-/// includes every PCI function, otherwise the endpoints its device scopes name on bus 0.
-fn cover_scopes(unit: u64, drhd: u64) {
-    if (byte_at(drhd + 4) & ALL_FUNCTIONS) != 0 {
-        cover_all(unit)
-        return
+/// Whether the unit translates a requester of a segment whose configuration an ECAM, or the
+/// configuration ports for zero, reaches: on VT-d one of segment 0 its remapping unit includes,
+/// every one when it includes every PCI function, otherwise each endpoint its device scopes name
+/// one hop below their start bus and each function of the buses below each bridge they name so;
+/// on SMMUv3 one of segment 0 its stream table holds.
+fn covered(unit: u64, segment: u64, ecam: u64, requester: u64) -> bool {
+    let covers = peek(unit + UNIT_COVERS)
+    if segment != 0 {
+        return false
     }
-    let end = drhd + u64.widen(u32_at(drhd) >> 16)
-    var at = drhd + DMAR_SCOPES
+    if peek(unit + UNIT_KIND) == SMMU {
+        return requester < covers
+    }
+    if (byte_at(covers + 4) & ALL_FUNCTIONS) != 0 {
+        return true
+    }
+    let end = covers + u64.widen(u32_at(covers) >> 16)
+    var at = covers + DMAR_SCOPES
     while at + 2 <= end {
         let length = u64.widen(byte_at(at + 1))
         if length == 0 {
-            return
+            return false
         }
-        if byte_at(at) == ENDPOINT_SCOPE and length == ONE_HOP and byte_at(at + 5) == 0 {
-            let requester = (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
-            cover(unit, requester)
+        let named = (u64.widen(byte_at(at + 5)) << 8) | (u64.widen(byte_at(at + 6)) << 3) | u64.widen(byte_at(at + 7) & 0x7)
+        if length == ONE_HOP and named == requester and (byte_at(at) == ENDPOINT_SCOPE or byte_at(at) == BRIDGE_SCOPE) {
+            return true
+        }
+        if length == ONE_HOP and byte_at(at) == BRIDGE_SCOPE {
+            let buses = config_read(ecam, requester: u32.truncate(named), offset: BUSES_OFFSET)
+            let bus = u32.truncate(requester >> 8)
+            if bus >= ((buses >> 8) & 0xFF) and bus <= ((buses >> 16) & 0xFF) and ((buses >> 8) & 0xFF) != 0 {
+                return true
+            }
         }
         at += length
     }
-} cover_scopes
-
-/// Records that the unit translates every function of bus 0.
-fn cover_all(unit: u64) {
-    for word in 0..<COVERED_WORDS {
-        poke(unit + UNIT_COVERED + word * 8, value: 0xFFFF_FFFF_FFFF_FFFF)
-    }
-} cover_all
-
-/// Records that the unit translates a requester of bus 0.
-fn cover(unit: u64, requester: u64) {
-    let at = unit + UNIT_COVERED + (requester >> 6) * 8
-    poke(at, value: peek(at) | (1u64 << u32.truncate(requester & 0x3F)))
-} cover
-
-/// Whether the unit translates a requester of bus 0.
-fn covered(unit: u64, requester: u64) -> bool {
-    let bits = peek(unit + UNIT_COVERED + (requester >> 6) * 8)
-    return ((bits >> u32.truncate(requester & 0x3F)) & 1) != 0
+    return false
 } covered
 
 /// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
-/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0. Every
-/// function's DMA then reaches nothing until it is attached.
+/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0, its stream
+/// table holding the stream table entries of the PCI host's buses that its stream ids reach,
+/// in a level-2 table per bus, or of the buses one chunk holds when it walks no two-level
+/// table. Every function's DMA then reaches nothing until it is attached.
 fn started_smmu() -> Option[Iommu] {
     let node = tree_node(compatible: "arm,smmu-v3")
     if node.reg == 0 {
@@ -847,8 +928,15 @@ fn started_smmu() -> Option[Iommu] {
         take regs.unmap()
         return None
     }
+    let walks_two = (identity & TWO_LEVELS) != 0
+    let wanted = tree_buses()
+    var log2 = LOG2_ENTRIES
+    while log2 < stream_bits and (1u64 << u32.fit(log2)) < wanted * BUS_STREAMS and (walks_two or (1u64 << u32.fit(log2)) < LINEAR_BUSES * BUS_STREAMS) {
+        log2 += 1
+    }
+    let buses = (1u64 << u32.fit(log2)) / BUS_STREAMS
     let unit = chunks(1)
-    let streams = chunks(1)
+    let streams = chunks((buses * BUS_TABLE + CHUNK - 1) / CHUNK)
     if unit == 0 or streams == 0 {
         take regs.unmap()
         return None
@@ -857,7 +945,16 @@ fn started_smmu() -> Option[Iommu] {
     poke(unit + UNIT_REGISTERS, value: base)
     poke(unit + UNIT_FLAGS, value: u64.widen(sizes & 0x7) << 8)
     poke(unit + UNIT_STREAMS, value: streams)
-    cover_all(unit)
+    poke(unit + UNIT_COVERS, value: buses * BUS_STREAMS)
+    var table = streams
+    var format = u32.truncate(log2)
+    if walks_two {
+        table = table_page(unit)
+        for bus in 0..<buses {
+            poke(table + bus * 8, value: (streams + bus * BUS_TABLE) | BUS_SPAN)
+        }
+        format |= TWO_LEVEL_FORMAT | BUS_SPLIT
+    }
     let queue = table_page(unit)
     poke(unit + UNIT_QUEUE, value: queue)
     mut regs.write(SmmuRegisters.control, value: 0)
@@ -867,8 +964,8 @@ fn started_smmu() -> Option[Iommu] {
     while (mut regs.read(SmmuRegisters.bypass) & UPDATE) != 0 {
     }
     mut regs.write(SmmuRegisters.control1, value: SHARED_CACHED)
-    mut regs.write(SmmuRegisters.streams, value: streams | READ_ALLOCATE)
-    mut regs.write(SmmuRegisters.streams_config, value: u32.truncate(LOG2_ENTRIES))
+    mut regs.write(SmmuRegisters.streams, value: table | READ_ALLOCATE)
+    mut regs.write(SmmuRegisters.streams_config, value: format)
     mut regs.write(SmmuRegisters.queue_base, value: queue | READ_ALLOCATE | LOG2_ENTRIES)
     mut regs.write(SmmuRegisters.queue_produce, value: 0)
     mut regs.write(SmmuRegisters.queue_consume, value: 0)

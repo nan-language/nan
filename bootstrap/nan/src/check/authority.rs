@@ -154,7 +154,7 @@ impl Checker<'_> {
             ("hw::IrqShared", "uninstall")
             | (
                 "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Iommu"
-                | "hw::IoDomain" | "hw::PciFunction" | "hw::dma_fence",
+                | "hw::IoDomain" | "hw::PciFunction" | "hw::PciPort" | "hw::dma_fence",
                 _,
             ) => Some(Authority::Confined),
             ("hw::Ring0", _) => Some(Authority::Priv),

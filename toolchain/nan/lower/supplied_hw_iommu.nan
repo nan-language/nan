@@ -16,7 +16,7 @@ fn iommu_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     let Some(name) = written.slice_bytes(4, end: written.as_bytes().len()) else {
         return false
     }
-    if unit_lower(mut lo, mut fx, supply, name) {
+    if unit_lower(mut lo, mut fx, supply, name) or pci_lower(mut lo, mut fx, supply, name) {
         return true
     }
     match name {
@@ -77,14 +77,6 @@ fn iommu_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             let root = mut lo.data_address(mut fx, id: root_data)
             supply.ret(mut lo, mut fx, held: Held.Scalar(root))
         }
-        "config_read" => {
-            let value = pci_config(mut lo, mut fx, supply, write: None)
-            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
-        }
-        "config_write" => {
-            discard pci_config(mut lo, mut fx, supply, write: Some(supply.param(3).scalar_value()))
-            supply.done(mut lo, mut fx)
-        }
         else => return false
     }
     return true
@@ -121,10 +113,50 @@ fn unit_lower(mut lo: Lowering, mut fx: Fx, supply: Supply, name: Str) -> bool {
     return true
 } unit_lower
 
-/// A PCI configuration access of a double word: through the ECAM a nonzero first parameter
+/// The PCI operations: the PCI record, its lock and configuration accesses.
+fn pci_lower(mut lo: Lowering, mut fx: Fx, supply: Supply, name: Str) -> bool {
+    match name {
+        "pci_state" => {
+            let state_address = mut lo.state(mut fx)
+            let record = mut fx.load(PTR, addr: state_address, offset: STATE_PCI)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(record))
+        }
+        "pci_ready" => {
+            let state_address = mut lo.state(mut fx)
+            mut fx.store(supply.param(0).scalar_value(), addr: state_address, offset: STATE_PCI)
+            supply.done(mut lo, mut fx)
+        }
+        "pci_lock" => {
+            let state_address = mut lo.state(mut fx)
+            let flags = mut lo.spin_lock(mut fx, base: state_address, offset: STATE_PCI_REMOVAL_LOCK)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(flags))
+        }
+        "pci_unlock" => {
+            let state_address = mut lo.state(mut fx)
+            mut lo.spin_unlock(mut fx, base: state_address, offset: STATE_PCI_REMOVAL_LOCK, flags: supply.param(0).scalar_value())
+            supply.done(mut lo, mut fx)
+        }
+        "config_read" => {
+            let value = pci_config(mut lo, mut fx, supply, write: None, width: 4)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "config_write" => {
+            discard pci_config(mut lo, mut fx, supply, write: Some(supply.param(3).scalar_value()), width: 4)
+            supply.done(mut lo, mut fx)
+        }
+        "config_write16" => {
+            discard pci_config(mut lo, mut fx, supply, write: Some(supply.param(3).scalar_value()), width: 2)
+            supply.done(mut lo, mut fx)
+        }
+        else => return false
+    }
+    return true
+} pci_lower
+
+/// A PCI configuration access of `width` bytes: through the ECAM a nonzero first parameter
 /// names, or on x86_64 through the configuration ports, which a lock keeps to one CPU at a time.
 /// Reads give the double word.
-fn pci_config(mut lo: Lowering, mut fx: Fx, supply: Supply, write: Option[clif::Value]) -> clif::Value {
+fn pci_config(mut lo: Lowering, mut fx: Fx, supply: Supply, write: Option[clif::Value], width: u64) -> clif::Value {
     let ecam = supply.param(0).scalar_value()
     let requester = mut fx.b.uextend(PTR, x: supply.param(1).scalar_value())
     let offset = mut fx.b.uextend(PTR, x: supply.param(2).scalar_value())
@@ -136,14 +168,14 @@ fn pci_config(mut lo: Lowering, mut fx: Fx, supply: Supply, write: Option[clif::
     if lo.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
         let ported = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ecam, y: 0)
         let chosen = mut fx.choose_in(mut lo, condition: ported, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-            return config_ports(mut lo1, fx: mut fx1, requester, offset, value)
+            return config_ports(mut lo1, fx: mut fx1, requester, offset, value, width)
         }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-            return config_mapped(mut lo1, fx: mut fx1, ecam, requester, offset, value)
+            return config_mapped(mut lo1, fx: mut fx1, ecam, requester, offset, value, width)
         })
         expect chosen.len() > 0
         read = chosen[0]
     } else {
-        let mapped = config_mapped(mut lo, mut fx, ecam, requester, offset, value)
+        let mapped = config_mapped(mut lo, mut fx, ecam, requester, offset, value, width)
         expect mapped.len() > 0
         read = mapped[0]
     }
@@ -151,13 +183,13 @@ fn pci_config(mut lo: Lowering, mut fx: Fx, supply: Supply, write: Option[clif::
 } pci_config
 
 /// A configuration access through the ECAM at `ecam`.
-fn config_mapped(mut lo: Lowering, mut fx: Fx, ecam: clif::Value, requester: clif::Value, offset: clif::Value, value: Option[clif::Value]) -> mem::List[clif::Value] {
+fn config_mapped(mut lo: Lowering, mut fx: Fx, ecam: clif::Value, requester: clif::Value, offset: clif::Value, value: Option[clif::Value], width: u64) -> mem::List[clif::Value] {
     let function = mut fx.b.ishl_imm_s(requester, y: 12)
     let base = mut fx.b.iadd(ecam, y: function)
     let at = mut fx.b.iadd(base, y: offset)
     match value {
         Some(written) => {
-            mut lo.mmio_write(mut fx, width: 4, address: at, value: written)
+            mut lo.mmio_write(mut fx, width, address: at, value: written)
             return fx.list1(mut fx.ptr(0))
         }
         None => return fx.list1(mut lo.mmio_read(mut fx, width: 4, address: at))
@@ -166,7 +198,7 @@ fn config_mapped(mut lo: Lowering, mut fx: Fx, ecam: clif::Value, requester: cli
 
 /// A configuration access through the configuration ports, under their lock with maskable
 /// interrupts disabled.
-fn config_ports(mut lo: Lowering, mut fx: Fx, requester: clif::Value, offset: clif::Value, value: Option[clif::Value]) -> mem::List[clif::Value] {
+fn config_ports(mut lo: Lowering, mut fx: Fx, requester: clif::Value, offset: clif::Value, value: Option[clif::Value], width: u64) -> mem::List[clif::Value] {
     let state_address = mut lo.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_PCI_LOCK)
     let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
@@ -184,11 +216,17 @@ fn config_ports(mut lo: Lowering, mut fx: Fx, requester: clif::Value, offset: cl
     let address = mut fx.b.bor_imm_s(combined, y: CONFIG_ENABLE)
     let address_port = mut fx.ptr(CONFIG_ADDRESS)
     mut lo.port_out(mut fx, width: 4, port: address_port, value: address)
-    let data_port = mut fx.ptr(CONFIG_DATA)
+    var data_port = clif::Value(index: 0)
+    if width == 4 {
+        data_port = mut fx.ptr(CONFIG_DATA)
+    } else {
+        let word = mut fx.b.band_imm_s(offset, y: 0x2)
+        data_port = mut fx.b.iadd_imm_s(word, y: i64.fit(CONFIG_DATA))
+    }
     var read = clif::Value(index: 0)
     match value {
         Some(written) => {
-            mut lo.port_out(mut fx, width: 4, port: data_port, value: written)
+            mut lo.port_out(mut fx, width, port: data_port, value: written)
             read = mut fx.ptr(0)
         }
         None => {

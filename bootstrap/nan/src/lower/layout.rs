@@ -520,8 +520,8 @@ impl Layouts {
                 self.record(ck, &[("record".to_owned(), Ty::Scalar(Scalar::U64))])
             }
             // A machine root grant: the handles of its root allocator, executor, clock and wall
-            // clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU and its PCI
-            // functions were taken;
+            // clock, and whether its regions, its `hw::Ring0`, its modules, its IOMMU, its PCI
+            // functions and its PCI ports were taken;
             // `boot::Machine` carries them into the `boot::Kernel` its `exit_services` returns.
             "boot::Kernel" | "boot::Machine" => self.record(
                 ck,
@@ -535,6 +535,7 @@ impl Layouts {
                     ("modules".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("iommu".to_owned(), Ty::Scalar(Scalar::Bool)),
                     ("functions".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("ports".to_owned(), Ty::Scalar(Scalar::Bool)),
                 ],
             ),
             // A physical frame, a page-table root, user frame or extended-state save area owning

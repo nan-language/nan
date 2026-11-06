@@ -1,0 +1,101 @@
+//! Lists the PCI ports and the functions behind them with their bus paths, the runtime numbering their buses and giving them windows, then maps each function's virtio registers through its BAR.
+
+registers Pl011 {
+    data: u8 at 0x0 write
+} Pl011
+
+/// The common configuration of a modern virtio device, which QEMU's devices lay out at the
+/// start of BAR 4, and the feature bit, in the second feature word, of virtio 1.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+} Common
+
+const COMMON_BAR: u8 = 4
+
+const VERSION_1: u32 = 1
+
+fn say(text: Slice[u8]) {
+    var port = trusted "the virt board maps the PL011 of the serial port at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
+    for byte in text {
+        mut port.write(Pl011.data, value: byte)
+    }
+    take port.unmap()
+} say
+
+fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
+    let alloc = k.alloc()
+    let ports = mut k.pci_ports()
+    for port in take ports {
+        var line = mem::Bytes.empty(alloc)
+        mut line.append(b"port ")
+        address(mut line, at: port.address())
+        let buses = port.buses()
+        match port.kind() {
+            hw::PortKind.Root => mut line.append(b" root")
+            hw::PortKind.Upstream => mut line.append(b" upstream")
+            hw::PortKind.Downstream => mut line.append(b" downstream")
+            hw::PortKind.Bridge => mut line.append(b" bridge")
+        }
+        mut line.append(b" buses ")
+        hex(mut line, value: u32.widen(buses.secondary), digits: 2)
+        mut line.append(b"-")
+        hex(mut line, value: u32.widen(buses.subordinate), digits: 2)
+        match port.slot() {
+            Some(slot) => {
+                mut line.append(b" slot ")
+                hex(mut line, value: u32.widen(slot.number), digits: 1)
+            }
+            None => {}
+        }
+        mut line.append(b"\n")
+        say(line.view())
+        take port.release()
+    }
+    let functions = mut k.pci_functions()
+    for function in take functions {
+        var mapped = function
+        if mapped.address().bus != 0 {
+            var line = mem::Bytes.empty(alloc)
+            mut line.append(b"function ")
+            address(mut line, at: mapped.address())
+            match attempt hw::Mmio[Common].of_bar(mut mapped, index: COMMON_BAR, offset: 0) {
+                Ok(common) => {
+                    var regs = common
+                    mut regs.write(Common.device_feature_select, value: 1)
+                    if (mut regs.read(Common.device_feature) & VERSION_1) != 0 {
+                        mut line.append(b": virtio 1 through its BAR")
+                    }
+                    take regs.unmap()
+                }
+                Err(_) => mut line.append(b": no BAR")
+            }
+            mut line.append(b"\n")
+            say(line.view())
+        }
+        take mapped.release()
+    }
+    take k.anchor(0u8, run: fn(exec: task::Executor) limits stack 16_384 {
+        say(b"anchored\n")
+    })
+} main
+
+/// Appends a bus path as segment:bus:device.function.
+fn address(mut line: mem::Bytes, at: hw::PciAddress) {
+    hex(mut line, value: u32.widen(at.segment), digits: 4)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.bus), digits: 2)
+    mut line.append(b":")
+    hex(mut line, value: u32.widen(at.device), digits: 2)
+    mut line.append(b".")
+    hex(mut line, value: u32.widen(at.function), digits: 1)
+} address
+
+/// Appends a value in `digits` hexadecimal digits.
+fn hex(mut line: mem::Bytes, value: u32, digits: u32) {
+    var shift = digits * 4
+    while shift > 0 {
+        shift -= 4
+        mut line.push(b"0123456789abcdef"[usize.widen((value >> shift) & 0xF)])
+    }
+} hex

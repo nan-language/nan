@@ -80,7 +80,7 @@ pub fn transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
             lo.transfers(&value)
         }
         "hw::IrqShared" | "hw::PerCpu" | "hw::Dma" | "hw::DmaShared" | "hw::IdtInstalled"
-        | "hw::IoDomain" | "hw::PciFunction" => true,
+        | "hw::IoDomain" | "hw::PciFunction" | "hw::PciPort" => true,
         "hw::Mmio" | "hw::Ports" | "hw::Idt" | "hw::Region" | "hw::PhysFrame"
         | "hw::PageTableRoot" | "hw::UserFrame" | "hw::ExtendedState" => false,
         _ => return None,
@@ -128,7 +128,7 @@ pub fn transfer(
             let contents = fx.load(PTR, address, 0);
             super::super::transfer::lift(lo, fx, contents, lift);
         }
-        "hw::IoDomain" | "hw::PciFunction" => {
+        "hw::IoDomain" | "hw::PciFunction" | "hw::PciPort" => {
             let record = fx.load(PTR, address, 0);
             super::super::transfer::rehome(lo, fx, record, owner);
         }

@@ -105,12 +105,37 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let root = lo.data_address(fx, root);
             supply.ret(lo, fx, Held::Scalar(root));
         }
+        "pci_state" => {
+            let state_address = lo.state(fx);
+            let record = fx.load(PTR, state_address, state::PCI);
+            supply.ret(lo, fx, Held::Scalar(record));
+        }
+        "pci_ready" => {
+            let state_address = lo.state(fx);
+            fx.store(supply.param(0).scalar(), state_address, state::PCI);
+            supply.done(lo, fx);
+        }
+        "pci_lock" => {
+            let state_address = lo.state(fx);
+            let flags = lo.spin_lock(fx, state_address, state::PCI_REMOVAL_LOCK);
+            supply.ret(lo, fx, Held::Scalar(flags));
+        }
+        "pci_unlock" => {
+            let state_address = lo.state(fx);
+            let flags = supply.param(0).scalar();
+            lo.spin_unlock(fx, state_address, state::PCI_REMOVAL_LOCK, flags);
+            supply.done(lo, fx);
+        }
         "config_read" => {
-            let value = config(lo, fx, supply, None);
+            let value = config(lo, fx, supply, None, 4);
             supply.ret(lo, fx, Held::Scalar(value));
         }
         "config_write" => {
-            config(lo, fx, supply, Some(supply.param(3).scalar()));
+            config(lo, fx, supply, Some(supply.param(3).scalar()), 4);
+            supply.done(lo, fx);
+        }
+        "config_write16" => {
+            config(lo, fx, supply, Some(supply.param(3).scalar()), 2);
             supply.done(lo, fx);
         }
         _ => return false,
@@ -118,10 +143,16 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     true
 }
 
-/// A PCI configuration access of a double word: through the ECAM a nonzero first parameter
+/// A PCI configuration access of `width` bytes: through the ECAM a nonzero first parameter
 /// names, or on x86_64 through the configuration ports, which a lock keeps to one CPU at a time.
 /// Reads give the double word.
-fn config(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, write: Option<Value>) -> Value {
+fn config(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    write: Option<Value>,
+    width: u64,
+) -> Value {
     let ecam = supply.param(0).scalar();
     let requester = fx.b.ins().uextend(PTR, supply.param(1).scalar());
     let offset = fx.b.ins().uextend(PTR, supply.param(2).scalar());
@@ -132,7 +163,7 @@ fn config(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, write: Option<Value>)
         let at = fx.b.ins().iadd(at, offset);
         match value {
             Some(value) => {
-                lo.mmio_write(fx, 4, at, value);
+                lo.mmio_write(fx, width, at, value);
                 vec![fx.ptr(0)]
             }
             None => vec![lo.mmio_read(fx, 4, at)],
@@ -164,10 +195,16 @@ fn config(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, write: Option<Value>)
                     let address = fx.b.ins().bor_imm_s(address, CONFIG_ENABLE);
                     let port = fx.ptr(CONFIG_ADDRESS);
                     lo.port_out(fx, 4, port, address);
-                    let port = fx.ptr(CONFIG_DATA);
+                    let port = match width {
+                        4 => fx.ptr(CONFIG_DATA),
+                        _ => {
+                            let word = fx.b.ins().band_imm_s(offset, 0x2);
+                            fx.b.ins().iadd_imm_s(word, CONFIG_DATA as i64)
+                        }
+                    };
                     let read = match value {
                         Some(value) => {
-                            lo.port_out(fx, 4, port, value);
+                            lo.port_out(fx, width, port, value);
                             fx.ptr(0)
                         }
                         None => lo.port_in(fx, 4, port),

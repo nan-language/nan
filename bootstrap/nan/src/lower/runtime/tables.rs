@@ -855,7 +855,7 @@ fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
         fx.store(value, grant, at);
     }
     let untaken = fx.int(types::I8, 0);
-    for field in ["regions", "ring0", "modules", "iommu", "functions"] {
+    for field in ["regions", "ring0", "modules", "iommu", "functions", "ports"] {
         let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
         fx.store(untaken, grant, at);
     }

@@ -242,7 +242,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
 ];
 
 /// The primitive capabilities, by canonical path.
-const PRIMITIVE_CAPABILITIES: [&str; 36] = [
+const PRIMITIVE_CAPABILITIES: [&str; 37] = [
     "mem::Alloc",
     "mem::Budget",
     "mem::Heap",
@@ -279,6 +279,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 36] = [
     "hw::Iommu",
     "hw::IoDomain",
     "hw::PciFunction",
+    "hw::PciPort",
 ];
 
 /// The base types with interior mutability, by canonical path.

@@ -42,7 +42,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.regions" => regions(lo, fx, supply),
         "boot::Kernel.modules" => modules(lo, fx, supply),
         "boot::Kernel.iommu" => iommu(lo, fx, supply),
-        "boot::Kernel.pci_functions" => pci_functions(lo, fx, supply),
+        "boot::Kernel.pci_functions" => pci_listed(lo, fx, supply, "functions", "enumerated"),
+        "boot::Kernel.pci_ports" => pci_listed(lo, fx, supply, "ports", "ports_enumerated"),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
         "boot::Kernel.policy" => lo.install_policy(fx, supply),
         "boot::Module.contents" => module_contents(lo, fx, supply),
@@ -162,27 +163,27 @@ fn iommu(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, none);
 }
 
-/// `k.pci_functions()`: the first time, the functions std's `hw` enumerates on a kernel, drawn
-/// through the root allocator; an empty list after, and on a test image.
-fn pci_functions(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+/// `k.pci_functions()` and `k.pci_ports()`: the first time, what std's `hw` function `listing`
+/// lists on a kernel, drawn through the root allocator, the grant's field `taken` recording the
+/// call; an empty list after, and on a test image.
+fn pci_listed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, taken: &str, listing: &str) {
     let grant = supply.param(0).address();
     let alloc = fx.offset(grant, field(lo, supply, "alloc"));
     if lo.kernel() {
-        let first = first_take(lo, fx, supply, "functions");
+        let first = first_take(lo, fx, supply, taken);
         fx.when(first, |fx| {
-            let functions =
-                super::hw::iommu::call_hw(lo, fx, "enumerated", &[Held::Address(alloc)]);
-            supply.ret(lo, fx, functions);
+            let listed = super::hw::iommu::call_hw(lo, fx, listing, &[Held::Address(alloc)]);
+            supply.ret(lo, fx, listed);
         });
     }
-    let list = supply.sret.expect("the functions' address");
-    let function_ty = supply
+    let list = supply.sret.expect("the list's address");
+    let element_ty = supply
         .abi
         .result
         .type_arg(0)
         .cloned()
-        .expect("the function type");
-    let element = Element::of(lo, &function_ty);
+        .expect("the element type");
+    let element = Element::of(lo, &element_ty);
     let cell = fx.load(PTR, alloc, 0);
     vector::empty(fx, list, cell, element);
     supply.ret(lo, fx, Held::Address(list));

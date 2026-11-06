@@ -487,7 +487,12 @@ pub mod state {
     pub const CLOCK_COUNTER: u64 = 504;
     pub const CLOCK_MASK: u64 = 512;
     pub const CLOCK_TICKS: u64 = 520;
-    pub const SIZE: u64 = 528;
+    /// On a kernel, the record of what std's `hw` found below the PCI host bridges, zero before
+    /// `boot::Kernel` lists it, and the lock ordering the removal of PCI functions with their
+    /// configuration.
+    pub const PCI: u64 = 528;
+    pub const PCI_REMOVAL_LOCK: u64 = 536;
+    pub const SIZE: u64 = 544;
 }
 
 impl Lowering<'_, '_> {

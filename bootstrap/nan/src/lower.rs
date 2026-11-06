@@ -237,7 +237,7 @@ impl Glue {
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: [&str; 14] = [
+const CRITICAL_OWNERS: [&str; 15] = [
     "sys::Domain",
     "task::Sender",
     "task::Receiver",
@@ -252,6 +252,7 @@ const CRITICAL_OWNERS: [&str; 14] = [
     "hw::Iommu",
     "hw::IoDomain",
     "hw::PciFunction",
+    "hw::PciPort",
 ];
 
 /// The outcome of lowering a final closure.

@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks; user mode, which kernel tasks run user threads in, with split tables and user frames; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; loading bundles into a running kernel; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on the machine targets: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks; user mode, which kernel tasks run user threads in, with split tables and user frames; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; PCI functions and ports; the CPU signal and shootdowns; thread context, per-CPU state, scheduling policies, the kernel lowering of waiting, preemption and the kernel clock; physical memory; firmware services, the hand-off to a loaded bare image and the start information; loading bundles into a running kernel; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 
@@ -22,6 +22,8 @@ pub fn Kernel.ring0(mut self) -> Option[hw::Ring0]
 pub fn Kernel.iommu(mut self) -> Option[hw::Iommu]
 
 pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
+
+pub fn Kernel.pci_ports(mut self) -> mem::List[hw::PciPort]
 
 pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
 ```
@@ -47,9 +49,9 @@ pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 - The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64, outside the [start information](#start-information) with its module list, memory map, command line, modules and their names on a bare target, and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on a bare target with a start information, the entries of type 1 of its memory map, on `aarch64-bare` without one, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.
 - The first call of `k.ring0()` returns `Some` of the machine's one `hw::Ring0` ([privileged intrinsics](23-low-level.md#privileged-intrinsics)); later calls return `None`.
 - The first call of `k.iommu()` enables the machine's IOMMU and returns `Some` of its `hw::Iommu` ([I/O domains](23-low-level.md#io-domains)) when the runtime drives it, and `None` otherwise; later calls return `None`. From then on the DMA of every PCI function the IOMMU translates reaches no memory until the function is attached ([PCI functions](#pci-functions)). The runtime drives:
-    - on x86_64, Intel VT-d when the ACPI DMAR table lists one remapping unit, in segment 0, and no reserved memory region, the platform remaps interrupts, and the unit queues invalidations, remaps interrupts and walks four-level tables. It translates the functions of bus 0 that the unit includes, and enables interrupt remapping: the machine then delivers no message-signalled interrupt in the format it delivers without remapping, such as those `install_msi` gave before ([locks](#locks));
-    - on AArch64, the SMMUv3 of the device tree's `arm,smmu-v3` node when it translates stage 1 through AArch64 tables of 4 KiB pages, walks them coherently and has 8 stream id bits or more. It translates every function of bus 0, its stream id being its requester id.
-- The first call of `k.pci_functions()` returns the functions of PCI bus 0 of segment 0 that are endpoints, those of header type 0 and not of the bridge class, in the order of their requester ids, drawn through `k.alloc()`; later calls return an empty list. Each has bus mastering and memory decoding off and INTx disabled. Configuration goes through the configuration mechanism #1 ports on x86_64 and, on AArch64, through the ECAM of the device tree's `pci-host-ecam-generic` node, which lists no function when it lies outside the memory the entry root maps uncached ([physical memory](#physical-memory)). On AArch64, every memory BAR that holds no address is given one from the 32-bit memory window of that node's `ranges`, aligned to its size, above every BAR the window holds.
+    - on x86_64, Intel VT-d when the ACPI DMAR table lists one remapping unit, in segment 0, and no reserved memory region, the platform remaps interrupts, and the unit queues invalidations, remaps interrupts and walks four-level tables. It translates the functions of segment 0 that the unit includes: every one when the unit includes every PCI function, and otherwise each endpoint a device scope names one hop below its start bus and the functions of the buses below each bridge a device scope names so. It enables interrupt remapping: the machine then delivers no message-signalled interrupt in the format it delivers without remapping, such as those `install_msi` gave before ([locks](#locks));
+    - on AArch64, the SMMUv3 of the device tree's `arm,smmu-v3` node when it translates stage 1 through AArch64 tables of 4 KiB pages, walks them coherently and has 8 stream id bits or more. It translates the functions of segment 0 on the buses of the device tree's PCI host whose requester ids its stream id bits reach, the first four alone when it walks no two-level stream table, each function's stream id being its requester id.
+- The first call of `k.pci_functions()` or `k.pci_ports()` finds what lies below each **host bridge**, drawn through `k.alloc()`: `k.pci_functions()` returns the endpoints, functions of header type 0 and not of the bridge class, and `k.pci_ports()` the bridges, of header type 1, each in the order a depth-first scan finds them; later calls of each return an empty list. The scan reads each bus in the order of its requester ids and enters each bridge where it finds it, from a host's first bus, then from each later bus of the host's range that no bridge holds and a function answers on, the root bus of another host bridge. Each endpoint has bus mastering and memory decoding off and INTx disabled; each bridge entered decodes memory and masters the bus, forwarding the accesses to and the DMA of what lies below it. The hosts are, on x86_64, those of the ACPI MCFG table whose ECAM lies in memory the entry root maps uncached ([physical memory](#physical-memory)), and segment 0 through the configuration mechanism #1 ports, which reach no extended capability, when none of them is in segment 0; on AArch64, segment 0 through the ECAM of the device tree's `pci-host-ecam-generic` node, on the buses its `bus-range` and that ECAM both hold, and no host when the ECAM lies outside the memory the entry root maps as device memory. The scan keeps the bus numbers and BAR addresses the firmware assigned. A bridge whose secondary bus is zero is given the next bus numbers of the host's range and a memory window of whole MiBs, at least one, from its bus's window, its I/O and prefetchable windows closed. A memory BAR that holds no address is given one from its bus's window, aligned to its size, above every BAR and bridge window the window holds, or none when the window has no room, and then is not a memory BAR. A bus's window is the memory window of the bridge whose secondary bus it is and, for a host's root buses, the 32-bit memory window of the node's `ranges` on AArch64 and none on x86_64.
 - `hw::cpu_count()` is the number of CPUs the platform reports as usable, on AArch64 those [machine discovery](27-program-model.md#descriptors) finds. CPUs are numbered from 0, the boot CPU being 0.
 - `hw::cpu_hardware_id(n)` returns `Some` of the hardware id of CPU n, its local APIC id on x86_64 and its affinity on AArch64, the `MPIDR_EL1` affinity fields at the positions `GICD_IROUTER` holds them, and `None` when n is not below `hw::cpu_count()`. On the host targets the hardware id of CPU n is n.
 - `hw::Anchor[S]` has no values; it names the anchor of type S.
@@ -662,7 +664,7 @@ interrupt fn Queue.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit lim
 
 ## PCI functions
 
-A **PCI function** is an `hw::PciFunction`, a function of PCI bus 0 that `boot::Kernel.pci_functions` lists ([anchor](#anchor)). Its DMA reaches the memory of the space it is attached to, through the IOMMU when one is enabled ([I/O domains](23-low-level.md#io-domains)), and its register windows and message-signalled interrupts derive from it with no trusted premise.
+A **PCI function** is an `hw::PciFunction`, an endpoint below a host bridge that `boot::Kernel.pci_functions` lists ([anchor](#anchor)) or a port's rescan finds ([PCI ports](#pci-ports)). Its DMA reaches the memory of the space it is attached to, through the IOMMU when one is enabled ([I/O domains](23-low-level.md#io-domains)), and its register windows and message-signalled interrupts derive from it with no trusted premise.
 
 ```nan-api
 // module: hw
@@ -671,6 +673,7 @@ pub open linear struct PciFunction {
 } PciFunction
 
 pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
+    pub segment: u16
     pub bus: u8
     pub device: u8
     pub function: u8
@@ -682,12 +685,15 @@ pub closed enum PciError derives Copy, Eq, Render {
     TooSmall
     Taken
     Unmapped
+    Removed
 } PciError
 
 pub fn PciFunction.address(self) -> PciAddress
 
 pub fn PciFunction.config_read(self, offset: u8) -> u32
     requires offset % 4 == 0
+
+pub fn PciFunction.removed(self) -> bool
 
 pub fn Mmio.of_bar(mut function: PciFunction, index: u8, offset: u64) -> Mmio[R] fails PciError
 
@@ -700,11 +706,13 @@ pub fn PciFunction.msix[T: Any and Send](mut self, entry: u16, cpu: u32, take de
 pub fn PciFunction.release(take self)
 ```
 
-- `function.address()` is its bus, device and function numbers; its **requester id** is `device << 3 | function` on bus 0. `function.config_read(offset)` reads the double word at `offset` of its configuration space. Nothing writes its configuration but the runtime.
-- `hw::Mmio[R].of_bar(mut function, index: i, offset: o)` enables the function's memory decoding and returns a window over R at offset o of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)); the window's bytes are those R spans from o to past its last register. It fails with `NotMemory` when BAR i is not a memory BAR, with `Misaligned` when o is not a multiple of the size of R's widest register or element, with `TooSmall` when the window's bytes do not lie within the BAR, with `Taken` when they overlap those of a window an earlier call gave over the BAR, or the function's MSI-X table or pending bit array, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)).
-- `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, and with `Unsupported` when the IOMMU does not translate the function. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Unsupported` when the IOMMU translates the function and cannot pass its accesses through. A function attached anew leaves the space it was attached to.
-- `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
+- `function.address()` is its **bus path**: its segment and its bus, device and function numbers; its **requester id** is `bus << 8 | device << 3 | function` in its segment. `function.config_read(offset)` reads the double word at `offset` of its configuration space, all ones once the function is removed. Nothing writes its configuration but the runtime.
+- `hw::Mmio[R].of_bar(mut function, index: i, offset: o)` enables the function's memory decoding and returns a window over R at offset o of its BAR i, the window `hw::Mmio.map` would give at that address ([register windows](23-low-level.md#register-windows)); the window's bytes are those R spans from o to past its last register. It fails with `Removed` when the function is removed, with `NotMemory` when BAR i is not a memory BAR, with `Misaligned` when o is not a multiple of the size of R's widest register or element, with `TooSmall` when the window's bytes do not lie within the BAR, with `Taken` when they overlap those of a window an earlier call gave over the BAR, or the function's MSI-X table or pending bit array, and with `Unmapped` when the BAR does not lie wholly in memory the entry root maps uncached ([physical memory](#physical-memory)).
+- `mut function.attach(space)` attaches the function to the domain of a space and enables its bus mastering: from then on its DMA reaches the domain's pages at their own addresses, and on AArch64 the page of the ITS's `GITS_TRANSLATER`, which its message-signalled interrupts write. It fails with `Physical` for the physical space, with `Closed` for a stale one, with `Exhausted` when no memory for the IOMMU's tables is left, and with `Unsupported` when the IOMMU does not translate the function, the function is not isolated or it is removed. `mut function.attach_physical()` attaches it to physical memory, which its DMA then reaches whole, and enables its bus mastering; it fails with `Exhausted` as `attach` does, and with `Unsupported` when the function is removed, or the IOMMU translates it and cannot pass its accesses through, as for a function below a bridge other than a PCIe port, whose DMA reaches the IOMMU under another requester id. A function attached anew leaves the space it was attached to.
+- A function is **isolated** when its DMA reaches the IOMMU under its own requester id and no peer receives it otherwise: each bridge above it is a PCIe switch upstream port, or a PCIe root or downstream port whose ACS capability validates the source of the requests from below and redirects their peer requests and completions upstream and forwards them there, which the runtime enables; and a function of a multi-function device has an ACS capability redirecting its peer requests and completions upstream, which the runtime enables. The runtime reads ACS capabilities through an ECAM alone.
+- `mut function.msix(entry: e, cpu: n, take dev, on_irq: f)` installs `dev` as `install_msi` does with the function's requester id as `source` ([locks](#locks)), then writes the interrupt's message to entry e of the function's MSI-X table, unmasked, and enables MSI-X. Once the IOMMU remaps interrupts on x86_64, the remapping entry accepts the function's messages alone; on AArch64 the ITS translates the events of the function's device id alone. It refuses with `Unsupported` when the function is not attached or is removed, has no MSI-X capability or entry e, or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does.
 - `take function.release()` cuts the function off: its bus mastering and memory decoding end, and its DMA reaches no memory once the IOMMU no longer caches its attachment.
+- A function is **removed** once the rescan or powering off of a port above it cuts it off ([PCI ports](#pci-ports)): from then on the IOMMU translates the requester ids of that port's buses to no memory until a function found anew there is attached, the operations of this section write no configuration, and `function.removed()` returns true. Its windows reach no function, as no BAR is given an address a window of a removed function reaches; an interrupt `msix` installed for it stays installed until uninstalled, and a function later found at its requester id may raise it. Its `release` only frees it.
 - An `hw::PciFunction` is a resource of the domain run holding it, which its [settlement](11-errors-domains.md#settlement) cuts off as `release` does.
 - Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) but `attach_physical`, which is a device operation (`authority.ungranted`). Each has the device fact.
 
@@ -755,6 +763,98 @@ pub fn unconfine(mut function: hw::PciFunction) -> hw::PciAddress fails hw::Iomm
     try mut function.attach_physical() // error: authority.ungranted
     return function.address()
 } unconfine
+```
+
+## PCI ports
+
+A **PCI port** is an `hw::PciPort`, a bridge below a host bridge that `boot::Kernel.pci_ports` lists ([anchor](#anchor)): a PCIe root port, switch upstream port or switch downstream port, or another bridge. A root or downstream port may have a **slot**, which a card enters and leaves through native PCIe hot plug.
+
+```nan-api
+// module: hw
+
+pub open linear struct PciPort {
+} PciPort
+
+pub closed enum PortKind derives Copy, Eq, Render {
+    Root
+    Upstream
+    Downstream
+    Bridge
+} PortKind
+
+pub closed struct PciBuses derives Copy, Eq, Render {
+    pub secondary: u8
+    pub subordinate: u8
+} PciBuses
+
+pub closed struct PciSlot derives Copy, Eq, Render {
+    pub number: u16
+    pub hot_plug: bool
+    pub surprise: bool
+    pub power_controller: bool
+    pub attention_button: bool
+} PciSlot
+
+pub closed struct SlotEvents derives Copy, Eq, Render {
+    pub present: bool
+    pub link_active: bool
+    pub presence_changed: bool
+    pub attention_pressed: bool
+    pub link_changed: bool
+} SlotEvents
+
+pub fn PciPort.address(self) -> PciAddress
+
+pub fn PciPort.kind(self) -> PortKind
+
+pub fn PciPort.buses(self) -> PciBuses
+
+pub fn PciPort.slot(self) -> Option[PciSlot]
+
+pub fn PciPort.slot_events(mut self) -> SlotEvents
+
+pub fn PciPort.power(mut self, on: bool)
+
+pub fn PciPort.slot_irq[T: Any and Send](mut self, cpu: u32, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+pub fn PciPort.rescan(mut self, alloc: mem::Alloc) -> mem::List[PciFunction]
+
+pub fn PciPort.release(take self)
+```
+
+- `port.address()` is its bus path, as a function's is ([PCI functions](#pci-functions)), `port.kind()` its kind, `Bridge` for every bridge but a PCIe port, and `port.buses()` its secondary and subordinate bus numbers.
+- `port.slot()` returns `Some` of its slot's capabilities when it is a root or downstream port with a slot and is not removed, and `None` otherwise: the slot's physical number, and whether it is hot-plug capable, may lose its card without notice, has a power controller and has an attention button.
+- `mut port.slot_events()` returns whether a card is present in the slot and its link is active, and whether, since the last call, the card's presence changed, the attention button was pressed and the link changed; it then clears those events. A port without a slot reports none.
+- `mut port.power(on: b)` turns the slot's power and power indicator on or off, where the slot has them, and waits until the slot completes the command. Turning them off first removes every function below the port.
+- `mut port.slot_irq(cpu: n, take dev, on_irq: f)` installs `dev` on the slot's hot-plug interrupt as `PciFunction.msix` installs it on a function's MSI-X entry, with the entry the port's PCIe capability names, and enables the interrupt on presence changes, on attention button presses where the slot has a button and on link changes where the port reports its link. The interrupt arrives once an event leaves no earlier one that `slot_events` has not cleared. It refuses with `Unsupported` when the slot is not hot-plug capable or the port is removed, has no such MSI-X entry or its table lies outside the memory the entry root maps uncached, and otherwise as `install_msi` does. On AArch64 the port's requests, which are the messages the runtime writes to its MSI-X table alone, then bypass the IOMMU.
+- `mut port.rescan(alloc)` removes every function and port below the port, then returns the endpoints its secondary bus holds, found anew as `boot::Kernel.pci_functions` finds them and drawn through `alloc`; it enters no bridge. Every memory BAR of each is given an address of the port's memory window, aligned to its size, above every address that window gave or held before, or none when the window has no room. A function or port is **removed** by the rescan or powering off of a port above it; a removed port has no slot and its rescan returns an empty list.
+- `take port.release()` gives the port up. An `hw::PciPort` is a resource of the domain run holding it, which its settlement releases as `release` does.
+- Every operation of this section is a confined operation ([I/O domains](23-low-level.md#io-domains)) with the device fact.
+
+```nan
+// file: manager/package.nan
+//! A device manager serving a hot-plug slot.
+
+package manager {
+    language 1
+    targets x86_64-bare
+    allow confined in manager
+} manager
+
+// file: manager/manager.nan
+//! Lists the functions of a card entering a slot, and removes those of a card about to leave it.
+
+pub fn served(mut port: hw::PciPort, alloc: mem::Alloc) -> mem::List[hw::PciFunction] {
+    let events = mut port.slot_events()
+    if events.attention_pressed {
+        mut port.power(on: false)
+    }
+    if events.presence_changed and events.present {
+        mut port.power(on: true)
+        return mut port.rescan(alloc)
+    }
+    return mem::List[hw::PciFunction].empty(alloc)
+} served
 ```
 
 ## Cross-CPU operations

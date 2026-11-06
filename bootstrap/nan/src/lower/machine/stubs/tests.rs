@@ -156,47 +156,110 @@ fn contains(code: &[u8], pattern: &[u8]) -> bool {
     code.windows(pattern.len()).any(|window| window == pattern)
 }
 
+/// The bits of the feature word `CpuFeatures` records.
+const RDTSCP: u32 = 0x1;
+const INVPCID: u32 = 0x2;
+const RDRAND: u32 = 0x4;
+const RDSEED: u32 = 0x8;
+const MONITOR: u32 = 0x10;
+const PCID: u32 = 0x20;
+const SMEP: u32 = 0x40;
+const SMAP: u32 = 0x80;
+const UMIP: u32 = 0x100;
+const XSAVE: u32 = 0x200;
+const XSAVEOPT: u32 = 0x400;
+const XSAVEC: u32 = 0x800;
+const XSAVES: u32 = 0x1000;
+
+/// The `or` of a feature bit into the word `CpuFeatures` builds in `r8d`.
+fn records(mask: u32) -> Vec<u8> {
+    match u8::try_from(mask) {
+        Ok(byte) if byte < 0x80 => vec![0x41, 0x83, 0xc8, byte],
+        _ => [&[0x41, 0x81, 0xc8][..], &mask.to_le_bytes()].concat(),
+    }
+}
+
 #[test]
-fn x64_stubs_test_the_features_cpu_features_records() {
-    let records = bytes(Stub::CpuFeatures);
-    let sets = |mask: u32| match mask {
-        0..0x80 => contains(&records, &[0x41, 0x83, 0xc8, mask as u8]),
-        _ => contains(
-            &records,
-            &[&[0x41, 0x81, 0xc8][..], &mask.to_le_bytes()].concat(),
-        ),
-    };
+fn cpu_features_records_each_feature_from_its_cpuid_bit() {
+    let code = bytes(Stub::CpuFeatures);
     assert!(contains(
-        &records,
+        &code,
         &[0x65, 0x4c, 0x89, 0x04, 0x25, 0xf8, 0x00, 0x00, 0x00]
     ));
-    for (stub, mask) in [
-        (Stub::Rdtscp, 0x01),
-        (Stub::Invpcid, 0x02),
-        (Stub::Rdrand, 0x04),
-        (Stub::Rdseed, 0x08),
-        (Stub::MonitorWait, 0x10),
+    let (eax, ecx, edx, ebx) = (0xe0, 0xe1, 0xe2, 0xe3);
+    for (mask, register, bit) in [
+        (RDTSCP, edx, 27),
+        (INVPCID, ebx, 10),
+        (RDRAND, ecx, 30),
+        (RDSEED, ebx, 18),
+        (PCID, ecx, 17),
+        (SMEP, ebx, 7),
+        (SMAP, ebx, 20),
+        (UMIP, ecx, 2),
+        (XSAVEOPT, eax, 0),
+        (XSAVEC, eax, 1),
+        (XSAVES, eax, 3),
     ] {
+        let tested = [0x0f, 0xba, register, bit, 0x73];
+        let after = code
+            .windows(tested.len())
+            .position(|window| window == tested);
+        let set = after.map(|at| &code[at + tested.len() + 1..]);
         assert!(
-            contains(&bytes(stub), &feature_test(mask)),
-            "{stub:?} tests {mask:#x}"
+            set.is_some_and(|set| set.starts_with(&records(mask))),
+            "CpuFeatures records {mask:#x} from bit {bit}"
         );
-        assert!(sets(u32::from(mask)), "CpuFeatures records {mask:#x}");
+    }
+    for mask in [MONITOR, XSAVE] {
+        assert!(
+            contains(&code, &records(mask)),
+            "CpuFeatures records {mask:#x}"
+        );
+    }
+}
+
+#[test]
+fn x64_stubs_test_the_bits_of_their_features() {
+    for (stub, mask) in [
+        (Stub::Rdtscp, RDTSCP),
+        (Stub::Invpcid, INVPCID),
+        (Stub::Rdrand, RDRAND),
+        (Stub::Rdseed, RDSEED),
+        (Stub::MonitorWait, MONITOR),
+        (Stub::IdleMwait, MONITOR),
+    ] {
+        let tested = feature_test(mask as u8);
+        assert!(contains(&bytes(stub), &tested), "{stub:?} tests {mask:#x}");
+    }
+    for (stub, masks) in [
+        (Stub::ExtendedSave, &[XSAVES, XSAVEC, XSAVEOPT, XSAVE][..]),
+        (Stub::ExtendedRestore, &[XSAVES, XSAVE]),
+        (Stub::ExtendedClear, &[XSAVE]),
+    ] {
+        for mask in masks {
+            let tested = [&[0xf7, 0xc1][..], &mask.to_le_bytes()].concat();
+            assert!(contains(&bytes(stub), &tested), "{stub:?} tests {mask:#x}");
+        }
     }
     let protection = bytes(Stub::EnableProtection);
-    let table = &protection[protection.len() - 40..];
-    let entries: Vec<(u32, u32)> = table
+    let entries: Vec<(u32, u32)> = protection[protection.len() - 40..]
         .chunks(8)
         .map(|entry| {
             let word = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().expect("four"));
             (word(0), word(4))
         })
         .collect();
-    let cr4 = [1 << 20, 1 << 21, 1 << 11, 1 << 17, 1 << 2];
-    for (index, (mask, bit)) in entries.into_iter().enumerate() {
-        assert!(mask == 0 || sets(mask), "CpuFeatures records {mask:#x}");
-        assert_eq!(bit, cr4[index], "variant {index} sets its CR4 bit");
-    }
+    let variants = [
+        (SMEP, 1 << 20),
+        (SMAP, 1 << 21),
+        (UMIP, 1 << 11),
+        (PCID, 1 << 17),
+        (0, 1 << 2),
+    ];
+    assert_eq!(
+        entries, variants,
+        "each hw::Protection variant's feature and CR4 bit"
+    );
 }
 
 #[test]

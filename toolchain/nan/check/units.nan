@@ -1308,6 +1308,18 @@ fn Checker.write_value(
     ) {
     let types = self.types()
     let kind = types.kind(ty)
+    match kind {
+        ty::TyKind.Item(item: owner, args: args) => {
+            let db = self.db()
+            if db.is_std(owner) {
+                let path = db.canonical(owner)
+                if self.write_held(mut out, path: path.as_str(), args, value, whole, encoder) {
+                    return
+                }
+            }
+        }
+        else => {}
+    }
     match value {
         Val.Int(int) => match kind {
             ty::TyKind.Scalar(scalar) => nir::literal_value(mut out, value: nir::Literal.Int(value: int, scalar: scalar))
@@ -1424,12 +1436,82 @@ fn Checker.write_view(
             None => {}
         }
     }
+    self.write_text(mut out, values)
+} Checker.write_view
+
+/// The bytes of a text, from the values of its bytes.
+fn Checker.write_text(self, mut out: mem::Bytes, values: Slice[Val]) {
     var text = mem::Bytes.empty(self.alloc())
     for value in values {
         mut text.push(u8.truncate(value.int_value().low_bits()))
     }
     encoding::bytes(mut out, value: text.view())
-} Checker.write_view
+} Checker.write_text
+
+/// A value of a std base type the interpreter models by fields of its own, by what it holds;
+/// false for a value of another type.
+fn Checker.write_held(
+    self,
+    mut out: mem::Bytes,
+    path: Str,
+    args: ty::Args,
+    value: Val,
+    whole: ConstValue,
+    encoder: nir::Encoder,
+    ) -> bool {
+    match value {
+        Val.Ptr(ptr) => {
+            if path != "hw::Ptr" {
+                return false
+            }
+            encode_number(mut out, value: ptr.address)
+            return true
+        }
+        Val.Int(index) => {
+            if path != "hw::Register" {
+                return false
+            }
+            encode_number(mut out, value: index.low_bits())
+            return true
+        }
+        Val.Struct(item: _, fields: _) => {}
+        else => {
+            return false
+        }
+    }
+    let element = first_type_arg(self.types(), args)
+    let fields = value.fields()
+    match path {
+        "text::Fixed" => {
+            let Some(held) = fields[0].fields().prefix(usize.widen(fields[1].int_value().low_bits())) else {
+                expect false
+                return true
+            }
+            self.write_text(mut out, values: held)
+        }
+        "core::CharCursor" or "core::SliceCursor" => {
+            let Val.View(view) = fields[0] else {
+                expect false
+                return true
+            }
+            self.write_view(mut out, args, values: whole.elements(view), whole, encoder)
+        }
+        "mem::Bounded" => self.write_elements(mut out, element, values: fields[0].fields(), whole, encoder)
+        "core::ArrayCursor" or "mem::BoundedCursor" => {
+            let Some(parts) = fields[0].fields().split_at(usize.widen(fields[1].int_value().low_bits())) else {
+                expect false
+                return true
+            }
+            self.write_elements(mut out, element, values: parts.tail, whole, encoder)
+        }
+        "core::Secret" or "core::Untrusted" => self.write_value(mut out, ty: element, value: fields[0], whole, encoder)
+        "mem::Id" or "hw::UserAddr" => encode_number(mut out, value: fields[0].int_value().low_bits())
+        else => {
+            return false
+        }
+    }
+    return true
+} Checker.write_held
 
 /// The first type argument of an argument list, `Unit` for none.
 fn first_type_arg(types: ty::Types, args: ty::Args) -> ty::Ty {

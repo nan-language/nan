@@ -433,7 +433,7 @@ Its parts are:
 - An instruction is its opcode, a uvar 0, or 1 plus its premise index when trusted, then its parts in notation order after the operation word, without slot names or labels, labelled operands in declaration order; a word the notation may omit or vary (`await`, `mut` after `ref`, `attempt`, `..=` for `..<`) is a uvar 0 or 1. Opcodes number the names of [Instructions](#instructions) from 0 in list order, each distinct name of an entry in turn and each `call` entry once, then the entries of [Terminators](#terminators), whose failing call holds its call as an instruction, then the query forms of the [proof cache](20-prover.md#proof-cache), in this order: `ite` (condition and two values), quotient and remainder (dividend and divisor), tag (its term), then fresh, skolem and bound symbols (their numbers).
 - An operand is a uvar 0 and a value's number, 1 and a literal, or 2, a mode and a place, which is its root's number and its steps as texts. `constant` holds a uvar 0 and a canonical path, or 1 and a const parameter's position. A function reference is a canonical path, a role and index (`body` and 0 for a function item, built-in, interface method or operation), and type arguments.
 - A type is a uvar constructor and its content: 0 a [scalar](04-types.md#scalars), its position in the scalar table; 1 `Unit`; 2 `Never`; 3 a named type, its canonical path and arguments; 4 a generic parameter, its position in the unit's; 5 a const argument, its literal; 6 a function type, a uvar 0, 1 or 2 for plain, `interrupt fn` or `task fn`, then its head as a function's part 5; 7 `ref` and 8 `ref mut`, with their type.
-- A literal is its type and its value: an integer as an svar, or a uvar for unsigned types; a float as its bits in 4 or 8 bytes, least significant first; a `bool` or `char` as a uvar; text and bytes as bytes; `Unit` as nothing. A const's value follows its type: a scalar or `Unit` as a literal's value, a struct as its fields in declaration order, an enum value as its variant's position and payload, an `Array` or `Slice` as the list of its elements, a `Str` as bytes, and a function value as its function reference.
+- A literal is its type and its value: an integer as an svar, or a uvar for unsigned types; a float as its bits in 4 or 8 bytes, least significant first; a `bool` or `char` as a uvar; text and bytes as bytes; `Unit` as nothing. A const's value follows its type: a scalar or `Unit` as a literal's value, a struct as its fields in declaration order, an enum value as its variant's position and payload, an `Array`, `Slice` or `mem::Bounded` as the list of its elements, a `Str` or `text::Fixed` as the bytes of its text, a `core::Secret` or `core::Untrusted` as the value it holds, a `mem::Id`, `hw::UserAddr`, `hw::Ptr` or `hw::Register` as a uvar of its index, value, address or register's position in its registers item, a `core::CharCursor` as the bytes of the text it has yet to yield, a `core::SliceCursor`, `core::ArrayCursor` or `mem::BoundedCursor` as the list of the elements it has yet to yield, and a function value as its function reference.
 - Part 9 holds, for each function it covers in order, a list of pairs of a target name and a digest, sorted by name. A digest is a record keyed from 1 by the rows of the [digest](10-effects-digests.md#digests) table; booleans are uvars, and a set is a uvar 0 and its sorted paths, or 1 for the unbounded set. Key 11, the class, is omitted when it is `traceless`, and is otherwise its position from 0 in the [class table](10-effects-digests.md#reversibility), followed for an irreversible class by the list of its kinds' positions in kind order.
 - The spans of a unit are, for each function in order, its span, the spans of its parameters, then those of its instructions and terminators in block order, each a text and four uvars followed, for a parameter or slot, by its name as a text.
 
@@ -441,6 +441,35 @@ The literal `300u16` encodes as these bytes:
 
 ```text
 00 01 AC 02
+```
+
+```nan
+pub closed struct Id derives Copy {
+    pub text: text::Fixed[8]
+} Id
+
+pub closed enum Match derives Copy {
+    Named(Id)
+} Match
+
+pub const NAME: text::Fixed[8] = text::Fixed[8].of("PNP0B00")
+
+pub const MATCHES: Array[Match, 1] = Array[Match, 1].filled(Match.Named(Id(text: NAME)))
+```
+
+The value of `NAME` encodes as the bytes of its text, and that of `MATCHES` as a list of one variant at position 0 holding them:
+
+```text
+07 50 4E 50 30 42 30 30
+01 00 07 50 4E 50 30 42 30 30
+```
+
+```text
+$ nan show example::NAME
+ok show example::NAME: records 1
+item example::NAME example/example.nan:10 ahsc424qcbqd2uue4j af4nndmqlolhoiqioc
+    pub const NAME: text::Fixed[8] = text::Fixed[8].of("PNP0B00")
+ok show example::NAME: records 1
 ```
 
 An implementation must write exactly the canonical encoding and decode each version it implements under that version's rules. A stream that does not decode, holds a record key this chapter does not define, or is not the canonical encoding of what it decodes to is an error (`nir.malformed`). A stream of a version the toolchain does not implement is an error (`nir.version-unsupported`). Both are reported on the `dep` directive through which the checked package reaches the package whose artefact holds the stream.

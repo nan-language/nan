@@ -987,6 +987,12 @@ impl<'a> Checker<'a> {
         whole: &ConstValue,
         encoder: &Encoder,
     ) {
+        if let Ty::Item(owner, args) = ty
+            && self.db.is_std(*owner)
+            && self.write_held(out, &self.db.canonical(*owner), args, value, whole, encoder)
+        {
+            return;
+        }
         match (ty, value) {
             (Ty::Scalar(scalar), Val::Int(int)) => {
                 literal_value(out, &Literal::Int(*int, *scalar));
@@ -1073,6 +1079,53 @@ impl<'a> Checker<'a> {
             },
             (_, other) => panic!("a const value of an unencodable kind: {other:?}"),
         }
+    }
+
+    /// A value of a std base type the interpreter models by fields of its own, by what it holds;
+    /// false for a value of another type.
+    fn write_held(
+        &self,
+        out: &mut Vec<u8>,
+        path: &str,
+        args: &[Arg],
+        value: &Val,
+        whole: &ConstValue,
+        encoder: &Encoder,
+    ) -> bool {
+        let element = args.first().and_then(Arg::ty).cloned().unwrap_or(Ty::Unit);
+        let elements = |out: &mut Vec<u8>, values: &[Val]| {
+            list(out, values.iter(), |out, value| {
+                self.write_value(out, &element, value, whole, encoder);
+            });
+        };
+        let text = |out: &mut Vec<u8>, values: &[Val]| {
+            let text: Vec<u8> = values.iter().map(|value| value.int() as u8).collect();
+            bytes(out, &text);
+        };
+        let seen = |cursor: &Val| match cursor {
+            Val::View(view) => whole.elements(view),
+            other => panic!("a cursor's view, not {other:?}"),
+        };
+        match (path, value) {
+            ("hw::Ptr", Val::Ptr(ptr)) => number(out, ptr.address),
+            ("hw::Register", Val::Int(index)) => number(out, *index as u64),
+            (_, Val::Struct(_, fields)) => match path {
+                "text::Fixed" => text(out, &fields[0].fields()[..fields[1].int() as usize]),
+                "core::CharCursor" => text(out, seen(&fields[0])),
+                "mem::Bounded" => elements(out, fields[0].fields()),
+                "core::SliceCursor" => elements(out, seen(&fields[0])),
+                "core::ArrayCursor" | "mem::BoundedCursor" => {
+                    elements(out, &fields[0].fields()[fields[1].int() as usize..]);
+                }
+                "core::Secret" | "core::Untrusted" => {
+                    self.write_value(out, &element, &fields[0], whole, encoder);
+                }
+                "mem::Id" | "hw::UserAddr" => number(out, fields[0].int() as u64),
+                _ => return false,
+            },
+            _ => return false,
+        }
+        true
     }
 }
 

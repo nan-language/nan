@@ -217,8 +217,9 @@ impl Checker<'_> {
     /// The items an item names: those its paths name, its test target aside; the functions
     /// named after a type under each member name it writes after `.` and each cursor method its
     /// `for` statements call; the type a function is named after; and the functions
-    /// implementing the interface of an impl line, with its Env's abandon method for one naming
-    /// `sys::Component`. It reads no other item's facts as a subject's.
+    /// implementing the interface of an impl line, those serving its protocol for a component's,
+    /// with its Env's abandon method for one naming `sys::Component`. It reads no other item's
+    /// facts as a subject's.
     pub fn names(&self, item: ItemId) -> Rc<BTreeSet<ItemId>> {
         if let Some(named) = self.named.borrow().get(&item) {
             return named.clone();
@@ -253,10 +254,12 @@ impl Checker<'_> {
         } = &self.sig(item).kind
             && let SigKind::Interface { methods } = &self.sig(bound.interface).kind
         {
+            let implemented = match self.line_protocol(item) {
+                Some(protocol) => self.served_names(protocol),
+                None => methods.iter().map(|method| method.name.clone()).collect(),
+            };
             named.extend(
-                methods
-                    .iter()
-                    .filter_map(|method| self.implementing_function(item, &method.name)),
+                (implemented.iter()).filter_map(|name| self.implementing_function(item, name)),
             );
             if self.db.canonical(bound.interface) == "sys::Component" {
                 named.extend(

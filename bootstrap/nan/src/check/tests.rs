@@ -98,3 +98,32 @@ fn a_package_declaring_any_is_judged_within_the_reach_of_a_final_build() {
         .collect();
     assert_eq!(missing, [(Some("tally/tally.nan".to_owned()), Some(4))]);
 }
+
+#[test]
+fn a_handler_of_an_operation_its_package_cannot_name_is_used() {
+    let scratch = Scratch::new(&[
+        (
+            "proto/package.nan",
+            "//! A protocol.\n\npackage proto {\n    language 1\n    targets any\n} proto\n",
+        ),
+        (
+            "proto/proto.nan",
+            "//! The Ping protocol.\n\npub protocol Ping {\n    /// Counts a ping.\n    pub fn ping() limits traceless\n    /// What only this package posts.\n    fn kicked() limits traceless\n} Ping\n\n/// Kicks the server `out` reaches.\npub fn kick(out: sys::Outbox[Ping]) fails task::SendError uses wait {\n    try await out.kicked()\n} kick\n",
+        ),
+        (
+            "server/package.nan",
+            "//! A server.\n\npackage server {\n    language 1\n    targets any\n    dep proto \"../proto\"\n} server\n",
+        ),
+        (
+            "server/server.nan",
+            "//! A component serving Ping.\n\n/// The Env.\npub closed struct Env {\n} Env\n\n/// The kicks counted.\npub closed struct Counter derives Encode {\n    pub kicks: u64\n} Counter\n\nimpl Counter: sys::Component[Env, proto::Ping]\n\npub fn Counter.start(mut env: Env) -> Counter = Counter(kicks: 0)\n\npub fn Counter.ping(mut self, mut env: Env, mut cx: sys::Cx[proto::Ping]) {\n} Counter.ping\n\nfn Counter.kicked(mut self, mut env: Env, mut cx: sys::Cx[proto::Ping]) {\n    self.kicks = self.kicks.wrapping_add(1)\n} Counter.kicked\n",
+        ),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let codes: Vec<Code> = reported(&workspace, &Scope::Workspace)
+        .into_iter()
+        .map(|diagnostic| diagnostic.code)
+        .filter(|code| *code != Code::DepLockStale)
+        .collect();
+    assert_eq!(codes, []);
+}

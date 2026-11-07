@@ -300,6 +300,9 @@ fn Lowering.value_data(mut self, value: mem::Shared[check::ConstValue], ty: ty::
 
 /// Writes a value of a type at an offset of an image.
 fn Lowering.write_val(mut self, constant: mem::Shared[check::ConstValue], value: check::Val, ty: ty::Ty, offset: u64, mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) {
+    if mut self.write_held(constant, value, ty, offset, mut image, mut extents) {
+        return
+    }
     let held_layout = mut self.layout_of(ty)
     match held_layout.contents().shape {
         LayoutShape.Empty => {}
@@ -403,9 +406,76 @@ fn write_variant_bytes(mut image: Image, shape: EnumShape, index: usize, offset:
     }
 } write_variant_bytes
 
+/// Writes a value of a std type the interpreter models by fields of its own as its layout holds
+/// it: a wrapper's as the value it wraps, a cursor over a view as its view, and the others' as a
+/// count and the array it counts; false for a value of another type.
+fn Lowering.write_held(mut self, constant: mem::Shared[check::ConstValue], value: check::Val, ty: ty::Ty, offset: u64, mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) -> bool {
+    let ty::TyKind.Item(item: owner, args: _) = self.ck.types().kind(ty) else {
+        return false
+    }
+    let check::Val.Struct(item: _, fields: held) = value else {
+        return false
+    }
+    if not self.ck.db().is_std(owner) {
+        return false
+    }
+    let fields = held.contents().view()
+    match self.wrapped(ty) {
+        Some(inner) => {
+            mut self.write_val(constant, value: fields[0], ty: inner, offset, mut image, mut extents)
+            return true
+        }
+        None => {}
+    }
+    let path = self.ck.db().canonical(owner)
+    match path.as_str() {
+        "core::SliceCursor" or "core::CharCursor" => mut self.write_val(constant, value: fields[0], ty, offset, mut image, mut extents)
+        "text::Fixed" or "core::ArrayCursor" => mut self.write_counted(constant, count: fields[1], array: fields[0], ty, offset, mut image, mut extents)
+        "mem::Bounded" => {
+            let count = check::Val.Int(wide::Wide.of_u64(u64.widen(fields[0].fields().len())))
+            mut self.write_counted(constant, count, array: fields[0], ty, offset, mut image, mut extents)
+        }
+        "mem::BoundedCursor" => {
+            let held_layout = mut self.layout_of(ty)
+            let LayoutShape.Record(parts) = held_layout.contents().shape else {
+                expect false
+                return true
+            }
+            expect parts.len() == 2
+            mut self.write_val(constant, value: fields[1], ty: parts[0].ty, offset: offset + parts[0].offset, mut image, mut extents)
+            let count = check::Val.Int(wide::Wide.of_u64(u64.widen(fields[0].fields().len())))
+            mut self.write_counted(constant, count, array: fields[0], ty: parts[1].ty, offset: offset + parts[1].offset, mut image, mut extents)
+        }
+        else => {
+            return false
+        }
+    }
+    return true
+} Lowering.write_held
+
+/// Writes a value laid out as a record of a count and an array: `count`, then `array`.
+fn Lowering.write_counted(mut self, constant: mem::Shared[check::ConstValue], count: check::Val, array: check::Val, ty: ty::Ty, offset: u64, mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) {
+    let held_layout = mut self.layout_of(ty)
+    let LayoutShape.Record(parts) = held_layout.contents().shape else {
+        expect false
+        return
+    }
+    expect parts.len() == 2
+    mut self.write_val(constant, value: count, ty: parts[0].ty, offset: offset + parts[0].offset, mut image, mut extents)
+    mut self.write_val(constant, value: array, ty: parts[1].ty, offset: offset + parts[1].offset, mut image, mut extents)
+} Lowering.write_counted
+
+/// The type a `core::Secret` or `core::Untrusted` type wraps; none for another type.
+fn Lowering.wrapped(self, ty: ty::Ty) -> Option[ty::Ty] {
+    if self.ck.is_std(ty, path: "core::Secret") or self.ck.is_std(ty, path: "core::Untrusted") {
+        return self.ck.types().type_arg(ty, index: 0)
+    }
+    return None
+} Lowering.wrapped
+
 /// The element type of a view type: a slice's element, or `u8` for a text.
 fn Lowering.view_element(self, ty: ty::Ty) -> ty::Ty {
-    if self.ck.is_std(ty, path: "core::Str") {
+    if self.ck.is_std(ty, path: "core::Str") or self.ck.is_std(ty, path: "core::CharCursor") {
         return ty::Ty.scalar(ty::Scalar.Unsigned8)
     }
     let Some(element) = self.ck.types().type_arg(ty, index: 0) else {
@@ -448,7 +518,10 @@ fn Lowering.scalar_bits(mut self, ty: ty::Ty, value: check::Val) -> wide::Wide {
         check::Val.Float32(number) => return wide::Wide.of_u64(u64.widen(number.to_bits()))
         check::Val.Float64(number) => return wide::Wide.of_u64(number.to_bits())
         check::Val.Ptr(pointer) => return wide::Wide.of_u64(pointer.address)
-        check::Val.Struct(item: item, fields: fields) => return mut self.layout_bits(item, fields: fields.contents().view())
+        check::Val.Struct(item: item, fields: fields) => match self.wrapped(ty) {
+            Some(inner) => return mut self.scalar_bits(ty: inner, value: fields.contents()[0])
+            None => return mut self.layout_bits(item, fields: fields.contents().view())
+        }
         check::Val.Variant(item: item, index: index, fields: _) => {
             let sig = self.ck.sig(item)
             let tag_name = match sig.contents().kind {

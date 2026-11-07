@@ -240,6 +240,9 @@ impl Lowering<'_, '_> {
         image: &mut Image,
         extents: &mut HashMap<(u32, Ty), DataId>,
     ) {
+        if self.write_held(constant, value, ty, offset, image, extents) {
+            return;
+        }
         let layout = self.layout(ty);
         match (&layout.shape, value) {
             (Shape::Empty, _) => {}
@@ -355,9 +358,111 @@ impl Lowering<'_, '_> {
         }
     }
 
+    /// Writes a value of a std type the interpreter models by fields of its own as its layout
+    /// holds it: a wrapper's as the value it wraps, a cursor over a view as its view, and the
+    /// others' as a count and the array it counts; false for a value of another type.
+    fn write_held(
+        &mut self,
+        constant: &Rc<ConstValue>,
+        value: &Val,
+        ty: &Ty,
+        offset: u64,
+        image: &mut Image,
+        extents: &mut HashMap<(u32, Ty), DataId>,
+    ) -> bool {
+        let (Ty::Item(owner, _), Val::Struct(_, fields)) = (ty, value) else {
+            return false;
+        };
+        if !self.ck.db.is_std(*owner) {
+            return false;
+        }
+        if let Some(inner) = self.wrapped(ty) {
+            self.write_val(constant, &fields[0], &inner, offset, image, extents);
+            return true;
+        }
+        let path = self.ck.db.canonical(*owner);
+        match path.as_str() {
+            "core::SliceCursor" | "core::CharCursor" => {
+                self.write_val(constant, &fields[0], ty, offset, image, extents);
+            }
+            "text::Fixed" | "core::ArrayCursor" => {
+                self.write_counted(constant, &fields[1], &fields[0], ty, offset, image, extents);
+            }
+            "mem::Bounded" => {
+                let count = Val::Int(fields[0].fields().len() as i128);
+                self.write_counted(constant, &count, &fields[0], ty, offset, image, extents);
+            }
+            "mem::BoundedCursor" => {
+                let layout = self.layout(ty);
+                let Shape::Record(parts) = &layout.shape else {
+                    panic!("a bounded cursor laid out as no record");
+                };
+                let parts = parts.clone();
+                let at = offset + parts[0].offset;
+                self.write_val(constant, &fields[1], &parts[0].ty, at, image, extents);
+                let count = Val::Int(fields[0].fields().len() as i128);
+                let at = offset + parts[1].offset;
+                self.write_counted(
+                    constant,
+                    &count,
+                    &fields[0],
+                    &parts[1].ty,
+                    at,
+                    image,
+                    extents,
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Writes a value laid out as a record of a count and an array: `count`, then `array`.
+    #[allow(clippy::too_many_arguments)]
+    fn write_counted(
+        &mut self,
+        constant: &Rc<ConstValue>,
+        count: &Val,
+        array: &Val,
+        ty: &Ty,
+        offset: u64,
+        image: &mut Image,
+        extents: &mut HashMap<(u32, Ty), DataId>,
+    ) {
+        let layout = self.layout(ty);
+        let Shape::Record(parts) = &layout.shape else {
+            panic!("a counted array laid out as no record");
+        };
+        let parts = parts.clone();
+        self.write_val(
+            constant,
+            count,
+            &parts[0].ty,
+            offset + parts[0].offset,
+            image,
+            extents,
+        );
+        self.write_val(
+            constant,
+            array,
+            &parts[1].ty,
+            offset + parts[1].offset,
+            image,
+            extents,
+        );
+    }
+
+    /// The type a `core::Secret` or `core::Untrusted` type wraps; none for another type.
+    fn wrapped(&self, ty: &Ty) -> Option<Ty> {
+        match self.ck.is_std(ty, "core::Secret") || self.ck.is_std(ty, "core::Untrusted") {
+            true => ty.type_arg(0).cloned(),
+            false => None,
+        }
+    }
+
     /// The element type of a view type: a slice's element, or `u8` for a text.
     fn view_element(&self, ty: &Ty) -> Ty {
-        if self.ck.is_std(ty, "core::Str") {
+        if self.ck.is_std(ty, "core::Str") || self.ck.is_std(ty, "core::CharCursor") {
             return Ty::Scalar(Scalar::U8);
         }
         ty.type_arg(0).cloned().expect("a view's element type")
@@ -389,7 +494,10 @@ impl Lowering<'_, '_> {
             Val::F32(value) => u128::from(value.to_bits()),
             Val::F64(value) => u128::from(value.to_bits()),
             Val::Ptr(pointer) => u128::from(pointer.address),
-            Val::Struct(item, fields) => self.layout_bits(*item, fields),
+            Val::Struct(item, fields) => match self.wrapped(ty) {
+                Some(inner) => self.scalar_bits(&inner, &fields[0]),
+                None => self.layout_bits(*item, fields),
+            },
             Val::Variant(item, index, _) => {
                 let name = match &self.ck.sig(*item).kind {
                     SigKind::Layout { tags, .. } => tags[*index as usize].clone(),

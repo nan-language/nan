@@ -12,7 +12,7 @@ use cranelift_codegen::ir::{
 };
 
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::{fetch_add, report, state};
+use super::super::runtime::{Routine, fetch_add, report, state};
 use super::Lowering;
 use super::cpus::{MAX_CPUS, cpu};
 use super::stubs::Stub;
@@ -35,8 +35,9 @@ const ROWS: u64 = MAX_CPUS + 1;
 /// record, the interrupt fn as a function value, the next device of its binding, the binding,
 /// the address and data of its message, zero without one, the ITS device id and CPU of an
 /// AArch64 message-signalled interrupt, the holding through which its owner's settlement
-/// uninstalls it, the x86_64 line it is installed on, zero for none, and the device from `VALUE`
-/// on, at its alignment.
+/// uninstalls it, the x86_64 line it is installed on, zero for none, its storm limit, zero for
+/// none, the kernel clock's nanosecond its window started at and the runs of its interrupt fn
+/// in that window, whether it is masked, and the device from `VALUE` on, at its alignment.
 pub mod device {
     pub const LOCK: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -50,8 +51,15 @@ pub mod device {
     pub const CPU: u64 = 80;
     pub const HOLDING: u64 = 88;
     pub const LINE: u64 = 96;
-    pub const VALUE: u64 = 104;
+    pub const LIMIT: u64 = 104;
+    pub const WINDOW: u64 = 112;
+    pub const RUNS: u64 = 120;
+    pub const MASKED: u64 = 128;
+    pub const VALUE: u64 = 136;
 }
+
+/// The nanoseconds of a device's window.
+const WINDOW_NS: i64 = 1_000_000_000;
 
 /// What `install_msi` gives: the interrupt installed, or the `hw::MsiError` variant refusing it.
 pub mod msi {
@@ -154,6 +162,167 @@ impl Lowering<'_, '_> {
         (present, reschedule)
     }
 
+    /// Whether an interrupt reaching a device record runs its interrupt fn, the caller holding
+    /// the device's lock: not once the device is masked, and an interrupt reaching it once its
+    /// window holds as many runs as its storm limit masks it, with its line or shared peripheral
+    /// interrupt.
+    pub fn admitted(&mut self, fx: &mut Fx, record: Value) -> Value {
+        let masked = fx.load(PTR, record, device::MASKED);
+        let live = fx.b.ins().icmp_imm_s(IntCC::Equal, masked, 0);
+        fx.choose_in(
+            self,
+            live,
+            &[types::I8],
+            |lo, fx| {
+                let limit = fx.load(PTR, record, device::LIMIT);
+                let limited = fx.b.ins().icmp_imm_s(IntCC::NotEqual, limit, 0);
+                fx.choose_in(
+                    lo,
+                    limited,
+                    &[types::I8],
+                    |lo, fx| vec![lo.counted(fx, record, limit)],
+                    |_, fx| vec![fx.int(types::I8, 1)],
+                )
+            },
+            |_, fx| vec![fx.int(types::I8, 0)],
+        )[0]
+    }
+
+    /// Counts a run of a limited device's interrupt fn in its window, a new window starting at
+    /// the first run after one second of the last, or masks the device once the window holds
+    /// `limit` runs. Gives whether the interrupt fn runs.
+    fn counted(&mut self, fx: &mut Fx, record: Value, limit: Value) -> Value {
+        let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
+        let start = fx.load(PTR, record, device::WINDOW);
+        let runs = fx.load(PTR, record, device::RUNS);
+        let elapsed = fx.b.ins().isub(now, start);
+        let over =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, elapsed, WINDOW_NS);
+        let none = fx.b.ins().icmp_imm_s(IntCC::Equal, runs, 0);
+        let fresh = fx.b.ins().bor(over, none);
+        let start = fx.b.ins().select(fresh, now, start);
+        let zero = fx.ptr(0);
+        let runs = fx.b.ins().select(fresh, zero, runs);
+        let full =
+            fx.b.ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, runs, limit);
+        fx.choose_in(
+            self,
+            full,
+            &[types::I8],
+            |lo, fx| {
+                let one = fx.ptr(1);
+                fx.store(one, record, device::MASKED);
+                let flags = lo.lock_bindings(fx);
+                lo.mask_line(fx, record, true);
+                lo.unlock_bindings(fx, flags);
+                vec![fx.int(types::I8, 0)]
+            },
+            |_, fx| {
+                fx.store(start, record, device::WINDOW);
+                let runs = fx.b.ins().iadd_imm_s(runs, 1);
+                fx.store(runs, record, device::RUNS);
+                vec![fx.int(types::I8, 1)]
+            },
+        )[0]
+    }
+
+    /// Masks at the interrupt controller, or unmasks for `masked` false, what a device record is
+    /// installed on: its line on x86_64, and on AArch64 its shared peripheral interrupt. The
+    /// caller holds the bindings lock.
+    fn mask_line(&mut self, fx: &mut Fx, record: Value, masked: bool) {
+        match self.machine_arch() {
+            Arch::Amd64 => {
+                let line = fx.load(PTR, record, device::LINE);
+                let lined = fx.b.ins().icmp_imm_s(IntCC::NotEqual, line, 0);
+                fx.when(lined, |fx| self.x64_mask_pin(fx, line, masked));
+            }
+            Arch::Aarch64 => {
+                let vector = fx.load(PTR, record, device::VECTOR);
+                let spi =
+                    fx.b.ins()
+                        .icmp_imm_s(IntCC::UnsignedLessThan, vector, super::its::LPI_BASE);
+                fx.when(spi, |fx| match masked {
+                    true => self.aarch64_disable(fx, vector),
+                    false => self.aarch64_enable(fx, vector),
+                });
+            }
+        }
+    }
+
+    /// Unmasks the line or shared peripheral interrupt a device record is or was installed on,
+    /// once a device is installed on it and none of them is masked. The caller holds the
+    /// bindings lock.
+    fn line_unmasked(&mut self, fx: &mut Fx, record: Value) {
+        let (installed, masked) = match self.machine_arch() {
+            Arch::Amd64 => {
+                let slot = fx.load(PTR, record, device::BINDING);
+                let line = fx.load(PTR, record, device::LINE);
+                (self.line_chained(fx, slot, line), self.masked_in(fx, slot))
+            }
+            Arch::Aarch64 => {
+                let vector = fx.load(PTR, record, device::VECTOR);
+                (
+                    self.installed_for(fx, vector, None),
+                    self.masked_on(fx, vector),
+                )
+            }
+        };
+        let clear = fx.b.ins().bxor_imm_s(masked, 1);
+        let unmasks = fx.b.ins().band(installed, clear);
+        fx.when(unmasks, |fx| self.mask_line(fx, record, false));
+    }
+
+    /// Whether a device chained in the binding at `slot` is masked.
+    fn masked_in(&mut self, fx: &mut Fx, slot: Value) -> Value {
+        let first = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), slot);
+        let none = fx.int(types::I8, 0);
+        fx.repeat(&[first, none], |fx, state| {
+            let (current, found) = (state[0], state[1]);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+            let seen = fx.choose(
+                present,
+                &[PTR, types::I8],
+                |fx| {
+                    let next = fx.load(PTR, current, device::NEXT);
+                    let masked = fx.load(PTR, current, device::MASKED);
+                    vec![next, fx.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)]
+                },
+                |fx| vec![fx.ptr(0), fx.int(types::I8, 0)],
+            );
+            let found = fx.b.ins().bor(found, seen[1]);
+            let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen[0], 0);
+            (more, vec![seen[0], found])
+        })[1]
+    }
+
+    /// Whether a device installed on a vector for any CPU is masked.
+    fn masked_on(&mut self, fx: &mut Fx, vector: Value) -> Value {
+        let state_address = self.state(fx);
+        let count = fx.load(PTR, state_address, state::THREAD_COUNT);
+        let rows = fx.b.ins().iadd_imm_s(count, 1);
+        let none = fx.int(types::I8, 0);
+        let found = fx.var(types::I8, none);
+        let zero = fx.ptr(0);
+        fx.each(zero, rows, |fx, row| {
+            let slot = self.irq_binding(fx, row, vector);
+            let masked = self.masked_in(fx, slot);
+            let seen = fx.b.use_var(found);
+            let seen = fx.b.ins().bor(seen, masked);
+            fx.b.def_var(found, seen);
+        });
+        fx.b.use_var(found)
+    }
+
+    /// `mut shared.unmask()` on a device record whose lock the caller released: unmasks its
+    /// line or shared peripheral interrupt once none of its devices is masked.
+    pub fn unmask_device(&mut self, fx: &mut Fx, record: Value) {
+        let flags = self.lock_bindings(fx);
+        self.line_unmasked(fx, record);
+        self.unlock_bindings(fx, flags);
+    }
+
     /// Takes the bindings lock, with maskable interrupts disabled so that its holder stays on
     /// its CPU, giving the flags to restore.
     fn lock_bindings(&mut self, fx: &mut Fx) -> Value {
@@ -217,9 +386,18 @@ impl Lowering<'_, '_> {
         let slot = self.irq_binding(fx, row, vector);
         self.chain(fx, record, slot);
         if aarch64 {
-            self.aarch64_route(fx, vector, target);
+            self.route_device(fx, vector, target);
         }
         self.unlock_bindings(fx, flags);
+    }
+
+    /// Routes the shared peripheral interrupt a device is installed on to CPU `cpu`, enabling it
+    /// unless a device installed on it is masked.
+    fn route_device(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
+        self.aarch64_steer(fx, vector, cpu);
+        let masked = self.masked_on(fx, vector);
+        let clear = fx.b.ins().bxor_imm_s(masked, 1);
+        fx.when(clear, |fx| self.aarch64_enable(fx, vector));
     }
 
     /// Whether devices are installed on a vector for a CPU other than `cpu`, or for any CPU for
@@ -356,7 +534,7 @@ impl Lowering<'_, '_> {
                     let every = fx.ptr(0);
                     let slot = self.irq_binding(fx, every, line);
                     self.chain(fx, record, slot);
-                    self.aarch64_route(fx, line, boot);
+                    self.route_device(fx, line, boot);
                     let done = fx.ptr(msi::INSTALLED as u64);
                     fx.b.def_var(outcome, done);
                 });
@@ -489,6 +667,9 @@ impl Lowering<'_, '_> {
                 },
             );
         }
+        let masked = fx.load(PTR, record, device::MASKED);
+        let masked = fx.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0);
+        fx.when(masked, |fx| self.line_unmasked(fx, record));
         self.unlock_bindings(fx, flags);
         let running = fx.offset(slot, binding::RUNNING);
         fx.repeat(&[], |fx, _| {

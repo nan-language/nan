@@ -1,4 +1,4 @@
-//! Raises the software interrupts of two i82557 Ethernet controllers on one INTx line, a shared peripheral interrupt, shared, then disabled once no device is left on it; then takes the PL011's transmit interrupt on its level-sensitive platform line, which takes no edge-triggered device meanwhile.
+//! Raises the software interrupts of two i82557 Ethernet controllers on one INTx line, a shared peripheral interrupt, shared, then disabled once no device is left on it; then takes the PL011's transmit interrupt on its level-sensitive platform line, which takes no edge-triggered device meanwhile, and leaves it raised under a storm limit, which masks the line until the interrupt is cleared and the device unmasked.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -44,6 +44,9 @@ const TRANSMIT: u32 = 0x20
 
 /// The polls of an interrupt count before the kernel gives up.
 const POLLS: u32 = 10_000_000
+
+/// The runs of the PL011's interrupt fn a second the storm takes before its line is masked.
+const STORM_LIMIT: u32 = 100
 
 fn say(text: Str) {
     var port = trusted "the virt board maps the PL011 of the serial port at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(0x0900_0000) }
@@ -97,6 +100,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
             take left.release()
         }
         platform_line()
+        storm_line()
     })
 } main
 
@@ -130,6 +134,52 @@ fn platform_line() {
         say(text: "platform: the line took no edge-triggered device while the PL011 held it\n")
     }
 } platform_line
+
+/// Installs the PL011 on its line under a storm limit with an interrupt fn that leaves its
+/// transmit interrupt raised, which the lines written before raised, so that the line storms
+/// until the runtime masks it; then clears the interrupt and unmasks the device.
+fn storm_line() {
+    let regs = trusted "the virt board maps the PL011 of the serial port at 0x0900_0000, and nothing writes its interrupt registers but this test" { hw::Mmio[Pl011Irqs].map(0x0900_0000) }
+    var shared = match hw::IrqShared.install_platform(Uart(regs: take regs, counted: 0), line: PL011_LINE, edge: false, active_low: false, on_irq: Uart.on_storm) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            let Uart(regs: left, counted: _) = refused
+            take left.unmap()
+            say(text: "storm: refused\n")
+            return
+        }
+    }
+    mut shared.limit(per_second: STORM_LIMIT)
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Uart) limits notrap, terminates, noalloc {
+            mut device.regs.write(Pl011Irqs.mask, value: TRANSMIT)
+        })
+    })
+    var masked = false
+    for _ in 0..<POLLS {
+        if shared.storming() {
+            masked = true
+            break
+        }
+    }
+    let ran = uart_counted(shared)
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Uart) limits notrap, terminates, noalloc {
+            mut device.regs.write(Pl011Irqs.mask, value: 0)
+            mut device.regs.write(Pl011Irqs.clear, value: TRANSMIT)
+        })
+    })
+    mut shared.unmask()
+    let unmasked = not shared.storming()
+    let Uart(regs: left, counted: _) = take shared.uninstall()
+    take left.unmap()
+    if masked and ran == u64.widen(STORM_LIMIT) {
+        say(text: "storm: the line was masked once the interrupt fn ran as often as its limit allows\n")
+    }
+    if unmasked {
+        say(text: "storm: the device no longer storms once unmasked\n")
+    }
+} storm_line
 
 /// Whether installing an edge-triggered device on the PL011's line is refused as unsupported.
 fn edge_refused() -> bool {
@@ -166,6 +216,13 @@ interrupt fn Uart.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limi
     take irq.complete()
     return hw::IrqExit.Resume
 } Uart.on_irq
+
+/// Counts the PL011's transmit interrupt, leaving it raised.
+interrupt fn Uart.on_storm(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    self.counted = self.counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Uart.on_storm
 
 /// Ends an interrupt of a device that never raises one.
 interrupt fn ignored(mut count: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {

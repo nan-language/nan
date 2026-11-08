@@ -1,8 +1,8 @@
 //! The x86_64 lines `hw::IrqShared.install_line` installs: pins of an I/O APIC, edge-triggered
 //! or level-triggered and active low or high, each delivered to one vector of the boot CPU whose
 //! devices sit in the row of every CPU, in the remapped format once the IOMMU remaps interrupts,
-//! and masked once no device is left on them. A line names its pin as the I/O APIC's register
-//! base shifted left by 8 bits with the pin's number.
+//! and masked while a device on them is masked or once no device is left on them. A line names
+//! its pin as the I/O APIC's register base shifted left by 8 bits with the pin's number.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -193,8 +193,22 @@ impl Lowering<'_, '_> {
         });
     }
 
+    /// Sets the mask bit of a line's pin when `masked` holds and clears it otherwise.
+    pub(super) fn x64_mask_pin(&mut self, fx: &mut Fx, line: Value, masked: bool) {
+        let apic = fx.b.ins().ushr_imm_s(line, 8);
+        let pin = fx.b.ins().band_imm_s(line, 0xFF);
+        let entry = self.ioapic_entry(fx, pin);
+        let held = self.ioapic_read(fx, apic, entry);
+        let bit = fx.ptr(MASKED);
+        let low = match masked {
+            true => fx.b.ins().bor(held, bit),
+            false => fx.b.ins().band_not(held, bit),
+        };
+        self.ioapic_write(fx, apic, entry, low);
+    }
+
     /// Whether a device installed on a line is chained in the binding at `slot`.
-    fn line_chained(&mut self, fx: &mut Fx, slot: Value, line: Value) -> Value {
+    pub(super) fn line_chained(&mut self, fx: &mut Fx, slot: Value, line: Value) -> Value {
         let first = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), slot);
         let none = fx.int(types::I8, 0);
         fx.repeat(&[first, none], |fx, state| {

@@ -117,9 +117,11 @@ fn device_value(mut lo: Lowering, value_ty: ty::Ty) -> u64 {
 /// and on a machine target install it on its interrupt, `install_msi` and `install_line` giving
 /// the device back in their refusal otherwise; the running task's domain then owns the record as
 /// a holding. `message` reads the message the record holds; `with` takes the record's lock
-/// around its body; `uninstall` ends the holding, removes the device from its interrupt and waits
-/// until no CPU runs its interrupt fn, then moves it out of the freed record. A CPU number past
-/// the CPUs traps.
+/// around its body; `limit` sets the record's storm limit, `storming` reads whether it is
+/// masked and `unmask` clears that and its window's runs, each doing nothing on the host;
+/// `uninstall` ends the holding, removes the device from its interrupt and waits until no CPU
+/// runs its interrupt fn, then moves it out of the freed record. A CPU number past the CPUs
+/// traps.
 fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let value_ty = supply.type_arg(lo, index: 0)
     let value_at = device_value(mut lo, value_ty)
@@ -179,6 +181,9 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             release_word(mut fx, lock_word)
             hw_forward(mut lo, mut fx, supply, called)
         }
+        "limit" => shared_limit(mut lo, mut fx, supply)
+        "storming" => shared_storming(mut lo, mut fx, supply)
+        "unmask" => shared_unmask(mut lo, mut fx, supply)
         "uninstall" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             let holding = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_HOLDING)
@@ -194,6 +199,50 @@ fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
     }
 } irq_shared
+
+/// `mut shared.limit(per_second: n)`: sets the device record's storm limit under its lock on a
+/// machine target.
+fn shared_limit(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    if lo.machine() {
+        let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+        let per_second = supply.param(1).scalar_value()
+        let limit = mut fx.b.uextend(PTR, x: per_second)
+        let lock_word = mut fx.offset(record, offset: DEVICE_RECORD_LOCK)
+        sync_acquire(mut lo, mut fx, lock_word, located: true)
+        mut fx.store(limit, addr: record, offset: DEVICE_RECORD_LIMIT)
+        release_word(mut fx, lock_word)
+    }
+    supply.done(mut lo, mut fx)
+} shared_limit
+
+/// `shared.storming()`: whether the device record is masked, false on the host.
+fn shared_storming(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    var storming = clif::Value(index: 0)
+    if lo.machine() {
+        let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+        let masked = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MASKED)
+        storming = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: masked, y: 0)
+    } else {
+        storming = mut fx.int(clif::Type.Int8, value: 0)
+    }
+    supply.ret(mut lo, mut fx, held: Held.Scalar(storming))
+} shared_storming
+
+/// `mut shared.unmask()`: clears the device record's mask and its window's runs under its lock,
+/// then unmasks its line once none of its devices is masked, on a machine target.
+fn shared_unmask(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    if lo.machine() {
+        let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+        let lock_word = mut fx.offset(record, offset: DEVICE_RECORD_LOCK)
+        sync_acquire(mut lo, mut fx, lock_word, located: true)
+        let zero = mut fx.ptr(0)
+        mut fx.store(zero, addr: record, offset: DEVICE_RECORD_MASKED)
+        mut fx.store(zero, addr: record, offset: DEVICE_RECORD_RUNS)
+        release_word(mut fx, lock_word)
+        mut lo.unmask_device(mut fx, record)
+    }
+    supply.done(mut lo, mut fx)
+} shared_unmask
 
 /// The CPU number an install names, as a word, trapping when it is not below the CPU count.
 fn cpu_number(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
@@ -366,8 +415,9 @@ fn return_refusal(mut lo: Lowering, mut fx: Fx, supply: Supply, refused: Refused
 } return_refusal
 
 /// The glue the dispatcher calls with a device's record when its interrupt fires: it takes the
-/// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext`, releases
-/// the lock and gives whether the fn's `hw::IrqExit` is `Reschedule`.
+/// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext` unless the
+/// device is masked or its storm limit masks it, releases the lock and gives whether the fn's
+/// `hw::IrqExit` is `Reschedule`.
 fn device_glue(mut lo: Lowering, value_ty: ty::Ty, handler_ty: ty::FnTyId) -> object::FuncId {
     var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -380,13 +430,20 @@ fn device_glue(mut lo: Lowering, value_ty: ty::Ty, handler_ty: ty::FnTyId) -> ob
         let value_at = device_value(mut lo1, value_ty)
         let lock_word = mut fx1.offset(record, offset: DEVICE_RECORD_LOCK)
         sync_acquire(mut lo1, fx: mut fx1, lock_word, located: false)
-        let handler = mut fx1.offset(record, offset: DEVICE_RECORD_HANDLER)
-        let value = mut fx1.offset(record, offset: value_at)
-        let handler_fn = ty::copy_fn_ty(lo1.ck.types().fn_of(handler_ty), alloc: lo1.alloc)
-        var args = Array[Held, 2].filled(Held.Address(value))
-        args[1] = Held.Empty
-        let called = mut lo1.call_value(mut fx1, fn_ty: handler_fn, function: handler, args: args.view())
-        let reschedule = mut lo1.reschedules(mut fx1, exit_ty: handler_fn.result, exit: called.result)
+        var reschedule = clif::Value(index: 0)
+        if lo1.machine() {
+            let admitted = mut lo1.admitted(mut fx1, record)
+            let ran = mut fx1.choose_in(mut lo1, condition: admitted, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                let rescheduled = glue_handler(mut lo2, fx: mut fx2, record, value_at, handler_ty)
+                return fx2.list1(rescheduled)
+            }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                return fx2.list1(mut fx2.int(clif::Type.Int8, value: 0))
+            })
+            expect ran.len() > 0
+            reschedule = ran[0]
+        } else {
+            reschedule = glue_handler(mut lo1, fx: mut fx1, record, value_at, handler_ty)
+        }
         release_word(mut fx1, lock_word)
         mut fx1.b.ret(Array[clif::Value, 1].filled(reschedule).view())
     })
@@ -398,6 +455,18 @@ struct PerCpuSlot derives Copy {
     stride: u64
     value_at: u64
 } PerCpuSlot
+
+/// Calls a device's interrupt fn with the device and a new `hw::IrqContext`, giving whether its
+/// `hw::IrqExit` is `Reschedule`.
+fn glue_handler(mut lo: Lowering, mut fx: Fx, record: clif::Value, value_at: u64, handler_ty: ty::FnTyId) -> clif::Value {
+    let handler = mut fx.offset(record, offset: DEVICE_RECORD_HANDLER)
+    let value = mut fx.offset(record, offset: value_at)
+    let handler_fn = ty::copy_fn_ty(lo.ck.types().fn_of(handler_ty), alloc: lo.alloc)
+    var args = Array[Held, 2].filled(Held.Address(value))
+    args[1] = Held.Empty
+    let called = mut lo.call_value(mut fx, fn_ty: handler_fn, function: handler, args: args.view())
+    return mut lo.reschedules(mut fx, exit_ty: handler_fn.result, exit: called.result)
+} glue_handler
 
 /// The bytes each CPU's slot of a per-CPU value takes, and the offset of its value in the slot,
 /// after a word set while its CPU is inside its `with`.

@@ -151,7 +151,7 @@ impl Checker<'_> {
             | ("hw::IrqShared", "install" | "install_on" | "install_msi" | "install_platform") => {
                 Some(Authority::Device)
             }
-            ("hw::IrqShared", "uninstall")
+            ("hw::IrqShared", "uninstall" | "limit" | "unmask")
             | (
                 "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::Iommu"
                 | "hw::IoDomain" | "hw::PciFunction" | "hw::PciKeeper" | "hw::PciPort"

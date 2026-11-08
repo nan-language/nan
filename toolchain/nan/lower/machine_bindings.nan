@@ -17,8 +17,10 @@ const BINDING_ROWS: u64 = MAX_CPUS + 1
 /// record, the interrupt fn as a function value, the next device of its binding, the binding,
 /// the address and data of its message, zero without one, the ITS device id and CPU of an
 /// AArch64 message-signalled interrupt, the holding through which its owner's settlement
-/// uninstalls it, the x86_64 line it is installed on, zero for none, and the device from
-/// `DEVICE_RECORD_VALUE` on, at its alignment.
+/// uninstalls it, the x86_64 line it is installed on, zero for none, its storm limit, zero for
+/// none, the kernel clock's nanosecond its window started at and the runs of its interrupt fn
+/// in that window, whether it is masked, and the device from `DEVICE_RECORD_VALUE` on, at its
+/// alignment.
 const DEVICE_RECORD_LOCK: u64 = 0
 
 const DEVICE_RECORD_VECTOR: u64 = 8
@@ -43,7 +45,18 @@ const DEVICE_RECORD_HOLDING: u64 = 88
 
 const DEVICE_RECORD_LINE: u64 = 96
 
-const DEVICE_RECORD_VALUE: u64 = 104
+const DEVICE_RECORD_LIMIT: u64 = 104
+
+const DEVICE_RECORD_WINDOW: u64 = 112
+
+const DEVICE_RECORD_RUNS: u64 = 120
+
+const DEVICE_RECORD_MASKED: u64 = 128
+
+const DEVICE_RECORD_VALUE: u64 = 136
+
+/// The nanoseconds of a device's window.
+const DEVICE_WINDOW_NS: i64 = 1_000_000_000
 
 /// What `install_msi` gives: the interrupt installed, or the `hw::MsiError` variant refusing it.
 const MSI_INSTALLED: i64 = 0
@@ -149,6 +162,167 @@ fn Lowering.run_chain(mut self, mut fx: Fx, slot: clif::Value) -> Ran {
     return Ran(present: present, reschedule: chosen[0])
 } Lowering.run_chain
 
+/// Whether an interrupt reaching a device record runs its interrupt fn, the caller holding the
+/// device's lock: not once the device is masked, and an interrupt reaching it once its window
+/// holds as many runs as its storm limit masks it, with its line or shared peripheral interrupt.
+fn Lowering.admitted(mut self, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let masked = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MASKED)
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: masked, y: 0)
+    let admitted = mut fx.choose_in(mut self, condition: live, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let limit = mut fx1.load(PTR, addr: record, offset: DEVICE_RECORD_LIMIT)
+        let limited = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: limit, y: 0)
+        return mut fx1.choose_in(mut lo1, condition: limited, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let counted = mut lo2.counted(mut fx2, record, limit)
+            return fx2.list1(counted)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(mut fx2.int(clif::Type.Int8, value: 1))
+        })
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 0))
+    })
+    expect admitted.len() > 0
+    return admitted[0]
+} Lowering.admitted
+
+/// Counts a run of a limited device's interrupt fn in its window, a new window starting at the
+/// first run after one second of the last, or masks the device once the window holds `limit`
+/// runs. Gives whether the interrupt fn runs.
+fn Lowering.counted(mut self, mut fx: Fx, record: clif::Value, limit: clif::Value) -> clif::Value {
+    let read = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect read.len() > 0
+    let now = read[0]
+    let held_start = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_WINDOW)
+    let held_runs = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_RUNS)
+    let elapsed = mut fx.b.isub(now, y: held_start)
+    let over = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: elapsed, y: DEVICE_WINDOW_NS)
+    let none = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: held_runs, y: 0)
+    let fresh = mut fx.b.bor(over, y: none)
+    let start = mut fx.b.select(fresh, x: now, y: held_start)
+    let zero = mut fx.ptr(0)
+    let runs = mut fx.b.select(fresh, x: zero, y: held_runs)
+    let full = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: runs, y: limit)
+    let ran = mut fx.choose_in(mut self, condition: full, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: DEVICE_RECORD_MASKED)
+        let flags = mut lo1.lock_bindings(mut fx1)
+        mut lo1.mask_line(mut fx1, record, masked: true)
+        mut lo1.unlock_bindings(mut fx1, flags)
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 0))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(start, addr: record, offset: DEVICE_RECORD_WINDOW)
+        let more = mut fx1.b.iadd_imm_s(runs, y: 1)
+        mut fx1.store(more, addr: record, offset: DEVICE_RECORD_RUNS)
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 1))
+    })
+    expect ran.len() > 0
+    return ran[0]
+} Lowering.counted
+
+/// Masks at the interrupt controller, or unmasks for `masked` false, what a device record is
+/// installed on: its line on x86_64, and on AArch64 its shared peripheral interrupt. The caller
+/// holds the bindings lock.
+fn Lowering.mask_line(mut self, mut fx: Fx, record: clif::Value, masked: bool) {
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => {
+            let line = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_LINE)
+            let lined = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: line, y: 0)
+            mut fx.if_true(lined, then: fn[mut self](mut fx1: Fx) {
+                mut self.x64_mask_pin(mut fx1, line, masked)
+            })
+        }
+        workspace::Arch.Aarch64 => {
+            let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
+            let spi = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: LPI_BASE)
+            mut fx.if_true(spi, then: fn[mut self](mut fx1: Fx) {
+                if masked {
+                    mut self.aarch64_disable(mut fx1, vector)
+                } else {
+                    mut self.aarch64_enable(mut fx1, vector)
+                }
+            })
+        }
+    }
+} Lowering.mask_line
+
+/// Unmasks the line or shared peripheral interrupt a device record is or was installed on, once
+/// a device is installed on it and none of them is masked. The caller holds the bindings lock.
+fn Lowering.line_unmasked(mut self, mut fx: Fx, record: clif::Value) {
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => {
+            let slot = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_BINDING)
+            let line = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_LINE)
+            let installed = mut self.line_chained(mut fx, slot, line)
+            let masked = mut self.masked_in(mut fx, slot)
+            mut self.unmask_clear(mut fx, record, installed, masked)
+        }
+        workspace::Arch.Aarch64 => {
+            let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
+            let installed = mut self.installed_for(mut fx, vector, cpu: None)
+            let masked = mut self.masked_on(mut fx, vector)
+            mut self.unmask_clear(mut fx, record, installed, masked)
+        }
+    }
+} Lowering.line_unmasked
+
+/// Unmasks the line of a device record when `installed` holds and `masked` does not.
+fn Lowering.unmask_clear(mut self, mut fx: Fx, record: clif::Value, installed: clif::Value, masked: clif::Value) {
+    let clear = mut fx.b.bxor_imm_s(masked, y: 1)
+    let unmasks = mut fx.b.band(installed, y: clear)
+    mut fx.if_true(unmasks, then: fn[mut self](mut fx1: Fx) {
+        mut self.mask_line(mut fx1, record, masked: false)
+    })
+} Lowering.unmask_clear
+
+/// Whether a device chained in the binding at `slot` is masked.
+fn Lowering.masked_in(mut self, mut fx: Fx, slot: clif::Value) -> clif::Value {
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let walked = mut fx.repeat(fx.list2(head, b: none).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let seen = mut fx1.choose(present, results: fx1.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next = mut fx2.load(PTR, addr: current, offset: DEVICE_RECORD_NEXT)
+            let masked = mut fx2.load(PTR, addr: current, offset: DEVICE_RECORD_MASKED)
+            return fx2.list2(next, b: mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: masked, y: 0))
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(mut fx2.ptr(0), b: mut fx2.int(clif::Type.Int8, value: 0))
+        })
+        expect seen.len() > 1
+        let found = mut fx1.b.bor(state[1], y: seen[1])
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen[0], y: 0)
+        return Pass(again: more, next: fx1.list2(seen[0], b: found))
+    })
+    expect walked.len() > 1
+    return walked[1]
+} Lowering.masked_in
+
+/// Whether a device installed on a vector for any CPU is masked.
+fn Lowering.masked_on(mut self, mut fx: Fx, vector: clif::Value) -> clif::Value {
+    let state_address = mut self.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let rows = mut fx.b.iadd_imm_s(count, y: 1)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let found = mut fx.variable(clif::Type.Int8, initial: none)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: rows, body: fn[mut self](mut fx1: Fx, row: clif::Value) {
+        let slot = mut self.irq_binding(mut fx1, row, vector)
+        let masked = mut self.masked_in(mut fx1, slot)
+        let seen = mut fx1.b.use_var(found)
+        let merged = mut fx1.b.bor(seen, y: masked)
+        mut fx1.b.def_var(found, val: merged)
+    })
+    return mut fx.b.use_var(found)
+} Lowering.masked_on
+
+/// `mut shared.unmask()` on a device record whose lock the caller released: unmasks its line or
+/// shared peripheral interrupt once none of its devices is masked.
+fn Lowering.unmask_device(mut self, mut fx: Fx, record: clif::Value) {
+    let flags = mut self.lock_bindings(mut fx)
+    mut self.line_unmasked(mut fx, record)
+    mut self.unlock_bindings(mut fx, flags)
+} Lowering.unmask_device
+
 /// Takes the bindings lock, with maskable interrupts disabled so that its holder stays on its
 /// CPU, giving the flags to restore.
 fn Lowering.lock_bindings(mut self, mut fx: Fx) -> clif::Value {
@@ -209,10 +383,21 @@ fn Lowering.install_device(mut self, mut fx: Fx, record: clif::Value, cpu: Optio
     let slot = mut self.irq_binding(mut fx, row, vector)
     mut self.chain(mut fx, record, slot)
     if aarch64 {
-        mut self.aarch64_route(mut fx, vector, cpu: target)
+        mut self.route_device(mut fx, vector, cpu: target)
     }
     mut self.unlock_bindings(mut fx, flags)
 } Lowering.install_device
+
+/// Routes the shared peripheral interrupt a device is installed on to CPU `cpu`, enabling it
+/// unless a device installed on it is masked.
+fn Lowering.route_device(mut self, mut fx: Fx, vector: clif::Value, cpu: clif::Value) {
+    mut self.aarch64_steer(mut fx, vector, cpu)
+    let masked = mut self.masked_on(mut fx, vector)
+    let clear = mut fx.b.bxor_imm_s(masked, y: 1)
+    mut fx.if_true(clear, then: fn[mut self](mut fx1: Fx) {
+        mut self.aarch64_enable(mut fx1, vector)
+    })
+} Lowering.route_device
 
 /// Whether devices are installed on a vector for a CPU other than `cpu`, or for any CPU for
 /// `None`, the devices installed for every CPU counting as the boot CPU's.
@@ -326,7 +511,7 @@ fn Lowering.aarch64_install_line(mut self, mut fx: Fx, record: clif::Value, line
                 let every_row = mut fx3.ptr(0)
                 let slot = mut self.irq_binding(mut fx3, row: every_row, vector: line)
                 mut self.chain(mut fx3, record, slot)
-                mut self.aarch64_route(mut fx3, vector: line, cpu: boot)
+                mut self.route_device(mut fx3, vector: line, cpu: boot)
                 let done = mut fx3.ptr(u64.fit(MSI_INSTALLED))
                 mut fx3.b.def_var(outcome, val: done)
             })
@@ -440,6 +625,11 @@ fn Lowering.uninstall_device(mut self, mut fx: Fx, record: clif::Value) {
             return mem::List[clif::Value].empty(fx1.alloc)
         })
     }
+    let masked_word = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_MASKED)
+    let masked = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: masked_word, y: 0)
+    mut fx.if_true(masked, then: fn[mut self](mut fx1: Fx) {
+        mut self.line_unmasked(mut fx1, record)
+    })
     mut self.unlock_bindings(mut fx, flags)
     let running = mut fx.offset(slot, offset: BINDING_RUNNING)
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {

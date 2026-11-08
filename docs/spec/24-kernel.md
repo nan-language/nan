@@ -538,6 +538,12 @@ pub fn IrqShared.message(self) -> Option[MsiMessage]
 
 pub fn IrqShared.with[R: Any](self, t: IrqsDisabled, body: fn(mut dev: T) -> R limits notrap, terminates, noalloc) -> R limits notrap, terminates, noalloc
 
+pub fn IrqShared.limit(mut self, per_second: u32)
+
+pub fn IrqShared.storming(self) -> bool
+
+pub fn IrqShared.unmask(mut self)
+
 pub fn IrqShared.uninstall(take self) -> T
 
 pub closed struct MsiMessage derives Copy, Eq {
@@ -571,9 +577,12 @@ pub closed struct MsiRefusal[T: Any and Send] {
 - On AArch64 the interrupt is one of the 8,192 LPIs of the interrupt controller's ITS, which translates the event the data names, for device id s, to it; `source` is the device id the ITS receives with the device's writes, a PCI function's requester id on the emulator's machine. Its message's address is that of the ITS's `GITS_TRANSLATER` and its data the event. A device id the ITS does not accept, or a machine without an ITS, is `Unsupported`; an ITS keeps at most 256 device ids.
 - `install_platform(take dev, line: l, edge: e, active_low: a, on_irq: f)` installs `dev` with f on the **line** l of a platform device and returns `Ok` of the `hw::IrqShared[T]`: on x86_64 the global system interrupt its ACPI resources give, an ISA interrupt being the one the MADT's interrupt source overrides give it, and on AArch64 the identifier of the shared peripheral interrupt its device tree's `interrupts` gives. A line is delivered to the boot CPU, edge-triggered when e holds and level-triggered otherwise. A level-triggered device joins the devices installed on a level-triggered line of its polarity, which share it as devices on one vector do; a line holding a device takes no other. On x86_64 the line is the pin holding l of the MADT's I/O APIC with the greatest first interrupt not above l; the runtime points the pin, active low when a holds and active high otherwise, at a vector of the boot CPU while a device is installed on the line and masks it once none is, and once the IOMMU remaps interrupts the pin's interrupts reach that vector through a remapping entry accepting the I/O APIC's requester id alone. On AArch64 the runtime makes the interrupt edge-triggered or level-sensitive while no device is installed on it, and a has no effect, the interrupt controller taking level-sensitive interrupts active high. It refuses with `Unsupported` when the line holds a device and either one is edge-triggered or, on x86_64, they differ in polarity; on x86_64 when no such I/O APIC lies in memory the entry root maps uncached or has the pin, or the IOMMU remaps interrupts and no device scope of its remapping unit names the I/O APIC; and on AArch64 when l is below 32, past 255 or a vector a contribution binds. It refuses with `Unreachable` when on x86_64 the pin cannot name the boot CPU's local APIC id, as for `install_msi`, or on AArch64 devices are installed on l for another CPU; and with `Exhausted` when on x86_64 a line no device is installed on finds no vector that no device is installed on for any CPU.
 - `with` reaches the device from other code, as `SpinLock.with` does.
+- `mut shared.limit(per_second: n)` sets the device's **storm limit**, none for 0 as for a device just installed. The runtime counts the runs of the device's interrupt fn in windows of one second of the [kernel clock](#kernel-time), each from the first run after the last window ended; an interrupt reaching the device once its window holds n runs **masks** it instead of running its interrupt fn. A masked device's interrupt fn no longer runs, and `shared.storming()` returns true. What a masked device is installed on is masked at the interrupt controller, with every other device on it, until no device installed on it is masked: on x86_64 the I/O APIC pin of its line, and on AArch64 its shared peripheral interrupt, a vector from 32 up. Any other interrupt reaching a masked device ends without running its interrupt fn.
+- `mut shared.unmask()` unmasks the device, its next window starting with the next run of its interrupt fn.
+- On the host targets `limit` and `unmask` do nothing, and `storming` returns false.
 - `take shared.uninstall()` removes the device from its interrupt, spins until no CPU runs f for it, and returns the device.
 - An installed device is a resource of the domain that holds its `hw::IrqShared`, which the domain's [settlement](11-errors-domains.md#settlement) uninstalls.
-- `install`, `install_on`, `install_msi` and `install_platform` are device operations and `uninstall` a confined one ([manifest grants](14-authority.md#manifest-grants)).
+- `install`, `install_on`, `install_msi` and `install_platform` are device operations and `limit`, `unmask` and `uninstall` confined ones ([manifest grants](14-authority.md#manifest-grants)).
 
 ```nan
 // file: serial/package.nan

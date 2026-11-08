@@ -1,4 +1,4 @@
-//! Takes the second UART's transmitter-empty interrupt on its edge-triggered platform line, which then takes no other device; raises the interrupts of two QEMU edu devices on one INTx line, shared, then masked once no device is left on it, and through MSI in place of INTx and back; then takes an AHCI port's first D2H FIS through the controller's MSI. With pci-testdev present the IOMMU stays off, so interrupts arrive in compatibility format, and otherwise they arrive remapped.
+//! Takes the second UART's transmitter-empty interrupt on its edge-triggered platform line, which then takes no other device; raises the interrupts of two QEMU edu devices on one INTx line, shared, then masked once no device is left on it, and through MSI in place of INTx and back, then leaves one raised under a storm limit, which masks the line until the interrupt is acknowledged and the device unmasked; then takes an AHCI port's first D2H FIS through the controller's MSI. With pci-testdev present the IOMMU stays off, so interrupts arrive in compatibility format, and otherwise they arrive remapped.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -77,6 +77,9 @@ const AHCI_MODE: u32 = 0x8000_0000
 const D2H: u32 = 0x1
 
 const RECEIVE: u32 = 0x10
+
+/// The runs of an edu device's interrupt fn a second the storm takes before its line is masked.
+const STORM_LIMIT: u32 = 100
 
 /// The polls of an interrupt count before the kernel gives up, and of a cleared condition.
 const POLLS: u32 = 10_000_000
@@ -333,7 +336,7 @@ fn messages(mut one: hw::PciFunction, take device: Edu) {
             if counted(line, seen: 1) == 2 {
                 say(text: "intx: the edu device's interrupt arrived in place of MSI\n")
             }
-            unmapped(take line.uninstall())
+            storm(mut one, kept: take line.uninstall())
         }
         Err(hw::MsiRefusal(dev: refused, error: _)) => {
             say(text: "intx: refused\n")
@@ -341,6 +344,45 @@ fn messages(mut one: hw::PciFunction, take device: Edu) {
         }
     }
 } messages
+
+/// Installs an edu device on its INTx line under a storm limit with an interrupt fn that leaves
+/// its interrupt raised, so that the line storms once raised until the runtime masks it; then
+/// acknowledges the interrupt and unmasks the device.
+fn storm(mut one: hw::PciFunction, take kept: Edu) {
+    let Edu(regs: regs, counted: _) = kept
+    var shared = match mut one.intx(line: EDU_LINE, dev: Edu(regs: take regs, counted: 0), on_irq: Edu.on_storm) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "storm: refused\n")
+            unmapped(take refused)
+            return
+        }
+    }
+    mut shared.limit(per_second: STORM_LIMIT)
+    raise(shared)
+    var masked = false
+    for _ in 0..<POLLS {
+        if shared.storming() {
+            masked = true
+            break
+        }
+    }
+    let ran = counted(shared, seen: 0)
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Edu) limits notrap, terminates, noalloc {
+            mut device.regs.write(EduRegs.acknowledge, value: 1)
+        })
+    })
+    mut shared.unmask()
+    let unmasked = not shared.storming()
+    unmapped(take shared.uninstall())
+    if masked and ran == u64.widen(STORM_LIMIT) {
+        say(text: "storm: the line was masked once the interrupt fn ran as often as its limit allows\n")
+    }
+    if unmasked {
+        say(text: "storm: the device no longer storms once unmasked\n")
+    }
+} storm
 
 /// Installs an edu device's registers on its INTx line.
 fn on_line(mut function: hw::PciFunction) -> Option[hw::IrqShared[Edu]] {
@@ -396,6 +438,13 @@ interrupt fn Edu.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limit
     take irq.complete()
     return hw::IrqExit.Resume
 } Edu.on_irq
+
+/// Counts the edu device's interrupts, leaving them raised.
+interrupt fn Edu.on_storm(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    self.counted = self.counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Edu.on_storm
 
 /// Resets the AHCI controller, installs it on its MSI vector and has port 0 receive FISes,
 /// whose first one, the D2H FIS of its disk, raises the interrupt.

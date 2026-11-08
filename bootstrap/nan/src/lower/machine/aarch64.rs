@@ -384,19 +384,28 @@ impl Lowering<'_, '_> {
         self.aarch64_cpu_prepare(vbar, private)
     }
 
-    /// Enables a shared peripheral interrupt routed to CPU `cpu`, for a contribution's binding or
-    /// an installed device.
-    pub fn aarch64_route(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
+    /// Enables a shared peripheral interrupt a contribution binds, routed to CPU `cpu`.
+    fn aarch64_route(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
+        self.aarch64_steer(fx, vector, cpu);
+        self.aarch64_enable(fx, vector);
+    }
+
+    /// Routes a shared peripheral interrupt to CPU `cpu`.
+    pub fn aarch64_steer(&mut self, fx: &mut Fx, vector: Value, cpu: Value) {
         let affinity = self.hardware_id(fx, cpu);
         let gicd = self.distributor(fx);
         let route = fx.b.ins().ishl_imm_s(vector, 3);
         let route = fx.b.ins().iadd(route, gicd);
         let route = fx.b.ins().iadd_imm_s(route, GICD_IROUTER as i64);
         self.mmio_write(fx, 8, route, affinity);
+    }
+
+    /// Enables a shared peripheral interrupt.
+    pub fn aarch64_enable(&mut self, fx: &mut Fx, vector: Value) {
         self.gic_spi_bit(fx, GICD_ISENABLER, vector);
     }
 
-    /// Disables a shared peripheral interrupt, once no installed device is left on it.
+    /// Disables a shared peripheral interrupt.
     pub fn aarch64_disable(&mut self, fx: &mut Fx, vector: Value) {
         self.gic_spi_bit(fx, GICD_ICENABLER, vector);
     }

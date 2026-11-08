@@ -130,9 +130,11 @@ pub fn device_value(lo: &mut Lowering, value_ty: &Ty) -> u64 {
 /// and on a machine target install it on its interrupt, `install_msi` and `install_line` giving
 /// the device back in their refusal otherwise; the running task's domain then owns the record as
 /// a holding. `message` reads the message the record holds; `with` takes the record's lock
-/// around its body; `uninstall` ends the holding, removes the device from its interrupt and waits
-/// until no CPU runs its interrupt fn, then moves it out of the freed record. A CPU number past
-/// the CPUs traps.
+/// around its body; `limit` sets the record's storm limit, `storming` reads whether it is
+/// masked and `unmask` clears that and its window's runs, each doing nothing on the host;
+/// `uninstall` ends the holding, removes the device from its interrupt and waits until no CPU
+/// runs its interrupt fn, then moves it out of the freed record. A CPU number past the CPUs
+/// traps.
 pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let value_at = device_value(lo, &value_ty);
@@ -193,6 +195,42 @@ pub fn irq_shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             );
             release_word(fx, word);
             forward(lo, fx, supply, called);
+        }
+        "limit" => {
+            if lo.machine() {
+                let record = fx.load(PTR, supply.param(0).address(), 0);
+                let limit = supply.param(1).scalar();
+                let limit = fx.b.ins().uextend(PTR, limit);
+                let word = fx.offset(record, device::LOCK);
+                acquire(lo, fx, word, true);
+                fx.store(limit, record, device::LIMIT);
+                release_word(fx, word);
+            }
+            supply.done(lo, fx);
+        }
+        "storming" => {
+            let storming = match lo.machine() {
+                true => {
+                    let record = fx.load(PTR, supply.param(0).address(), 0);
+                    let masked = fx.load(PTR, record, device::MASKED);
+                    fx.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
+                }
+                false => fx.int(types::I8, 0),
+            };
+            supply.ret(lo, fx, Held::Scalar(storming));
+        }
+        "unmask" => {
+            if lo.machine() {
+                let record = fx.load(PTR, supply.param(0).address(), 0);
+                let word = fx.offset(record, device::LOCK);
+                acquire(lo, fx, word, true);
+                let zero = fx.ptr(0);
+                fx.store(zero, record, device::MASKED);
+                fx.store(zero, record, device::RUNS);
+                release_word(fx, word);
+                lo.unmask_device(fx, record);
+            }
+            supply.done(lo, fx);
         }
         "uninstall" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -369,8 +407,9 @@ fn installed_or_refused(
 }
 
 /// The glue the dispatcher calls with a device's record when its interrupt fires: it takes the
-/// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext`, releases
-/// the lock and gives whether the fn's `hw::IrqExit` is `Reschedule`.
+/// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext` unless the
+/// device is masked or its storm limit masks it, releases the lock and gives whether the fn's
+/// `hw::IrqExit` is `Reschedule`.
 fn device_glue(lo: &mut Lowering, value_ty: &Ty, handler_ty: &FnTy) -> FuncId {
     let mut signature = Signature::new(super::super::super::CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
@@ -383,15 +422,30 @@ fn device_glue(lo: &mut Lowering, value_ty: &Ty, handler_ty: &FnTy) -> FuncId {
         let value_at = device_value(lo, &value_ty);
         let word = fx.offset(record, device::LOCK);
         acquire(lo, fx, word, false);
-        let handler = fx.offset(record, device::HANDLER);
-        let value = fx.offset(record, value_at);
-        let called = lo.call_value(
-            fx,
-            &handler_ty,
-            handler,
-            &[Held::Address(value), Held::Empty],
-        );
-        let reschedule = lo.reschedules(fx, &handler_ty.result, called.result);
+        let run = |lo: &mut Lowering, fx: &mut Fx| {
+            let handler = fx.offset(record, device::HANDLER);
+            let value = fx.offset(record, value_at);
+            let called = lo.call_value(
+                fx,
+                &handler_ty,
+                handler,
+                &[Held::Address(value), Held::Empty],
+            );
+            lo.reschedules(fx, &handler_ty.result, called.result)
+        };
+        let reschedule = match lo.machine() {
+            true => {
+                let admitted = lo.admitted(fx, record);
+                fx.choose_in(
+                    lo,
+                    admitted,
+                    &[types::I8],
+                    |lo, fx| vec![run(lo, fx)],
+                    |_, fx| vec![fx.int(types::I8, 0)],
+                )[0]
+            }
+            false => run(lo, fx),
+        };
         release_word(fx, word);
         fx.b.ins().return_(&[reschedule]);
     })

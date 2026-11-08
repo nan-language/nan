@@ -99,6 +99,8 @@ pub fn member(
             Val::Variant(interp.ty_item("core", "Result"), 1, Rc::new(vec![refusal]))
         }
         ("hw::IrqShared", "message") => Val::none(option),
+        ("hw::IrqShared", "limit" | "unmask") => Val::Unit,
+        ("hw::IrqShared", "storming") => Val::Bool(false),
         ("hw::SpinLock" | "hw::IrqShared", "with") => {
             let contents = interp.deref(&args[0]).fields()[0].clone();
             return Some(call_value(interp, &args[2], vec![contents], at, site));

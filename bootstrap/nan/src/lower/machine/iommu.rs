@@ -230,7 +230,7 @@ impl Lowering<'_, '_> {
 
     /// Writes the remapping table entry of CPU `cpu`'s vector `vector`, whose local APIC has id
     /// `id`, accepting only requester `source` when `validated` holds and level-triggered when
-    /// `level` does, and invalidates the unit's caches; gives the message naming it, or zero when
+    /// `level` is a value of 1, and invalidates the unit's caches; gives the message naming it, or zero when
     /// the entry cannot name an id past 255.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn remap(
@@ -242,7 +242,7 @@ impl Lowering<'_, '_> {
         id: Value,
         source: Value,
         validated: bool,
-        level: bool,
+        level: Option<Value>,
     ) -> Value {
         let flags = fx.load(PTR, unit, unit::FLAGS);
         let extended = fx.b.ins().band_imm_s(flags, EXTENDED);
@@ -262,9 +262,13 @@ impl Lowering<'_, '_> {
             let destination = fx.b.ins().ishl_imm_s(destination, 32);
             let low = fx.b.ins().ishl_imm_s(vector, 16);
             let low = fx.b.ins().bor(low, destination);
+            let low = fx.b.ins().bor_imm_s(low, PRESENT);
             let low = match level {
-                true => fx.b.ins().bor_imm_s(low, PRESENT | LEVEL),
-                false => fx.b.ins().bor_imm_s(low, PRESENT),
+                Some(level) => {
+                    let trigger = fx.b.ins().imul_imm_s(level, LEVEL);
+                    fx.b.ins().bor(low, trigger)
+                }
+                None => low,
             };
             let high = match validated {
                 true => {

@@ -401,8 +401,29 @@ impl Lowering<'_, '_> {
         self.gic_spi_bit(fx, GICD_ICENABLER, vector);
     }
 
-    /// Makes a shared peripheral interrupt level-sensitive, while it is disabled.
-    pub fn aarch64_level(&mut self, fx: &mut Fx, vector: Value) {
+    /// Makes a shared peripheral interrupt edge-triggered when `edge` is 1 and level-sensitive
+    /// otherwise, while it is disabled.
+    pub fn aarch64_trigger(&mut self, fx: &mut Fx, vector: Value, edge: Value) {
+        let (at, bit) = self.gic_config_bit(fx, vector);
+        let config = self.mmio_read(fx, 4, at);
+        let config = fx.b.ins().band_not(config, bit);
+        let set = fx.b.ins().imul(bit, edge);
+        let config = fx.b.ins().bor(config, set);
+        self.mmio_write(fx, 4, at, config);
+    }
+
+    /// 1 when a shared peripheral interrupt is edge-triggered, and 0 when it is level-sensitive.
+    pub fn aarch64_is_edge(&mut self, fx: &mut Fx, vector: Value) -> Value {
+        let (at, bit) = self.gic_config_bit(fx, vector);
+        let config = self.mmio_read(fx, 4, at);
+        let held = fx.b.ins().band(config, bit);
+        let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
+        fx.b.ins().uextend(PTR, held)
+    }
+
+    /// The address of the distributor's configuration word holding a shared peripheral
+    /// interrupt's trigger mode, and the bit of that word that makes it edge-triggered.
+    fn gic_config_bit(&mut self, fx: &mut Fx, vector: Value) -> (Value, Value) {
         let gicd = self.distributor(fx);
         let word = fx.b.ins().ushr_imm_s(vector, 4);
         let word = fx.b.ins().ishl_imm_s(word, 2);
@@ -412,10 +433,7 @@ impl Lowering<'_, '_> {
         let position = fx.b.ins().ishl_imm_s(position, 1);
         let position = fx.b.ins().iadd_imm_s(position, 1);
         let one = fx.ptr(1);
-        let edge = fx.b.ins().ishl(one, position);
-        let config = self.mmio_read(fx, 4, at);
-        let config = fx.b.ins().band_not(config, edge);
-        self.mmio_write(fx, 4, at, config);
+        (at, fx.b.ins().ishl(one, position))
     }
 
     /// Writes the bit of a shared peripheral interrupt alone to its word of one of the

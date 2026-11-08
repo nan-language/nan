@@ -148,7 +148,7 @@ impl Checker<'_> {
             ("hw::Mmio" | "hw::Ports", "map")
             | ("hw::IoSpace", "physical")
             | ("hw::PciFunction", "attach_physical")
-            | ("hw::IrqShared", "install" | "install_on" | "install_msi") => {
+            | ("hw::IrqShared", "install" | "install_on" | "install_msi" | "install_platform") => {
                 Some(Authority::Device)
             }
             ("hw::IrqShared", "uninstall")

@@ -1,8 +1,15 @@
-//! Raises the software interrupts of two i82557 Ethernet controllers on one INTx line, a shared peripheral interrupt, shared, then disabled once no device is left on it.
+//! Raises the software interrupts of two i82557 Ethernet controllers on one INTx line, a shared peripheral interrupt, shared, then disabled once no device is left on it; then takes the PL011's transmit interrupt on its level-sensitive platform line, which takes no edge-triggered device meanwhile.
 
 registers Pl011 {
     data: u8 at 0x0 write
 } Pl011
+
+/// The PL011's interrupt mask, whose transmit bit lets its transmit interrupt, raised by a
+/// write of its data and lowered by its interrupt clear, reach its line.
+registers Pl011Irqs {
+    mask: u32 at 0x38 write
+    clear: u32 at 0x44 write
+} Pl011Irqs
 
 /// The system control block of an i82557 in its BAR 0: the interrupts it raised, which a write
 /// of their bits acknowledges, and its interrupt control, whose software interrupt bit raises
@@ -29,6 +36,12 @@ const SOFTWARE: u8 = 0x2
 
 const SOFTWARE_RAISED: u8 = 0x4
 
+/// The shared peripheral interrupt the virt board's device tree gives the PL011, level-sensitive;
+/// and the transmit bit of its interrupt mask and clear.
+const PL011_LINE: u32 = 33
+
+const TRANSMIT: u32 = 0x20
+
 /// The polls of an interrupt count before the kernel gives up.
 const POLLS: u32 = 10_000_000
 
@@ -39,6 +52,12 @@ fn say(text: Str) {
     }
     take port.unmap()
 } say
+
+/// The PL011's interrupt registers with the interrupts its interrupt fn counted.
+linear struct Uart {
+    regs: hw::Mmio[Pl011Irqs]
+    counted: u64
+} Uart
 
 /// An i82557's system control block with the interrupts its interrupt fn counted.
 linear struct Nic {
@@ -77,8 +96,82 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         for left in take controllers {
             take left.release()
         }
+        platform_line()
     })
 } main
+
+/// Installs the PL011 on its level-sensitive line and unmasks its transmit interrupt, which the
+/// lines written before raised and which arrives once; while the PL011 holds the line, installing an edge-triggered device on it is
+/// refused. Writes what it saw once the PL011 is uninstalled, whose registers `say` maps.
+fn platform_line() {
+    let regs = trusted "the virt board maps the PL011 of the serial port at 0x0900_0000, and nothing writes its interrupt registers but this test" { hw::Mmio[Pl011Irqs].map(0x0900_0000) }
+    let shared = match hw::IrqShared.install_platform(Uart(regs: take regs, counted: 0), line: PL011_LINE, edge: false, active_low: false, on_irq: Uart.on_irq) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            let Uart(regs: left, counted: _) = refused
+            take left.unmap()
+            say(text: "platform: refused\n")
+            return
+        }
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Uart) limits notrap, terminates, noalloc {
+            mut device.regs.write(Pl011Irqs.mask, value: TRANSMIT)
+        })
+    })
+    let arrived = uart_counted(shared) == 1
+    let refused = edge_refused()
+    let Uart(regs: left, counted: _) = take shared.uninstall()
+    take left.unmap()
+    if arrived {
+        say(text: "platform: the PL011's interrupt arrived on its level-sensitive line\n")
+    }
+    if refused {
+        say(text: "platform: the line took no edge-triggered device while the PL011 held it\n")
+    }
+} platform_line
+
+/// Whether installing an edge-triggered device on the PL011's line is refused as unsupported.
+fn edge_refused() -> bool {
+    match hw::IrqShared.install_platform(0u64, line: PL011_LINE, edge: true, active_low: false, on_irq: ignored) {
+        Ok(installed) => {
+            discard take installed.uninstall()
+            return false
+        }
+        Err(hw::MsiRefusal(dev: _, error: error)) => return error == hw::MsiError.Unsupported
+    }
+} edge_refused
+
+/// The interrupts the PL011 counted once it counted one, or after `POLLS` polls.
+fn uart_counted(shared: hw::IrqShared[Uart]) -> u64 {
+    var count: u64 = 0
+    for _ in 0..<POLLS {
+        count = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut device: Uart) -> u64 limits notrap, terminates, noalloc {
+                return device.counted
+            })
+        })
+        if count > 0 {
+            return count
+        }
+    }
+    return count
+} uart_counted
+
+/// Counts the PL011's transmit interrupt, masking and clearing it.
+interrupt fn Uart.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    mut self.regs.write(Pl011Irqs.mask, value: 0)
+    mut self.regs.write(Pl011Irqs.clear, value: TRANSMIT)
+    self.counted = self.counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Uart.on_irq
+
+/// Ends an interrupt of a device that never raises one.
+interrupt fn ignored(mut count: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    take irq.complete()
+    return hw::IrqExit.Resume
+} ignored
 
 /// Installs both controllers on their shared INTx line, raises the second device's interrupt
 /// with the first installed, then with the first uninstalled, and raises it once more with

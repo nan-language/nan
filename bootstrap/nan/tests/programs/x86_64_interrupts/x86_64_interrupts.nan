@@ -1,4 +1,4 @@
-//! Raises the interrupts of two QEMU edu devices on one INTx line, shared, then masked once no device is left on it, and through MSI in place of INTx and back; then takes an AHCI port's first D2H FIS through the controller's MSI. With pci-testdev present the IOMMU stays off, so interrupts arrive in compatibility format, and otherwise they arrive remapped.
+//! Takes the second UART's transmitter-empty interrupt on its edge-triggered platform line, which then takes no other device; raises the interrupts of two QEMU edu devices on one INTx line, shared, then masked once no device is left on it, and through MSI in place of INTx and back; then takes an AHCI port's first D2H FIS through the controller's MSI. With pci-testdev present the IOMMU stays off, so interrupts arrive in compatibility format, and otherwise they arrive remapped.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -24,6 +24,15 @@ registers AhciRegs {
     command: u32 at 0x118 read write
 } AhciRegs
 
+/// The registers of the second 16550 UART: its interrupt enable, its interrupt identification,
+/// whose read clears a transmitter-empty interrupt, and its modem control, whose OUT2 bit
+/// connects its interrupt to its line.
+registers Com2Regs {
+    enable: u8 at 0x1 write
+    identity: u8 at 0x2 read
+    modem: u8 at 0x4 write
+} Com2Regs
+
 /// The memory an AHCI port writes the FISes it receives to.
 layout Received: bytes 4096 le {
     data: Array[u8, 4096] at 0
@@ -47,6 +56,15 @@ const EDU_LINE: u32 = 21
 const EDU_BAR: u8 = 0
 
 const AHCI_BAR: u8 = 5
+
+/// The global system interrupt of the second UART's ISA line, edge-triggered and active high,
+/// which q35's MADT overrides with no other; the interrupt enable bit of an empty transmitter
+/// holding register; and the modem control's OUT2 bit.
+const COM2_LINE: u32 = 3
+
+const EMPTY: u8 = 0x2
+
+const OUT2: u8 = 0x8
 
 /// The AHCI global control bits resetting the controller, enabling its interrupt and AHCI mode;
 /// the port's interrupt enable of a received D2H FIS; and its command bit receiving FISes.
@@ -77,6 +95,12 @@ linear struct Edu {
     counted: u64
 } Edu
 
+/// The second UART's registers with the interrupts its interrupt fn counted.
+linear struct Com2 {
+    regs: hw::Ports[Com2Regs]
+    counted: u64
+} Com2
+
 /// An AHCI controller's registers with the interrupts its interrupt fn counted.
 linear struct Ahci {
     regs: hw::Mmio[AhciRegs]
@@ -95,6 +119,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let iommu = enabled(mut k, wanted: remapped)
     let domain = domain_of(iommu)
     take k.anchor(take iommu, run: fn[take functions, take domain](exec: task::Executor) limits stack 65_536 {
+        platform_line()
         var edus = mem::List[hw::PciFunction].empty(alloc)
         var controllers = mem::List[hw::PciFunction].empty(alloc)
         for function in take functions {
@@ -139,6 +164,79 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         closed(take domain)
     })
 } main
+
+/// Installs the second UART on its edge-triggered line and enables its transmitter-empty
+/// interrupt, which arrives once; while the UART holds the line, installing another device on
+/// it is refused, edge-triggered or level-triggered.
+fn platform_line() {
+    let regs = trusted "the board decodes port 0x2F8 to its second 16550 UART and nothing else maps it" { hw::Ports[Com2Regs].map(0x2F8) }
+    let shared = match hw::IrqShared.install_platform(Com2(regs: take regs, counted: 0), line: COM2_LINE, edge: true, active_low: false, on_irq: Com2.on_irq) {
+        Ok(installed) => installed
+        Err(hw::MsiRefusal(dev: refused, error: _)) => {
+            say(text: "platform: refused\n")
+            let Com2(regs: left, counted: _) = refused
+            take left.unmap()
+            return
+        }
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        shared.with(t, body: fn(mut device: Com2) limits notrap, terminates, noalloc {
+            mut device.regs.write(Com2Regs.modem, value: OUT2)
+            mut device.regs.write(Com2Regs.enable, value: EMPTY)
+        })
+    })
+    if com2_counted(shared) == 1 {
+        say(text: "platform: the UART's interrupt arrived on its edge-triggered line\n")
+    }
+    if refused_on_line(edge: true) and refused_on_line(edge: false) {
+        say(text: "platform: the line took no other device while the UART held it\n")
+    }
+    let Com2(regs: left, counted: _) = take shared.uninstall()
+    take left.unmap()
+} platform_line
+
+/// Whether installing a device on the second UART's line, edge-triggered or level-triggered and
+/// active high, is refused as unsupported.
+fn refused_on_line(edge: bool) -> bool {
+    match hw::IrqShared.install_platform(0u64, line: COM2_LINE, edge, active_low: false, on_irq: ignored) {
+        Ok(installed) => {
+            discard take installed.uninstall()
+            return false
+        }
+        Err(hw::MsiRefusal(dev: _, error: error)) => return error == hw::MsiError.Unsupported
+    }
+} refused_on_line
+
+/// The interrupts the second UART counted once it counted one, or after `POLLS` polls.
+fn com2_counted(shared: hw::IrqShared[Com2]) -> u64 {
+    var count: u64 = 0
+    for _ in 0..<POLLS {
+        count = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+            return shared.with(t, body: fn(mut device: Com2) -> u64 limits notrap, terminates, noalloc {
+                return device.counted
+            })
+        })
+        if count > 0 {
+            return count
+        }
+    }
+    return count
+} com2_counted
+
+/// Counts the second UART's transmitter-empty interrupt, clearing it and disabling it.
+interrupt fn Com2.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    discard mut self.regs.read(Com2Regs.identity)
+    mut self.regs.write(Com2Regs.enable, value: 0)
+    self.counted = self.counted.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Com2.on_irq
+
+/// Ends an interrupt of a device that never raises one.
+interrupt fn ignored(mut count: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    take irq.complete()
+    return hw::IrqExit.Resume
+} ignored
 
 /// Closes the domain, if there is one.
 fn closed(take domain: Option[hw::IoDomain]) {

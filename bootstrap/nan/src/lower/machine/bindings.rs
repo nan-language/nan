@@ -287,31 +287,40 @@ impl Lowering<'_, '_> {
         outcome
     }
 
-    /// Installs a device record on a level-triggered line delivered to the boot CPU, which
-    /// `line` names as `hw::IrqShared.install_line` takes it, behind the devices installed on it
-    /// before; on x86_64 the remapping entry of a line no device is installed on accepts only
-    /// requester `source`. Gives one of the `msi` outcomes.
+    /// Installs a device record on a line delivered to the boot CPU, which `line` names as
+    /// `hw::IrqShared.install_line` takes it, edge-triggered when `edge` is 1 and otherwise
+    /// level-triggered behind the level devices installed on it before in the same mode; on
+    /// x86_64 the pin is active low when `active_low` is 1, and the remapping entry of a line no
+    /// device is installed on accepts only requester `source`. Gives one of the `msi` outcomes.
     pub fn install_line(
         &mut self,
         fx: &mut Fx,
         record: Value,
         line: Value,
         source: Value,
+        edge: Value,
+        active_low: Value,
     ) -> Value {
         let flags = self.lock_bindings(fx);
         let outcome = match self.machine_arch() {
-            Arch::Amd64 => self.x64_install_line(fx, record, line, source),
-            Arch::Aarch64 => self.aarch64_install_line(fx, record, line),
+            Arch::Amd64 => self.x64_install_line(fx, record, line, source, edge, active_low),
+            Arch::Aarch64 => self.aarch64_install_line(fx, record, line, edge),
         };
         self.unlock_bindings(fx, flags);
         outcome
     }
 
     /// The AArch64 part of `install_line`: the shared peripheral interrupt `line` takes the record
-    /// for the boot CPU, made level-sensitive while no device is installed on it, unless a row
-    /// has no vector for it, the final build binds it, or devices are installed on it for another
-    /// CPU.
-    fn aarch64_install_line(&mut self, fx: &mut Fx, record: Value, line: Value) -> Value {
+    /// for the boot CPU, made edge-triggered or level-sensitive while no device is installed on
+    /// it, unless a row has no vector for it, the final build binds it, devices are installed on
+    /// it for another CPU, or devices are installed on it and it or the record is edge-triggered.
+    fn aarch64_install_line(
+        &mut self,
+        fx: &mut Fx,
+        record: Value,
+        line: Value,
+        edge: Value,
+    ) -> Value {
         let above =
             fx.b.ins()
                 .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, line, 32);
@@ -333,15 +342,24 @@ impl Lowering<'_, '_> {
             let free = fx.b.ins().bxor_imm_s(elsewhere, 1);
             fx.when(free, |fx| {
                 let installed = self.installed_for(fx, line, None);
-                let fresh = fx.b.ins().bxor_imm_s(installed, 1);
-                fx.when(fresh, |fx| self.aarch64_level(fx, line));
-                fx.store(line, record, device::VECTOR);
-                let every = fx.ptr(0);
-                let slot = self.irq_binding(fx, every, line);
-                self.chain(fx, record, slot);
-                self.aarch64_route(fx, line, boot);
-                let done = fx.ptr(msi::INSTALLED as u64);
-                fx.b.def_var(outcome, done);
+                let held_edge = self.aarch64_is_edge(fx, line);
+                let edges = fx.b.ins().bor(held_edge, edge);
+                let edges = fx.b.ins().icmp_imm_s(IntCC::NotEqual, edges, 0);
+                let refused = fx.b.ins().band(installed, edges);
+                let unsupported = fx.ptr(msi::UNSUPPORTED as u64);
+                fx.b.def_var(outcome, unsupported);
+                let joins = fx.b.ins().bxor_imm_s(refused, 1);
+                fx.when(joins, |fx| {
+                    let fresh = fx.b.ins().bxor_imm_s(installed, 1);
+                    fx.when(fresh, |fx| self.aarch64_trigger(fx, line, edge));
+                    fx.store(line, record, device::VECTOR);
+                    let every = fx.ptr(0);
+                    let slot = self.irq_binding(fx, every, line);
+                    self.chain(fx, record, slot);
+                    self.aarch64_route(fx, line, boot);
+                    let done = fx.ptr(msi::INSTALLED as u64);
+                    fx.b.def_var(outcome, done);
+                });
             });
         });
         fx.b.use_var(outcome)
@@ -396,7 +414,7 @@ impl Lowering<'_, '_> {
                 remapping,
                 &[PTR, PTR],
                 |lo, fx| {
-                    let address = lo.remap(fx, unit, cpu, vector, id, source, validated, false);
+                    let address = lo.remap(fx, unit, cpu, vector, id, source, validated, None);
                     vec![address, fx.ptr(0)]
                 },
                 |_, fx| {

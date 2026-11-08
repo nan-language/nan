@@ -272,24 +272,26 @@ fn Lowering.install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif::Va
     return outcome
 } Lowering.install_msi
 
-/// Installs a device record on a level-triggered line delivered to the boot CPU, which `line`
-/// names as `hw::IrqShared.install_line` takes it, behind the devices installed on it before; on
-/// x86_64 the remapping entry of a line no device is installed on accepts only requester
-/// `source`. Gives one of the `MSI_` outcomes.
-fn Lowering.install_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, source: clif::Value) -> clif::Value {
+/// Installs a device record on a line delivered to the boot CPU, which `line` names as
+/// `hw::IrqShared.install_line` takes it, edge-triggered when `edge` is 1 and otherwise
+/// level-triggered behind the level devices installed on it before in the same mode; on x86_64
+/// the pin is active low when `active_low` is 1, and the remapping entry of a line no device is
+/// installed on accepts only requester `source`. Gives one of the `MSI_` outcomes.
+fn Lowering.install_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, source: clif::Value, edge: clif::Value, active_low: clif::Value) -> clif::Value {
     let flags = mut self.lock_bindings(mut fx)
     let outcome = match self.machine_arch() {
-        workspace::Arch.Amd64 => mut self.x64_install_line(mut fx, record, line, source)
-        workspace::Arch.Aarch64 => mut self.aarch64_install_line(mut fx, record, line)
+        workspace::Arch.Amd64 => mut self.x64_install_line(mut fx, record, line, source, edge, active_low)
+        workspace::Arch.Aarch64 => mut self.aarch64_install_line(mut fx, record, line, edge)
     }
     mut self.unlock_bindings(mut fx, flags)
     return outcome
 } Lowering.install_line
 
 /// The AArch64 part of `install_line`: the shared peripheral interrupt `line` takes the record for
-/// the boot CPU, made level-sensitive while no device is installed on it, unless a row has no
-/// vector for it, the final build binds it, or devices are installed on it for another CPU.
-fn Lowering.aarch64_install_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value) -> clif::Value {
+/// the boot CPU, made edge-triggered or level-sensitive while no device is installed on it,
+/// unless a row has no vector for it, the final build binds it, devices are installed on it for
+/// another CPU, or devices are installed on it and it or the record is edge-triggered.
+fn Lowering.aarch64_install_line(mut self, mut fx: Fx, record: clif::Value, line: clif::Value, edge: clif::Value) -> clif::Value {
     let above = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: line, y: 32)
     let below = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: line, y: i64.fit(BINDING_VECTORS))
     var inside = mut fx.b.band(above, y: below)
@@ -308,17 +310,26 @@ fn Lowering.aarch64_install_line(mut self, mut fx: Fx, record: clif::Value, line
         let free = mut fx1.b.bxor_imm_s(elsewhere, y: 1)
         mut fx1.if_true(free, then: fn[mut self](mut fx2: Fx) {
             let installed = mut self.installed_for(mut fx2, vector: line, cpu: None)
-            let fresh = mut fx2.b.bxor_imm_s(installed, y: 1)
-            mut fx2.if_true(fresh, then: fn[mut self](mut fx3: Fx) {
-                mut self.aarch64_level(mut fx3, vector: line)
+            let held_edge = mut self.aarch64_is_edge(mut fx2, vector: line)
+            let either = mut fx2.b.bor(held_edge, y: edge)
+            let edges = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: either, y: 0)
+            let refused = mut fx2.b.band(installed, y: edges)
+            let unsupported_held = mut fx2.ptr(u64.fit(MSI_UNSUPPORTED))
+            mut fx2.b.def_var(outcome, val: unsupported_held)
+            let joins = mut fx2.b.bxor_imm_s(refused, y: 1)
+            mut fx2.if_true(joins, then: fn[mut self](mut fx3: Fx) {
+                let fresh = mut fx3.b.bxor_imm_s(installed, y: 1)
+                mut fx3.if_true(fresh, then: fn[mut self](mut fx4: Fx) {
+                    mut self.aarch64_trigger(mut fx4, vector: line, edge)
+                })
+                mut fx3.store(line, addr: record, offset: DEVICE_RECORD_VECTOR)
+                let every_row = mut fx3.ptr(0)
+                let slot = mut self.irq_binding(mut fx3, row: every_row, vector: line)
+                mut self.chain(mut fx3, record, slot)
+                mut self.aarch64_route(mut fx3, vector: line, cpu: boot)
+                let done = mut fx3.ptr(u64.fit(MSI_INSTALLED))
+                mut fx3.b.def_var(outcome, val: done)
             })
-            mut fx2.store(line, addr: record, offset: DEVICE_RECORD_VECTOR)
-            let every_row = mut fx2.ptr(0)
-            let slot = mut self.irq_binding(mut fx2, row: every_row, vector: line)
-            mut self.chain(mut fx2, record, slot)
-            mut self.aarch64_route(mut fx2, vector: line, cpu: boot)
-            let done = mut fx2.ptr(u64.fit(MSI_INSTALLED))
-            mut fx2.b.def_var(outcome, val: done)
         })
     })
     return mut fx.b.use_var(outcome)
@@ -361,7 +372,7 @@ fn Lowering.x64_install_msi(mut self, mut fx: Fx, record: clif::Value, cpu: clif
         let unit = mut self.iommu_unit(mut fx1)
         let remapping = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: unit, y: 0)
         let message = mut fx1.choose_in(mut self, condition: remapping, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
-            let address = mut lo2.remap(mut fx2, unit, cpu, vector, id, source, validated, level: false)
+            let address = mut lo2.remap(mut fx2, unit, cpu, vector, id, source, validated, level: None)
             let data = mut fx2.ptr(0)
             return fx2.list2(address, b: data)
         }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {

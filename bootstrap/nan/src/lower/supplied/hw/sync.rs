@@ -304,13 +304,17 @@ fn install_msi(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty, v
 /// `install_line`: `Ok` of the shared device once installed on a line of a machine target, or
 /// `Err` of a refusal as `install_msi` gives one.
 fn install_line(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, value_ty: &Ty) {
-    let record = device_record(lo, fx, supply, value_ty, 3);
+    let record = device_record(lo, fx, supply, value_ty, 5);
     let outcome = match lo.machine() {
         true => {
             let line = supply.param(1).scalar();
             let source = supply.param(2).scalar();
             let source = fx.b.ins().uextend(PTR, source);
-            lo.install_line(fx, record, line, source)
+            let edge = supply.param(3).scalar();
+            let edge = fx.b.ins().uextend(PTR, edge);
+            let active_low = supply.param(4).scalar();
+            let active_low = fx.b.ins().uextend(PTR, active_low);
+            lo.install_line(fx, record, line, source, edge, active_low)
         }
         false => fx.ptr(msi::UNSUPPORTED as u64),
     };

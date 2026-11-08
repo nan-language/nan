@@ -196,6 +196,11 @@ const RUN_STOPPING: i64 = 7
 
 const RUN_STOPPED: i64 = 8
 
+/// A preempted kernel task waiting to resume, and one woken since it was preempted.
+const RUN_PREEMPTED: i64 = 9
+
+const RUN_PREEMPTED_NOTIFIED: i64 = 10
+
 /// The offsets of a domain record's fields.
 const DOMAIN_PARENT: u64 = 0
 
@@ -698,17 +703,15 @@ fn switch_out(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
 } switch_out
 
 /// Switches the running kernel task, which an interrupt preempted, away from its CPU: it
-/// becomes ready again once its registers are saved, and resumes through the seam that
-/// preempted it. A task interrupted while it switches away for another reason, parking or
-/// ending, stays as it is.
+/// becomes ready again once its registers are saved, keeping a wake it was notified of, and
+/// resumes through the seam that preempted it. A task interrupted while it switches away for
+/// another reason, parking or ending, stays as it is.
 fn yield_preempted(mut lo: Lowering, mut fx: Fx) {
     let record = current_task(mut lo, mut fx)
     let word = mut fx.offset(record, offset: TASK_STATE)
-    let running = mut fx.int(clif::Type.Int32, value: RUN_RUNNING)
-    let notified = mut fx.int(clif::Type.Int32, value: RUN_NOTIFIED)
-    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: word, e: running, x: notified)
-    let was_running = mut fx.b.icmp(clif::IntCC.Equal, x: seen, y: running)
-    let was_notified = mut fx.b.icmp(clif::IntCC.Equal, x: seen, y: notified)
+    let seen = mut fx.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: word)
+    let was_running = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: RUN_RUNNING)
+    let was_notified = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: RUN_NOTIFIED)
     let yields = mut fx.b.bor(was_running, y: was_notified)
     mut fx.if_true(yields, then: fn[mut lo](mut fx1: Fx) {
         let one = mut fx1.ptr(1)
@@ -735,7 +738,7 @@ fn park(mut lo: Lowering, mut fx: Fx) {
 } park
 
 /// Makes a task ready: a new or parked one joins the run queue, a running or parking one is
-/// notified.
+/// notified, and so is a preempted kernel task.
 fn tasks_wake(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let word = mut fx.offset(record, offset: TASK_STATE)
     let notified = mut fx.int(clif::Type.Int32, value: RUN_NOTIFIED)
@@ -747,8 +750,14 @@ fn tasks_wake(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
         let is_parked = mut fx1.b.bor(is_new, y: parked_now)
         let is_awake = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_RUNNING)
         let is_parking = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_PARKING)
-        let notify = mut fx1.b.bor(is_awake, y: is_parking)
-        let target = mut fx1.b.select(is_parked, x: ready, y: notified)
+        var notify = mut fx1.b.bor(is_awake, y: is_parking)
+        var target = mut fx1.b.select(is_parked, x: ready, y: notified)
+        if lo.on_cpus() {
+            let is_preempted = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_PREEMPTED)
+            notify = mut fx1.b.bor(notify, y: is_preempted)
+            let kept = mut fx1.int(clif::Type.Int32, value: RUN_PREEMPTED_NOTIFIED)
+            target = mut fx1.b.select(is_preempted, x: kept, y: target)
+        }
         let acting = mut fx1.b.bor(is_parked, y: notify)
         let again = mut fx1.choose_in(mut lo, condition: acting, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             let seen = mut fx2.b.atomic_cas(clif::MemFlags.owned(), p: word, e: current, x: target)
@@ -896,7 +905,17 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     let word = mut fx.offset(record, offset: TASK_STATE)
     let thread = mut lo.thread(mut fx)
     let running = mut fx.int(clif::Type.Int32, value: RUN_RUNNING)
-    mut fx.atomic_store(running, addr: word)
+    if lo.on_cpus() {
+        // A task woken since it was preempted resumes notified, so that its next park returns.
+        let before = mut fx.b.atomic_rmw(clif::Type.Int32, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Xchg, p: word, x: running)
+        let kept = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: RUN_PREEMPTED_NOTIFIED)
+        mut fx.if_true(kept, then: fn(mut fx1: Fx) {
+            let notified = mut fx1.int(clif::Type.Int32, value: RUN_NOTIFIED)
+            mut fx1.atomic_store(notified, addr: word)
+        })
+    } else {
+        mut fx.atomic_store(running, addr: word)
+    }
     mut fx.store(record, addr: thread, offset: THREAD_CURRENT)
     mut fx.store(thread, addr: record, offset: TASK_THREAD)
     var started: Option[clif::Value] = None
@@ -962,42 +981,72 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
         mut fx1.atomic_store(stopped, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        // A task switching away notified was woken after it parked, or was preempted, and keeps
-        // its serial executor's turn; one parking passes it on before it is parked, so a wake
-        // once parked finds the turn passed.
-        let parking_now = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_PARKING)
-        let ending = mut fx1.b.bor(parking_now, y: ended)
-        mut fx1.if_true(ending, then: fn[mut lo1](mut fx2: Fx) {
-            discard mut lo1.call_routine(mut fx2, routine: Routine.Turn, args: fx2.list1(record).view())
-        })
-        let notified_now = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_NOTIFIED)
-        let parking = mut fx1.b.bor(parking_now, y: notified_now)
-        mut fx1.if_true(parking, then: fn[mut lo1](mut fx2: Fx) {
-            let parking_state = mut fx2.int(clif::Type.Int32, value: RUN_PARKING)
-            let parked = mut fx2.int(clif::Type.Int32, value: RUN_PARKED)
-            let seen = mut fx2.b.atomic_cas(clif::MemFlags.owned(), p: word, e: parking_state, x: parked)
-            let notified = mut fx2.b.icmp(clif::IntCC.NotEqual, x: seen, y: parking_state)
-            mut fx2.if_true(notified, then: fn[mut lo1](mut fx3: Fx) {
-                let ready = mut fx3.int(clif::Type.Int32, value: RUN_READY)
-                mut fx3.atomic_store(ready, addr: word)
-                tasks_push_ready(mut lo1, fx: mut fx3, record)
-            })
-        })
-        mut fx1.if_true(ended, then: fn[mut lo1](mut fx2: Fx) {
-            release_stack(mut lo1, fx: mut fx2, record)
-            count_out(mut lo1, fx: mut fx2, record)
-            let done = mut fx2.load(PTR, addr: record, offset: TASK_DONE)
-            let has_done = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
-            mut fx2.if_true(has_done, then: fn(mut fx3: Fx) {
-                var signature = clif::Signature.new(CALL_CONV, alloc: fx3.alloc)
-                mut signature.params.push(clif::AbiParam(value_type: PTR))
-                let imported = mut fx3.b.import_signature(take signature)
-                discard mut fx3.b.call_indirect(imported, callee: done, args: fx3.list1(record).view())
-            })
+        if not lo1.on_cpus() {
+            settle_away(mut lo1, fx: mut fx1, record, word, state_now, ended)
+            return mem::List[clif::Value].empty(fx1.alloc)
+        }
+        let preempted_flag = mut fx1.load(PTR, addr: record, offset: TASK_PREEMPTED)
+        let preempted = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: preempted_flag, y: 0)
+        discard mut fx1.choose_in(mut lo1, condition: preempted, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            requeue_preempted(mut lo2, fx: mut fx2, record, word)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            settle_away(mut lo2, fx: mut fx2, record, word, state_now, ended)
+            return mem::List[clif::Value].empty(fx2.alloc)
         })
         return mem::List[clif::Value].empty(fx1.alloc)
     })
 } switch_in
+
+/// Settles the state of a task that switched away without being preempted: one notified was
+/// woken after it parked, and keeps its serial executor's turn, while one parking passes it on
+/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack.
+fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Value, state_now: clif::Value, ended: clif::Value) {
+    let parking_now = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_PARKING)
+    let ending = mut fx.b.bor(parking_now, y: ended)
+    mut fx.if_true(ending, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
+    })
+    let notified_now = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_NOTIFIED)
+    let parking = mut fx.b.bor(parking_now, y: notified_now)
+    mut fx.if_true(parking, then: fn[mut lo](mut fx1: Fx) {
+        let parking_state = mut fx1.int(clif::Type.Int32, value: RUN_PARKING)
+        let parked = mut fx1.int(clif::Type.Int32, value: RUN_PARKED)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: word, e: parking_state, x: parked)
+        let notified = mut fx1.b.icmp(clif::IntCC.NotEqual, x: seen, y: parking_state)
+        mut fx1.if_true(notified, then: fn[mut lo](mut fx2: Fx) {
+            let ready = mut fx2.int(clif::Type.Int32, value: RUN_READY)
+            mut fx2.atomic_store(ready, addr: word)
+            tasks_push_ready(mut lo, fx: mut fx2, record)
+        })
+    })
+    mut fx.if_true(ended, then: fn[mut lo](mut fx1: Fx) {
+        release_stack(mut lo, fx: mut fx1, record)
+        count_out(mut lo, fx: mut fx1, record)
+        let done = mut fx1.load(PTR, addr: record, offset: TASK_DONE)
+        let has_done = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
+        mut fx1.if_true(has_done, then: fn(mut fx2: Fx) {
+            var signature = clif::Signature.new(CALL_CONV, alloc: fx2.alloc)
+            mut signature.params.push(clif::AbiParam(value_type: PTR))
+            let imported = mut fx2.b.import_signature(take signature)
+            discard mut fx2.b.call_indirect(imported, callee: done, args: fx2.list1(record).view())
+        })
+    })
+} settle_away
+
+/// Requeues a preempted kernel task, which keeps its serial executor's turn, as notified when a
+/// wake reached it since it last ran.
+fn requeue_preempted(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Value) {
+    let running = mut fx.int(clif::Type.Int32, value: RUN_RUNNING)
+    let preempted = mut fx.int(clif::Type.Int32, value: RUN_PREEMPTED)
+    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: word, e: running, x: preempted)
+    let notified = mut fx.b.icmp(clif::IntCC.NotEqual, x: seen, y: running)
+    mut fx.if_true(notified, then: fn(mut fx1: Fx) {
+        let kept = mut fx1.int(clif::Type.Int32, value: RUN_PREEMPTED_NOTIFIED)
+        mut fx1.atomic_store(kept, addr: word)
+    })
+    tasks_push_ready(mut lo, mut fx, record)
+} requeue_preempted
 
 /// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the
 /// domain to end once none remains.

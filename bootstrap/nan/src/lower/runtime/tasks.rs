@@ -9,7 +9,8 @@
 //! resumed.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
+    AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC,
+    types,
 };
 
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
@@ -161,6 +162,9 @@ pub mod run {
     /// A trapping task switching away for the last time.
     pub const STOPPING: i64 = 7;
     pub const STOPPED: i64 = 8;
+    /// A preempted kernel task waiting to resume, and one woken since it was preempted.
+    pub const PREEMPTED: i64 = 9;
+    pub const PREEMPTED_NOTIFIED: i64 = 10;
 }
 
 /// The offsets of a domain record's fields.
@@ -629,18 +633,17 @@ fn switch_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 }
 
 /// Switches the running kernel task, which an interrupt preempted, away from its CPU: it becomes
-/// ready again once its registers are saved, and resumes through the seam that preempted it. A
-/// task interrupted while it switches away for another reason, parking or ending, stays as it is.
+/// ready again once its registers are saved, keeping a wake it was notified of, and resumes
+/// through the seam that preempted it. A task interrupted while it switches away for another
+/// reason, parking or ending, stays as it is.
 pub fn yield_preempted(lo: &mut Lowering, fx: &mut Fx) {
     let record = current_task(lo, fx);
     let word = fx.offset(record, task::STATE);
-    let running = fx.int(types::I32, run::RUNNING);
-    let notified = fx.int(types::I32, run::NOTIFIED);
     let seen =
         fx.b.ins()
-            .atomic_cas(MemFlagsData::trusted(), word, running, notified);
-    let was_running = fx.b.ins().icmp(IntCC::Equal, seen, running);
-    let was_notified = fx.b.ins().icmp(IntCC::Equal, seen, notified);
+            .atomic_load(types::I32, MemFlagsData::trusted(), word);
+    let was_running = fx.b.ins().icmp_imm_s(IntCC::Equal, seen, run::RUNNING);
+    let was_notified = fx.b.ins().icmp_imm_s(IntCC::Equal, seen, run::NOTIFIED);
     let yields = fx.b.ins().bor(was_running, was_notified);
     fx.when(yields, |fx| {
         let one = fx.ptr(1);
@@ -675,7 +678,7 @@ fn park(lo: &mut Lowering, fx: &mut Fx) {
 }
 
 /// Makes a task ready: a new or parked one joins the run queue, a running or parking one is
-/// notified.
+/// notified, and so is a preempted kernel task.
 pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let notified = fx.int(types::I32, run::NOTIFIED);
@@ -689,8 +692,14 @@ pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         let is_parked = fx.b.ins().bor(is_new, is_parked);
         let is_awake = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::RUNNING);
         let is_parking = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::PARKING);
-        let notify = fx.b.ins().bor(is_awake, is_parking);
-        let target = fx.b.ins().select(is_parked, ready, notified);
+        let mut notify = fx.b.ins().bor(is_awake, is_parking);
+        let mut target = fx.b.ins().select(is_parked, ready, notified);
+        if lo.on_cpus() {
+            let is_preempted = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::PREEMPTED);
+            notify = fx.b.ins().bor(notify, is_preempted);
+            let kept = fx.int(types::I32, run::PREEMPTED_NOTIFIED);
+            target = fx.b.ins().select(is_preempted, kept, target);
+        }
         let acting = fx.b.ins().bor(is_parked, notify);
         let again = fx.choose_in(
             lo,
@@ -852,7 +861,25 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
     let running = fx.int(types::I32, run::RUNNING);
-    fx.atomic_store(running, word);
+    if lo.on_cpus() {
+        // A task woken since it was preempted resumes notified, so that its next park returns.
+        let before = fx.b.ins().atomic_rmw(
+            types::I32,
+            MemFlagsData::trusted(),
+            AtomicRmwOp::Xchg,
+            word,
+            running,
+        );
+        let kept =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, before, run::PREEMPTED_NOTIFIED);
+        fx.when(kept, |fx| {
+            let notified = fx.int(types::I32, run::NOTIFIED);
+            fx.atomic_store(notified, word);
+        });
+    } else {
+        fx.atomic_store(running, word);
+    }
     fx.store(record, thread, thread::CURRENT);
     fx.store(thread, record, task::THREAD);
     let started = (!lo.seeded()).then(|| lo.now_ns(fx));
@@ -923,46 +950,91 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             Vec::new()
         },
         |lo, fx| {
-            // A task switching away notified was woken after it parked, or was preempted, and
-            // keeps its serial executor's turn; one parking passes it on before it is parked, so
-            // a wake once parked finds the turn passed.
-            let parking = fx.b.ins().icmp_imm_s(IntCC::Equal, state_now, run::PARKING);
-            let ending = fx.b.ins().bor(parking, ended);
-            fx.when(ending, |fx| {
-                lo.call_routine(fx, Routine::Turn, &[record]);
-            });
-            let notified =
-                fx.b.ins()
-                    .icmp_imm_s(IntCC::Equal, state_now, run::NOTIFIED);
-            let parking = fx.b.ins().bor(parking, notified);
-            fx.when(parking, |fx| {
-                let parking = fx.int(types::I32, run::PARKING);
-                let parked = fx.int(types::I32, run::PARKED);
-                let seen =
-                    fx.b.ins()
-                        .atomic_cas(MemFlagsData::trusted(), word, parking, parked);
-                let notified = fx.b.ins().icmp(IntCC::NotEqual, seen, parking);
-                fx.when(notified, |fx| {
-                    let ready = fx.int(types::I32, run::READY);
-                    fx.atomic_store(ready, word);
-                    push_ready(lo, fx, record);
-                });
-            });
-            fx.when(ended, |fx| {
-                release_stack(lo, fx, record);
-                count_out(lo, fx, record);
-                let done = fx.load(PTR, record, task::DONE);
-                let has_done = fx.b.ins().icmp_imm_s(IntCC::NotEqual, done, 0);
-                fx.when(has_done, |fx| {
-                    let mut signature = Signature::new(CALL_CONV);
-                    signature.params.push(AbiParam::new(PTR));
-                    let signature = fx.b.import_signature(signature);
-                    fx.b.ins().call_indirect(signature, done, &[record]);
-                });
-            });
+            if !lo.on_cpus() {
+                settle_away(lo, fx, record, word, state_now, ended);
+                return Vec::new();
+            }
+            let preempted = fx.load(PTR, record, task::PREEMPTED);
+            let preempted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, preempted, 0);
+            fx.choose_in(
+                lo,
+                preempted,
+                &[],
+                |lo, fx| {
+                    requeue_preempted(lo, fx, record, word);
+                    Vec::new()
+                },
+                |lo, fx| {
+                    settle_away(lo, fx, record, word, state_now, ended);
+                    Vec::new()
+                },
+            );
             Vec::new()
         },
     );
+}
+
+/// Settles the state of a task that switched away without being preempted: one notified was
+/// woken after it parked, and keeps its serial executor's turn, while one parking passes it on
+/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack.
+fn settle_away(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    record: Value,
+    word: Value,
+    state_now: Value,
+    ended: Value,
+) {
+    let parking = fx.b.ins().icmp_imm_s(IntCC::Equal, state_now, run::PARKING);
+    let ending = fx.b.ins().bor(parking, ended);
+    fx.when(ending, |fx| {
+        lo.call_routine(fx, Routine::Turn, &[record]);
+    });
+    let notified =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::Equal, state_now, run::NOTIFIED);
+    let parking = fx.b.ins().bor(parking, notified);
+    fx.when(parking, |fx| {
+        let parking = fx.int(types::I32, run::PARKING);
+        let parked = fx.int(types::I32, run::PARKED);
+        let seen =
+            fx.b.ins()
+                .atomic_cas(MemFlagsData::trusted(), word, parking, parked);
+        let notified = fx.b.ins().icmp(IntCC::NotEqual, seen, parking);
+        fx.when(notified, |fx| {
+            let ready = fx.int(types::I32, run::READY);
+            fx.atomic_store(ready, word);
+            push_ready(lo, fx, record);
+        });
+    });
+    fx.when(ended, |fx| {
+        release_stack(lo, fx, record);
+        count_out(lo, fx, record);
+        let done = fx.load(PTR, record, task::DONE);
+        let has_done = fx.b.ins().icmp_imm_s(IntCC::NotEqual, done, 0);
+        fx.when(has_done, |fx| {
+            let mut signature = Signature::new(CALL_CONV);
+            signature.params.push(AbiParam::new(PTR));
+            let signature = fx.b.import_signature(signature);
+            fx.b.ins().call_indirect(signature, done, &[record]);
+        });
+    });
+}
+
+/// Requeues a preempted kernel task, which keeps its serial executor's turn, as notified when a
+/// wake reached it since it last ran.
+fn requeue_preempted(lo: &mut Lowering, fx: &mut Fx, record: Value, word: Value) {
+    let running = fx.int(types::I32, run::RUNNING);
+    let preempted = fx.int(types::I32, run::PREEMPTED);
+    let seen =
+        fx.b.ins()
+            .atomic_cas(MemFlagsData::trusted(), word, running, preempted);
+    let notified = fx.b.ins().icmp(IntCC::NotEqual, seen, running);
+    fx.when(notified, |fx| {
+        let kept = fx.int(types::I32, run::PREEMPTED_NOTIFIED);
+        fx.atomic_store(kept, word);
+    });
+    push_ready(lo, fx, record);
 }
 
 /// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the

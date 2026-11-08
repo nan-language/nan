@@ -249,8 +249,8 @@ fn each_task(
 }
 
 /// Asks every task of the domain to stop and waits until each has: a new or parked task stops
-/// at once, a ready one leaves the run queue, and a running one stops once its thread has
-/// switched away from it, its thread receiving the stop signal until then.
+/// at once, a ready or preempted one leaves the run queue, and a running one stops once its
+/// thread has switched away from it, its thread receiving the stop signal until then.
 fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
     fx.repeat(&[], |fx, _| {
         let pending = fx.b.declare_var(types::I8);
@@ -297,7 +297,13 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let is_new = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::NEW);
     let is_parked = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::PARKED);
     let idle = fx.b.ins().bor(is_new, is_parked);
-    let is_ready = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::READY);
+    let mut is_ready = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::READY);
+    if lo.on_cpus() {
+        for queued in [run::PREEMPTED, run::PREEMPTED_NOTIFIED] {
+            let preempted = fx.b.ins().icmp_imm_s(IntCC::Equal, current, queued);
+            is_ready = fx.b.ins().bor(is_ready, preempted);
+        }
+    }
     let is_stopped = fx.b.ins().icmp_imm_s(IntCC::Equal, current, run::STOPPED);
     fx.choose_in(
         lo,

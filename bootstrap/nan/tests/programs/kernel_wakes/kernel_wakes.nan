@@ -1,0 +1,91 @@
+//! Passes values one at a time from a task on CPU 1 to one on CPU 0 that its policy gives slices of 1 ns, so that it is often preempted between registering to wait for a value and parking while the sender wakes it, then writes whether a timer had to end any of its waits.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The values passed.
+const VALUES: u64 = 20_000
+
+/// The milliseconds after which a wait for a value counts as stalled.
+const STALL_MS: u64 = 100
+
+struct Chopped {
+} Chopped
+
+impl Chopped: hw::Policy
+
+fn Chopped.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    if task.share.class == 1 {
+        return hw::Placement(cpu: 0, key: task.ran_ns, bound: true)
+    }
+    return hw::Placement(cpu: 1, key: task.ran_ns, bound: true)
+} Chopped.place
+
+fn Chopped.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
+    return None
+} Chopped.steal
+
+fn Chopped.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    if task.share.class == 1 {
+        return 1
+    }
+    return 1_000_000
+} Chopped.slice
+
+fn Chopped.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} Chopped.idle
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let clock = k.clock()
+    mut k.policy(Chopped())
+    take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+        let chopped = exec.split(task::Share(weight: 1, class: 1, reserve_ppm: 0))
+        defer take chopped.close()
+        let channel = task::Channel[u64].bounded(1, alloc)
+        var receiver = channel.receiver
+        let sender = channel.sender
+        var received: u64 = 0
+        var stalls: u64 = 0
+        try await task::scope(exec, body: fn[mut receiver, mut received, mut stalls](s: task::Scope) fails task::Cancelled uses wait {
+            let feeding = sender.split()
+            discard s.spawn(fn[take feeding]() fails task::Cancelled uses wait limits stack 8_192 {
+                for value in 0..<VALUES {
+                    discard attempt await feeding.send(value)
+                }
+            })
+            try await task::scope(chopped.executor(), body: fn[mut receiver, mut received, mut stalls](inner: task::Scope) {
+                discard inner.spawn(fn[mut receiver, mut received, mut stalls]() fails task::Cancelled uses wait limits stack 8_192 {
+                    while received < VALUES {
+                        let waited = try await task::within(clock, ms: STALL_MS, body: fn[mut receiver]() -> Option[u64] fails task::Cancelled uses wait {
+                            return try await mut receiver.receive()
+                        })
+                        match waited {
+                            Some(_) => {
+                                received += 1
+                            }
+                            None => {
+                                stalls += 1
+                            }
+                        }
+                    }
+                })
+            })
+        })
+        if stalls == 0 {
+            say(text: "no stalls\n")
+        } else {
+            say(text: "stalled\n")
+        }
+    })
+} main

@@ -270,7 +270,7 @@ fn a_replay_token_reruns_its_run() {
 
 #[test]
 fn a_test_head_names_a_function_and_takes_generated_values() {
-    let tests = "\npub const LIMIT: u32 = 4\n\ntest limit for LIMIT {\n    expect LIMIT == 4\n} limit\n\ntest any_half for half (mut value: u32) {\n    expect half(value) <= value\n} any_half\n\ntest view_half for half (values: Slice[u32]) {\n    expect half(values.len().truncate()) <= 4\n} view_half\n\nstruct Pair derives Copy {\n    left: u64\n} Pair\n\nimpl Pair: Generate\n";
+    let tests = "\npub const LIMIT: u32 = 4\n\ntest limit for LIMIT {\n    expect LIMIT == 4\n} limit\n\ntest any_half for half (mut value: u32) {\n    expect half(value) <= value\n} any_half\n\ntest view_half for half (values: Slice[u32]) {\n    expect half(values.len().truncate()) <= 4\n} view_half\n\nstruct Pair derives Copy {\n    left: u64\n} Pair\n\nimpl Pair: Generate\n\ntest unknown_function for halve {\n    expect half(2) == 1\n} unknown_function\n\ntest unknown_owner for Pear.left {\n    expect half(2) == 1\n} unknown_owner\n\ntest unknown_member for Pair.right {\n    expect half(2) == 1\n} unknown_member\n";
     let source = format!("{HALVES}{tests}");
     let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &source)]);
     let output = run_in(&scratch.0, "check").output;
@@ -279,6 +279,9 @@ fn a_test_head_names_a_function_and_takes_generated_values() {
         "error test.parameter-form app/app.nan:17 app::any_half",
         "error test.parameter-type app/app.nan:21 app::view_half",
         "error test.generate-manual-impl app/app.nan:29 app::impl[app::Pair: core::Generate]",
+        "error name.unknown app/app.nan:31 app::unknown_function",
+        "error name.unknown app/app.nan:35 app::unknown_owner",
+        "error name.unknown app/app.nan:39 app::unknown_member",
     ] {
         assert!(
             output.contains(&format!("\n{record}\n")),

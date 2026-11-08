@@ -13,7 +13,7 @@ test_params = "(" param_list ")" ;
 ```
 
 - The `IDENT` after `test` is the test's name and [closing label](02-items.md#item-shape).
-- The target is a [path](03-packages-modules.md#paths) with an optional member, naming a function item or a method a [derive](08-generics-interfaces.md#derives) writes; naming any other item is an error (`test.target-kind`). A generic target stands for all its instantiations.
+- The target is a [path](03-packages-modules.md#paths) with an optional member, naming a function item or a method a [derive](08-generics-interfaces.md#derives) writes; naming anything else is an error (`test.target-kind`), and naming nothing is an [unknown name](03-packages-modules.md#unknown-names). A generic target stands for all its instantiations.
 - A [disputed](18-contracts.md#todo) test never runs and counts for nothing.
 - A `mut` parameter is an error (`test.parameter-form`), and so is one whose type does not implement `Generate`, as no [view](05-properties.md#views) type does (`test.parameter-type`).
 - The body is checked as a function body without result that `uses wait`, whose failure type takes every failure unconverted from `try` and `fail` ([failures](11-errors-domains.md#failures)).
@@ -49,6 +49,16 @@ pub fn triple(level: u32) -> u32 {
 test triple_of_two for double { // error: test.target-unreachable
     expect triple(2) == 6
 } triple_of_two
+```
+
+```nan
+pub fn raised(level: u32, step: u32) -> u32 {
+    return level.saturating_add(step)
+} raised
+
+test raised_saturates for Gauge.raised { // error: name.unknown
+    expect raised(4_294_967_290, step: 10) == 4_294_967_295
+} raised_saturates
 ```
 
 ### Test runs

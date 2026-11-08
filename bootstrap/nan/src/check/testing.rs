@@ -60,8 +60,8 @@ impl Checker<'_> {
     /// A test's head: its target names a function item or a method a derive writes, and no
     /// parameter is `mut`.
     pub fn check_test_head(&self, item: ItemId, test: &TestItem) {
-        if self.test_target(item, test).is_none() && self.names_other(item, test) {
-            self.report(item, test.target.token(), Code::TestTargetKind);
+        if self.test_target(item, test).is_none() {
+            self.report_test_target(item, test);
         }
         for param in test.params.iter().flatten() {
             if param.mode == Mode::Mut {
@@ -70,18 +70,30 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether a test's target names something other than a function or derived method: an item
-    /// of another kind, or a field of its owner.
-    fn names_other(&self, item: ItemId, test: &TestItem) -> bool {
+    /// Reports a test's target naming no function item or derived method: an unknown name when
+    /// its path, or the member of a type it writes, names nothing, `test.target-kind` otherwise.
+    fn report_test_target(&self, item: ItemId, test: &TestItem) {
         let module = self.db.module_of(item);
-        let Some(member) = &test.member else {
-            return matches!(self.db.resolve(module, &test.target), Ok(Named::Item(_)));
-        };
-        let Some(TypeKey::Item(owner)) = self.db.owner_key(module, &test.target) else {
-            return false;
-        };
-        matches!(&self.sig(owner).kind, SigKind::Struct { fields }
-            if fields.iter().any(|field| field.name == member.text))
+        if let Err(error) = self.db.resolve(module, &test.target) {
+            match error.code {
+                Some(Code::NameUnknown) => {
+                    let span = self.path_span(item, error.token);
+                    self.report_unknown(item, span, self.item_candidates(module), None);
+                }
+                Some(code) => self.report_problem(item, error.token, code),
+                None => {}
+            }
+            return;
+        }
+        if let (Some(member), Some(key)) = (&test.member, self.db.owner_key(module, &test.target)) {
+            let candidates = self.member_candidates(module, &self.key_ty(key));
+            if !candidates.contains(&member.text) {
+                let span = (member.token, member.token);
+                self.report_unknown(item, span, candidates, None);
+                return;
+            }
+        }
+        self.report(item, test.target.token(), Code::TestTargetKind);
     }
 
     /// An impl line naming `Generate` outside std is an error; gives whether it is one.

@@ -165,7 +165,8 @@ const PCI_RECORD: u64 = 48
 /// The attachment of a function attached to physical memory.
 const ATTACHED_PHYSICAL: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
-/// The kinds of a BAR: none, 32-bit memory, I/O and 64-bit memory.
+/// The kinds of a BAR: none, 32-bit memory, I/O and 64-bit memory, `UNASSIGNED` added to the
+/// kind of a memory BAR given no address.
 const NO_BAR: u64 = 0
 
 const MEMORY32: u64 = 1
@@ -173,6 +174,8 @@ const MEMORY32: u64 = 1
 const IO_BAR: u64 = 2
 
 const MEMORY64: u64 = 3
+
+const UNASSIGNED: u64 = 4
 
 /// The configuration offsets the runtime reads and writes: the ids, the command and status,
 /// the class and revision, the header type, the first BAR, the capability list's head and the
@@ -456,6 +459,12 @@ pub closed enum PciError derives Copy, Eq, Render {
     Unresponsive
 } PciError
 
+pub closed struct PciBar derives Copy, Eq, Render {
+    pub size: u64
+    pub wide: bool
+    pub address: Option[u64]
+} PciBar
+
 pub closed enum PowerState derives Copy, Eq, Render {
     On
     Suspended
@@ -526,6 +535,24 @@ pub fn PciFunction.config_read(self, offset: u8) -> u32
     }
     return config(self.record, offset: u32.widen(offset))
 } PciFunction.config_read
+
+pub fn PciFunction.bar(self, index: u8) -> Option[PciBar] {
+    let bar_index = u64.widen(index)
+    if bar_index >= BARS {
+        return None
+    }
+    let bar = self.record + FUNCTION_BARS + bar_index * BAR_BYTES
+    var kind = peek(bar + 16)
+    var address = Some(peek(bar).wrapping_add(peek(self.record + FUNCTION_WINDOW)))
+    if kind > UNASSIGNED {
+        kind -= UNASSIGNED
+        address = None
+    }
+    if kind != MEMORY32 and kind != MEMORY64 {
+        return None
+    }
+    return Some(PciBar(size: peek(bar + 8), wide: kind == MEMORY64, address: address))
+} PciFunction.bar
 
 pub fn PciFunction.removed(self) -> bool {
     return gone(self.record)
@@ -1319,7 +1346,8 @@ fn above_held(record: u64, window: BusWindow, next: u64) -> u64 {
         let bar = record + FUNCTION_BARS + index * BAR_BYTES
         let base = peek(bar)
         let end = base + peek(bar + 8)
-        if peek(bar + 16) != NO_BAR and base >= window.start and base < window.end and end > mark {
+        let kind = peek(bar + 16)
+        if kind != NO_BAR and kind < UNASSIGNED and base >= window.start and base < window.end and end > mark {
             mark = end
         }
     }
@@ -1515,7 +1543,7 @@ fn memory_window(node: NodeValues) -> BusWindow {
 
 /// Gives BAR `index` of a function an address from `next` when it is a memory BAR and, unless
 /// `fresh` holds, holds no address, giving the window's next free address; a BAR the window has
-/// no room for is given none and no longer counts as memory.
+/// no room for is given none and marked unassigned.
 fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow, fresh: bool) -> u64 {
     let bar = record + FUNCTION_BARS + index * BAR_BYTES
     let kind = peek(bar + 16)
@@ -1535,7 +1563,7 @@ fn assign_bar(record: u64, index: u64, next: u64, window: BusWindow, fresh: bool
     }
     poke(bar, value: given)
     if given == 0 {
-        poke(bar + 16, value: NO_BAR)
+        poke(bar + 16, value: kind + UNASSIGNED)
         return next
     }
     return given + size

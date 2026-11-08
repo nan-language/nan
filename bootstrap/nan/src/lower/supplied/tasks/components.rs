@@ -6,12 +6,13 @@
 //! intake from its oldest to its newest entry, whether the intake has stopped, the task waiting
 //! for a message, the component task or the stepper's holder, and whether it waits, the task
 //! waiting for the record's tasks, the delayed entries in the order they enter the intake, the
-//! timers in flight and their count, the keyed tasks and the count of those not ended, the count
+//! timers in flight and their count, the keyed tasks not ended and their count, the count
 //! of what references the record, its allocator and executor cells, the number of `after` calls
 //! so far, whether the component task has ended, the outbox of the run's body or of the stepper,
 //! the nanosecond at which the executor's clock was minted with the executor's resolution, on
 //! whose grid delays end, the request whose handler runs, the stepper's holding, zero for a run,
-//! the executor's handle and the attached runner's handle, zero for none; the state, the Env and,
+//! the executor's handle, the attached runner's handle, zero for none, and the index of keyed
+//! tasks by key, zero before the first spawn; the state, the Env and,
 //! for a protocol declaring one, the summary follow. An intake entry
 //! holds its links, the task posting it (zero for a message the component sends itself), its
 //! status, its deadline and order while delayed, whether a keyed outbox posted it and that
@@ -22,6 +23,7 @@
 
 mod intake;
 mod keyed;
+mod keys;
 mod run;
 mod stepper;
 
@@ -70,7 +72,8 @@ pub mod runner {
     pub const HANDLE: u64 = 176;
     /// The handle of the runner a stepper's holder attached, zero for none.
     pub const RUNNER: u64 = 184;
-    pub const HEADER: u64 = 192;
+    pub const KEYS: u64 = 192;
+    pub const HEADER: u64 = 200;
 }
 
 pub mod entry {
@@ -457,7 +460,7 @@ pub fn withdraw(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         (present, next)
     });
     let claimed = intake::cancel_timers(lo, fx, record);
-    let stopped = keyed::unended(fx, record);
+    let stopped = fx.load(PTR, record, runner::LIVE_KEYED);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     intake::complete_claimed(lo, fx, claimed);
     fx.repeat(&[], |fx, _| {

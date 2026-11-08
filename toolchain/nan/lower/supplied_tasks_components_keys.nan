@@ -1,0 +1,231 @@
+//! The index of a runner's keyed tasks by key: an open-addressing table of node addresses, each slot zero when vacant, probed linearly from the high half of the key's product with `KEYS_MULTIPLIER`. It holds the node of each key not superseded. A table is a runtime record holding its slot count and how many nodes it holds, then its slots, at least twice as many as its nodes. The caller of each operation holds the runner's lock.
+
+const KEYS_SLOTS: u64 = 0
+
+const KEYS_USED: u64 = 8
+
+const KEYS_FIRST_SLOT: u64 = 16
+
+/// The slot count of a first table.
+const KEYS_FIRST: u64 = 8
+
+const KEYS_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15
+
+/// Makes room for one more node in a runner's index, drawing a table twice as large and moving
+/// the nodes into it: nonzero when there is room, zero on exhaustion, which leaves the index
+/// unchanged.
+fn keys_reserve(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let table = mut fx.load(PTR, addr: record, offset: RUNNER_KEYS)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: table, y: 0)
+    let count_types = fx.types2(PTR, b: PTR)
+    let counts = mut fx.choose(present, results: count_types.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let held_slots = mut fx1.load(PTR, addr: table, offset: KEYS_SLOTS)
+        let held_used = mut fx1.load(PTR, addr: table, offset: KEYS_USED)
+        return fx1.list2(held_slots, b: held_used)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let no_slots = mut fx1.ptr(0)
+        let none_used = mut fx1.ptr(0)
+        return fx1.list2(no_slots, b: none_used)
+    })
+    expect counts.len() == 2
+    let slots = counts[0]
+    let used = counts[1]
+    let one_more = mut fx.b.iadd_imm_s(used, y: 1)
+    let wanted = mut fx.b.ishl_imm_s(one_more, y: 1)
+    let enough = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: wanted, y: slots)
+    let results = fx.types1(clif::Type.Int8)
+    let room = mut fx.choose_in(mut lo, condition: enough, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(held)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let doubled = mut fx1.b.ishl_imm_s(slots, y: 1)
+        let first_slots = mut fx1.ptr(KEYS_FIRST)
+        let size = mut fx1.b.umax(doubled, y: first_slots)
+        let slot_bytes = mut fx1.b.ishl_imm_s(size, y: 3)
+        let bytes = mut fx1.b.iadd_imm_s(slot_bytes, y: i64.fit(KEYS_FIRST_SLOT))
+        let fresh = mut lo1.record_alloc(mut fx1, size: bytes)
+        let drawn = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: fresh, y: 0)
+        mut fx1.if_true(drawn, then: fn[mut lo1](mut fx2: Fx) {
+            mut fx2.store(size, addr: fresh, offset: KEYS_SLOTS)
+            mut fx2.store(used, addr: fresh, offset: KEYS_USED)
+            mut fx2.if_true(present, then: fn[mut lo1](mut fx3: Fx) {
+                let mask = mut fx3.b.iadd_imm_s(size, y: -1)
+                let zero = mut fx3.ptr(0)
+                mut fx3.each(zero, end: slots, body: fn(mut fx4: Fx, position: clif::Value) {
+                    let held = keys_slot_at(mut fx4, table, position)
+                    let taken = mut fx4.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+                    mut fx4.if_true(taken, then: fn(mut fx5: Fx) {
+                        keys_place(mut fx5, table: fresh, mask, node: held)
+                    })
+                })
+                mut lo1.record_free(mut fx3, address: table)
+            })
+            mut fx2.store(fresh, addr: record, offset: RUNNER_KEYS)
+        })
+        return fx1.list1(drawn)
+    })
+    expect room.len() == 1
+    return room[0]
+} keys_reserve
+
+/// Records a node under its key, in an index with room for it and no node of that key.
+fn keys_insert(mut fx: Fx, record: clif::Value, node: clif::Value) {
+    let table = mut fx.load(PTR, addr: record, offset: RUNNER_KEYS)
+    let slots = mut fx.load(PTR, addr: table, offset: KEYS_SLOTS)
+    let mask = mut fx.b.iadd_imm_s(slots, y: -1)
+    keys_place(mut fx, table, mask, node)
+    let used = mut fx.load(PTR, addr: table, offset: KEYS_USED)
+    let more = mut fx.b.iadd_imm_s(used, y: 1)
+    mut fx.store(more, addr: table, offset: KEYS_USED)
+} keys_insert
+
+/// Removes the node of a key from a runner's index, giving it, or zero when the index holds
+/// none, shifting back each later node whose probe passed its slot.
+fn keys_take(mut lo: Lowering, mut fx: Fx, record: clif::Value, key: clif::Value) -> clif::Value {
+    let table = mut fx.load(PTR, addr: record, offset: RUNNER_KEYS)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: table, y: 0)
+    let results = fx.types1(PTR)
+    let taken_nodes = mut fx.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let slots = mut fx1.load(PTR, addr: table, offset: KEYS_SLOTS)
+        let mask = mut fx1.b.iadd_imm_s(slots, y: -1)
+        let start = keys_home(mut fx1, key, mask)
+        let probe = fx1.list1(start)
+        let positions = mut fx1.repeat(probe.view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 1
+            let held = keys_slot_at(mut fx2, table, position: current[0])
+            let taken = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+            let other_results = fx2.types1(clif::Type.Int8)
+            let others = mut fx2.choose(taken, results: other_results.view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let held_key = mut fx3.load(PTR, addr: held, offset: KEYED_KEY)
+                let differs = mut fx3.b.icmp(clif::IntCC.NotEqual, x: held_key, y: key)
+                return fx3.list1(differs)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let vacant = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(vacant)
+            })
+            expect others.len() == 1
+            let other = others[0]
+            let stepped = mut fx2.b.iadd_imm_s(current[0], y: 1)
+            let next = mut fx2.b.band(stepped, y: mask)
+            let position = mut fx2.b.select(other, x: next, y: current[0])
+            return Pass(again: other, next: fx2.list1(position))
+        })
+        expect positions.len() == 1
+        let position = positions[0]
+        let found = keys_slot_at(mut fx1, table, position)
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: found, y: 0)
+        mut fx1.if_true(taken, then: fn(mut fx2: Fx) {
+            keys_remove(mut fx2, table, mask, hole: position)
+            let used = mut fx2.load(PTR, addr: table, offset: KEYS_USED)
+            let fewer = mut fx2.b.iadd_imm_s(used, y: -1)
+            mut fx2.store(fewer, addr: table, offset: KEYS_USED)
+        })
+        return fx1.list1(found)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    expect taken_nodes.len() == 1
+    return taken_nodes[0]
+} keys_take
+
+/// Runs `visit` on each node of a runner's index, then frees the index.
+fn keys_drain(mut lo: Lowering, mut fx: Fx, record: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, node: clif::Value)) {
+    let table = mut fx.load(PTR, addr: record, offset: RUNNER_KEYS)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: table, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let slots = mut fx1.load(PTR, addr: table, offset: KEYS_SLOTS)
+        let zero = mut fx1.ptr(0)
+        mut fx1.each(zero, end: slots, body: fn[mut lo](mut fx2: Fx, position: clif::Value) {
+            let held = keys_slot_at(mut fx2, table, position)
+            let taken = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+            mut fx2.if_true(taken, then: fn[mut lo](mut fx3: Fx) {
+                visit(mut lo, fx: mut fx3, node: held)
+            })
+        })
+        mut lo.record_free(mut fx1, address: table)
+        let vacant = mut fx1.ptr(0)
+        mut fx1.store(vacant, addr: record, offset: RUNNER_KEYS)
+    })
+} keys_drain
+
+/// The slot a key's probe starts from, in a table whose slot count is `mask` plus one.
+fn keys_home(mut fx: Fx, key: clif::Value, mask: clif::Value) -> clif::Value {
+    let multiplier = mut fx.int(clif::Type.Int64, value: i64.from_bits(KEYS_MULTIPLIER))
+    let product = mut fx.b.imul(key, y: multiplier)
+    let high = mut fx.b.ushr_imm_s(product, y: 32)
+    return mut fx.b.band(high, y: mask)
+} keys_home
+
+/// Writes a node at the first vacant slot from its key's.
+fn keys_place(mut fx: Fx, table: clif::Value, mask: clif::Value, node: clif::Value) {
+    let key = mut fx.load(PTR, addr: node, offset: KEYED_KEY)
+    let start = keys_home(mut fx, key, mask)
+    let probe = fx.list1(start)
+    let positions = mut fx.repeat(probe.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let held = keys_slot_at(mut fx1, table, position: current[0])
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+        let stepped = mut fx1.b.iadd_imm_s(current[0], y: 1)
+        let next = mut fx1.b.band(stepped, y: mask)
+        let position = mut fx1.b.select(taken, x: next, y: current[0])
+        return Pass(again: taken, next: fx1.list1(position))
+    })
+    expect positions.len() == 1
+    let at = keys_slot_address(mut fx, table, position: positions[0])
+    mut fx.store(node, addr: at, offset: 0)
+} keys_place
+
+/// Vacates slot `hole`, moving back into it each later node of its run whose probe passed it.
+fn keys_remove(mut fx: Fx, table: clif::Value, mask: clif::Value, hole: clif::Value) {
+    let stepped = mut fx.b.iadd_imm_s(hole, y: 1)
+    let next = mut fx.b.band(stepped, y: mask)
+    let shift_start = fx.list2(hole, b: next)
+    let ends = mut fx.repeat(shift_start.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let gap_at = current[0]
+        let scanned = current[1]
+        let held = keys_slot_at(mut fx1, table, position: scanned)
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+        let ideal_results = fx1.types1(PTR)
+        let ideals = mut fx1.choose(taken, results: ideal_results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let held_key = mut fx2.load(PTR, addr: held, offset: KEYED_KEY)
+            let home = keys_home(mut fx2, key: held_key, mask)
+            return fx2.list1(home)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let vacant = mut fx2.ptr(0)
+            return fx2.list1(vacant)
+        })
+        expect ideals.len() == 1
+        let ideal = ideals[0]
+        let travel = mut fx1.b.isub(scanned, y: ideal)
+        let travelled = mut fx1.b.band(travel, y: mask)
+        let distance = mut fx1.b.isub(scanned, y: gap_at)
+        let gap = mut fx1.b.band(distance, y: mask)
+        let passed = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: travelled, y: gap)
+        let moves = mut fx1.b.band(taken, y: passed)
+        mut fx1.if_true(moves, then: fn(mut fx2: Fx) {
+            let to = keys_slot_address(mut fx2, table, position: gap_at)
+            mut fx2.store(held, addr: to, offset: 0)
+        })
+        let moved_gap = mut fx1.b.select(moves, x: scanned, y: gap_at)
+        let scan_step = mut fx1.b.iadd_imm_s(scanned, y: 1)
+        let scan_next = mut fx1.b.band(scan_step, y: mask)
+        return Pass(again: taken, next: fx1.list2(moved_gap, b: scan_next))
+    })
+    expect ends.len() == 2
+    let vacated = keys_slot_address(mut fx, table, position: ends[0])
+    let vacant = mut fx.ptr(0)
+    mut fx.store(vacant, addr: vacated, offset: 0)
+} keys_remove
+
+fn keys_slot_address(mut fx: Fx, table: clif::Value, position: clif::Value) -> clif::Value {
+    let offset = mut fx.b.ishl_imm_s(position, y: 3)
+    let slots = mut fx.b.iadd_imm_s(table, y: i64.fit(KEYS_FIRST_SLOT))
+    return mut fx.b.iadd(slots, y: offset)
+} keys_slot_address
+
+fn keys_slot_at(mut fx: Fx, table: clif::Value, position: clif::Value) -> clif::Value {
+    let at = keys_slot_address(mut fx, table, position)
+    return mut fx.load(PTR, addr: at, offset: 0)
+} keys_slot_at

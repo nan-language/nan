@@ -337,6 +337,7 @@ pub fn Outbox.post(self, take message: M) fails task::SendError uses wait
 - Cancelling a keyed task by superseding its key is a runtime action that is a cancelling construct whose region is that task ([origin and absorption](11-errors-domains.md#origin-and-absorption)). Its cancellation points then behave as [acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation) states; the handler never waits for them.
 - The failure of a keyed task, always a cancellation, ends that task alone: the runner releases it.
 - `sys::Outbox[M]` is a base type: Copy and Send, and never linear, a view, Inert or AnyBits. It is a [generational handle](12-memory.md#generational-handles) naming a slot of the outbox table, which the capability-tables [support routine](27-program-model.md#runtime-support) keeps: its slots are memory of the support routines charged to no cell, a slot takes a new occupant only under a new generation, and a `spawn`, `run`, `start` or `resume` needing a slot when that memory is exhausted traps (`trap.exhausted`). Each keyed task has its own outbox, the runner passes one more to its body, and a stepper has one more.
+- A keyed task that has ended keeps its outbox, and the runner its record of the task, until its key is superseded, as `run` and a stepper's `end` and `abandon` supersede every key: a component holds an outbox slot for each key it spawned under and has not superseded since.
 
 `out.post(m)` is a [cancellation point](17-suspension-io.md#acknowledged-cancellation) and allocates nothing. It runs these steps:
 

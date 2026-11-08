@@ -701,6 +701,24 @@ struct Lingered {
 
 impl Linger: Component[Lingered, ProbeMessage]
 
+/// A component spawning a keyed task under each key it is sent, which posts the key, and
+/// cancelling the task of each key it is told to, adding up the keys posted.
+struct Keyring derives Encode {
+    posted: u64
+    keys: u64
+} Keyring
+
+enum KeyringMessage {
+    Spawn(u64)
+    Cancel(u64)
+    Posted(u64)
+} KeyringMessage
+
+impl Keyring: Component[ProbeEnv, KeyringMessage]
+
+/// The keys a keyring is sent.
+const KEYRING_KEYS: u64 = 300
+
 struct Tally {
 } Tally
 
@@ -1193,6 +1211,25 @@ fn Linger.on(mut self, take message: ProbeMessage, mut env: Lingered, mut cx: Cx
         discard slept
     })
 } Linger.on
+
+fn Keyring.start(mut env: ProbeEnv) -> Keyring = Keyring(posted: 0, keys: 0)
+
+fn Keyring.on(mut self, take message: KeyringMessage, mut env: ProbeEnv, mut cx: Cx[KeyringMessage]) {
+    match message {
+        KeyringMessage.Spawn(key) => {
+            let clock = env.clock
+            mut cx.spawn(key: key, run: fn(out: Outbox[KeyringMessage]) fails task::Cancelled uses wait {
+                try await clock.sleep(100)
+                discard attempt await out.post(KeyringMessage.Posted(key))
+            })
+        }
+        KeyringMessage.Cancel(key) => mut cx.cancel(key: key)
+        KeyringMessage.Posted(key) => {
+            self.posted += 1
+            self.keys += key
+        }
+    }
+} Keyring.on
 
 fn Plain.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
     env.counted += 1
@@ -1740,6 +1777,37 @@ test cancelled_keyed_task_posts_nothing for Cx.cancel {
     })
     expect last.handled == 0
 } cancelled_keyed_task_posts_nothing
+
+test cancelling_reaches_the_task_of_its_key_alone for Cx.cancel {
+    let world = testing::world()
+    let clock = world.clock
+    let last = try await host::Runner[Keyring].run(ProbeEnv(clock: clock, counted: 0), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[KeyringMessage]) fails task::SendError uses wait {
+        for index in 0..<KEYRING_KEYS {
+            try await inbox.post(KeyringMessage.Spawn(index * 7_919 % KEYRING_KEYS))
+        }
+        for index in 0..<KEYRING_KEYS {
+            let key = index * 13 % KEYRING_KEYS
+            if key % 3 != 0 {
+                try await inbox.post(KeyringMessage.Cancel(key))
+            }
+        }
+        for key in 0..<KEYRING_KEYS {
+            if key % 5 == 0 {
+                try await inbox.post(KeyringMessage.Spawn(key))
+            }
+        }
+        try await clock.sleep(1_000)
+    })
+    var posted: u64 = 0
+    var keys: u64 = 0
+    for key in 0..<KEYRING_KEYS {
+        if key % 3 == 0 or key % 5 == 0 {
+            posted += 1
+            keys += key
+        }
+    }
+    expect last.posted == posted and last.keys == keys
+} cancelling_reaches_the_task_of_its_key_alone
 
 test posted_messages_are_all_handled for Outbox.post {
     let world = testing::world()

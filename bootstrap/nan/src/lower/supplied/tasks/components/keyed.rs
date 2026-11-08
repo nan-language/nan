@@ -1,8 +1,10 @@
 //! Keyed tasks: their spawns, held on a stepper until its holder starts them, and the
 //! superseding of their keys.
 //!
-//! A keyed task's node holds its links, its task, key, outbox and region, whether its key was
-//! superseded, whether it has ended and whether it is held.
+//! A keyed task's node holds its links in its runner's list of keyed tasks not ended, its task,
+//! key, outbox and region, whether its key was superseded, whether it has ended and whether it
+//! is held. A node lives until its task has ended and its key is superseded, the runner's index
+//! of keys holding it until then.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
 use cranelift_module::FuncId;
@@ -15,9 +17,9 @@ use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
 use super::super::super::mem::lists::fn_param;
 use super::super::scopes::start_task;
-use super::{entry, intake, reference, runner, status, unreference, wake_waiter};
+use super::{entry, intake, keys, reference, runner, status, unreference, wake_waiter};
 
-mod node {
+pub mod node {
     pub const NEXT: u64 = 0;
     pub const PREVIOUS: u64 = 8;
     pub const TASK: u64 = 16;
@@ -40,7 +42,10 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
     supersede_key(lo, fx, record, key);
+    let room = keys::reserve(lo, fx, record);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
+    let short = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
+    fx.when(short, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
     let size = fx.ptr(region::SIZE);
     let task_region = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
     let keyed_outbox = fx.ptr(1);
@@ -86,6 +91,7 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
     fx.when(has_head, |fx| fx.store(node, head, node::PREVIOUS));
     fx.store(node, record, runner::KEYED);
+    keys::insert(fx, record, node);
     let live = fx.load(PTR, record, runner::LIVE_KEYED);
     let live = fx.b.ins().iadd_imm_s(live, 1);
     fx.store(live, record, runner::LIVE_KEYED);
@@ -95,9 +101,8 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.done(lo, fx);
 }
 
-/// Runs `visit` on each keyed task node of a runner, which may free the node. The caller holds
-/// the lock.
-pub fn each_keyed(
+/// Runs `visit` on the node of each keyed task of a runner not ended. The caller holds the lock.
+fn each_keyed(
     lo: &mut Lowering,
     fx: &mut Fx,
     record: Value,
@@ -126,14 +131,9 @@ pub fn each_keyed(
 /// the intake and every keyed task of the key still running is cancelled. The caller holds the
 /// lock.
 pub fn supersede_key(lo: &mut Lowering, fx: &mut Fx, record: Value, key: Value) {
-    each_keyed(lo, fx, record, |lo, fx, node| {
-        let node_key = fx.load(PTR, node, node::KEY);
-        let same = fx.b.ins().icmp(IntCC::Equal, node_key, key);
-        let superseded = fx.load(PTR, node, node::SUPERSEDED);
-        let live = fx.b.ins().icmp_imm_s(IntCC::Equal, superseded, 0);
-        let target = fx.b.ins().band(same, live);
-        fx.when(target, |fx| supersede_node(lo, fx, node));
-    });
+    let node = keys::take(lo, fx, record, key);
+    let found = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+    fx.when(found, |fx| supersede_node(lo, fx, node));
     let first = fx.load(PTR, record, runner::OLDEST);
     fx.repeat(&[first], |fx, state| {
         let node = state[0];
@@ -180,7 +180,7 @@ fn supersede_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
         ended,
         &[],
         |lo, fx| {
-            free_node(lo, fx, node);
+            lo.record_free(fx, node);
             Vec::new()
         },
         |lo, fx| {
@@ -194,12 +194,10 @@ fn supersede_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
 /// Supersedes the key of every keyed task of a runner and starts each held one, which that
 /// cancellation then reaches. The caller holds the lock.
 pub fn supersede_all(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    keys::drain(lo, fx, record, supersede_node);
     each_keyed(lo, fx, record, |lo, fx, node| {
         let held = fx.load(PTR, node, node::HELD);
         let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
-        let superseded = fx.load(PTR, node, node::SUPERSEDED);
-        let live = fx.b.ins().icmp_imm_s(IntCC::Equal, superseded, 0);
-        fx.when(live, |fx| supersede_node(lo, fx, node));
         fx.when(held, |fx| start_node(lo, fx, node));
     });
 }
@@ -242,29 +240,6 @@ pub fn start_held(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     })[1]
 }
 
-/// The count of a runner's keyed tasks that have not ended. The caller holds the lock.
-pub fn unended(fx: &mut Fx, record: Value) -> Value {
-    let first = fx.load(PTR, record, runner::KEYED);
-    let zero = fx.ptr(0);
-    fx.repeat(&[first, zero], |fx, state| {
-        let (current, count) = (state[0], state[1]);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
-        let next = fx.choose(
-            present,
-            &[PTR, PTR],
-            |fx| {
-                let ended = fx.load(PTR, current, node::ENDED);
-                let live = fx.b.ins().icmp_imm_s(IntCC::Equal, ended, 0);
-                let live = fx.b.ins().uextend(PTR, live);
-                let count = fx.b.ins().iadd(count, live);
-                vec![fx.load(PTR, current, node::NEXT), count]
-            },
-            |fx| vec![fx.ptr(0), count],
-        );
-        (present, next)
-    })[1]
-}
-
 /// Starts a held keyed task. The caller holds the lock.
 fn start_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     let zero = fx.ptr(0);
@@ -273,8 +248,8 @@ fn start_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     lo.call_routine(fx, Routine::Wake, &[started]);
 }
 
-/// Removes a keyed task's node from its runner's list and frees it. The caller holds the lock.
-fn free_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
+/// Removes a keyed task's node from its runner's list. The caller holds the lock.
+fn unlink(fx: &mut Fx, node: Value) {
     let record = fx.load(PTR, node, node::RUNNER);
     let next = fx.load(PTR, node, node::NEXT);
     let previous = fx.load(PTR, node, node::PREVIOUS);
@@ -293,13 +268,12 @@ fn free_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     );
     let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
     fx.when(has_next, |fx| fx.store(previous, next, node::PREVIOUS));
-    lo.record_free(fx, node);
 }
 
-/// What the executor thread does once a keyed task has ended: its region is freed, its node too
-/// once its key is superseded, the task waiting for the record's tasks wakes, the task's record
-/// is freed and its reference to the runner's record dropped. Its failure, a cancellation, needs
-/// no release.
+/// What the executor thread does once a keyed task has ended: its region is freed, its node
+/// leaves the runner's list and is freed once its key is superseded, the task waiting for the
+/// record's tasks wakes, the task's record is freed and its reference to the runner's record
+/// dropped. Its failure, a cancellation, needs no release.
 fn keyed_done(lo: &mut Lowering) -> FuncId {
     lo.glue_function(
         Glue::KeyedDone,
@@ -318,9 +292,10 @@ fn keyed_done(lo: &mut Lowering) -> FuncId {
             fx.store(live, record, runner::LIVE_KEYED);
             let task_region = fx.load(PTR, node, node::REGION);
             lo.record_free(fx, task_region);
+            unlink(fx, node);
             let superseded = fx.load(PTR, node, node::SUPERSEDED);
             let superseded = fx.b.ins().icmp_imm_s(IntCC::NotEqual, superseded, 0);
-            fx.when(superseded, |fx| free_node(lo, fx, node));
+            fx.when(superseded, |fx| lo.record_free(fx, node));
             wake_waiter(lo, fx, record);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             lo.record_free(fx, started);

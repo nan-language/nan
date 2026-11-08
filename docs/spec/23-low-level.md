@@ -560,8 +560,8 @@ pub fn next_used(mut ring: hw::DmaShared[UsedRing], seen: u16) -> Option[UsedEnt
     if published == seen {
         return None
     }
-    let slot = usize.widen(seen % 64)
-    return Some(mut ring.read_acquire_at(UsedRing.entries, index: slot))
+    let index = usize.widen(seen % 64)
+    return Some(mut ring.read_acquire_at(UsedRing.entries, index))
 } next_used
 
 pub fn sector_buffer(heap: mem::Heap) -> hw::Dma[Sector] {

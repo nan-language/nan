@@ -3118,7 +3118,10 @@ impl Body<'_, '_> {
         let mut index_arg = None;
         let mut value_arg = None;
         for arg in &args[1..] {
-            let label = arg.label_name().map(|name| name.text.as_str());
+            let label = match arg.label {
+                Some(_) => arg.label_name().map(|name| name.text.as_str()),
+                None => self.punned_name(&arg.value),
+            };
             match label {
                 Some("index") if indexed && index_arg.is_none() => {
                     index_arg = Some(self.check(&arg.value, &Ty::Scalar(Scalar::Usize)));

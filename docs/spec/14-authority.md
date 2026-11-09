@@ -1232,7 +1232,7 @@ The **authority summary** of a package is the set of these entries, over the [di
 
 A **widening** is a change after which a package's authority summary holds an entry it did not hold before. [Compatibility](29-identity-versioning.md#facts-outside-the-interface-hash) states which consumers a widening in a release breaks.
 
-The **closure summary** of a [final-link root](27-program-model.md#final-builds) is the set of pairs (P, e) where P is a package of its final closure other than the root and the std packages, and e an entry of P's authority summary. The root's [lock](29-identity-versioning.md#lock) records an approved closure summary, which only [approvals](29-identity-versioning.md#approvals), a first lock's included, extend. A closure summary holding a pair the approved one lacks is an error (`authority.widening-unapproved`), reported on the root's `package` line and listing each such pair; `nan check`, `nan test`, `nan build` and `nan run` of the root report it.
+The **closure summary** of a [final-link root](27-program-model.md#final-builds) is the set of pairs (P, e) where P is a package of its final closure other than the root and the std packages, and e an entry of P's authority summary. The root's [lock](29-identity-versioning.md#lock) records an approved closure summary, which only [approvals](29-identity-versioning.md#approvals), a first lock's included, extend. A closure summary holding a pair the approved one lacks is an error (`authority.widening-unapproved`), reported on the root's `package` line, naming the command `nan dep approve` of the root and listing each such pair; `nan check`, `nan test`, `nan build` and `nan run` of the root report it.
 
 ## Diagnostics
 

@@ -22,19 +22,31 @@ struct NeededEpoch derives Eq, Ord {
 /// The rules of a final-link root's approvals: each needed pair of its closure summary and
 /// each needed epoch pair its lock does not approve, listed on its `package` line.
 fn Checker.check_approvals(self, root: ty::PackageId) {
-    let alloc = self.alloc()
     let source = self.db().source(root)
     let Some(lock) = source.machine.lock() else {
         return
     }
-    let Some(manifest) = source.manifest else {
-        return
-    }
     let needed = self.needed(root)
+    for reported in take unapproved(source, needed, lock, grammar: self.session().grammar.contents(), alloc: self.alloc()) {
+        self.push_found(take reported)
+    }
+} Checker.check_approvals
+
+/// Whether a code reports what a final-link root's lock leaves unapproved.
+pkg fn is_unapproved(code: diagnostic::Code) -> bool {
+    return code == diagnostic::Code.AuthorityWideningUnapproved or code == diagnostic::Code.DepEpochUnapproved
+} is_unapproved
+
+/// The diagnostics of what a final-link root's final closure needs and its lock does not approve:
+/// on its `package` line, naming `nan dep approve` of the root, then listing each pair.
+fn unapproved(source: workspace::Package, needed: Needed, lock: machine::Lock, grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let Some(manifest) = source.manifest else {
+        return found
+    }
     var path = text::String.of(source.dir.as_str(), alloc)
     mut path.append("/package.nan")
-    let grammar = self.session().grammar.contents()
-    var unapproved = mem::List[text::String].empty(alloc)
+    var pairs = mem::List[text::String].empty(alloc)
     for pair in needed.pairs {
         if approves(lock, pair) {
             continue
@@ -42,7 +54,7 @@ fn Checker.check_approvals(self, root: ty::PackageId) {
         var written = text::String.of(pair.package_name.as_str(), alloc)
         mut written.push(' ')
         mut written.append(pair.entry.written(grammar, alloc).as_str())
-        mut unapproved.push(take written)
+        mut pairs.push(take written)
     }
     var epochs = mem::List[text::String].empty(alloc)
     for pair in needed.epochs {
@@ -54,9 +66,33 @@ fn Checker.check_approvals(self, root: ty::PackageId) {
         mut written.write(text::fmt("{epoch}", epoch: pair.epoch), budget: 32)
         mut epochs.push(take written)
     }
-    self.report_unapproved(path.as_str(), line: manifest.line, code: diagnostic::Code.AuthorityWideningUnapproved, listed: unapproved.view())
-    self.report_unapproved(path.as_str(), line: manifest.line, code: diagnostic::Code.DepEpochUnapproved, listed: epochs.view())
-} Checker.check_approvals
+    var command = text::String.of("nan dep approve ", alloc)
+    mut command.append(manifest.name.as_str())
+    let at = diagnostic::At(path: take path, line: manifest.line)
+    match listed_unapproved(at, code: diagnostic::Code.AuthorityWideningUnapproved, command: command.as_str(), listed: pairs.view(), alloc) {
+        Some(reported) => mut found.push(take reported)
+        None => {}
+    }
+    match listed_unapproved(at, code: diagnostic::Code.DepEpochUnapproved, command: command.as_str(), listed: epochs.view(), alloc) {
+        Some(reported) => mut found.push(take reported)
+        None => {}
+    }
+    return found
+} unapproved
+
+/// The diagnostic of a code listing pairs a lock does not approve at a manifest's `package`
+/// line, naming the command approving them; none when none is listed.
+fn listed_unapproved(at: diagnostic::At, code: diagnostic::Code, command: Str, listed: Slice[text::String], alloc: mem::Alloc) -> Option[diagnostic::Diagnostic] {
+    if listed.len() == 0 {
+        return None
+    }
+    var reported = diagnostic::Diagnostic.at(code, path: at.path.as_str(), line: at.line, alloc)
+    mut reported.because.push(diagnostic::Reason(role: diagnostic::Role.Command, subject: text::String.of(command, alloc), at: None))
+    for pair in listed {
+        mut reported.because.push(diagnostic::Reason.note(pair.as_str(), alloc))
+    }
+    return Some(take reported)
+} listed_unapproved
 
 /// Whether a lock approves a pair of a package and an entry of its authority summary.
 fn approves(lock: machine::Lock, pair: NeededPair) -> bool {
@@ -77,19 +113,6 @@ fn approves_epoch(lock: machine::Lock, pair: NeededEpoch) -> bool {
     }
     return false
 } approves_epoch
-
-/// Reports the pairs a lock does not approve, each a note, on a manifest's `package` line.
-fn Checker.report_unapproved(self, path: Str, line: u32, code: diagnostic::Code, listed: Slice[text::String]) {
-    if listed.len() == 0 {
-        return
-    }
-    let alloc = self.alloc()
-    var reported = diagnostic::Diagnostic.at(code, path, line, alloc)
-    for pair in listed {
-        mut reported.because.push(diagnostic::Reason.note(pair.as_str(), alloc))
-    }
-    self.push_found(take reported)
-} Checker.report_unapproved
 
 /// The authority summary of a package: the capabilities and validators its functions' digests,
 /// and the digests their code gives, hold, `alloc`, `device` and `priv` when one holds them,
@@ -188,17 +211,24 @@ fn Checker.needed(self, root: ty::PackageId) -> Needed {
     return needed
 } Checker.needed
 
+/// A lock with the approvals a package's final closure needs, and the diagnostics of what it
+/// leaves unapproved.
+pkg struct Approved {
+    pkg lock: machine::Lock
+    pkg unapproved: mem::List[diagnostic::Diagnostic]
+} Approved
+
 /// A lock with the approvals its package's final closure needs: every one when `all`, else those
-/// it holds that are still needed.
-pkg fn Session.approvals(self, package_index: usize, take lock: machine::Lock, all: bool) -> machine::Lock {
+/// it holds that are still needed; with the diagnostics of what that lock leaves unapproved.
+pkg fn Session.approvals(self, package_index: usize, take lock: machine::Lock, all: bool) -> Approved {
     let alloc = self.alloc
     let held = self.workspace.contents()
     let Some(closure) = held.closure_of(package_index) else {
-        return lock
+        return Approved(lock: take lock, unapproved: mem::List[diagnostic::Diagnostic].empty(alloc))
     }
     let Some(source) = held.package_at(package_index) else {
         expect false
-        return lock
+        return Approved(lock: take lock, unapproved: mem::List[diagnostic::Diagnostic].empty(alloc))
     }
     var pairs = mem::Set[NeededPair].empty(alloc)
     var epochs = mem::Set[NeededEpoch].empty(alloc)
@@ -229,11 +259,12 @@ pkg fn Session.approvals(self, package_index: usize, take lock: machine::Lock, a
         }
         approved.approved = listed
         approved.epochs = listed_epochs
-        return approved
+        return Approved(lock: take approved, unapproved: mem::List[diagnostic::Diagnostic].empty(alloc))
     }
     mut approved.approved.retain(fn(pair: machine::Approval) => pairs.contains_by(fn(needed: NeededPair) => needed_order(needed, pair)))
     mut approved.epochs.retain(fn(pair: machine::ApprovedEpoch) => epochs.contains_by(fn(needed: NeededEpoch) => epoch_order(needed, pair)))
-    return approved
+    let left = unapproved(source, needed: Needed(pairs: take pairs, epochs: take epochs), lock: approved, grammar: self.grammar.contents(), alloc)
+    return Approved(lock: take approved, unapproved: take left)
 } Session.approvals
 
 /// The order of a needed pair relative to an approved one.

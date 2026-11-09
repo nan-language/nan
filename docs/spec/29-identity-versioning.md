@@ -591,7 +591,7 @@ pub fn tally(left: u64, right: u64) -> u64 {
 An **assignment** gives one candidate to each source of P's `dep` directives and, in turn, to each source that a `dep` directive of an assigned release names. It is **acceptable** when:
 
 1. its closure holds one release per package name and no cycle;
-2. P and the package of each assigned path release check from source against it without error, with digests re-derived across the closure;
+2. P and the package of each assigned path release check from source against it without error, with digests re-derived across the closure, [approvals](#approvals) aside;
 3. the [release check](30-artefacts.md#releases) of every other assigned release, under each target P is checked for, finds no error;
 4. P's [reliance tests](22-testing.md#reliance-tests) and [affected tests](22-testing.md#affected-tests) pass, and so do the reliance tests recorded in each assigned release whose targets lie in a package assigned another release than the lock names.
 
@@ -624,8 +624,8 @@ failed dep sync example: files 0, errors 1, incomplete 0
 The lock of a final-link root records **approvals**: pairs of its [closure summary](14-authority.md#authority-summaries), and **epoch pairs** of a canonical path and a behaviour epoch.
 
 - A final closure **needs** each pair of its [closure summary](14-authority.md#authority-summaries); a needed pair the lock does not approve is an error (`authority.widening-unapproved`), as authority summaries state.
-- It also needs, for each requires-set entry of each of its packages that names a non-std item whose epoch in the assigned release is above 0, the pair of that item's canonical path and epoch. A needed epoch pair the lock does not approve is an error (`dep.epoch-unapproved`), reported on the root's `package` line and listing every such pair; `nan check`, `nan test`, `nan build` and `nan run` of the root report it.
-- `nan dep approve` adds every needed pair of both kinds to the lock, and a lock written for a package that had none approves every pair it needs. Nothing else adds an approval, and a written lock holds only needed approvals.
+- It also needs, for each requires-set entry of each of its packages that names a non-std item whose epoch in the assigned release is above 0, the pair of that item's canonical path and epoch. A needed epoch pair the lock does not approve is an error (`dep.epoch-unapproved`), reported on the root's `package` line, naming the command `nan dep approve` of the root and listing every such pair; `nan check`, `nan test`, `nan build` and `nan run` of the root report it.
+- `nan dep approve` adds every needed pair of both kinds to the lock, and a lock written for a package that had none approves every pair it needs. Nothing else adds an approval, and a written lock holds only needed approvals. `nan dep sync` reports the needed pairs that the lock it writes does not approve.
 
 ## Diagnostics
 

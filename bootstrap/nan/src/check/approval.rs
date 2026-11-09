@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use super::Checker;
 use super::db::PackageId;
 use super::ledger::Kind;
-use crate::diagnostic::{Code, Diagnostic, Reason};
+use crate::diagnostic::{Code, Diagnostic, Reason, Role};
 use crate::machine::lock::{Entry, Lock};
 use crate::workspace::{Member, Workspace};
 
@@ -101,56 +101,82 @@ impl Checker<'_> {
     /// The rules of a final-link root's approvals: each needed pair of its closure summary and
     /// each needed epoch pair its lock does not approve, listed on its `package` line.
     pub fn check_approvals(&self, root: PackageId) {
-        let data = self.db.package(root);
-        let (Some(lock), Some(manifest)) =
-            (data.source.machine.lock(), data.source.manifest.as_ref())
-        else {
-            return;
-        };
-        let needed = self.needed(root);
-        let path = format!("{}/package.nan", data.source.dir);
-        let unapproved: Vec<String> = needed
-            .pairs
-            .iter()
-            .filter(|(package, entry)| {
-                !lock
-                    .approved
-                    .iter()
-                    .any(|(known, approved)| known == package && approved == entry)
-            })
-            .map(|(package, entry)| format!("{package} {}", entry.written()))
-            .collect();
-        let epochs: Vec<String> = needed
-            .epochs
-            .iter()
-            .filter(|pair| !lock.epochs.contains(pair))
-            .map(|(item, epoch)| format!("{item} {epoch}"))
-            .collect();
-        for (code, listed) in [
-            (Code::AuthorityWideningUnapproved, unapproved),
-            (Code::DepEpochUnapproved, epochs),
-        ] {
-            if !listed.is_empty() {
-                self.found.borrow_mut().push(Diagnostic {
-                    because: listed.iter().map(|pair| Reason::note(pair)).collect(),
-                    ..Diagnostic::at(code, &path, manifest.line)
-                });
-            }
+        let source = self.db.package(root).source;
+        if let Some(lock) = source.machine.lock() {
+            let needed = self.needed(root);
+            self.found
+                .borrow_mut()
+                .extend(unapproved(source, &needed, lock));
         }
     }
 }
 
+/// Whether a code reports what a final-link root's lock leaves unapproved.
+pub fn is_unapproved(code: Code) -> bool {
+    matches!(
+        code,
+        Code::AuthorityWideningUnapproved | Code::DepEpochUnapproved
+    )
+}
+
+/// The diagnostics of what a final-link root's final closure needs and its lock does not approve:
+/// on its `package` line, naming `nan dep approve` of the root, then listing each pair.
+fn unapproved(
+    package: &crate::workspace::Package,
+    needed: &Needed,
+    lock: &Lock,
+) -> Vec<Diagnostic> {
+    let (Some(manifest), Some(name)) = (package.manifest.as_ref(), package.name()) else {
+        return Vec::new();
+    };
+    let path = format!("{}/package.nan", package.dir);
+    let pairs: Vec<String> = needed
+        .pairs
+        .iter()
+        .filter(|(package, entry)| {
+            !lock
+                .approved
+                .iter()
+                .any(|(known, approved)| known == package && approved == entry)
+        })
+        .map(|(package, entry)| format!("{package} {}", entry.written()))
+        .collect();
+    let epochs: Vec<String> = needed
+        .epochs
+        .iter()
+        .filter(|pair| !lock.epochs.contains(pair))
+        .map(|(item, epoch)| format!("{item} {epoch}"))
+        .collect();
+    [
+        (Code::AuthorityWideningUnapproved, pairs),
+        (Code::DepEpochUnapproved, epochs),
+    ]
+    .into_iter()
+    .filter(|(_, listed)| !listed.is_empty())
+    .map(|(code, listed)| Diagnostic {
+        because: std::iter::once(Reason {
+            role: Role::Command,
+            subject: format!("nan dep approve {name}"),
+            at: None,
+        })
+        .chain(listed.iter().map(|pair| Reason::note(pair)))
+        .collect(),
+        ..Diagnostic::at(code, &path, manifest.line)
+    })
+    .collect()
+}
+
 /// A lock with the approvals its package's final closure needs: every one when `all`, else those
-/// it holds that are still needed.
+/// it holds that are still needed; with the diagnostics of what that lock leaves unapproved.
 pub fn approvals(
     workspace: &Workspace,
     package: &crate::workspace::Package,
     mut lock: Lock,
     all: bool,
-) -> Lock {
+) -> (Lock, Vec<Diagnostic>) {
     let std = crate::stdlib::packages();
     let Some(closure) = workspace.closure_of(package) else {
-        return lock;
+        return (lock, Vec::new());
     };
     let mut pairs = BTreeSet::new();
     let mut epochs = BTreeSet::new();
@@ -170,11 +196,12 @@ pub fn approvals(
         epochs.extend(needed.epochs);
     }
     if all {
-        lock.approved = pairs.into_iter().collect();
-        lock.epochs = epochs.into_iter().collect();
+        lock.approved = pairs.iter().cloned().collect();
+        lock.epochs = epochs.iter().cloned().collect();
     } else {
         lock.approved.retain(|pair| pairs.contains(pair));
         lock.epochs.retain(|pair| epochs.contains(pair));
     }
-    lock
+    let left = unapproved(package, &Needed { pairs, epochs }, &lock);
+    (lock, left)
 }

@@ -113,7 +113,7 @@ pub fn approve(
     trace.scope = Some(written.clone());
     let package = &workspace.packages[index];
     let lock = package.machine.lock().cloned().unwrap_or_default();
-    let approved = crate::check::approvals(workspace, package, lock, true);
+    let (approved, _) = crate::check::approvals(workspace, package, lock, true);
     let path = format!("{}/.nan/lock.nan", package.dir);
     let bytes = approved.bytes();
     let mut changes = Vec::new();

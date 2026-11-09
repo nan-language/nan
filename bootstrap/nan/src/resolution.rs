@@ -394,7 +394,8 @@ impl Resolver<'_> {
     }
 
     /// Why an assignment is not acceptable, none when it is: the errors checking the closure
-    /// finds on the package, the current states and the releases, and its failing tests.
+    /// finds on the package, the current states and the releases, but for what the package's
+    /// lock leaves unapproved, and its failing tests.
     fn judge(&self, assigned: &[(Source, Candidate)]) -> io::Result<Option<Vec<Diagnostic>>> {
         let lock = self.candidate_lock(assigned);
         let (workspace, _) = self.assigned(&lock)?;
@@ -419,6 +420,7 @@ impl Resolver<'_> {
             .into_iter()
             .chain(workspace.diagnostics())
             .filter(|diagnostic| diagnostic.code.class() == DiagnosticClass::Error)
+            .filter(|diagnostic| !check::is_unapproved(diagnostic.code))
             .filter(|diagnostic| !self.forwarding || diagnostic.code != Code::NameMoved)
             .collect();
         let (own, others): (Vec<Diagnostic>, Vec<Diagnostic>) = errors
@@ -541,18 +543,24 @@ impl Resolver<'_> {
                 .unwrap_or_default()
         };
         let first = self.workspace.packages[self.package].machine.lock.is_none();
-        let lock = check::approvals(&workspace, &workspace.packages[self.package], lock, first);
+        let (lock, unapproved) =
+            check::approvals(&workspace, &workspace.packages[self.package], lock, first);
         let changes = self.changes(&lock);
-        let errors = match self.forwarding || !self.own_errors {
+        let mut errors: Vec<Diagnostic> = match self.forwarding || !self.own_errors {
             true => check::reported(&workspace, &Scope::Package(self.package))
                 .into_iter()
                 .filter(|diagnostic| match self.own_errors {
                     true => diagnostic.code == Code::NameMoved,
-                    false => diagnostic.code.class() == DiagnosticClass::Error,
+                    false => {
+                        diagnostic.code.class() == DiagnosticClass::Error
+                            && !check::is_unapproved(diagnostic.code)
+                    }
                 })
                 .collect(),
             false => Vec::new(),
         };
+        errors.extend(unapproved);
+        check::sort_diagnostics(&mut errors);
         Ok(Ok(Outcome::Resolved {
             lock,
             changes,

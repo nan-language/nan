@@ -341,3 +341,58 @@ fn a_test_reaching_a_rejected_item_reports_its_errors_and_runs_nothing() {
         run.output
     );
 }
+
+#[test]
+fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_approve() {
+    let length = "//! Lengths.\n\n/// A length.\npub fn length(count: u32, alloc: mem::Alloc) -> u32 {\n    var bytes = mem::List[u8].empty(alloc)\n    mut bytes.push(1)\n    return count + u32.truncate(bytes.len())\n} length\n";
+    let main = |logged: &str| {
+        format!(
+            "//! Entry of the app.\n\nfn main(take world: host::World) -> u8 fails task::Cancelled uses wait {{\n{logged}    return u8.truncate(lib::length(2, alloc: world.alloc))\n}} main\n"
+        )
+    };
+    let scratch = Scratch::new(&[
+        (
+            "lib/package.nan",
+            "//! Lengths.\n\npackage lib {\n    language 1\n    targets any\n} lib\n",
+        ),
+        ("lib/lib.nan", length),
+        (
+            "app/package.nan",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    entry main\n    dep lib \"../lib\"\n} app\n",
+        ),
+        ("app/app.nan", &main("")),
+    ]);
+    let dir = &scratch.0;
+    let verdict = |line: &str| {
+        let run = run_in(dir, line);
+        run.output.lines().next().expect("a verdict").to_owned()
+    };
+    assert_eq!(
+        verdict("dep sync app"),
+        "ok dep sync app: files 1, errors 0, incomplete 0"
+    );
+    assert_eq!(
+        verdict("dep sync app"),
+        "ok dep sync app: files 0, errors 0, incomplete 0"
+    );
+    let logged = "\n/// Logs a length.\npub fn logged(log: sys::Log, count: u32) {\n    log.info(\"length\", value: count)\n} logged\n";
+    fs::write(dir.join("lib/lib.nan"), format!("{length}{logged}")).expect("a widened lib");
+    fs::write(
+        dir.join("app/app.nan"),
+        main("    lib::logged(world.log, count: 1)\n"),
+    )
+    .expect("an app logging");
+    let synced = run_in(dir, "dep sync app").output;
+    assert!(
+        synced.contains("\nerror authority.widening-unapproved app/package.nan:3 app\n    package app {\n    because command - - nan dep approve app\n    because note - - lib capability \"sys::Log\"\nwrote app/.nan/lock.nan\n"),
+        "{synced}"
+    );
+    assert_eq!(
+        verdict("dep approve app"),
+        "ok dep approve app: files 1, errors 0, incomplete 0"
+    );
+    assert_eq!(
+        verdict("dep sync app"),
+        "ok dep sync app: files 0, errors 0, incomplete 0"
+    );
+}

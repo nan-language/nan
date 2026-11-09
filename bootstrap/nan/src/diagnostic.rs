@@ -346,6 +346,7 @@ codes! {
     NumWidenApplies = "num.widen-applies",
     NumWidenLossy = "num.widen-lossy",
     OwnConflict = "own.conflict",
+    OwnCopiedPart = "own.copied-part",
     OwnLinearDropped = "own.linear-dropped",
     OwnMoveNotOwned = "own.move-not-owned",
     OwnNotIndexable = "own.not-indexable",

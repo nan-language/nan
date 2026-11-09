@@ -1119,10 +1119,14 @@ impl<'c, 'a> Flow<'c, 'a> {
     }
 
     /// A `var` binding: of a part, or of a value derived from a view binding, it is a view binding
-    /// of the same part; any other value moves in.
+    /// of the same part; any other value moves in. A writable part that is Copy would be copied,
+    /// so that writes to the binding never reach it: an error.
     fn bind_var(&mut self, local: LocalId, value: &Value, expr: &TExpr, token: Tok) {
         if value.temporary && !self.is_copy(&expr.ty) {
             self.report(token, Code::OwnTemporarySource);
+        }
+        if value.form == Some(Form::Part) && value.writable && self.is_copy(&expr.ty) {
+            self.report(token, Code::OwnCopiedPart);
         }
         let viewing = matches!(value.form, Some(Form::Part | Form::Wrapped));
         if viewing && !self.is_copy(&expr.ty) {

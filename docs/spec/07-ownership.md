@@ -378,7 +378,7 @@ In the body of a projection:
 At a call of a projection:
 
 - The call is a read access to the receiver for a read projection and a `mut` access for a mut projection. A non-Copy result keeps that access active as a [hold](#holds).
-- A result whose type is Copy at the call holds nothing and is copied when used as a value. The exception is a part written through [indexing](#indexing) or passed to a `mut` parameter: it is the place it projects, and its hold lasts until the end of its statement.
+- A result whose type is Copy at the call holds nothing and is copied when used as a value. The exception is a part written through [indexing](#indexing) or passed to a `mut` parameter: it is the place it projects, and its hold lasts until the end of its statement. Initialising a `var` binding from a writable part whose type is Copy is an error (`own.copied-part`): the binding would hold a copy, which no write to it would reach the part through.
 - A part is never moved (`own.move-not-owned`). It is bound as a [view binding](#view-bindings), used within its statement as a receiver, the object of a field access, a read or `mut` argument or a matched value, discarded, returned from a projection, wrapped, unmarked, in `Some`, `Ok` or `Err`, which builds a wrapped part, or yielded by a branch of a value-yielding `if` or `match`. Such an `if` or `match` whose branches each yield a part that is not Copy or diverge is a part; any other moves in the value each branch yields.
 - A wrapped part is bound as a view binding, used within its statement as a read receiver, a read argument or an operand of an operator, used as a matched value, discarded or returned from a projection; any other use is an error (`own.wrapped-part-use`). A pattern matching a part or a wrapped part is matching a scrutinee that is not owned, so the names it binds are view bindings ([pattern bindings](04-types.md#pattern-bindings)).
 - A view value is owned and moved like any value, and every value it moves into derives from it.
@@ -573,6 +573,20 @@ pub fn renumber_first(frames: mem::List[Frame], seq: u32) {
     var head = frames.at(0)
     head.seq = seq // error: own.read-only-view
 } renumber_first
+```
+
+```nan
+pub closed struct Gauge derives Copy {
+    pub level: u32
+} Gauge
+
+pub fn raise_first(mut gauges: mem::List[Gauge]) {
+    if gauges.len() == 0 {
+        return
+    }
+    var head = mut gauges.at_mut(0) // error: own.copied-part
+    head.level += 1
+} raise_first
 ```
 
 ```nan
@@ -1060,6 +1074,7 @@ pub fn unbox_used(take table: mem::Box[Table]) -> usize {
 | `mode.mismatch` | error | [Marking](#marking), [Templates](13-text-encode.md#templates) |
 | `mode.unmarked` | error | [Marking](#marking) |
 | `own.conflict` | error | [Exclusivity](#exclusivity), [Holds](#holds), [Lending](16-concurrency.md#lending) |
+| `own.copied-part` | error | [Projection results](#projection-results) |
 | `own.linear-dropped` | error | [Linear consumption](#linear-consumption), [Linear types](05-properties.md#linear-types), [Expression statements](06-statements-expressions.md#expression-statements), [Match arms](06-statements-expressions.md#match-arms) |
 | `own.move-not-owned` | error | [Ownership](#ownership), [Modes](#modes), [Projection results](#projection-results), [View bindings](#view-bindings), [Captures](#captures) |
 | `own.not-indexable` | error | [Indexing](#indexing) |

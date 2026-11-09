@@ -133,18 +133,25 @@ pub fn member(
         }
         "erased" => {
             let codec = interp.ty_item("mem::wire", "Codec");
-            let canonical = interp.ck.db.members(TypeKey::Item(codec), "canonical")[0];
-            let function = FnVal::Function(FnRef {
-                callable: Callable::Item {
-                    item: canonical,
-                    role: Role::Body,
-                    index: 0,
-                },
-                args: Rc::from(type_args.to_vec()),
-            });
             let erased = interp.ty_item("mem::wire", "Erased");
-            let fields = vec![schema_hash(interp, &ty), Val::Fn(Rc::new(function))];
-            Ok(Flow::Return(Val::Struct(erased, Rc::new(fields))))
+            let SigKind::Struct { fields } = &interp.ck.sig(erased).kind else {
+                panic!("mem::wire::Erased is a struct");
+            };
+            let values = fields
+                .iter()
+                .map(|field| match field.name.as_str() {
+                    "schema" => schema_hash(interp, &ty),
+                    member => Val::Fn(Rc::new(FnVal::Function(FnRef {
+                        callable: Callable::Item {
+                            item: interp.ck.db.members(TypeKey::Item(codec), member)[0],
+                            role: Role::Body,
+                            index: 0,
+                        },
+                        args: Rc::from(type_args.to_vec()),
+                    }))),
+                })
+                .collect();
+            Ok(Flow::Return(Val::Struct(erased, Rc::new(values))))
         }
         _ => return None,
     })

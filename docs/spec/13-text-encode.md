@@ -936,10 +936,17 @@ pub fn Codec.encode(value: T, mut out: mem::Bytes)
 pub fn Codec.try_encode(value: T, mut out: mem::Bytes) fails mem::OutOfMemory
 
 pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+
+pub fn Codec.decode_located(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails DecodeFailure
+
+pub closed enum DecodeFailure derives Eq, Render {
+    At(error: core::DecodeError, path: text::String)
+} DecodeFailure
 ```
 
 - `encode` appends to `out` and traps when memory is exhausted (`trap.exhausted`); `try_encode` fails with `mem::OutOfMemory.Exhausted` and leaves `out` unchanged.
 - `decode` reads exactly one value; bytes left after it fail with `Trailing`.
+- `decode_located` reads one value as `decode` does, failing with `DecodeFailure.At` of the error `decode` fails with and the **path** of the value whose decoding failed: from the outermost, the key of each record field and variant, separated by `.`, and the index of each sequence element and map entry, written `[i]`, as in `rules[2].port`. A failing predicate names the struct holding it, and the path is empty for the whole value; it holds only keys the type declares.
 
 A **uvar** is an unsigned integer in LEB128: 7 bits per byte, least significant group first, the high bit set on every byte but the last. A uvar is minimal: its last byte is not 0 unless it is the only byte. A uvar that is not minimal or whose value exceeds 2^64 − 1 fails with `Malformed`.
 
@@ -989,15 +996,18 @@ An **erased decoder** is a `mem::wire::Erased`: the schema hash of a type and a 
 pub open struct Erased derives Copy {
     pub schema: SchemaHash
     pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
+    pub canonical_located: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure limits terminates
 } Erased
 
 pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
 
+pub fn Codec.canonical_located(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure
+
 pub fn Codec.erased() -> Erased limits pure, notrap, terminates
 ```
 
-- `canonical` reads one value as `decode` does, then gives the bytes `encode` writes for it, drawn through `alloc`, failing with `OutOfMemory` when it cannot draw them. Its result stays Untrusted, so it reads no contents for its caller.
-- `erased` gives the schema hash of `T` and `Codec[T].canonical`.
+- `canonical` reads one value as `decode` does, then gives the bytes `encode` writes for it, drawn through `alloc`, failing with `OutOfMemory` when it cannot draw them. Its result stays Untrusted, so it reads no contents for its caller. `canonical_located` gives the same bytes, failing as `decode_located` does.
+- `erased` gives the schema hash of `T`, `Codec[T].canonical` and `Codec[T].canonical_located`.
 - A package exports the erased decoders of its types by contributing them to a [registry](25-registries.md#registries), through which code checks records by their schema hashes without naming their types.
 
 ```nan

@@ -16,6 +16,25 @@ pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails cor
 pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
     example (attempt Codec[u8].canonical(Untrusted.of(b"\x05\x00"), alloc: testing::world().alloc)).is_err()
 
+pub fn Codec.decode_located(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails DecodeFailure
+    example attempt Codec[u16].decode_located(Untrusted.of(b"\xAC\x02"), alloc: testing::world().alloc) == Ok(300)
+    example attempt Codec[u8].decode_located(Untrusted.of(b"\x05\x00"), alloc: testing::world().alloc) == Err(DecodeFailure.At(error: core::DecodeError.Trailing, path: text::String.empty(testing::world().alloc)))
+{
+    match attempt Codec[T].decode(raw, alloc) {
+        Ok(value) => return value
+        Err(error) => fail DecodeFailure.At(error: error, path: Codec[T].rejected_at(raw, alloc))
+    }
+} Codec.decode_located
+
+pub fn Codec.canonical_located(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure
+    example (attempt Codec[u8].canonical_located(Untrusted.of(b"\x05\x00"), alloc: testing::world().alloc)).is_err()
+{
+    match attempt Codec[T].canonical(raw, alloc) {
+        Ok(canonical) => return canonical
+        Err(error) => fail DecodeFailure.At(error: error, path: Codec[T].rejected_at(raw, alloc))
+    }
+} Codec.canonical_located
+
 pub fn Codec.erased() -> Erased limits pure, notrap, terminates
     example Codec[u8].erased().schema == Codec[u8].schema_hash()
 
@@ -69,10 +88,370 @@ pub closed struct SchemaVariant derives Encode {
     pub payload: Option[usize]
 } SchemaVariant
 
+pub closed enum DecodeFailure derives Eq, Render {
+    At(error: core::DecodeError, path: text::String)
+} DecodeFailure
+
 pub open struct Erased derives Copy {
     pub schema: SchemaHash
     pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
+    pub canonical_located: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure limits terminates
 } Erased
+
+/// The path of the value at which decoding `raw` as `T` fails, empty for the whole value or
+/// when it does not fail: each record field by its key, each sequence element and map entry by
+/// its index and each variant by its key, as `rules[2].port`.
+validator fn Codec.rejected_at(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String limits terminates {
+    var bytes = mem::Bytes.empty(alloc)
+    if (attempt mut bytes.try_append(raw.inspect())).is_err() {
+        return text::String.empty(alloc)
+    }
+    var locator = Locator(bytes: take bytes, at: 0, chunk_left: 0, frames: mem::List[Frame].empty(alloc), alloc: alloc)
+    discard attempt T.decode(mut locator, alloc)
+    return locator.path(alloc)
+} Codec.rejected_at
+
+/// A decoder of `mem::wire` bytes that keeps, for each sequence, map, record and variant it is
+/// reading, what the path gives it, failing where `Codec.decode` fails: the bytes, the position
+/// read next, what is left of the text or bytes value being read, the frames, the innermost
+/// last, and the allocator the keys they name are copied through.
+struct Locator {
+    bytes: mem::Bytes
+    at: usize
+    chunk_left: usize
+    frames: mem::List[Frame]
+    alloc: mem::Alloc
+} Locator
+
+/// A sequence, map, record or variant being read: what of it is left, its elements, entries or
+/// fields, the end of the field value or payload being read, the extent of the last key read,
+/// and the segment of the path that names what is being read in it.
+struct Frame {
+    kind: FrameKind
+    left: u64
+    index: u64
+    value_end: Option[usize]
+    key_at: usize
+    key_len: usize
+    segment: Segment
+} Frame
+
+enum FrameKind derives Copy, Eq {
+    Sequence
+    Map
+    Record
+    Variant
+} FrameKind
+
+/// What a frame adds to the path: nothing, a field's or variant's key, or an element's or
+/// entry's index.
+enum Segment {
+    Whole
+    Key(text::String)
+    Index(u64)
+} Segment
+
+impl Locator: core::Decoder
+
+fn Locator.read_bool(mut self) -> bool fails core::DecodeError limits terminates {
+    return match try mut self.byte() {
+        0 => false
+        1 => true
+        else => fail core::DecodeError.Malformed
+    }
+} Locator.read_bool
+
+fn Locator.read_unsigned(mut self) -> u64 fails core::DecodeError limits terminates {
+    return try mut self.uvar()
+} Locator.read_unsigned
+
+fn Locator.read_signed(mut self) -> i64 fails core::DecodeError limits terminates {
+    let zigzag = try mut self.uvar()
+    let magnitude = i64.from_bits(zigzag >> 1)
+    if (zigzag & 1) == 0 {
+        return magnitude
+    }
+    return -magnitude - 1
+} Locator.read_signed
+
+fn Locator.read_float(mut self) -> f64 fails core::DecodeError limits terminates {
+    var bits: u64 = 0
+    for index in 0u32..<8 {
+        bits |= u64.widen(try mut self.byte()) << (8 * index)
+    }
+    return f64.from_bits(bits)
+} Locator.read_float
+
+fn Locator.read_char(mut self) -> char fails core::DecodeError limits terminates {
+    let scalar = try mut self.uvar()
+    if scalar > 0xFFFF_FFFF {
+        fail core::DecodeError.Invalid
+    }
+    let Some(found) = char.checked_from_bits(u32.truncate(scalar)) else {
+        fail core::DecodeError.Invalid
+    }
+    return found
+} Locator.read_char
+
+fn Locator.begin_text(mut self) -> usize fails core::DecodeError limits terminates {
+    self.chunk_left = try mut self.length()
+    return self.chunk_left
+} Locator.begin_text
+
+fn Locator.begin_bytes(mut self) -> usize fails core::DecodeError limits terminates {
+    self.chunk_left = try mut self.length()
+    return self.chunk_left
+} Locator.begin_bytes
+
+fn Locator.read_chunk(mut self, mut out: SliceMut[u8]) fails core::DecodeError limits terminates {
+    if out.len() > self.chunk_left {
+        fail core::DecodeError.Malformed
+    }
+    for index in 0..<out.len() {
+        out[index] = try mut self.byte()
+    }
+    self.chunk_left -= out.len()
+} Locator.read_chunk
+
+fn Locator.begin_sequence(mut self) fails core::DecodeError limits terminates {
+    try mut self.enter(FrameKind.Sequence)
+} Locator.begin_sequence
+
+fn Locator.begin_map(mut self) fails core::DecodeError limits terminates {
+    try mut self.enter(FrameKind.Map)
+} Locator.begin_map
+
+fn Locator.begin_record(mut self) fails core::DecodeError limits terminates {
+    try mut self.enter(FrameKind.Record)
+} Locator.begin_record
+
+fn Locator.next_follows(mut self) -> bool fails core::DecodeError limits terminates {
+    try mut self.value_ended()
+    let count = self.frames.len()
+    if count == 0 {
+        fail core::DecodeError.Malformed
+    }
+    var frame = mut self.frames.at_mut(count - 1)
+    frame.segment = Segment.Whole
+    if frame.kind == FrameKind.Variant {
+        fail core::DecodeError.Malformed
+    }
+    if frame.left == 0 {
+        return false
+    }
+    frame.left -= 1
+    if frame.kind != FrameKind.Record {
+        frame.segment = Segment.Index(frame.index)
+        frame.index += 1
+    }
+    return true
+} Locator.next_follows
+
+fn Locator.read_key(mut self, keys: Slice[Str]) -> Option[usize] fails core::DecodeError limits terminates {
+    let count = self.frames.len()
+    if count == 0 or self.frames[count - 1].kind != FrameKind.Record {
+        fail core::DecodeError.Malformed
+    }
+    let key_len = try mut self.length()
+    let key_at = self.at
+    self.at += key_len
+    let previous = self.frames[count - 1]
+    if previous.index > 0 {
+        match self.key_order(previous.key_at, earlier_len: previous.key_len, at: key_at, len: key_len) {
+            core::Ordering.Less => fail core::DecodeError.Malformed
+            core::Ordering.Equal => fail core::DecodeError.DuplicateKey
+            core::Ordering.Greater => {}
+        }
+    }
+    let value_len = try mut self.length()
+    let found = try mut self.named(keys, at: key_at, len: key_len)
+    var frame = mut self.frames.at_mut(count - 1)
+    frame.key_at = key_at
+    frame.key_len = key_len
+    frame.index = 1
+    frame.value_end = Some(self.at + value_len)
+    return found
+} Locator.read_key
+
+fn Locator.read_variant(mut self, keys: Slice[Str]) -> Option[usize] fails core::DecodeError limits terminates {
+    try mut self.enter(FrameKind.Variant)
+    let key_len = try mut self.length()
+    let key_at = self.at
+    self.at += key_len
+    return try mut self.named(keys, at: key_at, len: key_len)
+} Locator.read_variant
+
+fn Locator.payload_follows(mut self) -> bool fails core::DecodeError limits terminates {
+    let count = self.frames.len()
+    if count == 0 or self.frames[count - 1].kind != FrameKind.Variant {
+        fail core::DecodeError.Malformed
+    }
+    match try mut self.byte() {
+        0 => return false
+        1 => {
+            let payload_len = try mut self.length()
+            var frame = mut self.frames.at_mut(count - 1)
+            frame.value_end = Some(self.at + payload_len)
+            return true
+        }
+        else => fail core::DecodeError.Malformed
+    }
+} Locator.payload_follows
+
+fn Locator.skip(mut self) fails core::DecodeError limits terminates {
+    let count = self.frames.len()
+    if count == 0 {
+        fail core::DecodeError.Malformed
+    }
+    let Some(end) = self.frames[count - 1].value_end else {
+        fail core::DecodeError.Malformed
+    }
+    self.at = end
+} Locator.skip
+
+fn Locator.end(mut self) fails core::DecodeError limits terminates {
+    try mut self.value_ended()
+    let Some(frame) = mut self.frames.pop() else {
+        fail core::DecodeError.Malformed
+    }
+    if frame.left != 0 {
+        fail core::DecodeError.Malformed
+    }
+} Locator.end
+
+/// Reads one byte, failing with `Truncated` past the bytes.
+fn Locator.byte(mut self) -> u8 fails core::DecodeError limits terminates {
+    if self.at >= self.bytes.len() {
+        fail core::DecodeError.Truncated
+    }
+    let byte = self.bytes[self.at]
+    self.at += 1
+    return byte
+} Locator.byte
+
+/// Reads a uvar, failing with `Malformed` on one that is not minimal or exceeds 2^64 - 1.
+fn Locator.uvar(mut self) -> u64 fails core::DecodeError limits terminates {
+    var value: u64 = 0
+    for index in 0u32..<10 {
+        let byte = try mut self.byte()
+        if index == 9 and byte > 1 {
+            fail core::DecodeError.Malformed
+        }
+        value |= u64.widen(byte & 0x7F) << (7 * index)
+        if byte < 0x80 {
+            if byte == 0 and index > 0 {
+                fail core::DecodeError.Malformed
+            }
+            return value
+        }
+    }
+    fail core::DecodeError.Malformed
+} Locator.uvar
+
+/// Reads a byte length or count, failing with `Truncated` when it exceeds the bytes left.
+fn Locator.length(mut self) -> usize fails core::DecodeError limits terminates {
+    let length = try mut self.uvar()
+    if length > u64.widen(self.bytes.len() - self.at) {
+        fail core::DecodeError.Truncated
+    }
+    return usize.widen(length)
+} Locator.length
+
+/// Reads a count and opens a frame of `kind` for it, or a variant's frame, failing with `TooDeep`
+/// past 128 nested frames.
+fn Locator.enter(mut self, kind: FrameKind) fails core::DecodeError limits terminates {
+    if self.frames.len() >= 128 {
+        fail core::DecodeError.TooDeep
+    }
+    var left: u64 = 0
+    if kind != FrameKind.Variant {
+        left = u64.widen(try mut self.length())
+    }
+    match attempt mut self.frames.try_push(Frame(kind: kind, left: left, index: 0, value_end: None, key_at: 0, key_len: 0, segment: Segment.Whole)) {
+        Ok(_) => {}
+        Err(_) => fail core::DecodeError.OutOfMemory
+    }
+} Locator.enter
+
+/// Checks that the field value or payload the innermost frame read fills exactly its length.
+fn Locator.value_ended(mut self) fails core::DecodeError limits terminates {
+    let count = self.frames.len()
+    if count == 0 {
+        return
+    }
+    var frame = mut self.frames.at_mut(count - 1)
+    let Some(end) = frame.value_end else {
+        return
+    }
+    if self.at != end {
+        fail core::DecodeError.Malformed
+    }
+    frame.value_end = None
+} Locator.value_ended
+
+/// How the key at `at` of `len` bytes orders after the one at `earlier_at` of `earlier_len`.
+fn Locator.key_order(self, earlier_at: usize, earlier_len: usize, at: usize, len: usize) -> core::Ordering limits terminates {
+    for index in 0..<len {
+        if index == earlier_len {
+            return core::Ordering.Greater
+        }
+        let ordered = self.bytes[at + index].cmp(self.bytes[earlier_at + index])
+        if ordered != core::Ordering.Equal {
+            return ordered
+        }
+    }
+    return len.cmp(earlier_len)
+} Locator.key_order
+
+/// Whether the bytes at `at` of `len` bytes are those of a key.
+fn Locator.holds(self, at: usize, len: usize, key: Slice[u8]) -> bool limits terminates {
+    if key.len() != len {
+        return false
+    }
+    for index in 0..<len {
+        if self.bytes[at + index] != key[index] {
+            return false
+        }
+    }
+    return true
+} Locator.holds
+
+/// The index in `keys` of the key at `at` of `len` bytes, which the innermost frame's segment
+/// then names; none for a key `keys` lacks.
+fn Locator.named(mut self, keys: Slice[Str], at: usize, len: usize) -> Option[usize] fails core::DecodeError limits terminates {
+    for index in 0..<keys.len() {
+        if self.holds(at, len, key: keys[index].as_bytes()) {
+            let name = match attempt text::String.try_of(keys[index], alloc: self.alloc) {
+                Ok(copied) => copied
+                Err(_) => fail core::DecodeError.OutOfMemory
+            }
+            var frame = mut self.frames.at_mut(self.frames.len() - 1)
+            frame.segment = Segment.Key(take name)
+            return Some(index)
+        }
+    }
+    return None
+} Locator.named
+
+/// The path the frames give, from the outermost.
+fn Locator.path(self, alloc: mem::Alloc) -> text::String {
+    var path = text::String.empty(alloc)
+    for frame in self.frames {
+        match frame.segment {
+            Segment.Whole => {}
+            Segment.Key(key) => {
+                if not path.is_empty() {
+                    mut path.push('.')
+                }
+                mut path.append(key.as_str())
+            }
+            Segment.Index(index) => {
+                mut path.write(text::fmt("[{index}]", index), budget: 32)
+            }
+        }
+    }
+    return path
+} Locator.path
 
 pub open enum Kept {
     Empty
@@ -132,6 +511,29 @@ pub fn Schema.accepts(self, old: Schema, alloc: mem::Alloc) -> bool
         }
     }
 } Schema.accepts
+
+/// The bytes of a schema whose second node is a record whose first field's `defaulted` is not a
+/// bool.
+const MALFORMED_SCHEMA: Slice[u8] = b"\x01\x05nodes\x47\x02\x04Bool\x00\x06Record\x01\x37\x02\x06fields\x27\x01\x04\x07aliases\x01\x00\x09defaulted\x01\x02\x03key\x02\x01a\x05value\x01\x00\x04open\x01\x00"
+
+test decoding_names_the_value_it_rejects for Codec.decode_located {
+    let alloc = testing::world().alloc
+    let Err(DecodeFailure.At(error: error, path: path)) = attempt Codec[Schema].decode_located(Untrusted.of(MALFORMED_SCHEMA), alloc) else {
+        expect false
+        return
+    }
+    expect error == core::DecodeError.Malformed and path.as_str() == "nodes[1].Record.fields[0].defaulted"
+} decoding_names_the_value_it_rejects
+
+test erased_decoders_name_the_value_they_reject for Codec.canonical_located {
+    let alloc = testing::world().alloc
+    let erased = Codec[Schema].erased()
+    let Err(DecodeFailure.At(error: error, path: path)) = attempt (erased.canonical_located)(Untrusted.of(MALFORMED_SCHEMA), alloc) else {
+        expect false
+        return
+    }
+    expect error == core::DecodeError.Malformed and path.as_str() == "nodes[1].Record.fields[0].defaulted"
+} erased_decoders_name_the_value_they_reject
 
 test records_accept_defaulted_and_dropped_fields for Schema.accepts {
     let alloc = testing::world().alloc

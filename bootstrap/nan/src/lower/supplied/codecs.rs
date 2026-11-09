@@ -515,7 +515,8 @@ fn decode_constant(
     call(lo, fx, function, &[state, alloc, target])[0]
 }
 
-/// `Codec.erased()`: the type's schema hash and `Codec.canonical` of it as a function value.
+/// `Codec.erased()`: the type's schema hash and, for each other field, the member of `Codec` of
+/// it the field names as a function value.
 fn erased(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let result = supply.abi.result.clone();
     let layout = lo.layout(&result);
@@ -531,19 +532,28 @@ fn erased(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         .db
         .std_item("mem::wire", "Codec")
         .expect("mem::wire::Codec");
-    let canonical = lo.ck.db.members(TypeKey::Item(codec), "canonical")[0];
-    let function = FnRef {
-        callable: Callable::Item {
-            item: canonical,
-            role: Role::Body,
-            index: 0,
-        },
-        args: supply.args.clone(),
+    let Ty::Item(erased, _) = &result else {
+        panic!("an erased decoder's type");
     };
-    let value = lo.function_value(fx, &function).address();
-    let at = lo.layouts.field(lo.ck, &result, None, "canonical").offset;
-    let field = fx.b.ins().iadd_imm_s(target, at as i64);
-    lo.copy(fx, field, value, 16, 8);
+    let SigKind::Struct { fields } = &lo.ck.sig(*erased).kind else {
+        panic!("mem::wire::Erased is a struct");
+    };
+    for field in fields.iter().filter(|field| field.name != "schema") {
+        let member = field.name.as_str();
+        let item = lo.ck.db.members(TypeKey::Item(codec), member)[0];
+        let function = FnRef {
+            callable: Callable::Item {
+                item,
+                role: Role::Body,
+                index: 0,
+            },
+            args: supply.args.clone(),
+        };
+        let value = lo.function_value(fx, &function).address();
+        let at = lo.layouts.field(lo.ck, &result, None, member).offset;
+        let field = fx.b.ins().iadd_imm_s(target, at as i64);
+        lo.copy(fx, field, value, 16, 8);
+    }
     let held = lo.held_at(fx, &result, target);
     supply.ret(lo, fx, held);
 }

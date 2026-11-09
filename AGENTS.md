@@ -72,6 +72,10 @@ Design each command for who runs it: agent-facing commands run without interacti
 
 Never run a command that alters git history or the remote (commit, amend, rebase, merge, reset, cherry-pick, push, tag, branch deletion) without explicit approval from the user for that specific command. Approval covers one action and never carries over to the next.
 
+## Issues
+
+Whenever you hit a defect, a wrong or unclear diagnostic, a missing feature or any other gap in NaN that your current work does not cover, open an issue on `nan-language/nan` as the `file-issue` skill says, unless a search of the issues finds it already reported, and link the issue in your report.
+
 ## Code
 
 - Follow industry best practice. No over-engineering, no quick fixes.

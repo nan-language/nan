@@ -5,8 +5,9 @@
 /// record, its MSI-X capability's offset, the offset from its BARs' bus addresses to the CPU's,
 /// then each BAR's base, size and kind; then its host's record, its bus's generation when it was
 /// found, its path flags, the next record found and not yet listed, the offsets of its MSI,
-/// PCIe and power management capabilities, its state flag, and the configuration saved while it
-/// is suspended or reset, zero otherwise.
+/// PCIe and power management capabilities, its state flag, the configuration saved while it
+/// is suspended or reset, zero otherwise, and the record of the port above its bus, zero on a
+/// host bridge's.
 const FUNCTION_REQUESTER: u64 = 16
 
 const FUNCTION_ECAM: u64 = 24
@@ -43,18 +44,20 @@ const FUNCTION_STATE: u64 = 264
 
 const FUNCTION_SAVED: u64 = 272
 
-const FUNCTION_RECORD: u64 = 280
+const FUNCTION_UPSTREAM: u64 = 280
+
+const FUNCTION_RECORD: u64 = 288
 
 /// A port's record extends a function's, its path flags unused, with the flags of the path
 /// below it, and the bus address its memory window gives next with that window's end; a bridge
 /// has two BARs.
-const PORT_BELOW: u64 = 280
+const PORT_BELOW: u64 = 288
 
-const PORT_NEXT: u64 = 288
+const PORT_NEXT: u64 = 296
 
-const PORT_END: u64 = 296
+const PORT_END: u64 = 304
 
-const PORT_RECORD: u64 = 304
+const PORT_RECORD: u64 = 312
 
 const BRIDGE_BARS: u64 = 2
 
@@ -272,6 +275,14 @@ const SLOT_STATUS: u32 = 0x1A
 const SLOT_IMPLEMENTED: u32 = 0x100
 
 const REPORTS_LINK: u32 = 0x10_0000
+
+/// The shift of the link capabilities' field of the ASPM states a link's end supports, and the
+/// link control's field of those it enables, alike: L0s, L1 or both.
+const ASPM_SHIFT: u32 = 10
+
+const ASPM_STATES: u32 = 0x3
+
+const ASPM_L1: u32 = 0x2
 
 /// The offsets from the PCIe capability of its device capabilities, device control and status,
 /// and device control 2, which capabilities of version 2 have; the device capability bit of
@@ -766,6 +777,42 @@ pub fn PciFunction.reset(mut self) fails PciError {
     try restored(record, saved)
 } PciFunction.reset
 
+pub fn PciFunction.link_power(mut self, on: bool) fails PciError {
+    let record = self.record
+    if gone(record) {
+        fail PciError.Removed
+    }
+    let express = u32.truncate(peek(record + FUNCTION_EXPRESS))
+    let port = peek(record + FUNCTION_UPSTREAM)
+    if express == 0 or port == 0 or peek(port + FUNCTION_EXPRESS) == 0 {
+        fail PciError.Unsupported
+    }
+    let above = u32.truncate(peek(port + FUNCTION_EXPRESS))
+    var states: u32 = 0
+    if on {
+        states = aspm_support(record, express) & aspm_support(port, express: above)
+    }
+    let held = pci_lock()
+    let present = not gone(record) and not gone(port)
+    if present {
+        if (states & ASPM_L1) != 0 {
+            set_aspm(port, express: above, states)
+        }
+        set_aspm(record, express, states)
+        let saved = peek(record + FUNCTION_SAVED)
+        if saved != 0 {
+            poke(saved + SAVED_LINK, value: (peek(saved + SAVED_LINK) & ~u64.widen(ASPM_STATES)) | u64.widen(states))
+        }
+        if (states & ASPM_L1) == 0 {
+            set_aspm(port, express: above, states)
+        }
+    }
+    pci_unlock(held)
+    if not present {
+        fail PciError.Removed
+    }
+} PciFunction.link_power
+
 pub fn PciFunction.keeper(mut self) -> Option[PciKeeper] {
     let record = self.record
     let keeper = runtime_record(KEEPER_RECORD)
@@ -928,7 +975,7 @@ pub fn PciPort.rescan(mut self, alloc: mem::Alloc) -> mem::List[PciFunction] {
     for present in present_functions(host, bus, alloc).view() {
         let requester = present & 0xFFFF
         if endpoint(host, requester) {
-            let record = function_found(host, requester, flags: peek(port + PORT_BELOW), multi: present > 0xFFFF)
+            let record = function_found(host, requester, flags: peek(port + PORT_BELOW), multi: present > 0xFFFF, upstream: port)
             for index in 0..<BARS {
                 next = assign_bar(record, index, next, window, fresh: true)
             }
@@ -1272,9 +1319,9 @@ fn bus_level(host: u64, bus: u64, window: BusWindow, port: u64, flags: u64, give
         let requester = present & 0xFFFF
         var record: u64 = 0
         if ((host_config(host, requester, offset: HEADER_OFFSET) >> 16) & 0x7F) == BRIDGE_HEADER {
-            record = port_found(host, requester, flags)
+            record = port_found(host, requester, flags, upstream: port)
         } else if endpoint(host, requester) {
-            record = function_found(host, requester, flags, multi: present > 0xFFFF)
+            record = function_found(host, requester, flags, multi: present > 0xFFFF, upstream: port)
         }
         if record != 0 {
             address = above_held(record, window, next: address)
@@ -1370,8 +1417,8 @@ fn bar_count(record: u64) -> u64 {
 
 /// An endpoint's record, its path flags those of the path above it, exposed for a function of
 /// a multi-function device that does not redirect its peers' requests upstream.
-fn function_found(host: u64, requester: u64, flags: u64, multi: bool) -> u64 {
-    let record = new_record(host, requester, bytes: FUNCTION_RECORD, tag: FUNCTION_TAG)
+fn function_found(host: u64, requester: u64, flags: u64, multi: bool, upstream: u64) -> u64 {
+    let record = new_record(host, requester, bytes: FUNCTION_RECORD, tag: FUNCTION_TAG, upstream)
     var path = flags
     if multi and not acs_enabled(record, needed: FUNCTION_ACS) {
         path |= EXPOSED
@@ -1384,8 +1431,8 @@ fn function_found(host: u64, requester: u64, flags: u64, multi: bool) -> u64 {
 /// A bridge's record, and the path flags below it those above it
 /// and what it adds: a PCIe root or downstream port exposes them unless it redirects every peer
 /// request upstream, an upstream port adds nothing and any other bridge aliases them.
-fn port_found(host: u64, requester: u64, flags: u64) -> u64 {
-    let record = new_record(host, requester, bytes: PORT_RECORD, tag: PORT_TAG)
+fn port_found(host: u64, requester: u64, flags: u64, upstream: u64) -> u64 {
+    let record = new_record(host, requester, bytes: PORT_RECORD, tag: PORT_TAG, upstream)
     let express = u32.truncate(peek(record + FUNCTION_EXPRESS))
     var below = flags | ALIASED | EXPOSED
     if express != 0 {
@@ -1403,10 +1450,10 @@ fn port_found(host: u64, requester: u64, flags: u64) -> u64 {
     return record
 } port_found
 
-/// A record of `bytes` bytes for a host's function, with bus mastering and memory decoding off
-/// and INTx disabled, its BARs sized and its MSI-X, MSI, PCIe and power management capabilities
-/// found.
-fn new_record(host: u64, requester: u64, bytes: u64, tag: u64) -> u64 {
+/// A record of `bytes` bytes for a host's function below the port `upstream`, with bus mastering
+/// and memory decoding off and INTx disabled, its BARs sized and its MSI-X, MSI, PCIe and power
+/// management capabilities found.
+fn new_record(host: u64, requester: u64, bytes: u64, tag: u64, upstream: u64) -> u64 {
     let ecam = peek(host + HOST_ECAM)
     let id = u32.truncate(requester)
     let command = config_read(ecam, requester: id, offset: COMMAND_OFFSET) & 0xFFFF
@@ -1418,6 +1465,7 @@ fn new_record(host: u64, requester: u64, bytes: u64, tag: u64) -> u64 {
     poke(record + FUNCTION_WINDOW, value: peek(host + HOST_OFFSET))
     poke(record + FUNCTION_HOST, value: host)
     poke(record + FUNCTION_GENERATION, value: bus_generation(host, bus: requester >> 8))
+    poke(record + FUNCTION_UPSTREAM, value: upstream)
     var index: u64 = 0
     while index < bar_count(record) {
         index += size_bar(record, index)
@@ -2088,6 +2136,19 @@ fn live_config16(record: u64, offset: u32, value: u16) -> bool {
     pci_unlock(held)
     return present
 } live_config16
+
+/// The ASPM states a link's end supports, from the link capabilities of its PCIe capability at
+/// `express`.
+fn aspm_support(record: u64, express: u32) -> u32 {
+    return (config(record, offset: express + LINK_CAPABILITIES) >> ASPM_SHIFT) & ASPM_STATES
+} aspm_support
+
+/// Writes the ASPM states a link's end enables into the link control of its PCIe capability at
+/// `express`, keeping the control's other bits.
+fn set_aspm(record: u64, express: u32, states: u32) {
+    let control = config(record, offset: express + LINK_CONTROL) & 0xFFFF
+    set_config16(record, offset: express + LINK_CONTROL, value: u16.truncate((control & ~ASPM_STATES) | states))
+} set_aspm
 
 /// Stops a function decoding, mastering the bus and asserting INTx, writing its command itself.
 fn quiesce(record: u64) {

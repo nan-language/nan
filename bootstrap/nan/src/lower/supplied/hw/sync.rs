@@ -708,7 +708,7 @@ fn wait(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, signal_ty: &Ty, fields:
         release_word(fx, word);
         irq_restore(lo, fx, flags);
         settle::enter_wait(lo, fx, withdraw, address, current);
-        lo.call_routine(fx, Routine::Park, &[]);
+        task_ops::park_waiting(lo, fx);
         settle::leave_wait(lo, fx);
         tasks::waiting_on(lo, fx, 0);
         let origin = task_ops::origin(lo, fx);

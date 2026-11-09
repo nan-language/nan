@@ -9,7 +9,7 @@ pub mod domains;
 pub mod protocols;
 pub mod scopes;
 
-use cranelift_codegen::ir::{AbiParam, Signature, Value};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC};
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
@@ -72,6 +72,17 @@ pub fn fail_cancelled(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, origin: V
 /// The origin of a cancellation of the running call.
 pub fn origin(lo: &mut Lowering, fx: &mut Fx) -> Value {
     lo.call_routine(fx, Routine::Origin, &[])[0]
+}
+
+/// Parks the running task where it waits at a cancellation point, as `tasks::waiting_on` recorded,
+/// unless its call is cancelled: a cancellation that comes after this reads the origin finds the
+/// task waiting and wakes it.
+pub fn park_waiting(lo: &mut Lowering, fx: &mut Fx) {
+    let origin = origin(lo, fx);
+    let open = fx.b.ins().icmp_imm_s(IntCC::Equal, origin, 0);
+    fx.when(open, |fx| {
+        lo.call_routine(fx, Routine::Park, &[]);
+    });
 }
 
 /// Whether releasing a task type does anything, none for a type std declares in full.

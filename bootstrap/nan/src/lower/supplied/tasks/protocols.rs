@@ -313,7 +313,6 @@ pub fn await_reply(
     let lock = fx.offset(record, runner::LOCK);
     let at = fx.offset(node, entry::MESSAGE);
     fx.repeat(&[], |fx, _| {
-        lo.call_routine(fx, Routine::Park, &[]);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let current = fx.load(PTR, node, entry::STATUS);
         let replied =
@@ -350,6 +349,7 @@ pub fn await_reply(
         });
         components::leave_untaken(lo, fx, supply, message, record, node, current, at);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
+        lo.call_routine(fx, Routine::Park, &[]);
         (fx.int(types::I8, 1), Vec::new())
     });
     fx.b.ins()

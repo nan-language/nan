@@ -544,7 +544,6 @@ pub fn await_taken(
     let lock = fx.offset(record, runner::LOCK);
     let at = fx.offset(node, entry::MESSAGE);
     fx.repeat(&[], |fx, _| {
-        lo.call_routine(fx, Routine::Park, &[]);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let status = fx.load(PTR, node, entry::STATUS);
         let taken = fx.b.ins().icmp_imm_s(IntCC::Equal, status, status::TAKEN);
@@ -554,6 +553,7 @@ pub fn await_taken(
         });
         leave_untaken(lo, fx, supply, message, record, node, status, at);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
+        lo.call_routine(fx, Routine::Park, &[]);
         (fx.int(types::I8, 1), Vec::new())
     });
     fx.b.ins()

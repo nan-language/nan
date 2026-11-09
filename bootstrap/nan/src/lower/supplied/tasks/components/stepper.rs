@@ -258,7 +258,7 @@ fn wait(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, until_id
         }
         tasks::waiting_on(lo, fx, WAITING);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
-        lo.call_routine(fx, Routine::Park, &[]);
+        super::super::park_waiting(lo, fx);
         (fx.int(types::I8, 1), Vec::new())
     });
     fx.b.ins()

@@ -258,7 +258,11 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let withdraw = withdraw_sender(lo);
                 settle::enter_wait(lo, fx, withdraw, record, waiter);
-                lo.call_routine(fx, Routine::Park, &[]);
+                if linear {
+                    lo.call_routine(fx, Routine::Park, &[]);
+                } else {
+                    super::park_waiting(lo, fx);
+                }
                 settle::leave_wait(lo, fx);
                 if !linear {
                     tasks::waiting_on(lo, fx, 0);
@@ -416,7 +420,7 @@ fn receive(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         let withdraw = withdraw_receiver(lo);
         settle::enter_wait(lo, fx, withdraw, record, current);
-        lo.call_routine(fx, Routine::Park, &[]);
+        super::park_waiting(lo, fx);
         settle::leave_wait(lo, fx);
         tasks::waiting_on(lo, fx, 0);
         let (is, origin) = cancelled(lo, fx);

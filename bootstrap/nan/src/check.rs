@@ -134,8 +134,8 @@ pub struct Checker<'a> {
     cycles: RefCell<digest::Cycles>,
     /// The authorities each module performs directly, as far as checked.
     performed: RefCell<HashSet<(ModuleId, Authority)>>,
-    /// The folded names of each module's items in the values namespace, once gathered.
-    module_values: RefCell<HashMap<ModuleId, Rc<HashSet<String>>>>,
+    /// The items of each module in the values namespace by folded name, once gathered.
+    module_values: RefCell<HashMap<ModuleId, Rc<HashMap<String, ItemId>>>>,
     /// The typed holes of the bodies checked.
     holes: RefCell<Vec<Hole>>,
     /// The members the bodies checked name, each with the item and token writing its name.

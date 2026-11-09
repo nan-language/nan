@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use super::Checker;
 use super::db::{ItemId, ModuleId};
-use super::decl::fold;
+use super::decl::{declared_name, fold};
 use super::resolve::PathError;
 use super::sig::{FnSig, GenericDef, Problems, SigKind};
 use super::tir::{
@@ -20,7 +20,7 @@ use super::tir::{
 };
 use super::ty::{Param, Scalar, Ty};
 use super::unused::{Binding, Usage};
-use crate::diagnostic::{Code, Diagnostic, Fix, Offer};
+use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Role};
 use crate::syntax::ast::{self, ItemKind, Mode, Tok};
 
 /// The function, closure or other body whose `return`, `fail` and `try` statements act on.
@@ -476,14 +476,22 @@ impl<'c, 'a> Body<'c, 'a> {
             return;
         }
         let folded = fold(&name.text);
-        let clashes_local = visible.iter().any(|local| fold(&local.name) == folded);
-        let clashes_value = self.ck.module_values(self.module).contains(&folded);
         let clashes_scalar = self.ck.db.package_of(self.item) != self.ck.db.core()
             && Scalar::ALL.iter().any(|scalar| scalar.name() == folded);
         if clashes_scalar {
             self.report(name.token, Code::NameCoreRedefined);
-        } else if clashes_local || clashes_value {
-            self.report(name.token, Code::NameClash);
+        } else if let Some(local) = visible.iter().find(|local| fold(&local.name) == folded) {
+            let because =
+                vec![
+                    self.ck
+                        .reason(self.item, local.token, Role::Declared, local.name.clone()),
+                ];
+            self.ck
+                .report_because(self.item, name.token, Code::NameClash, because);
+        } else if let Some(&value) = self.ck.module_values(self.module).get(&folded) {
+            let declared = declared_name(self.ck.db.declaration(value)).expect("a named value");
+            self.ck
+                .report_clash(self.item, name.token, (value, declared));
         }
     }
 

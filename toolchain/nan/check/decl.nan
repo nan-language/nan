@@ -306,14 +306,22 @@ fn Checker.check_module_names(self, module: ty::ModuleId) {
 /// The names of one namespace of a module that fold equal to an earlier one's.
 fn Checker.check_folded_names(self, namespace: Slice[DeclaredName]) {
     let alloc = self.alloc()
-    var folded = mem::HashMap[text::String, ty::ItemId].empty(seed: 0, alloc)
-    for declared in namespace {
-        let earlier = mut folded.insert(fold(declared.name.text.as_str(), alloc), value: declared.item)
-        if earlier.is_some() {
-            self.report(declared.item, token: declared.name.token, code: diagnostic::Code.NameClash)
+    var folded = mem::HashMap[text::String, usize].empty(seed: 0, alloc)
+    for at in 0..<namespace.len() {
+        let declared = namespace[at]
+        match mut folded.insert(fold(declared.name.text.as_str(), alloc), value: at) {
+            Some(earlier) => self.report_clash(declared.item, token: declared.name.token, other: namespace[earlier].item, name: namespace[earlier].name)
+            None => {}
         }
     }
 } Checker.check_folded_names
+
+/// Reports a name at `token` of an item clashing with the name `name` that `other` declares.
+fn Checker.report_clash(self, item: ty::ItemId, token: u32, other: ty::ItemId, name: ast::Name) {
+    var because = mem::List[diagnostic::Reason].empty(self.alloc())
+    mut because.push(self.reason(other, token: name.token, role: diagnostic::Role.Declared, subject: text::String.of(name.text.as_str(), alloc: self.alloc())))
+    self.report_because(item, token, code: diagnostic::Code.NameClash, take because)
+} Checker.report_clash
 
 /// The members a module declares that are named like an earlier member of their type in
 /// the module, like one in another module when outside the type's module, or like a field or
@@ -766,8 +774,9 @@ fn Checker.check_generic_names(self, item: ty::ItemId, generics: Slice[ast::Gene
             self.report(item, token: param.name.token, code: diagnostic::Code.NameCoreRedefined)
         }
         let folded = fold(param.name.text.as_str(), alloc)
-        if holds_text(seen.view(), text: folded.as_str()) {
-            self.report(item, token: param.name.token, code: diagnostic::Code.NameClash)
+        match seen.position(fn(earlier: text::String) => earlier == folded) {
+            Some(earlier) => self.report_clash(item, token: param.name.token, other: item, name: generics[earlier].name)
+            None => {}
         }
         mut seen.push(take folded)
     }
@@ -1077,22 +1086,40 @@ fn Checker.check_unused_generics(self, item: ty::ItemId, sig: FnSig) {
 /// The parameters of a head: their names' convention and distinctness.
 fn Checker.check_params(self, item: ty::ItemId, params: Slice[ast::Param]) {
     let alloc = self.alloc()
-    var seen = mem::List[text::String].empty(alloc)
-    var folded = mem::List[text::String].empty(alloc)
-    for param in params {
-        let ast::ParamKind.Named(name: name, ty: _) = param.kind else {
+    var seen = mem::List[usize].empty(alloc)
+    for at in 0..<params.len() {
+        let ast::ParamKind.Named(name: name, ty: _) = params[at].kind else {
             continue
         }
         self.check_case(item, name, case: Case.Snake)
         let written = name.text.as_str()
         let folded_name = fold(written, alloc)
-        if holds_text(seen.view(), text: written) {
-            self.report(item, token: name.token, code: diagnostic::Code.ItemDuplicate)
-        } else if holds_text(folded.view(), text: folded_name.as_str()) {
-            self.report(item, token: name.token, code: diagnostic::Code.NameClash)
+        var duplicate = false
+        var clashing: Option[usize] = None
+        for earlier in seen {
+            let ast::ParamKind.Named(name: known, ty: _) = params[earlier].kind else {
+                continue
+            }
+            if known.text.as_str() == written {
+                duplicate = true
+            } else if clashing.is_none() and fold(known.text.as_str(), alloc) == folded_name {
+                clashing = Some(earlier)
+            }
         }
-        mut seen.push(text::String.of(written, alloc))
-        mut folded.push(take folded_name)
+        if duplicate {
+            self.report(item, token: name.token, code: diagnostic::Code.ItemDuplicate)
+        } else {
+            match clashing {
+                Some(earlier) => {
+                    let ast::ParamKind.Named(name: known, ty: _) = params[earlier].kind else {
+                        continue
+                    }
+                    self.report_clash(item, token: name.token, other: item, name: known)
+                }
+                None => {}
+            }
+        }
+        mut seen.push(at)
     }
 } Checker.check_params
 

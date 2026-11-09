@@ -11,8 +11,8 @@ use super::props::Property;
 use super::resolve::Named;
 use super::sig::SigKind;
 use super::ty::{Scalar, Ty};
-use crate::diagnostic::{Code, Offer};
-use crate::syntax::ast::{self, FnModifier, ItemKind, Mode};
+use crate::diagnostic::{Code, Offer, Role};
+use crate::syntax::ast::{self, FnModifier, ItemKind, Mode, Tok};
 use crate::syntax::parser::is_pascal;
 use crate::workspace::Authority;
 
@@ -37,21 +37,19 @@ pub fn in_values_namespace(item: &ast::Item) -> bool {
 }
 
 impl Checker<'_> {
-    /// The folded names of a module's items in the values namespace, which no local may fold to.
-    pub fn module_values(&self, module: ModuleId) -> Rc<HashSet<String>> {
+    /// A module's items in the values namespace by folded name, which no local may fold to, the
+    /// first declared for a name several fold to.
+    pub fn module_values(&self, module: ModuleId) -> Rc<HashMap<String, ItemId>> {
         if let Some(known) = self.module_values.borrow().get(&module) {
             return known.clone();
         }
-        let names: HashSet<String> = self
-            .db
-            .module(module)
-            .items
-            .iter()
-            .map(|item| self.db.declaration(*item))
-            .filter(|ast| in_values_namespace(ast))
-            .filter_map(declared_name)
-            .map(|declared| fold(&declared.text))
-            .collect();
+        let mut names: HashMap<String, ItemId> = HashMap::new();
+        for &item in &self.db.module(module).items {
+            let ast = self.db.declaration(item);
+            if let Some(declared) = declared_name(ast).filter(|_| in_values_namespace(ast)) {
+                names.entry(fold(&declared.text)).or_insert(item);
+            }
+        }
         let names = Rc::new(names);
         self.module_values
             .borrow_mut()
@@ -222,10 +220,10 @@ impl Checker<'_> {
             }
         }
         for namespace in [values, types] {
-            let mut folded: HashMap<String, ItemId> = HashMap::new();
+            let mut folded: HashMap<String, (ItemId, &ast::Name)> = HashMap::new();
             for (item, name) in namespace {
-                if folded.insert(fold(&name.text), item).is_some() {
-                    self.report(item, name.token, Code::NameClash);
+                if let Some((other, other_name)) = folded.insert(fold(&name.text), (item, name)) {
+                    self.report_clash(item, name.token, (other, other_name));
                 }
             }
         }
@@ -564,7 +562,7 @@ impl Checker<'_> {
     /// The generic parameters an item or method declares: their names, the type of a const
     /// parameter and where a `where` clause stands.
     fn check_generic_names(&self, item: ItemId, generics: &[ast::GenericParam]) {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<(String, &ast::Name)> = Vec::new();
         for param in generics {
             let constant = param
                 .bounds
@@ -590,10 +588,10 @@ impl Checker<'_> {
                 self.report(item, param.name.token, Code::NameCoreRedefined);
             }
             let folded = fold(&param.name.text);
-            if seen.contains(&folded) {
-                self.report(item, param.name.token, Code::NameClash);
+            if let Some((_, other)) = seen.iter().find(|(known, _)| *known == folded) {
+                self.report_clash(item, param.name.token, (item, other));
             }
-            seen.push(folded);
+            seen.push((folded, &param.name));
         }
     }
 
@@ -794,21 +792,28 @@ impl Checker<'_> {
 
     /// The parameters of a head: their names' convention and distinctness.
     fn check_params(&self, item: ItemId, params: &[ast::Param]) {
-        let mut seen: Vec<&str> = Vec::new();
-        let mut folded: Vec<String> = Vec::new();
+        let mut seen: Vec<&ast::Name> = Vec::new();
         for param in params {
             let ast::ParamKind::Named { name, .. } = &param.kind else {
                 continue;
             };
             self.check_case(item, name, Case::Snake);
-            if seen.contains(&name.text.as_str()) {
+            if seen.iter().any(|other| other.text == name.text) {
                 self.report(item, name.token, Code::ItemDuplicate);
-            } else if folded.contains(&fold(&name.text)) {
-                self.report(item, name.token, Code::NameClash);
+            } else if let Some(other) = seen
+                .iter()
+                .find(|other| fold(&other.text) == fold(&name.text))
+            {
+                self.report_clash(item, name.token, (item, other));
             }
-            seen.push(&name.text);
-            folded.push(fold(&name.text));
+            seen.push(name);
         }
+    }
+
+    /// Reports a name at `token` of an item clashing with the name `other` declares.
+    pub fn report_clash(&self, item: ItemId, token: Tok, (other, name): (ItemId, &ast::Name)) {
+        let because = vec![self.reason(other, name.token, Role::Declared, name.text.clone())];
+        self.report_because(item, token, Code::NameClash, because);
     }
 
     /// The head shape a function's or interface method's name prefix promises.

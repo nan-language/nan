@@ -665,7 +665,7 @@ The **folded form** of a name is the name with each uppercase letter made lowerc
 
 An item's generic parameters, with those of `Type` for a function named `Type.name`, are compared with each other and with its module's types. A parameter, binding or quantifier variable is compared with its module's values and with every parameter, binding and quantifier variable whose scope overlaps its own.
 
-Two compared names whose folded forms are equal are an error (`name.clash`), unless they are identical and reported as [`item.duplicate`](02-items.md#order-and-names), [`type.duplicate-member`](04-types.md#structs) or [`stmt.shadowing`](06-statements-expressions.md#bindings). A clash is reported on the generic parameter, parameter, binding or quantifier variable when exactly one of the two is one, and otherwise on the later declaration in byte order of file path and then position, an alias counting as declared before every module and a reserved alias before every `dep` alias.
+Two compared names whose folded forms are equal are an error (`name.clash`), unless they are identical and reported as [`item.duplicate`](02-items.md#order-and-names), [`type.duplicate-member`](04-types.md#structs) or [`stmt.shadowing`](06-statements-expressions.md#bindings). A clash is reported on the generic parameter, parameter, binding or quantifier variable when exactly one of the two is one, and otherwise on the later declaration in byte order of file path and then position, an alias counting as declared before every module and a reserved alias before every `dep` alias. Its because-chain holds a `declared` reason at the other name's declaration, the name its subject.
 
 ```nan
 pub const RETRY_LIMIT: u32 = 5
@@ -695,6 +695,16 @@ pub fn clamp_count(count: u32) -> u32 {
     }
     return count
 } clamp_count
+```
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error name.clash example/example.nan:5 example::clamp_count
+        let limit: u32 = LIMIT // error: name.clash
+    because declared example/example.nan:2 example::LIMIT LIMIT
+    const LIMIT: u32 = 8
+failed check example: errors 1, incomplete 0
 ```
 
 ## Name prefixes

@@ -511,6 +511,9 @@ impl Lowering<'_, '_> {
             .declare_function(routine.name(), linkage, &routine.signature())
             .expect("a support routine");
         self.routines.insert(routine, id);
+        if matches!(routine, Routine::Copy | Routine::Fill | Routine::Compare) {
+            self.keeping_none.insert(id);
+        }
         if linkage == Linkage::Local {
             self.queue.push(super::Pending::Routine(routine, id));
         }

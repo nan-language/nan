@@ -31,6 +31,7 @@ pub mod machine;
 mod place;
 mod release;
 mod runtime;
+mod slots;
 pub mod stack;
 mod supplied;
 mod symbols;
@@ -40,7 +41,7 @@ mod trap;
 mod types;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use cranelift_codegen::ir::{self, Signature, UserFuncName};
@@ -326,6 +327,9 @@ pub struct Lowering<'c, 'a> {
     /// The distinct instances lowered with one host symbol name.
     collisions: Vec<(Instance, Instance)>,
     routines: HashMap<runtime::Routine, FuncId>,
+    /// The functions that keep no address given to them once they return: the instances, the
+    /// glue and the routines over byte ranges.
+    keeping_none: HashSet<FuncId>,
     /// The instances and routines declared and not yet defined.
     queue: Vec<Pending>,
     releases: HashMap<Ty, bool>,
@@ -538,6 +542,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             named: HashMap::new(),
             collisions: Vec::new(),
             routines: HashMap::new(),
+            keeping_none: HashSet::new(),
             queue: Vec::new(),
             releases: HashMap::new(),
             release_groups: HashMap::new(),
@@ -612,6 +617,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             .declare_function(&name, Linkage::Local, &abi.signature())
             .unwrap_or_else(|error| panic!("declaring {name}: {error}"));
         self.instances.insert(instance.clone(), id);
+        self.keeping_none.insert(id);
         self.queue.push(Pending::Instance(instance, id));
         id
     }
@@ -824,6 +830,18 @@ impl<'c, 'a> Lowering<'c, 'a> {
             recorded
         };
         self.leave_definition();
+        let copy = self.routines.get(&runtime::Routine::Copy).copied();
+        let keeping_none = &self.keeping_none;
+        slots::share(&mut context.func, &|index| {
+            let id = FuncId::from_u32(index);
+            if Some(id) == copy {
+                slots::Callee::Copying
+            } else if keeping_none.contains(&id) {
+                slots::Callee::Plain
+            } else {
+                slots::Callee::Keeping
+            }
+        });
         DUMP.with(|dump| {
             if let Some(texts) = dump.borrow_mut().as_mut() {
                 let declaration = self.module.declarations().get_function_decl(id);
@@ -970,6 +988,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             _ => None,
         };
         self.glues.insert(glue, id);
+        self.keeping_none.insert(id);
         self.define(id, signature, flags, build);
         if let Some(walked) = walked {
             self.frames.last_mut().expect("the frame just defined").name = walked;

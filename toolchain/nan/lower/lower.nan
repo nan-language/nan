@@ -245,6 +245,9 @@ struct Lowering {
     /// The distinct instances lowered with one host symbol name.
     collisions: mem::List[InstanceCollision]
     routines: mem::HashMap[Routine, object::FuncId]
+    /// The functions that keep no address given to them once they return: the instances, the
+    /// glue and the routines over byte ranges.
+    keeping_none: mem::Set[object::FuncId]
     /// The instances and routines declared and not yet defined.
     queue: mem::List[Pending]
     releases: mem::HashMap[ty::Ty, bool]
@@ -486,6 +489,7 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         named: mem::HashMap[text::String, Instance].empty(seed: 0, alloc),
         collisions: mem::List[InstanceCollision].empty(alloc),
         routines: mem::HashMap[Routine, object::FuncId].empty(seed: 0, alloc),
+        keeping_none: mem::Set[object::FuncId].empty(alloc),
         queue: mem::List[Pending].empty(alloc),
         releases: mem::HashMap[ty::Ty, bool].empty(seed: 0, alloc),
         release_groups: mem::HashMap[ty::Ty, Option[usize]].empty(seed: 0, alloc),
@@ -578,6 +582,7 @@ fn Lowering.instance(mut self, take instance: Instance) -> object::FuncId {
 fn Lowering.declare_instance(mut self, take instance: Instance, name: Str, abi: Abi) -> object::FuncId {
     let id = mut self.module.declare_function(name, linkage: object::Linkage.Local, signature: abi.signature(self.alloc))
     discard mut self.instances.insert(instance.copy(self.alloc), value: id)
+    discard mut self.keeping_none.insert(id)
     mut self.queue.push(Pending.Instance(instance: take instance, id: id))
     return id
 } Lowering.declare_instance
@@ -819,8 +824,20 @@ fn Lowering.define(mut self, id: object::FuncId, take signature: clif::Signature
     build(mut self, mut fx)
     mut fx.b.seal_all_blocks()
     let Fx(b: b, sites: recorded, fn_params: _, mark: _, total_store_order: _, alloc: _) = fx
-    let built = take b.finalize()
+    var built = take b.finalize()
     mut self.leave_definition()
+    let copier = self.routines.get(Routine.Copy)
+    let plain = self.keeping_none
+    mut built.share_slots(callee: fn(index: u32) -> clif::Callee {
+        let called = object::FuncId(index: index)
+        if copier == Some(called) {
+            return clif::Callee.Copying
+        }
+        if plain.contains(called) {
+            return clif::Callee.Plain
+        }
+        return clif::Callee.Keeping
+    }, alloc: self.alloc)
     if self.dumping {
         let dumped_name = text::String.of(self.module.function_name(id), alloc: self.alloc)
         let dumped_text = built.display(self.alloc)
@@ -961,6 +978,7 @@ fn Lowering.glue_function(mut self, take glue: Glue, take signature: clif::Signa
         else => {}
     }
     discard mut self.glues.insert(take glue, value: id)
+    discard mut self.keeping_none.insert(id)
     mut self.define(id, take signature, flags, build)
     match walked {
         Some(walked_name) => {

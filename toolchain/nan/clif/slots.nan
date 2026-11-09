@@ -1,0 +1,553 @@
+//! Stack slot sharing: the slots of a function whose contents are never needed at once share one slot. A slot's contents are reached only through the addresses derived from its own, so they are needed wherever such an address is live. Slots whose addresses meet, in one call's arguments or one stored in the other, are needed together as one group. A slot is kept to itself when its address may outlive the addresses derived from it: stored outside the function's slots, or given to a callee that may keep it.
+
+/// What a callee does with the addresses given to it once it returns.
+pkg enum Callee derives Copy, Eq {
+    /// It may keep them.
+    Keeping
+    /// It keeps none.
+    Plain
+    /// It keeps none, copying the bytes at its second address to its first.
+    Copying
+} Callee
+
+/// A slot others share: the groups placed in it, its size and its alignment.
+struct Home {
+    slot: usize
+    roots: mem::List[usize]
+    size: u32
+    align_shift: u8
+} Home
+
+/// The groups of a function's slots, with the slots each address derived from slot addresses
+/// may point into: each slot's parent in its group, a group's root being its least slot;
+/// whether each slot, and once derived each group by its root, is kept to itself; whether each
+/// group, by its root, may hold an address derived from a slot address; and by value index,
+/// the slots each derived address may point into, ascending.
+struct Groups {
+    parent: mem::List[usize]
+    pinned: mem::List[bool]
+    holding: mem::List[bool]
+    derived: mem::List[mem::List[usize]]
+    changed: bool
+} Groups
+
+/// Shares the slots whose groups are never needed at once, a shared slot taking the largest
+/// size and alignment of the slots it stands for and those taking no bytes; `callee` tells by
+/// function index what a callee does with addresses.
+pkg fn Function.share_slots(mut self, callee: fn(index: u32) -> Callee, alloc: mem::Alloc) {
+    let count = self.stack_slots.len()
+    if count < 2 {
+        return
+    }
+    var parent = mem::List[usize].empty(alloc)
+    var pinned = mem::List[bool].empty(alloc)
+    var holding = mem::List[bool].empty(alloc)
+    for slot in 0..<count {
+        mut parent.push(slot)
+        mut pinned.push(false)
+        mut holding.push(false)
+    }
+    var derived = mem::List[mem::List[usize]].empty(alloc)
+    for _ in 0..<self.dfg.values.len() {
+        mut derived.push(mem::List[usize].empty(alloc))
+    }
+    var groups = Groups(parent: take parent, pinned: take pinned, holding: take holding, derived: take derived, changed: false)
+    self.derive(mut groups, callee, alloc)
+    let needed = self.needed(groups, alloc)
+    var homes = mem::List[Home].empty(alloc)
+    let moved = self.placed(groups, needed: needed.view(), homes: mut homes, alloc)
+    if moved.position(fn(home: Option[usize]) => home.is_some()).is_none() {
+        return
+    }
+    for home in homes {
+        self.stack_slots[home.slot] = StackSlotData(size: home.size, align_shift: home.align_shift)
+    }
+    for slot in 0..<count {
+        if moved[slot].is_some() {
+            self.stack_slots[slot] = StackSlotData(size: 0, align_shift: 0)
+        }
+    }
+    for block in self.layout_blocks(alloc) {
+        for inst in self.block_insts(block, alloc) {
+            let at = usize.widen(inst.index)
+            let InstructionData.StackLoad(opcode: opcode, slot: slot, offset: offset) = self.dfg.insts[at] else {
+                continue
+            }
+            if opcode != Opcode.StackAddr {
+                continue
+            }
+            let Some(home) = moved[usize.widen(slot.index)] else {
+                continue
+            }
+            self.dfg.insts[at] = InstructionData.StackLoad(opcode: opcode, slot: StackSlot(index: u32.fit(home)), offset: offset)
+        }
+    }
+} Function.share_slots
+
+/// The slot each slot, in index order, is placed in when another's, none when its own: the
+/// first of `homes` none of whose groups is its group or is needed where its group is, which
+/// grows to fit it, or else a new one of `homes`; a pinned group's slots stay their own.
+fn Function.placed(self, groups: Groups, needed: Slice[mem::List[u64]], mut homes: mem::List[Home], alloc: mem::Alloc) -> mem::List[Option[usize]] {
+    var moved = mem::List[Option[usize]].empty(alloc)
+    for slot in 0..<self.stack_slots.len() {
+        mut moved.push(None)
+        let root = groups.root(slot)
+        if groups.pinned[root] {
+            continue
+        }
+        let data = self.stack_slots[slot]
+        var fitting: Option[usize] = None
+        for at in 0..<homes.len() {
+            if fitting.is_none() and fits(homes[at].roots.view(), root, needed) {
+                fitting = Some(at)
+            }
+        }
+        let Some(at) = fitting else {
+            var roots = mem::List[usize].empty(alloc)
+            mut roots.push(root)
+            mut homes.push(Home(slot: slot, roots: take roots, size: data.size, align_shift: data.align_shift))
+            continue
+        }
+        var home = mut homes.at_mut(at)
+        if data.size > home.size {
+            home.size = data.size
+        }
+        if data.align_shift > home.align_shift {
+            home.align_shift = data.align_shift
+        }
+        mut home.roots.push(root)
+        moved[slot] = Some(home.slot)
+    }
+    return moved
+} Function.placed
+
+/// Whether a group fits in a slot holding groups: it is none of them and is needed where none
+/// of them is.
+fn fits(roots: Slice[usize], root: usize, needed: Slice[mem::List[u64]]) -> bool {
+    for other in roots {
+        if other == root or meets(needed[other].view(), right: needed[root].view()) {
+            return false
+        }
+    }
+    return true
+} fits
+
+/// Whether two sets of program points share one.
+fn meets(left: Slice[u64], right: Slice[u64]) -> bool {
+    for at in 0..<left.len() {
+        if (left[at] & right[at]) != 0 {
+            return true
+        }
+    }
+    return false
+} meets
+
+fn Groups.root(self, slot: usize) -> usize {
+    var at = slot
+    while self.parent[at] != at {
+        at = self.parent[at]
+    }
+    return at
+} Groups.root
+
+/// Places slots in one group, which holds an address when one of theirs does.
+fn Groups.unite(mut self, slots: Slice[usize]) {
+    if slots.len() < 2 {
+        return
+    }
+    for at in 1..<slots.len() {
+        let left = self.root(slots[at - 1])
+        let right = self.root(slots[at])
+        if left != right {
+            var low = left
+            var high = right
+            if right < left {
+                low = right
+                high = left
+            }
+            self.parent[high] = low
+            self.holding[low] = self.holding[low] or self.holding[high]
+            self.changed = true
+        }
+    }
+} Groups.unite
+
+/// Marks the groups of slots as holding an address.
+fn Groups.hold(mut self, slots: Slice[usize]) {
+    for slot in slots {
+        let root = self.root(slot)
+        if not self.holding[root] {
+            self.holding[root] = true
+            self.changed = true
+        }
+    }
+} Groups.hold
+
+/// Keeps slots to themselves.
+fn Groups.pin(mut self, slots: Slice[usize]) {
+    for slot in slots {
+        if not self.pinned[slot] {
+            self.pinned[slot] = true
+            self.changed = true
+        }
+    }
+} Groups.pin
+
+/// The slots values may point into, ascending.
+fn Groups.slots_of(self, values: Slice[Value], alloc: mem::Alloc) -> mem::List[usize] {
+    var slots = mem::List[usize].empty(alloc)
+    for value in values {
+        for slot in self.derived[usize.widen(value.index)] {
+            mut slots.push(slot)
+        }
+    }
+    return ascending(take slots, alloc)
+} Groups.slots_of
+
+/// Adds slots to those a value may point into.
+fn Groups.derive_value(mut self, value: Value, slots: Slice[usize], alloc: mem::Alloc) {
+    if slots.len() == 0 {
+        return
+    }
+    let at = usize.widen(value.index)
+    var known = mem::List[usize].empty(alloc)
+    for slot in self.derived[at] {
+        mut known.push(slot)
+    }
+    let before = known.len()
+    for slot in slots {
+        mut known.push(slot)
+    }
+    let merged = ascending(take known, alloc)
+    if merged.len() != before {
+        self.changed = true
+    }
+    self.derived[at] = merged
+} Groups.derive_value
+
+/// Values in ascending order, each once.
+fn ascending(take values: mem::List[usize], alloc: mem::Alloc) -> mem::List[usize] {
+    var sorted = values
+    mut sorted.sort_by(fn(left: usize, right: usize) => left.cmp(right))
+    var distinct = mem::List[usize].empty(alloc)
+    for value in sorted {
+        let count = distinct.len()
+        if count == 0 or distinct[count - 1] != value {
+            mut distinct.push(value)
+        }
+    }
+    return distinct
+} ascending
+
+/// The slots given to a copy, which holds an address when its source does.
+fn Groups.copied(mut self, given: Slice[usize], source: bool) {
+    mut self.unite(given)
+    if source {
+        mut self.hold(given)
+    }
+} Groups.copied
+
+/// The slots given to a callee that keeps none: they meet, and when several are given, the
+/// callee may store one's address in another.
+fn Groups.called(mut self, given: Slice[usize]) {
+    mut self.unite(given)
+    if given.len() > 1 {
+        mut self.hold(given)
+    }
+} Groups.called
+
+/// The slots a value read at an address may point into: those of the address's group when it
+/// holds addresses.
+fn Groups.read(self, address: Value, alloc: mem::Alloc) -> mem::List[usize] {
+    var single = mem::List[Value].empty(alloc)
+    mut single.push(address)
+    let slots = self.slots_of(single.view(), alloc)
+    for slot in slots {
+        if self.holding[self.root(slot)] {
+            return slots
+        }
+    }
+    return mem::List[usize].empty(alloc)
+} Groups.read
+
+/// A value stored at an address: a slot address stored in a slot's memory unites them in a
+/// group holding addresses, and one stored anywhere else is kept.
+fn Groups.stored(mut self, value: Value, address: Value, alloc: mem::Alloc) {
+    var single = mem::List[Value].empty(alloc)
+    mut single.push(value)
+    let kept = self.slots_of(single.view(), alloc)
+    if kept.len() == 0 {
+        return
+    }
+    single[0] = address
+    var holding = self.slots_of(single.view(), alloc)
+    if holding.len() == 0 {
+        mut self.pin(kept.view())
+        return
+    }
+    for slot in kept {
+        mut holding.push(slot)
+    }
+    let met = ascending(take holding, alloc)
+    mut self.unite(met.view())
+    mut self.hold(met.view())
+} Groups.stored
+
+/// The operands of an instruction, aliases resolved: its arguments, then those it passes to
+/// its branch targets.
+fn Function.operands(self, inst: Inst, alloc: mem::Alloc) -> mem::List[Value] {
+    var operands = mem::List[Value].empty(alloc)
+    for value in self.dfg.inst_data(inst).values(alloc) {
+        mut operands.push(self.dfg.resolve_aliases(value))
+    }
+    return operands
+} Function.operands
+
+/// Follows slot addresses through the function until nothing changes: into the values computed
+/// from them, the results of calls given them, block parameters and what a load reads from a
+/// group holding addresses; uniting the slots that meet in a call or in memory, and pinning
+/// those that a store or a callee may keep.
+fn Function.derive(self, mut groups: Groups, callee: fn(index: u32) -> Callee, alloc: mem::Alloc) {
+    loop {
+        groups.changed = false
+        for block in self.layout_blocks(alloc) {
+            for inst in self.block_insts(block, alloc) {
+                let reached = self.reached(inst, mut groups, callee, alloc)
+                for result in self.dfg.inst_results(inst, alloc) {
+                    mut groups.derive_value(result, slots: reached.view(), alloc)
+                }
+            }
+        }
+        if not groups.changed {
+            break
+        }
+    }
+    for slot in 0..<groups.pinned.len() {
+        if groups.pinned[slot] {
+            let root = groups.root(slot)
+            groups.pinned[root] = true
+        }
+    }
+} Function.derive
+
+/// The slots an instruction's results may point into, after what it does with the slot
+/// addresses it reads.
+fn Function.reached(self, inst: Inst, mut groups: Groups, callee: fn(index: u32) -> Callee, alloc: mem::Alloc) -> mem::List[usize] {
+    let args = self.operands(inst, alloc)
+    match self.dfg.inst_data(inst) {
+        InstructionData.StackLoad(opcode: opcode, slot: slot, offset: _) => {
+            if opcode == Opcode.StackAddr {
+                var reached = mem::List[usize].empty(alloc)
+                mut reached.push(usize.widen(slot.index))
+                return reached
+            }
+        }
+        InstructionData.Load(opcode: _, flags: _, arg: _, offset: _) or InstructionData.LoadNoOffset(opcode: _, flags: _, arg: _) => return groups.read(args[0], alloc)
+        InstructionData.Store(opcode: _, flags: _, x: _, p: _, offset: _) or InstructionData.StoreNoOffset(opcode: _, flags: _, x: _, p: _) => {
+            mut groups.stored(args[0], address: args[1], alloc)
+            return groups.read(args[1], alloc)
+        }
+        InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: _, x: _) => {
+            mut groups.stored(args[1], address: args[0], alloc)
+            return groups.read(args[0], alloc)
+        }
+        InstructionData.AtomicCas(opcode: _, flags: _, p: _, e: _, x: _) => {
+            mut groups.stored(args[2], address: args[0], alloc)
+            return groups.read(args[0], alloc)
+        }
+        InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => {
+            let given = groups.slots_of(args.view(), alloc)
+            expect usize.widen(func_ref.index) < self.dfg.ext_funcs.len()
+            match callee(self.dfg.ext_funcs[usize.widen(func_ref.index)].name.index) {
+                Callee.Keeping => mut groups.pin(given.view())
+                Callee.Plain => mut groups.called(given.view())
+                Callee.Copying => mut groups.copied(given.view(), source: groups.read(args[1], alloc).len() > 0)
+            }
+            return given
+        }
+        InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => {
+            let given = groups.slots_of(args.view(), alloc)
+            mut groups.called(given.view())
+            return given
+        }
+        InstructionData.Jump(opcode: _, destination: destination) => self.pass_to(destination, mut groups, alloc)
+        InstructionData.Brif(opcode: _, arg: _, then: then, otherwise: otherwise) => {
+            self.pass_to(then, mut groups, alloc)
+            self.pass_to(otherwise, mut groups, alloc)
+        }
+        else => {}
+    }
+    return groups.slots_of(args.view(), alloc)
+} Function.reached
+
+/// Derives each parameter of a branch target from the value passed to it.
+fn Function.pass_to(self, call: BlockCall, mut groups: Groups, alloc: mem::Alloc) {
+    let params = self.dfg.blocks[usize.widen(call.block.index)]
+    var single = mem::List[Value].empty(alloc)
+    mut single.push(Value(index: 0))
+    for at in 0..<params.len() {
+        if at >= call.args.len() {
+            break
+        }
+        single[0] = self.dfg.resolve_aliases(call.args[at])
+        let slots = groups.slots_of(single.view(), alloc)
+        mut groups.derive_value(params[at], slots: slots.view(), alloc)
+    }
+} Function.pass_to
+
+/// The program points, numbered in layout order, at which each group, by its root, is needed:
+/// where an address derived from one of its slots is defined, used or live.
+fn Function.needed(self, groups: Groups, alloc: mem::Alloc) -> mem::List[mem::List[u64]] {
+    let blocks = self.layout_blocks(alloc)
+    var starts = mem::List[usize].empty(alloc)
+    var points: usize = 0
+    for block in blocks {
+        mut starts.push(points)
+        points += self.laid.block_insts(block).len()
+    }
+    let successors = self.successors(blocks.view(), alloc)
+    let live_in = self.live_in(blocks.view(), successors: successors.view(), groups, alloc)
+    var needed = mem::List[mem::List[u64]].empty(alloc)
+    let words = (points + 63) / 64
+    for _ in 0..<groups.parent.len() {
+        var group = mem::List[u64].empty(alloc)
+        for _ in 0..<words {
+            mut group.push(0)
+        }
+        mut needed.push(take group)
+    }
+    for at in 0..<blocks.len() {
+        var live = live_out(successors[at].view(), live_in: live_in.view(), alloc)
+        let insts = self.laid.block_insts(blocks[at])
+        for back in 0..<insts.len() {
+            let offset = insts.len() - 1 - back
+            self.mark_inst(insts[offset], point: starts[at] + offset, live: mut live, needed: mut needed, groups, alloc)
+        }
+    }
+    return needed
+} Function.needed
+
+/// The positions in the layout of each block's successors.
+fn Function.successors(self, blocks: Slice[Block], alloc: mem::Alloc) -> mem::List[mem::List[usize]] {
+    var successors = mem::List[mem::List[usize]].empty(alloc)
+    for block in blocks {
+        var targets = mem::List[usize].empty(alloc)
+        let Some(last) = self.laid.last_inst(block) else {
+            mut successors.push(take targets)
+            continue
+        }
+        match self.dfg.inst_data(last) {
+            InstructionData.Jump(opcode: _, destination: destination) => mut targets.push(position_of(blocks, block: destination.block))
+            InstructionData.Brif(opcode: _, arg: _, then: then, otherwise: otherwise) => {
+                mut targets.push(position_of(blocks, block: then.block))
+                mut targets.push(position_of(blocks, block: otherwise.block))
+            }
+            else => {}
+        }
+        mut successors.push(take targets)
+    }
+    return successors
+} Function.successors
+
+/// The derived addresses live into each block, until nothing changes.
+fn Function.live_in(self, blocks: Slice[Block], successors: Slice[mem::List[usize]], groups: Groups, alloc: mem::Alloc) -> mem::List[mem::Set[Value]] {
+    var live_in = mem::List[mem::Set[Value]].empty(alloc)
+    for _ in blocks {
+        mut live_in.push(mem::Set[Value].empty(alloc))
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for position in 0..<blocks.len() {
+            let at = blocks.len() - 1 - position
+            var live = live_out(successors[at].view(), live_in: live_in.view(), alloc)
+            let insts = self.laid.block_insts(blocks[at])
+            for back in 0..<insts.len() {
+                self.live_before(insts[insts.len() - 1 - back], live: mut live, groups, alloc)
+            }
+            for param in self.dfg.blocks[usize.widen(blocks[at].index)] {
+                discard mut live.remove(param)
+            }
+            if live.len() != live_in[at].len() {
+                live_in[at] = live
+                changed = true
+            }
+        }
+    }
+    return live_in
+} Function.live_in
+
+/// The derived addresses live before an instruction, from those live after it.
+fn Function.live_before(self, inst: Inst, mut live: mem::Set[Value], groups: Groups, alloc: mem::Alloc) {
+    for result in self.dfg.inst_results(inst, alloc) {
+        discard mut live.remove(result)
+    }
+    for value in self.operands(inst, alloc) {
+        if groups.derived[usize.widen(value.index)].len() > 0 {
+            discard mut live.insert(value)
+        }
+    }
+} Function.live_before
+
+/// Marks an instruction's point as one at which the groups of the derived addresses it defines,
+/// uses or keeps live are needed, then makes `live` those live before it.
+fn Function.mark_inst(self, inst: Inst, point: usize, mut live: mem::Set[Value], mut needed: mem::List[mem::List[u64]], groups: Groups, alloc: mem::Alloc) {
+    var results = mem::List[Value].empty(alloc)
+    for result in self.dfg.inst_results(inst, alloc) {
+        if groups.derived[usize.widen(result.index)].len() > 0 {
+            mut results.push(result)
+        }
+    }
+    var used = mem::List[Value].empty(alloc)
+    for value in self.operands(inst, alloc) {
+        if groups.derived[usize.widen(value.index)].len() > 0 {
+            mut used.push(value)
+        }
+    }
+    for value in live {
+        mark(mut needed, groups, value, point)
+    }
+    for value in results {
+        mark(mut needed, groups, value, point)
+    }
+    for value in used {
+        mark(mut needed, groups, value, point)
+    }
+    for result in results {
+        discard mut live.remove(result)
+    }
+    for value in used {
+        discard mut live.insert(value)
+    }
+} Function.mark_inst
+
+/// Marks a point as one at which the groups of the slots a value may point into are needed.
+fn mark(mut needed: mem::List[mem::List[u64]], groups: Groups, value: Value, point: usize) {
+    for slot in groups.derived[usize.widen(value.index)] {
+        let root = groups.root(slot)
+        var words = mut needed.at_mut(root)
+        words[point / 64] = words[point / 64] | (1u64 << u32.fit(point % 64))
+    }
+} mark
+
+/// The position of a block in the layout.
+fn position_of(blocks: Slice[Block], block: Block) -> usize {
+    for at in 0..<blocks.len() {
+        if blocks[at] == block {
+            return at
+        }
+    }
+    expect false
+    return 0
+} position_of
+
+/// The values live out of a block: those live into its successors.
+fn live_out(successors: Slice[usize], live_in: Slice[mem::Set[Value]], alloc: mem::Alloc) -> mem::Set[Value] {
+    var live = mem::Set[Value].empty(alloc)
+    for successor in successors {
+        for value in live_in[successor] {
+            discard mut live.insert(value)
+        }
+    }
+    return live
+} live_out

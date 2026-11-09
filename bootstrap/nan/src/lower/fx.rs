@@ -176,8 +176,10 @@ impl<'f> Fx<'f> {
         self.b.ins().iadd(addr, offset)
     }
 
-    /// A new stack area of `size` bytes aligned to `align`, by its address.
+    /// A new stack area of `size` bytes aligned to `align`, or to 16 when it holds 16 bytes or
+    /// more, as vector instructions reading an operand from memory need, by its address.
     pub fn slot(&mut self, size: u64, align: u64) -> Value {
+        let align = if size >= 16 { align.max(16) } else { align };
         let shift = align.max(1).trailing_zeros() as u8;
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,

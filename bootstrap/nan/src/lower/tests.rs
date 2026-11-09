@@ -292,3 +292,32 @@ fn x64_stores_exchange_rather_than_fence() {
         assert_eq!(stores, fenced, "{target}");
     }
 }
+
+#[test]
+fn slots_of_values_never_needed_at_once_are_shared() {
+    let calls: String = (0..16)
+        .map(|offset| format!("    total = total.wrapping_add(make(seed + {offset}).words[0])\n"))
+        .collect();
+    let source = format!(
+        "//! Frames.\n\n/// A value of 1 KiB.\npub closed struct Big {{\n    pub words: Array[u64, 128]\n}} Big\n\n/// A large value from `seed`.\npub fn make(seed: u64) -> Big {{\n    return Big(words: Array[u64, 128].filled(seed))\n}} make\n\n/// Sixteen calls giving large values, one after the other.\npub fn sixteen(seed: u64) -> u64 {{\n    var total: u64 = 0\n{calls}    return total\n}} sixteen\n\nfn main(take world: host::World) fails task::Cancelled uses wait {{\n    world.log.info(\"total\", value: sixteen(1))\n}} main\n"
+    );
+    let scratch = Scratch::new(&[
+        (
+            "frames/package.nan",
+            "//! Frames.\n\npackage frames {\n    language 1\n    targets x86_64-host\n    entry main\n} frames\n",
+        ),
+        ("frames/frames.nan", &source),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let texts = crate::final_build::lowered_functions(&workspace, 0);
+    let (_, text) = texts
+        .iter()
+        .find(|(name, _)| name.ends_with("7sixteenE"))
+        .expect("the function");
+    let bytes: u64 = text
+        .lines()
+        .filter_map(|line| line.split("explicit_slot ").nth(1))
+        .filter_map(|rest| rest.split(',').next()?.trim().parse::<u64>().ok())
+        .sum();
+    assert!(bytes < 4 * 1024, "{bytes} bytes of slots\n{text}");
+}

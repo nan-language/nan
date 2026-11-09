@@ -12,7 +12,7 @@ use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, type
 
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::machine::{Stub, start};
+use super::super::machine::{Stub, heap, start};
 use super::super::runtime::tasks::task;
 use super::super::runtime::{Routine, report, state};
 use super::super::{Glue, Lowering};
@@ -47,6 +47,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
         "boot::Kernel.policy" => lo.install_policy(fx, supply),
         "boot::Module.contents" => module_contents(lo, fx, supply),
+        "boot::Module.clear" => {
+            let (base, len) = module_extent(lo, fx, supply);
+            heap::clear(lo, fx, base, len);
+            supply.done(lo, fx);
+        }
         "boot::start_info" => {
             let info = lo.start_info(fx);
             supply.ret(lo, fx, Held::Scalar(info));
@@ -310,14 +315,21 @@ fn modules(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, Held::Address(list));
 }
 
-/// `module.contents()`: a view of the module's memory.
-fn module_contents(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+/// The address and length of the bytes of the module the operation's receiver is.
+fn module_extent(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> (Value, Value) {
     let module = supply.param(0).address();
     let module_ty = supply.owner.clone().expect("the module type");
     let region_at = lo.layouts.field(lo.ck, &module_ty, None, "region").offset;
     let region = fx.offset(module, region_at);
-    let base = fx.load(PTR, region, region::BASE);
-    let len = fx.load(PTR, region, region::LEN);
+    (
+        fx.load(PTR, region, region::BASE),
+        fx.load(PTR, region, region::LEN),
+    )
+}
+
+/// `module.contents()`: a view of the module's memory.
+fn module_contents(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let (base, len) = module_extent(lo, fx, supply);
     let sret = supply.sret.expect("a view's address");
     fx.store(base, sret, 0);
     fx.store(len, sret, 8);

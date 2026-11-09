@@ -327,3 +327,17 @@ fn a_changed_path_dependency_runs_the_affected_tests_of_a_sync_and_refuses_runs_
         "{tested}"
     );
 }
+
+#[test]
+fn a_test_reaching_a_rejected_item_reports_its_errors_and_runs_nothing() {
+    let broken = HALVES.replace("value / 2", "value / true");
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &broken)]);
+    let run = run_in(&scratch.0, "test app::halves");
+    assert!(
+        run.output.starts_with(
+            "failed test app::halves: errors 1, incomplete 0, tests 0, failed 0\nerror type.mismatch app/app.nan:4 app::half\n"
+        ),
+        "{}",
+        run.output
+    );
+}

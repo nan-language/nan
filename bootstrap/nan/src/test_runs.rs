@@ -8,7 +8,7 @@ mod setup;
 mod shrink;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
 use crate::cache::{Cache, Exposed};
@@ -206,6 +206,20 @@ fn run_target(
             by_package.entry(package.0).or_default().push(selected);
         }
     }
+    let rejected = rejected_reach(checker, by_package.values().flatten());
+    if !rejected.is_empty() {
+        for item in rejected {
+            let data = checker.db.item(item);
+            let lines = data.syntax().item_lines(&data.syntax().items[data.index]);
+            let on_item = Scope::Lines(data.file.path.clone(), lines);
+            report.diagnostics.extend(
+                check::reported(workspace, &on_item)
+                    .into_iter()
+                    .filter(|diagnostic| diagnostic.code.class() == Class::Error),
+            );
+        }
+        return Ok(Ok(()));
+    }
     let mut planned = Vec::new();
     for (package, tests) in by_package {
         let package = PackageId(package);
@@ -261,6 +275,20 @@ fn run_target(
         )?;
     }
     Ok(Ok(()))
+}
+
+/// The items the checker rejects in the reach of the selected tests.
+fn rejected_reach<'a>(
+    checker: &Checker,
+    tests: impl Iterator<Item = &'a Selected>,
+) -> BTreeSet<ItemId> {
+    let reach: BTreeSet<ItemId> = tests
+        .flat_map(|test| checker.test_reach(test.item))
+        .collect();
+    reach
+        .into_iter()
+        .filter(|item| checker.rejected(*item))
+        .collect()
 }
 
 /// The name of the cache record of a test's passes on a checker's target.

@@ -613,8 +613,7 @@ impl Checker<'_> {
     }
 
     /// Whether the checker reports an error on a line of an item. Before every package is
-    /// checked, and for an item of a package a narrowed check leaves out, the item is judged
-    /// alone.
+    /// checked, and for an item of a package the check leaves out, the item is judged alone.
     pub fn rejected(&self, item: ItemId) -> bool {
         if !self.judged_all.get() || self.leaves_out(self.db.package_of(item)) {
             self.judge_alone(item);
@@ -622,13 +621,15 @@ impl Checker<'_> {
         self.rejections.borrow().contains(&item)
     }
 
-    /// Whether the check is narrowed to another package than one it reports on.
+    /// Whether the check leaves out a package it reports on: one it is not checked under the
+    /// checker's target, or another than the one the check is narrowed to.
     fn leaves_out(&self, package: PackageId) -> bool {
         let data = self.db.package(package);
         let narrowed = self.narrowed.map(crate::workspace::Member::Source);
         !data.carried
             && !data.quiet
-            && narrowed.is_some_and(|narrowed| data.member != Some(narrowed))
+            && (!check_targets(data.source).contains(&self.db.target)
+                || narrowed.is_some_and(|narrowed| data.member != Some(narrowed)))
     }
 
     /// Checks an item unless it is checked, judging it alone: rejected when its syntax errors or

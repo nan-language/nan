@@ -231,9 +231,9 @@ pub fn offer(
 
 /// Whether a fix of `fixed` passes the re-check: no diagnostic of its code left on its construct
 /// or a replacement, and each error either one the workspace reported before or one the fixed
-/// diagnostic kept unchecked, beside the replacements: anywhere for a declaration, whose uses
-/// depend on it, and otherwise later in its item or on its line than its failing token, or than
-/// its construct's start when the parse did not fail.
+/// diagnostic kept unchecked, beside the replacements: a syntax failure only when it is one,
+/// anywhere for a declaration, whose uses depend on it, and otherwise later in its item or on its
+/// line than its failing token, or than its construct's start when the parse did not fail.
 fn passes(
     workspace: &Workspace,
     fixed: &Diagnostic,
@@ -292,6 +292,9 @@ fn passes(
             .zip(fixed.span)
             .is_some_and(|(path, (start, _))| declares(workspace, path, start));
     let masked = |diagnostic: &Diagnostic| {
+        if diagnostic.failing.is_some() && fixed.failing.is_none() {
+            return false;
+        }
         if declaration {
             return true;
         }

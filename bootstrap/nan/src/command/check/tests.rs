@@ -137,6 +137,25 @@ fn a_rewrite_checks_with_the_try_its_outermost_call_needs() {
 }
 
 #[test]
+fn a_fix_introducing_a_syntax_failure_is_not_offered() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Lengths.\n\npub fn length(input: Slice[u8]) -> usize {\n    var rest = input\n    return rest.len()\n} length\n",
+        ),
+    ]);
+    let run = run_in(&scratch.0, "check");
+    assert!(
+        run.output.ends_with(
+            "\n    fix 1 app/app.nan\n    - pub fn length(input: Slice[u8]) -> usize {\n    + pub fn length(take input: Slice[u8]) -> usize {\nfailed check .: errors 1, incomplete 0\n"
+        ),
+        "{}",
+        run.output
+    );
+}
+
+#[test]
 fn a_prefix_reports_no_binding_its_open_scope_may_still_use() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),

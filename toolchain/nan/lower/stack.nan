@@ -1,4 +1,4 @@
-//! Stack limits: the frame size and call sites of each lowered function, the `stack N` demands on lowered functions and function values, the final build's judging of each demand, and the stack each grown call needs.
+//! Stack limits: the frame size and call sites of each lowered function, the `stack N` demands on lowered functions and function values, the final build's judging of each demand, the stack each grown call needs, and what the routine reserve of a task's stack holds.
 
 /// The stub call bound of every concrete target: the most of its caller's stack a call of a
 /// support routine or compiler stub uses.
@@ -26,8 +26,17 @@ enum StackKind {
     Param(usize)
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option[u64])
-    /// A call of a support routine, a compiler stub or the C library.
+    /// A call of a compiler stub, the C library or a support routine another image defines.
     Stub
+    /// A call of a support routine the image defines, which a stack use counts as a stub's: the
+    /// rest of its use lies in the routine reserve of a task's stack.
+    Routine(object::FuncId)
+    /// A support routine's call of a glue of a family, through an address a record holds.
+    Glues(StackFamily)
+    /// A call of code that the usable part of the stack it runs on holds but for the support
+    /// routines it calls: an entry glue's call of its task's entry, or a grown or nested call's
+    /// call of its thunk where the stack has room for its need.
+    Usable
     /// A grown call: a call of a wrapper, which calls its thunk through the support routine
     /// growing the stack, the thunk making the call `inner` describes.
     Grown(wrapper: object::FuncId, thunk: object::FuncId, inner: mem::Box[StackKind])
@@ -36,6 +45,36 @@ enum StackKind {
     /// unbounded.
     Nested(object::FuncId)
 } StackKind
+
+/// The families of glues support routines call through addresses.
+enum StackFamily derives Copy, Eq, Hash {
+    /// The glue a task starts with: an entry glue, or another glue, which the usable part of
+    /// the task's stack holds but for the routines it calls.
+    Task
+    /// The glue a task runs once its entry has ended.
+    End
+    /// The glue an executor thread runs once a task has ended.
+    Done
+    /// The glue withdrawing a stopped task's wait.
+    Withdraw
+    /// The glue writing a value in a trap report.
+    Written
+    /// The walk moving a value into another domain's reach.
+    Transfer
+    /// The walk moving a task closure's captures into another domain's reach.
+    Captures
+    /// The glue calling a hook of a kernel policy, which a CPU never calls while a hook runs on
+    /// it.
+    Policy
+    /// The release of a value of a type.
+    Release
+} StackFamily
+
+/// A glue or release support routines call through addresses, with its family.
+struct FamilyGlue derives Copy {
+    family: StackFamily
+    function: object::FuncId
+} FamilyGlue
 
 /// A grown call's thunk and the lowered function it calls, none for a function value's code.
 struct Grown derives Copy {
@@ -193,18 +232,31 @@ pkg fn stack_judge(ck: check::Checker, all_frames: Slice[Frame], demands: Slice[
 } stack_judge
 
 /// What judging the frames of a final build's lowered functions keeps: the index of each
-/// function's frame, the stack uses known so far and the functions being judged.
+/// function's frame, the stack uses known so far, the functions being judged, whether a policy
+/// hook runs where the function judged is called, and when judging what the routine reserve
+/// holds, the glues of each family and what a call of code the usable part holds uses beyond it.
 struct Judge {
     positions: mem::HashMap[object::FuncId, usize]
     known: mem::HashMap[UseKey, Use]
-    active: mem::List[object::FuncId]
+    active: mem::List[ActiveCall]
+    hooked: bool
+    glues: mem::List[FamilyGlue]
+    beneath: Option[u64]
     alloc: mem::Alloc
 } Judge
 
-/// A function and the bounds of its function-typed parameters, by position.
+/// A function of the path judged, with whether a policy hook runs there.
+struct ActiveCall derives Copy, Eq {
+    function: object::FuncId
+    hooked: bool
+} ActiveCall
+
+/// A function, the bounds of its function-typed parameters, by position, and whether a policy
+/// hook runs where it is called.
 struct UseKey derives Eq, Hash {
     function: object::FuncId
     bounds: mem::List[ParamBound]
+    hooked: bool
 } UseKey
 
 /// A judge of frames, each found by its function.
@@ -213,7 +265,7 @@ fn Judge.of(all_frames: Slice[Frame], alloc: mem::Alloc) -> Judge {
     for index in 0..<all_frames.len() {
         discard mut positions.insert(all_frames[index].function, value: index)
     }
-    return Judge(positions: take positions, known: mem::HashMap[UseKey, Use].empty(seed: 0, alloc), active: mem::List[object::FuncId].empty(alloc), alloc: alloc)
+    return Judge(positions: take positions, known: mem::HashMap[UseKey, Use].empty(seed: 0, alloc), active: mem::List[ActiveCall].empty(alloc), hooked: false, glues: mem::List[FamilyGlue].empty(alloc), beneath: None, alloc: alloc)
 } Judge.of
 
 /// The bounds a function's parameters have when it is judged on its own, none for a function
@@ -241,7 +293,7 @@ fn Judge.demand(mut self, ck: check::Checker, all_frames: Slice[Frame], demand: 
     expect position < all_frames.len()
     let frame = all_frames[position]
     let bounds = own_bounds(frame, alloc: self.alloc)
-    mut self.active.push(function)
+    mut self.active.push(ActiveCall(function: function, hooked: self.hooked))
     var deepest_bytes: u64 = 0
     var deepest_path = mem::List[CallStep].empty(self.alloc)
     var unbounded = mem::List[UnboundedCall].empty(self.alloc)
@@ -313,14 +365,15 @@ fn extend_found(mut found: mem::List[diagnostic::Diagnostic], take reported: Opt
 
 /// The stack use of a function whose function-typed parameters have bounds, by position.
 fn Judge.function(mut self, all_frames: Slice[Frame], function: object::FuncId, bounds: Slice[ParamBound]) -> Use {
-    if self.active.position(fn(value: object::FuncId) => value == function).is_some() {
+    let call = ActiveCall(function: function, hooked: self.hooked)
+    if self.active.position(fn(value: ActiveCall) => value == call).is_some() {
         return Use.Unbounded(mem::List[CallStep].empty(self.alloc))
     }
     var key_bounds = mem::List[ParamBound].empty(self.alloc)
     for bound in bounds {
         mut key_bounds.push(bound.copy(self.alloc))
     }
-    let key = UseKey(function: function, bounds: take key_bounds)
+    let key = UseKey(function: function, bounds: take key_bounds, hooked: self.hooked)
     match self.known.get(key) {
         Some(known) => return known.copy(self.alloc)
         None => {}
@@ -330,7 +383,7 @@ fn Judge.function(mut self, all_frames: Slice[Frame], function: object::FuncId, 
     }
     expect position < all_frames.len()
     let frame = all_frames[position]
-    mut self.active.push(function)
+    mut self.active.push(call)
     var deepest_bytes: u64 = 0
     var deepest_path = mem::List[CallStep].empty(self.alloc)
     var unbounded: Option[mem::List[CallStep]] = None
@@ -367,6 +420,17 @@ fn settled_use(take unbounded: Option[mem::List[CallStep]], own_size: u64, deepe
 fn Judge.site(mut self, all_frames: Slice[Frame], kind: StackKind, bounds: Slice[ParamBound]) -> Use {
     match kind {
         StackKind.Stub => return Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
+        StackKind.Routine(callee) => {
+            if self.beneath.is_none() {
+                return Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
+            }
+            return mut self.function(all_frames, function: callee, bounds: mem::List[ParamBound].empty(self.alloc).view())
+        }
+        StackKind.Glues(family) => return mut self.glues_use(all_frames, family)
+        StackKind.Usable => return match self.beneath {
+            Some(beneath) => Use.Bounded(bytes: beneath, path: mem::List[CallStep].empty(self.alloc))
+            None => Use.Unbounded(mem::List[CallStep].empty(self.alloc))
+        }
         StackKind.Grown(wrapper: wrapper, thunk: thunk, inner: inner) => {
             return match mut self.site(all_frames, kind: inner.contents(), bounds) {
                 Use.Bounded(bytes: used_bytes, path: calls) => Use.Bounded(bytes: used_bytes + (self.size(all_frames, function: wrapper) + STUB_CALL_BOUND + self.size(all_frames, function: thunk)), path: take calls)
@@ -418,6 +482,54 @@ fn Judge.passed_bound(mut self, all_frames: Slice[Frame], binding: Binding, boun
     }
 } Judge.passed_bound
 
+/// The stack use of a support routine's call of a glue of a family: when judging what the
+/// routine reserve holds, the most any glue of the family uses, at least what a call of code
+/// the usable part holds uses for a task's glue, and nothing for a policy hook's while a hook
+/// runs; unbounded otherwise.
+fn Judge.glues_use(mut self, all_frames: Slice[Frame], family: StackFamily) -> Use {
+    let Some(beneath) = self.beneath else {
+        return Use.Unbounded(mem::List[CallStep].empty(self.alloc))
+    }
+    let policy = family == StackFamily.Policy
+    if policy and self.hooked {
+        return Use.Bounded(bytes: 0, path: mem::List[CallStep].empty(self.alloc))
+    }
+    var floor: u64 = 0
+    if family == StackFamily.Task {
+        floor = beneath
+    }
+    var members = mem::List[object::FuncId].empty(self.alloc)
+    for glue in self.glues {
+        if glue.family == family {
+            mut members.push(glue.function)
+        }
+    }
+    let hooked = self.hooked
+    self.hooked = hooked or policy
+    let most = mut self.most(all_frames, functions: members.view(), floor)
+    self.hooked = hooked
+    return most
+} Judge.glues_use
+
+/// The most stack any of some functions uses under the bounds of their own parameters, at
+/// least `floor`.
+fn Judge.most(mut self, all_frames: Slice[Frame], functions: Slice[object::FuncId], floor: u64) -> Use {
+    var most_bytes = floor
+    var most_path = mem::List[CallStep].empty(self.alloc)
+    for function in functions {
+        match mut self.own_use(all_frames, function) {
+            Use.Bounded(bytes: used_bytes, path: calls) => {
+                if used_bytes > most_bytes {
+                    most_bytes = used_bytes
+                    most_path = calls
+                }
+            }
+            Use.Unbounded(calls) => return Use.Unbounded(take calls)
+        }
+    }
+    return Use.Bounded(bytes: most_bytes, path: take most_path)
+} Judge.most
+
 /// The stack use of a function under the bounds of its own parameters.
 fn Judge.own_use(mut self, all_frames: Slice[Frame], function: object::FuncId) -> Use {
     let own = self.own_of(all_frames, function)
@@ -460,7 +572,7 @@ fn Judge.subject(self, all_frames: Slice[Frame], kind: StackKind) -> text::Strin
         StackKind.Direct(callee: callee, bindings: _) => self.name(all_frames, function: callee)
         StackKind.Param(_) => text::String.of("parameter", alloc: self.alloc)
         StackKind.Bounded(_) => text::String.of("function value", alloc: self.alloc)
-        StackKind.Stub or StackKind.Nested(_) => text::String.empty(self.alloc)
+        StackKind.Stub or StackKind.Routine(_) or StackKind.Glues(_) or StackKind.Usable or StackKind.Nested(_) => text::String.empty(self.alloc)
         StackKind.Grown(wrapper: _, thunk: _, inner: inner) => self.subject(all_frames, kind: inner.contents())
     }
 } Judge.subject
@@ -481,6 +593,28 @@ fn Judge.name(self, all_frames: Slice[Frame], function: object::FuncId) -> text:
     expect position < all_frames.len()
     return text::String.of(all_frames[position].name.as_str(), alloc: self.alloc)
 } Judge.name
+
+/// The most stack any of `functions` uses beyond the usable part of a task's stack: calls of
+/// support routines the image defines and of glues through their addresses followed, and a
+/// call of code the usable part holds using `beneath`; none when one reaches an unbounded call
+/// site.
+fn routine_use(
+    all_frames: Slice[Frame],
+    glues: Slice[FamilyGlue],
+    beneath: u64,
+    functions: Slice[object::FuncId],
+    alloc: mem::Alloc,
+    ) -> Option[u64] {
+    var judge = Judge.of(all_frames, alloc)
+    for glue in glues {
+        mut judge.glues.push(glue)
+    }
+    judge.beneath = Some(beneath)
+    return match mut judge.most(all_frames, functions, floor: 0) {
+        Use.Bounded(bytes: used_bytes, path: _) => Some(used_bytes)
+        Use.Unbounded(_) => None
+    }
+} routine_use
 
 /// The stack each grown call's thunk needs on the stack it runs on: its frame and the stack use
 /// of what it calls up to the grown calls that code makes, each using its wrapper's frame and
@@ -567,9 +701,10 @@ fn Segments.segment(mut self, all_frames: Slice[Frame], function: object::FuncId
     var deepest: Option[u64] = Some(0)
     for site in frame.sites {
         let used = match site.kind {
-            StackKind.Stub or StackKind.Nested(_) => Some(STUB_CALL_BOUND)
+            StackKind.Stub or StackKind.Routine(_) or StackKind.Nested(_) => Some(STUB_CALL_BOUND)
             StackKind.Grown(wrapper: wrapper, thunk: _, inner: _) => Some(self.size(all_frames, function: wrapper) + STUB_CALL_BOUND)
             StackKind.Bounded(stack_bound) => stack_bound
+            StackKind.Glues(_) or StackKind.Usable => None
             StackKind.Param(position_param) => param_stack(frame.params.view(), position: position_param)
             StackKind.Direct(callee: callee, bindings: _) => mut self.segment(all_frames, function: callee)
         }
@@ -842,9 +977,9 @@ fn Components.deepest(self, all_frames: Slice[Frame], nesting: mem::HashMap[obje
 /// parameter, nothing for a call within the component.
 fn Components.site_need(self, all_frames: Slice[Frame], nesting: mem::HashMap[object::FuncId, Unit], component: usize, kind: StackKind, mut known: mem::HashMap[usize, Option[u64]]) -> Option[u64] {
     match kind {
-        StackKind.Stub or StackKind.Nested(_) => return Some(STUB_CALL_BOUND)
+        StackKind.Stub or StackKind.Routine(_) or StackKind.Nested(_) => return Some(STUB_CALL_BOUND)
         StackKind.Bounded(stack_bound) => return stack_bound
-        StackKind.Param(_) => return None
+        StackKind.Param(_) or StackKind.Glues(_) or StackKind.Usable => return None
         else => {}
     }
     let Some(callee) = direct_callee(kind) else {

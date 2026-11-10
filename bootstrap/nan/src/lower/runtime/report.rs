@@ -14,6 +14,7 @@ use cranelift_frontend::Variable;
 
 use super::super::fx::{Fx, PTR};
 use super::super::lines::{self, ENTRY_RECORD, FUNCTION_RECORD, LOCATION_RECORD};
+use super::super::stack::{Family, Kind};
 use super::super::trap::{KINDS, OPERAND_RECORD, Written};
 use super::super::{CALL_CONV, Lowering};
 use super::tasks::{self, trap_record};
@@ -723,7 +724,8 @@ fn write(
                 &[],
                 |_, fx| {
                     let signature = fx.b.import_signature(writer_signature());
-                    fx.b.ins().call_indirect(signature, writer, &[out, bits]);
+                    let call = fx.b.ins().call_indirect(signature, writer, &[out, bits]);
+                    fx.classify(call, Kind::Glues(Family::Written));
                     Vec::new()
                 },
                 |lo, fx| {

@@ -140,16 +140,6 @@ fn an_unbounded_closure_argument_names_the_calls_down_to_its_cause() {
 #[test]
 fn a_grown_call_needs_the_stack_up_to_the_next_grown_call() {
     let [recursive, wrapper, thunk, value_thunk, big] = [0, 1, 2, 3, 4].map(FuncId::from_u32);
-    let frame = |function, size, sites: Vec<Kind>| Frame {
-        function,
-        name: String::new(),
-        size,
-        params: Vec::new(),
-        sites: sites
-            .into_iter()
-            .map(|kind| Site { kind, at: None })
-            .collect(),
-    };
     let frames = [
         frame(
             recursive,
@@ -188,4 +178,53 @@ fn a_grown_call_needs_the_stack_up_to_the_next_grown_call() {
     let excluded = HashSet::from([wrapper, thunk, value_thunk]);
     let needs = needs(&frames, &grown, &excluded);
     assert_eq!(needs, [16 + 48 + 64 + STUB_CALL_BOUND, 32 + 4_096 + 100]);
+}
+
+/// A frame of lowered code outside source, of a size, with call sites of these kinds.
+fn frame(function: FuncId, size: u64, sites: Vec<Kind>) -> Frame {
+    Frame {
+        function,
+        name: String::new(),
+        size,
+        params: Vec::new(),
+        sites: sites
+            .into_iter()
+            .map(|kind| Site { kind, at: None })
+            .collect(),
+    }
+}
+
+#[test]
+fn the_routine_reserve_follows_routine_calls_and_holds_the_glues_above_the_usable_part() {
+    let [start, glue, routine] = [0, 1, 2].map(FuncId::from_u32);
+    let frames = [
+        frame(start, 64, vec![Kind::Glues(Family::Task)]),
+        frame(glue, 32, vec![Kind::Usable, Kind::Routine(routine)]),
+        frame(routine, 100, vec![Kind::Stub]),
+    ];
+    let families = HashMap::from([(Family::Task, vec![glue])]);
+    let call = routine_use(&frames, &families, 0, &[routine]);
+    assert_eq!(call, Some(100 + STUB_CALL_BOUND));
+    let started = routine_use(&frames, &families, 356, &[start]);
+    assert_eq!(started, Some(64 + 32 + 356));
+}
+
+#[test]
+fn a_policy_hook_calls_no_other_hook() {
+    let [raise, hook, place] = [0, 1, 2].map(FuncId::from_u32);
+    let frames = [
+        frame(raise, 200, vec![Kind::Glues(Family::Policy)]),
+        frame(
+            hook,
+            48,
+            vec![Kind::Direct {
+                callee: place,
+                bindings: Vec::new(),
+            }],
+        ),
+        frame(place, 16, vec![Kind::Routine(raise)]),
+    ];
+    let families = HashMap::from([(Family::Policy, vec![hook])]);
+    let used = routine_use(&frames, &families, 0, &[raise]);
+    assert_eq!(used, Some(200 + 48 + 16 + 200));
 }

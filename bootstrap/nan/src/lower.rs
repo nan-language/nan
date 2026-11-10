@@ -216,6 +216,33 @@ pub enum Glue {
 }
 
 impl Glue {
+    /// The family of glues support routines call through addresses that the glue is of.
+    fn family(&self) -> Option<stack::Family> {
+        match self {
+            Glue::Entry(_) => Some(stack::Family::Task),
+            Glue::ChildEnd(..) | Glue::RaceEnd | Glue::DomainEnd => Some(stack::Family::End),
+            Glue::ChildDone
+            | Glue::RaceDone
+            | Glue::DomainDone
+            | Glue::AnchorDone
+            | Glue::ComponentDone
+            | Glue::KeyedDone => Some(stack::Family::Done),
+            Glue::WithdrawSender
+            | Glue::WithdrawReceiver
+            | Glue::WithdrawWhen
+            | Glue::WithdrawRun
+            | Glue::WithdrawPost
+            | Glue::WithdrawStepper
+            | Glue::SimWithdraw
+            | Glue::WithdrawSignal(_) => Some(stack::Family::Withdraw),
+            Glue::Written(_) => Some(stack::Family::Written),
+            Glue::Transfer(_) => Some(stack::Family::Transfer),
+            Glue::Captures(_) => Some(stack::Family::Captures),
+            Glue::Policy(..) => Some(stack::Family::Policy),
+            _ => None,
+        }
+    }
+
     /// Whether a stopping task does not stop inside the glue: one completing the end of a
     /// task or of a construct.
     fn critical(&self) -> bool {
@@ -351,9 +378,13 @@ pub struct Lowering<'c, 'a> {
     /// each CPU has, once declared.
     machine_stubs: HashMap<machine::Stub, FuncId>,
     vector_seam: Option<FuncId>,
+    /// A kernel's preemption glue, which its vector seam calls on an interrupted task's stack.
+    preemption: Option<FuncId>,
     reserved: HashMap<&'static str, DataId>,
     irq_stacks: Option<DataId>,
     ist_stacks: Option<(DataId, u64)>,
+    /// The image's routine reserve, once a routine reads it.
+    routine_reserve: Option<DataId>,
     pub data: data::Data,
     pub lines: lines::Lines,
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
@@ -560,8 +591,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
             thread_id: None,
             machine_stubs: HashMap::new(),
             vector_seam: None,
+            preemption: None,
             reserved: HashMap::new(),
             irq_stacks: None,
+            routine_reserve: None,
             ist_stacks: None,
             data: data::Data::default(),
             lines: lines::Lines::default(),
@@ -898,9 +931,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
     }
 
     /// The call sites of a function built: those lowering classified as it emitted them, a
-    /// direct call of a routine or the C library bounded by the stub call bound, of a grown
-    /// call's wrapper grown, of another lowered function direct, and an unclassified call through
-    /// an address unbounded.
+    /// direct call of an import bounded by the stub call bound, of a routine the image defines a
+    /// routine call, of a grown call's wrapper grown, of another lowered function direct, and an
+    /// unclassified call through an address unbounded.
     fn sites(
         &self,
         func: &ir::Function,
@@ -946,10 +979,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
                         };
                         let callee = FuncId::from_u32(func.params.user_named_funcs()[*name].index);
                         let declaration = self.module.declarations().get_function_decl(callee);
-                        if declaration.linkage == Linkage::Import
-                            || self.routines.values().any(|routine| *routine == callee)
-                        {
+                        if declaration.linkage == Linkage::Import {
                             stack::Kind::Stub
+                        } else if self.routines.values().any(|routine| *routine == callee) {
+                            stack::Kind::Routine(callee)
                         } else {
                             stack::Kind::Direct {
                                 callee,
@@ -964,6 +997,25 @@ impl<'c, 'a> Lowering<'c, 'a> {
             }
         }
         sites
+    }
+
+    /// The glues and releases support routines call through addresses, by family.
+    fn families(&self) -> HashMap<stack::Family, Vec<FuncId>> {
+        let mut families: HashMap<stack::Family, Vec<FuncId>> = HashMap::new();
+        for (glue, id) in &self.glues {
+            if let Some(family) = glue.family() {
+                families.entry(family).or_default().push(*id);
+            }
+        }
+        for (instance, id) in &self.instances {
+            if let Instance::Release(_) = instance {
+                families
+                    .entry(stack::Family::Release)
+                    .or_default()
+                    .push(*id);
+            }
+        }
+        families
     }
 
     /// The function of a glue already asked for.
@@ -1031,7 +1083,8 @@ impl<'c, 'a> Lowering<'c, 'a> {
     /// The object of the lowering, holding a `.nan` section with `section` when given.
     fn finish(mut self, section: Option<&[u8]>) -> Lowered {
         let entry_stacks = runtime::tasks::emit_entry_stacks(&mut self);
-        lines::emit(&mut self, entry_stacks);
+        let glues = self.finish_reserve();
+        lines::emit(&mut self, entry_stacks, glues);
         self.finish_interrupts();
         self.emit_nested_needs();
         self.emit_needs();

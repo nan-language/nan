@@ -8,6 +8,8 @@
 //! A task asked to stop, or trapping, becomes stopped once off its thread instead, and is never
 //! resumed.
 
+use std::collections::{HashMap, HashSet};
+
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC,
     types,
@@ -17,9 +19,9 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use super::super::fx::{Fx, PTR};
 use super::super::host;
-use super::super::machine::Stub;
 use super::super::machine::schedule::HOOK_STACK;
-use super::super::{CALL_CONV, Lowering, lines, stack};
+use super::super::machine::{SEAM_FRAME, Stub};
+use super::super::{CALL_CONV, Lowering, lines, load, stack};
 use super::regions::origin;
 use super::{Routine, fetch_add, segments, state, system, tables};
 use crate::check::db::ItemId;
@@ -254,22 +256,57 @@ pub mod trap_record {
 }
 
 /// The default size of a task's stack, of the entry task's stack on a host target, and of a
-/// guard region.
+/// host target's guard region.
 pub const STACK: u64 = 65_536;
 pub const ENTRY_STACK: u64 = 67_108_864;
 pub const GUARD: u64 = 4_096;
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library
 /// functions that its calls of support routines run, whose use past the stub call bound the
-/// usable size does not count; a kernel task's also holds a call of a policy hook.
+/// usable size does not count: a host target's, and a machine target's where the frames of its
+/// support routines bound none.
 const ROUTINE_RESERVE: u64 = 32_768;
 
-/// The bytes a task's stack, or a segment of it, holds below its usable part for its routines.
-pub fn reserve(lo: &Lowering) -> u64 {
-    match lo.kernel() {
-        true => ROUTINE_RESERVE + HOOK_STACK,
-        false => ROUTINE_RESERVE,
+/// The symbol of a machine image's routine reserve, which its final build computes once every
+/// function is lowered: the bytes its task stacks hold beyond their usable size for what runs
+/// there that the usable size does not count, then the most stack a call of one of its support
+/// routines uses.
+const RESERVE: &str = "_NSroutine_reserve";
+
+/// The guard region a task's stack holds below the rest, on a host target alone.
+fn guard(lo: &Lowering) -> u64 {
+    match lo.machine() {
+        true => 0,
+        false => GUARD,
     }
+}
+
+/// The bytes a task's stack, or a segment of it, holds below its usable part for its routines:
+/// on a machine target the image's routine reserve, and while bundles are loaded, the most any
+/// of their glues uses with a call of a support routine.
+pub fn reserve(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    if !lo.machine() {
+        return fx.ptr(ROUTINE_RESERVE);
+    }
+    let id = lo.routine_reserve();
+    let address = lo.data_address(fx, id);
+    let own = fx.load(PTR, address, 0);
+    let call = fx.load(PTR, address, 8);
+    let head = lo.line_head(fx);
+    let zero = fx.ptr(0);
+    let found = fx.repeat(&[head, zero], |fx, state| {
+        let (tables, most) = (state[0], state[1]);
+        let glues = fx.load(PTR, tables, lines::GLUES);
+        let most = fx.b.ins().umax(most, glues);
+        let next = fx.load(PTR, tables, lines::NEXT);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        (more, vec![next, most])
+    });
+    let bundles = found[1];
+    let loaded = fx.b.ins().icmp_imm_s(IntCC::NotEqual, bundles, 0);
+    let call = fx.b.ins().select(loaded, call, zero);
+    let reserve = fx.b.ins().iadd(own, bundles);
+    fx.b.ins().iadd(reserve, call)
 }
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation
@@ -430,6 +467,98 @@ impl Lowering<'_, '_> {
     }
 }
 
+impl Lowering<'_, '_> {
+    /// The data object of the image's routine reserve, declared once and defined when lowering
+    /// finishes.
+    fn routine_reserve(&mut self) -> DataId {
+        if let Some(id) = self.routine_reserve {
+            return id;
+        }
+        let id = self
+            .module
+            .declare_data(RESERVE, Linkage::Local, false, false)
+            .expect("the routine reserve");
+        self.routine_reserve = Some(id);
+        id
+    }
+
+    /// Defines the routine reserve once every function is lowered, when a routine reads it: the
+    /// reserve its frames bound, or else the fixed routine reserve, with a call of a policy hook
+    /// on a kernel. Gives for a bundle the most its glues use beside the usable part of a task's
+    /// stack, each call of a support routine counted as a stub's, or else the fixed routine
+    /// reserve; zero for another image.
+    pub fn finish_reserve(&mut self) -> u64 {
+        let families = self.families();
+        if self.imports() {
+            let glues: Vec<FuncId> = families.values().flatten().copied().collect();
+            return stack::routine_use(&self.frames, &families, 0, &glues)
+                .unwrap_or(ROUTINE_RESERVE);
+        }
+        let Some(id) = self.routine_reserve else {
+            return 0;
+        };
+        let fixed = match self.kernel() {
+            true => ROUTINE_RESERVE + HOOK_STACK,
+            false => ROUTINE_RESERVE,
+        };
+        let (own, call) = self.bounded_reserve(&families).unwrap_or((fixed, fixed));
+        let mut bytes = own.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&call.to_le_bytes());
+        let mut description = DataDescription::new();
+        description.define(bytes.into_boxed_slice());
+        description.set_align(8);
+        self.module
+            .define_data(id, &description)
+            .expect("the routine reserve");
+        0
+    }
+
+    /// The routine reserve the frames of every function lowered bound, and the most a call of a
+    /// support routine uses from code outside them or, in a kernel exporting them, from a
+    /// bundle: the reserve holds the most the start of a task uses beside its usable part, each
+    /// call of code the usable part holds using that call, and on a kernel taking interrupts, a
+    /// seam frame and the most its preemption glue, or the trap an exception makes, uses. None
+    /// when a support routine reaches an unbounded call site.
+    fn bounded_reserve(
+        &self,
+        families: &HashMap<stack::Family, Vec<FuncId>>,
+    ) -> Option<(u64, u64)> {
+        let defined: HashSet<FuncId> = self.routines.values().copied().collect();
+        let mut roots: Vec<FuncId> = (self.frames.iter())
+            .filter(|frame| !defined.contains(&frame.function))
+            .flat_map(|frame| &frame.sites)
+            .filter_map(|site| match site.kind {
+                stack::Kind::Routine(routine) => Some(routine),
+                _ => None,
+            })
+            .collect();
+        if self.exports() {
+            roots.extend(
+                load::ROUTINES
+                    .iter()
+                    .filter_map(|routine| self.routines.get(routine)),
+            );
+        }
+        let call = stack::routine_use(&self.frames, families, 0, &roots)?;
+        let start: Vec<FuncId> = self
+            .routines
+            .get(&Routine::TaskStart)
+            .into_iter()
+            .copied()
+            .collect();
+        let started = stack::routine_use(&self.frames, families, call, &start)?;
+        let preempted = match self.preemption {
+            Some(glue) => {
+                let mut preempting = vec![glue];
+                preempting.extend(self.routines.get(&Routine::TrapRaise));
+                SEAM_FRAME + stack::routine_use(&self.frames, families, 0, &preempting)?
+            }
+            None => 0,
+        };
+        Some((call.max(started) + preempted, call))
+    }
+}
+
 /// Defines the table of task entries' own stacks, which the image's line tables point at.
 pub fn emit_entry_stacks(lo: &mut Lowering) -> DataId {
     let id = lo
@@ -502,7 +631,7 @@ fn own_stack_in(fx: &mut Fx, table: Value, code: Value, usable: Value) -> Value 
 /// `Spawn(glue, code, env, extra, stack, cell, domain, region)`: a new task record with
 /// `extra` bytes after it for the entry's result and failure, and a stack of `stack` usable
 /// bytes, or of the larger stack the entry's own `limits stack N` needs, with the routine
-/// reserve and the guard region, drawn through a cell for a domain, or mapped for the zero
+/// reserve and any guard region, drawn through a cell for a domain, or mapped for the zero
 /// cell; zero when the stack cannot be drawn. The task joins the list of live tasks.
 fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
@@ -515,9 +644,9 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.when(failed, |fx| {
         super::report::raise_kind(lo, fx, "trap.exhausted")
     });
-    let length =
-        fx.b.ins()
-            .iadd_imm_s(usable, (GUARD + reserve(lo) + 15) as i64);
+    let reserve = reserve(lo, fx);
+    let length = fx.b.ins().iadd(usable, reserve);
+    let length = fx.b.ins().iadd_imm_s(length, (guard(lo) + 15) as i64);
     let length = fx.b.ins().band_imm_s(length, -16);
     let stack = segments::draw(lo, fx, cell, domain, length, true);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, stack, 0);
@@ -529,9 +658,9 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(stack, record, task::STACK);
     fx.store(length, record, task::STACK_SIZE);
     fx.store(cell, record, task::STACK_CELL);
-    let guard = fx.b.ins().iadd_imm_s(stack, GUARD as i64);
+    let guard = fx.b.ins().iadd_imm_s(stack, guard(lo) as i64);
     fx.store(guard, record, task::GUARD);
-    let limit = fx.b.ins().iadd_imm_s(guard, reserve(lo) as i64);
+    let limit = fx.b.ins().iadd(guard, reserve);
     fx.store(limit, record, task::LIMIT);
     let top = fx.b.ins().iadd(stack, length);
     fx.store(top, record, task::TOP);
@@ -588,11 +717,13 @@ fn task_start(lo: &mut Lowering, fx: &mut Fx) {
     signature.params.push(AbiParam::new(PTR));
     let signature = fx.b.import_signature(signature);
     let glue = fx.load(PTR, record, task::GLUE);
-    fx.b.ins().call_indirect(signature, glue, &[record]);
+    let call = fx.b.ins().call_indirect(signature, glue, &[record]);
+    fx.classify(call, stack::Kind::Glues(stack::Family::Task));
     let end = fx.load(PTR, record, task::END);
     let has_end = fx.b.ins().icmp_imm_s(IntCC::NotEqual, end, 0);
     fx.when(has_end, |fx| {
-        fx.b.ins().call_indirect(signature, end, &[record]);
+        let call = fx.b.ins().call_indirect(signature, end, &[record]);
+        fx.classify(call, stack::Kind::Glues(stack::Family::End));
     });
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::TASKS_LOCK);
@@ -1014,7 +1145,8 @@ fn settle_away(
             let mut signature = Signature::new(CALL_CONV);
             signature.params.push(AbiParam::new(PTR));
             let signature = fx.b.import_signature(signature);
-            fx.b.ins().call_indirect(signature, done, &[record]);
+            let call = fx.b.ins().call_indirect(signature, done, &[record]);
+            fx.classify(call, stack::Kind::Glues(stack::Family::Done));
         });
     });
 }
@@ -1173,6 +1305,18 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
 /// deadline that expired cancels its region and wakes the task disarming it, and a component's
 /// delayed messages that are due enter its intake.
 pub fn deliver(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
+    deliver_as(lo, fx, op, result, true);
+}
+
+/// Delivers an operation's cancelled completion, which expires no deadline.
+pub fn deliver_cancelled(lo: &mut Lowering, fx: &mut Fx, op: Value) {
+    let cancelled = fx.int(types::I32, CANCELED);
+    deliver_as(lo, fx, op, cancelled, false);
+}
+
+/// Delivers an operation's completion with its result, an expired deadline's only when
+/// `expires`.
+fn deliver_as(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value, expires: bool) {
     let kind = fx.load(PTR, op, operation::KIND);
     let wait = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::WAIT);
     fx.when(wait, |fx| {
@@ -1185,11 +1329,13 @@ pub fn deliver(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
     let deadline = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::DEADLINE);
     fx.when(deadline, |fx| {
         set_done(fx, op, operation::COMPLETED);
-        let expired = fx.b.ins().icmp_imm_s(IntCC::Equal, result, EXPIRED);
-        fx.when(expired, |fx| {
-            let region_record = fx.load(PTR, op, operation::TASK);
-            lo.call_routine(fx, Routine::Cancel, &[region_record]);
-        });
+        if expires {
+            let expired = fx.b.ins().icmp_imm_s(IntCC::Equal, result, EXPIRED);
+            fx.when(expired, |fx| {
+                let region_record = fx.load(PTR, op, operation::TASK);
+                lo.call_routine(fx, Routine::Cancel, &[region_record]);
+            });
+        }
         let waiter = fx.offset(op, operation::WAITER);
         let waiter = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), waiter);
         let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);

@@ -1,6 +1,6 @@
 //! Stack limits: the frame size and call sites of each lowered function, the `stack N` demands
-//! on lowered functions and function values, the final build's judging of each demand, and the
-//! stack each grown call needs.
+//! on lowered functions and function values, the final build's judging of each demand, the
+//! stack each grown call needs, and what the routine reserve of a task's stack holds.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,8 +47,17 @@ pub enum Kind {
     Param(usize),
     /// A call the `stack N` of its type or head bounds; none for an unbounded one.
     Bounded(Option<u64>),
-    /// A call of a support routine, a compiler stub or the C library.
+    /// A call of a compiler stub, the C library or a support routine another image defines.
     Stub,
+    /// A call of a support routine the image defines, which a stack use counts as a stub's: the
+    /// rest of its use lies in the routine reserve of a task's stack.
+    Routine(FuncId),
+    /// A support routine's call of a glue of a family, through an address a record holds.
+    Glues(Family),
+    /// A call of code that the usable part of the stack it runs on holds but for the support
+    /// routines it calls: an entry glue's call of its task's entry, or a grown or nested call's
+    /// call of its thunk where the stack has room for its need.
+    Usable,
     /// A grown call: a call of a wrapper, which calls its thunk through the support routine
     /// growing the stack, the thunk making the call `inner` describes.
     Grown {
@@ -60,6 +69,31 @@ pub enum Kind {
     /// with room for its need, until lowering finds that need bounded and makes it a call of a
     /// support routine; unbounded.
     Nested(FuncId),
+}
+
+/// The families of glues support routines call through addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Family {
+    /// The glue a task starts with: an entry glue, or another glue, which the usable part of
+    /// the task's stack holds but for the routines it calls.
+    Task,
+    /// The glue a task runs once its entry has ended.
+    End,
+    /// The glue an executor thread runs once a task has ended.
+    Done,
+    /// The glue withdrawing a stopped task's wait.
+    Withdraw,
+    /// The glue writing a value in a trap report.
+    Written,
+    /// The walk moving a value into another domain's reach.
+    Transfer,
+    /// The walk moving a task closure's captures into another domain's reach.
+    Captures,
+    /// The glue calling a hook of a kernel policy, which a CPU never calls while a hook runs on
+    /// it.
+    Policy,
+    /// The release of a value of a type.
+    Release,
 }
 
 /// What a direct call passes for a function-typed or `Dyn` parameter of its callee.
@@ -135,6 +169,8 @@ pub fn uses(ck: &Checker, frames: &[Frame], tasks: &[Task]) -> Vec<Result<u64, V
         frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
         known: HashMap::new(),
         active: Vec::new(),
+        hooked: false,
+        routines: None,
     };
     tasks
         .iter()
@@ -171,6 +207,8 @@ pub fn judge(ck: &Checker, frames: &[Frame], demands: &[Demand]) -> Vec<Diagnost
         frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
         known: HashMap::new(),
         active: Vec::new(),
+        hooked: false,
+        routines: None,
     };
     let mut found = Vec::new();
     for demand in demands {
@@ -181,8 +219,14 @@ pub fn judge(ck: &Checker, frames: &[Frame], demands: &[Demand]) -> Vec<Diagnost
 
 struct Judge<'f> {
     frames: HashMap<FuncId, &'f Frame>,
-    known: HashMap<(FuncId, Vec<Bound>), Use>,
-    active: Vec<FuncId>,
+    known: HashMap<(FuncId, Vec<Bound>, bool), Use>,
+    /// The functions of the path judged, each with whether a policy hook runs there.
+    active: Vec<(FuncId, bool)>,
+    /// Whether a policy hook runs where the function judged is called.
+    hooked: bool,
+    /// When judging what the routine reserve holds, the glues of each family and what a call of
+    /// code the usable part holds uses beyond it.
+    routines: Option<(&'f HashMap<Family, Vec<FuncId>>, u64)>,
 }
 
 impl Judge<'_> {
@@ -204,7 +248,7 @@ impl Judge<'_> {
         };
         let frame = self.frames[&function];
         let bounds = own_bounds(frame);
-        self.active.push(function);
+        self.active.push((function, self.hooked));
         let mut deepest: (u64, Vec<(FuncId, usize)>) = (0, Vec::new());
         let mut unbounded = Vec::new();
         for (index, site) in frame.sites.iter().enumerate() {
@@ -241,17 +285,17 @@ impl Judge<'_> {
 
     /// The stack use of a function whose function-typed parameters have bounds, by position.
     fn function(&mut self, function: FuncId, bounds: &[Bound]) -> Use {
-        if self.active.contains(&function) {
+        if self.active.contains(&(function, self.hooked)) {
             return Use::Unbounded(Vec::new());
         }
-        let key = (function, bounds.to_vec());
+        let key = (function, bounds.to_vec(), self.hooked);
         if let Some(known) = self.known.get(&key) {
             return known.clone();
         }
         let Some(frame) = self.frames.get(&function).copied() else {
             return Use::Bounded(STUB_CALL_BOUND, Vec::new());
         };
-        self.active.push(function);
+        self.active.push((function, self.hooked));
         let mut deepest = (0, Vec::new());
         let mut unbounded = None;
         for (index, site) in frame.sites.iter().enumerate() {
@@ -283,6 +327,30 @@ impl Judge<'_> {
         };
         match kind {
             Kind::Stub => Use::Bounded(STUB_CALL_BOUND, Vec::new()),
+            Kind::Routine(callee) => match self.routines {
+                Some(_) => self.function(*callee, &[]),
+                None => Use::Bounded(STUB_CALL_BOUND, Vec::new()),
+            },
+            Kind::Glues(family) => match self.routines {
+                Some(_) if *family == Family::Policy && self.hooked => Use::Bounded(0, Vec::new()),
+                Some((families, beneath)) => {
+                    let floor = match family {
+                        Family::Task => beneath,
+                        _ => 0,
+                    };
+                    let hooked = self.hooked;
+                    self.hooked = hooked || *family == Family::Policy;
+                    let glues = families.get(family).map_or(&[][..], Vec::as_slice);
+                    let most = self.most(glues, floor);
+                    self.hooked = hooked;
+                    most
+                }
+                None => Use::Unbounded(Vec::new()),
+            },
+            Kind::Usable => match self.routines {
+                Some((_, beneath)) => Use::Bounded(beneath, Vec::new()),
+                None => Use::Unbounded(Vec::new()),
+            },
             Kind::Grown {
                 wrapper,
                 thunk,
@@ -338,6 +406,22 @@ impl Judge<'_> {
         }
     }
 
+    /// The most stack any of some functions uses under the bounds of their own parameters, at
+    /// least `floor`.
+    fn most(&mut self, functions: &[FuncId], floor: u64) -> Use {
+        let mut most = Use::Bounded(floor, Vec::new());
+        for function in functions {
+            match (self.own_use(*function), &most) {
+                (Use::Bounded(bytes, path), Use::Bounded(deepest, _)) if bytes > *deepest => {
+                    most = Use::Bounded(bytes, path);
+                }
+                (Use::Bounded(..), _) => {}
+                (unbounded, _) => return unbounded,
+            }
+        }
+        most
+    }
+
     /// The stack use of a function under the bounds of its own parameters.
     fn own_use(&mut self, function: FuncId) -> Use {
         let own = self
@@ -377,7 +461,9 @@ impl Judge<'_> {
             Kind::Direct { callee, .. } => self.name(*callee),
             Kind::Param(_) => "parameter".to_owned(),
             Kind::Bounded(_) => "function value".to_owned(),
-            Kind::Stub | Kind::Nested(_) => String::new(),
+            Kind::Stub | Kind::Routine(_) | Kind::Glues(_) | Kind::Usable | Kind::Nested(_) => {
+                String::new()
+            }
             Kind::Grown { inner, .. } => self.subject(inner),
         }
     }
@@ -390,6 +476,29 @@ impl Judge<'_> {
         self.frames
             .get(&function)
             .map_or_else(String::new, |frame| frame.name.clone())
+    }
+}
+
+/// The most stack any of `functions` uses beyond the usable part of a task's stack: calls of
+/// support routines the image defines and of glues through their addresses followed, and a
+/// call of code the usable part holds using `beneath`; none when one reaches an unbounded call
+/// site.
+pub fn routine_use(
+    frames: &[Frame],
+    families: &HashMap<Family, Vec<FuncId>>,
+    beneath: u64,
+    functions: &[FuncId],
+) -> Option<u64> {
+    let mut judge = Judge {
+        frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
+        known: HashMap::new(),
+        active: Vec::new(),
+        hooked: false,
+        routines: Some((families, beneath)),
+    };
+    match judge.most(functions, 0) {
+        Use::Bounded(bytes, _) => Some(bytes),
+        Use::Unbounded(_) => None,
     }
 }
 
@@ -540,9 +649,9 @@ fn deepest(
         let mut size = frame.size;
         for site in &frame.sites {
             let used = match &site.kind {
-                Kind::Stub | Kind::Nested(_) => Some(STUB_CALL_BOUND),
+                Kind::Stub | Kind::Routine(_) | Kind::Nested(_) => Some(STUB_CALL_BOUND),
                 Kind::Bounded(bytes) => *bytes,
-                Kind::Param(_) => None,
+                Kind::Param(_) | Kind::Glues(_) | Kind::Usable => None,
                 Kind::Direct { .. } | Kind::Grown { .. } => {
                     if let Kind::Grown { wrapper, thunk, .. } = &site.kind {
                         let carried = frames.get(wrapper).map_or(0, |frame| frame.size)
@@ -604,9 +713,10 @@ impl Segments<'_> {
         let mut deepest = Some(0);
         for site in &frame.sites {
             let used = match &site.kind {
-                Kind::Stub | Kind::Nested(_) => Some(STUB_CALL_BOUND),
+                Kind::Stub | Kind::Routine(_) | Kind::Nested(_) => Some(STUB_CALL_BOUND),
                 Kind::Grown { wrapper, .. } => Some(self.size(*wrapper) + STUB_CALL_BOUND),
                 Kind::Bounded(bytes) => *bytes,
+                Kind::Glues(_) | Kind::Usable => None,
                 Kind::Param(position) => frame
                     .params
                     .iter()

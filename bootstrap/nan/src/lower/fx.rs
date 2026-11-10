@@ -9,7 +9,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::{FunctionBuilder, Variable};
 
-use super::stack::Site;
+use super::stack::{Kind, Site};
 
 /// The type of addresses and sizes.
 pub const PTR: Type = types::I64;
@@ -54,6 +54,11 @@ fn access(unaligned_access: bool) -> MemFlagsData {
 }
 
 impl<'f> Fx<'f> {
+    /// Classifies a call the function makes outside source.
+    pub fn classify(&mut self, call: ir::Inst, kind: Kind) {
+        self.sites.push((call, Site { kind, at: None }));
+    }
+
     pub fn new(b: FunctionBuilder<'f>, total_store_order: bool) -> Fx<'f> {
         Fx {
             b,

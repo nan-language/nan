@@ -595,7 +595,7 @@ fn map_leaf(lo: &mut Lowering, fx: &mut Fx, base: Value) -> Value {
 
 /// The least alignment of an allocation carved from a chunk on a machine target, which suits
 /// devices reaching a DMA buffer of any type.
-const MIN_ALIGN: u64 = 16;
+pub const MIN_ALIGN: u64 = 16;
 
 /// The size class of a carved allocation of `size` bytes: its index and its bytes.
 fn class_of(fx: &mut Fx, size: Value) -> (Value, Value) {

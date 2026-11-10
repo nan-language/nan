@@ -55,7 +55,7 @@ pub const ENTRY: &str = "_NSentry";
 pub const BOOT_STACK: u64 = 128 * 1024;
 
 /// A seam frame: the most stack a vector seam uses for the state it saves.
-const SEAM_FRAME: u64 = 4_096;
+pub const SEAM_FRAME: u64 = 4_096;
 
 /// The `x86_64-bare` entry seam's machine code, which the PVH boot protocol enters in 32-bit
 /// protected mode with paging off and no stack. Using the start information's first word as a

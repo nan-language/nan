@@ -10,6 +10,7 @@ use cranelift_module::FuncId;
 
 use super::super::fx::{Fx, PTR};
 use super::super::host;
+use super::super::stack::{Family, Kind};
 use super::super::supplied::tasks::cowns;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::WAITING;
@@ -198,8 +199,10 @@ fn withdraw(fx: &mut Fx, record: Value) {
             let outer = fx.load(PTR, recorded, wait::OUTER);
             let glue = fx.load(PTR, recorded, wait::GLUE);
             let signature = fx.b.import_signature(withdraw_signature());
-            fx.b.ins()
-                .call_indirect(signature, glue, &[recorded, record]);
+            let call =
+                fx.b.ins()
+                    .call_indirect(signature, glue, &[recorded, record]);
+            fx.classify(call, Kind::Glues(Family::Withdraw));
             let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, outer, 0);
             (more, vec![outer])
         });

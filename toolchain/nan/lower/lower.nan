@@ -138,6 +138,21 @@ enum Glue derives Eq, Hash {
 
 /// Whether a stopping task does not stop inside the glue: one completing the end of a
 /// task or of a construct.
+/// The family of glues support routines call through addresses that the glue is of.
+fn Glue.family(self) -> Option[StackFamily] {
+    return match self {
+        Glue.Entry(_) => Some(StackFamily.Task)
+        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.RaceEnd or Glue.DomainEnd => Some(StackFamily.End)
+        Glue.ChildDone or Glue.RaceDone or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone => Some(StackFamily.Done)
+        Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.WithdrawStepper or Glue.SimWithdraw or Glue.WithdrawSignal(_) => Some(StackFamily.Withdraw)
+        Glue.Written(_) => Some(StackFamily.Written)
+        Glue.Transfer(_) => Some(StackFamily.Transfer)
+        Glue.Captures(_) => Some(StackFamily.Captures)
+        Glue.Policy(hook: _, ty: _) => Some(StackFamily.Policy)
+        else => None
+    }
+} Glue.family
+
 fn Glue.critical(self) -> bool {
     return match self {
         Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainEnd or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.WithdrawStepper or Glue.SimWithdraw or Glue.WithdrawSignal(_) or Glue.Gate(_) => true
@@ -272,9 +287,13 @@ struct Lowering {
     /// each CPU has, once declared.
     machine_stubs: mem::HashMap[Stub, object::FuncId]
     vector_seam_id: Option[object::FuncId]
+    /// A kernel's preemption glue, which its vector seam calls on an interrupted task's stack.
+    preemption: Option[object::FuncId]
     reservations: mem::HashMap[text::String, object::DataId]
     irq_stacks: Option[object::DataId]
     ist_stacks: Option[IstStacks]
+    /// The image's routine reserve, once a routine reads it.
+    routine_reserve_id: Option[object::DataId]
     data: Data
     lines: Lines
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
@@ -509,9 +528,11 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         thread_id: None,
         machine_stubs: mem::HashMap[Stub, object::FuncId].empty(seed: 0, alloc),
         vector_seam_id: None,
+        preemption: None,
         reservations: mem::HashMap[text::String, object::DataId].empty(seed: 0, alloc),
         irq_stacks: None,
         ist_stacks: None,
+        routine_reserve_id: None,
         data: Data.empty(alloc),
         lines: Lines.empty(alloc),
         entry_stacks: mem::List[TaskEntryStack].empty(alloc),
@@ -884,9 +905,9 @@ fn Lowering.compile_waiting(mut self) {
 } Lowering.compile_waiting
 
 /// The call sites of a function built: those lowering classified as it emitted them, a
-/// direct call of a routine or the C library bounded by the stub call bound, of a grown
-/// call's wrapper grown, of another lowered function direct, and an unclassified call through
-/// an address unbounded.
+/// direct call of an import bounded by the stub call bound, of a routine the image defines a
+/// routine call, of a grown call's wrapper grown, of another lowered function direct, and an
+/// unclassified call through an address unbounded.
 fn Lowering.sites(self, func: clif::Function, take recorded: mem::List[CallSite]) -> mem::List[Site] {
     var classified = mem::HashMap[clif::Inst, Site].empty(seed: 0, alloc: self.alloc)
     for call_site in take recorded {
@@ -934,14 +955,17 @@ fn Lowering.called_wrapper(self, func: clif::Function, inst: clif::Inst) -> Opti
 } Lowering.called_wrapper
 
 /// How a call lowering did not classify reaches its callee: directly for another lowered
-/// function, as a stub for an imported function or a routine, or unbounded through an
-/// address; none for an instruction that calls nothing.
+/// function, as a stub for an imported function, as a routine call for a routine the image
+/// defines, or unbounded through an address; none for an instruction that calls nothing.
 fn Lowering.unclassified_kind(self, func: clif::Function, inst: clif::Inst) -> Option[StackKind] {
     match func.inst_data(inst) {
         clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => {
             let callee = object::FuncId(index: func.ext_func(func_ref).name.index)
-            if self.module.function_linkage(callee) == object::Linkage.Import or self.is_routine(callee) {
+            if self.module.function_linkage(callee) == object::Linkage.Import {
                 return Some(StackKind.Stub)
+            }
+            if self.is_routine(callee) {
+                return Some(StackKind.Routine(callee))
             }
             return Some(StackKind.Direct(callee: callee, bindings: mem::List[ParamBinding].empty(self.alloc)))
         }
@@ -949,6 +973,24 @@ fn Lowering.unclassified_kind(self, func: clif::Function, inst: clif::Inst) -> O
         else => return None
     }
 } Lowering.unclassified_kind
+
+/// The glues and releases support routines call through addresses, with their families.
+fn Lowering.families(self) -> mem::List[FamilyGlue] {
+    var families = mem::List[FamilyGlue].empty(self.alloc)
+    for entry in self.glues {
+        match entry.key().family() {
+            Some(family) => mut families.push(FamilyGlue(family: family, function: entry.value()))
+            None => {}
+        }
+    }
+    for entry in self.instances {
+        match entry.key() {
+            Instance.Release(_) => mut families.push(FamilyGlue(family: StackFamily.Release, function: entry.value()))
+            else => {}
+        }
+    }
+    return families
+} Lowering.families
 
 /// Whether a declared function is a routine's.
 fn Lowering.is_routine(self, callee: object::FuncId) -> bool {
@@ -1029,7 +1071,8 @@ fn Lowering.layout_of(mut self, ty: ty::Ty) -> mem::Shared[Layout] {
 fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lowered {
     mut self.compile_waiting()
     let own_stacks = emit_entry_stacks(mut self)
-    lines_emit(mut self, own_stacks)
+    let glues = mut self.finish_reserve()
+    lines_emit(mut self, own_stacks, glues)
     mut self.finish_interrupts()
     mut self.compile_waiting()
     mut self.emit_nested_needs()

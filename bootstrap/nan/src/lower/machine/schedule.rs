@@ -18,6 +18,7 @@ use super::super::fx::{Fx, PTR};
 use super::super::layout::Shape;
 use super::super::runtime::tasks::{operation, task, thread};
 use super::super::runtime::{Routine, fetch_add, report, state, timers};
+use super::super::stack::{Family, Kind};
 use super::super::supplied::Supply;
 use super::super::supplied::tasks::accounts;
 use super::super::{CALL_CONV, Glue, Lowering};
@@ -314,6 +315,7 @@ impl Lowering<'_, '_> {
         let mut values = vec![value];
         values.extend_from_slice(args);
         let call = fx.b.ins().call_indirect(signature, code, &values);
+        fx.classify(call, Kind::Glues(Family::Policy));
         let results = fx.b.inst_results(call).to_vec();
         let zero = fx.ptr(0);
         fx.store(zero, own, cpu::HOOK);
@@ -321,8 +323,8 @@ impl Lowering<'_, '_> {
     }
 
     /// The slack the kernel's policy gives a timer the running task arms `delay` nanoseconds
-    /// ahead, its hook called with maskable interrupts disabled; zero under the default policy
-    /// and outside a task.
+    /// ahead, its hook called with maskable interrupts disabled; zero under the default policy,
+    /// outside a task and while a hook runs on the CPU.
     pub(super) fn timer_slack(&mut self, fx: &mut Fx, delay: Value) -> Value {
         let policy = self.policy(fx);
         let installed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, policy, 0);
@@ -335,7 +337,10 @@ impl Lowering<'_, '_> {
                 let own = lo.running_cpu(fx);
                 let thread = fx.load(PTR, own, cpu::THREAD);
                 let record = fx.load(PTR, thread, thread::CURRENT);
+                let hooked = fx.load(PTR, own, cpu::HOOK);
                 let running = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+                let unhooked = fx.b.ins().icmp_imm_s(IntCC::Equal, hooked, 0);
+                let running = fx.b.ins().band(running, unhooked);
                 let slack = fx.choose_in(
                     lo,
                     running,

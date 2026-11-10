@@ -15,6 +15,7 @@ use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::regions::{self, region};
 use super::super::super::runtime::tasks::{self, flag, kind, operation, task};
 use super::super::super::runtime::{Routine, report, tables, timers};
+use super::super::super::stack::{Family, Kind};
 use super::super::super::{Glue, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
@@ -493,6 +494,7 @@ fn entry_glue(lo: &mut Lowering, fn_ty: &FnTy) -> FuncId {
                 args.extend(held.values());
             }
             let call = lo.call_code(fx, abi.signature(), code, &args, fn_ty.limits.stack);
+            fx.classify(call, Kind::Usable);
             let returns = fx.b.inst_results(call).to_vec();
             let mut returns = returns.into_iter();
             let failed = abi.flagged.then(|| returns.next().expect("a failure flag"));
@@ -686,7 +688,8 @@ fn finish_child(
             fx.when(releases, |fx| {
                 let result = fx.load(PTR, record, task::RESULT);
                 let signature = fx.b.import_signature(super::record_signature());
-                fx.b.ins().call_indirect(signature, release, &[result]);
+                let call = fx.b.ins().call_indirect(signature, release, &[result]);
+                fx.classify(call, Kind::Glues(Family::Release));
             });
         }
     }

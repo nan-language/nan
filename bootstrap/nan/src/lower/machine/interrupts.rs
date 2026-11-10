@@ -471,6 +471,7 @@ impl Lowering<'_, '_> {
         let bound = self.bound_vectors();
         let dispatch = self.dispatcher(&bound);
         let preempt = self.preempt_glue();
+        self.preemption = Some(preempt);
         let ists = self.ists();
         let seam = self.vector_seam(dispatch, preempt, &ists);
         self.vector_seam = Some(seam);

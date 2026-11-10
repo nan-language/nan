@@ -14,6 +14,15 @@ const SWITCH_BACK: u64 = 40
 
 const SWITCH_SIZE: u64 = 64
 
+/// The alignment of a stack drawn through a cell: a chunk's on a host target, whose guard regions
+/// it protects page by page, and on a machine target the least a carved allocation has.
+fn stack_alignment(lo: Lowering) -> u64 {
+    if lo.machine() {
+        return MIN_ALIGN
+    }
+    return MEMORY_CHUNK
+} stack_alignment
+
 /// A stack of `length` bytes: mapped for the zero cell, drawn through a cell for a domain
 /// otherwise, its guard region made inaccessible when `guarded`; zero when it cannot be had.
 fn stack_draw(mut lo: Lowering, mut fx: Fx, cell: clif::Value, domain: clif::Value, length: clif::Value, guarded: bool) -> clif::Value {
@@ -22,7 +31,7 @@ fn stack_draw(mut lo: Lowering, mut fx: Fx, cell: clif::Value, domain: clif::Val
         let stack = system_map_stack(mut lo1, fx: mut fx1, len: length)
         return fx1.list1(stack)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let align = mut fx1.ptr(MEMORY_CHUNK)
+        let align = mut fx1.ptr(stack_alignment(lo1))
         let drawn_list = mut lo1.call_routine(mut fx1, routine: Routine.AllocIn, args: fx1.list4(cell, b: length, c: align, d: domain).view())
         expect drawn_list.len() > 0
         let drawn = drawn_list[0]
@@ -121,7 +130,8 @@ fn grow_routine(mut lo: Lowering, mut fx: Fx) {
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let signature = mut fx1.b.import_signature(record_signature(fx1.alloc))
-        discard mut fx1.b.call_indirect(signature, callee: thunk, args: fx1.list1(record).view())
+        let call = mut fx1.b.call_indirect(signature, callee: thunk, args: fx1.list1(record).view())
+        mut fx1.classify(call, kind: StackKind.Usable)
         return mem::List[clif::Value].empty(fx1.alloc)
     })
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
@@ -165,11 +175,12 @@ fn return_segment(mut lo: Lowering, mut fx: Fx, segment: clif::Value, length: cl
 /// The length of a segment for a call needing `need` bytes: its header, the routine reserve and
 /// the default task stack, or the room the call needs if more.
 fn segment_length(mut lo: Lowering, mut fx: Fx, need: clif::Value) -> clif::Value {
-    let reserve = tasks_reserve(lo)
+    let reserve = tasks_reserve(mut lo, mut fx)
     let wanted = mut fx.b.iadd_imm_s(need, y: i64.fit(STUB_CALL_BOUND))
     let default = mut fx.ptr(TASKS_STACK)
     let usable = mut fx.b.umax(wanted, y: default)
-    let padded = mut fx.b.iadd_imm_s(usable, y: i64.fit(SEGMENT_HEADER + reserve + 15))
+    let reserved = mut fx.b.iadd(usable, y: reserve)
+    let padded = mut fx.b.iadd_imm_s(reserved, y: i64.fit(SEGMENT_HEADER + 15))
     return mut fx.b.band_imm_s(padded, y: -16)
 } segment_length
 
@@ -180,14 +191,15 @@ fn run_on_segment(mut lo: Lowering, mut fx: Fx, task: clif::Value, drawn: DrawnS
     let segment = drawn.address
     let length = drawn.length
     let mapped = drawn.mapped
-    let reserve = tasks_reserve(lo)
+    let reserve = tasks_reserve(mut lo, mut fx)
     let limit = mut fx.load(PTR, addr: task, offset: TASK_LIMIT)
     let stack_top = mut fx.load(PTR, addr: task, offset: TASK_TOP)
     let older = mut fx.load(PTR, addr: task, offset: TASK_SEGMENT)
     mut fx.store(older, addr: segment, offset: 0)
     mut fx.store(length, addr: segment, offset: 8)
     mut fx.store(mapped, addr: segment, offset: 16)
-    let grown_limit = mut fx.b.iadd_imm_s(segment, y: i64.fit(SEGMENT_HEADER + reserve))
+    let reserved = mut fx.b.iadd(segment, y: reserve)
+    let grown_limit = mut fx.b.iadd_imm_s(reserved, y: i64.fit(SEGMENT_HEADER))
     let grown_top = mut fx.b.iadd(segment, y: length)
     mut fx.store(grown_limit, addr: task, offset: TASK_LIMIT)
     mut fx.store(grown_top, addr: task, offset: TASK_TOP)
@@ -253,7 +265,7 @@ fn nested_routine(mut lo: Lowering, mut fx: Fx) {
         discard mut fx1.choose_in(mut lo1, condition: short, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             let length = segment_length(mut lo2, fx: mut fx2, need)
             let domain = mut fx2.load(PTR, addr: task, offset: TASK_DOMAIN)
-            let align = mut fx2.ptr(MEMORY_CHUNK)
+            let align = mut fx2.ptr(stack_alignment(lo2))
             let drawn = mut lo2.call_routine(mut fx2, routine: Routine.AllocIn, args: fx2.list4(alloc, b: length, c: align, d: domain).view())
             expect drawn.len() == 1
             let segment = drawn[0]
@@ -265,13 +277,14 @@ fn nested_routine(mut lo: Lowering, mut fx: Fx) {
             return mem::List[clif::Value].empty(fx2.alloc)
         }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             let signature = mut fx2.b.import_signature(record_signature(fx2.alloc))
-            discard mut fx2.b.call_indirect(signature, callee: thunk, args: fx2.list1(held).view())
+            let call = mut fx2.b.call_indirect(signature, callee: thunk, args: fx2.list1(held).view())
+            mut fx2.classify(call, kind: StackKind.Usable)
             return mem::List[clif::Value].empty(fx2.alloc)
         })
         return mem::List[clif::Value].empty(fx1.alloc)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let length = segment_length(mut lo1, fx: mut fx1, need)
-        let align = mut fx1.ptr(MEMORY_CHUNK)
+        let align = mut fx1.ptr(stack_alignment(lo1))
         let drawn = mut lo1.call_routine(mut fx1, routine: Routine.Alloc, args: fx1.list3(alloc, b: length, c: align).view())
         expect drawn.len() == 1
         let segment = drawn[0]
@@ -318,7 +331,8 @@ fn grown_start_routine(mut lo: Lowering, mut fx: Fx) {
     let thunk = mut fx.load(PTR, addr: switch, offset: SWITCH_THUNK)
     let record = mut fx.load(PTR, addr: switch, offset: SWITCH_RECORD)
     let signature = mut fx.b.import_signature(record_signature(fx.alloc))
-    discard mut fx.b.call_indirect(signature, callee: thunk, args: fx.list1(record).view())
+    let call = mut fx.b.call_indirect(signature, callee: thunk, args: fx.list1(record).view())
+    mut fx.classify(call, kind: StackKind.Usable)
     let back = mut fx.offset(switch, offset: SWITCH_BACK)
     let zero = mut fx.ptr(0)
     mut lo.switch_stacks(mut fx, store: back, load: switch, payload: zero)

@@ -14,6 +14,7 @@ use super::super::super::abi::Repr;
 use super::super::super::body::{Body, Held};
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::{Routine, settle, state, tasks};
+use super::super::super::stack::{Family, Kind};
 use super::super::super::{Glue, Lowering, transfer, trap};
 use super::super::Supply;
 use crate::check::ty::Ty;
@@ -153,7 +154,8 @@ pub fn release_routine(lo: &mut Lowering, fx: &mut Fx) {
             fx.when(pending, |fx| {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let owner = transfer::raised(fx, reach);
-                transfer::call_walker(lo, fx, walk, &[value, reach, owner]);
+                let call = transfer::call_walker(lo, fx, walk, &[value, reach, owner]);
+                fx.classify(call, Kind::Glues(Family::Transfer));
             });
             (pending, vec![reach])
         });
@@ -186,7 +188,8 @@ pub fn poison(lo: &mut Lowering, fx: &mut Fx, held: Value, domain: Value) {
             let value = fx.load(PTR, entry, held::VALUE);
             let none = fx.ptr(0);
             let owner = transfer::raised(fx, reach);
-            transfer::call_walker(lo, fx, walk, &[value, none, owner]);
+            let call = transfer::call_walker(lo, fx, walk, &[value, none, owner]);
+            fx.classify(call, Kind::Glues(Family::Transfer));
         });
         grant_next(lo, fx, record);
     });

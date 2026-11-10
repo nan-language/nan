@@ -139,13 +139,11 @@ pub fn move_captures(
         let walks = fx.b.ins().icmp_imm_s(IntCC::NotEqual, walker, 0);
         fx.when(walks, |fx| {
             let inst = call_walker(lo, fx, walker, &[env, lift, owner]);
-            if let Some(position) = own {
-                let site = stack::Site {
-                    kind: stack::Kind::Param(position),
-                    at: None,
-                };
-                fx.sites.push((inst, site));
-            }
+            let kind = match own {
+                Some(position) => stack::Kind::Param(position),
+                None => stack::Kind::Glues(stack::Family::Captures),
+            };
+            fx.classify(inst, kind);
         });
     });
 }

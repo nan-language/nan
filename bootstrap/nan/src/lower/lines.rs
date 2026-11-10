@@ -2,11 +2,12 @@
 //! offset, which trap reports read to name the trapping operation and each caller.
 //!
 //! An image's line tables are its data object `_NSlines`: the addresses of the function, entry
-//! and location arrays and of the table of task entries' own stacks, the function count, and the
-//! address of the line tables of the next bundle loaded, zero for none. A function record is its
-//! address, its size, its first entry, its entry count and its flags; an entry is a code offset
-//! and a location; a location is the offsets from the record and lengths of its path, item and
-//! source line texts, which follow the records in the same array, and its line number.
+//! and location arrays and of the table of task entries' own stacks, the function count, the
+//! address of the line tables of the next bundle loaded, zero for none, and for a bundle the most
+//! its glues use beside the usable part of a task's stack. A function record is its address, its
+//! size, its first entry, its entry count and its flags; an entry is a code offset and a
+//! location; a location is the offsets from the record and lengths of its path, item and source
+//! line texts, which follow the records in the same array, and its line number.
 
 use std::collections::HashMap;
 
@@ -25,12 +26,14 @@ pub const SYMBOL: &str = "_NSlines";
 pub const BUNDLE_SYMBOL: &str = "_NSbundle_lines";
 
 /// The offsets in line tables of the location array, of the table of task entries' own stacks,
-/// of the function count and of the next line tables, and their size.
+/// of the function count, of the next line tables and of the most a bundle's glues use beside the
+/// usable part of a task's stack, and their size.
 pub const LOCATIONS: u64 = 16;
 pub const ENTRY_STACKS: u64 = 24;
 pub const COUNT: u64 = 32;
 pub const NEXT: u64 = 40;
-pub const HEADER: u64 = 48;
+pub const GLUES: u64 = 48;
+pub const HEADER: u64 = 56;
 
 /// The flags of a function record: trap reports leave its frames out, and a stopping task
 /// does not stop while one of its frames is on the task's stack.
@@ -168,8 +171,8 @@ pub fn path(ck: &Checker, item: ItemId) -> String {
 }
 
 /// Defines the line tables from every function lowered, pointing at the table of task entries'
-/// own stacks.
-pub fn emit(lo: &mut Lowering, entry_stacks: DataId) {
+/// own stacks, with what a bundle's glues use.
+pub fn emit(lo: &mut Lowering, entry_stacks: DataId, glues: u64) {
     let table = lo.lines.table(&mut lo.module, &lo.linking);
     let array = lo.lines.array(&mut lo.module);
     let lines = std::mem::take(&mut lo.lines);
@@ -252,6 +255,7 @@ pub fn emit(lo: &mut Lowering, entry_stacks: DataId) {
     let mut header = vec![0u8; HEADER as usize];
     header[COUNT as usize..COUNT as usize + 4]
         .copy_from_slice(&(lines.functions.len() as u32).to_le_bytes());
+    header[GLUES as usize..HEADER as usize].copy_from_slice(&glues.to_le_bytes());
     let mut description = DataDescription::new();
     description.define(header.into_boxed_slice());
     description.set_align(8);

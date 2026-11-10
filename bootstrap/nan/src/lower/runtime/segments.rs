@@ -6,7 +6,7 @@
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
 use super::super::fx::{Fx, PTR};
-use super::super::stack::STUB_CALL_BOUND;
+use super::super::stack::{Kind, STUB_CALL_BOUND};
 use super::super::{Lowering, nested, supplied};
 use super::tasks::{self, task};
 use super::{Routine, memory, report, system};
@@ -22,6 +22,15 @@ const SWITCH_THUNK: u64 = 24;
 const SWITCH_RECORD: u64 = 32;
 const SWITCH_BACK: u64 = 40;
 const SWITCH: u64 = 64;
+
+/// The alignment of a stack drawn through a cell: a chunk's on a host target, whose guard regions
+/// it protects page by page, and on a machine target the least a carved allocation has.
+fn alignment(lo: &Lowering) -> u64 {
+    match lo.machine() {
+        true => memory::MIN_ALIGN,
+        false => memory::CHUNK,
+    }
+}
 
 /// A stack of `length` bytes: mapped for the zero cell, drawn through a cell for a domain
 /// otherwise, its guard region made inaccessible when `guarded`; zero when it cannot be had.
@@ -40,7 +49,7 @@ pub fn draw(
         &[PTR],
         |lo, fx| vec![system::map_stack(lo, fx, length)],
         |lo, fx| {
-            let align = fx.ptr(memory::CHUNK);
+            let align = fx.ptr(alignment(lo));
             let drawn = lo.call_routine(fx, Routine::AllocIn, &[cell, length, align, domain])[0];
             if guarded {
                 let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, drawn, 0);
@@ -153,7 +162,8 @@ pub fn grow(lo: &mut Lowering, fx: &mut Fx) {
         },
         |_, fx| {
             let signature = fx.b.import_signature(supplied::tasks::record_signature());
-            fx.b.ins().call_indirect(signature, thunk, &[record]);
+            let call = fx.b.ins().call_indirect(signature, thunk, &[record]);
+            fx.classify(call, Kind::Usable);
             Vec::new()
         },
     );
@@ -202,13 +212,12 @@ fn return_segment(lo: &mut Lowering, fx: &mut Fx, segment: Value, length: Value,
 /// The length of a segment for a call needing `need` bytes: its header, the routine reserve and
 /// the default task stack, or the room the call needs if more.
 fn segment_length(lo: &mut Lowering, fx: &mut Fx, need: Value) -> Value {
-    let reserve = tasks::reserve(lo);
+    let reserve = tasks::reserve(lo, fx);
     let wanted = fx.b.ins().iadd_imm_s(need, STUB_CALL_BOUND as i64);
     let default = fx.ptr(tasks::STACK);
     let usable = fx.b.ins().umax(wanted, default);
-    let length =
-        fx.b.ins()
-            .iadd_imm_s(usable, (HEADER + reserve + 15) as i64);
+    let length = fx.b.ins().iadd(usable, reserve);
+    let length = fx.b.ins().iadd_imm_s(length, (HEADER + 15) as i64);
     fx.b.ins().band_imm_s(length, -16)
 }
 
@@ -223,14 +232,15 @@ fn run_on_segment(
     thunk: Value,
     record: Value,
 ) {
-    let reserve = tasks::reserve(lo);
+    let reserve = tasks::reserve(lo, fx);
     let limit = fx.load(PTR, task, task::LIMIT);
     let top = fx.load(PTR, task, task::TOP);
     let older = fx.load(PTR, task, task::SEGMENT);
     fx.store(older, segment, 0);
     fx.store(length, segment, 8);
     fx.store(mapped, segment, 16);
-    let grown_limit = fx.b.ins().iadd_imm_s(segment, (HEADER + reserve) as i64);
+    let grown_limit = fx.b.ins().iadd(segment, reserve);
+    let grown_limit = fx.b.ins().iadd_imm_s(grown_limit, HEADER as i64);
     let grown_top = fx.b.ins().iadd(segment, length);
     fx.store(grown_limit, task, task::LIMIT);
     fx.store(grown_top, task, task::TOP);
@@ -307,7 +317,7 @@ pub fn nested(lo: &mut Lowering, fx: &mut Fx) {
                 |lo, fx| {
                     let length = segment_length(lo, fx, need);
                     let domain = fx.load(PTR, task, task::DOMAIN);
-                    let align = fx.ptr(memory::CHUNK);
+                    let align = fx.ptr(alignment(lo));
                     let drawn =
                         lo.call_routine(fx, Routine::AllocIn, &[params[2], length, align, domain]);
                     let segment = drawn[0];
@@ -320,7 +330,8 @@ pub fn nested(lo: &mut Lowering, fx: &mut Fx) {
                 },
                 |_, fx| {
                     let signature = fx.b.import_signature(supplied::tasks::record_signature());
-                    fx.b.ins().call_indirect(signature, thunk, &[held]);
+                    let call = fx.b.ins().call_indirect(signature, thunk, &[held]);
+                    fx.classify(call, Kind::Usable);
                     Vec::new()
                 },
             );
@@ -328,7 +339,7 @@ pub fn nested(lo: &mut Lowering, fx: &mut Fx) {
         },
         |lo, fx| {
             let length = segment_length(lo, fx, need);
-            let align = fx.ptr(memory::CHUNK);
+            let align = fx.ptr(alignment(lo));
             let segment = lo.call_routine(fx, Routine::Alloc, &[params[2], length, align])[0];
             let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, segment, 0);
             fx.when(drawn, |fx| {
@@ -374,7 +385,8 @@ pub fn grown_start(lo: &mut Lowering, fx: &mut Fx) {
     let thunk = fx.load(PTR, switch, SWITCH_THUNK);
     let record = fx.load(PTR, switch, SWITCH_RECORD);
     let signature = fx.b.import_signature(supplied::tasks::record_signature());
-    fx.b.ins().call_indirect(signature, thunk, &[record]);
+    let call = fx.b.ins().call_indirect(signature, thunk, &[record]);
+    fx.classify(call, Kind::Usable);
     let back = fx.offset(switch, SWITCH_BACK);
     let zero = fx.ptr(0);
     lo.switch_stacks(fx, back, switch, zero);

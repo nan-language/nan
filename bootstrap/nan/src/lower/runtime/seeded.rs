@@ -13,6 +13,7 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
+use super::super::stack::{Family, Kind};
 use super::tasks::thread;
 use super::tasks::{self, CANCELED, EXPIRED, operation, run, task};
 use super::{Routine, state, timers};
@@ -405,7 +406,8 @@ pub fn cancel(lo: &mut Lowering, fx: &mut Fx, op: Value) {
             |_, fx| {
                 let signature =
                     fx.b.import_signature(super::super::supplied::tasks::record_signature());
-                fx.b.ins().call_indirect(signature, withdraw, &[op]);
+                let call = fx.b.ins().call_indirect(signature, withdraw, &[op]);
+                fx.classify(call, Kind::Glues(Family::Withdraw));
                 Vec::new()
             },
             |lo, fx| {

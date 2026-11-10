@@ -317,7 +317,7 @@ const TRAP_RECORD_LEN: u64 = 8
 const TRAP_RECORD_BYTES: u64 = 16
 
 /// The default size of a task's stack, of the entry task's stack on a host target, and of a
-/// guard region.
+/// host target's guard region.
 const TASKS_STACK: u64 = 65_536
 
 const ENTRY_STACK: u64 = 67_108_864
@@ -326,16 +326,176 @@ const TASKS_GUARD: u64 = 4_096
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library
 /// functions that its calls of support routines run, whose use past the stub call bound the
-/// usable size does not count; a kernel task's also holds a call of a policy hook.
+/// usable size does not count: a host target's, and a machine target's where the frames of its
+/// support routines bound none.
 const ROUTINE_RESERVE: u64 = 32_768
 
-/// The bytes a task's stack, or a segment of it, holds below its usable part for its routines.
-fn tasks_reserve(lo: Lowering) -> u64 {
-    if lo.kernel() {
-        return ROUTINE_RESERVE + HOOK_STACK
+/// The symbol of a machine image's routine reserve, which its final build computes once every
+/// function is lowered: the bytes its task stacks hold beyond their usable size for what runs
+/// there that the usable size does not count, then the most stack a call of one of its support
+/// routines uses.
+const ROUTINE_RESERVE_SYMBOL: Str = "_NSroutine_reserve"
+
+/// The guard region a task's stack holds below the rest, on a host target alone.
+fn guard_bytes(lo: Lowering) -> u64 {
+    if lo.machine() {
+        return 0
     }
-    return ROUTINE_RESERVE
+    return TASKS_GUARD
+} guard_bytes
+
+/// The bytes a task's stack, or a segment of it, holds below its usable part for its routines:
+/// on a machine target the image's routine reserve, and while bundles are loaded, the most any
+/// of their glues uses with a call of a support routine.
+fn tasks_reserve(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    if not lo.machine() {
+        return mut fx.ptr(ROUTINE_RESERVE)
+    }
+    let id = mut lo.routine_reserve()
+    let address = mut lo.data_address(mut fx, id)
+    let own = mut fx.load(PTR, addr: address, offset: 0)
+    let call = mut fx.load(PTR, addr: address, offset: 8)
+    let head = mut lo.line_head(mut fx)
+    let zero = mut fx.ptr(0)
+    let found = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let tables = state[0]
+        let glues = mut fx1.load(PTR, addr: tables, offset: LINES_GLUES)
+        let most = mut fx1.b.umax(state[1], y: glues)
+        let next = mut fx1.load(PTR, addr: tables, offset: LINES_NEXT)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        return Pass(again: more, next: fx1.list2(next, b: most))
+    })
+    expect found.len() > 1
+    let bundles = found[1]
+    let loaded = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: bundles, y: 0)
+    let counted = mut fx.b.select(loaded, x: call, y: zero)
+    let reserve = mut fx.b.iadd(own, y: bundles)
+    return mut fx.b.iadd(reserve, y: counted)
 } tasks_reserve
+
+/// The data object of the image's routine reserve, declared once and defined when lowering
+/// finishes.
+fn Lowering.routine_reserve(mut self) -> object::DataId {
+    match self.routine_reserve_id {
+        Some(declared) => return declared
+        None => {}
+    }
+    let id = mut self.module.declare_data(ROUTINE_RESERVE_SYMBOL, linkage: object::Linkage.Local, writable: false, tls: false)
+    self.routine_reserve_id = Some(id)
+    return id
+} Lowering.routine_reserve
+
+/// Defines the routine reserve once every function is lowered, when a routine reads it: the
+/// reserve its frames bound, or else the fixed routine reserve, with a call of a policy hook
+/// on a kernel. Gives for a bundle the most its glues use beside the usable part of a task's
+/// stack, each call of a support routine counted as a stub's, or else the fixed routine
+/// reserve; zero for another image.
+fn Lowering.finish_reserve(mut self) -> u64 {
+    let families = self.families()
+    if self.imports() {
+        var glues = mem::List[object::FuncId].empty(self.alloc)
+        for glue in families {
+            mut glues.push(glue.function)
+        }
+        return match routine_use(self.frames.view(), glues: families.view(), beneath: 0, functions: glues.view(), alloc: self.alloc) {
+            Some(used) => used
+            None => ROUTINE_RESERVE
+        }
+    }
+    let Some(id) = self.routine_reserve_id else {
+        return 0
+    }
+    var fixed = ROUTINE_RESERVE
+    if self.kernel() {
+        fixed = ROUTINE_RESERVE + HOOK_STACK
+    }
+    var own = fixed
+    var call = fixed
+    match self.bounded_reserve(families.view()) {
+        Some(bounded) => {
+            own = bounded.own
+            call = bounded.call
+        }
+        None => {}
+    }
+    var bytes = mem::Bytes.empty(self.alloc)
+    object::append_u64(mut bytes, value: own)
+    object::append_u64(mut bytes, value: call)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+    return 0
+} Lowering.finish_reserve
+
+/// A routine reserve the frames of every function lowered bound, and the most a call of a
+/// support routine uses.
+struct BoundedReserve derives Copy {
+    own: u64
+    call: u64
+} BoundedReserve
+
+/// The routine reserve the frames of every function lowered bound, and the most a call of a
+/// support routine uses from code outside them or, in a kernel exporting them, from a
+/// bundle: the reserve holds the most the start of a task uses beside its usable part, each
+/// call of code the usable part holds using that call, and on a kernel taking interrupts, a
+/// seam frame and the most its preemption glue, or the trap an exception makes, uses. None
+/// when a support routine reaches an unbounded call site.
+fn Lowering.bounded_reserve(self, families: Slice[FamilyGlue]) -> Option[BoundedReserve] {
+    var roots = mem::List[object::FuncId].empty(self.alloc)
+    for frame in self.frames {
+        if self.is_routine(frame.function) {
+            continue
+        }
+        for site in frame.sites {
+            match site.kind {
+                StackKind.Routine(routine) => mut roots.push(routine)
+                else => {}
+            }
+        }
+    }
+    if self.exports() {
+        for routine in exported_routines(self.alloc) {
+            match self.routines.get(routine) {
+                Some(id) => mut roots.push(id)
+                None => {}
+            }
+        }
+    }
+    let Some(call) = routine_use(self.frames.view(), glues: families, beneath: 0, functions: roots.view(), alloc: self.alloc) else {
+        return None
+    }
+    var start = mem::List[object::FuncId].empty(self.alloc)
+    match self.routines.get(Routine.TaskStart) {
+        Some(id) => mut start.push(id)
+        None => {}
+    }
+    let Some(started) = routine_use(self.frames.view(), glues: families, beneath: call, functions: start.view(), alloc: self.alloc) else {
+        return None
+    }
+    var preempted: u64 = 0
+    match self.preemption {
+        Some(glue) => {
+            var preempting = mem::List[object::FuncId].empty(self.alloc)
+            mut preempting.push(glue)
+            match self.routines.get(Routine.TrapRaise) {
+                Some(raise) => mut preempting.push(raise)
+                None => {}
+            }
+            let Some(used) = routine_use(self.frames.view(), glues: families, beneath: 0, functions: preempting.view(), alloc: self.alloc) else {
+                return None
+            }
+            preempted = SEAM_FRAME + used
+        }
+        None => {}
+    }
+    var most = call
+    if started > most {
+        most = started
+    }
+    return Some(BoundedReserve(own: most + preempted, call: call))
+} Lowering.bounded_reserve
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation the
 /// task waits on, which the task keeps until the bit clears.
@@ -590,8 +750,10 @@ fn tasks_spawn(mut lo: Lowering, mut fx: Fx) {
     mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
         raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
     })
-    let reserved = mut fx.b.iadd_imm_s(usable, y: i64.fit(TASKS_GUARD + tasks_reserve(lo) + 15))
-    let length = mut fx.b.band_imm_s(reserved, y: -16)
+    let reserve = tasks_reserve(mut lo, mut fx)
+    let reserved = mut fx.b.iadd(usable, y: reserve)
+    let guarded = mut fx.b.iadd_imm_s(reserved, y: i64.fit(guard_bytes(lo) + 15))
+    let length = mut fx.b.band_imm_s(guarded, y: -16)
     let stack = stack_draw(mut lo, mut fx, cell, domain, length, guarded: true)
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: stack, y: 0)
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
@@ -602,9 +764,9 @@ fn tasks_spawn(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(stack, addr: record, offset: TASK_STACK)
     mut fx.store(length, addr: record, offset: TASK_STACK_SIZE)
     mut fx.store(cell, addr: record, offset: TASK_STACK_CELL)
-    let guard = mut fx.b.iadd_imm_s(stack, y: i64.fit(TASKS_GUARD))
+    let guard = mut fx.b.iadd_imm_s(stack, y: i64.fit(guard_bytes(lo)))
     mut fx.store(guard, addr: record, offset: TASK_GUARD)
-    let limit = mut fx.b.iadd_imm_s(guard, y: i64.fit(tasks_reserve(lo)))
+    let limit = mut fx.b.iadd(guard, y: reserve)
     mut fx.store(limit, addr: record, offset: TASK_LIMIT)
     let stack_top = mut fx.b.iadd(stack, y: length)
     mut fx.store(stack_top, addr: record, offset: TASK_TOP)
@@ -661,11 +823,13 @@ fn task_start(mut lo: Lowering, mut fx: Fx) {
     mut signature.params.push(clif::AbiParam(value_type: PTR))
     let imported = mut fx.b.import_signature(take signature)
     let glue = mut fx.load(PTR, addr: record, offset: TASK_GLUE)
-    discard mut fx.b.call_indirect(imported, callee: glue, args: fx.list1(record).view())
+    let started = mut fx.b.call_indirect(imported, callee: glue, args: fx.list1(record).view())
+    mut fx.classify(started, kind: StackKind.Glues(StackFamily.Task))
     let end = mut fx.load(PTR, addr: record, offset: TASK_END)
     let has_end = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: end, y: 0)
     mut fx.if_true(has_end, then: fn(mut fx1: Fx) {
-        discard mut fx1.b.call_indirect(imported, callee: end, args: fx1.list1(record).view())
+        let ended = mut fx1.b.call_indirect(imported, callee: end, args: fx1.list1(record).view())
+        mut fx1.classify(ended, kind: StackKind.Glues(StackFamily.End))
     })
     let state_address = mut lo.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_TASKS_LOCK)
@@ -1027,7 +1191,8 @@ fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Va
             var signature = clif::Signature.new(CALL_CONV, alloc: fx2.alloc)
             mut signature.params.push(clif::AbiParam(value_type: PTR))
             let imported = mut fx2.b.import_signature(take signature)
-            discard mut fx2.b.call_indirect(imported, callee: done, args: fx2.list1(record).view())
+            let call = mut fx2.b.call_indirect(imported, callee: done, args: fx2.list1(record).view())
+            mut fx2.classify(call, kind: StackKind.Glues(StackFamily.Done))
         })
     })
 } settle_away
@@ -1182,6 +1347,18 @@ fn io_submit(mut lo: Lowering, mut fx: Fx) {
 /// deadline that expired cancels its region and wakes the task disarming it, and a component's
 /// delayed messages that are due enter its intake.
 fn deliver(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
+    deliver_as(mut lo, mut fx, op, result, expires: true)
+} deliver
+
+/// Delivers an operation's cancelled completion, which expires no deadline.
+fn deliver_cancelled(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let cancelled = mut fx.int(clif::Type.Int32, value: CANCELED)
+    deliver_as(mut lo, mut fx, op, result: cancelled, expires: false)
+} deliver_cancelled
+
+/// Delivers an operation's completion with its result, an expired deadline's only when
+/// `expires`.
+fn deliver_as(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value, expires: bool) {
     let kind = mut fx.load(PTR, addr: op, offset: OPERATION_KIND)
     let wait = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_WAIT)
     mut fx.if_true(wait, then: fn[mut lo](mut fx1: Fx) {
@@ -1194,11 +1371,13 @@ fn deliver(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
     let deadline = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_DEADLINE)
     mut fx.if_true(deadline, then: fn[mut lo](mut fx1: Fx) {
         set_done(mut fx1, op, done: OPERATION_COMPLETED)
-        let expired = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: TASKS_EXPIRED)
-        mut fx1.if_true(expired, then: fn[mut lo](mut fx2: Fx) {
-            let region_record = mut fx2.load(PTR, addr: op, offset: OPERATION_TASK)
-            discard mut lo.call_routine(mut fx2, routine: Routine.Cancel, args: fx2.list1(region_record).view())
-        })
+        if expires {
+            let expired = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: TASKS_EXPIRED)
+            mut fx1.if_true(expired, then: fn[mut lo](mut fx2: Fx) {
+                let region_record = mut fx2.load(PTR, addr: op, offset: OPERATION_TASK)
+                discard mut lo.call_routine(mut fx2, routine: Routine.Cancel, args: fx2.list1(region_record).view())
+            })
+        }
         let waiter_word = mut fx1.offset(op, offset: OPERATION_WAITER)
         let waiter = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: waiter_word)
         let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
@@ -1211,7 +1390,7 @@ fn deliver(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
     mut fx.if_true(after, then: fn[mut lo](mut fx1: Fx) {
         timer_completed(mut lo, fx: mut fx1, op)
     })
-} deliver
+} deliver_as
 
 /// Stores how far an operation's completion has been delivered.
 fn set_done(mut fx: Fx, op: clif::Value, done: i64) {

@@ -19,7 +19,7 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, 
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::tasks::{self, CANCELED, EXPIRED, operation};
+use super::super::runtime::tasks::{self, EXPIRED, operation};
 use super::super::runtime::{Routine, state, timers};
 use super::super::supplied::boot::firmware;
 use super::acpi::{FADT_SIGNATURE, load_u32, load_u64};
@@ -674,8 +674,7 @@ impl Lowering<'_, '_> {
 
     /// Delivers the cancelled completion of a timer the caller claimed.
     pub fn kernel_cancelled(&mut self, fx: &mut Fx, op: Value) {
-        let cancelled = fx.int(types::I32, CANCELED);
-        tasks::deliver(self, fx, op, cancelled);
+        tasks::deliver_cancelled(self, fx, op);
     }
 
     /// Reads the target's wall clock source: whether it gave a time, and that time in

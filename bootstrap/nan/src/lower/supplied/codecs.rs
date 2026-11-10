@@ -21,7 +21,7 @@ mod wire;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
-use super::super::body::Held;
+use super::super::body::{Body, Held};
 use super::super::call::{Called, Invoked};
 use super::super::data::const_arg;
 use super::super::fx::{Fx, PTR};
@@ -32,7 +32,7 @@ use super::mem::maps::Entries;
 use super::mem::vector::{self, Element};
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::{KEPT, Payload, SigKind};
-use crate::check::ty::{Arg, Scalar, Subst, Ty};
+use crate::check::ty::{Arg, Args, Scalar, Subst, Ty};
 use crate::hash::Hash;
 use crate::nir::{Callable, FnRef, Role};
 
@@ -527,35 +527,61 @@ fn erased(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let at = lo.layouts.field(lo.ck, &result, None, "schema").offset;
     let schema = fx.b.ins().iadd_imm_s(target, at as i64);
     lo.copy(fx, schema, hash, 33, 1);
-    let codec = lo
-        .ck
-        .db
-        .std_item("mem::wire", "Codec")
-        .expect("mem::wire::Codec");
-    let Ty::Item(erased, _) = &result else {
-        panic!("an erased decoder's type");
-    };
-    let SigKind::Struct { fields } = &lo.ck.sig(*erased).kind else {
-        panic!("mem::wire::Erased is a struct");
-    };
-    for field in fields.iter().filter(|field| field.name != "schema") {
-        let member = field.name.as_str();
-        let item = lo.ck.db.members(TypeKey::Item(codec), member)[0];
-        let function = FnRef {
-            callable: Callable::Item {
-                item,
-                role: Role::Body,
-                index: 0,
-            },
-            args: supply.args.clone(),
-        };
+    for (member, function, _) in erased_members(lo, &supply.args) {
         let value = lo.function_value(fx, &function).address();
-        let at = lo.layouts.field(lo.ck, &result, None, member).offset;
+        let at = lo.layouts.field(lo.ck, &result, None, &member).offset;
         let field = fx.b.ins().iadd_imm_s(target, at as i64);
         lo.copy(fx, field, value, 16, 8);
     }
     let held = lo.held_at(fx, &result, target);
     supply.ret(lo, fx, held);
+}
+
+/// At a call of `Codec.erased()`, the `stack N` demands the field types of `Erased` make of the
+/// members of `Codec` it gives as their values.
+pub fn fit_erased(body: &mut Body, fn_ref: &FnRef) {
+    let Callable::Item { item, .. } = fn_ref.callable else {
+        return;
+    };
+    if body.lo.ck.db.canonical(item) != "mem::wire::Codec.erased" {
+        return;
+    }
+    for (_, function, stack) in erased_members(body.lo, &fn_ref.args) {
+        if let Some(stack) = stack {
+            body.fit_named(&function, stack);
+        }
+    }
+}
+
+/// Each function-typed field of `mem::wire::Erased`, with the member of `Codec` of the type
+/// argument it names and the `stack N` its type demands.
+fn erased_members(lo: &Lowering, args: &Args) -> Vec<(String, FnRef, Option<u64>)> {
+    let db = &lo.ck.db;
+    let codec = db.std_item("mem::wire", "Codec").expect("mem::wire::Codec");
+    let erased = db
+        .std_item("mem::wire", "Erased")
+        .expect("mem::wire::Erased");
+    let SigKind::Struct { fields } = &lo.ck.sig(erased).kind else {
+        panic!("mem::wire::Erased is a struct");
+    };
+    fields
+        .iter()
+        .filter_map(|field| {
+            let Ty::Fn(fn_ty) = &field.ty else {
+                return None;
+            };
+            let item = db.members(TypeKey::Item(codec), &field.name)[0];
+            let function = FnRef {
+                callable: Callable::Item {
+                    item,
+                    role: Role::Body,
+                    index: 0,
+                },
+                args: args.clone(),
+            };
+            Some((field.name.clone(), function, fn_ty.limits.stack))
+        })
+        .collect()
 }
 
 /// Returns the value a decoding function read at `target`, or fails with the

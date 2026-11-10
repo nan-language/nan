@@ -321,3 +321,24 @@ fn slots_of_values_never_needed_at_once_are_shared() {
         .sum();
     assert!(bytes < 4 * 1024, "{bytes} bytes of slots\n{text}");
 }
+
+#[test]
+fn the_decoders_erased_gives_are_judged_at_its_call() {
+    let scratch = Scratch::new(&[
+        (
+            "trees/package.nan",
+            "//! Trees.\n\npackage trees {\n    language 1\n    targets x86_64-host\n    entry main\n    allow validate in trees\n} trees\n",
+        ),
+        (
+            "trees/trees.nan",
+            "//! Trees.\n\n/// A tree whose decoder reaches itself.\npub closed enum Tree derives Encode {\n    Leaf\n    Node(left: mem::Box[Tree])\n} Tree\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    let erased = mem::wire::Codec[Tree].erased()\n    world.log.info(\"schema\", value: erased.schema == mem::wire::Codec[Tree].schema_hash())\n} main\n",
+        ),
+    ]);
+    let built = crate::run(&["build".to_owned()], &scratch.0);
+    let reported = built
+        .output
+        .lines()
+        .filter(|line| line.starts_with("error limit.stack-unbounded trees/trees.nan:10 "))
+        .count();
+    assert_eq!(reported, 2, "{}", built.output);
+}

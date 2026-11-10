@@ -995,8 +995,8 @@ An **erased decoder** is a `mem::wire::Erased`: the schema hash of a type and a 
 
 pub open struct Erased derives Copy {
     pub schema: SchemaHash
-    pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates
-    pub canonical_located: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure limits terminates
+    pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates, stack 16_384
+    pub canonical_located: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure limits terminates, stack 16_384
 } Erased
 
 pub fn Codec.canonical(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError
@@ -1007,7 +1007,7 @@ pub fn Codec.erased() -> Erased limits pure, notrap, terminates
 ```
 
 - `canonical` reads one value as `decode` does, then gives the bytes `encode` writes for it, drawn through `alloc`, failing with `OutOfMemory` when it cannot draw them. Its result stays Untrusted, so it reads no contents for its caller. `canonical_located` gives the same bytes, failing as `decode_located` does.
-- `erased` gives the schema hash of `T`, `Codec[T].canonical` and `Codec[T].canonical_located`.
+- `erased` gives the schema hash of `T`, `Codec[T].canonical` and `Codec[T].canonical_located`. Each decoder fits its field's type at the call of `erased`, where a final build judges it against the `stack 16_384` of that type ([Stack limits](10-effects-digests.md#stack-limits)).
 - A package exports the erased decoders of its types by contributing them to a [registry](25-registries.md#registries), through which code checks records by their schema hashes without naming their types.
 
 ```nan
@@ -1045,6 +1045,40 @@ test probes_are_checked for checked {
     expect current.is_ok()
     expect far.is_err()
 } probes_are_checked
+```
+
+A call through an erased decoder uses that bound, so code with a stack limit of its own, as every kernel task has, can check what it is handed:
+
+```nan
+// file: settings/package.nan
+//! Settings a kernel checks.
+
+package settings {
+    language 1
+    targets x86_64-bare
+    entry main
+} settings
+
+// file: settings/settings.nan
+//! Checks a setting through an erased decoder.
+
+pub closed struct Setting derives Encode {
+    pub level: u32
+} Setting
+
+pub fn valid(decoder: mem::wire::Erased, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> bool limits stack 65_536 {
+    return (attempt (decoder.canonical)(raw, alloc)).is_ok()
+} valid
+
+fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
+    let alloc = k.alloc()
+    let accepted = valid(mem::wire::Codec[Setting].erased(), raw: Untrusted.of(b"\x00"), alloc)
+    loop {
+        if accepted {
+            continue
+        }
+    }
+} main
 ```
 
 ## Migrations

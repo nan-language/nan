@@ -96,6 +96,7 @@ impl Body<'_, '_, '_, '_> {
                 }
                 self.bounds_check(&fn_ref, &call.args, block, position);
                 supplied::numbers::operand_checks(self, &fn_ref, &call.args);
+                supplied::codecs::fit_erased(self, &fn_ref);
                 self.direct_target(&fn_ref)
             }
             Callee::Value(value) => {
@@ -599,10 +600,10 @@ impl Body<'_, '_, '_, '_> {
                     stack::Report::Own { head },
                 )
             }
-            FnSource::Named(fn_ref) => (
-                stack::Judged::Function(self.named_function(&fn_ref)),
-                stack::Report::Fit(at),
-            ),
+            FnSource::Named(fn_ref) => {
+                self.fit_named(&fn_ref, stack);
+                return;
+            }
             FnSource::Param(position) => {
                 let bound = match &self.abi.params[position].0.ty() {
                     Ty::Fn(fn_ty) => fn_ty.limits.stack,
@@ -616,6 +617,21 @@ impl Body<'_, '_, '_, '_> {
             judged,
             stack,
             report,
+        });
+    }
+
+    /// Records the `stack N` demand a function type makes of a named function that becomes a
+    /// value of that type at the current call or use.
+    pub fn fit_named(&mut self, fn_ref: &FnRef, stack: u64) {
+        let at = stack::At {
+            item: self.item,
+            span: self.current,
+        };
+        let judged = stack::Judged::Function(self.named_function(fn_ref));
+        self.lo.demands.push(stack::Demand {
+            judged,
+            stack,
+            report: stack::Report::Fit(at),
         });
     }
 

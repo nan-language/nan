@@ -70,6 +70,7 @@ A **run** is one execution of a test body on one [run target](#emulator-runs). O
 - the target did not run (`test.target-not-run`);
 - on a host target, no task of the domain is ready and no deadline is pending (`test.stalled`);
 - the run uses more than 10 seconds of host processor time, its process's or its emulator's (`test.timeout`), its domain then being [abandoned](11-errors-domains.md#abandoning-a-domain) without a trap report.
+- its process or its emulator ends without writing the run's outcome (`test.crashed`), reported by the signal ending the process or the status it exits with.
 
 These codes and `test.emulator-unavailable` are the **test-run codes**. `nan test` reports a failing test as [checking commands](33-toolchain.md#checking-commands) state, its cause being its test-run code or trap kind; a test-run code is never a diagnostic. A test passes when every run passes, and reports only its failing run of lowest index. Runs share no state, and their outcomes never depend on how many execute at once.
 
@@ -90,6 +91,31 @@ pub fn adjust(level: u32) -> u32 {
 test small_levels_unchanged for scale { // error: test.target-not-run
     expect adjust(3) == 3
 } small_levels_unchanged
+```
+
+```nan
+// file: halts/package.nan
+//! A test whose process ends.
+
+package halts {
+    language 1
+    targets x86_64-host
+    allow trusted in halts
+} halts
+
+// file: halts/halts.nan
+//! Ends the process through the C library.
+
+foreign fn abort() -> i32 convention "sysv"
+
+pub fn halt() -> i32 {
+    return trusted "the C library ends the process" { abort() }
+} halt
+
+test halt_returns for halt { // error: test.crashed
+    let code = halt()
+    expect code == 0
+} halt_returns
 ```
 
 ## Generation
@@ -483,6 +509,7 @@ test bump_stops_at_top for gauge::bump {
 
 | Code | Class | Rule |
 | --- | --- | --- |
+| `test.crashed` | error | [Test runs](#test-runs) |
 | `test.dbg` | incompleteness | [Debug output](#debug-output) |
 | `test.emulator-unavailable` | error | [Emulator runs](#emulator-runs) |
 | `test.escaped-failure` | error | [Test runs](#test-runs) |

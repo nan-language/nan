@@ -23,6 +23,7 @@ datatest_stable::harness! {
 
 /// The test-run codes, which `nan test` gives as a failing test's cause.
 const TEST_RUN: &[&str] = &[
+    "test.crashed",
     "test.emulator-unavailable",
     "test.escaped-failure",
     "test.stalled",

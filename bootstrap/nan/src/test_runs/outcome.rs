@@ -6,7 +6,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::command::Launch;
@@ -32,12 +32,6 @@ impl Image {
             }
             false => Image::Host(path),
         })
-    }
-
-    fn path(&self) -> &Path {
-        match self {
-            Image::Host(path) | Image::Machine(path, _) => path,
-        }
     }
 
     /// Removes the image with its boot volume and machine.
@@ -70,6 +64,11 @@ pub enum Ended {
         ran: bool,
     },
     TimedOut,
+    /// The process or the emulator ended without the run's outcome: by the signal or with the
+    /// exit status it states.
+    Crashed {
+        ending: String,
+    },
 }
 
 /// A draw of a case: its value, the bounds it was drawn within, and the value it gave once the
@@ -131,11 +130,10 @@ pub fn run(
             (output, start)
         }
     };
-    let frames = start.map(|start| &output.stdout[start..]);
     let mut trace = Vec::new();
     let mut draws = Vec::new();
     let mut ended = None;
-    let mut rest = frames.unwrap_or_default();
+    let mut rest = start.map_or(&[][..], |start| &output.stdout[start..]);
     while rest.len() >= 5 {
         let kind = rest[0];
         let len = u32::from_le_bytes(rest[1..5].try_into().expect("four bytes")) as usize;
@@ -160,24 +158,19 @@ pub fn run(
         }
         rest = &rest[5 + len..];
     }
-    match ended {
-        Some((ended, contended)) => Ok(Run {
-            ended,
-            contended,
-            trace,
-            draws,
-        }),
-        None => Err(io::Error::other(format!(
-            "test run {test}/{index} of {} ended with {} without an outcome:\n{}{}",
-            image.path().file_name().unwrap_or_default().display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-            match frames {
-                Some(_) => String::new(),
-                None => String::from_utf8_lossy(&output.stdout).into_owned(),
-            },
-        ))),
-    }
+    let (ended, contended) = ended.unwrap_or_else(|| {
+        let ending = match output.status.signal() {
+            Some(signal) => format!("by signal {signal}"),
+            None => format!("with status {}", output.status.code().unwrap_or_default()),
+        };
+        (Ended::Crashed { ending }, false)
+    });
+    Ok(Run {
+        ended,
+        contended,
+        trace,
+        draws,
+    })
 }
 
 /// The run of a test that outlived its bound.

@@ -625,7 +625,7 @@ fn token(target: Target, test: &str, index: u64, seed: u64) -> String {
 }
 
 /// The cause of a failing run, the first that applies of a trap, an escaped failure, a target
-/// that did not run, a stall and a timeout; none for a passing run.
+/// that did not run, a stall, a timeout and a crash; none for a passing run.
 fn cause(run: &Run) -> Option<String> {
     Some(match &run.ended {
         Ended::Passed { ran: true } => return None,
@@ -640,6 +640,7 @@ fn cause(run: &Run) -> Option<String> {
         Ended::Escaped { .. } => "test.escaped-failure".to_owned(),
         Ended::Stalled { ran: true } => "test.stalled".to_owned(),
         Ended::TimedOut => "test.timeout".to_owned(),
+        Ended::Crashed { .. } => "test.crashed".to_owned(),
     })
 }
 
@@ -703,6 +704,7 @@ fn record_lines(run: &Run, token: &str) -> Vec<String> {
                     .map(|line| format!("    {}", output::printable(line.as_bytes()))),
             );
         }
+        Ended::Crashed { ending } => lines.push(format!("ended {ending}")),
         _ => {}
     }
     if !run.trace.is_empty() {

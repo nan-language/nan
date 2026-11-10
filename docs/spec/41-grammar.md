@@ -492,7 +492,7 @@ Generated as [Keywords](01-lexical.md#keywords) states:
 | Class | Words |
 | --- | --- |
 | hard keywords | the 67 words of `HARD_KEYWORD` |
-| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `capability`, `changes`, `closed`, `confined`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `flexible`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `loaded`, `manual`, `migrate`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `protocol`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `summary`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
+| context words | `actuate`, `all`, `allow`, `any`, `as`, `at`, `be`, `because`, `bit`, `by`, `bytes`, `capability`, `changes`, `closed`, `codegen`, `confined`, `convention`, `deny`, `dep`, `depth`, `device`, `emit`, `entry`, `erase`, `example`, `flexible`, `from`, `irreversible`, `keyed`, `language`, `le`, `length`, `loaded`, `manual`, `migrate`, `noalloc`, `notrap`, `old`, `open`, `preserves`, `priv`, `protocol`, `pure`, `read`, `recorded`, `restorable`, `rest`, `result`, `spend`, `stack`, `stride`, `summary`, `tags`, `targets`, `task`, `terminates`, `traceless`, `undo`, `unique`, `validate`, `view`, `wait`, `write`, `write_one_clear` |
 | reserved words | `bank`, `ipc`, `machine`, `stable` |
 
 ## One-token lookahead

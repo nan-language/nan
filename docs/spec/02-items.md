@@ -1,10 +1,10 @@
 # Items
 
-This chapter defines the item: its shape and the column-0 rule, the fourteen item kinds with the `item` and `source_file` rules, resynchronisation, order and names, modifiers, function heads, methods, transparent functions, the clause region, constants, and the reserved forms of item heads.
+This chapter defines the item: its shape and the column-0 rule, the fifteen item kinds with the `item` and `source_file` rules, resynchronisation, order and names, modifiers, function heads, methods, transparent functions, the clause region, constants, and the reserved forms of item heads.
 
 ## Item shape
 
-An **item** is a construct of one of the fourteen [item kinds](#item-kinds) that starts at [column 0](01-lexical.md#lines). It reads `[pub|pkg] [modifiers] kind Name` followed by what its kind defines: an optional [visibility](03-packages-modules.md#visibility), the [modifiers](#modifiers), the kind keyword and the item's name. A disputed test starts with its `todo` marker ([todo](18-contracts.md#todo)). An item's **name** is the identifier its kind's rule declares, and a function's name is the whole `item_label` after `fn`. Impl lines, const asserts and tombstones have no name; [Order and names](#order-and-names) gives their identity.
+An **item** is a construct of one of the fifteen [item kinds](#item-kinds) that starts at [column 0](01-lexical.md#lines). It reads `[pub|pkg] [modifiers] kind Name` followed by what its kind defines: an optional [visibility](03-packages-modules.md#visibility), the [modifiers](#modifiers), the kind keyword and the item's name. A disputed test starts with its `todo` marker ([todo](18-contracts.md#todo)). An item's **name** is the identifier its kind's rule declares, and a function's name is the whole `item_label` after `fn`. Impl lines, const asserts and tombstones have no name; [Order and names](#order-and-names) gives their identity.
 
 Every item is braced or single-line:
 

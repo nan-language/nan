@@ -375,7 +375,7 @@ Each term links to its home, whose definition governs.
 | [item](02-items.md#item-shape) | Column-0 construct closed by its name. |
 | [item granularity](#guarantees) | Item is the unit of identity, checking, editing, merging, sealing and versioning. |
 | [item hash](29-identity-versioning.md#item-hash-and-interface-hash) | Hash of an item's whole normalised form. |
-| [item kind](02-items.md#item-kinds) | One of fourteen item forms. |
+| [item kind](02-items.md#item-kinds) | One of fifteen item forms. |
 | [join handle](16-concurrency.md#joins) | `task::Join[T, E]` a spawn returns. |
 | [judging root](25-registries.md#contributors) | Package against which registry admission and tables are judged. |
 | [kept fields](13-text-encode.md#flexible-structs) | Skipped fields a flexible struct holds as bytes. |

@@ -72,3 +72,26 @@ fn entries_append_once_per_release_and_read_back_in_index_order() {
         1
     );
 }
+
+#[test]
+fn an_entry_after_one_that_does_not_read_takes_the_index_past_it() {
+    let scratch = Scratch::new(&[("store/other", "")]);
+    let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&scratch.0).unwrap());
+    let dir = scratch.0.join("store");
+    let store = Store::new(StoreDir {
+        dir: Some(dir.clone()),
+        home: scratch.0.clone(),
+        uid,
+    });
+    let appended = |manifest: &str| {
+        store
+            .append(append(Some("meter"), manifest))
+            .unwrap()
+            .ok()
+            .unwrap()
+    };
+    appended("a");
+    let second = appended("b");
+    fs::write(dir.join(entry_name(2, &second.root())), b"").unwrap();
+    assert_eq!(appended("c").index, 3);
+}

@@ -387,13 +387,17 @@ impl Store {
 
     /// The store's entries in order of publication index, those that do not read left out.
     pub fn entries(&self) -> io::Result<Result<Vec<Entry>, Exposed>> {
-        let index = match self.index()? {
-            Ok(index) => index,
-            Err(exposed) => return Ok(Err(exposed)),
-        };
+        match self.index()? {
+            Ok(index) => self.entries_of(&index),
+            Err(exposed) => Ok(Err(exposed)),
+        }
+    }
+
+    /// The entries of the publication indexes and code roots of `index` that read, in its order.
+    fn entries_of(&self, index: &[(u64, Hash)]) -> io::Result<Result<Vec<Entry>, Exposed>> {
         let mut entries = Vec::new();
         for (number, root) in index {
-            match self.read(number, &root)? {
+            match self.read(*number, root)? {
                 Ok(entry) => entries.extend(entry),
                 Err(exposed) => return Ok(Err(exposed)),
             }
@@ -401,7 +405,7 @@ impl Store {
         Ok(Ok(entries))
     }
 
-    /// Appends an entry under the next publication index, unless the store holds its release:
+    /// Appends an entry under the publication index past every entry file's, unless the store holds its release:
     /// under its store name for a named release, at all for a path release. Returns the entry
     /// holding the release.
     pub fn append(&self, append: Append) -> io::Result<Result<Entry, Exposed>> {
@@ -419,7 +423,11 @@ impl Store {
         let locked: File = lock;
         locked.lock()?;
 
-        let entries = match self.entries()? {
+        let index = match self.index()? {
+            Ok(index) => index,
+            Err(exposed) => return Ok(Err(exposed)),
+        };
+        let entries = match self.entries_of(&index)? {
             Ok(entries) => entries,
             Err(exposed) => return Ok(Err(exposed)),
         };
@@ -433,7 +441,7 @@ impl Store {
             return Ok(Ok(held.clone()));
         }
         let entry = Entry {
-            index: entries.last().map_or(1, |entry| entry.index + 1),
+            index: index.last().map_or(1, |(number, _)| number + 1),
             package: append.package,
             name: append.name,
             parent: append.parent,

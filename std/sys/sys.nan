@@ -309,6 +309,12 @@ pub fn Cx.after(mut self, ms: u64, take send: M)
 
 pub fn Cx.after_ns(mut self, ns: u64, take send: M)
 
+pub closed struct Header derives Copy, Eq, Hash {
+    pub bytes: Array[u8, 32]
+} Header
+
+pub fn current_header() -> Option[Header]
+
 pub fn Cx.spawn(mut self, key: u64, take run: task fn(out: Outbox[M]) fails task::Cancelled uses wait)
 
 pub fn Cx.cancel(mut self, key: u64)
@@ -461,6 +467,8 @@ pub fn Stepper.attach(mut self, runner: Runner)
 pub fn Stepper.outbox(self) -> Outbox[M]
 
 pub fn Stepper.deliver(mut self, take message: M)
+
+pub fn Stepper.deliver_headed(mut self, take message: M, header: Header)
 
 pub fn Stepper.step(mut self) -> bool
 
@@ -730,6 +738,22 @@ impl Probe: Pressure[ProbeEnv, ProbeMessage]
 impl Probe: Health[ProbeEnv, ProbeMessage]
 
 impl Probe: Suspend[ProbeEnv, ProbeMessage]
+
+/// A component counting the messages it handles under the header a test marks them with.
+struct Traced derives Encode {
+    marked: u32
+} Traced
+
+struct TracedEnv {
+} TracedEnv
+
+enum Trace {
+    Begin
+    Sent
+    Posted
+} Trace
+
+impl Traced: Component[TracedEnv, Trace]
 
 struct Plain derives Encode {
 } Plain
@@ -1198,6 +1222,26 @@ fn noted(shelf: Shelf, alloc: mem::Alloc) -> mem::Map[u64, Held] fails task::Can
 } noted
 
 fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0, suspended: false)
+
+/// The header the tests of headers mark messages with.
+fn marked() -> Header = Header(bytes: Array[u8, 32].filled(7))
+
+fn Traced.start(mut env: TracedEnv) -> Traced = Traced(marked: 0)
+
+fn Traced.on(mut self, take message: Trace, mut env: TracedEnv, mut cx: Cx[Trace]) {
+    if current_header() == Some(marked()) {
+        self.marked += 1
+    }
+    match message {
+        Trace.Begin => {
+            mut cx.send(Trace.Sent)
+            mut cx.spawn(key: 1, run: fn(out: Outbox[Trace]) fails task::Cancelled uses wait {
+                discard attempt await out.post(Trace.Posted)
+            })
+        }
+        Trace.Sent or Trace.Posted => {}
+    }
+} Traced.on
 
 fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
     match message {
@@ -1943,6 +1987,29 @@ test delivered_messages_are_handled_at_once for Stepper.deliver {
     let last = try await take stepper.end()
     expect last.state.handled == 2 and last.env.counted == 2
 } delivered_messages_are_handled_at_once
+
+test handled_work_carries_the_delivered_header for Stepper.deliver_headed {
+    let world = testing::world()
+    var stepper = try Stepper[Traced, TracedEnv, Trace].start(TracedEnv(), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver_headed(Trace.Begin, header: marked())
+    discard mut stepper.start_keyed()
+    while try await stepper.ready() {
+        discard mut stepper.step()
+    }
+    undefer stepper
+    let last = try await take stepper.end()
+    expect last.state.marked == 3
+} handled_work_carries_the_delivered_header
+
+test plain_delivery_has_no_header for current_header {
+    let world = testing::world()
+    var stepper = try Stepper[Traced, TracedEnv, Trace].start(TracedEnv(), exec: world.exec, alloc: world.alloc)
+    mut stepper.deliver(Trace.Sent)
+    let last = try await take stepper.end()
+    expect current_header() == None
+    expect last.state.marked == 0
+} plain_delivery_has_no_header
 
 test steps_take_the_intake_oldest_first for Stepper.step {
     let world = testing::world()

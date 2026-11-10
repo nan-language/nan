@@ -14,8 +14,8 @@ use super::super::super::super::runtime::{Routine, holdings, seeded, settle, tas
 use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
 use super::{
-    call_handler, draw_record, entry, handle, handle_oldest, handler, intake, keyed, release_env,
-    runner, shape, status, unreference, wait_for,
+    HEADER_BYTES, call_handler, draw_record, entry, handle, handle_oldest, handler, intake, keyed,
+    release_env, runner, shape, status, unreference, wait_for,
 };
 use crate::check::ty::{Arg, Bound, Ty};
 
@@ -37,13 +37,23 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.store(inbox, sret, 0);
             supply.done(lo, fx);
         }
-        "deliver" => {
+        "deliver" | "deliver_headed" => {
             let record = record(fx);
             let (state, env, message) = types_of(supply);
             let layout = lo.layout(&message);
             let slot = fx.slot(layout.size, layout.align);
             lo.store_held(fx, slot, supply.param(1), &message);
-            handle(lo, fx, record, &state, &env, &message, slot, None);
+            let header = fx.slot(tasks::HEADER_BLOCK, 8);
+            let zero = fx.ptr(0);
+            let block = fx.ptr(tasks::HEADER_BLOCK);
+            lo.call_routine(fx, Routine::Fill, &[header, zero, block]);
+            if supply.member() == "deliver_headed" {
+                let one = fx.ptr(1);
+                fx.store(one, header, 0);
+                let bytes = fx.offset(header, 8);
+                lo.copy(fx, bytes, supply.param(2).address(), HEADER_BYTES, 1);
+            }
+            handle(lo, fx, record, &state, &env, &message, (slot, header), None);
             supply.done(lo, fx);
         }
         "step" => {

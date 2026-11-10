@@ -114,7 +114,9 @@ pub mod task {
     pub const LIMIT: u64 = 352;
     pub const TOP: u64 = 360;
     pub const SEGMENT: u64 = 368;
-    pub const SIZE: u64 = 376;
+    /// Its header's block.
+    pub const HEADER: u64 = 376;
+    pub const SIZE: u64 = 416;
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
@@ -307,6 +309,20 @@ pub fn reserve(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let call = fx.b.ins().select(loaded, call, zero);
     let reserve = fx.b.ins().iadd(own, bundles);
     fx.b.ins().iadd(reserve, call)
+}
+
+/// The bytes of a header's block: whether it holds a header, then the header's 32 bytes.
+pub const HEADER_BLOCK: u64 = 40;
+
+/// Copies the running task's header block to a cleared block, which stays cleared outside a
+/// task.
+pub fn inherit_header(lo: &mut Lowering, fx: &mut Fx, block: Value) {
+    let current = current_task(lo, fx);
+    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+    fx.when(inside, |fx| {
+        let own = fx.offset(current, task::HEADER);
+        lo.copy(fx, block, own, HEADER_BLOCK, 8);
+    });
 }
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation
@@ -634,7 +650,8 @@ fn own_stack_in(fx: &mut Fx, table: Value, code: Value, usable: Value) -> Value 
 /// `extra` bytes after it for the entry's result and failure, and a stack of `stack` usable
 /// bytes, or of the larger stack the entry's own `limits stack N` needs, with the routine
 /// reserve and any guard region, drawn through a cell for a domain, or mapped for the zero
-/// cell; zero when the stack cannot be drawn. The task joins the list of live tasks.
+/// cell; zero when the stack cannot be drawn. The task starts with the running task's header
+/// and joins the list of live tasks.
 fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (glue, code, env, extra) = (params[0], params[1], params[2], params[3]);
@@ -696,6 +713,8 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     let one = fx.ptr(1);
     fetch_add(fx, tasks, one);
     fx.store(region, record, task::REGION);
+    let header = fx.offset(record, task::HEADER);
+    inherit_header(lo, fx, header);
     let new = fx.int(types::I32, run::NEW);
     fx.store(new, record, task::STATE);
     let state_address = lo.state(fx);

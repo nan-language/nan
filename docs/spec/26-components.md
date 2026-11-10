@@ -269,6 +269,24 @@ pub fn Cx.after_ns(mut self, ns: u64, take send: M)
 - The operations of a component context never wait. `send`, `after` and `after_ns` draw the message's intake entry through the runner's allocator, and trap when it is exhausted (`trap.exhausted`); the entry is released when the message leaves the intake.
 - When the intake stops, every message still delayed by `after` or `after_ns` is released, and a later `send`, `after` or `after_ns` releases its message.
 
+### Headers
+
+A **header** is a `sys::Header` that a task carries, so that the work a message starts carries what its deliverer gave it, such as its cause and sender.
+
+```nan-api
+// module: sys
+
+pub closed struct Header derives Copy, Eq, Hash {
+    pub bytes: Array[u8, 32]
+} Header
+
+pub fn current_header() -> Option[Header]
+```
+
+- A task starts with the header of the task that started it, none for the first task of a program, of a test or of an interpreter run.
+- While a handler runs for a message, the task running it has the message's header, then its own again. A message delivered by [`deliver_headed`](#steppers) has the header that call gives and one delivered by `deliver` none; a message of the intake has the header of the task that queued it by `send`, `after`, `after_ns` or a [post](#keyed-tasks).
+- `sys::current_header()` returns the running task's header.
+
 ```nan
 pub closed struct Env {
     pub log: sys::Log
@@ -628,6 +646,8 @@ pub fn Stepper.outbox(self) -> Outbox[M]
 
 pub fn Stepper.deliver(mut self, take message: M)
 
+pub fn Stepper.deliver_headed(mut self, take message: M, header: Header)
+
 pub fn Stepper.step(mut self) -> bool
 
 pub fn Stepper.incoming(self) fails task::Cancelled uses wait
@@ -648,7 +668,7 @@ pub fn Stepper.abandon(take self)
 - `sys::Stepper[S, Env, M]` is a base type: linear, and never a view, Copy, Send, Inert or AnyBits. A use of `sys::Stepper.start` or `sys::Stepper.resume` where S does not implement `sys::Component[Env, M]` for the Env and M fixed at that use is an error (`component.not-component`). Steppers are available on every target.
 - `start(env, exec, alloc)` draws the stepper's record, which holds the intake, through `alloc`, trapping when `alloc` is exhausted (`trap.exhausted`), then calls `S.start(mut env)` on the calling task and returns the stepper holding the state and the Env. `resume(state, env, exec, alloc)` does the same with `state` as the state, calling no handler. The stepper's executor and allocator are `exec` and `alloc`. When `exec` is stale, both fail at once with the cancellation, releasing what they took as `run` releases its Env ([revocation](14-authority.md#revocation)).
 - `s.outbox()` returns the stepper's outbox, the same on every call.
-- `mut s.deliver(m)` calls `on` with `m`, or its operation's handler for a protocol, on the calling task. `mut s.step()` removes the oldest message of the intake, handles it so and returns `true`, completing its post or giving a request's handler's result or failure to its poster as the runner does; it returns `false` when the intake is empty. Both publish the summary as the runner does ([servers](#servers)).
+- `mut s.deliver(m)` calls `on` with `m`, or its operation's handler for a protocol, on the calling task, and `mut s.deliver_headed(m, header: h)` does so with `h` as the message's [header](#headers). `mut s.step()` removes the oldest message of the intake, handles it so and returns `true`, completing its post or giving a request's handler's result or failure to its poster as the runner does; it returns `false` when the intake is empty. Both publish the summary as the runner does ([servers](#servers)).
 - A keyed task that `spawn` starts on a stepper is **held**: its stack and record are drawn, but it starts only when `mut s.start_keyed()` starts every held keyed task, in the order of their spawns, returning how many it started. Superseding the key of a held task cancels it before it starts.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
 - `s.incoming()` returns once a message waits in the intake. `s.ready()` returns `true` once a message waits in the intake and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.

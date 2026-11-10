@@ -234,6 +234,8 @@ pub fn new_entry(lo: &mut Lowering, fx: &mut Fx, record: Value, message: &Ty, he
     let zero = fx.ptr(0);
     let header = fx.ptr(entry::MESSAGE);
     lo.call_routine(fx, Routine::Fill, &[node, zero, header]);
+    let queued = fx.offset(node, entry::HEADER);
+    tasks::inherit_header(lo, fx, queued);
     let at = fx.offset(node, entry::MESSAGE);
     lo.store_held(fx, at, held, message);
     node
@@ -498,6 +500,8 @@ pub fn enqueue(
     let zero = fx.ptr(0);
     let header = fx.ptr(entry::MESSAGE);
     lo.call_routine(fx, Routine::Fill, &[node, zero, header]);
+    let queued = fx.offset(node, entry::HEADER);
+    tasks::inherit_header(lo, fx, queued);
     let current = tasks::current_task(lo, fx);
     fx.store(current, node, entry::POSTER);
     fx.store(key, node, entry::KEY);

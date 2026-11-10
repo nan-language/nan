@@ -76,7 +76,9 @@ const COMPONENTS_ENTRY_NUMBER: u64 = 72
 
 const COMPONENTS_ENTRY_NUMBERING: u64 = 80
 
-const COMPONENTS_ENTRY_MESSAGE: u64 = 88
+const COMPONENTS_ENTRY_HEADER: u64 = 88
+
+const COMPONENTS_ENTRY_MESSAGE: u64 = 128
 
 /// The numberings of a request's entry: none, numbered by the holder serving it, or numbered and
 /// postponed by its handler.
@@ -110,6 +112,7 @@ fn components_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "sys::Cx.after" or "sys::Cx.after_ns" => components_after(mut lo, mut fx, supply)
         "sys::Cx.spawn" => components_spawn(mut lo, mut fx, supply)
+        "sys::current_header" => components_current_header(mut lo, mut fx, supply)
         "sys::Cx.cancel" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             let lock = mut fx.offset(record, offset: RUNNER_LOCK)
@@ -337,19 +340,28 @@ fn handle_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif
     mut fx.if_true(request, then: fn(mut fx1: Fx) {
         mut fx1.store(oldest, addr: record, offset: RUNNER_CURRENT)
     })
+    let header = mut fx.slot(HEADER_BLOCK, align: 8)
+    let queued = mut fx.offset(oldest, offset: COMPONENTS_ENTRY_HEADER)
+    mut lo.copy(mut fx, dst: header, src: queued, size: HEADER_BLOCK, align: 8)
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
     let sent = mut fx.b.bxor_imm_s(posted, y: 1)
     mut fx.if_true(sent, then: fn[mut lo](mut fx1: Fx) {
         discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: Array[clif::Value, 1].filled(oldest).view())
     })
-    components_handle(mut lo, mut fx, record, state, env, message, slot, node: Some(oldest))
+    components_handle(mut lo, mut fx, record, state, env, message, slot, header, node: Some(oldest))
 } handle_oldest
 
 /// Passes the message in a slot to `on`, or to its operation's handler for a protocol, with the
 /// state and the Env a runner's record holds, then publishes the summary; a request's reply goes
-/// to the entry `node` that posted it.
-fn components_handle(mut lo: Lowering, mut fx: Fx, record: clif::Value, state: ty::Ty, env: ty::Ty, message: ty::Ty, slot: clif::Value, node: Option[clif::Value]) {
+/// to the entry `node` that posted it. The running task has the header of a block while the
+/// handler runs.
+fn components_handle(mut lo: Lowering, mut fx: Fx, record: clif::Value, state: ty::Ty, env: ty::Ty, message: ty::Ty, slot: clif::Value, header: clif::Value, node: Option[clif::Value]) {
+    let current = current_task(mut lo, mut fx)
+    let own = mut fx.offset(current, offset: TASK_HEADER)
+    let saved = mut fx.slot(HEADER_BLOCK, align: 8)
+    mut lo.copy(mut fx, dst: saved, src: own, size: HEADER_BLOCK, align: 8)
+    mut lo.copy(mut fx, dst: own, src: header, size: HEADER_BLOCK, align: 8)
     let shape = components_shape(mut lo, state, env, message)
     let state_at = mut fx.offset(record, offset: shape.state_at)
     let env_at = mut fx.offset(record, offset: shape.env_at)
@@ -367,7 +379,37 @@ fn components_handle(mut lo: Lowering, mut fx: Fx, record: clif::Value, state: t
         }
     }
     protocols_publish(mut lo, mut fx, record, shape, state)
+    mut lo.copy(mut fx, dst: own, src: saved, size: HEADER_BLOCK, align: 8)
 } components_handle
+
+/// The bytes of a `sys::Header`.
+const HEADER_BYTES: u64 = 32
+
+/// `sys::current_header()`: the running task's header, none outside a task or for a task without
+/// one.
+fn components_current_header(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let current = current_task(mut lo, mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+    let presence = mut fx.choose(inside, results: fx.types1(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.load(PTR, addr: current, offset: TASK_HEADER)
+        return fx1.list1(mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 0))
+    })
+    expect presence.len() > 0
+    mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: presence[0], write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
+        let bytes = mut fx1.offset(current, offset: TASK_HEADER + 8)
+        mut lo1.copy(mut fx1, dst: at, src: bytes, size: HEADER_BYTES, align: 1)
+    })
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} components_current_header
 
 /// Settles the record of a run whose caller has stopped or of a stepper whose domain is
 /// abandoned, the tasks of that domain having stopped: its intake stops, each posted entry is

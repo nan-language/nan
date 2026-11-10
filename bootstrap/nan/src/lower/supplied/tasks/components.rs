@@ -17,7 +17,8 @@
 //! holds its links, the task posting it (zero for a message the component sends itself), its
 //! status, its deadline and order while delayed, whether a keyed outbox posted it and that
 //! outbox's key, where a request's reply goes (zero for any other message), the number a holder
-//! serving the request gave it and its numbering, and the message; a
+//! serving the request gave it and its numbering, the header of the task that queued it, and the
+//! message; a
 //! posted entry lies on the posting task's stack, any other is drawn through the runner's
 //! allocator.
 
@@ -27,7 +28,7 @@ mod keys;
 mod run;
 mod stepper;
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::super::body::Held;
 use super::super::super::call::Invoked;
@@ -88,7 +89,8 @@ pub mod entry {
     pub const REPLY: u64 = 64;
     pub const NUMBER: u64 = 72;
     pub const NUMBERING: u64 = 80;
-    pub const MESSAGE: u64 = 88;
+    pub const HEADER: u64 = 88;
+    pub const MESSAGE: u64 = 128;
 }
 
 /// The numberings of a request's entry: none, numbered by the holder serving it, or numbered and
@@ -120,6 +122,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "sys::Cx.after" | "sys::Cx.after_ns" => intake::after(lo, fx, supply),
         "sys::Cx.spawn" => keyed::spawn(lo, fx, supply),
+        "sys::current_header" => current_header(lo, fx, supply),
         "sys::Cx.cancel" => {
             let runner = fx.load(PTR, supply.param(0).address(), 0);
             let lock = fx.offset(runner, runner::LOCK);
@@ -362,18 +365,31 @@ fn handle_oldest(
         });
     });
     fx.when(request, |fx| fx.store(oldest, record, runner::CURRENT));
+    let header = fx.slot(tasks::HEADER_BLOCK, 8);
+    let queued = fx.offset(oldest, entry::HEADER);
+    lo.copy(fx, header, queued, tasks::HEADER_BLOCK, 8);
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     let sent = fx.b.ins().bxor_imm_s(posted, 1);
     fx.when(sent, |fx| {
         lo.call_routine(fx, Routine::Free, &[oldest]);
     });
-    handle(lo, fx, record, state, env, message, slot, Some(oldest));
+    handle(
+        lo,
+        fx,
+        record,
+        state,
+        env,
+        message,
+        (slot, header),
+        Some(oldest),
+    );
 }
 
 /// Passes the message in a slot to `on`, or to its operation's handler for a protocol, with the
 /// state and the Env a runner's record holds, then publishes the summary; a request's reply goes
-/// to the entry `node` that posted it.
+/// to the entry `node` that posted it. The running task has the header of a block while the
+/// handler runs.
 #[allow(clippy::too_many_arguments)]
 fn handle(
     lo: &mut Lowering,
@@ -382,9 +398,14 @@ fn handle(
     state: &Ty,
     env: &Ty,
     message: &Ty,
-    slot: Value,
+    (slot, header): (Value, Value),
     node: Option<Value>,
 ) {
+    let current = tasks::current_task(lo, fx);
+    let own = fx.offset(current, tasks::task::HEADER);
+    let saved = fx.slot(tasks::HEADER_BLOCK, 8);
+    lo.copy(fx, saved, own, tasks::HEADER_BLOCK, 8);
+    lo.copy(fx, own, header, tasks::HEADER_BLOCK, 8);
     let shape = shape(lo, state, env, message);
     let state_at = fx.offset(record, shape.state_at);
     let env_at = fx.offset(record, shape.env_at);
@@ -406,7 +427,37 @@ fn handle(
         }
     }
     super::protocols::publish(lo, fx, record, &shape, state);
+    lo.copy(fx, own, saved, tasks::HEADER_BLOCK, 8);
 }
+
+/// `sys::current_header()`: the running task's header, none outside a task or for a task without one.
+fn current_header(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let option = supply.abi.result.clone();
+    let layout = lo.layout(&option);
+    let result = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let current = tasks::current_task(lo, fx);
+    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+    let present = fx.choose(
+        inside,
+        &[types::I8],
+        |fx| {
+            let held = fx.load(PTR, current, tasks::task::HEADER);
+            vec![fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0)]
+        },
+        |fx| vec![fx.int(types::I8, 0)],
+    )[0];
+    lo.write_option_with(fx, &option, result, present, |lo, fx, payload| {
+        let bytes = fx.offset(current, tasks::task::HEADER + 8);
+        lo.copy(fx, payload, bytes, HEADER_BYTES, 1);
+    });
+    let held = lo.held_at(fx, &option, result);
+    supply.ret(lo, fx, held);
+}
+
+/// The bytes of a `sys::Header`.
+pub const HEADER_BYTES: u64 = 32;
 
 /// Settles the record of a run whose caller has stopped or of a stepper whose domain is
 /// abandoned, the tasks of that domain having stopped: its intake stops, each posted entry is

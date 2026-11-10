@@ -34,7 +34,7 @@ const KEPT: u64 = 64;
 
 /// The cell table's capacity.
 pub const CELLS: u64 = 65_536;
-pub const CELL_RECORD: u64 = 40;
+pub const CELL_RECORD: u64 = 48;
 
 /// The chunk map: a table of 2^16 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
@@ -48,6 +48,7 @@ mod cell {
     pub const GENERATION: u64 = 20;
     pub const OPEN: u64 = 24;
     pub const SUPPLY: u64 = 32;
+    pub const PEAK: u64 = 40;
 }
 
 /// The offsets of a region's supply record: its first chunk's address, its chunk count, then its
@@ -210,10 +211,11 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             fx.b.ins().return_(&[]);
         }
-        Routine::Charged | Routine::Limit => {
+        Routine::Charged | Routine::Peak | Routine::Limit => {
             let record = cell_record(lo, fx, params[0]);
             let field = match routine {
                 Routine::Charged => cell::CHARGE,
+                Routine::Peak => cell::PEAK,
                 _ => cell::LIMIT,
             };
             let bytes = fx.load(PTR, record, field);
@@ -285,6 +287,7 @@ pub fn new_cell(lo: &mut Lowering, fx: &mut Fx, limit: Value, parent: Value) -> 
     fx.store(limit, record, cell::LIMIT);
     let zero = fx.ptr(0);
     fx.store(zero, record, cell::CHARGE);
+    fx.store(zero, record, cell::PEAK);
     let root = fx.b.ins().icmp_imm_s(IntCC::Equal, parent, -1);
     let parent_index = fx.b.ins().band_imm_s(parent, 0xFFFF_FFFF);
     let parent_index = fx.b.ins().iadd_imm_s(parent_index, 1);
@@ -378,7 +381,7 @@ fn draw(lo: &mut Lowering, fx: &mut Fx, handle: Value, count: Value) -> Value {
         walk_chain(lo, fx, first, |fx, record| {
             let charge = fx.load(PTR, record, cell::CHARGE);
             let charged = fx.b.ins().iadd(charge, bytes);
-            fx.store(charged, record, cell::CHARGE);
+            set_charge(fx, record, charged);
         });
     });
     mapped
@@ -465,8 +468,16 @@ fn charge_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value) {
         let charge = fx.load(PTR, record, cell::CHARGE);
         let more = fx.b.ins().iadd(charge, bytes);
         let kept = fx.b.ins().select(open, more, charge);
-        fx.store(kept, record, cell::CHARGE);
+        set_charge(fx, record, kept);
     });
+}
+
+/// Sets a cell's charge to a value no less than it held, raising its peak to that value.
+fn set_charge(fx: &mut Fx, record: Value, charge: Value) {
+    fx.store(charge, record, cell::CHARGE);
+    let peak = fx.load(PTR, record, cell::PEAK);
+    let peak = fx.b.ins().umax(peak, charge);
+    fx.store(peak, record, cell::PEAK);
 }
 
 /// Subtracts a chunk's bytes from every open cell of the chain from a record.

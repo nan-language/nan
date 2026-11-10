@@ -65,6 +65,8 @@ pub enum Routine {
     Close,
     /// `(cell) -> bytes`: a cell's charge.
     Charged,
+    /// `(cell) -> bytes`: the highest charge a cell has held.
+    Peak,
     /// `(cell) -> bytes`: a cell's limit.
     Limit,
     /// `(size) -> address`: the environment of a task closure, in runtime memory.
@@ -223,6 +225,7 @@ impl Routine {
             Routine::Split => "_NScap_table_split",
             Routine::Close => "_NScap_table_close",
             Routine::Charged => "_NScap_table_charged",
+            Routine::Peak => "_NScap_table_peak",
             Routine::Limit => "_NScap_table_limit",
             Routine::TaskEnv => "_NScap_table_task_env",
             Routine::TaskEnvFree => "_NScap_table_task_env_free",
@@ -308,6 +311,7 @@ impl Routine {
             }
             Routine::KindPin => (&[P, P], &[P]),
             Routine::Charged
+            | Routine::Peak
             | Routine::Limit
             | Routine::TaskEnv
             | Routine::OutboxClaim
@@ -713,6 +717,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Split
         | Routine::Close
         | Routine::Charged
+        | Routine::Peak
         | Routine::Limit
         | Routine::TaskEnv
         | Routine::TaskEnvFree

@@ -70,6 +70,7 @@ pub fn member(
         ("mem::Budget", "charged") => {
             Val::Int(interp.budgets.charged(cell_of(interp, &args[0])) as i128)
         }
+        ("mem::Budget", "peak") => Val::Int(interp.budgets.peak(cell_of(interp, &args[0])) as i128),
         ("mem::Budget", "limit") => {
             Val::Int(interp.budgets.limit(cell_of(interp, &args[0])) as i128)
         }

@@ -107,9 +107,10 @@ fn budget(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             ret_handle(lo, fx, supply, holding);
         }
         "alloc" => ret_handle(lo, fx, supply, cell),
-        "limit" | "charged" => {
+        "limit" | "charged" | "peak" => {
             let routine = match supply.member() {
                 "limit" => Routine::Limit,
+                "peak" => Routine::Peak,
                 _ => Routine::Charged,
             };
             let bytes = lo.call_routine(fx, routine, &[cell])[0];

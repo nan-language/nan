@@ -7,6 +7,8 @@ pub const CHUNK: u64 = 65_536;
 struct Cell {
     limit: u128,
     charge: u128,
+    /// The highest charge it has held.
+    peak: u128,
     parent: Option<u32>,
     open: bool,
     /// The chunk last drawn through it, where its next small allocation goes when it fits.
@@ -43,6 +45,7 @@ impl Budgets {
         self.cells.push(Cell {
             limit,
             charge: 0,
+            peak: 0,
             parent,
             open: true,
             last: None,
@@ -56,6 +59,10 @@ impl Budgets {
 
     pub fn charged(&self, cell: u32) -> u128 {
         self.cells[cell as usize].charge
+    }
+
+    pub fn peak(&self, cell: u32) -> u128 {
+        self.cells[cell as usize].peak
     }
 
     pub fn limit(&self, cell: u32) -> u128 {
@@ -84,7 +91,9 @@ impl Budgets {
             return None;
         }
         for link in &chain {
-            self.cells[*link as usize].charge += bytes;
+            let link = &mut self.cells[*link as usize];
+            link.charge += bytes;
+            link.peak = link.peak.max(link.charge);
         }
         Some(
             (0..count)

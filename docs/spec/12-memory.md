@@ -47,6 +47,8 @@ pub fn Budget.limit(self) -> usize limits pure, notrap, terminates
 
 pub fn Budget.charged(self) -> usize
 
+pub fn Budget.peak(self) -> usize
+
 pub fn Budget.close(take self)
 ```
 
@@ -58,7 +60,7 @@ pub fn Budget.close(take self)
 - A return has no [digest fact](10-effects-digests.md#digests), so code under `noalloc` may release values. On the machine targets, each draw and return runs with maskable interrupts disabled on its CPU.
 - `take budget.close()` closes the budget's cell, making its allocator stale, so no draw succeeds through an allocator whose cell's chain holds that cell. Memory already drawn stays usable.
 - A chunk **returns** to its root cell's supply once no allocation in it is live, or when its domain is freed ([chunk ownership](#chunk-ownership)). A return subtracts 65,536 bytes from the charge of every open cell on the chain of the cell it is charged to: the cell it was drawn through, until [domain memory](11-errors-domains.md#domain-memory) passes its charge to another.
-- `charged()` is the cell's charge: 65,536 bytes for each chunk not yet returned that is charged to the cell or to a cell whose chain holds it.
+- `charged()` is the cell's charge: 65,536 bytes for each chunk not yet returned that is charged to the cell or to a cell whose chain holds it. `peak()` is the highest charge the cell has held since it was added.
 - An **allocation** is the memory that one draw of a std operation obtains for one purpose: a box, the storage of a container at one capacity, the slot storage of a store, or the contents of a `mem::Shared`. It is live until the operation that releases or replaces it frees it: the release of its box, container, store or shared value, or growth moving the elements into a new allocation.
 - An allocation of at most 64 KiB lies inside one chunk, which other allocations may share. A larger one occupies ⌈size ÷ 64 KiB⌉ consecutive chunks drawn together for it alone. Which chunk an allocation of at most 64 KiB lies in, when a draw happens for one, and how much memory a container or store draws for its contents beyond the capacities [growth](#growth) fixes, are the implementation's choice.
 - Each choice of this chapter left to the implementation is identical for one [toolchain hash](36-builds.md#toolchain-hash), so `charged()` and the points of exhaustion are reproducible.

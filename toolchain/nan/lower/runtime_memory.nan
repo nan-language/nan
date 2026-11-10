@@ -8,7 +8,7 @@ const MEMORY_KEPT: u64 = 64
 /// The cell table's capacity.
 const MEMORY_CELLS: u64 = 65_536
 
-const CELL_RECORD: u64 = 40
+const CELL_RECORD: u64 = 48
 
 /// The chunk map: a table of 2^16 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
@@ -27,6 +27,8 @@ const CELL_GENERATION: u64 = 20
 const CELL_OPEN: u64 = 24
 
 const CELL_SUPPLY: u64 = 32
+
+const CELL_PEAK: u64 = 40
 
 /// The offsets of a region's supply record: its first chunk's address, its chunk count, then its
 /// map of a bit per chunk.
@@ -167,7 +169,9 @@ fn machine_bytes(mut lo: Lowering, mut fx: Fx, routine: Routine, params: Slice[c
 
 /// The memory routines, `Alloc`, `AllocIn`, `Free` and `Lift` under the lock of allocations
 /// alone, as on a machine target.
-fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
+    waive length "one arm per memory routine, as the Rust defines them"
+{
     let params = mut fx.entry()
     expect params.len() > 0
     match routine {
@@ -215,10 +219,11 @@ fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
-        Routine.Charged or Routine.Limit => {
+        Routine.Charged or Routine.Peak or Routine.Limit => {
             let record = memory_cell_record(mut lo, mut fx, handle: params[0])
             let field = match routine {
                 Routine.Charged => CELL_CHARGE
+                Routine.Peak => CELL_PEAK
                 else => CELL_LIMIT
             }
             let bytes = mut fx.load(PTR, addr: record, offset: field)
@@ -300,6 +305,7 @@ fn new_cell(mut lo: Lowering, mut fx: Fx, limit: clif::Value, parent: clif::Valu
     mut fx.store(limit, addr: record, offset: CELL_LIMIT)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: record, offset: CELL_CHARGE)
+    mut fx.store(zero, addr: record, offset: CELL_PEAK)
     let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: parent, y: -1)
     let parent_low = mut fx.b.band_imm_s(parent, y: 0xFFFF_FFFF)
     let parent_plus = mut fx.b.iadd_imm_s(parent_low, y: 1)
@@ -386,7 +392,7 @@ fn memory_draw(mut lo: Lowering, mut fx: Fx, handle: clif::Value, count: clif::V
         walk_chain(mut lo, fx: mut fx1, head, visit: fn(mut fx2: Fx, record: clif::Value) {
             let charge = mut fx2.load(PTR, addr: record, offset: CELL_CHARGE)
             let charged = mut fx2.b.iadd(charge, y: bytes)
-            mut fx2.store(charged, addr: record, offset: CELL_CHARGE)
+            set_charge(mut fx2, record, charge: charged)
         })
     })
     return mapped
@@ -468,9 +474,17 @@ fn charge_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Va
         let charge = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
         let more = mut fx1.b.iadd(charge, y: bytes)
         let kept = mut fx1.b.select(open, x: more, y: charge)
-        mut fx1.store(kept, addr: record, offset: CELL_CHARGE)
+        set_charge(mut fx1, record, charge: kept)
     })
 } charge_chain
+
+/// Sets a cell's charge to a value no less than it held, raising its peak to that value.
+fn set_charge(mut fx: Fx, record: clif::Value, charge: clif::Value) {
+    mut fx.store(charge, addr: record, offset: CELL_CHARGE)
+    let peak = mut fx.load(PTR, addr: record, offset: CELL_PEAK)
+    let raised = mut fx.b.umax(peak, y: charge)
+    mut fx.store(raised, addr: record, offset: CELL_PEAK)
+} set_charge
 
 /// Subtracts a chunk's bytes from every open cell of the chain from a record.
 fn uncharge(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Value) {

@@ -19,8 +19,9 @@
 //! flight that `task::within` calls armed through it, linked through their timers. A
 //! `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock
 //! that delays count, which a host's wall clock reads from the platform instead, then its
-//! resolution. An entry of a capability kind holds its minter's state record, then the two words
-//! of its record. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind
+//! resolution. An entry of a capability kind holds its minter's state record, then its record
+//! when it fits two words, else the address of a block it owns holding the record, then the
+//! record's size in its fourth word, zero for one held in place. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind
 //! serving it and holds that entry's handle, then the method table of the kind for its service
 //! interface. A served `Fs` or `Net` entry holds that handle in place of its directory or
 //! network, and the method table after its state words, zero for an entry no kind serves.
@@ -93,6 +94,13 @@ pub const EXECUTOR_RESOLUTION: u64 = entry::STATE + 16;
 /// The state word of an executor's entry holding its share, and the share of a root grant's
 /// executor: a weight of 1 in class 0 reserving nothing.
 pub const EXECUTOR_SHARE: u64 = entry::STATE + 24;
+
+/// The state word of a kind's entry holding the size of the record its block holds, zero for a
+/// record its state words hold.
+const RECORD_SIZE: u64 = entry::STATE + 24;
+
+/// The most bytes of a kind's record its entry's state words hold.
+const RECORD_WORDS: i64 = 16;
 const ROOT_SHARE: u64 = 1;
 
 /// The working directory's descriptor for the `*at` system calls.
@@ -135,6 +143,12 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                         fx.store(table, record, entry::TABLE);
                         derive_text(lo, fx, record, params[3], params[4]);
                     });
+                    let boxed = owns_record(fx, record);
+                    fx.when(boxed, |fx| {
+                        let block = fx.load(PTR, source, entry::STATE + 8);
+                        let size = fx.load(PTR, source, RECORD_SIZE);
+                        store_record(lo, fx, record, block, size);
+                    });
                     vec![handle]
                 },
                 |fx| vec![fx.int(PTR, -1)],
@@ -157,9 +171,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let kind = fx.ptr(kind::KIND as u64);
             let handle = new_entry(lo, fx, kind);
             let record = entry_at(lo, fx, handle);
-            for (word, value) in params.iter().enumerate() {
-                fx.store(*value, record, entry::STATE + 8 * word as u64);
-            }
+            fx.store(params[0], record, entry::STATE);
+            store_record(lo, fx, record, params[1], params[2]);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             fx.b.ins().return_(&[handle]);
         }
@@ -176,10 +189,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let minter = fx.load(PTR, record, entry::STATE);
                     let one = fx.ptr(1);
                     super::fetch_add(fx, minter, one);
-                    for word in [1, 2] {
-                        let value = fx.load(PTR, record, entry::STATE + 8 * word);
-                        fx.store(value, params[1], 8 * (word - 1));
-                    }
+                    let size = fx.load(PTR, record, RECORD_SIZE);
+                    let boxed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, size, 0);
+                    let block = fx.load(PTR, record, entry::STATE + 8);
+                    let held = fx.offset(record, entry::STATE + 8);
+                    let from = fx.b.ins().select(boxed, block, held);
+                    let words = fx.ptr(RECORD_WORDS as u64);
+                    let length = fx.b.ins().select(boxed, size, words);
+                    lo.call_routine(fx, Routine::Copy, &[params[1], from, length]);
                     vec![minter]
                 },
                 |fx| vec![fx.ptr(0)],
@@ -202,8 +219,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let record = entry_at(lo, fx, handle);
                     let minter = fx.load(PTR, source, entry::STATE);
                     fx.store(minter, record, entry::STATE);
-                    fx.store(params[1], record, entry::STATE + 8);
-                    fx.store(params[2], record, entry::STATE + 16);
+                    store_record(lo, fx, record, params[1], params[2]);
                     let index = fx.b.ins().band_imm_s(params[0], 0xFFFF_FFFF);
                     let index = fx.b.ins().iadd_imm_s(index, 1);
                     let index = fx.b.ins().ireduce(types::I32, index);
@@ -314,6 +330,44 @@ fn owns_text(fx: &mut Fx, record: Value) -> Value {
     fx.b.ins().bor(fs, net)
 }
 
+/// Whether an entry is a kind's whose record lies in a block it owns.
+fn owns_record(fx: &mut Fx, record: Value) -> Value {
+    let kind = fx.load(types::I32, record, entry::KIND);
+    let of_kind = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::KIND);
+    let size = fx.load(PTR, record, RECORD_SIZE);
+    let boxed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, size, 0);
+    fx.b.ins().band(of_kind, boxed)
+}
+
+/// Gives a kind's entry the record of `size` bytes at `address`: in its state words when it fits
+/// them, else in a block of runtime memory it owns; traps when that memory is exhausted. The
+/// caller holds the lock.
+fn store_record(lo: &mut Lowering, fx: &mut Fx, record: Value, address: Value, size: Value) {
+    let zero = fx.ptr(0);
+    fx.store(zero, record, entry::STATE + 8);
+    fx.store(zero, record, entry::STATE + 16);
+    let boxed =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, size, RECORD_WORDS);
+    let kept = fx.b.ins().select(boxed, size, zero);
+    fx.store(kept, record, RECORD_SIZE);
+    let target = fx.choose(
+        boxed,
+        &[PTR],
+        |fx| {
+            let block = lo.record_alloc(fx, size);
+            let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, block, 0);
+            fx.when(failed, |fx| {
+                super::report::raise_kind(lo, fx, "trap.exhausted")
+            });
+            fx.store(block, record, entry::STATE + 8);
+            vec![block]
+        },
+        |fx| vec![fx.offset(record, entry::STATE + 8)],
+    )[0];
+    lo.call_routine(fx, Routine::Copy, &[target, address, size]);
+}
+
 /// Gives a derived `Fs` or `Net` entry a text of its own in runtime memory: its source's, which
 /// its state words hold, extended by a given text as a path for `Fs` and replaced by it for
 /// `Net`, or kept when the given text's address is zero.
@@ -380,7 +434,8 @@ fn revoke(lo: &mut Lowering, fx: &mut Fx, handle: Value) {
 }
 
 /// Revokes the entries being revoked and every live entry deriving from one, transitively:
-/// each becomes free, its generation advanced and its text freed. The caller holds the lock.
+/// each becomes free, its generation advanced and its text or record block freed. The caller
+/// holds the lock.
 fn sweep(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
     let count = fx.load(PTR, state_address, state::ENTRY_COUNT);
@@ -419,10 +474,12 @@ fn sweep(lo: &mut Lowering, fx: &mut Fx) {
         fx.when(revoked, |fx| {
             expire_deadlines(lo, fx, record);
             super::serial::release_waiting(lo, fx, record);
-            let owns = owns_text(fx, record);
+            let text = owns_text(fx, record);
+            let block = owns_record(fx, record);
+            let owns = fx.b.ins().bor(text, block);
             fx.when(owns, |fx| {
-                let text = fx.load(PTR, record, entry::STATE + 8);
-                lo.record_free(fx, text);
+                let owned = fx.load(PTR, record, entry::STATE + 8);
+                lo.record_free(fx, owned);
             });
             free_entry(lo, fx, record, index);
         });

@@ -811,7 +811,7 @@ pub fn reach[C: Kind[S, R], S: Send, R: AnyBits and Copy, T: Any, E](capability:
 pub fn derive[C: Kind[S, R], S: Send, R: AnyBits and Copy](capability: C, narrow: fn(state: S, record: R) -> R) -> C fails Revoked
 ```
 
-- A kind is a struct without fields, generic parameters, derives or a modifier other than `open`, and its record type is a scalar, a layout, an `hw::Ptr` or an `Array` of these, at most 16 bytes long. A `sys::Kind` impl line naming any other type or record type is an error (`authority.kind-form`), reported on the impl line. A construction of a kind is that error too: a kind's values come only from `mint` and `derive`.
+- A kind is a struct without fields, generic parameters, derives or a modifier other than `open`, and its record type is a scalar, a layout, an `hw::Ptr` or an `Array` of these. A `sys::Kind` impl line naming any other type or record type is an error (`authority.kind-form`), reported on the impl line. A construction of a kind is that error too: a kind's values come only from `mint` and `derive`.
 - A kind is Copy and Send, and never linear, a view, Inert or AnyBits. It implements `sys::Capability`, so `sys::revocable` derives entries from its entries.
 - A use of `sys::Minter.of`, `sys::Minter.mint`, `sys::Minter.revoke`, `sys::Minter.close`, `sys::reach` or `sys::derive` whose C is not a kind that the module of the code using it declares is an error (`authority.kind-foreign`).
 - A module declaring a kind performs `capability` directly ([manifest grants](#manifest-grants)).
@@ -903,6 +903,86 @@ api ports::Port.send ports/ports.nan:18
     pub fn Port.send(self) -> bool
     digest: effects none | authority ports::Port | may-trap no | terminates
 ok show ports::Port.send --api: records 1
+```
+
+A record as long as its layout attenuates by more than flags, such as a path:
+
+```nan
+// file: names/package.nan
+//! Names handed out by subtree.
+
+package names {
+    language 1
+    targets any
+    allow capability in names
+} names
+
+// file: names/names.nan
+//! A capability over a tree of names, attenuated to a subtree.
+
+pub open struct Tree {
+} Tree
+
+pub layout Below: bytes 64 le {
+    length: u8 at 0
+    path: Array[u8, 63] at 1
+} Below
+
+impl Tree: sys::Kind[u8, Below]
+
+pub fn open_names(alloc: mem::Alloc) -> sys::Minter[Tree, u8, Below] {
+    return sys::Minter.of(0, alloc)
+} open_names
+
+pub fn Tree.below(self, segment: Slice[u8]) -> Tree fails sys::Revoked {
+    return try sys::derive(self, narrow: fn(state: u8, record: Below) -> Below {
+        var below = record
+        var path = record.path
+        var at = usize.widen(record.length)
+        for byte in segment {
+            if at < 63 {
+                path[at] = byte
+                at += 1
+            }
+        }
+        below.path = path
+        below.length = u8.truncate(at)
+        return below
+    })
+} Tree.below
+
+pub fn Tree.ends_with(self, byte: u8) -> bool {
+    let ends = sys::reach(self, body: fn(state: u8, record: Below) -> bool {
+        if record.length == 0 {
+            return false
+        }
+        return record.path[usize.widen(record.length) - 1] == byte
+    })
+    return ends == Some(true)
+} Tree.ends_with
+
+test subtrees_keep_their_paths for Tree.below {
+    let world = testing::world()
+    let minter = open_names(world.alloc)
+    defer take minter.close()
+    let root = minter.mint(Below(length: 0, path: Array[u8, 63].filled(0)))
+    let data = try root.below(b"data/")
+    let agent = try data.below(b"agent")
+    let revoker = try sys::revocable(agent)
+    let copy = revoker.capability()
+    let data_ends = data.ends_with(b'/')
+    let agent_ends = agent.ends_with(b't')
+    let copy_ends = copy.ends_with(b't')
+    let root_ends = root.ends_with(b'/')
+    take revoker.revoke()
+    let revoked_copy_ends = copy.ends_with(b't')
+    minter.revoke(data)
+    let revoked_agent_ends = agent.ends_with(b't')
+    expect data_ends and agent_ends and copy_ends
+    expect not root_ends
+    expect not revoked_copy_ends
+    expect not revoked_agent_ends
+} subtrees_keep_their_paths
 ```
 
 ```nan

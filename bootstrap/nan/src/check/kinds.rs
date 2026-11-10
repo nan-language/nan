@@ -10,9 +10,6 @@ use crate::diagnostic::Code;
 use crate::syntax::ast::{ItemKind, Tok, TypeModifier};
 use crate::workspace::Authority;
 
-/// The largest record a kind's entries keep, in bytes.
-const RECORD_BYTES: u64 = 16;
-
 /// The std functions only the module declaring their kind uses.
 const KIND_USES: [&str; 6] = [
     "sys::Minter.of",
@@ -70,7 +67,7 @@ impl Checker<'_> {
     }
 
     /// The rules of an impl line naming `sys::Kind`: its module performs `capability`, and it
-    /// names a struct of a kind's form and a record of at most 16 bytes.
+    /// names a struct of a kind's form and a record of a fixed size.
     pub fn check_kind_impl(&self, line: ItemId) {
         let SigKind::Impl {
             target: Some(key),
@@ -87,12 +84,8 @@ impl Checker<'_> {
         self.require(line, token, Authority::Capability);
         let shaped = matches!(key, TypeKey::Item(item) if self.kind_shaped(*item));
         let record = bound.args.get(1).and_then(Arg::ty);
-        let sized = record.is_none_or(|record| {
-            record.has_error()
-                || self
-                    .fixed_size(record)
-                    .is_some_and(|size| size <= RECORD_BYTES)
-        });
+        let sized =
+            record.is_none_or(|record| record.has_error() || self.fixed_size(record).is_some());
         if !shaped || !sized {
             self.report(line, token, Code::AuthorityKindForm);
         }

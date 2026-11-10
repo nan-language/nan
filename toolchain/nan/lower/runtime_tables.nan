@@ -1,4 +1,4 @@
-//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then the two words of its record. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind serving it and holds that entry's handle, then the method table of the kind for its service interface. A served `Fs` or `Net` entry holds that handle in place of its directory or network, and the method table after its state words, zero for an entry no kind serves.
+//! Capability tables: the entry each Copy capability's handle names, with its generation, its kind, the entry it derives from and the authority it records, and the minting of the root grant's capabilities; the outbox table's slots are entries of the same table. A capability handle is the entry's index in its low 32 bits and its generation in its high 32. An entry record is its generation, whether it is live (2 while its revocation spreads), its kind, its source's index plus one (the next free entry's for a free one), and four words of state; the second and third words of a `Fs` or `Net` entry hold the address and length of a text the entry owns. A live entry's state never changes once its handle is returned, so an operation reads its words through a snapshot that rechecks the handle once they are read; a text, which revocation frees, is read only under the lock. An outbox's state is its runner's record, its key and whether it is a keyed task's. An executor's state is its cell, the handle of the clock it records, its resolution in nanoseconds, zero standing for one, and its share, packed; its entry also counts the nanoseconds its tasks and those of the executors deriving from it ran, and names the serial executor whose turn its tasks run in, which a serial executor's entry keeps with its waiting tasks, its seed and its picks. A `Clock` entry's state is the nanosecond of the clock that delays count at which its root was minted, then its resolution in nanoseconds, zero standing for one; it also heads the deadlines in flight that `task::within` calls armed through it, linked through their timers. A `WallClock` entry's state is how many nanoseconds the wall clock reads ahead of the clock that delays count, which a host's wall clock reads from the platform instead, then its resolution. An entry of a capability kind holds its minter's state record, then its record when it fits two words, else the address of a block it owns holding the record, then the record's size in its fourth word, zero for one held in place. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind serving it and holds that entry's handle, then the method table of the kind for its service interface. A served `Fs` or `Net` entry holds that handle in place of its directory or network, and the method table after its state words, zero for an entry no kind serves.
 
 /// The capability table's capacity.
 const TABLES_ENTRIES: u64 = 65_536
@@ -81,6 +81,13 @@ const TABLES_EXECUTOR_RESOLUTION: u64 = TABLES_ENTRY_STATE + 16
 const TABLES_EXECUTOR_SHARE: u64 = TABLES_ENTRY_STATE + 24
 
 const ROOT_SHARE: u64 = 1
+
+/// The state word of a kind's entry holding the size of the record its block holds, zero for a
+/// record its state words hold.
+const TABLES_RECORD_SIZE: u64 = TABLES_ENTRY_STATE + 24
+
+/// The most bytes of a kind's record its entry's state words hold.
+const TABLES_RECORD_WORDS: i64 = 16
 
 /// The working directory's descriptor for the `*at` system calls.
 const WORKING_DIRECTORY: i64 = -100
@@ -185,6 +192,12 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
                     mut fx2.store(table, addr: record, offset: TABLES_ENTRY_TABLE)
                     derive_text(mut lo, fx: mut fx2, record, text: params[3], len: params[4])
                 })
+                let boxed = owns_record(mut fx1, record)
+                mut fx1.if_true(boxed, then: fn[mut lo](mut fx2: Fx) {
+                    let block = mut fx2.load(PTR, addr: source, offset: TABLES_ENTRY_STATE + 8)
+                    let size = mut fx2.load(PTR, addr: source, offset: TABLES_RECORD_SIZE)
+                    store_record(mut lo, fx: mut fx2, record, address: block, size)
+                })
                 return fx1.list1(handle)
             }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
                 let stale = mut fx1.int(PTR, value: -1)
@@ -208,12 +221,9 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             let kind = mut fx.ptr(u64.fit(TABLES_KIND_KIND))
             let handle = tables_new_entry(mut lo, mut fx, kind)
             let record = entry_at(mut lo, mut fx, handle)
-            var word: u64 = 0
-            for value in params {
-                invariant word < 3
-                mut fx.store(value, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
-                word += 1
-            }
+            expect params.len() == 3
+            mut fx.store(params[0], addr: record, offset: TABLES_ENTRY_STATE)
+            store_record(mut lo, mut fx, record, address: params[1], size: params[2])
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
             mut fx.b.ret(fx.list1(handle).view())
         }
@@ -224,14 +234,18 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             let record = live_entry(mut lo, mut fx, handle: params[0])
             let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
-            let pinned = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+            let pinned = mut fx.choose(live, results: fx.types1(PTR).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
                 let minter = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
                 let one = mut fx1.ptr(1)
                 discard fetch_add(mut fx1, address: minter, amount: one)
-                for word in 1u64..<3 {
-                    let value = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8 * word)
-                    mut fx1.store(value, addr: params[1], offset: 8 * (word - 1))
-                }
+                let size = mut fx1.load(PTR, addr: record, offset: TABLES_RECORD_SIZE)
+                let boxed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: size, y: 0)
+                let block = mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+                let held = mut fx1.offset(record, offset: TABLES_ENTRY_STATE + 8)
+                let from = mut fx1.b.select(boxed, x: block, y: held)
+                let words = mut fx1.ptr(u64.fit(TABLES_RECORD_WORDS))
+                let length = mut fx1.b.select(boxed, x: size, y: words)
+                discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: fx1.list3(params[1], b: from, c: length).view())
                 return fx1.list1(minter)
             }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
                 let stale = mut fx1.ptr(0)
@@ -253,8 +267,7 @@ fn tables_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
                 let record = entry_at(mut lo, fx: mut fx1, handle)
                 let minter = mut fx1.load(PTR, addr: source, offset: TABLES_ENTRY_STATE)
                 mut fx1.store(minter, addr: record, offset: TABLES_ENTRY_STATE)
-                mut fx1.store(params[1], addr: record, offset: TABLES_ENTRY_STATE + 8)
-                mut fx1.store(params[2], addr: record, offset: TABLES_ENTRY_STATE + 16)
+                store_record(mut lo, fx: mut fx1, record, address: params[1], size: params[2])
                 let low = mut fx1.b.band_imm_s(params[0], y: 0xFFFF_FFFF)
                 let plus = mut fx1.b.iadd_imm_s(low, y: 1)
                 let index = mut fx1.b.ireduce(clif::Type.Int32, x: plus)
@@ -373,6 +386,40 @@ fn owns_text(mut fx: Fx, record: clif::Value) -> clif::Value {
     return mut fx.b.bor(fs, y: net)
 } owns_text
 
+/// Whether an entry is a kind's whose record lies in a block it owns.
+fn owns_record(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let kind = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+    let of_kind = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TABLES_KIND_KIND)
+    let size = mut fx.load(PTR, addr: record, offset: TABLES_RECORD_SIZE)
+    let boxed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: size, y: 0)
+    return mut fx.b.band(of_kind, y: boxed)
+} owns_record
+
+/// Gives a kind's entry the record of `size` bytes at `address`: in its state words when it fits
+/// them, else in a block of runtime memory it owns; traps when that memory is exhausted. The
+/// caller holds the lock.
+fn store_record(mut lo: Lowering, mut fx: Fx, record: clif::Value, address: clif::Value, size: clif::Value) {
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    mut fx.store(zero, addr: record, offset: TABLES_ENTRY_STATE + 16)
+    let boxed = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: size, y: TABLES_RECORD_WORDS)
+    let kept = mut fx.b.select(boxed, x: size, y: zero)
+    mut fx.store(kept, addr: record, offset: TABLES_RECORD_SIZE)
+    let target = mut fx.choose(boxed, results: fx.types1(PTR).view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let block = mut lo.record_alloc(mut fx1, size)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: block, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+            raise_kind(mut lo, fx: mut fx2, kind: "trap.exhausted")
+        })
+        mut fx1.store(block, addr: record, offset: TABLES_ENTRY_STATE + 8)
+        return fx1.list1(block)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.offset(record, offset: TABLES_ENTRY_STATE + 8)
+        return fx1.list1(held)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(target[0], b: address, c: size).view())
+} store_record
+
 /// Gives a derived `Fs` or `Net` entry a text of its own in runtime memory: its source's, which
 /// its state words hold, extended by a given text as a path for `Fs` and replaced by it for
 /// `Net`, or kept when the given text's address is zero.
@@ -432,7 +479,8 @@ fn revoke(mut lo: Lowering, mut fx: Fx, handle: clif::Value) {
 } revoke
 
 /// Revokes the entries being revoked and every live entry deriving from one, transitively:
-/// each becomes free, its generation advanced and its text freed. The caller holds the lock.
+/// each becomes free, its generation advanced and its text or record block freed. The caller
+/// holds the lock.
 fn sweep(mut lo: Lowering, mut fx: Fx) {
     let state_address = mut lo.state(mut fx)
     let count = mut fx.load(PTR, addr: state_address, offset: STATE_ENTRY_COUNT)
@@ -472,10 +520,12 @@ fn sweep(mut lo: Lowering, mut fx: Fx) {
         mut fx1.if_true(revoked, then: fn[mut lo](mut fx2: Fx) {
             expire_deadlines(mut lo, fx: mut fx2, record)
             release_waiting(mut lo, fx: mut fx2, owner: record)
-            let owns = owns_text(mut fx2, record)
+            let text = owns_text(mut fx2, record)
+            let block = owns_record(mut fx2, record)
+            let owns = mut fx2.b.bor(text, y: block)
             mut fx2.if_true(owns, then: fn[mut lo](mut fx3: Fx) {
-                let text = mut fx3.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
-                mut lo.record_free(mut fx3, address: text)
+                let owned = mut fx3.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+                mut lo.record_free(mut fx3, address: owned)
             })
             free_entry(mut lo, fx: mut fx2, record, index)
         })

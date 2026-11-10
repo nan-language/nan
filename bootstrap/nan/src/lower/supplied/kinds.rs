@@ -1,9 +1,9 @@
 //! Capability kinds: minters, reaches and derivations, and the handles and type tags of the
 //! capabilities a `nanos::Caps` holds. A minter is the holding of its state's record, which is a
 //! shared value's whose count holds one for the minter and one for each reach or derivation in
-//! flight, and which the outermost domain reaches. An entry of a kind holds that record and the two
-//! words of its own record; a reach pins the state under the table lock and calls its body outside
-//! it.
+//! flight, and which the outermost domain reaches. An entry of a kind holds that record and its
+//! own record, which the capability table keeps given its address and size; a reach pins the
+//! state under the table lock, which copies the record out, and calls its body outside it.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -17,7 +17,8 @@ use super::mem::stores::{contents_at, new_shared, release_shared, transfer_share
 use super::sys::fail_with;
 use crate::check::ty::Ty;
 
-/// The bytes of the slot holding a record's two words.
+/// The fewest bytes of the slot a pin copies a record into: the two words a record its entry's
+/// state words hold fills.
 const RECORD_SLOT: u64 = 16;
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
@@ -25,8 +26,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::Minter.of" => of(lo, fx, supply),
         "sys::Minter.mint" => {
             let minter = holdings::payload(fx, supply.param(0).address());
-            let (low, high) = record_words(lo, fx, supply.param(1), &supply.type_arg(2));
-            let handle = lo.call_routine(fx, Routine::KindMint, &[minter, low, high])[0];
+            let (record, size) = record_at(lo, fx, supply.param(1), &supply.type_arg(2));
+            let handle = lo.call_routine(fx, Routine::KindMint, &[minter, record, size])[0];
             let sret = supply.sret.expect("a capability's address");
             fx.store(handle, sret, 0);
             supply.done(lo, fx);
@@ -91,7 +92,7 @@ fn reach(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let option = supply.abi.result.clone();
     let state_ty = supply.type_arg(1);
     let handle = fx.load(PTR, supply.param(0).address(), 0);
-    let record = fx.slot(RECORD_SLOT, 8);
+    let record = pin_slot(lo, fx, &supply.type_arg(2));
     let minter = lo.call_routine(fx, Routine::KindPin, &[handle, record])[0];
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, minter, 0);
     fx.when(live, |fx| {
@@ -111,14 +112,14 @@ fn derive(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let state_ty = supply.type_arg(1);
     let record_ty = supply.type_arg(2);
     let handle = fx.load(PTR, supply.param(0).address(), 0);
-    let record = fx.slot(RECORD_SLOT, 8);
+    let record = pin_slot(lo, fx, &record_ty);
     let minter = lo.call_routine(fx, Routine::KindPin, &[handle, record])[0];
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, minter, 0);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
     let called = call_pinned(lo, fx, supply, &state_ty, minter, record);
     unpin(lo, fx, &state_ty, minter);
-    let (low, high) = record_words(lo, fx, called.result, &record_ty);
-    let derived = lo.call_routine(fx, Routine::KindDerive, &[handle, low, high])[0];
+    let (narrowed, size) = record_at(lo, fx, called.result, &record_ty);
+    let derived = lo.call_routine(fx, Routine::KindDerive, &[handle, narrowed, size])[0];
     let stale = fx.b.ins().icmp_imm_s(IntCC::Equal, derived, -1);
     fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
     let sret = supply.sret.expect("a capability's address");
@@ -154,14 +155,18 @@ fn unpin(lo: &mut Lowering, fx: &mut Fx, state_ty: &Ty, minter: Value) {
     release_shared(lo, fx, state_ty, held);
 }
 
-/// The two words of a record held one way or another, its bytes past its size zero.
-fn record_words(lo: &mut Lowering, fx: &mut Fx, record: Held, record_ty: &Ty) -> (Value, Value) {
-    let slot = fx.slot(RECORD_SLOT, 8);
-    let zero = fx.ptr(0);
-    fx.store(zero, slot, 0);
-    fx.store(zero, slot, 8);
+/// The address of a slot holding a record held one way or another, and its size.
+fn record_at(lo: &mut Lowering, fx: &mut Fx, record: Held, record_ty: &Ty) -> (Value, Value) {
+    let layout = lo.layout(record_ty);
+    let slot = fx.slot(layout.size, layout.align);
     lo.store_held(fx, slot, record, record_ty);
-    (fx.load(PTR, slot, 0), fx.load(PTR, slot, 8))
+    (slot, fx.ptr(layout.size))
+}
+
+/// A slot a pin copies a record of a type into.
+fn pin_slot(lo: &mut Lowering, fx: &mut Fx, record_ty: &Ty) -> Value {
+    let layout = lo.layout(record_ty);
+    fx.slot(layout.size.max(RECORD_SLOT), layout.align.max(8))
 }
 
 /// The tag of a capability type: the first 8 bytes, little-endian, of the digest of the hash of

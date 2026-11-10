@@ -1,6 +1,7 @@
-//! Capability kinds: minters, reaches and derivations, and the handles and type tags of the capabilities a `nanos::Caps` holds. A minter is the holding of its state's record, which is a shared value's whose count holds one for the minter and one for each reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that record and the two words of its own record; a reach pins the state under the table lock and calls its body outside it.
+//! Capability kinds: minters, reaches and derivations, and the handles and type tags of the capabilities a `nanos::Caps` holds. A minter is the holding of its state's record, which is a shared value's whose count holds one for the minter and one for each reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that record and its own record, which the capability table keeps given its address and size; a reach pins the state under the table lock, which copies the record out, and calls its body outside it.
 
-/// The bytes of the slot holding a record's two words.
+/// The fewest bytes of the slot a pin copies a record into: the two words a record its entry's
+/// state words hold fills.
 const KINDS_RECORD_SLOT: u64 = 16
 
 fn kinds_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
@@ -8,8 +9,8 @@ fn kinds_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "sys::Minter.of" => kinds_of(mut lo, mut fx, supply)
         "sys::Minter.mint" => {
             let minter = holdings_payload(mut fx, address: supply.param(0).address_value())
-            let words = kinds_record_words(mut lo, mut fx, record: supply.param(1), record_ty: supply.type_arg(lo, index: 2))
-            let minted = mut lo.call_routine(mut fx, routine: Routine.KindMint, args: fx.list3(minter, b: words.low, c: words.high).view())
+            let given = kinds_record_at(mut lo, mut fx, record: supply.param(1), record_ty: supply.type_arg(lo, index: 2))
+            let minted = mut lo.call_routine(mut fx, routine: Routine.KindMint, args: fx.list3(minter, b: given.address, c: given.size).view())
             expect minted.len() == 1
             let Some(sret) = supply.sret else {
                 expect false
@@ -101,7 +102,7 @@ fn kinds_reach(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let option = supply.abi.result
     let state_ty = supply.type_arg(lo, index: 1)
     let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let record = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
+    let record = kinds_pin_slot(mut lo, mut fx, record_ty: supply.type_arg(lo, index: 2))
     let pinned = mut lo.call_routine(mut fx, routine: Routine.KindPin, args: fx.list2(handle, b: record).view())
     expect pinned.len() == 1
     let minter = pinned[0]
@@ -123,7 +124,7 @@ fn kinds_derive(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let state_ty = supply.type_arg(lo, index: 1)
     let record_ty = supply.type_arg(lo, index: 2)
     let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let record = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
+    let record = kinds_pin_slot(mut lo, mut fx, record_ty)
     let pinned = mut lo.call_routine(mut fx, routine: Routine.KindPin, args: fx.list2(handle, b: record).view())
     expect pinned.len() == 1
     let minter = pinned[0]
@@ -133,8 +134,8 @@ fn kinds_derive(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     })
     let called = kinds_call_pinned(mut lo, mut fx, supply, state_ty, minter, record)
     kinds_unpin(mut lo, mut fx, state_ty, minter)
-    let words = kinds_record_words(mut lo, mut fx, record: called.result, record_ty)
-    let derived = mut lo.call_routine(mut fx, routine: Routine.KindDerive, args: fx.list3(handle, b: words.low, c: words.high).view())
+    let narrowed = kinds_record_at(mut lo, mut fx, record: called.result, record_ty)
+    let derived = mut lo.call_routine(mut fx, routine: Routine.KindDerive, args: fx.list3(handle, b: narrowed.address, c: narrowed.size).view())
     expect derived.len() == 1
     let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived[0], y: -1)
     mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
@@ -166,20 +167,31 @@ fn kinds_unpin(mut lo: Lowering, mut fx: Fx, state_ty: ty::Ty, minter: clif::Val
     release_shared(mut lo, mut fx, value_ty: state_ty, address: held)
 } kinds_unpin
 
-/// The two words of a record.
-struct RecordWords derives Copy {
-    low: clif::Value
-    high: clif::Value
-} RecordWords
+/// The address of a slot holding a record, and the record's size.
+struct RecordAt derives Copy {
+    address: clif::Value
+    size: clif::Value
+} RecordAt
 
-/// The two words of a record held one way or another, its bytes past its size zero.
-fn kinds_record_words(mut lo: Lowering, mut fx: Fx, record: Held, record_ty: ty::Ty) -> RecordWords {
-    let slot = mut fx.slot(KINDS_RECORD_SLOT, align: 8)
-    let zero = mut fx.ptr(0)
-    mut fx.store(zero, addr: slot, offset: 0)
-    mut fx.store(zero, addr: slot, offset: 8)
+/// The address of a slot holding a record held one way or another, and its size.
+fn kinds_record_at(mut lo: Lowering, mut fx: Fx, record: Held, record_ty: ty::Ty) -> RecordAt {
+    let laid = mut lo.layout_of(record_ty)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
     mut lo.store_held(mut fx, address: slot, held: record, ty: record_ty)
-    let low = mut fx.load(PTR, addr: slot, offset: 0)
-    let high = mut fx.load(PTR, addr: slot, offset: 8)
-    return RecordWords(low: low, high: high)
-} kinds_record_words
+    let size = mut fx.ptr(laid.contents().size)
+    return RecordAt(address: slot, size: size)
+} kinds_record_at
+
+/// A slot a pin copies a record of a type into.
+fn kinds_pin_slot(mut lo: Lowering, mut fx: Fx, record_ty: ty::Ty) -> clif::Value {
+    let laid = mut lo.layout_of(record_ty)
+    var size = laid.contents().size
+    if size < KINDS_RECORD_SLOT {
+        size = KINDS_RECORD_SLOT
+    }
+    var align = laid.contents().align
+    if align < 8 {
+        align = 8
+    }
+    return mut fx.slot(size, align: align)
+} kinds_pin_slot

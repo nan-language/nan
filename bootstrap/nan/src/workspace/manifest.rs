@@ -49,6 +49,14 @@ pub enum Target {
 }
 
 impl Target {
+    /// The host target of the machine running the toolchain.
+    pub fn running_host() -> Target {
+        match Arch::running() {
+            Arch::Amd64 => Target::X64Host,
+            Arch::Aarch64 => Target::Aarch64Host,
+        }
+    }
+
     /// The concrete targets.
     pub const CONCRETE: [Target; 8] = [
         Target::X64Host,

@@ -404,19 +404,20 @@ fn item_at(checker: &Checker, path: &str, line: u32) -> Option<ItemId> {
         })
 }
 
-/// The run targets of a package: each target it declares, `any` standing for `x86_64-host`.
+/// The run targets of a package: each target it declares, `any` standing for the host target
+/// of the machine running the toolchain.
 fn run_targets(package: &Package) -> Vec<Target> {
     let mut targets: Vec<Target> = package
         .manifest
         .iter()
         .flat_map(|manifest| &manifest.targets)
         .map(|target| match target {
-            Target::Any => Target::X64Host,
+            Target::Any => Target::running_host(),
             other => *other,
         })
         .collect();
     if targets.is_empty() {
-        targets.push(Target::X64Host);
+        targets.push(Target::running_host());
     }
     targets.sort();
     targets.dedup();

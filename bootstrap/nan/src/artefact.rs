@@ -587,14 +587,15 @@ pub fn decode(artefact: &[u8]) -> Result<Decoded, Code> {
     })
 }
 
-/// A uvar without redundant trailing groups, and the bytes after it.
+/// A uvar without redundant trailing groups, its value within 128 bits, and the bytes after it.
 pub fn read_uvar(bytes: &[u8]) -> Option<(u128, &[u8])> {
     let mut value = 0u128;
     for (at, byte) in bytes.iter().enumerate() {
-        if at >= 19 {
+        let group = byte & 0x7F;
+        if 7 * at + (u8::BITS - group.leading_zeros()) as usize > 128 {
             return None;
         }
-        value |= u128::from(byte & 0x7F) << (7 * at);
+        value |= u128::from(group) << (7 * at);
         if byte & 0x80 == 0 {
             let minimal = at == 0 || *byte != 0;
             return minimal.then_some((value, &bytes[at + 1..]));

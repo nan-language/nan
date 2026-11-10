@@ -177,3 +177,14 @@ fn an_artefact_holds_all_three_sections_or_none() {
     lone.extend(partial.finish());
     assert_eq!(decode(&lone).err(), Some(Code::ArtefactMalformed));
 }
+
+#[test]
+fn a_uvar_reads_only_when_its_last_group_fits_128_bits() {
+    let mut top = vec![0x80u8; 18];
+    top.push(0x03);
+    assert_eq!(read_uvar(&top), Some((3 << 126, &[][..])));
+    let mut past = vec![0x81u8];
+    past.extend([0x80; 17]);
+    past.push(0x04);
+    assert_eq!(read_uvar(&past), None);
+}

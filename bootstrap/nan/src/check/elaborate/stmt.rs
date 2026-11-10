@@ -325,8 +325,8 @@ impl Elab<'_, '_> {
     }
 
     /// `P = e` and `P op= e`: P's operands, then e, then the `at_mut` call of an indexed P, then
-    /// for `op=` the operator on P's value and e's, then `init` where P holds no value and
-    /// `assign` where it holds one.
+    /// for `op=` the operator on P's value and e's, then `init` where P holds no value or only
+    /// parts, after the release of the parts left, and `assign` where it holds one.
     fn assign(
         &mut self,
         token: Tok,
@@ -359,7 +359,11 @@ impl Elab<'_, '_> {
             }
             None => right,
         };
-        let holds = !self.moved.iter().any(|moved| is_prefix(moved, &place));
+        let partly = self.moved.iter().any(|moved| is_prefix(&place, moved));
+        let holds = !partly && !self.moved.iter().any(|moved| is_prefix(moved, &place));
+        if partly {
+            self.release_left(place.clone(), &target.ty, span);
+        }
         self.moved.retain(|moved| !is_prefix(&place, moved));
         self.emit(
             match holds {

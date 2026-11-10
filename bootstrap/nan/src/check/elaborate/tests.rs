@@ -410,3 +410,15 @@ fn an_indexed_place_is_passed_in_place() {
         "unit example::fill\n\nfn body (mut %0: ref mut example::Grid, read %1: usize) -> u8\n^0:\n    %2 = slot cells: Array[u8, 4096]\n    %3 = call Array.filled[u8, 4096](0u8)\n    init %2, %3\n    %4 = call Array.at_mut[u8, 4096](mut %2, %1)\n    assign %4, 1u8\n    %5 = call Array.at_mut[Array[u8, 64], 64](mut %0.rows, %1)\n    %6 = call Array.at_mut[u8, 64](mut %5, %1)\n    assign %6, 2u8\n    %7 = call Array.at[u8, 4096](read %2, %1)\n    %8 = load %7\n    return %8\n"
     );
 }
+
+#[test]
+fn assigning_a_var_with_a_part_moved_out_releases_only_the_parts_left() {
+    let text = unit_text(
+        "pub struct Pair {\n    pub kept: mem::Bytes\n    pub given: mem::Bytes\n} Pair\n\npub fn pair(alloc: mem::Alloc) -> Pair = Pair(kept: mem::Bytes.empty(alloc), given: mem::Bytes.empty(alloc))\n\npub fn renew(alloc: mem::Alloc) -> mem::Bytes {\n    var current = pair(alloc)\n    let given = current.given\n    current = pair(alloc)\n    return given\n} renew\n",
+        "example::renew",
+    );
+    assert_eq!(
+        text,
+        "unit example::renew\n\nfn body (read %0: mem::Alloc) -> mem::Bytes\n^0:\n    %1 = slot current: example::Pair\n    %2 = call example::pair(%0)\n    init %1, %2\n    %3 = slot given: mem::Bytes\n    init %3, take %1.given\n    %4 = call example::pair(%0)\n    release %1.kept\n    init %1, %4\n    release %1\n    return take %3\n"
+    );
+}

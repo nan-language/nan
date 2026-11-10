@@ -10,7 +10,7 @@ A **command** is a `nan` subcommand. Every command runs in a **workspace**, the 
 - The files `.nan/write`, `.nan/journal`, `.nan/repro/<n>`, `.nan/green/<agent>`, `.nan/images/<target>/` and `.nan/machine/<target>/` lie in the `.nan` directory of the workspace root; they are neither source files nor [machine files](35-format.md#machine-files).
 - In records, `<item>` is an item's or member's path as tool output writes [canonical paths](29-identity-versioning.md#canonical-paths) for the scope's package, or its canonical path when the scope holds several packages. A path naming a module, item or member, in a scope or an `<item>` argument, is its canonical path or, when the current directory lies inside a package, the path that package's root module would write for it; a text that is both is read as a canonical path. A package, and its `package` item, are named by the package name.
 - A command's **scope** is the argument naming what it acts on: `.` for the workspace; the path of a package, module, item or member; a file path ending in `.nan`, for that file's items; or a location, for the item holding that line. An omitted scope is the package holding the current directory, or `.` at the workspace root. A scope naming nothing is an error (`tool.unknown-scope`).
-- Every command accepts `--json` ([JSON Lines](#json-lines)), `--budget N` and `--skip N` ([output budgets](#output-budgets)). Any other option, argument or value outside its synopsis and the forms this chapter allows is an error (`tool.usage`).
+- Every command accepts `--json` ([JSON Lines](#json-lines)), `--budget N` and `--skip N` ([output budgets](#output-budgets)). Any other option, argument or value outside its synopsis and the forms this chapter allows is an error (`tool.usage`), whose `expected:` line gives the command's synopses below, the synopses of the commands the line's first word starts or, for any other word, `a command: ` and the first words of the commands, and whose `found:` line gives the first argument outside them, or `end of line` when the line ends before an argument they need.
 - No configuration file or environment variable affects a command, except `PATH`, through which a final build finds `cc` and runs under the emulator find QEMU and `swtpm`, and, in a [VCS workspace](31-trust.md#author-rule), the git configuration the author rule reads.
 
 The commands are:
@@ -120,6 +120,12 @@ $ nan run hello --keep-resets
 invalid run hello --keep-resets: files 0, errors 1, incomplete 0
 error tool.usage - -
 invalid run hello --keep-resets: files 0, errors 1, incomplete 0
+$ nan run hello --keep-reset
+invalid run hello --keep-reset: files 0, errors 1, incomplete 0
+error tool.usage - -
+    expected: nan run [<package>] [--keep-resets] [-- <argument>...]
+    found: --keep-reset
+invalid run hello --keep-reset: files 0, errors 1, incomplete 0
 ```
 
 ## Output contract

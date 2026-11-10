@@ -113,6 +113,67 @@ fn paired(leading: Str, second: Str) -> Option[Name] {
     }
 } paired
 
+/// The commands named by two words, the first being `leading`.
+fn family(leading: Str, alloc: mem::Alloc) -> mem::List[Name] {
+    var names = mem::List[Name].empty(alloc)
+    match leading {
+        "edit" => {
+            mut names.push(Name.EditReplace)
+            mut names.push(Name.EditRename)
+            mut names.push(Name.EditMove)
+        }
+        "key" => {
+            mut names.push(Name.KeyNew)
+            mut names.push(Name.KeyShow)
+            mut names.push(Name.KeyTrust)
+        }
+        "api" => mut names.push(Name.ApiUpdate)
+        "dep" => {
+            mut names.push(Name.DepAdd)
+            mut names.push(Name.DepSync)
+            mut names.push(Name.DepApprove)
+        }
+        else => {}
+    }
+    return names
+} family
+
+/// The command's synopses, as the commands' list gives them.
+proj fn Name.synopsis(self) -> Str {
+    return match self {
+        Name.Check => "nan check [<scope>] [--radius] [--agent <name>], nan check --prefix <path>[:<line>]"
+        Name.Verify => "nan verify [<scope>]"
+        Name.Test => "nan test [<scope>] [--affected], nan test --replay <token>"
+        Name.Fix => "nan fix [<scope>] [--propagate]"
+        Name.Fmt => "nan fmt [<scope>]"
+        Name.Holes => "nan holes [<scope>]"
+        Name.Show => "nan show <scope> [--api]"
+        Name.Read => "nan read <location>"
+        Name.Find => "nan find <name>, nan find --contributors <registry> [<package>]"
+        Name.Context => "nan context <item or location>"
+        Name.Explain => "nan explain <item or package>"
+        Name.Expand => "nan expand <type>"
+        Name.EditReplace => "nan edit replace <item> --expect <hash> --from <file>"
+        Name.EditRename => "nan edit rename <item> <name>"
+        Name.EditMove => "nan edit move <item> <module>"
+        Name.Merge => "nan merge <base> <ours> <theirs> [--path <path>]"
+        Name.Diff => "nan diff <old> <new> [--path <path>], nan diff --green [<scope>] [--agent <name>]"
+        Name.Seal => "nan seal <item> --as <principal>"
+        Name.KeyNew => "nan key new <principal>"
+        Name.KeyShow => "nan key show <principal>"
+        Name.KeyTrust => "nan key trust <principal> <key>"
+        Name.ApiUpdate => "nan api update [<scope>] [--confirm-docs <item>...]"
+        Name.DepAdd => "nan dep add <alias> <source>"
+        Name.DepSync => "nan dep sync [<package>]"
+        Name.DepApprove => "nan dep approve [<package>]"
+        Name.Publish => "nan publish --local <dir> [--name <store name>] [--as <principal> [--author <principal>...]] [--breaking <item>... <reason>]"
+        Name.Upgrade => "nan upgrade [<package>], nan upgrade --language <N> [<scope>]"
+        Name.Build => "nan build [<scope>] [--compare-with <image>], nan build <package> --against <interface> [--as <principal>]"
+        Name.Run => "nan run [<package>] [--keep-resets] [-- <argument>...]"
+        Name.Primer => "nan primer [<topic> or tools]"
+    }
+} Name.synopsis
+
 /// The command's name words.
 proj fn Name.words(self) -> Str {
     return match self {
@@ -193,6 +254,7 @@ fn Name.operands(self) -> usize {
     return match self {
         Name.Find or Name.EditRename or Name.EditMove or Name.DepAdd or Name.Diff or Name.KeyTrust => 2
         Name.Merge => 3
+        Name.Publish => 0
         else => 1
     }
 } Name.operands
@@ -400,9 +462,15 @@ fn Invocation.tool_error(self, code: diagnostic::Code, scope: Str, alloc: mem::A
 } Invocation.tool_error
 
 /// Reads the command line, or `None` when it is outside every synopsis this implementation runs.
-fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Option[Invocation] {
+/// The invocation a command line gives, or, when it lies outside its command's synopses, the
+/// first argument outside them, none when the line ends before an argument they need.
+fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Result[Invocation, Option[text::String]] {
     let Some(named) = Name.read(args) else {
-        return None
+        var at: usize = 0
+        if args.len() > 0 and family(args[0].as_str(), alloc).len() > 0 {
+            at = 1
+        }
+        return Err(argument_at(args, at, alloc))
     }
     let name = named.name
     var invocation = Invocation(name: name, args: mem::List[text::String].empty(alloc), operands: mem::List[text::String].empty(alloc), passed: mem::List[text::String].empty(alloc), flags: mem::List[text::String].empty(alloc), values: mem::List[Valued].empty(alloc), format: output::Format(json: false, budget: None, skip: 0))
@@ -423,15 +491,15 @@ fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Option[Invocati
         } else if arg == "--budget" or arg == "--skip" {
             index += 1
             if index >= args.len() {
-                return None
+                return Err(None)
             }
             let Some(value) = decimal(args[index].as_str()) else {
-                return None
+                return Err(argument_at(args, at: index, alloc))
             }
             if arg == "--skip" {
                 invocation.format.skip = value
             } else if value < 100 {
-                return None
+                return Err(argument_at(args, at: index, alloc))
             } else {
                 invocation.format.budget = Some(value)
             }
@@ -440,7 +508,7 @@ fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Option[Invocati
         } else if name.is_listing(arg) and invocation.value(arg).is_none() {
             let listed = listed_values(args, from: index + 1)
             if listed == 0 {
-                return None
+                return Err(argument_at(args, at: index + 1, alloc))
             }
             expect index < ~0usize - listed
             for at in (index + 1)..<(index + 1 + listed) {
@@ -452,11 +520,11 @@ fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Option[Invocati
         } else if holds_word(name.valued(), word: arg) and invocation.value(arg).is_none() {
             index += 1
             if index >= args.len() {
-                return None
+                return Err(None)
             }
             mut invocation.values.push(Valued(option: text::String.of(arg, alloc), value: text::String.of(args[index].as_str(), alloc)))
         } else if arg.starts_with("--") or invocation.operands.len() == name.operands() {
-            return None
+            return Err(Some(text::String.of(arg, alloc)))
         } else {
             mut invocation.operands.push(text::String.of(arg, alloc))
         }
@@ -466,10 +534,22 @@ fn read_command(args: Slice[text::String], alloc: mem::Alloc) -> Option[Invocati
     expect invocation.operands.len() <= ~0usize - invocation.flags.len() and invocation.operands.len() + invocation.flags.len() <= ~0usize - invocation.values.len()
     let others = invocation.operands.len() + invocation.flags.len() + invocation.values.len()
     if invocation.is_alone() and others != 1 {
+        let Some(option) = name.alone() else {
+            expect false
+            return Err(None)
+        }
+        return Err(Some(text::String.of(option, alloc)))
+    }
+    return Ok(take invocation)
+} read_command
+
+/// The argument at a position of a command line, none past its end.
+fn argument_at(args: Slice[text::String], at: usize, alloc: mem::Alloc) -> Option[text::String] {
+    if at >= args.len() {
         return None
     }
-    return Some(take invocation)
-} read_command
+    return Some(text::String.of(args[at].as_str(), alloc))
+} argument_at
 
 /// How many arguments from `from` on precede the next option or the end.
 fn listed_values(args: Slice[text::String], from: usize) -> usize
@@ -537,7 +617,7 @@ struct Ran {
 } Ran
 
 /// The output of a command line outside every synopsis: `tool.usage`.
-fn usage(args: Slice[text::String], alloc: mem::Alloc) -> Ran {
+fn usage(args: Slice[text::String], take found: Option[text::String], alloc: mem::Alloc) -> Ran {
     var command = text::String.empty(alloc)
     var json = false
     for at in 0..<args.len() {
@@ -554,11 +634,50 @@ fn usage(args: Slice[text::String], alloc: mem::Alloc) -> Ran {
         None => "records"
     }
     var records = mem::List[output::Record].empty(alloc)
-    mut records.push(unlocated(diagnostic::Code.ToolUsage, lines: mem::List[text::String].empty(alloc), alloc))
+    mut records.push(unlocated(diagnostic::Code.ToolUsage, lines: usage_lines(args, take found, alloc), alloc))
     let elision = text::String.of(command.as_str(), alloc)
     let written = output::Output(command: take command, elision: take elision, verdict: output::Verdict.Invalid, summary: tool_summary(counts, alloc), records: take records)
     return Ran(output: written.render(output::Format(json: json, budget: None, skip: 0), alloc), status: output::Verdict.Invalid.status(), launch: None)
 } usage
+
+/// The first words of the commands, in the order of the commands' list.
+const COMMANDS: Str = "check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer"
+
+/// The lines of a `tool.usage` record of a command line outside every synopsis: the synopses
+/// of its command, or of the commands its first word starts, or else the commands' first words;
+/// then the argument found outside them, or `end of line`.
+fn usage_lines(args: Slice[text::String], take found: Option[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var expected = text::String.of("expected: ", alloc)
+    match Name.read(args) {
+        Some(named) => mut expected.append(named.name.synopsis())
+        None => {
+            var leading = ""
+            if args.len() > 0 {
+                leading = args[0].as_str()
+            }
+            let names = family(leading, alloc)
+            if names.len() == 0 {
+                mut expected.append("a command: ")
+                mut expected.append(COMMANDS)
+            }
+            for at in 0..<names.len() {
+                if at > 0 {
+                    mut expected.append(", ")
+                }
+                mut expected.append(names[at].synopsis())
+            }
+        }
+    }
+    var shown = text::String.of("found: ", alloc)
+    match found {
+        Some(argument) => mut shown.append(output::argument(argument.as_str(), alloc).as_str())
+        None => mut shown.append("end of line")
+    }
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(take expected)
+    mut lines.push(take shown)
+    return lines
+} usage_lines
 
 /// The stack a command and each worker task of its crew run on: the entry task stack of
 /// `x86_64-host`.
@@ -636,8 +755,9 @@ fn print_ran(take ran: Ran) -> u8 {
 /// What a command line prints when the current directory does not read: its usage error, or
 /// the internal error naming that directory.
 fn without_directory(args: Slice[text::String], alloc: mem::Alloc) -> Ran {
-    let Some(invocation) = read_command(args, alloc) else {
-        return usage(args, alloc)
+    let invocation = match read_command(args, alloc) {
+        Ok(read) => read
+        Err(found) => return usage(args, take found, alloc)
     }
     let written = internal_error(invocation, args, trace: Trace.empty(alloc), code: diagnostic::Code.InternalInvariant, broken: text::fmt("the current directory does not read"), alloc)
     return Ran(output: written.render(invocation.format, alloc), status: written.verdict.status(), launch: None)
@@ -656,15 +776,16 @@ fn run(
     random: sys::Random,
     alloc: mem::Alloc,
     ) -> Ran fails task::Cancelled uses wait {
-    let Some(invocation) = read_command(args.view(), alloc) else {
-        return usage(args.view(), alloc)
+    let invocation = match read_command(args.view(), alloc) {
+        Ok(read) => read
+        Err(found) => return usage(args.view(), take found, alloc)
     }
     let traced = mem::Shared.of(Trace.empty(alloc), alloc: alloc)
     let given = traced.share()
     let line = copied_lines(args.view(), alloc)
     let user = cache::copied_override(home, alloc)
     let attempted = try await sys::Domain.run_sized(fn[take given, take line, take current, take user]() -> Result[Outcome, platform::IoError] fails task::Cancelled uses wait {
-        let Some(read) = read_command(line.view(), alloc) else {
+        let Ok(read) = read_command(line.view(), alloc) else {
             expect false
             return Err(platform::IoError.Other(0))
         }

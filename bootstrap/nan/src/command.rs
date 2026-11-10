@@ -85,6 +85,17 @@ enum Name {
 }
 
 impl Name {
+    /// The commands named by two words, the first being `first`.
+    fn family(first: &str) -> &'static [Name] {
+        match first {
+            "edit" => &[Name::EditReplace, Name::EditRename, Name::EditMove],
+            "key" => &[Name::KeyNew, Name::KeyShow, Name::KeyTrust],
+            "api" => &[Name::ApiUpdate],
+            "dep" => &[Name::DepAdd, Name::DepSync, Name::DepApprove],
+            _ => &[],
+        }
+    }
+
     /// The command named by the words a command line starts with, and how many it takes.
     fn read(args: &[String]) -> Option<(Name, usize)> {
         let second = args.get(1).map(String::as_str);
@@ -167,6 +178,50 @@ impl Name {
         }
     }
 
+    /// The command's synopses, as the commands' list gives them.
+    fn synopsis(self) -> &'static str {
+        match self {
+            Name::Check => {
+                "nan check [<scope>] [--radius] [--agent <name>], nan check --prefix <path>[:<line>]"
+            }
+            Name::Verify => "nan verify [<scope>]",
+            Name::Test => "nan test [<scope>] [--affected], nan test --replay <token>",
+            Name::Fix => "nan fix [<scope>] [--propagate]",
+            Name::Fmt => "nan fmt [<scope>]",
+            Name::Holes => "nan holes [<scope>]",
+            Name::Show => "nan show <scope> [--api]",
+            Name::Read => "nan read <location>",
+            Name::Find => "nan find <name>, nan find --contributors <registry> [<package>]",
+            Name::Context => "nan context <item or location>",
+            Name::Explain => "nan explain <item or package>",
+            Name::Expand => "nan expand <type>",
+            Name::EditReplace => "nan edit replace <item> --expect <hash> --from <file>",
+            Name::EditRename => "nan edit rename <item> <name>",
+            Name::EditMove => "nan edit move <item> <module>",
+            Name::Merge => "nan merge <base> <ours> <theirs> [--path <path>]",
+            Name::Diff => {
+                "nan diff <old> <new> [--path <path>], nan diff --green [<scope>] [--agent <name>]"
+            }
+            Name::Seal => "nan seal <item> --as <principal>",
+            Name::KeyNew => "nan key new <principal>",
+            Name::KeyShow => "nan key show <principal>",
+            Name::KeyTrust => "nan key trust <principal> <key>",
+            Name::ApiUpdate => "nan api update [<scope>] [--confirm-docs <item>...]",
+            Name::DepAdd => "nan dep add <alias> <source>",
+            Name::DepSync => "nan dep sync [<package>]",
+            Name::DepApprove => "nan dep approve [<package>]",
+            Name::Publish => {
+                "nan publish --local <dir> [--name <store name>] [--as <principal> [--author <principal>...]] [--breaking <item>... <reason>]"
+            }
+            Name::Upgrade => "nan upgrade [<package>], nan upgrade --language <N> [<scope>]",
+            Name::Build => {
+                "nan build [<scope>] [--compare-with <image>], nan build <package> --against <interface> [--as <principal>]"
+            }
+            Name::Run => "nan run [<package>] [--keep-resets] [-- <argument>...]",
+            Name::Primer => "nan primer [<topic> or tools]",
+        }
+    }
+
     /// The flags the command accepts, and its options taking a value.
     fn options(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
@@ -216,6 +271,7 @@ impl Name {
             Name::Find | Name::EditRename | Name::EditMove | Name::DepAdd | Name::KeyTrust => 2,
             Name::Merge => 3,
             Name::Diff => 2,
+            Name::Publish => 0,
             _ => 1,
         }
     }
@@ -415,8 +471,9 @@ struct Trace {
 }
 
 pub fn run(args: &[String], current: &Path) -> Run {
-    let Some(invocation) = read(args) else {
-        return usage(args);
+    let invocation = match read(args) {
+        Ok(invocation) => invocation,
+        Err(found) => return usage(args, found),
     };
     let mut trace = Trace::default();
     let outcome = caught(|| execute(&invocation, current, &mut trace));
@@ -449,8 +506,9 @@ pub fn run(args: &[String], current: &Path) -> Run {
 /// What a command line prints when the current directory does not read: its usage error, or
 /// the internal error naming that directory.
 pub fn without_directory(args: &[String]) -> Run {
-    let Some(invocation) = read(args) else {
-        return usage(args);
+    let invocation = match read(args) {
+        Ok(invocation) => invocation,
+        Err(found) => return usage(args, found),
     };
     let invariant = "the current directory does not read";
     let output = internal_error(&invocation, args, &Trace::default(), invariant);
@@ -566,8 +624,13 @@ fn reproducer(root: &Path, args: &[String], read: &[String]) -> io::Result<Strin
 }
 
 /// Reads the command line, or `None` when it is outside every synopsis this implementation runs.
-fn read(args: &[String]) -> Option<Invocation<'_>> {
-    let (name, taken) = Name::read(args)?;
+/// The invocation a command line gives, or, when it lies outside its command's synopses, the
+/// first argument outside them, none when the line ends before an argument they need.
+fn read(args: &[String]) -> Result<Invocation<'_>, Option<&str>> {
+    let Some((name, taken)) = Name::read(args) else {
+        let named = !Name::family(args.first().map_or("", String::as_str)).is_empty();
+        return Err(args.get(usize::from(named)).map(String::as_str));
+    };
     let rest = &args[taken..];
     let (flags, valued) = name.options();
     let mut invocation = Invocation {
@@ -594,12 +657,14 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
             "--json" => invocation.format.json = true,
             "--budget" => {
                 index += 1;
-                let budget = number(rest.get(index)?).filter(|budget| *budget >= 100)?;
-                invocation.format.budget = Some(budget);
+                let given = rest.get(index).map(String::as_str);
+                let budget = given.and_then(number).filter(|budget| *budget >= 100);
+                invocation.format.budget = Some(budget.ok_or(given)?);
             }
             "--skip" => {
                 index += 1;
-                invocation.format.skip = number(rest.get(index)?)?;
+                let given = rest.get(index).map(String::as_str);
+                invocation.format.skip = given.and_then(number).ok_or(given)?;
             }
             _ if flags.contains(&arg) && !invocation.flag(arg) => invocation.flags.push(arg),
             _ if name.listing().contains(&arg) && invocation.listed(arg).is_empty() => {
@@ -608,7 +673,7 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
                     .take_while(|value| !value.starts_with("--"))
                     .collect();
                 if listed.is_empty() {
-                    return None;
+                    return Err(rest.get(index + 1).map(String::as_str));
                 }
                 index += listed.len();
                 invocation
@@ -619,10 +684,11 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
                 && invocation.values.iter().all(|(option, _)| *option != arg) =>
             {
                 index += 1;
-                invocation.values.push((arg, rest.get(index)?.as_str()));
+                let value = rest.get(index).ok_or(None)?;
+                invocation.values.push((arg, value.as_str()));
             }
             _ if arg.starts_with("--") || invocation.operands.len() == name.operands() => {
-                return None;
+                return Err(Some(arg));
             }
             _ => invocation.operands.push(arg),
         }
@@ -630,9 +696,12 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
     }
     let alone = name
         .alone()
-        .is_some_and(|option| invocation.value(option).is_some());
+        .filter(|option| invocation.value(option).is_some());
     let others = invocation.operands.len() + invocation.flags.len() + invocation.values.len();
-    (!alone || others == 1).then_some(invocation)
+    match alone {
+        Some(option) if others > 1 => Err(Some(option)),
+        _ => Ok(invocation),
+    }
 }
 
 fn number(arg: &str) -> Option<usize> {
@@ -643,7 +712,7 @@ fn number(arg: &str) -> Option<usize> {
 }
 
 /// The output of a command line outside every synopsis: `tool.usage`.
-fn usage(args: &[String]) -> Run {
+fn usage(args: &[String], found: Option<&str>) -> Run {
     let command: Vec<String> = args.iter().map(|arg| output::argument(arg)).collect();
     let command = command.join(" ");
     let counts = Name::read(args).map_or(&["records"][..], |(name, _)| name.counts());
@@ -655,7 +724,7 @@ fn usage(args: &[String]) -> Run {
             .iter()
             .map(|count| (*count, usize::from(matches!(*count, "errors" | "records"))))
             .collect(),
-        records: vec![unlocated(Code::ToolUsage, Vec::new())],
+        records: vec![unlocated(Code::ToolUsage, usage_lines(args, found))],
     };
     Run {
         output: output.render(&Format {
@@ -666,6 +735,26 @@ fn usage(args: &[String]) -> Run {
         status: Verdict::Invalid.status(),
         launch: None,
     }
+}
+
+/// The first words of the commands, in the order of the commands' list.
+const COMMANDS: &str = "check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer";
+
+/// The lines of a `tool.usage` record of a command line outside every synopsis: the synopses
+/// of its command, or of the commands its first word starts, or else the commands' first words;
+/// then the argument found outside them, or `end of line`.
+fn usage_lines(args: &[String], found: Option<&str>) -> Vec<String> {
+    let family = Name::family(args.first().map_or("", String::as_str));
+    let expected = match Name::read(args) {
+        Some((name, _)) => name.synopsis().to_owned(),
+        None if !family.is_empty() => {
+            let synopses: Vec<&str> = family.iter().map(|name| name.synopsis()).collect();
+            synopses.join(", ")
+        }
+        None => format!("a command: {COMMANDS}"),
+    };
+    let found = found.map_or("end of line".to_owned(), output::argument);
+    vec![format!("expected: {expected}"), format!("found: {found}")]
 }
 
 fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Outcome> {

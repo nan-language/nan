@@ -97,8 +97,36 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
     }
     assert_eq!(
         run_in(&scratch.0, "frobnicate").output,
-        "invalid frobnicate: records 1\nerror tool.usage - -\ninvalid frobnicate: records 1\n"
+        "invalid frobnicate: records 1\nerror tool.usage - -\n    expected: a command: check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer\n    found: frobnicate\ninvalid frobnicate: records 1\n"
     );
+    for (line, found) in [
+        ("check --budget 99", "99"),
+        ("check --skip", "end of line"),
+        (
+            "test app --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
+            "--replay",
+        ),
+        ("publish app --local app", "app"),
+    ] {
+        let lines: Vec<String> = run_in(&scratch.0, line)
+            .output
+            .lines()
+            .filter_map(|text| text.strip_prefix("    "))
+            .map(str::to_owned)
+            .collect();
+        let synopsis = read(&args(line))
+            .err()
+            .and(Name::read(&args(line)))
+            .map(|(name, _)| name.synopsis());
+        assert_eq!(
+            lines,
+            [
+                format!("expected: {}", synopsis.unwrap_or_default()),
+                format!("found: {found}")
+            ],
+            "{line}"
+        );
+    }
 }
 
 #[test]

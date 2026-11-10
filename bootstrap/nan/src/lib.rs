@@ -36,7 +36,7 @@ mod workspace;
 
 pub use cache::use_home;
 pub use check::{Discharge, Measured};
-pub use command::{Launch, Run, run};
+pub use command::{Launch, Run, run, without_directory};
 pub use diagnostic::Code;
 pub use final_build::TaskStack;
 

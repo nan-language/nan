@@ -396,3 +396,15 @@ fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_ap
         "ok dep sync app: files 0, errors 0, incomplete 0"
     );
 }
+
+#[test]
+fn a_command_without_a_current_directory_is_an_internal_error_naming_it() {
+    let run = without_directory(&args("check app"));
+    assert_eq!(
+        (run.output.as_str(), run.status),
+        (
+            "internal-error check app: records 1\ninternal internal.invariant - -\n    invariant the current directory does not read\ninternal-error check app: records 1\n",
+            3
+        )
+    );
+}

@@ -446,6 +446,21 @@ pub fn run(args: &[String], current: &Path) -> Run {
     }
 }
 
+/// What a command line prints when the current directory does not read: its usage error, or
+/// the internal error naming that directory.
+pub fn without_directory(args: &[String]) -> Run {
+    let Some(invocation) = read(args) else {
+        return usage(args);
+    };
+    let invariant = "the current directory does not read";
+    let output = internal_error(&invocation, args, &Trace::default(), invariant);
+    Run {
+        output: output.render(&invocation.format),
+        status: output.verdict.status(),
+        launch: None,
+    }
+}
+
 thread_local! {
     /// Whether this thread runs a command, whose panic `caught` describes.
     static CATCHING: Cell<bool> = const { Cell::new(false) };

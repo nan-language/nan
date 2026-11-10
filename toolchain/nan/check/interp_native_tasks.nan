@@ -1,11 +1,16 @@
-//! The channels interpreter runs make without a wait: a channel's senders and receiver share a buffer drawn for its capacity, counting the handles that keep it; sending and receiving wait, which interpreter runs never do.
+//! The channels interpreter runs make without a wait: a channel's senders and receiver share a buffer drawn for its capacity, counting the handles that keep it and whether its receiver is unreleased; offering appends at once, while sending and receiving wait, which interpreter runs never do.
 
-/// The positions of a channel's shared parts: its buffer, its allocation and its handles.
+/// The positions of a channel's shared parts: its buffer, its allocation, its handles, its
+/// capacity and whether its receiver is unreleased.
 const CHANNEL_BUFFER: usize = 0
 
 const CHANNEL_ALLOCATION: usize = 1
 
 const CHANNEL_HANDLES: usize = 2
+
+const CHANNEL_CAPACITY: usize = 3
+
+const CHANNEL_RECEIVER: usize = 4
 
 /// A member of `task::Channel` or `task::Sender` an interpreter run can call; none for another.
 fn Interpreter.task_member(
@@ -35,6 +40,8 @@ fn Interpreter.task_member(
         var state = Val.single(Val.Array(mem::Shared.of(mem::List[Val].empty(alloc), alloc)), alloc)
         mut state.push(Val.Int(wide::Wide.of_u64(u64.widen(allocation))))
         mut state.push(Val.Int(wide::Wide.of_u64(2)))
+        mut state.push(args[0].copy(alloc))
+        mut state.push(Val.Bool(true))
         let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take state, alloc)), writable: true, size: 0)
         let shared = Val.Ref(Loc(extent: extent, path: mem::List[u32].empty(alloc)))
         let sender = Val.Struct(item: self.ty_item("task", name: "Sender"), fields: mem::Shared.of(Val.single(shared.copy(alloc), alloc), alloc))
@@ -52,6 +59,23 @@ fn Interpreter.task_member(
         mut self.memory.set(handles, stored: Val.Int(count.wrapping_add(wide::Wide.one())))
         return Some(InterpFlow.Return(take sender))
     }
+    if owner == "task::Sender" and member == "offer" {
+        expect args.len() >= 2
+        let sender = self.deref(args[0])
+        expect sender.fields().len() >= 1
+        let state = sender.fields()[0].place()
+        let buffer = state.with(u32.fit(CHANNEL_BUFFER), alloc)
+        var buffered = Val.copies(self.memory.get(buffer).fields(), alloc)
+        let capacity = self.memory.get(state.with(u32.fit(CHANNEL_CAPACITY), alloc)).int_value()
+        let open = self.memory.get(state.with(u32.fit(CHANNEL_RECEIVER), alloc)).bool_value()
+        let option = self.ty_item("core", name: "Option")
+        if open and u64.widen(buffered.len()) < capacity.low_bits() {
+            mut buffered.push(args[1].copy(alloc))
+            mut self.memory.set(buffer, stored: Val.Array(mem::Shared.of(take buffered, alloc)))
+            return Some(InterpFlow.Return(Val.none(option, alloc)))
+        }
+        return Some(InterpFlow.Return(Val.some(option, value: args[1].copy(alloc), alloc)))
+    }
     return None
 } Interpreter.task_member
 
@@ -61,6 +85,14 @@ fn Interpreter.task_release(mut self, handle: Val) {
     let alloc = self.alloc
     expect handle.fields().len() >= 1
     let state = handle.fields()[0].place()
+    match handle {
+        Val.Struct(item: item, fields: _) => {
+            if item == self.ty_item("task", name: "Receiver") {
+                mut self.memory.set(state.with(u32.fit(CHANNEL_RECEIVER), alloc), stored: Val.Bool(false))
+            }
+        }
+        else => {}
+    }
     let handles = state.with(u32.fit(CHANNEL_HANDLES), alloc)
     let left = self.memory.get(handles).int_value().wrapping_sub(wide::Wide.one())
     mut self.memory.set(handles, stored: Val.Int(left))

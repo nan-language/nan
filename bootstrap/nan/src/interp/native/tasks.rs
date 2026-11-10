@@ -1,6 +1,7 @@
 //! The channels interpreter runs make without waiting: a channel's senders and receiver share
-//! a buffer drawn for its capacity, counting the handles that keep it; sending and receiving
-//! wait, which interpreter runs never do.
+//! a buffer drawn for its capacity, counting the handles that keep it and whether its receiver
+//! is unreleased; offering appends at once, while sending and receiving wait, which
+//! interpreter runs never do.
 
 use std::rc::Rc;
 
@@ -12,10 +13,13 @@ use crate::check::db::ItemId;
 use crate::check::ty::{Arg, Ty};
 use crate::nir::Span;
 
-/// The positions of a channel's shared parts: its buffer, its allocation and its handles.
+/// The positions of a channel's shared parts: its buffer, its allocation, its handles, its
+/// capacity and whether its receiver is unreleased.
 const BUFFER: usize = 0;
 const ALLOCATION: usize = 1;
 const HANDLES: usize = 2;
+const CAPACITY: usize = 3;
+const RECEIVER: usize = 4;
 
 /// A member of `task::Channel` or `task::Sender` an interpreter run can call; none for another.
 pub fn member(
@@ -43,6 +47,8 @@ pub fn member(
                 Val::Array(Rc::new(Vec::new())),
                 Val::Int(i128::from(allocation)),
                 Val::Int(2),
+                args[0].clone(),
+                Val::Bool(true),
             ]));
             let shared = Val::Ref(Loc {
                 extent: interp.memory.alloc(state, true, 0),
@@ -65,6 +71,22 @@ pub fn member(
             interp.memory.set(&handles, Val::Int(count + 1));
             sender
         }
+        ("task::Sender", "offer") => {
+            let sender = interp.deref(&args[0]);
+            let state = place(&sender.fields()[0]);
+            let buffer = state.with(BUFFER as u32);
+            let mut buffered = interp.memory.get(&buffer).fields().to_vec();
+            let capacity = interp.memory.get(&state.with(CAPACITY as u32)).int();
+            let open = interp.memory.get(&state.with(RECEIVER as u32)).bool();
+            let option = interp.ty_item("core", "Option");
+            if open && (buffered.len() as i128) < capacity {
+                buffered.push(args[1].clone());
+                interp.memory.set(&buffer, Val::Array(Rc::new(buffered)));
+                Val::none(option)
+            } else {
+                Val::some(option, args[1].clone())
+            }
+        }
         _ => return None,
     };
     Some(Ok(Flow::Return(value)))
@@ -74,6 +96,13 @@ pub fn member(
 /// and returns its buffer's memory.
 pub fn release(interp: &mut Interpreter, handle: &Val) {
     let state = place(&handle.fields()[0]);
+    if let Val::Struct(item, _) = handle
+        && *item == interp.ty_item("task", "Receiver")
+    {
+        interp
+            .memory
+            .set(&state.with(RECEIVER as u32), Val::Bool(false));
+    }
     let handles = state.with(HANDLES as u32);
     let left = interp.memory.get(&handles).int() - 1;
     interp.memory.set(&handles, Val::Int(left));

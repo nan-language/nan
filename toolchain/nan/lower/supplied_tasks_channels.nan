@@ -63,6 +63,7 @@ fn channels_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             supply.done(mut lo, mut fx)
         }
         "task::Sender.send" => send(mut lo, mut fx, supply, element)
+        "task::Sender.offer" => offer(mut lo, mut fx, supply, element)
         "task::Receiver.receive" => receive(mut lo, mut fx, supply, element)
         "task::Receiver.drain" => drain(mut lo, mut fx, supply, element)
         else => {
@@ -289,6 +290,113 @@ fn send_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, sending: Sending, wal
     let again = mut fx.int(clif::Type.Int8, value: 1)
     return Pass(again: again, next: take next)
 } send_pass
+
+/// What one pass of an offer's loop reads: the channel's record and lock, the value offered and
+/// its type and shape, whether moving it does anything, the offering task's domain and where the
+/// result goes.
+struct Offering derives Copy {
+    record: clif::Value
+    lock: clif::Value
+    value: Held
+    element: ty::Ty
+    shape: Element
+    moves: bool
+    domain: clif::Value
+    result: clif::Value
+} Offering
+
+/// `sender.offer(v)`: appends `v` when the buffer has room and the receiver is unreleased,
+/// giving `None`, and otherwise gives `v` back at once, its holdings returned to the running
+/// task's domain.
+fn offer(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let record = holdings_payload(mut fx, address: supply.param(0).address_value())
+    let value = supply.param(1)
+    let shape = Element.of(mut lo, ty: element)
+    let moves = mut lo.transfers(element)
+    let domain = current_domain(mut lo, mut fx)
+    if moves {
+        let none = mut fx.ptr(0)
+        mut lo.transfer(mut fx, ty: element, address: value.address_value(), lift: none, owner: none)
+    }
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+    let offering = Offering(record: record, lock: lock, value: value, element: element, shape: shape, moves: moves, domain: domain, result: result)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(domain).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        return offer_pass(mut lo, fx: mut fx1, supply, offering, walked: walk_state[0])
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} offer
+
+/// One pass of an offer's loop, under the channel's lock: the value enters the buffer, or is
+/// given back when the buffer has no room or the receiver is released; otherwise the walk moving
+/// the value follows the channel's reach.
+fn offer_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, offering: Offering, walked: clif::Value) -> Pass {
+    let lock = offering.lock
+    let record = offering.record
+    let option = supply.abi.result
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let receiver = mut fx.load(PTR, addr: record, offset: CHANNEL_RECEIVER)
+    let open = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiver, y: 0)
+    let len = mut fx.load(PTR, addr: record, offset: CHANNEL_LEN)
+    let capacity = mut fx.load(PTR, addr: record, offset: CHANNEL_CAPACITY)
+    let room = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: len, y: capacity)
+    let fits = mut fx.b.band(open, y: room)
+    let reach = mut fx.load(PTR, addr: record, offset: CHANNEL_REACH)
+    var placed = reach
+    if offering.moves {
+        placed = mut fx.b.icmp(clif::IntCC.Equal, x: reach, y: walked)
+    } else {
+        placed = mut fx.int(clif::Type.Int8, value: 1)
+    }
+    let ready = mut fx.b.band(fits, y: placed)
+    mut fx.if_true(ready, then: fn[mut lo](mut fx1: Fx) {
+        let slot = channels_slot_at(mut fx1, record, shape: offering.shape, position: len)
+        mut lo.store_held(mut fx1, address: slot, held: offering.value, ty: offering.element)
+        let grown = mut fx1.b.iadd_imm_s(len, y: 1)
+        mut fx1.store(grown, addr: record, offset: CHANNEL_LEN)
+        let receiving = mut fx1.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiving, y: 0)
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(receiving).view())
+        })
+        let none = mut lo.none_value(mut fx1, option)
+        mut lo.store_held(mut fx1, address: offering.result, held: none, ty: option)
+        let held = mut lo.held_at(mut fx1, ty: option, address: offering.result)
+        supply.ret(mut lo, fx: mut fx1, held)
+    })
+    let refused = mut fx.b.bxor_imm_s(fits, y: 1)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        if offering.moves {
+            let none = mut fx1.ptr(0)
+            mut lo.transfer(mut fx1, ty: offering.element, address: offering.value.address_value(), lift: none, owner: offering.domain)
+        }
+        let given = mut fx1.int(clif::Type.Int8, value: 1)
+        mut lo.write_option_with(mut fx1, layout_ty: option, address: offering.result, presence: given, write_payload: fn(mut lo2: Lowering, mut fx2: Fx, at: clif::Value) {
+            mut lo2.store_held(mut fx2, address: at, held: offering.value, ty: offering.element)
+        })
+        let held = mut lo.held_at(mut fx1, ty: option, address: offering.result)
+        supply.ret(mut lo, fx: mut fx1, held)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    if offering.moves {
+        let keep = mut fx.int(PTR, value: TRANSFER_KEEP)
+        mut lo.transfer(mut fx, ty: offering.element, address: offering.value.address_value(), lift: reach, owner: keep)
+    }
+    let again = mut fx.int(clif::Type.Int8, value: 1)
+    var reached = mem::List[clif::Value].empty(fx.alloc)
+    mut reached.push(reach)
+    return Pass(again: again, next: take reached)
+} offer_pass
 
 /// Waits for room in a send's channel, whose lock the caller holds: the sender's node joins
 /// the waiting senders until a receiver wakes it; for droppable values a cancellation point.

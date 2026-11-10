@@ -560,6 +560,8 @@ pub fn Sender.split(self) -> Sender[T]
 
 pub fn Sender.send(self, take value: T) fails SendError uses wait
 
+pub fn Sender.offer(self, take value: T) -> Option[T]
+
 pub open struct Receiver[T: Any and Send] {
 } Receiver
 
@@ -578,6 +580,7 @@ pub closed enum SendError derives Render {
 - `task::Receiver[T]` is a base type: linear exactly when T is, Send, and never a view, Copy, Inert or AnyBits.
 - `sender.send(v)` appends `v` to the buffer, waiting while it is full. Values reach the receiver in the order their sends completed.
 - When T is droppable, `send` is a cancellation point. A cancelled `send` fails with cancellation, and otherwise a `send` whose receiver has been released fails with `SendError.Closed`; either failure releases `v`.
+- `sender.offer(v)` appends `v` to the buffer and returns `None` when the buffer has room and the receiver is unreleased, and otherwise returns `Some(v)`. It never waits, is no cancellation point and never fails, so code that may not wait hands values to another task with it.
 - When T is linear, `send` is no cancellation point and never fails. Once the receiver has been released, which only [settlement](11-errors-domains.md#settlement) does to a receiver of a linear T, `send` completes at once and `v` stays in the buffer, never released.
 - `receiver.receive()` removes and returns the oldest value, waiting while the buffer is empty and a sender of the channel is unreleased. It returns `None` once the buffer is empty and every sender has been released. A `receive` that fails with cancellation removes no value.
 - `take receiver.drain(visit: f)` passes every value, oldest first, to `f`, waiting while the buffer is empty and a sender is unreleased, and releases the receiver once the buffer is empty and every sender has been released. It is no cancellation point and never fails.

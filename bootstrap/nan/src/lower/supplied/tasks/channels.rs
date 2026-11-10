@@ -61,6 +61,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             supply.done(lo, fx);
         }
         "task::Sender.send" => send(lo, fx, supply, &element),
+        "task::Sender.offer" => offer(lo, fx, supply, &element),
         "task::Receiver.receive" => receive(lo, fx, supply, &element),
         "task::Receiver.drain" => drain(lo, fx, supply, &element),
         other => panic!("no lowering of {other}"),
@@ -285,6 +286,84 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
         );
         let again = fx.int(types::I8, 1);
         (again, next)
+    });
+    fx.b.ins()
+        .trap(cranelift_codegen::ir::TrapCode::user(1).expect("a trap code"));
+}
+
+/// `sender.offer(v)`: appends `v` when the buffer has room and the receiver is unreleased,
+/// giving `None`, and otherwise gives `v` back at once, its holdings returned to the running
+/// task's domain.
+fn offer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
+    let record = holdings::payload(fx, supply.param(0).address());
+    let value = supply.param(1);
+    let shape = Element::of(lo, element);
+    let moves = lo.transfers(element);
+    let domain = tasks::current_domain(lo, fx);
+    if moves {
+        let none = fx.ptr(0);
+        lo.transfer(fx, element, value.address(), none, none);
+    }
+    let option = supply.abi.result.clone();
+    let layout = lo.layout(&option);
+    let result = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let lock = fx.offset(record, channel::LOCK);
+    fx.repeat(&[domain], |fx, state| {
+        let walked = state[0];
+        lo.call_routine(fx, Routine::Lock, &[lock]);
+        let receiver = fx.load(PTR, record, channel::RECEIVER);
+        let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, receiver, 0);
+        let len = fx.load(PTR, record, channel::LEN);
+        let capacity = fx.load(PTR, record, channel::CAPACITY);
+        let room = fx.b.ins().icmp(IntCC::UnsignedLessThan, len, capacity);
+        let fits = fx.b.ins().band(open, room);
+        let reach = fx.load(PTR, record, channel::REACH);
+        let placed = match moves {
+            true => fx.b.ins().icmp(IntCC::Equal, reach, walked),
+            false => fx.int(types::I8, 1),
+        };
+        let ready = fx.b.ins().band(fits, placed);
+        fx.when(ready, |fx| {
+            let slot = slot_at(fx, record, shape, len);
+            lo.store_held(fx, slot, value, element);
+            let len = fx.b.ins().iadd_imm_s(len, 1);
+            fx.store(len, record, channel::LEN);
+            let receiving = fx.load(PTR, record, channel::WAITING_RECEIVER);
+            let zero = fx.ptr(0);
+            fx.store(zero, record, channel::WAITING_RECEIVER);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, receiving, 0);
+            fx.when(present, |fx| {
+                lo.call_routine(fx, Routine::Wake, &[receiving]);
+            });
+            let none = lo.none_value(fx, &option);
+            lo.store_held(fx, result, none, &option);
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
+        });
+        let refused = fx.b.ins().bxor_imm_s(fits, 1);
+        fx.when(refused, |fx| {
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            if moves {
+                let none = fx.ptr(0);
+                lo.transfer(fx, element, value.address(), none, domain);
+            }
+            let given = fx.int(types::I8, 1);
+            lo.write_option_with(fx, &option, result, given, |lo, fx, payload| {
+                lo.store_held(fx, payload, value, element);
+            });
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
+        });
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
+        if moves {
+            let keep = fx.int(PTR, transfer::KEEP);
+            lo.transfer(fx, element, value.address(), reach, keep);
+        }
+        let again = fx.int(types::I8, 1);
+        (again, vec![reach])
     });
     fx.b.ins()
         .trap(cranelift_codegen::ir::TrapCode::user(1).expect("a trap code"));

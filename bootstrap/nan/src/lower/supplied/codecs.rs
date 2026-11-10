@@ -1210,7 +1210,7 @@ fn encode_record(
                     wire::put_kept(lo, fx, state, cursor, Some(key.as_bytes()));
                 }
                 wire::put_literal_text(lo, fx, state, key.as_bytes());
-                let handles = lo.ck.is_handle(field_ty);
+                let handles = lo.ck.writes_handles(field_ty);
                 let counting = counting(fx, state, handles);
                 call(lo, fx, function, &[field, counting]);
                 let writing = framed(fx, state, counting, handles);
@@ -1274,7 +1274,7 @@ fn encode_case(
             let function = encoder(lo, format, payload_ty);
             match format {
                 Format::Wire => {
-                    let handles = lo.ck.is_handle(payload_ty);
+                    let handles = lo.ck.writes_handles(payload_ty);
                     let counting = counting(fx, state, handles);
                     call(lo, fx, function, &[payload, counting]);
                     let writing = framed(fx, state, counting, handles);
@@ -1290,7 +1290,7 @@ fn encode_case(
         CasePayload::Labelled(record) => match format {
             Format::Wire => {
                 let handles =
-                    (record.fields.iter()).any(|(_, field_ty, _)| lo.ck.is_handle(field_ty));
+                    (record.fields.iter()).any(|(_, field_ty, _)| lo.ck.writes_handles(field_ty));
                 let counting = counting(fx, state, handles);
                 encode_record(lo, fx, format, record, value, counting);
                 let writing = framed(fx, state, counting, handles);

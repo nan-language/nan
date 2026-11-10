@@ -93,15 +93,7 @@ pub fn encode_call(
     let mut carried = Vec::new();
     let mut fields = Vec::new();
     for (param, value) in named {
-        let tree = match interp.ck.is_handle(&param.ty) {
-            true => {
-                let hash = interp.ck.handle_hash(&param.ty);
-                let fields = vec![interp.deref(value), bytes(&hash.0)];
-                carried.push(Val::Struct(handle_item, Rc::new(fields)));
-                Tree::Unsigned((first + carried.len() - 1) as u64)
-            }
-            false => encoded(interp, value, &param.ty),
-        };
+        let tree = argument_tree(interp, value, &param.ty, first, &mut carried);
         fields.push((param.name.clone().into_bytes(), tree));
     }
     let payload = (!fields.is_empty()).then(|| Box::new(Tree::Record(fields)));
@@ -127,6 +119,40 @@ pub fn encode_call(
         true => Val::Struct(interp.ty_item("sys", "Reply"), Rc::new(Vec::new())),
         false => Val::Unit,
     }))
+}
+
+/// The tree of an argument of a call: a value of a handle type as the index among the handles
+/// beside the encoding, the first at `first`, of the handle it adds to `carried`; a handle record
+/// as the record of its fields; another value as it encodes.
+fn argument_tree(
+    interp: &Interpreter,
+    value: &Val,
+    ty: &Ty,
+    first: usize,
+    carried: &mut Vec<Val>,
+) -> Tree {
+    if interp.ck.is_handle(ty) {
+        let hash = interp.ck.handle_hash(ty);
+        let fields = vec![interp.deref(value), bytes(&hash.0)];
+        carried.push(Val::Struct(
+            interp.ty_item("sys", "Handle"),
+            Rc::new(fields),
+        ));
+        return Tree::Unsigned((first + carried.len() - 1) as u64);
+    }
+    let Some(fields) = interp.ck.handle_record(ty) else {
+        return encoded(interp, value, ty);
+    };
+    let value = interp.deref(value);
+    let mut named: Vec<_> = fields.into_iter().zip(value.fields().iter()).collect();
+    named.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+    let parts = (named.into_iter())
+        .map(|((name, ty), part)| {
+            let tree = argument_tree(interp, part, &ty, first, carried);
+            (name.into_bytes(), tree)
+        })
+        .collect();
+    Tree::Record(parts)
 }
 
 /// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply decoded from `raw` against

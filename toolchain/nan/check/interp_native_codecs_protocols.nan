@@ -73,16 +73,8 @@ fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take a
     var fields = mem::List[TreeField].empty(alloc)
     for position in named {
         let param = operation.sig.params[position]
-        let value = args[position + 1]
-        if ck.is_handle(param.ty) {
-            let hash = ck.handle_hash(param.ty)
-            var parts = Val.single(self.deref(value), alloc)
-            mut parts.push(Val.Array(mem::Shared.of(byte_values(hash.bytes.view(), alloc), alloc)))
-            mut carried.push(Val.Struct(item: handle_item, fields: mem::Shared.of(take parts, alloc)))
-            mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: Tree.Unsigned(u64.widen(first_index + carried.len() - 1))))
-        } else {
-            mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: self.encoded(value, ty: param.ty)))
-        }
+        let tree = self.argument_tree(args[position + 1], ty: param.ty, first_index, mut carried)
+        mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: take tree))
     }
     var payload: Option[mem::Box[Tree]] = None
     if fields.len() > 0 {
@@ -103,6 +95,36 @@ fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take a
     }
     return InterpFlow.Return(Val.Unit)
 } Interpreter.encode_call
+
+/// The tree of an argument of a call: a value of a handle type as the index among the handles
+/// beside the encoding, the first at `first_index`, of the handle it adds to `carried`; a handle
+/// record as the record of its fields; another value as it encodes.
+fn Interpreter.argument_tree(self, value: Val, ty: ty::Ty, first_index: usize, mut carried: mem::List[Val]) -> Tree {
+    let ck = self.ck
+    let alloc = self.alloc
+    if ck.is_handle(ty) {
+        let hash = ck.handle_hash(ty)
+        var parts = Val.single(self.deref(value), alloc)
+        mut parts.push(Val.Array(mem::Shared.of(byte_values(hash.bytes.view(), alloc), alloc)))
+        mut carried.push(Val.Struct(item: self.ty_item("sys", name: "Handle"), fields: mem::Shared.of(take parts, alloc)))
+        return Tree.Unsigned(u64.widen(first_index + carried.len() - 1))
+    }
+    let Some(record_fields) = ck.handle_record(ty) else {
+        return self.encoded(value, ty)
+    }
+    let held = self.deref(value)
+    var named = mem::List[usize].empty(alloc)
+    for position in 0..<record_fields.len() {
+        mut named.push(position)
+    }
+    mut named.sort_by(fn(left: usize, right: usize) => record_fields[left].name.as_str().cmp(record_fields[right].name.as_str()))
+    var parts = mem::List[TreeField].empty(alloc)
+    for position in named {
+        let tree = self.argument_tree(held.fields()[position], ty: record_fields[position].ty, first_index, mut carried)
+        mut parts.push(TreeField(key: name_bytes(record_fields[position].name.as_str(), alloc), value: take tree))
+    }
+    return Tree.Record(take parts)
+} Interpreter.argument_tree
 
 /// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply decoded from `raw` against
 /// `handles`, failing with `CallError.Failed` holding the failure of an `Err` one and with

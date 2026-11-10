@@ -942,7 +942,7 @@ operation_param = IDENT ":" type_expr ;
 - Operation names are distinct within their protocol (`item.duplicate`). An operation named `post`, `start`, `summary`, `hash` or `serve` is an error (`component.operation-name`).
 - An operation is visible where both it and its protocol are.
 - Each operation's `limits` clause holds `pure` or a [class](10-effects-digests.md#reversibility), the **class** of the operation, `traceless` for `pure`. An operation without one is an error (`component.operation-class`).
-- Each type of an operation is Send and not linear, and each type of a `pub` operation implements [Encode](13-text-encode.md#encode) or is a **handle type**: a type implementing [`sys::Capability`](14-authority.md#revocation), capability kinds included, or `sys::Outbox[Q]`. Any other type is an error (`component.operation-type`), reported on the operation's line.
+- Each type of an operation is Send and not linear, and each type of a `pub` operation implements [Encode](13-text-encode.md#encode), is a **handle type**: a type implementing [`sys::Capability`](14-authority.md#revocation), capability kinds included, or `sys::Outbox[Q]`, or is a **handle record**: a struct outside std that does not implement Encode and holds no kept fields, whose fields each implement Encode or are of a handle type, at least one of a handle type. Any other type is an error (`component.operation-type`), reported on the operation's line.
 - The clause region of an operation holds `requires`, `ensures`, `undo` and `todo` clauses, over the operation's parameters and, in `ensures`, `result`. Any other clause, or a `todo` clause holding an example clause, is an error (`component.operation-clause`).
 - The **summary type**, written after `summary`, implements Encode and is Copy; any other is an error (`component.summary-type`).
 
@@ -1285,7 +1285,7 @@ pub fn notify(outbox: sys::Outbox[Mailer]) fails task::SendError uses wait limit
 
 ### Protocol hashes
 
-The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), or for a handle type its **handle line**, `handle ` and the type's normalised text, followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
+The **operation hash** of an operation is the hash of the UTF-8 bytes `operation`, LF, each of the operation's lines in its protocol's [normalised form](29-identity-versioning.md#normalised-form) followed by LF, then, for each of its types in order, parameters first, the full form of the type's [schema hash](13-text-encode.md#schema-hashes), for a handle type its **handle line**, `handle ` and the type's normalised text, or for a handle record `record ` and the full form of the hash of `record`, LF, then, in byte order of name, each field's name, a space and the schema hash or handle line of its type followed by LF; each followed by LF. The **protocol hash** of a protocol is the hash of `protocol`, LF, then, when it declares a summary type, `summary `, the full form of that type's schema hash and LF, then, for each `pub` operation in byte order of name, its name, a space, the full form of its operation hash and LF.
 
 - The code root of a package records the hashes of each `pub` protocol it declares ([code roots](30-artefacts.md#code-roots)), and `nan show --api` prints a protocol's ([commands](33-toolchain.md#commands)).
 - Closures exchange a protocol's operations through their [wire encoding](#wire-encoding): all of them when they agree on its protocol hash, and otherwise each operation that the server's [protocol schema](#protocol-schemas) serves for the client's.
@@ -1317,7 +1317,18 @@ pub closed struct ParameterSchema derives Encode {
 pub closed enum TypeSchema derives Encode {
     Encoded(mem::wire::Schema)
     Handle(Array[u8, 33])
+    Record(mem::List[FieldSchema])
 } TypeSchema
+
+pub closed struct FieldSchema derives Encode {
+    pub name: text::String
+    pub value: PartSchema
+} FieldSchema
+
+pub closed enum PartSchema derives Encode {
+    Encoded(mem::wire::Schema)
+    Handle(Array[u8, 33])
+} PartSchema
 
 pub fn Wire.schema(alloc: mem::Alloc) -> ProtocolSchema
 
@@ -1326,8 +1337,8 @@ pub fn ProtocolSchema.serves(self, client: ProtocolSchema, operation: Str, alloc
 pub fn ProtocolSchema.serves_call(self, hash: ProtocolHash, peers: Slice[ProtocolSchema], operation: Str, alloc: mem::Alloc) -> bool
 ```
 
-- `Wire[P].schema(alloc)` gives P's protocol schema drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`): P's protocol hash and, in byte order of name, each `pub` operation of P with its parameters in byte order of name, the type schema of its result when it is a request, and that of its failure when it has a `fails` clause. The **type schema** of a handle type is `Handle` holding its [handle hash](#wire-encoding); that of another type is `Encoded` holding its [schema tree](13-text-encode.md#schema-hashes).
-- A type schema **accepts** another when both are `Encoded` and its tree [accepts](29-identity-versioning.md#encode-class) the other's, or both are `Handle` holding one hash.
+- `Wire[P].schema(alloc)` gives P's protocol schema drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`): P's protocol hash and, in byte order of name, each `pub` operation of P with its parameters in byte order of name, the type schema of its result when it is a request, and that of its failure when it has a `fails` clause. The **type schema** of a handle type is `Handle` holding its [handle hash](#wire-encoding); that of a handle record is `Record` holding, in byte order of name, each field's name and the part schema of its type, which is `Handle` or `Encoded` as a type schema is; that of another type is `Encoded` holding its [schema tree](13-text-encode.md#schema-hashes).
+- A type or part schema **accepts** another when both are `Encoded` and its tree [accepts](29-identity-versioning.md#encode-class) the other's, both are `Handle` holding one hash, or both are `Record` with fields of the same names, each field's part schema accepting the other's of its name.
 - A server's protocol schema S **serves** an operation for a client's protocol schema C when S has an operation of that name and, unless S and C hold one protocol hash, C has one too, such that: they have parameters of the same names, each of S's accepting C's of its name; C's has a result exactly when S's has one, accepting it; and C's has a failure when S's has one, accepting it. S's decoders then read every call of it C encodes, and C's every reply S gives. `server.serves(client, operation, alloc)` decides it, comparing trees as `Schema.accepts` does through `alloc`.
 - S serves a call of an operation made under a protocol hash `hash`, knowing the schemas `peers`, when it serves the operation for itself if `hash` is its own, and otherwise for the first schema of `peers` holding `hash`, none serving it when no schema does. `server.serves_call(hash, peers, operation, alloc)` decides it.
 
@@ -1381,7 +1392,7 @@ On `sys::Wire[P]`, the candidates of method resolution for a name also hold P's 
 | a one-way operation | `fn op(mut out: sys::Encoded, take p: T, ...)` |
 | a request | `fn op(mut out: sys::Encoded, take p: T, ...) -> sys::Reply[R, E]` |
 
-The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without payload when the operation has no parameters, and otherwise with the record of its arguments keyed by their parameters' names, as an enum variant with labelled payloads [encodes](13-text-encode.md#derived-encode-and-decode). The encoding of the **reply** to a request is the variant `Ok` holding its handler's result or `Err` holding its failure, as `Result[R, E]` encodes. A value of a handle type encodes as an unsigned integer: the index of its handle among the handles beside the encoding, which hold them in the order the encoding does. Decoding an encoding against its handles reads each value of a handle type T as `mem::wire::Codec.decode` reads one ([wire format](13-text-encode.md#wire-format)), and also fails with `Malformed` when an index it reads is not the count of handles read before it, with `Truncated` when no handle has that index, with `Invalid` when that handle's handle hash is not T's, and with `Trailing` when it leaves handles unread.
+The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without payload when the operation has no parameters, and otherwise with the record of its arguments keyed by their parameters' names, as an enum variant with labelled payloads [encodes](13-text-encode.md#derived-encode-and-decode). The encoding of the **reply** to a request is the variant `Ok` holding its handler's result or `Err` holding its failure, as `Result[R, E]` encodes. A value of a handle type encodes as an unsigned integer: the index of its handle among the handles beside the encoding, which hold them in the order the encoding does. A handle record encodes as a struct deriving Encode would. Decoding an encoding against its handles reads each value of a handle type T as `mem::wire::Codec.decode` reads one ([wire format](13-text-encode.md#wire-format)), and also fails with `Malformed` when an index it reads is not the count of handles read before it, with `Truncated` when no handle has that index, with `Invalid` when that handle's handle hash is not T's, and with `Trailing` when it leaves handles unread.
 
 - `Wire[P].op(mut out, ...)` appends the encoding of its call to `out.bytes` and the handles of its values of handle types to `out.handles`, each index counting the handles `out` held before, trapping when memory is exhausted (`trap.exhausted`). The operation's `requires` is no obligation there, and its class enters no digest.
 - `Wire[P].serve(out, request, hash, peers, raw, handles, alloc)` serves a call made under the protocol hash `hash`, which the holder serving it numbers `request`, `peers` holding the protocol schemas of the clients the server knows. It decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`. When `hash` is not P's protocol hash, it then fails with `UnknownSchema` unless P's protocol schema [serves the call](#protocol-schemas) under `hash` knowing `peers`, the schema drawn and the call judged through `alloc`. It then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments, a request carrying its number, and gives `Some` of a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. It gives `None` when the handler [postponed](#runner-capabilities) the request. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
@@ -1609,6 +1620,92 @@ test probe_calls_tally for carry {
     })
     expect last.total == 0
 } probe_calls_tally
+```
+
+A handle record carries values and handles together, here a reading with the clock it was taken on:
+
+```nan
+// file: stamps/package.nan
+//! Readings handed out with their clock.
+
+package stamps {
+    language 1
+    targets x86_64-host
+    allow validate in stamps
+} stamps
+
+// file: stamps/stamps.nan
+//! Readings returned beside the clock they were taken on.
+
+pub closed struct Stamped {
+    pub at: u64
+    pub clock: sys::Clock
+} Stamped
+
+pub protocol Stamps {
+    pub fn stamp(clock: sys::Clock) -> Stamped limits pure
+    pub fn keep(stamped: Stamped) limits pure
+} Stamps
+
+pub protocol Gauges {
+    pub fn stamp(clock: sys::Clock) -> Stamped limits pure
+    pub fn reset() limits pure
+} Gauges
+
+pub closed struct Env {
+} Env
+
+pub closed struct Stamper derives Encode {
+    pub stamps: u64
+    pub kept: u64
+} Stamper
+
+impl Stamper: sys::Component[Env, Stamps]
+
+pub fn Stamper.start(mut env: Env) -> Stamper = Stamper(stamps: 0, kept: 0)
+
+pub fn Stamper.stamp(mut self, take clock: sys::Clock, mut env: Env, mut cx: sys::Cx[Stamps]) -> Stamped {
+    self.stamps = self.stamps.wrapping_add(1)
+    return Stamped(at: self.stamps, clock: clock)
+} Stamper.stamp
+
+pub fn Stamper.keep(mut self, take stamped: Stamped, mut env: Env, mut cx: sys::Cx[Stamps]) {
+    self.kept = stamped.at
+} Stamper.keep
+
+/// The handles beside a call keeping a stamp taken on `clock`.
+pub fn kept_handles(clock: sys::Clock, alloc: mem::Alloc) -> usize
+    example kept_handles(testing::world().clock, alloc: testing::world().alloc) == 1
+{
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[Stamps].keep(mut call, stamped: Stamped(at: 3, clock: clock))
+    return call.handles.len()
+} kept_handles
+
+test stamps_travel_with_their_clock for Stamper.stamp {
+    let world = testing::world()
+    let alloc = world.alloc
+    let clock = world.clock
+    let last = try await host::Runner[Stamper].run(Env(), exec: world.exec, alloc, body: fn(inbox: sys::Outbox[Stamps]) fails sys::CallError[Never] uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let stamped = sys::Wire[Stamps].stamp(mut call, clock)
+        let peers = mem::List[sys::ProtocolSchema].empty(alloc)
+        let Some(reply) = try await sys::Wire[Stamps].serve(inbox, request: 0, hash: sys::Wire[Stamps].hash(), peers: peers.view(), raw: Untrusted.of(call.bytes.view()), handles: call.handles.view(), alloc) else {
+            expect false
+            return
+        }
+        let value = try stamped.decode(Untrusted.of(reply.bytes.view()), handles: reply.handles.view(), alloc)
+        let elapsed = attempt value.clock.elapsed_ns()
+        expect reply.handles.len() == 1 and value.at == 1
+        expect elapsed.is_ok()
+        var keeping = sys::Encoded.empty(alloc)
+        sys::Wire[Stamps].keep(mut keeping, stamped: Stamped(at: 7, clock: clock))
+        discard try await sys::Wire[Stamps].serve(inbox, request: 1, hash: sys::Wire[Stamps].hash(), peers: peers.view(), raw: Untrusted.of(keeping.bytes.view()), handles: keeping.handles.view(), alloc)
+    })
+    let served = sys::Wire[Stamps].schema(alloc).serves(sys::Wire[Gauges].schema(alloc), operation: "stamp", alloc)
+    expect last.stamps == 1 and last.kept == 7
+    expect served
+} stamps_travel_with_their_clock
 ```
 
 An impl line naming `sys::Protocol` is an error:

@@ -12,7 +12,7 @@ use super::resolve::Named;
 use super::reversibility::Class;
 use super::schema::{option, record, sequence, text, unsigned, variant};
 use super::sig::{FnSig, ParamSig, SigKind};
-use super::ty::{Arg, Const, LimitSet, Ty};
+use super::ty::{Arg, Const, LimitSet, Subst, Ty};
 use crate::diagnostic::Code;
 use crate::hash::Hash;
 use crate::nir::{Callable, FnRef};
@@ -93,13 +93,43 @@ impl Checker<'_> {
     }
 
     /// Whether a type may be one of an operation's: Send and not linear, and, for an operation
-    /// sent between closures, implementing Encode or a handle type.
+    /// sent between closures, implementing Encode, a handle type or a handle record.
     fn operation_type(&self, ty: &Ty, sent: bool) -> bool {
         if !self.has(ty, Property::Send) || self.has(ty, Property::Linear) {
             return false;
         }
+        !sent || self.encoded(ty) || self.is_handle(ty) || self.handle_record(ty).is_some()
+    }
+
+    /// Whether a type implements Encode.
+    fn encoded(&self, ty: &Ty) -> bool {
         let encode = self.db.core_item("Encode");
-        !sent || encode.is_none_or(|encode| self.implements(ty, encode)) || self.is_handle(ty)
+        encode.is_none_or(|encode| self.implements(ty, encode))
+    }
+
+    /// The fields of a handle record, with their types: a struct of the workspace that does not
+    /// implement Encode and holds no kept fields, each of its fields implementing Encode or a
+    /// handle type, at least one a handle type.
+    pub fn handle_record(&self, ty: &Ty) -> Option<Vec<(String, Ty)>> {
+        let Ty::Item(item, args) = ty else {
+            return None;
+        };
+        let sig = self.sig(*item);
+        let SigKind::Struct { fields } = &sig.kind else {
+            return None;
+        };
+        if self.db.is_std(*item) || self.encoded(ty) || self.is_handle(ty) {
+            return None;
+        }
+        let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
+        let fields: Vec<(String, Ty)> = (fields.iter())
+            .map(|field| (field.name.clone(), subst.ty(&field.ty)))
+            .collect();
+        let travels = |(name, ty): &(String, Ty)| {
+            name != crate::check::sig::KEPT && (self.encoded(ty) || self.is_handle(ty))
+        };
+        let handled = fields.iter().any(|(_, ty)| self.is_handle(ty));
+        (handled && fields.iter().all(travels)).then_some(fields)
     }
 
     /// Whether a type is a handle type: one implementing `sys::Capability`, or an outbox.
@@ -108,6 +138,12 @@ impl Checker<'_> {
         matches!(ty, Ty::Item(..))
             && (self.is_std(ty, "sys::Outbox")
                 || capability.is_some_and(|capability| self.implements(ty, capability)))
+    }
+
+    /// Whether a value of a type writes handles beside its encoding: a handle type's or a handle
+    /// record's.
+    pub fn writes_handles(&self, ty: &Ty) -> bool {
+        self.is_handle(ty) || self.handle_record(ty).is_some()
     }
 
     /// The hash of a handle type's handle line, which its handles carry.
@@ -650,9 +686,26 @@ impl Checker<'_> {
         ])
     }
 
-    /// The `mem::wire` encoding of the `sys::TypeSchema` of one of an operation's types: `Handle`
-    /// holding the handle hash of a handle type, `Encoded` holding the schema tree of another.
+    /// The `mem::wire` encoding of the `sys::TypeSchema` of one of an operation's types:
+    /// `Record` holding, in byte order of name, the name and part schema of each field of a
+    /// handle record, else the part schema of the type.
     fn type_schema(&self, ty: &Ty) -> Vec<u8> {
+        let Some(mut fields) = self.handle_record(ty) else {
+            return self.part_schema(ty);
+        };
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        let fields = (fields.into_iter()).map(|(name, ty)| {
+            record(vec![
+                ("name", text(&name)),
+                ("value", self.part_schema(&ty)),
+            ])
+        });
+        variant("Record", Some(sequence(fields)))
+    }
+
+    /// The `mem::wire` encoding of a `sys::TypeSchema` without fields: `Handle` holding the
+    /// handle hash of a handle type, `Encoded` holding the schema tree of another.
+    fn part_schema(&self, ty: &Ty) -> Vec<u8> {
         match self.is_handle(ty) {
             true => {
                 let hash = self.handle_hash(ty);
@@ -663,13 +716,23 @@ impl Checker<'_> {
         }
     }
 
-    /// The line of an operation hash naming one of its types: its schema hash, or `handle` and
-    /// its normalised text for a handle type.
+    /// The line of an operation hash naming one of its types: `handle` and its normalised text
+    /// for a handle type; for a handle record, `record` and the full form of the hash of
+    /// `record`, LF, then, in byte order of name, each field's name, a space and its line
+    /// followed by LF; else its schema hash.
     fn type_line(&self, ty: &Ty, module: ModuleId) -> String {
-        match self.is_handle(ty) {
-            true => format!("handle {}", self.canonical_text(ty, module)),
-            false => self.schema(ty).hash().full(),
+        if self.is_handle(ty) {
+            return format!("handle {}", self.canonical_text(ty, module));
         }
+        let Some(mut fields) = self.handle_record(ty) else {
+            return self.schema(ty).hash().full();
+        };
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut bytes = b"record\n".to_vec();
+        for (name, field) in &fields {
+            bytes.extend(format!("{name} {}\n", self.type_line(field, module)).as_bytes());
+        }
+        format!("record {}", Hash::of(&bytes).full())
     }
 
     /// A type's text, each item named by its canonical path, other types as `module` writes

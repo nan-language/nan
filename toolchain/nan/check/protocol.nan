@@ -102,19 +102,71 @@ fn reserved_name(name: Str) -> bool {
 } reserved_name
 
 /// Whether a type may be one of an operation's: Send and not linear, and, for an operation
-/// sent between closures, implementing Encode or a handle type.
+/// sent between closures, implementing Encode, a handle type or a handle record.
 fn Checker.operation_type(self, ty: ty::Ty, sent: bool) -> bool {
     if not self.has(ty, property: Property.Send) or self.has(ty, property: Property.Linear) {
         return false
     }
-    if not sent or self.is_handle(ty) {
-        return true
-    }
+    return not sent or self.encoded(ty) or self.is_handle(ty) or self.handle_record(ty).is_some()
+} Checker.operation_type
+
+/// Whether a type implements Encode.
+fn Checker.encoded(self, ty: ty::Ty) -> bool {
     return match self.db().core_item("Encode") {
         Some(encode) => self.implements(ty, interface_item: encode)
         None => true
     }
-} Checker.operation_type
+} Checker.encoded
+
+/// A field of a handle record: its name and type.
+pkg struct RecordField {
+    pkg name: text::String
+    pkg ty: ty::Ty
+} RecordField
+
+/// The fields of a handle record, with their types: a struct of the workspace that does not
+/// implement Encode and holds no kept fields, each of its fields implementing Encode or a
+/// handle type, at least one a handle type.
+pkg fn Checker.handle_record(self, ty: ty::Ty) -> Option[mem::List[RecordField]] {
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(ty) else {
+        return None
+    }
+    let held = self.sig(item)
+    let SigKind.Struct(fields: declared) = held.contents().kind else {
+        return None
+    }
+    if self.db().is_std(item) or self.encoded(ty) or self.is_handle(ty) {
+        return None
+    }
+    let alloc = self.alloc()
+    let subst = self.type_subst(TypeKey.Item(item), ty)
+    var fields = mem::List[RecordField].empty(alloc)
+    for field in declared {
+        mut fields.push(RecordField(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(self.types(), ty: field.ty)))
+    }
+    var handled = false
+    for field in fields {
+        if self.is_handle(field.ty) {
+            handled = true
+            break
+        }
+    }
+    if not handled {
+        return None
+    }
+    for field in fields {
+        if field.name.as_str() == KEPT_FIELD or not (self.encoded(field.ty) or self.is_handle(field.ty)) {
+            return None
+        }
+    }
+    return Some(take fields)
+} Checker.handle_record
+
+/// Whether a value of a type writes handles beside its encoding: a handle type's or a handle
+/// record's.
+pkg fn Checker.writes_handles(self, ty: ty::Ty) -> bool {
+    return self.is_handle(ty) or self.handle_record(ty).is_some()
+} Checker.writes_handles
 
 /// Whether a type is a handle type: one implementing `sys::Capability`, or an outbox.
 pkg fn Checker.is_handle(self, ty: ty::Ty) -> bool {
@@ -776,25 +828,64 @@ pkg fn Checker.protocol_schema(self, protocol: ty::ItemId) -> mem::Bytes {
     return out
 } Checker.protocol_schema
 
-/// The `sys::TypeSchema` of one of an operation's types: `Handle` holding the handle hash of a
-/// handle type, `Encoded` holding the schema tree of another.
+/// The `sys::TypeSchema` of one of an operation's types: `Record` holding, in byte order of
+/// name, the name and part schema of each field of a handle record, `Handle` holding the handle
+/// hash of a handle type, `Encoded` holding the schema tree of another.
 fn Checker.type_schema(self, ty: ty::Ty) -> sys::TypeSchema {
-    if self.is_handle(ty) {
-        return sys::TypeSchema.Handle(self.handle_hash(ty).bytes)
+    let Some(record_fields) = self.handle_record(ty) else {
+        if self.is_handle(ty) {
+            return sys::TypeSchema.Handle(self.handle_hash(ty).bytes)
+        }
+        return sys::TypeSchema.Encoded(self.schema(ty))
     }
-    return sys::TypeSchema.Encoded(self.schema(ty))
+    let alloc = self.alloc()
+    var fields = record_fields
+    mut fields.sort_by(fn(left: RecordField, right: RecordField) => left.name.as_str().cmp(right.name.as_str()))
+    var described = mem::List[sys::FieldSchema].empty(alloc)
+    for field in fields {
+        mut described.push(sys::FieldSchema(name: text::String.of(field.name.as_str(), alloc), value: self.part_schema(field.ty)))
+    }
+    return sys::TypeSchema.Record(take described)
 } Checker.type_schema
 
-/// The line of an operation hash naming one of its types: its schema hash, or `handle` and its
-/// normalised text for a handle type.
+/// The `sys::PartSchema` of a field of a handle record: `Handle` holding the handle hash of a
+/// handle type, `Encoded` holding the schema tree of another.
+fn Checker.part_schema(self, ty: ty::Ty) -> sys::PartSchema {
+    if self.is_handle(ty) {
+        return sys::PartSchema.Handle(self.handle_hash(ty).bytes)
+    }
+    return sys::PartSchema.Encoded(self.schema(ty))
+} Checker.part_schema
+
+/// The line of an operation hash naming one of its types: `handle` and its normalised text for
+/// a handle type; for a handle record, `record` and the full form of the hash of `record`, LF,
+/// then, in byte order of name, each field's name, a space and its line followed by LF; else its
+/// schema hash.
 fn Checker.type_line(self, ty: ty::Ty, module: ty::ModuleId) -> text::String {
     let alloc = self.alloc()
-    if not self.is_handle(ty) {
+    if self.is_handle(ty) {
+        var line = text::String.of("handle ", alloc)
+        let written = self.canonical_written(ty, module)
+        mut line.append(written.as_str())
+        return line
+    }
+    let Some(record_fields) = self.handle_record(ty) else {
         return schema_hash(self.schema(ty), alloc).full(alloc)
     }
-    var line = text::String.of("handle ", alloc)
-    let written = self.canonical_written(ty, module)
-    mut line.append(written.as_str())
+    var fields = record_fields
+    mut fields.sort_by(fn(left: RecordField, right: RecordField) => left.name.as_str().cmp(right.name.as_str()))
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(b"record\n")
+    for field in fields {
+        let written = self.type_line(field.ty, module)
+        mut bytes.append(field.name.as_bytes())
+        mut bytes.push(b' ')
+        mut bytes.append(written.as_bytes())
+        mut bytes.push(b'\n')
+    }
+    var line = text::String.of("record ", alloc)
+    let hashed = hashing::HashValue.of(bytes.view()).full(alloc)
+    mut line.append(hashed.as_str())
     return line
 } Checker.type_line
 

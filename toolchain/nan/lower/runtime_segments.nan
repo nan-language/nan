@@ -1,8 +1,8 @@
-//! Stack segments: the stacks tasks draw, and in a kernel keeping segments those the grown calls of its bundles run on. A segment starts with a header naming the stack the task ran on before it and its own length, then the routine reserve, then the room grown calls use.
+//! Stack segments: the stacks tasks draw, those the grown calls of the bundles a kernel loads run on, and those nested calls run on. A segment starts with a header naming the stack the task ran on before it, its own length and whether it is mapped rather than drawn through a cell, then the routine reserve, then the room grown and nested calls use.
 
 /// The bytes of a segment's header: the segment the task ran on before it, zero for its own
-/// stack, and the segment's length.
-const SEGMENT_HEADER: u64 = 16
+/// stack, the segment's length and whether it is mapped.
+const SEGMENT_HEADER: u64 = 24
 
 /// The offsets in the record `Grow` keeps in its frame while a segment runs: `Grow`'s context,
 /// the thunk and its record, and the segment's context once it switches back.
@@ -68,7 +68,7 @@ fn stack_bounds(mut fx: Fx, segment: clif::Value, low: clif::Value, high: clif::
 } stack_bounds
 
 /// Returns the segments an ended task's record still names, which a trap left it on.
-fn stack_segments_release(mut lo: Lowering, mut fx: Fx, record: clif::Value, cell: clif::Value) {
+fn stack_segments_release(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let newest = mut fx.load(PTR, addr: record, offset: TASK_SEGMENT)
     let grown = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: newest, y: 0)
     mut fx.if_true(grown, then: fn[mut lo](mut fx1: Fx) {
@@ -77,7 +77,8 @@ fn stack_segments_release(mut lo: Lowering, mut fx: Fx, record: clif::Value, cel
             let segment = state[0]
             let older = mut fx2.load(PTR, addr: segment, offset: 0)
             let length = mut fx2.load(PTR, addr: segment, offset: 8)
-            stack_give_back(mut lo, fx: mut fx2, cell, stack: segment, length, guarded: false)
+            let mapped = mut fx2.load(PTR, addr: segment, offset: 16)
+            return_segment(mut lo, fx: mut fx2, segment, length, mapped)
             let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: older, y: 0)
             return Pass(again: more, next: fx2.list1(older))
         })
@@ -126,40 +127,90 @@ fn grow_routine(mut lo: Lowering, mut fx: Fx) {
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } grow_routine
 
-/// Runs a thunk with its record on a new segment of a task's stack, then returns the segment.
+/// Runs a thunk with its record on a new segment of a task's stack, then returns the segment;
+/// when the segment cannot be drawn, the task traps (`trap.exhausted`).
 fn grow_on_segment(mut lo: Lowering, mut fx: Fx, task: clif::Value, thunk: clif::Value, record: clif::Value, need: clif::Value) {
     let cell = mut fx.load(PTR, addr: task, offset: TASK_STACK_CELL)
     let domain = mut fx.load(PTR, addr: task, offset: TASK_DOMAIN)
-    let reserve = tasks_reserve(lo)
-    let wanted = mut fx.b.iadd_imm_s(need, y: i64.fit(STUB_CALL_BOUND))
-    let default = mut fx.ptr(TASKS_STACK)
-    let usable = mut fx.b.umax(wanted, y: default)
-    let padded = mut fx.b.iadd_imm_s(usable, y: i64.fit(SEGMENT_HEADER + reserve + 15))
-    let length = mut fx.b.band_imm_s(padded, y: -16)
+    let length = segment_length(mut lo, mut fx, need)
     let segment = stack_draw(mut lo, mut fx, cell, domain, length, guarded: false)
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: segment, y: 0)
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
         raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
     })
+    let zero_cell = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: cell, y: 0)
+    let mapped = mut fx.b.uextend(PTR, x: zero_cell)
+    run_on_segment(mut lo, mut fx, task, drawn: DrawnSegment(address: segment, length: length, mapped: mapped), thunk, record)
+} grow_on_segment
+
+/// A segment drawn for a call: its address, its length and whether it is mapped.
+struct DrawnSegment derives Copy {
+    address: clif::Value
+    length: clif::Value
+    mapped: clif::Value
+} DrawnSegment
+
+/// Returns a segment: unmapped when `mapped`, freed otherwise.
+fn return_segment(mut lo: Lowering, mut fx: Fx, segment: clif::Value, length: clif::Value, mapped: clif::Value) {
+    let unmapping = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mapped, y: 0)
+    discard mut fx.choose_in(mut lo, condition: unmapping, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        unmap_stack(mut lo1, fx: mut fx1, stack: segment, len: length)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Free, args: fx1.list1(segment).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} return_segment
+
+/// The length of a segment for a call needing `need` bytes: its header, the routine reserve and
+/// the default task stack, or the room the call needs if more.
+fn segment_length(mut lo: Lowering, mut fx: Fx, need: clif::Value) -> clif::Value {
+    let reserve = tasks_reserve(lo)
+    let wanted = mut fx.b.iadd_imm_s(need, y: i64.fit(STUB_CALL_BOUND))
+    let default = mut fx.ptr(TASKS_STACK)
+    let usable = mut fx.b.umax(wanted, y: default)
+    let padded = mut fx.b.iadd_imm_s(usable, y: i64.fit(SEGMENT_HEADER + reserve + 15))
+    return mut fx.b.band_imm_s(padded, y: -16)
+} segment_length
+
+/// Runs a thunk with its record on a segment of a task's stack, given with its length and
+/// whether it is mapped, the newest the task's record names while it runs, then returns the
+/// segment.
+fn run_on_segment(mut lo: Lowering, mut fx: Fx, task: clif::Value, drawn: DrawnSegment, thunk: clif::Value, record: clif::Value) {
+    let segment = drawn.address
+    let length = drawn.length
+    let mapped = drawn.mapped
+    let reserve = tasks_reserve(lo)
     let limit = mut fx.load(PTR, addr: task, offset: TASK_LIMIT)
     let stack_top = mut fx.load(PTR, addr: task, offset: TASK_TOP)
     let older = mut fx.load(PTR, addr: task, offset: TASK_SEGMENT)
     mut fx.store(older, addr: segment, offset: 0)
     mut fx.store(length, addr: segment, offset: 8)
+    mut fx.store(mapped, addr: segment, offset: 16)
     let grown_limit = mut fx.b.iadd_imm_s(segment, y: i64.fit(SEGMENT_HEADER + reserve))
     let grown_top = mut fx.b.iadd(segment, y: length)
     mut fx.store(grown_limit, addr: task, offset: TASK_LIMIT)
     mut fx.store(grown_top, addr: task, offset: TASK_TOP)
     mut fx.store(segment, addr: task, offset: TASK_SEGMENT)
+    switch_onto(mut lo, mut fx, stack_top: grown_top, thunk, record)
+    mut fx.store(limit, addr: task, offset: TASK_LIMIT)
+    mut fx.store(stack_top, addr: task, offset: TASK_TOP)
+    mut fx.store(older, addr: task, offset: TASK_SEGMENT)
+    return_segment(mut lo, mut fx, segment, length, mapped)
+} run_on_segment
+
+/// Runs a thunk with its record on the stack whose top is `stack_top`, through `GrownStart`, and
+/// comes back once it returns.
+fn switch_onto(mut lo: Lowering, mut fx: Fx, stack_top: clif::Value, thunk: clif::Value, record: clif::Value) {
     let switch = mut fx.slot(SWITCH_SIZE, align: 16)
     mut fx.store(thunk, addr: switch, offset: SWITCH_THUNK)
     mut fx.store(record, addr: switch, offset: SWITCH_RECORD)
-    // The segment's first context: on x86_64 eight below its top over a zeroed return slot, so
-    // `GrownStart` is entered as a call leaves the stack, and the frame pointer of `Grow`, which
-    // `GrownStart`'s frame record links to.
-    var start = grown_top
+    // The stack's first context: on x86_64 eight below its top over a zeroed return slot, so
+    // `GrownStart` is entered as a call leaves the stack, and the frame pointer of the routine
+    // switching, which `GrownStart`'s frame record links to.
+    var start = stack_top
     if lo.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
-        start = mut fx.b.iadd_imm_s(grown_top, y: -8)
+        start = mut fx.b.iadd_imm_s(stack_top, y: -8)
         let zero = mut fx.ptr(0)
         mut fx.store(zero, addr: start, offset: 0)
     }
@@ -172,11 +223,85 @@ fn grow_on_segment(mut lo: Lowering, mut fx: Fx, task: clif::Value, thunk: clif:
     let start_address = mut fx.b.func_addr(PTR, func_ref: start_ref)
     mut fx.store(start_address, addr: fresh, offset: 16)
     mut lo.switch_stacks(mut fx, store: switch, load: fresh, payload: switch)
-    mut fx.store(limit, addr: task, offset: TASK_LIMIT)
-    mut fx.store(stack_top, addr: task, offset: TASK_TOP)
-    mut fx.store(older, addr: task, offset: TASK_SEGMENT)
-    stack_give_back(mut lo, mut fx, cell, stack: segment, length, guarded: false)
-} grow_on_segment
+} switch_onto
+
+/// `Nested(function, first, alloc, third, need)`: calls the function with its arguments through
+/// the thunk of nested calls, on the stack it runs on when that is the running task's and holds
+/// `need` bytes and the stub call bound above its limit below `Nested`'s frame. Otherwise the
+/// call runs on a new segment drawn through `alloc`, of the task's stack when a task runs,
+/// returned once it returns; a segment that cannot be drawn gives `OutOfMemory`'s code.
+fn nested_routine(mut lo: Lowering, mut fx: Fx) {
+    let params = mut fx.entry()
+    expect params.len() == 5
+    let need = params[4]
+    let alloc = params[2]
+    let held = mut fx.slot(NESTED_SIZE, align: 8)
+    mut fx.store(params[0], addr: held, offset: NESTED_FUNCTION)
+    mut fx.store(params[1], addr: held, offset: NESTED_FIRST)
+    mut fx.store(params[2], addr: held, offset: NESTED_ALLOC)
+    mut fx.store(params[3], addr: held, offset: NESTED_THIRD)
+    let out_of_memory = mut fx.ptr(u64.fit(FAILURE_OUT_OF_MEMORY))
+    mut fx.store(out_of_memory, addr: held, offset: NESTED_CODE)
+    let thunk_id = mut lo.nested_thunk()
+    let thunk_ref = mut lo.func_ref(mut fx, id: thunk_id)
+    let thunk = mut fx.b.func_addr(PTR, func_ref: thunk_ref)
+    let here = mut fx.slot(8, align: 8)
+    let task = current_task(mut lo, mut fx)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: task, y: 0)
+    discard mut fx.choose_in(mut lo, condition: present, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let short = short_of(mut fx1, task, here, need)
+        discard mut fx1.choose_in(mut lo1, condition: short, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let length = segment_length(mut lo2, fx: mut fx2, need)
+            let domain = mut fx2.load(PTR, addr: task, offset: TASK_DOMAIN)
+            let align = mut fx2.ptr(MEMORY_CHUNK)
+            let drawn = mut lo2.call_routine(mut fx2, routine: Routine.AllocIn, args: fx2.list4(alloc, b: length, c: align, d: domain).view())
+            expect drawn.len() == 1
+            let segment = drawn[0]
+            let got = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: segment, y: 0)
+            mut fx2.if_true(got, then: fn[mut lo2](mut fx3: Fx) {
+                let unmapped = mut fx3.ptr(0)
+                run_on_segment(mut lo2, fx: mut fx3, task, drawn: DrawnSegment(address: segment, length: length, mapped: unmapped), thunk, record: held)
+            })
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let signature = mut fx2.b.import_signature(record_signature(fx2.alloc))
+            discard mut fx2.b.call_indirect(signature, callee: thunk, args: fx2.list1(held).view())
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let length = segment_length(mut lo1, fx: mut fx1, need)
+        let align = mut fx1.ptr(MEMORY_CHUNK)
+        let drawn = mut lo1.call_routine(mut fx1, routine: Routine.Alloc, args: fx1.list3(alloc, b: length, c: align).view())
+        expect drawn.len() == 1
+        let segment = drawn[0]
+        let got = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: segment, y: 0)
+        mut fx1.if_true(got, then: fn[mut lo1](mut fx2: Fx) {
+            let segment_top = mut fx2.b.iadd(segment, y: length)
+            switch_onto(mut lo1, fx: mut fx2, stack_top: segment_top, thunk, record: held)
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Free, args: fx2.list1(segment).view())
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let code = mut fx.load(PTR, addr: held, offset: NESTED_CODE)
+    mut fx.b.ret(fx.list1(code).view())
+} nested_routine
+
+/// Whether a running task's stack lacks `need` bytes and the stub call bound above its limit
+/// below `here`, or `here` lies outside it.
+fn short_of(mut fx: Fx, task: clif::Value, here: clif::Value, need: clif::Value) -> clif::Value {
+    let limit = mut fx.load(PTR, addr: task, offset: TASK_LIMIT)
+    let stack_top = mut fx.load(PTR, addr: task, offset: TASK_TOP)
+    let above = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: here, y: limit)
+    let below = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: here, y: stack_top)
+    let room = mut fx.b.isub(here, y: limit)
+    let wanted = mut fx.b.iadd_imm_s(need, y: i64.fit(STUB_CALL_BOUND))
+    let lacking = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: room, y: wanted)
+    let inside = mut fx.b.band(above, y: below)
+    let roomy = mut fx.b.bxor_imm_s(lacking, y: 1)
+    let fits = mut fx.b.band(inside, y: roomy)
+    return mut fx.b.bxor_imm_s(fits, y: 1)
+} short_of
 
 /// `GrownStart(record)`: links its frame record to `Grow`'s, so walks of the stack pass from the
 /// segment to the stack it grew from, calls the thunk with its record, and switches back to

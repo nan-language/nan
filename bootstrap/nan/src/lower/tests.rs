@@ -331,14 +331,18 @@ fn the_decoders_erased_gives_are_judged_at_its_call() {
         ),
         (
             "trees/trees.nan",
-            "//! Trees.\n\n/// A tree whose decoder reaches itself.\npub closed enum Tree derives Encode {\n    Leaf\n    Node(left: mem::Box[Tree])\n} Tree\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    let erased = mem::wire::Codec[Tree].erased()\n    world.log.info(\"schema\", value: erased.schema == mem::wire::Codec[Tree].schema_hash())\n} main\n",
+            "//! Trees.\n\n/// A tree whose decoder reaches itself.\npub closed enum Tree derives Encode {\n    Leaf\n    Node(left: mem::Box[Tree])\n} Tree\n\n/// A value too large for the stack of an erased decoder.\npub closed struct Block derives Encode {\n    pub bytes: Array[u8, 32_768]\n} Block\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    let tree = mem::wire::Codec[Tree].erased()\n    let block = mem::wire::Codec[Block].erased()\n    world.log.info(\"schemas\", value: tree.schema != block.schema)\n} main\n",
         ),
     ]);
     let built = crate::run(&["build".to_owned()], &scratch.0);
-    let reported = built
-        .output
-        .lines()
-        .filter(|line| line.starts_with("error limit.stack-unbounded trees/trees.nan:10 "))
-        .count();
-    assert_eq!(reported, 2, "{}", built.output);
+    let reported: Vec<&str> = (built.output.lines())
+        .filter(|line| line.starts_with("error "))
+        .collect();
+    assert!(
+        !reported.is_empty()
+            && (reported.iter())
+                .all(|line| line.starts_with("error limit.stack-exceeded trees/trees.nan:16 ")),
+        "{}",
+        built.output
+    );
 }

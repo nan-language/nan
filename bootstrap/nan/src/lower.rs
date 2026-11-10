@@ -28,6 +28,7 @@ mod levels;
 mod lines;
 pub mod load;
 pub mod machine;
+mod nested;
 mod place;
 mod release;
 mod runtime;
@@ -144,6 +145,10 @@ pub enum Glue {
     EncodeCalls(Ty, Ty),
     /// Reads a value of a type in a codec's format, or through the calls of a decoder.
     Decode(supplied::codecs::DecodeFormat, Ty),
+    /// Makes a nested call from its record.
+    NestedThunk,
+    /// Writes the canonical encoding of a decoded value of a type to new bytes.
+    Canonical(Ty),
     /// Reads a uvar of the wire format.
     WireUvar,
     /// Reads a JSON number's text.
@@ -364,6 +369,8 @@ pub struct Lowering<'c, 'a> {
     contributed: Vec<load::Contributed>,
     /// For an image whose task stacks grow, its grown calls.
     growth: Option<grown::Growth>,
+    /// The nested calls it makes.
+    nested: nested::Nested,
     /// For a kernel running nanos jobs in isolated spaces, the image of their user-mode runtime.
     pub runtime_image: Option<Vec<u8>>,
 }
@@ -566,6 +573,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             sims: None,
             contributed: Vec::new(),
             growth: ck.db.target.is_nanos().then(grown::Growth::default),
+            nested: nested::Nested::default(),
             runtime_image: None,
         }
     }
@@ -641,7 +649,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 }
                 Pending::Routine(routine, id) => {
                     let flags = match routine {
-                        Routine::TaskStart | Routine::Grow | Routine::GrownStart => lines::HIDDEN,
+                        Routine::TaskStart
+                        | Routine::Grow
+                        | Routine::GrownStart
+                        | Routine::Nested => lines::HIDDEN,
                         _ => lines::HIDDEN | lines::CRITICAL,
                     };
                     self.define(id, routine.signature(), flags, |lo, fx| {
@@ -1022,6 +1033,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         let entry_stacks = runtime::tasks::emit_entry_stacks(&mut self);
         lines::emit(&mut self, entry_stacks);
         self.finish_interrupts();
+        self.emit_nested_needs();
         self.emit_needs();
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);

@@ -106,7 +106,7 @@ pub mod task {
     pub const BOUND: i64 = 1 << 32;
     /// On a machine target, the save area of the extended state it owns, zero for none.
     pub const EXTENDED: u64 = 344;
-    /// In an image keeping segments, the lowest address grown calls leave free on the stack the
+    /// The lowest address grown and nested calls leave free on the stack the
     /// task runs on and the top of that stack, and the newest segment it runs on, zero for its
     /// own stack.
     pub const LIMIT: u64 = 352;
@@ -531,12 +531,10 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(cell, record, task::STACK_CELL);
     let guard = fx.b.ins().iadd_imm_s(stack, GUARD as i64);
     fx.store(guard, record, task::GUARD);
-    if lo.keeps_segments() {
-        let limit = fx.b.ins().iadd_imm_s(guard, reserve(lo) as i64);
-        fx.store(limit, record, task::LIMIT);
-        let top = fx.b.ins().iadd(stack, length);
-        fx.store(top, record, task::TOP);
-    }
+    let limit = fx.b.ins().iadd_imm_s(guard, reserve(lo) as i64);
+    fx.store(limit, record, task::LIMIT);
+    let top = fx.b.ins().iadd(stack, length);
+    fx.store(top, record, task::TOP);
     // The initial stack pointer of the task's first run, which its switch restores: aligned to
     // 16 bytes, which the start routine is entered with on AArch64, and on x86_64 eight below
     // that, over a zeroed return slot, so the start routine is entered as a call leaves the
@@ -1115,16 +1113,14 @@ pub fn stop_running(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
-/// Returns an ended task's stack, and in an image keeping segments those a trap left it on:
-/// unmapped, or freed through its cell.
+/// Returns an ended task's stack and the segments a trap left it on: unmapped, or freed through
+/// its cell.
 pub fn release_stack(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let stack = fx.load(PTR, record, task::STACK);
     let cell = fx.load(PTR, record, task::STACK_CELL);
     let length = fx.load(PTR, record, task::STACK_SIZE);
     segments::give_back(lo, fx, cell, stack, length, true);
-    if lo.keeps_segments() {
-        segments::release(lo, fx, record, cell);
-    }
+    segments::release(lo, fx, record);
 }
 
 /// `IoSubmit(entry)`: submits an io_uring entry from the running task and parks until its

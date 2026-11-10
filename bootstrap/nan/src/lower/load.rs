@@ -155,7 +155,7 @@ const RECORD: &str = "_NSloaded_";
 
 /// The support routines a kernel exports: every one the lowered code of a kernel or of a nanos
 /// bundle calls.
-pub const ROUTINES: [Routine; 58] = [
+pub const ROUTINES: [Routine; 59] = [
     Routine::Copy,
     Routine::Fill,
     Routine::Compare,
@@ -211,6 +211,7 @@ pub const ROUTINES: [Routine; 58] = [
     Routine::Ready,
     Routine::Enqueue,
     Routine::Grow,
+    Routine::Nested,
     Routine::Thread,
     Routine::TimerArm,
     Routine::ExtendedOwn,

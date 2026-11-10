@@ -1,0 +1,155 @@
+//! Nested calls: the decoding of a type that holds itself, and the writing of the canonical encoding of a value so decoded, run through the `Nested` support routine, on the running task's stack when it has the room the call needs and on a segment otherwise. The call's need, which the nestings a decoding allows bound, is a word of a table the lowering fills once every frame is known.
+
+/// The symbol of the table of nested calls' needs.
+const NESTED_NEEDS: Str = "_NSstack_nested_needs"
+
+/// The offsets of the record a nested call's thunk reads: the called function's code and its
+/// three arguments, the second its allocator, then the code it gives.
+const NESTED_FUNCTION: u64 = 0
+
+const NESTED_FIRST: u64 = 8
+
+const NESTED_ALLOC: u64 = 16
+
+const NESTED_THIRD: u64 = 24
+
+const NESTED_CODE: u64 = 32
+
+const NESTED_SIZE: u64 = 40
+
+/// Calls a function of three arguments, the second an allocator, giving a code, through
+/// `Nested`, giving its code.
+fn Lowering.nested_call(mut self, mut fx: Fx, function: object::FuncId, args: Slice[clif::Value]) -> clif::Value {
+    var index = self.nested_called.len()
+    match self.nested_called.position(fn(known: object::FuncId) => known == function) {
+        Some(found) => {
+            index = found
+        }
+        None => mut self.nested_called.push(function)
+    }
+    let table = mut self.nested_needs_data()
+    let needs_address = mut self.data_address(mut fx, id: table)
+    let need = mut fx.load(PTR, addr: needs_address, offset: 8 * u64.widen(index))
+    let function_ref = mut self.func_ref(mut fx, id: function)
+    let code = mut fx.b.func_addr(PTR, func_ref: function_ref)
+    let routine = mut self.routine(Routine.Nested)
+    let reference = mut self.func_ref(mut fx, id: routine)
+    var values = mem::List[clif::Value].empty(fx.alloc)
+    mut values.push(code)
+    for arg in args {
+        mut values.push(arg)
+    }
+    mut values.push(need)
+    let call = mut fx.b.call(reference, args: values.view())
+    mut fx.sites.push(CallSite(inst: call, site: Site(kind: StackKind.Nested(function), at: None)))
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 1
+    return mut fx.b.ireduce(clif::Type.Int32, x: results[0])
+} Lowering.nested_call
+
+/// The thunk of a nested call: calls the function its record names with the arguments there,
+/// writing its code there.
+fn Lowering.nested_thunk(mut self) -> object::FuncId {
+    return mut self.glue_function(Glue.NestedThunk, signature: record_signature(self.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let held = params[0]
+        let function = mut fx1.load(PTR, addr: held, offset: NESTED_FUNCTION)
+        let leading = mut fx1.load(PTR, addr: held, offset: NESTED_FIRST)
+        let alloc = mut fx1.load(PTR, addr: held, offset: NESTED_ALLOC)
+        let trailing = mut fx1.load(PTR, addr: held, offset: NESTED_THIRD)
+        let signature = mut fx1.b.import_signature(nested_signature(fx1.alloc))
+        let call = mut fx1.b.call_indirect(signature, callee: function, args: fx1.list3(leading, b: alloc, c: trailing).view())
+        let results = fx1.b.inst_results(call, alloc: fx1.alloc)
+        expect results.len() == 1
+        let code = mut fx1.b.uextend(PTR, x: results[0])
+        mut fx1.store(code, addr: held, offset: NESTED_CODE)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} Lowering.nested_thunk
+
+/// The table of nested calls' needs, declared once and defined when lowering finishes.
+fn Lowering.nested_needs_data(mut self) -> object::DataId {
+    match self.nested_needs {
+        Some(id) => return id
+        None => {}
+    }
+    let id = mut self.module.declare_data(NESTED_NEEDS, linkage: object::Linkage.Local, writable: false, tls: false)
+    self.nested_needs = Some(id)
+    return id
+} Lowering.nested_needs_data
+
+/// Defines the table of nested calls' needs from the frames lowered, zero for a call whose need
+/// is unbounded, which runs on the stack it is made on; and makes each nested call of a bounded
+/// need a call of a support routine.
+fn Lowering.emit_nested_needs(mut self) {
+    let Some(id) = self.nested_needs else {
+        return
+    }
+    let nesting = self.nesting_functions()
+    var needs = mem::List[Option[u64]].empty(self.alloc)
+    var bounded = mem::HashMap[object::FuncId, Unit].empty(seed: 0, alloc: self.alloc)
+    for function in self.nested_called {
+        let need = nested_need(self.frames.view(), function, nesting, alloc: self.alloc)
+        if need.is_some() {
+            discard mut bounded.insert(function, value: Unit)
+        }
+        mut needs.push(need)
+    }
+    for at in 0..<self.frames.len() {
+        var frame = mut self.frames.at_mut(at)
+        for index in 0..<frame.sites.len() {
+            var site = mut frame.sites.at_mut(index)
+            match site.kind {
+                StackKind.Nested(function) => {
+                    if bounded.contains(function) {
+                        site.kind = StackKind.Stub
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+    var bytes = mem::Bytes.empty(self.alloc)
+    for need in needs {
+        match need {
+            Some(bytes_needed) => object::append_u64(mut bytes, value: bytes_needed)
+            None => object::append_u64(mut bytes, value: 0)
+        }
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+} Lowering.emit_nested_needs
+
+/// The functions lowered whose calls of each other pass a nesting on every cycle: the decoding
+/// functions of the formats bounding their nestings, and the wire format's encoding functions,
+/// which a nested call runs only on a value such a decoding read.
+fn Lowering.nesting_functions(self) -> mem::HashMap[object::FuncId, Unit] {
+    var nesting = mem::HashMap[object::FuncId, Unit].empty(seed: 0, alloc: self.alloc)
+    for entry in self.glues {
+        match entry.key() {
+            Glue.Decode(format: format, ty: _) => {
+                if codecs_nests(self, format) {
+                    discard mut nesting.insert(entry.value(), value: Unit)
+                }
+            }
+            Glue.Encode(format: Format.Wire, ty: _) => {
+                discard mut nesting.insert(entry.value(), value: Unit)
+            }
+            else => {}
+        }
+    }
+    return nesting
+} Lowering.nesting_functions
+
+/// The signature of a function a nested call calls: three arguments, giving a code.
+fn nested_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    for _ in 0..<3usize {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int32))
+    return signature
+} nested_signature

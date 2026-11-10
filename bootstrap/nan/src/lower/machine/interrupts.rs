@@ -1103,9 +1103,7 @@ impl Lowering<'_, '_> {
                             link: layout.link.map(|link| fx.load(PTR, saved, link)),
                             low: fx.load(PTR, record, task::GUARD),
                             high: fx.b.ins().iadd(base, size),
-                            segment: lo
-                                .keeps_segments()
-                                .then(|| fx.load(PTR, record, task::SEGMENT)),
+                            segment: Some(fx.load(PTR, record, task::SEGMENT)),
                         };
                         vec![stops::stoppable(lo, fx, &at)]
                     },

@@ -79,6 +79,10 @@ pub enum Routine {
     /// `(record)`: the first code a segment runs: the thunk and record of the grown call that
     /// `Grow` keeps in its frame, then back to `Grow`.
     GrownStart,
+    /// `(function, first, alloc, third, need) -> code`: calls a function of three arguments
+    /// giving a code, on a new segment drawn through `alloc` when the running stack lacks `need`
+    /// bytes above its limit; `OutOfMemory`'s code when the segment cannot be drawn.
+    Nested,
     /// `(address, domain) -> lifted`: passes the chunks an allocation lies in to a domain when
     /// a domain nested in it owns them; nonzero when they passed.
     Lift,
@@ -265,6 +269,7 @@ impl Routine {
             Routine::TaskStart => "_NSstack_switch_task_start",
             Routine::Grow => "_NSstack_switch_grow",
             Routine::GrownStart => "_NSstack_switch_grown_start",
+            Routine::Nested => "_NSstack_switch_nested",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
             Routine::Schedule => "_NSstack_switch_schedule",
             Routine::ThreadMain => "_NSstack_switch_thread_main",
@@ -304,7 +309,7 @@ impl Routine {
             Routine::Alloc => (&[P, P, P], &[P]),
             Routine::AllocIn => (&[P, P, P, P], &[P]),
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
-            Routine::Derive => (&[P, P, P, P, P], &[P]),
+            Routine::Derive | Routine::Nested => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[types::I8]),
             Routine::Rehome | Routine::KindRevoke | Routine::TrapReport | Routine::TimerArm => {
                 (&[P, P], &[])
@@ -758,6 +763,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
         Routine::Grow => segments::grow(lo, fx),
         Routine::GrownStart => segments::grown_start(lo, fx),
+        Routine::Nested => segments::nested(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::TimerArm => {

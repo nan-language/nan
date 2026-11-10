@@ -260,8 +260,7 @@ fn read_from(
         fx.store(zero, state, reader::TAKEN);
         count
     });
-    let function = decoder(lo, format, ty);
-    let code = call(lo, fx, function, &[state, alloc, target])[0];
+    let code = decode_entry(lo, fx, format, ty, &[state, alloc, target]);
     let read = fx.b.ins().icmp_imm_s(IntCC::Equal, code, 0);
     fx.choose_in(
         lo,
@@ -305,34 +304,51 @@ fn canonical(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         read,
         &[types::I32],
         |lo, fx| {
-            let function = encoder(lo, Format::Wire, &ty);
-            let size = measure(lo, fx, function, value);
+            let function = canonical_writer(lo, &ty);
             let alloc = fx.load(PTR, supply.param(1).address(), 0);
-            vector::empty(fx, bytes, alloc, BYTE);
-            let drawn = vector::resize(lo, fx, bytes, size, BYTE);
-            let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
-            fx.when(failed, |fx| lo.release(fx, &ty, value));
-            fx.choose_in(
-                lo,
-                failed,
-                &[types::I32],
-                |_, fx| vec![fx.int(types::I32, failure::OUT_OF_MEMORY)],
-                |lo, fx| {
-                    let state = fx.slot(writer::SIZE, 8);
-                    let data = fx.load(PTR, bytes, vector::DATA);
-                    fx.store(data, state, writer::BUFFER);
-                    let zero = fx.ptr(0);
-                    fx.store(zero, state, writer::LEN);
-                    call(lo, fx, function, &[value, state]);
-                    fx.store(size, bytes, vector::LEN);
-                    lo.release(fx, &ty, value);
-                    vec![fx.int(types::I32, 0)]
-                },
-            )
+            let args = [value, alloc, bytes];
+            vec![match reaches_itself(lo, &ty) {
+                true => lo.nested_call(fx, function, &args),
+                false => call(lo, fx, function, &args)[0],
+            }]
         },
         |_, _| vec![code],
     )[0];
     returned(lo, fx, supply, &result, bytes, code);
+}
+
+/// The function writing the canonical encoding of a value of a type, given its address, the
+/// allocator and the address of the bytes to make, then releasing the value: zero, or
+/// `OutOfMemory`'s code when the bytes cannot be drawn.
+fn canonical_writer(lo: &mut Lowering, ty: &Ty) -> FuncId {
+    let ty = ty.clone();
+    lo.glue_function(
+        Glue::Canonical(ty.clone()),
+        super::super::nested::nested_signature(),
+        move |lo, fx| {
+            let params = fx.entry();
+            let (value, alloc, bytes) = (params[0], params[1], params[2]);
+            let function = encoder(lo, Format::Wire, &ty);
+            let size = measure(lo, fx, function, value);
+            vector::empty(fx, bytes, alloc, BYTE);
+            let drawn = vector::resize(lo, fx, bytes, size, BYTE);
+            let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, drawn, 0);
+            fx.when(failed, |fx| {
+                lo.release(fx, &ty, value);
+                fail(fx, failure::OUT_OF_MEMORY);
+            });
+            let state = fx.slot(writer::SIZE, 8);
+            let data = fx.load(PTR, bytes, vector::DATA);
+            fx.store(data, state, writer::BUFFER);
+            let zero = fx.ptr(0);
+            fx.store(zero, state, writer::LEN);
+            call(lo, fx, function, &[value, state]);
+            fx.store(size, bytes, vector::LEN);
+            lo.release(fx, &ty, value);
+            let none = fx.int(types::I32, 0);
+            fx.b.ins().return_(&[none]);
+        },
+    )
 }
 
 /// The address of the schema hash of a type, as read-only data.
@@ -511,8 +527,7 @@ fn decode_constant(
     fx.store(end, state, reader::END);
     let zero = fx.ptr(0);
     fx.store(zero, state, reader::DEPTH);
-    let function = decoder(lo, &DecodeFormat::Wire, ty);
-    call(lo, fx, function, &[state, alloc, target])[0]
+    decode_entry(lo, fx, &DecodeFormat::Wire, ty, &[state, alloc, target])
 }
 
 /// `Codec.erased()`: the type's schema hash and, for each other field, the member of `Codec` of
@@ -1333,6 +1348,70 @@ fn decoder(lo: &mut Lowering, format: &DecodeFormat, ty: &Ty) -> FuncId {
             fx.b.ins().return_(&[none]);
         },
     )
+}
+
+/// Calls the decoding function of a type in a format with a reader, an allocator and a target,
+/// giving its code: as a nested decoding when the decoding reaches itself in a format nesting
+/// on every cycle of its decoding functions' calls of each other.
+pub fn decode_entry(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    format: &DecodeFormat,
+    ty: &Ty,
+    args: &[Value],
+) -> Value {
+    let function = decoder(lo, format, ty);
+    match nests(lo, format) && reaches_itself(lo, ty) {
+        true => lo.nested_call(fx, function, args),
+        false => call(lo, fx, function, args)[0],
+    }
+}
+
+/// Whether every cycle of a format's decoding functions' calls of each other passes a nesting,
+/// which the format bounds: the wire format's, and the calls of a std decoder.
+pub fn nests(lo: &Lowering, format: &DecodeFormat) -> bool {
+    match format {
+        DecodeFormat::Wire => true,
+        DecodeFormat::Calls(Ty::Item(item, _)) => lo.ck.db.is_std(*item),
+        _ => false,
+    }
+}
+
+/// Whether decoding a type reaches the decoding of a type it is part of: whether a type holds
+/// itself through the parts its decoding reads.
+fn reaches_itself(lo: &mut Lowering, ty: &Ty) -> bool {
+    let mut path = Vec::new();
+    let mut done = Vec::new();
+    holds_self(lo, &unwrapped(lo, ty), &mut path, &mut done)
+}
+
+fn holds_self(lo: &mut Lowering, ty: &Ty, path: &mut Vec<Ty>, done: &mut Vec<Ty>) -> bool {
+    if path.contains(ty) {
+        return true;
+    }
+    if done.contains(ty) {
+        return false;
+    }
+    path.push(ty.clone());
+    let parts: Vec<Ty> = match kind_of(lo, ty) {
+        Kind::Sequence(element, _) | Kind::Contents(element, _) => vec![element],
+        Kind::Map(key, value) => vec![key, value],
+        Kind::Record(record) => record.fields.into_iter().map(|(_, ty, _)| ty).collect(),
+        Kind::Variant(cases) => (cases.into_iter())
+            .flat_map(|case| match case.payload {
+                CasePayload::None => Vec::new(),
+                CasePayload::Single(ty) => vec![ty],
+                CasePayload::Labelled(record) => {
+                    record.fields.into_iter().map(|(_, ty, _)| ty).collect()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let held = (parts.iter()).any(|part| holds_self(lo, &unwrapped(lo, part), path, done));
+    path.pop();
+    done.push(ty.clone());
+    held
 }
 
 /// A decoding function's reader and allocator handle, in a format.

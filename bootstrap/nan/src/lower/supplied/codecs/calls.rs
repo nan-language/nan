@@ -17,8 +17,8 @@ use super::super::Supply;
 use super::super::mem::maps::Entries;
 use super::super::mem::vector::{self, Element};
 use super::{
-    BYTE, CasePayload, DecodeFormat, Kind, Record, by_key, call, check, contents_of, decoder,
-    elements_of, fail, failure, kind_of, reader, returned, text_of, unwrapped, utf8_valid,
+    BYTE, CasePayload, DecodeFormat, Kind, Record, by_key, call, check, contents_of, elements_of,
+    fail, failure, kind_of, reader, returned, text_of, unwrapped, utf8_valid,
 };
 use crate::check::ty::{Args, Scalar, Ty};
 
@@ -55,8 +55,8 @@ pub fn through(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty, method: &str)
     let target = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let function = decoder(lo, &DecodeFormat::Calls(decoder_ty), ty);
-    let code = call(lo, fx, function, &[state, alloc, target])[0];
+    let format = DecodeFormat::Calls(decoder_ty);
+    let code = super::decode_entry(lo, fx, &format, ty, &[state, alloc, target]);
     returned(lo, fx, &supply, ty, target, code);
 }
 

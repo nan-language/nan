@@ -8,7 +8,7 @@ use super::super::{Lowering, lines};
 
 /// The registers of a task interrupted on its stack: its instruction, stack and frame pointers,
 /// its link register where the architecture has one, the bounds of its own stack's usable part,
-/// and in an image keeping segments the newest segment it runs on, zero for none.
+/// and, for a walk that may start on a segment, the newest segment it runs on, zero for none.
 pub struct Interrupted {
     pub ip: Value,
     pub sp: Value,

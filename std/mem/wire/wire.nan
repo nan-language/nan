@@ -535,6 +535,53 @@ test erased_decoders_name_the_value_they_reject for Codec.canonical_located {
     expect error == core::DecodeError.Malformed and path.as_str() == "nodes[1].Record.fields[0].defaulted"
 } erased_decoders_name_the_value_they_reject
 
+/// A value holding itself, as deep as its nodes.
+enum Nest derives Encode {
+    Leaf
+    Node(inner: mem::Box[Nest])
+} Nest
+
+/// The wire encoding of a nest `depth` nodes deep.
+fn nest_bytes(depth: u32, alloc: mem::Alloc) -> mem::Bytes {
+    var nest = Nest.Leaf
+    for _ in 0..<depth {
+        nest = Nest.Node(inner: mem::Heap.of(alloc).boxed(take nest))
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    Codec[Nest].encode(nest, out: mut bytes)
+    return bytes
+} nest_bytes
+
+test values_holding_themselves_decode_within_the_nesting for Codec.canonical {
+    let alloc = testing::world().alloc
+    let deep = nest_bytes(60, alloc)
+    let deeper = nest_bytes(70, alloc)
+    let canonical = attempt Codec[Nest].canonical(Untrusted.of(deep.view()), alloc)
+    let refused = attempt (Codec[Nest].erased().canonical)(Untrusted.of(deeper.view()), alloc)
+    let Ok(written) = canonical else {
+        expect false
+        return
+    }
+    let decoded = attempt Codec[Nest].decode(written.view(), alloc)
+    expect written.byte_len() == deep.len() and decoded.is_ok()
+    expect refused.is_err()
+} values_holding_themselves_decode_within_the_nesting
+
+test values_holding_themselves_decode_on_small_stacks for Codec.canonical {
+    let world = testing::world()
+    let alloc = world.alloc
+    let deep = mem::Shared.of(nest_bytes(60, alloc), alloc)
+    var read = false
+    try await task::scope(world.exec, body: fn[mut read](s: task::Scope) fails task::Cancelled uses wait {
+        let held = deep.share()
+        let job = s.spawn(fn[take held]() -> bool limits stack 16_384 {
+            return (attempt Codec[Nest].canonical(Untrusted.of(held.contents().view()), alloc)).is_ok()
+        })
+        read = try await take job.join()
+    })
+    expect read
+} values_holding_themselves_decode_on_small_stacks
+
 test records_accept_defaulted_and_dropped_fields for Schema.accepts {
     let alloc = testing::world().alloc
     var old_fields = mem::List[SchemaField].empty(alloc)

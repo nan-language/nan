@@ -56,6 +56,10 @@ pub enum Kind {
         thunk: FuncId,
         inner: Box<Kind>,
     },
+    /// A nested decoding: a call of the support routine running a decoding function on a stack
+    /// with room for its need, until lowering finds that need bounded and makes it a call of a
+    /// support routine; unbounded.
+    Nested(FuncId),
 }
 
 /// What a direct call passes for a function-typed or `Dyn` parameter of its callee.
@@ -291,6 +295,7 @@ impl Judge<'_> {
                 unbounded => unbounded,
             },
             Kind::Bounded(bytes) => bound(bytes.ok_or_else(Vec::new)),
+            Kind::Nested(_) => Use::Unbounded(Vec::new()),
             Kind::Param(position) => bound(bound_at(bounds, *position)),
             Kind::Direct { callee, bindings } => {
                 let mut callee_bounds = match self.frames.get(callee) {
@@ -372,7 +377,7 @@ impl Judge<'_> {
             Kind::Direct { callee, .. } => self.name(*callee),
             Kind::Param(_) => "parameter".to_owned(),
             Kind::Bounded(_) => "function value".to_owned(),
-            Kind::Stub => String::new(),
+            Kind::Stub | Kind::Nested(_) => String::new(),
             Kind::Grown { inner, .. } => self.subject(inner),
         }
     }
@@ -418,6 +423,151 @@ pub fn needs(frames: &[Frame], grown: &[Grown], excluded: &HashSet<FuncId>) -> V
         .collect()
 }
 
+/// The most nestings of a decoding, each of which every cycle of decoding functions' calls of
+/// each other passes, and the one outside them.
+const NESTINGS: u64 = 129;
+
+/// The stack a nested decoding by `decoder` needs: along each path of calls, the frames of the
+/// functions outside a cycle of calls once, and those of each cycle of `decoders` once per
+/// nesting; none when a path reaches a cycle holding another function or an unbounded call
+/// site.
+pub fn nested_need(frames: &[Frame], decoder: FuncId, decoders: &HashSet<FuncId>) -> Option<u64> {
+    let frames: HashMap<FuncId, &Frame> =
+        frames.iter().map(|frame| (frame.function, frame)).collect();
+    let mut components = Components {
+        frames: &frames,
+        index: HashMap::new(),
+        low: HashMap::new(),
+        stack: Vec::new(),
+        of: HashMap::new(),
+        members: Vec::new(),
+    };
+    components.visit(decoder);
+    let mut known = HashMap::new();
+    let component = components.of[&decoder];
+    deepest(&frames, &components, decoders, component, &mut known)
+}
+
+/// The strongly connected components of the calls from a function, numbered as they complete,
+/// each callee's before its caller's.
+struct Components<'f> {
+    frames: &'f HashMap<FuncId, &'f Frame>,
+    index: HashMap<FuncId, usize>,
+    low: HashMap<FuncId, usize>,
+    stack: Vec<FuncId>,
+    of: HashMap<FuncId, usize>,
+    members: Vec<Vec<FuncId>>,
+}
+
+impl Components<'_> {
+    fn visit(&mut self, function: FuncId) {
+        let number = self.index.len();
+        self.index.insert(function, number);
+        self.low.insert(function, number);
+        self.stack.push(function);
+        for callee in callees(self.frames, function) {
+            if !self.index.contains_key(&callee) {
+                self.visit(callee);
+                let low = self.low[&function].min(self.low[&callee]);
+                self.low.insert(function, low);
+            } else if self.stack.contains(&callee) {
+                let low = self.low[&function].min(self.index[&callee]);
+                self.low.insert(function, low);
+            }
+        }
+        if self.low[&function] == self.index[&function] {
+            let mut members = Vec::new();
+            loop {
+                let member = self.stack.pop().expect("a member of the component");
+                self.of.insert(member, self.members.len());
+                members.push(member);
+                if member == function {
+                    break;
+                }
+            }
+            self.members.push(members);
+        }
+    }
+}
+
+/// The functions a function calls directly, through grown calls among them.
+fn callees(frames: &HashMap<FuncId, &Frame>, function: FuncId) -> Vec<FuncId> {
+    let Some(frame) = frames.get(&function) else {
+        return Vec::new();
+    };
+    (frame.sites.iter())
+        .filter_map(|site| direct(&site.kind))
+        .collect()
+}
+
+/// The function a call site calls directly, a grown call's included.
+fn direct(kind: &Kind) -> Option<FuncId> {
+    match kind {
+        Kind::Direct { callee, .. } => Some(*callee),
+        Kind::Grown { inner, .. } => direct(inner),
+        _ => None,
+    }
+}
+
+/// The deepest stack a call of a component's functions uses: its frames, once per nesting for a
+/// cycle, then its deepest call leaving it.
+fn deepest(
+    frames: &HashMap<FuncId, &Frame>,
+    components: &Components,
+    decoders: &HashSet<FuncId>,
+    component: usize,
+    known: &mut HashMap<usize, Option<u64>>,
+) -> Option<u64> {
+    if let Some(used) = known.get(&component) {
+        return *used;
+    }
+    let members = &components.members[component];
+    let cyclic = members.len() > 1
+        || members
+            .iter()
+            .any(|member| callees(frames, *member).contains(member));
+    if cyclic && !members.iter().all(|member| decoders.contains(member)) {
+        known.insert(component, None);
+        return None;
+    }
+    let mut own = 0;
+    let mut leaving = Some(0);
+    for member in members {
+        let Some(frame) = frames.get(member) else {
+            own += STUB_CALL_BOUND;
+            continue;
+        };
+        let mut size = frame.size;
+        for site in &frame.sites {
+            let used = match &site.kind {
+                Kind::Stub | Kind::Nested(_) => Some(STUB_CALL_BOUND),
+                Kind::Bounded(bytes) => *bytes,
+                Kind::Param(_) => None,
+                Kind::Direct { .. } | Kind::Grown { .. } => {
+                    if let Kind::Grown { wrapper, thunk, .. } = &site.kind {
+                        let carried = frames.get(wrapper).map_or(0, |frame| frame.size)
+                            + STUB_CALL_BOUND
+                            + frames.get(thunk).map_or(0, |frame| frame.size);
+                        size = size.max(frame.size + carried);
+                    }
+                    let callee = direct(&site.kind).expect("a direct callee");
+                    let target = components.of[&callee];
+                    match target == component {
+                        true => Some(0),
+                        false => deepest(frames, components, decoders, target, known),
+                    }
+                }
+            };
+            leaving = leaving.zip(used).map(|(leaving, used)| leaving.max(used));
+        }
+        own += size;
+    }
+    let rounds = if cyclic { NESTINGS } else { 1 };
+    let used = leaving.map(|leaving| own * rounds + leaving);
+    known.insert(component, used);
+    used
+}
+
 /// The stack a task whose entry is `function` starts with when its stack grows: 64 KiB, or the
 /// stack use of the entry up to the grown calls it makes if more.
 pub fn grown_start(frames: &[Frame], function: FuncId) -> u64 {
@@ -454,7 +604,7 @@ impl Segments<'_> {
         let mut deepest = Some(0);
         for site in &frame.sites {
             let used = match &site.kind {
-                Kind::Stub => Some(STUB_CALL_BOUND),
+                Kind::Stub | Kind::Nested(_) => Some(STUB_CALL_BOUND),
                 Kind::Grown { wrapper, .. } => Some(self.size(*wrapper) + STUB_CALL_BOUND),
                 Kind::Bounded(bytes) => *bytes,
                 Kind::Param(position) => frame

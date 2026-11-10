@@ -181,6 +181,88 @@ enum CasePayload {
     Labelled(Record)
 } CasePayload
 
+/// Calls the decoding function of a type in a format with a reader, an allocator and a target,
+/// giving its code: as a nested call when the decoding reaches itself in a format nesting on
+/// every cycle of its decoding functions' calls of each other.
+fn decode_entry(mut lo: Lowering, mut fx: Fx, format: DecodeFormat, ty: ty::Ty, args: Slice[clif::Value]) -> clif::Value {
+    let function = decoder(mut lo, format, ty)
+    if codecs_nests(lo, format) and reaches_itself(mut lo, ty) {
+        return mut lo.nested_call(mut fx, function, args)
+    }
+    let codes = codecs_call(mut lo, mut fx, function, args)
+    expect codes.len() == 1
+    return codes[0]
+} decode_entry
+
+/// Whether every cycle of a format's decoding functions' calls of each other passes a nesting,
+/// which the format bounds: the wire format's, and the calls of a std decoder.
+fn codecs_nests(lo: Lowering, format: DecodeFormat) -> bool {
+    return match format {
+        DecodeFormat.Wire => true
+        DecodeFormat.Calls(decoder_ty) => match lo.ck.types().kind(decoder_ty) {
+            ty::TyKind.Item(item: item, args: _) => lo.ck.db().is_std(item)
+            else => false
+        }
+        else => false
+    }
+} codecs_nests
+
+/// Whether decoding a type reaches the decoding of a type it is part of: whether a type holds
+/// itself through the parts its decoding reads.
+fn reaches_itself(mut lo: Lowering, ty: ty::Ty) -> bool {
+    var path = mem::List[ty::Ty].empty(lo.alloc)
+    var done = mem::List[ty::Ty].empty(lo.alloc)
+    return holds_self(mut lo, ty: unwrapped(lo, ty), mut path, mut done)
+} reaches_itself
+
+fn holds_self(mut lo: Lowering, ty: ty::Ty, mut path: mem::List[ty::Ty], mut done: mem::List[ty::Ty]) -> bool {
+    if path.position(fn(held: ty::Ty) => held == ty).is_some() {
+        return true
+    }
+    if done.position(fn(held: ty::Ty) => held == ty).is_some() {
+        return false
+    }
+    mut path.push(ty)
+    var parts = mem::List[ty::Ty].empty(lo.alloc)
+    match kind_of(mut lo, ty) {
+        CodecsKind.Sequence(element: element, form: _) => mut parts.push(element)
+        CodecsKind.Contents(inner: inner, shared: _) => mut parts.push(inner)
+        CodecsKind.Map(key: key, value: value) => {
+            mut parts.push(key)
+            mut parts.push(value)
+        }
+        CodecsKind.Record(record) => {
+            for field in record.fields {
+                mut parts.push(field.ty)
+            }
+        }
+        CodecsKind.Variant(cases) => {
+            for case in cases {
+                match case.payload {
+                    CasePayload.None => {}
+                    CasePayload.Single(payload) => mut parts.push(payload)
+                    CasePayload.Labelled(record) => {
+                        for field in record.fields {
+                            mut parts.push(field.ty)
+                        }
+                    }
+                }
+            }
+        }
+        else => {}
+    }
+    var held = false
+    for part in parts {
+        if holds_self(mut lo, ty: unwrapped(lo, ty: part), mut path, mut done) {
+            held = true
+            break
+        }
+    }
+    discard mut path.pop()
+    mut done.push(ty)
+    return held
+} holds_self
+
 /// A decoding function's reader and allocator handle, in a format.
 struct Decoding derives Copy {
     format: DecodeFormat
@@ -370,11 +452,7 @@ fn codecs_read_from(mut lo: Lowering, mut fx: Fx, raw: clif::Value, alloc: clif:
         }
         None => {}
     }
-    let function = decoder(mut lo, format, ty)
-    let call_args = fx.list3(state, b: alloc_handle, c: target)
-    let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
-    expect codes.len() == 1
-    let code = codes[0]
+    let code = decode_entry(mut lo, mut fx, format, ty, args: fx.list3(state, b: alloc_handle, c: target).view())
     let read = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: 0)
     let results = fx.types1(clif::Type.Int32)
     let checked = mut fx.choose(read, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
@@ -417,38 +495,54 @@ fn codecs_canonical(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let read = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: 0)
     let results = fx.types1(clif::Type.Int32)
     let checked = mut fx.choose(read, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
-        let function = encoder(mut lo, format: Format.Wire, ty)
-        let size = codecs_measure(mut lo, fx: mut fx1, function, value)
+        let function = canonical_writer(mut lo, ty)
         let alloc = mut fx1.load(PTR, addr: supply.param(1).address_value(), offset: 0)
-        vector_empty(mut fx1, address: bytes, alloc, element: CODECS_BYTE)
-        let drawn = vector_resize(mut lo, fx: mut fx1, address: bytes, capacity: size, element: CODECS_BYTE)
-        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
-        mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
-            mut lo.release(mut fx2, ty, address: value)
-        })
-        let written_types = fx1.types1(clif::Type.Int32)
-        return mut fx1.choose(failed, results: written_types.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let exhausted = mut fx2.int(clif::Type.Int32, value: FAILURE_OUT_OF_MEMORY)
-            return fx2.list1(exhausted)
-        }, otherwise: fn[mut lo](mut fx2: Fx) -> mem::List[clif::Value] {
-            let state = mut fx2.slot(WRITER_SIZE, align: 8)
-            let data = mut fx2.load(PTR, addr: bytes, offset: VECTOR_DATA)
-            mut fx2.store(data, addr: state, offset: WRITER_BUFFER)
-            let zero = mut fx2.ptr(0)
-            mut fx2.store(zero, addr: state, offset: WRITER_LEN)
-            let call_args = fx2.list2(value, b: state)
-            discard codecs_call(mut lo, fx: mut fx2, function, args: call_args.view())
-            mut fx2.store(size, addr: bytes, offset: VECTOR_LEN)
-            mut lo.release(mut fx2, ty, address: value)
-            let none = mut fx2.int(clif::Type.Int32, value: 0)
-            return fx2.list1(none)
-        })
+        let args = fx1.list3(value, b: alloc, c: bytes)
+        if reaches_itself(mut lo, ty) {
+            return fx1.list1(mut lo.nested_call(mut fx1, function, args: args.view()))
+        }
+        let codes = codecs_call(mut lo, fx: mut fx1, function, args: args.view())
+        expect codes.len() == 1
+        return fx1.list1(codes[0])
     }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
         return fx1.list1(code)
     })
     expect checked.len() == 1
     codecs_returned(mut lo, mut fx, supply, ty: result, target: bytes, code: checked[0])
 } codecs_canonical
+
+/// The function writing the canonical encoding of a value of a type, given its address, the
+/// allocator and the address of the bytes to make, then releasing the value: zero, or
+/// `OutOfMemory`'s code when the bytes cannot be drawn.
+fn canonical_writer(mut lo: Lowering, ty: ty::Ty) -> object::FuncId {
+    return mut lo.glue_function(Glue.Canonical(ty), signature: nested_signature(lo.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 3
+        let value = params[0]
+        let alloc = params[1]
+        let bytes = params[2]
+        let function = encoder(mut lo1, format: Format.Wire, ty)
+        let size = codecs_measure(mut lo1, fx: mut fx1, function, value)
+        vector_empty(mut fx1, address: bytes, alloc, element: CODECS_BYTE)
+        let drawn = vector_resize(mut lo1, fx: mut fx1, address: bytes, capacity: size, element: CODECS_BYTE)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo1](mut fx2: Fx) {
+            mut lo1.release(mut fx2, ty, address: value)
+            codecs_fail(mut fx2, code: FAILURE_OUT_OF_MEMORY)
+        })
+        let state = mut fx1.slot(WRITER_SIZE, align: 8)
+        let data = mut fx1.load(PTR, addr: bytes, offset: VECTOR_DATA)
+        mut fx1.store(data, addr: state, offset: WRITER_BUFFER)
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: state, offset: WRITER_LEN)
+        let call_args = fx1.list2(value, b: state)
+        discard codecs_call(mut lo1, fx: mut fx1, function, args: call_args.view())
+        mut fx1.store(size, addr: bytes, offset: VECTOR_LEN)
+        mut lo1.release(mut fx1, ty, address: value)
+        let none = mut fx1.int(clif::Type.Int32, value: 0)
+        mut fx1.b.ret(fx1.list1(none).view())
+    })
+} canonical_writer
 
 /// The address of the schema hash of a type, as read-only data.
 fn schema_hash_address(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) -> clif::Value {
@@ -621,11 +715,7 @@ fn codecs_decode_constant(mut lo: Lowering, mut fx: Fx, encoding: Slice[u8], ty:
     mut fx.store(end, addr: state, offset: READER_END)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: state, offset: READER_DEPTH)
-    let function = decoder(mut lo, format: DecodeFormat.Wire, ty)
-    let call_args = fx.list3(state, b: alloc, c: target)
-    let codes = codecs_call(mut lo, mut fx, function, args: call_args.view())
-    expect codes.len() == 1
-    return codes[0]
+    return decode_entry(mut lo, mut fx, format: DecodeFormat.Wire, ty, args: fx.list3(state, b: alloc, c: target).view())
 } codecs_decode_constant
 
 /// `Codec.erased()`: the type's schema hash and, for each other field, the member of `Codec` of

@@ -31,6 +31,10 @@ enum StackKind {
     /// A grown call: a call of a wrapper, which calls its thunk through the support routine
     /// growing the stack, the thunk making the call `inner` describes.
     Grown(wrapper: object::FuncId, thunk: object::FuncId, inner: mem::Box[StackKind])
+    /// A nested call: a call of the support routine running a function on a stack with room for
+    /// its need, until lowering finds that need bounded and makes it a call of a support routine;
+    /// unbounded.
+    Nested(object::FuncId)
 } StackKind
 
 /// A grown call's thunk and the lowered function it calls, none for a function value's code.
@@ -370,6 +374,7 @@ fn Judge.site(mut self, all_frames: Slice[Frame], kind: StackKind, bounds: Slice
             }
         }
         StackKind.Bounded(stack_bound) => return bounded_use(stack_bound, alloc: self.alloc)
+        StackKind.Nested(_) => return Use.Unbounded(mem::List[CallStep].empty(self.alloc))
         StackKind.Param(position) => return bound_use(param_bound(bounds, position, alloc: self.alloc), alloc: self.alloc)
         StackKind.Direct(callee: callee, bindings: bindings) => {
             var callee_bounds = self.own_of(all_frames, function: callee)
@@ -455,7 +460,7 @@ fn Judge.subject(self, all_frames: Slice[Frame], kind: StackKind) -> text::Strin
         StackKind.Direct(callee: callee, bindings: _) => self.name(all_frames, function: callee)
         StackKind.Param(_) => text::String.of("parameter", alloc: self.alloc)
         StackKind.Bounded(_) => text::String.of("function value", alloc: self.alloc)
-        StackKind.Stub => text::String.empty(self.alloc)
+        StackKind.Stub or StackKind.Nested(_) => text::String.empty(self.alloc)
         StackKind.Grown(wrapper: _, thunk: _, inner: inner) => self.subject(all_frames, kind: inner.contents())
     }
 } Judge.subject
@@ -562,7 +567,7 @@ fn Segments.segment(mut self, all_frames: Slice[Frame], function: object::FuncId
     var deepest: Option[u64] = Some(0)
     for site in frame.sites {
         let used = match site.kind {
-            StackKind.Stub => Some(STUB_CALL_BOUND)
+            StackKind.Stub or StackKind.Nested(_) => Some(STUB_CALL_BOUND)
             StackKind.Grown(wrapper: wrapper, thunk: _, inner: _) => Some(self.size(all_frames, function: wrapper) + STUB_CALL_BOUND)
             StackKind.Bounded(stack_bound) => stack_bound
             StackKind.Param(position_param) => param_stack(frame.params.view(), position: position_param)
@@ -654,3 +659,204 @@ fn stack_diagnostic(ck: check::Checker, at: At, code: diagnostic::Code, take bec
     reported.because = because
     return Some(take reported)
 } stack_diagnostic
+
+/// The most nestings of a decoding, each of which every cycle of decoding functions' calls of
+/// each other passes, and the one outside them.
+const NESTINGS: u64 = 129
+
+/// The stack a nested call of `function` needs: along each path of calls, the frames of the
+/// functions outside a cycle of calls once, and those of each cycle of `nesting` functions once
+/// per nesting; none when a path reaches a cycle holding another function or an unbounded call
+/// site.
+fn nested_need(all_frames: Slice[Frame], function: object::FuncId, nesting: mem::HashMap[object::FuncId, Unit], alloc: mem::Alloc) -> Option[u64] {
+    var positions = mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc)
+    for index in 0..<all_frames.len() {
+        discard mut positions.insert(all_frames[index].function, value: index)
+    }
+    var components = Components(positions: take positions, index: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), low: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), stack: mem::List[object::FuncId].empty(alloc), of: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), members: mem::List[mem::List[object::FuncId]].empty(alloc), alloc: alloc)
+    mut components.visit(all_frames, function)
+    var known = mem::HashMap[usize, Option[u64]].empty(seed: 0, alloc)
+    let Some(component) = components.of.get(function) else {
+        return None
+    }
+    return components.deepest(all_frames, nesting, component, mut known)
+} nested_need
+
+/// The strongly connected components of the calls from a function, numbered as they complete,
+/// each callee's before its caller's.
+struct Components {
+    positions: mem::HashMap[object::FuncId, usize]
+    index: mem::HashMap[object::FuncId, usize]
+    low: mem::HashMap[object::FuncId, usize]
+    stack: mem::List[object::FuncId]
+    of: mem::HashMap[object::FuncId, usize]
+    members: mem::List[mem::List[object::FuncId]]
+    alloc: mem::Alloc
+} Components
+
+fn Components.visit(mut self, all_frames: Slice[Frame], function: object::FuncId) {
+    let number = self.index.len()
+    discard mut self.index.insert(function, value: number)
+    discard mut self.low.insert(function, value: number)
+    mut self.stack.push(function)
+    for callee in self.callees(all_frames, function) {
+        if not self.index.contains(callee) {
+            mut self.visit(all_frames, function: callee)
+            let low = lesser_number(self.low.get(function), right: self.low.get(callee))
+            discard mut self.low.insert(function, value: low)
+        } else if self.stack.position(fn(held: object::FuncId) => held == callee).is_some() {
+            let low = lesser_number(self.low.get(function), right: self.index.get(callee))
+            discard mut self.low.insert(function, value: low)
+        }
+    }
+    if self.low.get(function) == self.index.get(function) {
+        var members = mem::List[object::FuncId].empty(self.alloc)
+        loop {
+            let Some(member) = mut self.stack.pop() else {
+                expect false
+                return
+            }
+            discard mut self.of.insert(member, value: self.members.len())
+            mut members.push(member)
+            if member == function {
+                break
+            }
+        }
+        mut self.members.push(take members)
+    }
+} Components.visit
+
+/// The lesser of two numbers a component search holds.
+fn lesser_number(left: Option[usize], right: Option[usize]) -> usize {
+    let Some(left_number) = left else {
+        expect false
+        return 0
+    }
+    let Some(right_number) = right else {
+        expect false
+        return 0
+    }
+    if right_number < left_number {
+        return right_number
+    }
+    return left_number
+} lesser_number
+
+/// The functions a function calls directly, through grown calls among them.
+fn Components.callees(self, all_frames: Slice[Frame], function: object::FuncId) -> mem::List[object::FuncId] {
+    var called = mem::List[object::FuncId].empty(self.alloc)
+    let Some(position) = self.positions.get(function) else {
+        return called
+    }
+    expect position < all_frames.len()
+    for site in all_frames[position].sites {
+        match direct_callee(site.kind) {
+            Some(callee) => mut called.push(callee)
+            None => {}
+        }
+    }
+    return called
+} Components.callees
+
+/// The function a call site calls directly, a grown call's included.
+fn direct_callee(kind: StackKind) -> Option[object::FuncId] {
+    return match kind {
+        StackKind.Direct(callee: callee, bindings: _) => Some(callee)
+        StackKind.Grown(wrapper: _, thunk: _, inner: inner) => direct_callee(inner.contents())
+        else => None
+    }
+} direct_callee
+
+/// The frame size of a function, 0 for one without a frame.
+fn Components.size(self, all_frames: Slice[Frame], function: object::FuncId) -> u64 {
+    let Some(position) = self.positions.get(function) else {
+        return 0
+    }
+    expect position < all_frames.len()
+    return all_frames[position].size
+} Components.size
+
+/// The deepest stack a call of a component's functions uses: its frames, once per nesting for a
+/// cycle, then its deepest call leaving it.
+fn Components.deepest(self, all_frames: Slice[Frame], nesting: mem::HashMap[object::FuncId, Unit], component: usize, mut known: mem::HashMap[usize, Option[u64]]) -> Option[u64] {
+    match known.get(component) {
+        Some(used) => return used
+        None => {}
+    }
+    expect component < self.members.len()
+    let members = self.members[component]
+    var cyclic = members.len() > 1
+    var outside = false
+    for member in members {
+        if self.callees(all_frames, function: member).position(fn(callee: object::FuncId) => callee == member).is_some() {
+            cyclic = true
+        }
+        if not nesting.contains(member) {
+            outside = true
+        }
+    }
+    if cyclic and outside {
+        discard mut known.insert(component, value: None)
+        return None
+    }
+    var own: u64 = 0
+    var leaving: Option[u64] = Some(0)
+    for member in members {
+        let Some(position) = self.positions.get(member) else {
+            own += STUB_CALL_BOUND
+            continue
+        }
+        expect position < all_frames.len()
+        let frame = all_frames[position]
+        var size = frame.size
+        for site in frame.sites {
+            match site.kind {
+                StackKind.Grown(wrapper: wrapper, thunk: thunk, inner: _) => {
+                    let carried = self.size(all_frames, function: wrapper) + STUB_CALL_BOUND + self.size(all_frames, function: thunk)
+                    if frame.size + carried > size {
+                        size = frame.size + carried
+                    }
+                }
+                else => {}
+            }
+            leaving = segment_max(leaving, right: self.site_need(all_frames, nesting, component, kind: site.kind, mut known))
+        }
+        own += size
+    }
+    var rounds: u64 = 1
+    if cyclic {
+        rounds = NESTINGS
+    }
+    var used: Option[u64] = None
+    match leaving {
+        Some(bytes) => {
+            used = Some(own * rounds + bytes)
+        }
+        None => {}
+    }
+    discard mut known.insert(component, value: used)
+    return used
+} Components.deepest
+
+/// The stack a call site of a component's function uses: none for a call through its own
+/// parameter, nothing for a call within the component.
+fn Components.site_need(self, all_frames: Slice[Frame], nesting: mem::HashMap[object::FuncId, Unit], component: usize, kind: StackKind, mut known: mem::HashMap[usize, Option[u64]]) -> Option[u64] {
+    match kind {
+        StackKind.Stub or StackKind.Nested(_) => return Some(STUB_CALL_BOUND)
+        StackKind.Bounded(stack_bound) => return stack_bound
+        StackKind.Param(_) => return None
+        else => {}
+    }
+    let Some(callee) = direct_callee(kind) else {
+        expect false
+        return None
+    }
+    let Some(target) = self.of.get(callee) else {
+        expect false
+        return None
+    }
+    if target == component {
+        return Some(0)
+    }
+    return self.deepest(all_frames, nesting, component: target, mut known)
+} Components.site_need

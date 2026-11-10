@@ -2,8 +2,11 @@
 //! each return address in the line tables, and writes at most 15 lines: the kind and location,
 //! the source line, the operands, and one line per caller outside std, innermost first.
 //!
-//! A report is written into a record on the trap routine's stack: its length, then its bytes.
-//! The scalar and text routines, and the glue writing values of other types, append to it.
+//! A report is written into a buffer: its length, then its bytes, then the room for the frames
+//! the walk reads. The scalar and text routines, and the glue writing values of other types,
+//! append to it. A trap a domain contains writes its report into the domain's trap record, once,
+//! and a trap or halt ending the run into the image's final report, which on a kernel the CPU
+//! that stops the others takes and elsewhere the first trap claims.
 
 pub mod values;
 
@@ -12,6 +15,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::Variable;
 
+use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
 use super::super::lines::{self, ENTRY_RECORD, FUNCTION_RECORD, LOCATION_RECORD};
 use super::super::stack::{Family, Kind};
@@ -25,6 +29,20 @@ pub const REPORT: u64 = 4_096;
 
 /// The most frames a walk reads.
 const FRAMES: u64 = 64;
+
+/// The bytes of the buffer a report is written into: its length, its bytes and the frames the
+/// walk reads.
+const BUFFER: u64 = 8 + REPORT + FRAMES * 16;
+
+/// The bytes of a trap record: its kind, then the buffer of its report.
+pub const TRAP_RECORD: u64 = trap_record::LEN + BUFFER;
+
+/// The image's final report: whether a trap claimed it, then the buffer of its report.
+const FINAL_REPORT: Reserved = Reserved {
+    name: "_NSfinal_report",
+    size: 8 + BUFFER,
+    align: 8,
+};
 
 /// The most lines a report holds.
 const LINES: u64 = 15;
@@ -40,8 +58,9 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::TrapReport => {
             let params = fx.entry();
             let zero = fx.ptr(0);
-            let report = write(lo, fx, params[0], zero, zero, zero);
-            fill(lo, fx, params[1], params[0], report);
+            let out = fx.b.ins().iadd_imm_s(params[1], trap_record::LEN as i64);
+            write(lo, fx, out, params[0], zero, zero, zero);
+            fx.store(params[0], params[1], trap_record::KIND);
             fx.b.ins().return_(&[]);
         }
         Routine::ReportScalar => {
@@ -572,12 +591,12 @@ fn location_record(fx: &mut Fx, tables: Value, number: Value) -> Value {
     fx.b.ins().select(has, location, zero)
 }
 
-/// `TrapRaise(kind, operands, count, caller)`: writes the report of a trap of the running task
-/// and abandons its `sys::Domain` body domain, or ends the process domain with status 70.
+/// `TrapRaise(kind, operands, count, caller)`: abandons the `sys::Domain` body domain of the
+/// running task, its first trap writing its report into the domain's trap record, or ends the
+/// process domain with status 70 and the report.
 fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (kind, operands, count, caller) = (params[0], params[1], params[2], params[3]);
-    let report = write(lo, fx, kind, operands, count, caller);
     let task = tasks::current_task(lo, fx);
     let domain = tasks::current_domain(lo, fx);
     let state_address = lo.state(fx);
@@ -585,22 +604,71 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, task, 0);
     let nested = fx.b.ins().icmp(IntCC::NotEqual, domain, process);
     let contained = fx.b.ins().band(inside, nested);
+    let first = fx.choose(
+        contained,
+        &[types::I8],
+        |fx| {
+            let flag = fx.offset(domain, tasks::domain::ABANDONED);
+            let zero = fx.ptr(0);
+            let one = fx.ptr(1);
+            let seen =
+                fx.b.ins()
+                    .atomic_cas(MemFlagsData::trusted(), flag, zero, one);
+            vec![fx.b.ins().icmp_imm_s(IntCC::Equal, seen, 0)]
+        },
+        |fx| vec![fx.int(types::I8, 0)],
+    )[0];
+    let later = fx.b.ins().bxor_imm_s(first, 1);
+    let later = fx.b.ins().band(contained, later);
+    fx.when(later, |fx| stop(lo, fx, task));
+    let out = fx.choose_in(
+        lo,
+        contained,
+        &[PTR],
+        |_, fx| {
+            let record = fx.load(PTR, domain, tasks::domain::TRAP);
+            vec![fx.b.ins().iadd_imm_s(record, trap_record::LEN as i64)]
+        },
+        |lo, fx| vec![final_report(lo, fx)],
+    )[0];
+    let report = write(lo, fx, out, kind, operands, count, caller);
     fx.when(contained, |fx| abandon(lo, fx, task, domain, kind, report));
     end_with(lo, fx, report);
 }
 
-/// Writes, on the running routine's stack, the report of a trap of a kind located at the call of
-/// the routine's caller, with the operands of a record when `count` is not 0, the location
-/// record at `caller` its first caller line when not 0, and its replay token in a test image.
+/// The buffer of the image's final report, for a trap or halt ending the run: on a kernel once
+/// its other CPUs stop, and otherwise once a trap claims it, a later one waiting for the end.
+fn final_report(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    let address = lo.reserved(fx, FINAL_REPORT);
+    if lo.on_cpus() {
+        lo.stop_other_cpus(fx);
+    } else {
+        let zero = fx.ptr(0);
+        let one = fx.ptr(1);
+        let seen =
+            fx.b.ins()
+                .atomic_cas(MemFlagsData::trusted(), address, zero, one);
+        let later = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
+        fx.when(later, |fx| {
+            fx.repeat(&[], |fx, _| (fx.int(types::I8, 1), Vec::new()));
+        });
+    }
+    fx.b.ins().iadd_imm_s(address, 8)
+}
+
+/// Writes into a buffer the report of a trap of a kind located at the call of the routine's
+/// caller, with the operands of a record when `count` is not 0, the location record at `caller`
+/// its first caller line when not 0, and its replay token in a test image.
 fn write(
     lo: &mut Lowering,
     fx: &mut Fx,
+    out: Value,
     kind: Value,
     operands: Value,
     count: Value,
     caller: Value,
 ) -> Report {
-    let frames = fx.slot(FRAMES * 16, 8);
+    let frames = fx.b.ins().iadd_imm_s(out, (8 + REPORT) as i64);
     let frame_pointer = fx.b.ins().get_frame_pointer(PTR);
     let zero = fx.ptr(0);
     let walked = fx.repeat(&[frame_pointer, zero, zero, zero, zero], |fx, state| {
@@ -666,7 +734,6 @@ fn write(
         let index = fx.b.ins().select(again, next, index);
         (again, vec![index])
     })[0];
-    let out = fx.slot(8 + REPORT, 8);
     fx.store(zero, out, 0);
     let report = Report { out };
     let kinds = lo.kind_names(fx);
@@ -800,13 +867,9 @@ fn write(
     report
 }
 
-/// Ends the process, or halts a machine's kernel, with a report written: a kernel first stops its
-/// other CPUs, and on a machine target the serial port is programmed again, as code may have
-/// reprogrammed it.
+/// Ends the process, or halts a machine's kernel, with the final report written: on a machine
+/// target the serial port is programmed again, as code may have reprogrammed it.
 fn end_with(lo: &mut Lowering, fx: &mut Fx, report: Report) {
-    if lo.on_cpus() {
-        lo.stop_other_cpus(fx);
-    }
     if lo.machine() && !lo.user() {
         lo.serial_init(fx);
     }
@@ -840,7 +903,7 @@ pub fn halt(
     location: Value,
     operand: Option<(&str, Value)>,
 ) {
-    let out = fx.slot(8 + REPORT, 8);
+    let out = final_report(lo, fx);
     let zero = fx.ptr(0);
     fx.store(zero, out, 0);
     let report = Report { out };
@@ -870,9 +933,9 @@ pub fn halt(
     end_with(lo, fx, report);
 }
 
-/// Abandons the `sys::Domain` body domain of a trapping task: the first trap of the domain
-/// writes its report into the domain's trap record and wakes the task waiting for the domain,
-/// which settles it; the trapping task releases the locks its thread holds for it and stops.
+/// Abandons the `sys::Domain` body domain of a trapping task, whose first trap wrote its report
+/// into the domain's trap record: records the kind and wakes the task waiting for the domain,
+/// which settles it; then stops the task.
 fn abandon(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -881,34 +944,22 @@ fn abandon(
     kind: Value,
     report: Report,
 ) {
-    let flag = fx.offset(domain, tasks::domain::ABANDONED);
-    let zero = fx.ptr(0);
-    let one = fx.ptr(1);
-    let seen =
+    let record =
         fx.b.ins()
-            .atomic_cas(MemFlagsData::trusted(), flag, zero, one);
-    let first = fx.b.ins().icmp_imm_s(IntCC::Equal, seen, 0);
-    fx.when(first, |fx| {
-        let record = fx.load(PTR, domain, tasks::domain::TRAP);
-        fill(lo, fx, record, kind, report);
-        let lock = fx.offset(domain, tasks::domain::LOCK);
-        lo.call_routine(fx, Routine::Lock, &[lock]);
-        let waiter = fx.load(PTR, domain, tasks::domain::WAITER);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
-        lo.call_routine(fx, Routine::Wake, &[waiter]);
-    });
-    super::locks::release_held(lo, fx);
-    tasks::stop_running(lo, fx, task);
+            .iadd_imm_s(report.out, -(trap_record::LEN as i64));
+    fx.store(kind, record, trap_record::KIND);
+    let lock = fx.offset(domain, tasks::domain::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let waiter = fx.load(PTR, domain, tasks::domain::WAITER);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    lo.call_routine(fx, Routine::Wake, &[waiter]);
+    stop(lo, fx, task);
 }
 
-/// Fills a trap record with a kind and a report written.
-fn fill(lo: &mut Lowering, fx: &mut Fx, record: Value, kind: Value, report: Report) {
-    fx.store(kind, record, trap_record::KIND);
-    let len = fx.load(PTR, report.out, 0);
-    fx.store(len, record, trap_record::LEN);
-    let target = fx.offset(record, trap_record::BYTES);
-    let bytes = fx.b.ins().iadd_imm_s(report.out, 8);
-    lo.call_routine(fx, Routine::Copy, &[target, bytes, len]);
+/// Stops a trapping task, which releases the locks its thread holds for it first.
+fn stop(lo: &mut Lowering, fx: &mut Fx, task: Value) {
+    super::locks::release_held(lo, fx);
+    tasks::stop_running(lo, fx, task);
 }
 
 /// Traps with a kind and no operands, from code lowering writes itself.

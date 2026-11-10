@@ -34,7 +34,7 @@ pub struct Data {
     next: u32,
 }
 
-/// A writable data object of zeros a machine image reserves: its name, size and alignment.
+/// A writable data object of zeros an image reserves: its name, size and alignment.
 #[derive(Clone, Copy)]
 pub struct Reserved {
     pub name: &'static str,
@@ -97,8 +97,8 @@ impl Lowering<'_, '_> {
         self.define_data(kind, image, 8)
     }
 
-    /// The writable data object of zeros a machine image reserves under a name, declared once;
-    /// a bundle imports it from its kernel.
+    /// The writable data object of zeros an image reserves under a name, declared once; a bundle
+    /// imports it from its kernel.
     pub fn reserved_data(&mut self, data: Reserved) -> DataId {
         let Reserved { name, size, align } = data;
         if let Some(id) = self.reserved.get(name) {
@@ -124,7 +124,7 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The address of the writable data object of zeros a machine image reserves under a name.
+    /// The address of the writable data object of zeros an image reserves under a name.
     pub fn reserved(&mut self, fx: &mut Fx, data: Reserved) -> Value {
         let id = self.reserved_data(data);
         self.data_address(fx, id)

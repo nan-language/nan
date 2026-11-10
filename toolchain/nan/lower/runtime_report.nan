@@ -1,10 +1,20 @@
-//! Trap reports: the trap routine walks the frame pointers from the trapping operation, finds each return address in the line tables, and writes at most 15 lines: the kind and location, the source line, the operands, and one line per caller outside std, innermost first. A report is written into a record on the trap routine's stack: its length, then its bytes. The scalar and text routines, and the glue writing values of other types, append to it.
+//! Trap reports: the trap routine walks the frame pointers from the trapping operation, finds each return address in the line tables, and writes at most 15 lines: the kind and location, the source line, the operands, and one line per caller outside std, innermost first. A report is written into a buffer: its length, then its bytes, then the room for the frames the walk reads. The scalar and text routines, and the glue writing values of other types, append to it. A trap a domain contains writes its report into the domain's trap record, once, and a trap or halt ending the run into the image's final report, which on a kernel the CPU that stops the others takes and elsewhere the first trap claims.
 
 /// The most bytes a report holds.
 const REPORT_REPORT: u64 = 4_096
 
 /// The most frames a walk reads.
 const REPORT_FRAMES: u64 = 64
+
+/// The bytes of the buffer a report is written into: its length, its bytes and the frames the
+/// walk reads.
+const REPORT_BUFFER: u64 = 8 + REPORT_REPORT + REPORT_FRAMES * 16
+
+/// The bytes of a trap record: its kind, then the buffer of its report.
+const REPORT_TRAP_RECORD: u64 = TRAP_RECORD_LEN + REPORT_BUFFER
+
+/// The image's final report: whether a trap claimed it, then the buffer of its report.
+const FINAL_REPORT_SYMBOL: Str = "_NSfinal_report"
 
 /// The most lines a report holds.
 const REPORT_LINES: u64 = 15
@@ -22,8 +32,9 @@ fn report_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
             let params = mut fx.entry()
             expect params.len() > 1
             let zero = mut fx.ptr(0)
-            let report = report_write(mut lo, mut fx, kind: params[0], operands: zero, count: zero, caller: zero)
-            report_fill(mut lo, mut fx, record: params[1], kind: params[0], report)
+            let out = mut fx.b.iadd_imm_s(params[1], y: i64.fit(TRAP_RECORD_LEN))
+            discard report_write(mut lo, mut fx, out, kind: params[0], operands: zero, count: zero, caller: zero)
+            mut fx.store(params[0], addr: params[1], offset: TRAP_RECORD_KIND)
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
         Routine.ReportScalar => {
@@ -593,13 +604,13 @@ fn shown_frame(mut fx: Fx, frames: clif::Value, index: clif::Value) -> ShownFram
     return ShownFrame(location: location, shown: shown)
 } shown_frame
 
-/// `TrapRaise(kind, operands, count, caller)`: writes the report of a trap of the running task
-/// and abandons its `sys::Domain` body domain, or ends the process domain with status 70.
+/// `TrapRaise(kind, operands, count, caller)`: abandons the `sys::Domain` body domain of the
+/// running task, its first trap writing its report into the domain's trap record, or ends the
+/// process domain with status 70 and the report.
 fn report_raise(mut lo: Lowering, mut fx: Fx) {
     let params = mut fx.entry()
     expect params.len() > 3
     let kind = params[0]
-    let report = report_write(mut lo, mut fx, kind, operands: params[1], count: params[2], caller: params[3])
     let task = current_task(mut lo, mut fx)
     let domain = current_domain(mut lo, mut fx)
     let state_address = mut lo.state(mut fx)
@@ -607,19 +618,63 @@ fn report_raise(mut lo: Lowering, mut fx: Fx) {
     let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: task, y: 0)
     let nested = mut fx.b.icmp(clif::IntCC.NotEqual, x: domain, y: process)
     let contained = mut fx.b.band(inside, y: nested)
+    let claimed = mut fx.choose(contained, results: fx.types1(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let flag = mut fx1.offset(domain, offset: DOMAIN_ABANDONED)
+        let zero = mut fx1.ptr(0)
+        let one = mut fx1.ptr(1)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero, x: one)
+        return fx1.list1(mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: 0))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.int(clif::Type.Int8, value: 0))
+    })
+    expect claimed.len() > 0
+    let unclaimed = mut fx.b.bxor_imm_s(claimed[0], y: 1)
+    let later = mut fx.b.band(contained, y: unclaimed)
+    mut fx.if_true(later, then: fn[mut lo](mut fx1: Fx) {
+        report_stop(mut lo, fx: mut fx1, task)
+    })
+    let buffers = mut fx.choose_in(mut lo, condition: contained, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let record = mut fx1.load(PTR, addr: domain, offset: DOMAIN_TRAP)
+        return fx1.list1(mut fx1.b.iadd_imm_s(record, y: i64.fit(TRAP_RECORD_LEN)))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(final_report(mut lo1, fx: mut fx1))
+    })
+    expect buffers.len() > 0
+    let report = report_write(mut lo, mut fx, out: buffers[0], kind, operands: params[1], count: params[2], caller: params[3])
     mut fx.if_true(contained, then: fn[mut lo](mut fx1: Fx) {
         report_abandon(mut lo, fx: mut fx1, task, domain, kind, report)
     })
     end_with(mut lo, mut fx, report)
 } report_raise
 
-/// Writes, on the running routine's stack, the report of a trap of a kind located at the call of
-/// the routine's caller, with the operands of a record when `count` is not 0, the location
-/// record at `caller` its first caller line when not 0, and its replay token in a test image.
-fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif::Value, count: clif::Value, caller: clif::Value) -> ReportReport
+/// The buffer of the image's final report, for a trap or halt ending the run: on a kernel once
+/// its other CPUs stop, and otherwise once a trap claims it, a later one waiting for the end.
+fn final_report(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let address = mut lo.reserved(mut fx, data_name: FINAL_REPORT_SYMBOL, size: 8 + REPORT_BUFFER, align: 8)
+    if lo.on_cpus() {
+        mut lo.stop_other_cpus(mut fx)
+    } else {
+        let zero = mut fx.ptr(0)
+        let one = mut fx.ptr(1)
+        let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: address, e: zero, x: one)
+        let later = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx.if_true(later, then: fn(mut fx1: Fx) {
+            discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+                let again = mut fx2.int(clif::Type.Int8, value: 1)
+                return Pass(again: again, next: mem::List[clif::Value].empty(fx2.alloc))
+            })
+        })
+    }
+    return mut fx.b.iadd_imm_s(address, y: 8)
+} final_report
+
+/// Writes into a buffer the report of a trap of a kind located at the call of the routine's
+/// caller, with the operands of a record when `count` is not 0, the location record at `caller`
+/// its first caller line when not 0, and its replay token in a test image.
+fn report_write(mut lo: Lowering, mut fx: Fx, out: clif::Value, kind: clif::Value, operands: clif::Value, count: clif::Value, caller: clif::Value) -> ReportReport
     waive length "one routine writing the report's lines in order, as the Rust writes them"
 {
-    let frames = mut fx.slot(REPORT_FRAMES * 16, align: 8)
+    let frames = mut fx.b.iadd_imm_s(out, y: i64.fit(8 + REPORT_REPORT))
     let frame_pointer = mut fx.b.get_frame_pointer(PTR)
     let zero = mut fx.ptr(0)
     let walk = mut fx.repeat(fx.list5(frame_pointer, b: zero, c: zero, d: zero, e: zero).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
@@ -687,7 +742,6 @@ fn report_write(mut lo: Lowering, mut fx: Fx, kind: clif::Value, operands: clif:
         return Pass(again: again, next: fx1.list1(chosen))
     })
     let first_visible = visible[0]
-    let out = mut fx.slot(8 + REPORT_REPORT, align: 8)
     mut fx.store(zero, addr: out, offset: 0)
     let report = ReportReport(out: out)
     let kinds = mut lo.kind_names(mut fx)
@@ -814,13 +868,9 @@ fn write_operand(mut lo: Lowering, mut fx: Fx, report: ReportReport, operands: c
     })
 } write_operand
 
-/// Ends the process, or halts a machine's kernel, with a report written: a kernel first stops
-/// its other CPUs, and on a machine target the serial port is programmed again, as code may
-/// have reprogrammed it.
+/// Ends the process, or halts a machine's kernel, with the final report written: on a machine
+/// target the serial port is programmed again, as code may have reprogrammed it.
 fn end_with(mut lo: Lowering, mut fx: Fx, report: ReportReport) {
-    if lo.on_cpus() {
-        mut lo.stop_other_cpus(mut fx)
-    }
     if lo.machine() and not lo.user() {
         mut lo.serial_init(mut fx)
     }
@@ -855,7 +905,7 @@ view struct HaltOperand {
 /// form of a trap report with `halt` and the cause in place of the trap kind and, given an
 /// operand, its line, then ends the machine with status 70.
 fn halt(mut lo: Lowering, mut fx: Fx, cause: Str, location: clif::Value, operand: Option[HaltOperand]) {
-    let out = mut fx.slot(8 + REPORT_REPORT, align: 8)
+    let out = final_report(mut lo, mut fx)
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: out, offset: 0)
     let report = ReportReport(out: out)
@@ -882,37 +932,25 @@ fn halt(mut lo: Lowering, mut fx: Fx, cause: Str, location: clif::Value, operand
     end_with(mut lo, mut fx, report)
 } halt
 
-/// Abandons the `sys::Domain` body domain of a trapping task: the first trap of the domain
-/// writes its report into the domain's trap record and wakes the task waiting for the domain,
-/// which settles it; the trapping task releases the locks its thread holds for it and stops.
+/// Abandons the `sys::Domain` body domain of a trapping task, whose first trap wrote its report
+/// into the domain's trap record: records the kind and wakes the task waiting for the domain,
+/// which settles it; then stops the task.
 fn report_abandon(mut lo: Lowering, mut fx: Fx, task: clif::Value, domain: clif::Value, kind: clif::Value, report: ReportReport) {
-    let flag = mut fx.offset(domain, offset: DOMAIN_ABANDONED)
-    let zero = mut fx.ptr(0)
-    let one = mut fx.ptr(1)
-    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero, x: one)
-    let first_trap = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: 0)
-    mut fx.if_true(first_trap, then: fn[mut lo](mut fx1: Fx) {
-        let record = mut fx1.load(PTR, addr: domain, offset: DOMAIN_TRAP)
-        report_fill(mut lo, fx: mut fx1, record, kind, report)
-        let lock = mut fx1.offset(domain, offset: DOMAIN_LOCK)
-        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
-        let waiter = mut fx1.load(PTR, addr: domain, offset: DOMAIN_WAITER)
-        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
-        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: fx1.list1(waiter).view())
-    })
-    locks_release_held(mut lo, mut fx)
-    stop_running(mut lo, mut fx, record: task)
+    let record = mut fx.b.iadd_imm_s(report.out, y: -i64.fit(TRAP_RECORD_LEN))
+    mut fx.store(kind, addr: record, offset: TRAP_RECORD_KIND)
+    let lock = mut fx.offset(domain, offset: DOMAIN_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let waiter = mut fx.load(PTR, addr: domain, offset: DOMAIN_WAITER)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: fx.list1(waiter).view())
+    report_stop(mut lo, mut fx, task)
 } report_abandon
 
-/// Fills a trap record with a kind and a report written.
-fn report_fill(mut lo: Lowering, mut fx: Fx, record: clif::Value, kind: clif::Value, report: ReportReport) {
-    mut fx.store(kind, addr: record, offset: TRAP_RECORD_KIND)
-    let len = mut fx.load(PTR, addr: report.out, offset: 0)
-    mut fx.store(len, addr: record, offset: TRAP_RECORD_LEN)
-    let target = mut fx.offset(record, offset: TRAP_RECORD_BYTES)
-    let bytes = mut fx.b.iadd_imm_s(report.out, y: 8)
-    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(target, b: bytes, c: len).view())
-} report_fill
+/// Stops a trapping task, which releases the locks its thread holds for it first.
+fn report_stop(mut lo: Lowering, mut fx: Fx, task: clif::Value) {
+    locks_release_held(mut lo, mut fx)
+    stop_running(mut lo, mut fx, record: task)
+} report_stop
 
 /// Traps with a kind and no operands, from code lowering writes itself.
 fn raise_kind(mut lo: Lowering, mut fx: Fx, kind: Str) {

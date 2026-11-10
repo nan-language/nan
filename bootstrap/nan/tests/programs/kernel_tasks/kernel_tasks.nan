@@ -1,11 +1,11 @@
-//! Starts tasks bounded to 4 KiB of stack that all sleep at once, then writes that they ended.
+//! Starts tasks bounded to 4 KiB of stack that each wait to send on a channel only received from once all have started, then writes that they ended.
 
 registers Uart {
     data: u8 at 0x0 write
 } Uart
 
 /// The tasks alive at once.
-const TASKS: u32 = 400
+const TASKS: u32 = 600
 
 fn say(text: Str) {
     var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
@@ -16,13 +16,20 @@ fn say(text: Str) {
 } say
 
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
-    let clock = k.clock()
+    let alloc = k.alloc()
     take k.anchor(0u8, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
-        try await task::scope(exec, body: fn(s: task::Scope) {
-            for _ in 0..<TASKS {
-                discard s.spawn(fn() fails task::Cancelled uses wait limits stack 4_096 {
-                    try await clock.sleep_ns(10_000_000)
+        let channel = task::Channel[u32].bounded(1, alloc)
+        var receiver = channel.receiver
+        let sender = channel.sender
+        try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
+            for index in 0..<TASKS {
+                let feeding = sender.split()
+                discard s.spawn(fn[take feeding]() fails task::Cancelled uses wait limits stack 4_096 {
+                    discard attempt await feeding.send(index)
                 })
+            }
+            for _ in 0..<TASKS {
+                discard try await mut receiver.receive()
             }
         })
         say(text: "tasks ended\n")

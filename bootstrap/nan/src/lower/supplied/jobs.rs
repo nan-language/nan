@@ -147,7 +147,7 @@ fn trap_of(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let abandoned = fx.ptr(kind_number("trap.abandoned") as u64);
     let kind = fx.b.ins().select(known, kind, abandoned);
     let cell = word_of(fx, supply.param(1));
-    let size = fx.ptr(trap_record::BYTES + report::REPORT);
+    let size = fx.ptr(report::TRAP_RECORD);
     let align = fx.ptr(8);
     let record = lo.call_routine(fx, Routine::Alloc, &[cell, size, align])[0];
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);

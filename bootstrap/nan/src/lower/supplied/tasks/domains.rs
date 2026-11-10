@@ -289,7 +289,7 @@ pub fn run_nested(
     abandoner: Option<&Abandoner>,
 ) -> Nested {
     let caller_domain = tasks::current_domain(lo, fx);
-    let size = fx.ptr(trap_record::BYTES + report::REPORT);
+    let size = fx.ptr(report::TRAP_RECORD);
     let align = fx.ptr(8);
     let trap = lo.call_routine(fx, Routine::AllocIn, &[cell, size, align, caller_domain])[0];
     let record_size = fx.ptr(domain::SIZE);

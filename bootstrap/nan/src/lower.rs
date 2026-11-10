@@ -236,7 +236,6 @@ impl Glue {
             | Glue::SimWithdraw
             | Glue::WithdrawSignal(_) => Some(stack::Family::Withdraw),
             Glue::Written(_) => Some(stack::Family::Written),
-            Glue::Transfer(_) => Some(stack::Family::Transfer),
             Glue::Captures(_) => Some(stack::Family::Captures),
             Glue::Policy(..) => Some(stack::Family::Policy),
             _ => None,
@@ -385,6 +384,8 @@ pub struct Lowering<'c, 'a> {
     ist_stacks: Option<(DataId, u64)>,
     /// The image's routine reserve, once a routine reads it.
     routine_reserve: Option<DataId>,
+    /// The walks moving the values of the cowns `await when`s hold.
+    pub held_walks: HashSet<FuncId>,
     pub data: data::Data,
     pub lines: lines::Lines,
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
@@ -595,6 +596,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             reserved: HashMap::new(),
             irq_stacks: None,
             routine_reserve: None,
+            held_walks: HashSet::new(),
             ist_stacks: None,
             data: data::Data::default(),
             lines: lines::Lines::default(),
@@ -1007,6 +1009,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 families.entry(family).or_default().push(*id);
             }
         }
+        families
+            .entry(stack::Family::Held)
+            .or_default()
+            .extend(self.held_walks.iter().copied());
         for (instance, id) in &self.instances {
             if let Instance::Release(_) = instance {
                 families

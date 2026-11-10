@@ -542,6 +542,7 @@ The **stack use** of a lowered function is its frame size plus the largest stack
 - A decoding in the [wire format](13-text-encode.md#wire-format), or through the calls of a std decoder, of a type holding itself through the parts its decoding reads, and the writing of the encoding `canonical` gives of a value it so decoded, is a **nested call**. Every cycle of the calls its decoding and encoding functions make of each other passes a sequence, map, record or variant, of which a decoding nests at most 128, so its **need** is the stack use of what it calls with the frames of each such cycle counted 129 times. It runs on the running task's stack when that has room for its need, and otherwise on memory drawn through the decoding's allocator, failing with `OutOfMemory` when that cannot be drawn. Its call site uses the stub call bound, and is unbounded when its need is.
 - A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call. So does a call of a method of the function's own `Dyn` parameter whose interface method head demands no `stack` limit, `value.render` in a `text::Writer.write` among them.
 - An indirect call site uses the N of the `stack N` that its function type, registry field type or interface method head demands; a call to a foreign fn the N of its `stack N`; a call to a compiler stub or support routine the stub call bound that [descriptors](27-program-model.md#descriptors) give.
+- An `await when` releasing its cowns moves each one's value into the storage of the domain its chunks pass to ([domain memory](11-errors-domains.md#domain-memory)), so each release uses the stub call bound plus the largest stack use among the moves of the cowns' value types, and is unbounded when one of them is.
 - A call site is **unbounded** when it is a call through the function's own function-typed or `Dyn` parameter whose stack bound is none, an indirect call whose type or head demands no `stack` limit, a call to a foreign fn whose head demands none, or a direct call whose callee reaches itself through [dependencies](#propagation) or holds a call site that is unbounded under the bounds that call gives it.
 
 At every [final build](27-program-model.md#final-builds), each function, closure and instantiation that the build lowers is judged against each `stack N` demanded of it by its own limits, by the interface method it implements or by a function type it fits:
@@ -705,6 +706,36 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     let heap = mem::Heap.of(world.alloc)
     let chain = Chain.Link(heap.boxed(Chain.End))
     world.log.info("linked", value: try await linked(take chain, exec: world.exec, alloc: world.alloc))
+} main
+```
+
+```nan
+// file: hoards/package.nan
+//! A chain grown in a cown.
+
+package hoards {
+    language 1
+    targets x86_64-host
+    entry main
+} hoards
+
+// file: hoards/hoards.nan
+//! Grows the chain a cown holds.
+
+pub closed enum Chain {
+    End
+    Link(mem::Box[Chain])
+} Chain
+
+pub fn grow(hoard: task::Cown[Chain], heap: mem::Heap) fails task::Cancelled uses wait limits stack 16_384 {
+    await when mut hoard { // error: limit.stack-unbounded
+        hoard = Chain.Link(heap.boxed(Chain.End))
+    }
+} grow
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let heap = mem::Heap.of(world.alloc)
+    try await grow(task::Cown.of(Chain.End, alloc: world.alloc), heap)
 } main
 ```
 

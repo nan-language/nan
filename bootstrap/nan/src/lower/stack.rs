@@ -54,6 +54,9 @@ pub enum Kind {
     Routine(FuncId),
     /// A support routine's call of a glue of a family, through an address a record holds.
     Glues(Family),
+    /// A call of a support routine the image defines that moves values through these walks
+    /// on the stack it is called on: the routine counts as a stub's and each walk beyond it.
+    Moves { routine: FuncId, walks: Vec<FuncId> },
     /// A call of code that the usable part of the stack it runs on holds but for the support
     /// routines it calls: an entry glue's call of its task's entry, or a grown or nested call's
     /// call of its thunk where the stack has room for its need.
@@ -85,8 +88,8 @@ pub enum Family {
     Withdraw,
     /// The glue writing a value in a trap report.
     Written,
-    /// The walk moving a value into another domain's reach.
-    Transfer,
+    /// The walk moving the value of a cown an `await when` holds into another domain's reach.
+    Held,
     /// The walk moving a task closure's captures into another domain's reach.
     Captures,
     /// The glue calling a hook of a kernel policy, which a CPU never calls while a hook runs on
@@ -351,6 +354,18 @@ impl Judge<'_> {
                 Some((_, beneath)) => Use::Bounded(beneath, Vec::new()),
                 None => Use::Unbounded(Vec::new()),
             },
+            Kind::Moves { routine, walks } => {
+                let called = match self.routines {
+                    Some(_) => self.function(*routine, &[]),
+                    None => Use::Bounded(STUB_CALL_BOUND, Vec::new()),
+                };
+                match (called, self.most(walks, 0)) {
+                    (Use::Bounded(bytes, _), Use::Bounded(walked, path)) => {
+                        Use::Bounded(bytes + walked, path)
+                    }
+                    (Use::Unbounded(path), _) | (_, Use::Unbounded(path)) => Use::Unbounded(path),
+                }
+            }
             Kind::Grown {
                 wrapper,
                 thunk,
@@ -461,9 +476,12 @@ impl Judge<'_> {
             Kind::Direct { callee, .. } => self.name(*callee),
             Kind::Param(_) => "parameter".to_owned(),
             Kind::Bounded(_) => "function value".to_owned(),
-            Kind::Stub | Kind::Routine(_) | Kind::Glues(_) | Kind::Usable | Kind::Nested(_) => {
-                String::new()
-            }
+            Kind::Stub
+            | Kind::Routine(_)
+            | Kind::Glues(_)
+            | Kind::Usable
+            | Kind::Moves { .. }
+            | Kind::Nested(_) => String::new(),
             Kind::Grown { inner, .. } => self.subject(inner),
         }
     }
@@ -651,7 +669,7 @@ fn deepest(
             let used = match &site.kind {
                 Kind::Stub | Kind::Routine(_) | Kind::Nested(_) => Some(STUB_CALL_BOUND),
                 Kind::Bounded(bytes) => *bytes,
-                Kind::Param(_) | Kind::Glues(_) | Kind::Usable => None,
+                Kind::Param(_) | Kind::Glues(_) | Kind::Usable | Kind::Moves { .. } => None,
                 Kind::Direct { .. } | Kind::Grown { .. } => {
                     if let Kind::Grown { wrapper, thunk, .. } = &site.kind {
                         let carried = frames.get(wrapper).map_or(0, |frame| frame.size)
@@ -717,6 +735,15 @@ impl Segments<'_> {
                 Kind::Grown { wrapper, .. } => Some(self.size(*wrapper) + STUB_CALL_BOUND),
                 Kind::Bounded(bytes) => *bytes,
                 Kind::Glues(_) | Kind::Usable => None,
+                Kind::Moves { walks, .. } => {
+                    let mut most = Some(0);
+                    for walk in walks {
+                        most = most
+                            .zip(self.segment(*walk))
+                            .map(|(most, used)| most.max(used));
+                    }
+                    most.map(|most| STUB_CALL_BOUND + most)
+                }
                 Kind::Param(position) => frame
                     .params
                     .iter()

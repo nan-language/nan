@@ -527,8 +527,10 @@ impl Lowering<'_, '_> {
         let mut roots: Vec<FuncId> = (self.frames.iter())
             .filter(|frame| !defined.contains(&frame.function))
             .flat_map(|frame| &frame.sites)
-            .filter_map(|site| match site.kind {
-                stack::Kind::Routine(routine) => Some(routine),
+            .filter_map(|site| match &site.kind {
+                stack::Kind::Routine(routine) | stack::Kind::Moves { routine, .. } => {
+                    Some(*routine)
+                }
                 _ => None,
             })
             .collect();

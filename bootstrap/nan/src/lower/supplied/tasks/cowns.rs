@@ -9,12 +9,13 @@
 //! and its task's wait record names both.
 
 use cranelift_codegen::ir::{self, InstBuilder, MemFlagsData, Value, condcodes::IntCC};
+use cranelift_module::FuncId;
 
 use super::super::super::abi::Repr;
 use super::super::super::body::{Body, Held};
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::{Routine, settle, state, tasks};
-use super::super::super::stack::{Family, Kind};
+use super::super::super::stack::{At, Family, Kind, Site};
 use super::super::super::{Glue, Lowering, transfer, trap};
 use super::super::Supply;
 use crate::check::ty::Ty;
@@ -155,7 +156,7 @@ pub fn release_routine(lo: &mut Lowering, fx: &mut Fx) {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let owner = transfer::raised(fx, reach);
                 let call = transfer::call_walker(lo, fx, walk, &[value, reach, owner]);
-                fx.classify(call, Kind::Glues(Family::Transfer));
+                fx.classify(call, Kind::Usable);
             });
             (pending, vec![reach])
         });
@@ -189,7 +190,7 @@ pub fn poison(lo: &mut Lowering, fx: &mut Fx, held: Value, domain: Value) {
             let none = fx.ptr(0);
             let owner = transfer::raised(fx, reach);
             let call = transfer::call_walker(lo, fx, walk, &[value, none, owner]);
-            fx.classify(call, Kind::Glues(Family::Transfer));
+            fx.classify(call, Kind::Glues(Family::Held));
         });
         grant_next(lo, fx, record);
     });
@@ -407,6 +408,29 @@ fn acquire(lo: &mut Lowering, fx: &mut Fx, record: Value, node: Value) {
     });
 }
 
+/// The cowns an `await when` holds: the record naming them, the walks moving their values, and
+/// where the `await when` lies.
+#[derive(Clone)]
+pub struct Holding {
+    pub held: Value,
+    pub walks: Vec<FuncId>,
+    pub at: At,
+}
+
+/// Releases the cowns an `await when` holds, whose walks the call counts as moving them on the
+/// releasing code's stack.
+pub fn release_held(lo: &mut Lowering, fx: &mut Fx, holding: &Holding) {
+    let routine = lo.routine(Routine::CownRelease);
+    let reference = lo.func_ref(fx, routine);
+    let call = fx.b.ins().call(reference, &[holding.held]);
+    let kind = Kind::Moves {
+        routine,
+        walks: holding.walks.clone(),
+    };
+    let at = Some(holding.at);
+    fx.sites.push((call, Site { kind, at }));
+}
+
 /// `await when`: acquires the cowns its accesses name in increasing rank, checks for poisoning,
 /// runs the region with a reference to each cown's value, and releases them as the region
 /// yields or any exit leaves it.
@@ -431,7 +455,14 @@ pub fn when(
             body.trap_unless(distinct, "trap.duplicate-access", trap::Operands::None);
         }
     }
+    let walks: Vec<FuncId> = values.iter().filter_map(|ty| body.lo.walker(ty)).collect();
+    body.lo.held_walks.extend(walks.iter().copied());
+    let at = At {
+        item: body.item,
+        span: body.current,
+    };
     let held = body.fx.slot(8 + held::SIZE * cowns.len() as u64, 8);
+    let holding = Holding { held, walks, at };
     let count = body.fx.ptr(cowns.len() as u64);
     body.fx.store(count, held, 0);
     let mut ordered: Vec<[Value; 3]> = cowns
@@ -505,7 +536,7 @@ pub fn when(
     body.fx.b.ins().brif(poisoned, sick, &[], healthy, &[]);
     body.fx.b.switch_to_block(sick);
     body.fx.b.seal_block(sick);
-    body.lo.call_routine(body.fx, Routine::CownRelease, &[held]);
+    release_held(body.lo, body.fx, &holding);
     if attempt {
         let err = body
             .lo
@@ -527,7 +558,7 @@ pub fn when(
         }
         Repr::Empty => {}
     }
-    body.open_region(region, release, Some(held));
+    body.open_region(region, release, Some(holding.clone()));
     let mut args: Vec<ir::BlockArg> = Vec::new();
     for (record, value_ty) in cowns.iter().zip(&values) {
         let at = value_at(body.lo, value_ty);
@@ -542,7 +573,7 @@ pub fn when(
         Repr::Address => Held::Address(params[0]),
         Repr::Empty => Held::Empty,
     };
-    body.lo.call_routine(body.fx, Routine::CownRelease, &[held]);
+    release_held(body.lo, body.fx, &holding);
     let outcome = match attempt {
         true => body
             .lo

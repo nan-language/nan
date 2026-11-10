@@ -97,12 +97,16 @@ impl Lowering<'_, '_> {
 
     /// The address of the glue moving a value of a type, zero when moving one does nothing.
     pub fn walker_address(&mut self, fx: &mut Fx, ty: &Ty) -> Value {
-        if !self.transfers(ty) {
+        let Some(glue) = self.walker(ty) else {
             return fx.ptr(0);
-        }
-        let glue = walker(self, ty);
+        };
         let reference = self.func_ref(fx, glue);
         fx.b.ins().func_addr(PTR, reference)
+    }
+
+    /// The glue moving a value of a type, none when moving one does nothing.
+    pub fn walker(&mut self, ty: &Ty) -> Option<FuncId> {
+        self.transfers(ty).then(|| walker(self, ty))
     }
 }
 

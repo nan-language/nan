@@ -175,7 +175,7 @@ fn release_routine(mut lo: Lowering, mut fx: Fx) {
                 walk_args[1] = reach
                 walk_args[2] = owner
                 let call = call_walker(mut lo, fx: mut fx3, walker: walk, args: walk_args.view())
-                mut fx3.classify(call, kind: StackKind.Glues(StackFamily.Transfer))
+                mut fx3.classify(call, kind: StackKind.Usable)
             })
             var reached = mem::List[clif::Value].empty(fx2.alloc)
             mut reached.push(reach)
@@ -214,7 +214,7 @@ fn poison(mut lo: Lowering, mut fx: Fx, held: clif::Value, domain: clif::Value) 
             walk_args[1] = none
             walk_args[2] = owner
             let call = call_walker(mut lo, fx: mut fx2, walker: walk, args: walk_args.view())
-            mut fx2.classify(call, kind: StackKind.Glues(StackFamily.Transfer))
+            mut fx2.classify(call, kind: StackKind.Glues(StackFamily.Held))
         })
         grant_next(mut lo, fx: mut fx1, record)
     })
@@ -447,6 +447,36 @@ fn cowns_acquire(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::
 /// `await when`: acquires the cowns its accesses name in increasing rank, checks for poisoning,
 /// runs the region with a reference to each cown's value, and releases them as the region
 /// yields or any exit leaves it.
+/// The cowns an `await when` holds: the record naming them, the walks moving their values, and
+/// where the `await when` lies.
+struct Holding {
+    held: clif::Value
+    walks: mem::List[object::FuncId]
+    at: At
+} Holding
+
+/// A copy of what an `await when` holds.
+fn Holding.copy(self, alloc: mem::Alloc) -> Holding {
+    var walks = mem::List[object::FuncId].empty(alloc)
+    for walk in self.walks {
+        mut walks.push(walk)
+    }
+    return Holding(held: self.held, walks: take walks, at: self.at)
+} Holding.copy
+
+/// Releases the cowns an `await when` holds, whose walks the call counts as moving them on the
+/// releasing code's stack.
+fn release_held(mut lo: Lowering, mut fx: Fx, holding: Holding) {
+    let routine = mut lo.routine(Routine.CownRelease)
+    let reference = mut lo.func_ref(mut fx, id: routine)
+    let call = mut fx.b.call(reference, args: Array[clif::Value, 1].filled(holding.held).view())
+    var walks = mem::List[object::FuncId].empty(fx.alloc)
+    for walk in holding.walks {
+        mut walks.push(walk)
+    }
+    mut fx.sites.push(CallSite(inst: call, site: Site(kind: StackKind.Moves(routine: routine, walks: take walks), at: Some(holding.at))))
+} release_held
+
 fn cowns_when(mut body: Body, mut lo: Lowering, mut fx: Fx, attempted: bool, accesses: Slice[nir::Operand], region: nir::Region, result: Option[nir::Value]) -> Held {
     let alloc = fx.alloc
     var cowns = mem::List[clif::Value].empty(alloc)
@@ -468,6 +498,7 @@ fn cowns_when(mut body: Body, mut lo: Lowering, mut fx: Fx, attempted: bool, acc
             mut body.trap_unless(mut lo, mut fx, holds: distinct, kind: "trap.duplicate-access", operands: Operands.None)
         }
     }
+    let walks = held_walks(mut lo, values: values.view())
     let held = mut fx.slot(8 + HELD_SIZE * u64.widen(cowns.len()), align: 8)
     let count = mut fx.ptr(u64.widen(cowns.len()))
     mut fx.store(count, addr: held, offset: 0)
@@ -520,8 +551,25 @@ fn cowns_when(mut body: Body, mut lo: Lowering, mut fx: Fx, attempted: bool, acc
         poisoned_words = mut fx.b.bor(poisoned_words, y: flag)
     }
     let poisoned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: poisoned_words, y: 0)
-    return when_region(mut body, mut lo, mut fx, attempted, region, result, held, cowns: cowns.view(), values: values.view(), poisoned)
+    let holding = Holding(held: held, walks: take walks, at: At(item: body.item, span: body.current))
+    return when_region(mut body, mut lo, mut fx, attempted, region, result, holding, cowns: cowns.view(), values: values.view(), poisoned)
 } cowns_when
+
+/// The walks moving the values of the types of the cowns an `await when` holds, which the image
+/// records.
+fn held_walks(mut lo: Lowering, values: Slice[ty::Ty]) -> mem::List[object::FuncId] {
+    var walks = mem::List[object::FuncId].empty(lo.alloc)
+    for value_ty in values {
+        match mut lo.walker(ty: value_ty) {
+            Some(walk) => {
+                mut walks.push(walk)
+                discard mut lo.held_walks.insert(walk, value: Unit)
+            }
+            None => {}
+        }
+    }
+    return walks
+} held_walks
 
 /// The blocks of an `await when` once its cowns are held: a poisoned cown releases them and
 /// fails the attempt or traps; otherwise the region runs on the cowns' values, and its yield
@@ -533,7 +581,7 @@ fn when_region(
     attempted: bool,
     region: nir::Region,
     result: Option[nir::Value],
-    held: clif::Value,
+    holding: Holding,
     cowns: Slice[clif::Value],
     values: Slice[ty::Ty],
     poisoned: clif::Value,
@@ -570,7 +618,7 @@ fn when_region(
     mut fx.b.brif(poisoned, then: sick, then_args: no_args.view(), otherwise: healthy, otherwise_args: no_args.view())
     mut fx.b.switch_to_block(sick)
     mut fx.b.seal_block(sick)
-    discard mut lo.call_routine(mut fx, routine: Routine.CownRelease, args: Array[clif::Value, 1].filled(held).view())
+    release_held(mut lo, mut fx, holding)
     if attempted {
         let err = mut lo.variant_value(mut fx, ty: result_ty, variant: "Err", payload_values: Array[Held, 1].filled(Held.Empty).view(), wrapped: None)
         mut fx.b.jump(done, args: err.values(alloc).view())
@@ -589,7 +637,7 @@ fn when_region(
         }
         Repr.Empty => {}
     }
-    mut body.open_region(region, yield_to: release, held: Some(held))
+    mut body.open_region(region, yield_to: release, held: Some(holding.copy(alloc)))
     var args = mem::List[clif::Value].empty(alloc)
     for index in 0..<cowns.len() {
         let at = cowns_value_at(mut lo, value: values[index])
@@ -611,7 +659,7 @@ fn when_region(
         }
         Repr.Empty => {}
     }
-    discard mut lo.call_routine(mut fx, routine: Routine.CownRelease, args: Array[clif::Value, 1].filled(held).view())
+    release_held(mut lo, mut fx, holding)
     var outcome = value
     if attempted {
         outcome = mut lo.variant_value(mut fx, ty: result_ty, variant: "Ok", payload_values: Array[Held, 1].filled(value).view(), wrapped: None)

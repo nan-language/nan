@@ -11,7 +11,7 @@ use cranelift_module::FuncId;
 
 use super::abi::{Abi, Given, Repr, Returned, substituted};
 use super::fx::{Fx, PTR};
-use super::runtime::Routine;
+use super::supplied::tasks::cowns::{self, Holding};
 use super::types::Wrap;
 use super::{Lowering, trap};
 use crate::check::db::ItemId;
@@ -62,7 +62,7 @@ impl Held {
 /// `when` region holds, which every exit from it releases.
 struct RegionExit {
     yield_to: ir::Block,
-    held: Option<IrValue>,
+    held: Option<Holding>,
 }
 
 pub struct Body<'b, 'c, 'a, 'f> {
@@ -776,10 +776,10 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         args: Vec<IrValue>,
     ) -> (ir::Block, Vec<ir::BlockArg>) {
         let target = self.blocks[to.0 as usize];
-        let left: Vec<IrValue> = self
+        let left: Vec<Holding> = self
             .regions_left(from, to)
             .into_iter()
-            .filter_map(|region| self.exits.get(&region).and_then(|exit| exit.held))
+            .filter_map(|region| self.exits.get(&region).and_then(|exit| exit.held.clone()))
             .collect();
         if left.is_empty() {
             return (target, args.into_iter().map(Into::into).collect());
@@ -795,8 +795,8 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         }
         self.fx.b.switch_to_block(release);
         let passed = self.fx.b.block_params(release).to_vec();
-        for held in left {
-            self.lo.call_routine(self.fx, Routine::CownRelease, &[held]);
+        for holding in &left {
+            cowns::release_held(self.lo, self.fx, holding);
         }
         let passed: Vec<ir::BlockArg> = passed.into_iter().map(Into::into).collect();
         self.fx.b.ins().jump(target, &passed);
@@ -1080,7 +1080,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
     }
 
     /// Opens a region whose `yield` jumps to `yield_to`, holding the cowns at `held`.
-    pub fn open_region(&mut self, region: &Region, yield_to: ir::Block, held: Option<IrValue>) {
+    pub fn open_region(&mut self, region: &Region, yield_to: ir::Block, held: Option<Holding>) {
         self.exits
             .insert(region.blocks[0], RegionExit { yield_to, held });
     }

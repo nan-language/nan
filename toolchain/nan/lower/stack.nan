@@ -33,6 +33,9 @@ enum StackKind {
     Routine(object::FuncId)
     /// A support routine's call of a glue of a family, through an address a record holds.
     Glues(StackFamily)
+    /// A call of a support routine the image defines that moves values through these walks
+    /// on the stack it is called on: the routine counts as a stub's and each walk beyond it.
+    Moves(routine: object::FuncId, walks: mem::List[object::FuncId])
     /// A call of code that the usable part of the stack it runs on holds but for the support
     /// routines it calls: an entry glue's call of its task's entry, or a grown or nested call's
     /// call of its thunk where the stack has room for its need.
@@ -59,8 +62,8 @@ enum StackFamily derives Copy, Eq, Hash {
     Withdraw
     /// The glue writing a value in a trap report.
     Written
-    /// The walk moving a value into another domain's reach.
-    Transfer
+    /// The walk moving the value of a cown an `await when` holds into another domain's reach.
+    Held
     /// The walk moving a task closure's captures into another domain's reach.
     Captures
     /// The glue calling a hook of a kernel policy, which a CPU never calls while a hook runs on
@@ -431,6 +434,20 @@ fn Judge.site(mut self, all_frames: Slice[Frame], kind: StackKind, bounds: Slice
             Some(beneath) => Use.Bounded(bytes: beneath, path: mem::List[CallStep].empty(self.alloc))
             None => Use.Unbounded(mem::List[CallStep].empty(self.alloc))
         }
+        StackKind.Moves(routine: routine, walks: walks) => {
+            var called = Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
+            if self.beneath.is_some() {
+                called = mut self.function(all_frames, function: routine, bounds: mem::List[ParamBound].empty(self.alloc).view())
+            }
+            let walked = mut self.most(all_frames, functions: walks.view(), floor: 0)
+            return match called {
+                Use.Bounded(bytes: called_bytes, path: _) => match walked {
+                    Use.Bounded(bytes: walked_bytes, path: calls) => Use.Bounded(bytes: called_bytes + walked_bytes, path: take calls)
+                    Use.Unbounded(calls) => Use.Unbounded(take calls)
+                }
+                Use.Unbounded(calls) => Use.Unbounded(take calls)
+            }
+        }
         StackKind.Grown(wrapper: wrapper, thunk: thunk, inner: inner) => {
             return match mut self.site(all_frames, kind: inner.contents(), bounds) {
                 Use.Bounded(bytes: used_bytes, path: calls) => Use.Bounded(bytes: used_bytes + (self.size(all_frames, function: wrapper) + STUB_CALL_BOUND + self.size(all_frames, function: thunk)), path: take calls)
@@ -572,7 +589,7 @@ fn Judge.subject(self, all_frames: Slice[Frame], kind: StackKind) -> text::Strin
         StackKind.Direct(callee: callee, bindings: _) => self.name(all_frames, function: callee)
         StackKind.Param(_) => text::String.of("parameter", alloc: self.alloc)
         StackKind.Bounded(_) => text::String.of("function value", alloc: self.alloc)
-        StackKind.Stub or StackKind.Routine(_) or StackKind.Glues(_) or StackKind.Usable or StackKind.Nested(_) => text::String.empty(self.alloc)
+        StackKind.Stub or StackKind.Routine(_) or StackKind.Glues(_) or StackKind.Usable or StackKind.Moves(routine: _, walks: _) or StackKind.Nested(_) => text::String.empty(self.alloc)
         StackKind.Grown(wrapper: _, thunk: _, inner: inner) => self.subject(all_frames, kind: inner.contents())
     }
 } Judge.subject
@@ -705,6 +722,7 @@ fn Segments.segment(mut self, all_frames: Slice[Frame], function: object::FuncId
             StackKind.Grown(wrapper: wrapper, thunk: _, inner: _) => Some(self.size(all_frames, function: wrapper) + STUB_CALL_BOUND)
             StackKind.Bounded(stack_bound) => stack_bound
             StackKind.Glues(_) or StackKind.Usable => None
+            StackKind.Moves(routine: _, walks: walks) => mut self.moves_segment(all_frames, walks: walks.view())
             StackKind.Param(position_param) => param_stack(frame.params.view(), position: position_param)
             StackKind.Direct(callee: callee, bindings: _) => mut self.segment(all_frames, function: callee)
         }
@@ -721,6 +739,19 @@ fn Segments.segment(mut self, all_frames: Slice[Frame], function: object::FuncId
     discard mut self.known.insert(function, value: segment)
     return segment
 } Segments.segment
+
+/// The stack use up to the grown calls they make of a call moving values through walks: the stub
+/// call bound and the most a walk uses, none for one reaching an unbounded call site another way.
+fn Segments.moves_segment(mut self, all_frames: Slice[Frame], walks: Slice[object::FuncId]) -> Option[u64] {
+    var most: Option[u64] = Some(0)
+    for walk in walks {
+        most = segment_max(most, right: mut self.segment(all_frames, function: walk))
+    }
+    let Some(walked) = most else {
+        return None
+    }
+    return Some(STUB_CALL_BOUND + walked)
+} Segments.moves_segment
 
 fn Segments.size(self, all_frames: Slice[Frame], function: object::FuncId) -> u64 {
     let Some(position) = self.positions.get(function) else {
@@ -979,7 +1010,7 @@ fn Components.site_need(self, all_frames: Slice[Frame], nesting: mem::HashMap[ob
     match kind {
         StackKind.Stub or StackKind.Routine(_) or StackKind.Nested(_) => return Some(STUB_CALL_BOUND)
         StackKind.Bounded(stack_bound) => return stack_bound
-        StackKind.Param(_) or StackKind.Glues(_) or StackKind.Usable => return None
+        StackKind.Param(_) or StackKind.Glues(_) or StackKind.Usable or StackKind.Moves(routine: _, walks: _) => return None
         else => {}
     }
     let Some(callee) = direct_callee(kind) else {

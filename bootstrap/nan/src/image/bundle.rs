@@ -117,14 +117,7 @@ fn body(
         image.resize(segment.address as usize, 0);
         image.extend_from_slice(&segment.bytes);
     }
-    let relocations: Vec<u64> = linked
-        .absolute
-        .iter()
-        .map(|(at, width)| {
-            assert_eq!(*width, 8, "a bundle's absolute addresses are words");
-            *at
-        })
-        .collect();
+    let relocations = &linked.absolute;
     let symbol = |name: &str| linked.symbol(name) as u128;
     let pair = |out: &mut Vec<u8>, (first, second): (u64, u64)| {
         uvar(out, u128::from(first));

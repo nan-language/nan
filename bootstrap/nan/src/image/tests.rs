@@ -17,9 +17,9 @@ fn module(triple: &str) -> ObjectModule {
     ObjectModule::new(ObjectBuilder::new(isa, "test", names).expect("a builder"))
 }
 
-/// An object as lowering writes it for a machine target: `entry` calling `callee` through a
-/// relocation of the kind given, `table` holding the address of `callee`, then 64 zeroed bytes.
-fn object(call: Reloc) -> Vec<u8> {
+/// An object as lowering writes it for a machine target: `entry` calling `callee`, `table`
+/// holding the address of `callee`, then 64 zeroed bytes.
+fn object() -> Vec<u8> {
     let mut module = module("x86_64-unknown-none-elf");
     let signature = module.make_signature();
     let mut function = |name: &str| {
@@ -30,7 +30,7 @@ fn object(call: Reloc) -> Vec<u8> {
     let (entry, callee) = (function("entry"), function("callee"));
     let relocation = ModuleReloc {
         offset: 1,
-        kind: call,
+        kind: Reloc::X86PCRel4,
         name: callee.into(),
         addend: -4,
     };
@@ -113,7 +113,7 @@ fn aarch64_object() -> Vec<u8> {
 #[test]
 fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memory_only() {
     let base = 0x0010_0000;
-    let linked = link(&object(Reloc::X86PCRel4), base, false);
+    let linked = link(&object(), base, false);
     let [text, data] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };
@@ -127,7 +127,7 @@ fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memor
         (base + 0x1000, Access::Write, 128)
     );
     assert_eq!(data.bytes, (base + 16).to_le_bytes());
-    assert_eq!(linked.absolute, [(base + 0x1000, 8)]);
+    assert_eq!(linked.absolute, [base + 0x1000]);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn link_patches_aarch64_branches_pages_and_page_offsets() {
     let patched = code(&[five_pages, ADD_X0 | 8 << 10, RET, 0, back_four, RET]);
     assert_eq!(text.bytes, patched);
     assert_eq!(data.bytes, (base + 16).to_le_bytes());
-    assert_eq!(linked.absolute, [(base + 0x1000, 8)]);
+    assert_eq!(linked.absolute, [base + 0x1000]);
 }
 
 #[test]
@@ -187,13 +187,13 @@ fn link_lists_a_relocated_images_absolute_addresses_after_its_segments() {
             .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
             .collect()
     };
-    let places: Vec<u64> = linked.absolute.iter().map(|(place, _)| *place).collect();
+    let places = &linked.absolute;
     assert_eq!(places.len(), 3, "the table's word and the extent's two");
     assert_eq!(
         (listed.address, listed.access),
         (data.address + 0x1000, Access::Read)
     );
-    assert_eq!(words(&listed.bytes), places);
+    assert_eq!(&words(&listed.bytes), places);
     let end = listed.address + 24;
     assert_eq!(
         words(&header.bytes[..RELOCATION_HEADER_BYTES]),
@@ -214,10 +214,4 @@ fn base_relocations_group_addresses_by_page_and_pad_odd_blocks() {
         pe::base_relocations(&[0x1008, 0x1010, 0x1ff8, 0x3000]),
         [&first[..], &second].concat()
     );
-}
-
-#[test]
-#[should_panic(expected = "32-bit absolute address")]
-fn uefi_images_reject_32_bit_absolute_addresses() {
-    write(Target::X64Uefi, &object(Reloc::Abs4), "entry");
 }

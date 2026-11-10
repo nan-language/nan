@@ -65,19 +65,13 @@ struct Segment {
 
 fn Segment.contains(self, address: u64) -> bool = address >= self.address and address - self.address < self.size
 
-/// The address and width in bytes of an absolute address a relocation wrote.
-struct Absolute derives Copy, Eq {
-    address: u64
-    width: u64
-} Absolute
-
 /// An object linked at an address: its segments, the address of each of its symbols, the
-/// absolute addresses its relocations wrote, and each word holding the address of a symbol it
-/// imports.
+/// address of each 8-byte absolute address its relocations wrote, and each word holding the
+/// address of a symbol it imports.
 struct Linked {
     segments: mem::List[Segment]
     symbols: mem::Map[text::String, u64]
-    absolute: mem::List[Absolute]
+    absolute: mem::List[u64]
     imports: mem::List[Import]
 } Linked
 
@@ -120,9 +114,8 @@ fn Linked.record_relocations(mut self, base: u64, alloc: mem::Alloc) {
         return
     }
     var places = mem::List[u64].empty(alloc)
-    for absolute in self.absolute {
-        expect absolute.width == 8
-        mut places.push(absolute.address)
+    for address in self.absolute {
+        mut places.push(address)
     }
     match self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(IMAGE_EXTENT)) {
         Some(extent) => {
@@ -181,8 +174,8 @@ fn Linked.record_extent(mut self, base: u64) {
     var words = Array[u64, 2].filled(base)
     words[1] = end
     mut self.write_words(at, words: words.view())
-    mut self.absolute.push(Absolute(address: at, width: 8))
-    mut self.absolute.push(Absolute(address: at + 8, width: 8))
+    mut self.absolute.push(at)
+    mut self.absolute.push(at + 8)
 } Linked.record_extent
 
 /// Writes the image's segments into the data object `SEGMENT_TABLE` when the object defines one,
@@ -206,7 +199,7 @@ fn Linked.record_segments(mut self, alloc: mem::Alloc) {
     }
     mut self.write_words(at, words: words.view())
     for index in 0..<u64.widen(self.segments.len()) {
-        mut self.absolute.push(Absolute(address: at + 8 + 24 * index, width: 8))
+        mut self.absolute.push(at + 8 + 24 * index)
     }
 } Linked.record_segments
 
@@ -216,7 +209,6 @@ fn Linked.record_segments(mut self, alloc: mem::Alloc) {
 const ABS64: u32 = 1
 const PC32: u32 = 2
 const PLT32: u32 = 4
-const ABS32: u32 = 10
 const A64_ABS64: u32 = 257
 const A64_ADR_PREL_PG_HI21: u32 = 275
 const A64_ADD_ABS_LO12_NC: u32 = 277
@@ -279,7 +271,7 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
             discard mut symbols.insert(text::String.of(symbol.name.as_str(), alloc), value: start + symbol.value)
         }
     }
-    var absolute = mem::List[Absolute].empty(alloc)
+    var absolute = mem::List[u64].empty(alloc)
     expect placed.len() == read_object.sections.len()
     for index in 0..<read_object.sections.len() {
         let Some(start) = placed[index] else {
@@ -320,7 +312,7 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
     mut linked.record_relocations(base, alloc)
     mut linked.record_extent(base)
     mut linked.record_segments(alloc)
-    mut linked.absolute.sort_by(absolute_order)
+    mut linked.absolute.sort_by(fn(left: u64, right: u64) => left.cmp(right))
     return linked
 } link
 
@@ -349,13 +341,6 @@ fn import_order(left: Import, right: Import) -> core::Ordering {
     }
     return left.name.as_str().cmp(right.name.as_str())
 } import_order
-
-fn absolute_order(left: Absolute, right: Absolute) -> core::Ordering {
-    if left.address != right.address {
-        return left.address.cmp(right.address)
-    }
-    return left.width.cmp(right.width)
-} absolute_order
 
 /// Adds the segment of an access at an address when it holds any section, its sections of
 /// zeros after the others and a code segment's `stubs` import stubs after its code, returning the
@@ -423,7 +408,7 @@ fn address_of(symbol: Symbol, placed: Slice[Option[u64]]) -> u64 {
 
 /// Writes the value a relocation computes from its target at an address of the segment,
 /// recording an absolute address written.
-fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem::List[Absolute]) {
+fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem::List[u64]) {
     expect self.contains(at)
     let offset = usize.widen(at - self.address)
     let relative = target - i64.from_bits(at)
@@ -431,15 +416,7 @@ fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem
     match kind {
         ABS64 or A64_ABS64 => {
             mut bytes.write_u64_le(offset, value: target.to_bits())
-            mut absolute.push(Absolute(address: at, width: 8))
-        }
-        ABS32 => {
-            let Some(address) = u32.checked_fit(target) else {
-                expect false
-                return
-            }
-            mut bytes.write_u32_le(offset, value: address)
-            mut absolute.push(Absolute(address: at, width: 4))
+            mut absolute.push(at)
         }
         PC32 or PLT32 => {
             let Some(displacement) = i32.checked_fit(relative) else {

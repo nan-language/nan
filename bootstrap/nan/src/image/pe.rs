@@ -96,15 +96,7 @@ pub fn write(linked: &Linked, entry: u64, arch: Arch) -> Vec<u8> {
     let relocations: Vec<u64> = linked
         .absolute
         .iter()
-        .map(|&(address, width)| {
-            assert!(
-                width == 8,
-                "a {}-bit absolute address at {address:#x} in a UEFI image, whose base \
-                 relocations rebase only 64-bit ones",
-                width * 8
-            );
-            address - IMAGE_BASE
-        })
+        .map(|address| address - IMAGE_BASE)
         .collect();
     let relocation_rva = (linked.end() - IMAGE_BASE).next_multiple_of(PAGE);
     let relocation_bytes = base_relocations(&relocations);

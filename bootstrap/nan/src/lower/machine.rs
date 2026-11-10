@@ -34,7 +34,9 @@ pub use user::{FAULT, SYSCALL};
 
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
+use cranelift_module::{
+    DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget,
+};
 
 use super::body::Held;
 use super::call::Invoked;
@@ -56,23 +58,28 @@ pub const BOOT_STACK: u64 = 128 * 1024;
 const SEAM_FRAME: u64 = 4_096;
 
 /// The `x86_64-bare` entry seam's machine code, which the PVH boot protocol enters in 32-bit
-/// protected mode: it loads the descriptor table and the entry root, enables SSE, switches to
-/// long mode, sets the boot stack and calls the boot glue with the start-information pointer.
-/// Its relocations, applied by the image writer, patch the addresses of the descriptor table's
-/// pseudo-descriptor, of the entry root and of the 64-bit code the far jump enters, the boot
-/// stack top and the call.
+/// protected mode with paging off and no stack. Using the start information's first word as a
+/// stack while it calls the next instruction, it takes its own address, from which it forms the
+/// relocation header's and takes the distance the image was loaded from its linked address. It
+/// adds that distance to each absolute address the header's table lists, then loads the
+/// descriptor table and the entry root, enables SSE, sets the boot stack, switches to long mode,
+/// far-returns to its 64-bit code, sets the boot stack again and calls the boot glue with the
+/// start-information pointer.
 const BARE_SEAM: &[u8] = &[
-    0xfa, 0xfc, 0x0f, 0x01, 0x15, 0x00, 0x00, 0x00, 0x00, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x22,
-    0xd8, 0x0f, 0x20, 0xe0, 0x0d, 0x20, 0x06, 0x00, 0x00, 0x0f, 0x22, 0xe0, 0xb9, 0x80, 0x00, 0x00,
-    0xc0, 0x0f, 0x32, 0x0d, 0x00, 0x01, 0x00, 0x00, 0x0f, 0x30, 0x0f, 0x20, 0xc0, 0x83, 0xe0, 0xfb,
-    0x0d, 0x03, 0x00, 0x00, 0x80, 0x0f, 0x22, 0xc0, 0xea, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x66,
-    0xb8, 0x10, 0x00, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0x31, 0xc0, 0x8e, 0xe0, 0x8e, 0xe8, 0x48,
-    0xbc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x89, 0xdf, 0x31, 0xf6, 0xe8, 0x00, 0x00,
-    0x00, 0x00, 0xf4, 0xeb, 0xfd,
+    0xfa, 0xfc, 0x8b, 0x03, 0x8d, 0x63, 0x04, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x5d, 0x89, 0x03, 0x8d,
+    0xb5, 0x00, 0x00, 0x00, 0x00, 0x89, 0xf2, 0x2b, 0x16, 0x74, 0x19, 0x8b, 0x7e, 0x18, 0x01, 0xd7,
+    0x8b, 0x4e, 0x20, 0xe3, 0x0f, 0x8b, 0x07, 0x01, 0xd0, 0x01, 0x10, 0x83, 0x50, 0x04, 0x00, 0x83,
+    0xc7, 0x08, 0xe2, 0xf1, 0x8d, 0x85, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x01, 0x10, 0x8d, 0x85, 0x00,
+    0x00, 0x00, 0x00, 0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xe0, 0x0d, 0x20, 0x06, 0x00, 0x00, 0x0f, 0x22,
+    0xe0, 0xb9, 0x80, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x0d, 0x00, 0x01, 0x00, 0x00, 0x0f, 0x30, 0x8d,
+    0xa5, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x20, 0xc0, 0x83, 0xe0, 0xfb, 0x0d, 0x03, 0x00, 0x00, 0x80,
+    0x0f, 0x22, 0xc0, 0x8d, 0x45, 0x6e, 0x6a, 0x08, 0x50, 0xcb, 0x66, 0xb8, 0x10, 0x00, 0x8e, 0xd8,
+    0x8e, 0xc0, 0x8e, 0xd0, 0x31, 0xc0, 0x8e, 0xe0, 0x8e, 0xe8, 0x48, 0x8d, 0x25, 0x00, 0x00, 0x00,
+    0x00, 0x89, 0xdf, 0x31, 0xf6, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4, 0xeb, 0xfd,
 ];
 
-/// The offset within `BARE_SEAM` of the 64-bit code the far jump enters.
-const BARE_LONG_MODE: i64 = 0x3f;
+/// The offset within `BARE_SEAM` of the address its call returns to.
+const BARE_HERE: i64 = 0x0c;
 
 /// The memory the entry root's own tables map at its physical addresses: the first 4 GiB.
 pub const MAPPED: u64 = 1 << 32;
@@ -319,21 +326,7 @@ impl Lowering<'_, '_> {
     /// with the device tree's address and the start information's.
     fn aarch64_bare_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
         let root = self.aarch64_boot_root();
-        let relocations = self
-            .module
-            .declare_data(
-                crate::image::RELOCATION_HEADER,
-                Linkage::Local,
-                false,
-                false,
-            )
-            .expect("the relocation header");
-        let mut description = DataDescription::new();
-        description.define(vec![0; crate::image::RELOCATION_HEADER_BYTES].into_boxed_slice());
-        description.set_align(8);
-        self.module
-            .define_data(relocations, &description)
-            .expect("the relocation header");
+        let relocations = self.relocation_header();
         let stack = self.reserved_data(boot_stack_data(boot_stack));
         let seam = self
             .module
@@ -420,9 +413,30 @@ impl Lowering<'_, '_> {
         self.reserved(fx, SECONDARY_RECORD)
     }
 
-    /// Reserves an `x86_64-bare` image's boot stack of `boot_stack` bytes, defines its
-    /// descriptor table, and emits the program entry seam, which calls `boot`.
+    /// The relocation header of a bare image, which the image writer fills.
+    fn relocation_header(&mut self) -> DataId {
+        let id = self
+            .module
+            .declare_data(
+                crate::image::RELOCATION_HEADER,
+                Linkage::Local,
+                false,
+                false,
+            )
+            .expect("the relocation header");
+        let mut description = DataDescription::new();
+        description.define(vec![0; crate::image::RELOCATION_HEADER_BYTES].into_boxed_slice());
+        description.set_align(8);
+        self.module
+            .define_data(id, &description)
+            .expect("the relocation header");
+        id
+    }
+
+    /// Reserves an `x86_64-bare` image's relocation header and boot stack of `boot_stack` bytes,
+    /// defines its descriptor table, and emits the program entry seam, which calls `boot`.
     fn bare_entry_seam(&mut self, boot: FuncId, boot_stack: u64) {
+        let relocations = self.relocation_header();
         let root = self.entry_root();
         let stack = self.reserved_data(boot_stack_data(boot_stack));
         let gdtr = self.define_gdt();
@@ -430,33 +444,22 @@ impl Lowering<'_, '_> {
             .module
             .declare_function(ENTRY, Linkage::Export, &Signature::new(super::CALL_CONV))
             .expect("the program entry seam");
-        let abs4 = |offset: u32, data: DataId, addend: i64| ModuleReloc {
+        let relative = |offset: u32, name: ModuleRelocTarget, addend: i64| ModuleReloc {
             offset,
-            kind: Reloc::Abs4,
-            name: data.into(),
+            kind: Reloc::X86PCRel4,
+            name,
             addend,
         };
+        let here = |offset: u32, data: DataId, addend: i64| {
+            relative(offset, data.into(), i64::from(offset) - BARE_HERE + addend)
+        };
         let relocs = vec![
-            abs4(0x05, gdtr, 0),
-            abs4(0x0a, root, 0),
-            ModuleReloc {
-                offset: 0x39,
-                kind: Reloc::Abs4,
-                name: seam.into(),
-                addend: BARE_LONG_MODE,
-            },
-            ModuleReloc {
-                offset: 0x51,
-                kind: Reloc::Abs8,
-                name: stack.into(),
-                addend: boot_stack as i64,
-            },
-            ModuleReloc {
-                offset: 0x5e,
-                kind: Reloc::X86PCRel4,
-                name: boot.into(),
-                addend: -4,
-            },
+            here(0x11, relocations, 0),
+            here(0x36, gdtr, 0),
+            here(0x3f, root, 0),
+            here(0x61, stack, boot_stack as i64),
+            relative(0x8d, stack.into(), boot_stack as i64 - 4),
+            relative(0x96, boot.into(), -4),
         ];
         self.module
             .define_function_bytes(seam, 16, BARE_SEAM, &relocs)

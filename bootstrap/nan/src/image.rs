@@ -69,12 +69,12 @@ struct Segment {
 }
 
 /// An object linked at an address: its segments, the address of each of its symbols, the
-/// address and width in bytes of each absolute address its relocations wrote, and the address of
-/// each word holding the address of a symbol it imports, with that symbol's name.
+/// address of each 8-byte absolute address its relocations wrote, and the address of each word
+/// holding the address of a symbol it imports, with that symbol's name.
 struct Linked {
     segments: Vec<Segment>,
     symbols: HashMap<String, u64>,
-    absolute: Vec<(u64, usize)>,
+    absolute: Vec<u64>,
     imports: Vec<(u64, String)>,
 }
 
@@ -102,17 +102,7 @@ impl Linked {
         let Some(header) = self.symbols.get(RELOCATION_HEADER).copied() else {
             return;
         };
-        let mut places: Vec<u64> = self
-            .absolute
-            .iter()
-            .map(|(place, width)| {
-                assert_eq!(
-                    *width, 8,
-                    "a relocated image's absolute addresses are 8 bytes"
-                );
-                *place
-            })
-            .collect();
+        let mut places = self.absolute.clone();
         if let Some(extent) = self.symbols.get(IMAGE_EXTENT) {
             places.extend([*extent, *extent + 8]);
         }
@@ -157,7 +147,7 @@ impl Linked {
         };
         let end = self.end();
         self.write_words(at, &[base, end]);
-        self.absolute.extend([(at, 8), (at + 8, 8)]);
+        self.absolute.extend([at, at + 8]);
     }
 
     /// Writes the image's segments into the data object `SEGMENT_TABLE` when the object defines
@@ -180,7 +170,7 @@ impl Linked {
             words.extend([segment.address, segment.size, access]);
         }
         self.write_words(at, &words);
-        let places = (0..self.segments.len() as u64).map(|index| (at + 8 + 24 * index, 8));
+        let places = (0..self.segments.len() as u64).map(|index| at + 8 + 24 * index);
         self.absolute.extend(places);
     }
 }
@@ -192,7 +182,6 @@ mod reloc {
     pub const X64_ABS64: u32 = 1;
     pub const X64_PC32: u32 = 2;
     pub const X64_PLT32: u32 = 4;
-    pub const X64_ABS32: u32 = 10;
     pub const A64_ABS64: u32 = 257;
     pub const A64_ADR_PREL_PG_HI21: u32 = 275;
     pub const A64_ADD_ABS_LO12_NC: u32 = 277;
@@ -335,12 +324,7 @@ fn link(object: &[u8], base: u64, importing: bool) -> Linked {
             match relocation.kind {
                 reloc::X64_ABS64 | reloc::A64_ABS64 => {
                     segment.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
-                    absolute.push((place, 8));
-                }
-                reloc::X64_ABS32 => {
-                    let value = u32::try_from(target).expect("an absolute address below 4 GiB");
-                    segment.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-                    absolute.push((place, 4));
+                    absolute.push(place);
                 }
                 reloc::X64_PC32 | reloc::X64_PLT32 => {
                     let value = i32::try_from(relative).expect("a relative address within 2 GiB");

@@ -1,0 +1,119 @@
+//! A bytecode loop of the size's rounds, run by an interpreter matching each instruction.
+
+enum BenchError derives Render {
+    Usage
+    Stdio(sys::StdioError) from
+    Cancelled(task::Cancelled) from
+} BenchError
+
+/// The number the first argument states in decimal, if it states one.
+validator fn size(args: Untrusted[mem::List[mem::Bytes]]) -> Option[u64] {
+    let Some(arg) = args.inspect().get(0) else {
+        return None
+    }
+    var value: u64 = 0
+    for digit in arg.view() {
+        if digit < b'0' or digit > b'9' {
+            return None
+        }
+        value = value * 10 + u64.widen(digit - b'0')
+    }
+    return Some(value)
+} size
+
+/// An instruction over eight registers, which it names by index.
+enum Op derives Copy {
+    Load(out: usize, value: u64)
+    Add(out: usize, left: usize, right: usize)
+    Mul(out: usize, left: usize, right: usize)
+    Xor(out: usize, left: usize, right: usize)
+    Shr(out: usize, source: usize, amount: u32)
+    JumpIfOdd(source: usize, goal: usize)
+    JumpIfLess(left: usize, right: usize, goal: usize)
+    Jump(goal: usize)
+    Halt
+} Op
+
+/// A program hashing the numbers below `rounds` with FNV-1a and a shift, counting the even hashes into register 6 and summing the odd ones into register 7.
+fn bytecode(rounds: u64, alloc: mem::Alloc) -> mem::List[Op] {
+    var ops = mem::List[Op].empty(alloc)
+    mut ops.push(Op.Load(out: 0, value: 0))
+    mut ops.push(Op.Load(out: 1, value: rounds))
+    mut ops.push(Op.Load(out: 2, value: 0xCBF2_9CE4_8422_2325))
+    mut ops.push(Op.Load(out: 3, value: 0x100_0000_01B3))
+    mut ops.push(Op.Load(out: 4, value: 1))
+    mut ops.push(Op.Load(out: 6, value: 0))
+    mut ops.push(Op.Load(out: 7, value: 0))
+    mut ops.push(Op.Xor(out: 2, left: 2, right: 0))
+    mut ops.push(Op.Mul(out: 2, left: 2, right: 3))
+    mut ops.push(Op.Shr(out: 5, source: 2, amount: 29))
+    mut ops.push(Op.Xor(out: 2, left: 2, right: 5))
+    mut ops.push(Op.JumpIfOdd(source: 2, goal: 14))
+    mut ops.push(Op.Add(out: 6, left: 6, right: 4))
+    mut ops.push(Op.Jump(goal: 15))
+    mut ops.push(Op.Add(out: 7, left: 7, right: 2))
+    mut ops.push(Op.Add(out: 0, left: 0, right: 4))
+    mut ops.push(Op.JumpIfLess(left: 0, right: 1, goal: 7))
+    mut ops.push(Op.Halt)
+    return ops
+} bytecode
+
+/// The register bank once `program` halts.
+fn run(program: Slice[Op]) -> Array[u64, 8] {
+    var bank = Array[u64, 8].filled(0)
+    var at: usize = 0
+    loop {
+        match program[at] {
+            Op.Load(out: out, value: value) => {
+                bank[out] = value
+                at += 1
+            }
+            Op.Add(out: out, left: left, right: right) => {
+                bank[out] = bank[left].wrapping_add(bank[right])
+                at += 1
+            }
+            Op.Mul(out: out, left: left, right: right) => {
+                bank[out] = bank[left].wrapping_mul(bank[right])
+                at += 1
+            }
+            Op.Xor(out: out, left: left, right: right) => {
+                bank[out] = bank[left] ^ bank[right]
+                at += 1
+            }
+            Op.Shr(out: out, source: source, amount: amount) => {
+                bank[out] = bank[source] >> amount
+                at += 1
+            }
+            Op.JumpIfOdd(source: source, goal: goal) => {
+                at = if bank[source] % 2 == 1 {
+                    goal
+                } else {
+                    at + 1
+                }
+            }
+            Op.JumpIfLess(left: left, right: right, goal: goal) => {
+                at = if bank[left] < bank[right] {
+                    goal
+                } else {
+                    at + 1
+                }
+            }
+            Op.Jump(goal: goal) => {
+                at = goal
+            }
+            Op.Halt => return bank
+        }
+    }
+} run
+
+fn main(take world: host::World) fails BenchError uses wait {
+    let Some(n) = size(world.args) else {
+        fail BenchError.Usage
+    }
+    let ops = bytecode(n, alloc: world.alloc)
+    let bank = run(ops.view())
+    var out = text::String.empty(world.alloc)
+    mut out.write(text::fmt("{hash} {evens} {odds}\n", hash: bank[2], evens: bank[6], odds: bank[7]), budget: 96)
+    let written = take out.into_bytes()
+    try await world.stdio.write_out(written.view())
+} main

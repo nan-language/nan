@@ -1,8 +1,10 @@
 //! Nanbench, the benchmark that gates NaN language versions: the token counts of the primer
 //! tiers, the measurements of the freeze, and the runs of named models over the task corpus with
-//! the metrics they give. Each command writes its results under `bootstrap/nanbench/results/`.
+//! the metrics they give; it also compares NaN's run times with Rust's and C++'s. Each command
+//! writes its results under `bootstrap/nanbench/results/`.
 
 mod agent;
+mod compare;
 mod corpus;
 mod measure;
 mod model;
@@ -94,6 +96,35 @@ fn measure() -> Result<bool, String> {
     publish("measurements.md", &text)?;
     publish("radii.tsv", &radii)?;
     Ok(within)
+}
+
+/// `nanbench compare [<program>...]`: builds the programs named, every one when none is, in NaN,
+/// Rust and C++, says each one's times once taken, writes `compare.md` when every program ran,
+/// and fails when a program's outputs differ between the languages.
+fn compare(names: &[String]) -> Result<bool, String> {
+    let fault = |error: std::io::Error| error.to_string();
+    let programs = compare::chosen(names)?;
+    let work = cache().join("compare");
+    if work.exists() {
+        fs::remove_dir_all(&work).map_err(fault)?;
+    }
+    fs::create_dir_all(work.join("home")).map_err(fault)?;
+    nan::use_home(work.join("home"), Some(work.join("store")));
+    let built: Vec<&str> = programs.iter().map(|(name, ..)| *name).collect();
+    let images = compare::build(&repository(), &work, &built)?;
+    let mut timed = Vec::new();
+    for ((name, measures, size), images) in programs.into_iter().zip(&images) {
+        let outcome = compare::time(images, size)?;
+        println!("{}", compare::line(name, &outcome));
+        timed.push(((name, measures, size), outcome));
+    }
+    if names.is_empty() {
+        let text = compare::document(&timed, &compare::compilers(&work)?, &timing::machine());
+        publish("compare.md", &text)?;
+    }
+    Ok(timed
+        .iter()
+        .all(|(_, outcome)| matches!(outcome, compare::Outcome::Timed(_))))
 }
 
 /// Runs tasks with a model, each in a workspace of its own under the cache, and gives each
@@ -195,11 +226,12 @@ fn main() -> ExitCode {
     let outcome = match args.first().map(String::as_str) {
         Some("tokens") => tokens(),
         Some("measure") => measure(),
+        Some("compare") => compare(&args[1..]),
         Some("corpus") => check_corpus(),
         Some("run") => run(&args[1..]),
         Some("report") => report(),
         _ => Err(
-            "usage: nanbench tokens | measure | corpus | run <model> [<task>...] | report"
+            "usage: nanbench tokens | measure | compare [<program>...] | corpus | run <model> [<task>...] | report"
                 .to_owned(),
         ),
     };

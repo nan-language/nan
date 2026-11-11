@@ -38,6 +38,7 @@ use super::super::super::runtime::tasks;
 use super::super::super::runtime::{Routine, fetch_add, report};
 use super::super::super::{Instance, Lowering};
 use super::super::Supply;
+use super::super::mem::lists::fn_param;
 use crate::check::props::Property;
 use crate::check::ty::{Arg, Ty};
 use crate::nir::{Callable, FnRef, Role};
@@ -123,6 +124,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "sys::Cx.after" | "sys::Cx.after_ns" => intake::after(lo, fx, supply),
         "sys::Cx.spawn" => keyed::spawn(lo, fx, supply),
         "sys::current_header" => current_header(lo, fx, supply),
+        "sys::run_headed" => run_headed(lo, fx, supply),
         "sys::Cx.cancel" => {
             let runner = fx.load(PTR, supply.param(0).address(), 0);
             let lock = fx.offset(runner, runner::LOCK);
@@ -454,6 +456,24 @@ fn current_header(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
     let held = lo.held_at(fx, &option, result);
     supply.ret(lo, fx, held);
+}
+
+/// `sys::run_headed(header, body: b)`: calls `b` with `header` as the running task's header,
+/// then the task's own again.
+fn run_headed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let current = tasks::current_task(lo, fx);
+    let own = fx.offset(current, tasks::task::HEADER);
+    let saved = fx.slot(tasks::HEADER_BLOCK, 8);
+    lo.copy(fx, saved, own, tasks::HEADER_BLOCK, 8);
+    let one = fx.ptr(1);
+    fx.store(one, own, 0);
+    let bytes = fx.offset(own, 8);
+    lo.copy(fx, bytes, supply.param(0).address(), HEADER_BYTES, 1);
+    let body_ty = fn_param(supply, 1);
+    let called = lo.call_value(fx, &body_ty, supply.param(1).address(), &[]);
+    lo.copy(fx, own, saved, tasks::HEADER_BLOCK, 8);
+    supply.forward_failure(lo, fx, &called);
+    supply.ret(lo, fx, called.result);
 }
 
 /// The bytes of a `sys::Header`.

@@ -33,9 +33,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "task::Executor" | "task::Account" => accounts::lower(lo, fx, supply),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),
         "sys::Domain" | "sys::Abandoner" | "sys::Trap" => domains::lower(lo, fx, supply),
-        "host::Runner" | "sys::Cx" | "sys::Outbox" | "sys::Stepper" | "sys::current_header" => {
-            components::lower(lo, fx, supply)
-        }
+        "host::Runner"
+        | "sys::Cx"
+        | "sys::Outbox"
+        | "sys::Stepper"
+        | "sys::current_header"
+        | "sys::run_headed" => components::lower(lo, fx, supply),
         _ => return false,
     }
     true

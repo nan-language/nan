@@ -281,11 +281,14 @@ pub closed struct Header derives Copy, Eq, Hash {
 } Header
 
 pub fn current_header() -> Option[Header]
+
+pub fn run_headed[T, E](header: Header, body: fn() -> T fails E uses wait) -> T fails E uses wait
 ```
 
 - A task starts with the header of the task that started it, none for the first task of a program, of a test or of an interpreter run.
 - While a handler runs for a message, the task running it has the message's header, then its own again. A message delivered by [`deliver_headed`](#steppers) has the header that call gives and one delivered by `deliver` none; a message of the intake has the header of the task that queued it by `send`, `after`, `after_ns` or a [post](#keyed-tasks).
 - `sys::current_header()` returns the running task's header.
+- `sys::run_headed(h, body: b)` calls `b` on the calling task with `h` as the task's header, then returns `b`'s result or fails with its failure, the task having its own header again. So a runner gives a header to the calls it serves through [`Wire[P].serve`](#wire-encoding), and to a stepper's `start`, `resume` and `resumed` and the tasks they start.
 
 ```nan
 pub closed struct Env {

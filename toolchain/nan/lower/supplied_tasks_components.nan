@@ -316,10 +316,17 @@ fn draw_record(mut lo: Lowering, mut fx: Fx, shape: ComponentsShape, cell: clif:
     return record
 } draw_record
 
+/// Where a step writes what it handles: a `sys::Handled` type and an address.
+struct HandledAt derives Copy {
+    handled: ty::Ty
+    at: clif::Value
+} HandledAt
+
 /// Removes the oldest entry of a runner's intake and handles its message on the running task:
 /// a one-way post completes, a request's entry awaits its handler's reply, and the entry of a
-/// message the component sent is freed. The caller holds the lock, which this releases.
-fn handle_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif::Value, state: ty::Ty, env: ty::Ty, message: ty::Ty) {
+/// message the component sent is freed. The caller holds the lock, which this releases. With a
+/// `sys::Handled` type and an address, it writes there what it handles.
+fn handle_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif::Value, state: ty::Ty, env: ty::Ty, message: ty::Ty, handled: Option[HandledAt]) {
     let laid = mut lo.layout_of(message)
     let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
     components_unlink(mut fx, record, node: oldest)
@@ -344,6 +351,10 @@ fn handle_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif
     let header = mut fx.slot(HEADER_BLOCK, align: 8)
     let queued = mut fx.offset(oldest, offset: COMPONENTS_ENTRY_HEADER)
     mut lo.copy(mut fx, dst: header, src: queued, size: HEADER_BLOCK, align: 8)
+    match handled {
+        Some(written) => write_handled(mut lo, mut fx, written, message, slot, header)
+        None => {}
+    }
     let lock = mut fx.offset(record, offset: RUNNER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
     let sent = mut fx.b.bxor_imm_s(posted, y: 1)
@@ -352,6 +363,37 @@ fn handle_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, oldest: clif
     })
     components_handle(mut lo, mut fx, record, state, env, message, slot, header, node: Some(oldest))
 } handle_oldest
+
+/// Writes the `sys::Handled` of a message in a slot handled under the header of a block: that
+/// header, and the index of the message's variant for an enum or a protocol, 0 for any other
+/// message type.
+fn write_handled(mut lo: Lowering, mut fx: Fx, written: HandledAt, message: ty::Ty, slot: clif::Value, header: clif::Value) {
+    let header_field = mut lo.layouts.field(lo.ck, ty: written.handled, variant: None, label: "header")
+    let operation_field = mut lo.layouts.field(lo.ck, ty: written.handled, variant: None, label: "operation")
+    let header_at = mut fx.offset(written.at, offset: header_field.offset)
+    let flag = mut fx.load(PTR, addr: header, offset: 0)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+    mut lo.write_option_with(mut fx, layout_ty: header_field.ty, address: header_at, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
+        let bytes = mut fx1.offset(header, offset: 8)
+        mut lo1.copy(mut fx1, dst: at, src: bytes, size: HEADER_BYTES, align: 1)
+    })
+    let operation = handled_operation(mut lo, mut fx, message, slot)
+    mut fx.store(operation, addr: written.at, offset: operation_field.offset)
+} write_handled
+
+/// The 16-bit operation number of a message in a slot: the index of its variant for an enum or a
+/// protocol, 0 for any other message type.
+fn handled_operation(mut lo: Lowering, mut fx: Fx, message: ty::Ty, slot: clif::Value) -> clif::Value {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(message) else {
+        return mut fx.int(clif::Type.Int16, value: 0)
+    }
+    match lo.ck.sig(item).contents().kind {
+        check::SigKind.Enum(variants: _) or check::SigKind.Protocol(operations: _, variants: _, summary: _) => {}
+        else => return mut fx.int(clif::Type.Int16, value: 0)
+    }
+    let index = mut lo.variant_index(mut fx, ty: message, address: slot)
+    return mut fx.b.ireduce(clif::Type.Int16, x: index)
+} handled_operation
 
 /// Passes the message in a slot to `on`, or to its operation's handler for a protocol, with the
 /// state and the Env a runner's record holds, then publishes the summary; a request's reply goes

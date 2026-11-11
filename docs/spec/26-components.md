@@ -641,6 +641,11 @@ pub closed struct Stopped[S, Env: Any] {
     pub env: Env
 } Stopped
 
+pub closed struct Handled derives Copy, Eq {
+    pub header: Option[Header]
+    pub operation: u16
+} Handled
+
 pub fn Stepper.start(take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
 
 pub fn Stepper.resume(take state: S, take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
@@ -651,7 +656,7 @@ pub fn Stepper.deliver(mut self, take message: M)
 
 pub fn Stepper.deliver_headed(mut self, take message: M, header: Header)
 
-pub fn Stepper.step(mut self) -> bool
+pub fn Stepper.step(mut self) -> Option[Handled]
 
 pub fn Stepper.incoming(self) fails task::Cancelled uses wait
 
@@ -671,7 +676,7 @@ pub fn Stepper.abandon(take self)
 - `sys::Stepper[S, Env, M]` is a base type: linear, and never a view, Copy, Send, Inert or AnyBits. A use of `sys::Stepper.start` or `sys::Stepper.resume` where S does not implement `sys::Component[Env, M]` for the Env and M fixed at that use is an error (`component.not-component`). Steppers are available on every target.
 - `start(env, exec, alloc)` draws the stepper's record, which holds the intake, through `alloc`, trapping when `alloc` is exhausted (`trap.exhausted`), then calls `S.start(mut env)` on the calling task and returns the stepper holding the state and the Env. `resume(state, env, exec, alloc)` does the same with `state` as the state, calling no handler. The stepper's executor and allocator are `exec` and `alloc`. When `exec` is stale, both fail at once with the cancellation, releasing what they took as `run` releases its Env ([revocation](14-authority.md#revocation)).
 - `s.outbox()` returns the stepper's outbox, the same on every call.
-- `mut s.deliver(m)` calls `on` with `m`, or its operation's handler for a protocol, on the calling task, and `mut s.deliver_headed(m, header: h)` does so with `h` as the message's [header](#headers). `mut s.step()` removes the oldest message of the intake, handles it so and returns `true`, completing its post or giving a request's handler's result or failure to its poster as the runner does; it returns `false` when the intake is empty. Both publish the summary as the runner does ([servers](#servers)).
+- `mut s.deliver(m)` calls `on` with `m`, or its operation's handler for a protocol, on the calling task, and `mut s.deliver_headed(m, header: h)` does so with `h` as the message's [header](#headers). `mut s.step()` removes the oldest message of the intake, handles it so, completing its post or giving a request's handler's result or failure to its poster as the runner does, and returns what it handled: a `sys::Handled` holding the message's header, `None` for a message without one, and its operation's number, the index of its variant for an enum M, of its operation for a protocol, and 0 for any other M. It returns `None` when the intake is empty. Both publish the summary as the runner does ([servers](#servers)).
 - A keyed task that `spawn` starts on a stepper is **held**: its stack and record are drawn, but it starts only when `mut s.start_keyed()` starts every held keyed task, in the order of their spawns, returning how many it started. Superseding the key of a held task cancels it before it starts.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
 - `s.incoming()` returns once a message waits in the intake. `s.ready()` returns `true` once a message waits in the intake and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.

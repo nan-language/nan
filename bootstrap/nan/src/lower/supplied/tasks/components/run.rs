@@ -153,7 +153,7 @@ fn component_glue(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Func
                 present,
                 &[types::I8],
                 |lo, fx| {
-                    handle_oldest(lo, fx, record, oldest, &state, &env, &message);
+                    handle_oldest(lo, fx, record, oldest, &state, &env, &message, None);
                     vec![fx.int(types::I8, 1)]
                 },
                 |lo, fx| {

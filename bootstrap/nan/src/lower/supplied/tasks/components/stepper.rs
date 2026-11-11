@@ -59,24 +59,26 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "step" => {
             let record = record(fx);
             let (state, env, message) = types_of(supply);
+            let option = supply.abi.result.clone();
+            let handled = lo.std_ty("sys", "Handled", Vec::new());
+            let layout = lo.layout(&option);
+            let result = supply
+                .sret
+                .unwrap_or_else(|| fx.slot(layout.size, layout.align));
             let lock = fx.offset(record, runner::LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let oldest = fx.load(PTR, record, runner::OLDEST);
             let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, oldest, 0);
-            fx.choose_in(
-                lo,
-                present,
-                &[],
-                |lo, fx| {
-                    handle_oldest(lo, fx, record, oldest, &state, &env, &message);
-                    Vec::new()
-                },
-                |lo, fx| {
-                    lo.call_routine(fx, Routine::Unlock, &[lock]);
-                    Vec::new()
-                },
-            );
-            supply.ret(lo, fx, Held::Scalar(present));
+            lo.write_option_with(fx, &option, result, present, |lo, fx, at| {
+                let handled = Some((&handled, at));
+                handle_oldest(lo, fx, record, oldest, &state, &env, &message, handled);
+            });
+            let empty = fx.b.ins().bxor_imm_s(present, 1);
+            fx.when(empty, |fx| {
+                lo.call_routine(fx, Routine::Unlock, &[lock]);
+            });
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
         }
         "incoming" => {
             let record = record(fx);

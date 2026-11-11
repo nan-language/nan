@@ -40,6 +40,7 @@ use super::super::super::{Instance, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
 use crate::check::props::Property;
+use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Ty};
 use crate::nir::{Callable, FnRef, Role};
 
@@ -338,7 +339,9 @@ fn draw_record(
 
 /// Removes the oldest entry of a runner's intake and handles its message on the running task:
 /// a one-way post completes, a request's entry awaits its handler's reply, and the entry of a
-/// message the component sent is freed. The caller holds the lock, which this releases.
+/// message the component sent is freed. The caller holds the lock, which this releases. With a
+/// `sys::Handled` type and an address, it writes there what it handles.
+#[allow(clippy::too_many_arguments)]
 fn handle_oldest(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -347,6 +350,7 @@ fn handle_oldest(
     state: &Ty,
     env: &Ty,
     message: &Ty,
+    handled: Option<(&Ty, Value)>,
 ) {
     let layout = lo.layout(message);
     let slot = fx.slot(layout.size, layout.align);
@@ -370,6 +374,9 @@ fn handle_oldest(
     let header = fx.slot(tasks::HEADER_BLOCK, 8);
     let queued = fx.offset(oldest, entry::HEADER);
     lo.copy(fx, header, queued, tasks::HEADER_BLOCK, 8);
+    if let Some((handled, at)) = handled {
+        write_handled(lo, fx, (handled, at), message, (slot, header));
+    }
     let lock = fx.offset(record, runner::LOCK);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     let sent = fx.b.ins().bxor_imm_s(posted, 1);
@@ -386,6 +393,44 @@ fn handle_oldest(
         (slot, header),
         Some(oldest),
     );
+}
+
+/// Writes the `sys::Handled` of a message in a slot handled under the header of a block: that
+/// header, and the index of the message's variant for an enum or a protocol, 0 for any other
+/// message type.
+fn write_handled(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    (handled, at): (&Ty, Value),
+    message: &Ty,
+    (slot, header): (Value, Value),
+) {
+    let header_field = lo.layouts.field(lo.ck, handled, None, "header");
+    let operation_field = lo.layouts.field(lo.ck, handled, None, "operation");
+    let header_at = fx.offset(at, header_field.offset);
+    let flag = fx.load(PTR, header, 0);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flag, 0);
+    lo.write_option_with(
+        fx,
+        &header_field.ty,
+        header_at,
+        present,
+        |lo, fx, payload| {
+            let bytes = fx.offset(header, 8);
+            lo.copy(fx, payload, bytes, HEADER_BYTES, 1);
+        },
+    );
+    let variants = matches!(message, Ty::Item(item, _) if matches!(
+        lo.ck.sig(*item).kind,
+        SigKind::Enum { .. } | SigKind::Protocol { .. }
+    ));
+    let operation = if variants {
+        let index = lo.variant_index(fx, message, slot);
+        fx.b.ins().ireduce(types::I16, index)
+    } else {
+        fx.int(types::I16, 0)
+    };
+    fx.store(operation, at, operation_field.offset);
 }
 
 /// Passes the message in a slot to `on`, or to its operation's handler for a protocol, with the

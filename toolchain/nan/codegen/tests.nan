@@ -796,6 +796,109 @@ fn arm_branches_or_divides(vcode: VCode[aarch64::Inst]) -> bool {
     return false
 } arm_branches_or_divides
 
+/// The sum of a parameter's quotients by 8 and 10 and its remainders by 8 and 7.
+fn constant_divisions(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let eight = mut b.iconst(clif::Type.Int64, imm: 8)
+    let ten = mut b.iconst(clif::Type.Int64, imm: 10)
+    let seven = mut b.iconst(clif::Type.Int64, imm: 7)
+    let eighth = mut b.udiv(params[0], y: eight)
+    let tenth = mut b.udiv(params[0], y: ten)
+    let low = mut b.urem(params[0], y: eight)
+    let left = mut b.urem(params[0], y: seven)
+    let quotients = mut b.iadd(eighth, y: tenth)
+    let remainders = mut b.iadd(low, y: left)
+    let total = mut b.iadd(quotients, y: remainders)
+    mut b.ret(one(total, alloc).view())
+    return take b.finalize()
+} constant_divisions
+
+test divides_by_constants_without_a_division for select {
+    let alloc = testing::world().alloc
+    let selected = select(constant_divisions(alloc), isa: host_isa(), alloc)
+    expect not x64_branches_or_divides(selected)
+} divides_by_constants_without_a_division
+
+/// The sum of two parameters, trapping when it overflows, as lowering checks it: the overflow
+/// flag inverted by a `bxor` with 1 decides the branch.
+fn sum_trapping_on_overflow(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let clif::Overflowed(value: sum, flag: overflowed) = mut b.uadd_overflow(params[0], y: params[1])
+    let fits = mut b.bxor_imm_s(overflowed, y: 1)
+    let done = mut b.create_block()
+    let overflowing = mut b.create_block()
+    mut b.brif(fits, then: done, then_args: no_values(alloc).view(), otherwise: overflowing, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(done)
+    mut b.ret(one(sum, alloc).view())
+    mut b.switch_to_block(overflowing)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} sum_trapping_on_overflow
+
+/// Whether x86-64 code writes a flag into a register or computes an exclusive or.
+fn x64_writes_flags(vcode: VCode[x64::Inst]) -> bool {
+    for held in vcode.insts {
+        match held.inst {
+            x64::Inst.Setcc(cond: _, dst: _) => return true
+            x64::Inst.Alu(op: x64::AluOp.Xor, size: _, dst: _, src: _) or x64::Inst.AluImm(op: x64::AluOp.Xor, size: _, dst: _, imm: _) => return true
+            else => {}
+        }
+    }
+    return false
+} x64_writes_flags
+
+test branches_on_the_flags_of_an_overflowing_operation for select {
+    let alloc = testing::world().alloc
+    let selected = select(sum_trapping_on_overflow(alloc), isa: host_isa(), alloc)
+    expect x64_branches_or_divides(selected)
+    expect not x64_writes_flags(selected)
+} branches_on_the_flags_of_an_overflowing_operation
+
+/// The product of the sum of a function's first two float parameters by its third.
+fn sum_times(alloc: mem::Alloc) -> clif::Function {
+    var signature = clif::Signature.new(clif::CallConv.SystemV, alloc)
+    for _ in 0u32..<3 {
+        mut signature.params.push(clif::AbiParam(value_type: clif::Type.Float64))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Float64))
+    var b = clif::Builder.new(clif::Function.new(clif::ExternalName(namespace: 0, index: 0), signature: take signature, alloc), alloc)
+    let entry = mut b.create_block()
+    mut b.append_block_params_for_function_params(entry)
+    mut b.switch_to_block(entry)
+    mut b.seal_block(entry)
+    let params = params_of(b, alloc)
+    expect params.len() == 3
+    let sum = mut b.fadd(params[0], y: params[1])
+    let product = mut b.fmul(sum, y: params[2])
+    mut b.ret(one(product, alloc).view())
+    return take b.finalize()
+} sum_times
+
+/// How many NaN canonicalizations x86-64 code holds.
+fn x64_canonicalizations(vcode: VCode[x64::Inst]) -> usize {
+    var count: usize = 0
+    for held in vcode.insts {
+        match held.inst {
+            x64::Inst.CanonNan(size: _, reg: _, temp: _) => {
+                count += 1
+            }
+            else => {}
+        }
+    }
+    return count
+} x64_canonicalizations
+
+test canonicalizes_only_float_results_whose_bits_show for select {
+    let alloc = testing::world().alloc
+    let selected = select(sum_times(alloc), isa: host_isa(), alloc)
+    expect x64_canonicalizations(selected) == 1
+} canonicalizes_only_float_results_whose_bits_show
+
 test selects_secret_operations_without_branches_or_divisions for select {
     let alloc = testing::world().alloc
     let x64_selected = select(secret_operations(alloc), isa: host_isa(), alloc)

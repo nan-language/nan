@@ -137,7 +137,11 @@ fn Selector.binary(mut self, func: clif::Function, inst: clif::Inst, opcode: cli
         clif::Opcode.Smulhi => mut self.mulhi(func, inst, x, y, signed: true)
         clif::Opcode.Band => mut self.bitwise(func, inst, op: x64::AluOp.And, x, y)
         clif::Opcode.Bor => mut self.bitwise(func, inst, op: x64::AluOp.Or, x, y)
-        clif::Opcode.Bxor => mut self.bitwise(func, inst, op: x64::AluOp.Xor, x, y)
+        clif::Opcode.Bxor => {
+            if not self.facts.fuses(func, value: result_of(func, inst, alloc: self.alloc)) {
+                mut self.bitwise(func, inst, op: x64::AluOp.Xor, x, y)
+            }
+        }
         clif::Opcode.Ishl => mut self.shift(func, inst, op: x64::ShiftOp.Shl, x, y)
         clif::Opcode.Ushr => mut self.shift(func, inst, op: x64::ShiftOp.Shr, x, y)
         clif::Opcode.Sshr => mut self.shift(func, inst, op: x64::ShiftOp.Sar, x, y)
@@ -540,6 +544,9 @@ fn Selector.extend(mut self, func: clif::Function, inst: clif::Inst, arg: clif::
 fn Selector.divide(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, signed: bool, remainder: bool) {
     let ty = func.value_type(x)
     expect ty != clif::Type.Int128
+    if not signed and mut self.divided_by_constant(func, inst, x, y, remainder) {
+        return
+    }
     var dividend = mut self.src(x, func)
     var divisor = mut self.src(y, func)
     if ty.bits() < 32 {
@@ -566,6 +573,167 @@ fn Selector.divide(mut self, func: clif::Function, inst: clif::Inst, x: clif::Va
         mut self.mov(dst, src: x64::RAX)
     }
 } Selector.divide
+
+/// An unsigned division or remainder by a constant other than zero, selected without a division:
+/// a power of two shifts or masks the dividend, any other divisor multiplies it by the divisor's
+/// magic number. Whether `y` is such a constant.
+fn Selector.divided_by_constant(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, remainder: bool) -> bool {
+    let Some(bits) = self.facts.constant(y, func) else {
+        return false
+    }
+    let ty = func.value_type(x)
+    let divisor = bits & width_mask(ty.bits())
+    if divisor == 0 {
+        return false
+    }
+    let source = mut self.src(x, func)
+    let dividend = mut self.extended(source, ty: ty, signed: false)
+    let dst = mut self.dst_of(func, inst)
+    if (divisor & (divisor - 1)) == 0 {
+        mut self.mov(dst, src: dividend)
+        if remainder {
+            mut self.and_mask(dst, mask: divisor - 1)
+        } else {
+            mut self.shift_right(dst, amount: u8.truncate(divisor.trailing_zeros()))
+        }
+        return true
+    }
+    let quotient = mut self.quotient_of(func, x, dividend, divisor)
+    if not remainder {
+        mut self.mov(dst, src: quotient)
+        return true
+    }
+    let product = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: product, imm: divisor))
+    mut self.emit(x64::Inst.Imul(size: x64::Size.Qword, dst: product, src: quotient))
+    mut self.mov(dst, src: dividend)
+    mut self.emit(x64::Inst.Alu(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: dst, src: product))
+    return true
+} Selector.divided_by_constant
+
+/// A quotient selected by a magic number, which a later division of the same dividend by the same
+/// divisor in the block takes again.
+struct Quotient derives Copy {
+    dividend: clif::Value
+    divisor: u64
+    reg: machinst::Reg
+} Quotient
+
+/// The quotient of `x`, held zero-extended in `dividend`, by a divisor neither zero nor a power of
+/// two: the one the block selected already, or a new one.
+fn Selector.quotient_of(mut self, func: clif::Function, x: clif::Value, dividend: machinst::Reg, divisor: u64) -> machinst::Reg {
+    let value = func.resolve_aliases(x)
+    for known in self.quotients {
+        if known.dividend == value and known.divisor == divisor {
+            return known.reg
+        }
+    }
+    let reg = mut self.magic_quotient(dividend, divisor)
+    mut self.quotients.push(Quotient(dividend: value, divisor: divisor, reg: reg))
+    return reg
+} Selector.quotient_of
+
+/// The quotient of a zero-extended dividend by a divisor neither zero nor a power of two: the high
+/// half of the dividend's product by the divisor's magic number, shifted.
+fn Selector.magic_quotient(mut self, dividend: machinst::Reg, divisor: u64) -> machinst::Reg {
+    let magic = magic_of(divisor)
+    let factor = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: factor, imm: magic.multiplier))
+    mut self.mov(x64::RAX, src: dividend)
+    mut self.emit(x64::Inst.MulWide(signed: false, size: x64::Size.Qword, src: factor))
+    let high = mut self.temp(false)
+    mut self.mov(high, src: x64::RDX)
+    if not magic.add {
+        mut self.shift_right(high, amount: magic.shift)
+        return high
+    }
+    let sum = mut self.temp(false)
+    mut self.mov(sum, src: dividend)
+    mut self.emit(x64::Inst.Alu(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: sum, src: high))
+    mut self.shift_right(sum, amount: 1)
+    mut self.emit(x64::Inst.Alu(op: x64::AluOp.Add, size: x64::Size.Qword, dst: sum, src: high))
+    mut self.shift_right(sum, amount: magic.shift - 1)
+    return sum
+} Selector.magic_quotient
+
+/// `reg >>= amount`, logically on 64 bits.
+fn Selector.shift_right(mut self, reg: machinst::Reg, amount: u8) {
+    if amount > 0 {
+        mut self.emit(x64::Inst.Shift(op: x64::ShiftOp.Shr, size: x64::Size.Qword, dst: reg, amount: amount))
+    }
+} Selector.shift_right
+
+/// `reg &= mask` on 64 bits, the mask an immediate when it fits.
+fn Selector.and_mask(mut self, reg: machinst::Reg, mask: u64) {
+    let Some(imm) = imm32(mask, width: 64) else {
+        let held = mut self.temp(false)
+        mut self.emit(x64::Inst.MovImm(dst: held, imm: mask))
+        mut self.emit(x64::Inst.Alu(op: x64::AluOp.And, size: x64::Size.Qword, dst: reg, src: held))
+        return
+    }
+    mut self.emit(x64::Inst.AluImm(op: x64::AluOp.And, size: x64::Size.Qword, dst: reg, imm: imm))
+} Selector.and_mask
+
+/// The bits of an integer `width` bits wide, at most 64.
+fn width_mask(width: u32) -> u64
+    example width_mask(8) == 0xFF
+    example width_mask(64) == 0xFFFF_FFFF_FFFF_FFFF
+{
+    if width >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF
+    }
+    return (1u64 << width) - 1
+} width_mask
+
+/// What divides an unsigned 64-bit integer by a constant without a division, as Hacker's Delight
+/// derives it: the high half of the dividend's product by `multiplier`, shifted right by `shift`,
+/// is the quotient, or, when `add` holds, that high half added to half the dividend less it,
+/// shifted right by `shift - 1`.
+struct Magic derives Copy, Eq {
+    multiplier: u64
+    add: bool
+    shift: u8
+} Magic
+
+/// The magic number of a divisor neither zero, one nor a power of two.
+fn magic_of(divisor: u64) -> Magic
+    example magic_of(3) == Magic(multiplier: 0xAAAA_AAAA_AAAA_AAAB, add: false, shift: 1)
+    example magic_of(7) == Magic(multiplier: 0x2492_4924_9249_2493, add: true, shift: 3)
+    example magic_of(10) == Magic(multiplier: 0xCCCC_CCCC_CCCC_CCCD, add: false, shift: 3)
+    example magic_of(125) == Magic(multiplier: 0x0624_DD2F_1A9F_BE77, add: true, shift: 7)
+    example magic_of(625) == Magic(multiplier: 0x346D_C5D6_3886_594B, add: false, shift: 7)
+{
+    var add = false
+    var exponent: u32 = 63
+    let nc = 0xFFFF_FFFF_FFFF_FFFF - 0u64.wrapping_sub(divisor) % divisor
+    var q1 = 0x8000_0000_0000_0000 / nc
+    var r1 = 0x8000_0000_0000_0000 - q1.wrapping_mul(nc)
+    var q2 = 0x7FFF_FFFF_FFFF_FFFF / divisor
+    var r2 = 0x7FFF_FFFF_FFFF_FFFF - q2.wrapping_mul(divisor)
+    loop {
+        exponent += 1
+        if r1 >= nc - r1 {
+            q1 = q1.wrapping_mul(2).wrapping_add(1)
+            r1 = r1.wrapping_mul(2).wrapping_sub(nc)
+        } else {
+            q1 = q1.wrapping_mul(2)
+            r1 = r1.wrapping_mul(2)
+        }
+        if r2.wrapping_add(1) >= divisor - r2 {
+            add = add or q2 >= 0x7FFF_FFFF_FFFF_FFFF
+            q2 = q2.wrapping_mul(2).wrapping_add(1)
+            r2 = r2.wrapping_mul(2).wrapping_add(1).wrapping_sub(divisor)
+        } else {
+            add = add or q2 >= 0x8000_0000_0000_0000
+            q2 = q2.wrapping_mul(2)
+            r2 = r2.wrapping_mul(2).wrapping_add(1)
+        }
+        let delta = divisor.wrapping_sub(1).wrapping_sub(r2)
+        if not (exponent < 128 and (q1 < delta or (q1 == delta and r1 == 0))) {
+            return Magic(multiplier: q2.wrapping_add(1), add: add, shift: u8.truncate(exponent - 64))
+        }
+    }
+} magic_of
 
 /// The high half of a product: `rdx` after a one-operand multiplication, or for a narrow type
 /// the bits of a 32-bit product above its width.
@@ -605,8 +773,7 @@ fn Selector.overflowing(mut self, func: clif::Function, inst: clif::Inst, x: cli
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(x, func)
     mut self.alu(func, op, size: exact_size(ty), dst, src, y)
-    let overflowed = mut self.reg(second_result_of(func, inst, alloc: self.alloc), func)
-    mut self.emit(x64::Inst.Setcc(cond: flag, dst: overflowed))
+    mut self.overflow_flag(func, inst, cond: flag)
 } Selector.overflowing
 
 /// A multiplication at the type's own width, with the flag of its overflow: `mul`, or `imul`
@@ -626,6 +793,16 @@ fn Selector.mul_overflowing(mut self, func: clif::Function, inst: clif::Inst, x:
         mut self.emit(x64::Inst.MulWide(signed: signed, size: size, src: b))
         mut self.mov(dst, src: x64::RAX)
     }
-    let overflowed = mut self.reg(second_result_of(func, inst, alloc: self.alloc), func)
-    mut self.emit(x64::Inst.Setcc(cond: x64::Cond.Overflow, dst: overflowed))
+    mut self.overflow_flag(func, inst, cond: x64::Cond.Overflow)
 } Selector.mul_overflowing
+
+/// The flag of an overflowing operation's overflow, written from the processor's flags unless the
+/// branch ending the block reads them in its place.
+fn Selector.overflow_flag(mut self, func: clif::Function, inst: clif::Inst, cond: x64::Cond) {
+    let flag = second_result_of(func, inst, alloc: self.alloc)
+    if self.facts.fuses(func, value: flag) {
+        return
+    }
+    let overflowed = mut self.reg(flag, func)
+    mut self.emit(x64::Inst.Setcc(cond: cond, dst: overflowed))
+} Selector.overflow_flag

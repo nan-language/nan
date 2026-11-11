@@ -378,7 +378,8 @@ fn char_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.done(lo, fx);
 }
 
-/// `Range.next`: the low bound, then the range past it.
+/// `Range.next`: the low bound, then the range past it. Only the last value of an inclusive range
+/// reads and clears `inclusive`.
 fn range_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let range_ty = supply.owner.clone().expect("a range type");
     let element_ty = element(lo, &range_ty);
@@ -390,32 +391,31 @@ fn range_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let ty = super::super::layout::scalar_type(scalar, lo.float_bits());
     let low = fx.load(ty, range, low_at);
     let high = fx.load(ty, range, high_at);
-    let inclusive = fx.load(types::I8, range, inclusive_at);
     let (less, less_or_equal) = match scalar.is_signed() {
         true => (IntCC::SignedLessThan, IntCC::SignedLessThanOrEqual),
         false => (IntCC::UnsignedLessThan, IntCC::UnsignedLessThanOrEqual),
     };
     let below = fx.b.ins().icmp(less, low, high);
-    let at_most = fx.b.ins().icmp(less_or_equal, low, high);
-    let inclusive = fx.b.ins().icmp_imm_s(IntCC::NotEqual, inclusive, 0);
-    let reaches = fx.b.ins().band(inclusive, at_most);
-    let present = fx.b.ins().bor(below, reaches);
-    fx.when(present, |fx| {
-        let next = fx.b.ins().iadd_imm_s(low, 1);
-        fx.choose(
-            below,
-            &[],
-            |fx| {
-                fx.store(next, range, low_at);
-                Vec::new()
-            },
-            |fx| {
+    let present = fx.choose(
+        below,
+        &[types::I8],
+        |fx| {
+            let next = fx.b.ins().iadd_imm_s(low, 1);
+            fx.store(next, range, low_at);
+            vec![fx.int(types::I8, 1)]
+        },
+        |fx| {
+            let inclusive = fx.load(types::I8, range, inclusive_at);
+            let inclusive = fx.b.ins().icmp_imm_s(IntCC::NotEqual, inclusive, 0);
+            let at_most = fx.b.ins().icmp(less_or_equal, low, high);
+            let reaches = fx.b.ins().band(inclusive, at_most);
+            fx.when(reaches, |fx| {
                 let closed = fx.int(types::I8, 0);
                 fx.store(closed, range, inclusive_at);
-                Vec::new()
-            },
-        );
-    });
+            });
+            vec![reaches]
+        },
+    )[0];
     let sret = supply.sret.expect("an option's address");
     let option = supply.abi.result.clone();
     lo.write_option(fx, &option, sret, present, Held::Scalar(low));

@@ -1,6 +1,6 @@
 //! NaN's run times against Rust's and C++'s: each program of `bootstrap/nanbench/bench/compare/`,
-//! written alike in the three languages, built by the bootstrap, by `rustc` and by the system C++
-//! compiler for the base x86-64 instruction set, then run on its size.
+//! written alike in the three languages, built by the NaN toolchain, by `rustc` and by the system
+//! C++ compiler for the base x86-64 instruction set, then run on its size.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,9 @@ const RUST_FLAGS: [&str; 4] = ["--edition", "2024", "-C", "opt-level=3"];
 
 const CXX_FLAGS: [&str; 2] = ["-std=c++20", "-O3"];
 
+/// Where a workspace's `x86_64-host` images are written.
+const IMAGES: &str = ".nan/images/x86_64-host";
+
 /// What a program's images give.
 pub enum Outcome {
     /// Each image's time, in the order of the languages.
@@ -60,7 +63,7 @@ pub fn chosen(names: &[String]) -> Result<Vec<Program>, String> {
         .collect())
 }
 
-/// Runs a command and gives its standard output, or fails with what it writes.
+/// Runs a command and gives its standard output, or fails with what it writes on both streams.
 fn output(command: &mut Command) -> Result<String, String> {
     let program = command.get_program().to_string_lossy().into_owned();
     let output = command
@@ -69,8 +72,9 @@ fn output(command: &mut Command) -> Result<String, String> {
     match output.status.success() {
         true => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         false => Err(format!(
-            "{program} exits with {:?}: {}",
+            "{program} exits with {:?}: {}{}",
             output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )),
     }
@@ -83,14 +87,21 @@ fn compiler(name: &str, work: &Path) -> Command {
     command
 }
 
-/// Builds the programs in each language under `work`, from a copy of their sources, and gives
-/// each one's images in the order of the languages; the calling process's user directory is set.
+/// Builds the programs in each language under `work`, from a copy of their sources, NaN's by the
+/// NaN toolchain the bootstrap builds from a copy of `toolchain/`, and gives each one's images in
+/// the order of the languages; the calling process's user directory is set.
 pub fn build(
     repository: &Path,
     work: &Path,
     programs: &[&str],
 ) -> Result<Vec<Vec<PathBuf>>, String> {
     let fault = |error: std::io::Error| error.to_string();
+    let toolchain = work.join("toolchain");
+    copy_tree(&repository.join("toolchain"), &toolchain).map_err(fault)?;
+    let built = nan::run(&["build".to_owned(), "nan".to_owned()], &toolchain).output;
+    if !built.starts_with("ok ") {
+        return Err(format!("nan build nan reports\n{built}"));
+    }
     let workspace = work.join("nan");
     for program in programs {
         copy_tree(
@@ -101,10 +112,11 @@ pub fn build(
         )
         .map_err(fault)?;
     }
-    let built = nan::run(&["build".to_owned()], &workspace).output;
-    if !built.starts_with("ok ") {
-        return Err(format!("nan build reports\n{built}"));
-    }
+    output(
+        Command::new(toolchain.join(IMAGES).join("nan"))
+            .arg("build")
+            .current_dir(&workspace),
+    )?;
     for dir in ["rust", "cpp"] {
         fs::create_dir_all(work.join(dir)).map_err(fault)?;
     }
@@ -127,11 +139,7 @@ pub fn build(
                 .arg(&cpp)
                 .arg(source.with_extension("cpp")),
         )?;
-        images.push(vec![
-            workspace.join(".nan/images/x86_64-host").join(program),
-            rust,
-            cpp,
-        ]);
+        images.push(vec![workspace.join(IMAGES).join(program), rust, cpp]);
     }
     Ok(images)
 }
@@ -198,7 +206,7 @@ pub fn line(program: &str, outcome: &Outcome) -> String {
 /// described.
 pub fn document(timed: &[(Program, Outcome)], compilers: &[String; 2], machine: &str) -> String {
     let mut text = format!(
-        "# NaN against Rust and C++\n\nTaken by `nanbench compare`: each program of `bootstrap/nanbench/bench/compare/`, written alike in the three languages, runs on its size, built for the base x86-64 instruction set by the bootstrap for `x86_64-host`, by `{}` with `{}` and by `{}` with `{}`. Each time is the median wall time of {RUNS} runs, on a machine with {machine}.\n\n| Program | Measures | Size | NaN | Rust | C++ | NaN / Rust | NaN / C++ |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "# NaN against Rust and C++\n\nTaken by `nanbench compare`: each program of `bootstrap/nanbench/bench/compare/`, written alike in the three languages, runs on its size, built for the base x86-64 instruction set by the NaN toolchain, which the bootstrap builds from `toolchain/`, for `x86_64-host`, by `{}` with `{}` and by `{}` with `{}`. Each time is the median wall time of {RUNS} runs, on a machine with {machine}.\n\n| Program | Measures | Size | NaN | Rust | C++ | NaN / Rust | NaN / C++ |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         compilers[0],
         RUST_FLAGS.join(" "),
         compilers[1],

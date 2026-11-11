@@ -18,6 +18,14 @@ struct Facts {
     /// arguments goes through, `NONE` for an edge without arguments.
     then_edges: mem::List[u32]
     else_edges: mem::List[u32]
+    /// Whether each value is the flag of an overflowing operation that only the conditional
+    /// branch ending its block tests, right after the operation, or the `bxor` with 1 inverting
+    /// such a flag for the branch: the branch reads the processor's flags instead.
+    fused: mem::List[bool]
+    /// Whether some instruction reads each value in a way that can show a NaN's bits: any but
+    /// an operand of `fadd`, `fsub`, `fmul`, `fdiv` or `sqrt`, whose result is a NaN whenever an
+    /// operand is one, of a float comparison or of a conversion of a float to an integer.
+    shown: mem::List[bool]
 } Facts
 
 fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
@@ -32,6 +40,8 @@ fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
         switches: find_switches(func, count: blocks, alloc),
         then_edges: filled(blocks, value: NONE, alloc),
         else_edges: filled(blocks, value: NONE, alloc),
+        fused: filled(values, value: false, alloc),
+        shown: filled(values, value: false, alloc),
     )
     mut known.place_blocks(func)
     mut known.count_values(func)
@@ -330,6 +340,147 @@ fn slot_align(data: clif::StackSlotData) -> u32
     return larger(8, other: 1u32 << u32.widen(data.align_shift))
 } slot_align
 
+/// Marks the flags of the overflowing operations each block's conditional branch tests right
+/// after them, directly or through one `bxor` with 1, when nothing else reads them and only
+/// constants come between, and those `bxor`s.
+fn Facts.fuse_overflow_checks(mut self, func: clif::Function) {
+    for block in self.order(func) {
+        let insts = func.block_insts(block, alloc: self.alloc)
+        let count = insts.len()
+        if count < 2 {
+            continue
+        }
+        let clif::InstructionData.Brif(opcode: _, arg: arg, then: _, otherwise: _) = func.inst_data(insts[count - 1]) else {
+            continue
+        }
+        let tested = func.resolve_aliases(arg)
+        let inverted = self.inverted_of(func, value: tested)
+        let flag = match inverted {
+            Some(value) => value
+            None => tested
+        }
+        if self.is_overflow_flag_before(func, flag, tested, insts: insts.view()) {
+            mut self.mark_fused(flag)
+            mut self.mark_fused(tested)
+        }
+    }
+} Facts.fuse_overflow_checks
+
+/// The value a `bxor` with 1 inverts when it defines `value`, a value only a branch reads, and
+/// nothing else reads what it inverts.
+fn Facts.inverted_of(self, func: clif::Function, value: clif::Value) -> Option[clif::Value] {
+    let at = usize.widen(value.index)
+    expect at < self.defs.len() and at < self.use_counts.len()
+    let def = self.defs[at]
+    if def == NONE or self.use_counts[at] != 1 {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: clif::Opcode.Bxor, x: x, y: y) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    let inverted = func.resolve_aliases(x)
+    let reads = usize.widen(inverted.index)
+    expect reads < self.use_counts.len()
+    if self.constant(y, func) != Some(1) or self.use_counts[reads] != 1 {
+        return None
+    }
+    return Some(inverted)
+} Facts.inverted_of
+
+/// Whether `flag` is the flag of an overflowing operation that nothing but `tested`, the value a
+/// block's last instruction tests, reads, and that only constants and the definition of `tested`
+/// follow before that instruction.
+fn Facts.is_overflow_flag_before(self, func: clif::Function, flag: clif::Value, tested: clif::Value, insts: Slice[clif::Inst]) -> bool {
+    let at = usize.widen(flag.index)
+    let tested_at = usize.widen(tested.index)
+    expect at < self.defs.len() and at < self.use_counts.len() and tested_at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE or self.use_counts[at] != 1 or not overflows(func.inst_data(clif::Inst(index: def)).opcode()) {
+        return false
+    }
+    let results = func.inst_results(clif::Inst(index: def), alloc: self.alloc)
+    if results.len() != 2 or results[1] != flag {
+        return false
+    }
+    var index = insts.len() - 1
+    while index > 0 {
+        index -= 1
+        let inst = insts[index]
+        if inst.index == def {
+            return true
+        }
+        if inst.index != self.defs[tested_at] and not is_constant_inst(func.inst_data(inst)) {
+            return false
+        }
+    }
+    return false
+} Facts.is_overflow_flag_before
+
+/// Whether an instruction is an `iconst`, `f32const` or `f64const`, which selection emits nothing
+/// for.
+fn is_constant_inst(data: clif::InstructionData) -> bool {
+    return match data {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => true
+        else => false
+    }
+} is_constant_inst
+
+/// Marks each value an instruction reads in a way that can show a NaN's bits.
+fn Facts.mark_shown_values(mut self, func: clif::Function) {
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            let data = func.inst_data(inst)
+            if hides_nan_bits(data) {
+                continue
+            }
+            each_operand(data, visit: fn[mut self](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                expect at < self.shown.len()
+                self.shown[at] = true
+            })
+        }
+    }
+} Facts.mark_shown_values
+
+/// Whether an instruction reads its operands without showing a NaN operand's bits: float
+/// arithmetic whose result is a NaN whenever an operand is one, a float comparison, or a
+/// conversion of a float to an integer, which gives the same integer for every NaN.
+fn hides_nan_bits(data: clif::InstructionData) -> bool {
+    return match data {
+        clif::InstructionData.Binary(opcode: opcode, x: _, y: _) => opcode == clif::Opcode.Fadd or opcode == clif::Opcode.Fsub or opcode == clif::Opcode.Fmul or opcode == clif::Opcode.Fdiv
+        clif::InstructionData.Unary(opcode: opcode, arg: _) => opcode == clif::Opcode.Sqrt or opcode == clif::Opcode.FcvtToSintSat or opcode == clif::Opcode.FcvtToUintSat
+        clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+        else => false
+    }
+} hides_nan_bits
+
+/// Whether some instruction can show the bits of a NaN a value holds.
+fn Facts.is_shown(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    return at >= self.shown.len() or self.shown[at]
+} Facts.is_shown
+
+/// Whether an opcode is an arithmetic operation that also gives the flag of its overflow.
+fn overflows(opcode: clif::Opcode) -> bool {
+    return match opcode {
+        clif::Opcode.UaddOverflow or clif::Opcode.SaddOverflow or clif::Opcode.UsubOverflow or clif::Opcode.SsubOverflow or clif::Opcode.UmulOverflow or clif::Opcode.SmulOverflow => true
+        else => false
+    }
+} overflows
+
+fn Facts.mark_fused(mut self, value: clif::Value) {
+    let at = usize.widen(value.index)
+    expect at < self.fused.len()
+    self.fused[at] = true
+} Facts.mark_fused
+
+/// Whether a value is a flag the conditional branch ending its block reads from the processor's
+/// flags, or the `bxor` inverting one for it.
+fn Facts.fuses(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    return at < self.fused.len() and self.fused[at]
+} Facts.fuses
+
 /// The constant a value is, when an `iconst`, `f32const` or `f64const` defines it: its bits.
 fn Facts.constant(self, value: clif::Value, func: clif::Function) -> Option[u64] {
     let at = usize.widen(func.resolve_aliases(value).index)
@@ -462,8 +613,8 @@ fn swapped(cond: clif::IntCC) -> clif::IntCC {
     }
 } swapped
 
-/// A comparison deciding whether a value is not zero, holding exactly then or, when
-/// `inverted`, exactly otherwise.
+/// A comparison, or an overflowing operation whose flag is fused, deciding whether a value is not
+/// zero, holding exactly then or, when `inverted`, exactly otherwise.
 struct Decider derives Copy, Eq {
     compare: clif::Inst
     inverted: bool
@@ -471,7 +622,8 @@ struct Decider derives Copy, Eq {
 
 /// The comparison deciding whether a value is not zero: the one defining it, the one deciding a
 /// value it extends or tests against zero, or the one deciding the condition of a select of 1 and
-/// 0 defining it.
+/// 0 defining it; or the overflowing operation whose fused flag, inverted by a fused `bxor` or
+/// not, defines it.
 fn Facts.decider(self, func: clif::Function, value: clif::Value) -> Option[Decider] {
     var current = value
     var inverted = false
@@ -493,6 +645,16 @@ fn Facts.decider(self, func: clif::Function, value: clif::Value) -> Option[Decid
                 return Some(Decider(compare: inst, inverted: inverted))
             }
             clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => return Some(Decider(compare: inst, inverted: inverted))
+            clif::InstructionData.Binary(opcode: opcode, x: x, y: _) => {
+                if not self.fuses(func, value: current) {
+                    return None
+                }
+                if opcode != clif::Opcode.Bxor {
+                    return Some(Decider(compare: inst, inverted: inverted))
+                }
+                current = x
+                inverted = not inverted
+            }
             clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => {
                 current = arg
             }

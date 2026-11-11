@@ -58,19 +58,24 @@ pub fn run(
     })
 }
 
-/// What the release gate reports on packages: their check diagnostics, then, when none is an
-/// error, their tests' report, and the errors of checking the releases they reach and their gate
-/// diagnostics, `authors` being the author principals a publication names; by path, line and
-/// code.
+/// What the release gate reports on packages: the diagnostics of checking each alone, then, when
+/// none is an error, their tests' report, and the errors of checking the releases they reach and
+/// their gate diagnostics, from the checkers of their checks, `authors` being the author
+/// principals a publication names; by path, line and code.
 pub fn judged(
     workspace: &Workspace,
     packages: &[usize],
     authors: &[String],
 ) -> io::Result<(Vec<Diagnostic>, Report)> {
-    let mut diagnostics: Vec<Diagnostic> = check::reported(workspace, &Scope::Workspace)
-        .into_iter()
-        .filter(|diagnostic| within(workspace, packages, diagnostic))
-        .collect();
+    let mut diagnostics = Vec::new();
+    let mut gate_found = Vec::new();
+    for index in packages {
+        let scope = Scope::Package(*index);
+        let checkers = check::checked_scope(workspace, &scope);
+        diagnostics.extend(check::reported_by(workspace, &checkers, &scope));
+        let package = &workspace.packages[*index];
+        gate_found.extend(check::gate(workspace, package, &checkers, authors));
+    }
     let mut report = Report::default();
     let errors = diagnostics
         .iter()
@@ -99,10 +104,9 @@ pub fn judged(
         }
     }
     for index in packages {
-        let package = &workspace.packages[*index];
-        diagnostics.extend(check::release_check(workspace, package));
-        diagnostics.extend(check::gate(workspace, package, authors));
+        diagnostics.extend(check::release_check(workspace, &workspace.packages[*index]));
     }
+    diagnostics.extend(gate_found);
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
     });
@@ -146,14 +150,4 @@ pub fn gated(workspace: &Workspace, scope: &Scope) -> Vec<usize> {
 /// Whether a scope of lines lies in a file.
 fn holds_lines(scope: &Scope, path: &str) -> bool {
     matches!(scope, Scope::Lines(scoped, _) if scoped == path)
-}
-
-/// Whether a diagnostic lies in one of the packages, or in no file.
-fn within(workspace: &Workspace, packages: &[usize], diagnostic: &Diagnostic) -> bool {
-    let Some(path) = diagnostic.path.as_deref() else {
-        return true;
-    };
-    packages
-        .iter()
-        .any(|index| path.starts_with(&format!("{}/", workspace.packages[*index].dir)))
 }

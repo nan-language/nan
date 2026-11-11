@@ -1,22 +1,22 @@
 //! The gate codes of the release gate: API snapshots that are not current, pending weakenings,
 //! trust escapes without a current seal, and seals breaking the author rule.
 
+use super::Checker;
 use super::snapshot::{Items, differing};
-use super::{Checker, check_targets, unchecked};
 use crate::diagnostic::{Code, Diagnostic, Reason};
 use crate::workspace::{Package, Target, Workspace};
 
 /// The diagnostics the release gate reports on a workspace package beyond its checks and tests,
-/// `authors` being the author principals a publication names.
-pub fn gate(workspace: &Workspace, package: &Package, authors: &[String]) -> Vec<Diagnostic> {
-    let std = crate::stdlib::packages();
-    let Some(closure) = workspace.closure_of(package) else {
+/// from the checkers of its check, `authors` being the author principals a publication names.
+pub fn gate(
+    workspace: &Workspace,
+    package: &Package,
+    checkers: &[(Target, Checker)],
+    authors: &[String],
+) -> Vec<Diagnostic> {
+    if workspace.closure_of(package).is_none() {
         return Vec::new();
-    };
-    let checkers: Vec<(Target, Checker)> = check_targets(package)
-        .into_iter()
-        .map(|target| (target, unchecked(workspace, closure, std, target)))
-        .collect();
+    }
     let views: Vec<(Target, &Checker)> =
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let items = Items::of(&views, package);

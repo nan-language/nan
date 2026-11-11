@@ -523,9 +523,28 @@ impl<'a> Checker<'a> {
 /// The diagnostics check time reports on lines of a scope, those of loading, lexing and parsing
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
+    reported_by(workspace, &checked_scope(workspace, scope), scope)
+}
+
+/// The checkers of what checking a scope runs, each under its target, once checked: of the
+/// package the scope lies in, checked alone, or of every closure for a scope holding several.
+pub fn checked_scope<'a>(workspace: &'a Workspace, scope: &Scope) -> Vec<(Target, Checker<'a>)> {
+    let checkers = scope_checkers(workspace, crate::stdlib::packages(), scope);
+    for (_, checker) in &checkers {
+        checker.check_all();
+    }
+    checkers
+}
+
+/// The diagnostics `reported` gives on lines of a scope, from the checkers of a check of it.
+pub fn reported_by(
+    workspace: &Workspace,
+    checkers: &[(Target, Checker)],
+    scope: &Scope,
+) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = workspace.diagnostics().collect();
     found.extend(root::pending_syncs(workspace, scope));
-    found.extend(diagnostics(workspace, scope));
+    found.extend(diagnostics(checkers));
     for (_, file) in workspace.files() {
         found.extend(file.syntax.diagnostics.iter().map(|diagnostic| {
             Diagnostic {
@@ -870,17 +889,14 @@ fn checkers<'a>(workspace: &'a Workspace, std: &'a [Arc<Package>]) -> Vec<(Targe
         .collect()
 }
 
-/// The diagnostics of the workspace's items under each target their packages are checked for,
-/// those of unused code once found under every target checking their file: of the package a
-/// scope lies in, checked alone, or of every package for a scope holding several.
-fn diagnostics(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
-    let std = crate::stdlib::packages();
+/// The diagnostics checked checkers found, those of unused code once found under every target
+/// checking their file.
+fn diagnostics(checkers: &[(Target, Checker)]) -> Vec<Diagnostic> {
     let mut found = Vec::new();
     let mut unused: Vec<(Diagnostic, usize)> = Vec::new();
     let mut checking: HashMap<String, usize> = HashMap::new();
-    for (_, checker) in scope_checkers(workspace, std, scope) {
-        checker.check_all();
-        for (_, package) in checked_packages(&checker) {
+    for (_, checker) in checkers {
+        for (_, package) in checked_packages(checker) {
             let data = checker.db.package(package);
             let modules = data.modules.iter().map(|module| checker.db.module(*module));
             let files = modules
@@ -891,9 +907,9 @@ fn diagnostics(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
             }
         }
         let mut emitted: Vec<Diagnostic> = Vec::new();
-        for diagnostic in checker.unused.into_inner() {
-            if !emitted.contains(&diagnostic) {
-                emitted.push(diagnostic);
+        for diagnostic in checker.unused.borrow().iter() {
+            if !emitted.contains(diagnostic) {
+                emitted.push(diagnostic.clone());
             }
         }
         for diagnostic in emitted {
@@ -902,7 +918,7 @@ fn diagnostics(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
                 None => unused.push((diagnostic, 1)),
             }
         }
-        found.extend(checker.found.into_inner());
+        found.extend(checker.found.borrow().iter().cloned());
     }
     found.extend(
         unused

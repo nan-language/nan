@@ -5,7 +5,8 @@
 //! example of each specification chapter, the commands the conformance harness runs and those of
 //! its section's `text` blocks, with the canonical NIR, the text of each function a final build
 //! lowers and what each host program of this machine's architecture writes; for every std
-//! package, `nan check` with its NIR and `nan test`; for every program of `tests/programs`, its
+//! package, `nan check` with its NIR and `nan verify`, which must pass outside any git working
+//! tree; for every program of `tests/programs`, its
 //! final build and lowering and what it writes, a machine program's under its emulator, a
 //! kernel's with the bundles each toolchain builds of its `bundles` directory; and for
 //! the toolchain workspace, which must check without a diagnostic and pass `nan verify` with
@@ -1028,13 +1029,19 @@ fn std_package(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         .expect("a package directory");
     let store = fresh_store(&format!("self-check-std-{package}"))?;
     let toolchain = Toolchain::new(image()?);
-    let dir = base().join("std").join(package);
+    let outside = std::env::temp_dir().join(format!(
+        "nan-self-check-std-{package}-{}",
+        std::process::id()
+    ));
+    let dir = outside.join("std");
     copy_tree(&repository().join("std"), &dir, false)?;
     compare(&toolchain, &dir, &store, &["check", package])?;
     compare_nir(&toolchain, &dir, &store, Some(package))?;
-    compare(&toolchain, &dir, &store, &["test", package])?;
-    fs::remove_dir_all(&dir)?;
-    fs::remove_dir_all(fronts(&dir, &store).0)?;
+    let (verified, status) = compare(&toolchain, &dir, &store, &["verify", package])?;
+    if status != Some(0) {
+        return Err(format!("nan verify {package} reports\n{verified}").into());
+    }
+    fs::remove_dir_all(outside)?;
     Ok(())
 }
 

@@ -590,6 +590,16 @@ pub fn raise_first(mut gauges: mem::List[Gauge]) {
 ```
 
 ```nan
+pub fn swapped(pair: Array[u32, 2]) -> Array[u32, 2] {
+    var order = pair
+    var head = order[0]
+    order[0] = order[1]
+    order[1] = head
+    return order
+} swapped
+```
+
+```nan
 pub fn count(bytes: Option[mem::Bytes]) -> usize {
     let Some(found) = bytes else {
         return 0

@@ -1143,7 +1143,9 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
         self.take(value, &expr.ty, token);
         self.declare(local, token);
-        self.keep_holds(local, value);
+        if !viewing {
+            self.keep_holds(local, value);
+        }
     }
 
     /// Matches a part of a scrutinee, `owned` when the scrutinee owns its value.

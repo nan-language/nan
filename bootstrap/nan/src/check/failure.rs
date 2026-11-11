@@ -135,11 +135,11 @@ impl Checker<'_> {
         implied
     }
 
-    /// Whether a head stating `uses wait`, or taking a function type that does, breaks the rule
-    /// that its failure type is cancellable: one that is not, or a missing `fails` clause where
-    /// `may_fail` does not already make the head miss it.
-    pub fn cancel_unmapped(&self, head: &FnTy, may_fail: bool) -> bool {
-        let waits = head.wait
+    /// Whether a head, stating `uses wait` when `wait` holds, or taking a function type that does,
+    /// breaks the rule that its failure type is cancellable: one that is not, or a missing `fails`
+    /// clause where `may_fail` does not already make the head miss it.
+    pub fn cancel_unmapped(&self, head: &FnTy, wait: bool, may_fail: bool) -> bool {
+        let waits = wait
             || head
                 .params
                 .iter()
@@ -149,7 +149,7 @@ impl Checker<'_> {
         }
         match &head.fails {
             Some(fails) => !self.is_cancellable(fails),
-            None => head.wait && !may_fail,
+            None => wait && !may_fail,
         }
     }
 
@@ -161,7 +161,7 @@ impl Checker<'_> {
         {
             return Some(Code::ErrorFailureType);
         }
-        self.cancel_unmapped(head, false)
+        self.cancel_unmapped(head, head.wait, false)
             .then_some(Code::ErrorCancelUnmapped)
     }
 

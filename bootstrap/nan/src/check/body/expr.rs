@@ -1952,7 +1952,7 @@ impl Body<'_, '_> {
 
     /// The rules a body's effects judge its head by: `fails` and `uses wait` written exactly when
     /// the body needs them, the unneeded ones judged unless `exempt`, and a cancellable failure
-    /// type beside waiting.
+    /// type beside waiting, judged without an unneeded `uses wait`.
     pub fn check_effects(
         &self,
         token: Tok,
@@ -1987,7 +1987,12 @@ impl Body<'_, '_> {
                 self.report_fixed(construct, Code::ItemWaitMissing, fixes);
             }
         }
-        if self.ck.cancel_unmapped(head, frame.may_fail.is_some()) {
+        let wait_unneeded = !exempt && !frame.todo && !frame.may_wait && head.wait;
+        let wait = head.wait && !wait_unneeded;
+        if self
+            .ck
+            .cancel_unmapped(head, wait, frame.may_fail.is_some())
+        {
             let fixes = match &head.fails {
                 None => add(clauses.after, " fails task::Cancelled"),
                 Some(fails) => self.ck.cancelled_variant_fix(fails).into_iter().collect(),
@@ -2009,7 +2014,7 @@ impl Body<'_, '_> {
                 fixes.into_iter().collect(),
             );
         }
-        if !frame.may_wait && head.wait {
+        if wait_unneeded {
             let fixes = clauses
                 .uses
                 .map(|uses| self.ck.fix_deleting(self.item, uses.token, uses.word.token));

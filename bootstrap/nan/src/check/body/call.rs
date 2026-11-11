@@ -1707,7 +1707,7 @@ impl Body<'_, '_> {
                     .frame()
                     .failure
                     .clone()
-                    .is_some_and(|frame_failure| self.ck.converts(failure, &frame_failure));
+                    .is_none_or(|frame_failure| self.ck.converts(failure, &frame_failure));
                 let fixes = if converts {
                     vec![self.ck.fix_inserting(self.item, first, "try ")]
                 } else {

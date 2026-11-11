@@ -490,3 +490,23 @@ fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
         run.output
     );
 }
+
+#[test]
+fn a_waiting_closure_that_cannot_wait_and_its_unhandled_await_fix_into_code_that_checks() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Headers.\n\npub fn seen() -> Option[sys::Header] uses wait {\n    let marked = sys::Header(bytes: Array[u8, 32].filled(7))\n    return await sys::run_headed(marked, body: fn() -> Option[sys::Header] uses wait {\n        return sys::current_header()\n    })\n} seen\n",
+        ),
+    ]);
+    let checked = run_in(&scratch.0, "check app").output;
+    assert!(!checked.contains("error.cancel-unmapped"), "{checked}");
+    assert!(
+        checked.contains("+     return try await sys::run_headed("),
+        "{checked}"
+    );
+    run_in(&scratch.0, "fix app");
+    let fixed = run_in(&scratch.0, "fix app");
+    assert_eq!(fixed.status, 0, "{}", fixed.output);
+}

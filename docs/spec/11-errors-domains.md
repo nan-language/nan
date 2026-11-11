@@ -196,7 +196,7 @@ pub fn first_setting(text: Slice[u8]) -> u8 fails ConfigError {
 
 ## Unhandled failures
 
-A call that may fail is marked `try` or `attempt`. A call that may fail without either is an error (`error.unhandled`). When the call's failure type converts to F, the exact fix inserts `try`.
+A call that may fail is marked `try` or `attempt`. A call that may fail without either is an error (`error.unhandled`). When the call's failure type converts to F, or the innermost function or closure holding the call has no `fails` clause, the exact fix inserts `try`.
 
 ```nan
 pub closed enum ParseError derives Eq, Render {
@@ -232,7 +232,7 @@ impl Cancelled: Render
 - Rendering a `task::Cancelled` writes `cancelled`.
 - `task::Cancelled` is a [parsing type](15-untrusted.md#validator-classes).
 - A failure value is a cancellation when it is a `task::Cancelled` value k or a value of its enum's cancellation variant holding k; the cancellation holds k. The cancellation of a cancellable type F holding k is k when F is `task::Cancelled`, `F.V(k)` when F is an enum with cancellation variant V, and the cancellation of its argument holding k when F is a generic parameter.
-- The failure type of a function head, closure or function type that states `uses wait`, and of a function head with a parameter whose function type states `uses wait`, is cancellable. A failure type that is not, or a missing `fails` clause beside `uses wait` where `item.fails-missing` does not apply, is an error (`error.cancel-unmapped`). The exact fix adds `fails task::Cancelled` to a head without a clause, and adds `Cancelled(task::Cancelled) from` to an enum of the current package that has no variant named `Cancelled`.
+- The failure type of a function head, closure or function type that states `uses wait`, and of a function head with a parameter whose function type states `uses wait`, is cancellable. A failure type that is not, or a missing `fails` clause beside `uses wait` where `item.fails-missing` does not apply, is an error (`error.cancel-unmapped`), unless deleting a `uses wait` that `item.wait-unneeded` reports removes it. The exact fix adds `fails task::Cancelled` to a head without a clause, and adds `Cancelled(task::Cancelled) from` to an enum of the current package that has no variant named `Cancelled`.
 
 ### Failure bounds
 

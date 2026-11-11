@@ -744,7 +744,7 @@ impl Checker<'_> {
             self.report(item, written.token, Code::ErrorFailureType);
             return;
         }
-        if bodiless && self.cancel_unmapped(&sig.fn_ty(), false) {
+        if bodiless && self.cancel_unmapped(&sig.fn_ty(), sig.wait, false) {
             let fixes = match &sig.fails {
                 None => {
                     let after = head

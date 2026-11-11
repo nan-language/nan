@@ -105,7 +105,7 @@ pub fn member(
             true => return Some(Ok(Flow::Fail(revoked(interp)))),
             false => derived(interp, &args[0]),
         },
-        ("task::Executor", "split" | "serial") => {
+        ("task::Executor", "split" | "split_on" | "serial") => {
             let exec = match stale(interp) {
                 true => interp.deref(&args[0]),
                 false => derived(interp, &args[0]),

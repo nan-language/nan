@@ -85,7 +85,7 @@ const FAILING_DRAWS: [&str; 8] = [
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
 /// exhausted capability tables, cells and runtime records.
-const TRAPPING: [&str; 35] = [
+const TRAPPING: [&str; 36] = [
     "mem::Alloc.split",
     "mem::Arena.at",
     "mem::Pool.at",
@@ -95,6 +95,7 @@ const TRAPPING: [&str; 35] = [
     "task::Join.join",
     "task::Executor.coarse",
     "task::Executor.split",
+    "task::Executor.split_on",
     "task::Executor.serial",
     "boot::Kernel.policy",
     "sys::revocable",

@@ -1,6 +1,6 @@
-//! Executors and their accounts: `task::Executor.coarse`, `split` and `serial`, which derive an
-//! entry from an executor's, and the members of `task::Account`, which owns the entry `split` or
-//! `serial` derived. An executor's share is one word: its weight in the low 32 bits, its class in
+//! Executors and their accounts: `task::Executor.coarse`, `split`, `split_on` and `serial`, which
+//! derive an entry from an executor's, and the members of `task::Account`, which owns the entry
+//! `split`, `split_on` or `serial` derived. An executor's share is one word: its weight in the low 32 bits, its class in
 //! the next 8 and its reservation in parts per million above them.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
@@ -21,21 +21,27 @@ const RESERVE_SHIFT: i64 = 40;
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
         "task::Executor.coarse" => sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
-        "task::Executor.split" => derive(lo, fx, supply, |lo, fx, record| {
-            let share_ty = supply.abi.params[1].0.ty().clone();
-            let share = supply.param(1);
-            let address = match share {
-                Held::Address(address) => address,
-                other => {
-                    let layout = lo.layout(&share_ty);
-                    let slot = fx.slot(layout.size, layout.align);
-                    lo.store_held(fx, slot, other, &share_ty);
-                    slot
+        "task::Executor.split" | "task::Executor.split_on" => {
+            derive(lo, fx, supply, |lo, fx, record| {
+                let share_ty = supply.abi.params[1].0.ty().clone();
+                let share = supply.param(1);
+                let address = match share {
+                    Held::Address(address) => address,
+                    other => {
+                        let layout = lo.layout(&share_ty);
+                        let slot = fx.slot(layout.size, layout.align);
+                        lo.store_held(fx, slot, other, &share_ty);
+                        slot
+                    }
+                };
+                let packed = pack_share(lo, fx, &share_ty, address);
+                fx.store(packed, record, tables::EXECUTOR_SHARE);
+                if supply.member() == "split_on" {
+                    let cell = fx.load(PTR, supply.param(2).address(), 0);
+                    fx.store(cell, record, entry::STATE);
                 }
-            };
-            let packed = pack_share(lo, fx, &share_ty, address);
-            fx.store(packed, record, tables::EXECUTOR_SHARE);
-        }),
+            })
+        }
         "task::Executor.serial" => derive(lo, fx, supply, |_, fx, record| {
             let seed = supply.param(1).scalar();
             fx.store(seed, record, entry::SEED);

@@ -13,12 +13,11 @@ fn Selector.slot_offset(self, slot: clif::StackSlot) -> u32 {
 } Selector.slot_offset
 
 /// The memory operand of an access to `p + offset`: folding a stack slot's address, a colocated
-/// symbol's, or an addition only this access reads, its register operands an index when
-/// `indexed`.
+/// symbol's, or an addition, its register operands an index when `indexed`.
 fn Selector.amode(mut self, p: clif::Value, func: clif::Function, offset: i32, indexed: bool) -> x64::Amode {
     let resolved = func.resolve_aliases(p)
     let at = usize.widen(resolved.index)
-    expect at < self.facts.defs.len() and at < self.facts.use_counts.len()
+    expect at < self.facts.defs.len()
     let def = self.facts.defs[at]
     if def != NONE {
         match func.inst_data(clif::Inst(index: def)) {
@@ -36,7 +35,7 @@ fn Selector.amode(mut self, p: clif::Value, func: clif::Function, offset: i32, i
                 }
             }
             clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) => {
-                if self.facts.use_counts[at] == 1 and func.value_type(resolved) == clif::POINTER {
+                if func.value_type(resolved) == clif::POINTER {
                     let Some(folded) = mut self.folded_add(func, x, y, offset, indexed) else {
                         return mut self.register_amode(p, func, offset)
                     }
@@ -74,8 +73,7 @@ fn Selector.folded_add(mut self, func: clif::Function, x: clif::Value, y: clif::
 } Selector.folded_add
 
 /// The memory operand of `x + y + disp` with base and index registers, a multiplication of one
-/// operand by 1, 2, 4 or 8 or its left shift by at most 3 folded into the index's scale when
-/// only this sum reads it.
+/// operand by 1, 2, 4 or 8 or its left shift by at most 3 folded into the index's scale.
 fn Selector.indexed(mut self, func: clif::Function, x: clif::Value, y: clif::Value, disp: i32) -> x64::Amode {
     var base_value = x
     var index_value = y
@@ -96,19 +94,38 @@ fn Selector.indexed(mut self, func: clif::Function, x: clif::Value, y: clif::Val
             }
         }
     }
-    let base = mut self.src(base_value, func)
     let index = mut self.src(index_value, func)
+    match self.slot_address(base_value, func, disp) {
+        Some(total) => return x64::Amode.Mem(base: x64::RSP, index: Some(index), shift: shift, disp: total)
+        None => {}
+    }
+    let base = mut self.src(base_value, func)
     return x64::Amode.Mem(base: base, index: Some(index), shift: shift, disp: disp)
 } Selector.indexed
 
-/// A pointer-sized value as an index and the shift scaling it, when only one instruction reads
-/// it and a multiplication by 1, 2, 4 or 8 or a left shift by at most 3 defines it.
+/// The offset from the stack pointer of `disp` bytes past the address a value holds, when it is
+/// a stack slot's and the offset fits.
+fn Selector.slot_address(self, value: clif::Value, func: clif::Function, disp: i32) -> Option[i32] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.facts.defs.len()
+    let def = self.facts.defs[at]
+    if def == NONE {
+        return None
+    }
+    let clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    return i32.checked_fit(i64.widen(self.slot_disp(slot, offset)) + i64.widen(disp))
+} Selector.slot_address
+
+/// A pointer-sized value as an index and the shift scaling it, when a multiplication by 1, 2, 4
+/// or 8 or a left shift by at most 3 defines it.
 fn Selector.scaled(self, func: clif::Function, value: clif::Value) -> Option[Scaled] {
     let resolved = func.resolve_aliases(value)
     let at = usize.widen(resolved.index)
-    expect at < self.facts.defs.len() and at < self.facts.use_counts.len()
+    expect at < self.facts.defs.len()
     let def = self.facts.defs[at]
-    if def == NONE or self.facts.use_counts[at] != 1 or func.value_type(resolved) != clif::POINTER {
+    if def == NONE or func.value_type(resolved) != clif::POINTER {
         return None
     }
     match func.inst_data(clif::Inst(index: def)) {
@@ -165,7 +182,7 @@ fn Selector.load(mut self, func: clif::Function, inst: clif::Inst, p: clif::Valu
 /// halves.
 fn Selector.store(mut self, func: clif::Function, x: clif::Value, p: clif::Value, offset: i32) {
     let ty = func.value_type(x)
-    let mem = mut self.amode(p, func, offset, indexed: false)
+    let mem = mut self.amode(p, func, offset, indexed: ty != clif::Type.Int128)
     if ty == clif::Type.Int128 {
         let low = mut self.src(x, func)
         let high = mut self.src_high(x, func)

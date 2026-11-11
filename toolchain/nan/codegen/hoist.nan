@@ -1,0 +1,412 @@
+//! Hoisting out of loops: a constant, or an arithmetic, comparison, conversion or select instruction, of a natural loop whose operands are defined outside the loop moves to the end of the one block outside the loop that branches to its header, out of each enclosing loop its operands are defined outside of; the function is copied with the instructions moved.
+
+/// The most rounds of finding the instructions to move, each finding those whose operands the
+/// earlier ones moved out.
+const HOIST_ROUNDS: u32 = 4
+
+/// A natural loop: its header, the loop immediately enclosing it, `NONE` for an outermost one,
+/// and the block outside it that branches to its header, `NONE` when it has not exactly one or
+/// another of its blocks has a predecessor outside it.
+struct Loop derives Copy, Eq {
+    header: u32
+    parent: u32
+    entry: u32
+} Loop
+
+/// A function's natural loops, those enclosing others first, and the innermost loop each block
+/// lies in, by block index, `NONE` for a block in none.
+struct Loops {
+    list: mem::List[Loop]
+    innermost: mem::List[u32]
+} Loops
+
+/// An instruction moved to the end of a block.
+struct Placed derives Copy, Eq {
+    block: u32
+    inst: u32
+} Placed
+
+/// What hoisting does: the loop each instruction moves out of, by instruction index, `NONE` for
+/// one that stays, and the instructions moved, in the order they are copied.
+struct Hoists {
+    moved: mem::List[u32]
+    placed: mem::List[Placed]
+} Hoists
+
+/// The function with its loop-invariant instructions moved out of their loops, or none when it
+/// moves none or holds a use before its definition in layout order.
+fn hoisted(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let loops = loops_of(func, alloc)
+    if loops.list.len() == 0 {
+        return None
+    }
+    let Some(hoists) = hoists_of(func, loops, alloc) else {
+        return None
+    }
+    var copier = Copier.hoisting(func, take hoists, alloc)
+    mut copier.copy_function(func, leaves: Leaves.empty(alloc))
+    return take copier.finish()
+} hoisted
+
+/// The successors and predecessors of each block, by block index.
+struct Graph {
+    succs: mem::List[mem::List[u32]]
+    preds: mem::List[mem::List[u32]]
+} Graph
+
+fn graph_of(func: clif::Function, count: usize, alloc: mem::Alloc) -> Graph {
+    var graph = Graph(succs: mem::List[mem::List[u32]].empty(alloc), preds: mem::List[mem::List[u32]].empty(alloc))
+    for _ in 0..<count {
+        mut graph.succs.push(mem::List[u32].empty(alloc))
+        mut graph.preds.push(mem::List[u32].empty(alloc))
+    }
+    for block in func.layout_blocks(alloc) {
+        for target in targets_of(func, block, alloc) {
+            let from = usize.widen(block.index)
+            let to = usize.widen(target.index)
+            expect from < count and to < count
+            var succs = mut graph.succs.at_mut(from)
+            mut succs.push(target.index)
+            var preds = mut graph.preds.at_mut(to)
+            mut preds.push(block.index)
+        }
+    }
+    return graph
+} graph_of
+
+/// The headers of the loops a depth-first walk from the entry finds, each with the blocks
+/// branching back to it, as `header << 32 | latch`, ordered by header.
+fn back_edges(graph: Graph, entry: u32, alloc: mem::Alloc) -> mem::List[u64] {
+    let count = graph.succs.len()
+    var state = filled(count, value: 0u8, alloc)
+    var path = mem::List[u32].empty(alloc)
+    var arms = mem::List[usize].empty(alloc)
+    var found = mem::List[u64].empty(alloc)
+    expect usize.widen(entry) < count
+    state[usize.widen(entry)] = 1
+    mut path.push(entry)
+    mut arms.push(0)
+    while path.len() > 0 {
+        let depth = path.len() - 1
+        let block = usize.widen(path[depth])
+        expect depth < arms.len() and block < count
+        let arm = arms[depth]
+        if arm >= graph.succs[block].len() {
+            state[block] = 2
+            discard mut path.pop()
+            discard mut arms.pop()
+            continue
+        }
+        arms[depth] = arm + 1
+        let next = graph.succs[block][arm]
+        let at = usize.widen(next)
+        expect at < count
+        if state[at] == 1 {
+            mut found.push((u64.widen(next) << 32) | u64.widen(path[depth]))
+        } else if state[at] == 0 {
+            state[at] = 1
+            mut path.push(next)
+            mut arms.push(0)
+        }
+    }
+    mut found.sort_by(fn(left: u64, right: u64) -> core::Ordering {
+        return left.cmp(right)
+    })
+    return found
+} back_edges
+
+/// The natural loops of a function: each header with the blocks reaching a block branching back
+/// to it without passing it.
+fn loops_of(func: clif::Function, alloc: mem::Alloc) -> Loops {
+    let count = block_count(func, alloc)
+    var loops = Loops(list: mem::List[Loop].empty(alloc), innermost: filled(count, value: NONE, alloc))
+    let Some(entry) = func.entry_block() else {
+        return loops
+    }
+    let graph = graph_of(func, count, alloc)
+    let edges = back_edges(graph, entry: entry.index, alloc)
+    var bodies = mem::List[mem::List[u32]].empty(alloc)
+    var headers = mem::List[u32].empty(alloc)
+    var at: usize = 0
+    while at < edges.len() {
+        let header = u32.truncate(edges[at] >> 32)
+        var latches = mem::List[u32].empty(alloc)
+        while at < edges.len() and u32.truncate(edges[at] >> 32) == header {
+            mut latches.push(u32.truncate(edges[at]))
+            at += 1
+        }
+        mut bodies.push(loop_body(graph, header, latches: latches.view(), alloc))
+        mut headers.push(header)
+    }
+    var order = mem::List[usize].empty(alloc)
+    for index in 0..<bodies.len() {
+        mut order.push(index)
+    }
+    mut order.sort_by(fn(left: usize, right: usize) -> core::Ordering {
+        return bodies[right].len().cmp(bodies[left].len())
+    })
+    var mark = filled(count, value: NONE, alloc)
+    for index in order {
+        let id = u32.fit(loops.list.len())
+        let header = headers[index]
+        expect usize.widen(header) < count
+        let parent = loops.innermost[usize.widen(header)]
+        for block in bodies[index] {
+            mark[usize.widen(block)] = id
+            loops.innermost[usize.widen(block)] = id
+        }
+        mut loops.list.push(Loop(header: header, parent: parent, entry: single_entry(graph, header, body: bodies[index].view(), mark: mark.view(), id)))
+    }
+    return loops
+} loops_of
+
+/// The blocks reaching one of `latches` without passing `header`, `header` included.
+fn loop_body(graph: Graph, header: u32, latches: Slice[u32], alloc: mem::Alloc) -> mem::List[u32] {
+    var seen = filled(graph.preds.len(), value: false, alloc)
+    var body = mem::List[u32].empty(alloc)
+    expect usize.widen(header) < seen.len()
+    seen[usize.widen(header)] = true
+    mut body.push(header)
+    var pending = mem::List[u32].empty(alloc)
+    for latch in latches {
+        mut pending.push(latch)
+    }
+    loop {
+        let Some(block) = mut pending.pop() else {
+            return body
+        }
+        let at = usize.widen(block)
+        expect at < seen.len()
+        if seen[at] {
+            continue
+        }
+        seen[at] = true
+        mut body.push(block)
+        for pred in graph.preds[at] {
+            mut pending.push(pred)
+        }
+    }
+} loop_body
+
+/// The one block outside a loop branching to its header, `mark` naming the loop `id` for its
+/// blocks; `NONE` when there is not exactly one or another block of the loop has a predecessor
+/// outside it.
+fn single_entry(graph: Graph, header: u32, body: Slice[u32], mark: Slice[u32], id: u32) -> u32 {
+    var entry = NONE
+    for block in body {
+        let at = usize.widen(block)
+        expect at < graph.preds.len()
+        for pred in graph.preds[at] {
+            expect usize.widen(pred) < mark.len()
+            if mark[usize.widen(pred)] == id {
+                continue
+            }
+            if block != header or entry != NONE {
+                return NONE
+            }
+            entry = pred
+        }
+    }
+    return entry
+} single_entry
+
+/// Whether a block lies in a loop.
+fn Loops.holds(self, loop_id: u32, block: u32) -> bool {
+    if block == NONE {
+        return false
+    }
+    expect usize.widen(block) < self.innermost.len()
+    var current = self.innermost[usize.widen(block)]
+    while current != NONE {
+        if current == loop_id {
+            return true
+        }
+        expect usize.widen(current) < self.list.len()
+        current = self.list[usize.widen(current)].parent
+    }
+    return false
+} Loops.holds
+
+/// The instructions hoisting moves: round after round over the blocks in layout order, each
+/// instruction of a loop block that is not cold and moves out of a loop, with the block it
+/// moves to; none when none moves.
+fn hoists_of(func: clif::Function, loops: Loops, alloc: mem::Alloc) -> Option[Hoists] {
+    var homes = filled(usize.widen(func.value_count()), value: NONE, alloc)
+    var inst_count: usize = 0
+    for block in func.layout_blocks(alloc) {
+        for param in func.block_params(block, alloc) {
+            homes[usize.widen(param.index)] = block.index
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                homes[usize.widen(result.index)] = block.index
+            }
+            inst_count = larger_index(inst_count, index: inst.index)
+        }
+    }
+    var hoists = Hoists(moved: filled(inst_count, value: NONE, alloc), placed: mem::List[Placed].empty(alloc))
+    for _ in 0u32..<HOIST_ROUNDS {
+        var changed = false
+        for block in func.layout_blocks(alloc) {
+            expect usize.widen(block.index) < loops.innermost.len()
+            if func.is_cold(block) or loops.innermost[usize.widen(block.index)] == NONE {
+                continue
+            }
+            if mut hoists.move_out(func, loops, block, mut homes, alloc) {
+                changed = true
+            }
+        }
+        if not changed {
+            break
+        }
+    }
+    if hoists.placed.len() == 0 {
+        return None
+    }
+    return Some(take hoists)
+} hoists_of
+
+fn larger_index(count: usize, index: u32) -> usize {
+    let after = usize.widen(index) + 1
+    if after > count {
+        return after
+    }
+    return count
+} larger_index
+
+/// Moves the instructions of a block that move out of a loop, the values they define taking
+/// the block they move to as their home; says whether it moved any.
+fn Hoists.move_out(mut self, func: clif::Function, loops: Loops, block: clif::Block, mut homes: mem::List[u32], alloc: mem::Alloc) -> bool {
+    var moved_any = false
+    for inst in func.block_insts(block, alloc) {
+        let at = usize.widen(inst.index)
+        expect at < self.moved.len()
+        if self.moved[at] != NONE or not is_hoistable(func, inst, alloc) {
+            continue
+        }
+        let target = outermost_target(func, loops, inst, block: block.index, homes: homes.view())
+        if target == NONE {
+            continue
+        }
+        expect usize.widen(target) < loops.list.len()
+        let entry = loops.list[usize.widen(target)].entry
+        self.moved[at] = target
+        mut self.placed.push(Placed(block: entry, inst: inst.index))
+        for result in func.inst_results(inst, alloc) {
+            homes[usize.widen(result.index)] = entry
+        }
+        moved_any = true
+    }
+    return moved_any
+} Hoists.move_out
+
+/// The outermost loop an instruction of `block` moves out of: walking out from the innermost
+/// loop holding the block while each loop has a single entry and holds no operand's home;
+/// `NONE` when it moves out of none.
+fn outermost_target(func: clif::Function, loops: Loops, inst: clif::Inst, block: u32, homes: Slice[u32]) -> u32 {
+    var target = NONE
+    expect usize.widen(block) < loops.innermost.len()
+    var current = loops.innermost[usize.widen(block)]
+    while current != NONE {
+        expect usize.widen(current) < loops.list.len()
+        let candidate = loops.list[usize.widen(current)]
+        if candidate.entry == NONE {
+            break
+        }
+        var inside = false
+        each_operand(func.inst_data(inst), visit: fn[mut inside](value: clif::Value) {
+            let at = usize.widen(func.resolve_aliases(value).index)
+            expect at < homes.len()
+            if homes[at] == NONE or loops.holds(current, block: homes[at]) {
+                inside = true
+            }
+        })
+        if inside {
+            break
+        }
+        target = current
+        current = candidate.parent
+    }
+    return target
+} outermost_target
+
+/// Whether an instruction is a constant, or an arithmetic, comparison, conversion or select
+/// instruction on scalar values, a division only by a constant other than 0 and -1, which
+/// computes its results from its operands alone.
+fn is_hoistable(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    for result in func.inst_results(inst, alloc) {
+        if func.value_type(result).is_vector() {
+            return false
+        }
+    }
+    return match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => true
+        clif::InstructionData.Binary(opcode: opcode, x: _, y: y) => is_pure_binary(opcode) or is_constant_division(func, opcode, divisor: y)
+        clif::InstructionData.Unary(opcode: opcode, arg: _) => is_pure_unary(opcode)
+        clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+        clif::InstructionData.Ternary(opcode: opcode, x: _, y: _, z: _) => opcode == clif::Opcode.Select
+        else => false
+    }
+} is_hoistable
+
+/// Whether an instruction divides by a constant that cannot make it trap: any but 0, and for a
+/// signed division any but 0 and -1.
+fn is_constant_division(func: clif::Function, opcode: clif::Opcode, divisor: clif::Value) -> bool {
+    let unsigned = opcode == clif::Opcode.Udiv or opcode == clif::Opcode.Urem
+    let signed = opcode == clif::Opcode.Sdiv or opcode == clif::Opcode.Srem
+    if not unsigned and not signed {
+        return false
+    }
+    let Some(def) = func.value_inst(divisor) else {
+        return false
+    }
+    let clif::InstructionData.UnaryImm(opcode: _, imm: imm) = func.inst_data(def) else {
+        return false
+    }
+    let width = func.value_type(divisor).bits()
+    if width == 0 or width > 64 {
+        return false
+    }
+    let shift = 64 - width
+    let value = i64.from_bits(imm.to_bits() << shift).shr_arith(shift)
+    return value != 0 and (unsigned or value != -1)
+} is_constant_division
+
+fn is_pure_binary(opcode: clif::Opcode) -> bool {
+    return match opcode {
+        clif::Opcode.Iadd or clif::Opcode.Isub or clif::Opcode.Imul or clif::Opcode.Umulhi or clif::Opcode.Smulhi or clif::Opcode.Band or clif::Opcode.Bor or clif::Opcode.Bxor => true
+        clif::Opcode.Ishl or clif::Opcode.Ushr or clif::Opcode.Sshr or clif::Opcode.Rotr or clif::Opcode.Umin or clif::Opcode.Umax => true
+        clif::Opcode.UaddOverflow or clif::Opcode.SaddOverflow or clif::Opcode.UsubOverflow or clif::Opcode.SsubOverflow or clif::Opcode.UmulOverflow or clif::Opcode.SmulOverflow => true
+        clif::Opcode.Fadd or clif::Opcode.Fsub or clif::Opcode.Fmul or clif::Opcode.Fdiv or clif::Opcode.Fcopysign or clif::Opcode.Fmin or clif::Opcode.Fmax => true
+        else => false
+    }
+} is_pure_binary
+
+fn is_pure_unary(opcode: clif::Opcode) -> bool {
+    return match opcode {
+        clif::Opcode.Ineg or clif::Opcode.Bnot or clif::Opcode.Clz or clif::Opcode.Ctz or clif::Opcode.Popcnt or clif::Opcode.Bswap => true
+        clif::Opcode.Uextend or clif::Opcode.Sextend or clif::Opcode.Ireduce or clif::Opcode.Bitcast => true
+        clif::Opcode.Sqrt or clif::Opcode.Fabs or clif::Opcode.Fneg or clif::Opcode.Fpromote or clif::Opcode.Fdemote => true
+        clif::Opcode.FcvtToSintSat or clif::Opcode.FcvtToUintSat or clif::Opcode.FcvtFromSint or clif::Opcode.FcvtFromUint => true
+        else => false
+    }
+} is_pure_unary
+
+/// Whether hoisting moves an instruction out of its block.
+fn Hoists.moves(self, inst: clif::Inst) -> bool {
+    let at = usize.widen(inst.index)
+    return at < self.moved.len() and self.moved[at] != NONE
+} Hoists.moves
+
+/// The instructions hoisting moves to the end of a block, in the order they are copied.
+fn Hoists.placed_in(self, block: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Inst] {
+    var found = mem::List[clif::Inst].empty(alloc)
+    for placed in self.placed {
+        if placed.block == block.index {
+            mut found.push(clif::Inst(index: placed.inst))
+        }
+    }
+    return found
+} Hoists.placed_in
+
+fn Hoists.empty(alloc: mem::Alloc) -> Hoists = Hoists(moved: mem::List[u32].empty(alloc), placed: mem::List[Placed].empty(alloc))

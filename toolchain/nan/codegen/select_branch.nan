@@ -31,8 +31,9 @@ fn int_cond(cond: clif::IntCC) -> x64::Cond {
     }
 } int_cond
 
-/// Sets the flags comparing two integers at their type's width: `test` against zero, `cmp` with
-/// an immediate when one side is a constant that fits, else `cmp`.
+/// Sets the flags comparing two integers at their type's width: `test` against zero, of the
+/// bits a mask keeps when only this comparison reads the masked value, `cmp` with an immediate
+/// when one side is a constant that fits, else `cmp`.
 fn Selector.int_compare(mut self, func: clif::Function, cond: clif::IntCC, x: clif::Value, y: clif::Value) -> FlagTest {
     let ty = func.value_type(x)
     if ty == clif::Type.Int128 {
@@ -46,6 +47,10 @@ fn Selector.int_compare(mut self, func: clif::Function, cond: clif::IntCC, x: cl
         lhs = y
         rhs = x
         tested = swapped(cond)
+    }
+    let against_zero = self.imm(rhs, func) == Some(0)
+    if against_zero and (tested == clif::IntCC.Equal or tested == clif::IntCC.NotEqual) and mut self.tests_bits(func, value: lhs, size) {
+        return FlagTest.One(int_cond(tested))
     }
     let reg = mut self.src(lhs, func)
     match self.imm(rhs, func) {
@@ -63,6 +68,52 @@ fn Selector.int_compare(mut self, func: clif::Function, cond: clif::IntCC, x: cl
     }
     return FlagTest.One(int_cond(tested))
 } Selector.int_compare
+
+/// Sets the flags of `test` over the bits a value keeps when only one instruction reads it and a
+/// `band`, or a remainder by a power of two, defines it, saying whether it did: `test` of the
+/// `band`'s operands, or of its masked operand with the mask, one of 8 bits testing the low byte.
+fn Selector.tests_bits(mut self, func: clif::Function, value: clif::Value, size: x64::Size) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.facts.defs.len() and at < self.facts.use_counts.len()
+    let def = self.facts.defs[at]
+    if def == NONE or self.facts.use_counts[at] != 1 {
+        return false
+    }
+    let clif::InstructionData.Binary(opcode: opcode, x: x, y: y) = func.inst_data(clif::Inst(index: def)) else {
+        return false
+    }
+    var masked = x
+    var mask: Option[i32] = None
+    if opcode == clif::Opcode.Band {
+        let operands = self.facts.commuted(func, x, y)
+        masked = operands.x
+        mask = self.imm(operands.y, func)
+        if mask.is_none() {
+            let left = mut self.src(operands.x, func)
+            let right = mut self.src(operands.y, func)
+            mut self.emit(x64::Inst.Test(size: size, lhs: left, rhs: right))
+            return true
+        }
+    } else if opcode == clif::Opcode.Urem {
+        let Some(divisor) = self.imm(y, func) else {
+            return false
+        }
+        let Some(_) = power_of_two(divisor) else {
+            return false
+        }
+        mask = Some(divisor - 1)
+    }
+    let Some(bits) = mask else {
+        return false
+    }
+    let reg = mut self.src(masked, func)
+    if bits >= 0 and bits <= 255 {
+        mut self.emit(x64::Inst.TestImm(size: x64::Size.Byte, lhs: reg, imm: bits))
+    } else {
+        mut self.emit(x64::Inst.TestImm(size: size, lhs: reg, imm: bits))
+    }
+    return true
+} Selector.tests_bits
 
 /// Sets the flags comparing two 128-bit integers: equality from the halves' differences, an
 /// order from the borrow and sign of subtracting them, the operands swapped for the orders

@@ -1,0 +1,312 @@
+//! Known bits: the bits of each integer value of at most 64 bits that every path gives alike, from constants through bitwise operations, shifts, extensions, comparisons and selects, a block parameter keeping the bits every argument passed to it agrees on; an instruction whose value they fix becomes a constant, and a branch they decide a jump.
+
+/// The bits of a value known to be 0 and those known to be 1, within its type's width.
+struct Bits derives Copy, Eq {
+    zeros: u64
+    ones: u64
+} Bits
+
+const NO_BITS: Bits = Bits(zeros: 0, ones: 0)
+
+/// The most rounds of finding the known bits before giving up on knowing any.
+const KNOWN_ROUNDS: u32 = 16
+
+/// The bits of a value of a type of at most 64 bits, every bit known.
+fn exact(value: u64, width: u32) -> Bits {
+    let mask = width_mask(width)
+    return Bits(zeros: ~value & mask, ones: value & mask)
+} exact
+
+/// Whether every bit of a width is known.
+fn Bits.is_exact(self, width: u32) -> bool {
+    return (self.zeros | self.ones) == width_mask(width)
+} Bits.is_exact
+
+/// The bits both of two values know alike.
+fn Bits.meet(self, other: Bits) -> Bits = Bits(zeros: self.zeros & other.zeros, ones: self.ones & other.ones)
+
+/// The known bits of each value of a function, by index, a value of no integer type of at most
+/// 64 bits knowing none; `passes`, ordered by parameter, are the arguments branches pass to block
+/// parameters. Gives none when the bits do not settle.
+fn value_bits(func: clif::Function, passes: Slice[Passed], alloc: mem::Alloc) -> Option[mem::List[Bits]] {
+    let count = usize.widen(func.value_count())
+    var known = filled(count, value: NO_BITS, alloc)
+    var seen = filled(count, value: false, alloc)
+    let entry = func.entry_block()
+    match entry {
+        Some(entered) => {
+            for param in func.block_params(entered, alloc) {
+                discard settle(mut known, mut seen, value: param, bits: NO_BITS)
+            }
+        }
+        None => {}
+    }
+    for _ in 0u32..<KNOWN_ROUNDS {
+        var changed = false
+        for block in func.layout_blocks(alloc) {
+            if entry != Some(block) and settle_params(func, block, passes, mut known, mut seen, alloc) {
+                changed = true
+            }
+            if settle_insts(func, block, mut known, mut seen, alloc) {
+                changed = true
+            }
+        }
+        if not changed {
+            return Some(take known)
+        }
+    }
+    return None
+} value_bits
+
+/// Records the bits of the values a block's instructions define, those of an instruction
+/// defining several knowing none; says whether any differ from those recorded.
+fn settle_insts(func: clif::Function, block: clif::Block, mut known: mem::List[Bits], mut seen: mem::List[bool], alloc: mem::Alloc) -> bool {
+    var changed = false
+    for inst in func.block_insts(block, alloc) {
+        let results = func.inst_results(inst, alloc)
+        for result in results {
+            var bits = NO_BITS
+            if results.len() == 1 {
+                bits = inst_bits(func, inst, result, known: known.view())
+            }
+            if settle(mut known, mut seen, value: result, bits) {
+                changed = true
+            }
+        }
+    }
+    return changed
+} settle_insts
+
+/// Records the bits of a block's parameters, saying whether any differ from those recorded.
+fn settle_params(func: clif::Function, block: clif::Block, passes: Slice[Passed], mut known: mem::List[Bits], mut seen: mem::List[bool], alloc: mem::Alloc) -> bool {
+    var changed = false
+    for param in func.block_params(block, alloc) {
+        let bits = param_bits(func, param, passes, known: known.view(), seen: seen.view())
+        if settle(mut known, mut seen, value: param, bits) {
+            changed = true
+        }
+    }
+    return changed
+} settle_params
+
+/// Records a value's bits, saying whether they differ from those recorded.
+fn settle(mut known: mem::List[Bits], mut seen: mem::List[bool], value: clif::Value, bits: Bits) -> bool {
+    let at = usize.widen(value.index)
+    expect at < known.len() and at < seen.len()
+    if seen[at] and known[at] == bits {
+        return false
+    }
+    known[at] = bits
+    seen[at] = true
+    return true
+} settle
+
+/// The bits every argument passed to a parameter agrees on, those of arguments not yet seen
+/// left out.
+fn param_bits(func: clif::Function, param: clif::Value, passes: Slice[Passed], known: Slice[Bits], seen: Slice[bool]) -> Bits {
+    if int_width(func, value: param) == 0 {
+        return NO_BITS
+    }
+    var bits = NO_BITS
+    var any = false
+    var at = first_pass(passes, param: param.index)
+    while at < passes.len() and passes[at].param == param.index {
+        let arg = usize.widen(passes[at].arg)
+        at += 1
+        expect arg < known.len() and arg < seen.len()
+        if not seen[arg] {
+            continue
+        }
+        if any {
+            bits = bits.meet(known[arg])
+        } else {
+            bits = known[arg]
+            any = true
+        }
+    }
+    if not any {
+        return NO_BITS
+    }
+    return bits
+} param_bits
+
+/// The width of a value's integer type of at most 64 bits, 0 for another type.
+fn int_width(func: clif::Function, value: clif::Value) -> u32 {
+    let ty = func.value_type(value)
+    if not ty.is_int() or ty.bits() > 64 {
+        return 0
+    }
+    return ty.bits()
+} int_width
+
+fn bits_of(func: clif::Function, value: clif::Value, known: Slice[Bits]) -> Bits {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < known.len()
+    return known[at]
+} bits_of
+
+/// The bits of an instruction's one result.
+fn inst_bits(func: clif::Function, inst: clif::Inst, result: clif::Value, known: Slice[Bits]) -> Bits {
+    let width = int_width(func, value: result)
+    if width == 0 {
+        return NO_BITS
+    }
+    return match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: imm) => exact(imm.to_bits(), width)
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => binary_bits(opcode, x: bits_of(func, value: x, known), y: bits_of(func, value: y, known), width)
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => unary_bits(func, opcode, arg, width, known)
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => compare_bits(cond, x: bits_of(func, value: x, known), y: bits_of(func, value: y, known), width: int_width(func, value: x))
+        clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: c, y: x, z: y) => select_bits(c: bits_of(func, value: c, known), width: int_width(func, value: c), x: bits_of(func, value: x, known), y: bits_of(func, value: y, known))
+        else => NO_BITS
+    }
+} inst_bits
+
+fn binary_bits(opcode: clif::Opcode, x: Bits, y: Bits, width: u32) -> Bits {
+    let mask = width_mask(width)
+    return match opcode {
+        clif::Opcode.Band => Bits(zeros: x.zeros | y.zeros, ones: x.ones & y.ones)
+        clif::Opcode.Bor => Bits(zeros: x.zeros & y.zeros, ones: x.ones | y.ones)
+        clif::Opcode.Bxor => Bits(zeros: (x.zeros & y.zeros) | (x.ones & y.ones), ones: (x.zeros & y.ones) | (x.ones & y.zeros))
+        clif::Opcode.Ishl => {
+            if not y.is_exact(width) or y.ones >= u64.widen(width) {
+                return NO_BITS
+            }
+            let amount = u32.truncate(y.ones)
+            return Bits(zeros: ((x.zeros << amount) | ((1u64 << amount) - 1)) & mask, ones: (x.ones << amount) & mask)
+        }
+        clif::Opcode.Ushr => {
+            if not y.is_exact(width) or y.ones >= u64.widen(width) {
+                return NO_BITS
+            }
+            let amount = u32.truncate(y.ones)
+            return Bits(zeros: ((x.zeros >> amount) | (mask & ~(mask >> amount))) & mask, ones: x.ones >> amount)
+        }
+        else => NO_BITS
+    }
+} binary_bits
+
+fn unary_bits(func: clif::Function, opcode: clif::Opcode, arg: clif::Value, width: u32, known: Slice[Bits]) -> Bits {
+    let bits = bits_of(func, value: arg, known)
+    let mask = width_mask(width)
+    return match opcode {
+        clif::Opcode.Uextend => {
+            let source = int_width(func, value: arg)
+            if source == 0 {
+                return NO_BITS
+            }
+            return Bits(zeros: bits.zeros | (mask & ~width_mask(source)), ones: bits.ones)
+        }
+        clif::Opcode.Ireduce => Bits(zeros: bits.zeros & mask, ones: bits.ones & mask)
+        else => NO_BITS
+    }
+} unary_bits
+
+/// The bits of a comparison's flag: 0 or 1, known when the operands' known bits decide it.
+fn compare_bits(cond: clif::IntCC, x: Bits, y: Bits, width: u32) -> Bits {
+    let flag = Bits(zeros: 0xFE, ones: 0)
+    if width == 0 {
+        return flag
+    }
+    if x.is_exact(width) and y.is_exact(width) {
+        if holds_compare(cond, x: x.ones, y: y.ones, width) {
+            return exact(1, width: 8)
+        }
+        return exact(0, width: 8)
+    }
+    let differ = ((x.ones & y.zeros) | (x.zeros & y.ones)) != 0
+    if differ and cond == clif::IntCC.Equal {
+        return exact(0, width: 8)
+    }
+    if differ and cond == clif::IntCC.NotEqual {
+        return exact(1, width: 8)
+    }
+    return flag
+} compare_bits
+
+/// Whether two values of a width compare as a condition says.
+fn holds_compare(cond: clif::IntCC, x: u64, y: u64, width: u32) -> bool {
+    let shift = 64 - width
+    let signed_x = i64.from_bits(x << shift).shr_arith(shift)
+    let signed_y = i64.from_bits(y << shift).shr_arith(shift)
+    return match cond {
+        clif::IntCC.Equal => x == y
+        clif::IntCC.NotEqual => x != y
+        clif::IntCC.SignedLessThan => signed_x < signed_y
+        clif::IntCC.SignedGreaterThanOrEqual => signed_x >= signed_y
+        clif::IntCC.SignedGreaterThan => signed_x > signed_y
+        clif::IntCC.SignedLessThanOrEqual => signed_x <= signed_y
+        clif::IntCC.UnsignedLessThan => x < y
+        clif::IntCC.UnsignedGreaterThanOrEqual => x >= y
+        clif::IntCC.UnsignedGreaterThan => x > y
+        clif::IntCC.UnsignedLessThanOrEqual => x <= y
+    }
+} holds_compare
+
+/// The bits of a select: those of the value its condition picks when known, else those both
+/// values agree on.
+fn select_bits(c: Bits, width: u32, x: Bits, y: Bits) -> Bits {
+    if c.ones != 0 {
+        return x
+    }
+    if width > 0 and c.is_exact(width) {
+        return y
+    }
+    return x.meet(y)
+} select_bits
+
+/// The arm a branch on a value takes when its known bits decide it: 0 for the first, when a bit
+/// is known to be 1, and 1 for the second, when every bit is known to be 0; `NONE` otherwise.
+fn known_arm(func: clif::Function, c: clif::Value, known: Slice[Bits]) -> u32 {
+    if known.len() == 0 {
+        return NONE
+    }
+    let bits = bits_of(func, value: c, known)
+    if bits.ones != 0 {
+        return 0
+    }
+    let width = int_width(func, value: c)
+    if width > 0 and bits.is_exact(width) {
+        return 1
+    }
+    return NONE
+} known_arm
+
+/// The constant an instruction computing one integer value from its operands alone gives when
+/// every bit of it is known and it is not a constant already.
+fn folded_value(func: clif::Function, inst: clif::Inst, known: Slice[Bits], alloc: mem::Alloc) -> Option[u64] {
+    if known.len() == 0 {
+        return None
+    }
+    match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) => return None
+        else => {}
+    }
+    let results = func.inst_results(inst, alloc)
+    if results.len() != 1 or not is_hoistable(func, inst, alloc) {
+        return None
+    }
+    let width = int_width(func, value: results[0])
+    let bits = bits_of(func, value: results[0], known)
+    if width == 0 or not bits.is_exact(width) {
+        return None
+    }
+    return Some(bits.ones)
+} folded_value
+
+/// Whether known bits fold an instruction of a function or decide a branch.
+fn folds_any(func: clif::Function, known: Slice[Bits], alloc: mem::Alloc) -> bool {
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            if folded_value(func, inst, known, alloc).is_some() {
+                return true
+            }
+            let clif::InstructionData.Brif(opcode: _, arg: arg, then: _, otherwise: _) = func.inst_data(inst) else {
+                continue
+            }
+            if known_arm(func, c: arg, known) != NONE {
+                return true
+            }
+        }
+    }
+    return false
+} folds_any

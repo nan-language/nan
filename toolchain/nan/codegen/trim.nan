@@ -1,0 +1,247 @@
+//! Trimming block parameters: a parameter only parameters nothing reads take is dropped with the arguments passed to it, and one whose branches pass it a single other value, or itself, stands for that value; the function is copied without them, with the values and branches its known bits fix folded.
+
+/// The trim of a dropped parameter nothing reads.
+const DROPPED: u32 = 0xFFFF_FFFE
+
+/// The most rounds of finding the parameters that stand for another value.
+const TRIM_ROUNDS: u32 = 8
+
+/// A value a branch passes to a block parameter.
+struct Passed derives Copy, Eq {
+    param: u32
+    arg: u32
+} Passed
+
+/// The values a function reads: the arguments its branches pass to block parameters, ordered
+/// by parameter, whether an instruction reads each value otherwise, and the parameters of its
+/// blocks other than its entry.
+struct Reads {
+    passes: mem::List[Passed]
+    read: mem::List[bool]
+    params: mem::List[u32]
+} Reads
+
+/// The function with its block parameters trimmed and the values and branches known bits fix
+/// folded, or none when it has none of these or holds a use before its definition in layout
+/// order.
+fn trimmed(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let reads = reads_of(func, alloc)
+    let trims = trims_of(reads, count: usize.widen(func.value_count()), alloc)
+    let known = match value_bits(func, passes: reads.passes.view(), alloc) {
+        Some(bits) => bits
+        None => mem::List[Bits].empty(alloc)
+    }
+    if trims.is_none() and not folds_any(func, known: known.view(), alloc) {
+        return None
+    }
+    let kept = match trims {
+        Some(found) => found
+        None => mem::List[u32].empty(alloc)
+    }
+    var copier = Copier.trimming(func, trims: take kept, known: take known, alloc)
+    mut copier.copy_function(func, leaves: Leaves.empty(alloc))
+    return take copier.finish()
+} trimmed
+
+fn reads_of(func: clif::Function, alloc: mem::Alloc) -> Reads {
+    var reads = Reads(passes: mem::List[Passed].empty(alloc), read: filled(usize.widen(func.value_count()), value: false, alloc), params: mem::List[u32].empty(alloc))
+    let entry = func.entry_block()
+    for block in func.layout_blocks(alloc) {
+        if entry != Some(block) {
+            for param in func.block_params(block, alloc) {
+                mut reads.params.push(param.index)
+            }
+        }
+        for inst in func.block_insts(block, alloc) {
+            note_reads(func, data: func.inst_data(inst), passes: mut reads.passes, read: mut reads.read, alloc)
+        }
+    }
+    mut reads.passes.sort_by(fn(left: Passed, right: Passed) -> core::Ordering {
+        return left.param.cmp(right.param)
+    })
+    return reads
+} reads_of
+
+/// What trimming does to each value of a function, by index: `NONE` for a value it keeps,
+/// `DROPPED` for a parameter it drops, else the index of the kept value a dropped parameter
+/// stands for; none when it drops no parameter.
+fn trims_of(reads: Reads, count: usize, alloc: mem::Alloc) -> Option[mem::List[u32]] {
+    var read = filled(count, value: false, alloc)
+    for index in 0..<reads.read.len() {
+        read[index] = reads.read[index]
+    }
+    let live = live_params(reads.passes.view(), take read, alloc)
+    var trims = filled(count, value: NONE, alloc)
+    var trimming = false
+    for param in reads.params {
+        expect usize.widen(param) < live.len()
+        if not live[usize.widen(param)] {
+            trims[usize.widen(param)] = DROPPED
+            trimming = true
+        }
+    }
+    if standing_in(reads.passes.view(), params: reads.params.view(), mut trims) {
+        trimming = true
+    }
+    if not trimming {
+        return None
+    }
+    return Some(take trims)
+} trims_of
+
+/// Records the values an instruction reads: the arguments its branches pass to parameters in
+/// `passes`, any other in `read`.
+fn note_reads(func: clif::Function, data: clif::InstructionData, mut passes: mem::List[Passed], mut read: mem::List[bool], alloc: mem::Alloc) {
+    match data {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => note_passes(func, call: destination, mut passes, alloc)
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            let at = usize.widen(func.resolve_aliases(arg).index)
+            expect at < read.len()
+            read[at] = true
+            note_passes(func, call: then_call, mut passes, alloc)
+            note_passes(func, call: else_call, mut passes, alloc)
+        }
+        else => each_operand(data, visit: fn[mut read](value: clif::Value) {
+            let at = usize.widen(func.resolve_aliases(value).index)
+            expect at < read.len()
+            read[at] = true
+        })
+    }
+} note_reads
+
+fn note_passes(func: clif::Function, call: clif::BlockCall, mut passes: mem::List[Passed], alloc: mem::Alloc) {
+    let params = func.block_params(call.block, alloc)
+    expect params.len() == call.args.len()
+    for index in 0..<params.len() {
+        mut passes.push(Passed(param: params[index].index, arg: func.resolve_aliases(call.args[index]).index))
+    }
+} note_passes
+
+/// Whether each value is read: by an instruction other than a branch passing it to a
+/// parameter, or by being passed to a parameter that is read; `passes` are ordered by
+/// parameter.
+fn live_params(passes: Slice[Passed], take read: mem::List[bool], alloc: mem::Alloc) -> mem::List[bool] {
+    var live = read
+    var pending = mem::List[u32].empty(alloc)
+    for index in 0..<live.len() {
+        if live[index] {
+            mut pending.push(u32.fit(index))
+        }
+    }
+    loop {
+        let Some(value) = mut pending.pop() else {
+            return live
+        }
+        var at = first_pass(passes, param: value)
+        while at < passes.len() and passes[at].param == value {
+            let arg = usize.widen(passes[at].arg)
+            expect arg < live.len()
+            if not live[arg] {
+                live[arg] = true
+                mut pending.push(passes[at].arg)
+            }
+            at += 1
+        }
+    }
+} live_params
+
+/// The index of the first of the passes, ordered by parameter, to a parameter or a later one.
+fn first_pass(passes: Slice[Passed], param: u32) -> usize {
+    var low: usize = 0
+    var high = passes.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if passes[middle].param < param {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+} first_pass
+
+/// Makes each kept parameter whose branches pass it a single value other than itself stand for
+/// that value, round after round as parameters standing for others make more do, saying whether
+/// it made any; each trim then names a kept value. `passes` are ordered by parameter.
+fn standing_in(passes: Slice[Passed], params: Slice[u32], mut trims: mem::List[u32]) -> bool {
+    var made = false
+    for _ in 0u32..<TRIM_ROUNDS {
+        var changed = false
+        for param in params {
+            expect usize.widen(param) < trims.len()
+            if trims[usize.widen(param)] != NONE {
+                continue
+            }
+            let single = single_passed(passes, param, trims: trims.view())
+            if single != NONE {
+                trims[usize.widen(param)] = single
+                changed = true
+            }
+        }
+        if not changed {
+            break
+        }
+        made = true
+    }
+    for param in params {
+        let trim = trims[usize.widen(param)]
+        if trim != NONE and trim != DROPPED {
+            trims[usize.widen(param)] = kept_of(trims.view(), value: trim)
+        }
+    }
+    return made
+} standing_in
+
+/// The one value other than itself branches pass a parameter, each argument taken as the kept
+/// value it stands for; `NONE` when they pass several or none.
+fn single_passed(passes: Slice[Passed], param: u32, trims: Slice[u32]) -> u32 {
+    var single = NONE
+    var at = first_pass(passes, param)
+    while at < passes.len() and passes[at].param == param {
+        let arg = kept_of(trims, value: passes[at].arg)
+        at += 1
+        if arg == param {
+            continue
+        }
+        if single != NONE and single != arg {
+            return NONE
+        }
+        single = arg
+    }
+    return single
+} single_passed
+
+/// The kept value a value stands for.
+fn kept_of(trims: Slice[u32], value: u32) -> u32 {
+    var current = value
+    for _ in 0..<trims.len() {
+        expect usize.widen(current) < trims.len()
+        let trim = trims[usize.widen(current)]
+        if trim == NONE or trim == DROPPED {
+            return current
+        }
+        current = trim
+    }
+    expect false
+    return current
+} kept_of
+
+/// The arguments a branch passes to the parameters of its target that trimming keeps.
+fn kept_args(func: clif::Function, call: clif::BlockCall, trims: Slice[u32], alloc: mem::Alloc) -> mem::List[clif::Value] {
+    var kept = mem::List[clif::Value].empty(alloc)
+    let params = func.block_params(call.block, alloc)
+    expect params.len() == call.args.len()
+    for index in 0..<params.len() {
+        let at = usize.widen(params[index].index)
+        if trims.len() == 0 or (at < trims.len() and trims[at] == NONE) {
+            mut kept.push(call.args[index])
+        }
+    }
+    return kept
+} kept_args
+
+/// Whether trimming keeps a block parameter.
+fn is_kept(trims: Slice[u32], param: clif::Value) -> bool {
+    let at = usize.widen(param.index)
+    return trims.len() == 0 or (at < trims.len() and trims[at] == NONE)
+} is_kept

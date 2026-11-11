@@ -1,4 +1,4 @@
-//! Register allocation: a linear scan over the live intervals that keeps each virtual register in one physical register, or in one spill slot, for all its life, spilling the interval whose accesses weigh least, an access in a loop weighing more; a register a call clobbers holds an interval across calls when saving it to a slot before each and loading it after weighs less.
+//! Register allocation: a linear scan over the live segments that keeps each virtual register in one physical register, or in one spill slot, for all its life, a register holding virtual registers whose segments never meet; it spills the virtual registers whose accesses weigh least, an access in a loop weighing more, and a register a call clobbers holds a virtual register across calls when saving it to a slot before each and loading it after weighs less.
 
 /// Where register allocation puts each virtual register, and what the frame must hold for it.
 struct Allocation {
@@ -21,13 +21,13 @@ struct Save derives Copy, Eq {
     vreg: u32
 } Save
 
-/// The state of the scan: the virtual register holding each physical register, and per physical
-/// register the first of its fixed ranges not yet behind the scan; the weight of each virtual
-/// register's accesses and of each instruction's position, and whether each virtual register is
-/// saved across the calls in its interval.
+/// The state of the scan: per physical register, the virtual registers it holds whose last
+/// position the scan has not passed, and the first of its fixed ranges not yet behind the scan;
+/// the weight of each virtual register's accesses and of each instruction's position, and
+/// whether each virtual register is saved across the calls where it is live.
 struct Scan {
     allocatable: machinst::RegSet
-    holders: Array[u32, REG_COUNT]
+    held: mem::List[mem::List[u32]]
     cursors: Array[u32, REG_COUNT]
     regs: mem::List[machinst::Reg]
     spilled: mem::List[u32]
@@ -36,11 +36,30 @@ struct Scan {
     saved: mem::List[bool]
 } Scan
 
+/// How the fixed ranges of a register meet a virtual register: not at all, only where calls
+/// clobber the register, saving it across them weighing the cost, or otherwise.
+enum Fixed derives Copy, Eq {
+    Clear
+    Calls(u64)
+    Held
+} Fixed
+
+/// The summed weight of the virtual registers a register holds that meet another, and the last
+/// position of the last of them.
+struct Meeting derives Copy, Eq {
+    weight: u64
+    end: u32
+} Meeting
+
 fn allocate[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -> Allocation {
     let live = Liveness.of(code, alloc)
     let count = usize.widen(code.vreg_count())
     let factors = position_factors(code, alloc)
-    var scan = Scan(allocatable: code.allocatable(), holders: Array[u32, REG_COUNT].filled(NONE), cursors: Array[u32, REG_COUNT].filled(0), regs: filled(count, value: NO_REG, alloc), spilled: mem::List[u32].empty(alloc), weights: access_weights(code, factors: factors.view(), alloc), factors: take factors, saved: filled(count, value: false, alloc))
+    var held = mem::List[mem::List[u32]].empty(alloc)
+    for _ in 0..<REG_COUNT {
+        mut held.push(mem::List[u32].empty(alloc))
+    }
+    var scan = Scan(allocatable: code.allocatable(), held: take held, cursors: Array[u32, REG_COUNT].filled(0), regs: filled(count, value: NO_REG, alloc), spilled: mem::List[u32].empty(alloc), weights: access_weights(code, factors: factors.view(), alloc), factors: take factors, saved: filled(count, value: false, alloc))
     for index in 0..<REG_COUNT {
         scan.cursors[index] = live.fixed_at[index]
     }
@@ -65,86 +84,149 @@ fn allocate[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -
     return take scan.finish(code, live, alloc)
 } allocate
 
-/// Gives a virtual register a free register, its hint's first; or, when none is free, a register
-/// only calls clobber in its interval, saved across them, when that weighs less than spilling;
-/// or else the register of the interval whose accesses weigh least, spilling that interval or
-/// this one, the one ending last among equal weights.
+/// Gives a virtual register a register where nothing else is live where it is, its hint's
+/// first; or, when none is, a register only calls clobber where it is live, saved across them,
+/// when that weighs less than spilling; or else the register whose virtual registers meeting it
+/// weigh least, spilling those or this one, the one ending last among equal weights.
 fn Scan.place[I: machinst::MachInst and Copy](mut self, code: VCode[I], live: Liveness, vreg: u32) {
     let at = usize.widen(vreg)
-    let start = live.start_of(vreg)
-    let end = live.end_of(vreg)
-    for index in 0..<REG_COUNT {
-        let holder = self.holders[index]
-        if holder != NONE and live.end_of(holder) < start {
-            self.holders[index] = NONE
-        }
-    }
+    mut self.release(live, start: live.start_of(vreg))
     expect at < code.floats.len() and at < code.hints.len()
     let float = code.floats[at]
     let preferred = self.preferred(code, vreg)
-    if preferred != NO_REG and self.allocatable.contains(preferred) and I.is_float(preferred) == float and mut self.is_free(live, reg: preferred, start, end) {
+    if preferred != NO_REG and self.allocatable.contains(preferred) and I.is_float(preferred) == float and mut self.is_free(live, reg: preferred, vreg) {
         mut self.assign(vreg, reg: preferred)
         return
     }
     for index in 0u32..<I.class_size(float) {
         let reg = I.class_reg(float, index: index)
-        if mut self.is_free(live, reg, start, end) {
+        if mut self.is_free(live, reg, vreg) {
             mut self.assign(vreg, reg)
             return
         }
     }
-    var victim = NO_REG
-    var lightest = self.weight(vreg)
-    var furthest = end
-    var across = NO_REG
-    var cheapest = lightest
-    for index in 0u32..<I.class_size(float) {
-        let reg = I.class_reg(float, index: index)
-        if self.holders[usize.widen(reg.index)] != NONE {
-            continue
-        }
-        match mut self.save_cost(live, reg, start, end) {
-            Some(cost) => {
-                if cost < cheapest {
-                    across = reg
-                    cheapest = cost
-                }
-            }
-            None => {}
-        }
-    }
-    if across != NO_REG {
-        expect at < self.saved.len()
-        self.saved[at] = true
-        mut self.assign(vreg, reg: across)
+    if mut self.place_across(code, live, vreg, float) {
         return
     }
-    for index in 0u32..<I.class_size(float) {
-        let reg = I.class_reg(float, index: index)
-        let holder = self.holders[usize.widen(reg.index)]
-        if holder == NONE {
+    mut self.evict_for(code, live, vreg, float)
+} Scan.place
+
+/// Forgets the virtual registers held whose last position lies before `start`.
+fn Scan.release(mut self, live: Liveness, start: u32) {
+    for index in 0..<self.held.len() {
+        if self.held[index].len() == 0 {
             continue
         }
-        let weight = self.weight(holder)
-        let lighter = weight < lightest or (weight == lightest and live.end_of(holder) > furthest)
-        if lighter and mut self.is_clear(live, reg, start, end) {
+        var holders = mut self.held.at_mut(index)
+        mut holders.retain(fn(holder: u32) => live.end_of(holder) >= start)
+    }
+} Scan.release
+
+/// Gives a virtual register the register only calls clobber where it is live whose saving
+/// across them weighs least, when that weighs less than spilling it, saying whether it did.
+fn Scan.place_across[I: machinst::MachInst and Copy](mut self, code: VCode[I], live: Liveness, vreg: u32, float: bool) -> bool {
+    var across = NO_REG
+    var cheapest = self.weight(vreg)
+    for index in 0u32..<I.class_size(float) {
+        let reg = I.class_reg(float, index: index)
+        if self.meets_held(live, reg, vreg) {
+            continue
+        }
+        let Fixed.Calls(cost) = mut self.fixed_use(live, reg, vreg) else {
+            continue
+        }
+        if cost < cheapest {
+            across = reg
+            cheapest = cost
+        }
+    }
+    if across == NO_REG {
+        return false
+    }
+    expect usize.widen(vreg) < self.saved.len()
+    self.saved[usize.widen(vreg)] = true
+    mut self.assign(vreg, reg: across)
+    return true
+} Scan.place_across
+
+/// Gives a virtual register the register whose held virtual registers meeting it weigh least,
+/// spilling those, when they weigh less than it and no fixed range of the register meets it;
+/// spills it otherwise.
+fn Scan.evict_for[I: machinst::MachInst and Copy](mut self, code: VCode[I], live: Liveness, vreg: u32, float: bool) {
+    var victim = NO_REG
+    var lightest = self.weight(vreg)
+    var furthest = live.end_of(vreg)
+    for index in 0u32..<I.class_size(float) {
+        let reg = I.class_reg(float, index: index)
+        let Some(meeting) = self.meeting(live, reg, vreg) else {
+            continue
+        }
+        let lighter = meeting.weight < lightest or (meeting.weight == lightest and meeting.end > furthest)
+        if lighter and mut self.fixed_use(live, reg, vreg) == Fixed.Clear {
             victim = reg
-            lightest = weight
-            furthest = live.end_of(holder)
+            lightest = meeting.weight
+            furthest = meeting.end
         }
     }
     if victim == NO_REG {
         mut self.spilled.push(vreg)
         return
     }
-    expect victim.is_physical()
-    let evicted = self.holders[usize.widen(victim.index)]
-    expect usize.widen(evicted) < self.regs.len() and usize.widen(evicted) < self.saved.len()
-    self.regs[usize.widen(evicted)] = NO_REG
-    self.saved[usize.widen(evicted)] = false
-    mut self.spilled.push(evicted)
+    mut self.spill_meeting(live, reg: victim, vreg)
     mut self.assign(vreg, reg: victim)
-} Scan.place
+} Scan.evict_for
+
+/// Whether a virtual register a register holds meets `vreg`.
+fn Scan.meets_held(self, live: Liveness, reg: machinst::Reg, vreg: u32) -> bool {
+    let at = usize.widen(reg.index)
+    expect at < self.held.len()
+    for holder in self.held[at] {
+        if live.meet(holder, vreg) {
+            return true
+        }
+    }
+    return false
+} Scan.meets_held
+
+/// The weight of the virtual registers a register holds that meet `vreg`, none when none does.
+fn Scan.meeting(self, live: Liveness, reg: machinst::Reg, vreg: u32) -> Option[Meeting] {
+    let at = usize.widen(reg.index)
+    expect at < self.held.len()
+    var found: Option[Meeting] = None
+    for holder in self.held[at] {
+        if not live.meet(holder, vreg) {
+            continue
+        }
+        var meeting = Meeting(weight: 0, end: 0)
+        match found {
+            Some(earlier) => {
+                meeting = earlier
+            }
+            None => {}
+        }
+        meeting.weight = meeting.weight.saturating_add(self.weight(holder))
+        meeting.end = larger(meeting.end, other: live.end_of(holder))
+        found = Some(meeting)
+    }
+    return found
+} Scan.meeting
+
+/// Spills the virtual registers a register holds that meet `vreg`.
+fn Scan.spill_meeting(mut self, live: Liveness, reg: machinst::Reg, vreg: u32) {
+    let at = usize.widen(reg.index)
+    expect at < self.held.len()
+    for holder in self.held[at] {
+        if not live.meet(holder, vreg) {
+            continue
+        }
+        expect usize.widen(holder) < self.regs.len() and usize.widen(holder) < self.saved.len()
+        self.regs[usize.widen(holder)] = NO_REG
+        self.saved[usize.widen(holder)] = false
+        mut self.spilled.push(holder)
+    }
+    var holders = mut self.held.at_mut(at)
+    mut holders.retain(fn(holder: u32) => not live.meet(holder, vreg))
+} Scan.spill_meeting
 
 fn Scan.weight(self, vreg: u32) -> u64 {
     let at = usize.widen(vreg)
@@ -238,63 +320,68 @@ fn Scan.preferred[I: machinst::MachInst and Copy](self, code: VCode[I], vreg: u3
 fn Scan.assign(mut self, vreg: u32, reg: machinst::Reg)
     requires reg.is_physical()
 {
-    expect usize.widen(vreg) < self.regs.len()
+    expect usize.widen(vreg) < self.regs.len() and usize.widen(reg.index) < self.held.len()
     self.regs[usize.widen(vreg)] = reg
-    self.holders[usize.widen(reg.index)] = vreg
+    var holders = mut self.held.at_mut(usize.widen(reg.index))
+    mut holders.push(vreg)
 } Scan.assign
 
-/// Whether no interval holds a register and no fixed range of it meets `start ..= end`.
-fn Scan.is_free(mut self, live: Liveness, reg: machinst::Reg, start: u32, end: u32) -> bool
+/// Whether no virtual register a register holds meets `vreg` and no fixed range of it does.
+fn Scan.is_free(mut self, live: Liveness, reg: machinst::Reg, vreg: u32) -> bool
     requires reg.is_physical()
 {
-    return self.holders[usize.widen(reg.index)] == NONE and mut self.is_clear(live, reg, start, end)
+    return not self.meets_held(live, reg, vreg) and mut self.fixed_use(live, reg, vreg) == Fixed.Clear
 } Scan.is_free
 
-/// The weight of saving a register across the calls clobbering it in `start ..= end`, a store and
-/// a load at each; none when another fixed range meets them.
-fn Scan.save_cost(mut self, live: Liveness, reg: machinst::Reg, start: u32, end: u32) -> Option[u64]
-    requires reg.is_physical()
-{
-    discard mut self.is_clear(live, reg, start, end)
-    let at = usize.widen(reg.index)
-    let limit = live.fixed_at[at + 1]
-    expect usize.widen(limit) <= live.fixed.len()
-    var cost: u64 = 0
-    var index = self.cursors[at]
-    while index < limit and live.fixed[usize.widen(index)].start <= end {
-        let range = live.fixed[usize.widen(index)]
-        if not range.call {
-            return None
-        }
-        let call_at = usize.widen(range.start / 2)
-        expect call_at < self.factors.len()
-        cost = cost.saturating_add(2 * self.factors[call_at])
-        index += 1
-    }
-    return Some(cost)
-} Scan.save_cost
-
-/// Whether no fixed range of a register meets `start ..= end`, the ranges ending before `start`
-/// passed for good.
-fn Scan.is_clear(mut self, live: Liveness, reg: machinst::Reg, start: u32, end: u32) -> bool
+/// How the fixed ranges of a register meet the segments of `vreg`, a save across a call being a
+/// store and a load at it; the ranges ending before `vreg` starts are passed for good.
+fn Scan.fixed_use(mut self, live: Liveness, reg: machinst::Reg, vreg: u32) -> Fixed
     requires reg.is_physical()
 {
     let at = usize.widen(reg.index)
+    let start = live.start_of(vreg)
     let limit = live.fixed_at[at + 1]
     expect usize.widen(limit) <= live.fixed.len()
     while self.cursors[at] < limit and live.fixed[usize.widen(self.cursors[at])].end < start {
         self.cursors[at] = self.cursors[at] + 1
     }
-    let cursor = self.cursors[at]
-    expect cursor <= limit
-    return cursor == limit or live.fixed[usize.widen(cursor)].start > end
-} Scan.is_clear
+    let end = live.end_of(vreg)
+    var segment = live.first_segment(vreg)
+    let last = live.end_segment(vreg)
+    var cost: u64 = 0
+    var calls = false
+    var index = self.cursors[at]
+    while index < limit and live.fixed[usize.widen(index)].start <= end {
+        let range = live.fixed[usize.widen(index)]
+        index += 1
+        while segment < last and live.segments[segment].end < range.start {
+            segment += 1
+        }
+        if segment == last {
+            break
+        }
+        if live.segments[segment].start > range.end {
+            continue
+        }
+        if not range.call {
+            return Fixed.Held
+        }
+        let call_at = usize.widen(range.start / 2)
+        expect call_at < self.factors.len()
+        cost = cost.saturating_add(2 * self.factors[call_at])
+        calls = true
+    }
+    if calls {
+        return Fixed.Calls(cost)
+    }
+    return Fixed.Clear
+} Scan.fixed_use
 
 /// The allocation: spill slots shared by spilled intervals that do not overlap, and the
 /// callee-saved registers the code changes. No vector is spilled or saved: the functions holding
 /// vectors make no call and hold fewer at once than allocation hands out registers.
 fn Scan.finish[I: machinst::MachInst and Copy](take self, code: VCode[I], live: Liveness, alloc: mem::Alloc) -> Allocation {
-    let Scan(allocatable: _, holders: _, cursors: _, regs: regs, spilled: spilled, weights: _, factors: _, saved: across) = self
+    let Scan(allocatable: _, held: _, cursors: _, regs: regs, spilled: spilled, weights: _, factors: _, saved: across) = self
     var by_start = spilled
     for vreg in 0..<across.len() {
         if across[vreg] {
@@ -364,7 +451,7 @@ fn saves_of[I: machinst::MachInst and Copy](code: VCode[I], live: Liveness, regs
         for vreg in held {
             expect usize.widen(vreg) < regs.len()
             let reg = regs[usize.widen(vreg)]
-            if live.start_of(vreg) <= position and position <= live.end_of(vreg) and clobbers.contains(reg) {
+            if live.covers(vreg, position) and clobbers.contains(reg) {
                 mut saves.push(Save(at: u32.fit(at), reg: reg, vreg: vreg))
             }
         }

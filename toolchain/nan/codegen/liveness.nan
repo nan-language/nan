@@ -1,15 +1,30 @@
-//! Liveness: the interval of positions each virtual register is live over, and the ranges over which instructions hold physical registers. Instruction `i` reads its uses at position `2i` and writes its definitions at `2i + 1`, an early definition at `2i`.
+//! Liveness: the positions each virtual register is live at, as disjoint segments, and the ranges over which instructions hold physical registers. Instruction `i` reads its uses at position `2i` and writes its definitions at `2i + 1`, an early definition at `2i`.
 
-/// The positions each virtual register is live over, from its first to its last, `NONE` where a
-/// register is never named; and per physical register, the ranges instructions hold it over,
-/// ordered by start.
+/// The positions each virtual register is live at: its segments, disjoint and in position
+/// order, `segments[segment_at[v] ..< segment_at[v + 1]]` for register `v`, with the first
+/// position of the first and the last of the last, `NONE` where a register is never named; and
+/// per physical register, the ranges instructions hold it over, ordered by start.
 struct Liveness {
     starts: mem::List[u32]
     ends: mem::List[u32]
+    segments: mem::List[Segment]
+    segment_at: mem::List[u32]
     /// The fixed ranges of physical register `r` are `fixed[fixed_at[r] ..< fixed_at[r + 1]]`.
     fixed: mem::List[Range]
     fixed_at: Array[u32, REG_BOUNDS]
 } Liveness
+
+/// A run of positions a virtual register is live at, both ends included.
+struct Segment derives Copy, Eq {
+    start: u32
+    end: u32
+} Segment
+
+/// The positions virtual registers are live at, each `vreg << 32 | position`: their
+/// definitions, their uses and the bounds of the blocks they are live through.
+struct Points {
+    list: mem::List[u64]
+} Points
 
 /// The entries of a table with one per physical register.
 const REG_COUNT: usize = usize.widen(machinst::PHYSICAL)
@@ -34,20 +49,91 @@ struct Exposed derives Copy, Eq {
 
 fn Liveness.of[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -> Liveness {
     let count = usize.widen(code.vreg_count())
-    var live = Liveness(starts: filled(count, value: NONE, alloc), ends: filled(count, value: 0u32, alloc), fixed: mem::List[Range].empty(alloc), fixed_at: Array[u32, REG_BOUNDS].filled(0))
+    var points = Points(list: mem::List[u64].empty(alloc))
     var def_blocks = filled(count, value: NONE, alloc)
     var def_positions = filled(count, value: NONE, alloc)
     for index in 0..<code.blocks.len() {
-        mut live.record_defs(code, block: u32.fit(index), mut def_blocks, mut def_positions)
+        mut points.record_defs(code, block: u32.fit(index), mut def_blocks, mut def_positions)
     }
     var exposed = mem::List[Exposed].empty(alloc)
     for index in 0..<code.blocks.len() {
-        mut live.record_uses(code, block: u32.fit(index), def_blocks, def_positions, mut exposed)
+        mut points.record_uses(code, block: u32.fit(index), def_blocks, def_positions, mut exposed)
     }
-    mut live.propagate(code, def_blocks, take exposed, alloc)
+    mut points.propagate(code, def_blocks, take exposed, alloc)
+    var live = Liveness.of_points(take points, count, code, alloc)
     mut live.record_fixed(code, alloc)
     return live
 } Liveness.of
+
+/// The liveness gathered points give: each virtual register is live from its first to its
+/// last point within each block, those positions joined with the next block's where they touch.
+fn Liveness.of_points[I: machinst::MachInst and Copy](take points: Points, count: usize, code: VCode[I], alloc: mem::Alloc) -> Liveness {
+    var sorted = points.list
+    mut sorted.sort_by(fn(left: u64, right: u64) -> core::Ordering {
+        return left.cmp(right)
+    })
+    let blocks = block_of_insts(code, alloc)
+    var live = Liveness(starts: filled(count, value: NONE, alloc), ends: filled(count, value: 0u32, alloc), segments: mem::List[Segment].empty(alloc), segment_at: filled(count + 1, value: 0u32, alloc), fixed: mem::List[Range].empty(alloc), fixed_at: Array[u32, REG_BOUNDS].filled(0))
+    var next_vreg: usize = 0
+    var at: usize = 0
+    while at < sorted.len() {
+        let vreg = usize.widen(u32.truncate(sorted[at] >> 32))
+        while next_vreg <= vreg and next_vreg < live.segment_at.len() {
+            live.segment_at[next_vreg] = u32.fit(live.segments.len())
+            next_vreg += 1
+        }
+        at = mut live.add_segments(sorted.view(), from: at, blocks: blocks.view())
+    }
+    while next_vreg < live.segment_at.len() {
+        live.segment_at[next_vreg] = u32.fit(live.segments.len())
+        next_vreg += 1
+    }
+    return live
+} Liveness.of_points
+
+/// Adds the segments of the virtual register whose points run from `points[from]`, recording
+/// its first and last position, and gives the index past its points.
+fn Liveness.add_segments(mut self, points: Slice[u64], from: usize, blocks: Slice[u32]) -> usize {
+    expect from < points.len()
+    let vreg = points[from] >> 32
+    let earliest = u32.truncate(points[from])
+    var start = earliest
+    var end = earliest
+    expect usize.widen(earliest / 2) < blocks.len()
+    var block = blocks[usize.widen(earliest / 2)]
+    var at = from + 1
+    while at < points.len() and (points[at] >> 32) == vreg {
+        let position = u32.truncate(points[at])
+        expect usize.widen(position / 2) < blocks.len() and position >= end
+        let within = blocks[usize.widen(position / 2)]
+        if within != block and position - end > 1 {
+            mut self.segments.push(Segment(start: start, end: end))
+            start = position
+        }
+        end = position
+        block = within
+        at += 1
+    }
+    mut self.segments.push(Segment(start: start, end: end))
+    let index = usize.widen(u32.truncate(vreg))
+    expect index < self.starts.len() and index < self.ends.len()
+    self.starts[index] = earliest
+    self.ends[index] = end
+    return at
+} Liveness.add_segments
+
+/// The block each instruction lies in.
+fn block_of_insts[I: machinst::MachInst and Copy](code: VCode[I], alloc: mem::Alloc) -> mem::List[u32] {
+    var blocks = filled(code.insts.len(), value: 0u32, alloc)
+    for index in 0..<code.blocks.len() {
+        let block = code.blocks[index]
+        for at in block.begin..<block.end {
+            expect usize.widen(at) < blocks.len()
+            blocks[usize.widen(at)] = u32.fit(index)
+        }
+    }
+    return blocks
+} block_of_insts
 
 /// The first position a virtual register is live at, `NONE` for one never named.
 fn Liveness.start_of(self, vreg: u32) -> u32 {
@@ -63,20 +149,59 @@ fn Liveness.end_of(self, vreg: u32) -> u32 {
     return self.ends[at]
 } Liveness.end_of
 
-fn Liveness.extend(mut self, vreg: u32, position: u32) {
+/// The index of a virtual register's first segment.
+fn Liveness.first_segment(self, vreg: u32) -> usize {
     let at = usize.widen(vreg)
-    expect at < self.starts.len() and at < self.ends.len()
-    if self.starts[at] == NONE or position < self.starts[at] {
-        self.starts[at] = position
-    }
-    if position > self.ends[at] {
-        self.ends[at] = position
-    }
-} Liveness.extend
+    expect at < self.segment_at.len()
+    return usize.widen(self.segment_at[at])
+} Liveness.first_segment
 
+/// The index past a virtual register's last segment.
+fn Liveness.end_segment(self, vreg: u32) -> usize {
+    let at = usize.widen(vreg) + 1
+    expect at < self.segment_at.len()
+    return usize.widen(self.segment_at[at])
+} Liveness.end_segment
+
+/// Whether two virtual registers are live at a common position.
+fn Liveness.meet(self, other: u32, vreg: u32) -> bool {
+    var at = self.first_segment(other)
+    let other_end = self.end_segment(other)
+    var own = self.first_segment(vreg)
+    let own_end = self.end_segment(vreg)
+    while at < other_end and own < own_end {
+        expect at < self.segments.len() and own < self.segments.len()
+        let theirs = self.segments[at]
+        let mine = self.segments[own]
+        if theirs.end < mine.start {
+            at += 1
+        } else if mine.end < theirs.start {
+            own += 1
+        } else {
+            return true
+        }
+    }
+    return false
+} Liveness.meet
+
+/// Whether a virtual register is live at a position.
+fn Liveness.covers(self, vreg: u32, position: u32) -> bool {
+    for at in self.first_segment(vreg)..<self.end_segment(vreg) {
+        expect at < self.segments.len()
+        let segment = self.segments[at]
+        if segment.start <= position and position <= segment.end {
+            return true
+        }
+    }
+    return false
+} Liveness.covers
+
+fn Points.add(mut self, vreg: u32, position: u32) {
+    mut self.list.push((u64.widen(vreg) << 32) | u64.widen(position))
+} Points.add
 /// Records where each virtual register a block defines is first defined, its parameters at the
 /// block's start.
-fn Liveness.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, mut def_blocks: mem::List[u32], mut def_positions: mem::List[u32])
+fn Points.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, mut def_blocks: mem::List[u32], mut def_positions: mem::List[u32])
     requires usize.widen(block) < code.blocks.len()
 {
     let data = code.blocks[usize.widen(block)]
@@ -87,7 +212,7 @@ fn Liveness.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I]
         expect usize.widen(vreg) < def_blocks.len() and usize.widen(vreg) < def_positions.len()
         def_blocks[usize.widen(vreg)] = block
         def_positions[usize.widen(vreg)] = start
-        mut self.extend(vreg, position: start)
+        mut self.add(vreg, position: start)
     }
     for at in data.begin..<data.end {
         let inst = code.insts[usize.widen(at)].inst
@@ -101,9 +226,9 @@ fn Liveness.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I]
             var position = writes
             if role == machinst::Role.EarlyDef or role == machinst::Role.Temp {
                 position = reads
-                mut self.extend(vreg, position: writes)
+                mut self.add(vreg, position: writes)
             }
-            mut self.extend(vreg, position: position)
+            mut self.add(vreg, position: position)
             expect usize.widen(vreg) < def_blocks.len() and usize.widen(vreg) < def_positions.len()
             if def_blocks[usize.widen(vreg)] == NONE {
                 def_blocks[usize.widen(vreg)] = block
@@ -112,11 +237,11 @@ fn Liveness.record_defs[I: machinst::MachInst and Copy](mut self, code: VCode[I]
             return reg
         })
     }
-} Liveness.record_defs
+} Points.record_defs
 
 /// Extends each virtual register over its uses in a block, noting the uses its definition does
 /// not precede in the block.
-fn Liveness.record_uses[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed])
+fn Points.record_uses[I: machinst::MachInst and Copy](mut self, code: VCode[I], block: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed])
     requires usize.widen(block) < code.blocks.len()
 {
     let data = code.blocks[usize.widen(block)]
@@ -135,20 +260,20 @@ fn Liveness.record_uses[I: machinst::MachInst and Copy](mut self, code: VCode[I]
     for arg in code.block_args(data) {
         mut self.use_at(arg.vreg(), block, position: jump, def_blocks, def_positions, mut exposed)
     }
-} Liveness.record_uses
+} Points.record_uses
 
-fn Liveness.use_at(mut self, vreg: u32, block: u32, position: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed]) {
-    mut self.extend(vreg, position: position)
+fn Points.use_at(mut self, vreg: u32, block: u32, position: u32, def_blocks: mem::List[u32], def_positions: mem::List[u32], mut exposed: mem::List[Exposed]) {
+    mut self.add(vreg, position: position)
     let at = usize.widen(vreg)
     expect at < def_blocks.len() and at < def_positions.len()
     if def_blocks[at] != block or def_positions[at] > position {
         mut exposed.push(Exposed(vreg: vreg, block: block))
     }
-} Liveness.use_at
+} Points.use_at
 
 /// Extends each virtual register over the blocks it is live through: from each block a use of it
 /// is exposed in, back through predecessors to the block defining it.
-fn Liveness.propagate[I: machinst::MachInst and Copy](mut self, code: VCode[I], def_blocks: mem::List[u32], take exposed: mem::List[Exposed], alloc: mem::Alloc) {
+fn Points.propagate[I: machinst::MachInst and Copy](mut self, code: VCode[I], def_blocks: mem::List[u32], take exposed: mem::List[Exposed], alloc: mem::Alloc) {
     let preds = Predecessors.of(code, alloc)
     var sorted = exposed
     mut sorted.sort_by(fn(left: Exposed, right: Exposed) -> core::Ordering {
@@ -170,7 +295,7 @@ fn Liveness.propagate[I: machinst::MachInst and Copy](mut self, code: VCode[I], 
             continue
         }
         live_in[exposed_at] = vreg
-        mut self.extend(vreg, position: 2 * code.blocks[exposed_at].begin)
+        mut self.add(vreg, position: 2 * code.blocks[exposed_at].begin)
         mut pending.push(exposure.block)
         loop {
             let Some(block) = mut pending.pop() else {
@@ -184,16 +309,16 @@ fn Liveness.propagate[I: machinst::MachInst and Copy](mut self, code: VCode[I], 
                     continue
                 }
                 live_out[at] = vreg
-                mut self.extend(vreg, position: (2 * code.blocks[at].end) - 1)
+                mut self.add(vreg, position: (2 * code.blocks[at].end) - 1)
                 if def_blocks[usize.widen(vreg)] != pred and live_in[at] != vreg {
                     live_in[at] = vreg
-                    mut self.extend(vreg, position: 2 * code.blocks[at].begin)
+                    mut self.add(vreg, position: 2 * code.blocks[at].begin)
                     mut pending.push(pred)
                 }
             }
         }
     }
-} Liveness.propagate
+} Points.propagate
 
 /// The predecessors of each block, `list[at[b] ..< at[b + 1]]` for block `b`.
 struct Predecessors {

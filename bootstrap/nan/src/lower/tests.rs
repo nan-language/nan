@@ -346,3 +346,56 @@ fn the_decoders_erased_gives_are_judged_at_its_call() {
         built.output
     );
 }
+
+/// A division whose divisor its requires proves nonzero lowers without the zero test that one
+/// over any divisor keeps.
+#[test]
+fn proven_divisions_lower_without_a_zero_test() {
+    let scratch = example(
+        "//! Means.\n\n\
+         pub fn mean(total: u64, count: u64) -> u64\n\
+         \x20   requires count > 0\n\
+         {\n\
+         \x20   return total / count\n\
+         } mean\n\n\
+         pub fn ratio(total: u64, count: u64) -> u64 {\n\
+         \x20   return total / count\n\
+         } ratio\n",
+    );
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let std = crate::stdlib::packages();
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
+    let lowered = |path: &str| {
+        let item = item_named(&checker, path);
+        let mut lowering = Lowering::new(
+            &checker,
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            super::load::Linking::Image,
+        );
+        let ((), texts) = dumping(|| {
+            lowering.instance(Instance::Nir {
+                item,
+                role: Role::Body,
+                index: 0,
+                args: no_args(),
+            });
+            lowering.drain();
+        });
+        let name = path.rsplit("::").next().expect("a name");
+        texts
+            .into_iter()
+            .find(|(symbol, _)| symbol.contains(name))
+            .map(|(_, text)| text)
+            .expect("the function's text")
+    };
+    let mean = lowered("example::mean");
+    assert!(!mean.contains("brif"), "mean tests its divisor:\n{mean}");
+    let ratio = lowered("example::ratio");
+    assert!(
+        ratio.contains("brif"),
+        "ratio does not test its divisor:\n{ratio}"
+    );
+}

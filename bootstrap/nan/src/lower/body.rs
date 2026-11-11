@@ -1192,10 +1192,12 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 result
             }
             BinaryOp::Div | BinaryOp::Rem => {
-                let ty = self.fx.b.func.dfg.value_type(b);
-                let zero = zero(self.fx, ty);
-                let nonzero = self.fx.b.ins().icmp(IntCC::NotEqual, b, zero);
-                self.trap_unless(nonzero, "trap.division-by-zero", operands);
+                if checked {
+                    let ty = self.fx.b.func.dfg.value_type(b);
+                    let zero = zero(self.fx, ty);
+                    let nonzero = self.fx.b.ins().icmp(IntCC::NotEqual, b, zero);
+                    self.trap_unless(nonzero, "trap.division-by-zero", operands);
+                }
                 match op {
                     BinaryOp::Div => self.fx.b.ins().udiv(a, b),
                     _ => self.fx.b.ins().urem(a, b),

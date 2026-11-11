@@ -139,15 +139,24 @@ pkg fn Token.location(self, session: check::Session) -> Option[text::String] {
     return None
 } Token.location
 
-/// Runs the tests a scope selects on each run target of their packages, as `runs` keeps them;
-/// a part of the build cache that is exposed ends it before any run.
-pkg fn run(session: check::Session, scope: scope::Scope, runs: Runs, user_cache: cache::Cache) -> Result[Report, cache::Exposed] fails platform::IoError {
+/// Runs the tests a scope selects on each run target of their packages, as `runs` keeps them,
+/// lowered by the checker `checked` holds for their packages under the target, or else by a check
+/// of their closure under it; a part of the build cache that is exposed ends it before any run.
+pkg fn run(session: check::Session, scope: scope::Scope, runs: Runs, user_cache: cache::Cache, checked: Option[check::Checked]) -> Result[Report, cache::Exposed] fails platform::IoError {
     let alloc = session.alloc
     let held = session.workspace.contents()
     var report = Report.empty(alloc)
     for closure in held.closures {
-        for target in scope_targets(held, closure, scope, alloc) {
-            let checker = session.checked(closure, target)
+        let packages = selecting(held, closure, scope, alloc)
+        for target in run_targets_of(held, packages: packages.view(), alloc) {
+            let reusable = match checked {
+                Some(given) => given.serving(target, packages: packages.view())
+                None => None
+            }
+            let checker = match reusable {
+                Some(found) => found
+                None => session.checked(closure, target)
+            }
             match try run_target(session, checker, scope, runs, user_cache, report: mut report) {
                 Ok(_) => {}
                 Err(exposed) => return Err(take exposed)
@@ -158,6 +167,22 @@ pkg fn run(session: check::Session, scope: scope::Scope, runs: Runs, user_cache:
     report.diagnostics = check::sorted_diagnostics(take report.diagnostics, alloc)
     return Ok(take report)
 } run
+
+/// Whether the checkers of a check serve a run target of the tests a scope selects, which `run`
+/// then lowers by them.
+pkg fn served(session: check::Session, scope: scope::Scope, checked: check::Checked) -> bool {
+    let alloc = session.alloc
+    let held = session.workspace.contents()
+    for closure in held.closures {
+        let packages = selecting(held, closure, scope, alloc)
+        for target in run_targets_of(held, packages: packages.view(), alloc) {
+            if checked.serving(target, packages: packages.view()).is_some() {
+                return true
+            }
+        }
+    }
+    return false
+} served
 
 /// The order of failures by path, line and target name.
 fn failure_order(left: Failure, right: Failure) -> core::Ordering {
@@ -172,10 +197,10 @@ fn failure_order(left: Failure, right: Failure) -> core::Ordering {
     return left.target.name().cmp(right.target.name())
 } failure_order
 
-/// The run targets of the packages a closure checks that hold a test a scope may select: one
-/// whose head the scope holds, or any for the lines of an item that is no test, which tests
-/// anywhere may target.
-fn scope_targets(held: workspace::Workspace, closure: workspace::Closure, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[workspace::Target] {
+/// The packages a closure checks that hold a test a scope may select, by index: one whose head
+/// the scope holds, or any for the lines of an item that is no test, which tests anywhere may
+/// target.
+fn selecting(held: workspace::Workspace, closure: workspace::Closure, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[usize] {
     var targeted = false
     match scope {
         scope::Scope.Lines(path: path, lines: lines) => {
@@ -193,13 +218,25 @@ fn scope_targets(held: workspace::Workspace, closure: workspace::Closure, scope:
         }
         else => {}
     }
-    var targets = mem::List[workspace::Target].empty(alloc)
+    var selected = mem::List[usize].empty(alloc)
     for index in closure.checked {
         let Some(source) = held.package_at(index) else {
             expect false
             continue
         }
-        if not selects(held, source, scope, targeted, alloc) {
+        if selects(held, source, scope, targeted, alloc) {
+            mut selected.push(index)
+        }
+    }
+    return selected
+} selecting
+
+/// The run targets of packages, by index, in order.
+fn run_targets_of(held: workspace::Workspace, packages: Slice[usize], alloc: mem::Alloc) -> mem::List[workspace::Target] {
+    var targets = mem::List[workspace::Target].empty(alloc)
+    for index in packages {
+        let Some(source) = held.package_at(index) else {
+            expect false
             continue
         }
         for target in run_targets(source, alloc) {
@@ -215,7 +252,7 @@ fn scope_targets(held: workspace::Workspace, closure: workspace::Closure, scope:
         }
     }
     return distinct
-} scope_targets
+} run_targets_of
 
 /// Whether a package holds a test a scope may select.
 fn selects(held: workspace::Workspace, source: workspace::Package, scope: scope::Scope, targeted: bool, alloc: mem::Alloc) -> bool {

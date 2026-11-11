@@ -87,7 +87,7 @@ pub use preserved::not_preserved;
 pub use published::summaries as publish_summaries;
 pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
 pub use references::Relocated;
-pub use releases::{release_check, release_errors};
+pub use releases::{holds_releases, release_check, release_errors};
 pub use root::{nir_streams, package_files as package_sources};
 use sig::{GenericDef, Sig};
 pub use snapshot::{Snapshots, Unsealed};
@@ -534,6 +534,36 @@ pub fn checked_scope<'a>(workspace: &'a Workspace, scope: &Scope) -> Vec<(Target
         checker.check_all();
     }
     checkers
+}
+
+/// The checker of a check under a target whose closure checks each workspace package of
+/// `packages`, by index, when the check is narrowed to none or to the one package `packages`
+/// holds.
+pub fn serving<'c, 'a>(
+    checkers: &'c [(Target, Checker<'a>)],
+    target: Target,
+    packages: &[usize],
+) -> Option<&'c Checker<'a>> {
+    checkers
+        .iter()
+        .filter(|(held, _)| *held == target)
+        .map(|(_, checker)| checker)
+        .find(|checker| {
+            checker
+                .narrowed
+                .is_none_or(|narrowed| packages == [narrowed])
+                && packages.iter().all(|package| checker.checks(*package))
+        })
+}
+
+impl Checker<'_> {
+    /// Whether the checker's closure checks the workspace package at an index.
+    fn checks(&self, index: usize) -> bool {
+        self.db
+            .packages
+            .iter()
+            .any(|data| !data.quiet && data.member == Some(crate::workspace::Member::Source(index)))
+    }
 }
 
 /// The diagnostics `reported` gives on lines of a scope, from the checkers of a check of it.

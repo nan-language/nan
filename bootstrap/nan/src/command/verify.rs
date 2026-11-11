@@ -60,8 +60,8 @@ pub fn run(
 
 /// What the release gate reports on packages: the diagnostics of checking each alone, then, when
 /// none is an error, their tests' report, and the errors of checking the releases they reach and
-/// their gate diagnostics, from the checkers of their checks, `authors` being the author
-/// principals a publication names; by path, line and code.
+/// their gate diagnostics, from the checkers of their checks where those serve, `authors` being
+/// the author principals a publication names; by path, line and code.
 pub fn judged(
     workspace: &Workspace,
     packages: &[usize],
@@ -69,12 +69,16 @@ pub fn judged(
 ) -> io::Result<(Vec<Diagnostic>, Report)> {
     let mut diagnostics = Vec::new();
     let mut gate_found = Vec::new();
+    let mut checks = Vec::new();
     for index in packages {
         let scope = Scope::Package(*index);
         let checkers = check::checked_scope(workspace, &scope);
         diagnostics.extend(check::reported_by(workspace, &checkers, &scope));
         let package = &workspace.packages[*index];
         gate_found.extend(check::gate(workspace, package, &checkers, authors));
+        let reused = test_runs::served(workspace, &scope, &checkers)
+            || check::holds_releases(workspace, package);
+        checks.push(reused.then_some(checkers));
     }
     let mut report = Report::default();
     let errors = diagnostics
@@ -83,8 +87,15 @@ pub fn judged(
     if !errors {
         match Cache::open()? {
             Ok(cache) => {
-                for index in packages {
-                    match test_runs::run(workspace, &Scope::Package(*index), &Runs::All, &cache)? {
+                for (index, checkers) in packages.iter().zip(&checks) {
+                    let scope = Scope::Package(*index);
+                    match test_runs::run(
+                        workspace,
+                        &scope,
+                        &Runs::All,
+                        &cache,
+                        checkers.as_deref(),
+                    )? {
                         Ok(ran) => {
                             report.tests += ran.tests;
                             report.failures.extend(ran.failures);
@@ -103,8 +114,11 @@ pub fn judged(
             }),
         }
     }
-    for index in packages {
-        diagnostics.extend(check::release_check(workspace, &workspace.packages[*index]));
+    for (index, checkers) in packages.iter().zip(&checks) {
+        if let Some(checkers) = checkers {
+            let package = &workspace.packages[*index];
+            diagnostics.extend(check::release_check(workspace, package, checkers));
+        }
     }
     diagnostics.extend(gate_found);
     diagnostics.sort_by(|left, right| {

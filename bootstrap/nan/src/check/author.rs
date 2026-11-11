@@ -5,7 +5,7 @@
 //! spec as the item's spec.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use super::entail::{self, Weakened};
@@ -27,8 +27,8 @@ struct Recorded {
     locks: HashMap<String, HashMap<String, String>>,
 }
 
-/// What checking the workspace in one change gives, by canonical path: each item's item hash and
-/// interface hash, sealed item hash and current spec.
+/// What checking the workspace in one change gives of the items at some canonical paths, by
+/// canonical path: each item's item hash and interface hash, sealed item hash and current spec.
 #[derive(Default)]
 struct Checked {
     hashes: HashMap<String, (Hash, Option<Hash>)>,
@@ -45,7 +45,10 @@ pub struct History<'w> {
     /// The most recent commit changing the workspace.
     top: Option<String>,
     recorded: RefCell<HashMap<Change, Rc<Recorded>>>,
-    checked: RefCell<HashMap<Change, Rc<Checked>>>,
+    /// The canonical paths each check of a change gives the facts of.
+    wanted: RefCell<BTreeSet<String>>,
+    /// The checks of changes, by the change and each canonical path a check gives the facts of.
+    checked: RefCell<HashMap<(Change, String), Rc<Checked>>>,
 }
 
 impl<'w> History<'w> {
@@ -60,6 +63,7 @@ impl<'w> History<'w> {
             current,
             top,
             recorded: RefCell::new(HashMap::new()),
+            wanted: RefCell::new(BTreeSet::new()),
             checked: RefCell::new(HashMap::new()),
         })
     }
@@ -100,20 +104,39 @@ impl<'w> History<'w> {
         recorded
     }
 
-    fn checked(&self, change: &Change) -> Rc<Checked> {
-        if let Some(known) = self.checked.borrow().get(change) {
+    /// Adds canonical paths to those each check of a change gives the facts of, so that one check
+    /// of a change serves the queries on all of them.
+    fn want<'p>(&self, paths: impl IntoIterator<Item = &'p str>) {
+        let mut wanted = self.wanted.borrow_mut();
+        for path in paths {
+            if !wanted.contains(path) {
+                wanted.insert(path.to_owned());
+            }
+        }
+    }
+
+    /// What checking the workspace in a change gives of the item at a canonical path, with the
+    /// other paths wanted.
+    fn checked(&self, change: &Change, path: &str) -> Rc<Checked> {
+        let key = (change.clone(), path.to_owned());
+        if let Some(known) = self.checked.borrow().get(&key) {
             return known.clone();
         }
+        self.want([path]);
+        let wanted = self.wanted.borrow().clone();
         let checked = Rc::new(match change {
-            Change::Uncommitted => Checked::of(self.current),
+            Change::Uncommitted => Checked::of(self.current, &wanted),
             Change::Commit(name) => self
                 .workspace(name, &|_| true)
-                .map(|workspace| Checked::of(&workspace))
+                .map(|workspace| Checked::of(&workspace, &wanted))
                 .unwrap_or_default(),
         });
-        self.checked
-            .borrow_mut()
-            .insert(change.clone(), checked.clone());
+        let mut known = self.checked.borrow_mut();
+        for covered in wanted {
+            known
+                .entry((change.clone(), covered))
+                .or_insert_with(|| checked.clone());
+        }
         checked
     }
 
@@ -158,15 +181,23 @@ impl<'w> History<'w> {
         path: &str,
         seal: &Seal,
     ) -> Option<String> {
-        let sealed = |change: &Change| self.checked(change).sealed.get(path) == Some(&seal.item);
+        self.want(
+            std::iter::once(path).chain(seal.entries.iter().map(|entry| entry.path.as_str())),
+        );
+        let sealed =
+            |change: &Change| self.checked(change, path).sealed.get(path) == Some(&seal.item);
         if !sealed(from) {
             return Some(String::new());
         }
         let mut introducers = self.introducers(from, &sealed);
         for entry in &seal.entries {
-            if self.checked(from).hashes.contains_key(&entry.path) {
+            if self
+                .checked(from, &entry.path)
+                .hashes
+                .contains_key(&entry.path)
+            {
                 let held = |change: &Change| {
-                    self.checked(change)
+                    self.checked(change, &entry.path)
                         .hashes
                         .get(&entry.path)
                         .is_some_and(|(item, interface)| held_hash(entry, *item, *interface))
@@ -212,7 +243,7 @@ impl<'w> History<'w> {
         }
         let spec = accepting?;
         let introduced = |change: &Change| {
-            self.checked(change)
+            self.checked(change, path)
                 .specs
                 .get(path)
                 .is_some_and(|held| held.same(spec))
@@ -236,6 +267,16 @@ impl<'w> History<'w> {
     ) -> Vec<Diagnostic> {
         let name = package.name().unwrap_or_default();
         let recorded = self.recorded(&Change::Uncommitted);
+        self.want(escaping.iter().flat_map(|path| {
+            let entries = recorded
+                .entries
+                .get(path)
+                .into_iter()
+                .flat_map(|entry| &entry.seals)
+                .flat_map(|seal| &seal.entries)
+                .map(|entry| entry.path.as_str());
+            std::iter::once(path.as_str()).chain(entries)
+        }));
         let mut found = Vec::new();
         for path in escaping {
             let seals: Vec<&Seal> = recorded
@@ -347,6 +388,7 @@ impl<'w> History<'w> {
             _ => Vec::new(),
         }
         .into_iter();
+        self.want(judged.iter().map(|(_, path, _, _)| path.as_str()));
         let mut found = Vec::new();
         for (change, path, accepted, earlier) in judged {
             let entailed = match items.first(&path) {
@@ -393,7 +435,7 @@ impl<'w> History<'w> {
         };
         let earlier: Vec<Seal> = self.parents(change).iter().flat_map(held).collect();
         let introduced = |at: &Change| {
-            self.checked(at)
+            self.checked(at, path)
                 .specs
                 .get(path)
                 .is_some_and(|spec| spec.same(accepted))
@@ -435,19 +477,28 @@ impl Recorded {
 }
 
 impl Checked {
-    fn of(workspace: &Workspace) -> Checked {
+    /// What checking a workspace gives of the items at some canonical paths.
+    fn of(workspace: &Workspace, paths: &BTreeSet<String>) -> Checked {
         let std = crate::stdlib::packages();
         let mut checked = Checked::default();
         for package in &workspace.packages {
             let Some(name) = package.name() else {
                 continue;
             };
+            if !paths
+                .iter()
+                .any(|path| path.split("::").next() == Some(name))
+            {
+                continue;
+            }
             let checkers = package_checkers(workspace, std, package);
             let views: Vec<(Target, &Checker)> =
                 checkers.iter().map(|(target, ck)| (*target, ck)).collect();
             let items = Items::of(&views, package);
-            for (path, variants) in &items.by_path {
-                let first = &variants[0];
+            for path in paths {
+                let Some(first) = items.first(path) else {
+                    continue;
+                };
                 let hashes = first.ck.hashes(first.item);
                 checked
                     .hashes
@@ -459,7 +510,9 @@ impl Checked {
                     checked.sealed.insert(path.clone(), sealed);
                 }
             }
-            if let (Some(path), Some(sealed)) = (items.package_path(), items.sealed_hash(name)) {
+            if let Some(path) = items.package_path().filter(|path| paths.contains(*path))
+                && let Some(sealed) = items.sealed_hash(name)
+            {
                 checked.sealed.insert(path.to_owned(), sealed);
             }
         }

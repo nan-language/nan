@@ -18,8 +18,8 @@ fn ChangeRecords.empty(alloc: mem::Alloc) -> ChangeRecords {
     return ChangeRecords(entries: mem::Map[text::String, RecordedEntry].empty(alloc), locks: mem::Map[text::String, mem::Map[text::String, text::String]].empty(alloc))
 } ChangeRecords.empty
 
-/// What checking the workspace in one change gives, by canonical path: each item's item hash and
-/// interface hash, sealed item hash and current spec.
+/// What checking the workspace in one change gives of the items at some canonical paths, by
+/// canonical path: each item's item hash and interface hash, sealed item hash and current spec.
 struct ChangeChecks {
     hashes: mem::Map[text::String, Hashes]
     sealed: mem::Map[text::String, hashing::HashValue]
@@ -29,6 +29,12 @@ struct ChangeChecks {
 fn ChangeChecks.empty(alloc: mem::Alloc) -> ChangeChecks {
     return ChangeChecks(hashes: mem::Map[text::String, Hashes].empty(alloc), sealed: mem::Map[text::String, hashing::HashValue].empty(alloc), specs: mem::Map[text::String, machine::Accepted].empty(alloc))
 } ChangeChecks.empty
+
+/// A check of a change, by the change and a canonical path it gives the facts of.
+struct CheckKey derives Eq, Hash {
+    change: vcs::Change
+    path: text::String
+} CheckKey
 
 /// The states of a workspace across the changes of its git history.
 pkg struct History {
@@ -40,7 +46,11 @@ pkg struct History {
     /// The most recent commit changing the workspace.
     top: Option[text::String]
     records_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeRecords]]
-    checks_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeChecks]]
+    /// The canonical paths each check of a change gives the facts of, each once.
+    wanted: mem::Arena[text::String]
+    wanted_once: cell::Claims[text::String]
+    /// The checks of changes, by the change and each canonical path a check gives the facts of.
+    checks: mem::OnceMap[CheckKey, mem::Shared[ChangeChecks]]
 } History
 
 /// The history of a session's workspace inside a git working tree; none outside every one.
@@ -62,7 +72,7 @@ pkg fn History.open(session: Session) -> Option[History] {
         let vcs::Commit(name: name, parents: held) = commit
         discard mut parents.insert(take name, value: take held)
     }
-    return Some(History(vcs: take opened, session: session.share(), parents: take parents, top: take top, records_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeRecords]].empty(seed: 0, alloc), checks_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeChecks]].empty(seed: 0, alloc)))
+    return Some(History(vcs: take opened, session: session.share(), parents: take parents, top: take top, records_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeRecords]].empty(seed: 0, alloc), wanted: mem::Arena[text::String].empty(alloc), wanted_once: cell::Claims[text::String].empty(alloc), checks: mem::OnceMap[CheckKey, mem::Shared[ChangeChecks]].empty(seed: 0, alloc)))
 } History.open
 
 fn History.parents_of(self, change: vcs::Change) -> mem::List[vcs::Change] {
@@ -124,21 +134,40 @@ fn History.recorded(self, change: vcs::Change) -> mem::Shared[ChangeRecords] {
     return stored.share()
 } History.recorded
 
-fn History.checked(self, change: vcs::Change) -> mem::Shared[ChangeChecks] {
+/// Adds a canonical path to those each check of a change gives the facts of, so that one check
+/// of a change serves the queries on all of them.
+fn History.want(self, path: Str) {
     let alloc = self.session.alloc
-    match self.checks_by_change.get(change) {
+    if self.wanted_once.claim(text::String.of(path, alloc)) {
+        discard self.wanted.push(text::String.of(path, alloc))
+    }
+} History.want
+
+/// What checking the workspace in a change gives of the item at a canonical path, with the
+/// other paths wanted.
+fn History.checked(self, change: vcs::Change, path: Str) -> mem::Shared[ChangeChecks] {
+    let alloc = self.session.alloc
+    match self.checks.get(CheckKey(change: change.copy(alloc), path: text::String.of(path, alloc))) {
         Some(known) => return known.share()
         None => {}
     }
+    self.want(path)
+    var wanted = mem::List[text::String].empty(alloc)
+    for held in self.wanted.cursor() {
+        mut wanted.push(text::String.of(held.as_str(), alloc))
+    }
     let computed = match change {
-        vcs::Change.Uncommitted => ChangeChecks.of(self.session)
+        vcs::Change.Uncommitted => ChangeChecks.of(self.session, paths: wanted.view())
         vcs::Change.Commit(name) => match self.workspace_at(name.as_str(), machine_only: false) {
-            Some(at) => ChangeChecks.of(at)
+            Some(at) => ChangeChecks.of(at, paths: wanted.view())
             None => ChangeChecks.empty(alloc)
         }
     }
-    let stored = self.checks_by_change.insert(change.copy(alloc), value: mem::Shared.of(take computed, alloc))
-    return stored.share()
+    let stored = mem::Shared.of(take computed, alloc)
+    for held in take wanted {
+        discard self.checks.insert(CheckKey(change: change.copy(alloc), path: take held), value: stored.share())
+    }
+    return stored
 } History.checked
 
 /// The changes, at or before `from`, introducing a fact that `from` holds: holding it while
@@ -193,12 +222,12 @@ fn holds_author(authors: Slice[text::String], author: Str) -> bool {
 
 /// Whether an item's sealed item hash as of a change is `item`.
 fn History.seals_item(self, change: vcs::Change, path: Str, item: hashing::HashValue) -> bool {
-    return self.checked(change).contents().sealed.get_by(fn(key: text::String) => key.as_str().cmp(path)) == Some(item)
+    return self.checked(change, path).contents().sealed.get_by(fn(key: text::String) => key.as_str().cmp(path)) == Some(item)
 } History.seals_item
 
 /// Whether an item's hashes as of a change hold the hash a closure entry records.
 fn History.holds_entry_hash(self, change: vcs::Change, entry: machine::ClosureEntry) -> bool {
-    let Some(hashes) = self.checked(change).contents().hashes.get(entry.path) else {
+    let Some(hashes) = self.checked(change, path: entry.path.as_str()).contents().hashes.get(entry.path) else {
         return false
     }
     return held_hash(entry, item: hashes.item, interface_hash: hashes.interface_hash)
@@ -229,12 +258,16 @@ fn History.holds_lock_line(self, change: vcs::Change, package_name: Str, dep: St
 /// its closure entries record; the empty text for a seal not current as of `from`.
 fn History.shared(self, from: vcs::Change, writers: Slice[vcs::Change], package_name: Str, path: Str, seal: machine::Seal) -> Option[text::String] {
     let alloc = self.session.alloc
+    self.want(path)
+    for entry in seal.entries {
+        self.want(entry.path.as_str())
+    }
     if not self.seals_item(from, path, item: seal.item) {
         return Some(text::String.empty(alloc))
     }
     var introducers = self.introducers(from, holds: fn(change: vcs::Change) => self.seals_item(change, path, item: seal.item))
     for entry in seal.entries {
-        if self.checked(from).contents().hashes.contains(entry.path) {
+        if self.checked(from, path: entry.path.as_str()).contents().hashes.contains(entry.path) {
             if self.holds_entry_hash(from, entry) {
                 for change in take self.introducers(from, holds: fn(change: vcs::Change) => self.holds_entry_hash(change, entry)) {
                     mut introducers.push(take change)
@@ -290,7 +323,7 @@ pkg fn History.would_share(self, package_name: Str, path: Str, seal: machine::Se
 
 /// Whether an item's spec as of a change is `spec`.
 fn History.introduces_spec(self, change: vcs::Change, path: Str, spec: machine::Accepted) -> bool {
-    let checks = self.checked(change)
+    let checks = self.checked(change, path)
     let Some(held) = checks.contents().specs.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
         return false
     }
@@ -310,6 +343,19 @@ pkg fn History.same_author(self, package_index: usize, items: Items, escaping: S
         None => ""
     }
     let records = self.recorded(vcs::Change.Uncommitted)
+    for path in escaping {
+        self.want(path.as_str())
+        match records.contents().entries.get(path) {
+            Some(entry) => {
+                for seal in entry.seals {
+                    for closure_entry in seal.entries {
+                        self.want(closure_entry.path.as_str())
+                    }
+                }
+            }
+            None => {}
+        }
+    }
     var found = mem::List[diagnostic::Diagnostic].empty(alloc)
     for path in escaping {
         var seals = mem::List[machine::Seal].empty(alloc)
@@ -413,6 +459,9 @@ pkg fn History.acceptances(self, package_index: usize, items: Items) -> mem::Lis
     var left = mem::List[mem::List[text::String]].empty(alloc)
     if weakened.len() > 0 {
         left = self.session.left(package_index, weakened: weakened.view())
+    }
+    for acceptance in judged {
+        self.want(acceptance.path.as_str())
     }
     var next: usize = 0
     var found = mem::List[diagnostic::Diagnostic].empty(alloc)
@@ -570,8 +619,8 @@ fn ChangeRecords.of(session: Session) -> ChangeRecords {
     return recorded
 } ChangeRecords.of
 
-/// What checking a session's workspace gives.
-fn ChangeChecks.of(session: Session) -> ChangeChecks {
+/// What checking a session's workspace gives of the items at some canonical paths.
+fn ChangeChecks.of(session: Session, paths: Slice[text::String]) -> ChangeChecks {
     let alloc = session.alloc
     var checked = ChangeChecks.empty(alloc)
     let held = session.workspace.contents()
@@ -583,11 +632,13 @@ fn ChangeChecks.of(session: Session) -> ChangeChecks {
         let Some(name) = source.name() else {
             continue
         }
+        if not names_package(paths, package_name: name) {
+            continue
+        }
         let checkers = session.package_checkers(index)
         let items = Items.of(checkers.view(), source, alloc)
-        for entry in items.by_path {
-            let path = entry.key()
-            let Some(variant) = entry.value().get(0) else {
+        for path in paths {
+            let Some(variant) = items.first_variant(path.as_str()) else {
                 continue
             }
             discard mut checked.hashes.insert(text::String.of(path.as_str(), alloc), value: variant.ck.hashes(variant.item))
@@ -602,6 +653,9 @@ fn ChangeChecks.of(session: Session) -> ChangeChecks {
         let Some(package_path) = items.package_path(alloc) else {
             continue
         }
+        if not holds_text(paths, text: package_path.as_str()) {
+            continue
+        }
         let Some(sealed) = items.sealed_hash(name, alloc) else {
             continue
         }
@@ -609,6 +663,23 @@ fn ChangeChecks.of(session: Session) -> ChangeChecks {
     }
     return checked
 } ChangeChecks.of
+
+/// Whether canonical paths name the package named `package_name` or an item of it.
+fn names_package(paths: Slice[text::String], package_name: Str) -> bool {
+    for path in paths {
+        let named = match path.find("::") {
+            Some(at) => path.slice_bytes(0, end: at)
+            None => Some(path.as_str())
+        }
+        match named {
+            Some(segment) => if segment == package_name {
+                return true
+            }
+            None => {}
+        }
+    }
+    return false
+} names_package
 
 /// Whether a closure entry records the item hash or interface hash an item has.
 fn held_hash(entry: machine::ClosureEntry, item: hashing::HashValue, interface_hash: Option[hashing::HashValue]) -> bool {

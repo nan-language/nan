@@ -4,11 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::Checker;
 use super::db::PackageId;
-use super::{Checker, check_targets, checked};
 use crate::artefact;
 use crate::diagnostic::{Class, Code, Diagnostic, Reason, Role};
-use crate::workspace::{Member, Package, Workspace, reaching_directive};
+use crate::workspace::{Member, Package, Target, Workspace, reaching_directive};
 
 impl Checker<'_> {
     /// The packages a package of the checker's closure reaches through its `dep` aliases, itself
@@ -132,27 +132,33 @@ fn errors(release: &Package, checked: &[Diagnostic]) -> Vec<Reason> {
         .collect()
 }
 
+/// Whether the closure checking a workspace package holds releases, which its release checks
+/// check.
+pub fn holds_releases(workspace: &Workspace, package: &Package) -> bool {
+    workspace.closure_of(package).is_some_and(|closure| {
+        closure
+            .members
+            .values()
+            .any(|member| matches!(member, Member::Release(_)))
+    })
+}
+
 /// The release checks of the releases a workspace package reaches, under each target it is
-/// checked for.
-pub fn release_check(workspace: &Workspace, package: &Package) -> Vec<Diagnostic> {
-    let Some(closure) = workspace.closure_of(package) else {
-        return Vec::new();
-    };
-    if !closure
-        .members
-        .values()
-        .any(|member| matches!(member, Member::Release(_)))
-    {
+/// checked for, from the checkers of its check.
+pub fn release_check(
+    workspace: &Workspace,
+    package: &Package,
+    checkers: &[(Target, Checker)],
+) -> Vec<Diagnostic> {
+    if !holds_releases(workspace, package) {
         return Vec::new();
     }
-    let std = crate::stdlib::packages();
     let mut found = Vec::new();
-    for target in check_targets(package) {
-        let checker = checked(workspace, closure, std, target);
+    for (_, checker) in checkers {
         let root = checker
             .package_named(package.name().unwrap_or_default())
             .expect("a checked package in its checker");
-        found.extend(release_errors(&checker, root));
+        found.extend(release_errors(checker, root));
     }
     found
 }

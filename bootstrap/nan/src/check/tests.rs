@@ -64,6 +64,44 @@ fn a_check_of_one_package_reads_only_what_it_reaches() {
 }
 
 #[test]
+fn a_check_narrowed_to_a_package_serves_none_of_its_dependencies() {
+    let manifest = |name: &str, deps: &str| {
+        format!(
+            "//! A package.\n\npackage {name} {{\n    language 1\n    targets any\n{deps}}} {name}\n"
+        )
+    };
+    let scratch = Scratch::new(&[
+        (
+            "user/package.nan",
+            &manifest("user", "    dep used \"../used\"\n"),
+        ),
+        (
+            "user/user.nan",
+            "//! Records.\n\npub closed struct Record {\n    pub size: used::Size\n} Record\n",
+        ),
+        ("used/package.nan", &manifest("used", "")),
+        (
+            "used/used.nan",
+            "//! Sizes.\n\npub closed struct Size {\n    pub bytes: u32\n} Size\n",
+        ),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let index = |dir: &str| {
+        workspace
+            .packages
+            .iter()
+            .position(|package| package.dir == dir)
+            .expect("the package")
+    };
+    let (user, used) = (index("user"), index("used"));
+    let narrowed = checked_scope(&workspace, &Scope::Package(user));
+    assert!(serving(&narrowed, Target::Any, &[user]).is_some());
+    assert!(serving(&narrowed, Target::Any, &[used]).is_none());
+    let whole = checked_scope(&workspace, &Scope::Workspace);
+    assert!(serving(&whole, Target::Any, &[user, used]).is_some());
+}
+
+#[test]
 fn a_package_declaring_any_is_judged_within_the_reach_of_a_final_build() {
     let domain = |name: &str| {
         format!(

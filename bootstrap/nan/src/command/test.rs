@@ -56,7 +56,7 @@ pub fn run(
     let mut report = Report::default();
     if errors == 0 {
         let ran = match Cache::open()? {
-            Ok(cache) => test_runs::run(workspace, &scope, &runs, &cache)?,
+            Ok(cache) => test_runs::run(workspace, &scope, &runs, &cache, None)?,
             Err(exposed) => Err(exposed),
         };
         match ran {

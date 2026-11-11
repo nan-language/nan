@@ -122,21 +122,32 @@ impl Token {
     }
 }
 
-/// Runs the tests a scope selects on each run target of their packages, as `runs` keeps them;
-/// a part of the build cache that is exposed ends it before any run.
+/// Runs the tests a scope selects on each run target of their packages, as `runs` keeps them,
+/// lowered by the checker of `checked` serving their packages under the target, or else by a
+/// check of their closure under it; a part of the build cache that is exposed ends it before any
+/// run.
 pub fn run(
     workspace: &Workspace,
     scope: &Scope,
     runs: &Runs,
     cache: &Cache,
+    checked: Option<&[(Target, Checker)]>,
 ) -> io::Result<Result<Report, Exposed>> {
     let mut report = Report::default();
     let std = crate::stdlib::packages();
     for closure in &workspace.closures {
-        for target in scope_targets(workspace, closure, scope) {
-            let checker = check::checked(workspace, closure, std, target);
-            if let Err(exposed) =
-                run_target(&checker, workspace, scope, (runs, cache), &mut report)?
+        let packages = selecting(workspace, closure, scope);
+        for target in run_targets_of(workspace, &packages) {
+            let fresh;
+            let reusable = checked.and_then(|checkers| check::serving(checkers, target, &packages));
+            let checker = match reusable {
+                Some(checker) => checker,
+                None => {
+                    fresh = check::checked(workspace, closure, std, target);
+                    &fresh
+                }
+            };
+            if let Err(exposed) = run_target(checker, workspace, scope, (runs, cache), &mut report)?
             {
                 return Ok(Err(exposed));
             }
@@ -153,27 +164,45 @@ pub fn run(
     Ok(Ok(report))
 }
 
-/// The run targets of the packages a closure checks that hold a test a scope may select: one
-/// whose head the scope holds, or any for the lines of an item that is no test, which tests
-/// anywhere may target.
-fn scope_targets(workspace: &Workspace, closure: &Closure, scope: &Scope) -> Vec<Target> {
+/// Whether the checkers of a check serve a run target of the tests a scope selects, which `run`
+/// then lowers by them.
+pub fn served(workspace: &Workspace, scope: &Scope, checkers: &[(Target, Checker)]) -> bool {
+    workspace.closures.iter().any(|closure| {
+        let packages = selecting(workspace, closure, scope);
+        run_targets_of(workspace, &packages)
+            .into_iter()
+            .any(|target| check::serving(checkers, target, &packages).is_some())
+    })
+}
+
+/// The packages a closure checks that hold a test a scope may select, by index: one whose head
+/// the scope holds, or any for the lines of an item that is no test, which tests anywhere may
+/// target.
+fn selecting(workspace: &Workspace, closure: &Closure, scope: &Scope) -> Vec<usize> {
     let targeted = match scope {
         Scope::Lines(path, lines) => workspace
             .file(path)
             .is_some_and(|(_, file)| !test_heads(file).any(|line| lines.contains(&line))),
         _ => false,
     };
-    let selects = |package: &&Package| {
-        package.files.iter().any(|file| {
-            test_heads(file).any(|line| targeted || scope.holds(workspace, &file.path, Some(line)))
-        })
-    };
-    let mut targets: Vec<Target> = closure
+    closure
         .checked
         .iter()
-        .map(|index| &*workspace.packages[*index])
-        .filter(selects)
-        .flat_map(run_targets)
+        .copied()
+        .filter(|index| {
+            workspace.packages[*index].files.iter().any(|file| {
+                test_heads(file)
+                    .any(|line| targeted || scope.holds(workspace, &file.path, Some(line)))
+            })
+        })
+        .collect()
+}
+
+/// The run targets of packages, by index, in order.
+fn run_targets_of(workspace: &Workspace, packages: &[usize]) -> Vec<Target> {
+    let mut targets: Vec<Target> = packages
+        .iter()
+        .flat_map(|index| run_targets(&workspace.packages[*index]))
         .collect();
     targets.sort();
     targets.dedup();
@@ -588,7 +617,8 @@ pub fn task_stacks(workspace: &Workspace) -> Vec<crate::final_build::TaskStack> 
     let std = crate::stdlib::packages();
     let mut found = Vec::new();
     for closure in &workspace.closures {
-        for target in scope_targets(workspace, closure, &Scope::Workspace) {
+        let packages = selecting(workspace, closure, &Scope::Workspace);
+        for target in run_targets_of(workspace, &packages) {
             let checker = check::checked(workspace, closure, std, target);
             let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
             for selected in select(&checker, workspace, &Scope::Workspace) {

@@ -435,7 +435,13 @@ impl Resolver<'_> {
         if own.is_empty() {
             let scope = Scope::Package(self.package);
             let changed = self.changed(&lock);
-            match test_runs::run(&workspace, &scope, &Runs::Reaching(changed), self.cache)? {
+            match test_runs::run(
+                &workspace,
+                &scope,
+                &Runs::Reaching(changed),
+                self.cache,
+                None,
+            )? {
                 Ok(report) => {
                     failures.extend(report.failures.iter().map(|failure| {
                         Diagnostic::at(Code::DepUnresolved, &failure.path, failure.line)

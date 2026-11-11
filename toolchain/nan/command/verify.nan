@@ -52,14 +52,22 @@ struct Judged {
     report: test_runs::Report
 } Judged
 
+/// A package the gate judges, by its index, with its check while its tests or release checks
+/// use it.
+struct PackageCheck {
+    package_index: usize
+    checked: Option[check::Checked]
+} PackageCheck
+
 /// What the release gate reports on packages: the diagnostics of checking each alone, then, when
 /// none is an error, their tests' report, and the errors of checking the releases they reach and
-/// their gate diagnostics, from the checkers of their checks, `authors` being the author
-/// principals a publication names; by path, line and code.
+/// their gate diagnostics, from the checkers of their checks where those serve, `authors` being
+/// the author principals a publication names; by path, line and code.
 fn judged(session: check::Session, packages: Slice[usize], authors: Slice[text::String]) -> Judged fails platform::IoError {
     let alloc = session.alloc
     var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
     var gate_found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var checks = mem::List[PackageCheck].empty(alloc)
     for index in packages {
         let scope = scope::Scope.Package(index)
         let checked = session.check_scope(scope)
@@ -69,14 +77,22 @@ fn judged(session: check::Session, packages: Slice[usize], authors: Slice[text::
         for reported in take session.gate(checked, package_index: index, authors) {
             mut gate_found.push(take reported)
         }
+        var kept: Option[check::Checked] = None
+        if test_runs::served(session, scope, checked) or session.holds_releases(index) {
+            kept = Some(take checked)
+        }
+        mut checks.push(PackageCheck(package_index: index, checked: take kept))
     }
     var report = test_runs::Report.empty(alloc)
     let errors = diagnostics.position(fn(reported: diagnostic::Diagnostic) => reported.code.class() == diagnostic::Class.Error).is_some()
     if not errors {
-        try tested(session, packages, diagnostics: mut diagnostics, report: mut report)
+        try tested(session, checks: checks.view(), diagnostics: mut diagnostics, report: mut report)
     }
-    for index in packages {
-        for reported in take session.release_check(index) {
+    for held in checks {
+        let Some(checked) = held.checked else {
+            continue
+        }
+        for reported in take session.release_check(checked, package_index: held.package_index) {
             mut diagnostics.push(take reported)
         }
     }
@@ -95,8 +111,9 @@ fn judged(session: check::Session, packages: Slice[usize], authors: Slice[text::
     return Judged(diagnostics: take deduplicated, report: take report)
 } judged
 
-/// Runs the tests of each package, adding what they find to a report and to diagnostics.
-fn tested(session: check::Session, packages: Slice[usize], mut diagnostics: mem::List[diagnostic::Diagnostic], mut report: test_runs::Report) fails platform::IoError {
+/// Runs the tests of each package checked, lowered by the checkers of its check where those
+/// serve, adding what they find to a report and to diagnostics.
+fn tested(session: check::Session, checks: Slice[PackageCheck], mut diagnostics: mem::List[diagnostic::Diagnostic], mut report: test_runs::Report) fails platform::IoError {
     let alloc = session.alloc
     let user_cache = match try cache::Cache.open(cache::copied_override(session.home, alloc), alloc) {
         Ok(opened) => opened
@@ -105,8 +122,12 @@ fn tested(session: check::Session, packages: Slice[usize], mut diagnostics: mem:
             return
         }
     }
-    for index in packages {
-        match try test_runs::run(session, scope: scope::Scope.Package(index), runs: test_runs::Runs.All, user_cache) {
+    for held in checks {
+        let checked = match held.checked {
+            Some(given) => Some(given.share(alloc))
+            None => None
+        }
+        match try test_runs::run(session, scope: scope::Scope.Package(held.package_index), runs: test_runs::Runs.All, user_cache, checked) {
             Ok(ran) => {
                 let test_runs::Report(tests: tests, failures: failures, diagnostics: found) = ran
                 expect report.tests <= ~0usize - tests

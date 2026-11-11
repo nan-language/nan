@@ -82,7 +82,7 @@ cargo install --locked cargo-nextest@0.9.148
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
 | `cargo nextest run` | Run all tests |
 | `cargo nextest run -p nan --test <harness> -E 'test(/<name>/)'` | Run one test of a harness: `conformance` (chapter), `programs`, `milestones`, `self_check`, `measurements` |
-| `cargo run -p nanbench -- <command>` | Nanbench: `tokens`, `measure`, `corpus`, `run <model>` (`ANTHROPIC_API_KEY`), `report` |
+| `cargo run -p nanbench -- <command>` | Nanbench: `tokens`, `measure`, `compare` (`c++`), `corpus`, `run <model>` (`ANTHROPIC_API_KEY`), `report` |
 
 ## License
 

@@ -1,7 +1,7 @@
 use std::fs;
 
 use crate::command::tests::{MANIFEST, run_in};
-use crate::workspace::tests::Scratch;
+use crate::workspace::tests::{Scratch, home};
 
 #[test]
 fn a_failing_check_shows_what_changed_since_the_agent_last_saw_green() {
@@ -385,7 +385,7 @@ fn a_store_entry_holding_another_release_than_the_lock_names_is_a_root_mismatch(
     let added = "\n/// Zero.\npub fn zero() -> u32 = 0\n";
     fs::write(dir.join("gauge/gauge.nan"), source + added).expect("a newer gauge");
     let second = published("publish --local gauge");
-    let store = std::env::temp_dir().join("nan-test-home/.nan/store");
+    let store = home().join(".nan/store");
     let entry = |root: &str| {
         fs::read_dir(&store)
             .expect("the store")
@@ -443,7 +443,7 @@ fn a_path_source_checks_at_its_locked_release_without_the_store_holding_it_and_t
         .find_map(|line| line.strip_prefix("dep dial alias dial \"../dial\" \""))
         .and_then(|rest| rest.split('"').next())
         .expect("the locked release");
-    let store = std::env::temp_dir().join("nan-test-home/.nan/store");
+    let store = home().join(".nan/store");
     let entry = fs::read_dir(&store)
         .expect("the store")
         .map(|entry| entry.expect("a store entry").path())

@@ -2,7 +2,7 @@ use std::fs;
 
 use crate::command::key::tests::TestPrincipal;
 use crate::command::tests::run_in;
-use crate::workspace::tests::Scratch;
+use crate::workspace::tests::{Scratch, home};
 
 const FIRST: &str = "//! Modes.\n\n/// A mode.\npub open enum Mode derives Eq, Encode {\n    Idle\n    Busy\n} Mode\n\n/// The level of a mode.\npub fn Mode.level(self) -> u8 {\n    return match self {\n        Mode.Idle => 0\n        Mode.Busy => 2\n    }\n} Mode.level\n";
 
@@ -121,7 +121,7 @@ fn a_release_published_as_a_principal_is_read_only_from_its_pinned_and_trusted_k
     run_in(&app, &format!("key trust {} {key}", publisher.0));
     let checked = run_in(dir, "check app").output;
     assert!(checked.starts_with("ok check app"), "{published}{checked}");
-    let store = std::env::temp_dir().join("nan-test-home/.nan/store");
+    let store = home().join(".nan/store");
     let entry = fs::read_dir(&store)
         .expect("the store")
         .map(|entry| entry.expect("a store entry").path())
@@ -186,7 +186,7 @@ fn a_release_is_built_only_from_the_sources_its_attestation_hashes_and_that_chec
         .into_iter()
         .find(|entry| entry.name.as_deref() == Some(name.as_str()))
         .expect("the release's entry");
-    let path = fs::read_dir(std::env::temp_dir().join("nan-test-home/.nan/store"))
+    let path = fs::read_dir(home().join(".nan/store"))
         .expect("the store directory")
         .map(|file| file.expect("a store file").path())
         .find(|path| {

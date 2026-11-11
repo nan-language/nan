@@ -4,19 +4,22 @@ use std::path::PathBuf;
 
 use crate::command::tests::{MANIFEST, run_in};
 use crate::sign;
-use crate::workspace::tests::Scratch;
+use crate::workspace::tests::{Scratch, home};
 
-/// A principal of this process's tests, named `name`, whose secret key the test home directory
-/// holds from `seed` when given; its key file is removed when dropped.
+/// A principal named `name`, whose secret key the test home directory holds from `seed` when
+/// given; its key file is removed when dropped.
 pub(crate) struct TestPrincipal(pub String);
 
 impl TestPrincipal {
     pub(crate) fn new(name: &str, seed: Option<[u8; 32]>) -> TestPrincipal {
-        let principal = TestPrincipal(format!("{name}-{}", std::process::id()));
+        let principal = TestPrincipal(name.to_owned());
         if let Some(seed) = seed {
-            let keys = std::env::temp_dir().join("nan-test-home/.nan/keys");
-            let made = fs::DirBuilder::new().mode(0o700).create(&keys);
-            assert!(made.is_ok() || keys.is_dir(), "the keys directory");
+            let keys = home().join(".nan/keys");
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&keys)
+                .expect("the keys directory");
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -30,7 +33,7 @@ impl TestPrincipal {
     }
 
     fn file(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("nan-test-home/.nan/keys/{}.key", self.0))
+        home().join(format!(".nan/keys/{}.key", self.0))
     }
 
     /// The text form of the public key of a seed.

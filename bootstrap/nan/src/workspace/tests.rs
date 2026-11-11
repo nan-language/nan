@@ -2,16 +2,37 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
+/// The home directory of this process's runs, empty when first given; the homes of exited
+/// processes are removed then.
+pub(crate) fn home() -> &'static Path {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        for entry in fs::read_dir(&tmp).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let pid = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("nan-test-home-"));
+            if pid.is_some_and(|pid| !Path::new("/proc").join(pid).exists()) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+        let home = tmp.join(format!("nan-test-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create the home directory");
+        crate::cache::use_home(home.clone(), None);
+        home
+    })
+}
+
 /// A directory under the system's temporary directory, removed when dropped.
 pub(crate) struct Scratch(pub PathBuf);
 
 impl Scratch {
-    /// A directory holding `files`; the process's runs use a home directory of their own.
+    /// A directory holding `files`, run under this process's home directory.
     pub(crate) fn new(files: &[(&str, &str)]) -> Scratch {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let home = std::env::temp_dir().join("nan-test-home");
-        fs::create_dir_all(&home).expect("create the home directory");
-        crate::cache::use_home(home, None);
+        home();
         let name = format!(
             "nan-test-{}-{}",
             std::process::id(),

@@ -41,6 +41,8 @@ fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             "sys::Fs" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_FS, interface_name: "FsService")
             "sys::Net" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_NET, interface_name: "NetService")
             "sys::Log" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_LOG, interface_name: "LogService")
+            "sys::Clock" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_CLOCK, interface_name: "ClockService")
+            "sys::WallClock" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_WALL, interface_name: "WallClockService")
             "sys::Random" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_RANDOM, interface_name: "RandomService")
             "sys::Stdio" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_STDIO, interface_name: "StdioService")
             "sys::Runner" => return served_capability(mut lo, mut fx, supply, kind: TABLES_KIND_RUNNER, interface_name: "RunnerService")
@@ -468,21 +470,25 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let taken = snapshot(mut lo, mut fx, handle)
     let minted = taken.words[0]
     let resolution = taken.words[1]
+    let kind = ServingKind(service: taken.words[2], table: taken.words[3])
     let stale = mut fx.b.bxor_imm_s(taken.live, y: 1)
+    let served = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: kind.table, y: 0)
     let member = supply.member()
     match member {
         "elapsed_ms" or "elapsed_ns" => {
             mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
                 fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
             })
+            mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+                let called = served_call(mut lo, fx: mut fx1, interface_name: "ClockService", method: "elapsed_ns", kind, args: mem::List[Held].empty(fx1.alloc).view())
+                let reading = round_down(mut fx1, resolution, reading: called.result.scalar_value())
+                let elapsed = in_unit(mut fx1, member, elapsed: reading)
+                supply.ret(mut lo, fx: mut fx1, held: Held.Scalar(elapsed))
+            })
             let now = mut lo.now_ns(mut fx)
             let elapsed = mut fx.b.isub(now, y: minted)
-            var result = round_down(mut fx, resolution, reading: elapsed)
-            if member == "elapsed_ms" {
-                let per_ms = mut fx.ptr(NS_PER_MS)
-                result = mut fx.b.udiv(result, y: per_ms)
-            }
-            supply.ret(mut lo, mut fx, held: Held.Scalar(result))
+            let rounded = round_down(mut fx, resolution, reading: elapsed)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(in_unit(mut fx, member, elapsed: rounded)))
         }
         "sleep" or "sleep_ns" => {
             mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
@@ -493,6 +499,11 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             } else {
                 supply.param(1).scalar_value()
             }
+            mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+                let called = served_call(mut lo, fx: mut fx1, interface_name: "ClockService", method: "sleep_ns", kind, args: Array[Held, 1].filled(Held.Scalar(ns)).view())
+                supply.forward_failure(mut lo, fx: mut fx1, called)
+                supply.done(mut lo, fx: mut fx1)
+            })
             let delay = clock_delay(mut lo, mut fx, minted, resolution, ns)
             if lo.seeded() or lo.kernel() {
                 let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
@@ -520,10 +531,27 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } sys_clock
 
+/// An elapsed time in nanoseconds in the unit of the `Clock` member reading it: whole
+/// milliseconds for `elapsed_ms`.
+fn in_unit(mut fx: Fx, member: Str, elapsed: clif::Value) -> clif::Value {
+    if member == "elapsed_ms" {
+        let per_ms = mut fx.ptr(NS_PER_MS)
+        return mut fx.b.udiv(elapsed, y: per_ms)
+    }
+    return elapsed
+} in_unit
+
 fn sys_wall_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "now_ns" => {
             let words = sys_checked(mut lo, mut fx, supply, capability: supply.param(0).address_value())
+            let kind = ServingKind(service: words[2], table: words[3])
+            let served = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: kind.table, y: 0)
+            mut fx.if_true(served, then: fn[mut lo](mut fx1: Fx) {
+                let called = served_call(mut lo, fx: mut fx1, interface_name: "WallClockService", method: "now_ns", kind, args: mem::List[Held].empty(fx1.alloc).view())
+                let rounded = round_down(mut fx1, resolution: words[1], reading: called.result.scalar_value())
+                supply.ret(mut lo, fx: mut fx1, held: Held.Scalar(rounded))
+            })
             var now = words[0]
             if lo.seeded() or lo.machine() {
                 let clock = mut lo.now_ns(mut fx)

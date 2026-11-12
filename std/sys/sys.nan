@@ -100,10 +100,14 @@ pub fn Clock.sleep_ns(self, ns: u64) fails task::Cancelled uses wait
 
 pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
 
+pub fn Clock.served[S: ClockService and Capability and Copy](service: S) -> Clock fails Revoked
+
 pub open struct WallClock {
 } WallClock
 
 pub fn WallClock.denied() -> WallClock
+
+pub fn WallClock.served[S: WallClockService and Capability and Copy](service: S) -> WallClock fails Revoked
 
 pub fn WallClock.now_ns(self) -> u64 fails Revoked
     example attempt testing::world().wall.now_ns() == Ok(0)
@@ -165,6 +169,15 @@ pub interface LogService {
 pub interface RandomService {
     fn fill(self, mut buf: SliceMut[u8]) limits stack 4_096
 } RandomService
+
+pub interface ClockService {
+    fn elapsed_ns(self) -> u64 limits stack 4_096
+    fn sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 4_096
+} ClockService
+
+pub interface WallClockService {
+    fn now_ns(self) -> u64 limits stack 4_096
+} WallClockService
 
 pub interface StdioService {
     fn read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError uses wait limits stack 4_096
@@ -821,6 +834,10 @@ impl Tally: RandomService
 
 impl Tally: StdioService
 
+impl Tally: ClockService
+
+impl Tally: WallClockService
+
 /// Counts the bytes of a value logged through a tally.
 fn Tally.log(self, level: LogLevel, message: Str, value: Str) limits stack 4_096 {
     discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(value.byte_len())))
@@ -844,6 +861,19 @@ fn Tally.write_out(self, data: Slice[u8]) limits stack 4_096 {
 fn Tally.write_err(self, data: Slice[u8]) limits stack 4_096 {
     self.write_out(data)
 } Tally.write_err
+
+fn Tally.elapsed_ns(self) -> u64 limits stack 4_096 {
+    return 1_234_567_891
+} Tally.elapsed_ns
+
+/// Counts the nanoseconds slept through a tally.
+fn Tally.sleep_ns(self, ns: u64) limits stack 4_096 {
+    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(ns))
+} Tally.sleep_ns
+
+fn Tally.now_ns(self) -> u64 limits stack 4_096 {
+    return 1_700_000_000_123_456_789
+} Tally.now_ns
 
 fn tally_count(state: core::atomic::AtomicU64, record: u64) -> u64 {
     discard state.fetch_add(record)
@@ -2554,6 +2584,52 @@ test served_logs_call_their_kind for Log.served {
     log.info("width", value: 1u32)
     expect counted == Some(5)
 } served_logs_call_their_kind
+
+test served_clocks_call_their_kind for Clock.served {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    let counter = minter.mint(0)
+    let Ok(clock) = attempt Clock.served(minter.mint(0)) else {
+        take minter.close()
+        expect false
+        return
+    }
+    let elapsed = attempt clock.elapsed_ns()
+    let ms = attempt clock.elapsed_ms()
+    let Ok(coarse) = attempt clock.coarse(1_000_000) else {
+        take minter.close()
+        expect false
+        return
+    }
+    let coarse_elapsed = attempt coarse.elapsed_ns()
+    let slept_ms = attempt await clock.sleep(3)
+    let slept_ns = attempt await clock.sleep_ns(5)
+    let slept = reach(counter, body: tally_count)
+    take minter.close()
+    let revoked = attempt clock.elapsed_ns()
+    expect elapsed == Ok(1_234_567_891) and ms == Ok(1_234) and coarse_elapsed == Ok(1_234_000_000)
+    expect slept_ms.is_ok() and slept_ns.is_ok() and slept == Some(3_000_005) and revoked == Err(Revoked.Stale)
+} served_clocks_call_their_kind
+
+test served_wall_clocks_call_their_kind for WallClock.served {
+    let world = testing::world()
+    let minter = tallies(0, alloc: world.alloc)
+    let Ok(wall) = attempt WallClock.served(minter.mint(0)) else {
+        take minter.close()
+        expect false
+        return
+    }
+    let now = attempt wall.now_ns()
+    let Ok(coarse) = attempt wall.coarse(1_000) else {
+        take minter.close()
+        expect false
+        return
+    }
+    let coarse_now = attempt coarse.now_ns()
+    take minter.close()
+    let revoked = attempt wall.now_ns()
+    expect now == Ok(1_700_000_000_123_456_789) and coarse_now == Ok(1_700_000_000_123_456_000) and revoked == Err(Revoked.Stale)
+} served_wall_clocks_call_their_kind
 
 test served_random_sources_call_their_kind for Random.served {
     let world = testing::world()

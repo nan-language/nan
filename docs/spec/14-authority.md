@@ -92,10 +92,14 @@ pub fn Clock.sleep_ns(self, ns: u64) fails task::Cancelled uses wait
 
 pub fn Clock.coarse(self, ns: u64) -> Clock fails Revoked
 
+pub fn Clock.served[S: ClockService and Capability and Copy](service: S) -> Clock fails Revoked
+
 pub open struct WallClock {
 } WallClock
 
 pub fn WallClock.denied() -> WallClock
+
+pub fn WallClock.served[S: WallClockService and Capability and Copy](service: S) -> WallClock fails Revoked
 
 pub fn WallClock.now_ns(self) -> u64 fails Revoked
 
@@ -225,6 +229,15 @@ pub interface RandomService {
     fn fill(self, mut buf: SliceMut[u8]) limits stack 4_096
 } RandomService
 
+pub interface ClockService {
+    fn elapsed_ns(self) -> u64 limits stack 4_096
+    fn sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 4_096
+} ClockService
+
+pub interface WallClockService {
+    fn now_ns(self) -> u64 limits stack 4_096
+} WallClockService
+
 pub interface StdioService {
     fn read_in(self, mut buf: SliceMut[u8]) -> usize fails StdioError uses wait limits stack 4_096
     fn write_out(self, data: Slice[u8]) fails StdioError uses wait limits stack 4_096
@@ -302,11 +315,12 @@ pub fn Runner.put_resource(self, id: u64, take resource: Held) fails RunnerError
 ```
 
 - `sys::Runner.denied()` gives a runner whose handle is stale from the start.
-- `C.served(service)` of `Fs`, `Net`, `Log`, `Random`, `Stdio` or `Runner` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
-- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
+- `C.served(service)` of `Fs`, `Net`, `Clock`, `WallClock`, `Log`, `Random`, `Stdio` or `Runner` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
+- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Clock.elapsed_ns` calls `elapsed_ns`, its reading rounded down to a multiple of the clock's resolution, and `elapsed_ms` that reading in whole milliseconds; `Clock.sleep` and `sleep_ns` call `sleep_ns` with their duration in nanoseconds; `WallClock.now_ns` calls `now_ns`, its reading rounded down likewise; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
 - A file, listener or connection opened through a served capability holds the number its method returned, and its operations call the method of their name with that number, except `sys::net::Conn.abandon`, which calls `reset`. Releasing a file or listener calls `release`, and [settlement](11-errors-domains.md#settlement) releasing a connection calls `reset`. `release`, `reset` and `close` are called whether or not the resource's entry is revoked.
 - The operations of a served `Runner`, `runner.send_to(port, hash, bytes, handles)`, `call`, `reply`, `publish`, `sync`, `capability`, `drop_capability`, `resource`, `take_resource` and `put_resource`, call `service`'s method of their name with their arguments on the calling task, and fail as it fails. [Component contexts, ports and resources](26-components.md#runner-capabilities) act through them, and a kernel relays them for an instance in an isolated space ([component instances](#component-instances)). `RunnerError.Unknown` is how a kind refuses a port, request, capability or resource it does not know.
 - The `Held` that `resource` or `take_resource` gives passes to the calling task's domain ([domain memory](11-errors-domains.md#domain-memory)), and `put_resource` on a stale `Runner` releases the `Held` it takes. The resource methods of `RunnerService` are bound by 8,192 bytes, as releasing a served resource counts the 4,096 bytes of its own kind's method.
+- `coarse` of a served `Clock` or `WallClock` serves the same kind with the coarser resolution. A deadline that `task::within` or `within_ns` sets on a served `Clock` passes as on the clock the platform gives, timed from the moment it was served.
 - Their digests are those of the served capability's operations, whatever the methods do.
 
 ## Revocation

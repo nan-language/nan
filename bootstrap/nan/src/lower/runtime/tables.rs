@@ -89,6 +89,10 @@ pub mod kind {
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
 /// executor's entry.
 pub const RESOLUTION: u64 = entry::STATE + 8;
+
+/// The state word of a served `Clock` or `WallClock` entry holding its service's handle, the
+/// address of its method table following.
+pub const CLOCK_SERVICE: u64 = entry::STATE + 16;
 pub const EXECUTOR_RESOLUTION: u64 = entry::STATE + 16;
 
 /// The state word of an executor's entry holding its share, and the share of a root grant's
@@ -637,11 +641,12 @@ pub fn denied(lo: &mut Lowering, fx: &mut Fx) -> Value {
 }
 
 /// The handle of a new entry of a kind deriving from the live entry of `service`, holding that
-/// handle and the address of a method table; -1 when `service` is stale.
+/// handle and the address of a method table, a `Clock`'s minted now; -1 when `service` is stale.
 pub fn served(lo: &mut Lowering, fx: &mut Fx, kind: i64, service: Value, table: Value) -> Value {
-    let table_at = match kind {
-        kind::FS | kind::NET => entry::TABLE,
-        _ => entry::STATE + 8,
+    let (service_at, table_at) = match kind {
+        kind::FS | kind::NET => (entry::STATE, entry::TABLE),
+        kind::CLOCK | kind::WALL => (CLOCK_SERVICE, CLOCK_SERVICE + 8),
+        _ => (entry::STATE, entry::STATE + 8),
     };
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::LOCK);
@@ -653,10 +658,14 @@ pub fn served(lo: &mut Lowering, fx: &mut Fx, kind: i64, service: Value, table: 
         live,
         &[PTR],
         |lo, fx| {
-            let kind = fx.ptr(kind as u64);
-            let handle = new_entry(lo, fx, kind);
+            let kind_value = fx.ptr(kind as u64);
+            let handle = new_entry(lo, fx, kind_value);
             let record = entry_at(lo, fx, handle);
-            fx.store(service, record, entry::STATE);
+            if kind == kind::CLOCK {
+                let now = lo.now_ns(fx);
+                fx.store(now, record, entry::STATE);
+            }
+            fx.store(service, record, service_at);
             fx.store(table, record, table_at);
             let index = fx.b.ins().band_imm_s(service, 0xFFFF_FFFF);
             let index = fx.b.ins().iadd_imm_s(index, 1);

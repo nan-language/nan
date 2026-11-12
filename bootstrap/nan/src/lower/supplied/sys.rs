@@ -63,6 +63,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         ("sys::Fs", "served") => return served::served(lo, fx, supply, kind::FS, "FsService"),
         ("sys::Net", "served") => return served::served(lo, fx, supply, kind::NET, "NetService"),
         ("sys::Log", "served") => return served::served(lo, fx, supply, kind::LOG, "LogService"),
+        ("sys::Clock", "served") => {
+            return served::served(lo, fx, supply, kind::CLOCK, "ClockService");
+        }
+        ("sys::WallClock", "served") => {
+            return served::served(lo, fx, supply, kind::WALL, "WallClockService");
+        }
         ("sys::Random", "served") => {
             return served::served(lo, fx, supply, kind::RANDOM, "RandomService");
         }
@@ -441,21 +447,23 @@ fn reaches(
 fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let handle = fx.load(PTR, capability, 0);
-    let (live, [minted, resolution, _, _]) = tables::snapshot(lo, fx, handle);
+    let (live, [minted, resolution, service, table]) = tables::snapshot(lo, fx, handle);
     let stale = fx.b.ins().bxor_imm_s(live, 1);
+    let served = fx.b.ins().icmp_imm_s(IntCC::NotEqual, table, 0);
     match supply.member() {
         member @ ("elapsed_ms" | "elapsed_ns") => {
             fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
+            fx.when(served, |fx| {
+                let called =
+                    served::call(lo, fx, "ClockService", "elapsed_ns", (service, table), &[]);
+                let elapsed = round_down(fx, resolution, called.result.scalar());
+                let elapsed = in_unit(fx, member, elapsed);
+                supply.ret(lo, fx, Held::Scalar(elapsed));
+            });
             let now = lo.now_ns(fx);
             let elapsed = fx.b.ins().isub(now, minted);
             let elapsed = round_down(fx, resolution, elapsed);
-            let elapsed = match member {
-                "elapsed_ms" => {
-                    let per_ms = fx.ptr(timers::NS_PER_MS);
-                    fx.b.ins().udiv(elapsed, per_ms)
-                }
-                _ => elapsed,
-            };
+            let elapsed = in_unit(fx, member, elapsed);
             supply.ret(lo, fx, Held::Scalar(elapsed));
         }
         member @ ("sleep" | "sleep_ns") => {
@@ -464,6 +472,13 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 "sleep" => timers::from_ms(fx, supply.param(1).scalar()),
                 _ => supply.param(1).scalar(),
             };
+            fx.when(served, |fx| {
+                let args = [Held::Scalar(ns)];
+                let called =
+                    served::call(lo, fx, "ClockService", "sleep_ns", (service, table), &args);
+                supply.forward_failure(lo, fx, &called);
+                supply.done(lo, fx);
+            });
             let delay = clock_delay(lo, fx, minted, resolution, ns);
             if lo.seeded() || lo.kernel() {
                 let cancelled = sims::wait(lo, fx, None, |lo, fx, op| match lo.seeded() {
@@ -482,10 +497,30 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
+/// An elapsed time in nanoseconds in the unit of the `Clock` member reading it: whole
+/// milliseconds for `elapsed_ms`.
+fn in_unit(fx: &mut Fx, member: &str, elapsed: Value) -> Value {
+    match member {
+        "elapsed_ms" => {
+            let per_ms = fx.ptr(timers::NS_PER_MS);
+            fx.b.ins().udiv(elapsed, per_ms)
+        }
+        _ => elapsed,
+    }
+}
+
 fn wall_clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "now_ns" => {
-            let [ahead, resolution, _, _] = checked(lo, fx, supply, supply.param(0).address());
+            let [ahead, resolution, service, table] =
+                checked(lo, fx, supply, supply.param(0).address());
+            let served = fx.b.ins().icmp_imm_s(IntCC::NotEqual, table, 0);
+            fx.when(served, |fx| {
+                let called =
+                    served::call(lo, fx, "WallClockService", "now_ns", (service, table), &[]);
+                let now = round_down(fx, resolution, called.result.scalar());
+                supply.ret(lo, fx, Held::Scalar(now));
+            });
             let now = match lo.seeded() || lo.machine() {
                 true => {
                     let now = lo.now_ns(fx);

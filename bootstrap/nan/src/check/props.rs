@@ -207,6 +207,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("sys::Minter", LINEAR_SEND),
     ("sys::Cx", VIEW_ONLY),
     ("sys::Outbox", COPY_SEND),
+    ("sys::Waker", COPY_SEND),
     ("sys::Handle", COPY_SEND),
     ("sys::Reply", COPY_SEND),
     ("sys::Abandoner", AFFINE_SEND),

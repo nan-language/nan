@@ -199,7 +199,7 @@ const POINTERS: [&str; 18] = [
 ];
 
 /// The base types that are generational handles, as capability kinds are.
-const HANDLES: [&str; 14] = [
+const HANDLES: [&str; 15] = [
     "mem::Alloc",
     "mem::Heap",
     "mem::Handle",
@@ -214,6 +214,7 @@ const HANDLES: [&str; 14] = [
     "sys::Stdio",
     "sys::Runner",
     "sys::Outbox",
+    "sys::Waker",
 ];
 
 /// The base types holding storage, its length, its capacity and its allocator.

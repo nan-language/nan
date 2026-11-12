@@ -273,13 +273,14 @@ impl Glue {
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: [&str; 17] = [
+const CRITICAL_OWNERS: [&str; 18] = [
     "sys::Domain",
     "task::Sender",
     "task::Receiver",
     "task::Scope",
     "sys::Cx",
     "sys::Outbox",
+    "sys::Waker",
     "mem::Shared",
     "task::Cown",
     "hw::Ring0",

@@ -30,7 +30,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.store(handle, record, runner::RUNNER);
             supply.done(lo, fx);
         }
-        "outbox" => {
+        "outbox" | "waker" => {
             let record = record(fx);
             let inbox = fx.load(PTR, record, runner::INBOX);
             let sret = supply.sret.expect("an outbox's address");
@@ -285,7 +285,10 @@ fn wait(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, until_id
     fx.repeat(&[], |fx, _| {
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let oldest = fx.load(PTR, record, runner::OLDEST);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, oldest, 0);
+        let queued = fx.b.ins().icmp_imm_s(IntCC::NotEqual, oldest, 0);
+        let woken = fx.load(PTR, record, runner::WOKEN);
+        let woken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, woken, 0);
+        let present = fx.b.ins().bor(queued, woken);
         let mut done = present;
         if until_idle {
             let idle = idle(fx, record);
@@ -299,6 +302,10 @@ fn wait(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, until_id
             for field in [runner::COMPONENT, runner::IDLE, runner::WAITER] {
                 fx.store(zero, record, field);
             }
+            fx.when(done, |fx| {
+                let zero = fx.ptr(0);
+                fx.store(zero, record, runner::WOKEN);
+            });
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             settle::leave_wait(lo, fx);
             tasks::waiting_on(lo, fx, 0);

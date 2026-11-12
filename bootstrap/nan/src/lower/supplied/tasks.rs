@@ -37,6 +37,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         | "sys::Cx"
         | "sys::Outbox"
         | "sys::Stepper"
+        | "sys::Waker"
         | "sys::current_header"
         | "sys::run_headed" => components::lower(lo, fx, supply),
         _ => return false,
@@ -93,9 +94,8 @@ pub fn needs_release(path: &str) -> Option<bool> {
     match path {
         "task::Join" | "task::Cown" | "task::Sender" | "task::Receiver" | "sys::Trap" => Some(true),
         "task::Scope" | "task::Executor" | "task::Account" | "task::Cancelled"
-        | "task::Poisoned" | "sys::Cx" | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper" => {
-            Some(false)
-        }
+        | "task::Poisoned" | "sys::Cx" | "sys::Outbox" | "sys::Abandoner" | "sys::Stepper"
+        | "sys::Waker" => Some(false),
         _ => None,
     }
 }

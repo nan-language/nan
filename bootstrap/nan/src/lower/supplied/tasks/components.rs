@@ -76,7 +76,9 @@ pub mod runner {
     /// The handle of the runner a stepper's holder attached, zero for none.
     pub const RUNNER: u64 = 184;
     pub const KEYS: u64 = 192;
-    pub const HEADER: u64 = 200;
+    /// Whether a stepper's waker woke it since its holder last waited.
+    pub const WOKEN: u64 = 200;
+    pub const HEADER: u64 = 208;
 }
 
 pub mod entry {
@@ -148,6 +150,21 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             )[0];
             let sret = supply.sret.expect("a runner's address");
             fx.store(handle, sret, 0);
+            supply.done(lo, fx);
+        }
+        "sys::Waker.wake" => {
+            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            let record = lo.call_routine(fx, Routine::OutboxClaim, &[handle])[0];
+            let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+            fx.when(live, |fx| {
+                let lock = fx.offset(record, runner::LOCK);
+                lo.call_routine(fx, Routine::Lock, &[lock]);
+                let one = fx.ptr(1);
+                fx.store(one, record, runner::WOKEN);
+                intake::wake_component(lo, fx, record);
+                lo.call_routine(fx, Routine::Unlock, &[lock]);
+                unreference(lo, fx, record);
+            });
             supply.done(lo, fx);
         }
         "sys::Outbox.post" => {

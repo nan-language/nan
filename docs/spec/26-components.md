@@ -672,6 +672,13 @@ pub fn Stepper.incoming(self) fails task::Cancelled uses wait
 
 pub fn Stepper.ready(self) -> bool fails task::Cancelled uses wait
 
+pub fn Stepper.waker(self) -> Waker
+
+pub open struct Waker {
+} Waker
+
+pub fn Waker.wake(self)
+
 pub fn Stepper.start_keyed(mut self) -> usize
 
 pub fn Stepper.idle(self) -> bool
@@ -691,7 +698,8 @@ pub fn Stepper.abandon(take self)
 - `mut s.take_sent()` removes the oldest message that the component's handlers sent through `send`, `after` or `after_ns` and gives it, calling no handler, as a `sys::Sent` holding the message, its header and the nanoseconds left before it would enter the intake, 0 for a message of the intake; those of the intake come first, then the delayed ones in the order they would enter it. It returns `None` when no such message waits; posts stay in the intake.
 - `mut s.take_held()` supersedes the key of the oldest held keyed task, cancelling it before it starts, and gives that key; it returns `None` when no keyed task is held.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
-- `s.incoming()` returns once a message waits in the intake. `s.ready()` returns `true` once a message waits in the intake and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.
+- `s.incoming()` returns once a message waits in the intake or the stepper is woken. `s.ready()` returns `true` once a message waits in the intake or the stepper is woken, and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.
+- `s.waker()` returns the stepper's waker, the same on every call. `sys::Waker` is a base type: Copy and Send, and never linear, a view, Inert or AnyBits; it names its stepper as its outbox does. `w.wake()` wakes the stepper, so that another task gets the attention of a holder waiting for work: a pending `incoming` or `ready` returns, and with none pending the next one returns at once. A wake of a stepper that has ended does nothing.
 - `s.state()` gives the state. Handlers run only within `start`, `deliver`, `step` and the operations of the [system interfaces](#system-interfaces), so the holder reads the state of a quiescent component, and the [encoding](13-text-encode.md#encode) of it is a **checkpoint** of the component, which `resume` takes back once decoded. A checkpoint holds the state alone: the intake, the delayed messages and the keyed tasks are the holder's to drain first, until the stepper is idle.
 - `take s.end()` stops the intake: the posts waiting in it fail with `task::SendError.Closed`, its other messages and every delayed message are released, and no message enters it afterwards. It then supersedes the key of every keyed task, starts every held one, and waits until every keyed task has ended. It makes the stepper's outbox stale and returns the state and the Env in a `sys::Stopped`. It is an [exempt primitive](17-suspension-io.md#acknowledged-cancellation): no cancellation point, and it never fails.
 - `take s.abandon()` is the stepper's [abandon method](17-suspension-io.md#abandoning-resources): it stops the intake and supersedes and starts keyed tasks as `end` does, without waiting for them, makes the outbox stale, and releases the state and the Env, a linear Env through its type's abandon method.

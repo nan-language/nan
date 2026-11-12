@@ -1879,6 +1879,30 @@ pub fn total(levels: core::simd::F32x4) -> f32 {
 ```
 
 ```nan
+// file: link/package.nan
+//! Call arguments a bare kernel encodes from construction text.
+
+package link {
+    language 1
+    targets x86_64-bare
+    allow validate in link
+} link
+
+// file: link/link.nan
+//! Encodes the construction text of a pair through its schema.
+
+pub closed struct Pair derives Encode {
+    pub left: u32
+    pub right: u32
+} Pair
+
+pub validator fn encoded(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError {
+    let schema = mem::wire::NamedSchema(tree: mem::wire::Codec[Pair].schema(alloc), names: mem::List.empty(alloc))
+    return try text::construction::encode_as(schema, raw, alloc)
+} encoded
+```
+
+```nan
 // file: vectors/package.nan
 //! Vector registers a bare kernel's task keeps across switches.
 

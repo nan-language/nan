@@ -646,6 +646,12 @@ pub closed struct Handled derives Copy, Eq {
     pub operation: u16
 } Handled
 
+pub closed struct Sent[M: Any] {
+    pub message: M
+    pub header: Option[Header]
+    pub delay_ns: u64
+} Sent
+
 pub fn Stepper.start(take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
 
 pub fn Stepper.resume(take state: S, take env: Env, exec: task::Executor, alloc: mem::Alloc) -> Stepper[S, Env, M] fails task::Cancelled
@@ -657,6 +663,10 @@ pub fn Stepper.deliver(mut self, take message: M)
 pub fn Stepper.deliver_headed(mut self, take message: M, header: Header)
 
 pub fn Stepper.step(mut self) -> Option[Handled]
+
+pub fn Stepper.take_sent(mut self) -> Option[Sent[M]]
+
+pub fn Stepper.take_held(mut self) -> Option[u64]
 
 pub fn Stepper.incoming(self) fails task::Cancelled uses wait
 
@@ -678,6 +688,8 @@ pub fn Stepper.abandon(take self)
 - `s.outbox()` returns the stepper's outbox, the same on every call.
 - `mut s.deliver(m)` calls `on` with `m`, or its operation's handler for a protocol, on the calling task, and `mut s.deliver_headed(m, header: h)` does so with `h` as the message's [header](#headers). `mut s.step()` removes the oldest message of the intake, handles it so, completing its post or giving a request's handler's result or failure to its poster as the runner does, and returns what it handled: a `sys::Handled` holding the message's header, `None` for a message without one, and its operation's number, the index of its variant for an enum M, of its operation for a protocol, and 0 for any other M. It returns `None` when the intake is empty. Both publish the summary as the runner does ([servers](#servers)).
 - A keyed task that `spawn` starts on a stepper is **held**: its stack and record are drawn, but it starts only when `mut s.start_keyed()` starts every held keyed task, in the order of their spawns, returning how many it started. Superseding the key of a held task cancels it before it starts.
+- `mut s.take_sent()` removes the oldest message that the component's handlers sent through `send`, `after` or `after_ns` and gives it, calling no handler, as a `sys::Sent` holding the message, its header and the nanoseconds left before it would enter the intake, 0 for a message of the intake; those of the intake come first, then the delayed ones in the order they would enter it. It returns `None` when no such message waits; posts stay in the intake.
+- `mut s.take_held()` supersedes the key of the oldest held keyed task, cancelling it before it starts, and gives that key; it returns `None` when no keyed task is held.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
 - `s.incoming()` returns once a message waits in the intake. `s.ready()` returns `true` once a message waits in the intake and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.
 - `s.state()` gives the state. Handlers run only within `start`, `deliver`, `step` and the operations of the [system interfaces](#system-interfaces), so the holder reads the state of a quiescent component, and the [encoding](13-text-encode.md#encode) of it is a **checkpoint** of the component, which `resume` takes back once decoded. A checkpoint holds the state alone: the intake, the delayed messages and the keyed tasks are the holder's to drain first, until the stepper is idle.

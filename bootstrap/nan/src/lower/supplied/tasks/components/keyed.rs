@@ -240,8 +240,31 @@ pub fn start_held(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     })[1]
 }
 
+/// The node of the oldest held keyed task of a stepper's record, zero for none. The caller holds
+/// the lock.
+pub fn oldest_held(fx: &mut Fx, record: Value) -> Value {
+    let first = fx.load(PTR, record, runner::KEYED);
+    let zero = fx.ptr(0);
+    fx.repeat(&[first, zero], |fx, state| {
+        let (node, found) = (state[0], state[1]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+        let moved = fx.choose(
+            present,
+            &[PTR, PTR],
+            |fx| {
+                let held = fx.load(PTR, node, node::HELD);
+                let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
+                let found = fx.b.ins().select(held, node, found);
+                vec![fx.load(PTR, node, node::NEXT), found]
+            },
+            |fx| vec![fx.ptr(0), found],
+        );
+        (present, moved)
+    })[1]
+}
+
 /// Starts a held keyed task. The caller holds the lock.
-fn start_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
+pub fn start_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     let zero = fx.ptr(0);
     fx.store(zero, node, node::HELD);
     let started = fx.load(PTR, node, node::TASK);

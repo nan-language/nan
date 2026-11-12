@@ -38,6 +38,8 @@ fn stepper_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let record = stepper_record(mut fx, supply)
             stepper_wait(mut lo, mut fx, supply, record, until_idle: true)
         }
+        "take_sent" => stepper_take_sent(mut lo, mut fx, supply)
+        "take_held" => stepper_take_held(mut lo, mut fx, supply)
         "start_keyed" => stepper_start_keyed(mut lo, mut fx, supply)
         "idle" => stepper_is_idle(mut lo, mut fx, supply)
         "state" => {
@@ -116,6 +118,65 @@ fn stepper_step(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let held = mut lo.held_at(mut fx, ty: option, address: result)
     supply.ret(mut lo, mut fx, held)
 } stepper_step
+
+/// `mut s.take_sent()`: removes the oldest message the component sent itself, giving it as a
+/// `sys::Sent`, none when none waits.
+fn stepper_take_sent(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let types = stepper_types(lo, supply)
+    let option = supply.abi.result
+    var args = mem::List[ty::Ty].empty(lo.alloc)
+    mut args.push(types.message)
+    let sent = lo.std_ty("sys", type_name: "Sent", take args)
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let found = oldest_sent(mut fx, record)
+    let in_intake = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: found, y: 0)
+    let delayed = mut fx.load(PTR, addr: record, offset: RUNNER_DELAYED)
+    let node = mut fx.b.select(in_intake, x: found, y: delayed)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+    mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
+        take_sent(mut lo1, fx: mut fx1, record, found: SentNode(node: node, in_intake: in_intake), message: types.message, written: SentAt(sent: sent, at: at))
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} stepper_take_sent
+
+/// `mut s.take_held()`: supersedes the key of the oldest held keyed task, giving that key, none
+/// when no keyed task is held.
+fn stepper_take_held(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let node = oldest_held(mut fx, record)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+    let key = mut fx.choose(present, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.load(PTR, addr: node, offset: KEYED_KEY))
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.ptr(0))
+    })
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        supersede_key(mut lo, fx: mut fx1, record, key: key[0])
+        start_node(mut lo, fx: mut fx1, node)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    scheduling_point(mut lo, mut fx)
+    mut lo.write_option(mut fx, option, address: result, presence: present, value: Held.Scalar(key[0]))
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} stepper_take_held
 
 /// `mut s.start_keyed()`: starts the held keyed tasks, giving how many.
 fn stepper_start_keyed(mut lo: Lowering, mut fx: Fx, supply: Supply) {

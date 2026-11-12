@@ -408,18 +408,7 @@ fn write_handled(
     let header_field = lo.layouts.field(lo.ck, handled, None, "header");
     let operation_field = lo.layouts.field(lo.ck, handled, None, "operation");
     let header_at = fx.offset(at, header_field.offset);
-    let flag = fx.load(PTR, header, 0);
-    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flag, 0);
-    lo.write_option_with(
-        fx,
-        &header_field.ty,
-        header_at,
-        present,
-        |lo, fx, payload| {
-            let bytes = fx.offset(header, 8);
-            lo.copy(fx, payload, bytes, HEADER_BYTES, 1);
-        },
-    );
+    write_header(lo, fx, &header_field.ty, header_at, header);
     let variants = matches!(message, Ty::Item(item, _) if matches!(
         lo.ck.sig(*item).kind,
         SigKind::Enum { .. } | SigKind::Protocol { .. }
@@ -431,6 +420,91 @@ fn write_handled(
         fx.int(types::I16, 0)
     };
     fx.store(operation, at, operation_field.offset);
+}
+
+/// Writes at `at` the `Option[sys::Header]` of type `option` that a header block holds.
+fn write_header(lo: &mut Lowering, fx: &mut Fx, option: &Ty, at: Value, block: Value) {
+    let flag = fx.load(PTR, block, 0);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flag, 0);
+    lo.write_option_with(fx, option, at, present, |lo, fx, payload| {
+        let bytes = fx.offset(block, 8);
+        lo.copy(fx, payload, bytes, HEADER_BYTES, 1);
+    });
+}
+
+/// Removes a stepper's oldest message that its component sent itself, from its intake or else
+/// from its delayed messages, and writes at `at` the `sys::Sent` of type `sent` holding it, its
+/// header and the nanoseconds left before it would enter the intake. The caller holds the lock
+/// and has found `node`, in the intake when `in_intake` holds.
+fn take_sent(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    record: Value,
+    (node, in_intake): (Value, Value),
+    message: &Ty,
+    (sent, at): (&Ty, Value),
+) {
+    fx.choose(
+        in_intake,
+        &[],
+        |fx| {
+            intake::unlink(fx, record, node);
+            Vec::new()
+        },
+        |fx| {
+            let next = fx.load(PTR, node, entry::NEXT);
+            fx.store(next, record, runner::DELAYED);
+            Vec::new()
+        },
+    );
+    let message_field = lo.layouts.field(lo.ck, sent, None, "message");
+    let header_field = lo.layouts.field(lo.ck, sent, None, "header");
+    let delay_field = lo.layouts.field(lo.ck, sent, None, "delay_ns");
+    let layout = lo.layout(message);
+    let message_at = fx.offset(at, message_field.offset);
+    let source = fx.offset(node, entry::MESSAGE);
+    lo.copy(fx, message_at, source, layout.size, layout.align);
+    let header_at = fx.offset(at, header_field.offset);
+    let block = fx.offset(node, entry::HEADER);
+    write_header(lo, fx, &header_field.ty, header_at, block);
+    let delay = fx.choose_in(
+        lo,
+        in_intake,
+        &[PTR],
+        |_, fx| vec![fx.ptr(0)],
+        |lo, fx| {
+            let deadline = fx.load(PTR, node, entry::DEADLINE);
+            let now = lo.now_ns(fx);
+            let later = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, deadline, now);
+            let left = fx.b.ins().isub(deadline, now);
+            let zero = fx.ptr(0);
+            vec![fx.b.ins().select(later, left, zero)]
+        },
+    )[0];
+    fx.store(delay, at, delay_field.offset);
+    lo.call_routine(fx, Routine::Free, &[node]);
+}
+
+/// The oldest entry of a runner's intake that its component sent itself, zero for none. The
+/// caller holds the lock.
+fn oldest_sent(fx: &mut Fx, record: Value) -> Value {
+    let first = fx.load(PTR, record, runner::OLDEST);
+    fx.repeat(&[first], |fx, state| {
+        let node = state[0];
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+        let moved = fx.choose(
+            present,
+            &[types::I8, PTR],
+            |fx| {
+                let poster = fx.load(PTR, node, entry::POSTER);
+                let posted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, poster, 0);
+                let next = fx.load(PTR, node, entry::NEXT);
+                vec![posted, fx.b.ins().select(posted, next, node)]
+            },
+            |fx| vec![fx.int(types::I8, 0), node],
+        );
+        (moved[0], vec![moved[1]])
+    })[0]
 }
 
 /// Passes the message in a slot to `on`, or to its operation's handler for a protocol, with the

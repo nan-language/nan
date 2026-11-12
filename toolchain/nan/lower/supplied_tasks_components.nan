@@ -371,15 +371,102 @@ fn write_handled(mut lo: Lowering, mut fx: Fx, written: HandledAt, message: ty::
     let header_field = mut lo.layouts.field(lo.ck, ty: written.handled, variant: None, label: "header")
     let operation_field = mut lo.layouts.field(lo.ck, ty: written.handled, variant: None, label: "operation")
     let header_at = mut fx.offset(written.at, offset: header_field.offset)
-    let flag = mut fx.load(PTR, addr: header, offset: 0)
-    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
-    mut lo.write_option_with(mut fx, layout_ty: header_field.ty, address: header_at, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
-        let bytes = mut fx1.offset(header, offset: 8)
-        mut lo1.copy(mut fx1, dst: at, src: bytes, size: HEADER_BYTES, align: 1)
-    })
+    write_header(mut lo, mut fx, option: header_field.ty, at: header_at, block: header)
     let operation = handled_operation(mut lo, mut fx, message, slot)
     mut fx.store(operation, addr: written.at, offset: operation_field.offset)
 } write_handled
+
+/// Writes at `at` the `Option[sys::Header]` of type `option` that a header block holds.
+fn write_header(mut lo: Lowering, mut fx: Fx, option: ty::Ty, at: clif::Value, block: clif::Value) {
+    let flag = mut fx.load(PTR, addr: block, offset: 0)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+    mut lo.write_option_with(mut fx, layout_ty: option, address: at, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        let bytes = mut fx1.offset(block, offset: 8)
+        mut lo1.copy(mut fx1, dst: payload, src: bytes, size: HEADER_BYTES, align: 1)
+    })
+} write_header
+
+/// Where a stepper's oldest message its component sent itself lies: its entry, in the intake
+/// when `in_intake` holds, else first among the delayed messages.
+struct SentNode derives Copy {
+    node: clif::Value
+    in_intake: clif::Value
+} SentNode
+
+/// Where `take_sent` writes: a `sys::Sent` type and an address.
+struct SentAt derives Copy {
+    sent: ty::Ty
+    at: clif::Value
+} SentAt
+
+/// Removes a stepper's oldest message that its component sent itself, from its intake or else
+/// from its delayed messages, and writes at `at` the `sys::Sent` of type `sent` holding it, its
+/// header and the nanoseconds left before it would enter the intake. The caller holds the lock
+/// and has found `node`, in the intake when `in_intake` holds.
+fn take_sent(mut lo: Lowering, mut fx: Fx, record: clif::Value, found: SentNode, message: ty::Ty, written: SentAt) {
+    let node = found.node
+    discard mut fx.choose(found.in_intake, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        components_unlink(mut fx1, record, node)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let next = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+        mut fx1.store(next, addr: record, offset: RUNNER_DELAYED)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let message_field = mut lo.layouts.field(lo.ck, ty: written.sent, variant: None, label: "message")
+    let header_field = mut lo.layouts.field(lo.ck, ty: written.sent, variant: None, label: "header")
+    let delay_field = mut lo.layouts.field(lo.ck, ty: written.sent, variant: None, label: "delay_ns")
+    let laid = mut lo.layout_of(message)
+    let message_at = mut fx.offset(written.at, offset: message_field.offset)
+    let source = mut fx.offset(node, offset: COMPONENTS_ENTRY_MESSAGE)
+    mut lo.copy(mut fx, dst: message_at, src: source, size: laid.contents().size, align: laid.contents().align)
+    let header_at = mut fx.offset(written.at, offset: header_field.offset)
+    let block = mut fx.offset(node, offset: COMPONENTS_ENTRY_HEADER)
+    write_header(mut lo, mut fx, option: header_field.ty, at: header_at, block)
+    let delay = mut fx.choose_in(mut lo, condition: found.in_intake, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut fx1.ptr(0))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let deadline = mut fx1.load(PTR, addr: node, offset: COMPONENTS_ENTRY_DEADLINE)
+        let now = mut lo1.now_ns(mut fx1)
+        let later = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThan, x: deadline, y: now)
+        let left = mut fx1.b.isub(deadline, y: now)
+        let zero = mut fx1.ptr(0)
+        return fx1.list1(mut fx1.b.select(later, x: left, y: zero))
+    })
+    mut fx.store(delay[0], addr: written.at, offset: delay_field.offset)
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(node).view())
+} take_sent
+
+/// The oldest entry of a runner's intake that its component sent itself, zero for none. The
+/// caller holds the lock.
+fn oldest_sent(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
+    let found = mut fx.repeat(Array[clif::Value, 1].filled(head).view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        let node = walk_state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+        var results = Array[clif::Type, 2].filled(PTR)
+        results[0] = clif::Type.Int8
+        let moved = mut fx1.choose(present, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let poster = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_POSTER)
+            let posted = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: poster, y: 0)
+            let next = mut fx2.load(PTR, addr: node, offset: COMPONENTS_ENTRY_NEXT)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(posted)
+            mut stepped.push(mut fx2.b.select(posted, x: next, y: node))
+            return stepped
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.int(clif::Type.Int8, value: 0))
+            mut ended.push(node)
+            return ended
+        })
+        expect moved.len() == 2
+        return Pass(again: moved[0], next: fx1.list1(moved[1]))
+    })
+    expect found.len() == 1
+    return found[0]
+} oldest_sent
 
 /// The 16-bit operation number of a message in a slot: the index of its variant for an enum or a
 /// protocol, 0 for any other message type.

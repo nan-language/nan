@@ -15,7 +15,7 @@ use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
 use super::{
     HEADER_BYTES, call_handler, draw_record, entry, handle, handle_oldest, handler, intake, keyed,
-    release_env, runner, shape, status, unreference, wait_for,
+    oldest_sent, release_env, runner, shape, status, take_sent, unreference, wait_for,
 };
 use crate::check::ty::{Arg, Bound, Ty};
 
@@ -77,6 +77,56 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.when(empty, |fx| {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
             });
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
+        }
+        "take_sent" => {
+            let record = record(fx);
+            let (_, _, message) = types_of(supply);
+            let option = supply.abi.result.clone();
+            let sent = lo.std_ty("sys", "Sent", vec![message.clone()]);
+            let layout = lo.layout(&option);
+            let result = supply
+                .sret
+                .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+            let lock = fx.offset(record, runner::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let found = oldest_sent(fx, record);
+            let in_intake = fx.b.ins().icmp_imm_s(IntCC::NotEqual, found, 0);
+            let delayed = fx.load(PTR, record, runner::DELAYED);
+            let node = fx.b.ins().select(in_intake, found, delayed);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+            lo.write_option_with(fx, &option, result, present, |lo, fx, at| {
+                take_sent(lo, fx, record, (node, in_intake), &message, (&sent, at));
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
+        }
+        "take_held" => {
+            let record = record(fx);
+            let option = supply.abi.result.clone();
+            let layout = lo.layout(&option);
+            let result = supply
+                .sret
+                .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+            let lock = fx.offset(record, runner::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let node = keyed::oldest_held(fx, record);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+            let key = fx.choose(
+                present,
+                &[PTR],
+                |fx| vec![fx.load(PTR, node, keyed::node::KEY)],
+                |fx| vec![fx.ptr(0)],
+            )[0];
+            fx.when(present, |fx| {
+                keyed::supersede_key(lo, fx, record, key);
+                keyed::start_node(lo, fx, node);
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            seeded::scheduling_point(lo, fx);
+            lo.write_option(fx, &option, result, present, Held::Scalar(key));
             let held = lo.held_at(fx, &option, result);
             supply.ret(lo, fx, held);
         }

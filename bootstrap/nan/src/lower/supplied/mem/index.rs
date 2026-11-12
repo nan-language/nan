@@ -1,9 +1,11 @@
 //! The hash index by which `mem::HashMap` and `mem::OnceMap` find their keys: an open-addressing
 //! table of 64-bit slots probed linearly, each 0 when vacant or a key's 32-bit hash fragment
 //! above the index of its entry plus 1. A key's fragment folds the state of a `mem::KeyHasher`
-//! its `hash` writes to, started from the FNV basis and the map's seed. A table record is two
-//! words, the table's address and its slot count, both 0 before the first entry; the table, drawn
-//! through the map's allocator, has at least twice as many slots as entries.
+//! its `hash` writes to, started from the FNV basis and the map's seed, or for a scalar key the
+//! high and low halves of the product of that start, with the key's bits flipped in, and a
+//! constant. A table record is two words, the table's address and its slot count, both 0 before
+//! the first entry; the table, drawn through the map's allocator, has at least twice as many
+//! slots as entries.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -22,17 +24,34 @@ const FIRST: u64 = 8;
 
 const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
+/// The multiplier folding a scalar key into its fragment: the 64-bit golden ratio.
+const FOLD: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// The hash fragment of the key of type `key` at an address, under a map's seed.
 pub fn fragment(lo: &mut Lowering, fx: &mut Fx, key: &Ty, at: Value, seed: Value) -> Value {
-    let hasher = lo.std_ty("mem", "KeyHasher", Vec::new());
-    let state = fx.slot(8, 8);
     let basis = fx.b.ins().iconst(types::I64, FNV_BASIS as i64);
     let start = fx.b.ins().bxor(basis, seed);
-    fx.store(start, state, 0);
-    let held = lo.held_at(fx, key, at);
-    let hasher_arg = vec![Arg::Ty(hasher)];
-    lo.call_method(fx, key, "Hash", hasher_arg, &[held, Held::Address(state)]);
-    let hashed = fx.load(types::I64, state, 0);
+    let hashed = match (key, lo.held_at(fx, key, at)) {
+        (Ty::Scalar(_), Held::Scalar(bits)) => {
+            let wide = match fx.b.func.dfg.value_type(bits) {
+                types::I64 => bits,
+                _ => fx.b.ins().uextend(types::I64, bits),
+            };
+            let flipped = fx.b.ins().bxor(start, wide);
+            let fold = fx.b.ins().iconst(types::I64, FOLD as i64);
+            let low = fx.b.ins().imul(flipped, fold);
+            let high = fx.b.ins().umulhi(flipped, fold);
+            fx.b.ins().bxor(low, high)
+        }
+        (_, held) => {
+            let hasher = lo.std_ty("mem", "KeyHasher", Vec::new());
+            let state = fx.slot(8, 8);
+            fx.store(start, state, 0);
+            let hasher_arg = vec![Arg::Ty(hasher)];
+            lo.call_method(fx, key, "Hash", hasher_arg, &[held, Held::Address(state)]);
+            fx.load(types::I64, state, 0)
+        }
+    };
     let high = fx.b.ins().ushr_imm_s(hashed, 32);
     let folded = fx.b.ins().bxor(hashed, high);
     fx.b.ins().band_imm_s(folded, 0xFFFF_FFFF)

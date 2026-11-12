@@ -1,4 +1,4 @@
-//! The hash index by which `mem::HashMap` and `mem::OnceMap` find their keys: an open-addressing table of 64-bit slots probed linearly, each 0 when vacant or a key's 32-bit hash fragment above the index of its entry plus 1. A key's fragment folds the state of a `mem::KeyHasher` its `hash` writes to, started from the FNV basis and the map's seed. A table record is two words, the table's address and its slot count, both 0 before the first entry; the table, drawn through the map's allocator, has at least twice as many slots as entries.
+//! The hash index by which `mem::HashMap` and `mem::OnceMap` find their keys: an open-addressing table of 64-bit slots probed linearly, each 0 when vacant or a key's 32-bit hash fragment above the index of its entry plus 1. A key's fragment folds the state of a `mem::KeyHasher` its `hash` writes to, started from the FNV basis and the map's seed, or for a scalar key the high and low halves of the product of that start, with the key's bits flipped in, and a constant. A table record is two words, the table's address and its slot count, both 0 before the first entry; the table, drawn through the map's allocator, has at least twice as many slots as entries.
 
 const INDEX_TABLE: u64 = 0
 
@@ -9,6 +9,9 @@ const INDEX_FIRST: u64 = 8
 
 const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325
 
+/// The multiplier folding a scalar key into its fragment: the 64-bit golden ratio.
+const INDEX_FOLD: u64 = 0x9e37_79b9_7f4a_7c15
+
 /// Where a search ends: the index of the entry it found or reached, and whether it found one.
 struct Lookup derives Copy {
     index: clif::Value
@@ -17,23 +20,49 @@ struct Lookup derives Copy {
 
 /// The hash fragment of the key of type `key` at an address, under a map's seed.
 fn index_fragment(mut lo: Lowering, mut fx: Fx, key: ty::Ty, at: clif::Value, seed: clif::Value) -> clif::Value {
+    let basis = mut fx.b.iconst(clif::Type.Int64, imm: i64.from_bits(FNV_BASIS))
+    let start = mut fx.b.bxor(basis, y: seed)
+    let held = mut lo.held_at(mut fx, ty: key, address: at)
+    let scalar = match lo.ck.types().kind(key) {
+        ty::TyKind.Scalar(_) => true
+        else => false
+    }
+    let hashed = match first held {
+        Held.Scalar(bits) if scalar => index_folded(mut fx, start, bits)
+        else => index_hashed(mut lo, mut fx, key, held, start)
+    }
+    let high = mut fx.b.ushr_imm_s(hashed, y: 32)
+    let folded = mut fx.b.bxor(hashed, y: high)
+    return mut fx.b.band_imm_s(folded, y: 0xFFFF_FFFF)
+} index_fragment
+
+/// A scalar key's bits flipped into a start state, then multiplied by `INDEX_FOLD`, with the high
+/// half of the product folded into the low half.
+fn index_folded(mut fx: Fx, start: clif::Value, bits: clif::Value) -> clif::Value {
+    var wide = bits
+    if fx.b.value_type(bits) != clif::Type.Int64 {
+        wide = mut fx.b.uextend(clif::Type.Int64, x: bits)
+    }
+    let flipped = mut fx.b.bxor(start, y: wide)
+    let fold = mut fx.b.iconst(clif::Type.Int64, imm: i64.from_bits(INDEX_FOLD))
+    let low = mut fx.b.imul(flipped, y: fold)
+    let high = mut fx.b.umulhi(flipped, y: fold)
+    return mut fx.b.bxor(low, y: high)
+} index_folded
+
+/// The state of a `mem::KeyHasher` started from a state that a key's `hash` writes to.
+fn index_hashed(mut lo: Lowering, mut fx: Fx, key: ty::Ty, held: Held, start: clif::Value) -> clif::Value {
     let no_args = mem::List[ty::Ty].empty(lo.alloc)
     let hasher = lo.std_ty("mem", type_name: "KeyHasher", args: take no_args)
     let state = mut fx.slot(8, align: 8)
-    let basis = mut fx.b.iconst(clif::Type.Int64, imm: i64.from_bits(FNV_BASIS))
-    let start = mut fx.b.bxor(basis, y: seed)
     mut fx.store(start, addr: state, offset: 0)
-    let held = mut lo.held_at(mut fx, ty: key, address: at)
     var hasher_arg = mem::List[ty::Arg].empty(lo.alloc)
     mut hasher_arg.push(ty::Arg.Ty(hasher))
     var hash_args = Array[Held, 2].filled(held)
     hash_args[1] = Held.Address(state)
     discard mut lo.call_method(mut fx, ty: key, interface_name: "Hash", own: take hasher_arg, args: hash_args.view())
-    let hashed = mut fx.load(clif::Type.Int64, addr: state, offset: 0)
-    let high = mut fx.b.ushr_imm_s(hashed, y: 32)
-    let folded = mut fx.b.bxor(hashed, y: high)
-    return mut fx.b.band_imm_s(folded, y: 0xFFFF_FFFF)
-} index_fragment
+    return mut fx.load(clif::Type.Int64, addr: state, offset: 0)
+} index_hashed
 
 /// The entry of a key's fragment that `matches` accepts, `matches` telling whether the entry of
 /// an index holds the sought key: its index and 1, or an unspecified index and 0.

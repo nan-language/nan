@@ -876,6 +876,16 @@ pub closed struct SchemaVariant derives Encode {
     pub payload: Option[usize]
 } SchemaVariant
 
+pub closed struct NamedSchema derives Encode {
+    pub tree: Schema
+    pub names: mem::List[SchemaName]
+} NamedSchema
+
+pub closed struct SchemaName derives Encode {
+    pub node: usize
+    pub path: text::String
+} SchemaName
+
 pub fn Codec.schema_hash() -> SchemaHash limits pure, notrap, terminates
 
 pub fn Codec.schema(alloc: mem::Alloc) -> Schema
@@ -897,6 +907,7 @@ pub fn Codec.schema(alloc: mem::Alloc) -> Schema
 - `mem::Box[T]`, `mem::Shared[T]` and `Untrusted[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
 - Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
 - `schema_hash` gives the schema hash of `T`, and `schema` its schema tree drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`).
+- A `NamedSchema` is a tree with its **names**: in order of `node`, each `Record` or `Variant` node made for a struct or enum instantiation with the canonical path of that struct or enum. Names take no part in schema hashes or in [accepting](29-identity-versioning.md#encode-class).
 
 ```nan
 pub closed struct Probe derives Encode {
@@ -1271,6 +1282,10 @@ pub open struct Codec[T: Encode] {
 } Codec
 
 pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+
+pub validator fn render_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError
+
+pub validator fn encode_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError
 ```
 
 `decode` reads exactly one value; bytes other than whitespace left after it fail with `Trailing`. Whitespace, U+0020, U+0009, U+000A and U+000D, may stand before and after each token: a word, a number, a literal, or one of `-inf`, `(`, `)`, `[`, `]`, `{`, `}`, `,`, `:` and `.`. A name or key is a `WORD` ([identifiers](01-lexical.md#identifiers)). Each kind reads as follows:
@@ -1290,6 +1305,11 @@ pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails cor
 - An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float is rounded to `f64` by roundTiesToEven. A char literal holds exactly one char; `_` separates digits and carries no meaning.
 - A field that an open type skips is any value of these forms.
 - Input that is not well-formed UTF-8 inside a literal, or a `\u{H}` escape naming a surrogate or a value above `10FFFF`, fails with `InvalidText`. Other input outside these forms, `\xHH` above `7F` in a char or text included, fails with `Malformed`.
+
+`render_as` and `encode_as` translate between construction text and `mem::wire` bytes through a [named schema](#schema-hashes), without naming the type:
+
+- `render_as(schema, raw, alloc, out: o)` reads `raw` as one `mem::wire` value of the schema's tree and appends to `o` its construction text, each value in its nested rendering: a record node with a name as the last segment of its name, `(` and its fields, one without a name as its fields alone, or `Unit` when it has none; a variant node as the last segment of its name, `.` and its key, without the name for `core::Option` and `core::Result`, then its payload in parentheses. Fields are written in the order of their keys in the bytes. Bytes that the type's `mem::wire` decoder would reject fail with that decoder's error, an undeclared field of an open record node being skipped.
+- `encode_as(schema, raw, alloc)` reads `raw` as construction text of the tree's root, as `decode` would for its type, and gives the bytes `mem::wire` encodes for it, a sequence's elements and a map's entries in the order written.
 
 Decoding the rendering of a value within a render budget that does not elide it gives the value back when its type implements `Encode` and every value it renders, itself included, renders as the tables and derived Render above state, holds no `Untrusted` value, whose `<untrusted>` decodes as no kind, and is not text or a char at the top level, which renders as its characters.
 

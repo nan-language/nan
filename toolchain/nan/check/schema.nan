@@ -34,6 +34,105 @@ pkg fn Checker.schema(self, ty: ty::Ty) -> mem::wire::Schema {
     return self.schema_within(ty, walk: mut walk)
 } Checker.schema
 
+/// A type's schema tree with its names.
+pkg fn Checker.named_schema(self, ty: ty::Ty) -> mem::wire::NamedSchema {
+    let tree = self.schema(ty)
+    var names = mem::List[mem::wire::SchemaName].empty(self.alloc())
+    self.name_nodes(ty, tree, at: 0, names: mut names)
+    mut names.sort_by(fn(left: mem::wire::SchemaName, right: mem::wire::SchemaName) => left.node.cmp(right.node))
+    return mem::wire::NamedSchema(tree: take tree, names: take names)
+} Checker.named_schema
+
+/// Adds to `names` the name of each node of `tree` made for a struct or enum instantiation at or
+/// under the node at `at`, which is made for `ty`.
+fn Checker.name_nodes(self, ty: ty::Ty, tree: mem::wire::Schema, at: usize, mut names: mem::List[mem::wire::SchemaName]) {
+    let alloc = self.alloc()
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return
+    }
+    let held_args = types.arg_list(args)
+    let path = self.db().canonical(item)
+    match path.as_str() {
+        "mem::Box" or "mem::Shared" or "core::Untrusted" => {
+            self.name_nodes(schema_arg_ty(held_args, index: 0), tree, at, names: mut names)
+            return
+        }
+        "core::Array" or "mem::Bounded" or "mem::Set" or "mem::List" => {
+            let mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) = tree.nodes[at] else {
+                return
+            }
+            self.name_nodes(schema_arg_ty(held_args, index: 0), tree, at: element, names: mut names)
+            return
+        }
+        "mem::Map" => {
+            let mem::wire::SchemaNode.Map(key: key, value: value) = tree.nodes[at] else {
+                return
+            }
+            self.name_nodes(schema_arg_ty(held_args, index: 0), tree, at: key, names: mut names)
+            self.name_nodes(schema_arg_ty(held_args, index: 1), tree, at: value, names: mut names)
+            return
+        }
+        else => {}
+    }
+    let sig = self.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: held_args, alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: declared) => {
+            let mem::wire::SchemaNode.Record(open: _, fields: fields) = tree.nodes[at] else {
+                return
+            }
+            mut names.push(mem::wire::SchemaName(node: at, path: text::String.of(path.as_str(), alloc)))
+            for field in fields {
+                match declared.position(fn(candidate: FieldSig) => candidate.name.as_str() == field.key.as_str()) {
+                    Some(index) => self.name_nodes(subst.ty(types, ty: declared[index].ty), tree, at: field.value, names: mut names)
+                    None => {}
+                }
+            }
+        }
+        SigKind.Enum(variants: declared) => {
+            let mem::wire::SchemaNode.Variant(open: _, variants: variants) = tree.nodes[at] else {
+                return
+            }
+            mut names.push(mem::wire::SchemaName(node: at, path: text::String.of(path.as_str(), alloc)))
+            for variant in variants {
+                let Some(payload_at) = variant.payload else {
+                    continue
+                }
+                match declared.position(fn(candidate: VariantSig) => candidate.name.as_str() == variant.key.as_str()) {
+                    Some(index) => self.name_payload_nodes(declared[index].payload, subst, tree, at: payload_at, names: mut names)
+                    None => {}
+                }
+            }
+        }
+        else => {}
+    }
+} Checker.name_nodes
+
+/// Adds to `names` the names of the nodes under a variant's payload at `at`, as `name_nodes` does.
+fn Checker.name_payload_nodes(self, payload: Payload, subst: ty::Subst, tree: mem::wire::Schema, at: usize, mut names: mem::List[mem::wire::SchemaName]) {
+    let types = self.types()
+    match payload {
+        Payload.None => {}
+        Payload.Single(payload_ty) => self.name_nodes(subst.ty(types, ty: payload_ty), tree, at, names: mut names)
+        Payload.Labelled(labelled) => {
+            let mem::wire::SchemaNode.Record(open: _, fields: labels) = tree.nodes[at] else {
+                return
+            }
+            for label in labels {
+                match labelled.position(fn(candidate: LabelledTy) => candidate.name.as_str() == label.key.as_str()) {
+                    Some(found) => self.name_nodes(subst.ty(types, ty: labelled[found].ty), tree, at: label.value, names: mut names)
+                    None => {}
+                }
+            }
+        }
+    }
+} Checker.name_payload_nodes
+
 /// The struct and enum instantiations of packages other than `package_id` that the schema tree
 /// of a type makes nodes for, each outside every other.
 pkg fn Checker.foreign_schemas(self, ty: ty::Ty, package_id: ty::PackageId) -> mem::List[ty::Ty] {

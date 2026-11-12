@@ -73,7 +73,7 @@ The table names every pub std type, interface, free function and registry with t
 | `mem` | `mem::OnceMap` | [Once maps](12-memory.md#once-maps) |
 | `mem` | `mem::wire::Codec` | [Wire format](13-text-encode.md#wire-format); `schema_hash` and `schema` in [Schema hashes](13-text-encode.md#schema-hashes), `canonical` and `erased` in [Erased decoders](13-text-encode.md#erased-decoders), `decode_from` and `encode_as` in [Migrations](13-text-encode.md#migrations) |
 | `mem` | `mem::wire::Kept` | [Flexible structs](13-text-encode.md#flexible-structs) |
-| `mem` | `mem::wire::SchemaHash`, `mem::wire::Schema`, `mem::wire::SchemaNode`, `mem::wire::SchemaField`, `mem::wire::SchemaVariant` | [Schema hashes](13-text-encode.md#schema-hashes); `mem::wire::Schema.accepts` in [Encode class](29-identity-versioning.md#encode-class) |
+| `mem` | `mem::wire::SchemaHash`, `mem::wire::Schema`, `mem::wire::SchemaNode`, `mem::wire::SchemaField`, `mem::wire::SchemaVariant`, `mem::wire::NamedSchema`, `mem::wire::SchemaName` | [Schema hashes](13-text-encode.md#schema-hashes); `mem::wire::Schema.accepts` in [Encode class](29-identity-versioning.md#encode-class) |
 | `mem` | `mem::wire::Erased` | [Erased decoders](13-text-encode.md#erased-decoders) |
 | `text` | `text::String`, `text::Fixed` | [Text types](13-text-encode.md#text-types) |
 | `text` | `text::utf8::Utf8Error`, `text::utf8::valid_prefix`, `text::utf8::is_valid`, `text::utf8::char_at`, `text::utf8::write_char` | [UTF-8](13-text-encode.md#utf-8) |
@@ -82,7 +82,7 @@ The table names every pub std type, interface, free function and registry with t
 | `text` | `text::Writer`, `text::fmt` | [Writers](13-text-encode.md#writers), [Templates](13-text-encode.md#templates) |
 | `text` | `text::base64::encode`, `text::base64::decode` | [Base64](13-text-encode.md#base64) |
 | `text` | `text::json::Codec` | [JSON](13-text-encode.md#json) |
-| `text` | `text::construction::Codec` | [Construction text](13-text-encode.md#construction-text) |
+| `text` | `text::construction::Codec`, `text::construction::render_as`, `text::construction::encode_as` | [Construction text](13-text-encode.md#construction-text) |
 | `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` and `spawn_sized` in [Joins](16-concurrency.md#joins) |
 | `task` | `task::Join` | [Joins](16-concurrency.md#joins) |
 | `task` | `task::within`, `task::within_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
@@ -323,7 +323,7 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | --- | --- | --- | --- | --- |
 | `core` | none | `alloc` | decoders | trusted code, declassifying decoders |
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
-| `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction`, `text::base64::decode` | trusted code, declassifying decoders and validators |
+| `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction`, `text::base64::decode`, `text::construction::render_as` and `encode_as` | trusted code, declassifying decoders and validators |
 | `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
 | `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `sys::Runner`, `sys::Handle`, `sys::load::Loader`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |

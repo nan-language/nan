@@ -32,13 +32,17 @@ pub enum Node {
         key: Box<Node>,
         value: Box<Node>,
     },
+    /// A record, `name` the canonical path of the struct it is made for.
     Record {
         open: bool,
         fields: Vec<Field>,
+        name: Option<String>,
     },
+    /// A variant, `name` the canonical path of the enum it is made for.
     Variant {
         open: bool,
         variants: Vec<Variant>,
+        name: Option<String>,
     },
     Back(u64),
 }
@@ -98,7 +102,7 @@ impl Node {
                 },
             ) => key.accepts(old_key) && value.accepts(old_value),
             (
-                Node::Record { open, fields },
+                Node::Record { open, fields, .. },
                 Node::Record {
                     fields: old_fields, ..
                 },
@@ -140,17 +144,42 @@ impl Node {
     /// The tree's `mem::wire` encoding as a `mem::wire::Schema`: its nodes in preorder, each
     /// naming its children by position.
     pub fn wire(&self) -> Vec<u8> {
+        self.laid().0
+    }
+
+    /// The `mem::wire` encoding of a `mem::wire::NamedSchema`: the tree and, in order of
+    /// position, the canonical path of the struct or enum each named node is made for.
+    pub fn named_wire(&self) -> Vec<u8> {
+        let (tree, names) = self.laid();
+        let names = names
+            .into_iter()
+            .map(|(at, path)| record(vec![("node", unsigned(at)), ("path", text(&path))]));
+        record(vec![("names", sequence(names)), ("tree", tree)])
+    }
+
+    /// The tree's encoding and its nodes' names by position.
+    fn laid(&self) -> (Vec<u8>, Vec<(u64, String)>) {
         let mut nodes = Vec::new();
-        self.lay(&mut nodes);
-        record(vec![("nodes", sequence(nodes.into_iter()))])
+        let mut names = Vec::new();
+        self.lay(&mut nodes, &mut names);
+        (record(vec![("nodes", sequence(nodes.into_iter()))]), names)
     }
 
     /// Lays out this node's encoding and then its children's, its fields and variants in byte
-    /// order of keys, giving its position: a variant keyed by its name, with a record of its
-    /// fields as payload when it has fields.
-    fn lay(&self, nodes: &mut Vec<Vec<u8>>) -> u64 {
+    /// order of keys, giving its position and recording its name: a variant keyed by its name,
+    /// with a record of its fields as payload when it has fields.
+    fn lay(&self, nodes: &mut Vec<Vec<u8>>, names: &mut Vec<(u64, String)>) -> u64 {
         let at = nodes.len();
         nodes.push(Vec::new());
+        if let Node::Record {
+            name: Some(name), ..
+        }
+        | Node::Variant {
+            name: Some(name), ..
+        } = self
+        {
+            names.push((at as u64, name.clone()));
+        }
         let (name, fields): (&str, Vec<(&str, Vec<u8>)>) = match self {
             Node::Bool => ("Bool", Vec::new()),
             Node::Char => ("Char", Vec::new()),
@@ -169,17 +198,17 @@ impl Node {
                 "Sequence",
                 vec![
                     ("capacity", option(capacity.map(unsigned))),
-                    ("element", unsigned(element.lay(nodes))),
+                    ("element", unsigned(element.lay(nodes, names))),
                     ("length", option(length.map(unsigned))),
                     ("unique", vec![u8::from(*unique)]),
                 ],
             ),
             Node::Map { key, value } => {
-                let key = unsigned(key.lay(nodes));
-                let value = unsigned(value.lay(nodes));
+                let key = unsigned(key.lay(nodes, names));
+                let value = unsigned(value.lay(nodes, names));
                 ("Map", vec![("key", key), ("value", value)])
             }
-            Node::Record { open, fields } => {
+            Node::Record { open, fields, .. } => {
                 let mut sorted: Vec<&Field> = fields.iter().collect();
                 sorted.sort_by(|left, right| left.key.cmp(&right.key));
                 let fields: Vec<Vec<u8>> = sorted
@@ -192,7 +221,7 @@ impl Node {
                             ),
                             ("defaulted", vec![u8::from(field.defaulted)]),
                             ("key", text(&field.key)),
-                            ("value", unsigned(field.value.lay(nodes))),
+                            ("value", unsigned(field.value.lay(nodes, names))),
                         ])
                     })
                     .collect();
@@ -204,7 +233,7 @@ impl Node {
                     ],
                 )
             }
-            Node::Variant { open, variants } => {
+            Node::Variant { open, variants, .. } => {
                 let mut sorted: Vec<&Variant> = variants.iter().collect();
                 sorted.sort_by(|left, right| left.key.cmp(&right.key));
                 let variants: Vec<Vec<u8>> = sorted
@@ -213,7 +242,7 @@ impl Node {
                         let payload = variant
                             .payload
                             .as_ref()
-                            .map(|payload| unsigned(payload.lay(nodes)));
+                            .map(|payload| unsigned(payload.lay(nodes, names)));
                         record(vec![
                             (
                                 "aliases",
@@ -387,6 +416,7 @@ impl Checker<'_> {
                 return Node::Record {
                     open: false,
                     fields: Vec::new(),
+                    name: None,
                 };
             }
             _ => {}
@@ -395,6 +425,7 @@ impl Checker<'_> {
             return Node::Record {
                 open: false,
                 fields: Vec::new(),
+                name: None,
             };
         };
         let arg = |index: usize| {
@@ -451,9 +482,11 @@ impl Checker<'_> {
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
         let open = self.db.ast(*item).is_open();
         walk.enclosing.push((ty.clone(), 1));
+        let name = Some(path);
         let node = match &sig.kind {
             SigKind::Struct { fields } => Node::Record {
                 open,
+                name,
                 fields: fields
                     .iter()
                     .filter(|field| !field.is_kept())
@@ -471,6 +504,7 @@ impl Checker<'_> {
             },
             SigKind::Enum { variants } => Node::Variant {
                 open,
+                name,
                 variants: variants
                     .iter()
                     .map(|variant| Variant {
@@ -481,6 +515,7 @@ impl Checker<'_> {
                             Payload::Single(payload) => Some(self.nested(&subst.ty(payload), walk)),
                             Payload::Labelled(fields) => Some(Node::Record {
                                 open: false,
+                                name: None,
                                 fields: fields
                                     .iter()
                                     .map(|(label, payload)| Field {
@@ -498,6 +533,7 @@ impl Checker<'_> {
             _ => Node::Record {
                 open,
                 fields: Vec::new(),
+                name: None,
             },
         };
         walk.enclosing.pop();

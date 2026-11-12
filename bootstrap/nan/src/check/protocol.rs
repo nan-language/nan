@@ -706,7 +706,7 @@ impl Checker<'_> {
     }
 
     /// The `mem::wire` encoding of a `sys::TypeSchema` without fields: `Handle` holding the
-    /// handle hash of a handle type, `Encoded` holding the schema tree of another.
+    /// handle hash of a handle type, `Encoded` holding the named schema tree of another.
     fn part_schema(&self, ty: &Ty) -> Vec<u8> {
         match self.is_handle(ty) {
             true => {
@@ -714,7 +714,7 @@ impl Checker<'_> {
                 let bytes = sequence(hash.0.iter().map(|byte| unsigned(u64::from(*byte))));
                 variant("Handle", Some(bytes))
             }
-            false => variant("Encoded", Some(self.schema(ty).wire())),
+            false => variant("Encoded", Some(self.schema(ty).named_wire())),
         }
     }
 

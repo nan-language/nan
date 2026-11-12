@@ -1,4 +1,4 @@
-//! Hoisting out of loops: a constant, or an arithmetic, comparison, conversion or select instruction, of a natural loop whose operands are defined outside the loop moves to the end of the one block outside the loop that branches to its header, out of each enclosing loop its operands are defined outside of. An instruction of those kinds in a loop that its own block does not read, and whose operands are read past it, sinks first to the end of the run of jumps from its block whose blocks only it reaches and do not read it, so that an operand can end where it is computed; the function is copied with the instructions moved.
+//! Hoisting out of loops: a constant, or an arithmetic, comparison, conversion or select instruction, of a natural loop whose operands are defined outside the loop moves to the end of the one block outside the loop that branches to its header, out of each enclosing loop its operands are defined outside of. An instruction of those kinds in a loop that its own block does not read, and whose operands are read past it, sinks first to the end of the run of jumps from its block whose blocks only it reaches and do not read it, so that an operand can end where it is computed; the function is copied with the instructions moved. Where the target keeps a wide constant in a register, a function whose loops check unsigned 64-bit products by constants for overflow is first copied with each check comparing the product's operand with the largest one whose product the type holds, a constant that then moves out of the loops.
 
 /// The most rounds of finding the instructions to move, each finding those whose operands the
 /// earlier ones moved out.
@@ -38,8 +38,71 @@ struct Hoists {
 } Hoists
 
 /// The function with its loop-invariant instructions moved out of their loops, or none when it
+/// moves none or holds a use before its definition in layout order. With `bounds`, a function
+/// whose loops check unsigned 64-bit products by constants first has each such check compare the
+/// operand with a bound, which then moves out of the loops as any constant.
+fn hoisted(func: clif::Function, bounds: bool, alloc: mem::Alloc) -> Option[clif::Function] {
+    if not bounds {
+        return moved_out(func, alloc)
+    }
+    let Some(split) = bounded(func, alloc) else {
+        return moved_out(func, alloc)
+    }
+    return match moved_out(split, alloc) {
+        Some(moved) => Some(take moved)
+        None => Some(take split)
+    }
+} hoisted
+
+/// The function with each checked unsigned 64-bit product by a constant split into the product
+/// and a comparison of its operand with the largest one whose product the type holds; none when
+/// no loop block checks one or the copy holds a use before its definition in layout order.
+fn bounded(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let loops = loops_of(func, alloc)
+    var found = false
+    for block in func.layout_blocks(alloc) {
+        expect usize.widen(block.index) < loops.innermost.len()
+        if func.is_cold(block) or loops.innermost[usize.widen(block.index)] == NONE {
+            continue
+        }
+        for inst in func.block_insts(block, alloc) {
+            if bounded_factor(func, inst).is_some() {
+                found = true
+            }
+        }
+    }
+    if not found {
+        return None
+    }
+    var copier = Copier.bounding(func, alloc)
+    mut copier.copy_function(func, leaves: Leaves.empty(alloc))
+    return take copier.finish()
+} bounded
+
+/// The operand and constant of a checked unsigned 64-bit product by a constant from 2 below 2^31.
+fn bounded_factor(func: clif::Function, inst: clif::Inst) -> Option[Factor] {
+    let clif::InstructionData.Binary(opcode: clif::Opcode.UmulOverflow, x: x, y: y) = func.inst_data(inst) else {
+        return None
+    }
+    if func.value_type(x) != clif::Type.Int64 {
+        return None
+    }
+    let factor = match constant_of(func, value: y) {
+        Some(constant) => Factor(value: x, factor: constant)
+        None => match constant_of(func, value: x) {
+            Some(constant) => Factor(value: y, factor: constant)
+            None => return None
+        }
+    }
+    if factor.factor < 2 or factor.factor >= 0x8000_0000 {
+        return None
+    }
+    return Some(factor)
+} bounded_factor
+
+/// The function with its loop-invariant instructions moved out of their loops, or none when it
 /// moves none or holds a use before its definition in layout order.
-fn hoisted(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+fn moved_out(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
     let loops = loops_of(func, alloc)
     if loops.list.len() == 0 {
         return None
@@ -50,7 +113,7 @@ fn hoisted(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
     var copier = Copier.hoisting(func, take hoists, alloc)
     mut copier.copy_function(func, leaves: Leaves.empty(alloc))
     return take copier.finish()
-} hoisted
+} moved_out
 
 /// The successors and predecessors of each block, by block index.
 struct Graph {

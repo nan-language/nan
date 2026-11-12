@@ -384,8 +384,8 @@ fn is_narrowable(ty: clif::Type) -> bool = ty.is_int() and ty.bits() <= 64
 /// edges it threads, with the variable through which each value read outside the block an edge
 /// is threaded through merges, the block being copied, the trims of the block parameters it
 /// drops, the known bits of the values it folds, the branches it speculates, the instructions it
-/// moves out of loops, the loops it versions, and the computations later ones alike take the
-/// values of.
+/// moves out of loops, the loops it versions, the computations later ones alike take the values
+/// of, and whether it splits checked products by constants.
 struct Copier {
     b: clif::Builder
     parts: mem::HashMap[Field, Part]
@@ -402,6 +402,7 @@ struct Copier {
     hoists: Hoists
     versions: Versions
     exprs: mem::HashMap[Expr, clif::Value]
+    bounds: bool
     alloc: mem::Alloc
 } Copier
 
@@ -473,7 +474,7 @@ fn Copier.new(func: clif::Function, slots: Slots, alloc: mem::Alloc) -> Copier {
         }
     }
     let plan = Plan(threads: mem::HashMap[Edge, u32].empty(seed: 0, alloc), kept: mem::List[bool].empty(alloc), crossing: mem::List[bool].empty(alloc), incoming: mem::List[u32].empty(alloc), shape: Shape.empty(alloc))
-    return Copier(b: take b, parts: take parts, slot_map: take slot_map, remaining: mem::List[u32].empty(alloc), lost: false, plan: take plan, merged: mem::HashMap[u32, clif::Variable].empty(seed: 0, alloc), current: clif::Block(index: NONE), loads: mem::List[Loaded].empty(alloc), trims: mem::List[u32].empty(alloc), known: mem::List[Bits].empty(alloc), speculations: Speculations.empty(alloc), hoists: Hoists.empty(alloc), versions: Versions.empty(alloc), exprs: mem::HashMap[Expr, clif::Value].empty(seed: 0, alloc), alloc: alloc)
+    return Copier(b: take b, parts: take parts, slot_map: take slot_map, remaining: mem::List[u32].empty(alloc), lost: false, plan: take plan, merged: mem::HashMap[u32, clif::Variable].empty(seed: 0, alloc), current: clif::Block(index: NONE), loads: mem::List[Loaded].empty(alloc), trims: mem::List[u32].empty(alloc), known: mem::List[Bits].empty(alloc), speculations: Speculations.empty(alloc), hoists: Hoists.empty(alloc), versions: Versions.empty(alloc), exprs: mem::HashMap[Expr, clif::Value].empty(seed: 0, alloc), bounds: false, alloc: alloc)
 } Copier.new
 
 /// Forgets the loads and computations later ones may take the values of, as the block the copy
@@ -537,6 +538,15 @@ fn Copier.hoisting(func: clif::Function, take hoists: Hoists, alloc: mem::Alloc)
     return copier
 } Copier.hoisting
 
+/// A copier splitting each checked unsigned 64-bit product by a constant from 2 below 2^31 into
+/// the product and a comparison of its operand with the largest one whose product the type
+/// holds, its stack slots kept.
+fn Copier.bounding(func: clif::Function, alloc: mem::Alloc) -> Copier {
+    var copier = Copier.trimming(func, trims: mem::List[u32].empty(alloc), known: mem::List[Bits].empty(alloc), alloc)
+    copier.bounds = true
+    return copier
+} Copier.bounding
+
 /// A copier adding the copies of the loops it versions, its stack slots kept.
 fn Copier.versioning(func: clif::Function, take versions: Versions, alloc: mem::Alloc) -> Copier {
     var copier = Copier.trimming(func, trims: mem::List[u32].empty(alloc), known: mem::List[Bits].empty(alloc), alloc)
@@ -557,7 +567,7 @@ fn copied_signature(signature: clif::Signature, alloc: mem::Alloc) -> clif::Sign
 
 /// The copy, once every block is sealed, when no use came before its definition.
 fn Copier.finish(take self) -> Option[clif::Function] {
-    let Copier(b: b, parts: _, slot_map: _, remaining: _, lost: lost, plan: _, merged: _, current: _, loads: _, trims: _, known: _, speculations: _, hoists: _, versions: _, exprs: _, alloc: _) = self
+    let Copier(b: b, parts: _, slot_map: _, remaining: _, lost: lost, plan: _, merged: _, current: _, loads: _, trims: _, known: _, speculations: _, hoists: _, versions: _, exprs: _, bounds: _, alloc: _) = self
     if lost {
         return None
     }
@@ -1030,6 +1040,17 @@ fn Copier.copy_inst(mut self, func: clif::Function, mut scope: Scope, inst: clif
                 return
             }
         }
+        clif::InstructionData.Binary(opcode: clif::Opcode.UmulOverflow, x: _, y: _) => {
+            if self.bounds {
+                match bounded_factor(func, inst) {
+                    Some(factor) => {
+                        mut self.copy_bounded(func, mut scope, inst, factor)
+                        return
+                    }
+                    None => {}
+                }
+            }
+        }
         clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: flags, arg: arg, offset: offset) => {
             let result = result_of(func, inst, alloc: self.alloc)
             if (flags.notrap and is_unread_value(scope.reads.view(), value: result)) or self.versions.pins(version: scope.fast, value: result) {
@@ -1239,6 +1260,23 @@ fn Copier.copy_inst(mut self, func: clif::Function, mut scope: Scope, inst: clif
         }
     }
 } Copier.copy_inst
+
+/// A checked product by a constant copied as the product and a comparison of its operand with
+/// the largest one whose product the type holds, which holds when it overflows.
+fn Copier.copy_bounded(mut self, func: clif::Function, mut scope: Scope, inst: clif::Inst, factor: Factor) {
+    let operand = mut self.value(scope, func, value: factor.value)
+    if self.lost {
+        return
+    }
+    let ty = func.value_type(factor.value)
+    let product = mut self.b.imul_imm_s(operand, y: i64.from_bits(factor.factor))
+    let bound = mut self.b.iconst(ty, imm: i64.from_bits(width_mask(ty.bits()) / factor.factor))
+    let overflowed = mut self.b.icmp(clif::IntCC.UnsignedGreaterThan, x: operand, y: bound)
+    let results = func.inst_results(inst, alloc: self.alloc)
+    expect results.len() == 2
+    mut self.bind_merged(mut scope, value: results[0], copy: product)
+    mut self.bind_merged(mut scope, value: results[1], copy: overflowed)
+} Copier.copy_bounded
 
 /// A branch whose known bits decide it, copied as a jump to the target it takes.
 fn Copier.jump_decided(mut self, func: clif::Function, scope: Scope, taken: clif::BlockCall, other_call: clif::BlockCall) {

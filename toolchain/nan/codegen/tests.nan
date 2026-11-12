@@ -467,6 +467,44 @@ test branches_on_the_comparison_deciding_a_tested_flag for compile {
     expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x39\xf7\x73\x05\x48\x89\xf0\x5d\xc3\x48\x89\xf8\x5d\xc3"
 } branches_on_the_comparison_deciding_a_tested_flag
 
+/// The first parameter when it lies below the second, else the second, branching on the
+/// comparison's flag inverted by a `bxor` with 1.
+fn inverted_flag(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let below = mut b.icmp(clif::IntCC.UnsignedLessThan, x: params[0], y: params[1])
+    let not_below = mut b.bxor_imm_s(below, y: 1)
+    let take_second = mut b.create_block()
+    let take_first = mut b.create_block()
+    mut b.brif(not_below, then: take_second, then_args: no_values(alloc).view(), otherwise: take_first, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(take_second)
+    mut b.ret(one(params[1], alloc).view())
+    mut b.switch_to_block(take_first)
+    mut b.ret(one(params[0], alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} inverted_flag
+
+test branches_on_the_comparison_a_bxor_inverts for select {
+    let alloc = testing::world().alloc
+    var selected = select(inverted_flag(alloc), isa: host_isa(), alloc)
+    mut selected.remove_dead(alloc)
+    var comparisons: usize = 0
+    for held in selected.insts {
+        match held.inst {
+            x64::Inst.Cmp(size: _, lhs: _, rhs: _) => {
+                comparisons += 1
+            }
+            x64::Inst.Setcc(cond: _, dst: _) => {
+                expect false
+            }
+            else => {}
+        }
+    }
+    expect comparisons == 1
+} branches_on_the_comparison_a_bxor_inverts
+
 /// `10k` for a parameter `k` below 8, else 99, through a chain of tests of the parameter.
 fn chain_of_tests(alloc: mem::Alloc) -> clif::Function {
     var b = builder_of(1, alloc)
@@ -522,7 +560,7 @@ fn calls_through_a_pointer(alloc: mem::Alloc) -> clif::Function {
 test keeps_values_across_calls_in_callee_saved_registers for compile {
     let alloc = testing::world().alloc
     let code = compile(calls_through_a_pointer(alloc), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
-    expect code.bytes.view() == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x48\x83\xec\x08\x48\x89\xfb\x49\x89\xf4\x4c\x89\xe7\xff\xd3\x49\x89\xc5\x4b\x8d\x7c\x25\x00\xff\xd3\x49\x6b\xcc\x03\x49\x6b\xd5\x05\x48\x8d\x0c\x11\x48\x8d\x04\x01\x48\x83\xc4\x08\x41\x5d\x41\x5c\x5b\x5d\xc3"
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x48\x83\xec\x08\x48\x89\xfb\x49\x89\xf4\x4c\x89\xe7\xff\xd3\x49\x89\xc5\x4b\x8d\x7c\x25\x00\xff\xd3\x4b\x8d\x0c\x64\x4b\x8d\x54\xad\x00\x48\x8d\x0c\x11\x48\x8d\x04\x01\x48\x83\xc4\x08\x41\x5d\x41\x5c\x5b\x5d\xc3"
     expect code.frame == 48
 } keeps_values_across_calls_in_callee_saved_registers
 
@@ -1176,7 +1214,7 @@ fn invariant_product(alloc: mem::Alloc) -> clif::Function {
 
 test hoists_loop_invariant_arithmetic_before_the_loop for hoisted {
     let alloc = testing::world().alloc
-    let Some(moved) = hoisted(invariant_product(alloc), alloc) else {
+    let Some(moved) = hoisted(invariant_product(alloc), bounds: false, alloc) else {
         expect false
         return
     }
@@ -1665,7 +1703,7 @@ fn byte_sum(alloc: mem::Alloc) -> clif::Function {
 
 test sinks_the_next_pointer_below_the_read_of_the_current for hoisted {
     let alloc = testing::world().alloc
-    let Some(moved) = hoisted(byte_sum(alloc), alloc) else {
+    let Some(moved) = hoisted(byte_sum(alloc), bounds: false, alloc) else {
         expect false
         return
     }
@@ -1689,6 +1727,71 @@ test sinks_the_next_pointer_below_the_read_of_the_current for hoisted {
     expect sums == 2
 } sinks_the_next_pointer_below_the_read_of_the_current
 
+/// The counts below the parameter written one after another as the digits of a decimal number,
+/// trapping when its product by 10 overflows.
+fn decimal_digits(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let head = mut b.create_block()
+    let i = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let number = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let body = mut b.create_block()
+    let step = mut b.create_block()
+    let exit = mut b.create_block()
+    let overflowing = mut b.create_block()
+    mut b.set_cold_block(overflowing)
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    var start = one(zero, alloc)
+    mut start.push(zero)
+    mut b.jump(head, args: start.view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp(clif::IntCC.UnsignedLessThan, x: i, y: params[0])
+    mut b.brif(more, then: body, then_args: no_values(alloc).view(), otherwise: exit, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(body)
+    let ten = mut b.iconst(clif::Type.Int64, imm: 10)
+    let clif::Overflowed(value: product, flag: overflowed) = mut b.umul_overflow(number, y: ten)
+    mut b.brif(overflowed, then: overflowing, then_args: no_values(alloc).view(), otherwise: step, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(step)
+    let grown = mut b.iadd(product, y: i)
+    let next = mut b.iadd_imm_s(i, y: 1)
+    var back = one(next, alloc)
+    mut back.push(grown)
+    mut b.jump(head, args: back.view())
+    mut b.switch_to_block(exit)
+    mut b.ret(one(number, alloc).view())
+    mut b.switch_to_block(overflowing)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} decimal_digits
+
+test moves_the_bound_of_a_checked_product_out_of_its_loop for hoisted {
+    let alloc = testing::world().alloc
+    let Some(moved) = hoisted(decimal_digits(alloc), bounds: true, alloc) else {
+        expect false
+        return
+    }
+    let Some(entry) = moved.entry_block() else {
+        expect false
+        return
+    }
+    var bounds: usize = 0
+    for inst in moved.block_insts(entry, alloc) {
+        match moved.inst_data(inst) {
+            clif::InstructionData.UnaryImm(opcode: _, imm: imm) => {
+                if imm.to_bits() == 0x1999_9999_9999_9999 {
+                    bounds += 1
+                }
+            }
+            else => {}
+        }
+    }
+    let checked = opcode_count(moved, opcode: clif::Opcode.UmulOverflow, alloc)
+    expect bounds == 1
+    expect checked == 0
+} moves_the_bound_of_a_checked_product_out_of_its_loop
+
 test multiplies_by_a_constant_checking_the_operand_against_a_bound for select {
     let alloc = testing::world().alloc
     var b = builder_of(1, alloc)
@@ -1707,20 +1810,20 @@ test multiplies_by_a_constant_checking_the_operand_against_a_bound for select {
     mut b.seal_all_blocks()
     let vcode = select(take b.finalize(), isa: host_isa(), alloc)
     var widening = false
-    var bounded = false
+    var against_bound = false
     for held in vcode.insts {
         match held.inst {
             x64::Inst.MulWide(signed: _, size: _, src: _) => {
                 widening = true
             }
             x64::Inst.Cmp(size: _, lhs: _, rhs: _) => {
-                bounded = true
+                against_bound = true
             }
             else => {}
         }
     }
     expect not widening
-    expect bounded
+    expect against_bound
 } multiplies_by_a_constant_checking_the_operand_against_a_bound
 
 /// The sum of two products of the first parameter, stored in a slot and loaded back, by the

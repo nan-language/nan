@@ -14,7 +14,7 @@ use crate::check::sig::{
 use crate::check::tir::{
     Lit, LocalId, LocalKind, TArm, TCapture, TClosure, TExpr, TKind, TStmtKind,
 };
-use crate::check::ty::{Arg, FnParam, FnTy, Scalar, Ty};
+use crate::check::ty::{Arg, FnParam, FnTy, Scalar, Subst, Ty};
 use crate::check::{Checker, Member};
 use crate::diagnostic::{Code, Fix};
 use crate::syntax::ast::{
@@ -650,7 +650,7 @@ impl Body<'_, '_> {
                 self.ck.contribution_entry(item, contribution)
             }
             (ItemKind::Fn(_), SigKind::Fn(function)) => {
-                return self.function_value(token, item, function, expected);
+                return self.function_value(token, item, function, Subst::default(), expected);
             }
             _ => {
                 self.report(token, Code::NameUnknown);
@@ -665,13 +665,14 @@ impl Body<'_, '_> {
         }
     }
 
-    /// A function item used as a value: its function type, a generic one taking its arguments
-    /// from the expected function type.
+    /// A function item used as a value: its function type, a generic one taking the arguments
+    /// `written` does not fix from the expected function type.
     fn function_value(
         &mut self,
         token: Tok,
         item: ItemId,
         function: &crate::check::sig::FnSig,
+        written: Subst,
         expected: Option<&Ty>,
     ) -> TExpr {
         if function.is_proj() {
@@ -688,11 +689,12 @@ impl Body<'_, '_> {
             self.report(token, Code::HwLandingCalled);
         }
         let ty = function.fn_ty();
-        let mut subst = crate::check::ty::Subst::default();
+        let mut subst = written;
         if !function.generics.is_empty() {
             let params: Vec<_> = function.generics.iter().map(|def| def.param).collect();
             if let Some(Ty::Fn(wanted)) = expected {
                 let mut infer = super::call::Infer::new(params.clone());
+                infer.subst = std::mem::take(&mut subst);
                 infer.unify(&Ty::Fn(Rc::new(ty.clone())), &Ty::Fn(wanted.clone()));
                 subst = infer.subst;
             }
@@ -852,10 +854,7 @@ impl Body<'_, '_> {
                         {
                             self.report(name.token, Code::TypeHiddenField);
                         }
-                        let subst = crate::check::ty::Subst::of(
-                            sig.generics.iter().map(|def| def.param),
-                            args,
-                        );
+                        let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
                         subst.ty(&field.ty)
                     }
                     None => {
@@ -1067,21 +1066,31 @@ impl Body<'_, '_> {
         }
         let candidates = self.ck.method_candidates(ty, &name.text);
         let function = candidates.iter().find_map(|candidate| match candidate {
-            crate::check::conform::Candidate::Function { item, .. } => Some(*item),
+            crate::check::conform::Candidate::Function { item, subst } => {
+                Some((*item, subst.clone()))
+            }
             crate::check::conform::Candidate::Method {
-                function: Some((item, _)),
+                function: Some((item, subst)),
                 ..
-            } => Some(*item),
+            } => {
+                let type_subst = type_key(ty)
+                    .map(|key| self.ck.type_subst(key, ty))
+                    .unwrap_or_default();
+                Some((
+                    *item,
+                    Subst(type_subst.0.into_iter().chain(subst.0.clone()).collect()),
+                ))
+            }
             _ => None,
         });
         match function {
-            Some(function) => match self.ck.fn_sig(function) {
+            Some((function, subst)) => match self.ck.fn_sig(function) {
                 Some(sig) => {
                     if !self.ck.db.visible(self.module, function) {
                         self.report(name.token, Code::NamePrivate);
                     }
                     self.name_member(name.token, Member::Function(function));
-                    self.function_value(token, function, &sig, expected)
+                    self.function_value(token, function, &sig, subst.fixed(), expected)
                 }
                 None => TExpr::failed(token),
             },

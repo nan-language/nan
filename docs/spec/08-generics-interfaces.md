@@ -322,7 +322,7 @@ A call infers the generic arguments of the function it calls from its arguments,
 - When the argument's type is fixed without an expected type, it is matched against that type, part by part, and each unfixed parameter is fixed to the part at its position. A part that differs is an error (`type.mismatch`).
 - Otherwise, such as for an unsuffixed literal, the argument takes that type as its expected type when it holds no unfixed parameter, and has no expected type otherwise.
 
-The omitted arguments of a type in a construction, variant path or member path `T.f(...)` are fixed first by matching the value's type, or the function's result type, against the expected type, then by the arguments, as for a function's own parameters. A generic function used as a value takes its arguments from the expected function type. Failure parameters are fixed as [failure polymorphism](10-effects-digests.md#failure-polymorphism) and [failure bounds](11-errors-domains.md#failure-bounds) state, and an argument for a function-typed parameter is judged by [fit](10-effects-digests.md#fit), not by matching. A parameter left unfixed is an error (`generic.uninferred`).
+The omitted arguments of a type in a construction, variant path or member path `T.f(...)` are fixed first by matching the value's type, or the function's result type, against the expected type, then by the arguments, as for a function's own parameters. A generic function used as a value takes the arguments its path does not write from the expected function type. Failure parameters are fixed as [failure polymorphism](10-effects-digests.md#failure-polymorphism) and [failure bounds](11-errors-domains.md#failure-bounds) state, and an argument for a function-typed parameter is judged by [fit](10-effects-digests.md#fit), not by matching. A parameter left unfixed is an error (`generic.uninferred`).
 
 ```nan
 pub fn first_or[T: Copy](values: Slice[T], fallback: T) -> T {
@@ -348,6 +348,21 @@ pub fn fallback_or[T: Copy](fallback: T, values: Slice[T]) -> T {
 pub fn first_level(levels: Slice[u8]) -> u8 {
     return fallback_or(0, values: levels) // error: type.literal-untyped
 } first_level
+```
+
+```nan
+pub open struct Schemas[T: Encode] {
+} Schemas
+
+pub fn Schemas.size(alloc: mem::Alloc) -> usize {
+    return mem::wire::Codec[T].schema(alloc).nodes.len()
+} Schemas.size
+
+pub fn sizes(alloc: mem::Alloc) -> usize {
+    var each = Array[fn(alloc: mem::Alloc) -> usize, 2].filled(Schemas[u8].size)
+    each[1] = Schemas[u64].size
+    return each[0](alloc) + each[1](alloc)
+} sizes
 ```
 
 ### Monomorphisation

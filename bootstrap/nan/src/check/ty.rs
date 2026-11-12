@@ -335,6 +335,16 @@ impl Subst {
         Subst(params.into_iter().zip(args.iter().cloned()).collect())
     }
 
+    /// The entries whose argument is other than their parameter itself.
+    pub fn fixed(self) -> Subst {
+        Subst(
+            self.0
+                .into_iter()
+                .filter(|(param, arg)| *arg != Arg::Ty(Ty::Param(*param)))
+                .collect(),
+        )
+    }
+
     pub fn insert(&mut self, param: Param, arg: Arg) {
         self.0.insert(param, arg);
     }

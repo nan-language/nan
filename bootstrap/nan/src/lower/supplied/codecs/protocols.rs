@@ -1,6 +1,7 @@
 //! The wire encoding of protocols: the encodings of calls of operations as members of
-//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`, `sys::Reply.decode`, and
-//! the handles `sys::Handle.of` makes and capability ids read.
+//! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`,
+//! `sys::Wire.encode_message`, `sys::Reply.decode`, and the handles `sys::Handle.of` makes and
+//! capability ids read.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
@@ -35,6 +36,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             constant(lo, fx, supply, &schema);
         }
         "sys::Wire.serve" => serve(lo, fx, supply),
+        "sys::Wire.encode_message" => encode_message(lo, fx, supply),
         "sys::Reply.decode" => decode_reply(lo, fx, supply),
         "sys::Handle.of" => handle_of(lo, fx, supply),
         "sys::CapabilityId.of_handle" => capability_of(lo, fx, supply),
@@ -189,6 +191,43 @@ pub fn encode_call(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, protocol: ItemId, 
     });
     lo.release(fx, &message, value);
     supply.done(lo, fx);
+}
+
+/// `Wire[P].encode_message(message, mut out)`: the call the message makes, encoded as its
+/// variant, appended to `out`, and `Some` of its operation's position among the operations of
+/// P's protocol schema; `None` for an operation that is not `pub`.
+fn encode_message(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let message = Ty::item(protocol_of(supply), Vec::new());
+    let value = address_of(lo, fx, &message, supply.param(0));
+    let Kind::Variant(cases) = kind_of(lo, &message) else {
+        unreachable!("a protocol encodes as a variant")
+    };
+    let mut keys: Vec<&str> = cases.iter().map(|case| case.key.as_str()).collect();
+    keys.sort_unstable();
+    let positions: Vec<usize> = (cases.iter())
+        .map(|case| {
+            keys.binary_search(&case.key.as_str())
+                .expect("a pub operation")
+        })
+        .collect();
+    let option = supply.abi.result.clone();
+    let index = lo.variant_index(fx, &message, value);
+    let parts = encoded_parts(lo, fx, supply.param(1).address());
+    for (case, position) in cases.iter().zip(positions) {
+        let this =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, index, case.index as i64);
+        fx.when(this, |fx| {
+            append(lo, fx, supply, parts, |lo, fx, state| {
+                encode_case(lo, fx, Format::Wire, &message, case, value, state)
+            });
+            let position = fx.int(types::I32, position as i64);
+            let some = lo.variant_value(fx, &option, "Some", &[Held::Scalar(position)], None);
+            supply.ret(lo, fx, some);
+        });
+    }
+    let none = lo.none_value(fx, &option);
+    supply.ret(lo, fx, none);
 }
 
 /// Fails with `CallError.Malformed` holding the `core::DecodeError` a decoding's code names.

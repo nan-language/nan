@@ -215,6 +215,22 @@ impl Checker<'_> {
         }
     }
 
+    /// The types of the parameters of a protocol's `pub` operations.
+    pub fn parameter_types(&self, protocol: ItemId) -> Vec<Ty> {
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            return Vec::new();
+        };
+        (self.hashed_operations(protocol).into_iter())
+            .flat_map(|index| {
+                operations[index]
+                    .sig
+                    .params
+                    .iter()
+                    .map(|param| param.ty.clone())
+            })
+            .collect()
+    }
+
     /// The results and failures of a protocol's `pub` requests.
     pub fn reply_types(&self, protocol: ItemId) -> Vec<Ty> {
         let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {

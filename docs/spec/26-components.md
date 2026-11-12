@@ -1424,6 +1424,8 @@ pub fn Wire.hash() -> ProtocolHash limits pure, notrap, terminates
 
 pub fn Wire.serve(out: Outbox[P], request: u64, hash: ProtocolHash, peers: Slice[ProtocolSchema], raw: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Option[Encoded] fails CallError[Never] uses wait
 
+pub fn Wire.encode_message(message: P, mut out: Encoded) -> Option[u32]
+
 pub open struct Reply[R: Send, E: Send] {
 } Reply
 
@@ -1445,9 +1447,10 @@ The **encoding** of a call of `op` is a `mem::wire` variant keyed `op`, without 
 
 - `Wire[P].op(mut out, ...)` appends the encoding of its call to `out.bytes` and the handles of its values of handle types to `out.handles`, each index counting the handles `out` held before, trapping when memory is exhausted (`trap.exhausted`). The operation's `requires` is no obligation there, and its class enters no digest.
 - `Wire[P].serve(out, request, hash, peers, raw, handles, alloc)` serves a call made under the protocol hash `hash`, which the holder serving it numbers `request`, `peers` holding the protocol schemas of the clients the server knows. It decodes the encoding of a call of a `pub` operation of P from `raw` against `handles`, an encoding keyed by another name failing with `UnknownVariant`. When `hash` is not P's protocol hash, it then fails with `UnknownSchema` unless P's protocol schema [serves the call](#protocol-schemas) under `hash` knowing `peers`, the schema drawn and the call judged through `alloc`. It then evaluates the operation's `requires` clauses over the arguments, a false one failing with `Invalid`, each such failure being `CallError.Malformed` holding it. It then calls the operation through `out` with the arguments, a request carrying its number, and gives `Some` of a `sys::Encoded` drawn through `alloc`, trapping when memory is exhausted: without bytes or handles for a one-way operation, and holding the reply for a request, `Err` when its handler failed. It gives `None` when the handler [postponed](#runner-capabilities) the request. The call failing as closed or cancelled, `serve` fails with `CallError.Closed` or `CallError.Cancelled` holding that failure.
+- `Wire[P].encode_message(message, mut out)` appends to `out` the encoding of the call `message` makes, as `Wire[P].op` appends that of a call of its operation with its arguments, and gives `Some` of the position of that operation among the operations of P's protocol schema. It gives `None`, appending nothing, for a message of an operation that is not `pub`.
 - `reply.decode(raw, handles, alloc)` decodes the reply of its request from `raw` against `handles` and gives its result, fails with `CallError.Failed` holding its failure, or, when it does not decode, with `CallError.Malformed` holding the decoding's failure. A call through an outbox never fails with `CallError.Malformed`.
 - The digest of `serve` states waiting and the class of each `pub` operation of P ([operation calls](#operation-calls)).
-- The [codec uses](15-untrusted.md#validate-grants) of `serve` mark P `decode` and `encode`, a use of the encoder of a protocol being a use of the encoders of the results and failures of its `pub` requests, and those of `decode` mark R and E `decode`. A call of `Wire[P].op` uses the encoder of each type of its operation's parameters.
+- The [codec uses](15-untrusted.md#validate-grants) of `serve` mark P `decode` and `encode`, a use of the encoder of a protocol being a use of the encoders of the results and failures of its `pub` requests, and those of `decode` mark R and E `decode`. A call of `Wire[P].op` uses the encoder of each type of its operation's parameters, and one of `Wire[P].encode_message` that of each type of the parameters of P's `pub` operations.
 
 A probe and a tally in separate closures each declare the `Counter` protocol over the types of `refusals`, with one protocol hash, so one encodes calls the other serves. The probe's `Adder`, declaring refusals of its own, has another protocol hash, yet the tally serves its `add`, whose schemas are compatible. The tally refuses the one-way `add` of the probe's `Gauge`, and calls breaking `requires`:
 

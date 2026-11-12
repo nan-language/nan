@@ -1,4 +1,4 @@
-//! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema` and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle hash.
+//! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.encode_message` and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle hash.
 
 /// A member of `sys::Wire` or `sys::Reply`; none for another.
 fn Interpreter.protocol_member(
@@ -14,12 +14,15 @@ fn Interpreter.protocol_member(
     if owner == "sys::Reply" and member == "decode" {
         return Some(try mut self.decode_reply(type_args, args, at, site))
     }
-    if owner != "sys::Wire" or (member != "hash" and member != "schema") {
+    if owner != "sys::Wire" or (member != "hash" and member != "schema" and member != "encode_message") {
         return None
     }
     let ty::TyKind.Item(item: protocol, args: _) = self.ck.types().kind(type_arg_or_unit(type_args, index: 0)) else {
         expect false
         return None
+    }
+    if member == "encode_message" {
+        return Some(try mut self.encode_message(protocol, args, at))
     }
     if member == "hash" {
         let hashes = self.ck.protocol_hashes(protocol)
@@ -46,21 +49,70 @@ fn Interpreter.field_position(self, item: ty::ItemId, name: Str) -> u32 {
     return u32.fit(position)
 } Interpreter.field_position
 
-/// `Wire[P].op(mut out, ...)`: the encoding of the call appended to `out.bytes`, each value of a
-/// handle type taken as the index of its handle, which goes to `out.handles`, trapping when memory
-/// is exhausted; a request's `sys::Reply`.
+/// `Wire[P].op(mut out, ...)`: the encoding of the call appended to `out`, trapping when memory is
+/// exhausted; a request's `sys::Reply`.
 fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take args: mem::List[Val], at: ItemSpan) -> InterpFlow fails End {
     let alloc = self.alloc
+    let Some(parts) = args.view().split_at(1) else {
+        expect false
+        fail End.Missing
+    }
+    if not mut self.appended_call(protocol, method, out_value: args[0], args: parts.tail) {
+        return try self.exhausted(fallible: false, at)
+    }
+    for position in 1..<args.len() {
+        mut self.release_value(args[position])
+    }
+    if self.ck.is_request(protocol, index: method) {
+        return InterpFlow.Return(Val.Struct(item: self.ty_item("sys", name: "Reply"), fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+    }
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.encode_call
+
+/// `Wire[P].encode_message(message, mut out)`: the encoding of the call the message makes appended
+/// to `out`, trapping when memory is exhausted, and `Some` of its operation's position among the
+/// protocol schema's operations; `None` for an operation that is not `pub`.
+fn Interpreter.encode_message(mut self, protocol: ty::ItemId, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
     let ck = self.ck.share()
+    let option = self.ty_item("core", name: "Option")
+    let message = self.deref(args[0])
+    let Val.Variant(item: _, index: method, fields: fields) = message else {
+        expect false
+        fail End.Missing
+    }
     let held = ck.sig(protocol)
     let SigKind.Protocol(operations: operations, variants: _, summary: _) = held.contents().kind else {
         expect false
         fail End.Missing
     }
+    var named = ck.hashed_operations(protocol)
+    mut named.sort_by(fn(left: usize, right: usize) => operations[left].name.as_str().cmp(operations[right].name.as_str()))
+    let Some(position) = named.position(fn(index: usize) => index == usize.widen(method)) else {
+        return InterpFlow.Return(Val.Variant(item: option, index: 1, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+    }
+    if not mut self.appended_call(protocol, method: usize.widen(method), out_value: args[1], args: fields.contents().view()) {
+        return try self.exhausted(fallible: false, at)
+    }
+    let some = Val.single(Val.Int(wide::Wide.of_u64(u64.widen(position))), alloc)
+    return InterpFlow.Return(Val.Variant(item: option, index: 0, fields: mem::Shared.of(take some, alloc)))
+} Interpreter.encode_message
+
+/// Appends the encoding of a call of an operation with its arguments to `out.bytes`, each value of
+/// a handle type taken as the index of its handle, which goes to `out.handles`; false on
+/// exhaustion.
+fn Interpreter.appended_call(mut self, protocol: ty::ItemId, method: usize, out_value: Val, args: Slice[Val]) -> bool {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let held = ck.sig(protocol)
+    let SigKind.Protocol(operations: operations, variants: _, summary: _) = held.contents().kind else {
+        expect false
+        return false
+    }
     let operation = operations[method]
     let encoded_item = self.ty_item("sys", name: "Encoded")
     let handle_item = self.ty_item("sys", name: "Handle")
-    let out = args[0].place()
+    let out = out_value.place()
     let bytes_at = out.with(self.field_position(encoded_item, name: "bytes"), alloc)
     let handles_at = out.with(self.field_position(encoded_item, name: "handles"), alloc)
     let first_index = self.entries(self.memory.get(handles_at)).len()
@@ -73,7 +125,7 @@ fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take a
     var fields = mem::List[TreeField].empty(alloc)
     for position in named {
         let param = operation.sig.params[position]
-        let tree = self.argument_tree(args[position + 1], ty: param.ty, first_index, mut carried)
+        let tree = self.argument_tree(args[position], ty: param.ty, first_index, mut carried)
         mut fields.push(TreeField(key: name_bytes(param.name.as_str(), alloc), value: take tree))
     }
     var payload: Option[mem::Box[Tree]] = None
@@ -84,17 +136,8 @@ fn Interpreter.encode_call(mut self, protocol: ty::ItemId, method: usize, take a
     Tree.Variant(key: name_bytes(operation.name.as_str(), alloc), payload: take payload).write_wire(mut written, alloc)
     let bytes = byte_values(written.view(), alloc)
     let handle_ty = ck.types().item(handle_item, args: mem::List[ty::Arg].empty(alloc))
-    if not mut self.append(place: bytes_at, values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) or not mut self.append(place: handles_at, values: carried.view(), element: handle_ty) {
-        return try self.exhausted(fallible: false, at)
-    }
-    for position in 1..<args.len() {
-        mut self.release_value(args[position])
-    }
-    if ck.is_request(protocol, index: method) {
-        return InterpFlow.Return(Val.Struct(item: self.ty_item("sys", name: "Reply"), fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
-    }
-    return InterpFlow.Return(Val.Unit)
-} Interpreter.encode_call
+    return mut self.append(place: bytes_at, values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) and mut self.append(place: handles_at, values: carried.view(), element: handle_ty)
+} Interpreter.appended_call
 
 /// The tree of an argument of a call: a value of a handle type as the index among the handles
 /// beside the encoding, the first at `first_index`, of the handle it adds to `carried`; a handle

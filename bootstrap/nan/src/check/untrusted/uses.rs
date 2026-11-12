@@ -285,7 +285,9 @@ impl Walk<'_, '_> {
     }
 
     /// The uses of naming an instantiation of a function: those of the conformances of its type
-    /// arguments to their bounds, and of the decoders and encoders its codec uses substitute.
+    /// arguments to their bounds, of the decoders and encoders its codec uses substitute, and for
+    /// `sys::Wire.encode_message` of the encoders of the parameters of the protocol's `pub`
+    /// operations.
     fn named(&mut self, token: Tok, function: ItemId, args: &[Arg]) {
         let Some(head) = self.ck.fn_sig(function) else {
             return;
@@ -297,6 +299,21 @@ impl Walk<'_, '_> {
         let subst = Subst::of(head.generics.iter().map(|def| def.param), args);
         for (param, codec) in self.ck.codec_uses(function) {
             self.codec(token, &subst.ty(&Ty::Param(param)), codec);
+        }
+        if self.ck.db.is_std(function)
+            && self.ck.db.canonical(function) == "sys::Wire.encode_message"
+        {
+            match subst.ty(&Ty::Param(head.generics[0].param)) {
+                Ty::Item(protocol, _) => {
+                    for ty in self.ck.parameter_types(protocol) {
+                        self.codec(token, &ty, Codec::Encode);
+                    }
+                }
+                Ty::Error => {}
+                _ => {
+                    self.uses.declassifying.insert(token);
+                }
+            }
         }
     }
 

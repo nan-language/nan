@@ -1,6 +1,7 @@
 //! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as
-//! members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema` and `sys::Reply.decode`. A
-//! `sys::Handle` holds the value of a handle type, then that type's handle hash.
+//! members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.encode_message` and
+//! `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle
+//! hash.
 
 use std::rc::Rc;
 
@@ -41,6 +42,7 @@ pub fn member(
             let encoding = interp.ck.protocol_schema(protocol());
             constant(interp, encoding, &schema, &args[0], at, site)
         }
+        ("sys::Wire", "encode_message") => encode_message(interp, protocol(), args, at),
         ("sys::Reply", "decode") => decode_reply(interp, type_args, args, at, site),
         _ => return None,
     })
@@ -67,9 +69,8 @@ fn field(interp: &Interpreter, item: ItemId, name: &str) -> u32 {
     }
 }
 
-/// `Wire[P].op(mut out, ...)`: the encoding of the call appended to `out.bytes`, each value of a
-/// handle type taken as the index of its handle, which goes to `out.handles`, trapping when
-/// memory is exhausted; a request's `sys::Reply`.
+/// `Wire[P].op(mut out, ...)`: the encoding of the call appended to `out`, trapping when memory
+/// is exhausted; a request's `sys::Reply`.
 pub fn encode_call(
     interp: &mut Interpreter,
     protocol: ItemId,
@@ -77,18 +78,79 @@ pub fn encode_call(
     args: &[Val],
     at: (ItemId, Span),
 ) -> Exec<Flow> {
+    if appended_call(interp, protocol, method, &args[0], &args[1..]).is_none() {
+        return exhausted(interp, false, at);
+    }
+    for value in &args[1..] {
+        release(interp, value);
+    }
+    Ok(Flow::Return(match interp.ck.is_request(protocol, method) {
+        true => Val::Struct(interp.ty_item("sys", "Reply"), Rc::new(Vec::new())),
+        false => Val::Unit,
+    }))
+}
+
+/// `Wire[P].encode_message(message, mut out)`: the encoding of the call the message makes
+/// appended to `out`, trapping when memory is exhausted, and `Some` of its operation's position
+/// among the protocol schema's operations; `None` for an operation that is not `pub`.
+fn encode_message(
+    interp: &mut Interpreter,
+    protocol: ItemId,
+    args: &[Val],
+    at: (ItemId, Span),
+) -> Exec<Flow> {
+    let option = interp.ty_item("core", "Option");
+    let message = interp.deref(&args[0]);
+    let Val::Variant(_, method, fields) = &message else {
+        panic!("a protocol message, not {message:?}")
+    };
+    let method = *method as usize;
+    let SigKind::Protocol { operations, .. } = &interp.ck.sig(protocol).kind else {
+        unreachable!("a protocol's signature")
+    };
+    let mut names: Vec<&str> = (interp.ck.hashed_operations(protocol).into_iter())
+        .map(|index| operations[index].name.as_str())
+        .collect();
+    names.sort_unstable();
+    let Some(position) = names
+        .iter()
+        .position(|name| *name == operations[method].name)
+    else {
+        return Ok(Flow::Return(Val::Variant(option, 1, Rc::new(Vec::new()))));
+    };
+    if appended_call(interp, protocol, method, &args[1], fields).is_none() {
+        return exhausted(interp, false, at);
+    }
+    let position = Val::Int(position as i128);
+    Ok(Flow::Return(Val::Variant(
+        option,
+        0,
+        Rc::new(vec![position]),
+    )))
+}
+
+/// Appends the encoding of a call of an operation with its arguments to `out.bytes`, each value
+/// of a handle type taken as the index of its handle, which goes to `out.handles`; none on
+/// exhaustion.
+fn appended_call(
+    interp: &mut Interpreter,
+    protocol: ItemId,
+    method: usize,
+    out: &Val,
+    args: &[Val],
+) -> Option<()> {
     let SigKind::Protocol { operations, .. } = &interp.ck.sig(protocol).kind else {
         unreachable!("a protocol's signature")
     };
     let operation = operations[method].clone();
     let encoded_item = interp.ty_item("sys", "Encoded");
     let handle_item = interp.ty_item("sys", "Handle");
-    let out = place(&args[0]);
+    let out = place(out);
     let bytes_at = out.with(field(interp, encoded_item, "bytes"));
     let handles_at = out.with(field(interp, encoded_item, "handles"));
     let held = interp.memory.get(&handles_at).clone();
     let first = entries(interp, &held).len();
-    let mut named: Vec<_> = operation.sig.params.iter().zip(&args[1..]).collect();
+    let mut named: Vec<_> = operation.sig.params.iter().zip(args).collect();
     named.sort_by(|left, right| left.0.name.cmp(&right.0.name));
     let mut carried = Vec::new();
     let mut fields = Vec::new();
@@ -107,18 +169,8 @@ pub fn encode_call(
         .map(|byte| Val::Int(i128::from(byte)))
         .collect();
     let handle = Ty::item(handle_item, Vec::new());
-    let appended = append(interp, &bytes_at, &written, &Ty::Scalar(Scalar::U8))
-        .and_then(|()| append(interp, &handles_at, &carried, &handle));
-    if appended.is_none() {
-        return exhausted(interp, false, at);
-    }
-    for value in &args[1..] {
-        release(interp, value);
-    }
-    Ok(Flow::Return(match interp.ck.is_request(protocol, method) {
-        true => Val::Struct(interp.ty_item("sys", "Reply"), Rc::new(Vec::new())),
-        false => Val::Unit,
-    }))
+    append(interp, &bytes_at, &written, &Ty::Scalar(Scalar::U8))
+        .and_then(|()| append(interp, &handles_at, &carried, &handle))
 }
 
 /// The tree of an argument of a call: a value of a handle type as the index among the handles

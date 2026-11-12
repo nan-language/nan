@@ -1,4 +1,4 @@
-//! The wire encoding of protocols: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`, `sys::Reply.decode`, and the handles `sys::Handle.of` makes and capability ids read.
+//! The wire encoding of protocols: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`, `sys::Wire.encode_message`, `sys::Reply.decode`, and the handles `sys::Handle.of` makes and capability ids read.
 
 /// A `sys::Handle`: the generational handle, then its type's handle hash.
 const HANDLE_HANDLE: u64 = 0
@@ -13,6 +13,7 @@ fn protocols_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             codecs_constant(mut lo, mut fx, supply, encoding: schema.view())
         }
         "sys::Wire.serve" => protocols_serve(mut lo, mut fx, supply)
+        "sys::Wire.encode_message" => protocols_encode_message(mut lo, mut fx, supply)
         "sys::Reply.decode" => protocols_decode_reply(mut lo, mut fx, supply)
         "sys::Handle.of" => protocols_handle_of(mut lo, mut fx, supply)
         "sys::CapabilityId.of_handle" => protocols_capability_of(mut lo, mut fx, supply)
@@ -180,6 +181,44 @@ fn protocols_encode_call(mut lo: Lowering, mut fx: Fx, abi: Abi, protocol: ty::I
     mut lo.release(mut fx, ty: message, address: value)
     supply.done(mut lo, mut fx)
 } protocols_encode_call
+
+/// `Wire[P].encode_message(message, mut out)`: the call the message makes, encoded as its variant,
+/// appended to `out`, and `Some` of its operation's position among the operations of P's protocol
+/// schema; `None` for an operation that is not `pub`.
+fn protocols_encode_message(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let message = lo.ck.types().item(protocols_of(lo, supply), args: mem::List[ty::Arg].empty(lo.alloc))
+    let value = tasks_address_of(mut lo, mut fx, ty: message, held: supply.param(0))
+    let CodecsKind.Variant(cases) = kind_of(mut lo, ty: message) else {
+        expect false
+        return
+    }
+    var keys = mem::List[usize].empty(lo.alloc)
+    for position in 0..<cases.len() {
+        mut keys.push(position)
+    }
+    mut keys.sort_by(fn(left: usize, right: usize) => cases[left].key.as_str().cmp(cases[right].key.as_str()))
+    let option = supply.abi.result
+    let index = mut lo.variant_index(mut fx, ty: message, address: value)
+    let parts = encoded_parts(mut lo, mut fx, encoded: supply.param(1).address_value())
+    for listed in 0..<cases.len() {
+        let case = cases[listed]
+        let Some(position) = keys.position(fn(key: usize) => key == listed) else {
+            expect false
+            return
+        }
+        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(case.index))
+        mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+            protocols_append(mut lo, fx: mut fx1, supply, parts, write: fn(mut lo1: Lowering, mut fx2: Fx, state: clif::Value) {
+                encode_case(mut lo1, fx: mut fx2, format: Format.Wire, ty: message, case, value, state)
+            })
+            let at = mut fx1.int(clif::Type.Int32, value: i64.fit(position))
+            let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Scalar(at)).view(), wrapped: None)
+            supply.ret(mut lo, fx: mut fx1, held: some)
+        })
+    }
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} protocols_encode_message
 
 /// Fails with `CallError.Malformed` holding the `core::DecodeError` a decoding's code names.
 fn protocols_fail_malformed(mut lo: Lowering, mut fx: Fx, supply: Supply, code: clif::Value) {

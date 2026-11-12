@@ -675,7 +675,7 @@ impl Lowering<'_, '_> {
 
     /// Copies `size` bytes, inline when small.
     pub fn copy(&mut self, fx: &mut Fx, dst: Value, src: Value, size: u64, align: u64) {
-        if size <= 64 {
+        if size <= 128 {
             fx.copy_small(dst, src, size, align);
             return;
         }

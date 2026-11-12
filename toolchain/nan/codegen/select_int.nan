@@ -841,6 +841,15 @@ fn Selector.mul_overflowing(mut self, func: clif::Function, inst: clif::Inst, x:
         mut self.imul(func, inst, x, y)
         return
     }
+    if not signed {
+        match self.facts.factor_of(func, x, y) {
+            Some(factor) => {
+                mut self.bounded_product(func, inst, factor)
+                return
+            }
+            None => {}
+        }
+    }
     let size = exact_size(ty)
     let a = mut self.src(x, func)
     let b = mut self.src(y, func)
@@ -855,6 +864,36 @@ fn Selector.mul_overflowing(mut self, func: clif::Function, inst: clif::Inst, x:
     }
     mut self.overflow_flag(func, inst, cond: x64::Cond.Overflow)
 } Selector.mul_overflowing
+
+/// An unsigned multiplication by a constant: `imul` by the immediate, or `lea` for 3, 5 and 9 of
+/// 64 bits, then a comparison leaving the processor's flags showing it overflows when the
+/// operand lies above the largest one whose product the type holds.
+fn Selector.bounded_product(mut self, func: clif::Function, inst: clif::Inst, factor: Factor) {
+    let ty = func.value_type(factor.value)
+    let size = exact_size(ty)
+    let operand = mut self.src(factor.value, func)
+    let product = mut self.dst_of(func, inst)
+    let shift = match factor.factor {
+        3 => 1u8
+        5 => 2u8
+        9 => 3u8
+        else => 0u8
+    }
+    if shift > 0 and size == x64::Size.Qword {
+        mut self.emit(x64::Inst.Lea(dst: product, src: x64::Amode.Mem(base: operand, index: Some(operand), shift: shift, disp: 0)))
+    } else {
+        mut self.emit(x64::Inst.ImulImm(size: size, dst: product, src: operand, imm: i32.fit(factor.factor)))
+    }
+    let largest = width_mask(ty.bits()) / factor.factor
+    if largest < 0x8000_0000 {
+        mut self.emit(x64::Inst.CmpImm(size: size, lhs: operand, imm: i32.fit(largest)))
+    } else {
+        let bound = mut self.temp(false)
+        mut self.emit(x64::Inst.MovImm(dst: bound, imm: largest))
+        mut self.emit(x64::Inst.Cmp(size: size, lhs: operand, rhs: bound))
+    }
+    mut self.overflow_flag(func, inst, cond: x64::Cond.Above)
+} Selector.bounded_product
 
 /// The flag of an overflowing operation's overflow, written from the processor's flags unless the
 /// branch ending the block reads them in its place.

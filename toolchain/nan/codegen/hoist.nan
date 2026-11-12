@@ -1,8 +1,11 @@
-//! Hoisting out of loops: a constant, or an arithmetic, comparison, conversion or select instruction, of a natural loop whose operands are defined outside the loop moves to the end of the one block outside the loop that branches to its header, out of each enclosing loop its operands are defined outside of; the function is copied with the instructions moved.
+//! Hoisting out of loops: a constant, or an arithmetic, comparison, conversion or select instruction, of a natural loop whose operands are defined outside the loop moves to the end of the one block outside the loop that branches to its header, out of each enclosing loop its operands are defined outside of. An instruction of those kinds in a loop that its own block does not read, and whose operands are read past it, sinks first to the end of the run of jumps from its block whose blocks only it reaches and do not read it, so that an operand can end where it is computed; the function is copied with the instructions moved.
 
 /// The most rounds of finding the instructions to move, each finding those whose operands the
 /// earlier ones moved out.
 const HOIST_ROUNDS: u32 = 4
+
+/// The mark of an instruction that sinks within its loop.
+const SUNK: u32 = 0xFFFF_FFFE
 
 /// A natural loop: its header, the loop immediately enclosing it, `NONE` for an outermost one,
 /// and the block outside it that branches to its header, `NONE` when it has not exactly one or
@@ -26,8 +29,9 @@ struct Placed derives Copy, Eq {
     inst: u32
 } Placed
 
-/// What hoisting does: the loop each instruction moves out of, by instruction index, `NONE` for
-/// one that stays, and the instructions moved, in the order they are copied.
+/// What hoisting does: the loop each instruction moves out of, `SUNK` for one sinking, by
+/// instruction index, `NONE` for one that stays, and the instructions moved, in the order they
+/// are copied.
 struct Hoists {
     moved: mem::List[u32]
     placed: mem::List[Placed]
@@ -245,6 +249,7 @@ fn hoists_of(func: clif::Function, loops: Loops, alloc: mem::Alloc) -> Option[Ho
         }
     }
     var hoists = Hoists(moved: filled(inst_count, value: NONE, alloc), placed: mem::List[Placed].empty(alloc))
+    mut hoists.sink_all(func, loops, mut homes, alloc)
     for _ in 0u32..<HOIST_ROUNDS {
         var changed = false
         for block in func.layout_blocks(alloc) {
@@ -265,6 +270,148 @@ fn hoists_of(func: clif::Function, loops: Loops, alloc: mem::Alloc) -> Option[Ho
     }
     return Some(take hoists)
 } hoists_of
+
+/// Sinks each instruction of a loop's block that hoisting may move, that its block reads nowhere
+/// past it but in its terminator and whose operands are each read on its way down, its results
+/// taking the block they sink to as their home.
+fn Hoists.sink_all(mut self, func: clif::Function, loops: Loops, mut homes: mem::List[u32], alloc: mem::Alloc) {
+    let single = single_predecessors(func, alloc)
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < loops.innermost.len()
+        if func.is_cold(block) or loops.innermost[at] == NONE {
+            continue
+        }
+        let insts = func.block_insts(block, alloc)
+        for index in 0..<insts.len() {
+            let inst = insts[index]
+            if not is_hoistable(func, inst, alloc) or is_constant_inst(func.inst_data(inst)) or reads_any(func, insts: insts.view(), from: index + 1, to: insts.len() - 1, inst, alloc) {
+                continue
+            }
+            let target = sink_target(func, loops, single: single.view(), block: block.index, inst, alloc)
+            if target == NONE or (target == block.index and index + 2 == insts.len()) or not operands_read_down(func, block, from: index + 1, target, inst, alloc) {
+                continue
+            }
+            self.moved[usize.widen(inst.index)] = SUNK
+            mut self.placed.push(Placed(block: target, inst: inst.index))
+            for result in func.inst_results(inst, alloc) {
+                homes[usize.widen(result.index)] = target
+            }
+        }
+    }
+} Hoists.sink_all
+
+/// The block an instruction sinks to: the last of the run of jumps from its block whose blocks
+/// have that jump as their only branch in, lie in the same loop, are not cold and read none of
+/// its results but in their terminators, the run stopping at a terminator reading one; short of
+/// a block ending with a branch on an overflow flag, which must follow its operation; `NONE`
+/// when there is none.
+fn sink_target(func: clif::Function, loops: Loops, single: Slice[u32], block: u32, inst: clif::Inst, alloc: mem::Alloc) -> u32 {
+    var previous = NONE
+    var target = block
+    loop {
+        let insts = func.block_insts(clif::Block(index: target), alloc)
+        expect insts.len() > 0
+        let last = insts[insts.len() - 1]
+        if branches_on_overflow(func, terminator: last, alloc) {
+            return previous
+        }
+        if reads_any(func, insts: insts.view(), from: insts.len() - 1, to: insts.len(), inst, alloc) {
+            return target
+        }
+        let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(last) else {
+            return target
+        }
+        let next = destination.block.index
+        let next_insts = func.block_insts(destination.block, alloc)
+        if single[usize.widen(next)] != target or loops.innermost[usize.widen(next)] != loops.innermost[usize.widen(block)] or func.is_cold(destination.block) or reads_any(func, insts: next_insts.view(), from: 0, to: next_insts.len() - 1, inst, alloc) {
+            return target
+        }
+        previous = target
+        target = next
+    }
+} sink_target
+
+/// Whether each operand of an instruction that no constant defines is read by an instruction from
+/// `from` on in its block, or in the run of jumps from there to the block it sinks to.
+fn operands_read_down(func: clif::Function, block: clif::Block, from: usize, target: u32, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    var operands = mem::List[clif::Value].empty(alloc)
+    each_operand(func.inst_data(inst), visit: fn[mut operands](value: clif::Value) {
+        let resolved = func.resolve_aliases(value)
+        let constant = match func.value_inst(resolved) {
+            Some(def) => is_constant_inst(func.inst_data(def))
+            None => false
+        }
+        if not constant {
+            mut operands.push(resolved)
+        }
+    })
+    var read = filled(operands.len(), value: false, alloc)
+    var current = block
+    var start = from
+    loop {
+        let insts = func.block_insts(current, alloc)
+        for index in start..<insts.len() {
+            each_operand(func.inst_data(insts[index]), visit: fn[mut read](value: clif::Value) {
+                let resolved = func.resolve_aliases(value)
+                for at in 0..<operands.len() {
+                    if operands[at] == resolved {
+                        read[at] = true
+                    }
+                }
+            })
+        }
+        if current.index == target {
+            break
+        }
+        let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(insts[insts.len() - 1]) else {
+            break
+        }
+        current = destination.block
+        start = 0
+    }
+    for was_read in read {
+        if not was_read {
+            return false
+        }
+    }
+    return true
+} operands_read_down
+
+/// Whether a terminator branches on the flag of an overflowing operation, inverted or not.
+fn branches_on_overflow(func: clif::Function, terminator: clif::Inst, alloc: mem::Alloc) -> bool {
+    let clif::InstructionData.Brif(opcode: _, arg: arg, then: _, otherwise: _) = func.inst_data(terminator) else {
+        return false
+    }
+    let Inverse(value: tested, inverted: _) = inverse_of(func, value: arg, alloc)
+    let Some(def) = func.value_inst(tested) else {
+        return false
+    }
+    return match func.inst_data(def) {
+        clif::InstructionData.Binary(opcode: opcode, x: _, y: _) => is_overflow_check(opcode)
+        else => false
+    }
+} branches_on_overflow
+
+/// Whether an instruction among `insts[from..<to]` reads a result of `inst`.
+fn reads_any(func: clif::Function, insts: Slice[clif::Inst], from: usize, to: usize, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    let results = func.inst_results(inst, alloc)
+    for index in from..<to {
+        var reads = false
+        each_operand(func.inst_data(insts[index]), visit: fn[mut reads](value: clif::Value) {
+            let resolved = func.resolve_aliases(value)
+            for result in results {
+                if result == resolved {
+                    reads = true
+                }
+            }
+        })
+        if reads {
+            return true
+        }
+    }
+    return false
+} reads_any
 
 fn larger_index(count: usize, index: u32) -> usize {
     let after = usize.widen(index) + 1

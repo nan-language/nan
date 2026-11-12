@@ -1,4 +1,4 @@
-//! Trimming block parameters: a parameter only parameters nothing reads take is dropped with the arguments passed to it, and one whose branches pass it a single other value, or itself, stands for that value; the function is copied without them, with the values and branches its known bits fix folded.
+//! Trimming block parameters: a parameter only parameters nothing reads take is dropped with the arguments passed to it, and one whose branches pass it a single other value, or itself, stands for that value unless an instruction laid out in or after its block defines that value; the function is copied without them, with the values and branches its known bits fix folded.
 
 /// The trim of a dropped parameter nothing reads.
 const DROPPED: u32 = 0xFFFF_FFFE
@@ -26,7 +26,10 @@ struct Reads {
 /// order.
 fn trimmed(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
     let reads = reads_of(func, alloc)
-    let trims = trims_of(reads, count: usize.widen(func.value_count()), alloc)
+    let trims = match trims_of(reads, count: usize.widen(func.value_count()), alloc) {
+        Some(found) => kept_before_uses(func, trims: take found, alloc)
+        None => None
+    }
     let known = match value_bits(func, passes: reads.passes.view(), alloc) {
         Some(bits) => bits
         None => mem::List[Bits].empty(alloc)
@@ -42,6 +45,45 @@ fn trimmed(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
     mut copier.copy_function(func, leaves: Leaves.empty(alloc))
     return take copier.finish()
 } trimmed
+
+/// The trims with each parameter kept that stands for a value an instruction laid out in or
+/// after the parameter's block defines, as the copy, made in layout order, would read that value
+/// before copying it; none when no parameter is trimmed then.
+fn kept_before_uses(func: clif::Function, take trims: mem::List[u32], alloc: mem::Alloc) -> Option[mem::List[u32]] {
+    let count = usize.widen(func.value_count())
+    var laid_at = filled(count, value: NONE, alloc)
+    var position: u32 = 0
+    for block in func.layout_blocks(alloc) {
+        for param in func.block_params(block, alloc) {
+            laid_at[usize.widen(param.index)] = position
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                laid_at[usize.widen(result.index)] = position
+            }
+        }
+        position += 1
+    }
+    var trimming = false
+    for index in 0..<trims.len() {
+        let trim = trims[index]
+        if trim == NONE {
+            continue
+        }
+        if trim != DROPPED {
+            expect usize.widen(trim) < count and index < count
+            if func.value_inst(clif::Value(index: trim)).is_some() and laid_at[index] <= laid_at[usize.widen(trim)] {
+                trims[index] = NONE
+                continue
+            }
+        }
+        trimming = true
+    }
+    if not trimming {
+        return None
+    }
+    return Some(take trims)
+} kept_before_uses
 
 fn reads_of(func: clif::Function, alloc: mem::Alloc) -> Reads {
     var reads = Reads(passes: mem::List[Passed].empty(alloc), read: filled(usize.widen(func.value_count()), value: false, alloc), params: mem::List[u32].empty(alloc))

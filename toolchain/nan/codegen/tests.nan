@@ -1209,6 +1209,56 @@ test folds_the_branches_known_bits_decide for trimmed {
     expect not branches
 } folds_the_branches_known_bits_decide
 
+/// Whether a word starting at 0 that a loop masks with the parameter is set once the loop's count
+/// reaches the parameter, its test laid out before its body and entered only from it: never.
+fn masked_in_a_loop(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let head = mut b.create_block()
+    let tested = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let tested_word = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let body = mut b.create_block()
+    let counter = mut b.append_block_param(body, ty: clif::Type.Int64)
+    let word = mut b.append_block_param(body, ty: clif::Type.Int64)
+    let exit = mut b.create_block()
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    var start = one(zero, alloc)
+    mut start.push(zero)
+    mut b.jump(body, args: start.view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp(clif::IntCC.UnsignedLessThan, x: tested, y: params[0])
+    var again = one(tested, alloc)
+    mut again.push(tested_word)
+    mut b.brif(more, then: body, then_args: again.view(), otherwise: exit, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(body)
+    let next = mut b.iadd_imm_s(counter, y: 1)
+    let masked = mut b.band(word, y: params[0])
+    var back = one(next, alloc)
+    mut back.push(masked)
+    mut b.jump(head, args: back.view())
+    mut b.switch_to_block(exit)
+    let set = mut b.icmp_imm_s(clif::IntCC.NotEqual, x: tested_word, y: 0)
+    mut b.ret(one(set, alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} masked_in_a_loop
+
+test folds_what_a_loop_keeps_reading_its_test_before_its_body for trimmed {
+    let alloc = testing::world().alloc
+    let Some(folded) = trimmed(masked_in_a_loop(alloc), alloc) else {
+        expect false
+        return
+    }
+    let comparisons = opcode_count(folded, opcode: clif::Opcode.Icmp, alloc)
+    var params: usize = 0
+    for block in folded.layout_blocks(alloc) {
+        params += folded.block_params(block, alloc).len()
+    }
+    expect comparisons == 1
+    expect params == 5
+} folds_what_a_loop_keeps_reading_its_test_before_its_body
+
 /// One more than the first parameter, trapping on overflow, when it is below the second, else
 /// the second.
 fn incremented_below(alloc: mem::Alloc) -> clif::Function {
@@ -1366,6 +1416,105 @@ test reads_a_flag_only_dead_instructions_read_as_unread for select {
     let vcode = select(take b.finalize(), isa: host_isa(), alloc)
     expect not x64_writes_flags(vcode)
 } reads_a_flag_only_dead_instructions_read_as_unread
+
+/// The sum of the bytes the first parameter points to, as many as the second counts, its next
+/// pointer and count computed before the block reading the byte.
+fn byte_sum(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let head = mut b.create_block()
+    let pointer = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let count = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let total = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let step = mut b.create_block()
+    let read = mut b.create_block()
+    let exit = mut b.create_block()
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    var start = one(params[0], alloc)
+    mut start.push(params[1])
+    mut start.push(zero)
+    mut b.jump(head, args: start.view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    mut b.brif(more, then: step, then_args: no_values(alloc).view(), otherwise: exit, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(step)
+    let next = mut b.iadd_imm_s(pointer, y: 1)
+    let left = mut b.iadd_imm_s(count, y: -1)
+    mut b.jump(read, args: no_values(alloc).view())
+    mut b.switch_to_block(read)
+    let byte = mut b.load(clif::Type.Int8, flags: clif::MemFlags.owned(), p: pointer, offset: 0)
+    let wide = mut b.uextend(clif::Type.Int64, x: byte)
+    let grown = mut b.iadd(total, y: wide)
+    var back = one(next, alloc)
+    mut back.push(left)
+    mut back.push(grown)
+    mut b.jump(head, args: back.view())
+    mut b.switch_to_block(exit)
+    mut b.ret(one(total, alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} byte_sum
+
+test sinks_the_next_pointer_below_the_read_of_the_current for hoisted {
+    let alloc = testing::world().alloc
+    let Some(moved) = hoisted(byte_sum(alloc), alloc) else {
+        expect false
+        return
+    }
+    var reading = clif::Block(index: NONE)
+    for block in moved.layout_blocks(alloc) {
+        for inst in moved.block_insts(block, alloc) {
+            match moved.inst_data(inst) {
+                clif::InstructionData.Load(opcode: _, flags: _, arg: _, offset: _) => {
+                    reading = block
+                }
+                else => {}
+            }
+        }
+    }
+    var sums: usize = 0
+    for inst in moved.block_insts(reading, alloc) {
+        if moved.inst_data(inst).opcode() == clif::Opcode.Iadd {
+            sums += 1
+        }
+    }
+    expect sums == 2
+} sinks_the_next_pointer_below_the_read_of_the_current
+
+test multiplies_by_a_constant_checking_the_operand_against_a_bound for select {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let ten = mut b.iconst(clif::Type.Int64, imm: 10)
+    let clif::Overflowed(value: product, flag: overflowed) = mut b.umul_overflow(params[0], y: ten)
+    let done = mut b.create_block()
+    let overflowing = mut b.create_block()
+    mut b.set_cold_block(overflowing)
+    mut b.brif(overflowed, then: overflowing, then_args: no_values(alloc).view(), otherwise: done, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(done)
+    mut b.ret(one(product, alloc).view())
+    mut b.switch_to_block(overflowing)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.seal_all_blocks()
+    let vcode = select(take b.finalize(), isa: host_isa(), alloc)
+    var widening = false
+    var bounded = false
+    for held in vcode.insts {
+        match held.inst {
+            x64::Inst.MulWide(signed: _, size: _, src: _) => {
+                widening = true
+            }
+            x64::Inst.Cmp(size: _, lhs: _, rhs: _) => {
+                bounded = true
+            }
+            else => {}
+        }
+    }
+    expect not widening
+    expect bounded
+} multiplies_by_a_constant_checking_the_operand_against_a_bound
 
 /// The sum of two products of the first parameter, stored in a slot and loaded back, by the
 /// second.

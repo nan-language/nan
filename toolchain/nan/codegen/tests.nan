@@ -217,7 +217,7 @@ test carries_loop_values_in_the_registers_of_their_parameters for compile {
     mut b.ret(one(total, alloc).view())
     mut b.seal_all_blocks()
     let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
-    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\x48\x39\xf8\x73\x0a\x48\x8d\x0c\x01\x48\x8d\x40\x01\xeb\xf1\x48\x89\xc8\x5d\xc3"
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\xeb\x08\x48\x8d\x0c\x01\x48\x8d\x40\x01\x48\x39\xf8\x72\xf3\x48\x89\xc8\x5d\xc3"
 } carries_loop_values_in_the_registers_of_their_parameters
 
 /// The parameter, after branches on it to blocks that only jump on to where the other edge
@@ -840,6 +840,65 @@ fn sum_trapping_on_overflow(alloc: mem::Alloc) -> clif::Function {
     return take b.finalize()
 } sum_trapping_on_overflow
 
+/// The count of the counter's values below the first parameter, each adding one with a check of
+/// its overflow whose trap writes the count it added to through the second parameter.
+fn reported_count(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let head = mut b.create_block()
+    let i = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let count = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let body = mut b.create_block()
+    let counted = mut b.create_block()
+    let overflowing = mut b.create_block()
+    mut b.set_cold_block(overflowing)
+    let exit = mut b.create_block()
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    var start = one(zero, alloc)
+    mut start.push(zero)
+    mut b.jump(head, args: start.view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp(clif::IntCC.UnsignedLessThan, x: i, y: params[0])
+    mut b.brif(more, then: body, then_args: no_values(alloc).view(), otherwise: exit, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(body)
+    let unit = mut b.iconst(clif::Type.Int64, imm: 1)
+    let clif::Overflowed(value: grown, flag: overflowed) = mut b.uadd_overflow(count, y: unit)
+    let fits = mut b.bxor_imm_s(overflowed, y: 1)
+    mut b.brif(fits, then: counted, then_args: no_values(alloc).view(), otherwise: overflowing, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(counted)
+    let next = mut b.iadd_imm_s(i, y: 1)
+    var back = one(next, alloc)
+    mut back.push(grown)
+    mut b.jump(head, args: back.view())
+    mut b.switch_to_block(overflowing)
+    mut b.store(clif::MemFlags.owned(), x: count, p: params[1], offset: 0)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.switch_to_block(exit)
+    mut b.ret(one(count, alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} reported_count
+
+test rebuilds_the_operand_a_trap_reports_from_the_overflowed_result for compile {
+    let alloc = testing::world().alloc
+    let code = compile(reported_count(alloc), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\x49\x89\xcb\x48\x89\xc1\x4c\x89\xd8\xeb\x0a\x48\x83\xc0\x01\x72\x0b\x48\x8d\x49\x01\x48\x39\xf9\x72\xf1\x5d\xc3\x48\x83\xe8\x01\x48\x89\x06\x0f\x0b"
+} rebuilds_the_operand_a_trap_reports_from_the_overflowed_result
+
+test reads_a_loaded_byte_zero_extended_without_extending_it_again for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let byte = mut b.load(clif::Type.Int8, flags: clif::MemFlags.owned(), p: params[0], offset: 0)
+    let wide = mut b.uextend(clif::Type.Int64, x: byte)
+    mut b.ret(one(wide, alloc).view())
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x0f\xb6\x07\x5d\xc3"
+} reads_a_loaded_byte_zero_extended_without_extending_it_again
+
 /// Whether x86-64 code writes a flag into a register or computes an exclusive or.
 fn x64_writes_flags(vcode: VCode[x64::Inst]) -> bool {
     for held in vcode.insts {
@@ -1190,6 +1249,58 @@ test speculates_a_short_branch_trapping_only_on_its_arm for speculated {
     expect selects == 1
     expect traps == 1
 } speculates_a_short_branch_trapping_only_on_its_arm
+
+/// Stores each count below the first parameter at that index of the buffer the second points
+/// to, its pointer then its length, trapping when the index reaches the length.
+fn bounded_stores(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let head = mut b.create_block()
+    let i = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let body = mut b.create_block()
+    let stored = mut b.create_block()
+    let outside = mut b.create_block()
+    mut b.set_cold_block(outside)
+    let exit = mut b.create_block()
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    let width = mut b.iconst(clif::Type.Int64, imm: 8)
+    mut b.jump(head, args: one(zero, alloc).view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp(clif::IntCC.UnsignedLessThan, x: i, y: params[0])
+    mut b.brif(more, then: body, then_args: no_values(alloc).view(), otherwise: exit, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(body)
+    let length = mut b.load(clif::Type.Int64, flags: clif::MemFlags.owned(), p: params[1], offset: 8)
+    let inside = mut b.icmp(clif::IntCC.UnsignedLessThan, x: i, y: length)
+    mut b.brif(inside, then: stored, then_args: no_values(alloc).view(), otherwise: outside, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(stored)
+    let data = mut b.load(clif::Type.Int64, flags: clif::MemFlags.owned(), p: params[1], offset: 0)
+    let scaled = mut b.imul(i, y: width)
+    let address = mut b.iadd(data, y: scaled)
+    mut b.store(clif::MemFlags.owned(), x: i, p: address, offset: 0)
+    let next = mut b.iadd_imm_s(i, y: 1)
+    mut b.jump(head, args: one(next, alloc).view())
+    mut b.switch_to_block(outside)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.switch_to_block(exit)
+    mut b.ret(no_values(alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} bounded_stores
+
+test versions_a_counted_loop_into_a_copy_without_its_checks for versioned {
+    let alloc = testing::world().alloc
+    let Some(versions) = versioned(bounded_stores(alloc), alloc) else {
+        expect false
+        return
+    }
+    let stores = opcode_count(versions, opcode: clif::Opcode.Store, alloc)
+    let loads = opcode_count(versions, opcode: clif::Opcode.Load, alloc)
+    let traps = opcode_count(versions, opcode: clif::Opcode.Trap, alloc)
+    expect stores == 2
+    expect loads == 2
+    expect traps == 1
+} versions_a_counted_loop_into_a_copy_without_its_checks
 
 /// The sum of two products of the first parameter, stored in a slot and loaded back, by the
 /// second.

@@ -9,6 +9,10 @@ struct Facts {
     defs: mem::List[u32]
     /// Each block's index in the code, `NONE` for one no path from the entry reaches.
     positions: mem::List[u32]
+    /// The reachable blocks in the order emission lays them out.
+    sequence: mem::List[clif::Block]
+    /// The block branching to each block when it is the only one, `NONE` otherwise.
+    single: mem::List[u32]
     /// The block a jump to each block lands in: past the blocks holding only a jump without
     /// arguments.
     destinations: mem::List[u32]
@@ -36,6 +40,8 @@ fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
         use_counts: filled(values, value: 0u32, alloc),
         defs: filled(values, value: NONE, alloc),
         positions: filled(blocks, value: NONE, alloc),
+        sequence: mem::List[clif::Block].empty(alloc),
+        single: single_predecessors(func, alloc),
         destinations: destinations(func, count: blocks, alloc),
         switches: find_switches(func, count: blocks, alloc),
         then_edges: filled(blocks, value: NONE, alloc),
@@ -193,23 +199,106 @@ fn Facts.reachable(self, func: clif::Function) -> mem::List[bool] {
     return seen
 } Facts.reachable
 
-/// The reachable blocks in the order emission lays them out: those not cold in layout order,
-/// then the cold ones.
+/// The reachable blocks in the order emission lays them out.
 fn Facts.order(self, func: clif::Function) -> mem::List[clif::Block] {
     var order = mem::List[clif::Block].empty(self.alloc)
-    let laid_out = func.layout_blocks(self.alloc)
-    for block in laid_out {
-        if self.position_of(block) != NONE and not func.is_cold(block) {
-            mut order.push(block)
-        }
-    }
-    for block in laid_out {
-        if self.position_of(block) != NONE and func.is_cold(block) {
-            mut order.push(block)
-        }
+    for block in self.sequence {
+        mut order.push(block)
     }
     return order
 } Facts.order
+
+/// The reachable blocks in the order emission lays them out: those not cold in layout order,
+/// each loop's header that tests whether the loop goes on moved after the latch jumping back to
+/// it, then the cold ones.
+fn emission_order(func: clif::Function, seen: Slice[bool], alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var hot = mem::List[clif::Block].empty(alloc)
+    var cold = mem::List[clif::Block].empty(alloc)
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < seen.len()
+        if not seen[at] {
+            continue
+        }
+        if func.is_cold(block) {
+            mut cold.push(block)
+        } else {
+            mut hot.push(block)
+        }
+    }
+    rotate_loops(func, order: mut hot, alloc)
+    for block in cold {
+        mut hot.push(block)
+    }
+    return hot
+} emission_order
+
+/// Moves each loop's header ending in a branch that leaves the loop or goes on in it right after
+/// the one block of the loop jumping back to it, so that the jump falls through into the test.
+fn rotate_loops(func: clif::Function, mut order: mem::List[clif::Block], alloc: mem::Alloc) {
+    let loops = loops_of(func, alloc)
+    for id in 0..<loops.list.len() {
+        let header = loops.list[id].header
+        let latch = jumping_back(func, loops, id: u32.fit(id), header, alloc)
+        if latch == NONE or not tests_staying(func, loops, id: u32.fit(id), header, alloc) {
+            continue
+        }
+        let Some(from) = order.position(fn(block: clif::Block) => block.index == header) else {
+            continue
+        }
+        let Some(to) = order.position(fn(block: clif::Block) => block.index == latch) else {
+            continue
+        }
+        if to <= from {
+            continue
+        }
+        let moved = order[from]
+        for at in from..<to {
+            order[at] = order[at + 1]
+        }
+        order[to] = moved
+    }
+} rotate_loops
+
+/// The one block of a loop branching to its header, when it ends with a jump; `NONE` otherwise.
+fn jumping_back(func: clif::Function, loops: Loops, id: u32, header: u32, alloc: mem::Alloc) -> u32 {
+    var latch = NONE
+    for block in func.layout_blocks(alloc) {
+        if not loops.holds(id, block: block.index) {
+            continue
+        }
+        for target in targets_of(func, block, alloc) {
+            if target.index == header {
+                if latch != NONE {
+                    return NONE
+                }
+                latch = block.index
+            }
+        }
+    }
+    if latch == NONE {
+        return NONE
+    }
+    let insts = func.block_insts(clif::Block(index: latch), alloc)
+    expect insts.len() > 0
+    return match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: _) => latch
+        else => NONE
+    }
+} jumping_back
+
+/// Whether a loop's header ends with a branch whose one target lies in the loop and the other
+/// outside it.
+fn tests_staying(func: clif::Function, loops: Loops, id: u32, header: u32, alloc: mem::Alloc) -> bool {
+    let insts = func.block_insts(clif::Block(index: header), alloc)
+    if insts.len() == 0 {
+        return false
+    }
+    return match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => loops.holds(id, block: then_call.block.index) != loops.holds(id, block: else_call.block.index)
+        else => false
+    }
+} tests_staying
 
 /// A block's index in the code, `NONE` for one no path from the entry reaches.
 fn Facts.position_of(self, block: clif::Block) -> u32 {
@@ -228,6 +317,7 @@ fn Facts.place_blocks(mut self, func: clif::Function) {
             self.positions[index] = 0
         }
     }
+    self.sequence = emission_order(func, seen: seen.view(), alloc: self.alloc)
     var next: u32 = 0
     for block in self.order(func) {
         let at = usize.widen(block.index)
@@ -496,6 +586,64 @@ fn Facts.constant(self, value: clif::Value, func: clif::Function) -> Option[u64]
         else => return None
     }
 } Facts.constant
+
+/// The overflowing addition or subtraction whose overflow alone sends to a cold block that traps
+/// the branch ending the one block branching there.
+fn Facts.overflow_sending(self, func: clif::Function, block: clif::Block) -> Option[clif::Inst] {
+    let at = usize.widen(block.index)
+    expect at < self.single.len()
+    let from = self.single[at]
+    if from == NONE or not is_trap_block(func, block, alloc: self.alloc) {
+        return None
+    }
+    let insts = func.block_insts(clif::Block(index: from), alloc: self.alloc)
+    expect insts.len() > 0
+    let clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+        return None
+    }
+    let Inverse(value: flag, inverted: inverted) = inverse_of(func, value: arg, alloc: self.alloc)
+    let sent = if inverted {
+        else_call.block
+    } else {
+        then_call.block
+    }
+    if sent != block or then_call.block == else_call.block {
+        return None
+    }
+    let Some(def) = func.value_inst(flag) else {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: opcode, x: _, y: _) = func.inst_data(def) else {
+        return None
+    }
+    let rebuildable = opcode == clif::Opcode.UaddOverflow or opcode == clif::Opcode.SaddOverflow or opcode == clif::Opcode.UsubOverflow or opcode == clif::Opcode.SsubOverflow
+    if not rebuildable or second_result_of(func, inst: def, alloc: self.alloc) != func.resolve_aliases(flag) {
+        return None
+    }
+    return Some(def)
+} Facts.overflow_sending
+
+/// Whether a load gives an integer value, which selection writes zero-extended to the whole
+/// register.
+fn Facts.is_loaded(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE or not func.value_type(value).is_int() {
+        return false
+    }
+    return match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: _, offset: _) => true
+        else => false
+    }
+} Facts.is_loaded
+
+/// Whether reachable code reads a value nowhere.
+fn Facts.is_unread(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.use_counts.len()
+    return self.use_counts[at] == 0
+} Facts.is_unread
 
 /// The first result of an instruction.
 fn result_of(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> clif::Value {

@@ -1,0 +1,982 @@
+//! Versioning loops: an innermost loop counting a parameter of its header up by one while it stays below a limit set outside the loop, leaving it only where that test fails or for cold blocks that trap, tests at the end of each iteration whether every branch to such a block holds off for each count left, and goes on in a copy of the loop without them when it does; the copy reads the values the loads it pins gave in that iteration, so the test also asks that no store of the counts left reach their bytes; the function is copied with each loop's copy.
+
+/// The most blocks a versioned loop holds.
+const VERSIONED_BLOCKS: usize = 64
+
+/// The most loads a versioned loop's copy pins, and the most stores whose reach its test bounds.
+const VERSIONED_ACCESSES: usize = 8
+
+/// The most block parameters followed to the value a branch passes them.
+const ORIGIN_STEPS: u32 = 8
+
+/// The largest scale of an index a store's address takes.
+const LARGEST_SCALE: u64 = 0x1_0000
+
+/// A check that an index stays below `limit`: the loop's counter plus `start`, the counter alone
+/// when `start` is `NO_VALUE`.
+struct Bound derives Copy, Eq {
+    start: clif::Value
+    limit: clif::Value
+} Bound
+
+/// The bytes a store writes on each count: `size` bytes from `offset` past `scale` times an index
+/// past `base`, the index being the counter plus `start`, or the counter alone when `start` is
+/// `NO_VALUE`; the same bytes on every count when `scale` is 0.
+struct Stride derives Copy, Eq {
+    base: clif::Value
+    start: clif::Value
+    scale: u64
+    offset: i32
+    size: u32
+} Stride
+
+/// The bytes a pinned load reads: `size` bytes from `offset` past `address`.
+struct Spot derives Copy, Eq {
+    address: clif::Value
+    offset: i32
+    size: u32
+} Spot
+
+/// A versioned loop: its header and latch, by block index, its blocks in layout order, the
+/// parameter it counts with and its limit, the blocks whose branches to a trap its copy drops,
+/// the loads its copy pins, by result index, and what the test ending each iteration bounds: the
+/// starts whose sums with the last count must not overflow, the bounds, the strides of the
+/// loop's stores and the spots of its pinned loads.
+struct Version {
+    header: u32
+    latch: u32
+    blocks: mem::List[u32]
+    counter: clif::Value
+    limit: clif::Value
+    dropped: mem::List[u32]
+    pinned: mem::List[u32]
+    starts: mem::List[clif::Value]
+    bounds: mem::List[Bound]
+    strides: mem::List[Stride]
+    spots: mem::List[Spot]
+} Version
+
+/// The loops a function versions, and the branches their copies add to each block, by block
+/// index.
+struct Versions {
+    list: mem::List[Version]
+    added: mem::List[u32]
+} Versions
+
+/// What finding a loop's version reads: the block defining each value and how many instructions
+/// read it, by value index; whether each block lies in the loop and whether it lies on every path
+/// from the loop's header to its latch, by block index; the block branching to each block when it
+/// is the only one; and the loop's counter.
+struct Region {
+    homes: mem::List[u32]
+    reads: mem::List[u32]
+    inside: mem::List[bool]
+    ruling: mem::List[bool]
+    single: mem::List[u32]
+    counter: clif::Value
+} Region
+
+/// The test a loop's header ends with: its counter, a parameter of the header, below a limit
+/// set outside the loop, the loop going on while it holds and leaving for `exit` otherwise.
+struct CountTest derives Copy, Eq {
+    counter: clif::Value
+    limit: clif::Value
+    exit: u32
+} CountTest
+
+/// The function with its counted loops versioned, or none when it versions none or holds a use
+/// before its definition in layout order.
+fn versioned(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let Some(versions) = versions_of(func, alloc) else {
+        return None
+    }
+    var copier = Copier.versioning(func, take versions, alloc)
+    mut copier.copy_function(func, leaves: Leaves.empty(alloc))
+    return take copier.finish()
+} versioned
+
+fn versions_of(func: clif::Function, alloc: mem::Alloc) -> Option[Versions] {
+    let loops = loops_of(func, alloc)
+    let count = loops.innermost.len()
+    var found = Versions(list: mem::List[Version].empty(alloc), added: filled(count, value: 0u32, alloc))
+    var region = Region(homes: homes_of(func, alloc), reads: use_counts(func, alloc), inside: filled(count, value: false, alloc), ruling: filled(count, value: false, alloc), single: single_predecessors(func, alloc), counter: NO_VALUE)
+    for id in 0..<loops.list.len() {
+        if not is_innermost(loops, id: u32.fit(id)) {
+            continue
+        }
+        let Some(version) = version_of(func, loops, id: u32.fit(id), mut region, alloc) else {
+            continue
+        }
+        mut found.note_exit(func, version, alloc)
+        mut found.list.push(take version)
+    }
+    if found.list.len() == 0 {
+        return None
+    }
+    return Some(take found)
+} versions_of
+
+fn is_innermost(loops: Loops, id: u32) -> bool {
+    for other in loops.list {
+        if other.parent == id {
+            return false
+        }
+    }
+    return true
+} is_innermost
+
+/// Counts the branch a loop's copy adds to the block its header leaves for.
+fn Versions.note_exit(mut self, func: clif::Function, version: Version, alloc: mem::Alloc) {
+    for target in targets_of(func, block: clif::Block(index: version.header), alloc) {
+        if is_listed(version.blocks.view(), value: target.index) {
+            continue
+        }
+        let at = usize.widen(target.index)
+        expect at < self.added.len()
+        self.added[at] += 1
+    }
+} Versions.note_exit
+
+/// The version of an innermost loop, none when it does not qualify or would drop no check.
+fn version_of(func: clif::Function, loops: Loops, id: u32, mut region: Region, alloc: mem::Alloc) -> Option[Version] {
+    let blocks = mut region.enter(func, loops, id, alloc)
+    if blocks.len() > VERSIONED_BLOCKS {
+        return None
+    }
+    let header = loops.list[usize.widen(id)].header
+    let Some(latch) = latch_of(func, blocks: blocks.view(), header, alloc) else {
+        return None
+    }
+    let Some(counting) = region.count_test(func, header, alloc) else {
+        return None
+    }
+    region.counter = counting.counter
+    if not region.counts_up(func, latch, header, alloc) or not region.leaves_only_by(func, blocks: blocks.view(), header, exit: counting.exit, alloc) or region.escapes(func, alloc) {
+        return None
+    }
+    mut region.rule(func, blocks: blocks.view(), header, latch, alloc)
+    var version = Version(header: header, latch: latch, blocks: take blocks, counter: counting.counter, limit: counting.limit, dropped: mem::List[u32].empty(alloc), pinned: mem::List[u32].empty(alloc), starts: mem::List[clif::Value].empty(alloc), bounds: mem::List[Bound].empty(alloc), strides: mem::List[Stride].empty(alloc), spots: mem::List[Spot].empty(alloc))
+    if not mut version.drop_checks(func, region, alloc) or version.dropped.len() == 0 {
+        return None
+    }
+    let pinned = version.pinned.len()
+    let starts = version.starts.len()
+    if mut version.reach_stores(func, region, alloc) {
+        mut version.pin_rest(func, region, alloc)
+    } else if pinned > 0 {
+        return None
+    } else {
+        mut version.pinned.truncate(0)
+        mut version.spots.truncate(0)
+        mut version.strides.truncate(0)
+        mut version.starts.truncate(starts)
+    }
+    return Some(take version)
+} version_of
+
+/// The blocks of a function a value is defined in, by value index, `NONE` for a value no block
+/// defines.
+fn homes_of(func: clif::Function, alloc: mem::Alloc) -> mem::List[u32] {
+    var homes = filled(usize.widen(func.value_count()), value: NONE, alloc)
+    for block in func.layout_blocks(alloc) {
+        for param in func.block_params(block, alloc) {
+            homes[usize.widen(param.index)] = block.index
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                homes[usize.widen(result.index)] = block.index
+            }
+        }
+    }
+    return homes
+} homes_of
+
+/// Makes the region that of a loop, its blocks marked inside it; the loop's blocks in layout
+/// order.
+fn Region.enter(mut self, func: clif::Function, loops: Loops, id: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var blocks = mem::List[u32].empty(alloc)
+    for index in 0..<self.inside.len() {
+        self.inside[index] = false
+        self.ruling[index] = false
+    }
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < loops.innermost.len() and at < self.inside.len()
+        if loops.innermost[at] == id {
+            self.inside[at] = true
+            mut blocks.push(block.index)
+        }
+    }
+    self.counter = NO_VALUE
+    return blocks
+} Region.enter
+
+/// Whether a block lies in the loop.
+fn Region.holds(self, block: u32) -> bool {
+    let at = usize.widen(block)
+    return at < self.inside.len() and self.inside[at]
+} Region.holds
+
+/// Whether the loop defines a value.
+fn Region.defines(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.homes.len()
+    return self.holds(self.homes[at])
+} Region.defines
+
+/// Whether a block of the loop lies on every path from its header to its latch.
+fn Region.rules(self, block: u32) -> bool {
+    let at = usize.widen(block)
+    return at < self.ruling.len() and self.ruling[at]
+} Region.rules
+
+/// The one block of a loop branching to its header, when its terminator is a jump.
+fn latch_of(func: clif::Function, blocks: Slice[u32], header: u32, alloc: mem::Alloc) -> Option[u32] {
+    var latch = NONE
+    for block in blocks {
+        for target in targets_of(func, block: clif::Block(index: block), alloc) {
+            if target.index != header {
+                continue
+            }
+            if latch != NONE {
+                return None
+            }
+            latch = block
+        }
+    }
+    if latch == NONE {
+        return None
+    }
+    let insts = func.block_insts(clif::Block(index: latch), alloc)
+    expect insts.len() > 0
+    return match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: _) => Some(latch)
+        else => None
+    }
+} latch_of
+
+/// The test the loop's header ends with, when it counts a 64-bit parameter of the header below a
+/// limit set outside the loop and leaves for a block other than a cold one that traps.
+fn Region.count_test(self, func: clif::Function, header: u32, alloc: mem::Alloc) -> Option[CountTest] {
+    let block = clif::Block(index: header)
+    let insts = func.block_insts(block, alloc)
+    expect insts.len() > 0
+    let clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+        return None
+    }
+    let stays_then = self.holds(then_call.block.index)
+    if stays_then == self.holds(else_call.block.index) {
+        return None
+    }
+    let exit = if stays_then {
+        else_call.block
+    } else {
+        then_call.block
+    }
+    let Some(def) = func.value_inst(arg) else {
+        return None
+    }
+    let clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) = func.inst_data(def) else {
+        return None
+    }
+    let wanted = if stays_then {
+        clif::IntCC.UnsignedLessThan
+    } else {
+        clif::IntCC.UnsignedGreaterThanOrEqual
+    }
+    let counter = func.resolve_aliases(x)
+    if cond != wanted or not is_param(func, block, value: counter, alloc) or self.defines(func, value: y) or func.value_type(counter) != clif::Type.Int64 or is_trap_block(func, block: exit, alloc) {
+        return None
+    }
+    return Some(CountTest(counter: counter, limit: func.resolve_aliases(y), exit: exit.index))
+} Region.count_test
+
+fn is_param(func: clif::Function, block: clif::Block, value: clif::Value, alloc: mem::Alloc) -> bool {
+    for param in func.block_params(block, alloc) {
+        if param == value {
+            return true
+        }
+    }
+    return false
+} is_param
+
+fn is_listed(values: Slice[u32], value: u32) -> bool {
+    for listed in values {
+        if listed == value {
+            return true
+        }
+    }
+    return false
+} is_listed
+
+/// Whether the latch passes the header the counter plus one in place of the counter.
+fn Region.counts_up(self, func: clif::Function, latch: u32, header: u32, alloc: mem::Alloc) -> bool {
+    let params = func.block_params(clif::Block(index: header), alloc)
+    let insts = func.block_insts(clif::Block(index: latch), alloc)
+    expect insts.len() > 0
+    let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(insts[insts.len() - 1]) else {
+        return false
+    }
+    expect params.len() == destination.args.len()
+    for index in 0..<params.len() {
+        if params[index] != self.counter {
+            continue
+        }
+        let next = self.origin_of(func, value: destination.args[index], alloc)
+        let Some(def) = func.value_inst(next) else {
+            return false
+        }
+        let clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) = func.inst_data(def) else {
+            return false
+        }
+        let left = func.resolve_aliases(x)
+        let right = func.resolve_aliases(y)
+        return (left == self.counter and iconst_of(func, value: right) == Some(1)) or (right == self.counter and iconst_of(func, value: left) == Some(1))
+    }
+    return false
+} Region.counts_up
+
+/// The value a block parameter stands for when the one branch to its block passes it a value,
+/// followed through such parameters; any other value itself.
+fn Region.origin_of(self, func: clif::Function, value: clif::Value, alloc: mem::Alloc) -> clif::Value {
+    var current = func.resolve_aliases(value)
+    for _ in 0u32..<ORIGIN_STEPS {
+        let at = usize.widen(current.index)
+        expect at < self.homes.len()
+        let home = self.homes[at]
+        if func.value_inst(current).is_some() or home == NONE or self.single[usize.widen(home)] == NONE {
+            return current
+        }
+        let Some(passed) = passed_to(func, from: self.single[usize.widen(home)], block: home, param: current, alloc) else {
+            return current
+        }
+        current = func.resolve_aliases(passed)
+    }
+    return current
+} Region.origin_of
+
+/// The value the branch ending `from` passes to a parameter of `block`, when one arm alone goes
+/// there.
+fn passed_to(func: clif::Function, from: u32, block: u32, param: clif::Value, alloc: mem::Alloc) -> Option[clif::Value] {
+    let insts = func.block_insts(clif::Block(index: from), alloc)
+    expect insts.len() > 0
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => return passed_in(func, call: destination, param, alloc)
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            let to_then = then_call.block.index == block
+            if to_then == (else_call.block.index == block) {
+                return None
+            }
+            if to_then {
+                return passed_in(func, call: then_call, param, alloc)
+            }
+            return passed_in(func, call: else_call, param, alloc)
+        }
+        else => return None
+    }
+} passed_to
+
+/// The argument a branch passes to a parameter of its target.
+fn passed_in(func: clif::Function, call: clif::BlockCall, param: clif::Value, alloc: mem::Alloc) -> Option[clif::Value] {
+    let params = func.block_params(call.block, alloc)
+    expect call.args.len() == params.len()
+    for index in 0..<params.len() {
+        if params[index] == param {
+            return Some(call.args[index])
+        }
+    }
+    return None
+} passed_in
+
+/// Whether the loop's blocks leave it only for cold blocks that trap and, from its header, for
+/// `exit`, and hold no instruction other than a store that may write memory.
+fn Region.leaves_only_by(self, func: clif::Function, blocks: Slice[u32], header: u32, exit: u32, alloc: mem::Alloc) -> bool {
+    for block in blocks {
+        for target in targets_of(func, block: clif::Block(index: block), alloc) {
+            if not self.holds(target.index) and not (block == header and target.index == exit) and not is_trap_block(func, block: target, alloc) {
+                return false
+            }
+        }
+        for inst in func.block_insts(clif::Block(index: block), alloc) {
+            let data = func.inst_data(inst)
+            let stores = match data {
+                clif::InstructionData.Store(opcode: clif::Opcode.Store, flags: _, x: _, p: _, offset: _) => true
+                else => false
+            }
+            if writes_memory(data) and not stores {
+                return false
+            }
+        }
+    }
+    return true
+} Region.leaves_only_by
+
+/// Whether an instruction of a block outside the loop other than a cold one that traps reads a
+/// value the loop defines, unless it computes values nothing reads.
+fn Region.escapes(self, func: clif::Function, alloc: mem::Alloc) -> bool {
+    for block in func.layout_blocks(alloc) {
+        if self.holds(block.index) or is_trap_block(func, block, alloc) {
+            continue
+        }
+        for inst in func.block_insts(block, alloc) {
+            if self.is_dead(func, inst, alloc) {
+                continue
+            }
+            var read = false
+            each_operand(func.inst_data(inst), visit: fn[mut read](value: clif::Value) {
+                if self.defines(func, value) {
+                    read = true
+                }
+            })
+            if read {
+                return true
+            }
+        }
+    }
+    return false
+} Region.escapes
+
+/// Whether an instruction computes from its operands alone values nothing reads.
+fn Region.is_dead(self, func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    if not is_hoistable(func, inst, alloc) {
+        return false
+    }
+    for result in func.inst_results(inst, alloc) {
+        if not is_unread_value(self.reads.view(), value: result) {
+            return false
+        }
+    }
+    return true
+} Region.is_dead
+
+/// Marks the blocks of the loop lying on every path from its header to its latch: the header,
+/// the latch, and each block without which the latch cannot be reached from the header.
+fn Region.rule(mut self, func: clif::Function, blocks: Slice[u32], header: u32, latch: u32, alloc: mem::Alloc) {
+    for block in blocks {
+        let rules = block == header or block == latch or not self.reaches_avoiding(func, from: header, to: latch, avoided: block, alloc)
+        let at = usize.widen(block)
+        expect at < self.ruling.len()
+        self.ruling[at] = rules
+    }
+} Region.rule
+
+/// Whether `to` can be reached from `from` through the loop's blocks other than `avoided`,
+/// without branching back to `from`.
+fn Region.reaches_avoiding(self, func: clif::Function, from: u32, to: u32, avoided: u32, alloc: mem::Alloc) -> bool {
+    var seen = filled(self.inside.len(), value: false, alloc)
+    var pending = mem::List[u32].empty(alloc)
+    expect usize.widen(from) < seen.len()
+    seen[usize.widen(from)] = true
+    mut pending.push(from)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            return false
+        }
+        if block == to {
+            return true
+        }
+        for target in targets_of(func, block: clif::Block(index: block), alloc) {
+            let at = usize.widen(target.index)
+            if target.index == avoided or not self.holds(target.index) or seen[at] {
+                continue
+            }
+            seen[at] = true
+            mut pending.push(target.index)
+        }
+    }
+} Region.reaches_avoiding
+
+/// Records each check of the loop: a branch to a cold block that traps, which the copy drops;
+/// false when one is no check that holds for every count left once it holds for the last one
+/// and, set outside the loop, where it lies on every path to the latch.
+fn Version.drop_checks(mut self, func: clif::Function, region: Region, alloc: mem::Alloc) -> bool {
+    let blocks = self.blocks
+    for block in blocks {
+        if block == self.header {
+            continue
+        }
+        let insts = func.block_insts(clif::Block(index: block), alloc)
+        expect insts.len() > 0
+        let clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+            continue
+        }
+        let traps_then = is_trap_block(func, block: then_call.block, alloc)
+        let traps_else = is_trap_block(func, block: else_call.block, alloc)
+        if not traps_then and not traps_else {
+            continue
+        }
+        if traps_then == traps_else or not mut self.bound_check(func, region, block, c: arg, holds_true: traps_else, alloc) {
+            return false
+        }
+        mut self.dropped.push(block)
+    }
+    return true
+} Version.drop_checks
+
+/// Records what a check holding when its condition `c` is `holds_true` bounds: nothing for a
+/// condition set outside the loop, a start for the flag of a sum's overflow, a bound for an index
+/// below a limit; false for any other check.
+fn Version.bound_check(mut self, func: clif::Function, region: Region, block: u32, c: clif::Value, holds_true: bool, alloc: mem::Alloc) -> bool {
+    if not region.defines(func, value: c) {
+        return region.rules(block)
+    }
+    let Inverse(value: tested, inverted: inverted) = inverse_of(func, value: c, alloc)
+    let wanted = holds_true != inverted
+    let Some(def) = func.value_inst(tested) else {
+        return false
+    }
+    match func.inst_data(def) {
+        clif::InstructionData.Binary(opcode: clif::Opcode.UaddOverflow, x: x, y: y) => return not wanted and second_result_of(func, inst: def, alloc) == func.resolve_aliases(tested) and mut self.sum_start(func, region, x, y)
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let below = if wanted {
+                cond
+            } else {
+                negated(cond)
+            }
+            return mut self.bound_by(func, region, below, x, y, alloc)
+        }
+        else => return false
+    }
+} Version.bound_check
+
+/// Records the start of a sum of the counter and a value set outside the loop; false for any
+/// other sum.
+fn Version.sum_start(mut self, func: clif::Function, region: Region, x: clif::Value, y: clif::Value) -> bool {
+    let Some(start) = region.start_of(func, x, y) else {
+        return false
+    }
+    mut self.starts.push(start)
+    return true
+} Version.sum_start
+
+/// Records the bound a comparison `below` holding sets: an index below a limit set outside the
+/// loop or loaded by a load the copy pins; false for any other comparison.
+fn Version.bound_by(mut self, func: clif::Function, region: Region, below: clif::IntCC, x: clif::Value, y: clif::Value, alloc: mem::Alloc) -> bool {
+    var index = x
+    var limit = y
+    if below == clif::IntCC.UnsignedGreaterThan {
+        index = y
+        limit = x
+    } else if below != clif::IntCC.UnsignedLessThan {
+        return false
+    }
+    let Some(start) = region.index_start(func, value: index, alloc) else {
+        return false
+    }
+    let Some(steady) = mut self.steady(func, region, value: limit, alloc) else {
+        return false
+    }
+    if start != NO_VALUE {
+        mut self.starts.push(start)
+    }
+    mut self.bounds.push(Bound(start: start, limit: steady))
+    return true
+} Version.bound_by
+
+/// The start of an index of the loop: `NO_VALUE` for its counter, else the value set outside the
+/// loop a sum adds to the counter; none for any other value.
+fn Region.index_start(self, func: clif::Function, value: clif::Value, alloc: mem::Alloc) -> Option[clif::Value] {
+    let resolved = func.resolve_aliases(value)
+    if resolved == self.counter {
+        return Some(NO_VALUE)
+    }
+    let Some(def) = func.value_inst(resolved) else {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: opcode, x: x, y: y) = func.inst_data(def) else {
+        return None
+    }
+    if opcode != clif::Opcode.Iadd and (opcode != clif::Opcode.UaddOverflow or result_of(func, inst: def, alloc) != resolved) {
+        return None
+    }
+    return self.start_of(func, x, y)
+} Region.index_start
+
+/// The operand of a sum set outside the loop when its other operand is the counter.
+fn Region.start_of(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Option[clif::Value] {
+    let left = func.resolve_aliases(x)
+    let right = func.resolve_aliases(y)
+    if left == self.counter and not self.defines(func, value: right) {
+        return Some(right)
+    }
+    if right == self.counter and not self.defines(func, value: left) {
+        return Some(left)
+    }
+    return None
+} Region.start_of
+
+/// A value that stays the same while the copy runs: one set outside the loop, or one a load the
+/// copy pins gives.
+fn Version.steady(mut self, func: clif::Function, region: Region, value: clif::Value, alloc: mem::Alloc) -> Option[clif::Value] {
+    let resolved = func.resolve_aliases(value)
+    if not region.defines(func, value: resolved) or mut self.pin(func, region, value: resolved, alloc) {
+        return Some(resolved)
+    }
+    return None
+} Version.steady
+
+/// Pins the load giving a value, when it reads an address set outside the loop in a block on
+/// every path to the latch; whether the value is pinned.
+fn Version.pin(mut self, func: clif::Function, region: Region, value: clif::Value, alloc: mem::Alloc) -> bool {
+    if is_listed(self.pinned.view(), value: value.index) {
+        return true
+    }
+    let Some(def) = func.value_inst(value) else {
+        return false
+    }
+    let clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: offset) = func.inst_data(def) else {
+        return false
+    }
+    let at = usize.widen(value.index)
+    expect at < region.homes.len()
+    if region.defines(func, value: arg) or not region.rules(region.homes[at]) or self.pinned.len() >= VERSIONED_ACCESSES {
+        return false
+    }
+    mut self.pinned.push(value.index)
+    mut self.spots.push(Spot(address: func.resolve_aliases(arg), offset: offset, size: func.value_type(value).bytes()))
+    return true
+} Version.pin
+
+/// Records the stride of each store of the loop; false when one has none or there are too many.
+fn Version.reach_stores(mut self, func: clif::Function, region: Region, alloc: mem::Alloc) -> bool {
+    let blocks = self.blocks
+    for block in blocks {
+        for inst in func.block_insts(clif::Block(index: block), alloc) {
+            let clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: offset) = func.inst_data(inst) else {
+                continue
+            }
+            let Some(stride) = mut self.stride_of(func, region, address: p, offset, size: func.value_type(x).bytes(), alloc) else {
+                return false
+            }
+            if self.strides.len() >= VERSIONED_ACCESSES {
+                return false
+            }
+            mut self.strides.push(stride)
+        }
+    }
+    return true
+} Version.reach_stores
+
+/// The stride of a store's address: one set outside the loop, or a steady base plus an index
+/// scaled by a constant.
+fn Version.stride_of(mut self, func: clif::Function, region: Region, address: clif::Value, offset: i32, size: u32, alloc: mem::Alloc) -> Option[Stride] {
+    let resolved = func.resolve_aliases(address)
+    if not region.defines(func, value: resolved) {
+        return Some(Stride(base: resolved, start: NO_VALUE, scale: 0, offset: offset, size: size))
+    }
+    let Some(def) = func.value_inst(resolved) else {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) = func.inst_data(def) else {
+        return None
+    }
+    return match mut self.scaled_stride(func, region, base: x, scaled: y, offset, size, alloc) {
+        Some(stride) => Some(stride)
+        None => mut self.scaled_stride(func, region, base: y, scaled: x, offset, size, alloc)
+    }
+} Version.stride_of
+
+/// The stride of `base` plus `scaled`, an index of the loop times a constant, when `base` is
+/// steady.
+fn Version.scaled_stride(mut self, func: clif::Function, region: Region, base: clif::Value, scaled: clif::Value, offset: i32, size: u32, alloc: mem::Alloc) -> Option[Stride] {
+    let Some(def) = func.value_inst(scaled) else {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: opcode, x: x, y: y) = func.inst_data(def) else {
+        return None
+    }
+    let Some(amount) = iconst_of(func, value: y) else {
+        return None
+    }
+    let scale = match opcode {
+        clif::Opcode.Imul => amount
+        clif::Opcode.Ishl => if amount < 16 {
+            1u64 << u32.truncate(amount)
+        } else {
+            0
+        }
+        else => 0
+    }
+    if scale == 0 or scale > LARGEST_SCALE {
+        return None
+    }
+    let Some(start) = region.index_start(func, value: x, alloc) else {
+        return None
+    }
+    let Some(steady) = mut self.steady(func, region, value: base, alloc) else {
+        return None
+    }
+    if start != NO_VALUE {
+        mut self.starts.push(start)
+    }
+    return Some(Stride(base: steady, start: start, scale: scale, offset: offset, size: size))
+} Version.scaled_stride
+
+/// Pins each other load of an address set outside the loop in a block on every path to the
+/// latch, when no store of the loop has that address as its base.
+fn Version.pin_rest(mut self, func: clif::Function, region: Region, alloc: mem::Alloc) {
+    let blocks = self.blocks
+    for block in blocks {
+        if not region.rules(block) {
+            continue
+        }
+        for inst in func.block_insts(clif::Block(index: block), alloc) {
+            let clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: _) = func.inst_data(inst) else {
+                continue
+            }
+            if not self.stores_at(func, address: arg) {
+                discard mut self.pin(func, region, value: result_of(func, inst, alloc), alloc)
+            }
+        }
+    }
+} Version.pin_rest
+
+/// Whether a store of the loop has an address as its base.
+fn Version.stores_at(self, func: clif::Function, address: clif::Value) -> bool {
+    let resolved = func.resolve_aliases(address)
+    for stride in self.strides {
+        if stride.base == resolved {
+            return true
+        }
+    }
+    return false
+} Version.stores_at
+
+/// The constant an `iconst` defining a value gives, as bits.
+fn iconst_of(func: clif::Function, value: clif::Value) -> Option[u64] {
+    let Some(def) = func.value_inst(value) else {
+        return None
+    }
+    let clif::InstructionData.UnaryImm(opcode: _, imm: imm) = func.inst_data(def) else {
+        return None
+    }
+    return Some(imm.to_bits())
+} iconst_of
+
+/// The versioned loop whose latch a block is, if any.
+fn Versions.latched(self, block: clif::Block) -> Option[u32] {
+    for index in 0..<self.list.len() {
+        if self.list[index].latch == block.index {
+            return Some(u32.fit(index))
+        }
+    }
+    return None
+} Versions.latched
+
+/// Whether the copy of a versioned loop drops the branch ending a block.
+fn Versions.drops(self, version: u32, block: clif::Block) -> bool {
+    let at = usize.widen(version)
+    return at < self.list.len() and is_listed(self.list[at].dropped.view(), value: block.index)
+} Versions.drops
+
+/// Whether the copy of a versioned loop pins the load giving a value.
+fn Versions.pins(self, version: u32, value: clif::Value) -> bool {
+    let at = usize.widen(version)
+    return at < self.list.len() and is_listed(self.list[at].pinned.view(), value: value.index)
+} Versions.pins
+
+/// The branches the copies add to a block.
+fn Versions.added_to(self, block: clif::Block) -> u32 {
+    let at = usize.widen(block.index)
+    if at >= self.added.len() {
+        return 0
+    }
+    return self.added[at]
+} Versions.added_to
+
+fn Versions.empty(alloc: mem::Alloc) -> Versions = Versions(list: mem::List[Version].empty(alloc), added: mem::List[u32].empty(alloc))
+
+/// Ends the latch of a versioned loop: tests whether its copy may go on from the next count,
+/// then branches to the copy's header when it may and to the loop's own otherwise, passing either
+/// the jump's arguments; then copies the loop's blocks into the copy.
+fn Copier.copy_versioned_latch(mut self, func: clif::Function, scope: Scope, version: u32, passed: Slice[clif::Value], leaves: Leaves) {
+    var fast = mut self.fast_scope(func, scope, version)
+    let holds = mut self.version_test(func, scope, version)
+    if self.lost {
+        return
+    }
+    let header = clif::Block(index: self.versions.list[usize.widen(version)].header)
+    let original = scope.block(header)
+    let copy = fast.block(header)
+    mut self.b.brif(holds, then: copy, then_args: passed, otherwise: original, otherwise_args: passed)
+    mut self.reached(copy)
+    mut self.reached(original)
+    let blocks = copied_list(self.versions.list[usize.widen(version)].blocks.view(), alloc: self.alloc)
+    for block in blocks {
+        mut self.b.switch_to_block(fast.block(clif::Block(index: block)))
+        mut self.copy_block(func, scope: mut fast, block: clif::Block(index: block), leaves)
+        if self.lost {
+            return
+        }
+    }
+    mut self.forget()
+} Copier.copy_versioned_latch
+
+/// The scope of a versioned loop's copy: the scope at the loop's latch, with a new block for each
+/// of the loop's blocks, its header reached from the latch and from the copy's own, and the
+/// values the loop defines yet to be copied but for those of pinned loads.
+fn Copier.fast_scope(mut self, func: clif::Function, scope: Scope, version: u32) -> Scope {
+    var fast = scope.duplicate(alloc: self.alloc)
+    fast.fast = version
+    fast.previous = NONE
+    let predecessors = predecessor_counts(func, alloc: self.alloc)
+    let header = self.versions.list[usize.widen(version)].header
+    let blocks = copied_list(self.versions.list[usize.widen(version)].blocks.view(), alloc: self.alloc)
+    let pinned = copied_list(self.versions.list[usize.widen(version)].pinned.view(), alloc: self.alloc)
+    for block in blocks {
+        let original = clif::Block(index: block)
+        expect usize.widen(block) < predecessors.len()
+        let reaching: u32 = if block == header {
+            2
+        } else {
+            predecessors[usize.widen(block)]
+        }
+        let copy = mut self.new_block(predecessors: reaching)
+        fast.blocks[usize.widen(block)] = copy
+        if func.is_cold(original) {
+            mut self.b.set_cold_block(copy)
+        }
+        for param in func.block_params(original, alloc: self.alloc) {
+            let copied = mut self.b.append_block_param(copy, ty: func.value_type(param))
+            mut fast.bind(param, copy: copied)
+        }
+        for inst in func.block_insts(original, alloc: self.alloc) {
+            for result in func.inst_results(inst, alloc: self.alloc) {
+                if not is_listed(pinned.view(), value: result.index) {
+                    mut fast.bind(result, copy: NO_VALUE)
+                }
+            }
+        }
+    }
+    return fast
+} Copier.fast_scope
+
+/// The test ending a versioned loop's latch: whether its next count reaches its limit, or each
+/// check its copy drops holds for every count left and no store of those counts reaches the bytes
+/// of a pinned load.
+fn Copier.version_test(mut self, func: clif::Function, scope: Scope, version: u32) -> clif::Value {
+    let at = usize.widen(version)
+    let starts = copied_list(self.versions.list[at].starts.view(), alloc: self.alloc)
+    let bounds = copied_list(self.versions.list[at].bounds.view(), alloc: self.alloc)
+    let reaching = self.versions.list[at].spots.len() > 0
+    let counter = mut self.value(scope, func, value: self.versions.list[at].counter)
+    let limit = mut self.value(scope, func, value: self.versions.list[at].limit)
+    if self.lost {
+        return NO_VALUE
+    }
+    let next = mut self.b.iadd_imm_s(counter, y: 1)
+    let ends = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: next, y: limit)
+    let last = mut self.b.iadd_imm_s(limit, y: -1)
+    var holds = mut self.b.iconst(clif::Type.Int8, imm: 1)
+    for start in starts {
+        let base = mut self.value(scope, func, value: start)
+        let sum = mut self.b.uadd_overflow(base, y: last)
+        holds = mut self.b.band_not(holds, y: sum.flag)
+    }
+    for bound in bounds {
+        let index = mut self.index_at(func, scope, start: bound.start, count: last)
+        let limit_copy = mut self.value(scope, func, value: bound.limit)
+        let below = mut self.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: limit_copy)
+        holds = mut self.b.band(holds, y: below)
+    }
+    if reaching {
+        let apart = mut self.reach_test(func, scope, version, counter, last)
+        holds = mut self.b.band(holds, y: apart)
+    }
+    return mut self.b.bor(ends, y: holds)
+} Copier.version_test
+
+/// An index at a count: the count plus the copy of `start`, the count alone for `NO_VALUE`.
+fn Copier.index_at(mut self, func: clif::Function, scope: Scope, start: clif::Value, count: clif::Value) -> clif::Value {
+    if start == NO_VALUE {
+        return count
+    }
+    let base = mut self.value(scope, func, value: start)
+    return mut self.b.iadd(base, y: count)
+} Copier.index_at
+
+/// Whether no store of the counts from `counter` to `last` reaches the bytes of a pinned load, as
+/// computed without wrapping.
+fn Copier.reach_test(mut self, func: clif::Function, scope: Scope, version: u32, counter: clif::Value, last: clif::Value) -> clif::Value {
+    let strides = copied_list(self.versions.list[usize.widen(version)].strides.view(), alloc: self.alloc)
+    let spots = copied_list(self.versions.list[usize.widen(version)].spots.view(), alloc: self.alloc)
+    var wraps = mut self.b.iconst(clif::Type.Int8, imm: 0)
+    var apart = mut self.b.iconst(clif::Type.Int8, imm: 1)
+    for stride in strides {
+        let base = mut self.value(scope, func, value: stride.base)
+        if self.lost {
+            return apart
+        }
+        var low = base
+        var high = base
+        if stride.scale > 0 {
+            let factor = mut self.b.iconst(clif::Type.Int64, imm: i64.from_bits(stride.scale))
+            let now = mut self.index_at(func, scope, start: stride.start, count: counter)
+            let scaled_now = mut self.b.umul_overflow(now, y: factor)
+            let end = mut self.index_at(func, scope, start: stride.start, count: last)
+            let scaled_end = mut self.b.umul_overflow(end, y: factor)
+            wraps = mut self.b.bor(wraps, y: scaled_now.flag)
+            wraps = mut self.b.bor(wraps, y: scaled_end.flag)
+            low = mut self.add_flagged(base, y: scaled_now.value, mut wraps)
+            high = mut self.add_flagged(base, y: scaled_end.value, mut wraps)
+        }
+        low = mut self.offset_flagged(low, by: i64.widen(stride.offset), mut wraps)
+        high = mut self.offset_flagged(high, by: i64.widen(stride.offset) + i64.widen(stride.size), mut wraps)
+        for spot in spots {
+            let address = mut self.value(scope, func, value: spot.address)
+            let read_from = mut self.offset_flagged(address, by: i64.widen(spot.offset), mut wraps)
+            let read_to = mut self.offset_flagged(read_from, by: i64.widen(spot.size), mut wraps)
+            let before = mut self.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: read_to, y: low)
+            let after = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: read_from, y: high)
+            let clear = mut self.b.bor(before, y: after)
+            apart = mut self.b.band(apart, y: clear)
+        }
+    }
+    return mut self.b.band_not(apart, y: wraps)
+} Copier.reach_test
+
+/// `x + y`, noting in `wraps` whether it wraps.
+fn Copier.add_flagged(mut self, x: clif::Value, y: clif::Value, mut wraps: clif::Value) -> clif::Value {
+    let sum = mut self.b.uadd_overflow(x, y: y)
+    wraps = mut self.b.bor(wraps, y: sum.flag)
+    return sum.value
+} Copier.add_flagged
+
+/// `x` moved by a signed amount, noting in `wraps` whether it wraps.
+fn Copier.offset_flagged(mut self, x: clif::Value, by: i64, mut wraps: clif::Value) -> clif::Value {
+    if by == 0 {
+        return x
+    }
+    let magnitude = if by > 0 {
+        by
+    } else {
+        0 - by
+    }
+    let amount = mut self.b.iconst(clif::Type.Int64, imm: magnitude)
+    let moved = if by > 0 {
+        mut self.b.uadd_overflow(x, y: amount)
+    } else {
+        mut self.b.usub_overflow(x, y: amount)
+    }
+    wraps = mut self.b.bor(wraps, y: moved.flag)
+    return moved.value
+} Copier.offset_flagged
+
+/// A check the copy of a versioned loop drops: a jump to the target it holds for.
+fn Copier.jump_past(mut self, func: clif::Function, scope: Scope, then_call: clif::BlockCall, else_call: clif::BlockCall) {
+    if is_trap_block(func, block: then_call.block, alloc: self.alloc) {
+        mut self.jump_kept(func, scope, kept: else_call)
+    } else {
+        mut self.jump_kept(func, scope, kept: then_call)
+    }
+} Copier.jump_past
+
+fn Copier.jump_kept(mut self, func: clif::Function, scope: Scope, kept: clif::BlockCall) {
+    let passed = mut self.values(scope, func, values: kept_args(func, call: kept, trims: self.trims.view(), alloc: self.alloc).view())
+    if self.lost {
+        return
+    }
+    let target = scope.block(kept.block)
+    mut self.b.jump(target, args: passed.view())
+    mut self.reached(target)
+} Copier.jump_kept

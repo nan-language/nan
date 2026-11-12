@@ -18,7 +18,19 @@ struct Selector {
     loc: clif::SourceLoc
     /// The quotients the block being selected computed by magic numbers.
     quotients: mem::List[Quotient]
+    /// The operand the block being selected rebuilds from an overflowing operation's result.
+    rebuilt: Rebuilt
 } Selector
+
+/// An operand of an addition or subtraction that a cold block reached only when the operation
+/// overflows rebuilds from its result, so that it need not stay live past the operation, and the
+/// register holding it there; `NO_VALUE` for none.
+struct Rebuilt derives Copy, Eq {
+    value: clif::Value
+    reg: machinst::Reg
+} Rebuilt
+
+const NOT_REBUILT: Rebuilt = Rebuilt(value: NO_VALUE, reg: NO_REG)
 
 /// The machine code of a function.
 fn select(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> VCode[x64::Inst] {
@@ -54,6 +66,7 @@ fn Selector.new(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> Selector {
         current: VBlock(begin: 0, end: 0, param_start: 0, param_count: 0, arg_start: 0, arg_count: 0, succ_start: 0, succ_count: 0),
         loc: clif::DEFAULT_LOC,
         quotients: mem::List[Quotient].empty(alloc),
+        rebuilt: NOT_REBUILT,
     )
     mut selector.facts.fuse_overflow_checks(func)
     mut selector.facts.mark_shown_values(func)
@@ -119,6 +132,9 @@ fn Selector.copy(mut self, src: machinst::Reg) -> machinst::Reg {
 /// time an instruction names the value.
 fn Selector.reg(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
     let resolved = func.resolve_aliases(value)
+    if resolved == self.rebuilt.value {
+        return self.rebuilt.reg
+    }
     let at = usize.widen(resolved.index)
     expect at < self.lows.len() and at < self.highs.len()
     let existing = self.lows[at]
@@ -187,9 +203,12 @@ fn imm32(bits: u64, width: u32) -> Option[i32] {
     return Some(i32.truncate(i64.from_bits(bits << shift).shr_arith(shift)))
 } imm32
 
-/// The register holding a value for an instruction to read; a constant or a stack slot's address
-/// is written into a new register for each read.
+/// The register holding a value for an instruction to read; a stack slot's address, and a
+/// constant other than a wide one, is written into a new register for each read.
 fn Selector.src(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
+    if self.is_wide(value, func) {
+        return mut self.reg(value, func)
+    }
     let Some(bits) = self.facts.constant(value, func) else {
         let at = usize.widen(func.resolve_aliases(value).index)
         expect at < self.facts.defs.len()
@@ -214,6 +233,40 @@ fn Selector.src(mut self, value: clif::Value, func: clif::Function) -> machinst:
     mut self.emit(x64::Inst.MovImm(dst: reg, imm: bits))
     return reg
 } Selector.src
+
+/// Whether a value is a wide constant: a float other than zero, or an integer of 64 bits no 32-bit
+/// immediate gives, which its own register holds from where it is defined, as a loop's
+/// preheader holds the constants hoisting moves there.
+fn Selector.is_wide(self, value: clif::Value, func: clif::Function) -> bool {
+    let Some(bits) = self.facts.constant(value, func) else {
+        return false
+    }
+    let ty = func.value_type(value)
+    if ty.is_float() {
+        return bits != 0
+    }
+    return ty == clif::Type.Int64 and imm32(bits, width: 64).is_none()
+} Selector.is_wide
+
+/// A wide constant written into its own register where it is defined.
+fn Selector.wide_constant(mut self, func: clif::Function, inst: clif::Inst) {
+    let result = result_of(func, inst, alloc: self.alloc)
+    if not self.is_wide(result, func) {
+        return
+    }
+    let Some(bits) = self.facts.constant(result, func) else {
+        return
+    }
+    let dst = mut self.reg(result, func)
+    let ty = func.value_type(result)
+    if ty.is_float() {
+        let int = mut self.temp(false)
+        mut self.emit(x64::Inst.MovImm(dst: int, imm: bits))
+        mut self.emit(x64::Inst.MovToXmm(size: x64::Size.of_bits(ty.bits()), dst: dst, src: int))
+        return
+    }
+    mut self.emit(x64::Inst.MovImm(dst: dst, imm: bits))
+} Selector.wide_constant
 
 /// The register holding a 128-bit value's high half for an instruction to read.
 fn Selector.src_high(mut self, value: clif::Value, func: clif::Function) -> machinst::Reg {
@@ -274,10 +327,12 @@ fn Selector.select_block(mut self, func: clif::Function, block: clif::Block) {
             }
         }
     }
+    mut self.rebuild_operand(func, block)
     for inst in func.block_insts(block, alloc: self.alloc) {
         self.loc = func.srcloc(inst)
         mut self.select_inst(func, block, inst)
     }
+    self.rebuilt = NOT_REBUILT
     mut self.finish_block()
 } Selector.select_block
 

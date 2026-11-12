@@ -7,7 +7,7 @@ fn Selector.select_inst(mut self, func: clif::Function, block: clif::Block, inst
         return
     }
     match func.inst_data(inst) {
-        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => {}
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => mut self.wide_constant(func, inst)
         clif::InstructionData.Unary(opcode: opcode, arg: arg) => mut self.unary(func, inst, opcode, arg)
         clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => mut self.binary(func, inst, opcode, x, y)
         clif::InstructionData.Ternary(opcode: opcode, x: x, y: y, z: z) => {
@@ -521,11 +521,16 @@ fn Selector.extended(mut self, src: machinst::Reg, ty: clif::Type, signed: bool)
     return wide
 } Selector.extended
 
+/// An extension, none for a zero extension of a loaded value, which its register holds already.
 fn Selector.extend(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
     let source = func.value_type(arg)
     let result = result_of(func, inst, alloc: self.alloc)
     let src = mut self.src(arg, func)
-    let wide = mut self.extended(src, ty: source, signed: signed)
+    let wide = if not signed and self.facts.is_loaded(func, value: arg) {
+        src
+    } else {
+        mut self.extended(src, ty: source, signed: signed)
+    }
     if func.value_type(result) != clif::Type.Int128 {
         mut self.alias(result, func, low: wide, high: NO_REG)
         return
@@ -766,10 +771,60 @@ fn Selector.minmax(mut self, func: clif::Function, inst: clif::Inst, x: clif::Va
     mut self.emit(x64::Inst.Cmov(cond: cond, size: op_size(ty), dst: dst, src: a))
 } Selector.minmax
 
-/// An addition or subtraction at the type's own width, with the flag of its overflow.
+/// In a cold block that traps, reached only when a 32- or 64-bit addition or subtraction
+/// overflows, an operand rebuilt from the operation's result: the first, or the second when the
+/// first is a constant.
+fn Selector.rebuild_operand(mut self, func: clif::Function, block: clif::Block) {
+    let Some(def) = self.facts.overflow_sending(func, block) else {
+        return
+    }
+    let clif::InstructionData.Binary(opcode: opcode, x: x, y: y) = func.inst_data(def) else {
+        return
+    }
+    let ty = func.value_type(x)
+    if ty.bits() < 32 or ty.bits() > 64 {
+        return
+    }
+    let size = exact_size(ty)
+    let adds = opcode == clif::Opcode.UaddOverflow or opcode == clif::Opcode.SaddOverflow
+    let result = result_of(func, inst: def, alloc: self.alloc)
+    let outcome = mut self.reg(result, func)
+    let rebuilt = mut self.temp(false)
+    if self.facts.constant(x, func).is_none() {
+        let op = if adds {
+            x64::AluOp.Sub
+        } else {
+            x64::AluOp.Add
+        }
+        mut self.alu(func, op, size, dst: rebuilt, src: outcome, y)
+        self.rebuilt = Rebuilt(value: func.resolve_aliases(x), reg: rebuilt)
+        return
+    }
+    if self.facts.constant(y, func).is_some() {
+        return
+    }
+    if adds {
+        mut self.alu(func, op: x64::AluOp.Sub, size, dst: rebuilt, src: outcome, y: x)
+    } else {
+        let minuend = mut self.src(x, func)
+        mut self.alu(func, op: x64::AluOp.Sub, size, dst: rebuilt, src: minuend, y: result)
+    }
+    self.rebuilt = Rebuilt(value: func.resolve_aliases(y), reg: rebuilt)
+} Selector.rebuild_operand
+
+/// An addition or subtraction at the type's own width, with the flag of its overflow; of 32 or
+/// 64 bits whose flag nothing reads, the plain operation.
 fn Selector.overflowing(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, op: x64::AluOp, flag: x64::Cond) {
     let ty = func.value_type(x)
     expect ty != clif::Type.Int128
+    if ty.bits() >= 32 and self.facts.is_unread(func, value: second_result_of(func, inst, alloc: self.alloc)) {
+        if op == x64::AluOp.Add {
+            mut self.iadd(func, inst, x, y)
+        } else {
+            mut self.isub(func, inst, x, y)
+        }
+        return
+    }
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(x, func)
     mut self.alu(func, op, size: exact_size(ty), dst, src, y)
@@ -777,10 +832,15 @@ fn Selector.overflowing(mut self, func: clif::Function, inst: clif::Inst, x: cli
 } Selector.overflowing
 
 /// A multiplication at the type's own width, with the flag of its overflow: `mul`, or `imul`
-/// with two operands, for bytes with one.
+/// with two operands, for bytes with one; of 32 or 64 bits whose flag nothing reads, the plain
+/// multiplication.
 fn Selector.mul_overflowing(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value, signed: bool) {
     let ty = func.value_type(x)
     expect ty != clif::Type.Int128
+    if ty.bits() >= 32 and self.facts.is_unread(func, value: second_result_of(func, inst, alloc: self.alloc)) {
+        mut self.imul(func, inst, x, y)
+        return
+    }
     let size = exact_size(ty)
     let a = mut self.src(x, func)
     let b = mut self.src(y, func)

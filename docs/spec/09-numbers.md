@@ -328,6 +328,26 @@ pub fn u64.trailing_zeros(self) -> u32 limits pure, notrap, terminates
     example 8u64.trailing_zeros() == 3
 ```
 
+## Minimum and maximum
+
+Every integer type declares `min` and `max`: `a.min(b)` is the lesser of a and b, and `a.max(b)` the greater.
+
+Core declares these items for `u64`, and the same items for every other integer type with that type's name in place of `u64` everywhere, literal suffixes included.
+
+```nan-api
+// module: core
+
+pub fn u64.min(self, other: u64) -> u64 limits pure, notrap, terminates
+    ensures result <= self and result <= other
+    ensures result == self or result == other
+    example 3u64.min(5) == 3
+
+pub fn u64.max(self, other: u64) -> u64 limits pure, notrap, terminates
+    ensures result >= self and result >= other
+    ensures result == self or result == other
+    example 3u64.max(5) == 5
+```
+
 ## Wide multiplication
 
 `a.wide_mul(b)` on `u64` and on `i64` returns the exact product p as a `core::WideProduct[T]`, where p = `high` × 2^64 + `low` and `low` lies in 0 to 2^64 − 1. No integer type is wider than 64 bits.

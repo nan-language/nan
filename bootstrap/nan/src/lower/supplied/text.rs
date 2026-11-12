@@ -146,12 +146,62 @@ fn string(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.done(lo, fx);
 }
 
-/// `String.write(value, budget)` and `try_write`: renders once to measure the output, then
-/// again into storage drawn for exactly that output.
+/// `String.write(value, budget)` and `try_write`: renders straight into the spare capacity
+/// when it holds the budget, else once to measure the output, then again into storage drawn for
+/// exactly that output.
 fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let address = supply.param(0).address();
     let value = supply.param(1).address();
     let budget = supply.param(2).scalar();
+    let len = fx.load(PTR, address, vector::LEN);
+    let capacity = fx.load(PTR, address, vector::CAPACITY);
+    let spare = fx.b.ins().isub(capacity, len);
+    let roomy =
+        fx.b.ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, spare, budget);
+    fx.choose_in(
+        lo,
+        roomy,
+        &[],
+        |lo, fx| {
+            string_write_in_place(lo, fx, (address, len), value, budget);
+            Vec::new()
+        },
+        |lo, fx| {
+            string_write_measured(lo, fx, supply, address, value, budget);
+            Vec::new()
+        },
+    );
+}
+
+/// Renders a `Dyn[Render]` value within a budget straight into the spare capacity of the string
+/// at an address, of a length, which holds the budget.
+fn string_write_in_place(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    (address, len): (Value, Value),
+    value: Value,
+    budget: Value,
+) {
+    let data = fx.load(PTR, address, vector::DATA);
+    let target = fx.b.ins().iadd(data, len);
+    let renderer = render::new_renderer(fx, target, budget);
+    render_passed(lo, fx, value, renderer);
+    let added = render::finish(lo, fx, renderer);
+    let grown = fx.b.ins().iadd(len, added);
+    fx.store(grown, address, vector::LEN);
+}
+
+/// Renders a `Dyn[Render]` value within a budget once to measure the output, then again into
+/// storage of the string at an address drawn for exactly that output.
+fn string_write_measured(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    address: Value,
+    value: Value,
+    budget: Value,
+) {
     let none = fx.ptr(0);
     let measure = render::new_renderer(fx, none, budget);
     render_passed(lo, fx, value, measure);

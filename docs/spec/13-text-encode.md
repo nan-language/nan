@@ -442,7 +442,7 @@ impl Fixed: Writer
 ```
 
 - `write` appends the output of `value.render` with render budget `budget`.
-- `text::String.write` calls `value.render` twice, first to measure the output, then to write it into memory drawn for exactly that output. It traps when that memory is exhausted (`trap.exhausted`); `try_write` fails with `mem::OutOfMemory.Exhausted` there, leaving the receiver unchanged.
+- `text::String.write` renders straight into the string's spare capacity when that holds the render budget. Otherwise it calls `value.render` twice, first to measure the output, then to write it into memory drawn for exactly that output. It traps when that memory is exhausted (`trap.exhausted`); `try_write` fails with `mem::OutOfMemory.Exhausted` there, leaving the receiver unchanged.
 - On `text::Fixed[N]` the render budget is the smaller of `budget` and `room()`; neither method traps or fails.
 
 ```nan
@@ -456,6 +456,14 @@ test clipping_marks_elision for clipped {
     clipped("a long line", mut out)
     expect out.as_str() == "a lon..."
 } clipping_marks_elision
+
+test clipping_into_kept_capacity_marks_elision for clipped {
+    let world = testing::world()
+    var out = text::String.of("a longer line", alloc: world.alloc)
+    mut out.clear()
+    clipped("a long line", mut out)
+    expect out.as_str() == "a lon..."
+} clipping_into_kept_capacity_marks_elision
 ```
 
 ## Templates

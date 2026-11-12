@@ -111,28 +111,39 @@ impl Checker<'_> {
         }
     }
 
-    /// The `validate` grant an impl line naming `core::Decoder` needs.
+    /// The `validate` grant an impl line naming `core::Decoder` or `core::Parse` needs.
     pub fn check_decoder_impl(&self, item: ItemId) {
         if let SigKind::Impl {
             interface: Some(bound),
             ..
         } = &self.sig(item).kind
-            && self.db.canonical(bound.interface) == "core::Decoder"
+            && ["core::Decoder", "core::Parse"]
+                .contains(&self.db.canonical(bound.interface).as_str())
         {
             self.require(item, self.db.ast(item).token, Authority::Validate);
         }
     }
 
     /// Whether a function is a validator: declared `validator`, or implementing a method of
-    /// `core::Decoder`.
+    /// `core::Decoder` or `core::Parse`.
     pub fn is_validator(&self, function: ItemId) -> bool {
-        let declared = matches!(&self.db.ast(function).kind,
-            ItemKind::Fn(head) if head.modifier.is_some_and(|(modifier, _)| modifier == FnModifier::Validator));
-        declared
-            || self.implemented_lines(function).iter().any(|&line| {
-                matches!(&self.sig(line).kind, SigKind::Impl { interface: Some(bound), .. }
-                    if self.db.canonical(bound.interface) == "core::Decoder")
-            })
+        self.declared_validator(function)
+            || self.implements_method_of(function, "core::Decoder")
+            || self.implements_method_of(function, "core::Parse")
+    }
+
+    /// Whether a function is declared `validator`.
+    fn declared_validator(&self, function: ItemId) -> bool {
+        matches!(&self.db.ast(function).kind,
+            ItemKind::Fn(head) if head.modifier.is_some_and(|(modifier, _)| modifier == FnModifier::Validator))
+    }
+
+    /// Whether a function implements a method of the interface at a canonical path.
+    pub(super) fn implements_method_of(&self, function: ItemId, interface: &str) -> bool {
+        self.implemented_lines(function).iter().any(|&line| {
+            matches!(&self.sig(line).kind, SigKind::Impl { interface: Some(bound), .. }
+                if self.db.canonical(bound.interface) == interface)
+        })
     }
 
     /// Reports the `validate` grant a call of a validator, or a function value naming one, needs.

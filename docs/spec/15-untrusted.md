@@ -128,7 +128,7 @@ pub fn joined(head: Untrusted[Slice[u8]], tail: Untrusted[Slice[u8]], alloc: mem
 
 ## Validators
 
-A **validator** is a function item declared with the `validator` [modifier](02-items.md#modifiers), or an [implementing function](08-generics-interfaces.md#conformance) of a method of `core::Decoder`, which [decoders](13-text-encode.md#decoders-as-validators) call. Code reads Untrusted contents only through `inspect`, in validators.
+A **validator** is a function item declared with the `validator` [modifier](02-items.md#modifiers), an [implementing function](08-generics-interfaces.md#conformance) of a method of `core::Decoder`, which [decoders](13-text-encode.md#decoders-as-validators) call, or an implementing function of `core::Parse.parse`, which [construction text](13-text-encode.md#construction-text) calls. Code reads Untrusted contents only through `inspect`, in validators.
 
 - `Untrusted.inspect` appears only as the callee of a call written in the body, or in an `ensures`, `example` or `decreases` clause, of a validator, closures written there included. Any other use, including naming it as a function value, is an error (`untrusted.inspect-outside-validator`).
 - A function declared `validator` has at least one parameter whose type is an Untrusted instantiation (`untrusted.validator-no-input`). These parameters are its **Untrusted inputs**.
@@ -222,7 +222,7 @@ A **parsing type** is one of these, and no other type is one:
 
 The checker decides whether a struct or enum is a parsing type, its type parameters counted as parsing types, from its full definition in the package declaring it. For a `pub` struct or enum this result is an [interface fact](05-properties.md#interface-facts), which consumers read instead of its fields.
 
-The **export types** of a function declared `validator` are:
+The **export types** of a function declared `validator` or implementing `core::Parse.parse` are:
 
 - its result type and its failure type;
 - the type of each parameter other than its Untrusted inputs that it receives by `mut`;
@@ -230,7 +230,7 @@ The **export types** of a function declared `validator` are:
 
 A validator or decoder is either parsing or declassifying:
 
-- A **parsing validator** is a function declared `validator` whose export types are all parsing types, or a parsing decoder.
+- A **parsing validator** is a function declared `validator` or implementing `core::Parse.parse` whose export types are all parsing types, or a parsing decoder.
 - A **declassifying validator** is any other validator or decoder, an [implementing function](08-generics-interfaces.md#conformance) of a method of `core::Decoder` included.
 - The decoder of a generic type item is declassifying. The decoder of any other type item is parsing exactly when the item is a parsing type.
 - A use of a decoder is parsing exactly when the instantiation it decodes is a parsing type.
@@ -284,7 +284,7 @@ The **codec uses** of a function are the type parameters whose decoders and enco
 
 - the declaration of a validator, on its head;
 - the declaration of a type item whose decoder is declassifying, on the line of its `derives` clause;
-- an impl line naming `core::Decoder`;
+- an impl line naming `core::Decoder` or `core::Parse`;
 - an impl line naming `sys::Component` for a [component entry](27-program-model.md#entry) serving a protocol that is no parsing type, whose bundle decodes the calls of other closures, on that line;
 - a use of a validator, or a declassifying use of a decoder or encoder, on the line holding the call, function value or instantiation.
 

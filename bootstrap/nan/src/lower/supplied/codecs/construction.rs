@@ -771,6 +771,107 @@ pub fn read_variant(
     (parts[0], parts[1], parts[2])
 }
 
+/// The text of a parsed type's value after whitespace, as its start and length: the bytes up to
+/// the first `,`, `:`, `)`, `]` or `}` outside parentheses, brackets, braces and literals, or up
+/// to the end, which the reader passes over, without the whitespace ending them.
+pub fn rendering(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value) {
+    let mut signature = Signature::new(CALL_CONV);
+    signature.params.push(AbiParam::new(PTR));
+    signature.returns.push(AbiParam::new(PTR));
+    signature.returns.push(AbiParam::new(PTR));
+    let function = lo.glue_function(Glue::ConstructionRendering, signature, |_, fx| {
+        let state = fx.entry()[0];
+        space(fx, state);
+        let start = fx.load(PTR, state, reader::POS);
+        let end = fx.load(PTR, state, reader::END);
+        let depth = fx.ptr(0);
+        let quote = fx.int(types::I64, 0);
+        let stop = fx.repeat(&[start, depth, quote], |fx, values| {
+            rendering_pass(fx, values, end)
+        })[0];
+        fx.store(stop, state, reader::POS);
+        let trimmed = fx.repeat(&[stop], |fx, values| {
+            let at = values[0];
+            let before = fx.b.ins().iadd_imm_s(at, -1);
+            let after_start = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, at, start);
+            let blank = fx.choose(
+                after_start,
+                &[types::I8],
+                |fx| {
+                    let byte = fx.load(types::I8, before, 0);
+                    let mut blank = fx.int(types::I8, 0);
+                    for character in *b" \t\n\r" {
+                        let this =
+                            fx.b.ins()
+                                .icmp_imm_s(IntCC::Equal, byte, i64::from(character));
+                        blank = fx.b.ins().bor(blank, this);
+                    }
+                    vec![blank]
+                },
+                |fx| vec![fx.int(types::I8, 0)],
+            )[0];
+            (blank, vec![fx.b.ins().select(blank, before, at)])
+        })[0];
+        let len = fx.b.ins().isub(trimmed, start);
+        fx.b.ins().return_(&[start, len]);
+    });
+    let reference = lo.call_ref(fx, function);
+    let call = fx.b.ins().call(reference, &[state]);
+    let results = fx.b.inst_results(call).to_vec();
+    (results[0], results[1])
+}
+
+/// A pass of the scan of a parsed type's text, over the position, the depth of brackets and the
+/// open literal's quote, zero for none.
+fn rendering_pass(fx: &mut Fx, values: &[Value], end: Value) -> (Value, Vec<Value>) {
+    let (at, depth, quote) = (values[0], values[1], values[2]);
+    let byte = byte_at(fx, at, end);
+    let one_of = |fx: &mut Fx, bytes: &[u8]| {
+        let mut found = fx.int(types::I8, 0);
+        for wanted in bytes {
+            let this =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, byte, i64::from(*wanted));
+            found = fx.b.ins().bor(found, this);
+        }
+        found
+    };
+    let quoted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, quote, 0);
+    let outside = fx.b.ins().bxor_imm_s(quoted, 1);
+    let backslash = one_of(fx, b"\\");
+    let escape = fx.b.ins().band(quoted, backslash);
+    let same = fx.b.ins().icmp(IntCC::Equal, byte, quote);
+    let closes = fx.b.ins().band(quoted, same);
+    let quotes = one_of(fx, b"\"'");
+    let opens = fx.b.ins().band(outside, quotes);
+    let opening = one_of(fx, b"([{");
+    let opener = fx.b.ins().band(outside, opening);
+    let closing = one_of(fx, b")]}");
+    let closer = fx.b.ins().band(outside, closing);
+    let separating = one_of(fx, b",:");
+    let separator = fx.b.ins().band(outside, separating);
+    let top = fx.b.ins().icmp_imm_s(IntCC::Equal, depth, 0);
+    let ending = fx.b.ins().bor(closer, separator);
+    let ends = fx.b.ins().band(ending, top);
+    let done = fx.b.ins().icmp_imm_s(IntCC::Equal, byte, -1);
+    let stop = fx.b.ins().bor(done, ends);
+    let zero = fx.int(types::I64, 0);
+    let kept = fx.b.ins().select(closes, zero, quote);
+    let next_quote = fx.b.ins().select(opens, byte, kept);
+    let up = fx.b.ins().uextend(types::I64, opener);
+    let down = fx.b.ins().uextend(types::I64, closer);
+    let raised = fx.b.ins().iadd(depth, up);
+    let next_depth = fx.b.ins().isub(raised, down);
+    let two = fx.ptr(2);
+    let one = fx.ptr(1);
+    let step = fx.b.ins().select(escape, two, one);
+    let stepped = fx.b.ins().iadd(at, step);
+    let bounded = fx.b.ins().umin(stepped, end);
+    let next = fx.b.ins().select(stop, at, bounded);
+    let again = fx.b.ins().bxor_imm_s(stop, 1);
+    (again, vec![next, next_depth, next_quote])
+}
+
 /// Passes over any value, nested no deeper than decoding reads.
 pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
     let mut signature = Signature::new(CALL_CONV);

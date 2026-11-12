@@ -1288,6 +1288,14 @@ pub validator fn render_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[
 pub validator fn encode_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError
 ```
 
+```nan-api
+// module: core
+
+pub interface Parse {
+    fn parse(raw: Untrusted[Str], alloc: mem::Alloc) -> Self fails DecodeError limits terminates
+} Parse
+```
+
 `decode` reads exactly one value; bytes other than whitespace left after it fail with `Trailing`. Whitespace, U+0020, U+0009, U+000A and U+000D, may stand before and after each token: a word, a number, a literal, or one of `-inf`, `(`, `)`, `[`, `]`, `{`, `}`, `,`, `:` and `.`. A name or key is a `WORD` ([identifiers](01-lexical.md#identifiers)). Each kind reads as follows:
 
 | Kind | Construction text |
@@ -1304,6 +1312,7 @@ pub validator fn encode_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[
 - A name before a record or variant key is not checked. A record without `(` has no fields, as in `Unit`. A labelled payload is read as the fields of a record without its name and parentheses: `Shape.Rect(w: 2, h: 3)`.
 - An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float is rounded to `f64` by roundTiesToEven. A char literal holds exactly one char; `_` separates digits and carries no meaning.
 - A field that an open type skips is any value of these forms.
+- A **parsed type** is a type implementing both `Render` and `core::Parse`, whose `parse` reads back the text its `render` writes. A value of a parsed type, at any depth, reads as its text: after whitespace, the bytes up to the first `,`, `:`, `)`, `]` or `}` outside parentheses, brackets, braces and char, text and byte-string literals, or up to the end of the input, without the whitespace that ends them. Bytes that are not well-formed UTF-8 fail with `InvalidText`; `parse` gives the value from the others, or the failure. Reading a parsed type is a use of its decoder, not of its `parse` ([validate grants](15-untrusted.md#validate-grants)).
 - Input that is not well-formed UTF-8 inside a literal, or a `\u{H}` escape naming a surrogate or a value above `10FFFF`, fails with `InvalidText`. Other input outside these forms, `\xHH` above `7F` in a char or text included, fails with `Malformed`.
 
 `render_as` and `encode_as` translate between construction text and `mem::wire` bytes through a [named schema](#schema-hashes), without naming the type:
@@ -1311,7 +1320,9 @@ pub validator fn encode_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[
 - `render_as(schema, raw, alloc, out: o)` reads `raw` as one `mem::wire` value of the schema's tree and appends to `o` its construction text, each value in its nested rendering: a record node with a name as the last segment of its name, `(` and its fields, one without a name as its fields alone, or `Unit` when it has none; a variant node as the last segment of its name, `.` and its key, without the name for `core::Option` and `core::Result`, then its payload in parentheses. Fields are written in the order of their keys in the bytes. Bytes that the type's `mem::wire` decoder would reject fail with that decoder's error, an undeclared field of an open record node being skipped.
 - `encode_as(schema, raw, alloc)` reads `raw` as construction text of the tree's root, as `decode` would for its type, and gives the bytes `mem::wire` encodes for it, a sequence's elements and a map's entries in the order written.
 
-Decoding the rendering of a value within a render budget that does not elide it gives the value back when its type implements `Encode` and every value it renders, itself included, renders as the tables and derived Render above state, holds no `Untrusted` value, whose `<untrusted>` decodes as no kind, and is not text or a char at the top level, which renders as its characters.
+Both write and read the value of a parsed type in the form its encoding has, not as its text.
+
+Decoding the rendering of a value within a render budget that does not elide it gives the value back when its type implements `Encode` and every value it renders, itself included, renders as the tables and derived Render above state or is of a parsed type, holds no `Untrusted` value, whose `<untrusted>` decodes as no kind, and is not text or a char at the top level, which renders as its characters.
 
 ```nan
 // file: ports/package.nan
@@ -1362,6 +1373,86 @@ test port_text_is_checked for load_port {
     expect small == Err(core::DecodeError.Invalid)
     expect unknown == Err(core::DecodeError.UnknownVariant)
 } port_text_is_checked
+```
+
+```nan
+// file: history/package.nan
+//! Commits read back from their rendering.
+
+package history {
+    language 1
+    targets any
+    allow validate in history
+} history
+
+// file: history/history.nan
+//! Commit ids rendered as `#` and their number, inside derived records.
+
+pub closed struct CommitId derives Copy, Eq, Encode {
+    pub number: u64
+} CommitId
+
+impl CommitId: Render
+
+impl CommitId: core::Parse
+
+pub fn CommitId.render(self, mut out: core::Renderer) {
+    mut out.write("#")
+    mut out.write_nested(self.number)
+} CommitId.render
+
+pub fn CommitId.parse(raw: Untrusted[Str], alloc: mem::Alloc) -> CommitId fails core::DecodeError {
+    let text = raw.inspect()
+    let Some(digits) = text.slice_bytes(1, end: text.byte_len()) else {
+        fail core::DecodeError.Malformed
+    }
+    if not text.starts_with("#") or digits.is_empty() {
+        fail core::DecodeError.Malformed
+    }
+    var number: u64 = 0
+    for byte in digits.as_bytes() {
+        if byte < b'0' or byte > b'9' {
+            fail core::DecodeError.Malformed
+        }
+        let Some(tens) = number.checked_mul(10) else {
+            fail core::DecodeError.OutOfRange
+        }
+        let Some(next) = tens.checked_add(u64.widen(byte - b'0')) else {
+            fail core::DecodeError.OutOfRange
+        }
+        number = next
+    }
+    return CommitId(number: number)
+} CommitId.parse
+
+pub closed struct Read derives Eq, Render, Encode {
+    pub commit: CommitId
+    pub parents: mem::List[CommitId]
+} Read
+
+pub fn load_read(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Read fails core::DecodeError
+    example (attempt load_read(Untrusted.of(b"Read(commit: #12, parents: [#1, #2])"), alloc: testing::world().alloc)).is_ok()
+    example attempt load_read(Untrusted.of(b"Read(commit: \"#1\", parents: [])"), alloc: testing::world().alloc) == Err(core::DecodeError.Malformed)
+{
+    return try text::construction::Codec[Read].decode(raw, alloc)
+} load_read
+
+test reads_read_their_rendering for load_read {
+    let world = testing::world()
+    var parents = mem::List[CommitId].empty(world.alloc)
+    mut parents.push(CommitId(number: 4))
+    let read = Read(commit: CommitId(number: 5), parents: take parents)
+    var out = text::String.empty(world.alloc)
+    mut out.write(text::fmt("{read}", read), budget: 64)
+    expect out.as_str() == "Read(commit: #5, parents: [#4])"
+    let loaded = attempt load_read(Untrusted.of(out.as_bytes()), alloc: world.alloc)
+    let expected: Result[Read, core::DecodeError] = Ok(take read)
+    expect loaded == expected
+    let spaced = attempt load_read(Untrusted.of(b"Read(parents: [ #1 , #2 ], commit: #3 )"), alloc: world.alloc)
+    expect spaced.is_ok()
+    let bad = attempt load_read(Untrusted.of(b"Read(commit: 5, parents: [])"), alloc: world.alloc)
+    expect bad == Err(core::DecodeError.Malformed)
+} reads_read_their_rendering
 ```
 
 ```nan

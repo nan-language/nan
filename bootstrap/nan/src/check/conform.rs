@@ -225,6 +225,15 @@ impl Checker<'_> {
         self.conformance(ty, interface).is_some()
     }
 
+    /// Whether a type is a parsed type: it implements both `core::Render` and `core::Parse`.
+    pub fn is_parsed(&self, ty: &Ty) -> bool {
+        ["Render", "Parse"].iter().all(|name| {
+            self.db
+                .core_item(name)
+                .is_some_and(|interface| self.implements(ty, interface))
+        })
+    }
+
     /// The interface arguments a failed type implements an interface with: failed too.
     fn error_args(&self, interface: ItemId) -> Args {
         self.shapes(interface)

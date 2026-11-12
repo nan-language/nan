@@ -491,6 +491,35 @@ impl Reader for ConstructionReader {
         }
     }
 
+    fn rendering(&mut self) -> Option<Vec<u8>> {
+        self.input.space();
+        let start = self.input.at;
+        let mut at = start;
+        let mut depth = 0usize;
+        let mut quote = None;
+        while let Some(byte) = self.byte_at(at) {
+            match quote {
+                Some(_) if byte == b'\\' => at += 1,
+                Some(open) if byte == open => quote = None,
+                Some(_) => {}
+                None => match byte {
+                    b'"' | b'\'' => quote = Some(byte),
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' | b',' | b':' if depth == 0 => break,
+                    b')' | b']' | b'}' => depth -= 1,
+                    _ => {}
+                },
+            }
+            at += 1;
+        }
+        self.input.at = at.min(self.input.bytes.len());
+        let mut stop = self.input.at;
+        while stop > start && b" \t\n\r".contains(&self.input.bytes[stop - 1]) {
+            stop -= 1;
+        }
+        Some(self.input.bytes[start..stop].to_vec())
+    }
+
     fn finish(&mut self, _: &mut Interpreter) -> Decoded<()> {
         self.input.space();
         match self.input.at == self.input.bytes.len() {

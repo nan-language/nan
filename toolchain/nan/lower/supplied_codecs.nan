@@ -1509,13 +1509,65 @@ fn decoder(mut lo: Lowering, format: DecodeFormat, ty: ty::Ty) -> object::FuncId
         let params = mut fx1.entry()
         expect params.len() == 3
         let decoding = Decoding(format: format, reader: params[0], alloc: params[1])
-        let kind = kind_of(mut lo1, ty: bare)
-        decode_kind(mut lo1, fx: mut fx1, decoding, ty: bare, kind, target: params[2])
+        if format == DecodeFormat.Construction and lo1.ck.is_parsed(bare) {
+            decode_parsed(mut lo1, fx: mut fx1, decoding, ty: bare, target: params[2])
+        } else {
+            let kind = kind_of(mut lo1, ty: bare)
+            decode_kind(mut lo1, fx: mut fx1, decoding, ty: bare, kind, target: params[2])
+        }
         let none = mut fx1.int(clif::Type.Int32, value: 0)
         let returned = fx1.list1(none)
         mut fx1.b.ret(returned.view())
     })
 } decoder
+
+/// Reads a value of a parsed type from construction text: what its `parse` gives for its text,
+/// failing with `InvalidText` when that is not well-formed UTF-8.
+fn decode_parsed(mut lo: Lowering, mut fx: Fx, decoding: Decoding, ty: ty::Ty, target: clif::Value) {
+    let text = construction_rendering(mut lo, mut fx, state: decoding.reader)
+    let valid = utf8_valid(mut lo, mut fx, start: text.start, len: text.len)
+    let invalid = mut fx.b.bxor_imm_s(valid, y: 1)
+    mut fx.if_true(invalid, then: fn(mut fx1: Fx) {
+        codecs_fail(mut fx1, code: FAILURE_INVALID_TEXT)
+    })
+    let raw = codecs_view(mut fx, start: text.start, len: text.len)
+    let alloc_slot = mut fx.slot(8, align: 8)
+    mut fx.store(decoding.alloc, addr: alloc_slot, offset: 0)
+    let parse_item = lo.core_interface("Parse")
+    let Some(method) = lo.ck.interface_method(parse_item, name: "parse") else {
+        expect false
+        return
+    }
+    var args = mem::List[Held].empty(lo.alloc)
+    mut args.push(raw)
+    mut args.push(Held.Address(alloc_slot))
+    let called = mut lo.call_interface(mut fx, ty, interface_item: parse_item, method: u32.fit(method), own: mem::List[ty::Arg].empty(lo.alloc), args: args.view())
+    let Some(failed) = called.failed else {
+        expect false
+        return
+    }
+    let Some(error) = called.failure else {
+        expect false
+        return
+    }
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        let error_ty = lo.std_ty("core", type_name: "DecodeError", args: mem::List[ty::Ty].empty(lo.alloc))
+        let index = mut lo.variant_index(mut fx1, ty: error_ty, address: error)
+        let code = mut fx1.b.iadd_imm_s(index, y: 1)
+        let narrow = mut fx1.b.ireduce(clif::Type.Int32, x: code)
+        let returned = fx1.list1(narrow)
+        mut fx1.b.ret(returned.view())
+    })
+    mut lo.store_held(mut fx, address: target, held: called.result, ty)
+} decode_parsed
+
+/// A view of `len` bytes from `start`, as a `Str` or slice of bytes is held.
+fn codecs_view(mut fx: Fx, start: clif::Value, len: clif::Value) -> Held {
+    let view = mut fx.slot(16, align: 8)
+    mut fx.store(start, addr: view, offset: 0)
+    mut fx.store(len, addr: view, offset: 8)
+    return Held.Address(view)
+} codecs_view
 
 /// Returns a failure code from a decoding function.
 fn codecs_fail(mut fx: Fx, code: i64) {

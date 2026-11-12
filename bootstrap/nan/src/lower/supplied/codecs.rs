@@ -1342,8 +1342,13 @@ fn decoder(lo: &mut Lowering, format: &DecodeFormat, ty: &Ty) -> FuncId {
                 reader: params[0],
                 alloc: params[1],
             };
-            let kind = kind_of(lo, &ty);
-            decode_kind(lo, fx, &decoding, &ty, &kind, params[2]);
+            match decoding.format == DecodeFormat::Construction && lo.ck.is_parsed(&ty) {
+                true => decode_parsed(lo, fx, &decoding, &ty, params[2]),
+                false => {
+                    let kind = kind_of(lo, &ty);
+                    decode_kind(lo, fx, &decoding, &ty, &kind, params[2]);
+                }
+            }
             let none = fx.int(types::I32, 0);
             fx.b.ins().return_(&[none]);
         },
@@ -1748,6 +1753,50 @@ fn decode_kind(
             fx.when(always, |fx| fail(fx, failure::INVALID));
         }
     }
+}
+
+/// Reads a value of a parsed type from construction text: what its `parse` gives for its text,
+/// failing with `InvalidText` when that is not well-formed UTF-8.
+fn decode_parsed(lo: &mut Lowering, fx: &mut Fx, decoding: &Decoding, ty: &Ty, target: Value) {
+    let (start, len) = construction::rendering(lo, fx, decoding.reader);
+    let valid = utf8_valid(lo, fx, start, len);
+    let invalid = fx.b.ins().bxor_imm_s(valid, 1);
+    fx.when(invalid, |fx| fail(fx, failure::INVALID_TEXT));
+    let raw = view(fx, start, len);
+    let alloc = fx.slot(8, 8);
+    fx.store(decoding.alloc, alloc, 0);
+    let parse = lo.core_interface("Parse");
+    let method = lo
+        .ck
+        .interface_method(parse, "parse")
+        .expect("the parse method");
+    let called = lo.call_interface(
+        fx,
+        ty,
+        parse,
+        method as u32,
+        Vec::new(),
+        &[raw, Held::Address(alloc)],
+    );
+    let (Some(failed), Some(error)) = (called.failed, called.failure) else {
+        panic!("a parse that fails");
+    };
+    fx.when(failed, |fx| {
+        let error_ty = lo.std_ty("core", "DecodeError", Vec::new());
+        let index = lo.variant_index(fx, &error_ty, error);
+        let code = fx.b.ins().iadd_imm_s(index, 1);
+        let code = fx.b.ins().ireduce(types::I32, code);
+        fx.b.ins().return_(&[code]);
+    });
+    lo.store_held(fx, target, called.result, ty);
+}
+
+/// A view of `len` bytes from `start`, as a `Str` or slice of bytes is held.
+fn view(fx: &mut Fx, start: Value, len: Value) -> Held {
+    let view = fx.slot(16, 8);
+    fx.store(start, view, 0);
+    fx.store(len, view, 8);
+    Held::Address(view)
 }
 
 /// Reads a value of a handle type: the index of the next handle the reader has not read, whose

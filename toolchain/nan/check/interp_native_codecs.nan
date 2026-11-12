@@ -177,6 +177,10 @@ interface Reader {
     fn end(mut self, mut interp: Interpreter) fails Failure
     /// Fails on what is left after the value.
     fn finish(mut self, mut interp: Interpreter) fails Failure
+    /// The text of a parsed type's value, for a format reading parsed types as their text.
+    fn rendering(mut self) -> Option[mem::Bytes] {
+        return None
+    } rendering
 } Reader
 
 impl WireReader: Reader
@@ -1402,6 +1406,12 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
             if self.carried.is_some() and ck.is_handle(ty) {
                 return try mut self.handle(mut interp, mut reader, ty)
             }
+            if ck.is_parsed(ty) {
+                match mut reader.rendering() {
+                    Some(text) => return try mut self.parsed(mut interp, ty, take text)
+                    None => {}
+                }
+            }
             return try mut self.item(mut interp, mut reader, item, args: ck.types().arg_list(args))
         }
         else => {}
@@ -1409,6 +1419,31 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
     expect false
     fail Failure.Decode(DecodeKind.Malformed)
 } Decoding.value
+
+/// A value of a parsed type: what its `parse` gives for its text.
+fn Decoding.parsed(mut self, mut interp: Interpreter, ty: ty::Ty, take text: mem::Bytes) -> Val fails Failure {
+    if not text::utf8::is_valid(text.view()) {
+        fail Failure.Decode(DecodeKind.InvalidText)
+    }
+    let alloc = interp.alloc
+    let view = mut interp.byte_view(text.view(), writable: false)
+    let untrusted = interp.ty_item("core", name: "Untrusted")
+    let raw = Val.Struct(item: untrusted, fields: mem::Shared.of(Val.single(take view, alloc), alloc))
+    let parse = interp.ty_item("core", name: "Parse")
+    let Some(method) = interp.ck.interface_method(parse, name: "parse") else {
+        expect false
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    mut type_args.push(ty::Arg.Ty(ty))
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: parse, method: u32.fit(method)), args: interp.ck.types().args(take type_args))
+    var args = Val.single(take raw, alloc)
+    mut args.push(interp.allocator(self.cell))
+    match try mut interp.call_function(fn_ref, args: take args, at: self.at, site: self.site) {
+        InterpFlow.Fail(error) => fail Failure.Raised(take error)
+        InterpFlow.Return(value) or InterpFlow.Yield(value) => return value
+    }
+} Decoding.parsed
 
 /// A value of a handle type: the index of the next handle not read, whose handle hash is the
 /// type's.

@@ -167,6 +167,8 @@ pub enum Glue {
     ConstructionLiteral(supplied::codecs::construction::Literal),
     /// Passes over a value of construction text.
     ConstructionSkip,
+    /// Reads the text of a parsed type's value in construction text.
+    ConstructionRendering,
     /// Decodes base64 text.
     Base64,
     /// Whether bytes are well-formed UTF-8.

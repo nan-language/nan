@@ -268,9 +268,10 @@ impl Checker<'_> {
     /// Whether a validator is declassifying: it implements a method of `core::Decoder`, or one
     /// of its export types is no parsing type.
     pub fn declassifying_validator(&self, function: ItemId) -> bool {
-        let declared = matches!(&self.db.ast(function).kind,
-            ItemKind::Fn(head) if head.modifier.is_some_and(|(modifier, _)| modifier == FnModifier::Validator));
-        let Some(head) = self.fn_sig(function).filter(|_| declared) else {
+        let Some(head) = self
+            .fn_sig(function)
+            .filter(|_| !self.implements_method_of(function, "core::Decoder"))
+        else {
             return true;
         };
         let mut exports: Vec<Ty> = vec![head.result.clone()];

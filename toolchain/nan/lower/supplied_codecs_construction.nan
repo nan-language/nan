@@ -880,6 +880,127 @@ fn variant_key(mut lo: Lowering, mut fx: Fx, state: clif::Value, buffer: clif::V
     return fx.list3(key[0], b: payload[0], c: key[1])
 } variant_key
 
+/// The text of a parsed type's value after whitespace, as its start and length: the bytes up to
+/// the first `,`, `:`, `)`, `]` or `}` outside parentheses, brackets, braces and literals, or up
+/// to the end, which the reader passes over, without the whitespace ending them.
+fn construction_rendering(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> Stretch {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: PTR))
+    let function = mut lo.glue_function(Glue.ConstructionRendering, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        rendering_glue(mut fx1)
+    })
+    let reference = mut lo.call_ref(mut fx, id: function)
+    let call_args = fx.list1(state)
+    let call = mut fx.b.call(reference, args: call_args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 2
+    return Stretch(start: results[0], len: results[1])
+} construction_rendering
+
+/// Whether a byte is one of `bytes`.
+fn construction_one_of(mut fx: Fx, byte: clif::Value, bytes: Slice[u8]) -> clif::Value {
+    var found = mut fx.int(clif::Type.Int8, value: 0)
+    for wanted in bytes {
+        let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(wanted))
+        found = mut fx.b.bor(found, y: this)
+    }
+    return found
+} construction_one_of
+
+/// A pass of the scan of a parsed type's text, over the position, the depth of brackets and the
+/// open literal's quote, zero for none.
+fn rendering_pass(mut fx: Fx, current: Slice[clif::Value], end: clif::Value) -> Pass {
+    expect current.len() == 3
+    let at = current[0]
+    let depth = current[1]
+    let quote = current[2]
+    let byte = construction_byte_at(mut fx, at, end)
+    let quoted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: quote, y: 0)
+    let outside = mut fx.b.bxor_imm_s(quoted, y: 1)
+    let backslash = construction_one_of(mut fx, byte, bytes: b"\\")
+    let escape = mut fx.b.band(quoted, y: backslash)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: byte, y: quote)
+    let closes = mut fx.b.band(quoted, y: same)
+    let quotes = construction_one_of(mut fx, byte, bytes: b"\"'")
+    let opens = mut fx.b.band(outside, y: quotes)
+    let opening = construction_one_of(mut fx, byte, bytes: b"([{")
+    let opener = mut fx.b.band(outside, y: opening)
+    let closing = construction_one_of(mut fx, byte, bytes: b")]}")
+    let closer = mut fx.b.band(outside, y: closing)
+    let separating = construction_one_of(mut fx, byte, bytes: b",:")
+    let separator = mut fx.b.band(outside, y: separating)
+    let top = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: depth, y: 0)
+    let ending = mut fx.b.bor(closer, y: separator)
+    let ends = mut fx.b.band(ending, y: top)
+    let done = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: -1)
+    let stop = mut fx.b.bor(done, y: ends)
+    let zero = mut fx.int(clif::Type.Int64, value: 0)
+    let kept = mut fx.b.select(closes, x: zero, y: quote)
+    let next_quote = mut fx.b.select(opens, x: byte, y: kept)
+    let up = mut fx.b.uextend(clif::Type.Int64, x: opener)
+    let down = mut fx.b.uextend(clif::Type.Int64, x: closer)
+    let raised = mut fx.b.iadd(depth, y: up)
+    let next_depth = mut fx.b.isub(raised, y: down)
+    let two = mut fx.ptr(2)
+    let one = mut fx.ptr(1)
+    let step = mut fx.b.select(escape, x: two, y: one)
+    let stepped = mut fx.b.iadd(at, y: step)
+    let bounded = mut fx.b.umin(stepped, y: end)
+    let next = mut fx.b.select(stop, x: at, y: bounded)
+    let again = mut fx.b.bxor_imm_s(stop, y: 1)
+    return Pass(again: again, next: fx.list3(next, b: next_depth, c: next_quote))
+} rendering_pass
+
+/// The body of the function reading a parsed type's text: receives the reader and gives the
+/// text's start and length.
+fn rendering_glue(mut fx: Fx) {
+    let params = mut fx.entry()
+    expect params.len() == 1
+    let state = params[0]
+    space(mut fx, state)
+    let start = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let end = mut fx.load(PTR, addr: state, offset: READER_END)
+    let depth = mut fx.ptr(0)
+    let quote = mut fx.int(clif::Type.Int64, value: 0)
+    let initial = fx.list3(start, b: depth, c: quote)
+    let scanned = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        return rendering_pass(mut fx1, current, end)
+    })
+    expect scanned.len() == 3
+    let stop = scanned[0]
+    mut fx.store(stop, addr: state, offset: READER_POS)
+    let from = fx.list1(stop)
+    let trimmed = mut fx.repeat(from.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let at = current[0]
+        let before = mut fx1.b.iadd_imm_s(at, y: -1)
+        let after_start = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThan, x: at, y: start)
+        let results = fx1.types1(clif::Type.Int8)
+        let chosen = mut fx1.choose(after_start, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let byte = mut fx2.load(clif::Type.Int8, addr: before, offset: 0)
+            var blank = mut fx2.int(clif::Type.Int8, value: 0)
+            for character in b" \t\n\r" {
+                let this = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(character))
+                blank = mut fx2.b.bor(blank, y: this)
+            }
+            return fx2.list1(blank)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(none)
+        })
+        expect chosen.len() == 1
+        let blank = chosen[0]
+        let next = mut fx1.b.select(blank, x: before, y: at)
+        return Pass(again: blank, next: fx1.list1(next))
+    })
+    expect trimmed.len() == 1
+    let len = mut fx.b.isub(trimmed[0], y: start)
+    let returned = fx.list2(start, b: len)
+    mut fx.b.ret(returned.view())
+} rendering_glue
+
 /// Passes over any value, nested no deeper than decoding reads.
 fn construction_skip(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> clif::Value {
     var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)

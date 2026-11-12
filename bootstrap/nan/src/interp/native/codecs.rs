@@ -17,7 +17,7 @@ use super::super::value::{FnVal, Loc, Val, View};
 use super::super::{End, Exec, Flow, Interpreter, Site};
 use super::collections::{conformance, ordering};
 use super::render::float_text;
-use super::stores::{boxed, cell_of, counted, entries, exhausted, holding, place};
+use super::stores::{allocator, boxed, cell_of, counted, entries, exhausted, holding, place};
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
@@ -1046,6 +1046,10 @@ trait Reader {
     fn end(&mut self, interp: &mut Interpreter) -> Decoded<()>;
     /// Fails on what is left after the value.
     fn finish(&mut self, interp: &mut Interpreter) -> Decoded<()>;
+    /// The text of a parsed type's value, for a format reading parsed types as their text.
+    fn rendering(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The position of a key among `keys`.
@@ -1092,8 +1096,42 @@ impl Decoding<'_, '_, '_, '_> {
             Ty::Item(..) if self.carried.is_some() && self.interp.ck.is_handle(ty) => {
                 self.handle(ty)
             }
-            Ty::Item(item, args) => self.item(*item, args),
+            Ty::Item(item, args) => {
+                if self.interp.ck.is_parsed(ty)
+                    && let Some(text) = self.reader.rendering()
+                {
+                    return self.parsed(ty, text);
+                }
+                self.item(*item, args)
+            }
             other => panic!("a decoded value of {other:?}"),
+        }
+    }
+
+    /// A value of a parsed type: what its `parse` gives for its text.
+    fn parsed(&mut self, ty: &Ty, text: Vec<u8>) -> Decoded<Val> {
+        if std::str::from_utf8(&text).is_err() {
+            return fail("InvalidText");
+        }
+        let view = byte_view(self.interp, &text, false);
+        let untrusted = self.interp.ty_item("core", "Untrusted");
+        let raw = Val::Struct(untrusted, Rc::new(vec![view]));
+        let alloc = allocator(self.interp, self.cell);
+        let parse = self.interp.ty_item("core", "Parse");
+        let method = self.interp.ck.interface_method(parse, "parse");
+        let fn_ref = FnRef {
+            callable: Callable::Method {
+                interface: parse,
+                method: method.expect("the parse method") as u32,
+            },
+            args: Rc::from(vec![Arg::Ty(ty.clone())]),
+        };
+        match self
+            .interp
+            .call_function(&fn_ref, vec![raw, alloc], self.at, self.site)?
+        {
+            Flow::Fail(error) => Err(Failure::Raised(error)),
+            Flow::Return(value) | Flow::Yield(value) => Ok(value),
         }
     }
 

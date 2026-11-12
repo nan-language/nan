@@ -18,7 +18,7 @@ use super::super::mem::maps::Entries;
 use super::super::mem::vector::{self, Element};
 use super::{
     BYTE, CasePayload, DecodeFormat, Kind, Record, by_key, call, check, contents_of, elements_of,
-    fail, failure, kind_of, reader, returned, text_of, unwrapped, utf8_valid,
+    fail, failure, kind_of, reader, returned, text_of, unwrapped, utf8_valid, view,
 };
 use crate::check::ty::{Args, Scalar, Ty};
 
@@ -70,14 +70,6 @@ fn write(lo: &mut Lowering, fx: &mut Fx, encoder: &Ty, target: Value, name: &str
     let mut all = vec![Held::Address(target)];
     all.extend_from_slice(args);
     lo.call_interface(fx, encoder, interface, method as u32, Vec::new(), &all);
-}
-
-/// A view of `len` bytes from `start`, as a `Str` or slice of bytes is held.
-fn view(fx: &mut Fx, start: Value, len: Value) -> Held {
-    let view = fx.slot(16, 8);
-    fx.store(start, view, 0);
-    fx.store(len, view, 8);
-    Held::Address(view)
 }
 
 /// The encoding function of a type through an encoder of a type: given the value's address and

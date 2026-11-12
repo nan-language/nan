@@ -1,6 +1,6 @@
 # Text, rendering and Encode
 
-This chapter defines the text types, their lengths and slicing, `text::utf8`, case folding, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules and flexible structs, schema trees and hashes, the formats `mem::wire` and `text::json`, erased decoders, migrations, and the construction text that `text::construction` decodes.
+This chapter defines the text types, their lengths and slicing, `text::utf8`, case folding, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules and flexible structs, schema trees and hashes, the formats `mem::wire`, `text::base64` and `text::json`, erased decoders, migrations, and the construction text that `text::construction` decodes.
 
 ## Text types
 
@@ -1170,6 +1170,33 @@ migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notra
 } Settings.from_first
 ```
 
+## Base64
+
+`text::base64` writes bytes as base64 with padding (RFC 4648, section 4) and reads it back.
+
+```nan-api
+// module: text::base64
+
+pub fn encode(bytes: Slice[u8], mut out: text::String)
+
+pub validator fn decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError
+```
+
+- `encode(bytes, out: o)` appends to `o` four chars of the alphabet `A` to `Z`, `a` to `z`, `0` to `9`, `+` and `/` for each group of three bytes, a last group of two bytes or one byte giving three chars and `=` or two chars and `==`.
+- `decode(raw, alloc)` returns the bytes whose encoding is exactly the bytes of `raw`; any other input fails with `Malformed`.
+
+```nan
+pub fn hello(mut out: text::String) {
+    text::base64::encode(b"hi!?", mut out)
+} hello
+
+test hello_is_padded for hello {
+    var out = text::String.empty(testing::world().alloc)
+    hello(mut out)
+    expect out.as_str() == "aGkhPw=="
+} hello_is_padded
+```
+
 ## JSON
 
 `text::json` encodes values as JSON text (RFC 8259) and decodes JSON bytes.
@@ -1195,7 +1222,7 @@ pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails cor
 | unsigned, signed | an integer in decimal, `-` before a negative value |
 | float | the number as [Render](#render) writes it; `NaN`, `inf` and `-inf` as JSON strings |
 | char, text | a JSON string |
-| bytes | a JSON string of the bytes in base64 with padding (RFC 4648, section 4) |
+| bytes | a JSON string of the bytes as [`text::base64::encode`](#base64) writes them |
 | sequence | an array |
 | map | an array of 2-element arrays, key then value |
 | record | an object, members in ascending byte order of keys |
@@ -1203,7 +1230,7 @@ pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails cor
 
 - JSON strings escape `"` as `\"`, `\` as `\\`, U+000A as `\n`, U+000D as `\r`, U+0009 as `\t`, U+0008 as `\b`, U+000C as `\f`, and other characters below U+0020 as `\u` with 4 lowercase hexadecimal digits; every other character is written as itself.
 - `decode` accepts the whitespace and escapes RFC 8259 allows and object members in any order. Input that is not well-formed UTF-8, or an escape naming a lone surrogate, fails with `InvalidText`; other input outside the RFC 8259 grammar, `null` included, fails with `Malformed`.
-- An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float any number, rounded to `f64` by roundTiesToEven, or one of the three JSON strings; a char a JSON string of exactly one char; bytes base64 exactly as `encode` writes it; a map entry an array of exactly 2 elements; a variant with payload an object of exactly 1 member. Other input for these kinds fails with `Malformed`.
+- An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float any number, rounded to `f64` by roundTiesToEven, or one of the three JSON strings; a char a JSON string of exactly one char; bytes a JSON string that `text::base64::decode` reads; a map entry an array of exactly 2 elements; a variant with payload an object of exactly 1 member. Other input for these kinds fails with `Malformed`.
 
 ```nan
 pub closed struct Probe derives Eq, Encode {

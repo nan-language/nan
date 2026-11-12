@@ -10,7 +10,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 | --- | --- | --- |
 | `core` | scalar operations, `Option`, `Result`, arrays and slices, `Str`, ranges, cursors, `Untrusted`, `Dyn`, the property, comparison, operator, render, encoding and generation interfaces, total float orders, wide products, signatures, lane types | `core::atomic`, `core::crypto`, `core::simd` |
 | `mem` | allocators, budgets, stores, ids, handles, boxes, shared values, collections, once maps | `mem::wire` |
-| `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::json`, `text::construction` |
+| `text` | owned and inline text, interning, writers, templates | `text::utf8`, `text::base64`, `text::json`, `text::construction` |
 | `task` | task scopes, joins, deadlines, races, cowns, channels, cancellation, poisoning, executors, completions | none |
 | `sys` | the sys capabilities, revocation, domains, components, loading bundles | `sys::fs`, `sys::net`, `sys::sim`, `sys::load` |
 | `hw` | pointers, address types, register windows, DMA, privileged intrinsics, the anchor, interrupts, signals, spin locks, cross-CPU operations, scheduling, physical memory, platform registries | `hw::sim` |
@@ -80,6 +80,7 @@ The table names every pub std type, interface, free function and registry with t
 | `text` | `text::case::fold`, `text::case::eq` | [Case folding](13-text-encode.md#case-folding) |
 | `text` | `text::Symbol`, `text::Interner` | [Interning](13-text-encode.md#interning) |
 | `text` | `text::Writer`, `text::fmt` | [Writers](13-text-encode.md#writers), [Templates](13-text-encode.md#templates) |
+| `text` | `text::base64::encode`, `text::base64::decode` | [Base64](13-text-encode.md#base64) |
 | `text` | `text::json::Codec` | [JSON](13-text-encode.md#json) |
 | `text` | `text::construction::Codec` | [Construction text](13-text-encode.md#construction-text) |
 | `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` and `spawn_sized` in [Joins](16-concurrency.md#joins) |
@@ -322,7 +323,7 @@ The [authority summary](14-authority.md#authority-summaries) of each std package
 | --- | --- | --- | --- | --- |
 | `core` | none | `alloc` | decoders | trusted code, declassifying decoders |
 | `mem` | `mem::Budget`, `mem::Heap`, `hw::Region` | `alloc` | decoders, the `core::Decoder` methods of `mem::wire` | trusted code, declassifying decoders and validators |
-| `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction` | trusted code, declassifying decoders and validators |
+| `text` | none | `alloc` | decoders, the `core::Decoder` methods of `text::json` and `text::construction`, `text::base64::decode` | trusted code, declassifying decoders and validators |
 | `task` | `task::Executor`, `task::Account`, `sys::Clock` | `alloc` | none | trusted code |
 | `sys` | the sys capabilities and the resources they open, `sys::Revoker[C]`, `sys::Minter[C, S, R]`, `sys::Runner`, `sys::Handle`, `sys::load::Loader`, `task::Executor` | `alloc` | none | trusted code |
 | `hw` | the hardware capabilities | `alloc`, `device`, `priv` | none | trusted code, `device` and `priv` grants |

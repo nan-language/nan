@@ -203,9 +203,12 @@ pub fn open_gap(
     let len = fx.load(PTR, address, LEN);
     let at = element.at(fx, data, index);
     let after = fx.b.ins().iadd_imm_s(at, element.size as i64);
-    let moved = fx.b.ins().isub(len, index);
-    let moved = element.bytes(fx, moved);
-    lo.call_routine(fx, Routine::Copy, &[after, at, moved]);
+    let count = fx.b.ins().isub(len, index);
+    let moving = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
+    fx.when(moving, |fx| {
+        let moved = element.bytes(fx, count);
+        lo.call_routine(fx, Routine::Copy, &[after, at, moved]);
+    });
     let len = fx.b.ins().iadd_imm_s(len, 1);
     fx.store(len, address, LEN);
     at
@@ -220,8 +223,11 @@ pub fn close_gap(lo: &mut Lowering, fx: &mut Fx, address: Value, index: Value, e
     let after = fx.b.ins().iadd_imm_s(at, element.size as i64);
     let rest = fx.b.ins().isub(len, index);
     let rest = fx.b.ins().iadd_imm_s(rest, -1);
-    let moved = element.bytes(fx, rest);
-    lo.call_routine(fx, Routine::Copy, &[at, after, moved]);
+    let moving = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rest, 0);
+    fx.when(moving, |fx| {
+        let moved = element.bytes(fx, rest);
+        lo.call_routine(fx, Routine::Copy, &[at, after, moved]);
+    });
     let len = fx.b.ins().iadd_imm_s(len, -1);
     fx.store(len, address, LEN);
 }

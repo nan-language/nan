@@ -26340,59 +26340,160 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\pub validator fn render_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
     \\    let bytes = raw.inspect()
     \\    var at = Cursor(at: 0, end: bytes.len())
-    \\    var enclosing = mem::List[usize].empty(alloc)
-    \\    try render_node(schema, node: 0, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
+    \\    var walk = Walk(enclosing: mem::List[usize].empty(alloc), depth: 0)
+    \\    var steps = mem::List[RenderStep].empty(alloc)
+    \\    mut steps.push(RenderStep.Node(0))
+    \\    while true {
+    \\        let Some(step) = mut steps.pop() else {
+    \\            break
+    \\        }
+    \\        try render_step(schema, step, bytes, at: mut at, walk: mut walk, steps: mut steps, alloc, out: mut out)
+    \\    }
     \\    if at.at != bytes.len() {
     \\        fail core::DecodeError.Trailing
     \\    }
     \\} render_as
     \\
-    \\fn render_node(schema: mem::wire::NamedSchema, node: usize, bytes: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
+    \\/// The nesting a walk of a schema tree is in: the record and variant nodes enclosing it, innermost
+    \\/// last, and how many sequences, maps, records and variants hold it.
+    \\struct Walk {
+    \\    enclosing: mem::List[usize]
+    \\    depth: usize
+    \\} Walk
+    \\
+    \\/// Enters a sequence, map, record or variant, failing with `TooDeep` past 128 of them.
+    \\fn Walk.nest(mut self) fails core::DecodeError {
+    \\    if self.depth >= 128 {
+    \\        fail core::DecodeError.TooDeep
+    \\    }
+    \\    self.depth += 1
+    \\} Walk.nest
+    \\
+    \\/// Closing text a rendering writes once the values before it are written.
+    \\enum Mark derives Copy {
+    \\    Bracket
+    \\    Brace
+    \\    Parenthesis
+    \\    Colon
+    \\} Mark
+    \\
+    \\/// A step a rendering has left to take, the last one pushed taken first: a node to read, the
+    \\/// elements, entries or fields of a node still to read, text to write, the end of a field or
+    \\/// payload, which restores the end of what holds it, and the end of a node.
+    \\enum RenderStep derives Copy {
+    \\    Node(usize)
+    \\    Elements(element: usize, left: u64, leading: bool)
+    \\    Entries(key: usize, value: usize, left: u64, leading: bool)
+    \\    Fields(node: usize, left: u64, written: usize)
+    \\    Write(Mark)
+    \\    Close(end: usize, outer: usize)
+    \\    Leave(enclosed: bool)
+    \\} RenderStep
+    \\
+    \\fn render_step(schema: mem::wire::NamedSchema, step: RenderStep, bytes: Slice[u8], mut at: Cursor, mut walk: Walk, mut steps: mem::List[RenderStep], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
+    \\    match step {
+    \\        RenderStep.Node(node) => try render_node(schema, node, bytes, at: mut at, walk: mut walk, steps: mut steps, alloc, out: mut out)
+    \\        RenderStep.Elements(element: element, left: left, leading: leading) => {
+    \\            if left == 0 {
+    \\                return
+    \\            }
+    \\            if not leading {
+    \\                mut out.append(", ")
+    \\            }
+    \\            mut steps.push(RenderStep.Elements(element: element, left: left - 1, leading: false))
+    \\            mut steps.push(RenderStep.Node(element))
+    \\        }
+    \\        RenderStep.Entries(key: key, value: value, left: left, leading: leading) => {
+    \\            if left == 0 {
+    \\                return
+    \\            }
+    \\            if not leading {
+    \\                mut out.append(", ")
+    \\            }
+    \\            mut steps.push(RenderStep.Entries(key: key, value: value, left: left - 1, leading: false))
+    \\            mut steps.push(RenderStep.Node(value))
+    \\            mut steps.push(RenderStep.Write(Mark.Colon))
+    \\            mut steps.push(RenderStep.Node(key))
+    \\        }
+    \\        RenderStep.Fields(node: node, left: left, written: written) => try render_field(schema, node, left, written, bytes, at: mut at, steps: mut steps, alloc, out: mut out)
+    \\        RenderStep.Write(mark) => {
+    \\            match mark {
+    \\                Mark.Bracket => mut out.append("]")
+    \\                Mark.Brace => mut out.append("}")
+    \\                Mark.Parenthesis => mut out.append(")")
+    \\                Mark.Colon => mut out.append(": ")
+    \\            }
+    \\        }
+    \\        RenderStep.Close(end: end, outer: outer) => {
+    \\            if at.at != end {
+    \\                fail core::DecodeError.Malformed
+    \\            }
+    \\            at.end = outer
+    \\        }
+    \\        RenderStep.Leave(enclosed: enclosed) => {
+    \\            walk.depth -= 1
+    \\            if enclosed {
+    \\                discard mut walk.enclosing.pop()
+    \\            }
+    \\        }
+    \\    }
+    \\} render_step
+    \\
+    \\/// Reads the node at `node`, writing a leaf and the opening text of any other node, and pushes
+    \\/// the steps that read the rest of it.
+    \\fn render_node(schema: mem::wire::NamedSchema, node: usize, bytes: Slice[u8], mut at: Cursor, mut walk: Walk, mut steps: mem::List[RenderStep], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
     \\    if node >= schema.tree.nodes.len() {
     \\        fail core::DecodeError.Malformed
     \\    }
     \\    match schema.tree.nodes[node] {
     \\        mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: _, unique: _) => {
+    \\            try mut walk.nest()
     \\            let count = try take_uvar(bytes, at: mut at)
     \\            if length.is_some() and length != Some(count) {
     \\                fail core::DecodeError.Malformed
     \\            }
     \\            mut out.append("[")
-    \\            for index in 0..<count {
-    \\                if index > 0 {
-    \\                    mut out.append(", ")
-    \\                }
-    \\                try render_node(schema, node: element, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            }
-    \\            mut out.append("]")
+    \\            mut steps.push(RenderStep.Leave(enclosed: false))
+    \\            mut steps.push(RenderStep.Write(Mark.Bracket))
+    \\            mut steps.push(RenderStep.Elements(element: element, left: count, leading: true))
     \\        }
     \\        mem::wire::SchemaNode.Map(key: key, value: value) => {
+    \\            try mut walk.nest()
     \\            let count = try take_uvar(bytes, at: mut at)
     \\            mut out.append("{")
-    \\            for index in 0..<count {
-    \\                if index > 0 {
-    \\                    mut out.append(", ")
-    \\                }
-    \\                try render_node(schema, node: key, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\                mut out.append(": ")
-    \\                try render_node(schema, node: value, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            }
-    \\            mut out.append("}")
+    \\            mut steps.push(RenderStep.Leave(enclosed: false))
+    \\            mut steps.push(RenderStep.Write(Mark.Brace))
+    \\            mut steps.push(RenderStep.Entries(key: key, value: value, left: count, leading: true))
     \\        }
-    \\        mem::wire::SchemaNode.Record(open: _, fields: _) => {
-    \\            mut enclosing.push(node)
-    \\            try render_record(schema, node, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            discard mut enclosing.pop()
+    \\        mem::wire::SchemaNode.Record(open: _, fields: fields) => {
+    \\            try mut walk.nest()
+    \\            mut walk.enclosing.push(node)
+    \\            let named = name_index(schema, at: node)
+    \\            match named {
+    \\                Some(index) => {
+    \\                    append_last_segment(mut out, path: schema.names[index].path.as_str())
+    \\                    mut out.append("(")
+    \\                }
+    \\                None => {
+    \\                    if fields.len() == 0 {
+    \\                        mut out.append("Unit")
+    \\                    }
+    \\                }
+    \\            }
+    \\            let count = try take_uvar(bytes, at: mut at)
+    \\            mut steps.push(RenderStep.Leave(enclosed: true))
+    \\            if named.is_some() {
+    \\                mut steps.push(RenderStep.Write(Mark.Parenthesis))
+    \\            }
+    \\            mut steps.push(RenderStep.Fields(node: node, left: count, written: 0))
     \\        }
     \\        mem::wire::SchemaNode.Variant(open: _, variants: _) => {
-    \\            mut enclosing.push(node)
-    \\            try render_variant(schema, node, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            discard mut enclosing.pop()
+    \\            try mut walk.nest()
+    \\            mut walk.enclosing.push(node)
+    \\            mut steps.push(RenderStep.Leave(enclosed: true))
+    \\            try render_variant(schema, node, bytes, at: mut at, steps: mut steps, alloc, out: mut out)
     \\        }
-    \\        mem::wire::SchemaNode.Back(depth: depth) => {
-    \\            let target = try back_target(enclosing.view(), depth)
-    \\            try render_node(schema, node: target, bytes, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\        }
+    \\        mem::wire::SchemaNode.Back(depth: depth) => mut steps.push(RenderStep.Node(try back_target(walk.enclosing.view(), depth)))
     \\        else => try render_leaf(schema.tree.nodes[node], bytes, at: mut at, alloc, out: mut out)
     \\    }
     \\} render_node
@@ -26457,27 +26558,15 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\    }
     \\} render_leaf
     \\
-    \\/// Writes a record read from `bytes`: its fields as `key: value`, in the name of its struct and
-    \\/// parentheses when its node has a name, and `Unit` for an unnamed record without fields.
-    \\fn render_record(schema: mem::wire::NamedSchema, node: usize, bytes: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
+    \\/// Reads the next field of a record still to read, of `left`: writes `key: ` unless its record
+    \\/// does not declare it, which an open record skips, and pushes the steps reading its value and
+    \\/// the fields after it.
+    \\fn render_field(schema: mem::wire::NamedSchema, node: usize, left: u64, written: usize, bytes: Slice[u8], mut at: Cursor, mut steps: mem::List[RenderStep], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
     \\    let mem::wire::SchemaNode.Record(open: open, fields: fields) = schema.tree.nodes[node] else {
     \\        fail core::DecodeError.Malformed
     \\    }
-    \\    let named = name_index(schema, at: node)
-    \\    match named {
-    \\        Some(index) => {
-    \\            append_last_segment(mut out, path: schema.names[index].path.as_str())
-    \\            mut out.append("(")
-    \\        }
-    \\        None => {
-    \\            if fields.len() == 0 {
-    \\                mut out.append("Unit")
-    \\            }
-    \\        }
-    \\    }
-    \\    let count = try take_uvar(bytes, at: mut at)
-    \\    var written: usize = 0
-    \\    for _ in 0..<count {
+    \\    var remaining = left
+    \\    while remaining > 0 {
     \\        let key_len = try take_uvar(bytes, at: mut at)
     \\        let key = try take_copy(bytes, at: mut at, len: key_len, alloc)
     \\        let len = try take_uvar(bytes, at: mut at)
@@ -26485,6 +26574,7 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\            fail core::DecodeError.Truncated
     \\        }
     \\        let end = at.at + usize.widen(len)
+    \\        remaining -= 1
     \\        let Some(index) = fields.position(fn(field: mem::wire::SchemaField) => field.key.as_bytes() == key.view()) else {
     \\            if not open {
     \\                fail core::DecodeError.UnknownKey
@@ -26497,22 +26587,17 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\        }
     \\        mut out.append(fields[index].key.as_str())
     \\        mut out.append(": ")
-    \\        var inner = Cursor(at: at.at, end: end)
-    \\        try render_node(schema, node: fields[index].value, bytes, at: mut inner, enclosing: mut enclosing, alloc, out: mut out)
-    \\        if inner.at != end {
-    \\            fail core::DecodeError.Malformed
-    \\        }
-    \\        at.at = end
-    \\        written += 1
+    \\        mut steps.push(RenderStep.Fields(node: node, left: remaining, written: written + 1))
+    \\        mut steps.push(RenderStep.Close(end: end, outer: at.end))
+    \\        at.end = end
+    \\        mut steps.push(RenderStep.Node(fields[index].value))
+    \\        return
     \\    }
-    \\    if named.is_some() {
-    \\        mut out.append(")")
-    \\    }
-    \\} render_record
+    \\} render_field
     \\
     \\/// Writes a variant read from `bytes`: the name of its enum, `.` and its key, without the name
-    \\/// for `Option` and `Result`, then its payload in parentheses.
-    \\fn render_variant(schema: mem::wire::NamedSchema, node: usize, bytes: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
+    \\/// for `Option` and `Result`, then pushes the steps reading its payload in parentheses.
+    \\fn render_variant(schema: mem::wire::NamedSchema, node: usize, bytes: Slice[u8], mut at: Cursor, mut steps: mem::List[RenderStep], alloc: mem::Alloc, mut out: text::String) fails core::DecodeError {
     \\    let mem::wire::SchemaNode.Variant(open: _, variants: variants) = schema.tree.nodes[node] else {
     \\        fail core::DecodeError.Malformed
     \\    }
@@ -26547,14 +26632,11 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\                fail core::DecodeError.Truncated
     \\            }
     \\            let end = at.at + usize.widen(len)
-    \\            var inner = Cursor(at: at.at, end: end)
     \\            mut out.append("(")
-    \\            try render_node(schema, node: payload, bytes, at: mut inner, enclosing: mut enclosing, alloc, out: mut out)
-    \\            mut out.append(")")
-    \\            if inner.at != end {
-    \\                fail core::DecodeError.Malformed
-    \\            }
-    \\            at.at = end
+    \\            mut steps.push(RenderStep.Close(end: end, outer: at.end))
+    \\            mut steps.push(RenderStep.Write(Mark.Parenthesis))
+    \\            at.end = end
+    \\            mut steps.push(RenderStep.Node(payload))
     \\        }
     \\        else => fail core::DecodeError.Malformed
     \\    }
@@ -26563,15 +26645,316 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\pub validator fn encode_as(schema: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails core::DecodeError {
     \\    let text = raw.inspect()
     \\    var at = Cursor(at: 0, end: text.len())
-    \\    var enclosing = mem::List[usize].empty(alloc)
+    \\    var walk = Walk(enclosing: mem::List[usize].empty(alloc), depth: 0)
+    \\    var frames = mem::List[Frame].empty(alloc)
     \\    var out = mem::Bytes.empty(alloc)
-    \\    try encode_node(schema, node: 0, text, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
+    \\    var next: Option[usize] = Some(0)
+    \\    while true {
+    \\        match next {
+    \\            Some(node) => {
+    \\                next = try encode_node(schema, node, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\            }
+    \\            None => {
+    \\                if frames.len() == 0 {
+    \\                    break
+    \\                }
+    \\                next = try encode_resume(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\            }
+    \\        }
+    \\    }
     \\    skip_space(text, at: mut at)
     \\    if at.at != text.len() {
     \\        fail core::DecodeError.Trailing
     \\    }
     \\    return out
     \\} encode_as
+    \\
+    \\/// Where the reading of a sequence, map, record or variant is: between elements, after an entry's
+    \\/// key or value, among the fields of a record or labelled payload, read with parentheses or not,
+    \\/// or in a payload.
+    \\enum Phase derives Copy, Eq {
+    \\    Elements
+    \\    Keys
+    \\    Values
+    \\    Fields(parenthesized: bool)
+    \\    Payload
+    \\} Phase
+    \\
+    \\/// A sequence, map, record or variant whose construction text is being read: its node, where its
+    \\/// reading is, the count of its elements or entries read, the encodings of what it read, by field
+    \\/// for a record, the fields present, the field or variant read, and whether a value of it is
+    \\/// being read.
+    \\struct Frame {
+    \\    node: usize
+    \\    phase: Phase
+    \\    count: u64
+    \\    out: mem::Bytes
+    \\    values: mem::List[mem::Bytes]
+    \\    present: mem::List[bool]
+    \\    chosen: usize
+    \\    reading: bool
+    \\} Frame
+    \\
+    \\/// Enters a frame reading the node at `node` in `phase`, with room for the fields of a record.
+    \\fn enter(mut walk: Walk, mut frames: mem::List[Frame], schema: mem::wire::NamedSchema, node: usize, phase: Phase, alloc: mem::Alloc) fails core::DecodeError {
+    \\    try mut walk.nest()
+    \\    var values = mem::List[mem::Bytes].empty(alloc)
+    \\    var present = mem::List[bool].empty(alloc)
+    \\    match schema.tree.nodes[node] {
+    \\        mem::wire::SchemaNode.Record(open: _, fields: fields) => {
+    \\            for _ in fields {
+    \\                mut values.push(mem::Bytes.empty(alloc))
+    \\                mut present.push(false)
+    \\            }
+    \\        }
+    \\        else => {}
+    \\    }
+    \\    mut frames.push(Frame(node: node, phase: phase, count: 0, out: mem::Bytes.empty(alloc), values: take values, present: take present, chosen: 0, reading: false))
+    \\} enter
+    \\
+    \\/// Appends bytes to the encoding of what the innermost frame reads, or to `out` outside every
+    \\/// frame.
+    \\fn emit(mut frames: mem::List[Frame], mut out: mem::Bytes, bytes: Slice[u8]) {
+    \\    let count = frames.len()
+    \\    if count == 0 {
+    \\        mut out.append(bytes)
+    \\        return
+    \\    }
+    \\    let top = count - 1
+    \\    match frames[top].phase {
+    \\        Phase.Fields(parenthesized: _) => {
+    \\            let chosen = frames[top].chosen
+    \\            mut frames[top].values[chosen].append(bytes)
+    \\        }
+    \\        else => mut frames[top].out.append(bytes)
+    \\    }
+    \\} emit
+    \\
+    \\/// Leaves the innermost frame, whose encoding `encoded` is, appending it to what holds it.
+    \\fn leave(mut walk: Walk, mut frames: mem::List[Frame], mut out: mem::Bytes, encoded: Slice[u8]) {
+    \\    discard mut frames.pop()
+    \\    walk.depth -= 1
+    \\    emit(mut frames, mut out, bytes: encoded)
+    \\} leave
+    \\
+    \\/// Starts reading the node at `node`: encodes a leaf, or enters a frame for any other node, and
+    \\/// gives the node of the value to read next, none when the innermost frame goes on.
+    \\fn encode_node(schema: mem::wire::NamedSchema, node: usize, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    if node >= schema.tree.nodes.len() {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    match schema.tree.nodes[node] {
+    \\        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => {
+    \\            try expect_byte(text, at: mut at, byte: 91)
+    \\            try enter(mut walk, frames: mut frames, schema, node, phase: Phase.Elements, alloc)
+    \\            if peek(text, at: mut at) == Some(93) {
+    \\                return None
+    \\            }
+    \\            frames[frames.len() - 1].reading = true
+    \\            return Some(element)
+    \\        }
+    \\        mem::wire::SchemaNode.Map(key: key, value: _) => {
+    \\            try expect_byte(text, at: mut at, byte: 123)
+    \\            try enter(mut walk, frames: mut frames, schema, node, phase: Phase.Keys, alloc)
+    \\            if peek(text, at: mut at) == Some(125) {
+    \\                return None
+    \\            }
+    \\            frames[frames.len() - 1].reading = true
+    \\            return Some(key)
+    \\        }
+    \\        mem::wire::SchemaNode.Record(open: _, fields: _) => {
+    \\            if word_next(text, at: mut at) {
+    \\                discard try take_word(text, at: mut at, alloc)
+    \\            }
+    \\            let parenthesized = peek(text, at: mut at) == Some(40)
+    \\            if parenthesized {
+    \\                at.at += 1
+    \\            }
+    \\            try enter(mut walk, frames: mut frames, schema, node, phase: Phase.Fields(parenthesized: parenthesized), alloc)
+    \\            mut walk.enclosing.push(node)
+    \\            return try next_field(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\        }
+    \\        mem::wire::SchemaNode.Variant(open: _, variants: _) => return try encode_variant(schema, node, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\        mem::wire::SchemaNode.Back(depth: depth) => return Some(try back_target(walk.enclosing.view(), depth))
+    \\        else => {
+    \\            var leaf = mem::Bytes.empty(alloc)
+    \\            try encode_leaf(schema.tree.nodes[node], text, at: mut at, alloc, out: mut leaf)
+    \\            emit(mut frames, mut out, bytes: leaf.view())
+    \\            return None
+    \\        }
+    \\    }
+    \\} encode_node
+    \\
+    \\/// Goes on reading the innermost frame once the value it was reading, if any, is read: gives the
+    \\/// node of its next value, or leaves it at its end and gives none.
+    \\fn encode_resume(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let reading = frames[top].reading
+    \\    frames[top].reading = false
+    \\    match frames[top].phase {
+    \\        Phase.Elements => return try next_element(schema, text, at: mut at, walk: mut walk, frames: mut frames, reading, alloc, out: mut out)
+    \\        Phase.Keys or Phase.Values => return try next_entry(schema, text, at: mut at, walk: mut walk, frames: mut frames, reading, alloc, out: mut out)
+    \\        Phase.Fields(parenthesized: _) => {
+    \\            if reading and peek(text, at: mut at) != Some(44) {
+    \\                return try fields_end(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\            }
+    \\            if reading {
+    \\                at.at += 1
+    \\            }
+    \\            return try next_field(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\        }
+    \\        Phase.Payload => return try payload_end(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\    }
+    \\} encode_resume
+    \\
+    \\/// Goes on reading the innermost frame's sequence after an element, if `reading` one: gives the
+    \\/// node of the next element, or ends the sequence.
+    \\fn next_element(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], reading: bool, alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: _) = schema.tree.nodes[frames[top].node] else {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    if reading {
+    \\        frames[top].count += 1
+    \\        if peek(text, at: mut at) == Some(44) {
+    \\            at.at += 1
+    \\            frames[top].reading = true
+    \\            return Some(element)
+    \\        }
+    \\    }
+    \\    try expect_byte(text, at: mut at, byte: 93)
+    \\    let count = frames[top].count
+    \\    if length.is_some() and length != Some(count) {
+    \\        fail core::DecodeError.OutOfRange
+    \\    }
+    \\    match capacity {
+    \\        Some(limit) => {
+    \\            if count > limit {
+    \\                fail core::DecodeError.OutOfRange
+    \\            }
+    \\        }
+    \\        None => {}
+    \\    }
+    \\    var encoded = mem::Bytes.empty(alloc)
+    \\    put_uvar(mut encoded, value: count)
+    \\    mut encoded.append(frames[top].out.view())
+    \\    leave(mut walk, frames: mut frames, mut out, encoded: encoded.view())
+    \\    return None
+    \\} next_element
+    \\
+    \\/// Goes on reading the innermost frame's map after a key or a value, if `reading` one: gives the
+    \\/// node of the value of the key read, of the next key, or ends the map.
+    \\fn next_entry(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], reading: bool, alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let mem::wire::SchemaNode.Map(key: key, value: value) = schema.tree.nodes[frames[top].node] else {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    if reading and frames[top].phase == Phase.Keys {
+    \\        try expect_byte(text, at: mut at, byte: 58)
+    \\        frames[top].phase = Phase.Values
+    \\        frames[top].reading = true
+    \\        return Some(value)
+    \\    }
+    \\    if reading {
+    \\        frames[top].count += 1
+    \\        frames[top].phase = Phase.Keys
+    \\        if peek(text, at: mut at) == Some(44) {
+    \\            at.at += 1
+    \\            frames[top].reading = true
+    \\            return Some(key)
+    \\        }
+    \\    }
+    \\    try expect_byte(text, at: mut at, byte: 125)
+    \\    var encoded = mem::Bytes.empty(alloc)
+    \\    put_uvar(mut encoded, value: frames[top].count)
+    \\    mut encoded.append(frames[top].out.view())
+    \\    leave(mut walk, frames: mut frames, mut out, encoded: encoded.view())
+    \\    return None
+    \\} next_entry
+    \\
+    \\/// Ends the innermost frame's variant once its payload is read: its key, then its payload framed.
+    \\fn payload_end(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let mem::wire::SchemaNode.Variant(open: _, variants: variants) = schema.tree.nodes[frames[top].node] else {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    try expect_byte(text, at: mut at, byte: 41)
+    \\    var encoded = mem::Bytes.empty(alloc)
+    \\    put_text(mut encoded, value: variants[frames[top].chosen].key.as_bytes())
+    \\    mut encoded.push(1)
+    \\    put_text(mut encoded, value: frames[top].out.view())
+    \\    discard mut walk.enclosing.pop()
+    \\    leave(mut walk, frames: mut frames, mut out, encoded: encoded.view())
+    \\    return None
+    \\} payload_end
+    \\
+    \\/// Reads the key of the next field of the innermost frame's record, each `key: value` up to the
+    \\/// closing parenthesis or the end, aliases read as their keys and fields an open type does not
+    \\/// declare skipped: gives the node of its value, or ends the record.
+    \\fn next_field(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let mem::wire::SchemaNode.Record(open: open, fields: fields) = schema.tree.nodes[frames[top].node] else {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    while word_next(text, at: mut at) {
+    \\        let key = try take_word(text, at: mut at, alloc)
+    \\        try expect_byte(text, at: mut at, byte: 58)
+    \\        let found = fields.position(fn(field: mem::wire::SchemaField) => field.key.as_bytes() == key.view() or field.aliases.position(fn(alias: text::String) => alias.as_bytes() == key.view()).is_some())
+    \\        match found {
+    \\            Some(index) => {
+    \\                if frames[top].present[index] {
+    \\                    fail core::DecodeError.DuplicateKey
+    \\                }
+    \\                frames[top].present[index] = true
+    \\                frames[top].chosen = index
+    \\                frames[top].reading = true
+    \\                return Some(fields[index].value)
+    \\            }
+    \\            None => {
+    \\                if not open {
+    \\                    fail core::DecodeError.UnknownKey
+    \\                }
+    \\                try skip_value(text, at: mut at, alloc)
+    \\            }
+    \\        }
+    \\        if peek(text, at: mut at) != Some(44) {
+    \\            break
+    \\        }
+    \\        at.at += 1
+    \\    }
+    \\    return try fields_end(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
+    \\} next_field
+    \\
+    \\/// Ends the innermost frame's record: its fields present, in byte order of keys, and its closing
+    \\/// parenthesis when it opened with one.
+    \\fn fields_end(schema: mem::wire::NamedSchema, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
+    \\    let top = frames.len() - 1
+    \\    let mem::wire::SchemaNode.Record(open: _, fields: fields) = schema.tree.nodes[frames[top].node] else {
+    \\        fail core::DecodeError.Malformed
+    \\    }
+    \\    var count: u64 = 0
+    \\    for index in 0..<fields.len() {
+    \\        if frames[top].present[index] {
+    \\            count += 1
+    \\        } else if not fields[index].defaulted {
+    \\            fail core::DecodeError.MissingField
+    \\        }
+    \\    }
+    \\    var encoded = mem::Bytes.empty(alloc)
+    \\    put_uvar(mut encoded, value: count)
+    \\    for index in 0..<fields.len() {
+    \\        if frames[top].present[index] {
+    \\            put_text(mut encoded, value: fields[index].key.as_bytes())
+    \\            put_text(mut encoded, value: frames[top].values[index].view())
+    \\        }
+    \\    }
+    \\    if frames[top].phase == Phase.Fields(parenthesized: true) {
+    \\        try expect_byte(text, at: mut at, byte: 41)
+    \\    }
+    \\    discard mut walk.enclosing.pop()
+    \\    leave(mut walk, frames: mut frames, mut out, encoded: encoded.view())
+    \\    return None
+    \\} fields_end
     \\
     \\fn is_space(byte: u8) -> bool = byte == 32 or byte == 9 or byte == 10 or byte == 13
     \\
@@ -26719,87 +27102,6 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\    fail core::DecodeError.Malformed
     \\} skip_group
     \\
-    \\fn encode_node(schema: mem::wire::NamedSchema, node: usize, text: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: mem::Bytes) fails core::DecodeError {
-    \\    if node >= schema.tree.nodes.len() {
-    \\        fail core::DecodeError.Malformed
-    \\    }
-    \\    match schema.tree.nodes[node] {
-    \\        mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: _) => {
-    \\            try expect_byte(text, at: mut at, byte: 91)
-    \\            var elements = mem::Bytes.empty(alloc)
-    \\            var count: u64 = 0
-    \\            if peek(text, at: mut at) != Some(93) {
-    \\                loop {
-    \\                    try encode_node(schema, node: element, text, at: mut at, enclosing: mut enclosing, alloc, out: mut elements)
-    \\                    count += 1
-    \\                    if peek(text, at: mut at) != Some(44) {
-    \\                        break
-    \\                    }
-    \\                    at.at += 1
-    \\                }
-    \\            }
-    \\            try expect_byte(text, at: mut at, byte: 93)
-    \\            if length.is_some() and length != Some(count) {
-    \\                fail core::DecodeError.OutOfRange
-    \\            }
-    \\            match capacity {
-    \\                Some(limit) => {
-    \\                    if count > limit {
-    \\                        fail core::DecodeError.OutOfRange
-    \\                    }
-    \\                }
-    \\                None => {}
-    \\            }
-    \\            put_uvar(mut out, value: count)
-    \\            mut out.append(elements.view())
-    \\        }
-    \\        mem::wire::SchemaNode.Map(key: key, value: value) => {
-    \\            try expect_byte(text, at: mut at, byte: 123)
-    \\            var entries = mem::Bytes.empty(alloc)
-    \\            var count: u64 = 0
-    \\            if peek(text, at: mut at) != Some(125) {
-    \\                loop {
-    \\                    try encode_node(schema, node: key, text, at: mut at, enclosing: mut enclosing, alloc, out: mut entries)
-    \\                    try expect_byte(text, at: mut at, byte: 58)
-    \\                    try encode_node(schema, node: value, text, at: mut at, enclosing: mut enclosing, alloc, out: mut entries)
-    \\                    count += 1
-    \\                    if peek(text, at: mut at) != Some(44) {
-    \\                        break
-    \\                    }
-    \\                    at.at += 1
-    \\                }
-    \\            }
-    \\            try expect_byte(text, at: mut at, byte: 125)
-    \\            put_uvar(mut out, value: count)
-    \\            mut out.append(entries.view())
-    \\        }
-    \\        mem::wire::SchemaNode.Record(open: _, fields: _) => {
-    \\            mut enclosing.push(node)
-    \\            if word_next(text, at: mut at) {
-    \\                discard try take_word(text, at: mut at, alloc)
-    \\            }
-    \\            if peek(text, at: mut at) == Some(40) {
-    \\                at.at += 1
-    \\                try encode_fields(schema, node, text, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\                try expect_byte(text, at: mut at, byte: 41)
-    \\            } else {
-    \\                try encode_fields(schema, node, text, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            }
-    \\            discard mut enclosing.pop()
-    \\        }
-    \\        mem::wire::SchemaNode.Variant(open: _, variants: _) => {
-    \\            mut enclosing.push(node)
-    \\            try encode_variant(schema, node, text, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\            discard mut enclosing.pop()
-    \\        }
-    \\        mem::wire::SchemaNode.Back(depth: depth) => {
-    \\            let target = try back_target(enclosing.view(), depth)
-    \\            try encode_node(schema, node: target, text, at: mut at, enclosing: mut enclosing, alloc, out: mut out)
-    \\        }
-    \\        else => try encode_leaf(schema.tree.nodes[node], text, at: mut at, alloc, out: mut out)
-    \\    }
-    \\} encode_node
-    \\
     \\/// Encodes a leaf read as its typed construction text decoder reads it.
     \\fn encode_leaf(node: mem::wire::SchemaNode, text: Slice[u8], mut at: Cursor, alloc: mem::Alloc, mut out: mem::Bytes) fails core::DecodeError {
     \\    let token = try take_token(text, at: mut at, alloc)
@@ -26857,63 +27159,10 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\    }
     \\} encode_leaf
     \\
-    \\/// Encodes the fields of a record, each `key: value` read up to the closing parenthesis or the
-    \\/// end, in byte order of keys, aliases read as their keys and fields an open type does not
-    \\/// declare skipped.
-    \\fn encode_fields(schema: mem::wire::NamedSchema, node: usize, text: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: mem::Bytes) fails core::DecodeError {
-    \\    let mem::wire::SchemaNode.Record(open: open, fields: fields) = schema.tree.nodes[node] else {
-    \\        fail core::DecodeError.Malformed
-    \\    }
-    \\    var values = mem::List[mem::Bytes].empty(alloc)
-    \\    var present = mem::List[bool].empty(alloc)
-    \\    for _ in fields {
-    \\        mut values.push(mem::Bytes.empty(alloc))
-    \\        mut present.push(false)
-    \\    }
-    \\    while word_next(text, at: mut at) {
-    \\        let key = try take_word(text, at: mut at, alloc)
-    \\        try expect_byte(text, at: mut at, byte: 58)
-    \\        let found = fields.position(fn(field: mem::wire::SchemaField) => field.key.as_bytes() == key.view() or field.aliases.position(fn(alias: text::String) => alias.as_bytes() == key.view()).is_some())
-    \\        match found {
-    \\            Some(index) => {
-    \\                if present[index] {
-    \\                    fail core::DecodeError.DuplicateKey
-    \\                }
-    \\                present[index] = true
-    \\                try encode_node(schema, node: fields[index].value, text, at: mut at, enclosing: mut enclosing, alloc, out: mut values[index])
-    \\            }
-    \\            None => {
-    \\                if not open {
-    \\                    fail core::DecodeError.UnknownKey
-    \\                }
-    \\                try skip_value(text, at: mut at, alloc)
-    \\            }
-    \\        }
-    \\        if peek(text, at: mut at) != Some(44) {
-    \\            break
-    \\        }
-    \\        at.at += 1
-    \\    }
-    \\    var count: u64 = 0
-    \\    for index in 0..<fields.len() {
-    \\        if present[index] {
-    \\            count += 1
-    \\        } else if not fields[index].defaulted {
-    \\            fail core::DecodeError.MissingField
-    \\        }
-    \\    }
-    \\    put_uvar(mut out, value: count)
-    \\    for index in 0..<fields.len() {
-    \\        if present[index] {
-    \\            put_text(mut out, value: fields[index].key.as_bytes())
-    \\            put_text(mut out, value: values[index].view())
-    \\        }
-    \\    }
-    \\} encode_fields
-    \\
-    \\/// Encodes a variant: optionally a name and `.`, its key or an alias of it, then its payload in
-    \\/// parentheses, a labelled payload as the fields of a record.
-    \\fn encode_variant(schema: mem::wire::NamedSchema, node: usize, text: Slice[u8], mut at: Cursor, mut enclosing: mem::List[usize], alloc: mem::Alloc, mut out: mem::Bytes) fails core::DecodeError {
+    \\/// Starts reading a variant: optionally a name and `.`, its key or an alias of it, then its
+    \\/// payload in parentheses, a labelled payload as the fields of a record; gives the node of its
+    \\/// payload, none for a variant without one or with a labelled one, whose fields are read next.
+    \\fn encode_variant(schema: mem::wire::NamedSchema, node: usize, text: Slice[u8], mut at: Cursor, mut walk: Walk, mut frames: mem::List[Frame], alloc: mem::Alloc, mut out: mem::Bytes) -> Option[usize] fails core::DecodeError {
     \\    let mem::wire::SchemaNode.Variant(open: _, variants: variants) = schema.tree.nodes[node] else {
     \\        fail core::DecodeError.Malformed
     \\    }
@@ -26925,24 +27174,27 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\    let Some(index) = variants.position(fn(variant: mem::wire::SchemaVariant) => variant.key.as_bytes() == key.view() or variant.aliases.position(fn(alias: text::String) => alias.as_bytes() == key.view()).is_some()) else {
     \\        fail core::DecodeError.UnknownVariant
     \\    }
-    \\    put_text(mut out, value: variants[index].key.as_bytes())
     \\    let Some(payload) = variants[index].payload else {
-    \\        mut out.push(0)
-    \\        return
+    \\        try mut walk.nest()
+    \\        walk.depth -= 1
+    \\        var encoded = mem::Bytes.empty(alloc)
+    \\        put_text(mut encoded, value: variants[index].key.as_bytes())
+    \\        mut encoded.push(0)
+    \\        emit(mut frames, mut out, bytes: encoded.view())
+    \\        return None
     \\    }
     \\    try expect_byte(text, at: mut at, byte: 40)
-    \\    var encoded = mem::Bytes.empty(alloc)
+    \\    try enter(mut walk, frames: mut frames, schema, node, phase: Phase.Payload, alloc)
+    \\    mut walk.enclosing.push(node)
+    \\    frames[frames.len() - 1].chosen = index
     \\    let labelled = name_index(schema, at: payload).is_none() and payload < schema.tree.nodes.len() and is_record(schema.tree.nodes[payload])
     \\    if labelled {
-    \\        mut enclosing.push(payload)
-    \\        try encode_fields(schema, node: payload, text, at: mut at, enclosing: mut enclosing, alloc, out: mut encoded)
-    \\        discard mut enclosing.pop()
-    \\    } else {
-    \\        try encode_node(schema, node: payload, text, at: mut at, enclosing: mut enclosing, alloc, out: mut encoded)
+    \\        try enter(mut walk, frames: mut frames, schema, node: payload, phase: Phase.Fields(parenthesized: false), alloc)
+    \\        mut walk.enclosing.push(payload)
+    \\        return try next_field(schema, text, at: mut at, walk: mut walk, frames: mut frames, alloc, out: mut out)
     \\    }
-    \\    try expect_byte(text, at: mut at, byte: 41)
-    \\    mut out.push(1)
-    \\    put_text(mut out, value: encoded.view())
+    \\    frames[frames.len() - 1].reading = true
+    \\    return Some(payload)
     \\} encode_variant
     \\
     \\fn is_record(node: mem::wire::SchemaNode) -> bool {
@@ -27004,6 +27256,59 @@ const TEXT_TEXT_CONSTRUCTION_CONSTRUCTION: Str =
     \\    expect bytes.view() == expected.view()
     \\    expect missing.is_err() and unknown.is_err() and wide.is_err()
     \\} encode_as_reads_construction_text
+    \\
+    \\/// Sequences nested `depth` deep under a schema whose root is a sequence of itself: their
+    \\/// construction text and their encoding.
+    \\struct Nested {
+    \\    schema: mem::wire::NamedSchema
+    \\    text: mem::Bytes
+    \\    bytes: mem::Bytes
+    \\} Nested
+    \\
+    \\fn nested(depth: usize, alloc: mem::Alloc) -> Nested {
+    \\    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    \\    mut nodes.push(mem::wire::SchemaNode.Sequence(element: 0, length: None, capacity: None, unique: false))
+    \\    var text = mem::Bytes.empty(alloc)
+    \\    var bytes = mem::Bytes.empty(alloc)
+    \\    for level in 0..<depth {
+    \\        mut text.push(b'[')
+    \\        if level + 1 < depth {
+    \\            mut bytes.push(1)
+    \\        } else {
+    \\            mut bytes.push(0)
+    \\        }
+    \\    }
+    \\    for _ in 0..<depth {
+    \\        mut text.push(b']')
+    \\    }
+    \\    let schema = mem::wire::NamedSchema(tree: mem::wire::Schema(nodes: take nodes), names: mem::List.empty(alloc))
+    \\    return Nested(schema: take schema, text: take text, bytes: take bytes)
+    \\} nested
+    \\
+    \\test render_as_nests_at_most_128_deep for render_as {
+    \\    let alloc = testing::world().alloc
+    \\    let deepest = nested(128, alloc)
+    \\    let deeper = nested(129, alloc)
+    \\    var out = text::String.empty(alloc)
+    \\    let rendered = attempt render_as(deepest.schema, raw: Untrusted.of(deepest.bytes.view()), alloc, out: mut out)
+    \\    var spilled = text::String.empty(alloc)
+    \\    let refused = attempt render_as(deeper.schema, raw: Untrusted.of(deeper.bytes.view()), alloc, out: mut spilled)
+    \\    expect rendered.is_ok() and out.as_bytes() == deepest.text.view()
+    \\    expect refused == Err(core::DecodeError.TooDeep)
+    \\} render_as_nests_at_most_128_deep
+    \\
+    \\test encode_as_nests_at_most_128_deep for encode_as {
+    \\    let alloc = testing::world().alloc
+    \\    let deepest = nested(128, alloc)
+    \\    let deeper = nested(129, alloc)
+    \\    let Ok(encoded) = attempt encode_as(deepest.schema, raw: Untrusted.of(deepest.text.view()), alloc) else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    let refused = attempt encode_as(deeper.schema, raw: Untrusted.of(deeper.text.view()), alloc)
+    \\    expect encoded.view() == deepest.bytes.view()
+    \\    expect refused == Err(core::DecodeError.TooDeep)
+    \\} encode_as_nests_at_most_128_deep
     \\
 
 const TEXT_TEXT_JSON_JSON: Str =

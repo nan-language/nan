@@ -162,13 +162,60 @@ fn render_append(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, text
     let copying = mut fx.b.band(has_room, y: keeping)
     mut fx.if_true(copying, then: fn[mut lo](mut fx1: Fx) {
         let target = mut fx1.b.iadd(buffer, y: kept)
-        let copy_args = fx1.list3(target, b: from, c: count)
-        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        copy_bytes(mut lo, fx: mut fx1, to: target, from, count)
     })
     let copied = mut fx.b.select(has_room, x: count, y: zero)
     let now_kept = mut fx.b.iadd(kept, y: copied)
     mut fx.store(now_kept, addr: state, offset: RENDERER_KEPT)
 } render_append
+
+/// Copies `count` bytes from `from` to `to`: up to 16 as the first and the last bytes of a
+/// width, loaded before they are stored, and more through the copy routine.
+fn copy_bytes(mut lo: Lowering, mut fx: Fx, to: clif::Value, from: clif::Value, count: clif::Value) {
+    let short = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: count, y: 16)
+    let nothing = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose_in(mut lo, condition: short, results: nothing.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        copy_ends(mut fx1, to, from, count, width: 8)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let copy_args = fx1.list3(to, b: from, c: count)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} copy_bytes
+
+/// Copies `count` bytes, at most twice `width`, from `from` to `to`: the first and the last bytes
+/// of the widest width of 8, 4 and 2 from `width` down that it holds, overlapping when it holds
+/// less than twice that, or its one byte.
+fn copy_ends(mut fx: Fx, to: clif::Value, from: clif::Value, count: clif::Value, width: u32) {
+    if width < 2 {
+        mut fx.if_true(count, then: fn(mut fx1: Fx) {
+            let byte = mut fx1.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: from, offset: 0)
+            mut fx1.b.store(clif::MemFlags.unaligned(), x: byte, p: to, offset: 0)
+        })
+        return
+    }
+    let ty = match width {
+        8 => clif::Type.Int64
+        4 => clif::Type.Int32
+        else => clif::Type.Int16
+    }
+    let holds = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: count, y: i64.widen(width))
+    let nothing = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose(holds, results: nothing.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let last = mut fx1.b.iadd_imm_s(count, y: -i64.widen(width))
+        let head = mut fx1.b.load(ty, flags: clif::MemFlags.unaligned(), p: from, offset: 0)
+        let tail_at = mut fx1.b.iadd(from, y: last)
+        let tail = mut fx1.b.load(ty, flags: clif::MemFlags.unaligned(), p: tail_at, offset: 0)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: head, p: to, offset: 0)
+        let end = mut fx1.b.iadd(to, y: last)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: tail, p: end, offset: 0)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        copy_ends(mut fx1, to, from, count, width: width / 2)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} copy_ends
 
 /// Appends a literal text to a rendering.
 fn render_append_text(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, text: Str) {
@@ -182,31 +229,66 @@ fn render_append_text(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value,
     render_append(mut lo, mut fx, renderer_value, text: start, len)
 } render_append_text
 
-/// Appends the decimal digits of an unsigned 64-bit value.
+/// Appends the decimal digits of an unsigned 64-bit value, two at a time from the table of
+/// digit pairs while two or more are left.
 fn append_decimal(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, value: clif::Value) {
     let digits = mut fx.slot(24, align: 8)
     let end = mut fx.ptr(24)
-    let initial = fx.list2(value, b: end)
-    let state = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
-        expect current.len() == 2
-        let remaining = current[0]
-        let position = current[1]
-        let ten = mut fx1.ptr(10)
-        let digit = mut fx1.b.urem(remaining, y: ten)
-        let rest = mut fx1.b.udiv(remaining, y: ten)
-        let at = mut fx1.b.iadd_imm_s(position, y: -1)
-        let shifted = mut fx1.b.iadd_imm_s(digit, y: i64.widen(b'0'))
-        let ascii = mut fx1.b.ireduce(clif::Type.Int8, x: shifted)
-        let place = mut fx1.b.iadd(digits, y: at)
-        mut fx1.store(ascii, addr: place, offset: 0)
-        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
-        return Pass(again: more, next: fx1.list2(rest, b: at))
+    var table = mem::Bytes.empty(lo.alloc)
+    for pair in 0u8..<100 {
+        mut table.push(b'0' + pair / 10)
+        mut table.push(b'0' + pair % 10)
+    }
+    let digit_pairs = mut lo.bytes_data(table.view())
+    let pairs = mut lo.data_address(mut fx, id: digit_pairs)
+    let large = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: value, y: 100)
+    let both = fx.types2(PTR, b: PTR)
+    let paired = mut fx.choose(large, results: both.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let initial = fx1.list2(value, b: end)
+        return mut fx1.repeat(initial.view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 2
+            let hundred = mut fx2.ptr(100)
+            let pair = mut fx2.b.urem(current[0], y: hundred)
+            let rest = mut fx2.b.udiv(current[0], y: hundred)
+            let at = mut fx2.b.iadd_imm_s(current[1], y: -2)
+            store_pair(mut fx2, pairs, pair, digits, at)
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: rest, y: 100)
+            return Pass(again: more, next: fx2.list2(rest, b: at))
+        })
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list2(value, b: end)
     })
-    expect state.len() == 2
-    let start = mut fx.b.iadd(digits, y: state[1])
-    let len = mut fx.b.isub(end, y: state[1])
-    render_append(mut lo, mut fx, renderer_value, text: start, len)
+    expect paired.len() == 2
+    let rest = paired[0]
+    let at = paired[1]
+    let two = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: rest, y: 10)
+    let one_ptr = fx.types1(PTR)
+    let started = mut fx.choose(two, results: one_ptr.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let place = mut fx1.b.iadd_imm_s(at, y: -2)
+        store_pair(mut fx1, pairs, pair: rest, digits, at: place)
+        return fx1.list1(place)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let place = mut fx1.b.iadd_imm_s(at, y: -1)
+        let shifted = mut fx1.b.iadd_imm_s(rest, y: i64.widen(b'0'))
+        let ascii = mut fx1.b.ireduce(clif::Type.Int8, x: shifted)
+        let address = mut fx1.b.iadd(digits, y: place)
+        mut fx1.store(ascii, addr: address, offset: 0)
+        return fx1.list1(place)
+    })
+    expect started.len() == 1
+    let text = mut fx.b.iadd(digits, y: started[0])
+    let len = mut fx.b.isub(end, y: started[0])
+    render_append(mut lo, mut fx, renderer_value, text, len)
 } append_decimal
+
+/// Writes the two digits of a pair below 100 from the table of digit pairs at `at` past `digits`.
+fn store_pair(mut fx: Fx, pairs: clif::Value, pair: clif::Value, digits: clif::Value, at: clif::Value) {
+    let offset = mut fx.b.ishl_imm_s(pair, y: 1)
+    let source = mut fx.b.iadd(pairs, y: offset)
+    let both = mut fx.b.load(clif::Type.Int16, flags: clif::MemFlags.unaligned(), p: source, offset: 0)
+    let place = mut fx.b.iadd(digits, y: at)
+    mut fx.b.store(clif::MemFlags.unaligned(), x: both, p: place, offset: 0)
+} store_pair
 
 /// Appends the uppercase hexadecimal digits of an unsigned 64-bit value, without leading zeros.
 fn append_hex(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, value: clif::Value) {

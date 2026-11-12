@@ -14,7 +14,7 @@ use cranelift_module::{DataDescription, Linkage, Module};
 
 use super::super::abi::{Abi, Repr};
 use super::super::body::{Body, Held};
-use super::super::fx::{Fx, PTR};
+use super::super::fx::{Fx, PTR, unaligned};
 use super::super::runtime::Routine;
 use super::super::runtime::report::decode_utf8;
 use super::super::{CALL_CONV, Glue, Instance, Lowering};
@@ -163,11 +163,67 @@ pub fn append(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, text: Value
     let copying = fx.b.ins().band(has_room, keeping);
     fx.when(copying, |fx| {
         let target = fx.b.ins().iadd(buffer, kept);
-        lo.call_routine(fx, Routine::Copy, &[target, text, count]);
+        copy_bytes(lo, fx, target, text, count);
     });
     let count = fx.b.ins().select(has_room, count, zero);
     let kept = fx.b.ins().iadd(kept, count);
     fx.store(kept, state, renderer::KEPT);
+}
+
+/// Copies `count` bytes from `from` to `to`: up to 16 as the first and the last bytes of a
+/// width, loaded before they are stored, and more through the copy routine.
+fn copy_bytes(lo: &mut Lowering, fx: &mut Fx, to: Value, from: Value, count: Value) {
+    let short =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, count, 16);
+    fx.choose_in(
+        lo,
+        short,
+        &[],
+        |_, fx| {
+            copy_ends(fx, to, from, count, &[types::I64, types::I32, types::I16]);
+            Vec::new()
+        },
+        |lo, fx| {
+            lo.call_routine(fx, Routine::Copy, &[to, from, count]);
+            Vec::new()
+        },
+    );
+}
+
+/// Copies `count` bytes, at most twice the first width, from `from` to `to`: the first and the
+/// last bytes of the widest width it holds, overlapping when it holds less than twice that, or
+/// its one byte.
+fn copy_ends(fx: &mut Fx, to: Value, from: Value, count: Value, widths: &[types::Type]) {
+    let Some((&ty, narrower)) = widths.split_first() else {
+        fx.when(count, |fx| {
+            let byte = fx.b.ins().load(types::I8, unaligned(), from, 0);
+            fx.b.ins().store(unaligned(), byte, to, 0);
+        });
+        return;
+    };
+    let width = i64::from(ty.bytes());
+    let holds =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, count, width);
+    fx.choose(
+        holds,
+        &[],
+        |fx| {
+            let last = fx.b.ins().iadd_imm_s(count, -width);
+            let first = fx.b.ins().load(ty, unaligned(), from, 0);
+            let tail = fx.b.ins().iadd(from, last);
+            let tail = fx.b.ins().load(ty, unaligned(), tail, 0);
+            fx.b.ins().store(unaligned(), first, to, 0);
+            let end = fx.b.ins().iadd(to, last);
+            fx.b.ins().store(unaligned(), tail, end, 0);
+            Vec::new()
+        },
+        |fx| {
+            copy_ends(fx, to, from, count, narrower);
+            Vec::new()
+        },
+    );
 }
 
 /// Appends a literal text to a rendering.
@@ -181,26 +237,71 @@ fn append_text(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, text: &str
     append(lo, fx, renderer_value, start, len);
 }
 
-/// Appends the decimal digits of an unsigned 64-bit value.
+/// Appends the decimal digits of an unsigned 64-bit value, two at a time from the table of
+/// digit pairs while two or more are left.
 pub fn append_decimal(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, value: Value) {
     let digits = fx.slot(24, 8);
     let end = fx.ptr(24);
-    let state = fx.repeat(&[value, end], |fx, state| {
-        let (rest, at) = (state[0], state[1]);
-        let ten = fx.ptr(10);
-        let digit = fx.b.ins().urem(rest, ten);
-        let rest = fx.b.ins().udiv(rest, ten);
-        let at = fx.b.ins().iadd_imm_s(at, -1);
-        let ascii = fx.b.ins().iadd_imm_s(digit, i64::from(b'0'));
-        let ascii = fx.b.ins().ireduce(types::I8, ascii);
-        let place = fx.b.ins().iadd(digits, at);
-        fx.store(ascii, place, 0);
-        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rest, 0);
-        (more, vec![rest, at])
-    });
-    let start = fx.b.ins().iadd(digits, state[1]);
-    let len = fx.b.ins().isub(end, state[1]);
-    append(lo, fx, renderer_value, start, len);
+    let pairs: Vec<u8> = (0..100u8)
+        .flat_map(|pair| [b'0' + pair / 10, b'0' + pair % 10])
+        .collect();
+    let pairs = lo.bytes_data(&pairs);
+    let pairs = lo.data_address(fx, pairs);
+    let large =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, value, 100);
+    let paired = fx.choose(
+        large,
+        &[PTR, PTR],
+        |fx| {
+            fx.repeat(&[value, end], |fx, state| {
+                let (rest, at) = (state[0], state[1]);
+                let hundred = fx.ptr(100);
+                let pair = fx.b.ins().urem(rest, hundred);
+                let rest = fx.b.ins().udiv(rest, hundred);
+                let at = fx.b.ins().iadd_imm_s(at, -2);
+                store_pair(fx, pairs, pair, digits, at);
+                let more =
+                    fx.b.ins()
+                        .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, rest, 100);
+                (more, vec![rest, at])
+            })
+        },
+        |_| vec![value, end],
+    );
+    let (rest, at) = (paired[0], paired[1]);
+    let two =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, rest, 10);
+    let start = fx.choose(
+        two,
+        &[PTR],
+        |fx| {
+            let at = fx.b.ins().iadd_imm_s(at, -2);
+            store_pair(fx, pairs, rest, digits, at);
+            vec![at]
+        },
+        |fx| {
+            let at = fx.b.ins().iadd_imm_s(at, -1);
+            let ascii = fx.b.ins().iadd_imm_s(rest, i64::from(b'0'));
+            let ascii = fx.b.ins().ireduce(types::I8, ascii);
+            let place = fx.b.ins().iadd(digits, at);
+            fx.store(ascii, place, 0);
+            vec![at]
+        },
+    )[0];
+    let text = fx.b.ins().iadd(digits, start);
+    let len = fx.b.ins().isub(end, start);
+    append(lo, fx, renderer_value, text, len);
+}
+
+/// Writes the two digits of a pair below 100 from the table of digit pairs at `at` past `digits`.
+fn store_pair(fx: &mut Fx, pairs: Value, pair: Value, digits: Value, at: Value) {
+    let offset = fx.b.ins().ishl_imm_s(pair, 1);
+    let source = fx.b.ins().iadd(pairs, offset);
+    let both = fx.b.ins().load(types::I16, unaligned(), source, 0);
+    let place = fx.b.ins().iadd(digits, at);
+    fx.b.ins().store(unaligned(), both, place, 0);
 }
 
 /// Appends the uppercase hexadecimal digits of an unsigned 64-bit value, without leading zeros.

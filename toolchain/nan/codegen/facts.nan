@@ -3,10 +3,15 @@
 /// What selection knows of a function before it selects an instruction.
 struct Facts {
     alloc: mem::Alloc
-    /// How many times each value is used.
+    /// How many times live instructions use each value.
     use_counts: mem::List[u32]
+    /// Whether each instruction is live, by instruction index: it has an effect, ends its block,
+    /// or a live instruction reads one of its results.
+    live: mem::List[bool]
     /// The index of the instruction defining each value, `NONE` for a block parameter.
     defs: mem::List[u32]
+    /// The index of the block defining each value, `NONE` for one no reachable block defines.
+    homes: mem::List[u32]
     /// Each block's index in the code, `NONE` for one no path from the entry reaches.
     positions: mem::List[u32]
     /// The reachable blocks in the order emission lays them out.
@@ -38,7 +43,9 @@ fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
     var known = Facts(
         alloc: alloc,
         use_counts: filled(values, value: 0u32, alloc),
+        live: mem::List[bool].empty(alloc),
         defs: filled(values, value: NONE, alloc),
+        homes: filled(values, value: NONE, alloc),
         positions: filled(blocks, value: NONE, alloc),
         sequence: mem::List[clif::Block].empty(alloc),
         single: single_predecessors(func, alloc),
@@ -345,13 +352,29 @@ fn Facts.place_blocks(mut self, func: clif::Function) {
     }
 } Facts.place_blocks
 
-/// Records which instruction defines each value and how often reachable code uses it.
+/// Records which instruction of reachable code defines each value, which instructions are live,
+/// and how often live instructions use each value.
 fn Facts.count_values(mut self, func: clif::Function) {
+    var count: usize = 0
     for block in self.order(func) {
+        for param in func.block_params(block, alloc: self.alloc) {
+            expect usize.widen(param.index) < self.homes.len()
+            self.homes[usize.widen(param.index)] = block.index
+        }
         for inst in func.block_insts(block, alloc: self.alloc) {
             for result in func.inst_results(inst, alloc: self.alloc) {
-                expect usize.widen(result.index) < self.defs.len()
+                expect usize.widen(result.index) < self.defs.len() and usize.widen(result.index) < self.homes.len()
                 self.defs[usize.widen(result.index)] = inst.index
+                self.homes[usize.widen(result.index)] = block.index
+            }
+            count = larger_index(count, index: inst.index)
+        }
+    }
+    self.live = self.live_insts(func, count)
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            if not self.is_live(inst) {
+                continue
             }
             each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
                 let at = usize.widen(func.resolve_aliases(value).index)
@@ -361,6 +384,56 @@ fn Facts.count_values(mut self, func: clif::Function) {
         }
     }
 } Facts.count_values
+
+/// The live instructions of reachable code, by instruction index: those with an effect or ending
+/// their block, then each one a live instruction reads a result of.
+fn Facts.live_insts(self, func: clif::Function, count: usize) -> mem::List[bool] {
+    var live = filled(count, value: false, alloc: self.alloc)
+    var pending = mem::List[u32].empty(self.alloc)
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            if not only_computes(func, inst, alloc: self.alloc) {
+                expect usize.widen(inst.index) < live.len()
+                live[usize.widen(inst.index)] = true
+                mut pending.push(inst.index)
+            }
+        }
+    }
+    loop {
+        let Some(at) = mut pending.pop() else {
+            return live
+        }
+        each_operand(func.inst_data(clif::Inst(index: at)), visit: fn[mut live, mut pending](value: clif::Value) {
+            let value_at = usize.widen(func.resolve_aliases(value).index)
+            expect value_at < self.defs.len()
+            let def = self.defs[value_at]
+            if def != NONE and not live[usize.widen(def)] {
+                live[usize.widen(def)] = true
+                mut pending.push(def)
+            }
+        })
+    }
+} Facts.live_insts
+
+/// Whether an instruction only computes values, so that it is dead when nothing reads them: one
+/// hoisting moves, a load that cannot fault, or the address of a stack slot, symbol or function.
+fn only_computes(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    if is_hoistable(func, inst, alloc) {
+        return true
+    }
+    return match func.inst_data(inst) {
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: flags, arg: _, offset: _) => flags.notrap
+        clif::InstructionData.StackLoad(opcode: _, slot: _, offset: _) or clif::InstructionData.FuncAddr(opcode: _, func_ref: _) => true
+        clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: _) => opcode == clif::Opcode.SymbolValue
+        else => false
+    }
+} only_computes
+
+/// Whether an instruction is live.
+fn Facts.is_live(self, inst: clif::Inst) -> bool {
+    let at = usize.widen(inst.index)
+    return at < self.live.len() and self.live[at]
+} Facts.is_live
 
 /// Shows `visit` each value an instruction reads, branch arguments included.
 fn each_operand(data: clif::InstructionData, visit: fn(value: clif::Value)) {
@@ -520,7 +593,7 @@ fn Facts.mark_shown_values(mut self, func: clif::Function) {
     for block in self.order(func) {
         for inst in func.block_insts(block, alloc: self.alloc) {
             let data = func.inst_data(inst)
-            if hides_nan_bits(data) {
+            if hides_nan_bits(data) or not self.is_live(inst) {
                 continue
             }
             each_operand(data, visit: fn[mut self](value: clif::Value) {
@@ -671,6 +744,19 @@ struct Operands derives Copy, Eq {
     x: clif::Value
     y: clif::Value
 } Operands
+
+/// Whether `kept` lives on past an instruction defining `result` from it and `spent` while
+/// `spent` ends there: other instructions read `kept`, or another block defines it, while that
+/// instruction alone reads `spent`, which its block defines.
+fn Facts.outlives(self, func: clif::Function, kept: clif::Value, spent: clif::Value, result: clif::Value) -> bool {
+    let kept_at = usize.widen(func.resolve_aliases(kept).index)
+    let spent_at = usize.widen(func.resolve_aliases(spent).index)
+    let result_at = usize.widen(func.resolve_aliases(result).index)
+    expect kept_at < self.use_counts.len() and spent_at < self.use_counts.len() and result_at < self.homes.len()
+    let home = self.homes[result_at]
+    let kept_lives = self.use_counts[kept_at] > 1 or self.homes[kept_at] != home
+    return kept_at != spent_at and kept_lives and self.use_counts[spent_at] == 1 and self.homes[spent_at] == home
+} Facts.outlives
 
 /// The value and amount of a right rotation `x | y` computes of a 32- or 64-bit integer, when
 /// one operand shifts it right and the other left by the rest of the width, and only the `bor`

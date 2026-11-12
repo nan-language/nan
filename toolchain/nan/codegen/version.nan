@@ -39,9 +39,9 @@ struct Spot derives Copy, Eq {
 
 /// A versioned loop: its header and latch, by block index, its blocks in layout order, the
 /// parameter it counts with and its limit, the blocks whose branches to a trap its copy drops,
-/// the loads its copy pins, by result index, and what the test ending each iteration bounds: the
+/// the loads its copy pins, by result index, what the test ending each iteration bounds: the
 /// starts whose sums with the last count must not overflow, the bounds, the strides of the
-/// loop's stores and the spots of its pinned loads.
+/// loop's stores and the spots of its pinned loads; and its vector copy, if any.
 struct Version {
     header: u32
     latch: u32
@@ -54,6 +54,7 @@ struct Version {
     bounds: mem::List[Bound]
     strides: mem::List[Stride]
     spots: mem::List[Spot]
+    lanes: Option[Lanes]
 } Version
 
 /// The loops a function versions, and the branches their copies add to each block, by block
@@ -84,10 +85,10 @@ struct CountTest derives Copy, Eq {
     exit: u32
 } CountTest
 
-/// The function with its counted loops versioned, or none when it versions none or holds a use
-/// before its definition in layout order.
-fn versioned(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
-    let Some(versions) = versions_of(func, alloc) else {
+/// The function with its counted loops versioned, with vector copies where `vectors` allows them,
+/// or none when it versions none or holds a use before its definition in layout order.
+fn versioned(func: clif::Function, vectors: bool, alloc: mem::Alloc) -> Option[clif::Function] {
+    let Some(versions) = versions_of(func, vectors, alloc) else {
         return None
     }
     var copier = Copier.versioning(func, take versions, alloc)
@@ -95,7 +96,7 @@ fn versioned(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] 
     return take copier.finish()
 } versioned
 
-fn versions_of(func: clif::Function, alloc: mem::Alloc) -> Option[Versions] {
+fn versions_of(func: clif::Function, vectors: bool, alloc: mem::Alloc) -> Option[Versions] {
     let loops = loops_of(func, alloc)
     let count = loops.innermost.len()
     var found = Versions(list: mem::List[Version].empty(alloc), added: filled(count, value: 0u32, alloc))
@@ -104,7 +105,7 @@ fn versions_of(func: clif::Function, alloc: mem::Alloc) -> Option[Versions] {
         if not is_innermost(loops, id: u32.fit(id)) {
             continue
         }
-        let Some(version) = version_of(func, loops, id: u32.fit(id), mut region, alloc) else {
+        let Some(version) = version_of(func, loops, id: u32.fit(id), mut region, vectors, alloc) else {
             continue
         }
         mut found.note_exit(func, version, alloc)
@@ -138,7 +139,7 @@ fn Versions.note_exit(mut self, func: clif::Function, version: Version, alloc: m
 } Versions.note_exit
 
 /// The version of an innermost loop, none when it does not qualify or would drop no check.
-fn version_of(func: clif::Function, loops: Loops, id: u32, mut region: Region, alloc: mem::Alloc) -> Option[Version] {
+fn version_of(func: clif::Function, loops: Loops, id: u32, mut region: Region, vectors: bool, alloc: mem::Alloc) -> Option[Version] {
     let blocks = mut region.enter(func, loops, id, alloc)
     if blocks.len() > VERSIONED_BLOCKS {
         return None
@@ -155,7 +156,7 @@ fn version_of(func: clif::Function, loops: Loops, id: u32, mut region: Region, a
         return None
     }
     mut region.rule(func, blocks: blocks.view(), header, latch, alloc)
-    var version = Version(header: header, latch: latch, blocks: take blocks, counter: counting.counter, limit: counting.limit, dropped: mem::List[u32].empty(alloc), pinned: mem::List[u32].empty(alloc), starts: mem::List[clif::Value].empty(alloc), bounds: mem::List[Bound].empty(alloc), strides: mem::List[Stride].empty(alloc), spots: mem::List[Spot].empty(alloc))
+    var version = Version(header: header, latch: latch, blocks: take blocks, counter: counting.counter, limit: counting.limit, dropped: mem::List[u32].empty(alloc), pinned: mem::List[u32].empty(alloc), starts: mem::List[clif::Value].empty(alloc), bounds: mem::List[Bound].empty(alloc), strides: mem::List[Stride].empty(alloc), spots: mem::List[Spot].empty(alloc), lanes: None)
     if not mut version.drop_checks(func, region, alloc) or version.dropped.len() == 0 {
         return None
     }
@@ -170,6 +171,9 @@ fn version_of(func: clif::Function, loops: Loops, id: u32, mut region: Region, a
         mut version.spots.truncate(0)
         mut version.strides.truncate(0)
         mut version.starts.truncate(starts)
+    }
+    if vectors {
+        version.lanes = lanes_of(func, version, region, alloc)
     }
     return Some(take version)
 } version_of
@@ -798,9 +802,19 @@ fn Copier.copy_versioned_latch(mut self, func: clif::Function, scope: Scope, ver
     let header = clif::Block(index: self.versions.list[usize.widen(version)].header)
     let original = scope.block(header)
     let copy = fast.block(header)
-    mut self.b.brif(holds, then: copy, then_args: passed, otherwise: original, otherwise_args: passed)
-    mut self.reached(copy)
-    mut self.reached(original)
+    if self.versions.list[usize.widen(version)].lanes.is_some() {
+        let entry = mut self.new_block(predecessors: 1)
+        let no_args = mem::List[clif::Value].empty(self.alloc)
+        mut self.b.brif(holds, then: entry, then_args: no_args.view(), otherwise: original, otherwise_args: passed)
+        mut self.reached(entry)
+        mut self.reached(original)
+        mut self.b.switch_to_block(entry)
+        mut self.enter_lanes(func, scope, version, passed, copy)
+    } else {
+        mut self.b.brif(holds, then: copy, then_args: passed, otherwise: original, otherwise_args: passed)
+        mut self.reached(copy)
+        mut self.reached(original)
+    }
     let blocks = copied_list(self.versions.list[usize.widen(version)].blocks.view(), alloc: self.alloc)
     for block in blocks {
         mut self.b.switch_to_block(fast.block(clif::Block(index: block)))
@@ -821,13 +835,18 @@ fn Copier.fast_scope(mut self, func: clif::Function, scope: Scope, version: u32)
     fast.previous = NONE
     let predecessors = predecessor_counts(func, alloc: self.alloc)
     let header = self.versions.list[usize.widen(version)].header
+    let entries: u32 = if self.versions.list[usize.widen(version)].lanes.is_some() {
+        3
+    } else {
+        2
+    }
     let blocks = copied_list(self.versions.list[usize.widen(version)].blocks.view(), alloc: self.alloc)
     let pinned = copied_list(self.versions.list[usize.widen(version)].pinned.view(), alloc: self.alloc)
     for block in blocks {
         let original = clif::Block(index: block)
         expect usize.widen(block) < predecessors.len()
         let reaching: u32 = if block == header {
-            2
+            entries
         } else {
             predecessors[usize.widen(block)]
         }
@@ -903,37 +922,45 @@ fn Copier.reach_test(mut self, func: clif::Function, scope: Scope, version: u32,
     var wraps = mut self.b.iconst(clif::Type.Int8, imm: 0)
     var apart = mut self.b.iconst(clif::Type.Int8, imm: 1)
     for stride in strides {
-        let base = mut self.value(scope, func, value: stride.base)
-        if self.lost {
-            return apart
-        }
-        var low = base
-        var high = base
-        if stride.scale > 0 {
-            let factor = mut self.b.iconst(clif::Type.Int64, imm: i64.from_bits(stride.scale))
-            let now = mut self.index_at(func, scope, start: stride.start, count: counter)
-            let scaled_now = mut self.b.umul_overflow(now, y: factor)
-            let end = mut self.index_at(func, scope, start: stride.start, count: last)
-            let scaled_end = mut self.b.umul_overflow(end, y: factor)
-            wraps = mut self.b.bor(wraps, y: scaled_now.flag)
-            wraps = mut self.b.bor(wraps, y: scaled_end.flag)
-            low = mut self.add_flagged(base, y: scaled_now.value, mut wraps)
-            high = mut self.add_flagged(base, y: scaled_end.value, mut wraps)
-        }
-        low = mut self.offset_flagged(low, by: i64.widen(stride.offset), mut wraps)
-        high = mut self.offset_flagged(high, by: i64.widen(stride.offset) + i64.widen(stride.size), mut wraps)
+        let written = mut self.reach_of(func, scope, stride, counter, last, mut wraps)
         for spot in spots {
             let address = mut self.value(scope, func, value: spot.address)
             let read_from = mut self.offset_flagged(address, by: i64.widen(spot.offset), mut wraps)
             let read_to = mut self.offset_flagged(read_from, by: i64.widen(spot.size), mut wraps)
-            let before = mut self.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: read_to, y: low)
-            let after = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: read_from, y: high)
-            let clear = mut self.b.bor(before, y: after)
+            let clear = mut self.disjoint(written, other: Reach(low: read_from, high: read_to))
             apart = mut self.b.band(apart, y: clear)
         }
     }
     return mut self.b.band_not(apart, y: wraps)
 } Copier.reach_test
+
+/// The bytes from `low` up to `high`.
+struct Reach derives Copy, Eq {
+    low: clif::Value
+    high: clif::Value
+} Reach
+
+/// The bytes a stride covers from count `counter` through count `last`, noting in `wraps`
+/// whether computing them wraps.
+fn Copier.reach_of(mut self, func: clif::Function, scope: Scope, stride: Stride, counter: clif::Value, last: clif::Value, mut wraps: clif::Value) -> Reach {
+    let base = mut self.value(scope, func, value: stride.base)
+    var low = base
+    var high = base
+    if stride.scale > 0 {
+        let factor = mut self.b.iconst(clif::Type.Int64, imm: i64.from_bits(stride.scale))
+        let now = mut self.index_at(func, scope, start: stride.start, count: counter)
+        let scaled_now = mut self.b.umul_overflow(now, y: factor)
+        let end = mut self.index_at(func, scope, start: stride.start, count: last)
+        let scaled_end = mut self.b.umul_overflow(end, y: factor)
+        wraps = mut self.b.bor(wraps, y: scaled_now.flag)
+        wraps = mut self.b.bor(wraps, y: scaled_end.flag)
+        low = mut self.add_flagged(base, y: scaled_now.value, mut wraps)
+        high = mut self.add_flagged(base, y: scaled_end.value, mut wraps)
+    }
+    low = mut self.offset_flagged(low, by: i64.widen(stride.offset), mut wraps)
+    high = mut self.offset_flagged(high, by: i64.widen(stride.offset) + i64.widen(stride.size), mut wraps)
+    return Reach(low: low, high: high)
+} Copier.reach_of
 
 /// `x + y`, noting in `wraps` whether it wraps.
 fn Copier.add_flagged(mut self, x: clif::Value, y: clif::Value, mut wraps: clif::Value) -> clif::Value {

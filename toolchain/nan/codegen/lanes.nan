@@ -1,0 +1,624 @@
+//! Two counts at once: the copy of a versioned loop whose blocks run one path, reading and writing 64-bit floats at addresses advancing 8 bytes a count and computing on them only by addition, subtraction, multiplication and division, gets a vector copy taking two counts an iteration while two are left, entered when no store of the counts left reaches the bytes another of its accesses reads or writes; the scalar copy takes the count left.
+
+/// What a value of a versioned loop stands for in its vector copy: nothing, a value the same on
+/// every count, the counter or the counter plus one, an index, an index scaled by a constant, an
+/// address advancing by such a scaled index, or two floats, one for each count.
+enum Role derives Copy, Eq {
+    Unread
+    Steady
+    Count
+    Next
+    Index(start: clif::Value)
+    Scaled(start: clif::Value, scale: u64)
+    Address(base: clif::Value, start: clif::Value, scale: u64)
+    Lane
+} Role
+
+/// How a versioned loop's vector copy takes two counts at once: the role of each value it
+/// defines, by value index; the instructions it copies, in order; the bytes its stores write and
+/// its loads read on each count; and the steady values its arithmetic reads two of.
+struct Lanes {
+    roles: mem::List[Role]
+    insts: mem::List[clif::Inst]
+    stores: mem::List[Stride]
+    loads: mem::List[Stride]
+    splats: mem::List[clif::Value]
+} Lanes
+
+/// The width in bytes of the floats the vector copy takes, and the scale of their indices.
+const LANE_BYTES: u32 = 8
+
+/// The vector copy of a versioned loop, none when its blocks branch other than past the checks
+/// its copy drops, or a value its copy reads has no role.
+fn lanes_of(func: clif::Function, version: Version, region: Region, alloc: mem::Alloc) -> Option[Lanes] {
+    let Some(path) = path_of(func, version, alloc) else {
+        return None
+    }
+    let read = read_in_copy(func, version, path: path.view(), alloc)
+    var lanes = Lanes(roles: filled(usize.widen(func.value_count()), value: Role.Unread, alloc), insts: mem::List[clif::Inst].empty(alloc), stores: mem::List[Stride].empty(alloc), loads: mem::List[Stride].empty(alloc), splats: mem::List[clif::Value].empty(alloc))
+    if not mut lanes.take_header(func, version, region, read: read.view(), alloc) {
+        return None
+    }
+    for block in path {
+        if not mut lanes.take_block(func, version, region, block, read: read.view(), alloc) {
+            return None
+        }
+    }
+    if lanes.stores.len() == 0 or lanes.stores.len() + lanes.loads.len() > VERSIONED_ACCESSES {
+        return None
+    }
+    return Some(take lanes)
+} lanes_of
+
+/// The blocks of a loop after its header in the order its one path runs them to the latch, each
+/// but the latch jumping to the next or branching to it past a check the copy drops; none when
+/// the loop's blocks branch otherwise.
+fn path_of(func: clif::Function, version: Version, alloc: mem::Alloc) -> Option[mem::List[u32]] {
+    var path = mem::List[u32].empty(alloc)
+    var block = next_on_path(func, version, block: version.header, alloc)
+    while block != NONE and block != version.header and path.len() < version.blocks.len() {
+        mut path.push(block)
+        if block == version.latch {
+            break
+        }
+        block = next_on_path(func, version, block, alloc)
+    }
+    if path.len() + 1 != version.blocks.len() or path.len() == 0 or path[path.len() - 1] != version.latch {
+        return None
+    }
+    return Some(take path)
+} path_of
+
+/// The block of the loop a block goes on to: its jump's target, or its branch's target in the
+/// loop when the branch is the header's test or a check the copy drops; `NONE` otherwise.
+fn next_on_path(func: clif::Function, version: Version, block: u32, alloc: mem::Alloc) -> u32 {
+    let insts = func.block_insts(clif::Block(index: block), alloc)
+    expect insts.len() > 0
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => return destination.block.index
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            if block != version.header and not is_listed(version.dropped.view(), value: block) {
+                return NONE
+            }
+            if is_listed(version.blocks.view(), value: then_call.block.index) {
+                return then_call.block.index
+            }
+            return else_call.block.index
+        }
+        else => return NONE
+    }
+} next_on_path
+
+/// Whether the copy reads each value, by value index: what its stores, the latch's jump and the
+/// header's test read, and what those values are computed from in the loop, past the loads it
+/// pins and through the parameters of the path's blocks.
+fn read_in_copy(func: clif::Function, version: Version, path: Slice[u32], alloc: mem::Alloc) -> mem::List[bool] {
+    var read = filled(usize.widen(func.value_count()), value: false, alloc)
+    let header_insts = func.block_insts(clif::Block(index: version.header), alloc)
+    expect header_insts.len() > 0
+    mark_read(func, inst: header_insts[header_insts.len() - 1], mut read)
+    for block in path {
+        for inst in func.block_insts(clif::Block(index: block), alloc) {
+            let roots = match func.inst_data(inst) {
+                clif::InstructionData.Store(opcode: _, flags: _, x: _, p: _, offset: _) => true
+                clif::InstructionData.Jump(opcode: _, destination: _) => block == version.latch
+                else => false
+            }
+            if roots {
+                mark_read(func, inst, mut read)
+            }
+        }
+    }
+    for _ in 0..<path.len() {
+        var changed = false
+        for at in 0..<path.len() {
+            let block = path[path.len() - 1 - at]
+            if mut spread_reads(func, version, block, mut read, alloc) {
+                changed = true
+            }
+        }
+        if not changed {
+            break
+        }
+    }
+    return read
+} read_in_copy
+
+/// Marks the values an instruction reads.
+fn mark_read(func: clif::Function, inst: clif::Inst, mut read: mem::List[bool]) {
+    each_operand(func.inst_data(inst), visit: fn[mut read](value: clif::Value) {
+        let at = usize.widen(func.resolve_aliases(value).index)
+        expect at < read.len()
+        read[at] = true
+    })
+} mark_read
+
+/// Marks what a block's read values are computed from: the operands of their instructions but
+/// pinned loads, and the arguments the branch to the block passes its read parameters, followed
+/// back to their origins; whether it marked a value.
+fn spread_reads(func: clif::Function, version: Version, block: u32, mut read: mem::List[bool], alloc: mem::Alloc) -> bool {
+    var changed = false
+    let insts = func.block_insts(clif::Block(index: block), alloc)
+    for index in 0..<insts.len() {
+        let inst = insts[insts.len() - 1 - index]
+        var feeds = false
+        for result in func.inst_results(inst, alloc) {
+            if read[usize.widen(result.index)] and not is_listed(version.pinned.view(), value: result.index) {
+                feeds = true
+            }
+        }
+        if feeds {
+            each_operand(func.inst_data(inst), visit: fn[mut read, mut changed](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                if not read[at] {
+                    read[at] = true
+                    changed = true
+                }
+            })
+        }
+    }
+    return changed
+} spread_reads
+
+/// The role of a value: steady for one the loop does not define.
+fn Lanes.role(self, func: clif::Function, region: Region, value: clif::Value) -> Role {
+    let resolved = func.resolve_aliases(value)
+    if not region.defines(func, value: resolved) {
+        return Role.Steady
+    }
+    let at = usize.widen(resolved.index)
+    expect at < self.roles.len()
+    return self.roles[at]
+} Lanes.role
+
+/// Gives the header's parameters their roles: the counter counts, another the latch passes back
+/// unchanged is steady, any other the copy must not read; false when the header computes more
+/// than its test or a parameter has no role.
+fn Lanes.take_header(mut self, func: clif::Function, version: Version, region: Region, read: Slice[bool], alloc: mem::Alloc) -> bool {
+    let header = clif::Block(index: version.header)
+    let insts = func.block_insts(header, alloc)
+    expect insts.len() > 0
+    for index in 0..<(insts.len() - 1) {
+        let data = func.inst_data(insts[index])
+        let tests = match data {
+            clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.UnaryImm(opcode: _, imm: _) => true
+            else => false
+        }
+        if not tests {
+            return false
+        }
+    }
+    let latch_insts = func.block_insts(clif::Block(index: version.latch), alloc)
+    let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(latch_insts[latch_insts.len() - 1]) else {
+        return false
+    }
+    let params = func.block_params(header, alloc)
+    for index in 0..<params.len() {
+        let param = params[index]
+        let at = usize.widen(param.index)
+        if param == version.counter {
+            self.roles[at] = Role.Count
+        } else if region.origin_of(func, value: destination.args[index], alloc) == param {
+            self.roles[at] = Role.Steady
+        } else if read[at] {
+            return false
+        }
+    }
+    return true
+} Lanes.take_header
+
+/// Gives a block's parameters the roles of the values passed to them and its instructions the
+/// roles of their results, noting those the vector copy copies; false when one the copy reads
+/// has no role.
+fn Lanes.take_block(mut self, func: clif::Function, version: Version, region: Region, block: u32, read: Slice[bool], alloc: mem::Alloc) -> bool {
+    for param in func.block_params(clif::Block(index: block), alloc) {
+        let origin = region.origin_of(func, value: param, alloc)
+        self.roles[usize.widen(param.index)] = self.role(func, region, value: origin)
+    }
+    let insts = func.block_insts(clif::Block(index: block), alloc)
+    for index in 0..<(insts.len() - 1) {
+        let inst = insts[index]
+        match func.inst_data(inst) {
+            clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: offset) => {
+                if not mut self.take_store(func, region, x, p, offset) {
+                    return false
+                }
+                mut self.insts.push(inst)
+            }
+            else => {
+                let results = func.inst_results(inst, alloc)
+                if results.len() == 0 or not read[usize.widen(results[0].index)] {
+                    continue
+                }
+                if is_listed(version.pinned.view(), value: results[0].index) {
+                    self.roles[usize.widen(results[0].index)] = Role.Steady
+                    continue
+                }
+                if not mut self.take_inst(func, region, inst, result: results[0]) {
+                    return false
+                }
+            }
+        }
+    }
+    return true
+} Lanes.take_block
+
+/// Notes a store of the vector copy: of two floats at an address advancing 8 bytes a count.
+fn Lanes.take_store(mut self, func: clif::Function, region: Region, x: clif::Value, p: clif::Value, offset: i32) -> bool {
+    if func.value_type(x) != clif::Type.Float64 or self.role(func, region, value: x) != Role.Lane {
+        return false
+    }
+    let Role.Address(base: base, start: start, scale: scale) = self.role(func, region, value: p) else {
+        return false
+    }
+    if scale != u64.widen(LANE_BYTES) {
+        return false
+    }
+    mut self.stores.push(Stride(base: base, start: start, scale: scale, offset: offset, size: LANE_BYTES))
+    return true
+} Lanes.take_store
+
+/// Gives an instruction's result its role, noting the instruction when the vector copy computes
+/// it on every iteration; false when it has none.
+fn Lanes.take_inst(mut self, func: clif::Function, region: Region, inst: clif::Inst, result: clif::Value) -> bool {
+    let role = match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => Role.Steady
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => mut self.binary_role(func, region, opcode, x, y)
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: offset) => mut self.load_role(func, region, address: arg, offset, result)
+        else => Role.Unread
+    }
+    if role == Role.Unread {
+        return false
+    }
+    self.roles[usize.widen(result.index)] = role
+    if role != Role.Steady and role != Role.Next {
+        mut self.insts.push(inst)
+    }
+    return true
+} Lanes.take_inst
+
+/// The role of a binary instruction's first result, `Unread` for none.
+fn Lanes.binary_role(mut self, func: clif::Function, region: Region, opcode: clif::Opcode, x: clif::Value, y: clif::Value) -> Role {
+    let left = self.role(func, region, value: x)
+    let right = self.role(func, region, value: y)
+    if left == Role.Steady and right == Role.Steady {
+        return Role.Steady
+    }
+    return match opcode {
+        clif::Opcode.Iadd or clif::Opcode.UaddOverflow => sum_role(func, x, y, left, right)
+        clif::Opcode.Imul => scaled_role(left, factor: iconst_of(func, value: y))
+        clif::Opcode.Ishl => match iconst_of(func, value: y) {
+            Some(shift) => if shift < 16 {
+                scaled_role(left, factor: Some(1u64 << u32.truncate(shift)))
+            } else {
+                Role.Unread
+            }
+            None => Role.Unread
+        }
+        clif::Opcode.Fadd or clif::Opcode.Fsub or clif::Opcode.Fmul or clif::Opcode.Fdiv => mut self.arithmetic_role(func, x, y, left, right)
+        else => Role.Unread
+    }
+} Lanes.binary_role
+
+/// The role of a sum: the counter plus one, an index, or an address.
+fn sum_role(func: clif::Function, x: clif::Value, y: clif::Value, left: Role, right: Role) -> Role {
+    if left == Role.Count and iconst_of(func, value: y) == Some(1) {
+        return Role.Next
+    }
+    if left == Role.Count and right == Role.Steady {
+        return Role.Index(start: func.resolve_aliases(y))
+    }
+    if right == Role.Count and left == Role.Steady {
+        return Role.Index(start: func.resolve_aliases(x))
+    }
+    if left == Role.Steady {
+        return addressed(base: x, scaled: right, func)
+    }
+    if right == Role.Steady {
+        return addressed(base: y, scaled: left, func)
+    }
+    return Role.Unread
+} sum_role
+
+/// The role of a steady base plus a scaled index: an address.
+fn addressed(base: clif::Value, scaled: Role, func: clif::Function) -> Role {
+    return match scaled {
+        Role.Scaled(start: start, scale: scale) => Role.Address(base: func.resolve_aliases(base), start: start, scale: scale)
+        else => Role.Unread
+    }
+} addressed
+
+/// The role of an index, the counter alone counting as one, times a constant factor: a scaled
+/// index.
+fn scaled_role(index: Role, factor: Option[u64]) -> Role {
+    let Some(scale) = factor else {
+        return Role.Unread
+    }
+    if scale == 0 or scale > LARGEST_SCALE {
+        return Role.Unread
+    }
+    return match index {
+        Role.Index(start: start) => Role.Scaled(start: start, scale: scale)
+        Role.Count => Role.Scaled(start: NO_VALUE, scale: scale)
+        else => Role.Unread
+    }
+} scaled_role
+
+/// The role of float arithmetic: two floats when an operand is, its steady operands read two
+/// at once.
+fn Lanes.arithmetic_role(mut self, func: clif::Function, x: clif::Value, y: clif::Value, left: Role, right: Role) -> Role {
+    if func.value_type(x) != clif::Type.Float64 or (left != Role.Lane and left != Role.Steady) or (right != Role.Lane and right != Role.Steady) {
+        return Role.Unread
+    }
+    if left == Role.Steady {
+        mut self.note_splat(func.resolve_aliases(x))
+    }
+    if right == Role.Steady {
+        mut self.note_splat(func.resolve_aliases(y))
+    }
+    return Role.Lane
+} Lanes.arithmetic_role
+
+fn Lanes.note_splat(mut self, value: clif::Value) {
+    for splat in self.splats {
+        if splat == value {
+            return
+        }
+    }
+    mut self.splats.push(value)
+} Lanes.note_splat
+
+/// The role of a load: two floats from an address advancing 8 bytes a count.
+fn Lanes.load_role(mut self, func: clif::Function, region: Region, address: clif::Value, offset: i32, result: clif::Value) -> Role {
+    if func.value_type(result) != clif::Type.Float64 {
+        return Role.Unread
+    }
+    let Role.Address(base: base, start: start, scale: scale) = self.role(func, region, value: address) else {
+        return Role.Unread
+    }
+    if scale != u64.widen(LANE_BYTES) {
+        return Role.Unread
+    }
+    mut self.loads.push(Stride(base: base, start: start, scale: scale, offset: offset, size: LANE_BYTES))
+    return Role.Lane
+} Lanes.load_role
+
+/// Goes on from a versioned latch whose checks hold: to the vector copy when no store of the
+/// counts left reaches bytes another access of the loop reads or writes, else to the scalar copy,
+/// either taking the jump's arguments; then builds the vector copy.
+fn Copier.enter_lanes(mut self, func: clif::Function, scope: Scope, version: u32, passed: Slice[clif::Value], copy: clif::Block) {
+    let at = usize.widen(version)
+    let Some(found) = self.versions.list[at].lanes else {
+        expect false
+        return
+    }
+    let stores = copied_list(found.stores.view(), alloc: self.alloc)
+    let loads = copied_list(found.loads.view(), alloc: self.alloc)
+    let counter = mut self.value(scope, func, value: self.versions.list[at].counter)
+    let limit = mut self.value(scope, func, value: self.versions.list[at].limit)
+    if self.lost {
+        return
+    }
+    let last = mut self.b.iadd_imm_s(limit, y: -1)
+    var wraps = mut self.b.iconst(clif::Type.Int8, imm: 0)
+    var apart = mut self.b.iconst(clif::Type.Int8, imm: 1)
+    for store in stores {
+        let written = mut self.reach_of(func, scope, stride: store, counter, last, mut wraps)
+        for load in loads {
+            if load.base != store.base or load.start != store.start or load.offset != store.offset {
+                let read = mut self.reach_of(func, scope, stride: load, counter, last, mut wraps)
+                let clear = mut self.disjoint(written, other: read)
+                apart = mut self.b.band(apart, y: clear)
+            }
+        }
+        for other in stores {
+            if other != store {
+                let rewritten = mut self.reach_of(func, scope, stride: other, counter, last, mut wraps)
+                let clear = mut self.disjoint(written, other: rewritten)
+                apart = mut self.b.band(apart, y: clear)
+            }
+        }
+    }
+    apart = mut self.b.band_not(apart, y: wraps)
+    let splats = mut self.splats_of(func, scope, version)
+    let rebased = mut self.rebased_of(func, scope, version)
+    let vector_header = mut self.new_block(predecessors: 2)
+    mut self.b.brif(apart, then: vector_header, then_args: passed, otherwise: copy, otherwise_args: passed)
+    mut self.reached(vector_header)
+    mut self.reached(copy)
+    mut self.copy_vector_loop(func, scope, version, vector_header, copy, last, splats: splats.view(), rebased: rebased.view())
+} Copier.enter_lanes
+
+/// An address a vector copy advances from: a base plus a start scaled, the address of count 0.
+struct Rebased derives Copy, Eq {
+    base: clif::Value
+    start: clif::Value
+    value: clif::Value
+} Rebased
+
+/// The addresses of count 0 of the addresses a vector copy's accesses advance, each computed
+/// once before the copy.
+fn Copier.rebased_of(mut self, func: clif::Function, scope: Scope, version: u32) -> mem::List[Rebased] {
+    var found_addresses = mem::List[Rebased].empty(self.alloc)
+    let Some(found) = self.versions.list[usize.widen(version)].lanes else {
+        return found_addresses
+    }
+    let roles = copied_list(found.roles.view(), alloc: self.alloc)
+    for role in roles {
+        let Role.Address(base: base, start: start, scale: scale) = role else {
+            continue
+        }
+        if rebased_value(found_addresses.view(), base, start) != NO_VALUE {
+            continue
+        }
+        var value = mut self.value(scope, func, value: base)
+        if start != NO_VALUE {
+            let started = mut self.value(scope, func, value: start)
+            let offset = mut self.b.imul_imm_s(started, y: i64.from_bits(scale))
+            value = mut self.b.iadd(value, y: offset)
+        }
+        mut found_addresses.push(Rebased(base: base, start: start, value: value))
+    }
+    return found_addresses
+} Copier.rebased_of
+
+/// The address of count 0 of an address advancing from `base` by `start` plus the counter.
+fn rebased_value(rebased: Slice[Rebased], base: clif::Value, start: clif::Value) -> clif::Value {
+    for address in rebased {
+        if address.base == base and address.start == start {
+            return address.value
+        }
+    }
+    return NO_VALUE
+} rebased_value
+
+/// The splats of the steady values a vector copy's arithmetic reads, in the order its lanes list
+/// them.
+fn Copier.splats_of(mut self, func: clif::Function, scope: Scope, version: u32) -> mem::List[clif::Value] {
+    var splats = mem::List[clif::Value].empty(self.alloc)
+    let Some(found) = self.versions.list[usize.widen(version)].lanes else {
+        return splats
+    }
+    let sources = copied_list(found.splats.view(), alloc: self.alloc)
+    for source in sources {
+        let steady = mut self.value(scope, func, value: source)
+        mut splats.push(mut self.b.splat(clif::Type.Float64x2, x: steady))
+    }
+    return splats
+} Copier.splats_of
+
+/// Whether two byte ranges share no byte.
+fn Copier.disjoint(mut self, reach: Reach, other: Reach) -> clif::Value {
+    let before = mut self.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: reach.high, y: other.low)
+    let after = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: reach.low, y: other.high)
+    return mut self.b.bor(before, y: after)
+} Copier.disjoint
+
+/// Builds a versioned loop's vector copy: a header taking the loop's parameters, going on while
+/// the counter is below the last count, so two counts are left, and leaving for the scalar
+/// copy's header otherwise, and a body taking two counts, then jumping back with the counter two
+/// higher.
+fn Copier.copy_vector_loop(mut self, func: clif::Function, scope: Scope, version: u32, vector_header: clif::Block, copy: clif::Block, last: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased]) {
+    let at = usize.widen(version)
+    let header = clif::Block(index: self.versions.list[at].header)
+    let counter = self.versions.list[at].counter
+    let params = func.block_params(header, alloc: self.alloc)
+    var lane_values = filled(usize.widen(func.value_count()), value: NO_VALUE, alloc: self.alloc)
+    var copied_params = mem::List[clif::Value].empty(self.alloc)
+    var count = NO_VALUE
+    mut self.b.switch_to_block(vector_header)
+    for param in params {
+        let copied = mut self.b.append_block_param(vector_header, ty: func.value_type(param))
+        lane_values[usize.widen(param.index)] = copied
+        mut copied_params.push(copied)
+        if param == counter {
+            count = copied
+        }
+    }
+    let more = mut self.b.icmp(clif::IntCC.UnsignedLessThan, x: count, y: last)
+    let body = mut self.new_block(predecessors: 1)
+    let no_args = mem::List[clif::Value].empty(self.alloc)
+    mut self.b.brif(more, then: body, then_args: no_args.view(), otherwise: copy, otherwise_args: copied_params.view())
+    mut self.reached(body)
+    mut self.reached(copy)
+    mut self.b.switch_to_block(body)
+    mut self.copy_lanes(func, scope, version, mut lane_values, count, splats, rebased)
+    let next = mut self.b.iadd_imm_s(count, y: 2)
+    var back = mem::List[clif::Value].empty(self.alloc)
+    for index in 0..<params.len() {
+        if params[index] == counter {
+            mut back.push(next)
+        } else {
+            mut back.push(copied_params[index])
+        }
+    }
+    mut self.b.jump(vector_header, args: back.view())
+    mut self.reached(vector_header)
+} Copier.copy_vector_loop
+
+/// Copies the instructions of a vector copy's body, each value it computes for both counts
+/// standing in `lane_values`, the steady values it reads taken from the scope at the latch.
+fn Copier.copy_lanes(mut self, func: clif::Function, scope: Scope, version: u32, mut lane_values: mem::List[clif::Value], count: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased]) {
+    let at = usize.widen(version)
+    let Some(found) = self.versions.list[at].lanes else {
+        return
+    }
+    let insts = copied_list(found.insts.view(), alloc: self.alloc)
+    let roles = copied_list(found.roles.view(), alloc: self.alloc)
+    let splat_sources = copied_list(found.splats.view(), alloc: self.alloc)
+    for inst in insts {
+        let data = func.inst_data(inst)
+        match data {
+            clif::InstructionData.Store(opcode: _, flags: flags, x: x, p: p, offset: offset) => {
+                let stored = lane_of(func, lane_values: lane_values.view(), value: x)
+                let address = lane_of(func, lane_values: lane_values.view(), value: p)
+                mut self.b.store(clif::MemFlags(aligned: false, notrap: flags.notrap), x: stored, p: address, offset)
+            }
+            else => {
+                let result = result_of(func, inst, alloc: self.alloc)
+                let copied = mut self.lane_inst(func, scope, data, role: roles[usize.widen(result.index)], lane_values: lane_values.view(), splat_sources: splat_sources.view(), splats, rebased, count)
+                lane_values[usize.widen(result.index)] = copied
+            }
+        }
+    }
+} Copier.copy_lanes
+
+/// The value a vector copy computes for both counts, `NO_VALUE` for a steady one.
+fn lane_of(func: clif::Function, lane_values: Slice[clif::Value], value: clif::Value) -> clif::Value {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < lane_values.len()
+    return lane_values[at]
+} lane_of
+
+/// The copy in a vector body of an instruction computing an index, a scaled index, an address
+/// advanced from its count 0 by the counter, two loaded floats or arithmetic on two floats.
+fn Copier.lane_inst(mut self, func: clif::Function, scope: Scope, data: clif::InstructionData, role: Role, lane_values: Slice[clif::Value], splat_sources: Slice[clif::Value], splats: Slice[clif::Value], rebased: Slice[Rebased], count: clif::Value) -> clif::Value {
+    match role {
+        Role.Index(start: start) => {
+            let base = mut self.value(scope, func, value: start)
+            return mut self.b.iadd(base, y: count)
+        }
+        Role.Scaled(start: _, scale: scale) => {
+            let clif::InstructionData.Binary(opcode: _, x: index, y: _) = data else {
+                return NO_VALUE
+            }
+            return mut self.b.imul_imm_s(lane_of(func, lane_values, value: index), y: i64.from_bits(scale))
+        }
+        Role.Address(base: base, start: start, scale: scale) => {
+            let advance = mut self.b.imul_imm_s(count, y: i64.from_bits(scale))
+            return mut self.b.iadd(rebased_value(rebased, base, start), y: advance)
+        }
+        else => {}
+    }
+    return match data {
+        clif::InstructionData.Load(opcode: _, flags: flags, arg: arg, offset: offset) => mut self.b.load(clif::Type.Float64x2, flags: clif::MemFlags(aligned: false, notrap: flags.notrap), p: lane_of(func, lane_values, value: arg), offset)
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => mut self.lane_arithmetic(opcode, x: lane_or_splat(func, lane_values, splat_sources, splats, value: x), y: lane_or_splat(func, lane_values, splat_sources, splats, value: y))
+        else => NO_VALUE
+    }
+} Copier.lane_inst
+
+/// Float arithmetic on two floats each.
+fn Copier.lane_arithmetic(mut self, opcode: clif::Opcode, x: clif::Value, y: clif::Value) -> clif::Value {
+    return match opcode {
+        clif::Opcode.Fadd => mut self.b.fadd(x, y: y)
+        clif::Opcode.Fsub => mut self.b.fsub(x, y: y)
+        clif::Opcode.Fmul => mut self.b.fmul(x, y: y)
+        else => mut self.b.fdiv(x, y: y)
+    }
+} Copier.lane_arithmetic
+
+/// The two floats a vector body computes for a value, or its steady value's splat.
+fn lane_or_splat(func: clif::Function, lane_values: Slice[clif::Value], splat_sources: Slice[clif::Value], splats: Slice[clif::Value], value: clif::Value) -> clif::Value {
+    let lane = lane_of(func, lane_values, value)
+    if lane != NO_VALUE {
+        return lane
+    }
+    let resolved = func.resolve_aliases(value)
+    for index in 0..<splat_sources.len() {
+        if splat_sources[index] == resolved {
+            return splats[index]
+        }
+    }
+    expect false
+    return NO_VALUE
+} lane_or_splat

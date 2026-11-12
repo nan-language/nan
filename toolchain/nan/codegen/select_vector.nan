@@ -150,9 +150,15 @@ fn Selector.vector(mut self, func: clif::Function, inst: clif::Inst) {
         }
         clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => {
             let ty = func.value_type(x)
-            let a = mut self.src(x, func)
-            let b = mut self.src(y, func)
-            let result = mut self.vector_binary(ty, opcode, a, b)
+            let operands = if commutes(opcode) and self.facts.outlives(func, kept: x, spent: y, result: result_of(func, inst, alloc: self.alloc)) {
+                Operands(x: y, y: x)
+            } else {
+                Operands(x: x, y: y)
+            }
+            let a = mut self.src(operands.x, func)
+            let b = mut self.src(operands.y, func)
+            let shown = self.facts.is_shown(func, value: result_of(func, inst, alloc: self.alloc))
+            let result = mut self.vector_binary(ty, opcode, a, b, shown)
             let dst = mut self.dst_of(func, inst)
             mut self.mov(dst, src: result)
         }
@@ -230,6 +236,9 @@ fn Selector.vector_unary(mut self, func: clif::Function, inst: clif::Inst, opcod
         if result_ty == clif::Type.Float32x4 {
             return mut self.broadcast(x64::Size.Dword, src: src)
         }
+        if result_ty == clif::Type.Float64x2 {
+            return mut self.broadcast(x64::Size.Qword, src: src)
+        }
         return mut self.splat_gpr(lane_size(result_ty), src: src)
     }
     if opcode == clif::Opcode.Bnot {
@@ -238,7 +247,7 @@ fn Selector.vector_unary(mut self, func: clif::Function, inst: clif::Inst, opcod
     }
     if opcode == clif::Opcode.Sqrt {
         let root = mut self.packed_unary(x64::Packed.Sqrtps, src: src)
-        return mut self.canonical_lanes(root)
+        return mut self.canonical_lanes(ty, value: root)
     }
     return match opcode {
         clif::Opcode.FcvtFromSint => mut self.packed_unary(x64::Packed.Cvtdq2ps, src: src)
@@ -306,17 +315,18 @@ fn Selector.saturated_lanes(mut self, src: machinst::Reg) -> machinst::Reg {
     return mut self.packed(x64::Packed.Pxor, lhs: fill, rhs: converted)
 } Selector.saturated_lanes
 
-/// A float vector whose NaN lanes are made the canonical NaN.
-fn Selector.canonical_lanes(mut self, value: machinst::Reg) -> machinst::Reg {
-    let nans = mut self.combined(x64::PackedImm.Cmpps, lhs: value, rhs: value, imm: 3)
-    let canonical = mut self.splat_bits(x64::Size.Dword, bits: 0x7FC0_0000)
-    let chosen = mut self.packed(x64::Packed.Pand, lhs: canonical, rhs: nans)
-    let kept = mut self.packed(x64::Packed.Pandn, lhs: nans, rhs: value)
-    return mut self.packed(x64::Packed.Por, lhs: chosen, rhs: kept)
+/// A float vector computed into a new register whose NaN lanes are made the canonical NaN in
+/// place.
+fn Selector.canonical_lanes(mut self, ty: clif::Type, value: machinst::Reg) -> machinst::Reg {
+    let mask = mut self.vector_temp()
+    let canon = mut self.vector_temp()
+    let temp = mut self.temp(false)
+    mut self.emit(x64::Inst.CanonNanLanes(size: lane_size(ty), reg: value, mask: mask, canon: canon, temp: temp))
+    return value
 } Selector.canonical_lanes
 
 /// A binary vector instruction's result in a new register.
-fn Selector.vector_binary(mut self, ty: clif::Type, opcode: clif::Opcode, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+fn Selector.vector_binary(mut self, ty: clif::Type, opcode: clif::Opcode, a: machinst::Reg, b: machinst::Reg, shown: bool) -> machinst::Reg {
     let size = lane_size(ty)
     return match opcode {
         clif::Opcode.Iadd => mut self.packed(lane_op(size, byte: x64::Packed.Paddb, word: x64::Packed.Paddw, dword: x64::Packed.Paddd, qword: x64::Packed.Paddq), lhs: a, rhs: b)
@@ -330,10 +340,10 @@ fn Selector.vector_binary(mut self, ty: clif::Type, opcode: clif::Opcode, a: mac
         clif::Opcode.UsubSat => mut self.packed(lane_op(size, byte: x64::Packed.Psubusb, word: x64::Packed.Psubusw, dword: x64::Packed.Psubusw, qword: x64::Packed.Psubusw), lhs: a, rhs: b)
         clif::Opcode.SsubSat => mut self.packed(lane_op(size, byte: x64::Packed.Psubsb, word: x64::Packed.Psubsw, dword: x64::Packed.Psubsw, qword: x64::Packed.Psubsw), lhs: a, rhs: b)
         clif::Opcode.Ishl or clif::Opcode.Ushr or clif::Opcode.Sshr => mut self.lanes_shift(size, opcode, value: a, amount: b)
-        clif::Opcode.Fadd => mut self.float_lanes(x64::Packed.Addps, a, b)
-        clif::Opcode.Fsub => mut self.float_lanes(x64::Packed.Subps, a, b)
-        clif::Opcode.Fmul => mut self.float_lanes(x64::Packed.Mulps, a, b)
-        clif::Opcode.Fdiv => mut self.float_lanes(x64::Packed.Divps, a, b)
+        clif::Opcode.Fadd => mut self.float_lanes(ty, op: float_op(ty, single: x64::Packed.Addps, double: x64::Packed.Addpd), a, b, shown)
+        clif::Opcode.Fsub => mut self.float_lanes(ty, op: float_op(ty, single: x64::Packed.Subps, double: x64::Packed.Subpd), a, b, shown)
+        clif::Opcode.Fmul => mut self.float_lanes(ty, op: float_op(ty, single: x64::Packed.Mulps, double: x64::Packed.Mulpd), a, b, shown)
+        clif::Opcode.Fdiv => mut self.float_lanes(ty, op: float_op(ty, single: x64::Packed.Divps, double: x64::Packed.Divpd), a, b, shown)
         clif::Opcode.Fmin => mut self.lanes_min(a, b)
         clif::Opcode.Fmax => mut self.lanes_max(a, b)
         else => mut self.pairwise(a, b)
@@ -350,11 +360,32 @@ fn lane_op(size: x64::Size, byte: x64::Packed, word: x64::Packed, dword: x64::Pa
     }
 } lane_op
 
-/// A float operation lane by lane, its NaN lanes made the canonical NaN.
-fn Selector.float_lanes(mut self, op: x64::Packed, a: machinst::Reg, b: machinst::Reg) -> machinst::Reg {
+/// A float operation lane by lane, its NaN lanes made the canonical NaN when an instruction can
+/// show their bits.
+fn Selector.float_lanes(mut self, ty: clif::Type, op: x64::Packed, a: machinst::Reg, b: machinst::Reg, shown: bool) -> machinst::Reg {
     let result = mut self.packed(op, lhs: a, rhs: b)
-    return mut self.canonical_lanes(result)
+    if not shown {
+        return result
+    }
+    return mut self.canonical_lanes(ty, value: result)
 } Selector.float_lanes
+
+/// Whether a vector operation gives the same lanes with its operands in either order, but for
+/// the bits of a NaN made canonical where they show.
+fn commutes(opcode: clif::Opcode) -> bool {
+    return match opcode {
+        clif::Opcode.Fadd or clif::Opcode.Fmul or clif::Opcode.Iadd or clif::Opcode.Imul or clif::Opcode.Band or clif::Opcode.Bor or clif::Opcode.Bxor => true
+        else => false
+    }
+} commutes
+
+/// The operation of a float vector type's lanes: on four floats of 32 bits or two of 64.
+fn float_op(ty: clif::Type, single: x64::Packed, double: x64::Packed) -> x64::Packed {
+    if ty == clif::Type.Float64x2 {
+        return double
+    }
+    return single
+} float_op
 
 /// `fmin` of four floats as Cranelift sequences it, a NaN when either lane is one and `-0.0`
 /// below `0.0`, its NaN lanes made the canonical NaN.
@@ -366,7 +397,7 @@ fn Selector.lanes_min(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst:
     let marked = mut self.packed(x64::Packed.Orps, lhs: either, rhs: nans)
     let fraction = mut self.shifted(x64::PackedShift.Psrld, src: nans, amount: 10)
     let least = mut self.packed(x64::Packed.Andnps, lhs: fraction, rhs: marked)
-    return mut self.canonical_lanes(least)
+    return mut self.canonical_lanes(clif::Type.Float32x4, value: least)
 } Selector.lanes_min
 
 /// `fmax` of four floats as Cranelift sequences it, a NaN when either lane is one and `0.0`
@@ -380,7 +411,7 @@ fn Selector.lanes_max(mut self, a: machinst::Reg, b: machinst::Reg) -> machinst:
     let nans = mut self.combined(x64::PackedImm.Cmpps, lhs: blended, rhs: blended, imm: 3)
     let fraction = mut self.shifted(x64::PackedShift.Psrld, src: nans, amount: 10)
     let greatest = mut self.packed(x64::Packed.Andnps, lhs: fraction, rhs: positive)
-    return mut self.canonical_lanes(greatest)
+    return mut self.canonical_lanes(clif::Type.Float32x4, value: greatest)
 } Selector.lanes_max
 
 /// `iadd_pairwise` of four 32-bit lanes each: `phaddd` at `x86_64-v2`, the even and odd lanes

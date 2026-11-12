@@ -363,32 +363,47 @@ pkg fn Module.declare_data(mut self, name: Str, linkage: Linkage, writable: bool
 } Module.declare_data
 
 /// Defines a declared function as a built one, compiled once the colocated functions it calls
-/// are defined, so that calls of small ones take their bodies in place, or sooner when too much
+/// are compiled, so that calls of small ones take their bodies in place, or sooner when too much
 /// waits; a body is taken in place only from a function `inlinable` defines.
 pkg fn Module.define_function(mut self, id: FuncId, take func: clif::Function, inlinable: bool) {
     mut self.mark_defined(id)
-    let callees = undefined_callees(func, functions: self.functions.view(), alloc: self.alloc)
+    let callees = self.schedule.pending_callees(func, functions: self.functions.view(), alloc: self.alloc)
     if callees.len() == 0 {
         mut self.compile(id, func: take func, inlinable)
+        mut self.release(id)
     } else {
-        mut self.schedule.hold(id, func: take func, callees: callees.view())
+        mut self.schedule.hold(id, func: take func, callees: callees.view(), inlinable)
     }
-    mut self.release(id)
     loop {
         let Some(waiting) = mut self.schedule.overflow() else {
             break
         }
-        let Waiting(id: held, func: held_func, missing: _) = waiting
-        mut self.compile(held, func: take held_func, inlinable: false)
+        mut self.compile_waited(take waiting)
     }
 } Module.define_function
 
-/// Compiles the functions waiting for a function now defined that wait for nothing else.
+/// Compiles a function that waited, then the functions waiting for it that wait for nothing else.
+fn Module.compile_waited(mut self, take waiting: Waiting) {
+    let Waiting(id: held, func: held_func, missing: _, inlinable: inlinable) = waiting
+    mut self.compile(held, func: take held_func, inlinable)
+    mut self.release(held)
+} Module.compile_waited
+
+/// Compiles the functions waiting for a function now compiled that wait for nothing else, and
+/// in turn those waiting for them.
 fn Module.release(mut self, id: FuncId) {
-    let ready = mut self.schedule.released(id)
-    for waiting in take ready {
-        let Waiting(id: held, func: held_func, missing: _) = waiting
-        mut self.compile(held, func: take held_func, inlinable: false)
+    var compiled = mem::List[FuncId].empty(self.alloc)
+    mut compiled.push(id)
+    loop {
+        let Some(done) = mut compiled.pop() else {
+            return
+        }
+        let ready = mut self.schedule.released(done)
+        for waiting in take ready {
+            let Waiting(id: held, func: held_func, missing: _, inlinable: inlinable) = waiting
+            mut self.compile(held, func: take held_func, inlinable)
+            mut compiled.push(held)
+        }
     }
 } Module.release
 
@@ -398,8 +413,7 @@ pkg fn Module.compile_waiting(mut self) {
         let Some(waiting) = mut self.schedule.oldest() else {
             return
         }
-        let Waiting(id: held, func: held_func, missing: _) = waiting
-        mut self.compile(held, func: take held_func, inlinable: false)
+        mut self.compile_waited(take waiting)
     }
 } Module.compile_waiting
 

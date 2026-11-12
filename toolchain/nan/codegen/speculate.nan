@@ -1,4 +1,4 @@
-//! Speculating short branches: a conditional branch whose arms run only constants, arithmetic, comparisons, conversions and selects into one join, except for branches to cold blocks that trap, computes both arms in its own block, branches to such a cold block only when the arm holding it is the one taken and its test sends it there, and passes the join the values its condition selects; the function is copied with the branches speculated. An arm divides only where selection shifts or masks, and multiplies only by a product x86-64 selects as one `lea`. A test of a trap that shares no operand with the comparison the branch tests branches alone, to a cold block that traps when the arm holding it is taken and goes on otherwise.
+//! Speculating short branches: a conditional branch whose arms run only constants, arithmetic, comparisons, conversions and selects into one join, except for branches to cold blocks that trap, computes both arms in its own block, branches to such a cold block only when the arm holding it is the one taken and its test sends it there, and passes the join the values its condition selects; the function is copied with the branches speculated. An arm divides only where selection shifts or masks, and multiplies only by a product x86-64 selects as one `lea`. A test of a trap that shares no operand with the comparisons the branch's condition combines branches alone, to a cold block that traps when the arm holding it is taken and goes on otherwise.
 
 /// The most instructions the arms of a speculated branch hold together, besides their branches.
 const SPECULATED_INSTS: usize = 16
@@ -388,29 +388,54 @@ fn trap_target(scope: Scope, func: clif::Function, then_call: clif::BlockCall, e
     return scope.block(else_call.block)
 } trap_target
 
-/// Whether the operation whose flag an arm's branch on `arg` tests reads an operand of the
-/// comparison defining `c`, as when `c` picks the arm in which the operation cannot overflow;
-/// true when no comparison defines `c`.
+/// Whether the operation or comparison whose flag an arm's branch on `arg` tests reads an operand
+/// of a comparison that `c` combines through `band`, `bor` and `bxor`, as when `c` picks the arm
+/// in which the operation cannot overflow; true when another instruction gives the flag.
 fn shares_operand(func: clif::Function, c: clif::Value, arg: clif::Value, alloc: mem::Alloc) -> bool {
-    let Some(compare) = func.value_inst(c) else {
-        return true
-    }
-    let clif::InstructionData.IntCompare(opcode: _, cond: _, x: cx, y: cy) = func.inst_data(compare) else {
-        return true
-    }
     let Inverse(value: tested, inverted: _) = inverse_of(func, value: arg, alloc)
     let Some(operation) = func.value_inst(tested) else {
         return true
     }
-    let clif::InstructionData.Binary(opcode: _, x: ox, y: oy) = func.inst_data(operation) else {
+    let Some(operands) = operands_of(func, inst: operation) else {
         return true
     }
-    let compared_x = func.resolve_aliases(cx)
-    let compared_y = func.resolve_aliases(cy)
-    let left = func.resolve_aliases(ox)
-    let right = func.resolve_aliases(oy)
-    return left == compared_x or left == compared_y or right == compared_x or right == compared_y
+    let left = func.resolve_aliases(operands.x)
+    let right = func.resolve_aliases(operands.y)
+    var pending = mem::List[clif::Value].empty(alloc)
+    mut pending.push(c)
+    loop {
+        let Some(value) = mut pending.pop() else {
+            return false
+        }
+        let Some(def) = func.value_inst(value) else {
+            continue
+        }
+        match func.inst_data(def) {
+            clif::InstructionData.IntCompare(opcode: _, cond: _, x: cx, y: cy) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: cx, y: cy) => {
+                let compared_x = func.resolve_aliases(cx)
+                let compared_y = func.resolve_aliases(cy)
+                if left == compared_x or left == compared_y or right == compared_x or right == compared_y {
+                    return true
+                }
+            }
+            clif::InstructionData.Binary(opcode: opcode, x: bx, y: by) => {
+                if opcode == clif::Opcode.Band or opcode == clif::Opcode.Bor or opcode == clif::Opcode.Bxor {
+                    mut pending.push(bx)
+                    mut pending.push(by)
+                }
+            }
+            else => {}
+        }
+    }
 } shares_operand
+
+/// The two operands of a binary operation or an integer comparison.
+fn operands_of(func: clif::Function, inst: clif::Inst) -> Option[Operands] {
+    return match func.inst_data(inst) {
+        clif::InstructionData.Binary(opcode: _, x: x, y: y) or clif::InstructionData.IntCompare(opcode: _, cond: _, x: x, y: y) => Some(Operands(x: x, y: y))
+        else => None
+    }
+} operands_of
 
 /// A value a branch tests, and whether it tests that value's inverse.
 struct Inverse derives Copy, Eq {

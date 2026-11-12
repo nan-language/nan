@@ -790,21 +790,34 @@ fn Versions.added_to(self, block: clif::Block) -> u32 {
 
 fn Versions.empty(alloc: mem::Alloc) -> Versions = Versions(list: mem::List[Version].empty(alloc), added: mem::List[u32].empty(alloc))
 
-/// Ends the latch of a versioned loop: tests whether its copy may go on from the next count,
+/// Ends the latch of a versioned loop: branches to the copy's header when the next count reaches
+/// the limit, else tests in a block of its own whether the copy may go on from the next count,
 /// then branches to the copy's header when it may and to the loop's own otherwise, passing either
 /// the jump's arguments; then copies the loop's blocks into the copy.
 fn Copier.copy_versioned_latch(mut self, func: clif::Function, scope: Scope, version: u32, passed: Slice[clif::Value], leaves: Leaves) {
     var fast = mut self.fast_scope(func, scope, version)
-    let holds = mut self.version_test(func, scope, version)
+    let counter = mut self.value(scope, func, value: self.versions.list[usize.widen(version)].counter)
+    let limit = mut self.value(scope, func, value: self.versions.list[usize.widen(version)].limit)
     if self.lost {
         return
     }
     let header = clif::Block(index: self.versions.list[usize.widen(version)].header)
     let original = scope.block(header)
     let copy = fast.block(header)
+    let next = mut self.b.iadd_imm_s(counter, y: 1)
+    let ends = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: next, y: limit)
+    let testing = mut self.new_block(predecessors: 1)
+    let no_args = mem::List[clif::Value].empty(self.alloc)
+    mut self.b.brif(ends, then: copy, then_args: passed, otherwise: testing, otherwise_args: no_args.view())
+    mut self.reached(copy)
+    mut self.reached(testing)
+    mut self.b.switch_to_block(testing)
+    let holds = mut self.version_test(func, scope, version, limit)
+    if self.lost {
+        return
+    }
     if self.versions.list[usize.widen(version)].lanes.is_some() {
         let entry = mut self.new_block(predecessors: 1)
-        let no_args = mem::List[clif::Value].empty(self.alloc)
         mut self.b.brif(holds, then: entry, then_args: no_args.view(), otherwise: original, otherwise_args: passed)
         mut self.reached(entry)
         mut self.reached(original)
@@ -827,7 +840,7 @@ fn Copier.copy_versioned_latch(mut self, func: clif::Function, scope: Scope, ver
 } Copier.copy_versioned_latch
 
 /// The scope of a versioned loop's copy: the scope at the loop's latch, with a new block for each
-/// of the loop's blocks, its header reached from the latch and from the copy's own, and the
+/// of the loop's blocks, its header reached twice from the latch and from the copy's own, and the
 /// values the loop defines yet to be copied but for those of pinned loads.
 fn Copier.fast_scope(mut self, func: clif::Function, scope: Scope, version: u32) -> Scope {
     var fast = scope.duplicate(alloc: self.alloc)
@@ -836,9 +849,9 @@ fn Copier.fast_scope(mut self, func: clif::Function, scope: Scope, version: u32)
     let predecessors = predecessor_counts(func, alloc: self.alloc)
     let header = self.versions.list[usize.widen(version)].header
     let entries: u32 = if self.versions.list[usize.widen(version)].lanes.is_some() {
-        3
+        4
     } else {
-        2
+        3
     }
     let blocks = copied_list(self.versions.list[usize.widen(version)].blocks.view(), alloc: self.alloc)
     let pinned = copied_list(self.versions.list[usize.widen(version)].pinned.view(), alloc: self.alloc)
@@ -870,21 +883,17 @@ fn Copier.fast_scope(mut self, func: clif::Function, scope: Scope, version: u32)
     return fast
 } Copier.fast_scope
 
-/// The test ending a versioned loop's latch: whether its next count reaches its limit, or each
-/// check its copy drops holds for every count left and no store of those counts reaches the bytes
-/// of a pinned load.
-fn Copier.version_test(mut self, func: clif::Function, scope: Scope, version: u32) -> clif::Value {
+/// Whether each check a versioned loop's copy drops holds for every count left before `limit`,
+/// the copy of its limit, and no store of those counts reaches the bytes of a pinned load.
+fn Copier.version_test(mut self, func: clif::Function, scope: Scope, version: u32, limit: clif::Value) -> clif::Value {
     let at = usize.widen(version)
     let starts = copied_list(self.versions.list[at].starts.view(), alloc: self.alloc)
     let bounds = copied_list(self.versions.list[at].bounds.view(), alloc: self.alloc)
     let reaching = self.versions.list[at].spots.len() > 0
     let counter = mut self.value(scope, func, value: self.versions.list[at].counter)
-    let limit = mut self.value(scope, func, value: self.versions.list[at].limit)
     if self.lost {
         return NO_VALUE
     }
-    let next = mut self.b.iadd_imm_s(counter, y: 1)
-    let ends = mut self.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: next, y: limit)
     let last = mut self.b.iadd_imm_s(limit, y: -1)
     var holds = mut self.b.iconst(clif::Type.Int8, imm: 1)
     for start in starts {
@@ -902,7 +911,7 @@ fn Copier.version_test(mut self, func: clif::Function, scope: Scope, version: u3
         let apart = mut self.reach_test(func, scope, version, counter, last)
         holds = mut self.b.band(holds, y: apart)
     }
-    return mut self.b.bor(ends, y: holds)
+    return holds
 } Copier.version_test
 
 /// An index at a count: the count plus the copy of `start`, the count alone for `NO_VALUE`.

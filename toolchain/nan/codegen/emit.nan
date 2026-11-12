@@ -1,4 +1,4 @@
-//! Emission of x86-64 code: the frame and its prologue and epilogue, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, and the runs of source locations.
+//! Emission of x86-64 code: the frame and its prologue and epilogue, a block ending in a trap reserving the stack slots when only such blocks reach them, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, and the runs of source locations.
 
 /// The frame below the saved frame pointer, from the stack pointer up: the outgoing argument
 /// area, the stack slots, the spill slots, padding, then the pushed callee-saved registers.
@@ -7,6 +7,10 @@ struct Frame {
     spills: u32
     /// The bytes the prologue subtracts from the stack pointer after its pushes.
     body: u32
+    /// The bytes a block ending in a trap subtracts from the stack pointer at its start when only
+    /// such blocks reach the stack slots and no value spills: the slots' bytes, which `body`
+    /// leaves out; 0 otherwise.
+    cold: u32
     /// The alignment beyond 16 the prologue aligns the stack pointer down to, 16 for none.
     align: u32
     saved: machinst::RegSet
@@ -49,8 +53,48 @@ fn Frame.of(code: VCode[x64::Inst], allocation: Allocation) -> Frame {
     if code.align > 16 {
         size += u64.widen(code.align - 16)
     }
-    return Frame(spills: spills, body: body, align: code.align, saved: allocation.saved, size: size)
+    if allocation.slot_count > 0 or code.align > 16 or code.slots_end == 0 or not only_traps_address_stack(code) {
+        return Frame(spills: spills, body: body, cold: 0, align: code.align, saved: allocation.saved, size: size)
+    }
+    let hot = round_up(pushed, to: 16) - pushed
+    return Frame(spills: spills, body: hot, cold: body - hot, align: code.align, saved: allocation.saved, size: size)
 } Frame.of
+
+/// Whether only blocks ending in a trap address the stack.
+fn only_traps_address_stack(code: VCode[x64::Inst]) -> bool {
+    for block in code.blocks {
+        if not ends_in_trap(code, block) and addresses_stack(code, block) {
+            return false
+        }
+    }
+    return true
+} only_traps_address_stack
+
+/// Whether a block's last instruction traps.
+fn ends_in_trap(code: VCode[x64::Inst], block: VBlock) -> bool {
+    if block.end <= block.begin or usize.widen(block.end) > code.insts.len() {
+        return false
+    }
+    return match code.insts[usize.widen(block.end) - 1].inst {
+        x64::Inst.Ud2 => true
+        else => false
+    }
+} ends_in_trap
+
+/// Whether an instruction of a block reads or writes the stack pointer.
+fn addresses_stack(code: VCode[x64::Inst], block: VBlock) -> bool {
+    var touches = false
+    for at in block.begin..<block.end {
+        expect usize.widen(at) < code.insts.len()
+        discard code.insts[usize.widen(at)].inst.map_regs(fn[mut touches](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            if reg == x64::RSP {
+                touches = true
+            }
+            return reg
+        })
+    }
+    return touches
+} addresses_stack
 
 /// The scratch registers of a class: `r11` and `r10`, or `xmm15` and `xmm14`.
 fn scratch(float: bool, index: u32) -> machinst::Reg
@@ -260,6 +304,9 @@ fn Emitter.block(mut self, code: VCode[x64::Inst], allocation: Allocation, block
     expect code.holds(data)
     mut self.asm.bind(block)
     self.held = Array[u32, SCRATCH_COUNT].filled(NONE)
+    if self.frame.cold > 0 and ends_in_trap(code, block: data) and addresses_stack(code, block: data) {
+        mut self.put(x64::Inst.AluImm(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: x64::RSP, imm: i32.fit(self.frame.cold)))
+    }
     let next = block + 1
     var at = data.begin
     while at < data.end {

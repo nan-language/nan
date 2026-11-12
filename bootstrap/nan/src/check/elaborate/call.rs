@@ -7,9 +7,10 @@ use std::ops::Range;
 use super::expr::Out;
 use super::{Elab, Elaborated, Fault, Held};
 use crate::check::db::ItemId;
+use crate::check::reversibility::Class;
 use crate::check::sig::{FnSig, SigKind};
 use crate::check::tir::{self, ClauseRole, Form, TBody, TClosure, TKind};
-use crate::check::ty::{Arg, Args, Scalar, Subst, Ty};
+use crate::check::ty::{Arg, Args, Const, Scalar, Subst, Ty};
 use crate::nir::{
     Builtin, Call, Callable, Callee, CheckKind, FnRef, Function, NTy, Op, Operand, Payload, Place,
     Role, Span, Terminator,
@@ -350,10 +351,31 @@ impl Elab<'_, '_> {
         }
     }
 
+    /// The class of the code a keyed task a spawn starts runs: a closure's, a named function's, or
+    /// the class the function type of another value states, the greatest without one.
+    fn ran(&self, run: &tir::TExpr) -> Class {
+        match &run.kind {
+            TKind::Closure(closure) => (self.ck.sites(self.item, self.body, Some(closure)).iter())
+                .fold(Class::Traceless, |class, site| class.join(site.facts.class)),
+            TKind::FnValue { item, .. } => self.ck.digest(*item).class,
+            _ => match &run.ty {
+                Ty::Fn(fn_ty) => fn_ty.limits.class.unwrap_or(Class::WORST),
+                _ => Class::WORST,
+            },
+        }
+    }
+
     /// The function a call names.
     fn callee(&self, call: &tir::Call) -> Elaborated<FnRef> {
         Ok(match &call.callee {
-            tir::Callee::Function { item } => FnRef::item(*item, call.type_args.clone()),
+            tir::Callee::Function { item } => {
+                let mut args = call.type_args.to_vec();
+                if self.ck.db.is_std(*item) && self.ck.db.canonical(*item) == "sys::Cx.spawn" {
+                    let class = (call.args.last()).map_or(Class::WORST, |run| self.ran(&run.expr));
+                    args.push(Arg::Const(Const::Int(i128::from(class.code()))));
+                }
+                FnRef::item(*item, args.into())
+            }
             tir::Callee::Method {
                 interface,
                 method,

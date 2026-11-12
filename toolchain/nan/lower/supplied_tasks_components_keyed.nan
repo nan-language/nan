@@ -20,10 +20,14 @@ const KEYED_RUNNER: u64 = 64
 
 const KEYED_HELD: u64 = 72
 
-const KEYED_SIZE: u64 = 80
+/// The `sys::Reversibility` of the code the task runs.
+const KEYED_CLASS: u64 = 80
+
+const KEYED_SIZE: u64 = 88
 
 /// `mut cx.spawn(key: k, run: f)`: supersedes `k`, then starts a keyed task running `f` with a
-/// new outbox of key `k`, in a region of its own, or holds it on a stepper.
+/// new outbox of key `k`, in a region of its own, or holds it on a stepper. The instance's
+/// arguments end with the code of the class of what `f` runs, which elaboration appends.
 fn components_spawn(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let run_ty = fn_param(lo, supply, index: 2)
     let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -58,6 +62,17 @@ fn components_spawn(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.store(outbox, addr: node, offset: COMPONENTS_KEYED_OUTBOX)
     mut fx.store(task_region, addr: node, offset: KEYED_REGION)
     mut fx.store(record, addr: node, offset: KEYED_RUNNER)
+    var class = ty::Class.worst()
+    let spawn_args = lo.ck.types().arg_list(supply.args)
+    if spawn_args.len() > 0 {
+        match spawn_args[spawn_args.len() - 1] {
+            ty::Arg.Const(ty::Const.Int(code)) => {
+                class = ty::Class.of_code(code.low_bits())
+            }
+            else => {}
+        }
+    }
+    store_class(mut lo, mut fx, class, node)
     components_reference(mut fx, record)
     let cell = mut fx.load(PTR, addr: record, offset: RUNNER_EXECUTOR)
     let exec = mut fx.load(PTR, addr: record, offset: RUNNER_HANDLE)
@@ -193,33 +208,9 @@ fn supersede_all(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
 /// Starts the held keyed tasks of a stepper's record in the order of their spawns, giving how
 /// many it started. The caller holds the lock.
 fn start_held(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let last = last_node(mut fx, record)
     let zero = mut fx.ptr(0)
-    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
-    var initial = Array[clif::Value, 2].filled(zero)
-    initial[1] = head
-    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
-        expect walk_state.len() == 2
-        let previous = walk_state[0]
-        let current = walk_state[1]
-        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
-        let next_values = mut fx1.choose(present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            var stepped = mem::List[clif::Value].empty(fx2.alloc)
-            mut stepped.push(mut fx2.load(PTR, addr: current, offset: KEYED_NEXT))
-            return stepped
-        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            var ended = mem::List[clif::Value].empty(fx2.alloc)
-            mut ended.push(mut fx2.ptr(0))
-            return ended
-        })
-        expect next_values.len() == 1
-        let kept = mut fx1.b.select(present, x: current, y: previous)
-        var carried = mem::List[clif::Value].empty(fx1.alloc)
-        mut carried.push(kept)
-        mut carried.push(next_values[0])
-        return Pass(again: present, next: take carried)
-    })
-    expect found.len() == 2
-    var walk = Array[clif::Value, 2].filled(found[0])
+    var walk = Array[clif::Value, 2].filled(last)
     walk[1] = zero
     let counted = mut fx.repeat(walk.view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
         expect walk_state.len() == 2
@@ -250,6 +241,134 @@ fn start_held(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value 
     expect counted.len() == 2
     return counted[1]
 } start_held
+
+/// Stores a class at a node as the `sys::Reversibility` it is.
+fn store_class(mut lo: Lowering, mut fx: Fx, class: ty::Class, node: clif::Value) {
+    let reversibility = lo.std_ty("sys", type_name: "Reversibility", args: mem::List[ty::Ty].empty(lo.alloc))
+    var name = "Traceless"
+    var flags = mem::List[Held].empty(lo.alloc)
+    match class {
+        ty::Class.Traceless => {}
+        ty::Class.Recorded => {
+            name = "Recorded"
+        }
+        ty::Class.Restorable => {
+            name = "Restorable"
+        }
+        ty::Class.Irreversible(kinds) => {
+            name = "Irreversible"
+            for bit in 0u32..<4 {
+                mut flags.push(Held.Scalar(mut fx.int(clif::Type.Int8, value: i64.widen((kinds >> bit) & 1))))
+            }
+        }
+    }
+    let held = mut lo.variant_value(mut fx, ty: reversibility, variant: name, payload_values: flags.view(), wrapped: None)
+    let at = mut fx.offset(node, offset: KEYED_CLASS)
+    mut lo.store_held(mut fx, address: at, held, ty: reversibility)
+} store_class
+
+/// The last node of a runner's keyed tasks, that of the earliest spawn, zero for none.
+fn last_node(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    var initial = Array[clif::Value, 2].filled(zero)
+    initial[1] = head
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let previous = walk_state[0]
+        let current = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next_values = mut fx1.choose(present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.load(PTR, addr: current, offset: KEYED_NEXT))
+            return stepped
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var ended = mem::List[clif::Value].empty(fx2.alloc)
+            mut ended.push(mut fx2.ptr(0))
+            return ended
+        })
+        expect next_values.len() == 1
+        let kept = mut fx1.b.select(present, x: current, y: previous)
+        var carried = mem::List[clif::Value].empty(fx1.alloc)
+        mut carried.push(kept)
+        mut carried.push(next_values[0])
+        return Pass(again: present, next: take carried)
+    })
+    expect found.len() == 2
+    return found[0]
+} last_node
+
+/// Whether a node's keyed task is held and its key not superseded.
+fn keyed_waiting(mut fx: Fx, node: clif::Value) -> clif::Value {
+    let held_word = mut fx.load(PTR, addr: node, offset: KEYED_HELD)
+    let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_word, y: 0)
+    let superseded = mut fx.load(PTR, addr: node, offset: KEYED_SUPERSEDED)
+    let current = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: superseded, y: 0)
+    return mut fx.b.band(held, y: current)
+} keyed_waiting
+
+/// The node of the `index`-th keyed task of a runner held under a key not superseded, in the
+/// order of their spawns, zero for none.
+fn nth_held(mut fx: Fx, record: clif::Value, index: clif::Value) -> clif::Value {
+    let last = last_node(mut fx, record)
+    let zero = mut fx.ptr(0)
+    let initial = fx.list3(last, b: zero, c: zero)
+    let walked = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 3
+        let current = walk_state[0]
+        let count = walk_state[1]
+        let found = walk_state[2]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: found, y: 0)
+        let going = mut fx1.b.band(present, y: missing)
+        let next = mut fx1.choose(going, results: Array[clif::Type, 3].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let waiting = keyed_waiting(mut fx2, node: current)
+            let reached = mut fx2.b.icmp(clif::IntCC.Equal, x: count, y: index)
+            let hit = mut fx2.b.band(waiting, y: reached)
+            let none = mut fx2.ptr(0)
+            let chosen = mut fx2.b.select(hit, x: current, y: none)
+            let counted = mut fx2.b.uextend(PTR, x: waiting)
+            let more = mut fx2.b.iadd(count, y: counted)
+            let previous = mut fx2.load(PTR, addr: current, offset: KEYED_PREVIOUS)
+            return fx2.list3(previous, b: more, c: chosen)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list3(current, b: count, c: found)
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect walked.len() == 3
+    return walked[2]
+} nth_held
+
+/// The node of a runner's keyed task held under `key` not superseded, zero for none.
+fn held_keyed(mut fx: Fx, record: clif::Value, key: clif::Value) -> clif::Value {
+    let head = mut fx.load(PTR, addr: record, offset: RUNNER_KEYED)
+    let zero = mut fx.ptr(0)
+    let initial = fx.list2(head, b: zero)
+    let walked = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 2
+        let current = walk_state[0]
+        let found = walk_state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: found, y: 0)
+        let going = mut fx1.b.band(present, y: missing)
+        let next = mut fx1.choose(going, results: Array[clif::Type, 2].filled(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let waiting = keyed_waiting(mut fx2, node: current)
+            let node_key = mut fx2.load(PTR, addr: current, offset: KEYED_KEY)
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: node_key, y: key)
+            let hit = mut fx2.b.band(waiting, y: same)
+            let none = mut fx2.ptr(0)
+            let chosen = mut fx2.b.select(hit, x: current, y: none)
+            let following = mut fx2.load(PTR, addr: current, offset: KEYED_NEXT)
+            return fx2.list2(following, b: chosen)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: found)
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect walked.len() == 2
+    return walked[1]
+} held_keyed
 
 /// The node of the oldest held keyed task of a stepper's record, zero for none. The caller holds
 /// the lock.

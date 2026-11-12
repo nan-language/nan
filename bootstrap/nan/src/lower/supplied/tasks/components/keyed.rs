@@ -6,9 +6,10 @@
 //! is held. A node lives until its task has ended and its key is superseded, the runner's index
 //! of keys holding it until then.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
+use super::super::super::super::body::Held;
 use super::super::super::super::fx::{Fx, PTR};
 use super::super::super::super::runtime::regions::region;
 use super::super::super::super::runtime::tasks::{self, task};
@@ -18,6 +19,8 @@ use super::super::super::Supply;
 use super::super::super::mem::lists::fn_param;
 use super::super::scopes::start_task;
 use super::{entry, intake, keys, reference, runner, status, unreference, wake_waiter};
+use crate::check::reversibility::{Class, KINDS};
+use crate::check::ty::{Arg, Const};
 
 pub mod node {
     pub const NEXT: u64 = 0;
@@ -30,11 +33,14 @@ pub mod node {
     pub const ENDED: u64 = 56;
     pub const RUNNER: u64 = 64;
     pub const HELD: u64 = 72;
-    pub const SIZE: u64 = 80;
+    /// The `sys::Reversibility` of the code the task runs.
+    pub const CLASS: u64 = 80;
+    pub const SIZE: u64 = 88;
 }
 
 /// `mut cx.spawn(key: k, run: f)`: supersedes `k`, then starts a keyed task running `f` with a
-/// new outbox of key `k`, in a region of its own, or holds it on a stepper.
+/// new outbox of key `k`, in a region of its own, or holds it on a stepper. The instance's
+/// arguments end with the code of the class of what `f` runs, which elaboration appends.
 pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let run_ty = fn_param(supply, 2);
     let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -58,6 +64,11 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(outbox, node, node::OUTBOX);
     fx.store(task_region, node, node::REGION);
     fx.store(record, node, node::RUNNER);
+    let class = match supply.args.last() {
+        Some(Arg::Const(Const::Int(code))) => Class::of_code(*code as u64),
+        _ => Class::WORST,
+    };
+    store_class(lo, fx, class, node);
     reference(fx, record);
     let cell = fx.load(PTR, record, runner::EXECUTOR);
     let exec = fx.load(PTR, record, runner::HANDLE);
@@ -191,6 +202,24 @@ fn supersede_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     );
 }
 
+/// Stores a class at a node as the `sys::Reversibility` it is.
+fn store_class(lo: &mut Lowering, fx: &mut Fx, class: Class, node: Value) {
+    let reversibility = lo.std_ty("sys", "Reversibility", Vec::new());
+    let (name, kinds) = match class {
+        Class::Traceless => ("Traceless", None),
+        Class::Recorded => ("Recorded", None),
+        Class::Restorable => ("Restorable", None),
+        Class::Irreversible(kinds) => ("Irreversible", Some(kinds)),
+    };
+    let flags: Vec<Held> = (kinds.into_iter())
+        .flat_map(|kinds| (0..KINDS.len()).map(move |bit| i64::from(kinds >> bit & 1)))
+        .map(|flag| Held::Scalar(fx.int(types::I8, flag)))
+        .collect();
+    let held = lo.variant_value(fx, &reversibility, name, &flags, None);
+    let at = fx.offset(node, node::CLASS);
+    lo.store_held(fx, at, held, &reversibility);
+}
+
 /// Supersedes the key of every keyed task of a runner and starts each held one, which that
 /// cancellation then reaches. The caller holds the lock.
 pub fn supersede_all(lo: &mut Lowering, fx: &mut Fx, record: Value) {
@@ -205,20 +234,8 @@ pub fn supersede_all(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 /// Starts the held keyed tasks of a stepper's record in the order of their spawns, giving how
 /// many it started. The caller holds the lock.
 pub fn start_held(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
+    let last = last_node(fx, record);
     let zero = fx.ptr(0);
-    let first = fx.load(PTR, record, runner::KEYED);
-    let last = fx.repeat(&[zero, first], |fx, state| {
-        let (previous, current) = (state[0], state[1]);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
-        let next = fx.choose(
-            present,
-            &[PTR],
-            |fx| vec![fx.load(PTR, current, node::NEXT)],
-            |fx| vec![fx.ptr(0)],
-        )[0];
-        let kept = fx.b.ins().select(present, current, previous);
-        (present, vec![kept, next])
-    })[0];
     fx.repeat(&[last, zero], |fx, state| {
         let (current, count) = (state[0], state[1]);
         let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
@@ -237,6 +254,89 @@ pub fn start_held(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
             |_, fx| vec![fx.ptr(0), count],
         );
         (present, next)
+    })[1]
+}
+
+/// The last node of a runner's keyed tasks, that of the earliest spawn, zero for none.
+fn last_node(fx: &mut Fx, record: Value) -> Value {
+    let zero = fx.ptr(0);
+    let first = fx.load(PTR, record, runner::KEYED);
+    fx.repeat(&[zero, first], |fx, state| {
+        let (previous, current) = (state[0], state[1]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+        let next = fx.choose(
+            present,
+            &[PTR],
+            |fx| vec![fx.load(PTR, current, node::NEXT)],
+            |fx| vec![fx.ptr(0)],
+        )[0];
+        let kept = fx.b.ins().select(present, current, previous);
+        (present, vec![kept, next])
+    })[0]
+}
+
+/// Whether a node's keyed task is held and its key not superseded.
+fn waiting(fx: &mut Fx, node: Value) -> Value {
+    let held = fx.load(PTR, node, node::HELD);
+    let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
+    let superseded = fx.load(PTR, node, node::SUPERSEDED);
+    let current = fx.b.ins().icmp_imm_s(IntCC::Equal, superseded, 0);
+    fx.b.ins().band(held, current)
+}
+
+/// The node of the `index`-th keyed task of a runner held under a key not superseded, in the
+/// order of their spawns, zero for none.
+pub fn nth_held(fx: &mut Fx, record: Value, index: Value) -> Value {
+    let last = last_node(fx, record);
+    let zero = fx.ptr(0);
+    fx.repeat(&[last, zero, zero], |fx, state| {
+        let (current, count, found) = (state[0], state[1], state[2]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, found, 0);
+        let going = fx.b.ins().band(present, missing);
+        let next = fx.choose(
+            going,
+            &[PTR, PTR, PTR],
+            |fx| {
+                let waiting = waiting(fx, current);
+                let reached = fx.b.ins().icmp(IntCC::Equal, count, index);
+                let hit = fx.b.ins().band(waiting, reached);
+                let zero = fx.ptr(0);
+                let found = fx.b.ins().select(hit, current, zero);
+                let counted = fx.b.ins().uextend(PTR, waiting);
+                let count = fx.b.ins().iadd(count, counted);
+                vec![fx.load(PTR, current, node::PREVIOUS), count, found]
+            },
+            |_| vec![current, count, found],
+        );
+        (going, next)
+    })[2]
+}
+
+/// The node of a runner's keyed task held under `key` not superseded, zero for none.
+pub fn held_keyed(fx: &mut Fx, record: Value, key: Value) -> Value {
+    let first = fx.load(PTR, record, runner::KEYED);
+    let zero = fx.ptr(0);
+    fx.repeat(&[first, zero], |fx, state| {
+        let (current, found) = (state[0], state[1]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, found, 0);
+        let going = fx.b.ins().band(present, missing);
+        let next = fx.choose(
+            going,
+            &[PTR, PTR],
+            |fx| {
+                let waiting = waiting(fx, current);
+                let node_key = fx.load(PTR, current, node::KEY);
+                let same = fx.b.ins().icmp(IntCC::Equal, node_key, key);
+                let hit = fx.b.ins().band(waiting, same);
+                let zero = fx.ptr(0);
+                let found = fx.b.ins().select(hit, current, zero);
+                vec![fx.load(PTR, current, node::NEXT), found]
+            },
+            |_| vec![current, found],
+        );
+        (going, next)
     })[1]
 }
 

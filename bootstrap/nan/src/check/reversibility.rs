@@ -88,6 +88,26 @@ impl Class {
         }
     }
 
+    /// The class as one integer: its position, then for an irreversible class its kinds' bits
+    /// above the two bits the position takes.
+    pub fn code(self) -> u64 {
+        let kinds = match self {
+            Class::Irreversible(kinds) => kinds,
+            _ => 0,
+        };
+        u64::from(self.position()) | u64::from(kinds) << 2
+    }
+
+    /// The class of an integer `code` gives.
+    pub fn of_code(code: u64) -> Class {
+        match code & 3 {
+            0 => Class::Traceless,
+            1 => Class::Recorded,
+            2 => Class::Restorable,
+            _ => Class::Irreversible((code >> 2) as u8),
+        }
+    }
+
     /// Its row's position in the class table.
     fn position(self) -> u8 {
         match self {

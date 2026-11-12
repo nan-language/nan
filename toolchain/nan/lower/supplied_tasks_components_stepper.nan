@@ -40,6 +40,9 @@ fn stepper_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "take_sent" => stepper_take_sent(mut lo, mut fx, supply)
         "take_held" => stepper_take_held(mut lo, mut fx, supply)
+        "held_task" => stepper_held_task(mut lo, mut fx, supply)
+        "start_held" => stepper_start_one(mut lo, mut fx, supply, dropped: false)
+        "drop_held" => stepper_start_one(mut lo, mut fx, supply, dropped: true)
         "start_keyed" => stepper_start_keyed(mut lo, mut fx, supply)
         "idle" => stepper_is_idle(mut lo, mut fx, supply)
         "state" => {
@@ -150,6 +153,60 @@ fn stepper_take_sent(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 
 /// `mut s.take_held()`: supersedes the key of the oldest held keyed task, giving that key, none
 /// when no keyed task is held.
+fn stepper_held_task(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = stepper_record(mut fx, supply)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let node = nth_held(mut fx, record, index: supply.param(1).scalar_value())
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+    mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
+        write_held_task(mut lo1, fx: mut fx1, node, at)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} stepper_held_task
+
+/// Writes the `sys::HeldTask` of a keyed task's node at `at`: its key and its class.
+fn write_held_task(mut lo: Lowering, mut fx: Fx, node: clif::Value, at: clif::Value) {
+    let task = lo.std_ty("sys", type_name: "HeldTask", args: mem::List[ty::Ty].empty(lo.alloc))
+    let reversibility = lo.std_ty("sys", type_name: "Reversibility", args: mem::List[ty::Ty].empty(lo.alloc))
+    let key_field = mut lo.layouts.field(lo.ck, ty: task, variant: None, label: "key")
+    let class_field = mut lo.layouts.field(lo.ck, ty: task, variant: None, label: "class")
+    let key = mut fx.load(PTR, addr: node, offset: KEYED_KEY)
+    mut fx.store(key, addr: at, offset: key_field.offset)
+    let from = mut fx.offset(node, offset: KEYED_CLASS)
+    let to = mut fx.offset(at, offset: class_field.offset)
+    let laid = mut lo.layout_of(reversibility)
+    mut lo.copy(mut fx, dst: to, src: from, size: laid.contents().size, align: 1)
+} write_held_task
+
+/// `mut s.start_held(k)` and `mut s.drop_held(k)`: starts the held keyed task of key `k`, first
+/// superseding `k` when `dropped`, and gives whether one was held.
+fn stepper_start_one(mut lo: Lowering, mut fx: Fx, supply: Supply, dropped: bool) {
+    let record = stepper_record(mut fx, supply)
+    let key = supply.param(1).scalar_value()
+    let lock = mut fx.offset(record, offset: RUNNER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let node = held_keyed(mut fx, record, key)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: node, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        if dropped {
+            supersede_key(mut lo, fx: mut fx1, record, key)
+        }
+        start_node(mut lo, fx: mut fx1, node)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    scheduling_point(mut lo, mut fx)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(present))
+} stepper_start_one
+
 fn stepper_take_held(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let record = stepper_record(mut fx, supply)
     let option = supply.abi.result

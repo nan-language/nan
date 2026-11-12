@@ -502,6 +502,29 @@ pub fn Stepper.take_sent(mut self) -> Option[Sent[M]]
 
 pub fn Stepper.take_held(mut self) -> Option[u64]
 
+pub closed struct HeldTask derives Copy, Eq {
+    pub key: u64
+    pub class: Reversibility
+} HeldTask
+
+pub fn Stepper.held(self, alloc: mem::Alloc) -> mem::List[HeldTask] {
+    var tasks = mem::List[HeldTask].empty(alloc)
+    var index: usize = 0
+    loop {
+        let Some(task) = self.held_task(index) else {
+            return tasks
+        }
+        mut tasks.push(task)
+        index += 1
+    }
+} Stepper.held
+
+fn Stepper.held_task(self, index: usize) -> Option[HeldTask]
+
+pub fn Stepper.start_held(mut self, key: u64) -> bool
+
+pub fn Stepper.drop_held(mut self, key: u64) -> bool
+
 pub fn Stepper.incoming(self) fails task::Cancelled uses wait
 
 pub fn Stepper.ready(self) -> bool fails task::Cancelled uses wait
@@ -781,6 +804,7 @@ enum ProbeMessage {
     DelayNs
     Spawn(u64)
     Stop
+    Spawns
 } ProbeMessage
 
 impl Probe: Component[ProbeEnv, ProbeMessage]
@@ -1116,6 +1140,8 @@ protocol Relay {
     pub fn claim(id: u64) limits traceless
     fn answered(total: u64) limits traceless
     fn refuse() limits traceless
+    fn queue() limits recorded
+    fn noted() limits recorded
 } Relay
 
 struct RelayEnv {
@@ -1236,6 +1262,15 @@ fn Relayer.refuse(mut self, mut env: RelayEnv, mut cx: Cx[Relay]) {
     self.refused += 1
 } Relayer.refuse
 
+fn Relayer.queue(mut self, mut env: RelayEnv, mut cx: Cx[Relay]) {
+    mut cx.spawn(key: 9, run: fn(out: Outbox[Relay]) fails task::Cancelled uses wait {
+        discard attempt await out.noted()
+    })
+} Relayer.queue
+
+fn Relayer.noted(mut self, mut env: RelayEnv, mut cx: Cx[Relay]) {
+} Relayer.noted
+
 fn Relayer.counted(mut self, outcome: Result[Unit, RunnerError]) {
     if outcome.is_err() {
         self.refused += 1
@@ -1323,6 +1358,12 @@ fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[
         ProbeMessage.Echo => mut cx.send(ProbeMessage.Count)
         ProbeMessage.Delay => mut cx.after(ms: 10, send: ProbeMessage.Count)
         ProbeMessage.DelayNs => mut cx.after_ns(ns: 1_500, send: ProbeMessage.Count)
+        ProbeMessage.Spawns => {
+            mut cx.spawn(key: 2, run: fn(out: Outbox[ProbeMessage]) {})
+            mut cx.spawn(key: 3, run: fn(out: Outbox[ProbeMessage]) fails task::Cancelled uses wait {
+                discard attempt await out.post(ProbeMessage.Count)
+            })
+        }
         ProbeMessage.Spawn(ms) => {
             let clock = env.clock
             mut cx.spawn(key: 1, run: fn(out: Outbox[ProbeMessage]) fails task::Cancelled uses wait {
@@ -2148,6 +2189,35 @@ test taken_messages_skip_their_handlers for Stepper.take_sent {
     expect none.is_none() and idle and last.state.handled == 0
 } taken_messages_skip_their_handlers
 
+test held_keyed_tasks_start_or_drop_one_at_a_time for Stepper.held {
+    let world = testing::world()
+    var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(ProbeMessage.Spawns)
+    let both = stepper.held(world.alloc)
+    let started = mut stepper.start_held(2)
+    let left = stepper.held(world.alloc)
+    let dropped = mut stepper.drop_held(3)
+    let again = mut stepper.drop_held(3)
+    let rest = stepper.held(world.alloc)
+    undefer stepper
+    discard try await take stepper.end()
+    expect both.len() == 2 and both[0].key == 2 and both[0].class == Reversibility.Traceless and both[1].key == 3
+    expect started and left.len() == 1 and left[0].key == 3
+    expect dropped and not again and rest.len() == 0
+} held_keyed_tasks_start_or_drop_one_at_a_time
+
+test held_keyed_tasks_state_the_class_of_their_code for Stepper.held {
+    let world = testing::world()
+    var stepper = try Stepper[Relayer, RelayEnv, Relay].start(RelayEnv(alloc: world.alloc), exec: world.exec, alloc: world.alloc)
+    defer take stepper.abandon()
+    mut stepper.deliver(Relay.queue())
+    let held = stepper.held(world.alloc)
+    undefer stepper
+    discard try await take stepper.end()
+    expect held.len() == 1 and held[0].key == 9 and held[0].class == Reversibility.Recorded
+} held_keyed_tasks_state_the_class_of_their_code
+
 test taken_keyed_tasks_never_run for Stepper.take_held {
     let world = testing::world()
     var stepper = try Stepper[Probe, ProbeEnv, ProbeMessage].start(ProbeEnv(clock: world.clock, counted: 0), exec: world.exec, alloc: world.alloc)
@@ -2443,7 +2513,7 @@ test messages_of_any_operation_round_trip for Wire.encode_any {
     var again = Encoded.empty(alloc)
     discard Wire[Relay].encode_any(message, out: mut again)
     let unknown = attempt Wire[Relay].decode_any(Untrusted.of(b"\x01"), handles: out.handles.view(), alloc)
-    expect number == 9 and operations.len() == 11
+    expect number == 9 and operations.len() == 13
     expect operations[9].name.as_str() == "answered" and operations[9].class == Reversibility.Traceless
     expect again.bytes.view() == out.bytes.view() and unknown.is_err()
 } messages_of_any_operation_round_trip

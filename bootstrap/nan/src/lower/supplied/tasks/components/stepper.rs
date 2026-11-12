@@ -130,6 +130,41 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let held = lo.held_at(fx, &option, result);
             supply.ret(lo, fx, held);
         }
+        "held_task" => {
+            let record = record(fx);
+            let option = supply.abi.result.clone();
+            let layout = lo.layout(&option);
+            let result = supply
+                .sret
+                .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+            let lock = fx.offset(record, runner::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let node = keyed::nth_held(fx, record, supply.param(1).scalar());
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+            lo.write_option_with(fx, &option, result, present, |lo, fx, at| {
+                held_task(lo, fx, node, at);
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let held = lo.held_at(fx, &option, result);
+            supply.ret(lo, fx, held);
+        }
+        member @ ("start_held" | "drop_held") => {
+            let record = record(fx);
+            let key = supply.param(1).scalar();
+            let lock = fx.offset(record, runner::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let node = keyed::held_keyed(fx, record, key);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, node, 0);
+            fx.when(present, |fx| {
+                if member == "drop_held" {
+                    keyed::supersede_key(lo, fx, record, key);
+                }
+                keyed::start_node(lo, fx, node);
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            seeded::scheduling_point(lo, fx);
+            supply.ret(lo, fx, Held::Scalar(present));
+        }
         "incoming" => {
             let record = record(fx);
             wait(lo, fx, supply, record, false);
@@ -177,6 +212,20 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "wake" => system(lo, fx, supply, "Suspend", "wake"),
         member => panic!("no lowering of sys::Stepper.{member}"),
     }
+}
+
+/// Writes the `sys::HeldTask` of a keyed task's node at `at`: its key and its class.
+fn held_task(lo: &mut Lowering, fx: &mut Fx, node: Value, at: Value) {
+    let task = lo.std_ty("sys", "HeldTask", Vec::new());
+    let reversibility = lo.std_ty("sys", "Reversibility", Vec::new());
+    let key_at = lo.layouts.field(lo.ck, &task, None, "key").offset;
+    let class_at = lo.layouts.field(lo.ck, &task, None, "class").offset;
+    let key = fx.load(PTR, node, keyed::node::KEY);
+    fx.store(key, at, key_at);
+    let from = fx.offset(node, keyed::node::CLASS);
+    let to = fx.offset(at, class_at);
+    let size = lo.layout(&reversibility).size;
+    lo.copy(fx, to, from, size, 1);
 }
 
 /// The state, Env and message types of a stepper.

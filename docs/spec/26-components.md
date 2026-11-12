@@ -668,6 +668,17 @@ pub fn Stepper.take_sent(mut self) -> Option[Sent[M]]
 
 pub fn Stepper.take_held(mut self) -> Option[u64]
 
+pub closed struct HeldTask derives Copy, Eq {
+    pub key: u64
+    pub class: Reversibility
+} HeldTask
+
+pub fn Stepper.held(self, alloc: mem::Alloc) -> mem::List[HeldTask]
+
+pub fn Stepper.start_held(mut self, key: u64) -> bool
+
+pub fn Stepper.drop_held(mut self, key: u64) -> bool
+
 pub fn Stepper.incoming(self) fails task::Cancelled uses wait
 
 pub fn Stepper.ready(self) -> bool fails task::Cancelled uses wait
@@ -697,6 +708,7 @@ pub fn Stepper.abandon(take self)
 - A keyed task that `spawn` starts on a stepper is **held**: its stack and record are drawn, but it starts only when `mut s.start_keyed()` starts every held keyed task, in the order of their spawns, returning how many it started. Superseding the key of a held task cancels it before it starts.
 - `mut s.take_sent()` removes the oldest message that the component's handlers sent through `send`, `after` or `after_ns` and gives it, calling no handler, as a `sys::Sent` holding the message, its header and the nanoseconds left before it would enter the intake, 0 for a message of the intake; those of the intake come first, then the delayed ones in the order they would enter it. It returns `None` when no such message waits; posts stay in the intake.
 - `mut s.take_held()` supersedes the key of the oldest held keyed task, cancelling it before it starts, and gives that key; it returns `None` when no keyed task is held.
+- `s.held(alloc)` lists, in the order of their spawns, the held keyed tasks whose key is not superseded, each as a `sys::HeldTask` holding its key and the class of the code it runs: a closure's, as the digest of its code states, a named function's, or otherwise the class the function type of the value states, `Irreversible` with every kind when it states none. `mut s.start_held(k)` starts the held keyed task of key `k`, and `mut s.drop_held(k)` supersedes `k`, cancelling that task before it starts; each returns whether such a task was held, and starts or cancels no other.
 - A stepper is **idle** when its intake is empty, no message waits for its delay to end, and none of its keyed tasks is held or running. `s.idle()` returns whether it is.
 - `s.incoming()` returns once a message waits in the intake or the stepper is woken. `s.ready()` returns `true` once a message waits in the intake or the stepper is woken, and `false` once the stepper is idle. Both are cancellation points, failing with the cancellation when it reaches them while they wait.
 - `s.waker()` returns the stepper's waker, the same on every call. `sys::Waker` is a base type: Copy and Send, and never linear, a view, Inert or AnyBits; it names its stepper as its outbox does. `w.wake()` wakes the stepper, so that another task gets the attention of a holder waiting for work: a pending `incoming` or `ready` returns, and with none pending the next one returns at once. A wake of a stepper that has ended does nothing.

@@ -1290,7 +1290,7 @@ fn incremented_below(alloc: mem::Alloc) -> clif::Function {
 
 test speculates_a_short_branch_trapping_only_on_its_arm for speculated {
     let alloc = testing::world().alloc
-    let Some(speculation) = speculated(incremented_below(alloc), alloc) else {
+    let Some(speculation) = speculated(incremented_below(alloc), leas: true, alloc) else {
         expect false
         return
     }
@@ -1299,6 +1299,70 @@ test speculates_a_short_branch_trapping_only_on_its_arm for speculated {
     expect selects == 1
     expect traps == 1
 } speculates_a_short_branch_trapping_only_on_its_arm
+
+/// Three times the first parameter plus one when the second is odd, trapping when the product
+/// overflows, else half the first.
+fn tripled_when_odd(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let two = mut b.iconst(clif::Type.Int64, imm: 2)
+    let parity = mut b.urem(params[1], y: two)
+    let even = mut b.icmp_imm_s(clif::IntCC.Equal, x: parity, y: 0)
+    let halving = mut b.create_block()
+    let tripling = mut b.create_block()
+    let tripled = mut b.create_block()
+    let overflowing = mut b.create_block()
+    mut b.set_cold_block(overflowing)
+    let join = mut b.create_block()
+    let result = mut b.append_block_param(join, ty: clif::Type.Int64)
+    mut b.brif(even, then: halving, then_args: no_values(alloc).view(), otherwise: tripling, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(halving)
+    let half = mut b.udiv(params[0], y: two)
+    mut b.jump(join, args: one(half, alloc).view())
+    mut b.switch_to_block(tripling)
+    let three = mut b.iconst(clif::Type.Int64, imm: 3)
+    let clif::Overflowed(value: product, flag: overflowed) = mut b.umul_overflow(params[0], y: three)
+    mut b.brif(overflowed, then: overflowing, then_args: no_values(alloc).view(), otherwise: tripled, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(tripled)
+    mut b.jump(join, args: one(product, alloc).view())
+    mut b.switch_to_block(overflowing)
+    mut b.trap(clif::TrapCode(user: 1))
+    mut b.switch_to_block(join)
+    mut b.ret(one(result, alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} tripled_when_odd
+
+test branches_on_a_check_of_an_arm_alone_when_the_branch_tests_other_values for speculated {
+    let alloc = testing::world().alloc
+    let Some(speculation) = speculated(tripled_when_odd(alloc), leas: true, alloc) else {
+        expect false
+        return
+    }
+    let selects = opcode_count(speculation, opcode: clif::Opcode.Select, alloc)
+    let conjunctions = opcode_count(speculation, opcode: clif::Opcode.Band, alloc)
+    var cold: usize = 0
+    for block in speculation.layout_blocks(alloc) {
+        if speculation.is_cold(block) {
+            cold += 1
+        }
+    }
+    let vcode = select(speculation, isa: host_isa(), alloc)
+    var overflow_set = false
+    for held in vcode.insts {
+        match held.inst {
+            x64::Inst.Setcc(cond: x64::Cond.Above, dst: _) => {
+                overflow_set = true
+            }
+            else => {}
+        }
+    }
+    expect selects == 1
+    expect conjunctions == 0
+    expect cold == 2
+    expect not overflow_set
+} branches_on_a_check_of_an_arm_alone_when_the_branch_tests_other_values
 
 /// Stores each count below the first parameter at that index of the buffer the second points
 /// to, its pointer then its length, trapping when the index reaches the length.

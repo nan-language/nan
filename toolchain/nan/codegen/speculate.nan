@@ -1,4 +1,4 @@
-//! Speculating short branches: a conditional branch whose arms run only constants, arithmetic, comparisons, conversions and selects into one join, except for branches to cold blocks that trap, computes both arms in its own block, branches to such a cold block only when the arm holding it is the one taken and its test sends it there, and passes the join the values its condition selects; the function is copied with the branches speculated.
+//! Speculating short branches: a conditional branch whose arms run only constants, arithmetic, comparisons, conversions and selects into one join, except for branches to cold blocks that trap, computes both arms in its own block, branches to such a cold block only when the arm holding it is the one taken and its test sends it there, and passes the join the values its condition selects; the function is copied with the branches speculated. An arm divides only where selection shifts or masks, and multiplies only by a product x86-64 selects as one `lea`. A test of a trap that shares no operand with the comparison the branch tests branches alone, to a cold block that traps when the arm holding it is taken and goes on otherwise.
 
 /// The most instructions the arms of a speculated branch hold together, besides their branches.
 const SPECULATED_INSTS: usize = 16
@@ -22,9 +22,10 @@ struct Speculations {
 } Speculations
 
 /// The function with its short branches speculated, or none when it speculates none or holds a
-/// use before its definition in layout order.
-fn speculated(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
-    let Some(speculations) = speculations_of(func, alloc) else {
+/// use before its definition in layout order; `leas` tells whether its products by 3, 5 and 9
+/// are each one `lea`.
+fn speculated(func: clif::Function, leas: bool, alloc: mem::Alloc) -> Option[clif::Function] {
+    let Some(speculations) = speculations_of(func, leas, alloc) else {
         return None
     }
     var copier = Copier.speculating(func, take speculations, alloc)
@@ -32,7 +33,7 @@ fn speculated(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function]
     return take copier.finish()
 } speculated
 
-fn speculations_of(func: clif::Function, alloc: mem::Alloc) -> Option[Speculations] {
+fn speculations_of(func: clif::Function, leas: bool, alloc: mem::Alloc) -> Option[Speculations] {
     let count = block_count(func, alloc)
     let preds = predecessor_counts(func, alloc)
     var found = Speculations(at: filled(count, value: NONE, alloc), arms: mem::List[Arm].empty(alloc), kept: filled(count, value: true, alloc))
@@ -44,10 +45,10 @@ fn speculations_of(func: clif::Function, alloc: mem::Alloc) -> Option[Speculatio
         let clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
             continue
         }
-        let Some(then_arm) = arm_of(func, call: then_call, preds: preds.view(), alloc) else {
+        let Some(then_arm) = arm_of(func, call: then_call, preds: preds.view(), leas, alloc) else {
             continue
         }
-        let Some(else_arm) = arm_of(func, call: else_call, preds: preds.view(), alloc) else {
+        let Some(else_arm) = arm_of(func, call: else_call, preds: preds.view(), leas, alloc) else {
             continue
         }
         if not is_worth_speculating(then_arm, else_arm) {
@@ -88,7 +89,7 @@ fn Speculations.claim(mut self, block: clif::Block, take then_arm: Arm, take els
 
 /// The arm a branch's edge starts, none when it holds an instruction other than those a
 /// speculated arm may hold or a branch other than to a cold block that traps.
-fn arm_of(func: clif::Function, call: clif::BlockCall, preds: Slice[u32], alloc: mem::Alloc) -> Option[Arm] {
+fn arm_of(func: clif::Function, call: clif::BlockCall, preds: Slice[u32], leas: bool, alloc: mem::Alloc) -> Option[Arm] {
     var current = call.block
     var blocks = mem::List[clif::Block].empty(alloc)
     loop {
@@ -101,7 +102,7 @@ fn arm_of(func: clif::Function, call: clif::BlockCall, preds: Slice[u32], alloc:
             return Some(Arm(blocks: take blocks, join: current, args: copy_values(call.args.view(), alloc)))
         }
         let insts = func.block_insts(current, alloc)
-        if insts.len() == 0 or not speculates(func, insts: insts.view(), alloc) {
+        if insts.len() == 0 or not speculates(func, insts: insts.view(), leas, alloc) {
             return None
         }
         mut blocks.push(current)
@@ -171,15 +172,52 @@ fn is_trap_block(func: clif::Function, block: clif::Block, alloc: mem::Alloc) ->
 
 /// Whether a block's instructions before its terminator are all ones a speculated arm may hold:
 /// those hoisting moves, except multiplications and divisions, whose latency would lengthen the
-/// arm not taken.
-fn speculates(func: clif::Function, insts: Slice[clif::Inst], alloc: mem::Alloc) -> bool {
+/// arm not taken, unless selection makes them one quick instruction.
+fn speculates(func: clif::Function, insts: Slice[clif::Inst], leas: bool, alloc: mem::Alloc) -> bool {
     for index in 0..<insts.len() {
-        if index + 1 < insts.len() and (not is_hoistable(func, inst: insts[index], alloc) or is_slow(func.inst_data(insts[index]))) {
+        let data = func.inst_data(insts[index])
+        if index + 1 < insts.len() and (not is_hoistable(func, inst: insts[index], alloc) or (is_slow(data) and not is_quick(func, data, leas))) {
             return false
         }
     }
     return true
 } speculates
+
+/// Whether selection makes a multiplication or division one quick instruction: an unsigned
+/// quotient or remainder by a power of two, a shift or a mask, or, when `leas`, a 64-bit
+/// unsigned product by 3, 5 or 9 checked for overflow, a `lea`.
+fn is_quick(func: clif::Function, data: clif::InstructionData, leas: bool) -> bool {
+    let clif::InstructionData.Binary(opcode: opcode, x: x, y: y) = data else {
+        return false
+    }
+    return match opcode {
+        clif::Opcode.Udiv or clif::Opcode.Urem => match constant_of(func, value: y) {
+            Some(divisor) => divisor != 0 and (divisor & (divisor - 1)) == 0
+            None => false
+        }
+        clif::Opcode.UmulOverflow => leas and func.value_type(x).bits() == 64 and (is_lea_factor(func, value: x) or is_lea_factor(func, value: y))
+        else => false
+    }
+} is_quick
+
+/// Whether a value is the constant 3, 5 or 9.
+fn is_lea_factor(func: clif::Function, value: clif::Value) -> bool {
+    return match constant_of(func, value) {
+        Some(factor) => factor == 3 or factor == 5 or factor == 9
+        None => false
+    }
+} is_lea_factor
+
+/// The bits of the constant an instruction gives a value, none for another value.
+fn constant_of(func: clif::Function, value: clif::Value) -> Option[u64] {
+    let Some(def) = func.value_inst(value) else {
+        return None
+    }
+    let clif::InstructionData.UnaryImm(opcode: _, imm: imm) = func.inst_data(def) else {
+        return None
+    }
+    return Some(imm.to_bits())
+} constant_of
 
 /// Whether an instruction multiplies or divides.
 fn is_slow(data: clif::InstructionData) -> bool {
@@ -218,8 +256,8 @@ fn Copier.copy_speculated(mut self, func: clif::Function, mut scope: Scope, c: c
     if self.lost {
         return
     }
-    mut self.copy_arm(func, mut scope, condition, arm: first_arm, then: true, leaves)
-    mut self.copy_arm(func, mut scope, condition, arm: first_arm + 1, then: false, leaves)
+    mut self.copy_arm(func, mut scope, c, condition, arm: first_arm, then: true, leaves)
+    mut self.copy_arm(func, mut scope, c, condition, arm: first_arm + 1, then: false, leaves)
     if self.lost {
         return
     }
@@ -251,9 +289,10 @@ fn Copier.copy_speculated(mut self, func: clif::Function, mut scope: Scope, c: c
     }
 } Copier.copy_speculated
 
-/// Copies the instructions of an arm of a speculated branch, each of its branches to a cold
-/// block that traps taken only when the condition picks the arm, `then` for the first arm.
-fn Copier.copy_arm(mut self, func: clif::Function, mut scope: Scope, condition: clif::Value, arm: u32, then: bool, leaves: Leaves) {
+/// Copies the instructions of an arm of a speculated branch on `c`, copied as `condition`, each
+/// of its branches to a cold block that traps taken only when the condition picks the arm,
+/// `then` for the first arm.
+fn Copier.copy_arm(mut self, func: clif::Function, mut scope: Scope, c: clif::Value, condition: clif::Value, arm: u32, then: bool, leaves: Leaves) {
     let blocks = self.speculations.arms[usize.widen(arm)].blocks
     var taken = NO_VALUE
     for block in blocks {
@@ -265,6 +304,10 @@ fn Copier.copy_arm(mut self, func: clif::Function, mut scope: Scope, condition: 
             }
         }
         let clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+            continue
+        }
+        if not shares_operand(func, c, arg, alloc: self.alloc) {
+            mut self.guard_trap_cold(func, scope, condition, then, arg, then_call, else_call)
             continue
         }
         if taken == NO_VALUE {
@@ -295,11 +338,7 @@ fn Copier.guard_trap(mut self, func: clif::Function, scope: Scope, taken: clif::
         bad = mut self.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
     }
     let sending = mut self.b.band(taken, y: bad)
-    let trap = if traps_then {
-        scope.block(then_call.block)
-    } else {
-        scope.block(else_call.block)
-    }
+    let trap = trap_target(scope, func, then_call, else_call, alloc: self.alloc)
     let next = mut self.new_block(predecessors: 1)
     let no_args = mem::List[clif::Value].empty(self.alloc)
     mut self.b.brif(sending, then: trap, then_args: no_args.view(), otherwise: next, otherwise_args: no_args.view())
@@ -307,6 +346,71 @@ fn Copier.guard_trap(mut self, func: clif::Function, scope: Scope, taken: clif::
     mut self.reached(next)
     mut self.b.switch_to_block(next)
 } Copier.guard_trap
+
+/// A branch of a speculated arm to a cold block that traps, copied as a branch on its test alone
+/// to a cold block that goes on to the trap when `condition` picks the arm, `then` for the first,
+/// and back to the copy otherwise, which goes on in a new block.
+fn Copier.guard_trap_cold(mut self, func: clif::Function, scope: Scope, condition: clif::Value, then: bool, arg: clif::Value, then_call: clif::BlockCall, else_call: clif::BlockCall) {
+    let traps_then = is_trap_block(func, block: then_call.block, alloc: self.alloc)
+    let Inverse(value: tested, inverted: inverted) = inverse_of(func, value: arg, alloc: self.alloc)
+    let flag = mut self.value(scope, func, value: tested)
+    if self.lost {
+        return
+    }
+    let trap = trap_target(scope, func, then_call, else_call, alloc: self.alloc)
+    let picking = mut self.new_block(predecessors: 1)
+    mut self.b.set_cold_block(picking)
+    let next = mut self.new_block(predecessors: 2)
+    let no_args = mem::List[clif::Value].empty(self.alloc)
+    if traps_then == inverted {
+        mut self.b.brif(flag, then: next, then_args: no_args.view(), otherwise: picking, otherwise_args: no_args.view())
+    } else {
+        mut self.b.brif(flag, then: picking, then_args: no_args.view(), otherwise: next, otherwise_args: no_args.view())
+    }
+    mut self.reached(picking)
+    mut self.reached(next)
+    mut self.b.switch_to_block(picking)
+    if then {
+        mut self.b.brif(condition, then: trap, then_args: no_args.view(), otherwise: next, otherwise_args: no_args.view())
+    } else {
+        mut self.b.brif(condition, then: next, then_args: no_args.view(), otherwise: trap, otherwise_args: no_args.view())
+    }
+    mut self.reached(trap)
+    mut self.reached(next)
+    mut self.b.switch_to_block(next)
+} Copier.guard_trap_cold
+
+/// The copy of the cold block that traps among a branch's two targets.
+fn trap_target(scope: Scope, func: clif::Function, then_call: clif::BlockCall, else_call: clif::BlockCall, alloc: mem::Alloc) -> clif::Block {
+    if is_trap_block(func, block: then_call.block, alloc) {
+        return scope.block(then_call.block)
+    }
+    return scope.block(else_call.block)
+} trap_target
+
+/// Whether the operation whose flag an arm's branch on `arg` tests reads an operand of the
+/// comparison defining `c`, as when `c` picks the arm in which the operation cannot overflow;
+/// true when no comparison defines `c`.
+fn shares_operand(func: clif::Function, c: clif::Value, arg: clif::Value, alloc: mem::Alloc) -> bool {
+    let Some(compare) = func.value_inst(c) else {
+        return true
+    }
+    let clif::InstructionData.IntCompare(opcode: _, cond: _, x: cx, y: cy) = func.inst_data(compare) else {
+        return true
+    }
+    let Inverse(value: tested, inverted: _) = inverse_of(func, value: arg, alloc)
+    let Some(operation) = func.value_inst(tested) else {
+        return true
+    }
+    let clif::InstructionData.Binary(opcode: _, x: ox, y: oy) = func.inst_data(operation) else {
+        return true
+    }
+    let compared_x = func.resolve_aliases(cx)
+    let compared_y = func.resolve_aliases(cy)
+    let left = func.resolve_aliases(ox)
+    let right = func.resolve_aliases(oy)
+    return left == compared_x or left == compared_y or right == compared_x or right == compared_y
+} shares_operand
 
 /// A value a branch tests, and whether it tests that value's inverse.
 struct Inverse derives Copy, Eq {

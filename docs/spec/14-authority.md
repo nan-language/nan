@@ -230,12 +230,12 @@ pub interface RandomService {
 } RandomService
 
 pub interface ClockService {
-    fn elapsed_ns(self) -> u64 limits stack 4_096
-    fn sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 4_096
+    fn elapsed_ns(self) -> u64 limits stack 1_024
+    fn sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 1_024
 } ClockService
 
 pub interface WallClockService {
-    fn now_ns(self) -> u64 limits stack 4_096
+    fn now_ns(self) -> u64 limits stack 1_024
 } WallClockService
 
 pub interface StdioService {

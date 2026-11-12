@@ -65,7 +65,8 @@ fn index_hashed(mut lo: Lowering, mut fx: Fx, key: ty::Ty, held: Held, start: cl
 } index_hashed
 
 /// The entry of a key's fragment that `matches` accepts, `matches` telling whether the entry of
-/// an index holds the sought key: its index and 1, or an unspecified index and 0.
+/// an index holds the sought key: its index and 1, or 0 and 0. The probe stops at a vacant slot,
+/// and asks `matches` only of an entry whose slot holds the key's fragment.
 fn index_find(mut lo: Lowering, mut fx: Fx, record: clif::Value, fragment: clif::Value, matches: fn(mut lo: Lowering, mut fx: Fx, index: clif::Value) -> clif::Value) -> Lookup {
     let table = mut fx.load(PTR, addr: record, offset: INDEX_TABLE)
     let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
@@ -80,35 +81,40 @@ fn index_find(mut lo: Lowering, mut fx: Fx, record: clif::Value, fragment: clif:
         let start = mut fx1.b.band(fragment, y: mask)
         let zero = mut fx1.ptr(0)
         let no = mut fx1.int(clif::Type.Int8, value: 0)
-        let initial = fx1.list3(start, b: zero, c: no)
-        let state = mut fx1.repeat(initial.view(), body: fn[mut lo1](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
-            expect current.len() == 3
-            let slot = index_slot_at(mut fx2, table, position: current[0])
-            let vacant = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: slot, y: 0)
-            let high = mut fx2.b.ushr_imm_s(slot, y: 32)
-            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: high, y: fragment)
-            let held = mut fx2.b.bxor_imm_s(vacant, y: 1)
-            let candidate = mut fx2.b.band(same, y: held)
-            let low = mut fx2.b.band_imm_s(slot, y: 0xFFFF_FFFF)
-            let index = mut fx2.b.iadd_imm_s(low, y: -1)
-            let hit_results = fx2.types1(clif::Type.Int8)
-            let hits = mut fx2.choose(candidate, results: hit_results.view(), then: fn[mut lo1](mut fx3: Fx) -> mem::List[clif::Value] {
-                let matched = matches(mut lo1, fx: mut fx3, index)
-                return fx3.list1(matched)
-            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
-                let missed = mut fx3.int(clif::Type.Int8, value: 0)
-                return fx3.list1(missed)
-            })
-            expect hits.len() == 1
-            let hit = hits[0]
-            let stepped = mut fx2.b.iadd_imm_s(current[0], y: 1)
-            let next = mut fx2.b.band(stepped, y: mask)
-            let stop = mut fx2.b.bor(vacant, y: hit)
-            let again = mut fx2.b.bxor_imm_s(stop, y: 1)
-            return Pass(again: again, next: fx2.list3(next, b: index, c: hit))
-        })
-        expect state.len() == 3
-        return fx1.list2(state[1], b: state[2])
+        let yes = mut fx1.int(clif::Type.Int8, value: 1)
+        let probe = mut fx1.b.create_block()
+        let position = mut fx1.b.append_block_param(probe, ty: PTR)
+        let held = mut fx1.b.create_block()
+        let candidate = mut fx1.b.create_block()
+        let next = mut fx1.b.create_block()
+        let done = mut fx1.b.create_block()
+        let index = mut fx1.b.append_block_param(done, ty: PTR)
+        let hit = mut fx1.b.append_block_param(done, ty: clif::Type.Int8)
+        let none_args = mem::List[clif::Value].empty(fx1.alloc)
+        mut fx1.b.jump(probe, args: fx1.list1(start).view())
+        mut fx1.b.switch_to_block(probe)
+        let slot = index_slot_at(mut fx1, table, position)
+        mut fx1.b.brif(slot, then: held, then_args: none_args.view(), otherwise: done, otherwise_args: fx1.list2(zero, b: no).view())
+        mut fx1.b.switch_to_block(held)
+        mut fx1.b.seal_block(held)
+        let high = mut fx1.b.ushr_imm_s(slot, y: 32)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: high, y: fragment)
+        mut fx1.b.brif(same, then: candidate, then_args: none_args.view(), otherwise: next, otherwise_args: none_args.view())
+        mut fx1.b.switch_to_block(candidate)
+        mut fx1.b.seal_block(candidate)
+        let low = mut fx1.b.band_imm_s(slot, y: 0xFFFF_FFFF)
+        let at = mut fx1.b.iadd_imm_s(low, y: -1)
+        let matched = matches(mut lo1, fx: mut fx1, index: at)
+        mut fx1.b.brif(matched, then: done, then_args: fx1.list2(at, b: yes).view(), otherwise: next, otherwise_args: none_args.view())
+        mut fx1.b.switch_to_block(next)
+        mut fx1.b.seal_block(next)
+        let stepped = mut fx1.b.iadd_imm_s(position, y: 1)
+        let wrapped = mut fx1.b.band(stepped, y: mask)
+        mut fx1.b.jump(probe, args: fx1.list1(wrapped).view())
+        mut fx1.b.seal_block(probe)
+        mut fx1.b.switch_to_block(done)
+        mut fx1.b.seal_block(done)
+        return fx1.list2(index, b: hit)
     })
     expect found.len() == 2
     return Lookup(index: found[0], found: found[1])

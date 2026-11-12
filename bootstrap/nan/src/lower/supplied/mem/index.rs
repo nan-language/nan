@@ -58,7 +58,8 @@ pub fn fragment(lo: &mut Lowering, fx: &mut Fx, key: &Ty, at: Value, seed: Value
 }
 
 /// The entry of a key's fragment that `matches` accepts, `matches` telling whether the entry of
-/// an index holds the sought key: its index and 1, or an unspecified index and 0.
+/// an index holds the sought key: its index and 1, or 0 and 0. The probe stops at a vacant slot,
+/// and asks `matches` only of an entry whose slot holds the key's fragment.
 pub fn find(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -77,29 +78,41 @@ pub fn find(
         |lo, fx| {
             let mask = fx.b.ins().iadd_imm_s(slots, -1);
             let start = fx.b.ins().band(fragment, mask);
-            let (zero, no) = (fx.ptr(0), fx.int(types::I8, 0));
-            let state = fx.repeat(&[start, zero, no], |fx, state| {
-                let slot = slot_at(fx, table, state[0]);
-                let vacant = fx.b.ins().icmp_imm_s(IntCC::Equal, slot, 0);
-                let high = fx.b.ins().ushr_imm_s(slot, 32);
-                let same = fx.b.ins().icmp(IntCC::Equal, high, fragment);
-                let held = fx.b.ins().bxor_imm_s(vacant, 1);
-                let candidate = fx.b.ins().band(same, held);
-                let low = fx.b.ins().band_imm_s(slot, 0xFFFF_FFFF);
-                let index = fx.b.ins().iadd_imm_s(low, -1);
-                let hit = fx.choose(
-                    candidate,
-                    &[types::I8],
-                    |fx| vec![matches(lo, fx, index)],
-                    |fx| vec![fx.int(types::I8, 0)],
-                )[0];
-                let next = fx.b.ins().iadd_imm_s(state[0], 1);
-                let next = fx.b.ins().band(next, mask);
-                let stop = fx.b.ins().bor(vacant, hit);
-                let again = fx.b.ins().bxor_imm_s(stop, 1);
-                (again, vec![next, index, hit])
-            });
-            vec![state[1], state[2]]
+            let (zero, no, yes) = (fx.ptr(0), fx.int(types::I8, 0), fx.int(types::I8, 1));
+            let probe = fx.b.create_block();
+            let position = fx.b.append_block_param(probe, PTR);
+            let held = fx.b.create_block();
+            let candidate = fx.b.create_block();
+            let next = fx.b.create_block();
+            let done = fx.b.create_block();
+            let index = fx.b.append_block_param(done, PTR);
+            let hit = fx.b.append_block_param(done, types::I8);
+            fx.b.ins().jump(probe, &[start.into()]);
+            fx.b.switch_to_block(probe);
+            let slot = slot_at(fx, table, position);
+            fx.b.ins()
+                .brif(slot, held, &[], done, &[zero.into(), no.into()]);
+            fx.b.switch_to_block(held);
+            fx.b.seal_block(held);
+            let high = fx.b.ins().ushr_imm_s(slot, 32);
+            let same = fx.b.ins().icmp(IntCC::Equal, high, fragment);
+            fx.b.ins().brif(same, candidate, &[], next, &[]);
+            fx.b.switch_to_block(candidate);
+            fx.b.seal_block(candidate);
+            let low = fx.b.ins().band_imm_s(slot, 0xFFFF_FFFF);
+            let at = fx.b.ins().iadd_imm_s(low, -1);
+            let matched = matches(lo, fx, at);
+            fx.b.ins()
+                .brif(matched, done, &[at.into(), yes.into()], next, &[]);
+            fx.b.switch_to_block(next);
+            fx.b.seal_block(next);
+            let stepped = fx.b.ins().iadd_imm_s(position, 1);
+            let stepped = fx.b.ins().band(stepped, mask);
+            fx.b.ins().jump(probe, &[stepped.into()]);
+            fx.b.seal_block(probe);
+            fx.b.switch_to_block(done);
+            fx.b.seal_block(done);
+            vec![index, hit]
         },
     );
     (found[0], found[1])

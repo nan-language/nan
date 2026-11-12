@@ -647,8 +647,9 @@ impl Checker<'_> {
     }
 
     /// The `mem::wire` encoding of a protocol's `sys::ProtocolSchema`: its protocol hash and, in
-    /// byte order of name, each `pub` operation with its parameters in byte order of name, the
-    /// type schema of its result for a request and of its failure for a `fails` clause.
+    /// byte order of name, each `pub` operation with its stated class, its parameters in byte
+    /// order of name, the type schema of its result for a request and of its failure for a
+    /// `fails` clause.
     pub fn protocol_schema(&self, protocol: ItemId) -> Vec<u8> {
         let (hash, _) = self.protocol_hashes(protocol);
         let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
@@ -667,6 +668,7 @@ impl Checker<'_> {
                     .then(|| self.type_schema(&operation.sig.result));
                 let failure = operation.sig.fails.as_ref().map(|ty| self.type_schema(ty));
                 let described = record(vec![
+                    ("class", self.written_class(protocol, index).schema()),
                     ("failure", option(failure)),
                     ("name", text(&operation.name)),
                     ("parameters", sequence(parameters)),

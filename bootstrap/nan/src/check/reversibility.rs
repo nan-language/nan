@@ -4,6 +4,7 @@
 use super::Checker;
 use super::db::ItemId;
 use super::resolve::Named;
+use super::schema::{record, variant};
 use crate::diagnostic::Code;
 use crate::encoding::{list, uvar};
 use crate::syntax::ast::{ClauseKind, FnItem, ItemKind, Name, Path};
@@ -148,6 +149,20 @@ impl Class {
             }
             other => WORDS[usize::from(other.position())].to_owned(),
         }
+    }
+
+    /// The class as `mem::wire` encodes a `sys::Reversibility`: the variant of its name, an
+    /// irreversible one holding whether it has each kind.
+    pub fn schema(self) -> Vec<u8> {
+        let Class::Irreversible(kinds) = self else {
+            let word = WORDS[usize::from(self.position())];
+            return variant(&format!("{}{}", word[..1].to_uppercase(), &word[1..]), None);
+        };
+        let mut fields: Vec<(&str, Vec<u8>)> = (KINDS.iter().enumerate())
+            .map(|(bit, kind)| (*kind, vec![u8::from(kinds & 1 << bit != 0)]))
+            .collect();
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        variant("Irreversible", Some(record(fields)))
     }
 
     /// The class in the canonical NIR encoding: its position, followed for an irreversible

@@ -1332,10 +1332,18 @@ pub closed struct ProtocolSchema derives Encode {
 
 pub closed struct OperationSchema derives Encode {
     pub name: text::String
+    pub class: Reversibility
     pub parameters: mem::List[ParameterSchema]
     pub result: Option[TypeSchema]
     pub failure: Option[TypeSchema]
 } OperationSchema
+
+pub closed enum Reversibility derives Copy, Eq, Encode {
+    Traceless
+    Recorded
+    Restorable
+    Irreversible(emit: bool, actuate: bool, erase: bool, spend: bool)
+} Reversibility
 
 pub closed struct ParameterSchema derives Encode {
     pub name: text::String
@@ -1365,7 +1373,7 @@ pub fn ProtocolSchema.serves(self, client: ProtocolSchema, operation: Str, alloc
 pub fn ProtocolSchema.serves_call(self, hash: ProtocolHash, peers: Slice[ProtocolSchema], operation: Str, alloc: mem::Alloc) -> bool
 ```
 
-- `Wire[P].schema(alloc)` gives P's protocol schema drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`): P's protocol hash and, in byte order of name, each `pub` operation of P with its parameters in byte order of name, the type schema of its result when it is a request, and that of its failure when it has a `fails` clause. The **type schema** of a handle type is `Handle` holding its [handle hash](#wire-encoding); that of a handle record is `Record` holding, in byte order of name, each field's name and the part schema of its type, which is `Handle` or `Encoded` as a type schema is; that of another type is `Encoded` holding its [schema tree](13-text-encode.md#schema-hashes).
+- `Wire[P].schema(alloc)` gives P's protocol schema drawn through `alloc`, trapping when memory is exhausted (`trap.exhausted`): P's protocol hash and, in byte order of name, each `pub` operation of P with the [class](10-effects-digests.md#reversibility) its `limits` clause states, its parameters in byte order of name, the type schema of its result when it is a request, and that of its failure when it has a `fails` clause. A class is the `Reversibility` variant of its name, `Irreversible` holding whether it has each kind. The **type schema** of a handle type is `Handle` holding its [handle hash](#wire-encoding); that of a handle record is `Record` holding, in byte order of name, each field's name and the part schema of its type, which is `Handle` or `Encoded` as a type schema is; that of another type is `Encoded` holding its [schema tree](13-text-encode.md#schema-hashes).
 - A type or part schema **accepts** another when both are `Encoded` and its tree [accepts](29-identity-versioning.md#encode-class) the other's, both are `Handle` holding one hash, or both are `Record` with fields of the same names, each field's part schema accepting the other's of its name.
 - A server's protocol schema S **serves** an operation for a client's protocol schema C when S has an operation of that name and, unless S and C hold one protocol hash, C has one too, such that: they have parameters of the same names, each of S's accepting C's of its name; C's has a result exactly when S's has one, accepting it; and C's has a failure when S's has one, accepting it. S's decoders then read every call of it C encodes, and C's every reply S gives. `server.serves(client, operation, alloc)` decides it, comparing trees as `Schema.accepts` does through `alloc`.
 - S serves a call of an operation made under a protocol hash `hash`, knowing the schemas `peers`, when it serves the operation for itself if `hash` is its own, and otherwise for the first schema of `peers` holding `hash`, none serving it when no schema does. `server.serves_call(hash, peers, operation, alloc)` decides it.

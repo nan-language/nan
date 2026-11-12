@@ -215,20 +215,24 @@ impl Checker<'_> {
         }
     }
 
-    /// The types of the parameters of a protocol's `pub` operations.
-    pub fn parameter_types(&self, protocol: ItemId) -> Vec<Ty> {
+    /// The types of the parameters of a protocol's `pub` operations, or of all its operations
+    /// when `every`.
+    pub fn parameter_types(&self, protocol: ItemId, every: bool) -> Vec<Ty> {
         let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
             return Vec::new();
         };
-        (self.hashed_operations(protocol).into_iter())
-            .flat_map(|index| {
-                operations[index]
-                    .sig
-                    .params
-                    .iter()
-                    .map(|param| param.ty.clone())
-            })
-            .collect()
+        let indices = match every {
+            true => (0..operations.len()).collect(),
+            false => self.hashed_operations(protocol),
+        };
+        let params = |index: usize| {
+            operations[index]
+                .sig
+                .params
+                .iter()
+                .map(|param| param.ty.clone())
+        };
+        indices.into_iter().flat_map(params).collect()
     }
 
     /// The results and failures of a protocol's `pub` requests.
@@ -663,9 +667,7 @@ impl Checker<'_> {
     }
 
     /// The `mem::wire` encoding of a protocol's `sys::ProtocolSchema`: its protocol hash and, in
-    /// byte order of name, each `pub` operation with its stated class, its parameters in byte
-    /// order of name with their declared positions, the type schema of its result for a request and of its failure for a
-    /// `fails` clause.
+    /// byte order of name, each `pub` operation's schema.
     pub fn protocol_schema(&self, protocol: ItemId) -> Vec<u8> {
         let (hash, _) = self.protocol_hashes(protocol);
         let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
@@ -673,28 +675,8 @@ impl Checker<'_> {
         };
         let mut described: Vec<(&str, Vec<u8>)> = (self.hashed_operations(protocol).into_iter())
             .map(|index| {
-                let operation = &operations[index];
-                let mut parameters: Vec<(usize, &ParamSig)> =
-                    operation.sig.params.iter().enumerate().collect();
-                parameters.sort_by(|left, right| left.1.name.cmp(&right.1.name));
-                let parameters = parameters.into_iter().map(|(position, param)| {
-                    record(vec![
-                        ("name", text(&param.name)),
-                        ("position", unsigned(position as u64)),
-                        ("value", self.type_schema(&param.ty)),
-                    ])
-                });
-                let result = (self.is_request(protocol, index))
-                    .then(|| self.type_schema(&operation.sig.result));
-                let failure = operation.sig.fails.as_ref().map(|ty| self.type_schema(ty));
-                let described = record(vec![
-                    ("class", self.written_class(protocol, index).schema()),
-                    ("failure", option(failure)),
-                    ("name", text(&operation.name)),
-                    ("parameters", sequence(parameters)),
-                    ("result", option(result)),
-                ]);
-                (operation.name.as_str(), described)
+                let name = operations[index].name.as_str();
+                (name, self.operation_schema(protocol, index))
             })
             .collect();
         described.sort_by(|left, right| left.0.cmp(right.0));
@@ -705,6 +687,45 @@ impl Checker<'_> {
                 "operations",
                 sequence(described.into_iter().map(|(_, described)| described)),
             ),
+        ])
+    }
+
+    /// The `mem::wire` encoding of the `sys::OperationSchema` of every operation of a protocol,
+    /// in declaration order.
+    pub fn operation_schemas(&self, protocol: ItemId) -> Vec<u8> {
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            unreachable!("a protocol's signature")
+        };
+        sequence((0..operations.len()).map(|index| self.operation_schema(protocol, index)))
+    }
+
+    /// The `mem::wire` encoding of an operation's `sys::OperationSchema`: its stated class, its
+    /// parameters in byte order of name with their declared positions, the type schema of its
+    /// result for a request and of its failure for a `fails` clause.
+    fn operation_schema(&self, protocol: ItemId, index: usize) -> Vec<u8> {
+        let SigKind::Protocol { operations, .. } = &self.sig(protocol).kind else {
+            unreachable!("a protocol's signature")
+        };
+        let operation = &operations[index];
+        let mut parameters: Vec<(usize, &ParamSig)> =
+            operation.sig.params.iter().enumerate().collect();
+        parameters.sort_by(|left, right| left.1.name.cmp(&right.1.name));
+        let parameters = parameters.into_iter().map(|(position, param)| {
+            record(vec![
+                ("name", text(&param.name)),
+                ("position", unsigned(position as u64)),
+                ("value", self.type_schema(&param.ty)),
+            ])
+        });
+        let result =
+            (self.is_request(protocol, index)).then(|| self.type_schema(&operation.sig.result));
+        let failure = operation.sig.fails.as_ref().map(|ty| self.type_schema(ty));
+        record(vec![
+            ("class", self.written_class(protocol, index).schema()),
+            ("failure", option(failure)),
+            ("name", text(&operation.name)),
+            ("parameters", sequence(parameters)),
+            ("result", option(result)),
         ])
     }
 

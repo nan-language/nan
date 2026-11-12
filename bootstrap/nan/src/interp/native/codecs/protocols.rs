@@ -1,6 +1,6 @@
 //! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as
-//! members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.encode_message` and
-//! `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle
+//! members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.operations`, the
+//! encodings and decodings of messages and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle
 //! hash.
 
 use std::rc::Rc;
@@ -43,6 +43,26 @@ pub fn member(
             constant(interp, encoding, &schema, &args[0], at, site)
         }
         ("sys::Wire", "encode_message") => encode_message(interp, protocol(), args, at),
+        ("sys::Wire", "operations") => {
+            let schema = interp.ty_item("sys", "OperationSchema");
+            let list = Ty::item(
+                interp.ty_item("mem", "List"),
+                vec![Arg::Ty(Ty::item(schema, Vec::new()))],
+            );
+            let encoding = interp.ck.operation_schemas(protocol());
+            constant(interp, encoding, &list, &args[0], at, site)
+        }
+        ("sys::Wire", "encode_any") => {
+            let message = interp.deref(&args[0]);
+            let Val::Variant(_, method, fields) = &message else {
+                panic!("a protocol message, not {message:?}")
+            };
+            match appended_call(interp, protocol(), *method as usize, &args[1], fields) {
+                Some(()) => Ok(Flow::Return(Val::Int(i128::from(*method)))),
+                None => exhausted(interp, false, at),
+            }
+        }
+        ("sys::Wire", "decode_any") => decode_any(interp, protocol(), args, at, site),
         ("sys::Reply", "decode") => decode_reply(interp, type_args, args, at, site),
         _ => return None,
     })
@@ -205,6 +225,43 @@ fn argument_tree(
         })
         .collect();
     Tree::Record(parts)
+}
+
+/// `Wire[P].decode_any(raw, handles, alloc)`: the message of any operation whose call `raw`
+/// encodes against `handles`, failing with the decoding's failure and with `Trailing` when bytes
+/// or handles are left.
+fn decode_any(
+    interp: &mut Interpreter,
+    protocol: ItemId,
+    args: &[Val],
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<Flow> {
+    let raw = interp.deref(&args[0]).fields()[0].clone();
+    let input = interp.bytes(&raw);
+    let view = interp.view(&args[1]);
+    let handles = interp.view_values(&view);
+    let cell = cell_of(interp, &args[2]);
+    let mut reader = WireReader::new(input);
+    let mut decoding = Decoding {
+        interp,
+        reader: &mut reader,
+        cell,
+        depth: 0,
+        at,
+        site,
+        carried: Some((handles, 0)),
+    };
+    let decoded = decoding
+        .value(&Ty::item(protocol, Vec::new()))
+        .and_then(|value| {
+            decoding.reader.finish(decoding.interp)?;
+            match decoding.carried {
+                Some((ref handles, taken)) if taken != handles.len() => super::fail("Trailing"),
+                _ => Ok(value),
+            }
+        });
+    super::outcome(interp, decoded)
 }
 
 /// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply decoded from `raw` against

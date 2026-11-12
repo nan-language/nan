@@ -1,4 +1,4 @@
-//! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.encode_message` and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle hash.
+//! The wire encoding of protocols in interpreter runs: the encodings of calls of operations as members of `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.operations`, the encodings and decodings of messages and `sys::Reply.decode`. A `sys::Handle` holds the value of a handle type, then that type's handle hash.
 
 /// A member of `sys::Wire` or `sys::Reply`; none for another.
 fn Interpreter.protocol_member(
@@ -14,7 +14,7 @@ fn Interpreter.protocol_member(
     if owner == "sys::Reply" and member == "decode" {
         return Some(try mut self.decode_reply(type_args, args, at, site))
     }
-    if owner != "sys::Wire" or (member != "hash" and member != "schema" and member != "encode_message") {
+    if owner != "sys::Wire" or (member != "hash" and member != "schema" and member != "encode_message" and member != "operations" and member != "encode_any" and member != "decode_any") {
         return None
     }
     let ty::TyKind.Item(item: protocol, args: _) = self.ck.types().kind(type_arg_or_unit(type_args, index: 0)) else {
@@ -23,6 +23,28 @@ fn Interpreter.protocol_member(
     }
     if member == "encode_message" {
         return Some(try mut self.encode_message(protocol, args, at))
+    }
+    if member == "encode_any" {
+        let message = self.deref(args[0])
+        let Val.Variant(item: _, index: method, fields: fields) = message else {
+            expect false
+            fail End.Missing
+        }
+        if not mut self.appended_call(protocol, method: usize.widen(method), out_value: args[1], args: fields.contents().view()) {
+            return Some(try self.exhausted(fallible: false, at))
+        }
+        return Some(InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(method)))))
+    }
+    if member == "decode_any" {
+        return Some(try mut self.decode_any(protocol, args, at, site))
+    }
+    if member == "operations" {
+        expect args.len() > 0
+        var element_args = mem::List[ty::Arg].empty(alloc)
+        mut element_args.push(ty::Arg.Ty(self.ck.types().item(self.ty_item("sys", name: "OperationSchema"), args: mem::List[ty::Arg].empty(alloc))))
+        let list = self.ck.types().item(self.ty_item("mem", name: "List"), args: take element_args)
+        let encoding = self.ck.operation_schemas(protocol)
+        return Some(try mut self.constant_value(take encoding, ty: list, alloc_value: args[0], at, site))
     }
     if member == "hash" {
         let hashes = self.ck.protocol_hashes(protocol)
@@ -168,6 +190,29 @@ fn Interpreter.argument_tree(self, value: Val, ty: ty::Ty, first_index: usize, m
     }
     return Tree.Record(take parts)
 } Interpreter.argument_tree
+
+/// `Wire[P].decode_any(raw, handles, alloc)`: the message of any operation whose call `raw` encodes
+/// against `handles`, failing with the decoding's failure and with `Trailing` when bytes or handles
+/// are left.
+fn Interpreter.decode_any(mut self, protocol: ty::ItemId, args: Slice[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    expect args.len() > 2
+    let message = self.ck.types().item(protocol, args: mem::List[ty::Arg].empty(alloc))
+    let wrapped = self.deref(args[0])
+    expect wrapped.fields().len() > 0
+    let input = mut self.bytes(wrapped.fields()[0].copy(alloc))
+    let view = mut self.view(args[1])
+    let handles = self.view_values(view)
+    let count = handles.len()
+    let cell = self.cell_of(args[2])
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site, carried: Some(take handles), taken: 0)
+    var reader = WireReader.new(take input, alloc)
+    var decoded = attempt mut decoding.whole(mut self, reader: mut reader, ty: message)
+    if decoded.is_ok() and decoding.taken != count {
+        decoded = Err(Failure.Decode(DecodeKind.Trailing))
+    }
+    return try self.decode_outcome(take decoded)
+} Interpreter.decode_any
 
 /// `reply.decode(raw, handles, alloc)`: the result of an `Ok` reply decoded from `raw` against
 /// `handles`, failing with `CallError.Failed` holding the failure of an `Err` one and with

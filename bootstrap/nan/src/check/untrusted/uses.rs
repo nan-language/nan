@@ -286,8 +286,8 @@ impl Walk<'_, '_> {
 
     /// The uses of naming an instantiation of a function: those of the conformances of its type
     /// arguments to their bounds, of the decoders and encoders its codec uses substitute, and for
-    /// `sys::Wire.encode_message` of the encoders of the parameters of the protocol's `pub`
-    /// operations.
+    /// `sys::Wire.encode_message`, `encode_any` and `decode_any` of the encoders or decoders of
+    /// the parameters of the protocol's `pub` operations, or of all its operations.
     fn named(&mut self, token: Tok, function: ItemId, args: &[Arg]) {
         let Some(head) = self.ck.fn_sig(function) else {
             return;
@@ -300,13 +300,17 @@ impl Walk<'_, '_> {
         for (param, codec) in self.ck.codec_uses(function) {
             self.codec(token, &subst.ty(&Ty::Param(param)), codec);
         }
-        if self.ck.db.is_std(function)
-            && self.ck.db.canonical(function) == "sys::Wire.encode_message"
-        {
+        let messages = match self.ck.db.canonical(function).as_str() {
+            "sys::Wire.encode_message" => Some((Codec::Encode, false)),
+            "sys::Wire.encode_any" => Some((Codec::Encode, true)),
+            "sys::Wire.decode_any" => Some((Codec::Decode, true)),
+            _ => None,
+        };
+        if let Some((codec, every)) = messages.filter(|_| self.ck.db.is_std(function)) {
             match subst.ty(&Ty::Param(head.generics[0].param)) {
                 Ty::Item(protocol, _) => {
-                    for ty in self.ck.parameter_types(protocol) {
-                        self.codec(token, &ty, Codec::Encode);
+                    for ty in self.ck.parameter_types(protocol, every) {
+                        self.codec(token, &ty, codec);
                     }
                 }
                 Ty::Error => {}

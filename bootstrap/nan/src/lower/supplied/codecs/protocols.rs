@@ -14,8 +14,9 @@ use super::super::mem::vector;
 use super::super::tasks::protocols::{Answer, await_reply};
 use super::super::{Supply, entry as supplied_entry, tasks::address_of};
 use super::{
-    BYTE, DecodeFormat, Format, HANDLE, Kind, constant, decode_constant, encode_case, encoder,
-    failure, kind_of, read_from, same_hash, writer,
+    BYTE, DecodeFormat, Format, HANDLE, Kind, constant, decode_constant, decode_entry,
+    decode_every, encode_case, encoder, every_case, failure, kind_of, read_from, returned,
+    same_hash, writer,
 };
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::SigKind;
@@ -37,6 +38,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "sys::Wire.serve" => serve(lo, fx, supply),
         "sys::Wire.encode_message" => encode_message(lo, fx, supply),
+        "sys::Wire.operations" => {
+            let schemas = lo.ck.operation_schemas(protocol_of(supply));
+            constant(lo, fx, supply, &schemas);
+        }
+        "sys::Wire.encode_any" => encode_any(lo, fx, supply),
+        "sys::Wire.decode_any" => decode_any(lo, fx, supply),
         "sys::Reply.decode" => decode_reply(lo, fx, supply),
         "sys::Handle.of" => handle_of(lo, fx, supply),
         "sys::CapabilityId.of_handle" => capability_of(lo, fx, supply),
@@ -230,6 +237,59 @@ fn encode_message(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, none);
 }
 
+/// `Wire[P].encode_any(message, mut out)`: the call the message makes, of any operation,
+/// encoded as its variant, appended to `out`, and its operation's number.
+fn encode_any(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let protocol = protocol_of(supply);
+    let message = Ty::item(protocol, Vec::new());
+    let value = address_of(lo, fx, &message, supply.param(0));
+    let cases = every_case(lo, protocol);
+    let index = lo.variant_index(fx, &message, value);
+    let parts = encoded_parts(lo, fx, supply.param(1).address());
+    for case in &cases {
+        let this =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, index, case.index as i64);
+        fx.when(this, |fx| {
+            append(lo, fx, supply, parts, |lo, fx, state| {
+                encode_case(lo, fx, Format::Wire, &message, case, value, state)
+            });
+            let number = fx.int(types::I16, case.index as i64);
+            supply.ret(lo, fx, Held::Scalar(number));
+        });
+    }
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// `Wire[P].decode_any(raw, handles, alloc)`: the message of any operation whose call `raw`
+/// encodes against `handles`, failing with the code of its decoding.
+fn decode_any(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let protocol = protocol_of(supply);
+    let message = Ty::item(protocol, Vec::new());
+    let layout = lo.layout(&message);
+    let target = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let raw = supply.param(0).address();
+    let handles = supply.param(1).address();
+    let alloc = supply.param(2).address();
+    let mut decode =
+        |lo: &mut Lowering, fx: &mut Fx, args: &[Value]| decode_every(lo, fx, protocol, args);
+    let format = DecodeFormat::Wire;
+    let code = read_from(
+        lo,
+        fx,
+        raw,
+        alloc,
+        Some(handles),
+        &format,
+        &message,
+        target,
+        &mut decode,
+    );
+    returned(lo, fx, supply, &message, target, code);
+}
+
 /// Fails with `CallError.Malformed` holding the `core::DecodeError` a decoding's code names.
 fn fail_malformed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, code: Value) {
     let error = super::decode_error(lo, fx, code);
@@ -286,15 +346,20 @@ fn read_handled(
     let handles = supply.param(raw + 1).address();
     let alloc = supply.param(raw + 2).address();
     let raw = supply.param(raw).address();
+    let mut decode = |lo: &mut Lowering, fx: &mut Fx, args: &[Value]| {
+        decode_entry(lo, fx, &DecodeFormat::Wire, ty, args)
+    };
+    let format = DecodeFormat::Wire;
     read_from(
         lo,
         fx,
         raw,
         alloc,
         Some(handles),
-        &DecodeFormat::Wire,
+        &format,
         ty,
         target,
+        &mut decode,
     )
 }
 

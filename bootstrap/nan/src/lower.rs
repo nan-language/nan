@@ -145,6 +145,8 @@ pub enum Glue {
     EncodeCalls(Ty, Ty),
     /// Reads a value of a type in a codec's format, or through the calls of a decoder.
     Decode(supplied::codecs::DecodeFormat, Ty),
+    /// Decodes the call of any operation of a protocol, its message's type.
+    DecodeEvery(Ty),
     /// Makes a nested call from its record.
     NestedThunk,
     /// Writes the canonical encoding of a decoded value of a type to new bytes.

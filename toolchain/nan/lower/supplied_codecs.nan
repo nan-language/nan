@@ -194,6 +194,40 @@ fn decode_entry(mut lo: Lowering, mut fx: Fx, format: DecodeFormat, ty: ty::Ty, 
     return codes[0]
 } decode_entry
 
+/// Calls the function decoding the call of any operation of a protocol from the wire format with
+/// a reader, an allocator and a target, giving its code: as a nested decoding when a type of its
+/// operations' parameters reaches itself.
+fn decode_every(mut lo: Lowering, mut fx: Fx, protocol: ty::ItemId, args: Slice[clif::Value]) -> clif::Value {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int32))
+    let message = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let function = mut lo.glue_function(Glue.DecodeEvery(message), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 3
+        let decoding = Decoding(format: DecodeFormat.Wire, reader: params[0], alloc: params[1])
+        let cases = every_case(mut lo1, protocol)
+        decode_variant(mut lo1, fx: mut fx1, decoding, ty: message, cases: cases.view(), target: params[2])
+        let none = mut fx1.int(clif::Type.Int32, value: 0)
+        let returned = fx1.list1(none)
+        mut fx1.b.ret(returned.view())
+    })
+    var nested = false
+    for parameter in lo.ck.parameter_types(protocol, every: true) {
+        if reaches_itself(mut lo, ty: parameter) {
+            nested = true
+        }
+    }
+    if nested {
+        return mut lo.nested_call(mut fx, function, args)
+    }
+    let codes = codecs_call(mut lo, mut fx, function, args)
+    expect codes.len() == 1
+    return codes[0]
+} decode_every
+
 /// Whether every cycle of a format's decoding functions' calls of each other passes a nesting,
 /// which the format bounds: the wire format's, and the calls of a std decoder.
 fn codecs_nests(lo: Lowering, format: DecodeFormat) -> bool {
@@ -423,14 +457,15 @@ fn codecs_result_at(mut lo: Lowering, mut fx: Fx, sret: Option[clif::Value], ty:
 /// parameter `raw`, drawing through the allocator of the parameter after it: the code of a
 /// decoding function, `Trailing` on what is left after the value, which is then released.
 fn codecs_read(mut lo: Lowering, mut fx: Fx, supply: Supply, raw: usize, format: DecodeFormat, ty: ty::Ty, target: clif::Value) -> clif::Value {
-    return codecs_read_from(mut lo, mut fx, raw: supply.param(raw).address_value(), alloc: supply.param(raw + 1).address_value(), handles: None, format, ty, target)
+    return codecs_read_from(mut lo, mut fx, raw: supply.param(raw).address_value(), alloc: supply.param(raw + 1).address_value(), handles: None, format, ty, target, every: None)
 } codecs_read
 
-/// Reads one value of `ty` at `target` from the bytes of the slice at `raw`, and in the wire
+/// Reads one value of `ty` at `target` from the bytes of the slice at `raw`, by the decoding
+/// function of the call of any operation of the protocol `every` when given, and in the wire
 /// format against the handles of the slice at `handles`, drawing through the allocator at
-/// `alloc`: the code of a decoding function, `Trailing` on bytes or handles left after the value,
-/// which is then released.
-fn codecs_read_from(mut lo: Lowering, mut fx: Fx, raw: clif::Value, alloc: clif::Value, handles: Option[clif::Value], format: DecodeFormat, ty: ty::Ty, target: clif::Value) -> clif::Value {
+/// `alloc`: the code of the decoding function, `Trailing` on bytes or handles left after the
+/// value, which is then released.
+fn codecs_read_from(mut lo: Lowering, mut fx: Fx, raw: clif::Value, alloc: clif::Value, handles: Option[clif::Value], format: DecodeFormat, ty: ty::Ty, target: clif::Value, every: Option[ty::ItemId]) -> clif::Value {
     let start = mut fx.load(PTR, addr: raw, offset: 0)
     let len = mut fx.load(PTR, addr: raw, offset: 8)
     let alloc_handle = mut fx.load(PTR, addr: alloc, offset: 0)
@@ -452,7 +487,11 @@ fn codecs_read_from(mut lo: Lowering, mut fx: Fx, raw: clif::Value, alloc: clif:
         }
         None => {}
     }
-    let code = decode_entry(mut lo, mut fx, format, ty, args: fx.list3(state, b: alloc_handle, c: target).view())
+    let entry_args = fx.list3(state, b: alloc_handle, c: target)
+    let code = match every {
+        Some(protocol) => decode_every(mut lo, mut fx, protocol, args: entry_args.view())
+        None => decode_entry(mut lo, mut fx, format, ty, args: entry_args.view())
+    }
     let read = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: 0)
     let results = fx.types1(clif::Type.Int32)
     let checked = mut fx.choose(read, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
@@ -956,6 +995,23 @@ fn codecs_declared(mut lo: Lowering, item: ty::ItemId, args: ty::Args) -> Codecs
         }
     }
 } codecs_declared
+
+/// The cases of every operation of a protocol, `pub` or not, in declaration order.
+fn every_case(mut lo: Lowering, protocol: ty::ItemId) -> mem::List[Case] {
+    var cases = mem::List[Case].empty(lo.alloc)
+    let sig = lo.ck.sig(protocol)
+    let check::SigKind.Protocol(operations: _, variants: variants, summary: _) = sig.contents().kind else {
+        expect false
+        return cases
+    }
+    let ty = lo.ck.types().item(protocol, args: mem::List[ty::Arg].empty(lo.alloc))
+    let subst = ty::Subst.of(mem::List[ty::Param].empty(lo.alloc).view(), args: mem::List[ty::Arg].empty(lo.alloc).view(), alloc: lo.alloc)
+    for index in 0..<variants.len() {
+        let variant = variants[index]
+        mut cases.push(Case(key: text::String.of(variant.name.as_str(), alloc: lo.alloc), index: index, payload: case_payload(mut lo, ty, variant, subst)))
+    }
+    return cases
+} every_case
 
 /// The payload of an enum's variant as it encodes.
 fn case_payload(mut lo: Lowering, ty: ty::Ty, variant: check::VariantSig, subst: ty::Subst) -> CasePayload {

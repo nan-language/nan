@@ -1340,7 +1340,7 @@ impl Decoding<'_, '_, '_, '_> {
                     false => fail("Invalid"),
                 }
             }
-            SigKind::Enum { variants } => {
+            SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => {
                 self.nest()?;
                 let names: Vec<&[u8]> = variants
                     .iter()

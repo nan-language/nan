@@ -31,7 +31,7 @@ use super::Supply;
 use super::mem::maps::Entries;
 use super::mem::vector::{self, Element};
 use crate::check::db::{ItemId, TypeKey};
-use crate::check::sig::{KEPT, Payload, SigKind};
+use crate::check::sig::{KEPT, Payload, SigKind, VariantSig};
 use crate::check::ty::{Arg, Args, Scalar, Subst, Ty};
 use crate::hash::Hash;
 use crate::nir::{Callable, FnRef, Role};
@@ -225,13 +225,15 @@ fn read(
 ) -> Value {
     let alloc = supply.param(raw + 1).address();
     let raw = supply.param(raw).address();
-    read_from(lo, fx, raw, alloc, None, format, ty, target)
+    let mut decode =
+        |lo: &mut Lowering, fx: &mut Fx, args: &[Value]| decode_entry(lo, fx, format, ty, args);
+    read_from(lo, fx, raw, alloc, None, format, ty, target, &mut decode)
 }
 
-/// Reads one value of `ty` at `target` from the bytes of the slice at `raw`, and in the wire
-/// format against the handles of the slice at `handles`, drawing through the allocator at
-/// `alloc`: the code of a decoding function, `Trailing` on bytes or handles left after the value,
-/// which is then released.
+/// Reads one value of `ty` at `target` from the bytes of the slice at `raw` through `decode`,
+/// which calls a decoding function, and in the wire format against the handles of the slice at
+/// `handles`, drawing through the allocator at `alloc`: the code of the decoding function,
+/// `Trailing` on bytes or handles left after the value, which is then released.
 #[allow(clippy::too_many_arguments)]
 fn read_from(
     lo: &mut Lowering,
@@ -242,6 +244,7 @@ fn read_from(
     format: &DecodeFormat,
     ty: &Ty,
     target: Value,
+    decode: &mut dyn FnMut(&mut Lowering, &mut Fx, &[Value]) -> Value,
 ) -> Value {
     let start = fx.load(PTR, raw, 0);
     let len = fx.load(PTR, raw, 8);
@@ -260,7 +263,7 @@ fn read_from(
         fx.store(zero, state, reader::TAKEN);
         count
     });
-    let code = decode_entry(lo, fx, format, ty, &[state, alloc, target]);
+    let code = decode(lo, fx, &[state, alloc, target]);
     let read = fx.b.ins().icmp_imm_s(IntCC::Equal, code, 0);
     fx.choose_in(
         lo,
@@ -773,40 +776,56 @@ fn declared(lo: &mut Lowering, item: crate::check::db::ItemId, args: &[Arg]) -> 
             })
         }
         SigKind::Enum { variants } | SigKind::Protocol { variants, .. } => Kind::Variant(
-            variants
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| match &sig.kind {
+            (0..variants.len())
+                .filter(|index| match &sig.kind {
                     SigKind::Protocol { .. } => lo.ck.hashed_operations(item).contains(index),
                     _ => true,
                 })
-                .map(|(index, variant)| Case {
-                    key: variant.name.clone(),
-                    index,
-                    payload: match &variant.payload {
-                        Payload::None => CasePayload::None,
-                        Payload::Single(payload) => CasePayload::Single(subst.ty(payload)),
-                        Payload::Labelled(labels) => CasePayload::Labelled(Record {
-                            fields: labels
-                                .iter()
-                                .map(|(name, payload)| {
-                                    let offset = lo
-                                        .layouts
-                                        .field(lo.ck, &ty, Some(&variant.name), name)
-                                        .offset;
-                                    (name.clone(), subst.ty(payload), offset)
-                                })
-                                .collect(),
-                            open: false,
-                            aliases: Vec::new(),
-                            owner: None,
-                            kept: None,
-                        }),
-                    },
-                })
+                .map(|index| case(lo, &ty, &subst, index, &variants[index]))
                 .collect(),
         ),
         other => panic!("an Encode type of kind {other:?}"),
+    }
+}
+
+/// The cases of every operation of a protocol, `pub` or not, in declaration order.
+fn every_case(lo: &mut Lowering, protocol: ItemId) -> Vec<Case> {
+    let sig = lo.ck.sig(protocol);
+    let SigKind::Protocol { variants, .. } = &sig.kind else {
+        unreachable!("a protocol's signature")
+    };
+    let ty = Ty::Item(protocol, Vec::new().into());
+    let subst = Subst::of(std::iter::empty(), &[]);
+    (variants.iter().enumerate())
+        .map(|(index, variant)| case(lo, &ty, &subst, index, variant))
+        .collect()
+}
+
+/// The case of a variant of an enum or a protocol's message at `index`.
+fn case(lo: &mut Lowering, ty: &Ty, subst: &Subst, index: usize, variant: &VariantSig) -> Case {
+    Case {
+        key: variant.name.clone(),
+        index,
+        payload: match &variant.payload {
+            Payload::None => CasePayload::None,
+            Payload::Single(payload) => CasePayload::Single(subst.ty(payload)),
+            Payload::Labelled(labels) => CasePayload::Labelled(Record {
+                fields: labels
+                    .iter()
+                    .map(|(name, payload)| {
+                        let offset = lo
+                            .layouts
+                            .field(lo.ck, ty, Some(&variant.name), name)
+                            .offset;
+                        (name.clone(), subst.ty(payload), offset)
+                    })
+                    .collect(),
+                open: false,
+                aliases: Vec::new(),
+                owner: None,
+                kept: None,
+            }),
+        },
     }
 }
 
@@ -1367,6 +1386,39 @@ pub fn decode_entry(
 ) -> Value {
     let function = decoder(lo, format, ty);
     match nests(lo, format) && reaches_itself(lo, ty) {
+        true => lo.nested_call(fx, function, args),
+        false => call(lo, fx, function, args)[0],
+    }
+}
+
+/// Calls the function decoding the call of any operation of a protocol from the wire format
+/// with a reader, an allocator and a target, giving its code: as a nested decoding when a type
+/// of its operations' parameters reaches itself.
+fn decode_every(lo: &mut Lowering, fx: &mut Fx, protocol: ItemId, args: &[Value]) -> Value {
+    let mut signature = Signature::new(CALL_CONV);
+    for _ in 0..3 {
+        signature.params.push(AbiParam::new(PTR));
+    }
+    signature.returns.push(AbiParam::new(types::I32));
+    let message = Ty::item(protocol, Vec::new());
+    let function = lo.glue_function(
+        Glue::DecodeEvery(message.clone()),
+        signature,
+        move |lo, fx| {
+            let params = fx.entry();
+            let decoding = Decoding {
+                format: DecodeFormat::Wire,
+                reader: params[0],
+                alloc: params[1],
+            };
+            let cases = every_case(lo, protocol);
+            decode_variant(lo, fx, &decoding, &message, &cases, params[2]);
+            let none = fx.int(types::I32, 0);
+            fx.b.ins().return_(&[none]);
+        },
+    );
+    let parameters = lo.ck.parameter_types(protocol, true);
+    match parameters.iter().any(|ty| reaches_itself(lo, ty)) {
         true => lo.nested_call(fx, function, args),
         false => call(lo, fx, function, args)[0],
     }

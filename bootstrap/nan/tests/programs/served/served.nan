@@ -1,0 +1,82 @@
+//! Reads, sleeps on and draws from a clock and a random source served by kinds wrapping served ones, from the entry task and from a task whose stack holds less than their methods' bounds.
+
+/// A clock passing every reading and sleep to the clock it wraps.
+pub open struct Wrapping {
+} Wrapping
+
+impl Wrapping: sys::Kind[sys::Clock, u8]
+
+impl Wrapping: sys::ClockService
+
+pub fn Wrapping.elapsed_ns(self) -> u64 limits stack 1_024 {
+    let Some(clock) = sys::reach(self, body: fn(clock: sys::Clock, record: u8) => clock) else {
+        return 0
+    }
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} Wrapping.elapsed_ns
+
+pub fn Wrapping.sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 1_024 {
+    let Some(clock) = sys::reach(self, body: fn(clock: sys::Clock, record: u8) => clock) else {
+        return
+    }
+    try await clock.sleep_ns(ns)
+} Wrapping.sleep_ns
+
+/// A random source passing every draw to the random source it wraps.
+pub open struct Drawing {
+} Drawing
+
+impl Drawing: sys::Kind[sys::Random, u8]
+
+impl Drawing: sys::RandomService
+
+pub fn Drawing.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    let Some(random) = sys::reach(self, body: fn(random: sys::Random, record: u8) => random) else {
+        return
+    }
+    discard attempt random.fill(mut buf)
+} Drawing.fill
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let clocks = sys::Minter[Wrapping, sys::Clock, u8].of(world.clock, alloc: world.alloc)
+    defer take clocks.close()
+    let randoms = sys::Minter[Drawing, sys::Random, u8].of(world.random, alloc: world.alloc)
+    defer take randoms.close()
+    let Ok(inner_clock) = attempt sys::Clock.served(clocks.mint(0)) else {
+        return
+    }
+    let inner_clocks = sys::Minter[Wrapping, sys::Clock, u8].of(inner_clock, alloc: world.alloc)
+    defer take inner_clocks.close()
+    let Ok(clock) = attempt sys::Clock.served(inner_clocks.mint(0)) else {
+        return
+    }
+    let Ok(inner_random) = attempt sys::Random.served(randoms.mint(0)) else {
+        return
+    }
+    let inner_randoms = sys::Minter[Drawing, sys::Random, u8].of(inner_random, alloc: world.alloc)
+    defer take inner_randoms.close()
+    let Ok(random) = attempt sys::Random.served(inner_randoms.mint(0)) else {
+        return
+    }
+    world.log.info("entry", value: works(clock, random))
+    try await clock.sleep_ns(1_000)
+    world.log.info("slept", value: true)
+    var small = false
+    try await task::scope(world.exec, body: fn[mut small](s: task::Scope) fails task::Cancelled uses wait {
+        small = try await s.spawn(fn() -> bool fails task::Cancelled uses wait limits stack 2_048 {
+            try await clock.sleep_ns(1_000)
+            return works(clock, random)
+        }).join()
+    })
+    world.log.info("small", value: small)
+} main
+
+/// Whether a clock reads and a random source fills a buffer.
+fn works(clock: sys::Clock, random: sys::Random) -> bool {
+    let read = (attempt clock.elapsed_ns()).is_ok()
+    var bytes = Array[u8, 16].filled(0)
+    return read and (attempt random.fill(mut bytes.view_mut())).is_ok()
+} works

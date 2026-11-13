@@ -47,7 +47,7 @@ pub fn draw(
         lo,
         mapped,
         &[PTR],
-        |lo, fx| vec![system::map_stack(lo, fx, length)],
+        |lo, fx| vec![system::map_stack(lo, fx, length, guarded)],
         |lo, fx| {
             let align = fx.ptr(alignment(lo));
             let drawn = lo.call_routine(fx, Routine::AllocIn, &[cell, length, align, domain])[0];
@@ -370,6 +370,27 @@ fn short_of(fx: &mut Fx, task: Value, here: Value, need: Value) -> Value {
     let roomy = fx.b.ins().bxor_imm_s(lacking, 1);
     let fits = fx.b.ins().band(inside, roomy);
     fx.b.ins().bxor_imm_s(fits, 1)
+}
+
+/// Whether `here` lies outside the stack of the running task, as it does when no task runs.
+pub fn off_task_stack(lo: &mut Lowering, fx: &mut Fx, here: Value) -> Value {
+    let task = tasks::current_task(lo, fx);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, task, 0);
+    fx.choose(
+        present,
+        &[types::I8],
+        |fx| {
+            let limit = fx.load(PTR, task, task::LIMIT);
+            let top = fx.load(PTR, task, task::TOP);
+            let above =
+                fx.b.ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, here, limit);
+            let below = fx.b.ins().icmp(IntCC::UnsignedLessThan, here, top);
+            let inside = fx.b.ins().band(above, below);
+            vec![fx.b.ins().bxor_imm_s(inside, 1)]
+        },
+        |fx| vec![fx.int(types::I8, 1)],
+    )[0]
 }
 
 /// `GrownStart(record)`: links its frame record to `Grow`'s, so walks of the stack pass from

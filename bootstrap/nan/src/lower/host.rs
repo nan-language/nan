@@ -334,8 +334,8 @@ pub fn thread_signals(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let pthread = lo.call_libc(fx, "pthread_self", &[], &[PTR])[0];
     fx.store(pthread, record, thread::PTHREAD);
     let size = fx.ptr(SIGNAL_STACK);
-    let signal_stack = map_stack(lo, fx, size);
-    let trap_stack = map_stack(lo, fx, size);
+    let signal_stack = map_stack(lo, fx, size, true);
+    let trap_stack = map_stack(lo, fx, size, true);
     let no_signal = fx.b.ins().icmp_imm_s(IntCC::Equal, signal_stack, 0);
     let no_trap = fx.b.ins().icmp_imm_s(IntCC::Equal, trap_stack, 0);
     let refused = fx.b.ins().bor(no_signal, no_trap);
@@ -1223,9 +1223,9 @@ pub fn unmap(lo: &mut Lowering, fx: &mut Fx, address: Value, len: Value) {
     lo.call_libc(fx, "munmap", &[address, len], &[types::I32]);
 }
 
-/// Maps a task stack of `len` bytes whose lowest page is an inaccessible guard, zero when the
-/// system refuses.
-pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value) -> Value {
+/// Maps a stack of `len` bytes, its lowest page an inaccessible guard when `guarded`, zero when
+/// the system refuses.
+pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> Value {
     let zero = fx.ptr(0);
     let protection = fx.int(types::I32, mmap::READ_WRITE);
     let flags = fx.int(types::I32, mmap::STACK);
@@ -1243,7 +1243,9 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value) -> Value {
         &[PTR],
         |_, fx| vec![fx.ptr(0)],
         |lo, fx| {
-            protect_guard(lo, fx, base, false);
+            if guarded {
+                protect_guard(lo, fx, base, false);
+            }
             vec![base]
         },
     )[0]

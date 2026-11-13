@@ -3,7 +3,9 @@
 //! wrapper. The wrapper writes the call's arguments into a record and has the `Grow` support
 //! routine run its thunk, which makes the call from the record, on the running stack when it has
 //! the room the thunk needs and on a new stack segment otherwise. Each thunk's need is a word of
-//! a table the lowering fills once every frame is known.
+//! a table the lowering fills once every frame is known. On every target, a call of a served
+//! capability's method has `Grow` run the thunk of its code likewise, needing the `stack N` its
+//! head demands.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +13,8 @@ use cranelift_codegen::ir::{self, AbiParam, InstBuilder, Signature, Value};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use super::fx::{Fx, PTR};
-use super::runtime::Routine;
+use super::runtime::{Routine, report, segments};
+use super::stack::STUB_CALL_BOUND;
 use super::{Glue, Lowering, stack};
 
 /// The symbol of the table of grown calls' needs.
@@ -134,6 +137,39 @@ impl Lowering<'_, '_> {
         let mut values = vec![code];
         values.extend_from_slice(args);
         fx.b.ins().call(reference, &values)
+    }
+
+    /// Calls code through its address on a stack with room for the `stack` bytes its head
+    /// demands and the stub call bound of the thunk calling it: through `Grow`, on the running
+    /// task's stack when it has that room and on a new segment of it otherwise, giving the call's
+    /// results. A call on a stack other than a running task's traps (`trap.exhausted`).
+    pub fn call_with_room(
+        &mut self,
+        fx: &mut Fx,
+        signature: Signature,
+        code: Value,
+        args: &[Value],
+        stack: u64,
+    ) -> Vec<Value> {
+        let returns = signature.returns.clone();
+        let slots = slots(&signature).max(args.len() as u64 + 1);
+        let thunk = self.thunk(&Called::Value(signature));
+        let record = fx.slot(SLOT * slots, SLOT);
+        fx.store(code, record, 0);
+        for (at, arg) in args.iter().enumerate() {
+            fx.store(*arg, record, SLOT * (at as u64 + 1));
+        }
+        let off = segments::off_task_stack(self, fx, record);
+        fx.when(off, |fx| report::raise_kind(self, fx, "trap.exhausted"));
+        let thunk = self.func_ref(fx, thunk);
+        let thunk = fx.b.ins().func_addr(PTR, thunk);
+        let need = fx.ptr(stack + STUB_CALL_BOUND);
+        self.call_routine(fx, Routine::Grow, &[thunk, record, need]);
+        returns
+            .iter()
+            .enumerate()
+            .map(|(at, result)| fx.load(result.value_type, record, SLOT * at as u64))
+            .collect()
     }
 
     /// The wrapper of a grown call, defined after its thunk when first asked for.

@@ -1,4 +1,4 @@
-//! Grown calls: in an image whose task stacks grow, a direct call closing a cycle of the calls emitted so far, and a call of a function value whose type demands no `stack N`, go through a wrapper. The wrapper writes the call's arguments into a record and has the `Grow` support routine run its thunk, which makes the call from the record, on the running stack when it has the room the thunk needs and on a new stack segment otherwise. Each thunk's need is a word of a table the lowering fills once every frame is known.
+//! Grown calls: in an image whose task stacks grow, a direct call closing a cycle of the calls emitted so far, and a call of a function value whose type demands no `stack N`, go through a wrapper. The wrapper writes the call's arguments into a record and has the `Grow` support routine run its thunk, which makes the call from the record, on the running stack when it has the room the thunk needs and on a new stack segment otherwise. Each thunk's need is a word of a table the lowering fills once every frame is known. On every target, a call of a served capability's method has `Grow` run the thunk of its code likewise, needing the `stack N` its head demands.
 
 /// The symbol of the table of grown calls' needs.
 const GROWN_NEEDS: Str = "_NSstack_switch_needs"
@@ -131,6 +131,40 @@ fn Lowering.call_code(mut self, mut fx: Fx, take signature: clif::Signature, cod
     }
     return mut fx.b.call(reference, args: values.view())
 } Lowering.call_code
+
+/// Calls code through its address on a stack with room for the `stack` bytes its head
+/// demands and the stub call bound of the thunk calling it: through `Grow`, on the running
+/// task's stack when it has that room and on a new segment of it otherwise, giving the call's
+/// results. A call on a stack other than a running task's traps (`trap.exhausted`).
+fn Lowering.call_with_room(mut self, mut fx: Fx, take signature: clif::Signature, code: clif::Value, args: Slice[clif::Value], stack: u64) -> mem::List[clif::Value] {
+    var returns = mem::List[clif::Type].empty(fx.alloc)
+    for result in signature.returns {
+        mut returns.push(result.value_type)
+    }
+    var slots = grown_slots(signature)
+    if u64.widen(args.len()) + 1 > slots {
+        slots = u64.widen(args.len()) + 1
+    }
+    let thunk = mut self.thunk(GrownCall.Value(take signature))
+    let record = mut fx.slot(GROWN_SLOT * slots, align: GROWN_SLOT)
+    mut fx.store(code, addr: record, offset: 0)
+    for at in 0..<args.len() {
+        mut fx.store(args[at], addr: record, offset: GROWN_SLOT * (u64.widen(at) + 1))
+    }
+    let off = off_task_stack(mut self, mut fx, here: record)
+    mut fx.if_true(off, then: fn[mut self](mut fx1: Fx) {
+        raise_kind(mut self, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let thunk_ref = mut self.func_ref(mut fx, id: thunk)
+    let thunk_address = mut fx.b.func_addr(PTR, func_ref: thunk_ref)
+    let need = mut fx.ptr(stack + STUB_CALL_BOUND)
+    discard mut self.call_routine(mut fx, routine: Routine.Grow, args: fx.list3(thunk_address, b: record, c: need).view())
+    var results = mem::List[clif::Value].empty(fx.alloc)
+    for at in 0..<returns.len() {
+        mut results.push(mut fx.load(returns[at], addr: record, offset: GROWN_SLOT * u64.widen(at)))
+    }
+    return results
+} Lowering.call_with_room
 
 /// The wrapper of a grown call, defined after its thunk when first asked for.
 fn Lowering.wrapper(mut self, called: GrownCall) -> object::FuncId {

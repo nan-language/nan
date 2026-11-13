@@ -1014,6 +1014,9 @@ pub enum Invoked {
     Bound(FuncId, usize, FuncId),
     /// Code at an address taking no environment, with the `stack N` its head demands.
     Code(IrValue, Option<u64>),
+    /// Code at an address taking no environment, run on a stack with room for the `stack N` its
+    /// head demands.
+    Room(IrValue, u64),
     /// A function value at an address, with the `stack N` its type demands.
     Value(IrValue, Option<u64>),
 }
@@ -1024,6 +1027,29 @@ pub struct Called {
     pub failed: Option<IrValue>,
     pub failure: Option<IrValue>,
     pub result: Held,
+}
+
+/// What a call of a calling form gives from the results of its call, the slot of its result when
+/// returned indirectly and the slot of its failure.
+fn called(
+    abi: &Abi,
+    results: Vec<IrValue>,
+    sret: Option<IrValue>,
+    failure: Option<IrValue>,
+) -> Called {
+    let mut results = results.into_iter();
+    let failed = abi.flagged.then(|| results.next().expect("a failure flag"));
+    let result = match abi.returned {
+        Returned::Scalar(_) => Held::Scalar(results.next().expect("a result")),
+        Returned::Part => Held::Address(results.next().expect("a part")),
+        Returned::Indirect => Held::Address(sret.expect("a result slot")),
+        Returned::Empty => Held::Empty,
+    };
+    Called {
+        failed,
+        failure,
+        result,
+    }
 }
 
 impl Lowering<'_, '_> {
@@ -1052,6 +1078,10 @@ impl Lowering<'_, '_> {
                 let reference = self.call_ref(fx, id);
                 fx.b.ins().call(reference, &values)
             }
+            Invoked::Room(code, stack) => {
+                let results = self.call_with_room(fx, abi.signature(), code, &values, stack);
+                return called(abi, results, sret, failure);
+            }
             Invoked::Bound(callee, position, function) => {
                 let reference = self.func_ref(fx, callee);
                 let inst = fx.b.ins().call(reference, &values);
@@ -1078,19 +1108,8 @@ impl Lowering<'_, '_> {
                 inst
             }
         };
-        let mut results = fx.b.inst_results(inst).to_vec().into_iter();
-        let failed = abi.flagged.then(|| results.next().expect("a failure flag"));
-        let result = match abi.returned {
-            Returned::Scalar(_) => Held::Scalar(results.next().expect("a result")),
-            Returned::Part => Held::Address(results.next().expect("a part")),
-            Returned::Indirect => Held::Address(sret.expect("a result slot")),
-            Returned::Empty => Held::Empty,
-        };
-        Called {
-            failed,
-            failure,
-            result,
-        }
+        let results = fx.b.inst_results(inst).to_vec();
+        called(abi, results, sret, failure)
     }
 
     /// A slot for the failure a call of a calling form writes, of its failure type, or a word

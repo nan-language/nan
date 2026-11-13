@@ -9,6 +9,7 @@
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
 
 use super::super::Lowering;
+use super::super::abi::Abi;
 use super::super::body::Held;
 use super::super::call::{Called, Invoked};
 use super::super::fx::{Fx, PTR};
@@ -73,7 +74,14 @@ pub fn call(
     let method = method_index(lo, interface, method);
     let slot = kind_slot(fx, service);
     let code = fx.load(PTR, table, 8 * (u64::from(method) + 3));
-    invoke(lo, fx, interface, method, code, slot, args)
+    let (abi, stack) = method_abi(lo, interface, method);
+    let mut held = vec![Held::Address(slot)];
+    held.extend_from_slice(args);
+    let invoked = match stack {
+        Some(stack) => Invoked::Room(code, stack),
+        None => Invoked::Code(code, None),
+    };
+    lo.invoke(fx, invoked, &abi, &held)
 }
 
 /// A slot holding the handle of a kind, which its methods take as `self`.
@@ -83,20 +91,11 @@ fn kind_slot(fx: &mut Fx, service: Value) -> Value {
     slot
 }
 
-fn invoke(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    interface: ItemId,
-    method: u32,
-    code: Value,
-    slot: Value,
-    args: &[Held],
-) -> Called {
+/// The calling form of a service interface's method and the `stack N` its head demands.
+fn method_abi(lo: &mut Lowering, interface: ItemId, method: u32) -> (Abi, Option<u64>) {
     let abi = lo.dyn_abi(interface, &no_args(), method);
     let (head, _) = lo.method_head(&Ty::Unit, interface, &no_args(), method);
-    let mut held = vec![Held::Address(slot)];
-    held.extend_from_slice(args);
-    lo.invoke(fx, Invoked::Code(code, head.limits.stack), &abi, &held)
+    (abi, head.limits.stack)
 }
 
 /// An operation of a served `Fs` opening, reading, writing or removing a file: the kind's method
@@ -269,14 +268,8 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, served: Value) {
     let interface = service_interface(lo, "FsService");
     let method = method_index(lo, interface, "release");
     let slot = kind_slot(fx, service);
-    invoke(
-        lo,
-        fx,
-        interface,
-        method,
-        code,
-        slot,
-        &[Held::Scalar(number)],
-    );
+    let (abi, stack) = method_abi(lo, interface, method);
+    let held = [Held::Address(slot), Held::Scalar(number)];
+    lo.invoke(fx, Invoked::Code(code, stack), &abi, &held);
     lo.record_free(fx, served);
 }

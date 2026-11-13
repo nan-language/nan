@@ -163,13 +163,13 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     }
 }
 
-/// A task stack of `len` bytes whose lowest page is an inaccessible guard on a host target, zero
-/// when the system refuses; a machine target draws it as a runtime record, its guard region
-/// unprotected since its stacks have static bounds.
-pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value) -> Value {
+/// A stack of `len` bytes whose lowest page is an inaccessible guard on a host target when
+/// `guarded`, zero when the system refuses; a machine target draws it as a runtime record, its
+/// guard region unprotected since its stacks have static bounds.
+pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> Value {
     match lo.machine() {
         true => lo.record_alloc(fx, len),
-        false => host::map_stack(lo, fx, len),
+        false => host::map_stack(lo, fx, len, guarded),
     }
 }
 

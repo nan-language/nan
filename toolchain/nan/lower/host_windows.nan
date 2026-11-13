@@ -10,7 +10,7 @@ const HEAP_ZERO_MEMORY: i64 = 8
 
 const MEM_COMMIT_RESERVE: i64 = 0x3000
 
-const MEM_RELEASE: i64 = 0x8000
+const MEM_RELEASE_ALL: i64 = 0x8000
 
 const PAGE_READWRITE: i64 = 4
 
@@ -50,7 +50,7 @@ const KEY_TERMINATION: i64 = 2
 
 const KEY_REQUEST: i64 = 3
 
-const INFINITE: i64 = 0xFFFF_FFFF
+const WAIT_INFINITE: i64 = 0xFFFF_FFFF
 
 /// The status a termination request ends the process with, `STATUS_CONTROL_C_EXIT`.
 const CONTROL_C_EXIT: i64 = 0xC000_013A
@@ -70,13 +70,13 @@ const PAGE_GUARD: i64 = 0x100
 /// The offsets in a thread's environment block of the bounds of the stack it runs on: its top,
 /// the lowest address of its usable part, the base of its reservation, and the bytes of its
 /// guard region the system keeps for a stack overflow's handler.
-const STACK_BASE: u64 = 0x8
+const TEB_STACK_BASE: u64 = 0x8
 
-const STACK_LIMIT: u64 = 0x10
+const TEB_STACK_LIMIT: u64 = 0x10
 
-const DEALLOCATION_STACK: u64 = 0x1478
+const TEB_DEALLOCATION_STACK: u64 = 0x1478
 
-const GUARANTEED_STACK_BYTES: u64 = 0x1748
+const TEB_GUARANTEED_STACK_BYTES: u64 = 0x1748
 
 /// The code of a stack overflow exception, the offsets in an exception record of its parameter
 /// count and of the parameter holding the faulting address, and the offsets of the record and
@@ -110,13 +110,13 @@ struct WindowsSaved derives Copy {
     size: u64
     flags_at: u64
     flags: i64
-    registers: Context
+    offsets: Context
 } WindowsSaved
 
 fn windows_saved(arch: workspace::Arch) -> WindowsSaved {
     return match arch {
-        workspace::Arch.Amd64 => WindowsSaved(size: 0x4D0, flags_at: 0x30, flags: 0x10_0003, registers: Context(arg: 0xB0, fp: 0xA0, sp: 0x98, ip: 0xF8, link: None))
-        workspace::Arch.Aarch64 => WindowsSaved(size: 0x390, flags_at: 0, flags: 0x40_0003, registers: Context(arg: 0x8, fp: 0xF0, sp: 0x100, ip: 0x108, link: Some(0xF8u64)))
+        workspace::Arch.Amd64 => WindowsSaved(size: 0x4D0, flags_at: 0x30, flags: 0x10_0003, offsets: Context(arg: 0xB0, fp: 0xA0, sp: 0x98, ip: 0xF8, link: None))
+        workspace::Arch.Aarch64 => WindowsSaved(size: 0x390, flags_at: 0, flags: 0x40_0003, offsets: Context(arg: 0x8, fp: 0xF0, sp: 0x100, ip: 0x108, link: Some(0xF8u64)))
     }
 } windows_saved
 
@@ -230,7 +230,7 @@ fn windows_entry_seam(mut lo: Lowering, program: Program) {
         discard mut seam_fx.entry()
         mut seam_lo.check_level(fx: mut seam_fx)
         system_start(mut seam_lo, fx: mut seam_fx)
-        run_entry(mut seam_lo, fx: mut seam_fx, program, entry, landing: mem::List[clif::Value].empty(seam_fx.alloc).view())
+        run_entry(mut seam_lo, fx: mut seam_fx, program, entry, passed: mem::List[clif::Value].empty(seam_fx.alloc).view())
     })
 } windows_entry_seam
 
@@ -263,8 +263,8 @@ fn windows_words(mut lo: Lowering, mut fx: Fx, line: clif::Value) -> CommandWord
         system_unavailable(mut lo, fx: mut fx1)
     })
     discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(copy, b: line, c: size).view())
-    let first = mut fx.load(clif::Type.Int8, addr: copy, offset: 0)
-    let quoted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: first, y: i64.widen(b'"'))
+    let leading = mut fx.load(clif::Type.Int8, addr: copy, offset: 0)
+    let quoted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: leading, y: i64.widen(b'"'))
     let start = mut fx.b.uextend(PTR, x: quoted)
     let program_end = mut fx.repeat(fx.list1(start).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         expect state.len() == 1
@@ -479,8 +479,8 @@ fn windows_start_threads(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(port, addr: state_address, offset: STATE_PORT)
     let count = windows_processors(mut lo, mut fx)
     let threads = windows_thread_records(mut lo, mut fx, count)
-    let first = mut fx.load(PTR, addr: threads, offset: 0)
-    let refused = windows_thread_start(mut lo, mut fx, record: first)
+    let first_thread = mut fx.load(PTR, addr: threads, offset: 0)
+    let refused = windows_thread_start(mut lo, mut fx, record: first_thread)
     unavailable_if(mut fx, condition: refused)
     windows_handle_faults(mut lo, mut fx)
     let handler_id = windows_control_handler(mut lo)
@@ -617,8 +617,8 @@ fn windows_processors(mut lo: Lowering, mut fx: Fx) -> clif::Value {
 fn windows_handle_faults(mut lo: Lowering, mut fx: Fx) {
     let handler_id = windows_fault_handler(mut lo)
     let handler = windows_function_address(mut lo, mut fx, id: handler_id)
-    let first = mut fx.ptr(1)
-    let added = first_result(mut lo.call_system(mut fx, name: "AddVectoredExceptionHandler", args: fx.list2(first, b: handler).view(), returns: fx.types1(PTR).view()))
+    let call_first = mut fx.ptr(1)
+    let added = first_result(mut lo.call_system(mut fx, name: "AddVectoredExceptionHandler", args: fx.list2(call_first, b: handler).view(), returns: fx.types1(PTR).view()))
     unavailable_unless(mut fx, address: added)
 } windows_handle_faults
 
@@ -634,18 +634,18 @@ fn windows_fault_handler(mut lo: Lowering) -> object::FuncId {
         let code = mut fx1.b.uextend(PTR, x: code32)
         let overflow = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: STACK_OVERFLOW)
         mut fx1.if_true(overflow, then: fn[mut lo1](mut fx2: Fx) {
-            let registers = windows_saved(lo1.arch()).registers
+            let offsets = windows_saved(lo1.arch()).offsets
             let count = mut fx2.load(clif::Type.Int32, addr: record, offset: PARAMETER_COUNT)
             let addressed = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: count, y: 2)
             let fault = mut fx2.choose(addressed, results: fx2.types1(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
                 let given = mut fx3.load(PTR, addr: record, offset: WINDOWS_FAULT_ADDRESS)
                 return fx3.list1(given)
             }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
-                let pointer = mut fx3.load(PTR, addr: context, offset: registers.sp)
-                return fx3.list1(pointer)
+                let stack_pointer = mut fx3.load(PTR, addr: context, offset: offsets.sp)
+                return fx3.list1(stack_pointer)
             })
             let thread = mut lo1.thread(mut fx2)
-            let guarded = overflow_interrupted(mut lo1, fx: mut fx2, thread, fault: fault[0], context, ctx: registers)
+            let guarded = overflow_interrupted(mut lo1, fx: mut fx2, thread, fault: fault[0], context, ctx: offsets)
             mut fx2.if_true(guarded, then: fn[mut lo1](mut fx3: Fx) {
                 let top = mut fx3.load(PTR, addr: thread, offset: THREAD_TRAP_STACK)
                 let low = mut fx3.b.iadd_imm_s(top, y: -i64.fit(WINDOWS_TRAP_STACK))
@@ -701,16 +701,16 @@ fn windows_suspend_and_stop(mut lo: Lowering, mut fx: Fx, thread: clif::Value) {
     let count = first_result(mut lo.call_system(mut fx, name: "SuspendThread", args: fx.list1(handle).view(), returns: fx.types1(clif::Type.Int32).view()))
     let suspended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: -1)
     mut fx.if_true(suspended, then: fn[mut lo](mut fx1: Fx) {
-        let layout = windows_saved(lo.arch())
-        let context = mut fx1.slot(layout.size, align: 16)
-        let flags = mut fx1.int(clif::Type.Int32, value: layout.flags)
-        mut fx1.store(flags, addr: context, offset: layout.flags_at)
+        let saved = windows_saved(lo.arch())
+        let context = mut fx1.slot(saved.size, align: 16)
+        let flags = mut fx1.int(clif::Type.Int32, value: saved.flags)
+        mut fx1.store(flags, addr: context, offset: saved.flags_at)
         let got = first_result(mut lo.call_system(mut fx1, name: "GetThreadContext", args: fx1.list2(handle, b: context).view(), returns: fx1.types1(clif::Type.Int32).view()))
         let read = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: got, y: 0)
         mut fx1.if_true(read, then: fn[mut lo](mut fx2: Fx) {
-            let before = mut fx2.load(PTR, addr: context, offset: layout.registers.ip)
-            stop_interrupted(mut lo, fx: mut fx2, thread, context, ctx: layout.registers)
-            let after = mut fx2.load(PTR, addr: context, offset: layout.registers.ip)
+            let before = mut fx2.load(PTR, addr: context, offset: saved.offsets.ip)
+            stop_interrupted(mut lo, fx: mut fx2, thread, context, ctx: saved.offsets)
+            let after = mut fx2.load(PTR, addr: context, offset: saved.offsets.ip)
             let redirected = mut fx2.b.icmp(clif::IntCC.NotEqual, x: before, y: after)
             mut fx2.if_true(redirected, then: fn[mut lo](mut fx3: Fx) {
                 discard mut lo.call_system(mut fx3, name: "SetThreadContext", args: fx3.list2(handle, b: context).view(), returns: fx3.types1(clif::Type.Int32).view())
@@ -749,8 +749,8 @@ fn windows_take_packets(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value])
     let count = mut fx.int(clif::Type.Int32, value: i64.fit(PORT_ENTRIES))
     let timeout = match wait {
         Some(waiting) => first_result(mut fx.choose_in(mut lo, condition: waiting, results: fx.types1(clif::Type.Int32).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-            let first = windows_first_timeout(mut lo1, fx: mut fx1)
-            return fx1.list1(first)
+            let due_ms = windows_first_timeout(mut lo1, fx: mut fx1)
+            return fx1.list1(due_ms)
         }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
             let polled = mut fx1.int(clif::Type.Int32, value: 0)
             return fx1.list1(polled)
@@ -793,15 +793,15 @@ fn windows_handle_packet(mut lo: Lowering, mut fx: Fx, key: clif::Value, overlap
     })
 } windows_handle_packet
 
-/// The milliseconds until the first timer is due, rounded up, `INFINITE` without one.
+/// The milliseconds until the first timer is due, rounded up, `WAIT_INFINITE` without one.
 fn windows_first_timeout(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let state_address = mut lo.state(mut fx)
     let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
-    let first = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
-    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: first, y: 0)
+    let earliest = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: earliest, y: 0)
     let due = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let first_due = mut fx1.load(PTR, addr: first, offset: OPERATION_DUE)
+        let first_due = mut fx1.load(PTR, addr: earliest, offset: OPERATION_DUE)
         return fx1.list1(first_due)
     }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
         let never = mut fx1.int(PTR, value: -1)
@@ -819,10 +819,10 @@ fn windows_first_timeout(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let partial = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
     let partial_word = mut fx.b.uextend(PTR, x: partial)
     let rounded = mut fx.b.iadd(whole_ms, y: partial_word)
-    let longest = mut fx.ptr(u64.fit(INFINITE - 1))
+    let longest = mut fx.ptr(u64.fit(WAIT_INFINITE - 1))
     let bounded = mut fx.b.umin(rounded, y: longest)
     let ms = mut fx.b.ireduce(clif::Type.Int32, x: bounded)
-    let forever = mut fx.int(clif::Type.Int32, value: INFINITE)
+    let forever = mut fx.int(clif::Type.Int32, value: WAIT_INFINITE)
     return mut fx.b.select(armed, x: ms, y: forever)
 } windows_first_timeout
 
@@ -874,10 +874,10 @@ fn windows_expire(mut lo: Lowering, mut fx: Fx) {
         let state_address = mut lo.state(mut fx1)
         let lock = mut fx1.offset(state_address, offset: STATE_TIMER_LOCK)
         discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
-        let first = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
-        let armed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: first, y: 0)
+        let earliest = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
+        let armed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: earliest, y: 0)
         let due = mut fx1.choose(armed, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let first_due = mut fx2.load(PTR, addr: first, offset: OPERATION_DUE)
+            let first_due = mut fx2.load(PTR, addr: earliest, offset: OPERATION_DUE)
             let passed = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: first_due, y: now)
             return fx2.list1(passed)
         }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
@@ -885,13 +885,13 @@ fn windows_expire(mut lo: Lowering, mut fx: Fx) {
             return fx2.list1(no)
         })
         mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
-            disarm(mut lo, fx: mut fx2, op: first)
-            claim_timer(mut fx2, op: first)
+            disarm(mut lo, fx: mut fx2, op: earliest)
+            claim_timer(mut fx2, op: earliest)
         })
         discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
         mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
             let expired = mut fx2.int(clif::Type.Int32, value: TASKS_EXPIRED)
-            deliver(mut lo, fx: mut fx2, op: first, result: expired)
+            deliver(mut lo, fx: mut fx2, op: earliest, result: expired)
         })
         return Pass(again: due[0], next: mem::List[clif::Value].empty(fx1.alloc))
     })
@@ -982,7 +982,7 @@ fn windows_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif:
 /// Releases memory `windows_commit` or `windows_map_chunks` gave, a whole reservation at once.
 fn windows_unmap(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
     let whole = mut fx.ptr(0)
-    let release = mut fx.int(clif::Type.Int32, value: MEM_RELEASE)
+    let release = mut fx.int(clif::Type.Int32, value: MEM_RELEASE_ALL)
     discard mut lo.call_system(mut fx, name: "VirtualFree", args: fx.list3(address, b: whole, c: release).view(), returns: fx.types1(clif::Type.Int32).view())
 } windows_unmap
 
@@ -1022,10 +1022,10 @@ fn windows_protect(mut lo: Lowering, mut fx: Fx, base: clif::Value, offset: u64,
 /// The bounds of the stack the running thread runs on, as its environment block records them.
 fn windows_stack_bounds(mut lo: Lowering, mut fx: Fx) -> StackBounds {
     let teb = first_result(mut lo.call_stub(mut fx, stub: Stub.Teb, args: mem::List[clif::Value].empty(fx.alloc).view()))
-    let base = mut fx.load(PTR, addr: teb, offset: STACK_BASE)
-    let limit = mut fx.load(PTR, addr: teb, offset: STACK_LIMIT)
-    let deallocation = mut fx.load(PTR, addr: teb, offset: DEALLOCATION_STACK)
-    let guaranteed = mut fx.load(clif::Type.Int32, addr: teb, offset: GUARANTEED_STACK_BYTES)
+    let base = mut fx.load(PTR, addr: teb, offset: TEB_STACK_BASE)
+    let limit = mut fx.load(PTR, addr: teb, offset: TEB_STACK_LIMIT)
+    let deallocation = mut fx.load(PTR, addr: teb, offset: TEB_DEALLOCATION_STACK)
+    let guaranteed = mut fx.load(clif::Type.Int32, addr: teb, offset: TEB_GUARANTEED_STACK_BYTES)
     return StackBounds(base: base, limit: limit, deallocation: deallocation, guaranteed: guaranteed)
 } windows_stack_bounds
 
@@ -1033,10 +1033,10 @@ fn windows_stack_bounds(mut lo: Lowering, mut fx: Fx) -> StackBounds {
 /// `windows_stack_bounds` gives them.
 fn windows_set_stack_bounds(mut lo: Lowering, mut fx: Fx, bounds: StackBounds) {
     let teb = first_result(mut lo.call_stub(mut fx, stub: Stub.Teb, args: mem::List[clif::Value].empty(fx.alloc).view()))
-    mut fx.store(bounds.base, addr: teb, offset: STACK_BASE)
-    mut fx.store(bounds.limit, addr: teb, offset: STACK_LIMIT)
-    mut fx.store(bounds.deallocation, addr: teb, offset: DEALLOCATION_STACK)
-    mut fx.store(bounds.guaranteed, addr: teb, offset: GUARANTEED_STACK_BYTES)
+    mut fx.store(bounds.base, addr: teb, offset: TEB_STACK_BASE)
+    mut fx.store(bounds.limit, addr: teb, offset: TEB_STACK_LIMIT)
+    mut fx.store(bounds.deallocation, addr: teb, offset: TEB_DEALLOCATION_STACK)
+    mut fx.store(bounds.guaranteed, addr: teb, offset: TEB_GUARANTEED_STACK_BYTES)
 } windows_set_stack_bounds
 
 /// Records a task's own stack as the running thread's: from its base, its guard region, then

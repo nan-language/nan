@@ -47,6 +47,15 @@ const OPERATION_ABORTED: i64 = 995
 /// more.
 const ACCEPT_ADDRESS: u64 = 44
 
+/// A request's arguments: its kind, its handle and the three words its kind gives meaning to.
+struct RequestArgs derives Copy {
+    kind: clif::Value
+    handle: clif::Value
+    a: clif::Value
+    b: clif::Value
+    c: clif::Value
+} RequestArgs
+
 /// `Request(kind, handle, a, b, c) -> (refused, result)`: runs a request of the running task on
 /// `handle` and parks until it completes. A transfer calls `ReadFile` or `WriteFile` of `b`
 /// bytes at `a`, through the completion port or, with `REQUEST_BLOCKING`, on a thread of its
@@ -58,11 +67,8 @@ const ACCEPT_ADDRESS: u64 = 44
 fn windows_define_request(mut lo: Lowering, mut fx: Fx) {
     let params = mut fx.entry()
     expect params.len() == 5
-    let kind = params[0]
-    let handle = params[1]
-    let a = params[2]
-    let b = params[3]
-    let c = params[4]
+    let given = RequestArgs(kind: params[0], handle: params[1], a: params[2], b: params[3], c: params[4])
+    let handle = given.handle
     let record = current_task(mut lo, mut fx)
     let region = mut fx.load(PTR, addr: record, offset: TASKS_TASK_REGION)
     let origin_before = regions_origin(mut fx, region)
@@ -79,10 +85,55 @@ fn windows_define_request(mut lo: Lowering, mut fx: Fx) {
     let op = mut fx.b.iadd_imm_s(request, y: i64.fit(REQUEST_OP))
     mut fx.store(record, addr: op, offset: OPERATION_TASK)
     mut fx.store(handle, addr: op, offset: OPERATION_WAITER)
-    let transfer = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: kind, y: REQUEST_ACCEPT)
-    let blocking_bit = mut fx.b.band_imm_s(kind, y: REQUEST_BLOCKING)
+    let transfer = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: given.kind, y: REQUEST_ACCEPT)
+    let blocking_bit = mut fx.b.band_imm_s(given.kind, y: REQUEST_BLOCKING)
     let blocking = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: blocking_bit, y: 0)
-    let started = mut fx.choose_in(mut lo, condition: transfer, results: fx.types2(clif::Type.Int8, b: clif::Type.Int64).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+    let started = windows_start_request(mut lo, mut fx, request, given, transfer, blocking)
+    expect started.len() == 2
+    let refused = mut fx.b.bxor_imm_s(started[0], y: 1)
+    mut fx.if_true(refused, then: fn(mut fx1: Fx) {
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        mut fx1.b.ret(fx1.list2(no, b: started[1]).view())
+    })
+    let word = mut fx.offset(record, offset: TASK_IO)
+    mut fx.atomic_store(op, addr: word)
+    let origin_started = regions_origin(mut fx, region)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_started, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.cancel_operation(mut fx1, op)
+    })
+    wait_delivered(mut lo, mut fx, op)
+    release_io(mut lo, mut fx, word, op)
+    let result = mut fx.choose_in(mut lo, condition: blocking, results: fx.types1(clif::Type.Int64).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let thread = mut fx1.load(PTR, addr: op, offset: OPERATION_LINK)
+        discard mut lo1.call_system(mut fx1, name: "CloseHandle", args: fx1.list1(thread).view(), returns: fx1.types1(clif::Type.Int32).view())
+        let transferred = mut fx1.load(clif::Type.Int64, addr: request, offset: REQUEST_OUTCOME)
+        return fx1.list1(transferred)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let count = mut fx1.b.iadd_imm_s(request, y: i64.fit(REQUEST_COUNT))
+        let wait = mut fx1.int(clif::Type.Int32, value: 0)
+        let done = first_result(mut lo1.call_system(mut fx1, name: "GetOverlappedResult", args: fx1.list4(handle, b: request, c: count, d: wait).view(), returns: fx1.types1(clif::Type.Int32).view()))
+        let outcome = windows_outcome(mut lo1, fx: mut fx1, done, count)
+        return fx1.list1(outcome)
+    })
+    let aborted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result[0], y: -OPERATION_ABORTED)
+    let origin_after = regions_origin(mut fx, region)
+    let cancelled_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_after, y: 0)
+    let failed = mut fx.b.band(aborted, y: cancelled_after)
+    mut fx.b.ret(fx.list2(failed, b: result[0]).view())
+} windows_define_request
+
+/// Starts a request of `Request` in the frame record at `request`: a transfer through the
+/// completion port or, when `blocking`, on a thread of its own, and otherwise an accept or a
+/// connect. Gives whether the call starting it left it to complete, and otherwise the negated
+/// error code.
+fn windows_start_request(mut lo: Lowering, mut fx: Fx, request: clif::Value, given: RequestArgs, transfer: clif::Value, blocking: clif::Value) -> mem::List[clif::Value] {
+    let kind = given.kind
+    let handle = given.handle
+    let a = given.a
+    let b = given.b
+    let c = given.c
+    return mut fx.choose_in(mut lo, condition: transfer, results: fx.types2(clif::Type.Int8, b: clif::Type.Int64).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         return mut fx1.choose_in(mut lo1, condition: blocking, results: fx1.types2(clif::Type.Int8, b: clif::Type.Int64).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             return windows_start_blocking(mut lo2, fx: mut fx2, request, kind, buffer: a, len: b)
         }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
@@ -117,39 +168,7 @@ fn windows_define_request(mut lo: Lowering, mut fx: Fx) {
         })
         return windows_pending(mut lo1, fx: mut fx1, called: called[0])
     })
-    expect started.len() == 2
-    let refused = mut fx.b.bxor_imm_s(started[0], y: 1)
-    mut fx.if_true(refused, then: fn(mut fx1: Fx) {
-        let no = mut fx1.int(clif::Type.Int8, value: 0)
-        mut fx1.b.ret(fx1.list2(no, b: started[1]).view())
-    })
-    let word = mut fx.offset(record, offset: TASK_IO)
-    mut fx.atomic_store(op, addr: word)
-    let origin_started = regions_origin(mut fx, region)
-    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_started, y: 0)
-    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
-        mut lo.cancel_operation(mut fx1, op)
-    })
-    wait_delivered(mut lo, mut fx, op)
-    release_io(mut lo, mut fx, word, op)
-    let result = mut fx.choose_in(mut lo, condition: blocking, results: fx.types1(clif::Type.Int64).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let thread = mut fx1.load(PTR, addr: op, offset: OPERATION_LINK)
-        discard mut lo1.call_system(mut fx1, name: "CloseHandle", args: fx1.list1(thread).view(), returns: fx1.types1(clif::Type.Int32).view())
-        let transferred = mut fx1.load(clif::Type.Int64, addr: request, offset: REQUEST_OUTCOME)
-        return fx1.list1(transferred)
-    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let count = mut fx1.b.iadd_imm_s(request, y: i64.fit(REQUEST_COUNT))
-        let wait = mut fx1.int(clif::Type.Int32, value: 0)
-        let done = first_result(mut lo1.call_system(mut fx1, name: "GetOverlappedResult", args: fx1.list4(handle, b: request, c: count, d: wait).view(), returns: fx1.types1(clif::Type.Int32).view()))
-        let given = windows_outcome(mut lo1, fx: mut fx1, done, count)
-        return fx1.list1(given)
-    })
-    let aborted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result[0], y: -OPERATION_ABORTED)
-    let origin_after = regions_origin(mut fx, region)
-    let cancelled_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_after, y: 0)
-    let failed = mut fx.b.band(aborted, y: cancelled_after)
-    mut fx.b.ret(fx.list2(failed, b: result[0]).view())
-} windows_define_request
+} windows_start_request
 
 /// Whether a call starting a request left it to complete through the completion port, true
 /// when it succeeded or left it pending, and otherwise the negated error code it gives.

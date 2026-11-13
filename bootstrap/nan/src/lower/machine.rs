@@ -256,7 +256,20 @@ impl Lowering<'_, '_> {
     /// x86_64; on AArch64, which Cranelift's backend cannot, a compiler stub does, keeping the
     /// floating-point registers host code keeps across calls, which the tasks of an isolated
     /// space share, or on another machine executor, whose tasks own their extended state, none.
+    /// On a Windows target the running stack's bounds in the thread's environment block are kept
+    /// across the switch and recorded again, on the thread it resumes on, once it resumes.
     pub fn switch_stacks(&mut self, fx: &mut Fx, store: Value, load: Value, payload: Value) {
+        let bounds = self
+            .windows()
+            .then(|| super::host::windows::stack_bounds(self, fx));
+        self.switch_only(fx, store, load, payload);
+        if let Some(bounds) = bounds {
+            super::host::windows::set_stack_bounds(self, fx, bounds);
+        }
+    }
+
+    /// The switch of `switch_stacks`.
+    fn switch_only(&mut self, fx: &mut Fx, store: Value, load: Value, payload: Value) {
         match self.ck.db.target.arch() {
             Some(Arch::Aarch64) => {
                 let stub = match self.machine() && !self.user() {

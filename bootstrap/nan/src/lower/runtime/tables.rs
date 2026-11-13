@@ -1050,6 +1050,7 @@ impl Lowering<'_, '_> {
     /// The function of the target's platform package named `name`.
     fn platform_function(&self, name: &str) -> ItemId {
         let platform = match self.ck.db.target.kind() {
+            Some(Kind::Windows) => "windows_platform",
             Some(Kind::Uefi) => "uefi_platform",
             Some(Kind::Bare) => "bare_platform",
             _ => "linux_platform",

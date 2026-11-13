@@ -167,6 +167,9 @@ pub enum Routine {
     /// `(entry) -> (cancelled, result)`: submits an io_uring entry and waits for its
     /// completion or its acknowledged cancellation.
     IoSubmit,
+    /// `(kind, handle, a, b, c) -> (cancelled, result)`: runs a Windows request on a handle and
+    /// waits for its completion or its acknowledged cancellation.
+    Request,
     /// `() -> Never`: runs the executor's scheduler on the calling thread.
     Schedule,
     /// `(thread) -> Never`: the start routine of an executor thread.
@@ -198,9 +201,10 @@ pub enum Routine {
     Yield,
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
     Stream,
-    /// `() -> nanoseconds`: a kernel's clock.
+    /// `() -> nanoseconds`: a kernel's clock, or a Windows target's monotonic clock.
     ClockNow,
-    /// `(op, ns)`: arms a timer of a kernel's clock expiring `ns` nanoseconds from now.
+    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows target's monotonic clock,
+    /// expiring `ns` nanoseconds from now.
     TimerArm,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
@@ -271,6 +275,7 @@ impl Routine {
             Routine::GrownStart => "_NSstack_switch_grown_start",
             Routine::Nested => "_NSstack_switch_nested",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
+            Routine::Request => "_NSstack_switch_request",
             Routine::Schedule => "_NSstack_switch_schedule",
             Routine::ThreadMain => "_NSstack_switch_thread_main",
             Routine::Terminations => "_NSstack_switch_terminations",
@@ -361,6 +366,7 @@ impl Routine {
             Routine::Draw => (&[P, P, P, P], &[P]),
             Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
             Routine::IoSubmit => (&[P], &[types::I8, types::I32]),
+            Routine::Request => (&[P, P, P, P, P], &[types::I8, types::I64]),
         }
     }
 
@@ -398,14 +404,14 @@ pub mod state {
     pub const PROCESS: u64 = 80;
     /// The entry task.
     pub const ENTRY_TASK: u64 = 88;
-    /// The signal number of the first termination request, zero before one.
+    /// The status the first termination request ends the process with, zero before one.
     pub const TERMINATION: u64 = 96;
     /// The operation reading termination requests.
     pub const SIGNALS: u64 = 104;
     /// Every live task, linked through their records, and the lock of that list.
     pub const TASKS: u64 = 120;
     pub const TASKS_LOCK: u64 = 128;
-    /// On a kernel, the lock of the timers.
+    /// On a kernel and a Windows target, the lock of the timers.
     pub const TIMER_LOCK: u64 = 136;
     /// The last rank a cown took.
     pub const RANKS: u64 = 144;
@@ -418,8 +424,8 @@ pub mod state {
     /// The construct that termination requests cancel, whose region is the entry task.
     pub const ROOT: u64 = 176;
     /// On the seeded scheduler: the run's seed, the index of the scheduling stream's next
-    /// value and the virtual clock's nanoseconds; there and on a kernel, the first timer and
-    /// the last order a task or timer took; on the seeded scheduler, whether a scheduling point
+    /// value and the virtual clock's nanoseconds; there, on a kernel and on a Windows target,
+    /// the first timer and the last order a task or timer took; on the seeded scheduler, whether a scheduling point
     /// found two ready tasks, and the first and last of the completions not yet delivered.
     pub const SEED: u64 = 184;
     pub const PICKS: u64 = 192;
@@ -503,7 +509,11 @@ pub mod state {
     pub const PCI_REMOVAL_LOCK: u64 = 536;
     /// The first of the arms whose charge left their band, linked through the arms.
     pub const LEFT: u64 = 544;
-    pub const SIZE: u64 = 552;
+    /// On a Windows target, the process's I/O completion port and the index of the thread-local
+    /// slot holding the running executor thread's record.
+    pub const PORT: u64 = 552;
+    pub const TLS_INDEX: u64 = 560;
+    pub const SIZE: u64 = 568;
 }
 
 impl Lowering<'_, '_> {
@@ -670,6 +680,8 @@ impl Lowering<'_, '_> {
     pub fn relax(&mut self, fx: &mut Fx) {
         if self.machine() {
             self.call_stub(fx, Stub::Pause, &[]);
+        } else if self.windows() {
+            self.call_system(fx, "SwitchToThread", &[], &[types::I32]);
         } else {
             self.call_libc(fx, "sched_yield", &[], &[types::I32]);
         }
@@ -767,10 +779,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::GrownStart => segments::grown_start(lo, fx),
         Routine::Nested => segments::nested(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),
+        Routine::ClockNow if lo.windows() => super::host::windows::define_clock_now(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::TimerArm => {
             let params = fx.entry();
-            lo.arm_clock(fx, params[0], params[1]);
+            match lo.windows() {
+                true => super::host::windows::arm_timer(lo, fx, params[0], params[1]),
+                false => lo.arm_clock(fx, params[0], params[1]),
+            }
             fx.b.ins().return_(&[]);
         }
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
@@ -784,8 +800,9 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::RecordFree
         | Routine::RecordResize => system::define(lo, fx, routine),
         Routine::Preempt | Routine::Overflow | Routine::CpuLimit | Routine::Terminations => {
-            super::host::define(lo, fx, routine)
+            super::host::linux::define(lo, fx, routine)
         }
+        Routine::Request => super::host::windows::define_request(lo, fx),
     }
 }
 

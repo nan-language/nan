@@ -1,8 +1,9 @@
 //! The system the runtime runs on: the memory of its records and of the chunks cells draw, task
-//! stacks, idling, its standard streams, its start and its exit. On a host target the host module
-//! provides them over the C library and Linux; on a machine target the machine module does, over
-//! the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space
-//! module does, over the boot heap whose chunks it draws and the system calls its kernel serves.
+//! stacks, idling, its standard streams, its start and its exit. On a Linux target the Linux
+//! module provides them over the C library and Linux, and on a Windows target the Windows module
+//! over `kernel32.dll`; on a machine target the machine module does, over the boot heap, the
+//! serial and exit ports and the CPUs; in an isolated space's runtime the space module does, over
+//! the boot heap whose chunks it draws and the system calls its kernel serves.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC};
 
@@ -53,7 +54,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             }
         }
         (_, true) => heap::define(lo, fx, routine),
-        (_, false) => host::define(lo, fx, routine),
+        (_, false) if lo.windows() => host::windows::define(lo, fx, routine),
+        (_, false) => host::linux::define(lo, fx, routine),
     }
 }
 
@@ -89,7 +91,8 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
     match (lo.machine(), lo.user()) {
         (true, true) => space::init(lo, fx),
         (true, false) => lo.machine_init(fx),
-        (false, _) => host::start_threads(lo, fx),
+        (false, _) if lo.windows() => host::windows::start_threads(lo, fx),
+        (false, _) => host::linux::start_threads(lo, fx),
     }
     let zero = fx.ptr(0);
     fx.b.ins().return_(&[zero]);
@@ -140,7 +143,8 @@ pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: V
     match (lo.machine(), lo.user()) {
         (true, false) => lo.serial_write(fx, text, len),
         (true, true) => {}
-        (false, _) => host::write_all(lo, fx, fd, text, len),
+        (false, _) if lo.windows() => host::windows::write_all(lo, fx, fd, text, len),
+        (false, _) => host::linux::write_all(lo, fx, fd, text, len),
     }
 }
 
@@ -148,7 +152,8 @@ pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: V
 pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
     match lo.machine() {
         true => heap::map_chunks(lo, fx, count),
-        false => host::map_chunks(lo, fx, count),
+        false if lo.windows() => host::windows::map_chunks(lo, fx, count),
+        false => host::linux::map_chunks(lo, fx, count),
     }
 }
 
@@ -156,9 +161,10 @@ pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
 pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     match lo.machine() {
         true => heap::unmap_chunks(lo, fx, base, count),
+        false if lo.windows() => host::windows::unmap(lo, fx, base),
         false => {
             let len = fx.b.ins().imul_imm_s(count, memory::CHUNK as i64);
-            host::unmap(lo, fx, base, len);
+            host::linux::unmap(lo, fx, base, len);
         }
     }
 }
@@ -169,7 +175,8 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
 pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> Value {
     match lo.machine() {
         true => lo.record_alloc(fx, len),
-        false => host::map_stack(lo, fx, len, guarded),
+        false if lo.windows() => host::windows::map_stack(lo, fx, len, guarded),
+        false => host::linux::map_stack(lo, fx, len, guarded),
     }
 }
 
@@ -177,35 +184,41 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> V
 pub fn unmap_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, len: Value) {
     match lo.machine() {
         true => lo.record_free(fx, stack),
-        false => host::unmap(lo, fx, stack, len),
+        false if lo.windows() => host::windows::unmap(lo, fx, stack),
+        false => host::linux::unmap(lo, fx, stack, len),
     }
 }
 
 /// Makes the guard region at the base of a stack drawn through a cell inaccessible, or
 /// accessible again, on a host target.
 pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bool) {
-    if !lo.machine() {
-        host::protect_guard(lo, fx, base, accessible);
+    match (lo.machine(), lo.windows()) {
+        (true, _) => {}
+        (false, true) => host::windows::protect_guard(lo, fx, base, accessible),
+        (false, false) => host::linux::protect_guard(lo, fx, base, accessible),
     }
 }
 
-/// Waits until a task may be ready: on a host target in the running thread's ring, handling the
-/// completions that arrive; on a machine target the CPU halts until an interrupt; in an isolated
-/// space until its first timer is due.
+/// Waits until a task may be ready: on a Linux target in the running thread's ring and on a
+/// Windows target on the completion port, handling the completions that arrive; on a machine
+/// target the CPU halts until an interrupt; in an isolated space until its first timer is due.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     match (lo.machine(), lo.user()) {
         (true, false) => {
             lo.call_stub(fx, Stub::IdleWait, &[]);
         }
         (true, true) => space::idle(lo, fx),
-        (false, _) => host::idle(lo, fx),
+        (false, _) if lo.windows() => host::windows::idle(lo, fx),
+        (false, _) => host::linux::idle(lo, fx),
     }
 }
 
 /// Wakes an executor thread waiting idle, other than the running one, so a task made ready runs;
 /// a machine CPU waiting idle wakes on its own timer.
 pub fn wake_idle(lo: &mut Lowering, fx: &mut Fx) {
-    if !lo.machine() {
-        host::wake_idle(lo, fx);
+    match (lo.machine(), lo.windows()) {
+        (true, _) => {}
+        (false, true) => host::windows::wake_idle(lo, fx),
+        (false, false) => host::linux::wake_idle(lo, fx),
     }
 }

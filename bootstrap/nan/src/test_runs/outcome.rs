@@ -1,7 +1,7 @@
 //! A test image as its runs start it, and one run of a test, given the test's number, the run's
 //! index and seed, its replay token and the draws a rerun forces: a process of the image on a
-//! host target, a boot of the emulator on it on a machine target, whose standard output or
-//! serial port carries frames, and how it ended.
+//! Linux target or under Wine on a Windows target, a boot of the emulator on it on a machine
+//! target, whose standard output or serial port carries frames, and how it ended.
 
 use std::fs;
 use std::io;
@@ -12,12 +12,13 @@ use std::process::Command;
 use crate::command::Launch;
 use crate::emulator::{self, Boots};
 use crate::lower::test_image::{RUN_FILE, RUN_START, TIMED_OUT, frame, outcome};
-use crate::workspace::Target;
+use crate::workspace::{Kind, Target};
 
-/// A test image as its runs start it: a host target's executable, or a machine image and the
-/// emulator invocation booting it.
+/// A test image as its runs start it: a Linux target's executable, a Windows target's, which
+/// Wine runs, or a machine image and the emulator invocation booting it.
 pub enum Image {
     Host(PathBuf),
+    Windows(PathBuf),
     Machine(PathBuf, Launch),
 }
 
@@ -25,19 +26,20 @@ impl Image {
     /// The test image at a path, as its runs on a run target start it: a machine image's boot
     /// volume and machine are made once, and every run finds them as they were made.
     pub fn new(target: Target, path: PathBuf) -> io::Result<Image> {
-        Ok(match target.is_machine() {
-            true => {
+        Ok(match target.kind() {
+            _ if target.is_machine() => {
                 let launch = emulator::launch(target, &path, &[], Boots::Fresh)?;
                 Image::Machine(path, launch)
             }
-            false => Image::Host(path),
+            Some(Kind::Windows) => Image::Windows(path),
+            _ => Image::Host(path),
         })
     }
 
     /// Removes the image with its boot volume and machine.
     pub fn discard(self) -> io::Result<()> {
         match self {
-            Image::Host(path) => fs::remove_file(path),
+            Image::Host(path) | Image::Windows(path) => fs::remove_file(path),
             Image::Machine(path, _) => emulator::discard(&path),
         }
     }
@@ -107,8 +109,12 @@ pub fn run(
     ];
     texts.extend(forced.into_iter().flatten().map(i128::to_string));
     let (output, start) = match image {
-        Image::Host(path) => {
-            let output = Command::new(path).args(&texts).output()?;
+        Image::Host(_) | Image::Windows(_) => {
+            let mut command = match image {
+                Image::Windows(path) => emulator::wine(path),
+                Image::Host(path) | Image::Machine(path, _) => Command::new(path),
+            };
+            let output = command.args(&texts).output()?;
             if output.status.code() == Some(TIMED_OUT) || output.status.signal() == Some(24) {
                 return Ok(timed_out());
             }

@@ -1,13 +1,23 @@
 //! Resolution: the greatest acceptable assignment of releases to the dependency sources of a package, and the lock `nan dep sync` and `nan upgrade` write from it, appending the path releases it locks to the local store. `nan upgrade` also forwards the package's uses of retired forms.
 
-/// A package whose locked release changes: its name, its old and new code roots and the class of
-/// the new release with the old as its parent.
+/// A package whose locked release changes: its name, its old and new code roots, the class of
+/// the new release with the old as its parent, the epoch of each exported item of the new release
+/// above 0 that differs from its epoch in the old, and the entries of the new release's authority
+/// summary that the old one's lacks.
 pkg struct Change {
     pkg package_name: text::String
     pkg old: Option[hashing::HashValue]
     pkg new: Option[hashing::HashValue]
     pkg class: store::Class
+    pkg epochs: mem::List[ItemEpoch]
+    pkg widenings: mem::List[machine::SummaryEntry]
 } Change
+
+/// An exported item of a release, by canonical path, and its behaviour epoch.
+pkg struct ItemEpoch {
+    pkg path: text::String
+    pkg epoch: u64
+} ItemEpoch
 
 /// What resolution decides.
 pkg enum Outcome {
@@ -88,8 +98,9 @@ fn pending_root(dir: Str, alloc: mem::Alloc) -> hashing::HashValue {
     return hashing::HashValue.of(pending_code_root(dir, alloc).as_bytes())
 } pending_root
 
-/// A store entry of its pending code root attesting its files, standing for the current state
-/// of a path source's package while candidates are checked.
+/// A store entry by its code root, outside the entries of the local store read: for a candidate
+/// lock, one of its pending code root attesting its files, standing for the current state of a
+/// path source's package.
 struct CurrentEntry {
     root: hashing::HashValue
     entry: mem::Shared[store::Entry]
@@ -677,6 +688,7 @@ fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result
         return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
     }
     var deps = mem::List[machine::Locked].empty(alloc)
+    var appended = mem::List[CurrentEntry].empty(alloc)
     for line in candidate.deps {
         var locked = line.copy(alloc)
         let Some(at) = assigned_at(assigned, package_name: line.package_name.as_str()) else {
@@ -690,10 +702,11 @@ fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result
         }
         let built = judged.session.build(closure, member: workspace::Member.Source(index))
         let check::Built(artefact: artefact_bytes, sources: sources) = built
-        let appended = try local.append(store::Append(package_name: text::String.of(line.package_name.as_str(), alloc), name: None, parent: None, summary: None, artefact: take artefact_bytes, sources: take sources))
-        match appended {
+        let appended_entry = try local.append(store::Append(package_name: text::String.of(line.package_name.as_str(), alloc), name: None, parent: None, summary: None, artefact: take artefact_bytes, sources: take sources))
+        match appended_entry {
             Ok(entry) => {
                 locked.root = entry.root(alloc)
+                mut appended.push(CurrentEntry(root: locked.root, entry: mem::Shared.of(take entry, alloc)))
             }
             Err(exposed) => return Err(take exposed)
         }
@@ -715,7 +728,7 @@ fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result
     lock.deps = deps
     let unlocked = self.root().machine.lock_file.is_none()
     let approved = judged.session.approvals(self.package_index, take lock, all: unlocked)
-    let changes = self.changes(approved.lock)
+    let changes = try self.changes(approved.lock, appended: appended.view())
     var errors = mem::List[diagnostic::Diagnostic].empty(alloc)
     if self.forwarding or not self.own_errors {
         for reported in take judged.session.reported(scope::Scope.Package(self.package_index)) {
@@ -762,38 +775,137 @@ fn root_of(lock: Option[machine::Lock], package_name: Str) -> Option[hashing::Ha
     return None
 } root_of
 
-/// The packages whose locked release a new lock changes, by name.
-fn Resolver.changes(self, lock: machine::Lock) -> mem::List[Change] {
+/// The packages whose locked release a new lock changes, by name, the path releases it locks
+/// that the store did not hold in `appended`.
+fn Resolver.changes(self, lock: machine::Lock, appended: Slice[CurrentEntry]) -> mem::List[Change] fails platform::IoError {
     let alloc = self.alloc
     let current = self.root().machine.lock()
-    var names = mem::List[text::String].empty(alloc)
+    var listed = mem::List[text::String].empty(alloc)
     match current {
         Some(held) => {
             for line in held.deps {
-                mut names.push(text::String.of(line.package_name.as_str(), alloc))
+                mut listed.push(text::String.of(line.package_name.as_str(), alloc))
             }
         }
         None => {}
     }
     for line in lock.deps {
-        mut names.push(text::String.of(line.package_name.as_str(), alloc))
+        mut listed.push(text::String.of(line.package_name.as_str(), alloc))
     }
-    mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    mut listed.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var names = mem::List[text::String].empty(alloc)
+    for index in 0..<listed.len() {
+        let name = listed[index].as_str()
+        if index > 0 and listed[index - 1].as_str() == name {
+            continue
+        }
+        if root_of(current, package_name: name) != root_of(Some(lock), package_name: name) {
+            mut names.push(text::String.of(name, alloc))
+        }
+    }
     var changes = mem::List[Change].empty(alloc)
+    if names.len() == 0 {
+        return changes
+    }
+    let held_before = mem::List[CurrentEntry].empty(alloc)
+    let before = match current {
+        Some(held) => try self.authority(held, appended: held_before.view(), names: names.view())
+        None => self.no_authority(names.len())
+    }
+    let after = try self.authority(lock, appended, names: names.view())
     for index in 0..<names.len() {
         let name = names[index].as_str()
-        if index > 0 and names[index - 1].as_str() == name {
-            continue
-        }
         let old = root_of(current, package_name: name)
         let new = root_of(Some(lock), package_name: name)
-        if old == new {
-            continue
+        var widenings = mem::List[machine::SummaryEntry].empty(alloc)
+        for entry in after[index] {
+            if not before[index].contains(entry) {
+                mut widenings.push(entry.copy(alloc))
+            }
         }
-        mut changes.push(Change(package_name: text::String.of(name, alloc), old: old, new: new, class: self.change_class(old, new)))
+        mut changes.push(Change(package_name: text::String.of(name, alloc), old: old, new: new, class: self.change_class(old, new), epochs: self.epochs(old, new), widenings: take widenings))
     }
     return changes
 } Resolver.changes
+
+/// An empty authority summary per package.
+fn Resolver.no_authority(self, count: usize) -> mem::List[mem::Set[machine::SummaryEntry]] {
+    var summaries = mem::List[mem::Set[machine::SummaryEntry]].empty(self.alloc)
+    for _ in 0..<count {
+        mut summaries.push(mem::Set[machine::SummaryEntry].empty(self.alloc))
+    }
+    return summaries
+} Resolver.no_authority
+
+/// The epoch of each exported item of a package's new release above 0 that differs from its
+/// epoch in the old, in byte order of canonical path.
+fn Resolver.epochs(self, old: Option[hashing::HashValue], new: Option[hashing::HashValue]) -> mem::List[ItemEpoch] {
+    let alloc = self.alloc
+    var epochs = mem::List[ItemEpoch].empty(alloc)
+    let Some(new_at) = self.entry_at(new) else {
+        return epochs
+    }
+    expect new_at < self.entries.len()
+    let Some(summary) = self.entries[new_at].contents().summary else {
+        return epochs
+    }
+    for exported in summary.items {
+        if exported.epoch > 0 and exported.epoch != self.epoch_in(old, path: exported.path.as_str()) {
+            mut epochs.push(ItemEpoch(path: text::String.of(exported.path.as_str(), alloc), epoch: exported.epoch))
+        }
+    }
+    return epochs
+} Resolver.epochs
+
+/// The epoch an item has in a release: its publish summary's, 0 without one or without a release.
+fn Resolver.epoch_in(self, root: Option[hashing::HashValue], path: Str) -> u64 {
+    let Some(at) = self.entry_at(root) else {
+        return 0
+    }
+    expect at < self.entries.len()
+    return release::epoch(self.entries[at].contents().summary, path)
+} Resolver.epoch_in
+
+/// The authority summary of each package of `names` that the closure a lock gives the package
+/// holds, in the order of `names`, each release, a path release included, read from the store or
+/// `appended`.
+fn Resolver.authority(self, lock: machine::Lock, appended: Slice[CurrentEntry], names: Slice[text::String]) -> mem::List[mem::Set[machine::SummaryEntry]] fails platform::IoError {
+    let alloc = self.alloc
+    let grammar = self.session.grammar.contents()
+    let root = self.root()
+    var lock_path = text::String.of(root.dir.as_str(), alloc)
+    mut lock_path.append("/.nan/lock.nan")
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    for file in take check::package_files(root, alloc) {
+        let artefact::SourceFile(path: within, content: content) = file
+        var path = text::String.of(root.dir.as_str(), alloc)
+        mut path.push('/')
+        mut path.append(within.as_str())
+        if path != lock_path {
+            mut files.push(artefact::SourceFile(path: take path, content: take content))
+        }
+    }
+    let Some(bytes) = lock.bytes(grammar, alloc) else {
+        expect false
+        return self.no_authority(names.len())
+    }
+    mut files.push(artefact::SourceFile(path: take lock_path, content: take bytes))
+    let alone = try workspace::Workspace.from_files(self.session.workspace.contents().root.as_str(), files: files.view(), syntaxes: workspace::Syntaxes.parsing(), store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+        for fresh in appended {
+            if fresh.root == held {
+                return Some(fresh.entry.share())
+            }
+        }
+        for at in 0..<self.entries.len() {
+            if self.root_at(at) == held {
+                return Some(self.entries[at].share())
+            }
+        }
+        return None
+    }, grammar, alloc)
+    let session = self.session.over(mem::Shared.of(take alone, alloc), alloc)
+    return session.authority_summaries(package_index: 0, names)
+} Resolver.authority
 
 /// The class of a package's new release with its old one as its parent: the class its publish
 /// summary records when it was published on that parent, else as their exported items compare.

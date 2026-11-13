@@ -264,7 +264,9 @@ impl Workspace {
         Workspace::from_files(root, files, &mut UserStore::default())
     }
 
-    fn from_files(
+    /// The workspace of in-memory files as `of_files` places them, its locks reading releases
+    /// through `store`.
+    pub fn from_files(
         root: PathBuf,
         files: &[(&str, &[u8])],
         store: &mut dyn closure::Store,

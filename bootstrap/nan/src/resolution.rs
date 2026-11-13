@@ -12,7 +12,7 @@ use crate::check;
 use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, Fix};
 use crate::fix;
 use crate::hash::Hash;
-use crate::machine::lock::{Lock, Locked};
+use crate::machine::lock::{Entry as Authority, Lock, Locked};
 use crate::release;
 use crate::scope::Scope;
 use crate::store::{Append, Class, Entry, Store};
@@ -21,13 +21,17 @@ use crate::test_runs::{self, Runs};
 use crate::workspace::manifest_deps;
 use crate::workspace::{Member, ReleaseStore, Workspace};
 
-/// A package whose locked release changes: its name, its old and new code roots and the class of
-/// the new release with the old as its parent.
+/// A package whose locked release changes: its name, its old and new code roots, the class of
+/// the new release with the old as its parent, the epoch of each exported item of the new release
+/// above 0 that differs from its epoch in the old, and the entries of the new release's authority
+/// summary that the old one's lacks.
 pub struct Change {
     pub package: String,
     pub old: Option<Hash>,
     pub new: Option<Hash>,
     pub class: Class,
+    pub epochs: Vec<(String, u64)>,
+    pub widenings: Vec<Authority>,
 }
 
 /// What resolution decides.
@@ -82,8 +86,9 @@ fn pending_root(dir: &str) -> Hash {
     Hash::of(&pending_code_root(dir))
 }
 
-/// The store a candidate lock reads: the entries of the local store, and for each path source's
-/// current state an entry of its pending code root attesting its files.
+/// The store a lock reads: the entries of the local store, and others by code root, for a
+/// candidate lock an entry of each path source's current state under its pending code root
+/// attesting its files.
 struct Candidates<'a> {
     entries: &'a [Entry],
     current: HashMap<Hash, Entry>,
@@ -517,6 +522,7 @@ impl Resolver<'_> {
             .closure_of(root)
             .expect("a resolved package's closure");
         let mut deps = Vec::new();
+        let mut appended = HashMap::new();
         for line in candidate.deps {
             let source = assigned
                 .iter()
@@ -525,7 +531,7 @@ impl Resolver<'_> {
             let root = match source {
                 Some((_, Candidate::Current(index))) => {
                     let built = check::root::build(&workspace, closure, Member::Source(index));
-                    let appended = store.append(Append {
+                    let appended_entry = store.append(Append {
                         package: line.package.clone(),
                         name: None,
                         parent: None,
@@ -533,8 +539,12 @@ impl Resolver<'_> {
                         artefact: built.artefact,
                         sources: built.sources,
                     })?;
-                    match appended {
-                        Ok(entry) => entry.root(),
+                    match appended_entry {
+                        Ok(entry) => {
+                            let root = entry.root();
+                            appended.insert(root, entry);
+                            root
+                        }
                         Err(exposed) => return Ok(Err(exposed)),
                     }
                 }
@@ -558,7 +568,7 @@ impl Resolver<'_> {
         let first = self.workspace.packages[self.package].machine.lock.is_none();
         let (lock, unapproved) =
             check::approvals(&workspace, &workspace.packages[self.package], lock, first);
-        let changes = self.changes(&lock);
+        let changes = self.changes(&lock, appended)?;
         let mut errors: Vec<Diagnostic> = match self.forwarding || !self.own_errors {
             true => check::reported(&workspace, &Scope::Package(self.package))
                 .into_iter()
@@ -582,11 +592,11 @@ impl Resolver<'_> {
         }))
     }
 
-    /// The packages whose locked release a new lock changes, by name.
-    fn changes(&self, lock: &Lock) -> Vec<Change> {
-        let old: BTreeMap<&str, Hash> = self.workspace.packages[self.package]
-            .machine
-            .lock()
+    /// The packages whose locked release a new lock changes, by name, the path releases it locks
+    /// that the store did not hold in `appended`.
+    fn changes(&self, lock: &Lock, appended: HashMap<Hash, Entry>) -> io::Result<Vec<Change>> {
+        let current = self.workspace.packages[self.package].machine.lock();
+        let old: BTreeMap<&str, Hash> = current
             .map(|lock| {
                 lock.deps
                     .iter()
@@ -599,16 +609,26 @@ impl Resolver<'_> {
             .iter()
             .map(|line| (line.package.as_str(), line.root))
             .collect();
-        let mut names: Vec<&str> = old.keys().chain(new.keys()).copied().collect();
-        names.sort();
-        names.dedup();
-        names
-            .into_iter()
+        let names: BTreeSet<&str> = old
+            .keys()
+            .chain(new.keys())
+            .copied()
             .filter(|name| old.get(name) != new.get(name))
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before = match current {
+            Some(current) => self.authority(current, HashMap::new(), &names)?,
+            None => BTreeMap::new(),
+        };
+        let after = self.authority(lock, appended, &names)?;
+        let entry = |root: Option<&Hash>| {
+            root.and_then(|root| self.entries.iter().find(|entry| entry.root() == *root))
+        };
+        Ok(names
+            .into_iter()
             .map(|name| {
-                let entry = |root: Option<&Hash>| {
-                    root.and_then(|root| self.entries.iter().find(|entry| entry.root() == *root))
-                };
                 let artefact = |root: Option<&Hash>| {
                     entry(root).map(|entry| (entry.artefact.clone(), entry.summary.clone()))
                 };
@@ -637,14 +657,65 @@ impl Resolver<'_> {
                     }
                     _ => Class::Additive,
                 };
+                let old_summary = entry(old.get(name)).and_then(|entry| entry.summary.as_ref());
+                let epochs = entry(new.get(name))
+                    .and_then(|entry| entry.summary.as_ref())
+                    .map(|summary| {
+                        (summary.items.iter())
+                            .filter(|(path, _, epoch)| {
+                                *epoch > 0 && *epoch != release::epoch(old_summary, path)
+                            })
+                            .map(|(path, _, epoch)| (path.clone(), *epoch))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let held = |summaries: &BTreeMap<String, BTreeSet<Authority>>| {
+                    summaries.get(name).cloned().unwrap_or_default()
+                };
                 Change {
                     package: name.to_owned(),
                     old: old.get(name).copied(),
                     new: new.get(name).copied(),
                     class,
+                    epochs,
+                    widenings: held(&after).difference(&held(&before)).cloned().collect(),
                 }
             })
-            .collect()
+            .collect())
+    }
+
+    /// The authority summary of each package of `names` that the closure a lock gives the
+    /// package holds, each release, a path release included, read from the store or `appended`.
+    fn authority(
+        &self,
+        lock: &Lock,
+        appended: HashMap<Hash, Entry>,
+        names: &BTreeSet<&str>,
+    ) -> io::Result<BTreeMap<String, BTreeSet<Authority>>> {
+        let root = &self.workspace.packages[self.package];
+        let mut files: Vec<(String, Vec<u8>)> = check::package_sources(root)
+            .into_iter()
+            .filter(|(path, _)| path != ".nan/lock.nan")
+            .map(|(path, content)| (format!("{}/{path}", root.dir), content))
+            .collect();
+        files.push((
+            format!("{}/.nan/lock.nan", root.dir),
+            lock.bytes().expect("a lock holds its snapshot"),
+        ));
+        let files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_slice()))
+            .collect();
+        let mut store = Candidates {
+            entries: &self.entries,
+            current: appended,
+        };
+        let alone = Workspace::from_files(self.workspace.root.clone(), &files, &mut store)?;
+        Ok(check::authority_summaries(
+            &alone,
+            &alone.packages[0],
+            names,
+        ))
     }
 }
 

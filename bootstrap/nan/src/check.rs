@@ -74,7 +74,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use approval::{approvals, is_unapproved};
+pub use approval::{approvals, authority_summaries, is_unapproved};
 pub use changes::{Change, changes, semantic_conflicts};
 pub use compatible::{compatible, encode_class, schema_records};
 pub use context::{Context, Green, context_gaps, contexts, greens};

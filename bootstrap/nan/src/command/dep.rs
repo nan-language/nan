@@ -186,7 +186,13 @@ fn synced(
                         hash(change.new),
                         change.class.word().to_owned(),
                     ],
-                    lines: Vec::new(),
+                    lines: (change.epochs.iter())
+                        .map(|(item, epoch)| format!("epoch {item} {epoch}"))
+                        .chain(
+                            (change.widenings.iter())
+                                .map(|entry| format!("widening {}", entry.written())),
+                        )
+                        .collect(),
                 });
             }
             errors.extend(invalid);

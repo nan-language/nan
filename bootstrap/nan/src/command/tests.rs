@@ -459,7 +459,7 @@ fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_ap
     .expect("an app logging");
     let synced = run_in(dir, "dep sync app").output;
     assert!(
-        synced.contains("\nerror authority.widening-unapproved app/package.nan:3 app\n    package app {\n    because command - - nan dep approve app\n    because note - - lib capability \"sys::Log\"\nwrote app/.nan/lock.nan\n"),
+        synced.contains(" additive\n    widening capability \"sys::Log\"\nerror authority.widening-unapproved app/package.nan:3 app\n    package app {\n    because command - - nan dep approve app\n    because note - - lib capability \"sys::Log\"\nwrote app/.nan/lock.nan\n"),
         "{synced}"
     );
     assert_eq!(
@@ -469,6 +469,50 @@ fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_ap
     assert_eq!(
         verdict("dep sync app"),
         "ok dep sync app: files 0, errors 0, incomplete 0"
+    );
+}
+
+#[test]
+fn a_sync_names_the_epoch_bumps_of_each_release_it_locks() {
+    let mean = |body: &str| {
+        format!(
+            "//! Totals of samples.\n\n/// The mean.\npub fn mean(total: u64, count: u64) -> u64 {{\n    return {body}\n}} mean\n"
+        )
+    };
+    let scratch = Scratch::new(&[
+        (
+            "meter/package.nan",
+            "//! Running totals.\n\npackage meter {\n    language 1\n    targets any\n} meter\n",
+        ),
+        ("meter/meter.nan", &mean("total / count.max(1)")),
+        (
+            "app/package.nan",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    entry main\n    dep meter \"meter\"\n} app\n",
+        ),
+        (
+            "app/app.nan",
+            "//! Entry of the app.\n\nfn main(take world: host::World) fails task::Cancelled uses wait {\n    world.log.info(\"mean\", value: meter::mean(7, count: 2))\n} main\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    for line in ["api update meter", "publish --local meter", "dep sync app"] {
+        assert_eq!(run_in(dir, line).status, 0, "{line}");
+    }
+    fs::write(
+        dir.join("meter/meter.nan"),
+        mean("(total + count.max(1) / 2) / count.max(1)"),
+    )
+    .expect("a rounding mean");
+    for line in [
+        "api update meter",
+        "publish --local meter --breaking meter::mean rounds",
+    ] {
+        assert_eq!(run_in(dir, line).status, 0, "{line}");
+    }
+    let synced = run_in(dir, "dep sync app").output;
+    assert!(
+        synced.contains(" breaking\n    epoch meter::mean 1\nerror dep.epoch-unapproved "),
+        "{synced}"
     );
 }
 

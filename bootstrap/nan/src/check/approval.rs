@@ -1,7 +1,7 @@
 //! Approvals: the authority summary of a package, the closure summary and epoch pairs a final-link
 //! root's final closure needs, and the rules that the root's lock approves them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 mod tests;
@@ -167,6 +167,31 @@ fn unapproved(
         ..Diagnostic::at(code, &path, manifest.line)
     })
     .collect()
+}
+
+/// The authority summary of each package named in `names` that a workspace package's closure
+/// holds, over the targets the package is checked for.
+pub fn authority_summaries(
+    workspace: &Workspace,
+    package: &crate::workspace::Package,
+    names: &BTreeSet<&str>,
+) -> BTreeMap<String, BTreeSet<Entry>> {
+    let mut summaries: BTreeMap<String, BTreeSet<Entry>> = BTreeMap::new();
+    let Some(closure) = workspace.closure_of(package) else {
+        return summaries;
+    };
+    for target in super::check_targets(package) {
+        let checker = super::unchecked(workspace, closure, crate::stdlib::packages(), target);
+        for name in names {
+            if let Some(id) = checker.package_named(name) {
+                summaries
+                    .entry((*name).to_owned())
+                    .or_default()
+                    .extend(checker.authority_summary(id));
+            }
+        }
+    }
+    summaries
 }
 
 /// A lock with the approvals its package's final closure needs: every one when `all`, else those

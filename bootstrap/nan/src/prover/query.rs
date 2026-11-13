@@ -1461,7 +1461,7 @@ impl<'w, 'a> Walk<'w, 'a> {
 
     /// Whether the prover knows a call as the application of its callee: a direct call of a
     /// pure function, or a call through a bound or `Dyn` whose method head demands `pure`, with
-    /// no function-typed argument that is impure and no argument with interior mutability.
+    /// no function-typed argument that is impure.
     fn pure_call(&self, fn_ref: &FnRef, args: &[TermId]) -> bool {
         let pure = match &fn_ref.callable {
             Callable::Item { item, .. } => self.ck.digest(*item).pure(),
@@ -1471,13 +1471,9 @@ impl<'w, 'a> Walk<'w, 'a> {
             },
             Callable::Derived { .. } | Callable::Builtin(_) => true,
         };
-        pure && args.iter().all(|arg| {
-            let ty = self.terms.ty(*arg);
-            !self.ck.has_interior(ty)
-                && match ty {
-                    Ty::Fn(fn_ty) => fn_ty.limits.pure,
-                    _ => true,
-                }
+        pure && args.iter().all(|arg| match self.terms.ty(*arg) {
+            Ty::Fn(fn_ty) => fn_ty.limits.pure,
+            _ => true,
         })
     }
 

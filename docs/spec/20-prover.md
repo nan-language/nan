@@ -91,7 +91,7 @@ A call to a function f has these facts:
 The term of a call is given by the first rule that applies:
 
 1. A call that the item unfolds is the term the transparent body returns, its parameters standing for the argument terms.
-2. A direct call to a [pure](10-effects-digests.md#purity) function, or a call through a bound or `Dyn` whose interface method head demands `pure`, is the application of the callee to its argument terms, provided every function-typed argument is pure and no argument has a type with [interior mutability](12-memory.md#interior-mutability).
+2. A direct call to a [pure](10-effects-digests.md#purity) function, or a call through a bound or `Dyn` whose interface method head demands `pure`, is the application of the callee to its argument terms, provided every function-typed argument is pure.
 3. Any other call is a fresh symbol.
 
 ```nan
@@ -137,6 +137,20 @@ pub fn Slot.free(self) -> u32 {
 pub fn Slot.capacity(self) -> u32 limits notrap {
     return self.used + self.free() // error: proof.unknown
 } Slot.capacity
+```
+
+```nan
+pub open struct Job {
+    pub done: mem::Shared[core::atomic::AtomicBool]
+} Job
+
+pub fn enqueue(mut jobs: mem::Bounded[Job, 8], take job: Job) -> Option[Job] limits notrap {
+    if jobs.is_full() {
+        return Some(take job)
+    }
+    mut jobs.push(take job)
+    return None
+} enqueue
 ```
 
 ## Frame rule

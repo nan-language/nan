@@ -15,7 +15,7 @@ use super::decl::{declared_name, fold};
 use super::resolve::PathError;
 use super::sig::{FnSig, GenericDef, Problems, SigKind};
 use super::tir::{
-    ClauseRole, Local, LocalId, LocalKind, TBlock, TBody, TClause, TExample, TExpr, TKind,
+    Callee, ClauseRole, Local, LocalId, LocalKind, TBlock, TBody, TClause, TExample, TExpr, TKind,
     TPattern, TPatternKind, TStmt, TStmtKind,
 };
 use super::ty::{Param, Scalar, Ty};
@@ -1638,6 +1638,10 @@ impl Body<'_, '_> {
             }
             return TExpr::failed(call.token);
         };
+        if let Callee::Value(_) = probed.callee {
+            self.report(call.token, Code::DeferNotCall);
+            return TExpr::failed(call.token);
+        }
         let waits = probed.head.wait
             || probed
                 .args

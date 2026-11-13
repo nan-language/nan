@@ -401,6 +401,12 @@ pub fn finish(log: sys::Log) {
 ```
 
 ```nan
+pub fn finish(done: fn()) {
+    defer done() // error: defer.not-call
+} finish
+```
+
+```nan
 pub fn count(log: sys::Log, sent: usize) {
     defer log.info("bytes sent", value: sent + 1) // error: defer.operand-form
 } count

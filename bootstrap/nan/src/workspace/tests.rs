@@ -292,7 +292,8 @@ fn modules_hold_their_summary_files() {
 
 #[test]
 fn variants_cover_each_declared_target_once() {
-    let targets = manifest("    language 1\n    targets x86_64-bare, x86_64-linux\n");
+    let targets =
+        manifest("    language 1\n    targets x86_64-bare, x86_64-linux, x86_64-windows\n");
     let base = [
         ("app/package.nan", targets.as_str()),
         ("app/app.nan", "//! Root.\n"),
@@ -315,13 +316,13 @@ fn variants_cover_each_declared_target_once() {
         let (_scratch, workspace) = load(&files);
         codes(&workspace)
     };
-    assert_eq!(case(&["io@bare", "io@linux"]), []);
+    assert_eq!(case(&["io@bare", "io@linux", "io@windows"]), []);
     assert_eq!(
-        case(&["io@bare"]),
+        case(&["io@bare", "io@linux"]),
         [("app/package.nan".to_owned(), 5, "module.variant-missing")]
     );
     assert_eq!(
-        case(&["io@bare", "io@linux", "io@x86_64"]),
+        case(&["io@bare", "io@linux", "io@windows", "io@x86_64"]),
         [(
             "app/io@x86_64/io.nan".to_owned(),
             1,
@@ -329,7 +330,7 @@ fn variants_cover_each_declared_target_once() {
         )]
     );
     assert_eq!(
-        case(&["io@bare", "io@linux", "io@uefi"]),
+        case(&["io@bare", "io@linux", "io@uefi", "io@windows"]),
         [(
             "app/io@uefi/io.nan".to_owned(),
             1,
@@ -337,10 +338,15 @@ fn variants_cover_each_declared_target_once() {
         )]
     );
     assert_eq!(
-        case(&["io", "io@bare", "io@linux"]),
+        case(&["io", "io@bare", "io@linux", "io@windows"]),
         [
             ("app/io@bare/io.nan".to_owned(), 1, "module.variant-mixed"),
             ("app/io@linux/io.nan".to_owned(), 1, "module.variant-mixed"),
+            (
+                "app/io@windows/io.nan".to_owned(),
+                1,
+                "module.variant-mixed"
+            ),
         ]
     );
 }

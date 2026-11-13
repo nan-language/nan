@@ -57,6 +57,10 @@ pub fn build(
         let reason = "a nanos program builds only against a kernel's interface file";
         return Ok(Build::failed(vec![bundle::interface_error(source, reason)]));
     }
+    if target.kind() == Some(Kind::Windows) {
+        let unavailable = Diagnostic::new(Code::TargetImageUnavailable);
+        return Ok(Build::failed(vec![at_manifest(source, unavailable)]));
+    }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
     let std = crate::stdlib::packages();

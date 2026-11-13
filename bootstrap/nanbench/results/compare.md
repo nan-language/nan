@@ -4,14 +4,14 @@ Taken by `nanbench compare`: each program of `bootstrap/nanbench/bench/compare/`
 
 | Program | Measures | Size | NaN | Rust | C++ | NaN / Rust | NaN / C++ |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| fib | function calls | 42 | 1.406 s | 0.898 s | 0.398 s | 1.57 | 3.54 |
-| collatz | integer arithmetic | 3000000 | 0.941 s | 0.596 s | 0.770 s | 1.58 | 1.22 |
-| sieve | byte stores | 50000000 | 0.352 s | 0.367 s | 0.308 s | 0.96 | 1.14 |
-| fannkuch | small inline arrays | 10 | 0.294 s | 0.196 s | 0.212 s | 1.50 | 1.39 |
-| matmul | nested loops over float arrays | 800 | 1.377 s | 0.208 s | 0.187 s | 6.62 | 7.35 |
-| nbody | float arithmetic over structs | 5000000 | 0.573 s | 0.308 s | 0.278 s | 1.86 | 2.06 |
-| interpreter | dispatch over enums | 20000000 | 0.699 s | 0.490 s | 0.515 s | 1.43 | 1.36 |
-| binary_trees | allocation | 16 | 0.690 s | 0.354 s | 0.408 s | 1.95 | 1.69 |
-| hash_map | hash maps | 4000000 | 1.332 s | 0.578 s | 2.039 s | 2.31 | 0.65 |
-| strings | text formatting | 10000000 | 0.664 s | 0.338 s | 0.640 s | 1.96 | 1.04 |
-| Geometric mean | | | | | | 1.88 | 1.66 |
+| fib | function calls | 42 | 1.042 s | 0.719 s | 0.351 s | 1.45 | 2.97 |
+| collatz | integer arithmetic | 3000000 | 0.574 s | 0.493 s | 0.666 s | 1.16 | 0.86 |
+| sieve | byte stores | 50000000 | 0.396 s | 0.363 s | 0.347 s | 1.09 | 1.14 |
+| fannkuch | small inline arrays | 10 | 0.194 s | 0.161 s | 0.172 s | 1.21 | 1.13 |
+| matmul | nested loops over float arrays | 800 | 0.269 s | 0.239 s | 0.233 s | 1.13 | 1.15 |
+| nbody | float arithmetic over structs | 5000000 | 0.317 s | 0.226 s | 0.245 s | 1.40 | 1.30 |
+| interpreter | dispatch over enums | 20000000 | 0.482 s | 0.396 s | 0.356 s | 1.22 | 1.35 |
+| binary_trees | allocation | 16 | 0.388 s | 0.283 s | 0.295 s | 1.37 | 1.31 |
+| hash_map | hash maps | 4000000 | 0.641 s | 0.544 s | 1.708 s | 1.18 | 0.38 |
+| strings | text formatting | 10000000 | 0.307 s | 0.263 s | 0.579 s | 1.17 | 0.53 |
+| Geometric mean | | | | | | 1.23 | 1.06 |

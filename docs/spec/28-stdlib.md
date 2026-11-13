@@ -358,11 +358,11 @@ The classes of the operations of the sys capabilities and of the resources they 
 
 ## Platform packages
 
-A **platform package** is the package that mints a target's [root grant](14-authority.md#root-grants) and implements the target-dependent operations of the capabilities that root grant yields. Exactly three exist; each concrete target's [descriptor](27-program-model.md#descriptors) names one:
+A **platform package** is the package that mints a target's [root grant](14-authority.md#root-grants) and implements the target-dependent operations of the capabilities that root grant yields. Exactly three exist; the [descriptor](27-program-model.md#descriptors) of each Linux, UEFI and bare target names one:
 
 | Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
-| `linux_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
+| `linux_platform` | the Linux targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
 | `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services` and `boot::Machine.enter`, through the firmware's boot services |
 | `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the [start information](24-kernel.md#start-information) and, on `aarch64-bare`, the device tree |
 

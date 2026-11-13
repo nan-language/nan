@@ -470,7 +470,7 @@ A **root grant** is the capability a platform [landing fn](23-low-level.md#landi
 
 | Target | Root grant |
 | --- | --- |
-| `x86_64-linux`, `aarch64-linux` | `host::World` |
+| `x86_64-linux`, `x86_64-windows`, `aarch64-linux`, `aarch64-windows` | `host::World` |
 | `x86_64-uefi`, `aarch64-uefi` | `boot::Machine` |
 | `x86_64-bare`, `aarch64-bare` | `boot::Kernel` |
 | `x86_64-nanos`, `aarch64-nanos` | `nanos::World` |

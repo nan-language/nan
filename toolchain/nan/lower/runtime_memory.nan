@@ -1,4 +1,4 @@
-//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A run passes to an enclosing domain when a value it holds leaves the domain owning it, charged from then on to that domain's cell when both cells' chains draw from one supply and the new chain has room for it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
+//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A cell whose charge a task has waited on has an arm record, kept as long as the cell: the band of charges the waiting task waits for the charge to leave, which holds every charge while no task waits, the task, and its link in the list of arms whose charge left their band, whose tasks a routine changing charges wakes once it has released the lock. A run passes to an enclosing domain when a value it holds leaves the domain owning it, charged from then on to that domain's cell when both cells' chains draw from one supply and the new chain has room for it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
 
 const MEMORY_CHUNK: u64 = 65_536
 
@@ -8,7 +8,7 @@ const MEMORY_KEPT: u64 = 64
 /// The cell table's capacity.
 const MEMORY_CELLS: u64 = 65_536
 
-const CELL_RECORD: u64 = 48
+const CELL_RECORD: u64 = 56
 
 /// The chunk map: a table of 2^16 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
@@ -29,6 +29,23 @@ const CELL_OPEN: u64 = 24
 const CELL_SUPPLY: u64 = 32
 
 const CELL_PEAK: u64 = 40
+
+const CELL_ARM: u64 = 48
+
+/// The offsets of an arm record: the lowest charge of its band and the band's span, the waiting
+/// task, the next arm of the list of arms whose charge left their band, and whether it is in
+/// that list.
+const ARM_LOW: u64 = 0
+
+const ARM_SPAN: u64 = 8
+
+const ARM_WAITER: u64 = 16
+
+const ARM_NEXT: u64 = 24
+
+const ARM_LISTED: u64 = 32
+
+const ARM_SIZE: u64 = 40
 
 /// The offsets of a region's supply record: its first chunk's address, its chunk count, then its
 /// map of a bit per chunk.
@@ -185,6 +202,7 @@ fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             let address = allocate(mut lo, mut fx, handle: params[0], size: params[1], align: params[2], domain)
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            wake_left(mut lo, mut fx)
             mut fx.b.ret(fx.list1(address).view())
         }
         Routine.Free => {
@@ -193,6 +211,7 @@ fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             memory_release(mut lo, mut fx, address: params[0])
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            wake_left(mut lo, mut fx)
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
         Routine.Split => {
@@ -247,6 +266,7 @@ fn memory_define(mut lo: Lowering, mut fx: Fx, routine: Routine)
             discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
             let lifted = memory_lift(mut lo, mut fx, address: params[0], to: params[1])
             discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            wake_left(mut lo, mut fx)
             mut fx.b.ret(fx.list1(lifted).view())
         }
         else => {
@@ -306,6 +326,7 @@ fn new_cell(mut lo: Lowering, mut fx: Fx, limit: clif::Value, parent: clif::Valu
     let zero = mut fx.ptr(0)
     mut fx.store(zero, addr: record, offset: CELL_CHARGE)
     mut fx.store(zero, addr: record, offset: CELL_PEAK)
+    mut fx.store(zero, addr: record, offset: CELL_ARM)
     let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: parent, y: -1)
     let parent_low = mut fx.b.band_imm_s(parent, y: 0xFFFF_FFFF)
     let parent_plus = mut fx.b.iadd_imm_s(parent_low, y: 1)
@@ -389,10 +410,10 @@ fn memory_draw(mut lo: Lowering, mut fx: Fx, handle: clif::Value, count: clif::V
     let mapped = drawn_chunks[0]
     let drawn = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mapped, y: 0)
     mut fx.if_true(drawn, then: fn[mut lo](mut fx1: Fx) {
-        walk_chain(mut lo, fx: mut fx1, head, visit: fn(mut fx2: Fx, record: clif::Value) {
+        walk_chain(mut lo, fx: mut fx1, head, visit: fn(mut fx2: Fx, state_address: clif::Value, record: clif::Value) {
             let charge = mut fx2.load(PTR, addr: record, offset: CELL_CHARGE)
             let charged = mut fx2.b.iadd(charge, y: bytes)
-            set_charge(mut fx2, record, charge: charged)
+            set_charge(mut fx2, state_address, record, charge: charged)
         })
     })
     return mapped
@@ -438,8 +459,9 @@ fn chain_fits(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Valu
     return result[1]
 } chain_fits
 
-/// Runs `visit` on every cell record of the chain from a record.
-fn walk_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, visit: fn(mut fx: Fx, record: clif::Value)) {
+/// Runs `visit` on every cell record of the chain from a record, given the runtime state's
+/// address.
+fn walk_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, visit: fn(mut fx: Fx, state_address: clif::Value, record: clif::Value)) {
     let state_address = mut lo.state(mut fx)
     let cells = mut fx.load(PTR, addr: state_address, offset: STATE_CELLS)
     discard mut fx.repeat(fx.list1(head).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
@@ -447,7 +469,7 @@ fn walk_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, visit: fn(mut fx:
         let record = state[0]
         let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
         let next = mut fx1.choose(present, results: fx1.types1(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            visit(mut fx2, record)
+            visit(mut fx2, state_address, record)
             let parent_word = mut fx2.load(clif::Type.Int32, addr: record, offset: CELL_PARENT)
             let parent = mut fx2.b.uextend(PTR, x: parent_word)
             let has_parent = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: parent, y: 0)
@@ -468,35 +490,109 @@ fn walk_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, visit: fn(mut fx:
 
 /// Adds a chunk's bytes to every open cell of the chain from a record.
 fn charge_chain(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Value) {
-    walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
+    walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, state_address: clif::Value, record: clif::Value) {
         let open_word = mut fx1.load(clif::Type.Int32, addr: record, offset: CELL_OPEN)
         let open = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: open_word, y: 0)
         let charge = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
         let more = mut fx1.b.iadd(charge, y: bytes)
         let kept = mut fx1.b.select(open, x: more, y: charge)
-        set_charge(mut fx1, record, charge: kept)
+        set_charge(mut fx1, state_address, record, charge: kept)
     })
 } charge_chain
 
 /// Sets a cell's charge to a value no less than it held, raising its peak to that value.
-fn set_charge(mut fx: Fx, record: clif::Value, charge: clif::Value) {
+fn set_charge(mut fx: Fx, state_address: clif::Value, record: clif::Value, charge: clif::Value) {
     mut fx.store(charge, addr: record, offset: CELL_CHARGE)
     let peak = mut fx.load(PTR, addr: record, offset: CELL_PEAK)
     let raised = mut fx.b.umax(peak, y: charge)
     mut fx.store(raised, addr: record, offset: CELL_PEAK)
+    left_band(mut fx, state_address, record, charge)
 } set_charge
 
 /// Subtracts a chunk's bytes from every open cell of the chain from a record.
 fn uncharge(mut lo: Lowering, mut fx: Fx, head: clif::Value, bytes: clif::Value) {
-    walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
+    walk_chain(mut lo, mut fx, head, visit: fn(mut fx1: Fx, state_address: clif::Value, record: clif::Value) {
         let open_word = mut fx1.load(clif::Type.Int32, addr: record, offset: CELL_OPEN)
         let open = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: open_word, y: 0)
         let charge = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
         let less = mut fx1.b.isub(charge, y: bytes)
         let kept = mut fx1.b.select(open, x: less, y: charge)
         mut fx1.store(kept, addr: record, offset: CELL_CHARGE)
+        left_band(mut fx1, state_address, record, charge: kept)
     })
 } uncharge
+
+/// When a cell's new charge lies outside its arm's band, widens the band to every charge and
+/// lists the arm for a wake while a task waits on it and it is not listed. The caller holds the
+/// lock.
+fn left_band(mut fx: Fx, state_address: clif::Value, record: clif::Value, charge: clif::Value) {
+    let record_arm = mut fx.load(PTR, addr: record, offset: CELL_ARM)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record_arm, y: 0)
+    mut fx.if_true(armed, then: fn(mut fx1: Fx) {
+        let low = mut fx1.load(PTR, addr: record_arm, offset: ARM_LOW)
+        let span = mut fx1.load(PTR, addr: record_arm, offset: ARM_SPAN)
+        let left = charge_outside(mut fx1, charge, low, span)
+        mut fx1.if_true(left, then: fn(mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: record_arm, offset: ARM_LOW)
+            let every = mut fx2.int(PTR, value: -1)
+            mut fx2.store(every, addr: record_arm, offset: ARM_SPAN)
+            let waiter = mut fx2.load(PTR, addr: record_arm, offset: ARM_WAITER)
+            let waits = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+            let listed = mut fx2.load(PTR, addr: record_arm, offset: ARM_LISTED)
+            let unlisted = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: listed, y: 0)
+            let lists = mut fx2.b.band(waits, y: unlisted)
+            mut fx2.if_true(lists, then: fn(mut fx3: Fx) {
+                let head = mut fx3.load(PTR, addr: state_address, offset: STATE_LEFT)
+                mut fx3.store(head, addr: record_arm, offset: ARM_NEXT)
+                let one = mut fx3.ptr(1)
+                mut fx3.store(one, addr: record_arm, offset: ARM_LISTED)
+                mut fx3.store(record_arm, addr: state_address, offset: STATE_LEFT)
+            })
+        })
+    })
+} left_band
+
+/// Whether a charge lies outside the band of `span` charges from `low`.
+fn charge_outside(mut fx: Fx, charge: clif::Value, low: clif::Value, span: clif::Value) -> clif::Value {
+    let above = mut fx.b.isub(charge, y: low)
+    return mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: above, y: span)
+} charge_outside
+
+/// Wakes the task of each arm listed as having left its band, taking each arm out of the list
+/// and its task out of the arm under the lock.
+fn wake_left(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_LEFT)
+    let pending = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(pending, then: fn[mut lo](mut fx1: Fx) {
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Lock, args: fx2.list1(lock).view())
+            let record_arm = mut fx2.load(PTR, addr: state_address, offset: STATE_LEFT)
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: record_arm, y: 0)
+            let taken = mut fx2.choose(present, results: fx2.types1(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let next = mut fx3.load(PTR, addr: record_arm, offset: ARM_NEXT)
+                mut fx3.store(next, addr: state_address, offset: STATE_LEFT)
+                let zero = mut fx3.ptr(0)
+                mut fx3.store(zero, addr: record_arm, offset: ARM_LISTED)
+                let waiter = mut fx3.load(PTR, addr: record_arm, offset: ARM_WAITER)
+                mut fx3.store(zero, addr: record_arm, offset: ARM_WAITER)
+                return fx3.list1(waiter)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let none = mut fx3.ptr(0)
+                return fx3.list1(none)
+            })
+            let waiter = taken[0]
+            discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: fx2.list1(lock).view())
+            let waits = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+            mut fx2.if_true(waits, then: fn[mut lo](mut fx3: Fx) {
+                discard mut lo.call_routine(mut fx3, routine: Routine.Wake, args: fx3.list1(waiter).view())
+            })
+            return Pass(again: present, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+    })
+} wake_left
 
 /// An allocation of `size` bytes aligned to `align` through a cell, in a chunk of a domain;
 /// zero on exhaustion. The caller holds the lock.
@@ -1202,4 +1298,5 @@ fn free_chunks(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {
         return Pass(again: present, next: take next)
     })
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    wake_left(mut lo, mut fx)
 } free_chunks

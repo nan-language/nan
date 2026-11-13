@@ -1,6 +1,6 @@
 # Memory and allocation
 
-This chapter defines allocators and the rule that allocation is authority, budgets with their cells and chunks, generational handles, growth and its two failure forms, the stores `mem::Heap`, `mem::Arena[T]` and `mem::Pool[T, B]` with their ids, handles, boxes and regions, chunk ownership, `mem::Shared[T]`, the collections and their eager methods, interior mutability with `mem::OnceMap[K, V]`, and the properties of these types.
+This chapter defines allocators and the rule that allocation is authority, budgets with their cells and chunks, watches of a cell's charge, generational handles, growth and its two failure forms, the stores `mem::Heap`, `mem::Arena[T]` and `mem::Pool[T, B]` with their ids, handles, boxes and regions, chunk ownership, `mem::Shared[T]`, the collections and their eager methods, interior mutability with `mem::OnceMap[K, V]`, and the properties of these types.
 
 ## Allocators
 
@@ -104,6 +104,56 @@ pub fn scratch_size(alloc: mem::Alloc) -> usize {
 } scratch_size
 ```
 
+### Watches
+
+A **watch** is a linear `mem::Watch` that follows the charge of a budget's cell against **thresholds** in bytes. The **band** of a charge is the number of the watch's thresholds that are at most the charge: with thresholds in ascending order, band k holds the charges from threshold k − 1 up to below threshold k.
+
+```nan-api
+// module: mem
+
+pub open linear struct Watch derives Send {
+} Watch
+
+pub fn Budget.watch(self, thresholds: Slice[usize], alloc: Alloc) -> Watch
+
+pub fn Watch.band(self) -> usize
+
+pub fn Watch.changed(self, seen: usize) -> usize fails task::Cancelled uses wait
+
+pub fn Watch.set(mut self, thresholds: Slice[usize])
+
+pub fn Watch.close(take self)
+```
+
+- `budget.watch(thresholds, alloc)` returns a watch of the budget's cell holding a copy of `thresholds`, in any order, drawn through `alloc`. `set(thresholds)` replaces the copy, drawing through that allocator when the copy needs more room. Both trap on exhaustion (`trap.exhausted`) ([growth](#growth)). `take watch.close()` releases the copy. A cell may have any number of watches.
+- `band()` is the band of the cell's charge, which counts the chunks charged to every cell whose chain holds it ([budgets](#budgets)), so a watch of a root cell follows the draws and returns through every cell split from it.
+- `changed(seen)` returns the band of the cell's charge once it differs from `seen`: at once when it already does, otherwise once a draw or a return takes the charge out of the band it lies in. Draws and returns compare each charge they change with the band a task waits on and, when the charge leaves it, make that task ready; a draw or return keeping every charge in its band makes no task ready.
+- `changed` is a waiting primitive whose cancellation the runtime acknowledges at once ([acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation)): when a suspended `changed` becomes cancelled after the charge has left its band, it returns the new band instead of the cancellation.
+- At most one task waits on a cell's charge at a time: a `changed` that would suspend while another task waits in a `changed` of a watch of the same cell traps (`trap.duplicate-access`). The first wait on a cell takes a record of the support routines' memory, and traps when that memory is exhausted (`trap.exhausted`).
+- Once the cell is closed its charge no longer changes, so a `changed` waiting on it waits until it is cancelled.
+- `changed` has the wait fact, and `watch` and `set` the alloc fact. A watch holds an allocator naming its cell, through which `band` and `changed` read the charge, so their digests hold `mem::Alloc` among their capabilities and a watch is a [capability type](05-properties.md#capability-types).
+
+```nan
+pub fn scratch_level(alloc: mem::Alloc) -> usize
+    example scratch_level(testing::world().alloc) == 1
+{
+    let pool = alloc.split(1_048_576)
+    let scratch = mem::Bytes.zeroed(100_000, alloc: pool.alloc())
+    var watermarks = Array[usize, 2].filled(65_536)
+    watermarks[1] = 196_608
+    let watch = pool.watch(watermarks.view(), alloc)
+    let level = watch.band()
+    take watch.close()
+    discard scratch.len()
+    take pool.close()
+    return level
+} scratch_level
+
+pub fn next_level(watch: mem::Watch, level: usize) -> usize fails task::Cancelled uses wait {
+    return try await watch.changed(seen: level)
+} next_level
+```
+
 ## Generational handles
 
 A **generational handle** is a Copy value naming one slot of a table by the slot's index and by the generation the slot had when the handle was made, each a `u32`. Cell tables, [capability tables](14-authority.md#capability-tables) and [pools](#pools) are such tables.
@@ -143,7 +193,7 @@ pub closed enum OutOfMemory derives Copy, Eq, Hash, Render {
 } OutOfMemory
 ```
 
-- A std operation that may draw memory traps on exhaustion (`trap.exhausted`) unless its name starts with `try_`. Each such operation of this chapter other than `make_mut` has a `try_` form (`push` and `try_push`, `boxed` and `try_boxed`), which fails with `mem::OutOfMemory.Exhausted` instead, leaving its receiver unchanged and releasing the values it took.
+- A std operation that may draw memory traps on exhaustion (`trap.exhausted`) unless its name starts with `try_`. Each such operation of this chapter other than `make_mut`, `Budget.watch` and `Watch.set` has a `try_` form (`push` and `try_push`, `boxed` and `try_boxed`), which fails with `mem::OutOfMemory.Exhausted` instead, leaving its receiver unchanged and releasing the values it took.
 - The **capacity** of a list or bytes is the number of elements its memory holds: 0 after `empty`, and `len` after `zeroed(len, alloc)`. When `push`, `insert` or `append` needs a length beyond the capacity, or `reserve(n)` needs the length plus n, the new capacity is the largest of twice the old capacity, the needed length and 4. A capacity whose size in bytes exceeds 2^64 − 1 is exhaustion. A capacity never decreases.
 - A pool's `reserve(n)` makes its next n inserts draw no memory.
 - Removing elements never draws memory.
@@ -821,7 +871,7 @@ pub fn cached_square(cache: mem::OnceMap[u32, u64], key: u32) -> u64 {
 
 ## Memory types
 
-Every type this chapter declares other than `mem::OutOfMemory` and `mem::KeyValue` is a [base type](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `mem::Alloc`, `mem::Budget` and `mem::Heap`. "as" means exactly when every type argument other than a brand has the property; a brand affects no property.
+Every type this chapter declares other than `mem::OutOfMemory`, `mem::KeyValue` and `mem::Watch` is a [base type](05-properties.md#structural-properties) with these properties. The primitive capabilities among them are `mem::Alloc`, `mem::Budget` and `mem::Heap`. "as" means exactly when every type argument other than a brand has the property; a brand affects no property.
 
 | Type | linear | view | Copy | Send | Inert | AnyBits |
 | --- | --- | --- | --- | --- | --- | --- |

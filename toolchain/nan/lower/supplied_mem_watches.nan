@@ -1,0 +1,125 @@
+//! Watches of a cell's charge: a watch holds the allocator naming its cell. A wait for the charge to leave a band arms the cell's arm record, made on the cell's first wait, with the band and the waiting task, which a draw or return taking the charge out of the band wakes.
+
+/// `wait_outside(low, high)` waits until the charge of the watch's cell lies outside the charges
+/// from `low` up to below `high`.
+fn watches_watch(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(watch_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let cell_field = mut lo.layouts.field(lo.ck, ty: watch_ty, variant: None, label: "cell")
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: cell_field.offset)
+    match supply.member() {
+        "wait_outside" => watches_wait_outside(mut lo, mut fx, supply, handle)
+        else => {
+            expect false
+        }
+    }
+} watches_watch
+
+/// Returns at once when the charge lies outside the band; otherwise arms the cell's arm record
+/// with the band and the running task, which another task waiting on it traps, and parks until a
+/// wake. A wait cancelled at its start fails at once; a cancelled one returns only when the
+/// charge left the band.
+fn watches_wait_outside(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: clif::Value) {
+    let low = supply.param(1).scalar_value()
+    let high = supply.param(2).scalar_value()
+    let span = mut fx.b.isub(high, y: low)
+    let early = tasks_origin(mut lo, mut fx)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: early, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: early)
+    })
+    let current = current_task(mut lo, mut fx)
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let record = memory_cell_record(mut lo, mut fx, handle)
+    let charge = mut fx.load(PTR, addr: record, offset: CELL_CHARGE)
+    let left = charge_outside(mut fx, charge, low, span)
+    mut fx.if_true(left, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        supply.done(mut lo, fx: mut fx1)
+    })
+    let held = mut fx.load(PTR, addr: record, offset: CELL_ARM)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: held, y: 0)
+    let arms = mut fx.choose_in(mut lo, condition: missing, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let size = mut fx1.ptr(ARM_SIZE)
+        let made = mut lo1.record_alloc(mut fx1, size)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: made, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo1](mut fx2: Fx) {
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Unlock, args: fx2.list1(lock).view())
+            raise_kind(mut lo1, fx: mut fx2, kind: "trap.exhausted")
+        })
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: made, offset: ARM_LOW)
+        let every = mut fx1.int(PTR, value: -1)
+        mut fx1.store(every, addr: made, offset: ARM_SPAN)
+        mut fx1.store(zero, addr: made, offset: ARM_WAITER)
+        mut fx1.store(zero, addr: made, offset: ARM_NEXT)
+        mut fx1.store(zero, addr: made, offset: ARM_LISTED)
+        mut fx1.store(made, addr: record, offset: CELL_ARM)
+        return fx1.list1(made)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(held)
+    })
+    let record_arm = arms[0]
+    let waiter = mut fx.load(PTR, addr: record_arm, offset: ARM_WAITER)
+    let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+    let elsewhere = mut fx.b.icmp(clif::IntCC.NotEqual, x: waiter, y: current)
+    let other = mut fx.b.band(waits, y: elsewhere)
+    mut fx.if_true(other, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
+    })
+    mut fx.store(low, addr: record_arm, offset: ARM_LOW)
+    mut fx.store(span, addr: record_arm, offset: ARM_SPAN)
+    mut fx.store(current, addr: record_arm, offset: ARM_WAITER)
+    waiting_on(mut lo, mut fx, what: REGIONS_WAITING)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    let withdraw = withdraw_arm(mut lo)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record_arm, node: current)
+    park_waiting(mut lo, mut fx)
+    leave_wait(mut lo, mut fx)
+    waiting_on(mut lo, mut fx, what: 0)
+    let origin = tasks_origin(mut lo, mut fx)
+    let stopped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    mut fx.if_true(stopped, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        clear_arm_waiter(mut fx1, record_arm, task: current)
+        let now = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
+        let gone = charge_outside(mut fx1, charge: now, low, span)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        let stays = mut fx1.b.bxor_imm_s(gone, y: 1)
+        mut fx1.if_true(stays, then: fn[mut lo](mut fx2: Fx) {
+            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
+        })
+    })
+    supply.done(mut lo, mut fx)
+} watches_wait_outside
+
+/// Takes a task out of an arm record when it waits there. The caller holds the lock.
+fn clear_arm_waiter(mut fx: Fx, record_arm: clif::Value, task: clif::Value) {
+    let waiter = mut fx.load(PTR, addr: record_arm, offset: ARM_WAITER)
+    let ours = mut fx.b.icmp(clif::IntCC.Equal, x: waiter, y: task)
+    mut fx.if_true(ours, then: fn(mut fx1: Fx) {
+        let none = mut fx1.ptr(0)
+        mut fx1.store(none, addr: record_arm, offset: ARM_WAITER)
+    })
+} clear_arm_waiter
+
+/// The glue withdrawing a stopped task's wait on a charge, which the wait records with its arm
+/// record.
+fn withdraw_arm(mut lo: Lowering) -> object::FuncId {
+    return mut lo.glue_function(Glue.WithdrawArm, signature: withdraw_signature(lo.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let param_values = mut fx1.entry()
+        expect param_values.len() > 1
+        let record_arm = mut fx1.load(PTR, addr: param_values[0], offset: WAIT_OBJECT)
+        let state_address = mut lo1.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        clear_arm_waiter(mut fx1, record_arm, task: param_values[1])
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_arm

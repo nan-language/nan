@@ -64,7 +64,7 @@ The table names every pub std type, interface, free function and registry with t
 | `core` | `core::atomic::AtomicU8`, `core::atomic::AtomicU16`, `core::atomic::AtomicU32`, `core::atomic::AtomicU64`, `core::atomic::AtomicUsize`, `core::atomic::AtomicBool` | [Atomics](16-concurrency.md#atomics) |
 | `core` | `core::crypto::PublicKey`, `core::crypto::Signature`, `core::crypto::SecretKey` | [Signatures](31-trust.md#signatures) |
 | `core` | `core::simd::U8x16`, `core::simd::I8x16`, `core::simd::U16x8`, `core::simd::I16x8`, `core::simd::U32x4`, `core::simd::I32x4`, `core::simd::U64x2`, `core::simd::I64x2`, `core::simd::F32x4`, `core::simd::F16x8`, `core::simd::Mask8x16`, `core::simd::Mask16x8`, `core::simd::Mask32x4`, `core::simd::Mask64x2` | [Lanes](09-numbers.md#lanes) |
-| `mem` | `mem::Alloc`, `mem::Budget`, `mem::OutOfMemory` | [Allocators](12-memory.md#allocators), [Budgets](12-memory.md#budgets), [Growth](12-memory.md#growth) |
+| `mem` | `mem::Alloc`, `mem::Budget`, `mem::Watch`, `mem::OutOfMemory` | [Allocators](12-memory.md#allocators), [Budgets](12-memory.md#budgets), [Watches](12-memory.md#watches), [Growth](12-memory.md#growth) |
 | `mem` | `mem::Heap`, `mem::Arena`, `mem::Id`, `mem::Pool`, `mem::Handle` | [Stores](12-memory.md#stores) |
 | `mem` | `mem::Box` | [Box](07-ownership.md#box); `from_box` in [Dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch) |
 | `mem` | `mem::Shared` | [Shared values](12-memory.md#shared-values) |

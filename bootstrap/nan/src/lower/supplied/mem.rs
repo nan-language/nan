@@ -8,6 +8,7 @@ pub mod maps;
 mod segments;
 pub mod stores;
 pub mod vector;
+mod watches;
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -49,6 +50,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let entries = Entries::of_set(lo, supply.type_arg(0));
             maps::view_next(lo, fx, supply, &entries);
         }
+        "mem::Watch" => watches::watch(lo, fx, supply),
         _ => return stores::lower(lo, fx, supply),
     }
     true

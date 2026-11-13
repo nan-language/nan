@@ -13707,6 +13707,9 @@ const TEXT_MEM_MEM: Str =
     \\pub fn Alloc.split(self, limit: usize) -> Budget
     \\    ensures result.limit() == limit
     \\
+    \\/// The charge of the cell the allocator names.
+    \\pkg fn Alloc.charged(self) -> usize
+    \\
     \\pub open linear struct Budget {
     \\} Budget
     \\
@@ -13719,6 +13722,74 @@ const TEXT_MEM_MEM: Str =
     \\pub fn Budget.peak(self) -> usize
     \\
     \\pub fn Budget.close(take self)
+    \\
+    \\pub open linear struct Watch derives Send {
+    \\    cell: Alloc
+    \\    thresholds: List[usize]
+    \\} Watch
+    \\
+    \\pub fn Budget.watch(self, thresholds: Slice[usize], alloc: Alloc) -> Watch {
+    \\    var kept = List[usize].empty(alloc)
+    \\    copy_thresholds(mut kept, thresholds)
+    \\    return Watch(cell: self.alloc(), thresholds: take kept)
+    \\} Budget.watch
+    \\
+    \\pub fn Watch.band(self) -> usize {
+    \\    return self.band_of(self.cell.charged()).band
+    \\} Watch.band
+    \\
+    \\pub fn Watch.changed(self, seen: usize) -> usize fails task::Cancelled uses wait {
+    \\    loop {
+    \\        let band = self.band_of(self.cell.charged())
+    \\        if band.band != seen {
+    \\            return band.band
+    \\        }
+    \\        try await self.wait_outside(band.low, high: band.high)
+    \\    }
+    \\} Watch.changed
+    \\
+    \\pub fn Watch.set(mut self, thresholds: Slice[usize]) {
+    \\    mut self.thresholds.truncate(0)
+    \\    copy_thresholds(mut self.thresholds, thresholds)
+    \\} Watch.set
+    \\
+    \\pub fn Watch.close(take self) {
+    \\    let Watch(cell: _, thresholds: _) = self
+    \\} Watch.close
+    \\
+    \\/// Waits until the charge of the watched cell lies outside the charges from `low` up to below
+    \\/// `high`.
+    \\pkg fn Watch.wait_outside(self, low: usize, high: usize) fails task::Cancelled uses wait
+    \\
+    \\/// The band of a charge, and the charges around it in that band: from `low` up to below `high`.
+    \\struct Band derives Copy {
+    \\    band: usize
+    \\    low: usize
+    \\    high: usize
+    \\} Band
+    \\
+    \\/// The band of a charge among the watch's thresholds.
+    \\fn Watch.band_of(self, charge: usize) -> Band {
+    \\    var band: usize = 0
+    \\    var low: usize = 0
+    \\    var high: usize = 0xFFFF_FFFF_FFFF_FFFF
+    \\    for threshold in self.thresholds.view() {
+    \\        if threshold <= charge {
+    \\            band = band.saturating_add(1)
+    \\            low = low.max(threshold)
+    \\        } else {
+    \\            high = high.min(threshold)
+    \\        }
+    \\    }
+    \\    return Band(band: band, low: low, high: high)
+    \\} Watch.band_of
+    \\
+    \\fn copy_thresholds(mut kept: List[usize], thresholds: Slice[usize]) {
+    \\    mut kept.reserve(thresholds.len())
+    \\    for threshold in thresholds {
+    \\        mut kept.push(threshold)
+    \\    }
+    \\} copy_thresholds
     \\
     \\pub closed enum OutOfMemory derives Copy, Eq, Hash, Render {
     \\    Exhausted
@@ -14462,6 +14533,122 @@ const TEXT_MEM_MEM: Str =
     \\    expect before == 0
     \\    expect peak >= 131_072 and charge < peak
     \\} peak_keeps_the_highest_charge
+    \\
+    \\/// Thresholds of one and three chunks.
+    \\fn chunk_levels() -> Array[usize, 2] {
+    \\    var levels = Array[usize, 2].filled(65_536)
+    \\    levels[1] = 196_608
+    \\    return levels
+    \\} chunk_levels
+    \\
+    \\test watch_starts_in_the_band_of_the_charge for Budget.watch {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let kept = Bytes.zeroed(100_000, alloc: budget.alloc())
+    \\    let watch = budget.watch(chunk_levels().view(), alloc: world.alloc)
+    \\    let band = watch.band()
+    \\    take watch.close()
+    \\    discard kept.len()
+    \\    take budget.close()
+    \\    expect band == 1
+    \\} watch_starts_in_the_band_of_the_charge
+    \\
+    \\test band_follows_draws_and_returns_through_a_child for Watch.band {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let child = budget.alloc().split(1_048_576)
+    \\    let watch = budget.watch(chunk_levels().view(), alloc: world.alloc)
+    \\    let before = watch.band()
+    \\    var grown = Bytes.zeroed(100_000, alloc: child.alloc())
+    \\    let drawn = watch.band()
+    \\    mut grown.reserve(150_000)
+    \\    let higher = watch.band()
+    \\    discard grown
+    \\    let returned = watch.band()
+    \\    take watch.close()
+    \\    take child.close()
+    \\    take budget.close()
+    \\    expect before == 0 and drawn == 1 and higher == 2 and returned == 0
+    \\} band_follows_draws_and_returns_through_a_child
+    \\
+    \\test changed_wakes_when_a_draw_leaves_the_band for Watch.changed {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let alloc = budget.alloc()
+    \\    let watch = budget.watch(chunk_levels().view(), alloc: world.alloc)
+    \\    var woken: usize = 0
+    \\    var kept: usize = 0
+    \\    let ran = attempt await task::scope(world.exec, body: fn[mut woken, mut kept](s: task::Scope) fails task::Cancelled uses wait {
+    \\        let waiting = s.spawn(fn() -> usize fails task::Cancelled uses wait {
+    \\            return try await watch.changed(seen: 0)
+    \\        })
+    \\        try await world.clock.sleep(1)
+    \\        let drawn = Bytes.zeroed(100_000, alloc)
+    \\        woken = try await take waiting.join()
+    \\        kept = drawn.len()
+    \\    })
+    \\    let unchanged = match attempt await watch.changed(seen: 1) {
+    \\        Ok(band) => band
+    \\        Err(_) => 2
+    \\    }
+    \\    take watch.close()
+    \\    take budget.close()
+    \\    expect ran.is_ok() and woken == 1 and kept == 100_000 and unchanged == 0
+    \\} changed_wakes_when_a_draw_leaves_the_band
+    \\
+    \\/// Whether a wait of `changed` from band 0 ends with the deadline of a `within`.
+    \\fn waits_out(watch: Watch, clock: sys::Clock) -> bool fails task::Cancelled uses wait {
+    \\    let outcome = try await task::within(clock, ms: 10, body: fn() -> usize fails task::Cancelled uses wait {
+    \\        return try await watch.changed(seen: 0)
+    \\    })
+    \\    return outcome == None
+    \\} waits_out
+    \\
+    \\test cancelled_changed_stops_waiting for Watch.changed {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let watch = budget.watch(chunk_levels().view(), alloc: world.alloc)
+    \\    var ended = 0u32
+    \\    let ran = attempt await task::scope(world.exec, body: fn[mut ended](s: task::Scope) fails task::Cancelled uses wait {
+    \\        for _ in 0..<2u32 {
+    \\            let waiting = s.spawn(fn() -> bool fails task::Cancelled uses wait {
+    \\                return try await waits_out(watch, clock: world.clock)
+    \\            })
+    \\            if try await take waiting.join() {
+    \\                ended += 1
+    \\            }
+    \\        }
+    \\    })
+    \\    take watch.close()
+    \\    take budget.close()
+    \\    expect ran.is_ok() and ended == 2
+    \\} cancelled_changed_stops_waiting
+    \\
+    \\test set_replaces_the_thresholds for Watch.set {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let kept = Bytes.zeroed(100_000, alloc: budget.alloc())
+    \\    var watch = budget.watch(chunk_levels().view(), alloc: world.alloc)
+    \\    mut watch.set(Array[usize, 1].filled(196_608).view())
+    \\    let band = watch.band()
+    \\    take watch.close()
+    \\    discard kept.len()
+    \\    take budget.close()
+    \\    expect band == 0
+    \\} set_replaces_the_thresholds
+    \\
+    \\test close_releases_the_thresholds for Watch.close {
+    \\    let world = testing::world()
+    \\    let budget = world.alloc.split(1_048_576)
+    \\    let copies = world.alloc.split(65_536)
+    \\    let watch = budget.watch(chunk_levels().view(), alloc: copies.alloc())
+    \\    let held = copies.charged()
+    \\    take watch.close()
+    \\    let left = copies.charged()
+    \\    take copies.close()
+    \\    take budget.close()
+    \\    expect held == 65_536 and left == 0
+    \\} close_releases_the_thresholds
     \\
     \\test close_ends_draws for Budget.close {
     \\    let budget = testing::world().alloc.split(65_536)

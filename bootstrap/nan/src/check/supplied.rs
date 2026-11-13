@@ -83,10 +83,11 @@ const FAILING_DRAWS: [&str; 8] = [
 ];
 
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
-/// handles, indexes past an end, duplicate windows and bindings, CPUs past the last, and
+/// handles, indexes past an end, duplicate windows, bindings and waits, CPUs past the last, and
 /// exhausted capability tables, cells and runtime records.
-const TRAPPING: [&str; 36] = [
+const TRAPPING: [&str; 37] = [
     "mem::Alloc.split",
+    "mem::Watch.wait_outside",
     "mem::Arena.at",
     "mem::Pool.at",
     "mem::Pool.at_mut",

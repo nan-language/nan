@@ -67,7 +67,7 @@ pub fn member(
             Val::Struct(budget, Rc::new(vec![Val::Int(i128::from(cell))]))
         }
         ("mem::Budget" | "mem::Heap", "alloc") => allocator(interp, cell_of(interp, &args[0])),
-        ("mem::Budget", "charged") => {
+        ("mem::Budget" | "mem::Alloc", "charged") => {
             Val::Int(interp.budgets.charged(cell_of(interp, &args[0])) as i128)
         }
         ("mem::Budget", "peak") => Val::Int(interp.budgets.peak(cell_of(interp, &args[0])) as i128),

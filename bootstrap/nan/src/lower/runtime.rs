@@ -501,7 +501,9 @@ pub mod state {
     /// configuration.
     pub const PCI: u64 = 528;
     pub const PCI_REMOVAL_LOCK: u64 = 536;
-    pub const SIZE: u64 = 544;
+    /// The first of the arms whose charge left their band, linked through the arms.
+    pub const LEFT: u64 = 544;
+    pub const SIZE: u64 = 552;
 }
 
 impl Lowering<'_, '_> {

@@ -9,6 +9,10 @@
 //! found from the address of its first chunk through the chunk map: its cell handle, its domain,
 //! its live allocation count, the offset of its free bytes, its chunk count, its links in its
 //! domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A
+//! cell whose charge a task has waited on has an arm record, kept as long as the cell: the band
+//! of charges the waiting task waits for the charge to leave, which holds every charge while no
+//! task waits, the task, and its link in the list of arms whose charge left their band, whose
+//! tasks a routine changing charges wakes once it has released the lock. A
 //! run passes to an enclosing domain when a value it holds leaves the domain owning it, charged
 //! from then on to that domain's cell when both cells' chains draw from one supply and the new
 //! chain has room for it, and the runs a domain still owns are freed when it ends.
@@ -34,14 +38,14 @@ const KEPT: u64 = 64;
 
 /// The cell table's capacity.
 pub const CELLS: u64 = 65_536;
-pub const CELL_RECORD: u64 = 48;
+pub const CELL_RECORD: u64 = 56;
 
 /// The chunk map: a table of 2^16 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
 pub const MAP_ROOTS: u64 = 65_536;
 const MAP_LEAVES: u64 = 65_536;
 
-mod cell {
+pub mod cell {
     pub const LIMIT: u64 = 0;
     pub const CHARGE: u64 = 8;
     pub const PARENT: u64 = 16;
@@ -49,6 +53,19 @@ mod cell {
     pub const OPEN: u64 = 24;
     pub const SUPPLY: u64 = 32;
     pub const PEAK: u64 = 40;
+    pub const ARM: u64 = 48;
+}
+
+/// The offsets of an arm record: the lowest charge of its band and the band's span, the waiting
+/// task, the next arm of the list of arms whose charge left their band, and whether it is in
+/// that list.
+pub mod arm {
+    pub const LOW: u64 = 0;
+    pub const SPAN: u64 = 8;
+    pub const WAITER: u64 = 16;
+    pub const NEXT: u64 = 24;
+    pub const LISTED: u64 = 32;
+    pub const SIZE: u64 = 40;
 }
 
 /// The offsets of a region's supply record: its first chunk's address, its chunk count, then its
@@ -177,6 +194,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let address = allocate(lo, fx, params[0], params[1], params[2], domain);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            wake_left(lo, fx);
             fx.b.ins().return_(&[address]);
         }
         Routine::Free => {
@@ -185,6 +203,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             lo.call_routine(fx, Routine::Lock, &[lock]);
             release(lo, fx, params[0]);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            wake_left(lo, fx);
             fx.b.ins().return_(&[]);
         }
         Routine::Split => {
@@ -240,6 +259,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let lifted = lift(lo, fx, params[0], params[1]);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            wake_left(lo, fx);
             fx.b.ins().return_(&[lifted]);
         }
         _ => unreachable!("a memory routine"),
@@ -247,7 +267,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 }
 
 /// The record of a cell by handle, whatever its generation.
-fn cell_record(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
+pub fn cell_record(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
     let index = fx.b.ins().band_imm_s(handle, 0xFFFF_FFFF);
     record_at(lo, fx, index)
 }
@@ -288,6 +308,7 @@ pub fn new_cell(lo: &mut Lowering, fx: &mut Fx, limit: Value, parent: Value) -> 
     let zero = fx.ptr(0);
     fx.store(zero, record, cell::CHARGE);
     fx.store(zero, record, cell::PEAK);
+    fx.store(zero, record, cell::ARM);
     let root = fx.b.ins().icmp_imm_s(IntCC::Equal, parent, -1);
     let parent_index = fx.b.ins().band_imm_s(parent, 0xFFFF_FFFF);
     let parent_index = fx.b.ins().iadd_imm_s(parent_index, 1);
@@ -378,10 +399,10 @@ fn draw(lo: &mut Lowering, fx: &mut Fx, handle: Value, count: Value) -> Value {
     )[0];
     let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mapped, 0);
     fx.when(drawn, |fx| {
-        walk_chain(lo, fx, first, |fx, record| {
+        walk_chain(lo, fx, first, |fx, state_address, record| {
             let charge = fx.load(PTR, record, cell::CHARGE);
             let charged = fx.b.ins().iadd(charge, bytes);
-            set_charge(fx, record, charged);
+            set_charge(fx, state_address, record, charged);
         });
     });
     mapped
@@ -429,8 +450,14 @@ fn chain_fits(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value, start:
     result[1]
 }
 
-/// Runs `visit` on every cell record of the chain from a record.
-fn walk_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, visit: impl FnOnce(&mut Fx, Value)) {
+/// Runs `visit` on every cell record of the chain from a record, given the runtime state's
+/// address.
+fn walk_chain(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    first: Value,
+    visit: impl FnOnce(&mut Fx, Value, Value),
+) {
     let state_address = lo.state(fx);
     let cells = fx.load(PTR, state_address, state::CELLS);
     let mut visit = Some(visit);
@@ -442,7 +469,7 @@ fn walk_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, visit: impl FnOnce(&
             &[PTR],
             |fx| {
                 if let Some(visit) = visit.take() {
-                    visit(fx, record);
+                    visit(fx, state_address, record);
                 }
                 let parent = fx.load(types::I32, record, cell::PARENT);
                 let parent = fx.b.ins().uextend(PTR, parent);
@@ -462,33 +489,109 @@ fn walk_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, visit: impl FnOnce(&
 
 /// Adds a chunk's bytes to every open cell of the chain from a record.
 fn charge_chain(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value) {
-    walk_chain(lo, fx, first, |fx, record| {
+    walk_chain(lo, fx, first, |fx, state_address, record| {
         let open = fx.load(types::I32, record, cell::OPEN);
         let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, open, 0);
         let charge = fx.load(PTR, record, cell::CHARGE);
         let more = fx.b.ins().iadd(charge, bytes);
         let kept = fx.b.ins().select(open, more, charge);
-        set_charge(fx, record, kept);
+        set_charge(fx, state_address, record, kept);
     });
 }
 
 /// Sets a cell's charge to a value no less than it held, raising its peak to that value.
-fn set_charge(fx: &mut Fx, record: Value, charge: Value) {
+fn set_charge(fx: &mut Fx, state_address: Value, record: Value, charge: Value) {
     fx.store(charge, record, cell::CHARGE);
     let peak = fx.load(PTR, record, cell::PEAK);
     let peak = fx.b.ins().umax(peak, charge);
     fx.store(peak, record, cell::PEAK);
+    left_band(fx, state_address, record, charge);
 }
 
 /// Subtracts a chunk's bytes from every open cell of the chain from a record.
 fn uncharge(lo: &mut Lowering, fx: &mut Fx, first: Value, bytes: Value) {
-    walk_chain(lo, fx, first, |fx, record| {
+    walk_chain(lo, fx, first, |fx, state_address, record| {
         let open = fx.load(types::I32, record, cell::OPEN);
         let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, open, 0);
         let charge = fx.load(PTR, record, cell::CHARGE);
         let less = fx.b.ins().isub(charge, bytes);
         let kept = fx.b.ins().select(open, less, charge);
         fx.store(kept, record, cell::CHARGE);
+        left_band(fx, state_address, record, kept);
+    });
+}
+
+/// When a cell's new charge lies outside its arm's band, widens the band to every charge and
+/// lists the arm for a wake while a task waits on it and it is not listed. The caller holds the
+/// lock.
+fn left_band(fx: &mut Fx, state_address: Value, record: Value, charge: Value) {
+    let record_arm = fx.load(PTR, record, cell::ARM);
+    let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record_arm, 0);
+    fx.when(armed, |fx| {
+        let low = fx.load(PTR, record_arm, arm::LOW);
+        let span = fx.load(PTR, record_arm, arm::SPAN);
+        let left = outside(fx, charge, low, span);
+        fx.when(left, |fx| {
+            let zero = fx.ptr(0);
+            fx.store(zero, record_arm, arm::LOW);
+            let every = fx.int(PTR, -1);
+            fx.store(every, record_arm, arm::SPAN);
+            let waiter = fx.load(PTR, record_arm, arm::WAITER);
+            let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+            let listed = fx.load(PTR, record_arm, arm::LISTED);
+            let unlisted = fx.b.ins().icmp_imm_s(IntCC::Equal, listed, 0);
+            let lists = fx.b.ins().band(waits, unlisted);
+            fx.when(lists, |fx| {
+                let head = fx.load(PTR, state_address, state::LEFT);
+                fx.store(head, record_arm, arm::NEXT);
+                let one = fx.ptr(1);
+                fx.store(one, record_arm, arm::LISTED);
+                fx.store(record_arm, state_address, state::LEFT);
+            });
+        });
+    });
+}
+
+/// Whether a charge lies outside the band of `span` charges from `low`.
+pub fn outside(fx: &mut Fx, charge: Value, low: Value, span: Value) -> Value {
+    let above = fx.b.ins().isub(charge, low);
+    fx.b.ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, above, span)
+}
+
+/// Wakes the task of each arm listed as having left its band, taking each arm out of the list
+/// and its task out of the arm under the lock.
+pub fn wake_left(lo: &mut Lowering, fx: &mut Fx) {
+    let state_address = lo.state(fx);
+    let head = fx.load(PTR, state_address, state::LEFT);
+    let pending = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
+    fx.when(pending, |fx| {
+        let lock = fx.offset(state_address, state::LOCK);
+        fx.repeat(&[], |fx, _| {
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let record_arm = fx.load(PTR, state_address, state::LEFT);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record_arm, 0);
+            let waiter = fx.choose(
+                present,
+                &[PTR],
+                |fx| {
+                    let next = fx.load(PTR, record_arm, arm::NEXT);
+                    fx.store(next, state_address, state::LEFT);
+                    let zero = fx.ptr(0);
+                    fx.store(zero, record_arm, arm::LISTED);
+                    let waiter = fx.load(PTR, record_arm, arm::WAITER);
+                    fx.store(zero, record_arm, arm::WAITER);
+                    vec![waiter]
+                },
+                |fx| vec![fx.ptr(0)],
+            )[0];
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+            fx.when(waits, |fx| {
+                lo.call_routine(fx, Routine::Wake, &[waiter]);
+            });
+            (present, Vec::new())
+        });
     });
 }
 
@@ -1195,4 +1298,5 @@ pub fn free_chunks(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
         (present, next)
     });
     lo.call_routine(fx, Routine::Unlock, &[lock]);
+    wake_left(lo, fx);
 }

@@ -1,4 +1,4 @@
-//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's.
+//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's; once anchored, watches the charge of a pool's budget while a draw through a budget split from it crosses a threshold.
 
 /// The memory the entry root maps with the tables the image holds, and the bytes of a frame.
 const MAPPED: u64 = 0x1_0000_0000
@@ -131,6 +131,27 @@ fn halved(take region: hw::Region, mut regions: mem::List[hw::Region]) -> bool {
     return refused and covered
 } halved
 
+/// Whether a task waiting for the charge of a pool's budget to leave its band sees the band of
+/// one chunk once a chunk is drawn through a budget split from the pool.
+fn watch_follows_draws(exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    let pool = alloc.split(1_048_576)
+    let instance = pool.alloc().split(1_048_576)
+    let watch = pool.watch(Array[usize, 1].filled(65_536).view(), alloc)
+    var band: usize = 0
+    let ran = attempt await task::scope(exec, body: fn[mut band](s: task::Scope) fails task::Cancelled uses wait {
+        let waiting = s.spawn(fn() -> usize fails task::Cancelled uses wait limits stack 4_096 {
+            return try await watch.changed(seen: 0)
+        })
+        let drawn = mem::Bytes.zeroed(1, alloc: instance.alloc())
+        band = try await take waiting.join()
+        discard drawn.len()
+    })
+    take watch.close()
+    take instance.close()
+    take pool.close()
+    return ran.is_ok() and band == 1
+} watch_follows_draws
+
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     var regions = mut k.regions()
     if layout_agrees(k, regions, listed: true, alloc: k.alloc()) {
@@ -163,7 +184,11 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     if split {
         say(text: "region split at its middle\n")
     }
-    take k.anchor(take regions, run: fn(exec: task::Executor) limits stack 16_384 {
+    let alloc = k.alloc()
+    take k.anchor(take regions, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         say(text: "anchored\n")
+        if try await watch_follows_draws(exec, alloc) {
+            say(text: "watch follows draws\n")
+        }
     })
 } main

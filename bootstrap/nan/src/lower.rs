@@ -197,6 +197,8 @@ pub enum Glue {
     SimWithdraw,
     /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
     WithdrawSignal(Ty),
+    /// Withdraws a stopped task's wait on the charge of a cell.
+    WithdrawArm,
     /// Compares two values of a type structurally, for `testing::same`.
     Same(Ty),
     /// Calls the interrupt fn of a device of a type behind an IRQ-safe lock, the interrupt fn
@@ -238,7 +240,8 @@ impl Glue {
             | Glue::WithdrawPost
             | Glue::WithdrawStepper
             | Glue::SimWithdraw
-            | Glue::WithdrawSignal(_) => Some(stack::Family::Withdraw),
+            | Glue::WithdrawSignal(_)
+            | Glue::WithdrawArm => Some(stack::Family::Withdraw),
             Glue::Written(_) => Some(stack::Family::Written),
             Glue::Captures(_) => Some(stack::Family::Captures),
             Glue::Policy(..) => Some(stack::Family::Policy),
@@ -268,6 +271,7 @@ impl Glue {
                 | Glue::WithdrawStepper
                 | Glue::SimWithdraw
                 | Glue::WithdrawSignal(_)
+                | Glue::WithdrawArm
                 | Glue::Gate(_)
         )
     }
@@ -275,7 +279,7 @@ impl Glue {
 
 /// The std types whose operations a stopping task completes before it stops, beside those
 /// with interior mutability.
-const CRITICAL_OWNERS: [&str; 18] = [
+const CRITICAL_OWNERS: [&str; 19] = [
     "sys::Domain",
     "task::Sender",
     "task::Receiver",
@@ -284,6 +288,7 @@ const CRITICAL_OWNERS: [&str; 18] = [
     "sys::Outbox",
     "sys::Waker",
     "mem::Shared",
+    "mem::Watch",
     "task::Cown",
     "hw::Ring0",
     "hw::Mmio",

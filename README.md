@@ -1,6 +1,6 @@
 # NaN
 
-NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux on x86_64 and AArch64, UEFI and bare metal.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux and Windows on x86_64 and AArch64, UEFI and bare metal.
 
 The language is specified in [docs/spec](docs/spec/00-charter.md); [the primer](docs/spec/39-primer.md) is the short introduction.
 
@@ -30,7 +30,8 @@ sudo apt install nan
 
 Requirements:
 
-- Host programs: a C compiler as `cc`; for the other architecture, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`.
+- Linux programs: a C compiler as `cc`; for the other architecture, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`.
+- Running Windows programs and their tests: Wine, as `wine`.
 - `uefi` and `bare` programs: QEMU 10.2 or later and `swtpm`; for `uefi`, the OVMF or AAVMF firmware.
 
 ## Usage
@@ -42,7 +43,7 @@ Run `nan` from a directory of NaN packages. Most commands take a scope: a packag
 | `nan check` | Report diagnostics |
 | `nan fmt` | Rewrite files into canonical format |
 | `nan build` | Write a program's image under `.nan/images/<target>/` |
-| `nan run` | Build and run a program; UEFI and bare images boot under QEMU, state in `.nan/machine/<target>/` |
+| `nan run` | Build and run a program; Windows images run under Wine, UEFI and bare images boot under QEMU, state in `.nan/machine/<target>/` |
 | `nan test` | Run tests; `--affected` only those changed since they passed, `--replay <token>` a failing run |
 | `nan show <path> --api` | Print an item's head, contracts and digest, std included |
 | `nan primer` | Print the primer |

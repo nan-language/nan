@@ -113,11 +113,11 @@ const CLASSES: u64 = 44;
 const UNSHARED: i64 = 0x7F;
 const FREED: i64 = 0x80;
 
-/// The byte routines of `mem_op`: the C library's on a host target; on a machine target, which
-/// has no C library, the copy and fill compiler stubs and a comparison loop.
+/// The byte routines of `mem_op`: the C library's on a Linux target; on a Windows or machine
+/// target, which has no C library, the copy and fill compiler stubs and a comparison loop.
 pub fn bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();
-    if lo.machine() {
+    if lo.machine() || lo.windows() {
         machine_bytes(lo, fx, routine, &params);
         return;
     }
@@ -138,7 +138,7 @@ pub fn bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     }
 }
 
-/// The byte routines of a machine target.
+/// The byte routines of a Windows or machine target.
 fn machine_bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine, params: &[Value]) {
     let flags = super::super::fx::unaligned();
     let zero = fx.ptr(0);

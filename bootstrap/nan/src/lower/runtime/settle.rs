@@ -279,8 +279,9 @@ fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
 }
 
 /// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to
-/// stop. A running task's thread receives the stop signal; on a kernel, its CPU receives the
-/// CPU signal when the task is first asked, and the CPU's timer interrupts ask again.
+/// stop. A running task's thread receives the stop signal, or on a Windows target is suspended
+/// and redirected as the stop signal's handler does; on a kernel, its CPU receives the CPU signal
+/// when the task is first asked, and the CPU's timer interrupts ask again.
 fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     let one = fx.ptr(1);
     let asked = fx.offset(record, task::STOP);
@@ -353,8 +354,12 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                             return;
                         }
                         let thread = fx.load(PTR, record, task::THREAD);
-                        let pthread = fx.load(PTR, thread, tasks::thread::PTHREAD);
-                        let signal = fx.int(types::I32, i64::from(host::SIGURG));
+                        if lo.windows() {
+                            host::windows::stop_thread(lo, fx, thread);
+                            return;
+                        }
+                        let pthread = fx.load(PTR, thread, tasks::thread::SYSTEM);
+                        let signal = fx.int(types::I32, i64::from(host::linux::SIGURG));
                         lo.call_libc(fx, "pthread_kill", &[pthread, signal], &[types::I32]);
                     });
                     vec![running]

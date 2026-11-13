@@ -358,17 +358,18 @@ The classes of the operations of the sys capabilities and of the resources they 
 
 ## Platform packages
 
-A **platform package** is the package that mints a target's [root grant](14-authority.md#root-grants) and implements the target-dependent operations of the capabilities that root grant yields. Exactly three exist; the [descriptor](27-program-model.md#descriptors) of each Linux, UEFI and bare target names one:
+A **platform package** is the package that mints a target's [root grant](14-authority.md#root-grants) and implements the target-dependent operations of the capabilities that root grant yields. Exactly four exist; the [descriptor](27-program-model.md#descriptors) of each Linux, Windows, UEFI and bare target names one:
 
 | Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
 | `linux_platform` | the Linux targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
+| `windows_platform` | the Windows targets | `host::World` | the sys capabilities, through the functions of Windows's system libraries and the [host I/O backend](27-program-model.md#host-io-backend) |
 | `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services` and `boot::Machine.enter`, through the firmware's boot services |
 | `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the [start information](24-kernel.md#start-information) and, on `aarch64-bare`, the device tree |
 
-- A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI, PVH or device trees; no other std item has one.
+- A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, Windows, UEFI, PVH or device trees; no other std item has one.
 - No alias and no `dep` directive names a platform package, so no path outside it reaches its items. The [final closure](27-program-model.md#final-builds) of a program also holds the platform package its descriptor names, and no other.
-- Each platform package's manifest grants `priv` to its modules, so its package item is sealed ([device and priv grants](14-authority.md#device-and-priv-grants)); that of `linux_platform`, whose modules hold trusted code, also grants them `trusted`.
+- Each platform package's manifest grants `priv` to its modules, so its package item is sealed ([device and priv grants](14-authority.md#device-and-priv-grants)); those of `linux_platform` and `windows_platform`, whose modules hold trusted code, also grant them `trusted`.
 - `uefi_platform` and `bare_platform` each contribute the `hw::preempt` entry of their targets ([preemption](24-kernel.md#preemption)).
 
 A **target-dependent operation** is an operation of a sys capability, of a resource one opens, or of `boot::Services`. Its std item reaches the platform function through the capability-table [support routine](27-program-model.md#runtime-support), which calls the platform function recorded in the table entry of the capability, or of the entry a resource records ([resources](14-authority.md#resources)): the platform package's for an entry its root grant minted, and the sim's, which `sys` implements on every target, for an entry a [sim](22-testing.md#simulated-capabilities) constructor minted. That call contributes exactly these facts to the item's [digest](10-effects-digests.md#digests): wait exactly when the operation's head states `uses wait`; alloc exactly when the operation takes a `mem::Alloc`; may-trap exactly when it takes a `mem::Alloc` or adds a [capability table](14-authority.md#capability-tables) entry; terminates exactly when wait does not hold. A capability that no root grant of a target yields has values there only as sims.

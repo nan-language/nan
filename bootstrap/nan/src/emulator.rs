@@ -1,6 +1,7 @@
-//! The emulator the machine targets' descriptors name: whether a target's images can run on this
-//! machine, the invocation booting a machine image under the emulator, its boots with the TPM
-//! emulator serving them, and boots bounded in host processor time.
+//! The emulators the descriptors name: whether a target's images can run on this machine, the
+//! invocation running a Windows image under Wine, the invocation booting a machine image under
+//! the emulator, its boots with the TPM emulator serving them, and boots bounded in host
+//! processor time.
 
 use std::fs;
 use std::io::{self, Read};
@@ -11,6 +12,18 @@ use std::time::{Duration, Instant};
 
 use crate::command::Launch;
 use crate::workspace::{Arch, Kind, Target};
+
+/// The program running a Windows image, Wine, from the `PATH`, and the setting of its
+/// environment that keeps Wine's own diagnostics off the image's standard error.
+pub const WINE: &str = "wine";
+pub const WINE_QUIET: (&str, &str) = ("WINEDEBUG", "-all");
+
+/// The command running a Windows image under Wine with its standard streams.
+pub fn wine(image: &Path) -> Command {
+    let mut command = Command::new(WINE);
+    command.arg(image).env(WINE_QUIET.0, WINE_QUIET.1);
+    command
+}
 
 /// The firmware an `x86_64-uefi` image boots through, its code and the template of its
 /// variables, and their fallbacks across distributions, the builds reaching the TPM first.
@@ -276,17 +289,27 @@ fn kvm_usable(arch: Arch) -> bool {
             .is_ok()
 }
 
-/// Whether a target's images can run on this machine, never a Windows or nanos target's: a Linux
-/// target's when the machine has its architecture, and a machine target's when its emulator can
-/// start, the emulator program running and able to end with the process that starts it, the TPM
-/// emulator running, and the firmware present for a UEFI target.
+/// Whether a target's images can run on this machine, never a nanos target's: a Linux target's
+/// when the machine has its architecture, a Windows target's when it has and Wine runs, and a
+/// machine target's when its emulator can start, the emulator program running and able to end
+/// with the process that starts it, the TPM emulator running, and the firmware present for a UEFI
+/// target.
 pub fn available(target: Target) -> bool {
     let Some(arch) = target.arch() else {
         return false;
     };
     match target.kind() {
-        Some(Kind::Windows | Kind::Nanos) => return false,
+        Some(Kind::Nanos) => return false,
         Some(Kind::Linux) => return arch == Arch::running(),
+        Some(Kind::Windows) => {
+            return arch == Arch::running()
+                && Command::new(WINE)
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+        }
         _ => {}
     }
     let runs = Command::new(program(arch))
@@ -484,6 +507,7 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
     Ok(Launch {
         program: program(arch).into(),
         args,
+        env: Vec::new(),
         machine: Some(Machine {
             dir,
             fresh: kept.is_none(),

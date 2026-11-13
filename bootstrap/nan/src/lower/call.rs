@@ -283,6 +283,12 @@ impl Body<'_, '_, '_, '_> {
                 let reference = self.lo.call_ref(self.fx, *id);
                 self.fx.b.ins().call(reference, &args)
             }
+            Target::Foreign(id, ..) if self.lo.windows() => {
+                let declaration = self.lo.module.declarations().get_function_decl(*id);
+                let name = declaration.linkage_name(*id).into_owned();
+                let signature = declaration.signature.clone();
+                self.lo.call_imported(self.fx, &name, signature, &args)
+            }
             Target::Foreign(id, ..) => {
                 let reference = self.lo.func_ref(self.fx, *id);
                 self.fx.b.ins().call(reference, &args)
@@ -988,7 +994,19 @@ impl Lowering<'_, '_> {
             Repr::Empty => Returned::Empty,
             Repr::Address => panic!("a foreign fn returning a value in memory"),
         };
-        let mut signature = Signature::new(super::CALL_CONV);
+        let convention = match self.windows() {
+            true => {
+                let arch = self
+                    .ck
+                    .db
+                    .target
+                    .arch()
+                    .expect("a Windows target's architecture");
+                super::host::windows::convention(arch)
+            }
+            false => super::CALL_CONV,
+        };
+        let mut signature = Signature::new(convention);
         for repr in &params {
             if let Repr::Scalar(ty) = repr {
                 signature.params.push(AbiParam::new(*ty));

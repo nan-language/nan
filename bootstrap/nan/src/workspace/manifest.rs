@@ -171,14 +171,15 @@ impl Target {
         selector == self.name() || selector == arch || selector == kind
     }
 
-    /// The platform package a concrete target's descriptor names; `any`, the Windows targets and
-    /// the nanos targets name none.
+    /// The platform package a concrete target's descriptor names; `any` and the nanos targets
+    /// name none.
     pub fn platform_package(self) -> Option<&'static str> {
         match self.kind()? {
             Kind::Linux => Some("linux_platform"),
+            Kind::Windows => Some("windows_platform"),
             Kind::Uefi => Some("uefi_platform"),
             Kind::Bare => Some("bare_platform"),
-            Kind::Windows | Kind::Nanos => None,
+            Kind::Nanos => None,
         }
     }
 
@@ -195,9 +196,10 @@ impl Target {
     /// What an image of the target appends to its package's name.
     pub fn image_suffix(self) -> &'static str {
         match self.kind() {
+            Some(Kind::Windows) => ".exe",
             Some(Kind::Uefi) => ".efi",
             Some(Kind::Bare) => ".elf",
-            Some(Kind::Linux | Kind::Windows | Kind::Nanos) | None => "",
+            Some(Kind::Linux | Kind::Nanos) | None => "",
         }
     }
 }

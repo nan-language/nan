@@ -3,7 +3,7 @@
 //! image of a kernel's user-mode runtime, a bundle whose job is the runtime's start, recording
 //! where it defines each export.
 
-use super::{Access, Linked, link};
+use super::{Access, Imports, Linked, link};
 use crate::encoding::{Record, bytes, list, uvar};
 use crate::lower::load::{Contributed, Interface};
 
@@ -23,7 +23,7 @@ pub fn write(
     interface: &Interface,
     seed: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, Vec<String>> {
-    let linked = link(object, 0, true);
+    let linked = link(object, 0, Imports::Bundle);
     let index = |name: &str| interface.exports.iter().position(|export| export == name);
     let mut missing: Vec<String> = linked
         .imports
@@ -72,7 +72,7 @@ pub fn runtime(
     stack: u64,
     boot: u64,
 ) -> Vec<u8> {
-    let linked = link(object, 0, false);
+    let linked = link(object, 0, Imports::None);
     let exports: Vec<u64> = interface
         .exports
         .iter()

@@ -1,6 +1,6 @@
 # 0202. The Windows targets
 
-Status: accepted
+Status: superseded by 0203
 
 ## Context
 

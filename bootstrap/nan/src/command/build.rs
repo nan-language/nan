@@ -13,11 +13,13 @@ use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::workspace::{Kind, Target, Workspace};
 
-/// What `nan run` starts once it has built an image: the image on a host target, the emulator
-/// booting it on a machine target, and its arguments.
+/// What `nan run` starts once it has built an image: the image on a Linux target, Wine running it
+/// on a Windows target, the emulator booting it on a machine target; its arguments and the
+/// environment variables it sets.
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub env: Vec<(&'static str, &'static str)>,
     /// The machine directory of the emulator, whose end gives the run's status; none for an
     /// image.
     pub machine: Option<Machine>,
@@ -31,7 +33,10 @@ impl Launch {
         if let Some(machine) = &self.machine {
             return emulator::run(self, machine);
         }
-        let error = Command::new(&self.program).args(&self.args).exec();
+        let error = Command::new(&self.program)
+            .args(&self.args)
+            .envs(self.env.iter().copied())
+            .exec();
         panic!("starting {}: {error}", self.program.display());
     }
 }
@@ -100,9 +105,19 @@ pub fn run(
                 emulator::launch(target, &path, &files, boots())?
             }
             Some(Kind::Bare) => emulator::launch(target, &path, &[], boots())?,
+            Some(Kind::Windows) => Launch {
+                program: PathBuf::from(emulator::WINE),
+                args: [path.to_string_lossy().into_owned()]
+                    .into_iter()
+                    .chain(invocation.passed.iter().cloned())
+                    .collect(),
+                env: vec![emulator::WINE_QUIET],
+                machine: None,
+            },
             _ => Launch {
                 program: path,
                 args: invocation.passed.to_vec(),
+                env: Vec::new(),
                 machine: None,
             },
         };

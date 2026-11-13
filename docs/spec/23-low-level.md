@@ -1491,7 +1491,7 @@ convention_clause = 'convention' TEXT ;
 - Declaring a foreign fn is a `trusted` operation (`authority.ungranted`), and each declaration is a trust escape.
 - Its parameters are read parameters, and its parameter and result types are integer and float scalars, `hw::Ptr[T]` and AnyBits layouts; its result may also be `Unit` or `Never`. Its name is one identifier, and it has no generic parameters or `fails`. Any other head is an error (`trusted.foreign-signature`). [Effects, digests and limits](10-effects-digests.md#foreign-functions-and-trusted-code) gives its waiting and digest rules.
 - Its symbol is its name. A call of a foreign fn, or through a foreign function type, passes and returns an integer or float scalar as the convention passes the C type of that width and signedness, a pointer as its address, an integer layout as its bits value, and a bytes layout as a structure of N bytes with alignment 1.
-- A final build of a Linux target's image resolves the symbols of the foreign fns it reaches through its linker ([images](27-program-model.md#images)). A final build of a machine target's image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
+- A final build of a Linux target's image resolves the symbols of the foreign fns it reaches through its linker, and that of a Windows target's image imports each from `kernel32.dll` by its symbol ([images](27-program-model.md#images)). A final build of a machine target's image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
 
 ### Calling conventions
 

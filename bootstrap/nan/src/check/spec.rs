@@ -111,7 +111,7 @@ impl Checker<'_> {
     fn clause_texts(&self, item: ItemId, clauses: &[ast::Clause]) -> Vec<String> {
         clauses
             .iter()
-            .filter(|clause| !clause.disputed)
+            .filter(|clause| clause.disputed.is_none())
             .filter_map(|clause| match &clause.kind {
                 ClauseKind::Requires(expr)
                 | ClauseKind::Ensures(expr)
@@ -134,7 +134,7 @@ impl Checker<'_> {
                 };
                 let targets = matches!(self.test_target(item, test),
                     Some(TestTarget::Function(target)) if target == function);
-                if test.disputed || !targets {
+                if test.disputed.is_some() || !targets {
                     continue;
                 }
                 let Some(path) = self.canonical_path(item) else {

@@ -155,10 +155,9 @@ impl Checker<'_> {
         let ItemKind::Fn(function) = &self.db.ast(abandon).kind else {
             return true;
         };
-        !function
-            .clauses
-            .iter()
-            .any(|clause| !clause.disputed && matches!(clause.kind, ClauseKind::Requires(_)))
+        !function.clauses.iter().any(|clause| {
+            clause.disputed.is_none() && matches!(clause.kind, ClauseKind::Requires(_))
+        })
     }
 
     /// The function named `abandon` after a type item, in the type's module.

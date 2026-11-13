@@ -242,8 +242,8 @@ pub enum ClauseKind {
     Ensures(Expr),
     Example(Expr),
     Decreases(Expr),
-    /// `todo "question"` without a clause: a missing specification.
-    Missing,
+    /// `todo "question"` without a clause: a missing specification, and its text.
+    Missing(Text),
     Waive {
         length: bool,
         reason: Text,
@@ -259,8 +259,8 @@ pub enum ClauseKind {
 #[derive(Clone, Debug)]
 pub struct Clause {
     pub token: Tok,
-    /// Whether `todo TEXT` precedes the clause it marks.
-    pub disputed: bool,
+    /// The text of the `todo` preceding the clause it marks, which disputes it.
+    pub disputed: Option<Text>,
     pub kind: ClauseKind,
 }
 
@@ -476,8 +476,8 @@ pub struct ContributeItem {
 
 #[derive(Clone, Debug)]
 pub struct TestItem {
-    /// Whether `todo TEXT` precedes the test, which disputes it.
-    pub disputed: bool,
+    /// The text of the `todo` preceding the test, which disputes it.
+    pub disputed: Option<Text>,
     pub name: Name,
     /// The test target: a path, and the member it names through it.
     pub target: Path,

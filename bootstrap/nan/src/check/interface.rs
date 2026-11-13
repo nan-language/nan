@@ -330,7 +330,9 @@ impl Checker<'_> {
         for method in &interface.methods {
             for clause in &method.clauses {
                 let allowed = match clause.kind {
-                    ClauseKind::Requires(_) | ClauseKind::Ensures(_) | ClauseKind::Missing => true,
+                    ClauseKind::Requires(_) | ClauseKind::Ensures(_) | ClauseKind::Missing(_) => {
+                        true
+                    }
                     ClauseKind::Decreases(_) | ClauseKind::Waive { .. } => method.body.is_some(),
                     ClauseKind::Example(_) | ClauseKind::Undo { .. } => false,
                 };

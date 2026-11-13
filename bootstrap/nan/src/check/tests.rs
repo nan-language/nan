@@ -191,7 +191,10 @@ fn a_validator_implements_no_interface_method() {
 }
 
 #[test]
-fn a_todo_expression_states_its_intent() {
-    let source = "//! Delays.\n\npub fn retry_delay(retries: u32) -> u32 {\n    if retries == 0 {\n        return 0\n    }\n    return todo \"\"\n} retry_delay\n";
-    assert!(reported_in("", source).contains(&(Code::TodoEmptyReason, Some(7))));
+fn every_form_of_todo_states_its_intent() {
+    let source = "//! Delays.\n\npub fn retry_delay(retries: u32) -> u32\n    todo \"\" ensures result >= retries\n    todo \" \"\n{\n    if retries == 0 {\n        return 0\n    }\n    return todo \"\"\n} retry_delay\n\ntodo \"  \" test retry_delay_grows for retry_delay {\n    expect retry_delay(1) >= 1\n} retry_delay_grows\n";
+    let reported = reported_in("", source);
+    for line in [4, 5, 10, 13] {
+        assert!(reported.contains(&(Code::TodoEmptyReason, Some(line))));
+    }
 }

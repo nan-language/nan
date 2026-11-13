@@ -379,7 +379,7 @@ fn select(checker: &Checker, workspace: &Workspace, scope: &Scope) -> Vec<Select
         let ItemKind::Test(test) = &data.ast.kind else {
             continue;
         };
-        if test.disputed || !checker.db.is_reported(item) {
+        if test.disputed.is_some() || !checker.db.is_reported(item) {
             continue;
         }
         let property = test.params.is_some();

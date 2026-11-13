@@ -1371,11 +1371,16 @@ impl Body<'_, '_> {
     }
 
     fn clause(&mut self, clause: &ast::Clause, sig: &FnSig) {
-        if clause.disputed {
-            self.report(clause.token, Code::TodoDisputed);
-        }
-        if let ast::ClauseKind::Missing = clause.kind {
-            self.report(clause.token, Code::TodoMissingSpec);
+        let todo = match (&clause.kind, &clause.disputed) {
+            (ast::ClauseKind::Missing(reason), _) => Some((reason, Code::TodoMissingSpec)),
+            (_, Some(reason)) => Some((reason, Code::TodoDisputed)),
+            _ => None,
+        };
+        if let Some((reason, code)) = todo {
+            self.report(clause.token, code);
+            if reason.value.trim_matches(' ').is_empty() {
+                self.report(reason.token, Code::TodoEmptyReason);
+            }
         }
         let saved = self.cx;
         let typed = match &clause.kind {
@@ -1413,12 +1418,12 @@ impl Body<'_, '_> {
                 let body = self.example(example);
                 self.examples.push(TExample {
                     token: clause.token,
-                    disputed: clause.disputed,
+                    disputed: clause.disputed.is_some(),
                     body,
                 });
                 None
             }
-            ast::ClauseKind::Missing
+            ast::ClauseKind::Missing(_)
             | ast::ClauseKind::Waive { .. }
             | ast::ClauseKind::Undo { .. } => None,
         };
@@ -1426,7 +1431,7 @@ impl Body<'_, '_> {
             self.clauses.push(TClause {
                 token: clause.token,
                 role,
-                disputed: clause.disputed,
+                disputed: clause.disputed.is_some(),
                 expr,
             });
         }

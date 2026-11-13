@@ -65,7 +65,7 @@ impl Checker<'_> {
             }
             for clause in &method.clauses {
                 match &clause.kind {
-                    ClauseKind::Requires(_) | ClauseKind::Ensures(_) | ClauseKind::Missing => {}
+                    ClauseKind::Requires(_) | ClauseKind::Ensures(_) | ClauseKind::Missing(_) => {}
                     ClauseKind::Undo { target, member, .. } => {
                         match self.operation_undoer(item, index, target, member.as_ref()) {
                             None => self.report(item, clause.token, Code::EffectUndoTarget),

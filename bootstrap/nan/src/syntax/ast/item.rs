@@ -511,23 +511,24 @@ impl<'a> Lower<'a> {
                 premise: self.text_of(self.tokens_of(node, TokenKind::Text)[0]),
             },
             _ => {
+                let text = self.text_of(self.tokens_of(node, TokenKind::Text)[0]);
                 return match self.nodes(node).first().copied() {
                     Some(marked) => Clause {
                         token,
-                        disputed: true,
+                        disputed: Some(text),
                         ..self.clause(marked)
                     },
                     None => Clause {
                         token,
-                        disputed: false,
-                        kind: ClauseKind::Missing,
+                        disputed: None,
+                        kind: ClauseKind::Missing(text),
                     },
                 };
             }
         };
         Clause {
             token,
-            disputed: false,
+            disputed: None,
             kind,
         }
     }
@@ -924,7 +925,7 @@ impl<'a> Lower<'a> {
             .expect("a test body opens");
         let target = self.find(node, Rule::TestTarget).expect("a test target");
         TestItem {
-            disputed: self.text(tokens[0]) == "todo",
+            disputed: (self.text(tokens[0]) == "todo").then(|| self.text_of(tokens[1])),
             name: self.name(self.idents(node)[0]),
             target: self.path(self.find(target, Rule::Path).expect("a target path")),
             member: self.idents(target).first().map(|token| self.name(*token)),

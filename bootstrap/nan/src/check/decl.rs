@@ -473,8 +473,11 @@ impl Checker<'_> {
                 self.check_case(item, &contribution.name, Case::Snake);
             }
             ItemKind::Test(test) => {
-                if test.disputed {
+                if let Some(reason) = &test.disputed {
                     self.report(item, ast.token, Code::TodoDisputed);
+                    if reason.value.trim_matches(' ').is_empty() {
+                        self.report(item, reason.token, Code::TodoEmptyReason);
+                    }
                 }
                 self.check_case(item, &test.name, Case::Snake);
                 self.check_test_head(item, test);

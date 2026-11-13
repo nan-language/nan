@@ -88,10 +88,9 @@ fn every_pub_std_function_has_an_example_or_a_test() {
             let ItemKind::Fn(function) = &ast.kind else {
                 return false;
             };
-            let example = function
-                .clauses
-                .iter()
-                .any(|clause| matches!(clause.kind, ClauseKind::Example(_)) && !clause.disputed);
+            let example = function.clauses.iter().any(|clause| {
+                matches!(clause.kind, ClauseKind::Example(_)) && clause.disputed.is_none()
+            });
             let path = db.canonical(*item);
             let machine = |ty: ItemId| MACHINE_VALUES.contains(&db.canonical(ty).as_str());
             let owner = match db.owners.get(item) {

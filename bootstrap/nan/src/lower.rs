@@ -57,7 +57,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId, TypeKey};
 use crate::check::ty::{self as ty, Args, Ty};
 use crate::nir::{Role, Span};
-use crate::workspace::{Arch, Level, Target};
+use crate::workspace::{Arch, Kind, Level, Target};
 pub use abi::Abi;
 use fx::Fx;
 use layout::Layouts;
@@ -429,13 +429,13 @@ enum Pending {
 /// The settings an image's code is generated with: the base set of its architecture, the x86-64
 /// one with SSE2 or the A64 one of Armv8.0-A, with the extensions of its codegen level, frame
 /// pointers in every function, Cranelift's stack switching where it has it, and the canonical NaN
-/// as the NaN every float operation returns. A host image is position-independent and links
+/// as the NaN every float operation returns. A Linux image is position-independent and links
 /// against glibc with inline stack probes for its guard pages; a machine image loads at a fixed
 /// address and is not position-independent, so its code reaches its own functions and data
 /// directly, with no global offset table and no stack probes.
 fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
     let mut flags = settings::builder();
-    let host = target.is_host();
+    let host = target.kind() == Some(Kind::Linux);
     let triple = match (target.arch(), host) {
         (Some(Arch::Aarch64), true) => "aarch64-unknown-linux-gnu",
         (Some(Arch::Aarch64), false) => "aarch64-unknown-none-elf",

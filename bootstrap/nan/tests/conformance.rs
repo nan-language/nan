@@ -3,10 +3,11 @@
 //! holding nothing else, `nan verify` included for a gate code, compares a host example's
 //! obligation outcomes with the proof cache's, builds its programs and compares what an
 //! `x86_64-host` one writes with the text its section gives, runs the commands of the `text`
-//! blocks of its section, and finds each item of its `nan-api` blocks in the std sources, one
-//! test per chapter, whose runs of `nan` use the harnesses' home directory and a local store of
-//! their own.
+//! blocks of its section, finds each item of its `nan-api` blocks in the std sources and the
+//! heading each of its links to a section names, one test per chapter, whose runs of `nan` use the
+//! harnesses' home directory and a local store of their own.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -459,6 +460,87 @@ fn api_failures(text: &str) -> std::io::Result<Vec<String>> {
     Ok(failures)
 }
 
+/// The lines of a chapter outside its fenced blocks, numbered from 1.
+fn prose(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut fenced = false;
+    text.lines().enumerate().filter_map(move |(index, line)| {
+        if line.starts_with("```") {
+            fenced = !fenced;
+            return None;
+        }
+        (!fenced).then_some((index + 1, line))
+    })
+}
+
+/// The anchors of a chapter's headings, as the renderer derives them: lowercased, spaces made
+/// hyphens, other punctuation dropped, and a repeated one suffixed with its count.
+fn anchors(text: &str) -> HashSet<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut found = HashSet::new();
+    for (_, line) in prose(text) {
+        let title = line.trim_start_matches('#');
+        if title.len() == line.len() || !title.starts_with(' ') {
+            continue;
+        }
+        let anchor: String = title
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| match c {
+                ' ' => Some('-'),
+                '-' | '_' => Some(c),
+                c if c.is_alphanumeric() => Some(c),
+                _ => None,
+            })
+            .collect();
+        let count = seen.entry(anchor.clone()).or_default();
+        found.insert(match *count {
+            0 => anchor.clone(),
+            n => format!("{anchor}-{n}"),
+        });
+        *count += 1;
+    }
+    found
+}
+
+/// The links of a chapter to a section of a chapter whose anchor names no heading there.
+fn link_failures(path: &Utf8Path, text: &str) -> std::io::Result<Vec<String>> {
+    let own = path.file_name().expect("a chapter file");
+    let mut known: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    let mut failures = Vec::new();
+    for (line, content) in prose(text) {
+        for link in content.split("](").skip(1) {
+            let Some(link) = link.split(')').next() else {
+                continue;
+            };
+            let Some((file, anchor)) = link.split_once('#') else {
+                continue;
+            };
+            let file = if file.is_empty() { own } else { file };
+            if file.contains('/') || !file.ends_with(".md") {
+                continue;
+            }
+            if !known.contains_key(file) {
+                let headings = match fs::read_to_string(path.with_file_name(file)) {
+                    Ok(target) => Some(anchors(&target)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                known.insert(file.to_owned(), headings);
+            }
+            if !known[file]
+                .as_ref()
+                .is_some_and(|headings| headings.contains(anchor))
+            {
+                failures.push(format!(
+                    "{path}:{line}: the link to {link} names no heading"
+                ));
+            }
+        }
+    }
+    Ok(failures)
+}
+
 fn chapter(path: &Utf8Path, text: String) -> datatest_stable::Result<()> {
     let chapter = path.file_stem().expect("a chapter file");
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
@@ -471,6 +553,7 @@ fn chapter(path: &Utf8Path, text: String) -> datatest_stable::Result<()> {
         .into_iter()
         .map(|failure| format!("{path}:{failure}"))
         .collect();
+    failures.extend(link_failures(path, &text)?);
     for example in examples(&text) {
         match fs::remove_dir_all(&store) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),

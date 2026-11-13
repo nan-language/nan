@@ -97,7 +97,7 @@ An impl line naming `sys::Component` is checked in this order, and only the firs
 1. A target with generic parameters is an error (`component.state-generic`).
 2. A target that is not [Inert](05-properties.md#inert) is an error (`component.state-not-inert`).
 3. A target that does not implement [Encode](13-text-encode.md#encode) is an error (`component.state-not-encode`). Its exact fix adds `Encode` to the target's `derives` clause, writing `derives Encode` when the target has none.
-4. A [linear](05-properties.md#linear) Env whose type has no [abandon method](17-suspension-io.md#abandoning-resources) visible at the impl line, or whose abandon method has a requires clause that is not [disputed](18-contracts.md#disputed-clauses), is an error (`component.env-not-abandonable`).
+4. A [linear](05-properties.md#linear-types) Env whose type has no [abandon method](17-suspension-io.md#abandoning-resources) visible at the impl line, or whose abandon method has a requires clause that is not [disputed](18-contracts.md#disputed-clauses), is an error (`component.env-not-abandonable`).
 
 The **state schema** of a component is the [schema hash](13-text-encode.md#schema-hashes) of its component state. The [code root](30-artefacts.md#code-roots) of a package records the schema tree of every component state the package declares.
 

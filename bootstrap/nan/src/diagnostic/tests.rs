@@ -3,13 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::Code;
 
-/// The codes of rules that no workspace state reaches: no NIR stream is decoded, and language 1
-/// is the only language.
-const UNREACHED: [&str; 3] = [
-    "language.newer-dependency",
-    "nir.malformed",
-    "nir.version-unsupported",
-];
+/// The codes of rules that no workspace state reaches: language 1 is the only language.
+const UNREACHED: [&str; 1] = ["language.newer-dependency"];
 
 /// Whether `text` holds `name` as a whole code name.
 fn names(text: &str, name: &str) -> bool {

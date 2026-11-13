@@ -1,0 +1,1347 @@
+//! Decoding of NIR streams: whether a stream is the canonical encoding of units under the NIR version it names. A value of a struct, enum or layout type is read only as part of its field: its encoding follows declarations the stream need not hold.
+
+/// Why a NIR stream does not decode: a version other than the one this toolchain implements, or bytes that are not the canonical encoding of units; none when it decodes.
+pkg fn stream_defect(stream: Slice[u8], alloc: mem::Alloc) -> Option[diagnostic::Code] {
+    let malformed = Some(diagnostic::Code.NirMalformed)
+    let Some(head) = stream.prefix(MAGIC.len()) else {
+        return malformed
+    }
+    if head != MAGIC {
+        return malformed
+    }
+    let Some(whole) = stream.prefix(stream.len()) else {
+        return malformed
+    }
+    let end = stream.len()
+    var r = Reader(bytes: take whole, at: MAGIC.len(), end: end, failed: false)
+    let written = mut r.number()
+    if r.failed {
+        return malformed
+    }
+    if written != VERSION {
+        return Some(diagnostic::Code.NirVersionUnsupported)
+    }
+    var previous: Option[Order] = None
+    let items = mut r.count()
+    for _ in 0..<items {
+        let order = mut r.unit(alloc)
+        match previous {
+            Some(before) => {
+                let ordered = r.precedes(before, later: order)
+                mut r.need(ordered)
+            }
+            None => {}
+        }
+        previous = Some(order)
+    }
+    if not r.done() {
+        return malformed
+    }
+    return None
+} stream_defect
+
+/// Encoded bytes being read: where the next value starts, where the record field being read ends, and whether every value read so far was well formed. A failed reader reads every value as 0 or empty.
+view struct Reader {
+    bytes: Slice[u8]
+    at: usize
+    end: usize
+    failed: bool
+} Reader
+
+/// A run of the bytes being read: where it starts and where it ends.
+struct Run derives Copy, Eq {
+    start: usize
+    end: usize
+} Run
+
+/// The fields of a record being read: how many are left, the greatest key the record defines, the last key read, the keys read as bits, and where the record's enclosing field ends.
+struct Fields derives Copy {
+    left: u64
+    keys: u64
+    last: u64
+    seen: u64
+    outer: usize
+} Fields
+
+fn Fields.has(self, key: u64) -> bool {
+    return key < 64 and ((self.seen >> u32.fit(key)) & 1) == 1
+} Fields.has
+
+/// Whether it holds every key from 1 to `last`.
+fn Fields.through(self, last: u64) -> bool {
+    for key in 1..<(last + 1) {
+        if not self.has(key) {
+            return false
+        }
+    }
+    return true
+} Fields.through
+
+fn Reader.need(mut self, holds: bool) {
+    if not holds {
+        self.failed = true
+    }
+} Reader.need
+
+/// Whether every value read was well formed and none is left.
+fn Reader.done(self) -> bool = not self.failed and self.at == self.end
+
+/// A uvar within 64 bits, without redundant trailing groups.
+fn Reader.number(mut self) -> u64 {
+    var value: u64 = 0
+    var shift: u32 = 0
+    loop {
+        if self.failed or self.at >= self.end or self.at >= self.bytes.len() {
+            self.failed = true
+            return 0
+        }
+        let byte = self.bytes[self.at]
+        self.at += 1
+        let group = u64.widen(byte & 0x7F)
+        if shift == 63 and group > 1 {
+            self.failed = true
+            return 0
+        }
+        value = value | (group << shift)
+        if (byte & 0x80) == 0 {
+            if shift > 0 and byte == 0 {
+                self.failed = true
+                return 0
+            }
+            return value
+        }
+        shift += 7
+        if shift > 63 {
+            self.failed = true
+            return 0
+        }
+    }
+} Reader.number
+
+/// A choice among a number of alternatives, by its position.
+fn Reader.choice(mut self, alternatives: u64) -> u64 {
+    let position = mut self.number()
+    mut self.need(position < alternatives)
+    if self.failed {
+        return 0
+    }
+    return position
+} Reader.choice
+
+fn Reader.flag(mut self) -> bool {
+    return mut self.choice(2) == 1
+} Reader.flag
+
+/// The count of a list whose elements each take a byte at least.
+fn Reader.count(mut self) -> u64 {
+    let items = mut self.number()
+    if self.failed or items > u64.widen(self.end - self.at) {
+        self.failed = true
+        return 0
+    }
+    return items
+} Reader.count
+
+/// The count of a list the encoding omits when it is empty.
+fn Reader.nonempty(mut self) -> u64 {
+    let items = mut self.count()
+    mut self.need(items > 0)
+    return items
+} Reader.nonempty
+
+/// Bytes: a uvar length, then the bytes.
+fn Reader.chunk(mut self) -> Run {
+    let length = mut self.number()
+    if self.failed or length > u64.widen(self.end - self.at) {
+        self.failed = true
+        return Run(start: self.at, end: self.at)
+    }
+    let start = self.at
+    self.at = start + usize.widen(length)
+    return Run(start: start, end: self.at)
+} Reader.chunk
+
+/// A text: bytes holding UTF-8.
+fn Reader.text(mut self) -> Run {
+    let run = mut self.chunk()
+    if not text::utf8::is_valid(self.held(run)) {
+        self.failed = true
+    }
+    return run
+} Reader.text
+
+/// `width` bytes as they stand.
+fn Reader.fixed(mut self, width: usize) {
+    if self.failed or self.end - self.at < width {
+        self.failed = true
+        return
+    }
+    self.at += width
+} Reader.fixed
+
+/// The bytes of a run.
+proj fn Reader.held(self, run: Run) -> Slice[u8] {
+    let Some(upto) = self.bytes.prefix(run.end) else {
+        return self.bytes
+    }
+    let Some(parts) = upto.split_at(run.start) else {
+        return self.bytes
+    }
+    return parts.tail
+} Reader.held
+
+/// Whether a run holds the bytes of `name`.
+fn Reader.names(self, run: Run, name: Slice[u8]) -> bool = self.held(run) == name
+
+/// Whether the bytes of two runs are equal.
+fn Reader.same(self, run: Run, other: Run) -> bool = self.held(run) == self.held(other)
+
+/// Whether the bytes of one run come strictly before another's in byte order.
+fn Reader.before(self, earlier: Run, later: Run) -> bool {
+    let left = self.held(earlier)
+    let right = self.held(later)
+    var at: usize = 0
+    while at < left.len() and at < right.len() {
+        if left[at] != right[at] {
+            return left[at] < right[at]
+        }
+        at += 1
+    }
+    return left.len() < right.len()
+} Reader.before
+
+/// Whether the bytes of a run hold a `/`.
+fn Reader.slashed(self, run: Run) -> bool {
+    for byte in self.held(run) {
+        if byte == b'/' {
+            return true
+        }
+    }
+    return false
+} Reader.slashed
+
+/// The fields of the record at the reader, whose keys run from 1 to `keys`.
+fn Reader.fields(mut self, keys: u64) -> Fields {
+    let left = mut self.count()
+    return Fields(left: left, keys: keys, last: 0, seen: 0, outer: self.end)
+} Reader.fields
+
+/// Enters the next field of a record, whose key is then the fields' last; false when none is left.
+fn Reader.field(mut self, mut fields: Fields) -> bool {
+    if fields.left == 0 or self.failed {
+        return false
+    }
+    fields.left -= 1
+    let key = mut self.number()
+    mut self.need(fields.last < key and key <= fields.keys)
+    let length = mut self.number()
+    if self.failed or length > u64.widen(self.end - self.at) {
+        self.failed = true
+        return false
+    }
+    fields.last = key
+    if key < 64 {
+        fields.seen = fields.seen | (1u64 << u32.fit(key))
+    }
+    self.end = self.at + usize.widen(length)
+    return true
+} Reader.field
+
+/// Leaves a field, whose content must have been read whole.
+fn Reader.close(mut self, fields: Fields) {
+    mut self.need(self.at == self.end)
+    self.end = fields.outer
+} Reader.close
+
+/// What orders a stream's units: a unit's path and first target.
+struct Order derives Copy {
+    path: Run
+    target: Run
+} Order
+
+/// Whether one unit's order comes strictly before another's.
+fn Reader.precedes(self, earlier: Order, later: Order) -> bool {
+    if self.same(earlier.path, other: later.path) {
+        return self.before(earlier.target, later: later.target)
+    }
+    return self.before(earlier.path, later: later.path)
+} Reader.precedes
+
+/// What reading a unit's spans and digests needs of a function: its role, its parameter count and, for each block, whether each instruction is a slot.
+struct Skeleton {
+    role: u64
+    params: u64
+    blocks: mem::List[mem::List[bool]]
+} Skeleton
+
+/// How many functions part 9 covers: those of the roles `body`, `closure` and `default`.
+fn covered_count(functions: Slice[Skeleton]) -> u64 {
+    var items: u64 = 0
+    for function in functions {
+        if function.role == 0 or function.role == 2 or function.role == 12 {
+            items += 1
+        }
+    }
+    return items
+} covered_count
+
+/// A unit, giving its path and first target, which order a stream's units.
+fn Reader.unit(mut self, alloc: mem::Alloc) -> Order {
+    var path = Run(start: 0, end: 0)
+    var targets = mem::List[Run].empty(alloc)
+    var functions = mem::List[Skeleton].empty(alloc)
+    var fields = mut self.fields(12)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                path = mut self.text()
+            }
+            2 => {
+                discard mut self.choice(15)
+            }
+            3 => {
+                targets = mut self.sorted_texts(alloc)
+                mut self.need(targets.len() > 0)
+            }
+            4 => mut self.visibility()
+            5 => {
+                let head = mut self.head(false)
+                mut self.need(head != 0)
+            }
+            6 => mut self.declaration()
+            7 => mut self.properties()
+            8 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    mut functions.push(mut self.function(alloc))
+                }
+            }
+            9 => mut self.digests(targets.view(), covered: covered_count(functions.view()), alloc)
+            10 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    discard mut self.text()
+                }
+            }
+            11 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    discard mut self.choice(4)
+                }
+            }
+            else => mut self.spans(functions.view())
+        }
+        mut self.close(fields)
+    }
+    let spanned = fields.has(8) == fields.has(12)
+    let digested = fields.has(9) == (covered_count(functions.view()) > 0)
+    mut self.need(fields.through(4) and spanned and digested)
+    var target = Run(start: 0, end: 0)
+    if targets.len() > 0 {
+        target = targets[0]
+    }
+    return Order(path: path, target: target)
+} Reader.unit
+
+/// A list of texts in strictly increasing byte order.
+fn Reader.sorted_texts(mut self, alloc: mem::Alloc) -> mem::List[Run] {
+    var names = mem::List[Run].empty(alloc)
+    let items = mut self.count()
+    for _ in 0..<items {
+        let name = mut self.text()
+        let held = names.len()
+        if held > 0 {
+            let ordered = self.before(names[held - 1], later: name)
+            mut self.need(ordered)
+        }
+        mut names.push(name)
+    }
+    return names
+} Reader.sorted_texts
+
+/// An optional word of the `visibility` rule.
+fn Reader.visibility(mut self) {
+    if mut self.flag() {
+        discard mut self.choice(2)
+    }
+} Reader.visibility
+
+/// A head as part 5 writes it, giving the keys it holds as bits; a function's head holds its result and wait flag.
+fn Reader.head(mut self, function: bool) -> u64 {
+    var fields = mut self.fields(9)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    discard mut self.choice(11)
+                }
+            }
+            2 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    mut self.generic()
+                }
+            }
+            3 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    mut self.parameter()
+                }
+            }
+            4 or 5 => {
+                discard mut self.ty()
+            }
+            6 or 9 => {
+                discard mut self.flag()
+            }
+            7 => mut self.limit_clause()
+            else => {
+                discard mut self.text()
+            }
+        }
+        mut self.close(fields)
+    }
+    let declared = (fields.seen >> 3) != 0
+    if function or declared {
+        mut self.need(fields.has(4) and fields.has(6))
+    }
+    return fields.seen
+} Reader.head
+
+/// A generic parameter: its name, then its bounds or a const parameter's type.
+fn Reader.generic(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.text()
+            }
+            2 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    discard mut self.ty()
+                }
+            }
+            else => {
+                discard mut self.ty()
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(1))
+} Reader.generic
+
+/// A parameter of a head: its mode, name and type.
+fn Reader.parameter(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.choice(3)
+            }
+            2 => {
+                discard mut self.text()
+            }
+            else => {
+                discard mut self.ty()
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(3))
+} Reader.parameter
+
+/// A limits clause: its entries in the order of the `limit` rule, each its word and `stack`'s size or the class.
+fn Reader.limit_clause(mut self) {
+    var next: u64 = 0
+    let items = mut self.nonempty()
+    for _ in 0..<items {
+        var word: u64 = 6
+        var fields = mut self.fields(2)
+        while mut self.field(mut fields) {
+            if fields.last == 1 {
+                word = mut self.choice(6)
+            } else if word == 4 {
+                discard mut self.number()
+            } else if word == 5 {
+                discard mut self.class()
+            } else {
+                self.failed = true
+            }
+            mut self.close(fields)
+        }
+        mut self.need(fields.has(1) and (fields.has(2) == (word >= 4)) and word >= next)
+        next = word + 1
+    }
+} Reader.limit_clause
+
+/// A reversibility class, giving its position: for an irreversible class, its kinds follow.
+fn Reader.class(mut self) -> u64 {
+    let class = mut self.choice(4)
+    if class == 3 {
+        var next: u64 = 0
+        let items = mut self.count()
+        for _ in 0..<items {
+            let kind = mut self.choice(4)
+            mut self.need(kind >= next)
+            next = kind + 1
+        }
+    }
+    return class
+} Reader.class
+
+/// What decoding a value needs of a type: its constructor, and for a named type its path, the encoding of its arguments and their count.
+enum Shape derives Copy {
+    Scalar(u64)
+    Unit
+    Named(Named)
+    Function
+    Other
+} Shape
+
+/// A named type: its path, the run of its arguments' encodings and their count.
+struct Named derives Copy {
+    path: Run
+    args: Run
+    count: u64
+} Named
+
+fn Reader.ty(mut self) -> Shape {
+    match mut self.choice(9) {
+        0 => {
+            return Shape.Scalar(mut self.choice(14))
+        }
+        1 => {
+            return Shape.Unit
+        }
+        3 => {
+            let path = mut self.text()
+            let items = mut self.count()
+            let start = self.at
+            for _ in 0..<items {
+                discard mut self.ty()
+            }
+            return Shape.Named(Named(path: path, args: Run(start: start, end: self.at), count: items))
+        }
+        4 => {
+            discard mut self.number()
+        }
+        5 => mut self.literal()
+        6 => {
+            discard mut self.choice(3)
+            discard mut self.head(true)
+            return Shape.Function
+        }
+        7 or 8 => {
+            discard mut self.ty()
+        }
+        else => {}
+    }
+    return Shape.Other
+} Reader.ty
+
+/// A literal: its type, then its value.
+fn Reader.literal(mut self) {
+    match mut self.ty() {
+        Shape.Scalar(scalar) => mut self.scalar_value(scalar)
+        Shape.Unit => {}
+        Shape.Named(named) => {
+            let textual = self.names(named.path, name: b"core::Str") and named.count == 0
+            let binary = self.names(named.path, name: b"core::Slice") and named.count == 1 and self.names(named.args, name: b"\x00\x00")
+            if textual {
+                discard mut self.text()
+            } else if binary {
+                discard mut self.chunk()
+            } else {
+                self.failed = true
+            }
+        }
+        else => {
+            self.failed = true
+        }
+    }
+} Reader.literal
+
+/// The width of an integer type, by its position in the scalar table.
+fn integer_width(scalar: u64) -> u32 {
+    return match scalar {
+        0 or 4 => 8
+        1 or 5 => 16
+        2 or 6 => 32
+        else => 64
+    }
+} integer_width
+
+/// A value of a scalar type, by its position in the scalar table: an integer's uvar or svar below 2 to the power of its width, a float's bits, a `bool` or a `char`.
+fn Reader.scalar_value(mut self, scalar: u64) {
+    match scalar {
+        10 => mut self.fixed(4)
+        11 => mut self.fixed(8)
+        12 => {
+            discard mut self.flag()
+        }
+        13 => {
+            let value = mut self.number()
+            mut self.need(value <= 0xFFFF_FFFF and char.checked_from_bits(u32.truncate(value)).is_some())
+        }
+        else => {
+            let bits = integer_width(scalar)
+            let value = mut self.number()
+            mut self.need(bits == 64 or (value >> bits) == 0)
+        }
+    }
+} Reader.scalar_value
+
+/// A const's value, following its type; false when it reaches a value whose encoding follows a declaration.
+fn Reader.value(mut self, shape: Shape) -> bool {
+    match shape {
+        Shape.Scalar(scalar) => mut self.scalar_value(scalar)
+        Shape.Unit => {}
+        Shape.Function => mut self.fn_ref()
+        Shape.Named(named) => {
+            return mut self.named_value(named)
+        }
+        Shape.Other => {
+            return false
+        }
+    }
+    return true
+} Reader.value
+
+/// A value of a named type, which its path decides; false for one whose encoding follows a declaration.
+fn Reader.named_value(mut self, named: Named) -> bool {
+    let path = named.path
+    if self.names(path, name: b"hw::Ptr") or self.names(path, name: b"hw::Register") or self.names(path, name: b"mem::Id") or self.names(path, name: b"hw::UserAddr") {
+        discard mut self.number()
+        return true
+    }
+    if self.names(path, name: b"core::Str") or self.names(path, name: b"text::Fixed") or self.names(path, name: b"core::CharCursor") {
+        discard mut self.text()
+        return true
+    }
+    let sequence = self.names(path, name: b"core::Array") or self.names(path, name: b"core::Slice") or self.names(path, name: b"mem::Bounded")
+    let cursor = self.names(path, name: b"core::SliceCursor") or self.names(path, name: b"core::ArrayCursor") or self.names(path, name: b"mem::BoundedCursor")
+    if sequence or cursor {
+        let element = mut self.element(named)
+        let items = mut self.number()
+        for _ in 0..<items {
+            let start = self.at
+            if not mut self.value(element) {
+                return false
+            }
+            if self.failed or self.at == start {
+                break
+            }
+        }
+        return true
+    }
+    if self.names(path, name: b"core::Secret") or self.names(path, name: b"core::Untrusted") {
+        let held = mut self.element(named)
+        return mut self.value(held)
+    }
+    return false
+} Reader.named_value
+
+/// The type of a value's elements or of the value it holds: its type's first argument.
+fn Reader.element(mut self, named: Named) -> Shape {
+    mut self.need(named.count > 0)
+    let at = self.at
+    let end = self.end
+    self.at = named.args.start
+    self.end = named.args.end
+    let shape = mut self.ty()
+    self.at = at
+    self.end = end
+    return shape
+} Reader.element
+
+/// A declaration: what its item declares beyond its head.
+fn Reader.declaration(mut self) {
+    var fields = mut self.fields(11)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    mut self.struct_field()
+                }
+            }
+            2 => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    mut self.variant()
+                }
+            }
+            3 => mut self.layout_record()
+            4 => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    mut self.register()
+                }
+            }
+            5 => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    mut self.method()
+                }
+            }
+            6 => mut self.implementation()
+            7 => mut self.registry_record()
+            8 => mut self.contribution()
+            9 => mut self.constant()
+            10 => {
+                discard mut self.text()
+            }
+            else => mut self.protocol()
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.seen != 0)
+} Reader.declaration
+
+fn Reader.struct_field(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => mut self.visibility()
+            2 => {
+                discard mut self.text()
+            }
+            else => {
+                discard mut self.ty()
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(3))
+} Reader.struct_field
+
+fn Reader.variant(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.text()
+            }
+            2 => {
+                match mut self.choice(3) {
+                    1 => {
+                        discard mut self.ty()
+                    }
+                    2 => {
+                        let items = mut self.count()
+                        for _ in 0..<items {
+                            discard mut self.text()
+                            discard mut self.ty()
+                        }
+                    }
+                    else => {}
+                }
+            }
+            else => {
+                let from = mut self.number()
+                mut self.need(from == 1)
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(2))
+} Reader.variant
+
+fn Reader.layout_record(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                if mut self.flag() {
+                    discard mut self.text()
+                } else {
+                    discard mut self.number()
+                }
+                if mut self.flag() {
+                    discard mut self.choice(2)
+                }
+            }
+            2 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    mut self.layout_field()
+                }
+            }
+            else => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    discard mut self.text()
+                    discard mut self.number()
+                }
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(1))
+} Reader.layout_record
+
+fn Reader.layout_field(mut self) {
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        if fields.last == 1 {
+            discard mut self.text()
+        } else {
+            match mut self.choice(3) {
+                0 => {
+                    discard mut self.number()
+                    if mut self.flag() {
+                        discard mut self.number()
+                    }
+                }
+                2 => {
+                    discard mut self.ty()
+                    discard mut self.number()
+                }
+                else => {}
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(2))
+} Reader.layout_field
+
+fn Reader.register(mut self) {
+    var fields = mut self.fields(5)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.text()
+            }
+            2 => {
+                discard mut self.ty()
+            }
+            3 or 4 => {
+                discard mut self.number()
+            }
+            else => {
+                discard mut self.choice(4)
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(3) and fields.has(5))
+} Reader.register
+
+fn Reader.method(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.text()
+            }
+            2 => {
+                discard mut self.head(true)
+            }
+            else => {
+                discard mut self.flag()
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(3))
+} Reader.method
+
+fn Reader.implementation(mut self) {
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        discard mut self.ty()
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(1))
+} Reader.implementation
+
+fn Reader.registry_record(mut self) {
+    var fields = mut self.fields(4)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                discard mut self.ty()
+            }
+            2 => {
+                discard mut self.text()
+            }
+            3 => {
+                let items = mut self.nonempty()
+                for _ in 0..<items {
+                    discard mut self.text()
+                }
+            }
+            else => {
+                let loaded = mut self.number()
+                mut self.need(loaded == 1)
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(2))
+} Reader.registry_record
+
+fn Reader.contribution(mut self) {
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        discard mut self.text()
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(2))
+} Reader.contribution
+
+/// A const: its type, then its value, read up to a value whose encoding follows a declaration.
+fn Reader.constant(mut self) {
+    var shape: Option[Shape] = None
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        if fields.last == 1 {
+            shape = Some(mut self.ty())
+        } else {
+            match shape {
+                Some(held) => {
+                    if not mut self.value(held) {
+                        self.at = self.end
+                    }
+                }
+                None => {
+                    self.failed = true
+                }
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(1))
+} Reader.constant
+
+fn Reader.protocol(mut self) {
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        if fields.last == 1 {
+            discard mut self.ty()
+        } else {
+            let items = mut self.count()
+            for _ in 0..<items {
+                mut self.operation()
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(2))
+} Reader.protocol
+
+fn Reader.operation(mut self) {
+    var fields = mut self.fields(3)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => mut self.visibility()
+            2 => {
+                discard mut self.text()
+            }
+            else => {
+                discard mut self.head(true)
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(3))
+} Reader.operation
+
+/// A declared type's structural properties, or an interface's Dyn-usability.
+fn Reader.properties(mut self) {
+    var fields = mut self.fields(7)
+    while mut self.field(mut fields) {
+        discard mut self.flag()
+        mut self.close(fields)
+    }
+    mut self.need(fields.seen != 0)
+} Reader.properties
+
+fn Reader.function(mut self, alloc: mem::Alloc) -> Skeleton {
+    var role: u64 = 0
+    var params: u64 = 0
+    var blocks = mem::List[mem::List[bool]].empty(alloc)
+    var fields = mut self.fields(8)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1 => {
+                role = mut self.choice(13)
+            }
+            2 => {
+                discard mut self.number()
+            }
+            3 => {
+                params = mut self.count()
+                for _ in 0..<params {
+                    discard mut self.choice(3)
+                    discard mut self.ty()
+                }
+            }
+            4 or 5 => {
+                discard mut self.ty()
+            }
+            6 => {
+                discard mut self.flag()
+            }
+            7 => {
+                let items = mut self.count()
+                for _ in 0..<items {
+                    mut blocks.push(mut self.block(alloc))
+                }
+            }
+            else => mut self.closure()
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(4) and fields.has(6) and fields.has(7))
+    return Skeleton(role: role, params: params, blocks: take blocks)
+} Reader.function
+
+/// A closure's kind and limits.
+fn Reader.closure(mut self) {
+    var fields = mut self.fields(2)
+    while mut self.field(mut fields) {
+        if fields.last == 1 {
+            discard mut self.flag()
+        } else {
+            mut self.limit_clause()
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.has(1))
+} Reader.closure
+
+/// A block: its parameter types, its instructions and its terminator, giving whether each instruction is a slot.
+fn Reader.block(mut self, alloc: mem::Alloc) -> mem::List[bool] {
+    let params = mut self.count()
+    for _ in 0..<params {
+        discard mut self.ty()
+    }
+    var slots = mem::List[bool].empty(alloc)
+    let items = mut self.count()
+    for _ in 0..<items {
+        mut slots.push(mut self.inst())
+    }
+    mut self.terminator()
+    return slots
+} Reader.block
+
+/// An instruction: its opcode, its premise marker and its parts, giving whether it is a slot.
+fn Reader.inst(mut self) -> bool {
+    let code = mut self.number()
+    discard mut self.number()
+    match code {
+        0 => {
+            discard mut self.ty()
+        }
+        1 or 2 or 6 => mut self.place()
+        3 => {
+            discard mut self.flag()
+            mut self.place()
+        }
+        4 or 5 => {
+            mut self.place()
+            mut self.operand()
+        }
+        7 => mut self.fn_ref()
+        8 => {
+            if mut self.flag() {
+                discard mut self.number()
+            } else {
+                discard mut self.text()
+            }
+        }
+        9 => {
+            discard mut self.ty()
+            mut self.operands()
+        }
+        10 => {
+            discard mut self.ty()
+            discard mut self.text()
+            match mut self.choice(3) {
+                1 => mut self.operand()
+                2 => mut self.operands()
+                else => {}
+            }
+        }
+        11 => {
+            mut self.place()
+            discard mut self.ty()
+            discard mut self.text()
+        }
+        12 => {
+            discard mut self.number()
+            mut self.operands()
+        }
+        13 => {
+            mut self.operand()
+            discard mut self.ty()
+            if mut self.flag() {
+                discard mut self.text()
+            }
+        }
+        14 or 25 or 32 or 37 or 41 => mut self.operand()
+        15..=24 or 26..=31 => {
+            mut self.operand()
+            mut self.operand()
+        }
+        33..=35 => mut self.call(code)
+        36 => {
+            discard mut self.choice(6)
+            mut self.operand()
+        }
+        38 or 39 => {
+            mut self.operand()
+            discard mut self.flag()
+            mut self.operand()
+            mut self.region()
+        }
+        40 => {
+            discard mut self.flag()
+            mut self.operands()
+            mut self.region()
+        }
+        else => {
+            self.failed = true
+        }
+    }
+    return code == 0
+} Reader.inst
+
+fn Reader.terminator(mut self) {
+    match mut self.number() {
+        42 => mut self.target()
+        43 => {
+            mut self.operand()
+            mut self.target()
+            mut self.target()
+        }
+        44 => {
+            let code = mut self.number()
+            mut self.need(code >= 33 and code <= 35)
+            discard mut self.number()
+            mut self.call(code)
+            discard mut self.number()
+            discard mut self.number()
+        }
+        45 => {
+            if mut self.flag() {
+                mut self.operand()
+            }
+        }
+        46 or 49 => mut self.operand()
+        47 => {
+            discard mut self.text()
+        }
+        48 => {}
+        else => {
+            self.failed = true
+        }
+    }
+} Reader.terminator
+
+/// A call's parts after its opcode: `await`, its callee and its operands.
+fn Reader.call(mut self, code: u64) {
+    discard mut self.flag()
+    match code {
+        33 => mut self.fn_ref()
+        34 => {
+            discard mut self.number()
+        }
+        else => {
+            mut self.place()
+            discard mut self.text()
+            discard mut self.text()
+        }
+    }
+    mut self.operands()
+} Reader.call
+
+fn Reader.target(mut self) {
+    discard mut self.number()
+    mut self.operands()
+} Reader.target
+
+fn Reader.operand(mut self) {
+    match mut self.choice(3) {
+        0 => {
+            discard mut self.number()
+        }
+        1 => mut self.literal()
+        else => {
+            discard mut self.choice(3)
+            mut self.place()
+        }
+    }
+} Reader.operand
+
+fn Reader.operands(mut self) {
+    let items = mut self.count()
+    for _ in 0..<items {
+        mut self.operand()
+    }
+} Reader.operands
+
+fn Reader.place(mut self) {
+    discard mut self.number()
+    let items = mut self.count()
+    for _ in 0..<items {
+        discard mut self.text()
+    }
+} Reader.place
+
+fn Reader.region(mut self) {
+    let items = mut self.count()
+    for _ in 0..<items {
+        discard mut self.number()
+    }
+} Reader.region
+
+/// A function reference: its canonical path, role and index, and type arguments.
+fn Reader.fn_ref(mut self) {
+    discard mut self.text()
+    discard mut self.choice(13)
+    discard mut self.number()
+    let items = mut self.count()
+    for _ in 0..<items {
+        discard mut self.ty()
+    }
+} Reader.fn_ref
+
+/// Part 9: for each covered function, its digest under each of the unit's targets.
+fn Reader.digests(mut self, targets: Slice[Run], covered: u64, alloc: mem::Alloc) {
+    let items = mut self.count()
+    mut self.need(items == covered)
+    for _ in 0..<items {
+        let pairs = mut self.count()
+        mut self.need(pairs == u64.widen(targets.len()))
+        var at: usize = 0
+        for _ in 0..<pairs {
+            let target = mut self.text()
+            let named = at < targets.len() and self.same(target, other: targets[at])
+            mut self.need(named)
+            mut self.digest(alloc)
+            at += 1
+        }
+    }
+} Reader.digests
+
+fn Reader.digest(mut self, alloc: mem::Alloc) {
+    var fields = mut self.fields(11)
+    while mut self.field(mut fields) {
+        match fields.last {
+            1..=8 => {
+                discard mut self.flag()
+            }
+            9 or 10 => {
+                if mut self.choice(2) == 0 {
+                    discard mut self.sorted_texts(alloc)
+                }
+            }
+            else => {
+                let class = mut self.class()
+                mut self.need(class != 0)
+            }
+        }
+        mut self.close(fields)
+    }
+    mut self.need(fields.through(10))
+} Reader.digest
+
+/// Part 12: for each function, its span, its parameters' spans with their names, then each block's instructions' spans, a binding's slot's with its name, and its terminator's span.
+fn Reader.spans(mut self, functions: Slice[Skeleton]) {
+    let items = mut self.count()
+    mut self.need(items == u64.widen(functions.len()))
+    for function in functions {
+        mut self.span()
+        let params = mut self.count()
+        mut self.need(params == function.params)
+        for _ in 0..<params {
+            mut self.span()
+            discard mut self.text()
+        }
+        let blocks = mut self.count()
+        mut self.need(blocks == u64.widen(function.blocks.len()))
+        for slots in function.blocks {
+            let insts = mut self.count()
+            mut self.need(insts == u64.widen(slots.len()))
+            for slot in slots {
+                mut self.span()
+                if slot {
+                    mut self.slot_name()
+                }
+            }
+            mut self.span()
+        }
+    }
+} Reader.spans
+
+/// A span: its path, which holds a `/`, and its four positions.
+fn Reader.span(mut self) {
+    let path = mut self.text()
+    let slashed = self.slashed(path)
+    mut self.need(slashed)
+    for _ in 0..<4u32 {
+        discard mut self.number()
+    }
+} Reader.span
+
+/// A slot's name, when the text at the reader is one rather than the next span's path.
+fn Reader.slot_name(mut self) {
+    if self.failed {
+        return
+    }
+    let at = self.at
+    let name = mut self.text()
+    if self.failed or self.slashed(name) {
+        self.at = at
+        self.failed = false
+    }
+} Reader.slot_name
+
+/// The unit of a private struct `e::A` under `any`, without a declaration.
+const UNIT_A: Slice[u8] = b"\x04\x01\x05\x04e::A\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x00"
+
+/// The unit of a private struct `e::B` under `any`, without a declaration.
+const UNIT_B: Slice[u8] = b"\x04\x01\x05\x04e::B\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x00"
+
+/// The defect of a stream of a version and two units.
+fn sample_defect(header: Slice[u8], earlier: Slice[u8], later: Slice[u8], alloc: mem::Alloc) -> Option[diagnostic::Code] {
+    var stream = mem::Bytes.empty(alloc)
+    mut stream.append(MAGIC)
+    mut stream.append(header)
+    mut stream.append(b"\x02")
+    mut stream.append(earlier)
+    mut stream.append(later)
+    return stream_defect(stream.view(), alloc)
+} sample_defect
+
+test units_decode_only_in_order_under_the_version_this_toolchain_implements for stream_defect {
+    let alloc = testing::world().alloc
+    let malformed = Some(diagnostic::Code.NirMalformed)
+    let ordered = sample_defect(b"\x01", earlier: UNIT_A, later: UNIT_B, alloc)
+    expect ordered.is_none()
+    let reversed = sample_defect(b"\x01", earlier: UNIT_B, later: UNIT_A, alloc)
+    expect reversed == malformed
+    let newer = sample_defect(b"\x02", earlier: UNIT_A, later: UNIT_B, alloc)
+    expect newer == Some(diagnostic::Code.NirVersionUnsupported)
+    let redundant = sample_defect(b"\x81\x00", earlier: UNIT_A, later: UNIT_B, alloc)
+    expect redundant == malformed
+} units_decode_only_in_order_under_the_version_this_toolchain_implements
+
+test a_unit_holds_only_the_keys_and_values_this_version_defines for stream_defect {
+    let alloc = testing::world().alloc
+    let malformed = Some(diagnostic::Code.NirMalformed)
+    let undefined = sample_defect(b"\x01", earlier: b"\x05\x01\x05\x04e::A\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x00\x0D\x01\x00", later: UNIT_B, alloc)
+    expect undefined == malformed
+    let visible = sample_defect(b"\x01", earlier: b"\x04\x01\x05\x04e::A\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x02", later: UNIT_B, alloc)
+    expect visible == malformed
+    let unsorted = sample_defect(b"\x01", earlier: b"\x04\x01\x05\x04e::A\x02\x01\x01\x03\x11\x02\x0Bx86_64-host\x03any\x04\x01\x00", later: UNIT_B, alloc)
+    expect unsorted == malformed
+    let unpremised = sample_defect(b"\x01", earlier: b"\x05\x01\x05\x04e::A\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x00\x0A\x01\x00", later: UNIT_B, alloc)
+    expect unpremised == malformed
+    let premised = sample_defect(b"\x01", earlier: b"\x05\x01\x05\x04e::A\x02\x01\x01\x03\x05\x01\x03any\x04\x01\x00\x0A\x09\x01\x07checked", later: UNIT_B, alloc)
+    expect premised.is_none()
+} a_unit_holds_only_the_keys_and_values_this_version_defines

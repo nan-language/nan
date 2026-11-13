@@ -155,7 +155,7 @@ fn read_closures(
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Read fails platform::IoError {
-    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), unconfirmed: mem::List[Unconfirmed].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
+    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), unconfirmed: mem::List[Unconfirmed].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), streams: mem::List[StreamDefect].empty(alloc), alloc: alloc)
     var closures = mem::List[Closure].empty(alloc)
     var index: usize = 0
     for held in packages {
@@ -187,7 +187,7 @@ fn read_closures(
         }
         mut closure.checked.push(at)
     }
-    let ClosureReader(releases: releases, confirmed: confirmed, unconfirmed: unconfirmed, found: found, alloc: _) = reader
+    let ClosureReader(releases: releases, confirmed: confirmed, unconfirmed: unconfirmed, found: found, streams: _, alloc: _) = reader
     return Read(closures: take closures, releases: take releases, confirmed: take confirmed, unconfirmed: take unconfirmed, found: take found)
 } read_closures
 
@@ -243,8 +243,16 @@ struct ClosureReader {
     confirmed: mem::List[mem::Shared[store::Entry]]
     unconfirmed: mem::List[Unconfirmed]
     found: mem::List[diagnostic::Diagnostic]
+    /// The defect of the NIR stream of each release's artefact decoded, by its code root.
+    streams: mem::List[StreamDefect]
     alloc: mem::Alloc
 } ClosureReader
+
+/// The defect of the NIR stream of a release's artefact, by its code root.
+struct StreamDefect {
+    root: hashing::HashValue
+    defect: Option[diagnostic::Code]
+} StreamDefect
 
 fn ClosureReader.report(mut self, code: diagnostic::Code, pack: Package, line: u32) {
     var path = text::String.of(pack.dir.as_str(), alloc: self.alloc)
@@ -259,6 +267,33 @@ fn ClosureReader.report(mut self, code: diagnostic::Code, pack: Package, line: u
     }
     mut self.found.push(diagnostic::Diagnostic.at(code, path: path.as_str(), line, alloc: self.alloc))
 } ClosureReader.report
+
+/// Reports on the `dep` directive at `line` of `pack`'s manifest why the NIR stream of a release's
+/// artefact does not decode, decoding each release's stream once.
+fn ClosureReader.decode_stream(mut self, entry: store::Entry, pack: Package, line: u32) {
+    let root = entry.root(self.alloc)
+    var defect: Option[diagnostic::Code] = None
+    var known = false
+    for held in self.streams {
+        if held.root == root {
+            defect = held.defect
+            known = true
+        }
+    }
+    if not known {
+        match artefact::decode(entry.artefact.view(), alloc: self.alloc) {
+            Ok(decoded) => {
+                defect = decoded.nir_defect(self.alloc)
+            }
+            Err(_) => {}
+        }
+        mut self.streams.push(StreamDefect(root: root, defect: defect))
+    }
+    match defect {
+        Some(code) => mut self.report(code, pack, line)
+        None => {}
+    }
+} ClosureReader.decode_stream
 
 /// The workspace package at a directory, by index.
 fn package_at_dir(packages: Slice[mem::Shared[Package]], dir: Str) -> Option[usize] {
@@ -433,6 +468,7 @@ fn ClosureReader.locked_member(
             }
             return None
         }
+        mut self.decode_stream(stored.contents(), pack, line: reaching)
         return Some(Member.Release(try mut self.release(take stored, dir: line.package_name.as_str(), loaded_release, grammar)))
     }
     let dir = resolve_source(pack.dir.as_str(), source: line.source.as_str(), alloc)
@@ -462,6 +498,7 @@ fn ClosureReader.locked_member(
         }
         return Some(Member.Source(at))
     }
+    mut self.decode_stream(stored.contents(), pack, line: reaching)
     return Some(Member.Release(try mut self.release(take stored, dir: dir.as_str(), loaded_release, grammar)))
 } ClosureReader.locked_member
 

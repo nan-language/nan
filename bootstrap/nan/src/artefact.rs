@@ -402,6 +402,16 @@ impl Decoded {
         rest.is_empty().then_some(trees)
     }
 
+    /// Why the NIR stream its code root holds does not decode; none when it decodes or the code
+    /// root holds none.
+    pub fn nir_defect(&self) -> Option<Code> {
+        let fields = owned_record(&self.code_root)?;
+        let (stream, rest) = read_bytes(field(&fields, 4)?)?;
+        rest.is_empty()
+            .then(|| crate::nir::decode::defect(stream))
+            .flatten()
+    }
+
     /// The public key of the artefact's publisher, when it holds sections.
     pub fn publisher_key(&self) -> Option<[u8; 32]> {
         Signer::of(&self.sections.as_ref()?.signature, 3).map(|signer| signer.key)

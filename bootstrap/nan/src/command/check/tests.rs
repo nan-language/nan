@@ -415,6 +415,81 @@ fn a_store_entry_holding_another_release_than_the_lock_names_is_a_root_mismatch(
 }
 
 #[test]
+fn a_locked_release_whose_nir_stream_does_not_decode_is_reported_on_its_dep_line() {
+    let scratch = Scratch::new(&[
+        (
+            "gauge/package.nan",
+            "//! Gauges.\n\npackage gauge {\n    language 1\n    targets any\n} gauge\n",
+        ),
+        (
+            "gauge/gauge.nan",
+            "//! Gauges.\n\n/// A reading.\npub fn reading() -> u32 = 1\n",
+        ),
+        (
+            "app/app.nan",
+            "//! Apps.\n\npub fn reading() -> u32 = gauge::reading()\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    let name = format!(
+        "nan-test/{}/gauge",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    );
+    fs::write(
+        dir.join("app/package.nan"),
+        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets any\n    dep gauge \"{name}\"\n}} app\n"),
+    )
+    .expect("the app manifest");
+    run_in(dir, "api update gauge");
+    run_in(dir, &format!("publish --local gauge --name {name}"));
+    run_in(&dir.join("app"), "dep sync");
+    let cache = crate::cache::Cache::open()
+        .expect("the user directory")
+        .unwrap_or_else(|_| panic!("an exposed user directory"));
+    let store = crate::store::Store::new(cache.store());
+    let entry = store
+        .entries()
+        .expect("the store")
+        .unwrap_or_else(|_| panic!("an exposed store"))
+        .into_iter()
+        .find(|entry| entry.name.as_deref() == Some(name.as_str()))
+        .expect("the release's entry");
+    let decoded = crate::artefact::decode(&entry.artefact).expect("the release's artefact");
+    let lock_path = dir.join("app/.nan/lock.nan");
+    for (stream, code) in [
+        (b"NIR\0\x02", "nir.version-unsupported"),
+        (b"NIX\0\x01", "nir.malformed"),
+    ] {
+        let mut root = decoded.code_root.clone();
+        let at = root
+            .windows(5)
+            .position(|window| window == b"NIR\0\x01")
+            .expect("the NIR stream");
+        root[at..at + 5].copy_from_slice(stream);
+        let tampered = store
+            .append(crate::store::Append {
+                package: entry.package.clone(),
+                name: entry.name.clone(),
+                parent: entry.parent,
+                summary: entry.summary.clone(),
+                artefact: crate::artefact::artefact(&root, &decoded.attestation),
+                sources: entry.sources.clone(),
+            })
+            .expect("the store")
+            .unwrap_or_else(|_| panic!("an exposed store"));
+        let mut lock = crate::machine::lock::Lock::read(&fs::read(&lock_path).expect("the lock"))
+            .expect("a valid lock");
+        lock.deps[0].root = tampered.root();
+        fs::write(&lock_path, lock.bytes().expect("a lock")).expect("the tampered lock");
+        let output = run_in(dir, "check app").output;
+        assert!(
+            output.contains(&format!("\nerror {code} app/package.nan:6 app\n")),
+            "{output}"
+        );
+    }
+}
+
+#[test]
 fn a_path_source_checks_at_its_locked_release_without_the_store_holding_it_and_then_awaits_a_sync()
 {
     let scratch = Scratch::new(&[

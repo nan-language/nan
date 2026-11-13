@@ -14,7 +14,7 @@ use super::testing::Target as TestTarget;
 use super::ty::{Arg, Param, Scalar, Ty};
 use crate::encoding::{Record, bytes, list, uvar};
 use crate::interp::{ConstValue, FnVal, Val};
-use crate::nir::encode::{Encoder, Names, literal_value};
+use crate::nir::encode::{Encoder, MAGIC, Names, VERSION, literal_value};
 use crate::nir::{Callable, Function, Literal, Op, Role, Span, Unit};
 use crate::prover::Status;
 use crate::syntax::ast::{
@@ -73,8 +73,8 @@ pub fn stream(checkers: &[(Target, &Checker)], package: &str) -> Stream {
         (&left.path, left_targets[0].0.name()).cmp(&(&right.path, right_targets[0].0.name()))
     });
     let mut lines: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-    let mut out = vec![0x4E, 0x49, 0x52, 0x00];
-    uvar(&mut out, 1);
+    let mut out = MAGIC.to_vec();
+    uvar(&mut out, u128::from(VERSION));
     list(
         &mut out,
         units.into_iter(),

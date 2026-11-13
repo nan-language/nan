@@ -10,6 +10,12 @@ use crate::check::ty::{Arg, Bound, Const, FnTy, LimitSet, Param, Scalar, Ty};
 use crate::encoding::{Record, bytes, list, svar, uvar};
 use crate::syntax::ast::{FnKind, Mode};
 
+/// The bytes a NIR stream starts with.
+pub const MAGIC: [u8; 4] = *b"NIR\0";
+
+/// The NIR version this toolchain writes and decodes.
+pub const VERSION: u64 = 1;
+
 /// What the encoding writes for the items, members and generic parameters a unit names.
 pub trait Names {
     /// An item's canonical path, or a core vocabulary name's.

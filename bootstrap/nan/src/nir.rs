@@ -2,6 +2,7 @@
 //! interpreter read. A unit holds the NIR functions of one item; each function numbers its blocks
 //! and values as elaboration orders them, and keeps the type of every value.
 
+pub mod decode;
 pub mod encode;
 #[cfg(test)]
 mod text;

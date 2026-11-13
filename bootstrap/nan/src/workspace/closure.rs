@@ -126,6 +126,7 @@ pub fn closures(packages: &[Arc<Package>], store: &mut dyn Store) -> io::Result<
         confirmed: Vec::new(),
         unconfirmed: Vec::new(),
         found: Vec::new(),
+        streams: HashMap::new(),
     };
     let owns: Vec<Option<Own>> = (0..packages.len())
         .map(|index| reader.own(index))
@@ -186,6 +187,8 @@ struct Reader<'a> {
     confirmed: Vec<Entry>,
     unconfirmed: Vec<Unconfirmed>,
     found: Vec<Diagnostic>,
+    /// The defect of the NIR stream of each release's artefact decoded, by its code root.
+    streams: HashMap<Hash, Option<Code>>,
 }
 
 impl Reader<'_> {
@@ -194,6 +197,19 @@ impl Reader<'_> {
         let diagnostic = Diagnostic::at(code, &path, line);
         if !self.found.contains(&diagnostic) {
             self.found.push(diagnostic);
+        }
+    }
+
+    /// Reports on the `dep` directive at `line` of `package`'s manifest why the NIR stream of a
+    /// release's artefact does not decode, decoding each release's stream once.
+    fn decode_stream(&mut self, entry: &Entry, package: &Package, line: u32) {
+        let defect = *self.streams.entry(entry.root()).or_insert_with(|| {
+            artefact::decode(&entry.artefact)
+                .ok()
+                .and_then(|decoded| decoded.nir_defect())
+        });
+        if let Some(code) = defect {
+            self.report(code, package, line);
         }
     }
 
@@ -305,7 +321,10 @@ impl Reader<'_> {
                         }
                         Some(Member::Source(at))
                     }
-                    (None, Some(entry)) => Some(Member::Release(self.release(entry, &dir)?)),
+                    (None, Some(entry)) => {
+                        self.decode_stream(&entry, package, reaching);
+                        Some(Member::Release(self.release(entry, &dir)?))
+                    }
                     (None, None) => {
                         missing(self);
                         self.at(&dir).map(Member::Source)
@@ -313,7 +332,10 @@ impl Reader<'_> {
                 }
             } else {
                 match entry {
-                    Some(entry) => Some(Member::Release(self.release(entry, &line.package)?)),
+                    Some(entry) => {
+                        self.decode_stream(&entry, package, reaching);
+                        Some(Member::Release(self.release(entry, &line.package)?))
+                    }
                     None => {
                         missing(self);
                         None

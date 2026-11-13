@@ -46,6 +46,12 @@ struct Relocation derives Copy {
     addend: u64
 } Relocation
 
+/// The offset and type of a part of a value.
+struct Placed derives Copy {
+    offset: u64
+    ty: ty::Ty
+} Placed
+
 /// An extent of a const value with the type of its elements.
 struct ExtentKey derives Copy, Eq, Hash {
     extent: u32
@@ -349,20 +355,31 @@ fn Lowering.write_record(mut self, constant: mem::Shared[check::ConstValue], val
         check::Val.View(view) => {
             let element = self.view_element(ty)
             let element_layout = mut self.layout_of(element)
-            let key = ExtentKey(extent: view.array.extent, element: element)
-            let known = extents.get(key)
+            let extent = view.array.extent
+            expect usize.widen(extent) < constant.contents().of.len()
             var target = object::DataId(index: 0)
-            match known {
-                Some(found) => {
-                    target = found
+            var at: u64 = 0
+            match constant.contents().of[usize.widen(extent)] {
+                Some(item) => {
+                    let item_ty = self.ck.const_ty(item)
+                    at = mut self.part_offset(ty: item_ty, value: constant.contents().data[usize.widen(extent)], path: view.array.path.view(), depth: 0)
+                    target = mut self.const_data(item, ty: item_ty)
                 }
                 None => {
-                    target = mut self.extent_data(constant, extent: view.array.extent, element)
-                    discard mut extents.insert(key, value: target)
+                    expect view.array.path.len() == 0
+                    let key = ExtentKey(extent: extent, element: element)
+                    match extents.get(key) {
+                        Some(found) => {
+                            target = found
+                        }
+                        None => {
+                            target = mut self.extent_data(constant, extent, element)
+                            discard mut extents.insert(key, value: target)
+                        }
+                    }
                 }
             }
-            expect view.array.path.len() == 0
-            let addend = u64.widen(view.start) * element_layout.contents().size
+            let addend = at + u64.widen(view.start) * element_layout.contents().size
             mut image.data.push(DataAddress(offset: u32.truncate(offset), target: target, addend: i64.from_bits(addend)))
             expect usize.widen(offset) <= image.bytes.len() and image.bytes.len() - usize.widen(offset) >= 16
             write_le(mut image.bytes, at: usize.widen(offset) + 8, value: u64.widen(view.len), size: 8, big: false)
@@ -464,6 +481,78 @@ fn Lowering.write_counted(mut self, constant: mem::Shared[check::ConstValue], co
     mut self.write_val(constant, value: count, ty: parts[0].ty, offset: offset + parts[0].offset, mut image, mut extents)
     mut self.write_val(constant, value: array, ty: parts[1].ty, offset: offset + parts[1].offset, mut image, mut extents)
 } Lowering.write_counted
+
+/// The offset, within a value of a type laid out as `write_val` lays it out, of the part a path
+/// of field, payload and element indexes reaches.
+fn Lowering.part_offset(mut self, ty: ty::Ty, value: check::Val, path: Slice[u32], depth: usize) -> u64 {
+    if depth >= path.len() {
+        return 0
+    }
+    let index = path[depth]
+    let found = mut self.part_at(ty, value, index)
+    expect usize.widen(index) < value.fields().len()
+    return found.offset + mut self.part_offset(ty: found.ty, value: value.fields()[usize.widen(index)], path, depth: depth + 1)
+} Lowering.part_offset
+
+/// The offset and type of the part at an index of a value of a type.
+fn Lowering.part_at(mut self, ty: ty::Ty, value: check::Val, index: u32) -> Placed {
+    match self.wrapped(ty) {
+        Some(inner) => return Placed(offset: 0, ty: inner)
+        None => {}
+    }
+    let held_layout = mut self.layout_of(ty)
+    var counted = false
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Item(item: owner, args: _) => {
+            if self.ck.db().is_std(owner) {
+                let path = self.ck.db().canonical(owner)
+                match path.as_str() {
+                    "text::Fixed" or "core::ArrayCursor" or "mem::Bounded" => {
+                        counted = true
+                    }
+                    else => {}
+                }
+            }
+        }
+        else => {}
+    }
+    let at = usize.widen(index)
+    match held_layout.contents().shape {
+        LayoutShape.Record(fields) => {
+            if counted {
+                expect index == 0 and fields.len() == 2
+                return fields[1].placed()
+            }
+            expect at < fields.len()
+            return fields[at].placed()
+        }
+        LayoutShape.Array(element: element, count: _) => {
+            let element_layout = mut self.layout_of(element)
+            return Placed(offset: u64.widen(index) * element_layout.contents().size, ty: element)
+        }
+        LayoutShape.Bytes(fields: fields, big: _) => {
+            expect at < fields.len()
+            return fields[at].placed()
+        }
+        LayoutShape.Enum(shape) => {
+            let check::Val.Variant(item: _, index: variant, fields: _) = value else {
+                expect false
+                return Placed(offset: 0, ty: ty)
+            }
+            expect usize.widen(variant) < shape.variants.len() and at < shape.variants[usize.widen(variant)].fields.len()
+            return shape.variants[usize.widen(variant)].fields[at].placed()
+        }
+        else => {
+            expect false
+            return Placed(offset: 0, ty: ty)
+        }
+    }
+} Lowering.part_at
+
+/// The offset and type of a field.
+fn Field.placed(self) -> Placed {
+    return Placed(offset: self.offset, ty: self.ty)
+} Field.placed
 
 /// The type a `core::Secret` or `core::Untrusted` type wraps; none for another type.
 fn Lowering.wrapped(self, ty: ty::Ty) -> Option[ty::Ty] {

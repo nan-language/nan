@@ -67,6 +67,8 @@ struct InterpFrame {
     unit: mem::Shared[nir::NirUnit]
     function: usize
     values: mem::List[Option[Val]]
+    /// The place within the extent of a const's value of each value read from there.
+    homes: mem::HashMap[u32, Loc]
     subst: ty::Subst
     slots: mem::List[u32]
 } InterpFrame
@@ -83,6 +85,8 @@ pkg struct Interpreter {
     stop: Option[RunSite]
     /// The values viewing the extents of literal data created so far, by literal.
     pkg literals: mem::HashMap[nir::Literal, Val]
+    /// The extent holding the value of each const and contribution reached so far.
+    consts: mem::HashMap[ty::ItemId, u32]
     budgets: Budgets
 } Interpreter
 
@@ -94,8 +98,10 @@ struct ExtentOrder {
 
 /// A value const evaluation computed, with the data its views refer to.
 pkg struct ConstValue {
-    /// The arrays its views and references see, by index.
+    /// The values its views and references see, by index.
     pkg data: mem::List[Val]
+    /// For each of its data that is the value of a const or contribution, that item.
+    pkg of: mem::List[Option[ty::ItemId]]
     /// The value, its views and references naming data by index as their extent.
     pkg value: Val
 } ConstValue
@@ -114,7 +120,7 @@ proj fn InterpFrame.nir(self) -> nir::Function {
 
 pkg fn Interpreter.new(take ck: Checker) -> Interpreter {
     let alloc = ck.alloc()
-    return Interpreter(ck: take ck, alloc: alloc, steps: 0, memory: Memory.empty(alloc), calls: mem::List[ItemSpan].empty(alloc), stop: None, literals: mem::HashMap[nir::Literal, Val].empty(seed: 0, alloc), budgets: Budgets.empty(alloc))
+    return Interpreter(ck: take ck, alloc: alloc, steps: 0, memory: Memory.empty(alloc), calls: mem::List[ItemSpan].empty(alloc), stop: None, literals: mem::HashMap[nir::Literal, Val].empty(seed: 0, alloc), consts: mem::HashMap[ty::ItemId, u32].empty(seed: 0, alloc), budgets: Budgets.empty(alloc))
 } Interpreter.new
 
 /// Runs a function of an item's unit with arguments and type arguments.
@@ -470,7 +476,7 @@ fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function:
     for _ in 0..<code.types.len() {
         mut values.push(None)
     }
-    var frame = InterpFrame(unit: unit.share(), function: function, values: take values, subst: self.ck.unit_subst(item, args: type_args), slots: mem::List[u32].empty(self.alloc))
+    var frame = InterpFrame(unit: unit.share(), function: function, values: take values, homes: mem::HashMap[u32, Loc].empty(seed: 0, alloc: self.alloc), subst: self.ck.unit_subst(item, args: type_args), slots: mem::List[u32].empty(self.alloc))
     var position: usize = 0
     for arg in take args {
         if position >= code.params.len() {
@@ -483,6 +489,13 @@ fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function:
         }
         expect usize.widen(param.index) < frame.values.len()
         if referenced and not code.ty(param).is_reference() {
+            let param_home = self.const_place(arg)
+            match param_home {
+                Some(home) => {
+                    discard mut frame.homes.insert(param.index, value: home.copy(self.alloc))
+                }
+                None => {}
+            }
             frame.values[usize.widen(param.index)] = Some(self.deref(arg))
         } else {
             frame.values[usize.widen(param.index)] = Some(take arg)
@@ -498,6 +511,18 @@ fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function:
         Err(end) => fail end
     }
 } Interpreter.execute
+
+/// The place a reference designates within the extent of a const's value, none for another
+/// value.
+fn Interpreter.const_place(self, value: Val) -> Option[Loc] {
+    let Val.Ref(loc) = value else {
+        return None
+    }
+    if self.memory.extent(loc.extent).of.is_none() {
+        return None
+    }
+    return Some(loc.copy(self.alloc))
+} Interpreter.const_place
 
 /// Runs blocks from `start` until a return, a failure, or the `yield` ending a region.
 fn Interpreter.blocks(mut self, mut frame: InterpFrame, start: nir::BlockId) -> InterpFlow fails End {
@@ -600,8 +625,11 @@ fn Interpreter.inst(mut self, mut frame: InterpFrame, inst: nir::Inst, site: Run
         nir::Op.Move(place) => {
             value = Some(try mut self.moved(frame, place, at))
         }
-        nir::Op.Ref(place) or nir::Op.RefMut(place) => {
-            value = Some(Val.Ref(try mut self.reference(frame, place, at)))
+        nir::Op.Ref(place) => {
+            value = Some(Val.Ref(try mut self.reference(frame, place, writable: false, at)))
+        }
+        nir::Op.RefMut(place) => {
+            value = Some(Val.Ref(try mut self.reference(frame, place, writable: true, at)))
         }
         nir::Op.Init(place: place, operand: operand) => try mut self.store_at(frame, place, operand, assigned: false, at)
         nir::Op.Assign(place: place, operand: operand) => try mut self.store_at(frame, place, operand, assigned: true, at)
@@ -611,6 +639,16 @@ fn Interpreter.inst(mut self, mut frame: InterpFrame, inst: nir::Inst, site: Run
         }
         nir::Op.Constant(constant) => {
             value = Some(try mut self.constant(frame, constant, at))
+            match constant {
+                nir::Constant.Item(item) => {
+                    let Some(result) = inst.result else {
+                        return
+                    }
+                    let home = Loc(extent: self.consts.at(item), path: mem::List[u32].empty(alloc))
+                    discard mut frame.homes.insert(result.index, value: take home)
+                }
+                else => {}
+            }
         }
         nir::Op.Construct(ty: built, fields: fields) => {
             value = Some(try mut self.construct(frame, built, fields: fields.view(), at, site))
@@ -966,6 +1004,8 @@ fn Interpreter.variant_index(self, item: ty::ItemId, name: Str) -> u32 {
     return 0
 } Interpreter.variant_index
 
+/// The value a `constant` names; a const's or contribution's, held in an extent from the
+/// first time the run reaches it.
 fn Interpreter.constant(mut self, frame: InterpFrame, constant: nir::Constant, at: ItemSpan) -> Val fails End {
     match constant {
         nir::Constant.Item(item) => {
@@ -973,10 +1013,16 @@ fn Interpreter.constant(mut self, frame: InterpFrame, constant: nir::Constant, a
                 ast::ItemKind.Registry(_) => fail End.Uninterpretable(self.report("uninterpretable", at))
                 else => {}
             }
-            let Some(value) = self.ck.const_value(item) else {
-                fail End.Missing
+            if not self.consts.contains(item) {
+                let Some(constant_value) = self.ck.const_value(item) else {
+                    fail End.Missing
+                }
+                let imported = mut self.import(constant_value.contents())
+                let size = self.ck.interp_layout(self.ck.const_ty(item)).size
+                let extent = mut self.memory.alloc_data(take imported, of: Some(item), size)
+                discard mut self.consts.insert(item, value: extent)
             }
-            return mut self.import(value.contents())
+            return self.memory.extent(self.consts.at(item)).value.copy(self.alloc)
         }
         nir::Constant.Param(param) => {
             match frame.subst.get(param) {
@@ -992,9 +1038,12 @@ fn Interpreter.constant(mut self, frame: InterpFrame, constant: nir::Constant, a
 /// A value an earlier run computed, the data it views held in this run's memory.
 fn Interpreter.import(mut self, value: ConstValue) -> Val {
     var extents = mem::List[u32].empty(self.alloc)
-    for data in value.data {
+    var index: usize = 0
+    while index < value.data.len() and index < value.of.len() {
+        let data = value.data[index]
         let size = u64.widen(data.fields().len())
-        mut extents.push(mut self.memory.alloc_data(data.copy(self.alloc), size))
+        mut extents.push(mut self.memory.alloc_data(data.copy(self.alloc), of: value.of[index], size))
+        index += 1
     }
     return value.value.remap(map: fn(extent: u32) -> u32 {
         expect usize.widen(extent) < extents.len()
@@ -1041,10 +1090,12 @@ fn Interpreter.export(self, value: Val) -> Option[ConstValue] {
         }
     }
     var data = mem::List[Val].empty(alloc)
+    var of = mem::List[Option[ty::ItemId]].empty(alloc)
     for extent in order.extents {
         mut data.push(self.memory.extent(extent).value.remap(map: fn(known: u32) => order.positions.at(known), alloc))
+        mut of.push(self.memory.extent(extent).of)
     }
-    return Some(ConstValue(data: take data, value: value.remap(map: fn(known: u32) => order.positions.at(known), alloc)))
+    return Some(ConstValue(data: take data, of: take of, value: value.remap(map: fn(known: u32) => order.positions.at(known), alloc)))
 } Interpreter.export
 
 fn Interpreter.collect_extents(self, value: Val, mut order: ExtentOrder) {
@@ -1081,7 +1132,7 @@ fn Interpreter.operand(mut self, frame: InterpFrame, operand: nir::Operand, at: 
         }
         nir::Operand.Literal(literal) => return mut self.literal(literal.contents())
         nir::Operand.Place(mode: ast::Mode.Take, place: place) => return try mut self.moved(frame, place: place.contents(), at)
-        nir::Operand.Place(mode: _, place: place) => return Val.Ref(try mut self.reference(frame, place: place.contents(), at))
+        nir::Operand.Place(mode: mode, place: place) => return Val.Ref(try mut self.reference(frame, place: place.contents(), writable: mode == ast::Mode.Mut, at))
     }
 } Interpreter.operand
 
@@ -1115,7 +1166,7 @@ fn Interpreter.literal(mut self, literal: nir::Literal) -> Val {
         else => {}
     }
     let len = elements.len()
-    let extent = mut self.memory.alloc_data(Val.Array(mem::Shared.of(take elements, alloc)), size: u64.widen(len))
+    let extent = mut self.memory.alloc_data(Val.Array(mem::Shared.of(take elements, alloc)), of: None, size: u64.widen(len))
     let value = Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: len))
     discard mut self.literals.insert(literal.copy(alloc), value: value.copy(alloc))
     return value
@@ -1285,11 +1336,24 @@ fn Interpreter.read_step(self, value: Val, place: nir::Place, step: usize, label
     return try self.read_from(value.fields()[usize.widen(index)], place, step: step + 1, labelled: taken.labelled, at)
 } Interpreter.read_step
 
-/// A reference to a place: its location, or a new read-only extent holding the value when
-/// it lies within an owned value.
-fn Interpreter.reference(mut self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Loc fails End {
+/// A reference to a place: its location; for a read-only reference to a place within a value
+/// read from the extent of a const's value, its place there; or a new read-only extent
+/// holding the value when it lies within another owned value.
+fn Interpreter.reference(mut self, frame: InterpFrame, place: nir::Place, writable: bool, at: ItemSpan) -> Loc fails End {
     match try self.locate(frame, place, at) {
         Some(loc) => return loc
+        None => {}
+    }
+    match frame.homes.get(place.root.index) {
+        Some(home) => {
+            if not writable {
+                let Some(loc) = try self.located(Some(home.copy(self.alloc)), value: self.memory.get(home), place, step: 0, labelled: false, at) else {
+                    expect false
+                    fail End.Missing
+                }
+                return loc
+            }
+        }
         None => {}
     }
     let value = try self.read(frame, place, at)
@@ -1589,6 +1653,13 @@ fn Interpreter.call(mut self, frame: InterpFrame, call: nir::Call, at: ItemSpan,
     for operand in call.args {
         mut args.push(try mut self.operand(frame, operand, at))
     }
+    let receiver_home = self.projected_home(frame, call)
+    match receiver_home {
+        Some(home) => {
+            args[0] = Val.Ref(home.copy(self.alloc))
+        }
+        None => {}
+    }
     if call.awaited {
         fail End.Uninterpretable(self.report("uninterpretable", at))
     }
@@ -1626,6 +1697,30 @@ fn Interpreter.call(mut self, frame: InterpFrame, call: nir::Call, at: ItemSpan,
         }
     }
 } Interpreter.call
+
+/// Where the receiver of a call of a projection lies in the extent of a const's value, when it
+/// is a value read from there.
+fn Interpreter.projected_home(self, frame: InterpFrame, call: nir::Call) -> Option[Loc] {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return None
+    }
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return None
+    }
+    let Some(sig) = self.ck.fn_sig(item) else {
+        return None
+    }
+    if not sig.is_proj() or call.args.len() == 0 {
+        return None
+    }
+    let nir::Operand.Value(receiver) = call.args[0] else {
+        return None
+    }
+    let Some(home) = frame.homes.get(receiver.index) else {
+        return None
+    }
+    return Some(home.copy(self.alloc))
+} Interpreter.projected_home
 
 /// Calls a function or closure value as a call in progress, past the call depth a trap.
 fn Interpreter.called(mut self, callee: FnVal, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {

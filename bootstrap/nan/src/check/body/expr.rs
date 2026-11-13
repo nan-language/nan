@@ -654,12 +654,11 @@ impl Body<'_, '_> {
     fn item_value(&mut self, token: Tok, item: ItemId, expected: Option<&Ty>) -> TExpr {
         let sig = self.ck.sig(item);
         let ty = match (&self.ck.db.ast(item).kind, &sig.kind) {
-            (ItemKind::Const(_), SigKind::Const { ty }) => ty.clone(),
+            (ItemKind::Const(_), SigKind::Const { .. }) | (ItemKind::Contribute(_), _) => {
+                self.ck.const_ty(item)
+            }
             (ItemKind::Registry(registry), SigKind::Registry { entry }) => {
                 self.ck.registry_ty(registry, entry.clone())
-            }
-            (ItemKind::Contribute(contribution), _) => {
-                self.ck.contribution_entry(item, contribution)
             }
             (ItemKind::Fn(_), SigKind::Fn(function)) => {
                 return self.function_value(token, item, function, Subst::default(), expected);
@@ -2423,6 +2422,15 @@ pub fn same(left: &Ty, right: &Ty) -> bool {
 }
 
 impl Checker<'_> {
+    /// The type of the value of a const or contribution.
+    pub fn const_ty(&self, item: ItemId) -> Ty {
+        match (&self.db.ast(item).kind, &self.sig(item).kind) {
+            (ItemKind::Const(_), SigKind::Const { ty }) => ty.clone(),
+            (ItemKind::Contribute(contribution), _) => self.contribution_entry(item, contribution),
+            _ => Ty::Error,
+        }
+    }
+
     /// The entry type of the registry a contribution adds to, when its path names one.
     pub fn contribution_entry(&self, item: ItemId, contribution: &ast::ContributeItem) -> Ty {
         match self

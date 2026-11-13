@@ -91,6 +91,8 @@ struct Frame {
     unit: Rc<Unit>,
     function: usize,
     values: Vec<Option<Val>>,
+    /// The place within the extent of a const's value of each value read from there.
+    homes: HashMap<u32, Loc>,
     subst: Subst,
     slots: Vec<u32>,
 }
@@ -111,6 +113,8 @@ pub struct Interpreter<'c, 'a> {
     stop: Option<Site>,
     /// The extents of literal data created so far.
     literals: Vec<(Literal, Val)>,
+    /// The extent holding the value of each const and contribution reached so far.
+    consts: HashMap<ItemId, u32>,
     budgets: budget::Budgets,
 }
 
@@ -123,6 +127,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             calls: Vec::new(),
             stop: None,
             literals: Vec::new(),
+            consts: HashMap::new(),
             budgets: budget::Budgets::default(),
         }
     }
@@ -441,6 +446,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         let mut frame = Frame {
             function,
             values: vec![None; unit.functions[function].types.len()],
+            homes: HashMap::new(),
             subst: self.ck.unit_subst(item, type_args),
             slots: Vec::new(),
             unit: unit.clone(),
@@ -448,7 +454,12 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         let nir = frame.function(&unit);
         for (param, arg) in nir.params.iter().zip(args) {
             let arg = match (nir.ty(param.value).is_reference(), arg) {
-                (false, reference @ Val::Ref(_)) => self.deref(&reference),
+                (false, Val::Ref(loc)) => {
+                    if self.memory.extent(loc.extent).of.is_some() {
+                        frame.homes.insert(param.value.0, loc.clone());
+                    }
+                    self.deref(&Val::Ref(loc))
+                }
                 (_, arg) => arg,
             };
             frame.values[param.value.0 as usize] = Some(arg);
@@ -556,7 +567,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 }
                 Some(value)
             }
-            Op::Ref(place) | Op::RefMut(place) => Some(Val::Ref(self.reference(frame, place, at)?)),
+            Op::Ref(place) => Some(Val::Ref(self.reference(frame, place, false, at)?)),
+            Op::RefMut(place) => Some(Val::Ref(self.reference(frame, place, true, at)?)),
             Op::Init(place, operand) | Op::Assign(place, operand) => {
                 let value = self.operand(frame, operand, at)?;
                 let loc = self
@@ -580,7 +592,17 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             Op::FnRef(fn_ref) => Some(Val::Fn(Rc::new(FnVal::Function(
                 self.substituted(frame, fn_ref),
             )))),
-            Op::Constant(constant) => Some(self.constant(frame, constant, at)?),
+            Op::Constant(constant) => {
+                let value = self.constant(frame, constant, at)?;
+                if let (Constant::Item(item), Some(result)) = (constant, inst.result) {
+                    let home = Loc {
+                        extent: self.consts[item],
+                        path: Vec::new(),
+                    };
+                    frame.homes.insert(result.0, home);
+                }
+                Some(value)
+            }
             Op::Construct { ty, fields } => {
                 let values = fields
                     .iter()
@@ -800,6 +822,8 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         }
     }
 
+    /// The value a `constant` names; a const's or contribution's, held in an extent from the
+    /// first time the run reaches it.
     fn constant(&mut self, frame: &Frame, constant: &Constant, at: (ItemId, Span)) -> Exec<Val> {
         match constant {
             Constant::Item(item) => {
@@ -809,8 +833,18 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 ) {
                     return Err(End::Uninterpretable(self.report("uninterpretable", at)));
                 }
-                let value = self.ck.const_value(*item).ok_or(End::Missing)?;
-                Ok(self.import(&value))
+                let extent = match self.consts.get(item) {
+                    Some(extent) => *extent,
+                    None => {
+                        let constant = self.ck.const_value(*item).ok_or(End::Missing)?;
+                        let value = self.import(&constant);
+                        let (size, _) = memory::layout(self.ck, &self.ck.const_ty(*item));
+                        let extent = self.memory.alloc_data(value, Some(*item), size);
+                        self.consts.insert(*item, extent);
+                        extent
+                    }
+                };
+                Ok(self.memory.extent(extent).value.clone())
             }
             Constant::Param(param) => match frame.subst.get(*param) {
                 Some(Arg::Const(Const::Int(value))) => Ok(Val::Int(*value)),
@@ -826,9 +860,10 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         let extents: Vec<u32> = value
             .data
             .iter()
-            .map(|data| {
+            .zip(&value.of)
+            .map(|(data, of)| {
                 let size = data.fields().len() as u64;
-                self.memory.alloc_data(data.clone(), size)
+                self.memory.alloc_data(data.clone(), *of, size)
             })
             .collect();
         remap(&value.value, &|index| extents[index as usize])
@@ -890,6 +925,10 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 .iter()
                 .map(|extent| remap(&self.memory.extent(*extent).value, &position))
                 .collect(),
+            of: extents
+                .iter()
+                .map(|extent| self.memory.extent(*extent).of)
+                .collect(),
             value: remap(value, &position),
         })
     }
@@ -926,7 +965,12 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 }
                 Ok(value)
             }
-            Operand::Place(_, place) => Ok(Val::Ref(self.reference(frame, place, at)?)),
+            Operand::Place(mode, place) => Ok(Val::Ref(self.reference(
+                frame,
+                place,
+                *mode == Mode::Mut,
+                at,
+            )?)),
         }
     }
 
@@ -952,9 +996,9 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                     .map(|byte| Val::Int(i128::from(*byte)))
                     .collect();
                 let len = elements.len();
-                let extent = self
-                    .memory
-                    .alloc_data(Val::Array(Rc::new(elements)), len as u64);
+                let extent =
+                    self.memory
+                        .alloc_data(Val::Array(Rc::new(elements)), None, len as u64);
                 let value = Val::View(View {
                     array: Loc {
                         extent,
@@ -974,10 +1018,21 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         let root = frame.values[place.root.0 as usize]
             .clone()
             .unwrap_or_else(|| panic!("place root %{} undefined", place.root.0));
-        let mut current: (Option<Loc>, Val) = match &root {
+        let current = match &root {
             Val::Ref(loc) => (Some(loc.clone()), self.memory.get(loc).clone()),
             other => (None, other.clone()),
         };
+        self.walk(current, place, at)
+    }
+
+    /// Where the steps of a place lead from its root's location, if any, and value.
+    fn walk(
+        &mut self,
+        root: (Option<Loc>, Val),
+        place: &Place,
+        at: (ItemId, Span),
+    ) -> Exec<Option<Loc>> {
+        let mut current = root;
         let mut labelled = false;
         for step in &place.steps {
             if let Val::Ref(loc) = &current.1 {
@@ -1083,11 +1138,24 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         Ok(current)
     }
 
-    /// A reference to a place: its location, or a new read-only extent holding the value when
-    /// it lies within an owned value.
-    fn reference(&mut self, frame: &Frame, place: &Place, at: (ItemId, Span)) -> Exec<Loc> {
+    /// A reference to a place: its location; for a read-only reference to a place within a value
+    /// read from the extent of a const's value, its place there; or a new read-only extent
+    /// holding the value when it lies within another owned value.
+    fn reference(
+        &mut self,
+        frame: &Frame,
+        place: &Place,
+        writable: bool,
+        at: (ItemId, Span),
+    ) -> Exec<Loc> {
         if let Some(loc) = self.locate(frame, place, at)? {
             return Ok(loc);
+        }
+        if !writable && let Some(home) = frame.homes.get(&place.root.0) {
+            let root = (Some(home.clone()), self.memory.get(home).clone());
+            return Ok(self
+                .walk(root, place, at)?
+                .expect("a place within a const's value"));
         }
         let value = self.read(frame, place, at)?;
         if let Val::Ref(loc) = value {
@@ -1276,6 +1344,9 @@ impl<'c, 'a> Interpreter<'c, 'a> {
             .iter()
             .map(|operand| self.operand(frame, operand, at))
             .collect::<Exec<Vec<Val>>>()?;
+        if let Some(home) = self.projected_home(frame, call) {
+            args[0] = Val::Ref(home);
+        }
         if call.awaited {
             return Err(End::Uninterpretable(self.report("uninterpretable", at)));
         }
@@ -1309,6 +1380,24 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         let flow = self.invoke(&callee, args, at, site);
         self.calls.pop();
         flow
+    }
+
+    /// Where the receiver of a call of a projection lies in the extent of a const's value, when
+    /// it is a value read from there.
+    fn projected_home(&self, frame: &Frame, call: &Call) -> Option<Loc> {
+        let Callee::Fn(fn_ref) = &call.callee else {
+            return None;
+        };
+        let Callable::Item { item, .. } = fn_ref.callable else {
+            return None;
+        };
+        if !self.ck.fn_sig(item).is_some_and(|sig| sig.is_proj()) {
+            return None;
+        }
+        let Some(Operand::Value(receiver)) = call.args.first() else {
+            return None;
+        };
+        frame.homes.get(&receiver.0).cloned()
     }
 
     /// Calls a function or closure value with its arguments.
@@ -1419,8 +1508,10 @@ fn check_trap(kind: CheckKind) -> &'static str {
 /// A value const evaluation computed, with the data its views refer to.
 #[derive(Debug)]
 pub struct ConstValue {
-    /// The arrays its views and references see, by index.
+    /// The values its views and references see, by index.
     pub data: Vec<Val>,
+    /// For each of its data that is the value of a const or contribution, that item.
+    pub of: Vec<Option<ItemId>>,
     /// The value, its views and references naming data by index as their extent.
     pub value: Val,
 }

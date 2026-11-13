@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::value::{Loc, Val};
 use crate::check::Checker;
+use crate::check::db::ItemId;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Scalar, Subst, Ty};
 
@@ -20,6 +21,8 @@ pub struct Extent {
     pub live: bool,
     /// Whether it holds literal data or the data of a const, which a const's value may view.
     pub data: bool,
+    /// The const or contribution whose value it holds.
+    pub of: Option<ItemId>,
     pub address: u64,
     pub size: u64,
 }
@@ -32,15 +35,22 @@ pub struct Memory {
 impl Memory {
     /// A new live extent holding a value, at the next address past the last extent.
     pub fn alloc(&mut self, value: Val, writable: bool, size: u64) -> u32 {
-        self.add(value, writable, false, size)
+        self.add(value, writable, false, None, size)
     }
 
-    /// A new read-only extent of literal or const data.
-    pub fn alloc_data(&mut self, value: Val, size: u64) -> u32 {
-        self.add(value, false, true, size)
+    /// A new read-only extent of literal or const data, the value of the const `of` if any.
+    pub fn alloc_data(&mut self, value: Val, of: Option<ItemId>, size: u64) -> u32 {
+        self.add(value, false, true, of, size)
     }
 
-    fn add(&mut self, value: Val, writable: bool, data: bool, size: u64) -> u32 {
+    fn add(
+        &mut self,
+        value: Val,
+        writable: bool,
+        data: bool,
+        of: Option<ItemId>,
+        size: u64,
+    ) -> u32 {
         let address = match self.extents.last() {
             Some(last) => (last.address + last.size + GRANULE).div_ceil(GRANULE) * GRANULE,
             None => FIRST_ADDRESS,
@@ -50,6 +60,7 @@ impl Memory {
             writable,
             live: true,
             data,
+            of,
             address,
             size,
         });

@@ -267,20 +267,32 @@ impl Lowering<'_, '_> {
             (Shape::Record(_), Val::View(view)) => {
                 let element = self.view_element(ty);
                 let element_layout = self.layout(&element);
-                let key = (view.array.extent, element.clone());
-                let target = match extents.get(&key) {
-                    Some(id) => *id,
+                let extent = view.array.extent;
+                let (target, at) = match constant.of[extent as usize] {
+                    Some(item) => {
+                        let item_ty = self.ck.const_ty(item);
+                        let whole = &constant.data[extent as usize];
+                        let at = self.part_offset(&item_ty, whole, &view.array.path);
+                        (self.const_data(item, &item_ty), at)
+                    }
                     None => {
-                        let id = self.extent_data(constant, view.array.extent, &element);
-                        extents.insert(key, id);
-                        id
+                        assert!(
+                            view.array.path.is_empty(),
+                            "a const view into a part of its data"
+                        );
+                        let key = (extent, element.clone());
+                        let target = match extents.get(&key) {
+                            Some(id) => *id,
+                            None => {
+                                let id = self.extent_data(constant, extent, &element);
+                                extents.insert(key, id);
+                                id
+                            }
+                        };
+                        (target, 0)
                     }
                 };
-                assert!(
-                    view.array.path.is_empty(),
-                    "a const view into a part of its data"
-                );
-                let addend = view.start as u64 * element_layout.size;
+                let addend = at + view.start as u64 * element_layout.size;
                 image.data.push((offset as u32, target, addend as i64));
                 let len = (view.len as u64).to_le_bytes();
                 let at = offset as usize + 8;
@@ -450,6 +462,50 @@ impl Lowering<'_, '_> {
             image,
             extents,
         );
+    }
+
+    /// The offset, within a value of a type laid out as `write_val` lays it out, of the part a
+    /// path of field, payload and element indexes reaches.
+    fn part_offset(&mut self, ty: &Ty, value: &Val, path: &[u32]) -> u64 {
+        let Some((&index, rest)) = path.split_first() else {
+            return 0;
+        };
+        let (offset, part_ty) = self.part_at(ty, value, index);
+        offset + self.part_offset(&part_ty, &value.fields()[index as usize], rest)
+    }
+
+    /// The offset and type of the part at an index of a value of a type.
+    fn part_at(&mut self, ty: &Ty, value: &Val, index: u32) -> (u64, Ty) {
+        if let Some(inner) = self.wrapped(ty) {
+            return (0, inner);
+        }
+        let layout = self.layout(ty);
+        let counted = match ty {
+            Ty::Item(owner, _) if self.ck.db.is_std(*owner) => matches!(
+                self.ck.db.canonical(*owner).as_str(),
+                "text::Fixed" | "core::ArrayCursor" | "mem::Bounded"
+            ),
+            _ => false,
+        };
+        let field =
+            |fields: &[super::layout::Field], at: usize| (fields[at].offset, fields[at].ty.clone());
+        match (&layout.shape, value) {
+            (Shape::Record(parts), _) if counted => {
+                assert_eq!(index, 0, "a part of a counted array other than its array");
+                field(parts, 1)
+            }
+            (Shape::Array { element, .. }, _) => {
+                let element = element.clone();
+                (u64::from(index) * self.layout(&element).size, element)
+            }
+            (Shape::Record(fields) | Shape::Bytes { fields, .. }, Val::Struct(..)) => {
+                field(fields, index as usize)
+            }
+            (Shape::Enum(shape), Val::Variant(_, variant, _)) => {
+                field(&shape.variants[*variant as usize].fields, index as usize)
+            }
+            (shape, value) => panic!("a part {index} of {value:?} laid out as {shape:?}"),
+        }
     }
 
     /// The type a `core::Secret` or `core::Untrusted` type wraps; none for another type.

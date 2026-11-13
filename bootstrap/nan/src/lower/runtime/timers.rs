@@ -1,16 +1,42 @@
-//! The timers of the clocks the runtime keeps itself, the seeded scheduler's virtual clock and a
-//! kernel's clock: one list of operations ordered by the nanosecond each is due, then by the
-//! order in which they were armed. A kernel's CPUs share the list behind the timer lock.
+//! The timers of the clocks the runtime keeps itself, the seeded scheduler's virtual clock, a
+//! kernel's clock and a Windows target's monotonic clock: one list of operations ordered by the
+//! nanosecond each is due, then by the order in which they were armed. A kernel's CPUs and a
+//! Windows target's executor threads share the list behind the timer lock.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::tasks::operation;
-use super::{seeded, state};
+use super::{Routine, seeded, state};
 
 /// The nanoseconds of a millisecond.
 pub const NS_PER_MS: u64 = 1_000_000;
+
+/// Takes a timer that is armed and has not expired out of the timers, under the timer lock,
+/// giving whether it did so; its cancelled completion is then the caller's to deliver.
+pub fn claim_armed(lo: &mut Lowering, fx: &mut Fx, op: Value) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::TIMER_LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let done = fx.load(PTR, op, operation::DONE);
+    let pending = fx.b.ins().icmp_imm_s(IntCC::Equal, done, 0);
+    let order = fx.load(PTR, op, operation::ORDER);
+    let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, order, 0);
+    let in_flight = fx.b.ins().band(pending, armed);
+    fx.when(in_flight, |fx| {
+        disarm(lo, fx, op);
+        claim(fx, op);
+    });
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    in_flight
+}
+
+/// Marks a timer taken out of the timers as completed, so no other thread or CPU delivers it.
+pub fn claim(fx: &mut Fx, op: Value) {
+    let completed = fx.ptr(operation::COMPLETED as u64);
+    fx.store(completed, op, operation::DONE);
+}
 
 /// Arms a timer due at nanosecond `due`, after every timer due no later.
 pub fn arm(lo: &mut Lowering, fx: &mut Fx, op: Value, due: Value) {

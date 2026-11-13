@@ -1,0 +1,380 @@
+//! The file operations of `sys::Fs` and `sys::fs::File` beneath the working directory.
+
+foreign fn CreateFileW(name: hw::Ptr[u16], access: u32, share: u32, security: u64, disposition: u32, flags: u32, template: u64) -> u64 convention "win64"
+
+foreign fn CreateDirectoryW(name: hw::Ptr[u16], security: u64) -> i32 convention "win64"
+
+foreign fn GetCurrentDirectoryW(len: u32, buffer: hw::Ptr[u16]) -> u32 convention "win64"
+
+foreign fn GetFinalPathNameByHandleW(handle: u64, buffer: hw::Ptr[u16], len: u32, flags: u32) -> u32 convention "win64"
+
+foreign fn ReadFile(handle: u64, buffer: u64, count: u32, done: hw::Ptr[u32], overlapped: u64) -> i32 convention "win64"
+
+foreign fn GetFileSizeEx(handle: u64, size: hw::Ptr[Count]) -> i32 convention "win64"
+
+foreign fn SetEndOfFile(handle: u64) -> i32 convention "win64"
+
+foreign fn SetFileInformationByHandle(handle: u64, class: u32, information: hw::Ptr[u32], len: u32) -> i32 convention "win64"
+
+/// The access rights of a file read from, of one written to and removed when it was created
+/// outside, and of one removed.
+const READ_ACCESS: u32 = 0x8000_0000
+
+const WRITE_ACCESS: u32 = 0x4001_0000
+
+const DELETE_ACCESS: u32 = 0x1_0080
+
+/// Sharing reads, writes and removals with every other handle.
+const SHARE_ALL: u32 = 7
+
+/// Opening an existing file only, and opening it or creating it.
+const OPEN_EXISTING: u32 = 3
+
+const OPEN_ALWAYS: u32 = 4
+
+/// The flags opening a directory, opening a symbolic link itself, and a plain file's.
+const BACKUP_SEMANTICS: u32 = 0x0200_0000
+
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000
+
+const NORMAL: u32 = 0x80
+
+/// The access to a directory that reads its attributes, enough to give its final path.
+const READ_ATTRIBUTES: u32 = 0x80
+
+/// The handle `CreateFileW` gives on failure.
+const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The error code of a file or directory that already exists, and the information class
+/// marking a file for removal once its handles close.
+const ALREADY_EXISTS: u32 = 183
+
+const REMOVAL_CLASS: u32 = 4
+
+/// The UTF-16 units a path buffer holds, and the most a full path has, its NUL excluded.
+const PATH_UNITS: usize = 2_048
+
+const PATH_LIMIT: usize = 2_047
+
+/// A path: its units, a NUL after them, and their count; a full path's first `base` units are
+/// the working directory's.
+struct Path {
+    units: Array[u16, 2_048]
+    len: usize
+    base: usize
+} Path
+
+/// The failure of a negated error code of a file operation.
+fn failure(error: i64) -> sys::fs::FsError {
+    return match -error {
+        2 or 3 => sys::fs::FsError.NotFound
+        39 or 112 => sys::fs::FsError.NoSpace
+        123 => sys::fs::FsError.InvalidPath
+        else => sys::fs::FsError.Denied
+    }
+} failure
+
+/// Appends a unit to a path, false when it is full.
+fn push_unit(mut path: Path, unit: u16) -> bool {
+    if path.len >= PATH_LIMIT {
+        return false
+    }
+    path.units[path.len] = unit
+    path.len += 1
+    return true
+} push_unit
+
+/// The full path of `prefix` and then `path` beneath the working directory, which the system
+/// does not reinterpret: `\\?\` and the working directory's path, or `\\?\UNC\` and a network
+/// path without its first two units, then the segments with `\` separators. Fails with
+/// `InvalidPath` when a segment holds a char Windows reserves or the path is too long.
+fn full_path(prefix: Str, path: Str) -> Path fails sys::fs::FsError {
+    var full = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
+    let room = u32.fit(PATH_UNITS - 8)
+    let start = hw::Ptr.of_view_mut(mut full.units.view_mut()).addr() + 16
+    let len = usize.widen(GetCurrentDirectoryW(room, buffer: hw::Ptr[u16].of_addr(start)))
+    if len == 0 or len >= PATH_UNITS - 8 {
+        fail sys::fs::FsError.Denied
+    }
+    let verbatim = len >= 4 and full.units[8] == 0x5C and full.units[9] == 0x5C and full.units[10] == 0x3F
+    let network = not verbatim and full.units[8] == 0x5C and full.units[9] == 0x5C
+    var from: usize = 8
+    if network {
+        from = 9
+        for unit in b"\\\\?\\UNC" {
+            discard push_unit(mut full, unit: u16.widen(unit))
+        }
+    } else if not verbatim {
+        for unit in b"\\\\?\\" {
+            discard push_unit(mut full, unit: u16.widen(unit))
+        }
+    }
+    for at in from..<(8 + len) {
+        full.units[full.len] = full.units[at]
+        full.len += 1
+    }
+    if full.units[full.len - 1] == 0x5C {
+        full.len -= 1
+    }
+    full.base = full.len
+    try append_segments(mut full, text: prefix)
+    try append_segments(mut full, text: path)
+    full.units[full.len] = 0
+    return full
+} full_path
+
+/// Appends `\\` and a relative path's segments to a full path, each `/` as `\\`, unless the path
+/// is empty.
+fn append_segments(mut full: Path, text: Str) fails sys::fs::FsError {
+    let bytes = text.as_bytes()
+    if bytes.len() == 0 {
+        return
+    }
+    if not push_unit(mut full, unit: 0x5C) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    for byte in bytes {
+        if byte < 0x20 or byte == b'\\' or byte == b':' or byte == b'*' or byte == b'?' or byte == b'"' or byte == b'<' or byte == b'>' or byte == b'|' {
+            fail sys::fs::FsError.InvalidPath
+        }
+    }
+    let room = i32.fit(PATH_LIMIT - full.len)
+    let start = hw::Ptr.of_view_mut(mut full.units.view_mut()).addr() + (2 * full.len)
+    let written = MultiByteToWideChar(UTF8, flags: 0, text: hw::Ptr.of_view(bytes), len: i32.fit(bytes.len()), wide: hw::Ptr[u16].of_addr(start), room)
+    if written <= 0 {
+        fail sys::fs::FsError.InvalidPath
+    }
+    for at in full.len..<(full.len + usize.fit(written)) {
+        if full.units[at] == 0x2F {
+            full.units[at] = 0x5C
+        }
+    }
+    full.len += usize.fit(written)
+} append_segments
+
+/// The final path the system gives an open handle, in a buffer; its length, zero when it gives
+/// none.
+fn final_path(handle: u64, mut buffer: Path) {
+    let len = usize.widen(GetFinalPathNameByHandleW(handle, buffer: hw::Ptr.of_view_mut(mut buffer.units.view_mut()), len: u32.fit(PATH_UNITS), flags: 0))
+    buffer.len = 0
+    if len <= PATH_LIMIT {
+        buffer.len = len
+    }
+} final_path
+
+/// Whether an open handle's final path lies beneath the final path of the working directory,
+/// which `.` opens.
+fn inside(handle: u64) -> bool fails sys::fs::FsError {
+    var working = Array[u16, 2].filled(0)
+    working[0] = 0x2E
+    let root = CreateFileW(hw::Ptr.of_view(working.view()), access: READ_ATTRIBUTES, share: SHARE_ALL, security: 0, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS, template: 0)
+    if root == INVALID {
+        fail failure(last_error())
+    }
+    var tree = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
+    final_path(root, buffer: mut tree)
+    discard CloseHandle(root)
+    var reached = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
+    final_path(handle, buffer: mut reached)
+    if tree.len == 0 or reached.len <= tree.len {
+        return false
+    }
+    for at in 0..<tree.len {
+        if tree.units[at] != reached.units[at] {
+            return false
+        }
+    }
+    return reached.units[tree.len] == 0x5C
+} inside
+
+/// A handle a path was opened with, and whether opening it created the file.
+struct Opened {
+    handle: u64
+    created: bool
+} Opened
+
+/// Opens a full path with `access`, `disposition` and `flags`.
+fn open_path(path: Path, access: u32, disposition: u32, flags: u32) -> Opened fails sys::fs::FsError {
+    let handle = CreateFileW(hw::Ptr.of_view(path.units.view()), access, share: SHARE_ALL, security: 0, disposition, flags, template: 0)
+    if handle == INVALID {
+        fail failure(last_error())
+    }
+    return Opened(handle: handle, created: disposition == OPEN_ALWAYS and GetLastError() != ALREADY_EXISTS)
+} open_path
+
+/// Marks an open file for removal once its handles close.
+fn mark_removed(handle: u64) -> bool {
+    var removed = Array[u32, 1].filled(1)
+    return SetFileInformationByHandle(handle, class: REMOVAL_CLASS, information: hw::Ptr.of_view_mut(mut removed.view_mut()), len: 4) != 0
+} mark_removed
+
+/// Closes a handle unless its file lies beneath the working directory, removing the file when
+/// its open created it: whether it lies there.
+fn keep_inside(opened: Opened) -> bool fails sys::fs::FsError {
+    if try inside(opened.handle) {
+        return true
+    }
+    if opened.created {
+        discard mark_removed(opened.handle)
+    }
+    discard CloseHandle(opened.handle)
+    return false
+} keep_inside
+
+/// Opens an existing directory of a full path, creating it when it is missing.
+fn open_directory(path: Path) -> Opened fails sys::fs::FsError {
+    match attempt open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS) {
+        Ok(opened) => return opened
+        Err(error) => match error {
+            sys::fs::FsError.NotFound => {}
+            else => fail error
+        }
+    }
+    if CreateDirectoryW(hw::Ptr.of_view(path.units.view()), security: 0) == 0 and GetLastError() != ALREADY_EXISTS {
+        fail failure(last_error())
+    }
+    return try open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS)
+} open_directory
+
+/// Creates each missing directory of a full path's segments but its last, each once it is found
+/// to lie beneath the working directory; each separator after the first segment ends the path in
+/// turn, then is put back.
+fn make_parents(mut path: Path) fails sys::fs::FsError {
+    for at in (path.base + 1)..<path.len {
+        if path.units[at] != 0x5C {
+            continue
+        }
+        path.units[at] = 0
+        let opened = try open_directory(path)
+        path.units[at] = 0x5C
+        if not try keep_inside(opened) {
+            fail sys::fs::FsError.Denied
+        }
+        discard CloseHandle(opened.handle)
+    }
+} make_parents
+
+/// Opens an existing file beneath the working directory for reading.
+fn open_reading(prefix: Str, path: Str) -> u64 fails sys::fs::FsError {
+    let full = try full_path(prefix, path)
+    let opened = try open_path(full, access: READ_ACCESS, disposition: OPEN_EXISTING, flags: NORMAL)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    return opened.handle
+} open_reading
+
+/// Opens a file beneath the working directory for writing, creating its missing directories
+/// and the file, and truncating it.
+fn open_writing(prefix: Str, path: Str) -> u64 fails sys::fs::FsError {
+    var full = try full_path(prefix, path)
+    try make_parents(mut full)
+    let opened = try open_path(full, access: WRITE_ACCESS, disposition: OPEN_ALWAYS, flags: NORMAL)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    if SetEndOfFile(opened.handle) == 0 {
+        let error = last_error()
+        discard CloseHandle(opened.handle)
+        fail failure(error)
+    }
+    return opened.handle
+} open_writing
+
+/// Closes a handle.
+fn close(handle: u64) {
+    discard CloseHandle(handle)
+} close
+
+/// Writes every byte of `data` to a file at its position.
+fn write_whole(handle: u64, data: Slice[u8]) fails sys::fs::FsError {
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        var written = Array[u32, 1].filled(0)
+        if WriteFile(handle, buffer: hw::Ptr.of_view(parts.tail), count: u32.saturate(parts.tail.len()), written: hw::Ptr.of_view_mut(mut written.view_mut()), overlapped: 0) == 0 {
+            fail failure(last_error())
+        }
+        if written[0] == 0 {
+            fail sys::fs::FsError.NoSpace
+        }
+        done += usize.widen(written[0])
+    }
+} write_whole
+
+/// Reads at most `len` bytes at `address` from a file at its position: the count, 0 at its end.
+fn read_some(handle: u64, address: u64, len: usize) -> usize fails sys::fs::FsError {
+    var read = Array[u32, 1].filled(0)
+    if ReadFile(handle, buffer: address, count: u32.saturate(len), done: hw::Ptr.of_view_mut(mut read.view_mut()), overlapped: 0) == 0 {
+        fail failure(last_error())
+    }
+    return usize.widen(read[0])
+} read_some
+
+pkg fn fs_open(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
+    return descriptor(try open_reading(prefix, path))
+} fs_open
+
+pkg fn fs_create(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
+    return descriptor(try open_writing(prefix, path))
+} fs_create
+
+pkg fn fs_read_all(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
+    let handle = try open_reading(prefix, path)
+    defer close(handle)
+    var contents = mem::Bytes.empty(alloc)
+    var chunk = Array[u8, 4_096].filled(0)
+    loop {
+        let address = u64.widen(hw::Ptr.of_view_mut(mut chunk.view_mut()).addr())
+        let count = try read_some(handle, address, len: 4_096)
+        if count == 0 {
+            return contents
+        }
+        let Some(filled) = chunk.view().prefix(count) else {
+            return contents
+        }
+        mut contents.append(filled)
+    }
+} fs_read_all
+
+pkg fn fs_write_all(dir: i32, prefix: Str, path: Str, data: Slice[u8]) fails sys::fs::FsError {
+    let handle = try open_writing(prefix, path)
+    defer close(handle)
+    try write_whole(handle, data)
+} fs_write_all
+
+pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    let full = try full_path(prefix, path)
+    let opened = try open_path(full, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    let removed = mark_removed(opened.handle)
+    let error = last_error()
+    discard CloseHandle(opened.handle)
+    if not removed {
+        fail failure(error)
+    }
+} fs_remove
+
+pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
+    return try read_some(handle_of(fd), address, len)
+} file_read
+
+pkg fn file_write(fd: i32, data: Slice[u8]) -> usize fails sys::fs::FsError {
+    var written = Array[u32, 1].filled(0)
+    if WriteFile(handle_of(fd), buffer: hw::Ptr.of_view(data), count: u32.saturate(data.len()), written: hw::Ptr.of_view_mut(mut written.view_mut()), overlapped: 0) == 0 {
+        fail failure(last_error())
+    }
+    return usize.widen(written[0])
+} file_write
+
+pkg fn file_byte_len(fd: i32) -> u64 fails sys::fs::FsError {
+    var size = Count(value: 0)
+    if GetFileSizeEx(handle_of(fd), size: hw::Ptr.of_mut(mut size)) == 0 {
+        fail failure(last_error())
+    }
+    return u64.fit(size.value)
+} file_byte_len

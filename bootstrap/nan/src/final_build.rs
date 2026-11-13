@@ -57,10 +57,6 @@ pub fn build(
         let reason = "a nanos program builds only against a kernel's interface file";
         return Ok(Build::failed(vec![bundle::interface_error(source, reason)]));
     }
-    if target.kind() == Some(Kind::Windows) {
-        let unavailable = Diagnostic::new(Code::TargetImageUnavailable);
-        return Ok(Build::failed(vec![at_manifest(source, unavailable)]));
-    }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
     let std = crate::stdlib::packages();
@@ -111,7 +107,7 @@ pub fn build(
     let written = workspace.root.join(&image);
     if let Err(output) = write_image(target, &lowered.object, &written)? {
         let mut diagnostic = at_entry(source, Code::TargetLinkFailed);
-        let linker = lower::host::linker(target).to_owned();
+        let linker = lower::host::linux::linker(target).to_owned();
         diagnostic.envelope = Some((linker, output.lines().map(str::to_owned).collect()));
         diagnostics.push(diagnostic);
         return Ok(Build::failed(diagnostics));
@@ -403,9 +399,9 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
 }
 
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing any
-/// earlier image at once: on a host target an executable the target's linker links, giving the
-/// linker's output when it fails; on a machine target the image writer's, entered by the program
-/// entry seam.
+/// earlier image at once: on a Linux target an executable the target's linker links, giving the
+/// linker's output when it fails; on a Windows or machine target the image writer's, entered by
+/// the program entry seam.
 pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Result<(), String>> {
     let directory = image.parent().expect("an image lies in a directory");
     fs::create_dir_all(directory)?;
@@ -416,15 +412,19 @@ pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Re
     let staged =
         |extension: &str| directory.join(format!(".{name}.{}.{extension}", std::process::id()));
     let new = staged("new");
-    match target.is_machine() {
-        true => {
+    match target.kind() {
+        Some(Kind::Windows) => {
+            let bytes = crate::image::write(target, object, lower::host::windows::ENTRY);
+            fs::write(&new, bytes)?;
+        }
+        _ if target.is_machine() => {
             let bytes = crate::image::write(target, object, lower::machine::ENTRY);
             fs::write(&new, bytes)?;
         }
-        false => {
+        _ => {
             let staged_object = staged("o");
             fs::write(&staged_object, object)?;
-            let linked = lower::host::link(target, &staged_object, &new);
+            let linked = lower::host::linux::link(target, &staged_object, &new);
             fs::remove_file(&staged_object)?;
             if let Err(output) = linked {
                 return Ok(Err(output));

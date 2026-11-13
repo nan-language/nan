@@ -1,0 +1,67 @@
+//! Reads, writes and closes on handles: the standard streams, files and sockets.
+
+foreign fn CloseHandle(handle: u64) -> i32 convention "win64"
+
+foreign fn GetModuleHandleW(name: hw::Ptr[u16]) -> u64 convention "win64"
+
+/// The handle numbers `GetStdHandle` takes for the standard streams, standard input's first.
+const STD_INPUT: u32 = 0xFFFF_FFF6
+
+/// The handle `GetStdHandle` gives for a stream that failed to open.
+const INVALID_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The error code of a read from a pipe whose writer closed it: the stream's end.
+const BROKEN_PIPE: i64 = 109
+
+/// The handle of the standard stream a descriptor names: 0 standard input, 1 standard output and
+/// 2 standard error; zero when the stream is missing.
+fn standard_handle(fd: i32) -> u64 {
+    let handle = GetStdHandle(STD_INPUT - u32.fit(fd))
+    if handle == INVALID_HANDLE {
+        return 0
+    }
+    return handle
+} standard_handle
+
+/// Closes the handle of a file or a socket: a socket only exists once Winsock is loaded.
+pkg fn release(fd: i32) {
+    let handle = handle_of(fd)
+    let name = wide_name(WINSOCK)
+    if GetModuleHandleW(hw::Ptr.of_view(name.view())) != 0 and close_socket(handle) {
+        return
+    }
+    discard CloseHandle(handle)
+} release
+
+pkg fn stdio_read(fd: i32, address: u64, len: usize) -> usize fails sys::StdioError uses wait {
+    let handle = standard_handle(fd)
+    if handle == 0 {
+        fail sys::StdioError.Closed
+    }
+    let count = try await transfer(handle, buffer: address, len: u32.saturate(len), writes: false, blocking: true)
+    if count == -BROKEN_PIPE {
+        return 0
+    }
+    if count < 0 {
+        fail sys::StdioError.Closed
+    }
+    return usize.fit(count)
+} stdio_read
+
+pkg fn stdio_write(fd: i32, data: Slice[u8]) fails sys::StdioError uses wait {
+    let handle = standard_handle(fd)
+    if handle == 0 {
+        fail sys::StdioError.Closed
+    }
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        let count = try await transfer(handle, buffer: address_of(parts.tail), len: u32.saturate(parts.tail.len()), writes: true, blocking: true)
+        if count <= 0 {
+            fail sys::StdioError.Closed
+        }
+        done += usize.fit(count)
+    }
+} stdio_write

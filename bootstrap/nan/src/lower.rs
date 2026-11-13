@@ -430,25 +430,26 @@ enum Pending {
 /// one with SSE2 or the A64 one of Armv8.0-A, with the extensions of its codegen level, frame
 /// pointers in every function, Cranelift's stack switching where it has it, and the canonical NaN
 /// as the NaN every float operation returns. A Linux image is position-independent and links
-/// against glibc with inline stack probes for its guard pages; a machine image loads at a fixed
-/// address and is not position-independent, so its code reaches its own functions and data
-/// directly, with no global offset table and no stack probes.
+/// against glibc; a Windows or machine image is linked at a fixed address, which the image writer
+/// records how to move, so its code reaches its own functions and data directly, with no global
+/// offset table. A host image has inline stack probes for its guard pages; a machine image none.
 fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
     let mut flags = settings::builder();
-    let host = target.kind() == Some(Kind::Linux);
-    let triple = match (target.arch(), host) {
+    let linux = target.kind() == Some(Kind::Linux);
+    let triple = match (target.arch(), linux) {
         (Some(Arch::Aarch64), true) => "aarch64-unknown-linux-gnu",
         (Some(Arch::Aarch64), false) => "aarch64-unknown-none-elf",
         (_, true) => "x86_64-unknown-linux-gnu",
         (_, false) => "x86_64-unknown-none-elf",
     };
-    let on_host = if host { "true" } else { "false" };
+    let pic = if linux { "true" } else { "false" };
+    let probes = if target.is_host() { "true" } else { "false" };
     for (name, value) in [
         ("opt_level", "speed"),
-        ("is_pic", on_host),
+        ("is_pic", pic),
         ("preserve_frame_pointers", "true"),
         ("stack_switch_model", "basic"),
-        ("enable_probestack", on_host),
+        ("enable_probestack", probes),
         ("probestack_strategy", "inline"),
         ("unwind_info", "false"),
         ("tls_model", "elf_gd"),
@@ -476,9 +477,13 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
         None,
         linking,
     );
-    host::entry_seam(&mut lowering, program);
+    match lowering.windows() {
+        true => host::windows::entry_seam(&mut lowering, program),
+        false => host::linux::entry_seam(&mut lowering, program),
+    }
     lowering.drain();
-    lowering.finish(Some((&program.section, &program.tree)))
+    let sections = (!lowering.windows()).then_some((&program.section[..], &program.tree));
+    lowering.finish(sections)
 }
 
 /// Lowers the reach of a final build for a machine target: the entry function and the target's
@@ -624,6 +629,11 @@ impl<'c, 'a> Lowering<'c, 'a> {
             nested: nested::Nested::default(),
             runtime_image: None,
         }
+    }
+
+    /// Whether the image is a Windows target's.
+    pub fn windows(&self) -> bool {
+        self.ck.db.target.kind() == Some(Kind::Windows)
     }
 
     /// Whether the image's code runs on a machine's runtime: an image of a UEFI or bare target, or

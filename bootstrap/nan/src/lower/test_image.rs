@@ -136,9 +136,10 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
         super::load::Linking::Image,
     );
     let entry = entry_glue(&mut lowering, tests);
-    match lowering.machine() {
-        true => machine_seam(&mut lowering, entry),
-        false => super::host::test_seam(&mut lowering, entry),
+    match (lowering.machine(), lowering.windows()) {
+        (true, _) => machine_seam(&mut lowering, entry),
+        (false, true) => super::host::windows::test_seam(&mut lowering, entry),
+        (false, false) => super::host::linux::test_seam(&mut lowering, entry),
     }
     lowering.drain();
     lowering.finish(None)
@@ -193,7 +194,7 @@ pub fn start_run(
 }
 
 /// The length of a NUL-terminated text.
-fn text_len(fx: &mut Fx, text: Value) -> Value {
+pub fn text_len(fx: &mut Fx, text: Value) -> Value {
     let zero = fx.ptr(0);
     fx.repeat(&[zero], |fx, state| {
         let at = fx.b.ins().iadd(text, state[0]);

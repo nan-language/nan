@@ -292,24 +292,7 @@ fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Li
     }
     var table = mem::Map[text::String, u64].empty(alloc)
     if imports == Imports.Table {
-        let named = table_imports(read_object, alloc)
-        // Each library's words end with a zero word.
-        var at = next
-        for index in 0..<named.len() {
-            if index > 0 and named[index - 1].library != named[index].library {
-                at += 8
-            }
-            var name = text::String.of(named[index].library.as_str(), alloc)
-            mut name.append("!")
-            mut name.append(named[index].function.as_str())
-            mut imported.push(Import(address: at, name: take name))
-            discard mut table.insert(text::String.of(named[index].symbol.as_str(), alloc), value: at)
-            at += 8
-        }
-        let words = at + 8 - next
-        var zeros = mem::Bytes.empty(alloc)
-        object::resize(mut zeros, length: usize.widen(words))
-        mut segments.push(Segment(address: next, access: Access.Write, bytes: take zeros, size: words))
+        mut segments.push(import_table(read_object, at: next, mut imported, mut table, alloc))
     }
     var symbols = mem::Map[text::String, u64].empty(alloc)
     for symbol in read_object.symbols {
@@ -344,23 +327,12 @@ fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Li
             let place = start + relocation.offset
             var target: i64 = 0
             if undefined(symbol) {
-                match called.position(fn(name: text::String) => name == symbol.name) {
-                    Some(stub) => {
-                        target = i64.from_bits(stubs + u64.widen(stub) * IMPORT_STUB_BYTES) + relocation.addend
-                    }
-                    None if imports == Imports.Table => {
-                        let Some(word) = table.get_by(fn(key: text::String) => key.as_str().cmp(symbol.name.as_str())) else {
-                            expect false
-                            continue
-                        }
-                        target = i64.from_bits(word) + relocation.addend
-                    }
-                    None => {
-                        expect imports == Imports.Bundle and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
-                        mut imported.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
-                        continue
-                    }
+                let Some(imported_at) = import_target(called, table, name: symbol.name.as_str(), stubs) else {
+                    expect imports == Imports.Bundle and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
+                    mut imported.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
+                    continue
                 }
+                target = i64.from_bits(imported_at) + relocation.addend
             } else {
                 target = i64.from_bits(address_of(symbol, placed: placed.view())) + relocation.addend
             }
@@ -378,6 +350,40 @@ fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Li
 
 /// Whether a symbol is one the object leaves undefined.
 fn undefined(symbol: Symbol) -> bool = symbol.section.is_none() and not symbol.name.is_empty()
+
+/// The address an undefined symbol's relocation reaches: the import stub of a function the
+/// object calls, which `stubs` begin, or the import address table's word of a Windows image's
+/// import; none for a bundle's import, which its loader resolves.
+fn import_target(called: mem::List[text::String], table: mem::Map[text::String, u64], name: Str, stubs: u64) -> Option[u64] {
+    match called.position(fn(known: text::String) => known.as_str() == name) {
+        Some(stub) => return Some(stubs + u64.widen(stub) * IMPORT_STUB_BYTES)
+        None => {}
+    }
+    return table.get_by(fn(key: text::String) => key.as_str().cmp(name))
+} import_target
+
+/// Lays out a Windows image's import address table at `at`, after its other segments: the words
+/// of each library's functions, which a zero word ends, each recorded in `imported` with its
+/// library and in `table` by the symbol naming it; gives the table's segment.
+fn import_table(read_object: Object, at: u64, mut imported: mem::List[Import], mut table: mem::Map[text::String, u64], alloc: mem::Alloc) -> Segment {
+    let named = table_imports(read_object, alloc)
+    var word = at
+    for index in 0..<named.len() {
+        if index > 0 and named[index - 1].library != named[index].library {
+            word += 8
+        }
+        var name = text::String.of(named[index].library.as_str(), alloc)
+        mut name.append("!")
+        mut name.append(named[index].function.as_str())
+        mut imported.push(Import(address: word, name: take name))
+        discard mut table.insert(text::String.of(named[index].symbol.as_str(), alloc), value: word)
+        word += 8
+    }
+    let words = word + 8 - at
+    var zeros = mem::Bytes.empty(alloc)
+    object::resize(mut zeros, length: usize.widen(words))
+    return Segment(address: at, access: Access.Write, bytes: take zeros, size: words)
+} import_table
 
 /// The names of the undefined symbols an object calls, in the order of their first calls.
 fn called_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -412,8 +418,8 @@ fn table_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[Named] {
                 expect false
                 continue
             }
-            var library = KERNEL32
-            var function = import
+            var library = text::String.of(KERNEL32, alloc)
+            var function = text::String.of(import, alloc)
             match import.find("!") {
                 Some(split) => {
                     let Some(head) = import.slice_bytes(0, end: split) else {
@@ -424,12 +430,12 @@ fn table_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[Named] {
                         expect false
                         continue
                     }
-                    library = head
-                    function = tail
+                    library = text::String.of(head, alloc)
+                    function = text::String.of(tail, alloc)
                 }
                 None => {}
             }
-            mut named.push(Named(library: text::String.of(library, alloc), function: text::String.of(function, alloc), symbol: text::String.of(whole, alloc)))
+            mut named.push(Named(library: take library, function: take function, symbol: text::String.of(whole, alloc)))
         }
     }
     mut named.sort_by(named_order)

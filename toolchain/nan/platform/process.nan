@@ -77,13 +77,6 @@ foreign fn posix_spawnattr_setsigmask(attributes: hw::Ptr[u64], mask: hw::Ptr[u6
 
 foreign fn posix_spawnattr_setsigdefault(attributes: hw::Ptr[u64], defaults: hw::Ptr[u64]) -> i32 convention "sysv"
 
-/// A variable of the environment a program starts with, which replaces this process's variable
-/// of its name.
-pkg struct EnvVar derives Copy {
-    pkg name: Str
-    pkg value: Str
-} EnvVar
-
 /// How a process ended: the status it exited with, or the number of the signal that ended it.
 pkg enum Status derives Copy, Eq {
     Exited(i32)
@@ -159,13 +152,13 @@ fn Gathered.empty(alloc: mem::Alloc) -> Gathered {
 /// for none; its standard output captured; its standard error captured, or the null device unless
 /// `capture_errors`. It starts with no signal blocked and `SIGPIPE` at its default action.
 pkg fn run_output(program: Str, args: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> Output fails IoError {
-    let env = mem::List[EnvVar].empty(alloc)
+    let env = mem::List[text::String].empty(alloc)
     return try run_output_with(program, args, env: env.view(), input: take input, capture_errors, alloc)
 } run_output
 
-/// Runs a program as `run_output` does, with this process's environment with the variables of
-/// `env` set.
-pkg fn run_output_with(program: Str, args: Slice[text::String], env: Slice[EnvVar], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> Output fails IoError {
+/// Runs a program as `run_output` does, with this process's environment with the variables that
+/// the `NAME=VALUE` entries of `env` give set.
+pkg fn run_output_with(program: Str, args: Slice[text::String], env: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> Output fails IoError {
     var streams = Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Null)
     if input.is_some() {
         streams.input = Stream.Piped
@@ -207,7 +200,7 @@ fn input_bytes(take input: Option[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes 
 /// `within` with its process id, between waits of `poll_ms` milliseconds for its output, whether
 /// it may go on, and once that gives false or fails, kills it and gives none or the failure.
 pkg fn run_bounded(program: Str, args: Slice[text::String], dir: Str, poll_ms: i32, within: fn(id: u32) -> bool fails IoError, alloc: mem::Alloc) -> Option[Output] fails IoError {
-    var child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Piped), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
+    var child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Piped), dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
     var gathered = Gathered.empty(alloc)
     var ended: Option[Status] = None
     loop {
@@ -254,7 +247,7 @@ pkg fn run_attached(program: Str, args: Slice[text::String], dir: Str, alloc: me
     if changed != 0 {
         fail error_of(changed)
     }
-    let child = try spawn(program, args, streams: Streams(input: Stream.Inherited, out: Stream.Inherited, err: Stream.Inherited), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
+    let child = try spawn(program, args, streams: Streams(input: Stream.Inherited, out: Stream.Inherited, err: Stream.Inherited), dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
     let Some(ended) = try waited(child.pid, options: 0) else {
         fail IoError.Other(0)
     }
@@ -269,7 +262,7 @@ pkg struct Background derives Copy {
 /// Starts a program the `PATH` finds, given its arguments after its name, in the directory `dir`,
 /// with its standard streams the null device.
 pkg fn start_background(program: Str, args: Slice[text::String], dir: Str, alloc: mem::Alloc) -> Background fails IoError {
-    let child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Null, err: Stream.Null), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
+    let child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Null, err: Stream.Null), dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
     return Background(pid: child.pid)
 } start_background
 
@@ -290,10 +283,10 @@ pkg fn sleep_ms(milliseconds: i32) {
 } sleep_ms
 
 /// Replaces this process by a program the `PATH` finds, a name holding `/` being its path, given
-/// its arguments after its name, with this process's environment with the variables of `env` set
-/// and this process's standard streams, no signal blocked and `SIGPIPE` at its default action.
-/// Returns only when the system refuses, with the failure.
-pkg fn replace_process(program: Str, args: Slice[text::String], env: Slice[EnvVar], alloc: mem::Alloc) -> IoError {
+/// its arguments after its name, with this process's environment with the variables that the
+/// `NAME=VALUE` entries of `env` give set and this process's standard streams, no signal blocked
+/// and `SIGPIPE` at its default action. Returns only when the system refuses, with the failure.
+pkg fn replace_process(program: Str, args: Slice[text::String], env: Slice[text::String], alloc: mem::Alloc) -> IoError {
     let Ok(path) = attempt c_text(program.as_bytes()) else {
         return IoError.Other(EINVAL)
     }
@@ -307,12 +300,12 @@ pkg fn replace_process(program: Str, args: Slice[text::String], env: Slice[EnvVa
         }
     }
     let argv = pointers(texts.view(), alloc)
-    let read = attempt environment_with(env, alloc)
-    match read {
+    let gathered = attempt environment_with(env, alloc)
+    match gathered {
         Err(error) => return error
         Ok(_) => {}
     }
-    let Ok(environment) = read else {
+    let Ok(environment) = gathered else {
         return IoError.Other(EINVAL)
     }
     let envp = pointers(environment.view(), alloc)
@@ -347,10 +340,10 @@ pkg fn monotonic_nanos() -> u64 {
 } monotonic_nanos
 
 /// Starts a program the `PATH` finds, given its arguments after its name, with this process's
-/// environment with the variables of `env` set, its standard streams as `streams` gives, in the
-/// directory `dir` or this process's for none, no signal blocked and `SIGPIPE` at its default
-/// action.
-fn spawn(program: Str, args: Slice[text::String], streams: Streams, dir: Option[Str], env: Slice[EnvVar], alloc: mem::Alloc) -> Child fails IoError {
+/// environment with the variables that the `NAME=VALUE` entries of `env` give set, its standard
+/// streams as `streams` gives, in the directory `dir` or this process's for none, no signal
+/// blocked and `SIGPIPE` at its default action.
+fn spawn(program: Str, args: Slice[text::String], streams: Streams, dir: Option[Str], env: Slice[text::String], alloc: mem::Alloc) -> Child fails IoError {
     let file = try c_text(program.as_bytes())
     var texts = mem::Bytes.empty(alloc)
     try add_text(mut texts, written: program.as_bytes())
@@ -505,9 +498,9 @@ fn add_text(mut texts: mem::Bytes, written: Slice[u8]) fails IoError {
     mut texts.push(0)
 } add_text
 
-/// The NUL-terminated `NAME=VALUE` texts of this process's environment with the variables of
-/// `env` set.
-fn environment_with(env: Slice[EnvVar], alloc: mem::Alloc) -> mem::Bytes fails IoError {
+/// The NUL-terminated `NAME=VALUE` texts of this process's environment with the variables that
+/// the `NAME=VALUE` entries of `env` give set.
+fn environment_with(env: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes fails IoError {
     let current = try read_file("/proc/self/environ", alloc)
     let held = current.view()
     var texts = mem::Bytes.empty(alloc)
@@ -529,26 +522,24 @@ fn environment_with(env: Slice[EnvVar], alloc: mem::Alloc) -> mem::Bytes fails I
         start = at + 1
     }
     for variable in env {
-        var written = mem::Bytes.empty(alloc)
-        mut written.append(variable.name.as_bytes())
-        mut written.push(b'=')
-        mut written.append(variable.value.as_bytes())
-        try add_text(mut texts, written: written.view())
+        try add_text(mut texts, written: variable.as_bytes())
     }
     return texts
 } environment_with
 
-/// Whether an environment entry `NAME=VALUE` names a variable of `env`.
-fn set_by(entry: Slice[u8], env: Slice[EnvVar]) -> bool {
+/// Whether an environment entry `NAME=VALUE` sets the variable an entry of `env` sets.
+fn set_by(entry: Slice[u8], env: Slice[text::String]) -> bool {
     for variable in env {
-        let name = variable.name.as_bytes()
-        let Some(parts) = entry.split_at(name.len()) else {
+        let Some(split) = variable.as_str().find("=") else {
             continue
         }
-        let Some(sign) = parts.tail.prefix(1) else {
+        let Some(named) = variable.as_bytes().prefix(split + 1) else {
             continue
         }
-        if parts.head == name and sign == b"=" {
+        let Some(head) = entry.prefix(named.len()) else {
+            continue
+        }
+        if head == named {
             return true
         }
     }

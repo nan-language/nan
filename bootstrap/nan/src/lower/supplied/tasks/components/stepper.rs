@@ -190,6 +190,14 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             supply.ret(lo, fx, Held::Scalar(idle));
         }
+        "keyed" => {
+            let record = record(fx);
+            let lock = fx.offset(record, runner::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let live = fx.load(PTR, record, runner::LIVE_KEYED);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            supply.ret(lo, fx, Held::Scalar(live));
+        }
         "state" => {
             let record = record(fx);
             let (state, env, message) = types_of(supply);

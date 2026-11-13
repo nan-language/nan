@@ -1,4 +1,4 @@
-//! Emission of x86-64 code: the frame and its prologue and epilogue, a block ending in a trap reserving the stack slots when only such blocks reach them, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, and the runs of source locations.
+//! Emission of x86-64 code: the frame and its prologue and epilogue, a block ending in a trap reserving the stack slots when only such blocks reach them, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, a jump to a small block replaced by a copy of it, and the runs of source locations.
 
 /// The frame below the saved frame pointer, from the stack pointer up: the outgoing argument
 /// area, the stack slots, the spill slots, padding, then the pushed callee-saved registers.
@@ -320,7 +320,11 @@ fn Emitter.block(mut self, code: VCode[x64::Inst], allocation: Allocation, block
             x64::Inst.Jmp(label: label) => {
                 mut self.edge_moves(code, allocation, data)
                 if label != next {
-                    mut self.put(vinst.inst)
+                    if label != block and copyable(code, block: label, within: COPIED_INSTS) {
+                        mut self.copy_block(code, allocation, block: label, from: block, within: COPIED_INSTS)
+                    } else {
+                        mut self.put(vinst.inst)
+                    }
                 }
             }
             x64::Inst.Jcc(cond: cond, label: label) => {
@@ -345,6 +349,94 @@ fn Emitter.block(mut self, code: VCode[x64::Inst], allocation: Allocation, block
         at += 1
     }
 } Emitter.block
+
+/// A copy of a block `copyable` allows, in place of a jump to it from block `from`: its
+/// instructions, then its jumps to the blocks other than the one after `from`, the conditional
+/// one taken to an earlier block when neither target follows, and a jump replaced by a copy of
+/// its target too while the copies hold at most `within` instructions.
+fn Emitter.copy_block(mut self, code: VCode[x64::Inst], allocation: Allocation, block: u32, from: u32, within: u32)
+    requires usize.widen(block) < code.blocks.len()
+{
+    let data = code.blocks[usize.widen(block)]
+    expect code.holds(data) and data.end - data.begin <= within
+    self.held = Array[u32, SCRATCH_COUNT].filled(NONE)
+    let next = from + 1
+    let left = within - (data.end - data.begin)
+    var at = data.begin
+    while at < data.end {
+        let vinst = code.insts[usize.widen(at)]
+        mut self.locate(vinst.loc)
+        match vinst.inst {
+            x64::Inst.Jmp(label: label) => {
+                mut self.edge_moves(code, allocation, data)
+                if label != next {
+                    if label != from and label != block and copyable(code, block: label, within: left) {
+                        mut self.copy_block(code, allocation, block: label, from: from, within: left)
+                    } else {
+                        mut self.put(vinst.inst)
+                    }
+                }
+            }
+            x64::Inst.Jcc(cond: cond, label: label) => {
+                expect at + 1 < data.end
+                let ends = at + 2 == data.end and data.arg_count == 0 and not is_jcc(code, at: at, begin: data.begin)
+                let x64::Inst.Jmp(label: other) = code.insts[usize.widen(at + 1)].inst else {
+                    mut self.put(vinst.inst)
+                    at += 1
+                    continue
+                }
+                if not ends {
+                    mut self.put(vinst.inst)
+                    at += 1
+                    continue
+                }
+                if label == next {
+                    mut self.put(x64::Inst.Jcc(cond: cond.invert(), label: other))
+                } else if other == next {
+                    mut self.put(vinst.inst)
+                } else if other <= from and label > from {
+                    mut self.put(x64::Inst.Jcc(cond: cond.invert(), label: other))
+                    mut self.put(x64::Inst.Jmp(label: label))
+                } else {
+                    mut self.put(vinst.inst)
+                    mut self.put(x64::Inst.Jmp(label: other))
+                }
+                at += 2
+                continue
+            }
+            else => mut self.instruction(code, allocation, inst: vinst.inst)
+        }
+        at += 1
+    }
+} Emitter.copy_block
+
+/// Whether a jump to a block is replaced by a copy of it: a block other than the entry of at most
+/// `within` instructions that, besides its jumps, only compute registers and flags.
+fn copyable(code: VCode[x64::Inst], block: u32, within: u32) -> bool {
+    if block == 0 or usize.widen(block) >= code.blocks.len() {
+        return false
+    }
+    let data = code.blocks[usize.widen(block)]
+    if data.end - data.begin > within {
+        return false
+    }
+    for at in data.begin..<data.end {
+        expect usize.widen(at) < code.insts.len()
+        let inst = code.insts[usize.widen(at)].inst
+        match inst {
+            x64::Inst.Jmp(label: _) or x64::Inst.Jcc(cond: _, label: _) => {}
+            else => {
+                if not inst.is_pure() {
+                    return false
+                }
+            }
+        }
+    }
+    return true
+} copyable
+
+/// The most instructions of the blocks a jump to them is replaced by.
+const COPIED_INSTS: u32 = 4
 
 /// A call, the registers saved across it stored to their slots before it and loaded after.
 fn Emitter.saved_call(mut self, code: VCode[x64::Inst], allocation: Allocation, inst: x64::Inst, at: u32) {

@@ -81,8 +81,8 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
         "check a b",
         "check --budget 99",
         "check --skip",
-        "test app --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
-        "test --affected --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
+        "test app --replay sc/x86_64-linux/app::halves/0/aaaaaaaaaaaaaaa",
+        "test --affected --replay sc/x86_64-linux/app::halves/0/aaaaaaaaaaaaaaa",
         "check app --prefix app/app.nan",
         "check --prefix app/app.nan --radius",
         "check --prefix app/app.nan --agent other",
@@ -103,7 +103,7 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
         ("check --budget 99", "99"),
         ("check --skip", "end of line"),
         (
-            "test app --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
+            "test app --replay sc/x86_64-linux/app::halves/0/aaaaaaaaaaaaaaa",
             "--replay",
         ),
         ("publish app --local app", "app"),
@@ -309,13 +309,13 @@ fn a_replay_token_reruns_its_run() {
     assert!(
         replayed
             .output
-            .contains("\nfail app::halves app/app.nan:7 x86_64-host trap.expect\n")
+            .contains("\nfail app::halves app/app.nan:7 x86_64-linux trap.expect\n")
     );
     for wrong in [
         token.replacen("sc/", "hb/", 1),
         token.replacen("/0/", "/00/", 1),
         token.replacen("halves", "thirds", 1),
-        token.replacen("x86_64-host", "x86_64-uefi", 1),
+        token.replacen("x86_64-linux", "x86_64-uefi", 1),
         format!("{token}a"),
     ] {
         let run = run_in(&scratch.0, &format!("test --replay {wrong}"));
@@ -433,7 +433,7 @@ fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_ap
         ("lib/lib.nan", length),
         (
             "app/package.nan",
-            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    entry main\n    dep lib \"../lib\"\n} app\n",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-linux\n    entry main\n    dep lib \"../lib\"\n} app\n",
         ),
         ("app/app.nan", &main("")),
     ]);
@@ -487,7 +487,7 @@ fn a_sync_names_the_epoch_bumps_of_each_release_it_locks() {
         ("meter/meter.nan", &mean("total / count.max(1)")),
         (
             "app/package.nan",
-            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    entry main\n    dep meter \"meter\"\n} app\n",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-linux\n    entry main\n    dep meter \"meter\"\n} app\n",
         ),
         (
             "app/app.nan",

@@ -199,7 +199,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     let target = target(&root.join(name))?;
     let bundles = bundles(&root, name, &target)?;
     let mut runs = Vec::new();
-    match target.strip_suffix("-host") {
+    match target.strip_suffix("-linux") {
         Some(arch) if arch != std::env::consts::ARCH => {}
         Some(_) => {
             let (status, written) = run_host(&root, &target, name)?;

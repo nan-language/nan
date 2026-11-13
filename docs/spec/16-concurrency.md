@@ -827,7 +827,7 @@ pub fn Account.close(take self)
 
 package pool {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } pool
 
 // file: pool/pool.nan
@@ -858,7 +858,7 @@ pub fn accounts_hold(exec: task::Executor) -> bool
 
 package counter {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } counter
 
@@ -892,7 +892,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package batch {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } batch
 

@@ -29,7 +29,7 @@ impl Arch {
 /// NaN OS kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
-    Host,
+    Linux,
     Uefi,
     Bare,
     Nanos,
@@ -37,10 +37,10 @@ pub enum Kind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
-    X64Host,
+    X64Linux,
     X64Uefi,
     X64Bare,
-    Aarch64Host,
+    Aarch64Linux,
     Aarch64Uefi,
     Aarch64Bare,
     X64Nanos,
@@ -52,17 +52,17 @@ impl Target {
     /// The host target of the machine running the toolchain.
     pub fn running_host() -> Target {
         match Arch::running() {
-            Arch::Amd64 => Target::X64Host,
-            Arch::Aarch64 => Target::Aarch64Host,
+            Arch::Amd64 => Target::X64Linux,
+            Arch::Aarch64 => Target::Aarch64Linux,
         }
     }
 
     /// The concrete targets.
     pub const CONCRETE: [Target; 8] = [
-        Target::X64Host,
+        Target::X64Linux,
         Target::X64Uefi,
         Target::X64Bare,
-        Target::Aarch64Host,
+        Target::Aarch64Linux,
         Target::Aarch64Uefi,
         Target::Aarch64Bare,
         Target::X64Nanos,
@@ -71,10 +71,10 @@ impl Target {
 
     pub fn name(self) -> &'static str {
         match self {
-            Target::X64Host => "x86_64-host",
+            Target::X64Linux => "x86_64-linux",
             Target::X64Uefi => "x86_64-uefi",
             Target::X64Bare => "x86_64-bare",
-            Target::Aarch64Host => "aarch64-host",
+            Target::Aarch64Linux => "aarch64-linux",
             Target::Aarch64Uefi => "aarch64-uefi",
             Target::Aarch64Bare => "aarch64-bare",
             Target::X64Nanos => "x86_64-nanos",
@@ -101,10 +101,10 @@ impl Target {
     /// A concrete target's architecture; `any` has none.
     pub fn arch(self) -> Option<Arch> {
         match self {
-            Target::X64Host | Target::X64Uefi | Target::X64Bare | Target::X64Nanos => {
+            Target::X64Linux | Target::X64Uefi | Target::X64Bare | Target::X64Nanos => {
                 Some(Arch::Amd64)
             }
-            Target::Aarch64Host
+            Target::Aarch64Linux
             | Target::Aarch64Uefi
             | Target::Aarch64Bare
             | Target::Aarch64Nanos => Some(Arch::Aarch64),
@@ -115,7 +115,7 @@ impl Target {
     /// A concrete target's kind; `any` has none.
     pub fn kind(self) -> Option<Kind> {
         match self {
-            Target::X64Host | Target::Aarch64Host => Some(Kind::Host),
+            Target::X64Linux | Target::Aarch64Linux => Some(Kind::Linux),
             Target::X64Uefi | Target::Aarch64Uefi => Some(Kind::Uefi),
             Target::X64Bare | Target::Aarch64Bare => Some(Kind::Bare),
             Target::X64Nanos | Target::Aarch64Nanos => Some(Kind::Nanos),
@@ -125,7 +125,7 @@ impl Target {
 
     /// Whether the target is a host target, whose images run as Linux processes.
     pub fn is_host(self) -> bool {
-        self.kind() == Some(Kind::Host)
+        self.kind() == Some(Kind::Linux)
     }
 
     /// Whether the target is a machine target, a UEFI or bare one, whose image the
@@ -148,7 +148,7 @@ impl Target {
             None => return false,
         };
         let kind = match self.kind() {
-            Some(Kind::Host) => "host",
+            Some(Kind::Linux) => "linux",
             Some(Kind::Uefi) => "uefi",
             Some(Kind::Bare) => "bare",
             Some(Kind::Nanos) => "nanos",
@@ -161,7 +161,7 @@ impl Target {
     /// name none.
     pub fn platform_package(self) -> Option<&'static str> {
         match self.kind()? {
-            Kind::Host => Some("host_platform"),
+            Kind::Linux => Some("linux_platform"),
             Kind::Uefi => Some("uefi_platform"),
             Kind::Bare => Some("bare_platform"),
             Kind::Nanos => None,
@@ -171,7 +171,7 @@ impl Target {
     /// The module and name of the root grant a concrete target's entry takes; `any` has none.
     pub fn root_grant(self) -> Option<(&'static str, &'static str)> {
         match self.kind()? {
-            Kind::Host => Some(("host", "World")),
+            Kind::Linux => Some(("host", "World")),
             Kind::Uefi => Some(("boot", "Machine")),
             Kind::Bare => Some(("boot", "Kernel")),
             Kind::Nanos => Some(("nanos", "World")),
@@ -183,7 +183,7 @@ impl Target {
         match self.kind() {
             Some(Kind::Uefi) => ".efi",
             Some(Kind::Bare) => ".elf",
-            Some(Kind::Host | Kind::Nanos) | None => "",
+            Some(Kind::Linux | Kind::Nanos) | None => "",
         }
     }
 }

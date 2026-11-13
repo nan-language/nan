@@ -135,12 +135,12 @@ fn manifest_directives_are_checked() {
             5,
         ),
         (
-            "    language 1\n    targets any, x86_64-host\n",
+            "    language 1\n    targets any, x86_64-linux\n",
             "manifest.any-not-alone",
             5,
         ),
         (
-            "    language 1\n    targets x86_64-host, x86_64-host\n",
+            "    language 1\n    targets x86_64-linux, x86_64-linux\n",
             "manifest.duplicate",
             5,
         ),
@@ -292,7 +292,7 @@ fn modules_hold_their_summary_files() {
 
 #[test]
 fn variants_cover_each_declared_target_once() {
-    let targets = manifest("    language 1\n    targets x86_64-bare, x86_64-host\n");
+    let targets = manifest("    language 1\n    targets x86_64-bare, x86_64-linux\n");
     let base = [
         ("app/package.nan", targets.as_str()),
         ("app/app.nan", "//! Root.\n"),
@@ -315,13 +315,13 @@ fn variants_cover_each_declared_target_once() {
         let (_scratch, workspace) = load(&files);
         codes(&workspace)
     };
-    assert_eq!(case(&["io@bare", "io@host"]), []);
+    assert_eq!(case(&["io@bare", "io@linux"]), []);
     assert_eq!(
         case(&["io@bare"]),
         [("app/package.nan".to_owned(), 5, "module.variant-missing")]
     );
     assert_eq!(
-        case(&["io@bare", "io@host", "io@x86_64"]),
+        case(&["io@bare", "io@linux", "io@x86_64"]),
         [(
             "app/io@x86_64/io.nan".to_owned(),
             1,
@@ -329,7 +329,7 @@ fn variants_cover_each_declared_target_once() {
         )]
     );
     assert_eq!(
-        case(&["io@bare", "io@host", "io@uefi"]),
+        case(&["io@bare", "io@linux", "io@uefi"]),
         [(
             "app/io@uefi/io.nan".to_owned(),
             1,
@@ -337,10 +337,10 @@ fn variants_cover_each_declared_target_once() {
         )]
     );
     assert_eq!(
-        case(&["io", "io@bare", "io@host"]),
+        case(&["io", "io@bare", "io@linux"]),
         [
             ("app/io@bare/io.nan".to_owned(), 1, "module.variant-mixed"),
-            ("app/io@host/io.nan".to_owned(), 1, "module.variant-mixed"),
+            ("app/io@linux/io.nan".to_owned(), 1, "module.variant-mixed"),
         ]
     );
 }

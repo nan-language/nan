@@ -2,7 +2,7 @@
 //! comments after locking, snapshotting and publishing each of its packages into a local store
 //! holding nothing else, `nan verify` included for a gate code, compares a host example's
 //! obligation outcomes with the proof cache's, builds its programs and compares what an
-//! `x86_64-host` one writes with the text its section gives, runs the commands of the `text`
+//! `x86_64-linux` one writes with the text its section gives, runs the commands of the `text`
 //! blocks of its section, finds each item of its `nan-api` blocks in the std sources and the
 //! heading each of its links to a section names, one test per chapter, whose runs of `nan` use the
 //! harnesses' home directory and a local store of their own.
@@ -79,7 +79,7 @@ impl Example {
                 let entry = lines.iter().any(|line| line.trim() == "entry main");
                 let target = lines.iter().find_map(|line| {
                     let target = line.trim().strip_prefix("targets ")?;
-                    ["x86_64-host", "x86_64-uefi", "x86_64-bare"]
+                    ["x86_64-linux", "x86_64-uefi", "x86_64-bare"]
                         .into_iter()
                         .find(|known| target.split(", ").any(|one| one == *known))
                 })?;
@@ -296,7 +296,7 @@ fn test(
 }
 
 /// Builds each program of an example on its target: every image builds, reporting what check
-/// time reports and the one diagnostic a final-build marker states, and an `x86_64-host` program
+/// time reports and the one diagnostic a final-build marker states, and an `x86_64-linux` program
 /// whose section gives what it writes writes exactly that and exits with the status stated.
 fn build(
     example: &Example,
@@ -321,7 +321,7 @@ fn build(
                 "nan build {program} exits with {code:?} and reports\n{output}expected {expected:?}"
             ));
         }
-        let host = target == "x86_64-host";
+        let host = target == "x86_64-linux";
         let Some(written) = example
             .written
             .as_ref()
@@ -329,7 +329,7 @@ fn build(
         else {
             continue;
         };
-        let image = dir.join(".nan/images/x86_64-host").join(&program);
+        let image = dir.join(".nan/images/x86_64-linux").join(&program);
         let run = Command::new(&image)
             .current_dir(dir)
             .output()

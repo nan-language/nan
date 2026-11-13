@@ -43,7 +43,7 @@ const PRIVILEGED_PRIMITIVES: [&str; 10] = [
 
 /// The calling conventions and the targets each serves.
 const CONVENTIONS: [(&str, &[Target]); 3] = [
-    ("sysv", &[Target::X64Host, Target::Aarch64Host]),
+    ("sysv", &[Target::X64Linux, Target::Aarch64Linux]),
     ("win64", &[Target::X64Uefi]),
     ("aapcs64", &[Target::Aarch64Uefi]),
 ];

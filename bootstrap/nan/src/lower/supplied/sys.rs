@@ -91,7 +91,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::Runner" => runner(lo, fx, supply),
         "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" => resource(lo, fx, supply),
         "sys::revocable" | "sys::Revoker" => revocation(lo, fx, supply),
-        "host_platform::submit" => submit(lo, fx, supply),
+        "linux_platform::submit" => submit(lo, fx, supply),
         _ => return false,
     }
     true
@@ -994,7 +994,7 @@ fn revocation(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// `host_platform::submit(entry)`: the operation's result once its completion arrives.
+/// `linux_platform::submit(entry)`: the operation's result once its completion arrives.
 fn submit(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let entry = supply.param(0).address();
     let results = lo.call_routine(fx, Routine::IoSubmit, &[entry]);

@@ -9,7 +9,7 @@ Title: the defect in one sentence naming the command, diagnostic or item, such a
 Labels: bug, each label under areas in .github/labels.yml for the parts of NaN the issue concerns, and each label under impacts that applies. Through the API, an issue gets no label from this template: set them all when filing it.
 -->
 
-Toolchain vX.Y.Z, target x86_64-host.
+Toolchain vX.Y.Z, target x86_64-linux.
 <!-- The release, or the commit of a toolchain built from source, and the target when the defect depends on it. -->
 
 ## What happens

@@ -836,7 +836,7 @@ impl Package {
         self.manifest
             .as_ref()
             .and_then(|manifest| manifest.targets.first().copied())
-            .unwrap_or(Target::X64Host)
+            .unwrap_or(Target::X64Linux)
     }
 
     /// The canonical path of a module of the package, its name absent for the root module.

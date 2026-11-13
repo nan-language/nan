@@ -1034,7 +1034,7 @@ impl Lowering<'_, '_> {
         let platform = match self.ck.db.target.kind() {
             Some(Kind::Uefi) => "uefi_platform",
             Some(Kind::Bare) => "bare_platform",
-            _ => "host_platform",
+            _ => "linux_platform",
         };
         self.ck
             .db

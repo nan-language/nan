@@ -3,7 +3,7 @@ use std::fs;
 use crate::command::tests::run_in;
 use crate::workspace::tests::Scratch;
 
-const MANIFEST: &str = "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-host\n    entry main\n} exits\n";
+const MANIFEST: &str = "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-linux\n    entry main\n} exits\n";
 
 const SOURCE: &str = "//! Exits.\n\nfn main(take world: host::World) -> u8 fails task::Cancelled uses wait {\n    world.log.info(\"exiting\", value: 3u8)\n    return 3\n} main\n";
 
@@ -14,7 +14,7 @@ fn stage_comparison_reports_each_package_whose_code_root_differs() {
     let built = run_in(dir, "build");
     assert_eq!(built.status, 0, "{}", built.output);
     fs::copy(
-        dir.join(".nan/images/x86_64-host/exits"),
+        dir.join(".nan/images/x86_64-linux/exits"),
         dir.join("stage1"),
     )
     .expect("a copy");
@@ -89,7 +89,7 @@ fn a_locked_release_reaches_the_methods_its_tests_call() {
         ),
         (
             "exits/package.nan",
-            "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-host\n    entry main\n    dep count \"../count\"\n} exits\n",
+            "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-linux\n    entry main\n    dep count \"../count\"\n} exits\n",
         ),
         (
             "exits/exits.nan",

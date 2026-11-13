@@ -12,7 +12,7 @@ fn with_outer(test: impl FnOnce(&Checker, At)) {
     let scratch = Scratch::new(&[
         (
             "app/package.nan",
-            "//! Calls.\n\npackage app {\n    language 1\n    targets x86_64-host\n} app\n",
+            "//! Calls.\n\npackage app {\n    language 1\n    targets x86_64-linux\n} app\n",
         ),
         (
             "app/app.nan",
@@ -24,7 +24,7 @@ fn with_outer(test: impl FnOnce(&Checker, At)) {
         &workspace,
         &workspace.closures[0],
         crate::stdlib::packages(),
-        Target::X64Host,
+        Target::X64Linux,
     );
     let item = |canonical: &str| {
         (0..checker.db.items.len())

@@ -56,7 +56,7 @@ Each task's stack use is its entry's, judged as a final build judges a `stack N`
 
 ## Time of an allocation through `mem::Alloc`, its cell charge included
 
-A box drawn through a heap over an allocator, every box kept so that the heap draws chunks and charges its cell, by an `x86_64-host` image.
+A box drawn through a heap over an allocator, every box kept so that the heap draws chunks and charges its cell, by an `x86_64-linux` image.
 
 | Milestone | Time |
 | --- | ---: |
@@ -94,7 +94,7 @@ A seam's round trip, a self-interrupt sent through the local APIC and taken, a t
 
 ## Time of a generation check in a capability table
 
-An operation failing at a stale capability's generation check: on `x86_64-host` for M2, on `x86_64-bare` under the emulator for M4.
+An operation failing at a stale capability's generation check: on `x86_64-linux` for M2, on `x86_64-bare` under the emulator for M4.
 
 | Milestone | Time |
 | --- | ---: |

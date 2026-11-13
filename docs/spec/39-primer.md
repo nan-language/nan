@@ -713,7 +713,7 @@ interrupt fn Serial.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit li
 
 ### Manifests
 
-- The [manifest](03-packages-modules.md#manifest) `package.nan` holds `package name { ... } name` with one directive per line, in this order: `language 1`; `targets` naming `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, their `aarch64-` counterparts or `any`; `entry main`; `codegen x86_64-v3` or another [level](27-program-model.md#codegen-levels) a program's builds may use, its image refusing a processor without it; `dep alias "source"` lines by alias; `allow <authority> in <modules or aliases>` lines by authority; `deny a -> b` lines, each forbidding `a` from depending on `b`. It holds no versions or hashes.
+- The [manifest](03-packages-modules.md#manifest) `package.nan` holds `package name { ... } name` with one directive per line, in this order: `language 1`; `targets` naming `x86_64-linux`, `x86_64-uefi`, `x86_64-bare`, their `aarch64-` counterparts or `any`; `entry main`; `codegen x86_64-v3` or another [level](27-program-model.md#codegen-levels) a program's builds may use, its image refusing a processor without it; `dep alias "source"` lines by alias; `allow <authority> in <modules or aliases>` lines by authority; `deny a -> b` lines, each forbidding `a` from depending on `b`. It holds no versions or hashes.
 - A package with `entry main` is a program and its entry is `fn main(take world: host::World) fails E uses wait`, or `-> u8` for an exit status, on the host; a package without one is a library. A trap in `main` exits with status 70 after the trap report. A termination request from the host cancels `main`, and the process exits with status 128 plus the signal number. Every declared [target](27-program-model.md#targets) is checked.
 - A module's last path segment is unique in its package and the module graph is acyclic. A directory `name@target` holds one target's [variant](03-packages-modules.md#target-variants) of module `name` and exports identical items.
 - A manifest granting `device` or `priv` needs a seal.
@@ -724,7 +724,7 @@ interrupt fn Serial.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit li
 
 package hello {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hello
 
@@ -863,7 +863,7 @@ test growing_never_narrows for Window.grow (window: Window, margin: u32) {
 
 package tally {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } tally
 

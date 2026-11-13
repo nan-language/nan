@@ -8,7 +8,7 @@ fn a_symbol_no_library_defines_fails_the_link() {
     let scratch = Scratch::new(&[
         (
             "probe/package.nan",
-            "//! A program.\n\npackage probe {\n    language 1\n    targets x86_64-host\n    entry main\n    allow trusted in probe\n} probe\n",
+            "//! A program.\n\npackage probe {\n    language 1\n    targets x86_64-linux\n    entry main\n    allow trusted in probe\n} probe\n",
         ),
         (
             "probe/probe.nan",

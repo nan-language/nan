@@ -129,7 +129,7 @@ const GRANT: &str = "allow validate in platform, command\n";
 
 /// The targets directive of the toolchain's manifest, which its copies replace with the host
 /// target of this machine's architecture.
-const DECLARED_TARGET: &str = "targets x86_64-host\n";
+const DECLARED_TARGET: &str = "targets x86_64-linux\n";
 
 /// How long one run of a program or of the NaN toolchain may take, and one of the NaN toolchain
 /// over its own workspace, which checks, tests or builds the whole toolchain.
@@ -213,7 +213,7 @@ fn hash_tree(dir: &Path, prefix: &str, hasher: &mut DefaultHasher) -> std::io::R
 
 /// The host target of this machine's architecture.
 fn host_target() -> String {
-    format!("{}-host", std::env::consts::ARCH)
+    format!("{}-linux", std::env::consts::ARCH)
 }
 
 /// The image of the toolchain that `nan build nan` writes in the workspace `dir`.
@@ -693,7 +693,7 @@ fn lowered(dump: &[u8]) -> Result<Vec<(String, String)>, String> {
     Ok(functions)
 }
 
-/// The support routines the NaN toolchain lowers its own way on `x86_64-host`, whose programs
+/// The support routines the NaN toolchain lowers its own way on `x86_64-linux`, whose programs
 /// the harness compares by what they write instead.
 const OWN_ROUTINES: [&str; 17] = [
     "_NScap_table_alloc",
@@ -716,7 +716,7 @@ const OWN_ROUTINES: [&str; 17] = [
 ];
 
 /// Compares the text of each function the final build of `program` lowers with the bootstrap's,
-/// for an `x86_64-host` program those `comparable` keeps, as it gives them.
+/// for an `x86_64-linux` program those `comparable` keeps, as it gives them.
 fn compare_lowered(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -770,7 +770,7 @@ fn compare_lowered(
 }
 
 /// The prefix of the symbols of std's `hw` package, whose synchronisation operations read the
-/// line tables the NaN toolchain lays out its own way on `x86_64-host`, so that the harness
+/// line tables the NaN toolchain lays out its own way on `x86_64-linux`, so that the harness
 /// compares the programs calling them by what they write instead.
 const HW_FUNCTIONS: &str = "_N2hw_";
 
@@ -838,7 +838,7 @@ fn compare_program(
     program: &str,
     target: &str,
 ) -> Result<(), String> {
-    match target.strip_suffix("-host") {
+    match target.strip_suffix("-linux") {
         Some(arch) if arch != std::env::consts::ARCH => Ok(()),
         Some(_) => compare_processes(bootstrap, store, program, target),
         None => compare_boots(toolchain, bootstrap, store, program),
@@ -941,7 +941,7 @@ fn compare_example(
         for program in programs(example) {
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
-                let host = program.1.strip_suffix("-host");
+                let host = program.1.strip_suffix("-linux");
                 compare_lowered(toolchain, dir, store, &program.0, host.is_some())?;
                 if host == Some(std::env::consts::ARCH) {
                     compare_processes(dir, store, &program.0, &program.1)?;
@@ -965,10 +965,10 @@ fn compare_example(
 
 /// The concrete targets.
 const TARGETS: [&str; 6] = [
-    "x86_64-host",
+    "x86_64-linux",
     "x86_64-uefi",
     "x86_64-bare",
-    "aarch64-host",
+    "aarch64-linux",
     "aarch64-uefi",
     "aarch64-bare",
 ];
@@ -1071,7 +1071,7 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if !bundles.is_empty() {
         compare_bundled(&toolchain, &dir, &store, name, &target, &bundles)?;
     }
-    compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-host"))?;
+    compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-linux"))?;
     if bundles.is_empty() {
         compare_program(&toolchain, &dir, &store, name, &target)?;
     }
@@ -1476,7 +1476,7 @@ fn compare_published(
 const SIGNED_FILES: [(&str, &str); 4] = [
     (
         "procinfo/package.nan",
-        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-host\n    allow trusted in procinfo\n} procinfo\n",
+        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-linux\n    allow trusted in procinfo\n} procinfo\n",
     ),
     (
         "procinfo/procinfo.nan",
@@ -1484,7 +1484,7 @@ const SIGNED_FILES: [(&str, &str); 4] = [
     ),
     (
         "app/package.nan",
-        "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    dep procinfo \"self-check-signing\"\n    allow trusted in procinfo\n} app\n",
+        "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-linux\n    dep procinfo \"self-check-signing\"\n    allow trusted in procinfo\n} app\n",
     ),
     (
         "app/app.nan",

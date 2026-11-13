@@ -5,7 +5,8 @@
 const SEGMENT_HEADER: u64 = 24
 
 /// The offsets in the record `Grow` keeps in its frame while a segment runs: `Grow`'s context,
-/// the thunk and its record, and the segment's context once it switches back.
+/// the thunk and its record, the segment's context once it switches back, and on a Windows
+/// target the segment's bounds.
 const SWITCH_THUNK: u64 = 24
 
 const SWITCH_RECORD: u64 = 32
@@ -13,6 +14,12 @@ const SWITCH_RECORD: u64 = 32
 const SWITCH_BACK: u64 = 40
 
 const SWITCH_SIZE: u64 = 64
+
+const SWITCH_LOW: u64 = 64
+
+const SWITCH_HIGH: u64 = 72
+
+const SWITCH_WINDOWS_SIZE: u64 = 80
 
 /// The alignment of a stack drawn through a cell: a chunk's on a host target, whose guard regions
 /// it protects page by page, and on a machine target the least a carved allocation has.
@@ -204,17 +211,24 @@ fn run_on_segment(mut lo: Lowering, mut fx: Fx, task: clif::Value, drawn: DrawnS
     mut fx.store(grown_limit, addr: task, offset: TASK_LIMIT)
     mut fx.store(grown_top, addr: task, offset: TASK_TOP)
     mut fx.store(segment, addr: task, offset: TASK_SEGMENT)
-    switch_onto(mut lo, mut fx, stack_top: grown_top, thunk, record)
+    switch_onto(mut lo, mut fx, low: segment, stack_top: grown_top, thunk, record)
     mut fx.store(limit, addr: task, offset: TASK_LIMIT)
     mut fx.store(stack_top, addr: task, offset: TASK_TOP)
     mut fx.store(older, addr: task, offset: TASK_SEGMENT)
     return_segment(mut lo, mut fx, segment, length, mapped)
 } run_on_segment
 
-/// Runs a thunk with its record on the stack whose top is `stack_top`, through `GrownStart`, and
+/// Runs a thunk with its record on the stack from `low` to `stack_top`, through `GrownStart`, and
 /// comes back once it returns.
-fn switch_onto(mut lo: Lowering, mut fx: Fx, stack_top: clif::Value, thunk: clif::Value, record: clif::Value) {
-    let switch = mut fx.slot(SWITCH_SIZE, align: 16)
+fn switch_onto(mut lo: Lowering, mut fx: Fx, low: clif::Value, stack_top: clif::Value, thunk: clif::Value, record: clif::Value) {
+    var switch = low
+    if lo.windows() {
+        switch = mut fx.slot(SWITCH_WINDOWS_SIZE, align: 16)
+        mut fx.store(low, addr: switch, offset: SWITCH_LOW)
+        mut fx.store(stack_top, addr: switch, offset: SWITCH_HIGH)
+    } else {
+        switch = mut fx.slot(SWITCH_SIZE, align: 16)
+    }
     mut fx.store(thunk, addr: switch, offset: SWITCH_THUNK)
     mut fx.store(record, addr: switch, offset: SWITCH_RECORD)
     // The stack's first context: on x86_64 eight below its top over a zeroed return slot, so
@@ -291,7 +305,7 @@ fn nested_routine(mut lo: Lowering, mut fx: Fx) {
         let got = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: segment, y: 0)
         mut fx1.if_true(got, then: fn[mut lo1](mut fx2: Fx) {
             let segment_top = mut fx2.b.iadd(segment, y: length)
-            switch_onto(mut lo1, fx: mut fx2, stack_top: segment_top, thunk, record: held)
+            switch_onto(mut lo1, fx: mut fx2, low: segment, stack_top: segment_top, thunk, record: held)
             discard mut lo1.call_routine(mut fx2, routine: Routine.Free, args: fx2.list1(segment).view())
         })
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -343,6 +357,11 @@ fn grown_start_routine(mut lo: Lowering, mut fx: Fx) {
     let params = mut fx.entry()
     expect params.len() == 1
     let switch = params[0]
+    if lo.windows() {
+        let low = mut fx.load(PTR, addr: switch, offset: SWITCH_LOW)
+        let high = mut fx.load(PTR, addr: switch, offset: SWITCH_HIGH)
+        windows_enter_segment(mut lo, mut fx, low, high)
+    }
     let frame = mut fx.b.get_frame_pointer(PTR)
     let grow_id = mut lo.routine(Routine.Grow)
     let grow_ref = mut lo.func_ref(mut fx, id: grow_id)

@@ -693,8 +693,8 @@ fn lowered(dump: &[u8]) -> Result<Vec<(String, String)>, String> {
     Ok(functions)
 }
 
-/// The support routines the NaN toolchain lowers its own way on `x86_64-linux`, whose programs
-/// the harness compares by what they write instead.
+/// The support routines the NaN toolchain lowers its own way on a host target, whose programs the
+/// harness compares by what they write instead.
 const OWN_ROUTINES: [&str; 17] = [
     "_NScap_table_alloc",
     "_NScap_table_alloc_in",
@@ -716,7 +716,7 @@ const OWN_ROUTINES: [&str; 17] = [
 ];
 
 /// Compares the text of each function the final build of `program` lowers with the bootstrap's,
-/// for an `x86_64-linux` program those `comparable` keeps, as it gives them.
+/// for a host program those `comparable` keeps, as it gives them.
 fn compare_lowered(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -830,7 +830,8 @@ fn renumbered(text: &str, numbers: &mut std::collections::HashMap<String, usize>
 
 /// Runs the images of `program` for `target` that each toolchain built in its workspace and
 /// compares what both write and the statuses they end with: a host program's standard streams
-/// when this machine has its architecture, a machine program's serial port under its emulator.
+/// when this machine has its architecture, a Windows one's under Wine, a machine program's serial
+/// port under its emulator.
 fn compare_program(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -838,11 +839,77 @@ fn compare_program(
     program: &str,
     target: &str,
 ) -> Result<(), String> {
-    match target.strip_suffix("-linux") {
-        Some(arch) if arch != std::env::consts::ARCH => Ok(()),
-        Some(_) => compare_processes(bootstrap, store, program, target),
-        None => compare_boots(toolchain, bootstrap, store, program),
+    match target.split_once('-') {
+        Some((arch, "linux" | "windows")) if arch != std::env::consts::ARCH => Ok(()),
+        Some((_, "linux")) => compare_processes(bootstrap, store, program, target),
+        Some((_, "windows")) => compare_wine(toolchain, bootstrap, store, program),
+        _ => compare_boots(toolchain, bootstrap, store, program),
     }
+}
+
+/// Runs the Windows image of `program` that each toolchain builds in its workspace with
+/// `nan run`, under Wine in a prefix of its own that Wine sets up first, and compares what both
+/// write and the statuses they end with; nothing where Wine does not run.
+fn compare_wine(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+) -> Result<(), String> {
+    let run = nan::run(&["run".to_owned(), program.to_owned()], bootstrap);
+    let Some(launch) = run.launch else {
+        if run.output.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("nan run {program} reports\n{}", run.output));
+    };
+    let prefix = bootstrap.join(".wine");
+    let wine = |args: &[String]| {
+        let mut command = Command::new(&launch.program);
+        command
+            .args(args)
+            .envs(launch.env.iter().copied())
+            .env("WINEPREFIX", &prefix)
+            .current_dir(bootstrap)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+    Supervised::start(
+        wine(&["wineboot".to_owned(), "--init".to_owned()]),
+        RUN_LIMIT,
+    )?
+    .finish()?;
+    let expected = Supervised::start(wine(&launch.args), RUN_LIMIT)?.finish()?;
+    let (front_dir, front_store) = fronts(bootstrap, store);
+    let mut command = Command::new(&toolchain.image);
+    command
+        .args(["run", program])
+        .current_dir(&front_dir)
+        .env("NAN_SELF_CHECK_HOME", front_home())
+        .env("NAN_SELF_CHECK_STORE", &front_store)
+        .env("WINEPREFIX", &prefix)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let ran = Supervised::start(command, RUN_LIMIT)?.finish()?;
+    if ran != expected {
+        let written = |ran: &Ran| {
+            format!(
+                "{}{}exiting with {:?}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr),
+                ran.status
+            )
+        };
+        return Err(format!(
+            "{program} built by the bootstrap writes\n{}\nbuilt by the NaN toolchain\n{}",
+            written(&expected),
+            written(&ran)
+        ));
+    }
+    Ok(())
 }
 
 /// Runs the host image of `program` for `target` that each toolchain built in its workspace and
@@ -942,7 +1009,8 @@ fn compare_example(
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
                 let host = program.1.strip_suffix("-linux");
-                compare_lowered(toolchain, dir, store, &program.0, host.is_some())?;
+                let windows = program.1.ends_with("-windows");
+                compare_lowered(toolchain, dir, store, &program.0, host.is_some() || windows)?;
                 if host == Some(std::env::consts::ARCH) {
                     compare_processes(dir, store, &program.0, &program.1)?;
                 }
@@ -1073,7 +1141,8 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if !bundles.is_empty() {
         compare_bundled(&toolchain, &dir, &store, name, &target, &bundles)?;
     }
-    compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-linux"))?;
+    let host = target.ends_with("-linux") || target.ends_with("-windows");
+    compare_lowered(&toolchain, &dir, &store, name, host)?;
     if bundles.is_empty() {
         compare_program(&toolchain, &dir, &store, name, &target)?;
     }

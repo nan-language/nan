@@ -146,6 +146,9 @@ enum Routine derives Copy, Eq, Hash {
     /// `(entry) -> (cancelled, result)`: submits an io_uring entry and waits for its
     /// completion or its acknowledged cancellation.
     IoSubmit
+    /// `(kind, handle, a, b, c) -> (cancelled, result)`: runs a Windows request on a handle and
+    /// waits for its completion or its acknowledged cancellation.
+    Request
     /// `() -> Never`: runs the executor's scheduler on the calling thread.
     Schedule
     /// `(thread) -> Never`: the start routine of an executor thread.
@@ -177,9 +180,10 @@ enum Routine derives Copy, Eq, Hash {
     Yield
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
     Stream
-    /// `() -> nanoseconds`: a kernel's clock.
+    /// `() -> nanoseconds`: a kernel's clock, or a Windows target's monotonic clock.
     ClockNow
-    /// `(op, ns)`: arms a timer of a kernel's clock expiring `ns` nanoseconds from now.
+    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows target's monotonic clock,
+    /// expiring `ns` nanoseconds from now.
     TimerArm
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw
@@ -263,6 +267,7 @@ proj fn Routine.name(self) -> Str
         Routine.GrownStart => "_NSstack_switch_grown_start"
         Routine.Nested => "_NSstack_switch_nested"
         Routine.IoSubmit => "_NSstack_switch_io_submit"
+        Routine.Request => "_NSstack_switch_request"
         Routine.Schedule => "_NSstack_switch_schedule"
         Routine.ThreadMain => "_NSstack_switch_thread_main"
         Routine.Terminations => "_NSstack_switch_terminations"
@@ -319,6 +324,7 @@ fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
         Routine.Draw => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Origin or Routine.Init or Routine.Thread or Routine.ClockNow => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.IoSubmit => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: Some(int32), alloc))
+        Routine.Request => RoutineTypes(params: type_list(None, count: 5, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: Some(clif::Type.Int64), alloc))
     }
 } Routine.types
 
@@ -386,7 +392,7 @@ const STATE_PROCESS: u64 = 80
 /// The entry task.
 const STATE_ENTRY_TASK: u64 = 88
 
-/// The signal number of the first termination request, zero before one.
+/// The status the first termination request ends the process with, zero before one.
 const STATE_TERMINATION: u64 = 96
 
 /// The operation reading termination requests.
@@ -397,7 +403,7 @@ const STATE_TASKS: u64 = 120
 
 const STATE_TASKS_LOCK: u64 = 128
 
-/// On a kernel, the lock of the timers.
+/// On a kernel and a Windows target, the lock of the timers.
 const STATE_TIMER_LOCK: u64 = 136
 
 /// The last rank a cown took.
@@ -416,9 +422,9 @@ const STATE_REGIONS: u64 = 168
 const STATE_ROOT: u64 = 176
 
 /// On the seeded scheduler: the run's seed, the index of the scheduling stream's next value and
-/// the virtual clock's nanoseconds; there and on a kernel, the first timer and the last order a
-/// task or timer took; on the seeded scheduler, whether a scheduling point found two ready
-/// tasks, and the first and last of the completions not yet delivered.
+/// the virtual clock's nanoseconds; there, on a kernel and on a Windows target, the first timer
+/// and the last order a task or timer took; on the seeded scheduler, whether a scheduling point
+/// found two ready tasks, and the first and last of the completions not yet delivered.
 const STATE_SEED: u64 = 184
 
 const STATE_PICKS: u64 = 192
@@ -545,7 +551,13 @@ const STATE_PCI_REMOVAL_LOCK: u64 = 536
 /// The first of the arms whose charge left their band, linked through the arms.
 const STATE_LEFT: u64 = 544
 
-const STATE_SIZE: u64 = 552
+/// On a Windows target, the process's I/O completion port and the index of the thread-local slot
+/// holding the running executor thread's record.
+const STATE_PORT: u64 = 552
+
+const STATE_TLS_INDEX: u64 = 560
+
+const STATE_SIZE: u64 = 568
 
 /// The function of a routine, declared now and defined once lowering reaches the end of its
 /// queue.
@@ -615,7 +627,7 @@ fn Lowering.state_data(mut self) -> object::DataId {
     return id
 } Lowering.state_data
 
-/// The address of the thread-local word holding the running executor thread's record, on a host
+/// The address of the thread-local word holding the running executor thread's record, on a Linux
 /// target.
 fn Lowering.thread_slot(mut self, mut fx: Fx) -> clif::Value {
     let id = match self.thread_id {
@@ -675,11 +687,14 @@ fn Lowering.thread(mut self, mut fx: Fx) -> clif::Value {
 } Lowering.thread
 
 /// The record of the running executor thread, as `thread` gives it, read in place rather than
-/// through the `Thread` routine on `x86_64-linux`: only code with no suspension point between the
+/// through the `Thread` routine on a host target: only code with no suspension point between the
 /// read and its uses reads it so.
 fn Lowering.thread_inline(mut self, mut fx: Fx) -> clif::Value {
     if self.machine() {
         return mut self.thread(mut fx)
+    }
+    if self.windows() {
+        return windows_current_thread(mut self, mut fx)
     }
     let slot = mut self.thread_slot(mut fx)
     return mut fx.load(PTR, addr: slot, offset: 0)
@@ -715,6 +730,8 @@ fn Lowering.call_libc(mut self, mut fx: Fx, name: Str, args: Slice[clif::Value],
 fn Lowering.relax(mut self, mut fx: Fx) {
     if self.machine() {
         discard mut self.call_stub(mut fx, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx.alloc).view())
+    } else if self.windows() {
+        discard mut self.call_system(mut fx, name: "SwitchToThread", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view())
     } else {
         discard mut self.call_libc(mut fx, name: "sched_yield", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view())
     }
@@ -780,10 +797,20 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.GrownStart => grown_start_routine(mut lo, mut fx)
         Routine.Nested => nested_routine(mut lo, mut fx)
         Routine.Turn => define_turn(mut lo, mut fx)
-        Routine.ClockNow => define_clock_now(mut lo, mut fx)
+        Routine.ClockNow => {
+            if lo.windows() {
+                windows_define_clock_now(mut lo, mut fx)
+            } else {
+                define_clock_now(mut lo, mut fx)
+            }
+        }
         Routine.TimerArm => {
             let params = mut fx.entry()
-            mut lo.arm_clock(mut fx, op: params[0], ns: params[1])
+            if lo.windows() {
+                windows_arm_timer(mut lo, mut fx, op: params[0], ns: params[1])
+            } else {
+                mut lo.arm_clock(mut fx, op: params[0], ns: params[1])
+            }
             mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
         }
         Routine.Draw => define_draw(mut lo, mut fx)
@@ -792,7 +819,8 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.Extended => mut lo.define_extended(mut fx)
         Routine.ExtendedOwn => mut lo.define_extended_own(mut fx)
         Routine.Init or Routine.Exit or Routine.RecordAlloc or Routine.RecordFree or Routine.RecordResize => system_define(mut lo, mut fx, routine)
-        Routine.Preempt or Routine.Overflow or Routine.CpuLimit or Routine.Terminations => host_define(mut lo, mut fx, routine)
+        Routine.Preempt or Routine.Overflow or Routine.CpuLimit or Routine.Terminations => linux_define(mut lo, mut fx, routine)
+        Routine.Request => windows_define_request(mut lo, mut fx)
     }
 } runtime_define
 

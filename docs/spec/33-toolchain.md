@@ -102,7 +102,7 @@ ok show core::Option.is_some --api: records 1
 
 package hello {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hello
 

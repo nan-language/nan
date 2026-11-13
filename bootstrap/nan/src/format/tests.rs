@@ -23,8 +23,8 @@ fn tokens_are_spaced_and_numbers_grouped() {
         "//! Sums.\n\npub const MASK: u64 = 0xFEB0_0000\n\nconst BIG: u32 = 1_000_000\n\nconst SMALL: u32 = 100\n\nconst HALF: f64 = 1_234.5678\n\nfn f(x: u32) -> u32 = -x + ~x * foo(x)[0].y - ~- -x\n",
     );
     check(
-        "//! T.\n\npackage app {\n    language 1\n    targets x86_64 - host\n} app\n",
-        "//! T.\n\npackage app {\n    language 1\n    targets x86_64-host\n} app\n",
+        "//! T.\n\npackage app {\n    language 1\n    targets x86_64 - linux\n} app\n",
+        "//! T.\n\npackage app {\n    language 1\n    targets x86_64-linux\n} app\n",
     );
 }
 
@@ -83,8 +83,8 @@ fn canonical_order_sorts_modifiers_clauses_directives_limits_and_derives() {
         "//! C.\n\npub open linear view struct S derives Copy, Hash, Render, Custom {\n    x: u32\n} S\n\nfn f(x: u32) -> u32 limits pure, notrap, stack 64\n    requires x > 0\n    ensures result > 0\n    todo \"check\" example f(1) == 1\n    waive length \"why\"\n{\n    return x\n} f\n",
     );
     check(
-        "//! P.\n\npackage app {\n    deny b -> a\n    allow trusted in zeta, alpha\n    dep units \"../units\"\n    entry main\n    deny a -> c\n    targets x86_64-host, x86_64-bare\n    dep clock \"../clock\"\n    allow device in app\n    language 1\n} app\n",
-        "//! P.\n\npackage app {\n    language 1\n    targets x86_64-bare, x86_64-host\n    entry main\n    dep clock \"../clock\"\n    dep units \"../units\"\n    allow device in app\n    allow trusted in alpha, zeta\n    deny a -> c\n    deny b -> a\n} app\n",
+        "//! P.\n\npackage app {\n    deny b -> a\n    allow trusted in zeta, alpha\n    dep units \"../units\"\n    entry main\n    deny a -> c\n    targets x86_64-linux, x86_64-bare\n    dep clock \"../clock\"\n    allow device in app\n    language 1\n} app\n",
+        "//! P.\n\npackage app {\n    language 1\n    targets x86_64-bare, x86_64-linux\n    entry main\n    dep clock \"../clock\"\n    dep units \"../units\"\n    allow device in app\n    allow trusted in alpha, zeta\n    deny a -> c\n    deny b -> a\n} app\n",
     );
 }
 

@@ -14,7 +14,7 @@ The **bootstrap** is the [implementation](00-charter.md#conformance) written in 
 
 ### NaN toolchain
 
-The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. Its workspace declares `x86_64-host`, and a copy of it declaring `aarch64-host` instead builds it for that target; its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
+The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. Its workspace declares `x86_64-linux`, and a copy of it declaring `aarch64-linux` instead builds it for that target; its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
 
 - For every workspace and command line, the NaN toolchain prints what the bootstrap prints, exits with the same status and writes the same source and machine files; each image it writes behaves as the bootstrap's image of that build does.
 

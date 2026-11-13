@@ -470,7 +470,7 @@ A **root grant** is the capability a platform [landing fn](23-low-level.md#landi
 
 | Target | Root grant |
 | --- | --- |
-| `x86_64-host`, `aarch64-host` | `host::World` |
+| `x86_64-linux`, `aarch64-linux` | `host::World` |
 | `x86_64-uefi`, `aarch64-uefi` | `boot::Machine` |
 | `x86_64-bare`, `aarch64-bare` | `boot::Kernel` |
 | `x86_64-nanos`, `aarch64-nanos` | `nanos::World` |
@@ -563,7 +563,7 @@ test held_clock_is_found for storage_clock {
 
 package greet {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } greet
 

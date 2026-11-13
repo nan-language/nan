@@ -310,7 +310,7 @@ Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Load`, `sys::load::Job`, `nanos::Instance`, `nanos::Inbox`, `nanos::Link`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::PciKeeper`, `hw::PciPort`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::PageTableRoot`, `hw::ExtendedState`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; `sys::load::Table.read`, whose receiver only a loaded registry, which no std package declares, gives; and `Untrusted.inspect`, which only validators call.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-linux` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `boot::Module`, `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Load`, `sys::load::Job`, `nanos::Instance`, `nanos::Inbox`, `nanos::Link`, `hw::Ring0`, `hw::Iommu`, `hw::IoDomain`, `hw::PciFunction`, `hw::PciKeeper`, `hw::PciPort`, `hw::Region`, `hw::PhysFrame[S]`, `hw::UserFrame`, `hw::PageTableRoot`, `hw::ExtendedState`, `hw::IrqContext` and `hw::TrapFrame[V]`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; `sys::load::Table.read`, whose receiver only a loaded registry, which no std package declares, gives; and `Untrusted.inspect`, which only validators call.
 - Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
@@ -362,13 +362,13 @@ A **platform package** is the package that mints a target's [root grant](14-auth
 
 | Platform package | Targets | Root grant | Implements |
 | --- | --- | --- | --- |
-| `host_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
+| `linux_platform` | the host targets | `host::World` | the sys capabilities, through Linux system calls and the [host I/O backend](27-program-model.md#host-io-backend) |
 | `uefi_platform` | the UEFI targets | `boot::Machine` | `boot::Services` and `boot::Machine.enter`, through the firmware's boot services |
 | `bare_platform` | the bare targets | `boot::Kernel` | none; it builds the root grant from the [start information](24-kernel.md#start-information) and, on `aarch64-bare`, the device tree |
 
 - A platform package holds the entry [landing fn](23-low-level.md#landing-functions) of its targets, the one item that calls `hw::mint_root`, and every dependence of std on Linux, ELF, glibc, UEFI, PVH or device trees; no other std item has one.
 - No alias and no `dep` directive names a platform package, so no path outside it reaches its items. The [final closure](27-program-model.md#final-builds) of a program also holds the platform package its descriptor names, and no other.
-- Each platform package's manifest grants `priv` to its modules, so its package item is sealed ([device and priv grants](14-authority.md#device-and-priv-grants)); that of `host_platform`, whose modules hold trusted code, also grants them `trusted`.
+- Each platform package's manifest grants `priv` to its modules, so its package item is sealed ([device and priv grants](14-authority.md#device-and-priv-grants)); that of `linux_platform`, whose modules hold trusted code, also grants them `trusted`.
 - `uefi_platform` and `bare_platform` each contribute the `hw::preempt` entry of their targets ([preemption](24-kernel.md#preemption)).
 
 A **target-dependent operation** is an operation of a sys capability, of a resource one opens, or of `boot::Services`. Its std item reaches the platform function through the capability-table [support routine](27-program-model.md#runtime-support), which calls the platform function recorded in the table entry of the capability, or of the entry a resource records ([resources](14-authority.md#resources)): the platform package's for an entry its root grant minted, and the sim's, which `sys` implements on every target, for an entry a [sim](22-testing.md#simulated-capabilities) constructor minted. That call contributes exactly these facts to the item's [digest](10-effects-digests.md#digests): wait exactly when the operation's head states `uses wait`; alloc exactly when the operation takes a `mem::Alloc`; may-trap exactly when it takes a `mem::Alloc` or adds a [capability table](14-authority.md#capability-tables) entry; terminates exactly when wait does not hold. A capability that no root grant of a target yields has values there only as sims.
@@ -379,7 +379,7 @@ A **target-dependent operation** is an operation of a sys capability, of a resou
 
 package pause {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } pause
 
@@ -401,7 +401,7 @@ fn main(take world: host::World) fails PauseError uses wait {
 
 ```nan
 pub fn uptime_ms() -> u64 {
-    return host_platform::monotonic_ms() // error: name.unknown
+    return linux_platform::monotonic_ms() // error: name.unknown
 } uptime_ms
 ```
 

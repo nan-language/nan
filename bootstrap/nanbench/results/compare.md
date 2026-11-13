@@ -1,6 +1,6 @@
 # NaN against Rust and C++
 
-Taken by `nanbench compare`: each program of `bootstrap/nanbench/bench/compare/`, written alike in the three languages, runs on its size, built for the base x86-64 instruction set by the NaN toolchain, which the bootstrap builds from `toolchain/`, for `x86_64-host`, by `rustc 1.99.0 (b940084d7 2026-09-28)` with `--edition 2024 -C opt-level=3` and by `c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` with `-std=c++20 -O3`. Each time is the median wall time of 5 runs, on a machine with Intel(R) Xeon(R) Processor @ 2.10GHz, 4 hardware threads, 15 GiB of memory.
+Taken by `nanbench compare`: each program of `bootstrap/nanbench/bench/compare/`, written alike in the three languages, runs on its size, built for the base x86-64 instruction set by the NaN toolchain, which the bootstrap builds from `toolchain/`, for `x86_64-linux`, by `rustc 1.99.0 (b940084d7 2026-09-28)` with `--edition 2024 -C opt-level=3` and by `c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` with `-std=c++20 -O3`. Each time is the median wall time of 5 runs, on a machine with Intel(R) Xeon(R) Processor @ 2.10GHz, 4 hardware threads, 15 GiB of memory.
 
 | Program | Measures | Size | NaN | Rust | C++ | NaN / Rust | NaN / C++ |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |

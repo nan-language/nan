@@ -55,13 +55,13 @@ fn an_item_both_sides_change_differently_is_a_conflict_block() {
 
 #[test]
 fn manifest_targets_both_sides_change_merge_as_sets() {
-    let base = "//! App.\n\npackage app {\n    language 1\n    targets x86_64-host\n} app\n";
-    let ours = base.replace("x86_64-host", "x86_64-bare, x86_64-host");
-    let theirs = base.replace("x86_64-host", "x86_64-host, x86_64-uefi");
+    let base = "//! App.\n\npackage app {\n    language 1\n    targets x86_64-linux\n} app\n";
+    let ours = base.replace("x86_64-linux", "x86_64-bare, x86_64-linux");
+    let theirs = base.replace("x86_64-linux", "x86_64-linux, x86_64-uefi");
     let (text, conflicts) = merged("app/package.nan", base, &ours, &theirs);
     assert_eq!(conflicts, 0);
     assert!(
-        text.contains("    targets x86_64-bare, x86_64-host, x86_64-uefi\n"),
+        text.contains("    targets x86_64-bare, x86_64-linux, x86_64-uefi\n"),
         "{text}"
     );
 }

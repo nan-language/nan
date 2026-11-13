@@ -4,10 +4,10 @@ This chapter defines targets and the dependencies they allow, target descriptors
 
 ## Targets
 
-A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets.
+A **target** is a platform a package is checked and built for: `x86_64-linux`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-linux`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets.
 
 - The targets other than `any` are the **concrete targets**, each fixed by its [descriptor](#descriptors). A package declaring `any` is valid on every concrete target and is checked once, under the `any` descriptor.
-- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-host` and `aarch64-host` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**, and `x86_64-nanos` and `aarch64-nanos` the **nanos targets**, whose programs and libraries run on a NaN OS kernel; the UEFI and bare targets are the **machine targets**.
+- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-linux` and `aarch64-linux` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**, and `x86_64-nanos` and `aarch64-nanos` the **nanos targets**, whose programs and libraries run on a NaN OS kernel; the UEFI and bare targets are the **machine targets**.
 - A package **covers** a target when it declares that target or `any`. A `dep` directive naming a package that does not cover every target the declaring package declares, `any` included, is an error (`target.dependency-uncovered`).
 
 ```nan
@@ -56,7 +56,7 @@ pub fn drop_twice() -> ring::Drops {
 
 package hostinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } hostinfo
 
 // file: hostinfo/hostinfo.nan
@@ -85,7 +85,7 @@ pub fn pages(bytes: usize) -> usize {
 
 A **descriptor** is the fixed definition of a target. The language version fixes every descriptor; no option, file or variable changes one. A concrete target's descriptor fixes its [environment](#environments), [root grant](14-authority.md#root-grants), [platform package](28-stdlib.md#platform-packages) (whose entry [landing fn](23-low-level.md#landing-functions) mints the root grant), [calling conventions](23-low-level.md#calling-conventions), [privileged intrinsics](23-low-level.md#privileged-intrinsics), [compiler stubs](23-low-level.md#compiler-stubs), codegen, [image](#images) format, [support routine](#runtime-support) names and these values:
 
-| Field | `x86_64-host` | `x86_64-uefi` | `x86_64-bare` |
+| Field | `x86_64-linux` | `x86_64-uefi` | `x86_64-bare` |
 | --- | --- | --- | --- |
 | Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
@@ -102,7 +102,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Wall clock | none | the firmware's `GetTime` | the CMOS clock, its year read in the century from 2000 |
 | Emulator | none | QEMU with OVMF firmware | QEMU |
 
-| Field | `aarch64-host` | `aarch64-uefi` | `aarch64-bare` |
+| Field | `aarch64-linux` | `aarch64-uefi` | `aarch64-bare` |
 | --- | --- | --- | --- |
 | Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | UEFI firmware with boot services, on AArch64 at EL1, on a machine its device tree or ACPI tables describe ([machine discovery](#descriptors)) | an AArch64 machine with a GICv3, entering the image at EL1 or EL2 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none, the device tree or else the ACPI tables the start information names describing the machine ([machine discovery](#descriptors)); with both zero, the device tree lies at `0x4000_0000` |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
@@ -240,7 +240,7 @@ The `entry main` directive names the **entry function**: the function item `main
 
 | Target | Head |
 | --- | --- |
-| `x86_64-host`, `aarch64-host` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
+| `x86_64-linux`, `aarch64-linux` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
 | `x86_64-uefi`, `aarch64-uefi` | `fn main(take P: boot::Machine) -> Never` |
 | `x86_64-bare`, `aarch64-bare` | `fn main(take P: boot::Kernel) -> Never` |
 | `x86_64-nanos`, `aarch64-nanos` | `fn main(take P: nanos::World, take I: In) -> Out fails E uses wait`, In and Out implementing `Encode`, or a form of the host targets |
@@ -255,7 +255,7 @@ The entry function of a bare target starts kernel tasks only by ending in `take 
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } status
 
@@ -402,7 +402,7 @@ fn main(take world: nanos::World, input: u32) fails task::Cancelled uses wait li
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } status
 
@@ -420,7 +420,7 @@ fn main(take world: host::World) fails task::Cancelled { // error: target.entry-
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry start // error: target.entry-missing
 } status
 
@@ -470,7 +470,7 @@ A **program** is a package with an `entry` directive; a **library** is a package
 
 package hello {
     language 1
-    targets x86_64-bare, x86_64-host
+    targets x86_64-bare, x86_64-linux
     entry main // error: target.program-targets
 } hello
 
@@ -506,7 +506,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package hello {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hello
 
@@ -524,7 +524,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package echo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     dep hello "../hello" // error: target.dep-program
 } echo
 
@@ -614,7 +614,7 @@ A **codegen level** names extensions beyond the base instruction set of a [descr
 
 package mixer {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
     codegen x86_64-v3
 } mixer
@@ -646,7 +646,7 @@ A **support routine** is one of these fixed routines of the implementation, each
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
 
-The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-host`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-host` the mode is the kernel's, which a user process cannot set.
+The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-linux`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-linux` the mode is the kernel's, which a user process cannot set.
 
 ### Host I/O backend
 
@@ -662,7 +662,7 @@ On the host targets every waiting primitive of the platform package performs its
 
 An **image** is the output of a final build:
 
-- On a host target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-host` and `aarch64-linux-gnu-gcc` for `aarch64-host`, from the `PATH`. It carries the [host ELF section](30-artefacts.md#host-elf-section). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
+- On a host target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-linux` and `aarch64-linux-gnu-gcc` for `aarch64-linux`, from the `PATH`. It carries the [host ELF section](30-artefacts.md#host-elf-section). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
 - On `x86_64-uefi`, a PE32+ image for machine type `0x8664`, subsystem EFI application, with base relocations, named after the package with `.efi`. The firmware calls its entry point, the program entry seam, with the image handle and system table under `"win64"`, and the seam passes both to the entry landing fn.
 - On `aarch64-uefi`, the same with machine type `0xAA64`, its entry point called under `"aapcs64"`.
 - On `x86_64-bare`, a statically linked ELF64 executable with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x0010_0000`, or all moved by one multiple of 2 MiB below 4 GiB, named after the package with `.elf`. A `XEN_ELFNOTE_PHYS32_ENTRY` note names the program entry seam, which a PVH loader enters, moved with the segments, in 32-bit protected mode with paging disabled and `ebx` holding the physical address of the start information. The seam adjusts each absolute address the image holds by the distance it was moved, maps all physical memory the start information lists at its physical addresses, in page tables the image reserves, enables long mode and passes the `ebx` value to the entry landing fn.

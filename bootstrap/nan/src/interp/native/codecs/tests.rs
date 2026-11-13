@@ -3,7 +3,7 @@ use crate::scope::Scope;
 use crate::workspace::Workspace;
 use crate::workspace::tests::Scratch;
 
-const MANIFEST: &str = "//! Codec cases.\n\npackage app {\n    language 1\n    targets x86_64-host\n    allow validate in app\n} app\n";
+const MANIFEST: &str = "//! Codec cases.\n\npackage app {\n    language 1\n    targets x86_64-linux\n    allow validate in app\n} app\n";
 
 const CASES: &str = r#"//! Codec cases.
 

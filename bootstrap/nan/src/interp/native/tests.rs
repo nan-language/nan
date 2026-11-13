@@ -4,7 +4,7 @@ use crate::workspace::Workspace;
 use crate::workspace::tests::Scratch;
 
 const MANIFEST: &str =
-    "//! Native cases.\n\npackage app {\n    language 1\n    targets x86_64-host\n} app\n";
+    "//! Native cases.\n\npackage app {\n    language 1\n    targets x86_64-linux\n} app\n";
 
 const CASES: &str = r#"//! Native cases.
 

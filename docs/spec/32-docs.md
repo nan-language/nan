@@ -168,7 +168,7 @@ pub const SLOT_FRAMES: u32 = 8
 
 package probe {
     language 1
-    targets x86_64-bare, x86_64-host
+    targets x86_64-bare, x86_64-linux
 } probe
 
 // file: probe/probe.nan
@@ -186,7 +186,7 @@ pkg fn default_stack() -> usize {
     return 16_384
 } default_stack
 
-// file: probe/platform@host/platform.nan
+// file: probe/platform@linux/platform.nan
 //! Stack defaults per machine.
 
 /// The stack reserve of one task.
@@ -201,7 +201,7 @@ pkg fn default_stack() -> usize {
 
 package probe {
     language 1
-    targets x86_64-bare, x86_64-host
+    targets x86_64-bare, x86_64-linux
 } probe
 
 // file: probe/probe.nan
@@ -219,7 +219,7 @@ pkg fn default_stack() -> usize {
     return 16_384
 } default_stack
 
-// file: probe/platform@host/platform.nan
+// file: probe/platform@linux/platform.nan
 //! Stack defaults per machine.
 
 /// The stack reserve of one host task. // error: doc.variant-mismatch

@@ -416,7 +416,7 @@ A **trap report** describes one trap in at most 15 lines of text, each ending wi
 
 package tally {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } tally
 

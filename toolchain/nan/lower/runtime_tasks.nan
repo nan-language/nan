@@ -79,8 +79,8 @@ const TASK_ARGUMENT: u64 = 224
 /// Nonzero once the abandoning of its domain asks it to stop.
 const TASK_STOP: u64 = 240
 
-/// The first of the deadlines in flight that the constructs it runs armed, linked through their
-/// records.
+/// The deadline of the innermost construct it runs that sets one, which links through its record
+/// to that of the next one out.
 const TASK_DEADLINES: u64 = 248
 
 /// The record of its wait in a structure other domains reach, which settlement withdraws: the
@@ -273,8 +273,9 @@ const OPERATION_WAITER: u64 = 64
 
 const OPERATION_LINK: u64 = 72
 
-/// On the seeded scheduler and on a kernel, when a timer is due and the order in which it was
-/// armed, and for a wait in a sim, the glue withdrawing it from the sim, given the record.
+/// When a deadline is due, and on the seeded scheduler and on a kernel when a timer is due and
+/// the order in which it was armed; for a wait in a sim, the glue withdrawing it from the sim,
+/// given the record.
 const OPERATION_DUE: u64 = 80
 
 const OPERATION_ORDER: u64 = 88
@@ -306,6 +307,9 @@ const TASKS_KIND_DEADLINE: i64 = 2
 /// A component's delayed message, whose expiry lets the messages due into the intake of the
 /// runner its `TASK` field names.
 const TASKS_KIND_AFTER: i64 = 3
+
+/// A deadline no timer ends, which cancels nothing.
+const TASKS_KIND_PACED: i64 = 4
 
 /// The error numbers of an expired timeout and of a cancelled operation, negated.
 const TASKS_EXPIRED: i64 = -62
@@ -598,6 +602,33 @@ fn current_task(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let thread = mut lo.thread(mut fx)
     return task_of(mut fx, thread)
 } current_task
+
+/// Whether a task's record links a deadline, and the earliest nanosecond at which one of them is
+/// due.
+fn earliest_deadline(mut fx: Fx, record: clif::Value) -> mem::List[clif::Value] {
+    let deadlines = mut fx.load(PTR, addr: record, offset: TASK_DEADLINES)
+    let latest = mut fx.int(PTR, value: -1)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let earliest = mut fx.repeat(fx.list3(deadlines, b: latest, c: none).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 2
+        let current = state[0]
+        let soonest = state[1]
+        let seen_any = state[2]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types3(PTR, b: PTR, c: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let due = mut fx2.load(PTR, addr: current, offset: OPERATION_DUE)
+            let link = mut fx2.load(PTR, addr: current, offset: OPERATION_LINK)
+            let sooner = mut fx2.b.umin(soonest, y: due)
+            let seen = mut fx2.int(clif::Type.Int8, value: 1)
+            return fx2.list3(link, b: sooner, c: seen)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list3(current, b: soonest, c: seen_any)
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect earliest.len() > 2
+    return fx.list2(earliest[2], b: earliest[1])
+} earliest_deadline
 
 /// The task an executor thread's record runs, zero for no record.
 fn task_of(mut fx: Fx, thread: clif::Value) -> clif::Value {

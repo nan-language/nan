@@ -566,7 +566,7 @@ fn attenuate(
 }
 
 /// A reading of a clock rounded down to a multiple of its resolution.
-fn round_down(fx: &mut Fx, resolution: Value, reading: Value) -> Value {
+pub fn round_down(fx: &mut Fx, resolution: Value, reading: Value) -> Value {
     let one = fx.ptr(1);
     let resolution = fx.b.ins().umax(resolution, one);
     let rest = fx.b.ins().urem(reading, resolution);

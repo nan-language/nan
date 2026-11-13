@@ -1,4 +1,4 @@
-//! Task scopes, their children and join handles, deadlines and races. A scope's record is its region, its lock, the state of its kept failure (none, being recorded, a value of its failure type, or a cancellation's origin), that origin, its executor's cell, the count of what references it, whether its call has returned, and its kept failure. A child's record keeps its scope as owner; a join handle is the child's record. A race's record is its region, its lock and the task that decided it.
+//! Task scopes, their children and join handles, and races. A scope's record is its region, its lock, the state of its kept failure (none, being recorded, a value of its failure type, or a cancellation's origin), that origin, its executor's cell, the count of what references it, whether its call has returned, and its kept failure. A child's record keeps its scope as owner; a join handle is the child's record. A race's record is its region, its lock and the task that decided it.
 
 const SCOPES_SCOPE_LOCK: u64 = 40
 
@@ -46,7 +46,6 @@ struct CaptureSite derives Copy {
 fn scopes_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.path.as_str() {
         "task::scope" => scope_call(mut lo, mut fx, supply)
-        "task::within" or "task::within_ns" => scopes_within(mut lo, mut fx, supply)
         "task::race" => race_call(mut lo, mut fx, supply)
         "task::Scope.cancel" => {
             let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
@@ -839,137 +838,6 @@ fn release_join(mut lo: Lowering, mut fx: Fx, address: clif::Value, result: ty::
         finish_child(mut lo, fx: mut fx1, record, scope_record, result_ty: Some(result))
     })
 } release_join
-
-/// `task::within(clock, ms, body: b)` and `task::within_ns(clock, ns, body: b)`: runs `b` in a
-/// region that a deadline cancels; `None` when `b` fails with a cancellation of that region.
-fn scopes_within(mut lo: Lowering, mut fx: Fx, supply: Supply) {
-    let body_ty = fn_param(lo, supply, index: 2)
-    let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-    let ns = if supply.path.as_str() == "task::within" {
-        from_ms(mut fx, ms: supply.param(1).scalar_value())
-    } else {
-        supply.param(1).scalar_value()
-    }
-    let size = mut fx.ptr(REGIONS_REGION_SIZE)
-    let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
-    expect record_values.len() == 1
-    let record = record_values[0]
-    let timer = mut fx.slot(DEADLINE_SIZE, align: 8)
-    let zero = mut fx.ptr(0)
-    let timer_size = mut fx.ptr(DEADLINE_SIZE)
-    var fill_args = Array[clif::Value, 3].filled(timer)
-    fill_args[1] = zero
-    fill_args[2] = timer_size
-    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
-    let deadline = mut fx.int(PTR, value: TASKS_KIND_DEADLINE)
-    mut fx.store(deadline, addr: timer, offset: OPERATION_KIND)
-    mut fx.store(record, addr: timer, offset: OPERATION_TASK)
-    let linked = link_deadline(mut lo, mut fx, clock, timer)
-    let live = linked.live
-    discard mut fx.choose_in(mut lo, condition: live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let delay = clock_delay(mut lo1, fx: mut fx1, minted: linked.minted, resolution: linked.resolution, ns)
-        arm_deadline(mut lo1, fx: mut fx1, timer, ns: delay)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        discard mut lo1.call_routine(mut fx1, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
-        return mem::List[clif::Value].empty(fx1.alloc)
-    })
-    let current = current_task(mut lo, mut fx)
-    let enclosing = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
-    mut fx.store(record, addr: current, offset: TASKS_TASK_REGION)
-    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: mem::List[Held].empty(fx.alloc).view())
-    mut fx.store(enclosing, addr: current, offset: TASKS_TASK_REGION)
-    mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
-        unlink_deadline(mut lo, fx: mut fx1, timer)
-        disarm_deadline(mut lo, fx: mut fx1, timer)
-    })
-    let id = mut fx.load(PTR, addr: record, offset: REGIONS_REGION_ID)
-    mut lo.record_free(mut fx, address: record)
-    let option = supply.abi.result
-    let laid = mut lo.layout_of(option)
-    let slot = match supply.sret {
-        Some(sret) => sret
-        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
-    }
-    match called.failed {
-        Some(failed) => {
-            match called.failure {
-                Some(failure) => {
-                    match body_ty.failure {
-                        Some(failure_ty) => {
-                            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
-                                within_failed(mut lo, fx: mut fx1, supply, failure_ty, failure, id, slot)
-                            })
-                        }
-                        None => {}
-                    }
-                }
-                None => {}
-            }
-        }
-        None => {}
-    }
-    let some = mut fx.int(clif::Type.Int8, value: 1)
-    mut lo.write_option(mut fx, option, address: slot, presence: some, value: called.result)
-    let held = mut lo.held_at(mut fx, ty: option, address: slot)
-    supply.ret(mut lo, mut fx, held)
-} scopes_within
-
-/// What `task::within` does once its body failed: a cancellation of its own region gives
-/// `None`, any other failure becomes the call's.
-fn within_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::Ty, failure: clif::Value, id: clif::Value, slot: clif::Value) {
-    let option = supply.abi.result
-    let held = mut lo.held_at(mut fx, ty: failure_ty, address: failure)
-    var own = id
-    match mut lo.cancellation_origin(mut fx, failure_ty, held) {
-        Some(found) => {
-            let same = mut fx.b.icmp(clif::IntCC.Equal, x: found.origin, y: id)
-            own = mut fx.b.band(found.cancelled, y: same)
-        }
-        None => {
-            own = mut fx.int(clif::Type.Int8, value: 0)
-        }
-    }
-    discard mut fx.choose_in(mut lo, condition: own, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let none = mut fx1.int(clif::Type.Int8, value: 0)
-        mut lo1.write_option(mut fx1, option, address: slot, presence: none, value: Held.Empty)
-        let none_held = mut lo1.held_at(mut fx1, ty: option, address: slot)
-        supply.ret(mut lo1, fx: mut fx1, held: none_held)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let Some(target) = supply.failure else {
-            expect false
-            return mem::List[clif::Value].empty(fx1.alloc)
-        }
-        mut lo1.store_held(mut fx1, address: target, held, ty: failure_ty)
-        supply.raise_failure(mut fx1)
-        return mem::List[clif::Value].empty(fx1.alloc)
-    })
-} within_failed
-
-/// Arms a deadline's timer of `ns` nanoseconds, whose expiry cancels its region, first among
-/// the deadlines the running task armed.
-fn arm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value, ns: clif::Value) {
-    let current = current_task(mut lo, mut fx)
-    let armed = mut fx.load(PTR, addr: current, offset: TASK_DEADLINES)
-    mut fx.store(armed, addr: timer, offset: OPERATION_LINK)
-    mut fx.store(timer, addr: current, offset: TASK_DEADLINES)
-    let spec = mut fx.offset(timer, offset: OPERATION_SIZE)
-    mut lo.arm_timer(mut fx, op: timer, ns, spec)
-} arm_deadline
-
-/// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it
-/// out of the deadlines the running task armed, of which it is the first.
-fn disarm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value) {
-    let current = current_task(mut lo, mut fx)
-    let waiter = mut fx.offset(timer, offset: OPERATION_WAITER)
-    mut fx.atomic_store(current, addr: waiter)
-    mut lo.cancel_operation(mut fx, op: timer)
-    wait_delivered(mut lo, mut fx, op: timer)
-    let now_current = current_task(mut lo, mut fx)
-    let armed = mut fx.load(PTR, addr: timer, offset: OPERATION_LINK)
-    mut fx.store(armed, addr: now_current, offset: TASK_DEADLINES)
-} disarm_deadline
 
 /// `task::race(exec, left: l, right: r)`: the result or failure of the first of two tasks to
 /// end, once both have ended.

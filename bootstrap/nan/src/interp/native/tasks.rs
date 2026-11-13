@@ -21,8 +21,9 @@ const HANDLES: usize = 2;
 const CAPACITY: usize = 3;
 const RECEIVER: usize = 4;
 
-/// A member of `task::Channel` or `task::Sender`, or `sys::current_header`, which no task of an
-/// interpreter run has, an interpreter run can call; none for another.
+/// A member of `task::Channel` or `task::Sender`, or `sys::current_header` or
+/// `task::deadline_ns`, as no task of an interpreter run has a header or a deadline, that an
+/// interpreter run can call; none for another.
 pub fn member(
     interp: &mut Interpreter,
     owner: &str,
@@ -88,7 +89,9 @@ pub fn member(
                 Val::some(option, args[1].clone())
             }
         }
-        ("sys::current_header", "") => Val::none(interp.ty_item("core", "Option")),
+        ("sys::current_header" | "task::deadline_ns", "") => {
+            Val::none(interp.ty_item("core", "Option"))
+        }
         _ => return None,
     };
     Some(Ok(Flow::Return(value)))

@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod channels;
 pub mod components;
 pub mod cowns;
+pub mod deadlines;
 pub mod domains;
 pub mod protocols;
 pub mod scopes;
@@ -27,8 +28,12 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         .rsplit_once('.')
         .map_or(supply.path.as_str(), |(owner, _)| owner);
     match owner {
-        "task::scope" | "task::Scope" | "task::Join" | "task::within" | "task::within_ns"
-        | "task::race" => scopes::lower(lo, fx, supply),
+        "task::scope" | "task::Scope" | "task::Join" | "task::race" => {
+            scopes::lower(lo, fx, supply)
+        }
+        "task::within" | "task::within_ns" | "task::paced" | "task::deadline_ns" => {
+            deadlines::lower(lo, fx, supply)
+        }
         "task::Cown" => cowns::lower(lo, fx, supply),
         "task::Executor" | "task::Account" => accounts::lower(lo, fx, supply),
         "task::Channel" | "task::Sender" | "task::Receiver" => channels::lower(lo, fx, supply),

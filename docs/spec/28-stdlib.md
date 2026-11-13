@@ -24,7 +24,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `nanos`, `testing`, the platform packages.
 
-- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within` and `task::within_ns`; `sys::load` names `hw::Ptr` and `hw::Order`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over` and `text::String` in the schema trees of `mem::wire`; `task` names `sys::Clock` in `task::within`, `task::within_ns`, `task::paced` and `task::deadline_ns`; `sys::load` names `hw::Ptr` and `hw::Order`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -85,7 +85,7 @@ The table names every pub std type, interface, free function and registry with t
 | `text` | `text::construction::Codec`, `text::construction::render_as`, `text::construction::encode_as` | [Construction text](13-text-encode.md#construction-text) |
 | `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` and `spawn_sized` in [Joins](16-concurrency.md#joins) |
 | `task` | `task::Join` | [Joins](16-concurrency.md#joins) |
-| `task` | `task::within`, `task::within_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
+| `task` | `task::within`, `task::within_ns`, `task::paced`, `task::deadline_ns`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
 | `task` | `task::Cown`, `task::Poisoned` | [Cowns](16-concurrency.md#cowns), [Poisoned cowns](16-concurrency.md#poisoned-cowns) |
 | `task` | `task::Channel`, `task::Sender`, `task::Receiver`, `task::SendError` | [Channels](16-concurrency.md#channels) |
 | `task` | `task::Executor`, `task::Share`, `task::Account` | [Executors](16-concurrency.md#executors) |

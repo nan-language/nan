@@ -80,8 +80,8 @@ pub mod task {
     pub const ARGUMENT: u64 = 224;
     /// Nonzero once the abandoning of its domain asks it to stop.
     pub const STOP: u64 = 240;
-    /// The first of the deadlines in flight that the constructs it runs armed, linked through
-    /// their records.
+    /// The deadline of the innermost construct it runs that sets one, which links through its
+    /// record to that of the next one out.
     pub const DEADLINES: u64 = 248;
     /// The record of its wait in a structure other domains reach, which settlement withdraws:
     /// the glue withdrawing it, given the record, then what that glue reads.
@@ -218,9 +218,9 @@ pub mod operation {
     /// armed; for a wait in a sim, the sim's record.
     pub const WAITER: u64 = 64;
     pub const LINK: u64 = 72;
-    /// On the seeded scheduler and on a kernel, when a timer is due and the order in which it
-    /// was armed, and for a wait in a sim, the glue withdrawing it from the sim, given the
-    /// record.
+    /// When a deadline is due, and on the seeded scheduler and on a kernel when a timer is due
+    /// and the order in which it was armed; for a wait in a sim, the glue withdrawing it from
+    /// the sim, given the record.
     pub const DUE: u64 = 80;
     pub const ORDER: u64 = 88;
     pub const WITHDRAW: u64 = 96;
@@ -244,6 +244,8 @@ pub mod kind {
     /// A component's delayed message, whose expiry lets the messages due into the intake of
     /// the runner its `TASK` field names.
     pub const AFTER: i64 = 3;
+    /// A deadline no timer ends, which cancels nothing.
+    pub const PACED: i64 = 4;
 }
 
 /// The error numbers of an expired timeout and of a cancelled operation, negated.
@@ -408,6 +410,33 @@ pub fn current_task(lo: &mut Lowering, fx: &mut Fx) -> Value {
         |fx| vec![fx.load(PTR, thread, thread::CURRENT)],
         |fx| vec![fx.ptr(0)],
     )[0]
+}
+
+/// Whether a task's record links a deadline, and the earliest nanosecond at which one of them
+/// is due.
+pub fn earliest_deadline(fx: &mut Fx, record: Value) -> [Value; 2] {
+    let first = fx.load(PTR, record, task::DEADLINES);
+    let latest = fx.int(PTR, -1);
+    let none = fx.int(types::I8, 0);
+    let found = fx.repeat(&[first, latest, none], |fx, state| {
+        let (current, earliest, any) = (state[0], state[1], state[2]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
+        let next = fx.choose(
+            present,
+            &[PTR, PTR, types::I8],
+            |fx| {
+                let due = fx.load(PTR, current, operation::DUE);
+                vec![
+                    fx.load(PTR, current, operation::LINK),
+                    fx.b.ins().umin(earliest, due),
+                    fx.int(types::I8, 1),
+                ]
+            },
+            |_| vec![current, earliest, any],
+        );
+        (present, next)
+    });
+    [found[2], found[1]]
 }
 
 /// Whether a domain is `outer` or nested in it.

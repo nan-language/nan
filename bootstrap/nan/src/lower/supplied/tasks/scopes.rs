@@ -1,4 +1,4 @@
-//! Task scopes, their children and join handles, deadlines and races.
+//! Task scopes, their children and join handles, and races.
 //!
 //! A scope's record is its region, its lock, the state of its kept failure (none, being
 //! recorded, a value of its failure type, or a cancellation's origin), that origin, its
@@ -13,8 +13,8 @@ use super::super::super::body::{Body, Held};
 use super::super::super::call::adapt_value;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::regions::{self, region};
-use super::super::super::runtime::tasks::{self, flag, kind, operation, task};
-use super::super::super::runtime::{Routine, report, tables, timers};
+use super::super::super::runtime::tasks::{self, flag, task};
+use super::super::super::runtime::{Routine, report, tables};
 use super::super::super::stack::{Family, Kind};
 use super::super::super::{Glue, Lowering};
 use super::super::Supply;
@@ -50,7 +50,6 @@ mod race {
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
         "task::scope" => scope_call(lo, fx, supply),
-        "task::within" | "task::within_ns" => within(lo, fx, supply),
         "task::race" => race_call(lo, fx, supply),
         "task::Scope.cancel" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -758,116 +757,6 @@ pub fn release_join(lo: &mut Lowering, fx: &mut Fx, address: Value, result: &Ty)
     fx.when(done, |fx| {
         finish_child(lo, fx, record, scope_record, Some(result))
     });
-}
-
-/// `task::within(clock, ms, body: b)` and `task::within_ns(clock, ns, body: b)`: runs `b` in a
-/// region that a deadline cancels; `None` when `b` fails with a cancellation of that region.
-fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
-    let body_ty = fn_param(supply, 2);
-    let clock = fx.load(PTR, supply.param(0).address(), 0);
-    let ns = match supply.path.as_str() {
-        "task::within" => timers::from_ms(fx, supply.param(1).scalar()),
-        _ => supply.param(1).scalar(),
-    };
-    let size = fx.ptr(region::SIZE);
-    let record = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
-    let timer = fx.slot(tables::deadline::SIZE, 8);
-    let zero = fx.ptr(0);
-    let timer_size = fx.ptr(tables::deadline::SIZE);
-    lo.call_routine(fx, Routine::Fill, &[timer, zero, timer_size]);
-    let deadline = fx.int(PTR, kind::DEADLINE);
-    fx.store(deadline, timer, operation::KIND);
-    fx.store(record, timer, operation::TASK);
-    let (live, [minted, resolution]) = tables::link_deadline(lo, fx, clock, timer);
-    fx.choose_in(
-        lo,
-        live,
-        &[],
-        |lo, fx| {
-            let delay = super::super::sys::clock_delay(lo, fx, minted, resolution, ns);
-            arm_deadline(lo, fx, timer, delay);
-            Vec::new()
-        },
-        |lo, fx| {
-            lo.call_routine(fx, Routine::Cancel, &[record]);
-            Vec::new()
-        },
-    );
-    let current = tasks::current_task(lo, fx);
-    let enclosing = fx.load(PTR, current, task::REGION);
-    fx.store(record, current, task::REGION);
-    let called = lo.call_value(fx, &body_ty, supply.param(2).address(), &[]);
-    fx.store(enclosing, current, task::REGION);
-    fx.when(live, |fx| {
-        tables::unlink_deadline(lo, fx, timer);
-        disarm_deadline(lo, fx, timer);
-    });
-    let id = fx.load(PTR, record, region::ID);
-    lo.record_free(fx, record);
-    let option = supply.abi.result.clone();
-    let layout = lo.layout(&option);
-    let slot = supply
-        .sret
-        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let fails = body_ty.fails.clone();
-    if let (Some(failed), Some(failure), Some(fails)) = (called.failed, called.failure, fails) {
-        fx.when(failed, |fx| {
-            let held = lo.held_at(fx, &fails, failure);
-            let own = lo
-                .cancellation_origin(fx, &fails, held)
-                .map(|(is_cancellation, origin)| {
-                    let same = fx.b.ins().icmp(IntCC::Equal, origin, id);
-                    fx.b.ins().band(is_cancellation, same)
-                })
-                .unwrap_or_else(|| fx.int(types::I8, 0));
-            fx.choose_in(
-                lo,
-                own,
-                &[],
-                |lo, fx| {
-                    let none = fx.int(types::I8, 0);
-                    lo.write_option(fx, &option, slot, none, Held::Empty);
-                    let held = lo.held_at(fx, &option, slot);
-                    supply.ret(lo, fx, held);
-                    Vec::new()
-                },
-                |lo, fx| {
-                    let target = supply.failure.expect("a failure address");
-                    lo.store_held(fx, target, held, &fails);
-                    supply.fail(fx);
-                    Vec::new()
-                },
-            );
-        });
-    }
-    let some = fx.int(types::I8, 1);
-    lo.write_option(fx, &option, slot, some, called.result);
-    let held = lo.held_at(fx, &option, slot);
-    supply.ret(lo, fx, held);
-}
-
-/// Arms a deadline's timer of `ns` nanoseconds, whose expiry cancels its region, first among
-/// the deadlines the running task armed.
-fn arm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value, ns: Value) {
-    let current = tasks::current_task(lo, fx);
-    let armed = fx.load(PTR, current, task::DEADLINES);
-    fx.store(armed, timer, operation::LINK);
-    fx.store(timer, current, task::DEADLINES);
-    let spec = fx.offset(timer, operation::SIZE);
-    lo.arm_timer(fx, timer, ns, spec);
-}
-
-/// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it
-/// out of the deadlines the running task armed, of which it is the first.
-fn disarm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value) {
-    let current = tasks::current_task(lo, fx);
-    let waiter = fx.offset(timer, operation::WAITER);
-    fx.atomic_store(current, waiter);
-    lo.cancel_operation(fx, timer);
-    tasks::wait_delivered(lo, fx, timer);
-    let current = tasks::current_task(lo, fx);
-    let armed = fx.load(PTR, timer, operation::LINK);
-    fx.store(armed, current, task::DEADLINES);
 }
 
 /// `task::race(exec, left: l, right: r)`: the result or failure of the first of two tasks to

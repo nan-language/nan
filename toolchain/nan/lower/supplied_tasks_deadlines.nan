@@ -1,0 +1,228 @@
+//! Deadlines: `task::within` and `within_ns`, whose deadline cancels their body, `task::paced`, whose deadline cancels nothing, and `task::deadline_ns`, which reads the earliest of the deadlines a task runs under. The running task's record links the deadline of the innermost of these calls it runs, whose record links that of the next one out; each record holds when its deadline is due, in nanoseconds of the clock that delays count.
+
+fn deadlines_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.path.as_str() {
+        "task::within" or "task::within_ns" => deadlines_within(mut lo, mut fx, supply)
+        "task::paced" => deadlines_paced(mut lo, mut fx, supply)
+        "task::deadline_ns" => deadlines_deadline_ns(mut lo, mut fx, supply)
+        else => {
+            expect false
+        }
+    }
+} deadlines_lower
+
+/// `task::within(clock, ms, body: b)` and `task::within_ns(clock, ns, body: b)`: runs `b` in a
+/// region that a deadline cancels; `None` when `b` fails with a cancellation of that region.
+fn deadlines_within(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let body_ty = fn_param(lo, supply, index: 2)
+    let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let ns = if supply.path.as_str() == "task::within" {
+        from_ms(mut fx, ms: supply.param(1).scalar_value())
+    } else {
+        supply.param(1).scalar_value()
+    }
+    let size = mut fx.ptr(REGIONS_REGION_SIZE)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let timer = mut fx.slot(DEADLINE_SIZE, align: 8)
+    let zero = mut fx.ptr(0)
+    let timer_size = mut fx.ptr(DEADLINE_SIZE)
+    var fill_args = Array[clif::Value, 3].filled(timer)
+    fill_args[1] = zero
+    fill_args[2] = timer_size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let deadline = mut fx.int(PTR, value: TASKS_KIND_DEADLINE)
+    mut fx.store(deadline, addr: timer, offset: OPERATION_KIND)
+    mut fx.store(record, addr: timer, offset: OPERATION_TASK)
+    let linked = link_deadline(mut lo, mut fx, clock, timer)
+    let live = linked.live
+    set_within_deadline(mut lo, mut fx, linked, ns, record, timer)
+    let current = current_task(mut lo, mut fx)
+    let enclosing = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+    mut fx.store(record, addr: current, offset: TASKS_TASK_REGION)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: mem::List[Held].empty(fx.alloc).view())
+    mut fx.store(enclosing, addr: current, offset: TASKS_TASK_REGION)
+    discard mut fx.choose_in(mut lo, condition: live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        unlink_deadline(mut lo1, fx: mut fx1, timer)
+        disarm_deadline(mut lo1, fx: mut fx1, timer)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        pop_deadline(mut lo1, fx: mut fx1, deadline: timer)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let id = mut fx.load(PTR, addr: record, offset: REGIONS_REGION_ID)
+    mut lo.record_free(mut fx, address: record)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    match called.failed {
+        Some(failed) => {
+            match called.failure {
+                Some(failure) => {
+                    match body_ty.failure {
+                        Some(failure_ty) => {
+                            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                                within_failed(mut lo, fx: mut fx1, supply, failure_ty, failure, id, slot)
+                            })
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let some = mut fx.int(clif::Type.Int8, value: 1)
+    mut lo.write_option(mut fx, option, address: slot, presence: some, value: called.result)
+    let held = mut lo.held_at(mut fx, ty: option, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} deadlines_within
+
+/// Sets the deadline of a `within` call, whose region's record is `record` and whose timer is
+/// `timer`, on the clock `linked` gives: when the clock is live, arms the timer; otherwise
+/// cancels the region and makes the deadline due at once.
+fn set_within_deadline(mut lo: Lowering, mut fx: Fx, linked: LinkedDeadline, ns: clif::Value, record: clif::Value, timer: clif::Value) {
+    discard mut fx.choose_in(mut lo, condition: linked.live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let now = mut lo1.now_ns(mut fx1)
+        let delay = on_grid(mut fx1, now, origin: linked.minted, resolution: linked.resolution, ns)
+        let due = due_after(mut fx1, now, delay)
+        mut fx1.store(due, addr: timer, offset: OPERATION_DUE)
+        push_deadline(mut lo1, fx: mut fx1, deadline: timer)
+        let spec = mut fx1.offset(timer, offset: OPERATION_SIZE)
+        mut lo1.arm_timer(mut fx1, op: timer, ns: delay, spec)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
+        let paced = mut fx1.int(PTR, value: TASKS_KIND_PACED)
+        mut fx1.store(paced, addr: timer, offset: OPERATION_KIND)
+        let now = mut lo1.now_ns(mut fx1)
+        mut fx1.store(now, addr: timer, offset: OPERATION_DUE)
+        push_deadline(mut lo1, fx: mut fx1, deadline: timer)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} set_within_deadline
+
+/// What `task::within` does once its body failed: a cancellation of its own region gives
+/// `None`, any other failure becomes the call's.
+fn within_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::Ty, failure: clif::Value, id: clif::Value, slot: clif::Value) {
+    let option = supply.abi.result
+    let held = mut lo.held_at(mut fx, ty: failure_ty, address: failure)
+    var own = id
+    match mut lo.cancellation_origin(mut fx, failure_ty, held) {
+        Some(found) => {
+            let same = mut fx.b.icmp(clif::IntCC.Equal, x: found.origin, y: id)
+            own = mut fx.b.band(found.cancelled, y: same)
+        }
+        None => {
+            own = mut fx.int(clif::Type.Int8, value: 0)
+        }
+    }
+    discard mut fx.choose_in(mut lo, condition: own, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        mut lo1.write_option(mut fx1, option, address: slot, presence: none, value: Held.Empty)
+        let none_held = mut lo1.held_at(mut fx1, ty: option, address: slot)
+        supply.ret(mut lo1, fx: mut fx1, held: none_held)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let Some(target) = supply.failure else {
+            expect false
+            return mem::List[clif::Value].empty(fx1.alloc)
+        }
+        mut lo1.store_held(mut fx1, address: target, held, ty: failure_ty)
+        supply.raise_failure(mut fx1)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} within_failed
+
+/// `task::paced(clock, at_ns, body: b)`: calls `b` under a deadline due once `clock` reads
+/// `at_ns`, or at the call for a stale clock, which no timer ends.
+fn deadlines_paced(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let entry = snapshot(mut lo, mut fx, handle: clock)
+    let minted = entry.words[0]
+    let resolution = entry.words[1]
+    let at = supply.param(1).scalar_value()
+    let dues = mut fx.choose_in(mut lo, condition: entry.live, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let end = on_grid(mut fx1, now: minted, origin: minted, resolution, ns: at)
+        return fx1.list1(due_after(mut fx1, now: minted, delay: end))
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(mut lo1.now_ns(mut fx1))
+    })
+    expect dues.len() > 0
+    let deadline = mut fx.slot(OPERATION_SIZE, align: 8)
+    let paced = mut fx.int(PTR, value: TASKS_KIND_PACED)
+    mut fx.store(paced, addr: deadline, offset: OPERATION_KIND)
+    mut fx.store(dues[0], addr: deadline, offset: OPERATION_DUE)
+    push_deadline(mut lo, mut fx, deadline)
+    let body_ty = fn_param(lo, supply, index: 2)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: mem::List[Held].empty(fx.alloc).view())
+    pop_deadline(mut lo, mut fx, deadline)
+    supply.forward_failure(mut lo, mut fx, called)
+    supply.ret(mut lo, mut fx, held: called.result)
+} deadlines_paced
+
+/// `task::deadline_ns(clock)`: the earliest deadline the running task runs under, read on
+/// `clock`; none outside a task, without a deadline or for a stale clock.
+fn deadlines_deadline_ns(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let entry = snapshot(mut lo, mut fx, handle: clock)
+    let minted = entry.words[0]
+    let resolution = entry.words[1]
+    let current = current_task(mut lo, mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+    let found = mut fx.choose(inside, results: fx.types2(clif::Type.Int8, b: PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return earliest_deadline(mut fx1, record: current)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        let zero = mut fx1.ptr(0)
+        return fx1.list2(none, b: zero)
+    })
+    expect found.len() > 1
+    let present = mut fx.b.band(entry.live, y: found[0])
+    let before = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: found[1], y: minted)
+    let since = mut fx.b.isub(found[1], y: minted)
+    let zero = mut fx.ptr(0)
+    let elapsed = mut fx.b.select(before, x: zero, y: since)
+    let reading = round_down(mut fx, resolution, reading: elapsed)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    mut lo.write_option(mut fx, option, address: slot, presence: present, value: Held.Scalar(reading))
+    let held = mut lo.held_at(mut fx, ty: option, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} deadlines_deadline_ns
+
+/// Makes a deadline's record the running task's innermost.
+fn push_deadline(mut lo: Lowering, mut fx: Fx, deadline: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let outer = mut fx.load(PTR, addr: current, offset: TASK_DEADLINES)
+    mut fx.store(outer, addr: deadline, offset: OPERATION_LINK)
+    mut fx.store(deadline, addr: current, offset: TASK_DEADLINES)
+} push_deadline
+
+/// Takes the running task's innermost deadline, whose record is `deadline`, out of its
+/// deadlines.
+fn pop_deadline(mut lo: Lowering, mut fx: Fx, deadline: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let outer = mut fx.load(PTR, addr: deadline, offset: OPERATION_LINK)
+    mut fx.store(outer, addr: current, offset: TASK_DEADLINES)
+} pop_deadline
+
+/// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it
+/// out of the running task's deadlines, of which it is the innermost.
+fn disarm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let waiter = mut fx.offset(timer, offset: OPERATION_WAITER)
+    mut fx.atomic_store(current, addr: waiter)
+    mut lo.cancel_operation(mut fx, op: timer)
+    wait_delivered(mut lo, mut fx, op: timer)
+    pop_deadline(mut lo, mut fx, deadline: timer)
+} disarm_deadline

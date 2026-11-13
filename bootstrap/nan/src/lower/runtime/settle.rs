@@ -14,7 +14,7 @@ use super::super::stack::{Family, Kind};
 use super::super::supplied::tasks::cowns;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::WAITING;
-use super::tasks::{self, domain, operation, run, task};
+use super::tasks::{self, domain, kind, operation, run, task};
 use super::{Routine, holdings, memory, serial, state, tables};
 
 /// The offsets of a wait record's fields: the glue withdrawing the wait, given the record and
@@ -111,9 +111,9 @@ fn each_stopped(fx: &mut Fx, first: Value, visit: &mut dyn FnMut(&mut Fx, Value)
     });
 }
 
-/// Cancels the operation a stopped task waits on and the deadlines it armed, and waits until
-/// each one's completion has been delivered; a deadline then leaves its clock's deadlines and
-/// its region is freed.
+/// Cancels the operation a stopped task waits on and the deadlines it armed timers for, and
+/// waits until each one's completion has been delivered; such a deadline then leaves its
+/// clock's deadlines and its region is freed.
 fn cancel_operations(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let op = claim_operation(lo, fx, record);
     let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, op, 0);
@@ -124,10 +124,14 @@ fn cancel_operations(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         fx.repeat(&[first], |fx, state| {
             let timer = state[0];
             let next = fx.load(PTR, timer, operation::LINK);
-            settle_operation(lo, fx, timer);
-            tables::unlink_deadline(lo, fx, timer);
-            let region = fx.load(PTR, timer, operation::TASK);
-            lo.record_free(fx, region);
+            let op_kind = fx.load(PTR, timer, operation::KIND);
+            let timed = fx.b.ins().icmp_imm_s(IntCC::Equal, op_kind, kind::DEADLINE);
+            fx.when(timed, |fx| {
+                settle_operation(lo, fx, timer);
+                tables::unlink_deadline(lo, fx, timer);
+                let region = fx.load(PTR, timer, operation::TASK);
+                lo.record_free(fx, region);
+            });
             let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
             (more, vec![next])
         });

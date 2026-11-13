@@ -16,7 +16,7 @@ use super::super::body::Held;
 use super::super::call::Invoked;
 use super::super::fx::{Fx, PTR};
 use super::super::layout::Shape;
-use super::super::runtime::tasks::{operation, task, thread};
+use super::super::runtime::tasks::{self, task, thread};
 use super::super::runtime::{Routine, fetch_add, report, state, timers};
 use super::super::stack::{Family, Kind};
 use super::super::supplied::Supply;
@@ -245,8 +245,7 @@ impl Lowering<'_, '_> {
     }
 
     /// An `hw::TaskView` of a task in a slot: its record's address, its executor's handle and
-    /// share, the CPU it last ran on, the nanoseconds it ran and the earliest of the deadlines
-    /// the constructs it runs armed.
+    /// share, the CPU it last ran on, the nanoseconds it ran and the earliest of its deadlines.
     fn task_view(&mut self, fx: &mut Fx, view_ty: &Ty, record: Value) -> Held {
         let layout = self.layout(view_ty);
         let slot = fx.slot(layout.size, layout.align);
@@ -271,35 +270,9 @@ impl Lowering<'_, '_> {
         let at = field(self, "ran_ns").offset;
         fx.store(ran_ns, slot, at);
         let deadline = field(self, "deadline_ns");
-        let first = fx.load(PTR, record, task::DEADLINES);
-        let latest = fx.int(PTR, -1);
-        let none = fx.int(types::I8, 0);
-        let earliest = fx.repeat(&[first, latest, none], |fx, state| {
-            let (current, earliest, any) = (state[0], state[1], state[2]);
-            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
-            let next = fx.choose(
-                present,
-                &[PTR, PTR, types::I8],
-                |fx| {
-                    let due = fx.load(PTR, current, operation::DUE);
-                    vec![
-                        fx.load(PTR, current, operation::LINK),
-                        fx.b.ins().umin(earliest, due),
-                        fx.int(types::I8, 1),
-                    ]
-                },
-                |_| vec![current, earliest, any],
-            );
-            (present, next)
-        });
+        let [any, earliest] = tasks::earliest_deadline(fx, record);
         let deadline_at = fx.offset(slot, deadline.offset);
-        self.write_option(
-            fx,
-            &deadline.ty,
-            deadline_at,
-            earliest[2],
-            Held::Scalar(earliest[1]),
-        );
+        self.write_option(fx, &deadline.ty, deadline_at, any, Held::Scalar(earliest));
         Held::Address(slot)
     }
 

@@ -320,6 +320,10 @@ pub fn within[T, E](clock: sys::Clock, ms: u64, body: fn() -> T fails E uses wai
 
 pub fn within_ns[T, E](clock: sys::Clock, ns: u64, body: fn() -> T fails E uses wait) -> Option[T] fails E uses wait
 
+pub fn paced[T, E](clock: sys::Clock, at_ns: u64, body: fn() -> T fails E uses wait) -> T fails E uses wait
+
+pub fn deadline_ns(clock: sys::Clock) -> Option[u64]
+
 pub fn race[T: Send, E: Send](exec: Executor, take left: task fn() -> T fails E uses wait, take right: task fn() -> T fails E uses wait) -> T fails E uses wait
 ```
 
@@ -328,6 +332,10 @@ pub fn race[T: Send, E: Send](exec: Executor, take left: task fn() -> T fails E 
 - When the deadline passes before `b` ends, the call cancels. Its region is the calling task while it runs `b`.
 - When `b` returns t, the call returns `Some(t)`, whether or not the deadline has passed.
 - When `b` fails with a cancellation whose origin is this call, the call returns `None`. When `b` fails otherwise, the call fails with that failure.
+
+`task::paced(clock, at_ns, body: b)` calls `b` on the calling task with a deadline at the first moment at which `sys::Clock.elapsed_ns` of `clock` reaches `at_ns`, or at the moment of the call when `clock` is stale at the call, then returns `b`'s result or fails with its failure. That deadline cancels nothing.
+
+A task's **deadline** is the earliest of the deadlines of the `within`, `within_ns` and `paced` calls whose body it runs; a task it starts does not take it. `task::deadline_ns(clock)` returns the calling task's deadline as the nanoseconds `clock` has elapsed at that moment, rounded down to a multiple of its resolution, or 0 when that moment comes before `clock` starts counting. It returns `None` when the task has no deadline or `clock` is stale.
 
 `task::race(exec, left: l, right: r)` runs these steps:
 

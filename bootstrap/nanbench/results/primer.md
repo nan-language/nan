@@ -8,7 +8,7 @@ The token count of each tier's `nan primer` text under each tokenizer; a tier's 
 | low-level | 1462 | 1457 | 1457 | 1462 | 3000 |
 | concurrency | 1673 | 1678 | 1678 | 1678 | 3000 |
 | kernel | 1316 | 1319 | 1319 | 1319 | 3000 |
-| packages | 1869 | 1866 | 1866 | 1869 | 3000 |
+| packages | 1881 | 1877 | 1877 | 1881 | 3000 |
 | contracts | 1301 | 1299 | 1299 | 1301 | 3000 |
 | components | 791 | 791 | 791 | 791 | 3000 |
 | tools | 964 | 960 | 960 | 964 | 1000 |

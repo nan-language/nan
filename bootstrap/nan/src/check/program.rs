@@ -208,7 +208,7 @@ impl Checker<'_> {
         const HOST_FORMS: &str = "fn main(take P: host::World) fails E uses wait or fn main(take P: \
                                   host::World) -> u8 fails E uses wait";
         let forms = match kind {
-            Kind::Host => HOST_FORMS.to_owned(),
+            Kind::Linux => HOST_FORMS.to_owned(),
             Kind::Uefi => "fn main(take P: boot::Machine) -> Never".to_owned(),
             Kind::Bare => "fn main(take P: boot::Kernel) -> Never".to_owned(),
             Kind::Nanos => format!(
@@ -247,7 +247,7 @@ impl Checker<'_> {
                 && waits
         };
         let rest = match kind {
-            Kind::Host => host,
+            Kind::Linux => host,
             Kind::Nanos => host || job(),
             Kind::Uefi => machine(&sig, taken(0, "boot::Machine")),
             Kind::Bare => machine(&sig, taken(0, "boot::Kernel")),

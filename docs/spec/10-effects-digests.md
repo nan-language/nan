@@ -388,7 +388,7 @@ pub fn count_kept(filter: Filter, data: Slice[u8]) -> usize limits noalloc {
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -430,7 +430,7 @@ pub fn settle(service: StallService) -> usize limits noalloc {
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -450,7 +450,7 @@ pub fn process_id() -> i32 limits noalloc {
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -605,7 +605,7 @@ The frame size of a lowered function is the size the backend reports for its fra
 
 package brackets {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } brackets
 
@@ -640,7 +640,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package steps {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } steps
 
@@ -667,7 +667,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package gauge {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } gauge
 
@@ -697,7 +697,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package numbers {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } numbers
 
@@ -722,7 +722,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package chains {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } chains
 
@@ -760,7 +760,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package hoards {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hoards
 
@@ -790,7 +790,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package forests {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } forests
 

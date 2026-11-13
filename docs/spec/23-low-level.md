@@ -1500,7 +1500,7 @@ convention_clause = 'convention' TEXT ;
 
 | Convention | Meaning | Targets |
 | --- | --- | --- |
-| `"sysv"` | the calling convention of the System V ABI for the target's architecture: the AMD64 one on x86_64 and the Procedure Call Standard for the Arm 64-bit Architecture on AArch64 | `x86_64-host`, `aarch64-host` |
+| `"sysv"` | the calling convention of the System V ABI for the target's architecture: the AMD64 one on x86_64 and the Procedure Call Standard for the Arm 64-bit Architecture on AArch64 | `x86_64-linux`, `aarch64-linux` |
 | `"win64"` | the Microsoft x64 calling convention | `x86_64-uefi` |
 | `"aapcs64"` | the Procedure Call Standard for the Arm 64-bit Architecture, with `x18` reserved for the platform | `aarch64-uefi` |
 
@@ -1513,7 +1513,7 @@ convention_clause = 'convention' TEXT ;
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -1539,7 +1539,7 @@ pub fn last_error() -> i32 {
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -1559,7 +1559,7 @@ pub fn read_input(mut buf: SliceMut[u8]) -> isize {
 
 package procinfo {
     language 1
-    targets aarch64-host, x86_64-host
+    targets aarch64-linux, x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -1579,7 +1579,7 @@ pub fn process_id() -> i32 {
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 
@@ -1599,7 +1599,7 @@ pub fn process_id() -> i32 {
 
 package procinfo {
     language 1
-    targets aarch64-host
+    targets aarch64-linux
     allow trusted in procinfo
 } procinfo
 

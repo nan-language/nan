@@ -151,7 +151,7 @@ The toolchain fixes the names and encoding of the files in `store`. A command ap
 
 package hello {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hello
 

@@ -7,7 +7,7 @@ use crate::workspace::Workspace;
 use crate::workspace::tests::Scratch;
 
 const MANIFEST: &str =
-    "//! Render cases.\n\npackage app {\n    language 1\n    targets x86_64-host\n} app\n";
+    "//! Render cases.\n\npackage app {\n    language 1\n    targets x86_64-linux\n} app\n";
 
 const CASES: &str = r#"//! Render cases.
 
@@ -125,7 +125,7 @@ fn templates_and_derived_and_builtin_renderings_write_their_text_within_the_budg
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
-const FLOATS_MANIFEST: &str = "//! Floats read and written.\n\npackage floats {\n    language 1\n    targets x86_64-host\n    entry main\n    allow validate in floats\n} floats\n";
+const FLOATS_MANIFEST: &str = "//! Floats read and written.\n\npackage floats {\n    language 1\n    targets x86_64-linux\n    entry main\n    allow validate in floats\n} floats\n";
 
 const FLOATS: &str = r#"//! Decodes each argument as an `f64` and an `f32` through JSON and construction text, and logs each value with its JSON encoding.
 
@@ -332,7 +332,7 @@ fn images_write_and_read_floats_as_the_interpreter() {
     ]);
     let built = crate::run(&["build".to_owned()], &scratch.0);
     assert_eq!(built.status, 0, "{}", built.output);
-    let image = scratch.0.join(".nan/images/x86_64-host/floats");
+    let image = scratch.0.join(".nan/images/x86_64-linux/floats");
     for batch in decimals().chunks(200) {
         let run = Command::new(&image)
             .args(batch)

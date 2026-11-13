@@ -1,6 +1,6 @@
 //! The synchronisation primitives of `hw`: `hw::without_irqs`, spin locks, devices behind an
 //! IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of
-//! the CPU holding it plus one, each executor thread being a CPU on `x86_64-host`, so a CPU
+//! the CPU holding it plus one, each executor thread being a CPU on `x86_64-linux`, so a CPU
 //! acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and
 //! interrupts to install a device on.
 

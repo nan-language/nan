@@ -6,7 +6,7 @@ use crate::command::key::tests::TestPrincipal;
 use crate::command::tests::run_in;
 use crate::workspace::tests::Scratch;
 
-const MANIFEST: &str = "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-host\n    allow trusted in procinfo\n} procinfo\n";
+const MANIFEST: &str = "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-linux\n    allow trusted in procinfo\n} procinfo\n";
 
 const SOURCE: &str = "//! Reads process facts.\n\nforeign fn getpid() -> i32 limits notrap, terminates, noalloc convention \"sysv\"\n\npub fn process_id() -> i32 {\n    return getpid()\n} process_id\n";
 

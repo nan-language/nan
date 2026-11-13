@@ -96,7 +96,7 @@ fn renaming_or_moving_a_type_forwards_the_functions_named_after_it() {
 fn a_release_published_as_a_principal_is_read_only_from_its_pinned_and_trusted_key_until_forged() {
     let scratch = Scratch::new(&[(
         "procinfo/package.nan",
-        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-host\n    allow trusted in procinfo\n} procinfo\n",
+        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-linux\n    allow trusted in procinfo\n} procinfo\n",
     )]);
     let dir = &scratch.0;
     let scratch_name = dir.file_name().expect("a directory name").to_string_lossy();
@@ -139,7 +139,7 @@ fn a_release_published_as_a_principal_is_read_only_from_its_pinned_and_trusted_k
     fs::create_dir_all(dir.join("app")).expect("the app directory");
     fs::write(
         dir.join("app/package.nan"),
-        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets x86_64-host\n    dep procinfo \"{name}\"\n    allow trusted in procinfo\n}} app\n"),
+        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets x86_64-linux\n    dep procinfo \"{name}\"\n    allow trusted in procinfo\n}} app\n"),
     )
     .expect("the app manifest");
     fs::write(
@@ -206,7 +206,7 @@ fn a_release_is_built_only_from_the_sources_its_attestation_hashes_and_that_chec
     fs::create_dir_all(dir.join("app")).expect("the app directory");
     fs::write(
         dir.join("app/package.nan"),
-        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets x86_64-host\n    entry main\n    dep meter \"{name}\"\n}} app\n"),
+        format!("//! Apps.\n\npackage app {{\n    language 1\n    targets x86_64-linux\n    entry main\n    dep meter \"{name}\"\n}} app\n"),
     )
     .expect("the app manifest");
     fs::write(

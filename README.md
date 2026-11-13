@@ -66,7 +66,7 @@ A kernel declaring loaded registries also gets an interface file, against which 
 
 ## Development
 
-`toolchain/` holds the NaN toolchain; `nan build nan` there builds it into `toolchain/.nan/images/x86_64-host/nan` (or for AArch64 with `targets aarch64-host` in its manifest).
+`toolchain/` holds the NaN toolchain; `nan build nan` there builds it into `toolchain/.nan/images/x86_64-linux/nan` (or for AArch64 with `targets aarch64-linux` in its manifest).
 
 `bootstrap/` holds the bootstrap compiler, in Rust with Cranelift. It built the first NaN toolchain and checks every toolchain change against its own output; it freezes when the NaN toolchain 1.0 is released. It requires [rustup](https://rustup.rs) and `cc`. From `bootstrap/`:
 

@@ -42,7 +42,7 @@ A missing end is never reported. In const evaluation, a trap is an error (`const
 
 package geometry {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in geometry
 } geometry
 

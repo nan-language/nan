@@ -186,7 +186,7 @@ The **ledger** of an item is the list of its entries of the kinds this table giv
 
 package procinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow trusted in procinfo
 } procinfo
 

@@ -445,6 +445,31 @@ test transfer_moves_funds for transfer {
 ```
 
 ```nan
+pub closed struct Meter {
+    pub reading: u64
+} Meter
+
+pub closed struct Station {
+    pub meter: task::Cown[Meter]
+    pub step: u64
+} Station
+
+pub fn advance(station: Station) -> u64 fails task::Cancelled uses wait {
+    await when mut station.meter {
+        station.meter.reading += station.step
+    }
+    return await when station.meter => station.meter.reading
+} advance
+
+test advance_adds_the_step for advance {
+    let world = testing::world()
+    let station = Station(meter: task::Cown.of(Meter(reading: 4), alloc: world.alloc), step: 3)
+    let reading = try await advance(station)
+    expect reading == 7
+} advance_adds_the_step
+```
+
+```nan
 pub closed struct Account {
     pub balance: u64
 } Account

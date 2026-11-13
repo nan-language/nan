@@ -164,6 +164,18 @@ impl Body<'_, '_> {
     }
 }
 
+/// The text of a binding or a field path from one, its segments joined by `.`.
+fn path_text(expr: &ast::Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Path { path, args: None } if path.segments.len() == 1 => {
+            Some(path.segments[0].text.clone())
+        }
+        ExprKind::SelfValue => Some("self".to_owned()),
+        ExprKind::Field { base, name } => Some(format!("{}.{}", path_text(base)?, name.text)),
+        _ => None,
+    }
+}
+
 /// Whether an expression is a binding or a field path from one.
 fn is_path_place(expr: &ast::Expr) -> bool {
     match &expr.kind {
@@ -808,6 +820,9 @@ impl Body<'_, '_> {
         name: &ast::Name,
         expected: Option<&Ty>,
     ) -> TExpr {
+        if let Some(value) = self.when_value(base, name) {
+            return self.local_expr(token, value);
+        }
         if let Some(target) = self.type_target(base) {
             return match target {
                 TypeTarget::Type(ty) => self.member_value(token, &ty, name, expected),
@@ -824,6 +839,13 @@ impl Body<'_, '_> {
         }
         let typed_base = self.expr(base, None);
         self.field_of(token, typed_base, name, true)
+    }
+
+    /// The binding an enclosing `await when` gives the cown's value its access names by the
+    /// place path `base.name`.
+    fn when_value(&mut self, base: &ast::Expr, name: &ast::Name) -> Option<LocalId> {
+        let path = path_text(base)?;
+        self.lookup_local(&format!("{path}.{}", name.text))
     }
 
     /// A field of a value: of its struct or layout, where visible; `read` unless the field is
@@ -2260,7 +2282,7 @@ impl Body<'_, '_> {
                     fixes.into_iter().collect(),
                 );
             }
-            seen.push(path);
+            seen.push(path.clone());
             let mut place = self.path_expr(
                 access.root.token,
                 &ast::Path {
@@ -2280,19 +2302,20 @@ impl Body<'_, '_> {
                 }
                 Ty::Error
             };
-            bound.push((access.root.clone(), value_ty, access.mode));
+            bound.push((path, access.root.token, value_ty, access.mode));
             typed_accesses.push((access.mode, place));
         }
         self.push_scope();
         let mut accesses_typed = Vec::new();
-        for ((root, value_ty, mode), (access_mode, place)) in bound.into_iter().zip(typed_accesses)
+        for ((path, token, value_ty, mode), (access_mode, place)) in
+            bound.into_iter().zip(typed_accesses)
         {
             let id = crate::check::tir::LocalId(self.locals.len() as u32);
             self.locals.push(crate::check::tir::Local {
-                name: root.text.clone(),
+                name: path,
                 ty: value_ty,
                 kind: LocalKind::Param(mode),
-                token: root.token,
+                token,
                 captured: None,
                 closure: self.frame().closure,
             });
@@ -2356,6 +2379,14 @@ impl Body<'_, '_> {
             }
             ExprKind::SelfValue => Some(self.expr(target, None)),
             ExprKind::Field { base, name } => {
+                if let Some(value) = self.when_value(base, name) {
+                    return Some(TExpr {
+                        token: target.token,
+                        last: target.last,
+                        ty: self.local(value).ty.clone(),
+                        kind: TKind::Local(value),
+                    });
+                }
                 if self.type_target(base).is_some() {
                     return self.failed_place(target);
                 }

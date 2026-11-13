@@ -158,6 +158,30 @@ fn Body.signed_operation(self, op: ast::BinaryOp, left: ast::Expr, right: ast::E
     return Some(self.ck.fix_replacing(self.item, head: left.token, last: right.last, text: assigned.as_str()))
 } Body.signed_operation
 
+/// Appends the text of a binding or a field path from one to `path`, its segments joined by `.`;
+/// false when the expression is no such path.
+fn append_path(mut path: text::String, expr: ast::Expr) -> bool {
+    match first expr.kind {
+        ast::ExprKind.Path(path: written, args: None) if written.segments.len() == 1 => {
+            mut path.append(written.segments[0].text.as_str())
+            return true
+        }
+        ast::ExprKind.SelfValue => {
+            mut path.append("self")
+            return true
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            if not append_path(mut path, expr: base.contents()) {
+                return false
+            }
+            mut path.push('.')
+            mut path.append(name.text.as_str())
+            return true
+        }
+        else => return false
+    }
+} append_path
+
 /// Whether an expression is a binding or a field path from one.
 fn is_path_place(expr: ast::Expr) -> bool {
     return match expr.kind {
@@ -912,6 +936,10 @@ fn Body.enum_args(
 
 /// `base.name`: a member through a type or interface, or a field of a value.
 fn Body.field_expr(mut self, token: u32, base: ast::Expr, name: ast::Name, expected: Option[ty::Ty]) -> TExpr {
+    match mut self.when_value(base, name) {
+        Some(value) => return mut self.local_expr(token, local: value)
+        None => {}
+    }
     let target = mut self.type_target(base)
     match target {
         Some(TypeTarget.Type(found)) => return mut self.member_value(token, ty: found, name, expected)
@@ -929,6 +957,18 @@ fn Body.field_expr(mut self, token: u32, base: ast::Expr, name: ast::Name, expec
     let typed_base = mut self.expr(base, expected: None)
     return mut self.field_of(token, base: take typed_base, name, read: true)
 } Body.field_expr
+
+/// The binding an enclosing `await when` gives the cown's value its access names by the place
+/// path `base.name`.
+fn Body.when_value(mut self, base: ast::Expr, name: ast::Name) -> Option[LocalId] {
+    var path = text::String.empty(self.ck.alloc())
+    if not append_path(mut path, expr: base) {
+        return None
+    }
+    mut path.push('.')
+    mut path.append(name.text.as_str())
+    return mut self.lookup_local(path.as_str())
+} Body.when_value
 
 /// The fields of a struct's or layout's signature.
 proj fn Sig.declared_fields(self) -> Option[Slice[FieldSig]] {
@@ -2463,11 +2503,11 @@ fn Body.when_expr(mut self, expr: ast::Expr, attempted: Option[u32], expected: O
     var typed_accesses = mem::List[TAccess].empty(alloc)
     var position: usize = 0
     for place in take places {
-        invariant position < accesses.len() and position < values.len() and self.scopes.len() > 0
+        invariant position < accesses.len() and position < values.len() and position < seen.len() and self.scopes.len() > 0
         let access = accesses[position]
         let id = LocalId(index: u32.truncate(self.locals.len()))
         let closure = self.frame().closure
-        mut self.locals.push(Local(name: text::String.of(access.root.text.as_str(), alloc), ty: values[position], kind: LocalKind.Param(access.mode), token: access.root.token, captured: None, closure: closure))
+        mut self.locals.push(Local(name: text::String.of(seen[position].as_str(), alloc), ty: values[position], kind: LocalKind.Param(access.mode), token: access.root.token, captured: None, closure: closure))
         let scope = self.scopes.len()
         mut (mut self.scopes.at_mut(scope - 1)).push(id)
         mut typed_accesses.push(TAccess(mode: access.mode, place: take place, local: id))
@@ -2539,6 +2579,10 @@ fn Body.place(mut self, target: ast::Expr, assigned: bool) -> Option[TExpr] {
         }
         ast::ExprKind.SelfValue => return Some(mut self.expr(target, expected: None))
         ast::ExprKind.Field(base: base, name: name) => {
+            match mut self.when_value(base.contents(), name) {
+                Some(value) => return Some(TExpr(token: target.token, last: target.last, ty: self.local(value).ty, kind: TKind.Local(value)))
+                None => {}
+            }
             let names_type = mut self.type_target(base.contents())
             if names_type.is_some() {
                 return mut self.failed_place(target)

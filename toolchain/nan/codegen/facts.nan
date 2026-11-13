@@ -3,8 +3,10 @@
 /// What selection knows of a function before it selects an instruction.
 struct Facts {
     alloc: mem::Alloc
-    /// How many times live instructions use each value.
+    /// How many times live instructions use each value, and of those how many as the address they
+    /// access memory at.
     use_counts: mem::List[u32]
+    addressed: mem::List[u32]
     /// Whether each instruction is live, by instruction index: it has an effect, ends its block,
     /// or a live instruction reads one of its results.
     live: mem::List[bool]
@@ -43,6 +45,7 @@ fn Facts.of(func: clif::Function, alloc: mem::Alloc) -> Facts {
     var known = Facts(
         alloc: alloc,
         use_counts: filled(values, value: 0u32, alloc),
+        addressed: filled(values, value: 0u32, alloc),
         live: mem::List[bool].empty(alloc),
         defs: filled(values, value: NONE, alloc),
         homes: filled(values, value: NONE, alloc),
@@ -535,14 +538,42 @@ fn Facts.count_values(mut self, func: clif::Function) {
             if not self.is_live(inst) {
                 continue
             }
-            each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
+            let data = func.inst_data(inst)
+            each_operand(data, visit: fn[mut self](value: clif::Value) {
                 let at = usize.widen(func.resolve_aliases(value).index)
                 expect at < self.use_counts.len()
                 self.use_counts[at] += 1
             })
+            let Some(address) = accessed_address(data) else {
+                continue
+            }
+            let at = usize.widen(func.resolve_aliases(address).index)
+            expect at < self.addressed.len()
+            self.addressed[at] += 1
         }
     }
 } Facts.count_values
+
+/// The address a load, store or atomic operation accesses memory at.
+fn accessed_address(data: clif::InstructionData) -> Option[clif::Value] {
+    return match data {
+        clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: _) => Some(arg)
+        clif::InstructionData.LoadNoOffset(opcode: opcode, flags: _, arg: arg) => if opcode == clif::Opcode.Bitcast {
+            None
+        } else {
+            Some(arg)
+        }
+        clif::InstructionData.Store(opcode: _, flags: _, x: _, p: p, offset: _) or clif::InstructionData.StoreNoOffset(opcode: _, flags: _, x: _, p: p) or clif::InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: p, x: _) or clif::InstructionData.AtomicCas(opcode: _, flags: _, p: p, e: _, x: _) => Some(p)
+        else => None
+    }
+} accessed_address
+
+/// Whether live instructions use a value only as the address they access memory at.
+fn Facts.only_addresses(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.use_counts.len() and at < self.addressed.len()
+    return self.use_counts[at] == self.addressed[at]
+} Facts.only_addresses
 
 /// The live instructions of reachable code, by instruction index: those with an effect or ending
 /// their block, then each one a live instruction reads a result of.

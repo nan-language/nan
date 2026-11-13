@@ -1,7 +1,32 @@
-//! The timers of the clocks the runtime keeps itself, the seeded scheduler's virtual clock and a kernel's clock: one list of operations ordered by the nanosecond each is due, then by the order in which they were armed. A kernel's CPUs share the list behind the timer lock.
+//! The timers of the clocks the runtime keeps itself, the seeded scheduler's virtual clock, a kernel's clock and a Windows target's monotonic clock: one list of operations ordered by the nanosecond each is due, then by the order in which they were armed. A kernel's CPUs and a Windows target's executor threads share the list behind the timer lock.
 
 /// The nanoseconds of a millisecond.
 const NS_PER_MS: u64 = 1_000_000
+
+/// Takes a timer that is armed and has not expired out of the timers, under the timer lock,
+/// giving whether it did so; its cancelled completion is then the caller's to deliver.
+fn claim_armed(mut lo: Lowering, mut fx: Fx, op: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let done = mut fx.load(PTR, addr: op, offset: OPERATION_DONE)
+    let pending = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+    let order = mut fx.load(PTR, addr: op, offset: OPERATION_ORDER)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: order, y: 0)
+    let in_flight = mut fx.b.band(pending, y: armed)
+    mut fx.if_true(in_flight, then: fn[mut lo](mut fx1: Fx) {
+        disarm(mut lo, fx: mut fx1, op)
+        claim_timer(mut fx1, op)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return in_flight
+} claim_armed
+
+/// Marks a timer taken out of the timers as completed, so no other thread or CPU delivers it.
+fn claim_timer(mut fx: Fx, op: clif::Value) {
+    let completed = mut fx.ptr(u64.fit(OPERATION_COMPLETED))
+    mut fx.store(completed, addr: op, offset: OPERATION_DONE)
+} claim_timer
 
 /// Arms a timer due at nanosecond `due`, after every timer due no later.
 fn arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, due: clif::Value) {

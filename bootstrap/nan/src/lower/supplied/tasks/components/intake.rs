@@ -16,7 +16,8 @@ use super::{entry, numbering, reference, runner, status, unreference, wake_waite
 use crate::check::ty::Ty;
 
 /// The fields of a delayed message's timer after its operation record: its links in its
-/// runner's timers, its relative time, and on a kernel the next timer a cancellation claimed.
+/// runner's timers, its relative time, and on a kernel and a Windows target the next timer a
+/// cancellation claimed.
 mod timer {
     use super::operation;
     pub const NEXT: u64 = operation::SIZE;

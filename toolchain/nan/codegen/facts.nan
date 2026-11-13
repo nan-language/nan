@@ -215,10 +215,12 @@ fn Facts.order(self, func: clif::Function) -> mem::List[clif::Block] {
     return order
 } Facts.order
 
-/// The reachable blocks in the order emission lays them out: those not cold in layout order,
-/// each loop's header that tests whether the loop goes on moved after the latch jumping back to
-/// it, then the cold ones.
-fn emission_order(func: clif::Function, seen: Slice[bool], alloc: mem::Alloc) -> mem::List[clif::Block] {
+/// The reachable blocks in the order emission lays them out: those not cold in layout order with
+/// the blocks of each loop together, each loop's header that tests whether the loop goes on moved
+/// after the latch jumping back to it, each block that one jump alone lands in moved after that
+/// jump when both lie in the same innermost loop, then the cold ones.
+fn Facts.emission_order(self, func: clif::Function, seen: Slice[bool]) -> mem::List[clif::Block] {
+    let alloc = self.alloc
     var hot = mem::List[clif::Block].empty(alloc)
     var cold = mem::List[clif::Block].empty(alloc)
     for block in func.layout_blocks(alloc) {
@@ -233,17 +235,174 @@ fn emission_order(func: clif::Function, seen: Slice[bool], alloc: mem::Alloc) ->
             mut hot.push(block)
         }
     }
-    rotate_loops(func, order: mut hot, alloc)
+    let loops = loops_of(func, alloc)
+    var together = loops_together(order: hot.view(), loops, count: seen.len(), alloc)
+    rotate_loops(func, loops, order: mut together, alloc)
+    var order = self.chained(func, loops, order: together.view())
     for block in cold {
-        mut hot.push(block)
+        mut order.push(block)
     }
-    return hot
-} emission_order
+    return order
+} Facts.emission_order
+
+/// The blocks of `order` in chains of blocks of one innermost loop: each block that the jump
+/// ending one block alone lands in, of the blocks of `order`, right after that block, then each
+/// block right after the one before it in `order` when that one branches to it; the chains in
+/// the order of their first blocks.
+fn Facts.chained(self, func: clif::Function, loops: Loops, order: Slice[clif::Block]) -> mem::List[clif::Block] {
+    let alloc = self.alloc
+    let count = self.positions.len()
+    var placed = filled(count, value: false, alloc)
+    var jumps = filled(count, value: 0u32, alloc)
+    for block in order {
+        expect usize.widen(block.index) < count
+        placed[usize.widen(block.index)] = true
+        let Some(target) = self.jump_target(func, block) else {
+            continue
+        }
+        expect usize.widen(target.index) < count
+        jumps[usize.widen(target.index)] += 1
+    }
+    var chains = Chains.of(count, alloc)
+    for block in order {
+        let Some(target) = self.jump_target(func, block) else {
+            continue
+        }
+        let at = usize.widen(target.index)
+        expect at < count
+        if placed[at] and jumps[at] == 1 and loops.alike(block.index, other: target.index) and func.entry_block() != Some(target) {
+            mut chains.link(block.index, after: target.index)
+        }
+    }
+    for at in 1..<order.len() {
+        let before = order[at - 1].index
+        let after = order[at].index
+        if loops.alike(before, other: after) and self.successors(func, block: order[at - 1]).position(fn(block: clif::Block) => block.index == after) != None {
+            mut chains.link(before, after: after)
+        }
+    }
+    var chained = mem::List[clif::Block].empty(alloc)
+    for block in order {
+        if chains.previous[usize.widen(block.index)] != NONE {
+            continue
+        }
+        var walk = block.index
+        while walk != NONE {
+            mut chained.push(clif::Block(index: walk))
+            expect usize.widen(walk) < chains.next.len()
+            walk = chains.next[usize.widen(walk)]
+        }
+    }
+    return chained
+} Facts.chained
+
+/// The blocks of `order` with the blocks of each loop together where its first block lies, in
+/// the order of `order`, those of each loop it holds together alike.
+fn loops_together(order: Slice[clif::Block], loops: Loops, count: usize, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var members = mem::List[mem::List[clif::Block]].empty(alloc)
+    for _ in 0..<loops.list.len() {
+        mut members.push(mem::List[clif::Block].empty(alloc))
+    }
+    for block in order {
+        expect usize.widen(block.index) < loops.innermost.len()
+        var current = loops.innermost[usize.widen(block.index)]
+        while current != NONE {
+            expect usize.widen(current) < members.len() and usize.widen(current) < loops.list.len()
+            mut members[usize.widen(current)].push(block)
+            current = loops.list[usize.widen(current)].parent
+        }
+    }
+    var placed = filled(count, value: false, alloc)
+    var laid = mem::List[clif::Block].empty(alloc)
+    lay_region(region: NONE, blocks: order, members: members.view(), loops, mut placed, mut laid)
+    return laid
+} loops_together
+
+/// Lays out each of `blocks` not yet placed, the blocks of a loop `region` holds, or of the
+/// function for `NONE`, together where the first of them lies.
+fn lay_region(region: u32, blocks: Slice[clif::Block], members: Slice[mem::List[clif::Block]], loops: Loops, mut placed: mem::List[bool], mut laid: mem::List[clif::Block]) {
+    for block in blocks {
+        let at = usize.widen(block.index)
+        expect at < placed.len()
+        if placed[at] {
+            continue
+        }
+        let child = loops.child_of(region, block: block.index)
+        if child == NONE {
+            placed[at] = true
+            mut laid.push(block)
+        } else {
+            expect usize.widen(child) < members.len()
+            lay_region(region: child, blocks: members[usize.widen(child)].view(), members, loops, mut placed, mut laid)
+        }
+    }
+} lay_region
+
+/// The block the jump ending a block lands in, if a jump ends it.
+fn Facts.jump_target(self, func: clif::Function, block: clif::Block) -> Option[clif::Block] {
+    let insts = func.block_insts(block, alloc: self.alloc)
+    if insts.len() == 0 {
+        return None
+    }
+    return match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => Some(self.destination(destination.block))
+        else => None
+    }
+} Facts.jump_target
+
+/// Blocks laid out in chains: the block after and before each in its chain, `NONE` for none,
+/// and each block's representative among the blocks of its chain.
+struct Chains {
+    next: mem::List[u32]
+    previous: mem::List[u32]
+    roots: mem::List[u32]
+} Chains
+
+fn Chains.of(count: usize, alloc: mem::Alloc) -> Chains {
+    var roots = mem::List[u32].empty(alloc)
+    for index in 0..<count {
+        mut roots.push(u32.fit(index))
+    }
+    return Chains(next: filled(count, value: NONE, alloc), previous: filled(count, value: NONE, alloc), roots: take roots)
+} Chains.of
+
+/// The representative of a block's chain.
+fn Chains.root(mut self, block: u32) -> u32 {
+    var walk = block
+    loop {
+        expect usize.widen(walk) < self.roots.len()
+        let up = self.roots[usize.widen(walk)]
+        if up == walk {
+            return walk
+        }
+        expect usize.widen(up) < self.roots.len()
+        self.roots[usize.widen(walk)] = self.roots[usize.widen(up)]
+        walk = up
+    }
+} Chains.root
+
+/// Joins the chain ending in `block` and the chain starting with `after`, when they are two.
+fn Chains.link(mut self, block: u32, after: u32) {
+    let at = usize.widen(block)
+    let to = usize.widen(after)
+    expect at < self.next.len() and to < self.previous.len()
+    if self.next[at] != NONE or self.previous[to] != NONE {
+        return
+    }
+    let ending = mut self.root(block)
+    let starting = mut self.root(after)
+    if ending == starting {
+        return
+    }
+    self.next[at] = after
+    self.previous[to] = block
+    expect usize.widen(starting) < self.roots.len()
+    self.roots[usize.widen(starting)] = ending
+} Chains.link
 
 /// Moves each loop's header ending in a branch that leaves the loop or goes on in it right after
 /// the one block of the loop jumping back to it, so that the jump falls through into the test.
-fn rotate_loops(func: clif::Function, mut order: mem::List[clif::Block], alloc: mem::Alloc) {
-    let loops = loops_of(func, alloc)
+fn rotate_loops(func: clif::Function, loops: Loops, mut order: mem::List[clif::Block], alloc: mem::Alloc) {
     for id in 0..<loops.list.len() {
         let header = loops.list[id].header
         let latch = jumping_back(func, loops, id: u32.fit(id), header, alloc)
@@ -324,7 +483,7 @@ fn Facts.place_blocks(mut self, func: clif::Function) {
             self.positions[index] = 0
         }
     }
-    self.sequence = emission_order(func, seen: seen.view(), alloc: self.alloc)
+    self.sequence = self.emission_order(func, seen: seen.view())
     var next: u32 = 0
     for block in self.order(func) {
         let at = usize.widen(block.index)

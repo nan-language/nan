@@ -251,8 +251,8 @@ impl Checker<'_> {
         }
     }
 
-    /// The fields of a layout: their forms and types for its kind, within its `width` bytes, and
-    /// each bit or byte covered by exactly one.
+    /// The fields of a layout: their forms and types for its kind, within its `width` bytes, and,
+    /// unless one is rejected, each bit or byte covered by exactly one.
     fn check_layout_fields(&self, item: ItemId, layout: &ast::LayoutItem, width: u64, bytes: bool) {
         let data = self.db.item(item);
         let units = if bytes { width } else { width * 8 };
@@ -262,6 +262,7 @@ impl Checker<'_> {
         };
         let mut covered: Vec<Option<usize>> = vec![None; units as usize];
         let mut rests = 0;
+        let mut rejected = false;
         let mut names: Vec<&str> = Vec::new();
         for (index, (field, typed)) in layout.fields.iter().zip(&fields).enumerate() {
             if names.contains(&field.name.text.as_str()) {
@@ -271,6 +272,7 @@ impl Checker<'_> {
             let span = match &field.kind {
                 LayoutFieldKind::Rest if bytes => {
                     self.report(item, field.name.token, Code::LayoutFieldForm);
+                    rejected = true;
                     continue;
                 }
                 LayoutFieldKind::Rest => {
@@ -282,6 +284,7 @@ impl Checker<'_> {
                 }
                 LayoutFieldKind::Bit { .. } if bytes => {
                     self.report(item, field.name.token, Code::LayoutFieldForm);
+                    rejected = true;
                     continue;
                 }
                 LayoutFieldKind::Bit { low, high } => {
@@ -290,6 +293,7 @@ impl Checker<'_> {
                         high.map_or(low, |high| int_literal(data.text(high)).unwrap_or(0) as u64);
                     if high <= low && field_ranged(&field.kind) {
                         self.report(item, field.name.token, Code::LayoutFieldForm);
+                        rejected = true;
                         continue;
                     }
                     (low, high)
@@ -299,6 +303,7 @@ impl Checker<'_> {
                         if !typed.ty.has_error() {
                             self.report(item, field.name.token, Code::LayoutFieldType);
                         }
+                        rejected = true;
                         continue;
                     };
                     let at = int_literal(data.text(*at)).unwrap_or(0) as u64;
@@ -317,7 +322,7 @@ impl Checker<'_> {
                 covered[unit as usize] = Some(index);
             }
         }
-        if rests == 0 && covered.iter().any(Option::is_none) {
+        if rests == 0 && !rejected && covered.iter().any(Option::is_none) {
             let head = self.db.ast(item).token;
             let fixes = match &layout.repr {
                 LayoutRepr::Integer { .. } => self

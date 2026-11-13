@@ -294,7 +294,7 @@ layout_field = 'bit' INT ( "..=" INT )? | 'rest' | type_expr 'at' INT ;
 - In an integer layout, a field is `bit i`, a `bool` occupying bit i; `bit i..=j`, occupying bits i to j as the smallest unsigned integer type holding j − i + 1 bits; `T at i`, where T is an unsigned integer type or an integer layout, occupying its width from bit i; or `rest`. Bit 0 is the least significant. A ranged field whose i is not below its j is an error (`layout.field-form`).
 - In a bytes layout, a field is `T at k`, where T is an integer scalar, a layout or an `Array` of these, occupying its size from byte k. `bit` and `rest` fields in a bytes layout are errors (`layout.field-form`), and a field type that the layout's kind does not list is an error (`layout.field-type`).
 - A field reaching beyond the representation is an error (`layout.out-of-range`), and two fields sharing a bit or byte, or two `rest` fields, are an error (`layout.overlap`).
-- Every bit of an integer layout and every byte of a bytes layout is covered by exactly one field; a `rest` field covers every bit no other field covers. An uncovered bit or byte is an error (`layout.uncovered`), reported on the head line; for an integer layout the exact fix adds `reserved: rest`.
+- Every bit of an integer layout and every byte of a bytes layout is covered by exactly one field; a `rest` field covers every bit no other field covers. An uncovered bit or byte is an error (`layout.uncovered`), reported on the head line; for an integer layout the exact fix adds `reserved: rest`. A layout with a field rejected for its form or type is not checked for coverage, and that field overlaps no other.
 - Fields and tags have the visibility of their layout. A layout has no modifiers, generic parameters or predicates.
 
 ### Layout values
@@ -397,6 +397,13 @@ pub layout Control: u16 le {
     enabled: bit 15
     reserved: rest
 } Control
+```
+
+```nan
+pub layout Status: bytes 2 le {
+    ready: bool at 0 // error: layout.field-type
+    count: u8 at 1
+} Status
 ```
 
 ```nan

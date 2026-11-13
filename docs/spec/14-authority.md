@@ -1253,6 +1253,58 @@ pub fn poll_once(mut regs: hw::Mmio[uart::UartRegs]) -> bool {
 } poll_once
 ```
 
+```nan
+// file: uart/package.nan
+//! 16550 serial registers.
+
+package uart {
+    language 1
+    targets x86_64-bare
+    allow device in uart, uart_regs // error: authority.unknown-name
+} uart
+
+// file: uart/uart.nan
+//! 16550 status reads.
+
+pub layout LineStatus: u8 {
+    data_ready: bit 0
+    reserved: rest
+} LineStatus
+
+pub registers UartRegs {
+    data: u8 at 0x0 read write
+    line_status: LineStatus at 0x5 read
+} UartRegs
+
+pub fn has_byte(mut regs: hw::Mmio[UartRegs]) -> bool {
+    let status = mut regs.read(UartRegs.line_status)
+    return status.data_ready
+} has_byte
+```
+
+```nan
+// file: uart/package.nan
+//! 16550 serial registers.
+
+package uart {
+    language 1
+    targets x86_64-bare
+    allow device in uart // incomplete: unused.grant
+} uart
+
+// file: uart/uart.nan
+//! 16550 status reads.
+
+pub layout LineStatus: u8 {
+    data_ready: bit 0
+    reserved: rest
+} LineStatus
+
+pub fn has_byte(status: LineStatus) -> bool {
+    return status.data_ready
+} has_byte
+```
+
 ## Denied dependencies
 
 `deny a -> b` forbids module `a` from depending on `b`: an item of `a` naming an item or member by a path whose first segment is `b` is an error (`authority.denied-dependency`), reported on each line holding such a path. Only direct dependence, as [modules](03-packages-modules.md#modules) defines it, is denied.

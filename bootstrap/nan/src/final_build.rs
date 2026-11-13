@@ -2,6 +2,8 @@
 //! and building a bundle against a kernel's interface.
 
 mod bundle;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -86,7 +88,7 @@ pub fn build(
         }
     }
     let (lowered, interface, runtime) = lower_program(&checker, source, root, &artefacts);
-    diagnostics.extend(collisions(source, &lowered));
+    diagnostics.extend(collisions(source, &lowered.collisions));
     for lowered in std::iter::once(&lowered).chain(&runtime) {
         diagnostics.extend(lower::stack::judge(
             &checker,
@@ -430,13 +432,12 @@ pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Re
 
 /// The symbol collisions of a lowering for the image of a final-link root or tested package,
 /// each reported on its `package` line, quoting both entities.
-pub fn collisions(package: &Package, lowered: &lower::Lowered) -> Vec<Diagnostic> {
+pub fn collisions(package: &Package, pairs: &[(String, String)]) -> Vec<Diagnostic> {
     let line = package
         .manifest
         .as_ref()
         .map_or(1, |manifest| manifest.line);
-    lowered
-        .collisions
+    pairs
         .iter()
         .map(|(first, second)| Diagnostic {
             because: vec![Reason::note(first), Reason::note(second)],

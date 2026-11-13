@@ -52,6 +52,73 @@ pub fn first_byte(source: Slice[u8]) -> u8
 } first_byte
 ```
 
+```nan
+// file: ring/package.nan
+//! Byte copies for rings.
+
+package ring {
+    language 1
+    targets any
+    allow trusted in ring
+} ring
+
+// file: ring/ring.nan
+//! Copies a prefix between byte views.
+
+pub fn copy_prefix(source: Slice[u8], mut target: SliceMut[u8], count: usize)
+    requires count <= source.len()
+    requires count <= target.len()
+{
+    let from = hw::Ptr.of_view(source)
+    let to = hw::Ptr.of_view_mut(mut target)
+    (trusted "both views hold at least count initialised elements" { // error: trusted.block-value
+        from.copy(to, count)
+    })
+} copy_prefix
+```
+
+```nan
+// file: ring/package.nan
+//! Byte reads for rings.
+
+package ring {
+    language 1
+    targets any
+    allow trusted in ring
+} ring
+
+// file: ring/ring.nan
+//! Reads the first byte of a view.
+
+pub fn first_byte(source: Slice[u8]) -> u8
+    requires source.len() > 0
+{
+    let start = hw::Ptr.of_view(source)
+    return trusted "" { start.read() } // error: trusted.empty-premise
+} first_byte
+```
+
+```nan
+// file: ring/package.nan
+//! Byte reads for rings.
+
+package ring {
+    language 1
+    targets any
+    allow trusted in ring
+} ring
+
+// file: ring/ring.nan
+//! Reads the first byte of a view.
+
+pub fn first_byte(source: Slice[u8]) -> u8
+    requires source.len() > 0
+{
+    let start = hw::Ptr.of_view(source)
+    return trusted "source is a live view of at least one byte" { trusted "start is aligned" { start.read() } } // error: trusted.nested
+} first_byte
+```
+
 ### Trusted primitives
 
 A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `write_cr3_tagged`, `read_msr`, `write_msr`, `write_ttbr0`, `write_ttbr0_tagged`, `write_sysreg`, `invalidate_data_cache` and `firmware_call` ([privileged intrinsics](#privileged-intrinsics)), `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)), `boot::Machine.enter` ([hand-off](24-kernel.md#hand-off)), `sys::load::Loader.prepare_unverified` ([loading](24-kernel.md#loading)) and `sys::load::Loader.isolate_unverified` ([isolated spaces](24-kernel.md#isolated-spaces)).
@@ -289,6 +356,65 @@ pub layout LineStatus: u8 { // error: layout.uncovered
 } LineStatus
 ```
 
+```nan
+pub layout LineStatus: i8 { // error: layout.repr
+    data_ready: bit 0
+    reserved: rest
+} LineStatus
+```
+
+```nan
+pub layout LineStatus: u8 {
+    data_ready: bit 0u8 // error: layout.literal
+    reserved: rest
+} LineStatus
+```
+
+```nan
+pub layout Control: u16 { // error: layout.endianness
+    enabled: bit 15
+    reserved: rest
+} Control
+```
+
+```nan
+pub layout Mode: u8 tags {
+    Real = 0
+    Long = 256 // error: layout.tag-value
+} Mode
+```
+
+```nan
+pub layout PageEntry: u64 le {
+    frame: bit 51..=12 // error: layout.field-form
+    reserved: rest
+} PageEntry
+```
+
+```nan
+pub layout Control: u16 le {
+    mode: i8 at 0 // error: layout.field-type
+    enabled: bit 15
+    reserved: rest
+} Control
+```
+
+```nan
+pub layout LineStatus: u8 {
+    data_ready: bit 0
+    overrun: bit 8 // error: layout.out-of-range
+    reserved: rest
+} LineStatus
+```
+
+```nan
+pub layout LineStatus: u8 {
+    data_ready: bit 0
+    errors: bit 0..=3 // error: layout.overlap
+    reserved: rest
+} LineStatus
+```
+
 ## Registers
 
 A **registers block** is a `registers` item describing a device's registers: for each, its type, its offset in the block and its access. A **volatile access** is a read or write of one register through a [register window](#register-windows), never merged or reordered.
@@ -309,6 +435,47 @@ register_access = 'read' 'write'? | 'write' | 'write_one_clear' ;
 - A register is readable when its access is `read`, `read write` or `write_one_clear`, and writable when it is `write`, `read write` or `write_one_clear`. Writing a `write_one_clear` register clears exactly the bits written as 1, and reading it returns its bits.
 - A registers item is a type without values. Using one as the type of a value, or instantiating `hw::Mmio[R]`, `hw::Ports[R]` or `hw::Register[R, T]` with an R that is neither a registers item nor a type parameter, is an error (`register.window-type`).
 - The member path `R.f` of a register f of R is a value of type `hw::Register[R, T]`, where T is the register's type.
+
+```nan
+pub registers TimerRegs {
+    enabled: bool at 0x0 read write // error: register.type
+} TimerRegs
+```
+
+```nan
+pub registers SerialRegs {
+    data: u8 at 0x0u8 read write // error: register.literal
+} SerialRegs
+```
+
+```nan
+pub registers SerialRegs {
+    irq_status: u32 at 0x6 write_one_clear // error: register.misaligned
+} SerialRegs
+```
+
+```nan
+pub registers SerialRegs {
+    scratch: Array[u32, 4] at 0x10 read write // error: register.stride
+} SerialRegs
+```
+
+```nan
+pub registers SerialRegs {
+    data: u8 at 0x0 read write
+    divisor: u16 at 0x0 read write // error: register.overlap
+} SerialRegs
+```
+
+```nan
+pub registers SerialRegs {
+    data: u8 at 0x0 read write
+} SerialRegs
+
+pub closed struct Console {
+    pub regs: SerialRegs // error: register.window-type
+} Console
+```
 
 ### Register windows
 
@@ -438,6 +605,51 @@ package kernel {
 // file: kernel/kernel.nan
 //! The serial port's registers.
 
+pub registers SerialRegs {
+    data: u8 at 0x0 read write
+} SerialRegs
+
+pub fn receive_byte(mut regs: hw::Mmio[SerialRegs]) -> u8 {
+    let register = SerialRegs.data
+    return mut regs.read(register) // error: register.operand
+} receive_byte
+```
+
+```nan
+// file: kernel/package.nan
+//! Serial console for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! The serial port's registers.
+
+pub registers SerialRegs {
+    data: u8 at 0x0 write
+} SerialRegs
+
+pub fn receive_byte(mut regs: hw::Mmio[SerialRegs]) -> u8 {
+    return mut regs.read(SerialRegs.data) // error: register.not-readable
+} receive_byte
+```
+
+```nan
+// file: kernel/package.nan
+//! Serial console for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! The serial port's registers.
+
 pub layout LineStatus: u8 {
     data_ready: bit 0
     reserved: rest
@@ -451,6 +663,50 @@ pub registers SerialRegs {
 pub fn clear_status(mut regs: hw::Mmio[SerialRegs]) {
     mut regs.write(SerialRegs.line_status, value: LineStatus(data_ready: false, reserved: 0)) // error: register.not-writable
 } clear_status
+```
+
+```nan
+// file: kernel/package.nan
+//! Serial console for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! The serial port's registers.
+
+pub registers SerialRegs {
+    scratch: Array[u32, 4] at 0x10 stride 4 read write
+} SerialRegs
+
+pub fn clear_scratch(mut regs: hw::Mmio[SerialRegs]) {
+    mut regs.write(SerialRegs.scratch, value: Array[u32, 4].filled(0)) // error: register.array-access
+} clear_scratch
+```
+
+```nan
+// file: kernel/package.nan
+//! Timer for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! The timer's port registers.
+
+pub registers TimerRegs {
+    count: u64 at 0x0 read
+} TimerRegs
+
+pub fn count(mut ports: hw::Ports[TimerRegs]) -> u64 { // error: register.port-width
+    return mut ports.read(TimerRegs.count)
+} count
 ```
 
 ```nan
@@ -1151,6 +1407,24 @@ package kernel {
     language 1
     targets x86_64-bare
     allow priv in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Passes raw words.
+
+pub landing fn enter_raw(number: u64) -> Option[u64] limits stack 4_096 { // error: hw.landing-signature
+    return Some(number)
+} enter_raw
+```
+
+```nan
+// file: kernel/package.nan
+//! Raw entry for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow priv in kernel
     allow validate in kernel
 } kernel
 
@@ -1171,6 +1445,25 @@ pub landing fn enter_raw(number: Untrusted[u64], args: Array[Untrusted[u64], 6])
 pub fn echo(number: Untrusted[u64], args: Array[Untrusted[u64], 6]) -> u64 {
     return enter_raw(number, args) // error: hw.landing-called
 } echo
+```
+
+```nan
+// file: kernel/package.nan
+//! Raw entry for a bare kernel.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow priv in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Mints the kernel root grant.
+
+pub landing fn enter(start: usize) -> boot::Kernel limits stack 4_096 {
+    discard start
+    return hw::mint_root() // error: hw.mint-root-misplaced
+} enter
 ```
 
 ## Foreign functions
@@ -1257,6 +1550,26 @@ package procinfo {
 //! Reads the process id from the C library.
 
 foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+pub fn process_id() -> i32 {
+    return getpid()
+} process_id
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on the host.
+
+package procinfo {
+    language 1
+    targets x86_64-host
+    allow trusted in procinfo
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Reads the process id from the C library.
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "cdecl" // error: trusted.convention-unknown
 
 pub fn process_id() -> i32 {
     return getpid()
@@ -1368,6 +1681,25 @@ pub fn release_flag(flag: hw::Ptr[u32]) {
         flag.atomic_store(0, order: hw::Order.Release)
     }
 } release_flag
+```
+
+```nan
+// file: ring/package.nan
+//! Shared flags for rings.
+
+package ring {
+    language 1
+    targets any
+    allow trusted in ring
+} ring
+
+// file: ring/ring.nan
+//! A claim flag shared through a pointer.
+
+pub fn claim_flag(flag: hw::Ptr[bool]) -> bool {
+    let previous = trusted "flag addresses a live bool that every task reaches only atomically" { flag.atomic_swap(true, order: hw::Order.Acquire) } // error: hw.atomic-type
+    return not previous
+} claim_flag
 ```
 
 ## Hardware types

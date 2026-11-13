@@ -107,6 +107,44 @@ pub closed struct Node {
 ```
 
 ```nan
+pub const MAX_LEVEL: u32 = 100
+
+pub closed struct Gauge {
+    pub level: MAX_LEVEL // error: type.not-a-type
+} Gauge
+```
+
+```nan
+pub closed struct Span {
+    pub start: u32
+    pub start: u32 // error: type.duplicate-member
+} Span
+```
+
+```nan
+// file: example/package.nan
+//! Counters.
+
+package example {
+    language 1
+    targets any
+} example
+
+// file: example/example.nan
+//! Reads counters.
+
+pub fn misses_of(counter: tally::Counter) -> u64 = counter.misses // error: type.hidden-field
+
+// file: example/tally/tally.nan
+//! A counter.
+
+pub open struct Counter {
+    pub hits: u64
+    misses: u64
+} Counter
+```
+
+```nan
 pub closed struct Node {
     pub value: u32
     pub next: Option[Node] // error: type.recursive
@@ -304,6 +342,15 @@ pub fn shift_for(scale: meter::Scale) -> u32 {
 ```
 
 ```nan
+pub closed struct Total {
+    pub sum: u64
+    samples: u32 // error: type.closed-hidden-field
+} Total
+
+pub fn Total.count(self) -> u32 = self.samples
+```
+
+```nan
 // file: meter/package.nan
 //! Running totals.
 
@@ -336,6 +383,41 @@ pub fn fresh_sum() -> u64 {
     let total = meter::Total(sum: 0, samples: 0) // error: type.open-construction
     return total.sum
 } fresh_sum
+```
+
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! An open total.
+
+pub open struct Total {
+    pub sum: u64
+    pub samples: u32
+} Total
+
+// file: report/package.nan
+//! Reports meter totals.
+
+package report {
+    language 1
+    targets any
+    dep meter "../meter"
+} report
+
+// file: report/report.nan
+//! Takes a total apart by hand.
+
+pub fn sum_of(total: meter::Total) -> u64 {
+    let meter::Total(sum: sum, samples: _) = total // error: pattern.open-struct
+    return sum
+} sum_of
 ```
 
 ```nan
@@ -412,8 +494,39 @@ pub closed struct Span derives Copy, Eq {
 } Span
 
 pub fn Span.point(position: u32) -> Span {
+    return Span(position, end: position) // error: type.unlabelled-field
+} Span.point
+```
+
+```nan
+pub closed struct Span derives Copy, Eq {
+    pub start: u32
+    pub end: u32 where start <= end
+} Span
+
+pub fn Span.point(position: u32) -> Span {
     return Span(start: position) // error: type.missing-field
 } Span.point
+```
+
+```nan
+pub closed struct Span derives Copy, Eq {
+    pub start: u32
+    pub end: u32 where start <= end
+} Span
+
+pub fn Span.point(position: u32) -> Span {
+    return Span(start: position, end: position, end: position) // error: type.duplicate-label
+} Span.point
+```
+
+```nan
+pub closed enum Shape derives Eq {
+    Dot
+    Segment(u32)
+} Shape
+
+pub fn Shape.origin() -> Shape = Shape.Dot() // error: type.payload-shape
 ```
 
 ## Predicates
@@ -686,6 +799,39 @@ pub fn is_small(size: u32, limit: u32) -> bool {
 } is_small
 ```
 
+```nan
+pub closed struct Point derives Copy, Eq {
+    pub x: i32
+    pub y: i32
+} Point
+
+const ORIGIN: Point = Point(x: 0, y: 0)
+
+pub fn is_origin(point: Point) -> bool {
+    return match point {
+        ORIGIN => true // error: pattern.const-kind
+        else => false
+    }
+} is_origin
+```
+
+```nan
+pub fn is_set(flag: bool) -> bool {
+    return match flag {
+        false..=true => true // error: pattern.range-kind
+    }
+} is_set
+```
+
+```nan
+pub fn is_small(size: u32) -> bool {
+    return match size {
+        10..<10 => true // error: pattern.empty-range
+        else => false
+    }
+} is_small
+```
+
 ### Pattern bindings
 
 The names a pattern binds are distinct (`pattern.duplicate-binding`). What the names of a `for` pattern bind is fixed by [iteration](07-ownership.md#iteration). In a `let` statement or a `match` arm, each name is a pattern binding ([bindings](06-statements-expressions.md#bindings)) and binds its part of the scrutinee as follows:
@@ -694,6 +840,18 @@ The names a pattern binds are distinct (`pattern.duplicate-binding`). What the n
 - A non-Copy part of an owned scrutinee is moved out of it, by a [partial move](07-ownership.md#ownership) when the scrutinee is a place. The scrutinee is **owned** when it is a temporary other than a [part or wrapped part](07-ownership.md#projection-results), or a place that owns its value as [ownership](07-ownership.md#ownership) states.
 - A non-Copy part of any other scrutinee is bound as a [view binding](07-ownership.md#view-bindings), writable only as that section states. While the binding is live, a scrutinee that is a projection result keeps its [hold](07-ownership.md#holds), frozen or held as its projection gives, and a scrutinee that is a place is frozen.
 - Parts matched by a wildcard, literal, range or constant are neither moved nor copied.
+
+```nan
+pub closed struct Span derives Copy, Eq {
+    pub start: u32
+    pub end: u32 where start <= end
+} Span
+
+pub fn Span.length(self) -> u32 {
+    let Span(start: edge, end: edge) = self // error: pattern.duplicate-binding
+    return edge
+} Span.length
+```
 
 ### Refutability
 

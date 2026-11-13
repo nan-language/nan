@@ -128,6 +128,24 @@ pub fn Pair.code(self) -> u32 {
 ```
 
 ```nan
+pub interface Describe {
+    fn code(self) -> u32
+} Describe
+
+pub const LIMIT: u32 = 4
+
+impl LIMIT: Describe // error: interface.impl-target
+```
+
+```nan
+pub closed struct Tag derives Copy {
+    pub id: u32
+} Tag
+
+impl u32: Tag // error: interface.not-interface
+```
+
+```nan
 pub interface Shape {
     fn area(self) -> u64
     fn perimeter(self) -> u64
@@ -143,6 +161,20 @@ pub fn Square.area(self) -> u64 {
     let side = u64.widen(self.side)
     return side * side
 } Square.area
+```
+
+```nan
+pub interface Describe {
+    fn code(self) -> u32
+} Describe
+
+pub closed struct Tag derives Copy {
+    pub id: u32
+} Tag
+
+impl Tag: Describe
+
+fn Tag.code(self) -> u32 = self.id // error: interface.impl-visibility
 ```
 
 ```nan
@@ -245,6 +277,19 @@ pub fn zero_of[T: Default]() -> T { // error: generic.parameter-unused
 } zero_of
 ```
 
+```nan
+pub closed struct Window[N: f64] { // error: generic.const-type
+    pub size: u32
+} Window
+```
+
+```nan
+pub closed struct Pair[T: Copy where true] { // error: generic.where-misplaced
+    pub left: T
+    pub right: T
+} Pair
+```
+
 ## Instantiation
 
 An **instantiation** is a generic item with every generic parameter fixed by an argument.
@@ -278,6 +323,14 @@ pub fn doubled(values: Array[u8, WIDTH]) -> Array[u8, 8] {
 pub const DEPTH: u32 = 4
 
 pub fn layered(values: Array[u8, DEPTH]) -> u8 = 0 // error: type.mismatch
+```
+
+```nan
+pub fn width(values: Array[u8]) -> usize = values.len() // error: generic.arity
+```
+
+```nan
+pub fn width(values: Array[u8, u16]) -> usize = values.len() // error: generic.argument-kind
 ```
 
 ```nan
@@ -470,6 +523,32 @@ pub fn Strip.size(self) -> u64 = u64.widen(self.length)
 pub fn is_short(strip: Strip) -> bool {
     return strip.is_small() // error: interface.unqualified-call
 } is_short
+```
+
+```nan
+pub interface Describe {
+    fn code(self) -> u32 {
+        return 1
+    } code
+} Describe
+
+pub interface Label {
+    fn code(self) -> u32 {
+        return 2
+    } code
+} Label
+
+pub closed struct Tag derives Copy {
+    pub id: u32
+} Tag
+
+impl Tag: Describe
+
+impl Tag: Label
+
+pub fn tag_code(tag: Tag) -> u32 {
+    return tag.code() // error: interface.ambiguous-method
+} tag_code
 ```
 
 ## Coherence
@@ -763,6 +842,27 @@ pub fn is_pressing(priority: Priority) -> bool
 pub closed struct Reading derives Eq { // error: derive.constituent-missing
     pub level: f64
 } Reading
+```
+
+```nan
+pub closed enum Priority derives Copy, Debug { // error: derive.unknown
+    Low
+    Urgent
+} Priority
+```
+
+```nan
+pub closed enum Priority derives Copy, Copy, Eq { // error: derive.duplicate
+    Low
+    Urgent
+} Priority
+```
+
+```nan
+pub closed enum Priority derives Default { // error: derive.enum-default
+    Low
+    Urgent
+} Priority
 ```
 
 ## Diagnostics

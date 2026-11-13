@@ -1,5 +1,8 @@
 //! Diagnostic codes, their classes, and the diagnostics the toolchain reports.
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Error,
@@ -27,6 +30,9 @@ macro_rules! codes {
         }
 
         impl Code {
+            #[cfg(test)]
+            pub const ALL: &[Code] = &[$(Code::$variant,)*];
+
             pub fn name(self) -> &'static str {
                 match self {
                     $(Code::$variant => $name,)*

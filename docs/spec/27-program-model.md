@@ -414,6 +414,24 @@ fn main(take world: host::World) fails task::Cancelled { // error: target.entry-
 } main
 ```
 
+```nan
+// file: status/package.nan
+//! Logs a start line.
+
+package status {
+    language 1
+    targets x86_64-host
+    entry start // error: target.entry-missing
+} status
+
+// file: status/status.nan
+//! Entry of the status program.
+
+fn start(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("starting", value: 1u32)
+} start
+```
+
 ### Host runs
 
 A program run on a host target is one Linux process:

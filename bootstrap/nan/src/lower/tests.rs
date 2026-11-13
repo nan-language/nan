@@ -4,6 +4,7 @@ use super::{Instance, Lowering, dumping};
 use crate::check::checked;
 use crate::check::db::ItemId;
 use crate::check::ty::no_args;
+use crate::diagnostic::Code;
 use crate::nir::Role;
 use crate::workspace::tests::Scratch;
 use crate::workspace::{Target, Workspace};
@@ -51,7 +52,17 @@ fn distinct_instances_with_one_symbol_name_collide() {
         item,
         args: no_args(),
     });
-    assert_eq!(lowering.collisions.len(), 1);
+    let pairs: Vec<(String, String)> = (lowering.collisions.iter())
+        .map(|(first, second)| {
+            let entity = |instance| super::symbols::entity(&checker, instance);
+            (entity(first), entity(second))
+        })
+        .collect();
+    let reported: Vec<Code> = crate::final_build::collisions(&workspace.packages[0], &pairs)
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect();
+    assert_eq!(reported, [Code::ArtefactSymbolCollision]);
 }
 
 /// A function computing only on Secret values, and each Secret member it calls, lowers to one

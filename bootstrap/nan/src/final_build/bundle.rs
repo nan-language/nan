@@ -233,7 +233,7 @@ pub fn bundle(
         level: read.level,
     };
     let lowered = lower::lower_bundle(&checker, &bundle);
-    diagnostics.extend(collisions(source, &lowered));
+    diagnostics.extend(collisions(source, &lowered.collisions));
     diagnostics.extend(lower::stack::judge(
         &checker,
         &lowered.frames,

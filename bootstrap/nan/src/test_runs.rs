@@ -554,7 +554,7 @@ fn build(
     }
     let lowered = lower(checker, workspace, package, tests);
     let data = checker.db.package(package);
-    let collisions = crate::final_build::collisions(data.source, &lowered);
+    let collisions = crate::final_build::collisions(data.source, &lowered.collisions);
     if !collisions.is_empty() {
         return Ok(Err(collisions));
     }

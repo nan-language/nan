@@ -469,6 +469,18 @@ pub fn rounded(value: f64) -> i64
 ```
 
 ```nan
+pub fn level_byte(level: f64) -> u8 {
+    return u8.truncate(level) // error: num.conversion-undefined
+} level_byte
+```
+
+```nan
+pub fn level_word(level: u32) -> u32 {
+    return u32.fit(level) // error: num.same-type-conversion
+} level_word
+```
+
+```nan
 pub fn level_byte(level: u32) -> u8 {
     return u8.widen(level) // error: num.widen-lossy
 } level_byte

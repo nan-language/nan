@@ -230,6 +230,14 @@ pub fn forget(fs: sys::Fs) fails sys::fs::FsError uses wait {
 } forget
 ```
 
+```nan
+pub fn enable(fs: sys::Fs) fails sys::fs::FsError uses wait limits restorable
+    undo enable "the flag holds 0 before enable runs" // error: effect.undo-target
+{
+    try await fs.write_all("flag", data: b"1")
+} enable
+```
+
 ## Propagation
 
 Facts propagate through direct calls. The **own operations** of a function or closure are the operations of its body outside the bodies of the [closures](07-ownership.md#closures) it holds. Its digest is the join of the facts of its own operations with:
@@ -520,6 +528,26 @@ pub fn announce(log: sys::Log, count: u32) -> u32 limits pure {
 
 ```nan
 pub fn checksum(data: Slice[u8]) -> u64 limits pure, noalloc { // error: limit.redundant
+    var total: u64 = 0
+    for byte in data {
+        total = total.wrapping_add(u64.widen(byte))
+    }
+    return total
+} checksum
+```
+
+```nan
+pub fn checksum(data: Slice[u8]) -> u64 limits notrap, notrap { // error: limit.duplicate
+    var total: u64 = 0
+    for byte in data {
+        total = total.wrapping_add(u64.widen(byte))
+    }
+    return total
+} checksum
+```
+
+```nan
+pub fn checksum(data: Slice[u8]) -> u64 limits stack 0 { // error: limit.stack-size
     var total: u64 = 0
     for byte in data {
         total = total.wrapping_add(u64.widen(byte))
@@ -873,6 +901,48 @@ pub fn is_set(byte: u8) -> bool fails FlagError {
 pub fn set_count(data: Slice[u8]) -> usize {
     return count_matching(data, matches: is_set) // error: effect.fit-fails
 } set_count
+```
+
+```nan
+pub fn count_matching(data: Slice[u8], matches: fn(byte: u8) -> bool limits notrap) -> usize {
+    var count: usize = 0
+    for byte in data {
+        if matches(byte) {
+            count += 1
+        }
+    }
+    return count
+} count_matching
+
+pub fn task_count(data: Slice[u8], matches: task fn(byte: u8) -> bool) -> usize {
+    return count_matching(data, matches) // error: effect.fit-kind
+} task_count
+```
+
+```nan
+pub closed struct Matcher {
+    pub matches: fn(byte: u8) -> bool
+} Matcher
+
+pub fn is_wide(code: u16) -> bool = code > 0xFF
+
+pub fn wide_matcher() -> Matcher {
+    return Matcher(matches: is_wide) // error: effect.fit-head
+} wide_matcher
+```
+
+```nan
+pub closed struct Waiter {
+    pub ready: fn(byte: u8) -> bool fails task::Cancelled uses wait
+} Waiter
+
+pub closed struct Matcher {
+    pub matches: fn(byte: u8) -> bool fails task::Cancelled
+} Matcher
+
+pub fn matcher_of(waiter: Waiter) -> Matcher {
+    return Matcher(matches: waiter.ready) // error: effect.fit-wait
+} matcher_of
 ```
 
 ## Higher-order calls

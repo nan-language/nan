@@ -436,3 +436,104 @@ fn a_command_without_a_current_directory_is_an_internal_error_naming_it() {
         )
     );
 }
+
+/// A workspace of `meter` and `app`, which depends on it by path, with the lock of `app`.
+fn meter_and_app() -> Scratch {
+    let meter = "//! A package.\n\npackage meter {\n    language 1\n    targets any\n} meter\n";
+    let app = "//! A package.\n\npackage app {\n    language 1\n    targets any\n    dep meter \"../meter\"\n} app\n";
+    let scratch = Scratch::new(&[
+        ("meter/package.nan", meter),
+        (
+            "meter/meter.nan",
+            "//! Meters.\n\n/// One.\npub fn one() -> u32 = 1\n",
+        ),
+        ("app/package.nan", app),
+        (
+            "app/app.nan",
+            "//! Apps.\n\n/// Two.\npub fn two() -> u32 = meter::one() + 1\n",
+        ),
+    ]);
+    assert_eq!(run_in(&scratch.0, "dep sync app").status, 0);
+    scratch
+}
+
+/// The code and location of each diagnostic record of an output.
+fn records(output: &str) -> Vec<String> {
+    (output.lines())
+        .filter(|line| line.starts_with("error ") || line.starts_with("incomplete "))
+        .map(|line| line.split(' ').take(3).collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+#[test]
+fn a_locked_release_neither_its_path_nor_the_store_holds_is_missing() {
+    let scratch = meter_and_app();
+    fs::remove_dir_all(crate::workspace::tests::home().join(".nan/store")).expect("the store");
+    fs::remove_dir_all(scratch.0.join("meter")).expect("meter");
+    let checked = run_in(&scratch.0, "check app");
+    assert_eq!(
+        records(&checked.output),
+        ["error dep.release-missing app/package.nan:6"]
+    );
+}
+
+#[test]
+fn a_package_its_own_closure_holds_closes_a_cycle() {
+    let scratch = meter_and_app();
+    let path = scratch.0.join("app/.nan/lock.nan");
+    let Ok(mut lock) = crate::machine::lock::Lock::read(&fs::read(&path).expect("the lock")) else {
+        panic!("an invalid lock");
+    };
+    let mut own = lock.deps[0].clone();
+    own.package = "app".to_owned();
+    own.alias = None;
+    own.source = ".".to_owned();
+    lock.deps.insert(0, own);
+    fs::write(&path, lock.bytes().expect("a lock")).expect("write the lock");
+    let meter = "//! A package.\n\npackage meter {\n    language 1\n    targets any\n    dep app \"../app\"\n} meter\n";
+    fs::write(scratch.0.join("meter/package.nan"), meter).expect("write the manifest");
+    let checked = run_in(&scratch.0, "check app");
+    assert!(
+        records(&checked.output).contains(&"error dep.cycle app/package.nan:6".to_owned()),
+        "{}",
+        checked.output
+    );
+}
+
+#[test]
+fn a_user_directory_others_may_write_is_exposed() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = meter_and_app();
+    let user = crate::workspace::tests::home().join(".nan");
+    let mode = |mode| fs::set_permissions(&user, fs::Permissions::from_mode(mode));
+    mode(0o777).expect("open the user directory");
+    let synced = run_in(&scratch.0, "dep sync app");
+    mode(0o700).expect("close the user directory");
+    assert_eq!(
+        records(&synced.output),
+        ["error build.cache-exposed ~/.nan"]
+    );
+}
+
+#[test]
+fn a_path_rewrite_to_another_interface_form_does_not_preserve() {
+    let meter = "//! A package.\n\npackage meter {\n    language 1\n    targets any\n} meter\n";
+    let scratch = Scratch::new(&[
+        ("meter/package.nan", meter),
+        (
+            "meter/meter.nan",
+            "//! Meters.\n\n/// The mean.\npub fn mean(x: u32) -> u32 = x\n",
+        ),
+    ]);
+    let publish = || {
+        assert_eq!(run_in(&scratch.0, "api update meter").status, 0);
+        run_in(&scratch.0, "publish --local meter")
+    };
+    assert_eq!(publish().status, 0);
+    let retired = "//! Meters.\n\n/// The average.\npub fn average(x: u64) -> u64 = x\n\nretired mean => average preserves\n";
+    fs::write(scratch.0.join("meter/meter.nan"), retired).expect("write the source");
+    assert_eq!(
+        records(&publish().output),
+        ["error retired.not-preserved meter/meter.nan:6"]
+    );
+}

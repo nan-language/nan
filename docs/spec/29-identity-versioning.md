@@ -505,6 +505,75 @@ The **local store** is the store of one user's releases, in the user directory (
 
 With `--as`, the publisher is the given principal and the release's **author principals** are the `--author` principals, the publisher alone when none is given. Step 1's release gate then applies the [author rule](31-trust.md#author-rule) to them, and step 6 writes the artefact's [sections](30-artefacts.md#sections): its signature by the publisher, its certificate with the publisher as builder, and its provenance naming the author principals. A principal outside the principal form is an error (`seal.bad-principal`), and so is a publisher without a [secret key](31-trust.md#principals), or whose secret key's public key differs from the one the package's principals file gives it (`key.missing`); the package is then not published. `--author` without `--as` is `tool.usage`.
 
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! Totals of samples.
+
+pub const START: u64 = 0
+
+// file: report/package.nan
+//! Reports meter totals.
+
+package report {
+    language 1
+    targets any
+    dep meter "meter"
+} report
+
+// file: report/.nan/history.nan
+nan history 1
+name "report"
+head "aee3thhlicxhty5oa744qupoqsjo2rpxmf32n6rchd5njkys4may4mp"
+check "afsiq3a6v4hy3tlzg5iqw5vfj6ttzhf54unbrywkj6sv3htmxqsq6n7"
+
+// file: report/report.nan
+//! Totals of reports.
+
+pub const FIRST: u64 = meter::START
+
+// file: app/package.nan
+//! Tallies reports.
+
+package app {
+    language 1
+    targets any
+    dep report "../report"
+} app
+
+// file: app/app.nan
+//! Tallies of reports.
+
+pub const BASE: u64 = report::FIRST
+```
+
+```text
+$ nan publish --local meter --breaking meter::LIMIT clamps
+failed publish --local meter --breaking meter::LIMIT clamps: files 0, errors 1, incomplete 0
+error version.breaking-target meter/package.nan:3 meter
+    package meter {
+failed publish --local meter --breaking meter::LIMIT clamps: files 0, errors 1, incomplete 0
+$ nan publish --local report --name meter
+failed publish --local report --name meter: files 0, errors 2, incomplete 0
+error version.parent-missing report/package.nan:3 report
+    package report {
+error version.store-name-taken report/package.nan:3 report
+    package report {
+failed publish --local report --name meter: files 0, errors 2, incomplete 0
+$ nan publish --local app
+failed publish --local app: files 0, errors 1, incomplete 0
+error version.path-dependency app/package.nan:6 app
+        dep report "../report"
+failed publish --local app: files 0, errors 1, incomplete 0
+```
+
 ## Lock
 
 The **lock** of a package is its machine file `.nan/lock.nan`, written only by `nan dep add`, `nan dep sync`, `nan dep approve`, `nan upgrade` without `--language` and the [merge driver](33-toolchain.md#merge-driver). It records:

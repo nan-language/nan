@@ -103,7 +103,7 @@ The [code root](30-artefacts.md#code-roots) of every artefact records its packag
 
 The command writes the changed source files only when no step reports an error; otherwise it writes nothing. With `--language`, `nan upgrade` performs no resolution, fetches nothing and writes no machine file.
 
-Upgrading the package of this block to the version it states changes no file:
+Upgrading the package of this block to the version it states changes no file, and downgrading it is an error:
 
 ```nan
 pub const MAX_PAYLOAD: u16 = 1_400
@@ -113,6 +113,12 @@ pub const MAX_PAYLOAD: u16 = 1_400
 $ nan upgrade --language 1
 ok upgrade . --language 1: files 0, errors 0, incomplete 0
 ok upgrade . --language 1: files 0, errors 0, incomplete 0
+$ nan upgrade --language 0
+failed upgrade . --language 0: files 0, errors 2, incomplete 0
+error language.unsupported - -
+error language.downgrade example/package.nan:4 example
+        language 1
+failed upgrade . --language 0: files 0, errors 2, incomplete 0
 ```
 
 ## Prover monotonicity

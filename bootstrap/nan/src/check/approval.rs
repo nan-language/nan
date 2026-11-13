@@ -3,6 +3,9 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+mod tests;
+
 use super::Checker;
 use super::db::PackageId;
 use super::ledger::Kind;

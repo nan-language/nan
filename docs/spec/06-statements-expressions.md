@@ -100,6 +100,16 @@ pub fn byte_count(values: Slice[u8]) -> usize {
 } byte_count
 ```
 
+```nan
+pub fn first_byte(values: Slice[u8]) -> Option[u8] {
+    let fallback = None // error: generic.uninferred
+    if values.len() == 0 {
+        return fallback
+    }
+    return Some(values[0])
+} first_byte
+```
+
 ## Assignment
 
 ```ebnf
@@ -196,6 +206,20 @@ pub fn advance_twice(mut counter: Counter) -> u32 {
 ```
 
 ```nan
+pub closed struct Counter {
+    pub count: u32
+} Counter
+
+pub fn Counter.reset(mut self) {
+    self.count = 0
+} Counter.reset
+
+pub fn restart(mut counter: Counter) {
+    discard mut counter.reset() // error: stmt.discard-unit
+} restart
+```
+
+```nan
 pub fn reopened(alloc: mem::Alloc) -> usize {
     let bytes = mem::Bytes.empty(alloc)
     discard bytes
@@ -246,6 +270,31 @@ pub fn first_blank_row(cells: Slice[u8], width: usize) -> Option[usize] {
         return Some(row)
     }
 } first_blank_row
+```
+
+```nan
+pub fn first_zero(values: Slice[u32]) -> Option[usize] {
+    var index: usize = 0
+    loop as scan { // error: stmt.unused-label
+        if index >= values.len() {
+            return None
+        }
+        if values[index] == 0 {
+            break
+        }
+        index += 1
+    }
+    return Some(index)
+} first_zero
+```
+
+```nan
+pub fn first_byte(line: Slice[u8]) -> u8 {
+    if line.len() == 0 {
+        break // error: stmt.no-loop
+    }
+    return line[0]
+} first_byte
 ```
 
 ```nan
@@ -315,6 +364,17 @@ pub fn digit_value(byte: u8) -> u8 {
     }
     return digit
 } digit_value
+```
+
+```nan
+pub closed struct Totals {
+    pub sum: u64
+} Totals
+
+pub fn Totals.add(mut self, value: u8) {
+    self.sum += u64.widen(value)
+    return self.sum // error: stmt.return-value
+} Totals.add
 ```
 
 ```nan
@@ -424,6 +484,15 @@ pub fn doubled_or_zero(reading: Option[u32]) -> u32 {
 } doubled_or_zero
 ```
 
+```nan
+pub fn doubled_or_zero(reading: u32) -> u32 {
+    let value = reading else { // error: stmt.irrefutable-else
+        return 0
+    }
+    return value.saturating_mul(2)
+} doubled_or_zero
+```
+
 ## Match
 
 ```ebnf
@@ -455,6 +524,21 @@ pub fn Command.is_motion(self) -> bool {
         Command.Stop or Command.Pause => false
     }
 } Command.is_motion
+```
+
+```nan
+pub closed enum Command {
+    Start
+    Stop
+    Step(u32)
+} Command
+
+pub fn Command.distance(self) -> u32 {
+    return match self {
+        Command.Step(count) or Command.Start => count // error: expr.or-bindings
+        Command.Stop => 0
+    }
+} Command.distance
 ```
 
 ```nan
@@ -505,6 +589,22 @@ pub fn may_cross(light: Light) -> bool {
     return match light { // error: expr.non-exhaustive
         Light.Green => true
         Light.Amber => false
+    }
+} may_cross
+```
+
+```nan
+pub closed enum Light {
+    Red
+    Amber
+    Green
+} Light
+
+pub fn may_cross(light: Light) -> bool {
+    return match light {
+        Light.Green => true
+        Light.Amber or Light.Red => false
+        else => false // error: expr.unreachable-arm
     }
 } may_cross
 ```
@@ -745,6 +845,20 @@ pub fn clamp_reading(reading: u32, limit: u32) -> u32 {
 ```
 
 ```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+pub fn Gauge.read(self) -> u32 {
+    return self.level
+} Gauge.read
+
+pub fn level_of(gauge: Gauge) -> u32 {
+    return gauge.read(0) // error: expr.argument-count
+} level_of
+```
+
+```nan
 pub fn clamp_to(value: u32, low: u32, high: u32) -> u32 {
     if value < low {
         return low
@@ -890,6 +1004,20 @@ pub closed struct Handler {
 pub fn Handler.apply(self, arg: u32) -> u32 {
     return self.run(arg) // error: expr.field-call
 } Handler.apply
+```
+
+```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+pub fn Gauge.read(self) -> u32 {
+    return self.level
+} Gauge.read
+
+pub fn level_of(gauge: Gauge) -> u32 {
+    return gauge.read // error: expr.method-value
+} level_of
 ```
 
 ## Evaluation order
@@ -1064,6 +1192,25 @@ waive_clause = "waive" ( 'depth' | 'length' ) TEXT NL ;
 - `waive depth "why"` accepts every `threshold.depth` excess of its body, and `waive length "why"` its `threshold.length` excess. The text states the reason; a reason that is empty or holds only spaces is an error (`threshold.empty-reason`).
 - A waiver for a threshold the body does not exceed, or a second waiver of one kind, is an error (`threshold.unused-waiver`), whose exact fix deletes it.
 - The [ledger](31-trust.md#ledger) lists every waiver.
+
+```nan
+pub fn has_repeat(values: Slice[u8], skip: u8) -> bool
+    waive depth "" // error: threshold.empty-reason
+{
+    for left in 0..<values.len() {
+        if values[left] != skip {
+            for right in 0..<values.len() {
+                if left != right {
+                    if values[left] == values[right] {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+} has_repeat
+```
 
 ```nan
 pub fn double(value: u32) -> u32

@@ -359,6 +359,14 @@ pub fn drain(mut totals: Totals) {
 
 A **projection** is a function with the `proj` [modifier](02-items.md#modifiers), whose result derives only from its receiver. A read projection takes `self` and a mut projection `mut self`; a `proj fn` whose first parameter is neither is an error (`own.proj-receiver`).
 
+```nan
+pub closed struct Inbox {
+    pub dropped: u32
+} Inbox
+
+pub proj fn dropped_of(inbox: Inbox) -> u32 = inbox.dropped // error: own.proj-receiver
+```
+
 ### Projection results
 
 The result of a projection has one of three forms, fixed by the result type `R` of its head, judged with every type parameter counted as no view:
@@ -413,6 +421,29 @@ pub fn newest_seq(inbox: Inbox) -> Option[u32] {
     }
     return Some(frame.seq)
 } newest_seq
+```
+
+```nan
+pub closed struct Frame {
+    pub seq: u32
+    pub payload: mem::List[u8]
+} Frame
+
+pub closed struct Inbox {
+    pub frames: mem::List[Frame]
+} Inbox
+
+pub proj fn Inbox.newest(self) -> Option[Frame] {
+    let count = self.frames.len()
+    if count == 0 {
+        return None
+    }
+    return Some(self.frames[count - 1])
+} Inbox.newest
+
+pub fn newest_frame(inbox: Inbox) -> Option[Frame] {
+    return inbox.newest() // error: own.wrapped-part-use
+} newest_frame
 ```
 
 A name bound to a part, by `let`, a pattern or a `for` over a read cursor, derives from what the part derives from, so a projection returns it:
@@ -528,6 +559,16 @@ pub fn third(data: Slice[u8]) -> u8 {
 test short_input for third {
     expect third(b"ab") == 0
 } short_input
+```
+
+```nan
+pub closed struct Inbox {
+    pub dropped: u32
+} Inbox
+
+pub fn first_dropped(inbox: Inbox) -> u32 {
+    return inbox[0] // error: own.not-indexable
+} first_dropped
 ```
 
 ## View bindings
@@ -693,6 +734,12 @@ pub fn add_after_newest(mut inbox: Inbox, take extra: Frame) -> usize {
     mut inbox.frames.push(take extra) // error: own.conflict
     return newest.payload.len()
 } add_after_newest
+```
+
+```nan
+pub fn latch(mut kept: Slice[u8], payload: mem::List[u8]) {
+    kept = payload.view() // error: own.view-escape
+} latch
 ```
 
 ### Conflict reports
@@ -903,6 +950,16 @@ pub fn clamp_all(levels: Array[u8, 8], ceiling: u8) {
 } clamp_all
 ```
 
+```nan
+pub fn total(count: u32) -> u32 {
+    var sum: u32 = 0
+    for step in count { // error: own.not-iterable
+        sum += step
+    }
+    return sum
+} total
+```
+
 ## Closures
 
 A **closure** is a function expression; a **capture** is a place of the enclosing body that a closure's body names. A closure has a short form `fn(x: T) => e` or a long form with a head and a block, each with an optional capture list.
@@ -1001,6 +1058,43 @@ pub fn count_nonzero(values: Slice[u32]) -> u32 {
 ```
 
 ```nan
+pub fn each_value(values: Slice[u32], visit: fn(value: u32)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+pub fn count_nonzero(values: Slice[u32]) -> u32 {
+    var count: u32 = 0
+    each_value(values, visit: fn[mut count, mut count](value: u32) { // error: closure.capture-duplicate
+        if value > 0 {
+            count += 1
+        }
+    })
+    return count
+} count_nonzero
+```
+
+```nan
+pub fn each_value(values: Slice[u32], visit: fn(value: u32)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+pub fn count_nonzero(values: Slice[u32]) -> u32 {
+    var count: u32 = 0
+    var seen: u32 = 0
+    each_value(values, visit: fn[mut count, mut seen](value: u32) { // error: closure.capture-unused
+        if value > 0 {
+            count += 1
+        }
+    })
+    return count
+} count_nonzero
+```
+
+```nan
 pub closed struct Stage {
     pub apply: fn(value: u32) -> u32
 } Stage
@@ -1008,6 +1102,49 @@ pub closed struct Stage {
 pub fn lowering_stage(floor: u32) -> Stage {
     return Stage(apply: fn(value: u32) => value.saturating_sub(floor)) // error: closure.second-class
 } lowering_stage
+```
+
+```nan
+pub closed enum FlagError derives Eq, Render {
+    Unknown(u8)
+} FlagError
+
+pub fn is_set(byte: u8) -> bool fails FlagError {
+    if byte > 1 {
+        fail FlagError.Unknown(byte)
+    }
+    return byte == 1
+} is_set
+
+pub fn count_where(data: Slice[u8], keep: fn(byte: u8) -> bool fails FlagError) -> usize fails FlagError {
+    var count: usize = 0
+    for byte in data {
+        if try keep(byte) {
+            count += 1
+        }
+    }
+    return count
+} count_where
+
+pub fn set_count(data: Slice[u8]) -> usize fails FlagError {
+    return try count_where(data, keep: fn(byte: u8) => try is_set(byte)) // error: closure.short-effect
+} set_count
+```
+
+```nan
+pub closed struct Inbox {
+    pub dropped: u32
+} Inbox
+
+pub proj fn Inbox.dropped_count(self) -> u32 = self.dropped
+
+pub closed struct Stage {
+    pub apply: fn(inbox: Inbox) -> u32
+} Stage
+
+pub fn dropped_stage() -> Stage {
+    return Stage(apply: Inbox.dropped_count) // error: closure.projection-value
+} dropped_stage
 ```
 
 ## Result location

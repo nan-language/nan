@@ -297,6 +297,55 @@ A **compare-and-swap edit** replaces one item only while its item hash is unchan
 
 A malformed or mis-checksummed hash is `tool.usage`.
 
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! Totals of samples.
+
+pub fn mean(total: u64, count: u64) -> u64 = total / count.max(1)
+
+// file: two.txt
+pub fn mean(total: u64, count: u64) -> u64 = total / count.max(1)
+
+pub fn half(total: u64) -> u64 = total / 2
+
+// file: median.txt
+pub fn median(total: u64, count: u64) -> u64 = total / count.max(1)
+
+// file: narrow.txt
+pub fn mean(total: u64, count: u64) -> u32 = total / count.max(1)
+```
+
+```text
+$ nan edit replace meter::mean --expect afl2l7z66yterlysb2 --from two.txt
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from two.txt: files 0, errors 1, incomplete 0
+error edit.not-one-item meter/meter.nan:3 meter::mean
+    pub fn mean(total: u64, count: u64) -> u64 = total / count.max(1)
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from two.txt: files 0, errors 1, incomplete 0
+$ nan edit replace meter::mean --expect afl2l7z66yterlysb2 --from median.txt
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from median.txt: files 0, errors 1, incomplete 0
+error edit.identity-changed meter/meter.nan:3 meter::mean
+    pub fn mean(total: u64, count: u64) -> u64 = total / count.max(1)
+    because command - - nan edit rename
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from median.txt: files 0, errors 1, incomplete 0
+$ nan edit replace meter::mean --expect afl2l7z66yterlysb2 --from narrow.txt
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from narrow.txt: files 0, errors 2, incomplete 0
+error edit.check-failed meter/meter.nan:3 meter::mean
+    pub fn mean(total: u64, count: u64) -> u64 = total / count.max(1)
+error type.mismatch meter/meter.nan:3 meter::mean
+    pub fn mean(total: u64, count: u64) -> u32 = total / count.max(1)
+    expected: u32
+    found: u64
+failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from narrow.txt: files 0, errors 2, incomplete 0
+```
+
 ### Rename and move
 
 `nan edit rename <item> <name>` renames an item or member; `nan edit move <item> <module>` moves an item to another module of its package, with the functions named after it and the impl lines naming it in its module. Each:
@@ -349,6 +398,39 @@ A conflicting item or file, or a source file with a version that does not lex, i
 
 - A source file holding a conflict block is an error (`merge.unresolved`), reported on the block's first line in place of every diagnostic of its lines, with two exact fixes keeping ours' or theirs' text.
 - A **semantic conflict** is an error (`merge.semantic-conflict`): one side changed the interface hash of an item I, and the other added an item J naming I or changed J so that it names I where its base did not. It is reported on J, quoting I's base and changed `api` lines; the file form reports it when I and J lie in the file.
+
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! Sample limits.
+
+pub const LIMIT: u32 = 10
+
+// file: ours.txt
+//! Sample limits.
+
+pub const LIMIT: u32 = 20
+
+// file: theirs.txt
+//! Sample limits.
+
+pub const LIMIT: u32 = 30
+```
+
+```text
+$ nan merge meter/meter.nan ours.txt theirs.txt --path meter/meter.nan
+failed merge meter/meter.nan ours.txt theirs.txt --path meter/meter.nan: files 1, conflicts 1, errors 1
+error merge.conflict meter/meter.nan:3 -
+wrote ours.txt
+failed merge meter/meter.nan ours.txt theirs.txt --path meter/meter.nan: files 1, conflicts 1, errors 1
+```
 
 ## Last green
 

@@ -1058,6 +1058,25 @@ pub protocol Relay {
 } Relay
 ```
 
+```nan
+pub protocol Gate {
+    pub fn post(at: u64) limits pure // error: component.operation-name
+} Gate
+```
+
+```nan
+pub protocol Gate {
+    pub fn open(at: u64) limits pure
+        decreases at // error: component.operation-clause
+} Gate
+```
+
+```nan
+pub protocol Gate summary mem::Bytes { // error: component.summary-type
+    pub fn open(at: u64) limits pure
+} Gate
+```
+
 A [capability kind](14-authority.md#capability-kinds) is a handle type:
 
 ```nan

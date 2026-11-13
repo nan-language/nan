@@ -493,6 +493,18 @@ test describe_counts for describe {
 ```
 
 ```nan
+pub fn describe(mut out: text::String, template: Str, seq: u32) {
+    mut out.write(text::fmt(template, seq), budget: 64) // error: text.template-not-literal
+} describe
+```
+
+```nan
+pub fn describe(mut out: text::String, seq: u32) {
+    mut out.write(text::fmt("frame {seq} {ok", seq), budget: 64) // error: text.template-malformed
+} describe
+```
+
+```nan
 pub fn describe(mut out: text::String, seq: u32) {
     mut out.write(text::fmt("frame {seq} of {total}", seq), budget: 64) // error: text.hole-unbound
 } describe
@@ -501,6 +513,12 @@ pub fn describe(mut out: text::String, seq: u32) {
 ```nan
 pub fn describe(mut out: text::String, seq: u32, total: u32) {
     mut out.write(text::fmt("frame {seq}", seq, total), budget: 64) // error: text.argument-unused
+} describe
+```
+
+```nan
+pub fn describe(mut out: text::String, seq: u32, total: u32) {
+    mut out.write(text::fmt("frame {seq}", seq, seq: total), budget: 64) // error: text.argument-duplicate
 } describe
 ```
 
@@ -539,6 +557,20 @@ pub closed struct Reading derives Copy, Eq, Encode {
     pub sensor: u16
     pub level: i32
 } Reading
+```
+
+```nan
+pub closed struct Reading {
+    pub sensor: u16
+} Reading
+
+impl Reading: Encode // error: encode.manual-impl
+```
+
+```nan
+pub closed view struct Excerpt derives Encode { // error: encode.view
+    pub text: Str
+} Excerpt
 ```
 
 ```nan
@@ -1184,9 +1216,161 @@ struct FirstSettings derives Encode {
     retries: u8
 } FirstSettings
 
+migrate fn Settings.from_first(old: FirstSettings) -> Settings limits notrap, terminates { // error: encode.migrate-form
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
+```
+
+```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
+check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+
+// file: settings/settings.nan
+//! The settings record and the shape of its first release.
+
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.from_first(take old: FirstSettings) -> Settings { // error: encode.migrate-limits
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
+```
+
+```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
+check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+
+// file: settings/settings.nan
+//! The settings record and the shape of its first release.
+
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates { // error: encode.migrate-effect
+    discard core::atomic::AtomicU32.of(0)
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
+```
+
+```nan
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
 migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates { // error: encode.migrate-schema
     return Settings(retries: old.retries, backoff: 100)
 } Settings.from_first
+```
+
+```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
+check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+
+// file: settings/settings.nan
+//! The settings record and the shape of its first release.
+
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates {
+    return Settings(retries: old.retries, backoff: 100)
+} Settings.from_first
+
+migrate fn Settings.from_older(take old: FirstSettings) -> Settings limits notrap, terminates { // error: encode.migrate-duplicate
+    return Settings(retries: old.retries, backoff: 50)
+} Settings.from_older
+```
+
+```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
+check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+
+// file: settings/settings.nan
+//! The settings record and the shape of its first release.
+
+pub closed struct Settings derives Encode {
+    pub retries: u8
+    pub backoff: u16
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+migrate fn Settings.to_first(self) -> FirstSettings limits notrap, terminates { // error: encode.migrate-inverse-alone
+    return FirstSettings(retries: self.retries)
+} Settings.to_first
 ```
 
 ## Base64

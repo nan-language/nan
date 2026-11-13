@@ -63,6 +63,36 @@ pub closed struct Gain {
 pub registry gains: Gain keyed by level // error: registry.key-type
 ```
 
+```nan
+pub registry levels: u8 keyed by level // error: registry.entry-type
+```
+
+```nan
+pub closed struct Port {
+    pub number: u16
+} Port
+
+pub registry ports: Port keyed by address // error: registry.unknown-field
+```
+
+```nan
+pub closed struct Gain {
+    pub id: u8
+    pub level: f32
+} Gain
+
+pub registry gains: Gain keyed by id unique level // error: registry.unique-type
+```
+
+```nan
+pub closed struct Port {
+    pub number: u16
+    pub irq: u8
+} Port
+
+pub registry ports: Port keyed by number unique irq, number // error: registry.unique-repeated
+```
+
 ## Contributions
 
 A **contribution** is a `contribute` item adding one entry to a registry.
@@ -221,6 +251,26 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     world.log.info("codecs", value: codecs::formats.len())
     world.log.info("short frame tag", value: framing::SHORT_TAG)
 } main
+```
+
+```nan
+// file: codecs/package.nan
+//! Frame codec registry.
+
+package codecs {
+    language 1
+    targets any
+    allow contribute formats in framing // error: registry.grant-not-alias
+} codecs
+
+// file: codecs/codecs.nan
+//! The table of frame codecs, keyed by frame tag.
+
+pub closed struct Codec {
+    pub tag: u8
+} Codec
+
+pub registry formats: Codec keyed by tag
 ```
 
 ## Function fields
@@ -484,6 +534,26 @@ interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_02
 } on_timer
 
 contribute hw::vectors timer = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.Irq(on_timer)) // error: registry.platform-entry
+```
+
+```nan
+// file: kernel/package.nan
+//! Timer interrupts for a bare kernel and its host build.
+
+package kernel {
+    language 1
+    targets x86_64-bare, x86_64-host
+} kernel
+
+// file: kernel/kernel.nan
+//! Binds the timer vector.
+
+interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    take irq.complete()
+    return hw::IrqExit.Reschedule
+} on_timer
+
+contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer)) // error: registry.platform-target
 ```
 
 ## Diagnostics

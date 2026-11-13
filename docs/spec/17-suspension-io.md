@@ -388,6 +388,25 @@ pub fn greet(take conn: sys::net::Conn) -> sys::net::Conn fails LinkError uses w
 ```
 
 ```nan
+pub fn count(log: sys::Log, sent: usize) {
+    undefer log // error: defer.undefer-unmatched
+    log.info("bytes sent", value: sent)
+} count
+```
+
+```nan
+pub fn finish(log: sys::Log) {
+    defer log.info // error: defer.not-call
+} finish
+```
+
+```nan
+pub fn count(log: sys::Log, sent: usize) {
+    defer log.info("bytes sent", value: sent + 1) // error: defer.operand-form
+} count
+```
+
+```nan
 pub closed enum LinkError derives Render {
     Net(sys::net::NetError) from
     Cancelled(task::Cancelled) from
@@ -397,6 +416,28 @@ pub fn ping(take conn: sys::net::Conn) fails LinkError uses wait {
     defer take conn.close() // error: defer.waits
     discard try await mut conn.write(b"ping\n")
 } ping
+```
+
+```nan
+pub closed enum SaveError derives Render {
+    Full
+} SaveError
+
+pub fn save(count: u32) fails SaveError {
+    if count > 9 {
+        fail SaveError.Full
+    }
+} save
+
+pub fn finish(count: u32) fails SaveError {
+    defer save(count) // error: defer.fails
+} finish
+```
+
+```nan
+pub fn finish(count: u32) {
+    defer count.saturating_add(1) // error: defer.has-result
+} finish
 ```
 
 ## Abandoning resources

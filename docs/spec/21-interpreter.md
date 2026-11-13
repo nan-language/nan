@@ -136,6 +136,10 @@ const FRAME_BYTES: u32 = 1_500
 const assert FRAME_BYTES <= 1_024 // error: const.assert-false
 ```
 
+```nan
+pub const EMPTY_HEADER: Slice[u8] = Array[u8, 10].filled(0).view() // error: const.view-not-static
+```
+
 ## Example runs
 
 An **example run** executes the `example` function of one [example](18-contracts.md#examples) that is not disputed, without inputs.

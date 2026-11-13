@@ -325,6 +325,24 @@ The **accepted spec** of an item is the spec its snapshot records as accepted, w
 
 A snapshot is **current** when `nan api update` would leave it unchanged, absence included. A snapshot that is not current is incompleteness (`api.stale`), reported on the first line of each item whose entries differ and, for entries of items no longer present, on the summary line of the module's [module summary file](32-docs.md#module-summaries), the first variant's in byte order of path for a module with target variants, or of `package.nan` when the module no longer exists.
 
+```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+```
+
+```text
+$ nan edit rename example::Gauge.level reading
+ok edit rename example::Gauge.level reading: files 1, errors 0, incomplete 0
+wrote example/example.nan
+ok edit rename example::Gauge.level reading: files 1, errors 0, incomplete 0
+$ nan verify
+failed verify .: errors 0, incomplete 1, tests 0, failed 0
+incomplete api.stale example/example.nan:2 example::Gauge
+    pub closed struct Gauge {
+failed verify .: errors 0, incomplete 1, tests 0, failed 0
+```
+
 ## Weakening
 
 A **weakening** is a change after which an item's current spec no longer keeps its accepted spec. The **weakened parts** of an item are exactly:

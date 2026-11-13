@@ -16,6 +16,15 @@ fail_expr = "fail" operator_expr ;
 - In the rules of this chapter, F is the failure type of the innermost function, closure or test body holding the expression. In a test body every failure type converts to F unchanged ([test items](22-testing.md#test-items)).
 - A call **may fail** when the head or function type of its callee has a `fails` clause whose type, once the call fixes its generic parameters, is not `Never` ([failure polymorphism](10-effects-digests.md#failure-polymorphism)); otherwise the call cannot fail.
 
+```nan
+pub fn digit(byte: u8) -> u8 fails u8 { // error: error.failure-type
+    if byte > b'9' {
+        fail byte
+    }
+    return byte
+} digit
+```
+
 ### Fail
 
 `fail e` evaluates `e`, converts its value to F by [failure conversion](#failure-conversion), and ends the innermost function, closure or test body with the converted value as its failure; the blocks it leaves exit as at a `return` ([registration and exits](17-suspension-io.md#registration-and-exits)). The type of `fail e` is `Never`.
@@ -79,6 +88,16 @@ pub fn retries_or_default(text: Slice[u8]) -> u8
 } retries_or_default
 ```
 
+```nan
+pub fn twice(value: u8) -> u16 {
+    return u16.widen(value) * 2
+} twice
+
+pub fn total(value: u8) -> u16 {
+    return try twice(value) // error: error.marker-unneeded
+} total
+```
+
 ## Error enums
 
 An **error enum** is an enum named as a failure type; any enum may be one. A **from variant** is a variant declared with `'from'` ([enums](04-types.md#enums)); it lets failure conversion wrap a failure of its payload type.
@@ -98,6 +117,23 @@ pub closed enum ReadError {
 pub closed enum LoadError[E] {
     Read(ReadError) from
     Source(E) from
+} LoadError
+```
+
+```nan
+pub closed enum LoadError {
+    Code(u32) from // error: error.from-shape
+} LoadError
+```
+
+```nan
+pub closed enum ReadError {
+    Empty
+} ReadError
+
+pub closed enum LoadError {
+    Read(ReadError) from
+    Retry(ReadError) from // error: error.from-duplicate
 } LoadError
 ```
 

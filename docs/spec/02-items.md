@@ -329,6 +329,19 @@ pub closed enum ReadError derives Eq, Render {
     Empty
 } ReadError
 
+pub fn first_byte(data: Slice[u8]) -> u8 { // error: item.fails-missing
+    if data.len() == 0 {
+        fail ReadError.Empty
+    }
+    return data[0]
+} first_byte
+```
+
+```nan
+pub closed enum ReadError derives Eq, Render {
+    Empty
+} ReadError
+
 pub fn byte_count(data: Slice[u8]) -> usize fails ReadError { // error: item.fails-unneeded
     return data.len()
 } byte_count
@@ -338,6 +351,12 @@ pub fn byte_count(data: Slice[u8]) -> usize fails ReadError { // error: item.fai
 pub fn pause(clock: sys::Clock) fails task::Cancelled { // error: item.wait-missing
     try await clock.sleep(ms: 10)
 } pause
+```
+
+```nan
+pub fn ready() -> bool uses wait { // error: item.wait-unneeded
+    return true
+} ready
 ```
 
 ## Methods
@@ -403,6 +422,10 @@ pub fn geo::Square.code(self) -> u32 = self.side
 pub closed struct Square {
     pub side: u32
 } Square
+```
+
+```nan
+pub fn u32.doubled(self) -> u32 = self.saturating_mul(2) // error: item.method-misplaced
 ```
 
 ```nan
@@ -545,6 +568,14 @@ const assert MAX_PAYLOAD >= 1_024
 
 ```nan
 pub const RETRIES = 3 // error: item.const-untyped
+```
+
+```nan
+pub closed linear struct Ticket {
+    pub number: u32
+} Ticket
+
+pub const FIRST_TICKET: Ticket = Ticket(number: 1) // error: item.const-type
 ```
 
 ```nan

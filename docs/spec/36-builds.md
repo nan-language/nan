@@ -145,6 +145,31 @@ The toolchain fixes the names and encoding of the files in `store`. A command ap
 - An `<image>` that is not an ELF64 file holding exactly one `.nan` section whose artefacts decode is an error (`build.image-unreadable`), reported without a source line and naming the path.
 - A package whose two code roots differ, or which only one of the two closures holds, is an error (`build.stage-mismatch`), naming the package and both code roots in short form, or `absent`. It is reported on the `package` line of a package checked from source, and otherwise without a source line.
 
+```nan
+// file: hello/package.nan
+//! Greets.
+
+package hello {
+    language 1
+    targets x86_64-host
+    entry main
+} hello
+
+// file: hello/hello.nan
+//! Greets.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("hello", value: 0u8)
+} main
+```
+
+```text
+$ nan build hello --compare-with hello/hello.nan
+failed build hello --compare-with hello/hello.nan: files 0, errors 1, incomplete 0
+error build.image-unreadable hello/hello.nan -
+failed build hello --compare-with hello/hello.nan: files 0, errors 1, incomplete 0
+```
+
 ## Diagnostics
 
 | Code | Class | Rule |

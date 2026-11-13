@@ -163,6 +163,17 @@ pub fn digit_count(value: u64) -> u32
 ```
 
 ```nan
+pub fn digit_count(value: u64) -> u32
+    decreases value
+{
+    if value < 10 {
+        return 1
+    }
+    return 1 + digit_count(value / 2 + 5) // error: contract.decreases-unproven
+} digit_count
+```
+
+```nan
 pub fn halve(value: u64) -> u64
     decreases value // error: contract.decreases-unneeded
 {
@@ -477,6 +488,31 @@ package board {
 
 pub fn entry(table: Slice[u32], index: usize) -> u32 {
     assume index < table.len() because "callers pass valid indexes" // error: contract.assume-untrusted
+    return table[index]
+} entry
+```
+
+```nan
+// file: board/package.nan
+//! Firmware table access.
+
+package board {
+    language 1
+    targets any
+    allow trusted in board
+} board
+
+// file: board/board.nan
+//! Reads entries of a firmware table of fixed length.
+
+pub const ENTRIES: usize = 16
+
+pub fn entry(table: Slice[u32], index: usize) -> u32
+    requires index < ENTRIES
+{
+    trusted "the firmware hands over the whole table" {
+        assume table.len() == ENTRIES because "" // error: contract.empty-reason
+    }
     return table[index]
 } entry
 ```

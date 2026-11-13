@@ -191,6 +191,26 @@ A machine file is **valid** when it lexes, its first line names its kind, it par
 - Otherwise a machine file that is not valid, other than through a reserved lock field, is an error (`format.machine-invalid`), reported on its first line that breaks these rules, or on its check line when only the check differs. It has no exact fix.
 - A command reads nothing from a machine file that is not valid and never rewrites it.
 
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/.nan/history.nan
+nan history 1
+name "meter"
+check "afsiq3a6v4hy3tlzg5iqw5vfj6ttzhf54unbrywkj6sv3htmxqsq6n7" // error: format.machine-invalid
+
+// file: meter/meter.nan
+//! Totals of samples.
+
+pub const START: u64 = 0
+```
+
 ### Lock
 
 ```ebnf

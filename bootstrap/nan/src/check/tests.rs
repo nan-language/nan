@@ -165,3 +165,33 @@ fn a_handler_of_an_operation_its_package_cannot_name_is_used() {
         .collect();
     assert_eq!(codes, []);
 }
+
+/// The code and line of each diagnostic that checking a package of one source file reports, its
+/// manifest holding `grants` after its targets.
+fn reported_in(grants: &str, source: &str) -> Vec<(Code, Option<u32>)> {
+    let manifest = format!(
+        "//! A package.\n\npackage probe {{\n    language 1\n    targets any\n{grants}}} probe\n"
+    );
+    let scratch = Scratch::new(&[
+        ("probe/package.nan", &manifest),
+        ("probe/probe.nan", source),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    reported(&workspace, &Scope::Workspace)
+        .into_iter()
+        .map(|diagnostic| (diagnostic.code, diagnostic.line))
+        .collect()
+}
+
+#[test]
+fn a_validator_implements_no_interface_method() {
+    let source = "//! Headers.\n\npub interface Header {\n    fn code(self, raw: Untrusted[Slice[u8]]) -> u8\n} Header\n\npub closed struct Marker {\n} Marker\n\nimpl Marker: Header\n\npub validator fn Marker.code(self, raw: Untrusted[Slice[u8]]) -> u8 {\n    let Some(head) = raw.inspect().prefix(1) else {\n        return 0\n    }\n    return head[0]\n} Marker.code\n";
+    let reported = reported_in("    allow validate in probe\n", source);
+    assert!(reported.contains(&(Code::UntrustedValidatorInterface, Some(12))));
+}
+
+#[test]
+fn a_todo_expression_states_its_intent() {
+    let source = "//! Delays.\n\npub fn retry_delay(retries: u32) -> u32 {\n    if retries == 0 {\n        return 0\n    }\n    return todo \"\"\n} retry_delay\n";
+    assert!(reported_in("", source).contains(&(Code::TodoEmptyReason, Some(7))));
+}

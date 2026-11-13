@@ -276,6 +276,25 @@ pub interrupt fn on_spurious(take irq: hw::IrqContext) limits stack 256 { // err
 
 ```nan
 // file: timer/package.nan
+//! Tick counting for a bare kernel.
+
+package timer {
+    language 1
+    targets x86_64-bare
+} timer
+
+// file: timer/timer.nan
+//! Reads the tick count of a device.
+
+pub interrupt fn on_tick(mut ticks: task::Cown[u64], take irq: hw::IrqContext) -> hw::IrqExit limits stack 256 { // error: kernel.irq-wait
+    discard await when ticks => ticks
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_tick
+```
+
+```nan
+// file: timer/package.nan
 //! Spurious interrupt handling for a bare kernel.
 
 package timer {

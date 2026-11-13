@@ -210,6 +210,12 @@ pub fn relayed_count(counter: task::Cown[Counter], exec: task::Executor) -> u64 
 } relayed_count
 ```
 
+```nan
+pub fn run_job(take job: task fn() -> u64 fails task::Cancelled uses wait) -> u64 fails task::Cancelled uses wait {
+    return try await job() // error: task.task-fn-call
+} run_job
+```
+
 ## Lending
 
 **Lending** is a task closure's capture of a place by `mut`, or by read when the place is not Copy. A task closure lends only when both hold:
@@ -436,6 +442,38 @@ test transfer_moves_funds for transfer {
     let left = try await balance_of(savings)
     expect left == 6
 } transfer_moves_funds
+```
+
+```nan
+pub closed struct Account {
+    pub balance: u64
+} Account
+
+pub fn balance_of(account: Account) -> u64 fails task::Cancelled uses wait {
+    return await when account => account.balance // error: task.when-not-cown
+} balance_of
+```
+
+```nan
+pub closed struct Account {
+    pub balance: u64
+} Account
+
+pub fn empty(account: task::Cown[Account]) fails task::Cancelled uses wait {
+    await when take account { // error: task.when-take
+        account.balance = 0
+    }
+} empty
+```
+
+```nan
+pub closed struct Account {
+    pub balance: u64
+} Account
+
+pub fn balance_of(account: task::Cown[Account]) -> u64 fails task::Cancelled uses wait {
+    return await when account, account => account.balance // error: task.when-duplicate
+} balance_of
 ```
 
 ```nan

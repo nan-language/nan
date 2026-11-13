@@ -59,7 +59,7 @@ fn tokens() -> Result<bool, String> {
     );
     let mut within = true;
     for (tier, cap) in tokens::TIERS {
-        let counts = tokenizers.counts(&tokens::primer(tier, &cache()));
+        let counts = tokenizers.counts(&tokens::primer(tier, &cache())?);
         let size = counts.iter().copied().max().unwrap_or_default();
         within &= size <= cap;
         let counts: Vec<String> = counts.iter().map(usize::to_string).collect();

@@ -92,11 +92,21 @@ fn llama3_ranks(cache: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
-/// The `nan primer` text of a tier, run in `dir`, which no workspace holds.
-pub fn primer(tier: &str, dir: &Path) -> String {
+/// The manifest of the package whose workspace `nan primer` runs in.
+const MANIFEST: &str = "//! The workspace nanbench prints the primer in.\n\npackage primer {\n    language 1\n    targets any\n} primer\n";
+
+/// The `nan primer` text of a tier, run in a workspace of one package under `dir`.
+pub fn primer(tier: &str, dir: &Path) -> Result<String, String> {
+    let workspace = dir.join("primer");
+    fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    fs::write(workspace.join("package.nan"), MANIFEST).map_err(|error| error.to_string())?;
     let mut args = vec!["primer".to_owned()];
     if tier != "core" {
         args.push(tier.to_owned());
     }
-    nan::run(&args, dir).output
+    let run = nan::run(&args, &workspace);
+    match run.status {
+        0 => Ok(run.output),
+        status => Err(format!("nan primer {tier} exits with {status}\n{}", run.output)),
+    }
 }

@@ -95,6 +95,7 @@ pub fn update(
         }
     }
     changes.sort();
+    check::sort_diagnostics(&mut diagnostics);
     journal::apply(&workspace.root, &changes)?;
     let count = |class: Class| {
         diagnostics

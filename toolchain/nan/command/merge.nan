@@ -1,10 +1,10 @@
 //! `nan merge <base> <ours> <theirs> [--path <path>]`: the merge driver, merging three versions of the workspace, or with `--path` of one file, into `<ours>`.
 
-/// What a merge found and wrote: its diagnostics, the records of those its checks report, the
-/// number of files it wrote and their paths as its records print them.
+/// What a merge found and wrote: its diagnostics, the session of the merged version its checks
+/// ran on, the number of files it wrote and their paths as its records print them.
 struct MergeFound {
     diagnostics: mem::List[diagnostic::Diagnostic]
-    checked: mem::List[output::Record]
+    checked: Option[check::Session]
     files: usize
     wrote: mem::List[text::String]
 } MergeFound
@@ -44,26 +44,24 @@ fn merge_run(invocation: Invocation, current: Str, home: Option[cache::HomeOverr
     let theirs = platform::join(current, name: invocation.operands[2].as_str(), alloc)
     let grammar = syntax::Grammar.load(alloc)
     let checking = Checking(std: workspace::CarriedStd.unloaded(parsing: mem::Shared.of(workspace::Parsing.empty(served: false, alloc), alloc: alloc), alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(home, alloc))
-    var merging = MergeFound(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), checked: mem::List[output::Record].empty(alloc), files: 0, wrote: mem::List[text::String].empty(alloc))
+    var merging = MergeFound(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), checked: None, files: 0, wrote: mem::List[text::String].empty(alloc))
     match invocation.value("--path") {
         Some(path) => try merge_file(path, ours: invocation.operands[1].as_str(), base: base.as_str(), ours_path: ours_path.as_str(), theirs: theirs.as_str(), current, checking, mut merging, alloc)
         None => try merge_workspaces(base.as_str(), ours_path: ours_path.as_str(), theirs: theirs.as_str(), checking, mut merging, alloc)
     }
+    let sorted = check::sorted_diagnostics(take merging.diagnostics, alloc)
     var conflicts: usize = 0
     var errors: usize = 0
     var records = mem::List[output::Record].empty(alloc)
-    for reported in merging.diagnostics {
-        invariant conflicts < merging.diagnostics.len() and errors < merging.diagnostics.len()
-        if reported.code == diagnostic::Code.MergeConflict {
-            conflicts += 1
-            mut records.push(conflict_record(reported, alloc))
-        }
+    for reported in sorted {
+        invariant conflicts < sorted.len() and errors < sorted.len()
         if reported.code.class() == diagnostic::Class.Error {
             errors += 1
         }
-    }
-    for record_checked in take merging.checked {
-        mut records.push(take record_checked)
+        if reported.code == diagnostic::Code.MergeConflict {
+            conflicts += 1
+        }
+        mut records.push(merge_record(reported, checked: merging.checked, alloc))
     }
     for path in merging.wrote {
         var fields = mem::List[text::String].empty(alloc)
@@ -101,9 +99,9 @@ fn merge_file(path: Str, ours: Str, base: Str, ours_path: Str, theirs: Str, curr
                 let theirs_session = version_session(session, path, content: theirs_content, alloc)
                 let result = version_session(session, path, content: merged.content, alloc)
                 for reported in take check::semantic_conflicts(base_session, ours: ours_session, theirs: theirs_session, merged: result, file: Some(path)) {
-                    mut merging.checked.push(record(result.workspace.contents(), std: result.std(), scope: scope::Scope.Workspace, reported, alloc))
                     mut merging.diagnostics.push(take reported)
                 }
+                merging.checked = Some(take result)
             }
         }
         None => {}
@@ -148,7 +146,9 @@ fn merge_workspaces(base: Str, ours_path: Str, theirs: Str, checking: Checking, 
     let read = mem::Arena[text::String].empty(alloc)
     let loaded = try workspace::Workspace.load(ours_path, read, given: checking.home, grammar, alloc)
     let merged_session = checking.session(take loaded, alloc)
-    var found = merged_session.reported(scope::Scope.Workspace)
+    for reported in take merged_session.reported(scope::Scope.Workspace) {
+        mut merging.diagnostics.push(take reported)
+    }
     match base_session {
         Some(base_version) => {
             match ours_session {
@@ -156,7 +156,7 @@ fn merge_workspaces(base: Str, ours_path: Str, theirs: Str, checking: Checking, 
                     match theirs_session {
                         Some(theirs_version) => {
                             for reported in take check::semantic_conflicts(base_version, ours: ours_version, theirs: theirs_version, merged: merged_session, file: None) {
-                                mut found.push(take reported)
+                                mut merging.diagnostics.push(take reported)
                             }
                         }
                         None => {}
@@ -167,10 +167,7 @@ fn merge_workspaces(base: Str, ours_path: Str, theirs: Str, checking: Checking, 
         }
         None => {}
     }
-    for reported in take found {
-        mut merging.checked.push(record(merged_session.workspace.contents(), std: merged_session.std(), scope: scope::Scope.Workspace, reported, alloc))
-        mut merging.diagnostics.push(take reported)
-    }
+    merging.checked = Some(take merged_session)
 } merge_workspaces
 
 /// The bytes of a version's file, none when it cannot be read.
@@ -180,6 +177,20 @@ fn read_version(path: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
     }
     return Some(take bytes)
 } read_version
+
+/// The record of a diagnostic of a merge: a conflict's, or that of one its checks of the merged
+/// version report.
+fn merge_record(reported: diagnostic::Diagnostic, checked: Option[check::Session], alloc: mem::Alloc) -> output::Record {
+    match checked {
+        Some(session) => {
+            if reported.code != diagnostic::Code.MergeConflict {
+                return record(session.workspace.contents(), std: session.std(), scope: scope::Scope.Workspace, reported, alloc)
+            }
+        }
+        None => {}
+    }
+    return conflict_record(reported, alloc)
+} merge_record
 
 /// The record of a conflict, which lies in a version outside any workspace and quotes no line.
 fn conflict_record(reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> output::Record {

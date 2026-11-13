@@ -42,42 +42,36 @@ pub fn run(
     trace.scope = Some(written.clone());
     let mut diagnostics = check::reported(workspace, &scope);
     fix::offer(workspace, current, scoped, &mut diagnostics);
-    let count = |class: Class| {
-        diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code.class() == class)
-            .count()
-    };
-    let (mut errors, incomplete) = (count(Class::Error), count(Class::Incompleteness));
-    let mut records: Vec<Record> = diagnostics
-        .iter()
-        .map(|diagnostic| record(workspace, &scope, diagnostic))
-        .collect();
     let mut report = Report::default();
-    if errors == 0 {
+    if !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.class() == Class::Error)
+    {
         let ran = match Cache::open()? {
             Ok(cache) => test_runs::run(workspace, &scope, &runs, &cache, None)?,
             Err(exposed) => Err(exposed),
         };
         match ran {
             Ok(ran) => report = ran,
-            Err(exposed) => {
-                let diagnostic = Diagnostic {
-                    path: Some(exposed.0),
-                    ..Diagnostic::new(Code::BuildCacheExposed)
-                };
-                records.push(record(workspace, &scope, &diagnostic));
-                errors += 1;
-            }
+            Err(exposed) => diagnostics.push(Diagnostic {
+                path: Some(exposed.0),
+                ..Diagnostic::new(Code::BuildCacheExposed)
+            }),
         }
     }
-    errors += report.diagnostics.len();
-    records.extend(
-        report
-            .diagnostics
+    diagnostics.append(&mut report.diagnostics);
+    check::sort_diagnostics(&mut diagnostics);
+    let count = |class: Class| {
+        diagnostics
             .iter()
-            .map(|diagnostic| record(workspace, &scope, diagnostic)),
-    );
+            .filter(|diagnostic| diagnostic.code.class() == class)
+            .count()
+    };
+    let (errors, incomplete) = (count(Class::Error), count(Class::Incompleteness));
+    let mut records: Vec<Record> = diagnostics
+        .iter()
+        .map(|diagnostic| record(workspace, &scope, diagnostic))
+        .collect();
     records.extend(fail_records(workspace, &scope, &report));
     Ok(output(
         invocation,

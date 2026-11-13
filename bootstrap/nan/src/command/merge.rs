@@ -22,7 +22,7 @@ pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
     trace.scope = Some(written.clone());
     let (base, ours_path, theirs) = (current.join(base), current.join(ours), current.join(theirs));
     let mut diagnostics = Vec::new();
-    let mut checked: Vec<Record> = Vec::new();
+    let mut checked: Option<Workspace> = None;
     let mut files = 0;
     let mut wrote = Vec::new();
     match invocation.value("--path") {
@@ -52,12 +52,14 @@ pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
                     let [base, ours, theirs] =
                         versions.each_ref().map(|content| version(content.as_ref()));
                     let result = version(merged.content.as_ref());
-                    for diagnostic in
-                        check::semantic_conflicts(&base, &ours, &theirs, &result, Some(path))
-                    {
-                        checked.push(record(&result, &Scope::Workspace, &diagnostic));
-                        diagnostics.push(diagnostic);
-                    }
+                    diagnostics.extend(check::semantic_conflicts(
+                        &base,
+                        &ours,
+                        &theirs,
+                        &result,
+                        Some(path),
+                    ));
+                    checked = Some(result);
                 }
             }
             replace(&ours_path, merged.content.as_deref())?;
@@ -96,16 +98,14 @@ pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
                 }
             }
             let merged = Workspace::load(ours_path.clone(), &mut Vec::new())?;
-            let mut found = check::reported(&merged, &Scope::Workspace);
+            diagnostics.extend(check::reported(&merged, &Scope::Workspace));
             if let [Some(base), Some(ours), Some(theirs)] = &versions[..] {
-                found.extend(check::semantic_conflicts(base, ours, theirs, &merged, None));
+                diagnostics.extend(check::semantic_conflicts(base, ours, theirs, &merged, None));
             }
-            for diagnostic in found {
-                checked.push(record(&merged, &Scope::Workspace, &diagnostic));
-                diagnostics.push(diagnostic);
-            }
+            checked = Some(merged);
         }
     }
+    check::sort_diagnostics(&mut diagnostics);
     let conflicts = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.code == Code::MergeConflict)
@@ -116,9 +116,12 @@ pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
         .count();
     let records: Vec<Record> = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == Code::MergeConflict)
-        .map(conflict_record)
-        .chain(checked)
+        .map(|diagnostic| match &checked {
+            Some(checked) if diagnostic.code != Code::MergeConflict => {
+                record(checked, &Scope::Workspace, diagnostic)
+            }
+            _ => conflict_record(diagnostic),
+        })
         .chain(wrote.iter().map(|path| Record {
             word: "wrote".to_owned(),
             fields: vec![path.clone()],

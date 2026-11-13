@@ -57,6 +57,7 @@ pub fn language(
             .into_iter()
             .filter(|diagnostic| diagnostic.code.class() == Class::Error),
     );
+    check::sort_diagnostics(&mut diagnostics);
     let errors = diagnostics.len();
     Ok(Output {
         command: invocation.command(&written, true),

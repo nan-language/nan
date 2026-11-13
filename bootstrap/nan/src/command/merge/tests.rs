@@ -1,4 +1,4 @@
-use crate::command::tests::run_in;
+use crate::command::tests::{records, run_in};
 use crate::workspace::tests::Scratch;
 
 const MANIFEST: &str =
@@ -30,5 +30,31 @@ fn a_use_of_an_item_the_other_side_changed_is_a_semantic_conflict() {
     assert!(
         run.output
             .contains("\n    because note - - + pub fn scale(x: u64) -> u64")
+    );
+}
+
+#[test]
+fn a_workspace_merge_prints_its_conflicts_among_its_checks_by_path_and_line() {
+    let limit = |value: u32| format!("//! Limits.\n\npub const LIMIT: u32 = {value}\n");
+    let scale = "//! Example.\n\n/// Twice a value.\npub fn scale(x: u32) -> u32 = x * 2\n";
+    let scratch = Scratch::new(&[
+        ("base/example/package.nan", MANIFEST),
+        ("base/example/example.nan", scale),
+        ("base/example/z.nan", &limit(10)),
+        ("ours/example/package.nan", MANIFEST),
+        ("ours/example/example.nan", &scale.replace("x * 2", "nope")),
+        ("ours/example/z.nan", &limit(20)),
+        ("theirs/example/package.nan", MANIFEST),
+        ("theirs/example/example.nan", scale),
+        ("theirs/example/z.nan", &limit(30)),
+    ]);
+    let run = run_in(&scratch.0, "merge base ours theirs");
+    assert_eq!(
+        records(&run.output),
+        [
+            "error name.unknown example/example.nan:4",
+            "error merge.conflict example/z.nan:3",
+            "error merge.unresolved example/z.nan:3"
+        ]
     );
 }

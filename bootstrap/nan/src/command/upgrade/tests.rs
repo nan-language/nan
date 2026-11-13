@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::command::tests::run_in;
+use crate::command::tests::{MANIFEST, records, run_in};
 use crate::workspace::tests::Scratch;
 
 const GAUGE: &str = "//! Readings.\n\n/// A reading in percent.\npub fn percent(raw: u32) -> u32 = raw.saturating_mul(100) / 1_024\n";
@@ -65,5 +65,25 @@ fn a_rename_published_behind_a_tombstone_forwards_until_nan_upgrade_rewrites_the
             .contains("\nincomplete unused.tombstone gauge/gauge.nan:"),
         "{}",
         checked.output
+    );
+}
+
+#[test]
+fn an_upgrade_prints_its_errors_by_path_and_line() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Apps.\n\n/// Two.\npub fn two() -> u32 = nope\n",
+        ),
+    ]);
+    let run = run_in(&scratch.0, "upgrade --language 0 app");
+    assert_eq!(
+        records(&run.output),
+        [
+            "error language.unsupported -",
+            "error name.unknown app/app.nan:4",
+            "error language.downgrade app/package.nan:4"
+        ]
     );
 }

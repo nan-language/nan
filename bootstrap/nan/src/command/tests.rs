@@ -371,6 +371,22 @@ fn a_test_reaching_a_rejected_item_reports_its_errors_and_runs_nothing() {
 }
 
 #[test]
+fn a_test_prints_the_errors_it_reaches_among_those_of_its_scope_by_line() {
+    let broken = HALVES
+        .replace("value / 2", "value / true")
+        .replace("== 2", "== todo \"more\"");
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &broken)]);
+    let run = run_in(&scratch.0, "test app::halves");
+    assert_eq!(
+        records(&run.output),
+        [
+            "error type.mismatch app/app.nan:4",
+            "incomplete todo.hole app/app.nan:8"
+        ]
+    );
+}
+
+#[test]
 fn a_final_link_root_syncs_under_its_approvals_and_names_the_widening_left_to_approve() {
     let length = "//! Lengths.\n\n/// A length.\npub fn length(count: u32, alloc: mem::Alloc) -> u32 {\n    var bytes = mem::List[u8].empty(alloc)\n    mut bytes.push(1)\n    return count + u32.truncate(bytes.len())\n} length\n";
     let main = |logged: &str| {
@@ -458,7 +474,7 @@ fn meter_and_app() -> Scratch {
 }
 
 /// The code and location of each diagnostic record of an output.
-fn records(output: &str) -> Vec<String> {
+pub(super) fn records(output: &str) -> Vec<String> {
     (output.lines())
         .filter(|line| line.starts_with("error ") || line.starts_with("incomplete "))
         .map(|line| line.split(' ').take(3).collect::<Vec<_>>().join(" "))

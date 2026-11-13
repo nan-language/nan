@@ -73,7 +73,7 @@ pub fn run(
                     &written,
                     workspace,
                     index,
-                    &[diagnostic],
+                    vec![diagnostic],
                 ));
             }
         },
@@ -101,7 +101,7 @@ pub fn run(
                 path: Some(exposed.0),
                 ..Diagnostic::new(Code::BuildCacheExposed)
             });
-            return Ok(refusal(invocation, &written, workspace, index, &refused));
+            return Ok(refusal(invocation, &written, workspace, index, refused));
         }
     };
     let store = Store::new(cache.store());
@@ -112,7 +112,7 @@ pub fn run(
                 path: Some(exposed.0),
                 ..Diagnostic::new(Code::BuildCacheExposed)
             });
-            return Ok(refusal(invocation, &written, workspace, index, &refused));
+            return Ok(refusal(invocation, &written, workspace, index, refused));
         }
     };
     let history = package.machine.history();
@@ -146,7 +146,7 @@ pub fn run(
         ));
     }
     if !refused.is_empty() {
-        return Ok(refusal(invocation, &written, workspace, index, &refused));
+        return Ok(refusal(invocation, &written, workspace, index, refused));
     }
     let Moved {
         changed,
@@ -205,7 +205,7 @@ pub fn run(
             &written,
             workspace,
             index,
-            &[diagnostic],
+            vec![diagnostic],
         ));
     }
     let parent_summary = parent.and_then(|entry| entry.summary.as_ref());
@@ -219,13 +219,7 @@ pub fn run(
         .unwrap_or_default();
     let unpreserved = check::not_preserved(workspace, index, &parent_exported, &held, &exported);
     if !unpreserved.is_empty() {
-        return Ok(refusal(
-            invocation,
-            &written,
-            workspace,
-            index,
-            &unpreserved,
-        ));
+        return Ok(refusal(invocation, &written, workspace, index, unpreserved));
     }
     let compatible = check::compatible(&moved_workspace, index, &parent_exported, &exported);
     let classes = release::classes(
@@ -306,7 +300,7 @@ pub fn run(
                 &written,
                 workspace,
                 index,
-                &[diagnostic],
+                vec![diagnostic],
             ));
         }
     };
@@ -445,19 +439,20 @@ fn moved_tombstones(workspace: &Workspace, index: usize) -> Moved {
     }
 }
 
-/// The output of a refused publish: its diagnostics.
+/// The output of a refused publish: its diagnostics, by path, line and code.
 fn refusal(
     invocation: &Invocation,
     written: &str,
     workspace: &Workspace,
     index: usize,
-    diagnostics: &[Diagnostic],
+    mut diagnostics: Vec<Diagnostic>,
 ) -> Output {
+    check::sort_diagnostics(&mut diagnostics);
     let records = diagnostics
         .iter()
         .map(|diagnostic| record(workspace, &Scope::Package(index), diagnostic))
         .collect();
-    output(invocation, written, records, diagnostics, &[])
+    output(invocation, written, records, &diagnostics, &[])
 }
 
 fn output(

@@ -567,11 +567,13 @@ error version.parent-missing report/package.nan:3 report
 error version.store-name-taken report/package.nan:3 report
     package report {
 failed publish --local report --name meter: files 0, errors 2, incomplete 0
-$ nan publish --local app
-failed publish --local app: files 0, errors 1, incomplete 0
+$ nan publish --local app --name meter
+failed publish --local app --name meter: files 0, errors 2, incomplete 0
+error version.store-name-taken app/package.nan:3 app
+    package app {
 error version.path-dependency app/package.nan:6 app
         dep report "../report"
-failed publish --local app: files 0, errors 1, incomplete 0
+failed publish --local app --name meter: files 0, errors 2, incomplete 0
 ```
 
 ## Lock

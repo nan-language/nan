@@ -39,8 +39,9 @@ pub mod node {
 }
 
 /// `mut cx.spawn(key: k, run: f)`: supersedes `k`, then starts a keyed task running `f` with a
-/// new outbox of key `k`, in a region of its own, or holds it on a stepper. The instance's
-/// arguments end with the code of the class of what `f` runs, which elaboration appends.
+/// new outbox of key `k`, in a region of its own, or holds it on a stepper, whose keyed tasks
+/// lie in no region enclosing their own. The instance's arguments end with the code of the
+/// class of what `f` runs, which elaboration appends.
 pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let run_ty = fn_param(supply, 2);
     let record = fx.load(PTR, supply.param(0).address(), 0);
@@ -54,6 +55,12 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.when(short, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
     let size = fx.ptr(region::SIZE);
     let task_region = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
+    let holding = fx.load(PTR, record, runner::HOLDING);
+    let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, holding, 0);
+    fx.when(held, |fx| {
+        let zero = fx.ptr(0);
+        fx.store(zero, task_region, region::PARENT);
+    });
     let keyed_outbox = fx.ptr(1);
     let outbox = lo.call_routine(fx, Routine::OutboxMint, &[record, key, keyed_outbox])[0];
     let node_size = fx.ptr(node::SIZE);
@@ -90,8 +97,6 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     );
     fx.store(outbox, started, task::ARGUMENT);
     fx.store(started, node, node::TASK);
-    let holding = fx.load(PTR, record, runner::HOLDING);
-    let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, holding, 0);
     fx.when(held, |fx| {
         let one = fx.ptr(1);
         fx.store(one, node, node::HELD);
